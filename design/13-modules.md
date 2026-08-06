@@ -782,15 +782,37 @@ has nowhere to receive them: it is not a call, so it has no parameter list, and 
 are not a module-level anything — they are what this run of this program was started with. A named
 function does have a parameter list, which is the whole reason for the form.
 
-The two signatures are these, and there are no others:
+The signatures are these, and there are no others:
 
 ```
 main()
 main(args: []string)
+main() -> Result[unit, E]
+main(args: []string) -> Result[unit, E]
 ```
 
 A `main` that asks for nothing is for the program that has work to do and no arguments to read; it
 costs nothing, since the conversion below is reached only by the other one.
+
+**A `main` may answer with a `Result[unit, E]`, and that is what lets `?` reach the top of a
+program.** Without it every fallible call in `main` ends in `.unwrap()`, which reports a failure as a
+panic naming the line that gave up rather than the thing that went wrong; with it the error travels
+as a value to the end of the program and is reported once, on stderr, with a non-zero exit status.
+
+Three things about that form are decided rather than incidental:
+
+- **The `unit` is not decoration.** A value `main` answered with would have nowhere to go, since what
+  the platform takes is a status and not a value. `Result[int, E]` is refused for that reason rather
+  than quietly using the integer.
+- **`E` must be `Display`.** The report is the whole point, and an error nobody can render would exit
+  non-zero having said nothing. The bound is checked where `main` is written.
+- **The status is `1`, not something read off the error.** A status is one byte and an error is a
+  value; mapping one onto the other is the program's business, and a program that wants to choose its
+  own has `exit` and always did.
+
+The reporting is `sysl.main_result`, an ordinary library function instantiated at whatever error type
+`main` named — the same arrangement as `args_of` below, and for the same reason: the entry point
+carries as little hand-written code as the platform allows.
 
 **`args` is a slice of `string`.** What the platform hands a program is C's pair — a count, and a
 vector of NUL-terminated byte runs — and neither of those appears in a sysl signature anywhere. The
