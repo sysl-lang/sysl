@@ -91,10 +91,29 @@ a conversion whichever way it goes.
 ## 3. A derivation inherits its base's behaviour and may replace none of it
 
 A `new` type over a scalar arrives with everything the scalar could do — `==`, `<`, `+`, `-`, `*`,
-`str` and the rest of the catalog — working at itself and producing itself. And **no `impl` may
-replace or extend any of it**: `impl Add[Span] for Stamp` is refused because `add` is how `Add` is
-implemented for `Stamp` and the compiler provides that, and `impl Display for Stamp` is refused
-because `Stamp` already implements `Display`.
+`str` and the rest of the catalog — working at itself and producing itself. And **an `impl` may
+replace almost none of it**: `impl Add[Span] for Stamp` is refused because `add` is how `Add` is
+implemented for `Stamp` and the compiler provides that.
+
+The one exception is **rendering**, and it is `override`'s (`02 §`):
+
+```
+type Stamp = new int
+
+override impl Display for Stamp
+    display(self, out: *Writer, fmt: FormatSpec) = display_str("#" + str(int(self)), out, fmt)
+```
+
+A derivation has its base's memberships, so the library's blanket over every integer already covers
+`Stamp` and a block of its own is an override rather than a first implementation. It used to be
+refused for that reason and now is not.
+
+**That is a narrowing of the ruling rather than a hole in it**, and the line is what the base
+*guarantees about its values*. `<` is such a guarantee: a `Stamp` that ordered differently would be a
+set of `i64`s that do not order the way `i64`s order, and every fact the base promises would hold
+only until somebody looked. How a value **renders** is not one of those facts — a `Stamp` printing as
+`#7` is the same `i64` it was, and nothing downstream reasons about it differently. So rendering is
+the row a derivation may take back, and the operators are not.
 
 Both halves of that are deliberate, and stating the reason is most of why this section exists.
 
@@ -122,14 +141,16 @@ taste:
 | | a `new` derivation | a one-field struct |
 |---|---|---|
 | distinct type | yes | yes |
-| the base's catalog | free, and unchangeable | nothing, write it all |
+| the base's catalog | free; only `Display` is replaceable | nothing, write it all |
 | an operation the base does not have | impossible | ordinary |
 | an operation the base has that is now nonsense | present anyway | absent |
+| rendering as something other than the base | `override impl Display` | ordinary |
 
 **Use a derivation for an identity** — a slot number, a handle, a unit-tagged measurement, anything
 whose operations are its representation's operations. **Use a struct for a quantity with an algebra
-of its own.** What has no answer today is the case in the middle: a type that wants most of its
-base's catalog and one row of its own. That is recorded as open below.
+of its own.** The case in the middle — a type that wants most of its base's catalog and one row of
+its own — now has exactly one row available to it, `Display`, and the reasoning above is why it is
+that row and not another. The rest of the middle is still open, and is recorded below.
 
 ### The catalog is the base's, and the range still holds
 

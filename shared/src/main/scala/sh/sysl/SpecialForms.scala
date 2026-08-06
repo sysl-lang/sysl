@@ -203,9 +203,18 @@ trait SpecialForms extends Closures {
    * words the programmer wrote rather than in the machinery underneath them.
    */
   private def renderer(t: TExpr, op: String): (String, TExpr, Option[Int]) = {
-    // A constrained subtype renders exactly as its base does — a number or a character — so it
-    // reaches the base's renderer rather than asking for a `Display` impl of its own.
-    checkWriterShape(); Type.underlying(t.ty)
+    // A subtype renders exactly as its base does — a number or a character — so it reaches the
+    // base's renderer rather than asking for a `Display` impl of its own. That is what a subtype is
+    // for, and it is what keeps `type Percent = int :: 0..100` printing like the integer it is.
+    //
+    // **Unless it has said otherwise**, which `02 § override` made writable and nothing had to
+    // before. A derived subtype has its base's memberships (`16 §3`), so the library's blanket over
+    // every integer already covers it and a block of its own is an override — the one case where
+    // the type has a renderer the base does not. Collapsing first would find the base's, which
+    // would make that block compile and do nothing.
+    checkWriterShape()
+
+    if implsOf(displayTrait, ownerKey(t.ty)).nonEmpty then t.ty else Type.underlying(t.ty)
   } match
     case a: Type.Abstract =>
       if !satisfies(displayTrait, a) then boundErr(s"'$op' needs '${a.name}: ${qn(displayTrait)}'")
