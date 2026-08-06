@@ -70,5 +70,34 @@ error message has to be worth reading when it fires. Two things worth settling t
 - whether `var` is what a reader would have reached for anyway. If nearly every use of a mutable
   struct wants `var`, the hole has been hiding a papercut rather than preventing one.
 
+## The Scala reading, raised and answered
+
+The natural objection is Scala's: a `val` fixes the *binding*, and what it holds may still be mutable.
+Three facts decide it, and the third is not a matter of taste.
+
+- **That reading already exists here, spelled `&`.** Every Scala object is behind a reference, so the
+  analogue is a reference field — and it works today with no hole involved:
+
+  ```sysl
+  val h = Holder(0, buf())
+
+  h.xs.push(1)          // accepted, and correct: the Buf is behind a `&`
+  ```
+
+  This is why `val t = table()` mostly works. `Table`'s `cells`, `aligns` and `rules` are `&Buf`, so
+  adding a row is legitimate; only `self.ncols` and `self.pending` are the struct's own bytes.
+
+- **The disputed case has no Scala analogue.** Scala has no inline structs, so it never has to say
+  what happens when the contents *are* the binding's storage. Here they are.
+
+- **A module-level `val` is emitted as `constant` — rodata.** `val table: [4]int = [10, 20, 30, 40]`
+  lowers to `@table = private constant [4 x i32]`. Permitting field writes to a `val` is therefore
+  not a semantics choice at module scope, it is a write to read-only memory. Keeping the Scala
+  reading would mean `val` meaning one thing for a local and another for a module-level table, which
+  is worse than either.
+
+So the chapter's reading stands — `val` is read-only storage — and `&` is how a program asks for a
+fixed name over mutable content. The cost of closing the hole is one word at the call site, `var`.
+
 Found by probe, 2026-08-06, while writing a table demo. Not fixed, deliberately — the fix is small and
 the fallout is not, and nothing is unsound today beyond `val` meaning less than the chapter says.
