@@ -70,6 +70,30 @@ object Project {
     if slash >= 0 then path.substring(slash + 1) else path
   }
 
+  /** What a project rooted at this path is *called*, which is not the same question as what the
+   * caller typed to reach it.
+   *
+   * `.`, `..`, a trailing separator and a path that doubles back through `..` all name a directory
+   * whose name is somewhere other than the end of the string, so the segments are resolved against
+   * the working directory and the last one that survives is the answer. `basename` cannot do this
+   * and should not try: it answers about the *text*, which is what its other callers want.
+   *
+   * A path that resolves to the root has no last segment and so has no name; `a.out` is the same
+   * fallback the driver has always used for a name it could not work out.
+   */
+  def nameOf(path: String): String = {
+    val absolute = if path.startsWith("/") || path.startsWith("\\") then path
+                   else s"${getCurrentDirectory}/$path"
+
+    val resolved = absolute.split("[/\\\\]").foldLeft(List.empty[String]) {
+      case (segments, "" | ".") => segments
+      case (segments, "..")     => segments.dropRight(1)
+      case (segments, segment)  => segments :+ segment
+    }
+
+    resolved.lastOption.getOrElse("a.out")
+  }
+
   /** The directory an output path sits in, where it names one — the default standard-module path
    * does, and it is a directory a fresh clone has never had, so writing the artifact has to make it.
    */

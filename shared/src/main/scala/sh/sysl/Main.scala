@@ -450,7 +450,7 @@ private[sysl] def execute(cfg: Config): Int = {
       stdout(compiled.ir); 0
 
     case "build" =>
-      val exe = cfg.output.getOrElse(defaultOutputName(cfg.file))
+      val exe = cfg.output.getOrElse(defaultOutput(cfg.file))
 
       Toolchain.build(compiled.ir, exe, target, archives, cfg.optimize, compiled.links, native.objects,
         paths) match
@@ -562,12 +562,14 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
     case Left(err) => report(err)
     case Right((ir, meta)) =>
       // The standard module's default output is the place a compilation looks for it, so that
-      // building it and finding it are not two things to keep in agreement. Any other library
-      // is named after the root it was built from, there being nowhere in particular it belongs.
+      // building it and finding it are not two things to keep in agreement. Any other library is
+      // named after the root it was built from and written inside it, which is the same rule a
+      // build's executable follows and for the same reason: the root is the one place that names
+      // the library without depending on where the caller happened to be standing.
       val out =
         cfg.output.getOrElse(
           if cfg.std then cfg.stdSearch.getOrElse(LibraryArtifact.stdDefault)
-          else defaultOutputName(cfg.file) + LibraryArtifact.extension)
+          else defaultOutput(cfg.file, LibraryArtifact.extension))
 
       Project.parentOf(out).foreach(createDirectories)
 
@@ -798,11 +800,30 @@ private def listTargets(): Int = {
   0
 }
 
+/** Where a build writes when the caller named no output.
+ *
+ * A **file** project is named by a path carrying an extension, so dropping it leaves a name that
+ * cannot be the thing being built: `foo.sysl` becomes `foo`, beside the caller.
+ *
+ * A **directory** project has no extension to drop, and the name left over *is* the directory —
+ * so the linker was handed a path it could not open, and `sysl build .` failed for every project
+ * there has ever been while `sysl build test` failed for every project sitting in the working
+ * directory. A directory has somewhere obvious to put the thing built out of it, which is inside
+ * itself, so that is where it goes.
+ *
+ * **The point is that the answer stops depending on where the build was started.** `sysl build .`,
+ * `sysl build test` and `sysl build ../test` are three ways of naming one project, and all three now
+ * write `test/test` rather than three different paths, one of which was the project.
+ */
+private def defaultOutput(file: String, suffix: String = ""): String =
+  if isDirectory(file) then s"$file/${Project.nameOf(file)}$suffix"
+  else defaultOutputName(file) + suffix
+
+/** The name a **file** project's output takes: its own, with the extension dropped. */
 private def defaultOutputName(file: String): String = {
-  val slash = math.max(file.lastIndexOf('/'), file.lastIndexOf('\\'))
-  val name  = if slash >= 0 then file.substring(slash + 1) else file
-  val dot   = name.lastIndexOf('.')
-  val base  = if dot > 0 then name.substring(0, dot) else name
+  val name = Project.basename(file)
+  val dot  = name.lastIndexOf('.')
+  val base = if dot > 0 then name.substring(0, dot) else name
   if base.isEmpty then "a.out" else base
 }
 
