@@ -166,6 +166,12 @@ trait ImplConformance extends MemberLowering {
    * the two are fixed from different places and the order is what lets them be: a call reads the
    * type's off the receiver and appends the ones it solved, so the same positional substitution
    * serves a member that adds parameters and one that adds none.
+   *
+   * Which of them stand for a **value** and which for a **list of types** comes from both sides for
+   * the same reason the names do. A block declares the ones its subject is generic over and a member
+   * declares its own, and the lowered function is generic over the two together — so a member taking
+   * `[..A]` is walked with a pack standing at a pack, rather than at one opaque type whose parts
+   * nothing could reach.
    */
   protected def synthesize(home: MemberHome, m: MethodDecl): FuncDecl = {
     val name = s"${home.symbol}.${m.name}${home.alt}"
@@ -178,8 +184,8 @@ trait ImplConformance extends MemberLowering {
       m.body,
       home.bounds ++ m.bounds,
       m.variadic,
-      tvalues = home.tvalues,
-      tpacks = home.tpacks,
+      tvalues = home.tvalues ++ m.tvalues,
+      tpacks = home.tpacks ++ m.tpacks,
     ).setPos(m.pos)
   }
 

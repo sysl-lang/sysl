@@ -100,6 +100,24 @@ class ValueGenericsTests extends AnyFreeSpec with RunSupport with CodegenSupport
             |var b: Buf[SIZE] = Buf([1u8, 2u8, 3u8])
             |print(b.data.len)""".stripMargin) shouldBe "3\n"
     }
+
+    /** A **member's own** list, which is a different list from the type's: the type's are fixed by
+     * the receiver and the member's are solved at the call. The two meet in the lowered function, so
+     * the kinds have to come from both sides — a member's own `const` read as an ordinary type
+     * parameter would stand at an opaque type and its body could not do arithmetic on it.
+     */
+    "a method declares one of its own, solved from the argument" in {
+      run("""struct Sum
+            |    seen: usize
+            |    take[const N: usize](*self, xs: [N]int) -> usize
+            |        self.seen = self.seen + N
+            |        N
+            |end Sum
+            |var s = Sum(0usize)
+            |print(s.take([1, 2, 3]))
+            |print(s.take([4, 5]))
+            |print(s.seen)""".stripMargin) shouldBe "3\n2\n5\n"
+    }
   }
 
   /** `10 §9` admits **integers, `bool`, `char` and enum values** on day one, for one reason: a value

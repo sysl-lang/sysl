@@ -269,7 +269,7 @@ trait DeclParser extends ExprParser {
     (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> resultRef) ~ funcBody <~ endName(name) ^^ {
       case (recv, params, variadic) ~ ret ~ body =>
         MethodDecl(name, recv, isProperty = false, generics.names, params, ret, body, generics.bounds,
-          generics.defaults, variadic = variadic)
+          generics.defaults, variadic = variadic, tvalues = generics.values, tpacks = generics.packs)
     }
 
   /** A property takes the same `funcBody` a method does, so `name -> T` may be answered by an
@@ -432,7 +432,7 @@ trait DeclParser extends ExprParser {
         case name ~ tps ~ ((recv, params, variadic)) ~ ret =>
           val tp = tps.getOrElse(TypeParams.none)
           MethodDecl(name, recv, isProperty = false, tp.names, params, ret, Nil, tp.bounds, tp.defaults,
-            variadic = variadic)
+            variadic = variadic, tvalues = tp.values, tpacks = tp.packs)
       },
     )
 

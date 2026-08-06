@@ -420,6 +420,15 @@ case class MethodDecl(
     vis: Visibility = Visibility.Public,
     variadic: Boolean = false,
     overrides: Boolean = false,
+    /** Which of `tparams` stand for a **value** rather than a type (`10 §9`), and at what type. */
+    tvalues: Map[String, TypeRef] = Map.empty,
+    /** Which of `tparams` stand for a **list** of types (`10 §10`).
+      *
+      * A member's parameter list is its own, exactly as a function's is, so a pack may stand in it.
+      * What cannot carry one is a declaration whose parameters *are* its shape — a struct, an enum
+      * or a trait — and that refusal is about the shape rather than about members.
+      */
+    tpacks: Set[String] = Set.empty,
 ) extends Positioned {
 
   /** The mode this member takes its receiver in, or `None` for an associated function — which is the

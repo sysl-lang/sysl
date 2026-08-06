@@ -256,16 +256,14 @@ class TypePackTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     /** A pack on a **method's own** parameter list, which is a different position from a struct's.
      * `Row[..A]` is refused because a struct has nowhere to spread a list over its own shape, and
-     * the same reason does not reach a method — a method's parameters are its own, exactly as a
-     * free function's are, and the free-function form is green above.
+     * that reason does not reach a method, whose parameters are its own exactly as a free
+     * function's are.
      *
-     * The shape that wants it is a container fixed at one type taking a row of several — which a
-     * slice of erased elements already covers, so this is a hole rather than a blocker.
-     *
-     * The list parses; `A` is then registered as an ordinary type parameter, so `(..A)` is met by a
-     * diagnostic recommending the very declaration that was written.
+     * The two lists meet in the lowered function, so a member is generic over the block's parameters
+     * and its own together — which is why the kinds have to come from both sides and not just from
+     * the block.
      */
-    "may stand on a method of an ordinary struct" ignore {
+    "may stand on a method of an ordinary struct" in {
       run("""struct Row
             |    n: usize
             |    take[..A: Display](*self, t: (..A))
@@ -275,6 +273,19 @@ class TypePackTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |var r = Row(0usize)
             |r.take((1, "abc", true))
             |print(r.n)""".stripMargin) shouldBe "8\n"
+    }
+
+    /** But **not** on a trait's member, and for a reason that has nothing to do with packs: no
+     * member a trait requires may declare parameters of its own, since a table slot cannot hold a
+     * function that does not exist until a call names its types. A pack is one more way to write
+     * that list, so it meets the rule already there — and the message sends the reader to the
+     * inherent member, which is the position that does work.
+     */
+    "but not on a trait's member, which has a table slot to fill" in {
+      err("""trait Take
+            |    take[..A: Display](self, t: (..A)) -> usize
+            |print(1)""".stripMargin) should
+        include("an inherent member may declare them")
     }
 
     "reaches the parts through a reference receiver" in {

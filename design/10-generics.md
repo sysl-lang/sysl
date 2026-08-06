@@ -414,6 +414,10 @@ struct Buf[const N: usize]
     used: usize
 ```
 
+An **inherent member's own** list takes one on the same terms a function's does — `take[const N:
+usize](*self, xs: [N]int)` — with the type's parameters fixed by the receiver and the member's
+solved at the call. A trait's member may declare none of any kind, for the reason §10 gives.
+
 Ada has had this since **1983** (a *generic formal object*), C++ since templates (a *non-type
 template parameter*), Rust since 1.51 (*const generics*), and Zig spells it `comptime`. The
 languages without it — Go, Java, Kotlin, C# — are the ones where every array is a heap object
@@ -666,6 +670,20 @@ nothing about a real tuple is inferred from the representative one.
 - **An `impl` subject** — `impl[..A: Eq] Eq for (..A)`, which is what the feature is for.
 - **A function's parameter or result** — `widest[..A: Display](t: (..A)) -> usize`, since a free
   function over any tuple is the same need one step out of the catalog.
+- **An inherent member's own parameter list** — `take[..A: Display](*self, t: (..A))`, because a
+  member's parameters are its own exactly as a function's are. The type's parameters are fixed by
+  the receiver and the member's are solved at the call; the two meet in the lowered function, which
+  is generic over both lists together.
+
+  A **trait's** member is refused, and not for a reason about packs: no member a trait requires may
+  declare parameters of its own, since a table slot cannot hold a function that does not exist until
+  a call names its types. A pack is one more way of writing that list, so it meets the rule already
+  there.
+
+  A `struct`, an `enum` and a `trait` are refused as before. That refusal is about a declaration
+  whose parameters **are** its shape, and a member has no shape for a list to be spread over — so it
+  never reached members, and reading it as though it did is what kept this position closed longer
+  than the reason for it lasted.
 
 And nowhere else, day one. In particular there is **no pack expansion in an expression**: no
 `f(..a)` spreading a tuple into an argument list, and no `(..A, int)` appending to a pack in a type.
