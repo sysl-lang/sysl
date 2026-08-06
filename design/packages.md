@@ -226,7 +226,7 @@ This is the single most valuable property in the chapter and it is available alm
 because the reason other ecosystems need build scripts mostly does not apply. Cargo's `build.rs`
 exists in large part to compile vendored C, and **sysl already compiles a package's C
 declaratively**: `15 § 7` establishes that any source tree may carry C inside its module tree, and
-`bindings/regex` and the SQLite package both do exactly that. The linker inputs a package needs are
+the regex and SQLite packages both do exactly that. The linker inputs a package needs are
 `link` directives in the source (`13 §`), not a program that computes them.
 
 **A dependency is consumed as source, so this is a claim about the source path and not only about
@@ -446,11 +446,19 @@ code reaches.
   `build-lib` on a tree holding `examples/demo.sysl` refuses it, because `13 §1` puts a file with no
   `module` header in the anonymous root module wherever it sits, and `13 §8` says a library may not
   be there. Everything under a package root is compiled *into* the library, so there is no "outside"
-  the way `bindings/<name>/lib` had one. The demo went into that repository's README, which works and
-  is not the same as being compiled. The options look like a directory the build ignores by
-  convention, a manifest key naming what is not part of the library, or deciding a package simply
-  does not carry programs — and the third is the one that needs an argument, since an example that is
-  never compiled is an example that rots.
+  — which is exactly what the in-tree bindings had, since a `bindings/<name>/lib` root left the demo
+  somewhere to sit beside it. The demo went into that repository's README, which works and is not the
+  same as being compiled. The options look like a directory the build ignores by convention, a
+  manifest key naming what is not part of the library, or deciding a package simply does not carry
+  programs — and the third is the one that needs an argument, since an example that is never compiled
+  is an example that rots.
+
+  **Confirmed a second time, and the cost is now the whole tree's.** Moving the regex binding out to
+  [sysl-lang/regex](https://github.com/sysl-lang/regex) emptied `bindings/` and retired it, so there
+  is no longer anywhere in the project where a binding's example program *is* compiled. Every one of
+  them is now a fenced block in a README that nothing runs. That does not change the options above;
+  it changes which way the third one has to argue, since "an example that rots" has stopped being
+  hypothetical.
 
 ## The first package
 

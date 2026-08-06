@@ -68,27 +68,21 @@ reads — the same convention `sysl run <path> -- <args>` follows.
 
 That needs a `clang` on the PATH: sysl emits textual LLVM IR and links it with clang.
 
-`bindings/` holds bindings to real C libraries. Each is a library rather than a single file — its
-sysl and the `.c` shims that read whatever only a header knows — and `--lib` takes the tree itself:
+**Bindings to real C libraries are packages, and none of them lives in this tree** — see the list at
+[github.com/sysl-lang](https://github.com/sysl-lang). Each is a library rather than a single file:
+its sysl, and the `.c` shims that read whatever only a header knows. `--lib` takes either the tree
+itself or an artifact built from it, and both roads carry the shims, because a `.c` anywhere in a
+tree is compiled with it (`design/15 §7`) — whether that tree is a library, a package a
+`dependencies` block brought in, or the project itself:
 
 ```bash
-sbt "syslJVM/run run bindings/regex/match.sysl --lib bindings/regex/lib"
+sysl run prog.sysl --lib /path/to/some/package     # the source tree
+sysl build-lib /path/to/some/package -o /tmp/it.syslib
+sysl run prog.sysl --lib /tmp/it.syslib            # or an artifact
 ```
 
-Building it into an artifact first is the other road, and gives a program that compiles without the
-library's source anywhere near it:
-
-```bash
-sbt "syslJVM/run build-lib bindings/regex/lib -o /tmp/rx.syslib"
-sbt "syslJVM/run run bindings/regex/match.sysl --lib /tmp/rx.syslib"
-```
-
-Both carry the shims: a `.c` anywhere in a tree is compiled with it (`design/15 §7`), whether the
-tree is a library, a package a `dependencies` block brought in, or the project itself.
-
-`bindings/regex` binds POSIX regular expressions and needs nothing installed, since they are part of
-libc. A program built against it says nothing about linking, because `link "regex"` is written once
-in the binding and travels with it.
+Ordinarily a program names one in `package.hocon` instead and `sysl build` fetches it, which is what
+`design/packages.md` is about.
 
 **Binding a library your package manager installed takes two flags**, because a toolchain searches
 its own directories and nothing else — on a Mac that means `/opt/homebrew` is invisible to it:
@@ -104,11 +98,20 @@ for you, and neither belongs in a source file — where a prefix lives is a fact
 not about the code (`design/15 §8`). `LIBRARY_PATH` and `CPATH` work too, since clang reads them, and
 are the better answer for a machine where the setting is always the same.
 
-**The SQLite binding used to live here and now has a repository of its own** —
-[sysl-lang/sqlite3](https://github.com/sysl-lang/sqlite3), the first sysl package outside this tree
-(`design/packages.md`). It moved because a binding to a library nobody is obliged to have
+**Both bindings that used to live here have repositories of their own now, and `bindings/` is gone.**
+SQLite went first — [sysl-lang/sqlite3](https://github.com/sysl-lang/sqlite3), the first sysl package
+outside this tree (`design/packages.md`) — because a binding to a library nobody is obliged to have
 installed is a *package*, not an example, and keeping it here made the compiler's own suite depend on
 SQLite being present.
+
+POSIX regex followed to [sysl-lang/regex](https://github.com/sysl-lang/regex), and its reason is the
+weaker one, which is the point: nothing had to be installed for it and the suite it added was green
+everywhere, so the argument was only that a library is not part of the language and does not belong
+in the language's repository. It is the organisation's worked example of binding a C library the
+machine already has — a shim for what only a header knows, no `@link` for what the driver already
+passes, and a `requires` clause naming what it needs of the target. What sysl still owns is the
+*mechanism*: `15 §7` and `15 §8` are pinned on fixtures in `LibraryBuildCliTests`, where the inputs
+can be chosen to be discriminating rather than being whatever one real library happens to do.
 
 A program's own unit tests are `@test` functions written beside what they test, and `sysl test` is
 what runs them (`design/testing.md`):
