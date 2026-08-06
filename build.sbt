@@ -46,8 +46,14 @@ ThisBuild / description := "A modern, ref-counted, OS-level systems language —
 // Gated on an environment variable rather than a separate task, matching `SYSL_RELEASE`: one
 // `publishTo`, switched, so there is no second configuration to drift.
 //
-//     sbt publishSigned                      # Central, the release
+//     sbt publishSigned                      # Central, 1 of 2 — stages locally, uploads nothing
+//     sbt sonatypeBundleRelease              # Central, 2 of 2 — the upload, and the release
 //     SYSL_PUBLISH_GITHUB=1 sbt publish      # GitHub Packages, the head start
+//
+// `publishSigned` alone publishes nothing: it writes the signed artifacts under
+// `target/sonatype-staging/` and prints a `published … to <local path>` line for each, then exits
+// successfully in about a second. `sonatypeBundleRelease` is what uploads the bundle and polls until
+// the deployment reports `PUBLISHED`.
 //
 // **This does not shorten the release and must never be allowed to stand in for it.** A GitHub
 // Packages copy makes a downstream build succeed whether or not the Central upload worked, which is
