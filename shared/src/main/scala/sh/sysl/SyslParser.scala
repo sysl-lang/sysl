@@ -142,12 +142,6 @@ class SyslParser(val source: Source) extends DeclParser {
   protected lazy val contractMsg: Parser[String] =
     accept("string literal", { case t: lexical.StrLit => t.value })
 
-  /** A declaration that may carry a visibility modifier (`13 §2`).
-   *
-   * The five forms are grouped so the modifier is written once, before whichever of them follows,
-   * rather than threaded through five rules that would each have to remember it. An `impl` is not
-   * among them and takes none: it declares no name, so there is nothing for a modifier to restrict.
-   */
   /** `static val`, `static var` — a binding in the file the program starts in asking to be the
    * module's rather than that file's body's (`13 §7`).
    *
@@ -177,12 +171,31 @@ class SyslParser(val source: Source) extends DeclParser {
         "a module member cannot have",
     )
 
+  /** A declaration that may carry a visibility modifier (`13 §2`).
+   *
+   * The forms are grouped so the modifier is written once, before whichever of them follows, rather
+   * than threaded through rules that would each have to remember it. An `impl` is not among them and
+   * takes none: it declares no name, so there is nothing for a modifier to restrict.
+   *
+   * **`varDecl` is here as well as in `statement`, and that is what lets a module's storage be
+   * private.** Outside the file a program starts in, a top-level `var` is the module's storage and is
+   * the same declaration `static var` spells in that file (`13 §7`) — so it takes a visibility for the
+   * same reason the `val` beside it does. Without this the modifier was a parse error reading
+   * "identifier expected", which says the word was not followed by a name rather than that the form
+   * takes none; `private static var` parsed all along, and the two spellings are one declaration.
+   *
+   * It changes nothing for a bare `var`: `visibility` succeeds as `Public` on the empty input, the
+   * `Public` branch hands back exactly the node `varDecl` built, and `statement`'s own `varDecl` reads
+   * the ones written inside a body. In the entry file the modifier restricts a local and so says
+   * nothing, which is what `private val` there has always done.
+   */
   protected lazy val declaration: PackratParser[Stmt] =
     attributedDecl |
       implVisibility |
       misplacedOverride |
       staticDecl |
-      visibility ~ (structDecl | enumDecl | typeDecl | traitDecl | externDecl | constDecl | valDecl | funcDecl) ^^ {
+      visibility ~ (structDecl | enumDecl | typeDecl | traitDecl | externDecl | constDecl | valDecl |
+        varDecl | funcDecl) ^^ {
         case Visibility.Public ~ d => d
         case v ~ d                 => restrict(v, d)
       }

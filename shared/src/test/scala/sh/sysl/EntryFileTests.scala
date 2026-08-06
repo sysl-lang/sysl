@@ -227,6 +227,27 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
     }
   }
 
+  /** A visibility modifier on a binding of the **body**, which restricts nothing and is accepted.
+    *
+    * Both spellings take one at a file's top level, and in the entry file both are locals — so the
+    * modifier says nothing there, exactly as `private` on a `val` inside a function body would. It is
+    * not refused, which is a choice rather than an oversight: the same line is meaningful the moment
+    * the file gains a `module` header or stops carrying the statements, so refusing it would make
+    * moving a declaration between files a rewrite.
+    *
+    * The pair is here so the two cannot drift. `private var` did not parse at all until 2026-08-06,
+    * and the argument for accepting it was that the `val` beside it always had been.
+    */
+  "a modifier on the entry file's own binding says nothing, and is not refused for it" - {
+    "a 'val'" in {
+      run("private val a: int = 1\nprint(str(a))") shouldBe "1\n"
+    }
+
+    "and a 'var'" in {
+      run("private var n: int = 1\nn += 1\nprint(str(n))") shouldBe "2\n"
+    }
+  }
+
   /** `static var` — module storage the program may **write**, which is what `static val` is not.
     *
     * Three things separate it from the `val`, and each is what the word `var` already means: it may
@@ -352,6 +373,54 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
 
     "and a program with no statements at all runs and does nothing" in {
       run("f() -> int = 1") shouldBe ""
+    }
+  }
+
+  /** A file that names a module is never the one the program starts in (`13 §7`).
+    *
+    * Which file that is comes down to what a file *runs*, and where nothing runs a lone file of
+    * bindings is a body after all — that is what keeps a one-file `var n = 1` meaning what it always
+    * meant. But the fallback reached files with a `module` header too, and a header says there is no
+    * body for a binding to belong to instead.
+    *
+    * What that cost is not visible at the `var`. The file became a body, so every function *reading*
+    * the `var` became a nested function of it — and a nested function may not be `private` and may not
+    * be generic, so those were the two diagnostics a library got. They named the function rather than
+    * the cause, and they appeared only where no other file supplied a beginning: the module compiled
+    * when a program imported it, and was refused by `build-lib`, where a library is all there is.
+    */
+  "a file that names a module is not one of them, whatever else the program carries" - {
+    // A library, which is what `build-lib` compiles: files, and no beginning anywhere.
+    "so a library's private helper may read its module's storage" in {
+      irIn(("m", "a.sysl", "module m\n\nvar n: int = 1\n\nprivate peek() -> int = n")) should not be empty
+    }
+
+    // The same fault, seen through the other thing a nested function may not be. There is no
+    // workaround for this one — dropping the modifier answers the test above and not this.
+    "and a generic one may too" in {
+      irIn(
+        ("m", "a.sysl",
+         "module m\n\nvar n: int = 0\n\ntally[T: Display](x: T) -> int\n    n += 1\n    n"),
+      ) should not be empty
+    }
+
+    // Where the program's beginning is a declared `main` rather than loose statements, nothing at
+    // any file's top level runs — so this is the fallback's case with a program around it.
+    "even where the program's beginning is a 'main' and so runs nothing at the top level" in {
+      runIn(
+        ("", "main.sysl", "main()\n    m.bump()\n    print(str(m.peek()))"),
+        ("m", "a.sysl", "module m\n\nvar n: int = 1\n\nbump() = n += 1\n\nprivate seen() -> int = n\n\npeek() -> int = seen()"),
+      ) shouldBe "2\n"
+    }
+
+    // The guard on the change, and the reason it is a condition rather than the fallback's removal:
+    // a **headerless** file is still eligible, so where nothing runs its lone binding is still a
+    // local of the body it was written in — which is what a sibling failing to see it says.
+    "while a headerless one is still eligible, its binding still a local a sibling cannot see" in {
+      errOf(
+        "a.sysl" -> "var n: int = 1",
+        "b.sysl" -> "peek() -> int = n",
+      ) should not be empty
     }
   }
 }

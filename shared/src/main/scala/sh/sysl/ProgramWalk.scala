@@ -581,6 +581,10 @@ trait ProgramWalk
    * no such file falls back to the second pass, where a lone binding is a body after all — which is
    * what keeps a one-file `var n = 1` meaning what it has always meant.
    *
+   * **That fallback reaches only a file with no `module` header**, because a file that names a module
+   * has no body for a binding to belong to instead (`13 §7`). Nothing else here needs the condition:
+   * the first pass is about what a file *runs*, and a `print` runs whatever the header says.
+   *
    * A program with none of either is a complete program that does nothing, which is what a tree of
    * pure declarations should compile to: a library is not an error.
    */
@@ -603,14 +607,26 @@ trait ProgramWalk
         for (u, _) <- others do refuse(first, u, !Bodies.isTopLevelBinding(_))
         Some((first, s))
 
-      // Nothing runs, so the bindings decide — and only where one file carries them. Several is
-      // **not** the two-beginnings mistake: a program in which nothing runs has no beginning for a
-      // second one to compete with, so each of those files is holding module storage and the whole
-      // thing is a library that does nothing. Picking a winner among them would be arbitrary, and
-      // would make one file's bindings local and invisible to the rest for no reason a reader could
-      // see.
+      // Nothing runs, so the bindings decide — and only where one file carries them, and only where
+      // that file could have had a body at all. **A file with a `module` header could not**: `13 §7`
+      // says everything it declares is the module's already, so there is nothing there for a `var` to
+      // belong to *instead*, and reading one as a local would be reading the header off the file.
+      //
+      // Without that condition a library was its own beginning. A package is one module, in files
+      // that all name it, and the moment one of them held a `var` it was chosen here — after which
+      // every function touching that `var` was a nested function of a body that does not exist, and
+      // was refused for the things a nested function may not be: `private`, and generic. The module
+      // compiled when a program imported it, because a real entry file won the pass above, and was
+      // refused by `build-lib`, where there is no program. That is the whole of what a library build
+      // is — files and no beginning — so the fallback had to be told which files could be one.
+      //
+      // Several is **not** the two-beginnings mistake: a program in which nothing runs has no
+      // beginning for a second one to compete with, so each of those files is holding module storage
+      // and the whole thing is a library that does nothing. Picking a winner among them would be
+      // arbitrary, and would make one file's bindings local and invisible to the rest for no reason a
+      // reader could see.
       case Nil =>
-        files.filter((u, _) => carries(u, Bodies.isTopLevelBinding)) match
+        files.filter((u, _) => u.module.isEmpty && carries(u, Bodies.isTopLevelBinding)) match
           case one :: Nil => Some(one)
           case _          => None
   }
