@@ -227,6 +227,27 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
     }
   }
 
+  /** A visibility modifier on a binding of the **body**, which restricts nothing and is accepted.
+    *
+    * Both spellings take one at a file's top level, and in the entry file both are locals — so the
+    * modifier says nothing there, exactly as `private` on a `val` inside a function body would. It is
+    * not refused, which is a choice rather than an oversight: the same line is meaningful the moment
+    * the file gains a `module` header or stops carrying the statements, so refusing it would make
+    * moving a declaration between files a rewrite.
+    *
+    * The pair is here so the two cannot drift. `private var` did not parse at all until 2026-08-06,
+    * and the argument for accepting it was that the `val` beside it always had been.
+    */
+  "a modifier on the entry file's own binding says nothing, and is not refused for it" - {
+    "a 'val'" in {
+      run("private val a: int = 1\nprint(str(a))") shouldBe "1\n"
+    }
+
+    "and a 'var'" in {
+      run("private var n: int = 1\nn += 1\nprint(str(n))") shouldBe "2\n"
+    }
+  }
+
   /** `static var` — module storage the program may **write**, which is what `static val` is not.
     *
     * Three things separate it from the `val`, and each is what the word `var` already means: it may

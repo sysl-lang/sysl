@@ -345,6 +345,18 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
       ) should include("cannot be module storage")
     }
 
+    // A **slice** owes one too, and it is worth asking separately because it is the plausible hole:
+    // a `[]const u8` reads as a borrowed view of somebody else's bytes, and a rule tested only
+    // through `string` would not say whether the count travels with the view. It does. Found while
+    // writing a library that wanted to remember a name, which is why its name is a fixed array of
+    // bytes and not a slice of one.
+    "which a slice does as much as a string, however much it reads like a view" in {
+      errIn(
+        ("", "main.sysl", "print(str(m.name.len))"),
+        ("m", "a.sysl", "module m\n\nvar name: []const u8 = \"\".bytes"),
+      ) should include("cannot be module storage")
+    }
+
     // Asserted against the visibility diagnostic rather than against there being *a* diagnostic,
     // which is what this used to check. `private var` did not parse, so the test passed on
     // "identifier expected" — a parse error about the line, standing in for a rule about reach.
