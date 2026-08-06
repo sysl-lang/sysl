@@ -816,7 +816,12 @@ case class TVal(
  * absent for a `main` that takes no parameters — so a program that does not ask for its arguments
  * carries none of the conversion.
  */
-case class TEntry(func: String, argsFn: Option[String])
+/** The program's entry point: which function it is, how its arguments are made, and -- where it
+  * results in a `Result` -- the instantiated `sysl.main_result` that reports the failure and chooses
+  * the exit status, together with the type the call answers with.
+  */
+case class TEntry(func: String, argsFn: Option[String],
+                  resultFn: Option[String] = None, resultTy: Option[Type] = None)
 
 /** One `@test` function, as the runner needs it (`testing.md`).
  *

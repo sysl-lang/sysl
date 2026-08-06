@@ -147,6 +147,7 @@ object Reachability {
       case e: TEntry =>
         calls += e.func
         e.argsFn.foreach(calls += _)
+        e.resultFn.foreach(calls += _)
       case s: TVSlot  => calls += s.target
       case r: TRender =>
         r.slot match

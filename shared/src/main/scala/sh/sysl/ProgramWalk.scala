@@ -468,13 +468,40 @@ trait ProgramWalk
 
           val (params, ret) = funcInsts(key)
 
-          if !Type.noValue(ret) then
-            err(s"'main' yields nothing, so it may not result in ${show(ret)} — " +
-              "a program's exit status is not something a signature can say")
+          // **A `main` either yields nothing or answers with a `Result[unit, E]`**, and the second
+          // is what lets `?` reach the top of a program. Without it every fallible call in `main`
+          // ends in `.unwrap()`, which reports a failure as a panic naming the line that gave up
+          // rather than the thing that went wrong.
+          //
+          // Nothing else is admitted. A status is one byte and a return type is a value: mapping
+          // one onto the other is the program's business, and `exit` is how a program that wants to
+          // choose its own says so.
+          val fallible = ret match
+            case e: Type.Enum if e.base == Library.key("Result") && Type.noValue(e.targs.head) =>
+              Some(e)
+            case _ =>
+              if !Type.noValue(ret) then
+                err(s"'main' yields nothing or a 'Result[unit, E]', so it may not result in " +
+                  s"${show(ret)} — a program's exit status is not something a signature can say")
+              None
           if decl.variadic then err("'main' is called with the arguments the platform has, not a list it reads")
 
+          // The reporter is instantiated at the error type `main` named, and its bound is what
+          // holds that type to being renderable — an error nobody can print would otherwise exit
+          // non-zero with nothing said.
+          val reporter = fallible.map { r =>
+            val fd = funcDecls(Library.key("main_result"))
+
+            checkParamBounds(Modules.show(fd.name), fd.tparams, fd.bounds, List(r.targs(1)))
+
+            val sym = instantiateFunc(fd, List(r.targs(1)))
+
+            funcsUsed += sym
+            sym
+          }
+
           params.map(_._2) match
-            case Nil                      => Some(TEntry(key, None))
+            case Nil                      => Some(TEntry(key, None, reporter, fallible))
             // Written either way: the arguments are the platform's and a program that only reads
             // them may say so, which costs the entry point nothing since the two views are one
             // layout and `args_of` yields the one that may stand in for either.
@@ -482,7 +509,7 @@ trait ProgramWalk
               val argsFn = Library.key("args_of")
 
               funcsUsed += argsFn
-              Some(TEntry(key, Some(argsFn)))
+              Some(TEntry(key, Some(argsFn), reporter, fallible))
             case ts =>
               err(s"'main' takes either nothing or one '[]string' of the program's arguments, " +
                 s"not (${ts.map(show).mkString(", ")})")

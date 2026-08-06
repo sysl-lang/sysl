@@ -227,7 +227,20 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
         s"${slice.llvm} ${ownTemp(r, slice)}"
       }
 
-      emit(s"call void @$entrySymbol(${args.getOrElse("")})")
+      // **A `main` that answers with a `Result` is called for its answer**, which is then handed
+      // to the reporter the walk instantiated: it is what prints the error and picks the status, and
+      // it is ordinary sysl for the same reason `args_of` is — the entry point should carry as
+      // little hand-written IR as the platform will let it.
+      (e.resultFn, e.resultTy) match
+        case (Some(fn), Some(ty)) =>
+          val r = freshTemp()
+
+          emit(s"$r = call ${ty.llvm} @$entrySymbol(${args.getOrElse("")})")
+          emit(s"call void @$fn(${ty.llvm} $r)")
+
+        case _ =>
+          emit(s"call void @$entrySymbol(${args.getOrElse("")})")
+
       popTemps()
 
     releaseAll()
