@@ -21,7 +21,7 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
    * reference. Supplied by `CallAnalysis`, which is mixed in last: it is the one step every route to
    * a member ends in, and the routes are what the traits between here and there are.
    */
-  protected def buildReceiver(mode: RecvMode, tr: TExpr): TExpr
+  protected def buildReceiver(mode: RecvMode, tr: TExpr, member: String = ""): TExpr
 
 
   /** Type-checks positional arguments against a resolved parameter list. `pre` holds arguments

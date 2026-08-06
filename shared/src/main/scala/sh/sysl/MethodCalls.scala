@@ -91,7 +91,7 @@ trait MethodCalls extends FuncAddress {
             // A member's tail begins where its declared parameters stop, and the receiver holds one
             // of the slots — so the cut is one past what a free function's would be.
             val (declared, tail) = bound.splitAt(params.length - 1)
-            val recvArg  = buildReceiver(m.receiver.get, tr)
+            val recvArg  = buildReceiver(m.receiver.get, tr, mname)
             val restArgs = declared.zip(params.tail).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
             funcsUsed += fname
             recheckAfter(recvArg,
@@ -351,7 +351,7 @@ trait MethodCalls extends FuncAddress {
 
     val name            = instantiateFunc(fd, ownerArgs ::: own)
     val (params, rtype) = funcInsts(name)
-    val recvArg         = buildReceiver(m.receiver.get, recv)
+    val recvArg         = buildReceiver(m.receiver.get, recv, m.name)
 
     recheckAfter(recvArg,
       TCall(name, checkArgs(shown, params, passed, Some(recvArg :: provisional)) ::: tail.map(variadicArg(_)), rtype))

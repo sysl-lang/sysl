@@ -152,7 +152,7 @@ trait CallAnalysis extends OperatorCalls {
    * a matching argument would: a value is copied, `*self` takes the instance's address, `&self`
    * needs the reference itself.
    */
-  protected def buildReceiver(mode: RecvMode, tr: TExpr): TExpr = mode match
+  protected def buildReceiver(mode: RecvMode, tr: TExpr, member: String = ""): TExpr = mode match
     case RecvMode.ByValue =>
       val recv = tr.ty match
         case _: Type.Named => tr
@@ -179,6 +179,17 @@ trait CallAnalysis extends OperatorCalls {
             case _           => tr
           if !isPlace(place) then
             err("'*self' needs a variable, field, or dereference to point at — this receiver has no address")
+          // **A `*self` receiver is an `&` the caller did not write, and it is asked the same
+          // question.** Assignment and an explicit `&` both refuse a `val`, so a method that takes
+          // the address of one to write through it has to be refused as well — otherwise `val` says
+          // read-only and means nothing, and a module-level `val`, which is emitted as `constant`,
+          // would have a store aimed into read-only storage.
+          //
+          // The message names the *member*, because the write is not here: the caller wrote a call
+          // and the assignment is a line inside somebody else's body.
+          if readOnly(place) then
+            err(s"'$member' takes '*self', so it writes through what it is called on — and a 'val' " +
+              "is written once, so there is nothing to write through")
           // A `*self` method is handed somewhere to write, so it is the one call that could move
           // storage a live `ref` is standing on (`03 § ref`). It is asked here because this is where
           // the receiver becomes a place the caller can be told about.

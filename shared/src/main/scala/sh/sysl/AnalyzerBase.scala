@@ -259,6 +259,12 @@ trait AnalyzerBase extends Scoping {
   protected def coerce(t: TExpr, expected: Type): TExpr
   protected def autoDeref(t: TExpr): TExpr
   protected def isPlace(t: TExpr): Boolean
+
+  /** Whether a place is one a write may not reach — a `val`, or a field or element of one.
+   * Declared here because both callers are: assignment and `&` ask it in `ExprAnalysis`, and a
+   * `*self` receiver asks it in `CallAnalysis`, which is the same question about the same place.
+   */
+  protected def readOnly(t: TExpr): Boolean
   protected def instantiateFunc(f: FuncDecl, targs: List[Type]): String
 
   /** The call trait a value of this type implements, where it implements one (`12 §6`). */
