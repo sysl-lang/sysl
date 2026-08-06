@@ -332,6 +332,42 @@ class TupleTests extends AnyFreeSpec with ParseSupport with RunSupport with Code
     "and a tuple wider than three implements the catalog like any other" in {
       run("print((1, 2, 3, 4) == (1, 2, 3, 4))") shouldBe "true\n"
     }
+
+    /** The rows are written `[..A: Eq]`, and a bound on a pack distributes over the members rather
+     * than asking them to agree — so parts of *different* types is the ordinary case and not an
+     * extension of it. Equality and rendering were pinned that way above; ordering and hashing were
+     * not, and both do more with a part than compare it for sameness.
+     */
+    "ordering reaches a part of a different type from the one before it" in {
+      run("""print((1, "a") < (1, "b"), (1, "b") < (1, "a"), (1, "a") < (2, "a"))""") shouldBe
+        "true false true\n"
+    }
+
+    "a hash mixes parts of different types" in {
+      run("""print((1, "a").hash() == (1, "a").hash(), (1, "a").hash() == (1, "b").hash())""") shouldBe
+        "true false\n"
+    }
+
+    /** Width and heterogeneity at once, which is the case no single row could have covered before
+     * the ceiling went: four parts, four types, none of them each other's.
+     */
+    "a wide tuple of four unrelated types renders and compares" in {
+      run("""val t = (1, "a", true, 'c')
+            |print(t)
+            |print(t == (1, "a", true, 'c'), t == (1, "a", false, 'c'))
+            |""".stripMargin) shouldBe "(1, a, true, c)\ntrue false\n"
+    }
+
+    /** A part that is itself a tuple, which asks whether the row satisfies its own bound — the same
+     * question the slice row answers yes to, and the one a fixed array could not answer at all until
+     * a length became a value.
+     */
+    "a part that is itself a tuple is met by the same row" in {
+      run("""val t = ((1, "a"), (true, 'c'))
+            |print(t)
+            |print(t == ((1, "a"), (true, 'c')), t == ((1, "b"), (true, 'c')))
+            |""".stripMargin) shouldBe "((1, a), (true, c))\ntrue false\n"
+    }
   }
 
   /** §13's paragraph on who owns a tuple's traits, checked against `02`'s rule rather than against

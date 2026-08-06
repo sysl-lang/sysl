@@ -228,6 +228,55 @@ class TypePackTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |print(t)""".stripMargin) shouldBe "(xy, pq, xypq)\n(xy, pq, xypq)\n"
     }
 
+    /** Each part erased to a `&Display` **individually**, which is a different capability from the
+     * whole tuple rendering itself: a caller that lays parts out has to see them one at a time, and
+     * a tuple's own `Display` answers a single joined string with no way back into it.
+     *
+     * A bound is a promise about one type, so a heterogeneous row is written as a slice of erased
+     * elements; this is the same erasure reached through a pack instead.
+     *
+     * **The part is passed as it stands, not as `&t.i`.** Erasure is a coercion at a position whose
+     * type is already the trait; `&` is address-of, so writing it there asks for a `*int` and gets
+     * one, and the diagnostic then reads as though the erasure were unavailable.
+     */
+    "erases each part to a trait object on its own" in {
+      run("""import sysl.buf.byte_sink
+            |width(v: &Display) -> usize
+            |    var sink = byte_sink()
+            |    var out: *Writer = &sink
+            |    v.display(out, FormatSpec(0, -1, false))
+            |    sink.text().len
+            |row[..A: Display](t: (..A)) -> usize
+            |    var n = 0usize
+            |    for const i in 0..<A.len
+            |        n = n + width(t.i)
+            |    n
+            |print(row((1, "abc", true)))""".stripMargin) shouldBe "8\n"
+    }
+
+    /** A pack on a **method's own** parameter list, which is a different position from a struct's.
+     * `Row[..A]` is refused because a struct has nowhere to spread a list over its own shape, and
+     * the same reason does not reach a method — a method's parameters are its own, exactly as a
+     * free function's are, and the free-function form is green above.
+     *
+     * The shape that wants it is a container fixed at one type taking a row of several — which a
+     * slice of erased elements already covers, so this is a hole rather than a blocker.
+     *
+     * The list parses; `A` is then registered as an ordinary type parameter, so `(..A)` is met by a
+     * diagnostic recommending the very declaration that was written.
+     */
+    "may stand on a method of an ordinary struct" ignore {
+      run("""struct Row
+            |    n: usize
+            |    take[..A: Display](*self, t: (..A))
+            |        for const i in 0..<A.len
+            |            self.n = self.n + str(t.i).len
+            |end Row
+            |var r = Row(0usize)
+            |r.take((1, "abc", true))
+            |print(r.n)""".stripMargin) shouldBe "8\n"
+    }
+
     "reaches the parts through a reference receiver" in {
       run("""trait Tag
             |    tag(self) -> string
