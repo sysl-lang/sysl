@@ -67,6 +67,25 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
         List(ExternDecl("abs", List(Param("n", NamedType("int"))), Some(NamedType("int")), vis = Visibility.File))
     }
 
+    // A `var` at the top of a file that names a module is that module's storage and is the same
+    // declaration `static var` spells in the entry file (`13 §7`), so it takes a modifier for the
+    // same reason the `val` beside it does. It did not parse at all until the form was added to
+    // `declaration`, and what a reader got was "identifier expected" pointing at the `private` —
+    // which reads as a missing name rather than as a form that takes no modifier.
+    "and so does a 'var', which is module storage outside the entry file" in {
+      prog("private var n: int = 1") shouldBe
+        List(VarDecl("n", Some(NamedType("int")), Some(i(1)), vis = Visibility.File))
+    }
+
+    "with the scoped spelling too" in {
+      prog("private[m] var n: int") shouldBe
+        List(VarDecl("n", Some(NamedType("int")), None, vis = Visibility.Scoped("m")))
+    }
+
+    "while an unmarked one is public, exactly as it was" in {
+      prog("var n: int = 1") shouldBe List(VarDecl("n", Some(NamedType("int")), Some(i(1))))
+    }
+
     // The argument is a simple name, not a path: a visibility scope is always an enclosing module,
     // and there is no way to name an unrelated one (`13 §2`).
     "but the scope argument is one segment, not a path" in {

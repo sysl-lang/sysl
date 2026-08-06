@@ -731,6 +731,13 @@ complete declaration of storage, and the type's zero is what it starts at. That 
 the same reason a `val`'s is (`§2`), and it bites harder here, since there may be no initializer for
 one to be inferred from.
 
+It takes a **visibility** like any other module member (`§2`), in both spellings: `private var count:
+int = 0` keeps a module's state inside the file that carries the functions maintaining it, which is
+what a module with state usually wants and what the `val` beside it could always say. Only the
+`static var` form parsed one until 2026-08-06, and the plain form's refusal was the grammar's
+complaint about the word after the modifier rather than a rule — `private static var` had worked all
+along, and the two are one declaration.
+
 `guide/slab` was the customer and is now the demonstration: two regions, one address each for the
 life of the program, declared where they are carved rather than threaded as a `*u8` through six
 sections. What it still cannot say is what address a region should *start* at — module storage has no
@@ -739,6 +746,17 @@ way to state an alignment, so the allocator rounds up and pays for it out of the
 A program in which no file carries a statement is a complete program that does nothing: the entry
 point exists, runs nothing, and succeeds. That is what a tree of pure declarations compiles to,
 which is what it should compile to — a library is not an error.
+
+**And a file that names a module is not the beginning of it, which is the case that has to be said
+out loud rather than left to follow.** Where nothing runs anywhere, a lone file of bindings is a body
+after all — that is what keeps a one-file `var n = 1` meaning what it has always meant — but the
+sentence at the top of this section is what bounds that: only a file *with no header* has a body for
+a binding to belong to instead. A library is exactly the shape that tests it, since a library is
+files and no beginning; and the failure did not appear at the `var`. The file became a body, so every
+function **reading** the `var` became a nested function of it, and was refused for the two things a
+nested function may not be — `private`, and generic. Which meant a module holding state could compile
+when a program imported it, because the program supplied a beginning, and be refused by `build-lib`,
+where there is none. Found on 2026-08-06 by the first library that kept state.
 
 ### `main` — the named form of the entry point
 

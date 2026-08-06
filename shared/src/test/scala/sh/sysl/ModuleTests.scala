@@ -345,11 +345,23 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
       ) should include("cannot be module storage")
     }
 
-    "while 'private' keeps it inside its own module" in {
+    // Asserted against the visibility diagnostic rather than against there being *a* diagnostic,
+    // which is what this used to check. `private var` did not parse, so the test passed on
+    // "identifier expected" — a parse error about the line, standing in for a rule about reach.
+    "while 'private' keeps it inside the file that declares it" in {
       errIn(
         ("", "main.sysl", "print(str(m.n))"),
         ("m", "a.sysl", "module m\n\nprivate var n: int = 1"),
-      ) should not be empty
+      ) should include("'m.n' is private to 'a.sysl', the file that declares it")
+    }
+
+    // The other half of that, and the half a parse error could never have shown: the file that
+    // declared it uses it freely, so the modifier restricts rather than refuses.
+    "though the file that declares it reads and writes it as before" in {
+      runIn(
+        ("", "main.sysl", "print(str(m.peek()))"),
+        ("m", "a.sysl", "module m\n\nprivate var n: int = 1\n\npeek() -> int\n    n += 1\n    n"),
+      ) shouldBe "2\n"
     }
 
     // It reaches the rest of the machinery through the same table `static var` does, so the checks
