@@ -190,8 +190,12 @@ trait ExprParser extends SyslParserBase {
    */
   protected lazy val postfixTail: PackratParser[Expr => Expr] =
     here ~ (op("[") ~> expression <~ op("]")) ^^ { case p ~ idx => (e: Expr) => Index(e, idx).setPos(p) } |
-      here ~ (op(".") ~> ident) ^^ { case p ~ n => (e: Expr) => Field(e, n).setPos(p) } |
-      here ~ (op(".") ~> (tupleIndex | nestedTupleIndex)) ^^ { case p ~ n => (e: Expr) => Field(e, n).setPos(p) } |
+      // **The position is taken after the dot, so a diagnostic points at the member rather than at
+      // the punctuation.** Every message about a member — a missing one, a wrong arity, a receiver
+      // that may not be written through — names the member, and a caret under the `.` sends the
+      // reader looking one column to the left of what was said.
+      (op(".") ~> here ~ ident) ^^ { case p ~ n => (e: Expr) => Field(e, n).setPos(p) } |
+      (op(".") ~> here ~ (tupleIndex | nestedTupleIndex)) ^^ { case p ~ n => (e: Expr) => Field(e, n).setPos(p) } |
       here ~ (op("::") ~> ident) ^^ { case p ~ n => (e: Expr) => TypeAttr(e, n).setPos(p) } |
       // A call is the exception: what is wrong with `foo(…)` is nearly always `foo` — it does not
       // exist, or it does not take these arguments — so the callee's own position wins, and the

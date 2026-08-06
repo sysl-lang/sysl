@@ -161,7 +161,10 @@ trait CollectionExprAnalysis extends ExprSupport {
             // The element's qualifier stays on the receiver's type and comes off the value read out
             // of it, exactly as a field's does (`03 § Device memory`).
             case i: Type.Integer => TIndex(tr, checkedIndexWidth(ti, i), Type.unqualified(elem))
-            case other           => err(s"an index must be an integer, not ${show(other)}")
+            // At the index's own position rather than the subscript's: the message is about what
+            // was written between the brackets, and a caret on the `[` points one character to the
+            // left of the thing being complained about.
+            case other           => at(index.pos)(err(s"an index must be an integer, not ${show(other)}"))
 
         // A type with no elements of its own is indexed through `Index`, whose one method the
         // subscript *is* (`14 §3`). The index is not held to being an integer here: what a

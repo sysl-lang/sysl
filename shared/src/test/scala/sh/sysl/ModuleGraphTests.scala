@@ -26,13 +26,16 @@ class ModuleGraphTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
 
     // The reference that begins the chain is the one to point at: from there a reader can follow
-    // the rest of the message through the modules it names.
+    // the rest of the message through the modules it names. It lands on the *member* being reached
+    // across the boundary — `b.g()`'s `g` — rather than on the dot it used to sit on. The module
+    // name would arguably be better still, since the message is about modules; that would be the
+    // analyzer choosing this diagnostic's position rather than taking the node's.
     "and the diagnostic points at the reference that begins the chain" in {
       errIn(
         ("", "main.sysl", "print(a.f())"),
         ("a", "a.sysl", "module a\nf() -> int = b.g()\nh() -> int = 1"),
         ("b", "b.sysl", "module b\ng() -> int = a.h()"),
-      ) should include("--> a.sysl:2:15")
+      ) should include("--> a.sysl:2:16")
     }
 
     "when one names the other's type" in {

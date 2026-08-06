@@ -52,6 +52,15 @@ class ValReceiverTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       err(counter + "val c: Counter = Counter(0)\nc.bump()") should include("'bump'")
     }
 
+    // **And it names the fix, with the binding in it.** One `val` bound to a mutable object
+    // produces one of these per mutating call — five, for a five-line program that builds a table —
+    // so every one of them has to be enough on its own to find the single word that is wrong.
+    "and names the binding to change, which is the whole fix" in {
+      val said = err(counter + "val c: Counter = Counter(0)\nc.bump()")
+
+      said should include("write 'var c'")
+    }
+
     "including a local one, which is where it was found" in {
       val src = counter + "main()\n    val c = Counter(0)\n\n    c.bump()"
 

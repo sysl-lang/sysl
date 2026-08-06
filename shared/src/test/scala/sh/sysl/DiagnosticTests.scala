@@ -102,6 +102,8 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
       out should include("--> t.sysl:3:7")
     }
 
+    // Under the field's own name, not under the `.` beside it — the message says `'y'`, so that is
+    // where a reader is sent. `DiagnosticPositionTests` holds the general form of this.
     "on the selection that names a missing field" in {
       val src =
         """struct P
@@ -110,7 +112,7 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
           |print(p.y)
           |""".stripMargin
 
-      diag(src) should include("--> t.sysl:4:8")
+      diag(src) should include("--> t.sysl:4:9")
     }
 
     "on the construct that raised the error, not on the last thing it looked at" in {

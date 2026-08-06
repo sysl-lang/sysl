@@ -188,8 +188,16 @@ trait CallAnalysis extends OperatorCalls {
           // The message names the *member*, because the write is not here: the caller wrote a call
           // and the assignment is a line inside somebody else's body.
           if readOnly(place) then
-            err(s"'$member' takes '*self', so it writes through what it is called on — and a 'val' " +
-              "is written once, so there is nothing to write through")
+            // **The message says what to write**, because one `val` produces one of these per
+            // mutating call — a five-line program that binds a table with `val` gets five, and
+            // every one of them is about the same word. Naming the binding is what makes the fix
+            // findable from any of the five.
+            val fix = place match
+              case TLoad(name, _) => s" — write 'var ${name.takeWhile(_ != '.')}' if it is meant to change"
+              case _              => " — write 'var' if it is meant to change"
+
+            err(s"'$member' takes '*self', so it writes through what it is called on, and a 'val' " +
+              s"is written once$fix")
           // A `*self` method is handed somewhere to write, so it is the one call that could move
           // storage a live `ref` is standing on (`03 § ref`). It is asked here because this is where
           // the receiver becomes a place the caller can be told about.
