@@ -367,9 +367,11 @@ the bodies are checked once at their definition against the bounds alone.
 Two things are the shape's own. **A composed type is filed under the whole of itself** — `[]int`,
 not `[]` — so a shape needs a key that the types it covers do not have, and dropping the arguments
 is what makes one; a lookup that finds nothing under the type's own key falls back to it. And
-because an **array's length is not something a parameter can stand for** (`10 § Open d` — const
-generics are not in the language), the length stays part of the shape: `[2]T` and `[3]T` are two
-shapes, each covering every element type at its own length.
+because an **array's length is not something a parameter can stand for** (`10 §9` — value generics
+are designed and not built), the length stays part of the shape: `[2]T` and `[3]T` are two shapes,
+each covering every element type at its own length. That is the arrangement `[const N: usize]`
+replaces when it lands, and until then it is why the library implements `Display` for every slice
+and for no array at all.
 
 A `string` is **not** covered by `[]T`. It is a view of bytes that are valid UTF-8, and that
 invariant is the whole difference between it and a `[]u8` — a block written for every slice has said

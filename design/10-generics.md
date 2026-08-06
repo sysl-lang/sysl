@@ -20,6 +20,11 @@ parameter, `Self`, bounded by its own trait.
 holds every application of the type to what it asks, and lets its members be checked at their
 definition the way a bounded function's body is — see §5.
 
+**§9 is the exception to "already carries": value generics are designed here and not implemented.**
+It is marked as such where it starts, and it is written out rather than left in the open list because
+the decisions it takes — the spelling, which values may parameterize a type, and what a length may
+*not* be used for — are what an implementation would otherwise take one at a time and inconsistently.
+
 This chapter rests on `02-traits.md` (a bound *is* a trait), `03-memory-model.md` (why every
 value is copyable, which decides what an unbounded parameter may do), and `09-enums-and-
 patterns.md` (`Option`/`Result` are generic enums). The `?` operator and the error types are
@@ -390,6 +395,124 @@ an entire category of design difficulty that afflicts languages with nominal sub
 should stay deleted: polymorphism over a set of types is expressed by a bound or a trait object,
 never by a covariant container.
 
+## 9. Value generics
+
+**Designed, not yet built.** A parameter may stand for a **value** rather than a type, which is what
+lets one declaration cover every array length:
+
+```
+impl[const N: usize, T: Display] Display for [N]T
+    display(self, out: *Writer, fmt: FormatSpec) = self[..].display(out, fmt)
+
+sum[const N: usize](xs: [N]int) -> int
+    var t = 0
+    for i in 0..<N do t = t + xs[i]
+    t
+
+struct Buf[const N: usize]
+    data: [N]byte
+    used: usize
+```
+
+Ada has had this since **1983** (a *generic formal object*), C++ since templates (a *non-type
+template parameter*), Rust since 1.51 (*const generics*), and Zig spells it `comptime`. The
+languages without it — Go, Java, Kotlin, C# — are the ones where every array is a heap object
+carrying its length at runtime, so there is nothing for a value parameter to be *for*. sysl is not
+one of those.
+
+### `const` marks it, and it is the same `const` as everywhere else
+
+**A value parameter is a `const` whose value the instantiation supplies**, and it is written that
+way. `13 §7 Constants` declares one as `const NAME: Type = expr`; a parameter is that with the
+initializer left for the caller, so `[const N: usize]` is the existing grammar in a new position
+rather than a new idea. That chapter already says so from the other side, recording constants as
+**the prerequisite** for this feature: *"a value cannot be passed as an argument before it can be
+named."*
+
+**The marker is not decoration.** `[N: usize]` on its own is indistinguishable from a bounded type
+parameter — `[T: Ord]` has the same shape, an identifier and a colon and a name. Only name resolution
+could tell them apart, by asking whether the thing after the colon is a trait or a type, and that is
+the wrong place for the question: a trait name misspelled into a type name would silently stop
+declaring a type parameter and start declaring a value one, with the complaint arriving somewhere
+else. Reading a signature would also mean going to look up what the bound is before knowing what
+kind of parameter it is.
+
+It settles two more things the unmarked spelling would have to guess at. A bound is a `+`-separated
+**list** while a value parameter's type is one type, so `[N: usize + Ord]` would otherwise parse and
+mean nothing. And a default is a **type** after a type parameter (`[T = int]`) and an **expression**
+after a value one (`[const N = 3]`) — one slot, two grammars, which the parser can only take apart if
+it already knows which parameter it is reading.
+
+**`val` is the alternative and `13 §7` rules it out in its own words: "a `val` is a thing, where a
+`const` is a value", and "the whole difference from a `const` is an address".** A type argument is a
+value and never a thing — there is nothing for a type to hold the address *of* — so `[val N: usize]`
+would name the one of the two that cannot be what is meant. It would also promise less than the
+parameter delivers, since a `val` is bound at run time: a module's runs before the script body, but
+it still runs.
+
+The one place `const` means something else is `[]const u8`, where it marks a view whose elements may
+not be written. That is a modifier inside a type rather than a declaration, so the two never occupy
+one slot, and Rust carries the identical pair — `*const T` beside `const N: usize` — without anyone
+confusing them.
+
+### Which values, and why not all of them
+
+A value parameter puts a value into a **type's identity**: `[3]T` and `[4]T` are different types, so
+the compiler must decide when two parameter values are the same value, and must be able to write
+that value into a mangled name. Admissible on day one:
+
+**integers, `bool`, `char`, and enum values** — each already compares structurally and already
+mangles (`Type.mangleOne`).
+
+The rest are excluded for reasons rather than for now:
+
+- **Floating point** may not be admitted before it is written down that the comparison is on the
+  **bit pattern**. `NaN != NaN` under the ordinary comparison, which would make a type not equal to
+  itself; C++20 admits floats only inside its "structural type" rule for exactly this.
+- **Strings** need interning first, or two spellings of one text are two types.
+- **Structs** are the step Rust has left unstable for years (`adt_const_params`), and nothing here
+  wants them yet.
+
+### What may be written with `N`, and what may not
+
+`N` is a `usize` (or whatever its declared type is) and may be used as one: as an array length in a
+type, and as an ordinary value in a body. It is **not** a term the type system does arithmetic on.
+
+```
+f[const N: usize](xs: [N]int) -> [N]int         // fine
+g[const N: usize](xs: [N]int) -> [N + 1]int     // REFUSED
+```
+
+`[N + 1]T` needs the compiler to decide when two *expressions* denote the same length — that
+`N + 1` and `1 + N` are one type, and that `2 * N` and `N + N` are — which is type-level arithmetic
+and a different feature entirely. Rust separates them the same way and has kept
+`generic_const_exprs` unstable long after const generics shipped. A body may compute `N + 1` freely;
+what it may not do is put the result in a type.
+
+### Inference, monomorphization, and what this retires
+
+**A value argument is inferred from the argument's type**, by §4's existing bidirectional rule with
+one more thing to unify: matching `[3]int` against `[N]int` binds `N` to 3, exactly as matching
+`Box[int]` against `Box[T]` binds `T`. `sum(a)` where `a: [3]int` needs nothing written. Where
+nothing can be inferred from, `§ Open a` applies unchanged — the argument is supplied by annotating
+what receives the result, since there is still no call-site argument syntax.
+
+**Monomorphization keys on the value arguments beside the type arguments** (§7): `sum` at `N = 3`
+and `N = 4` are two functions, exactly as `id` at `int` and `real` are two. Nothing about the cost
+model changes, and the length is a constant inside each copy — which is what already makes every
+index checkable against one.
+
+**It retires the array-shape workaround.** An `impl` matching an array today is filed under a key
+that includes the length — `[3]`, `[4]` — because there is no way to be generic over one, so a block
+covers every element type at *one* length and each other length needs its own. That is why the
+library implements `Display` for every slice and for no array, and why printing a fixed array is
+answered by the whole-array view instead (`14 §6`). One block over `[N]T` is what replaces it.
+
+**It does not retire the tuple arity rule.** A tuple's shape is how many parts it has *and what each
+one is*, which is not one value of one type, so `Eq`/`Ord`/`Hash`/`Display` at arity 2 and 3 stay
+hand-written. Value generics and variadic generics are different features and this is only the
+first.
+
 ---
 
 ## Open (not yet decided)
@@ -428,31 +551,19 @@ never by a covariant container.
 - **c. `where` clauses.** An out-of-line bound syntax for readability when the inline `[T: A +
   B]` list grows long or involves relations between parameters. All of Rust/Swift/Kotlin have
   one; a candidate ergonomic addition, not a day-one need.
-- **d. Value generics.** Parameterizing over a *value* — most importantly an array length,
-  `[N: usize]` — so a function can be generic over `[N]T`. Not implemented (array sizes are
-  literals today); a clear eventual want for fixed-size numeric and buffer code. It is what an
-  `impl` matching an array's **shape** is missing: `impl[T] Total for [3]T` covers every element
-  type at length 3, and each other length needs its own block (`02`).
+- **d. Value generics** — **designed, and no longer an open question: see §9**, which settles the
+  spelling (`[const N: usize]`), the admissible value types and why they are staged, what may be
+  written with the parameter, and how inference and monomorphization reach it. It remains
+  **unbuilt**, which is a different thing from undecided.
 
-  **Not "const generics", which is Rust's name for it and the wrong one here.** `const` in sysl
-  already means a read-only view (`[]const u8`, `03 §1`), and a word that means *immutable* in one
-  place and *known at compile time* in another is the kind of collision this design does not make
-  elsewhere. `static` is taken too (`13 §7`). C++ calls it a non-type template parameter, which
-  defines the thing by what it is not; Ada 83 — the oldest of these by a decade — calls it a
-  **generic formal object**, and *value* is that word said shorter.
-
-  **The name is general on purpose, and the admissible types are staged.** A value parameter puts a
-  value into a type's identity: `[3]T` and `[4]T` are different types, so the compiler has to decide
-  when two parameter values are the same value, and that needs an equality it can compute and a
-  mangling it can write. So the first set is **integers, `bool`, `char`, and enum values** — every
-  one of which already mangles (`Type.mangleOne`) and compares structurally.
-
-  Widening is a later question and each step has a reason to be taken separately: **strings** want
-  interning before they can be compared as identities; **structs** are what Rust has left unstable
-  for years under `adt_const_params`; **floats** may not be admitted without first writing down that
-  the comparison is on the bit pattern, since `NaN != NaN` would otherwise make a type not equal to
-  itself. Naming the feature after its general shape and admitting types one at a time is the path
-  every language here took, and none of them had to rename it afterwards.
+  **The name is the one part worth keeping here, because it was nearly wrong.** Rust calls this
+  *const generics*, and that is what this entry said until the feature was taken up. The word is
+  fine as sysl's **keyword**, since `const` already declares a compile-time constant (`13 §`) and
+  `[const N: usize]` is that declaration with the initializer left to the caller. It is wrong as the
+  feature's **name**, because naming it after one admissible spelling hides that the parameter may be
+  a `bool`, a `char` or an enum value too. C++ calls it a non-type template parameter, which defines
+  the thing by what it is not; Ada 83 — the oldest of these by a decade — calls it a **generic formal
+  object**, and *value* is that word said shorter.
 - **e. Higher-kinded parameters.** Parameterizing over a *type constructor* (`F[_]`) is
   **excluded**, not merely deferred: it pushes inference toward undecidable, and no target use
   (an OS, drivers, embedded) needs it. Abstraction over containers is served by traits and

@@ -95,7 +95,7 @@ fixed-point intrinsics:
 
 The *general* `fixed[B, F]` form needs two things the basics language may not yet have:
 
-- **Value-generic parameters** (`10 § Open d`) — a type parameterized by a compile-time *integer*
+- **Value-generic parameters** (`10 §9`) — a type parameterized by a compile-time *integer*
   (`F`), not just by a type. Array sizes (`[16]byte`) already parameterize on a compile-time int, so
   the machinery is partly present, but user-type value generics are a larger step.
 - **A little type-level arithmetic** — the multiply rule computing `F₁ + F₂` and choosing a
