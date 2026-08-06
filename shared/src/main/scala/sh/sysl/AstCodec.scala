@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 22
+  val Version: Int = 23
 
   private val Magic = "sysl-ast"
 
@@ -327,9 +327,9 @@ object AstCodec {
         case Invariant(c, m)              => tok("inv"); expr(c); opt(m)(sref)
         case Variant(e)                   => tok("vnt"); expr(e)
 
-        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, t, cv, tr, pu, gh) =>
+        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, tvs, t, cv, tr, pu, gh) =>
           tok("fn"); sref(n); list(tps)(sref); list(ps)(param); opt(rt)(typ); list(b)(stmt)
-          bounds(bs); bool(va); vis(vs); tdefaults(tds); opt(t)(testAttr)
+          bounds(bs); bool(va); vis(vs); tdefaults(tds); tdefaults(tvs); opt(t)(testAttr)
           opt(cv)(c => { pos(c); sref(c.name); opt(c.arg)(sref) }); bool(tr); bool(pu); bool(gh)
 
         case ExternDecl(n, ps, rt, va, lk, vs) =>
@@ -707,7 +707,7 @@ object AstCodec {
         case "vnt"  => Variant(expr())
         case "fn" =>
           FuncDecl(sref(), list(sref()), list(param()), opt(typ()), list(stmt()),
-            bounds(), bool(), vis(), tdefaults(), opt(testAttr()),
+            bounds(), bool(), vis(), tdefaults(), tdefaults(), opt(testAttr()),
             opt(at(CallConv(sref(), opt(sref())))), bool(), bool(), bool())
         case "ext" =>
           ExternDecl(sref(), list(param()), opt(typ()), bool(), opt(sref()), vis())

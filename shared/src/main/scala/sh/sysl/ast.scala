@@ -781,6 +781,11 @@ case class FuncDecl(
     variadic: Boolean = false,
     vis: Visibility = Visibility.Public,
     tdefaults: Map[String, TypeRef] = Map.empty,
+    /** Which of `tparams` stand for **values** rather than types, and the type each argument must
+      * have — `[const N: usize]` (`10 §9`). The two kinds share `tparams` because they share one
+      * list, one namespace and one argument position; this map is what tells them apart.
+      */
+    tvalues: Map[String, TypeRef] = Map.empty,
     test: Option[TestAttr] = None,
     conv: Option[CallConv] = None,
     /** `@tailrec` — see `TFunc.tailrec`. */

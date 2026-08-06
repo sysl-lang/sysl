@@ -117,18 +117,39 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
 
   /** Whether a written type names any of the parameters being solved, and so is not yet a type.
    *
-   * An array's length is an expression rather than a type, so nothing in it can name one.
+   * **An array's length counts** (`10 §9`). It used to be true that nothing in a length could name a
+   * parameter — the comment here said so — and value generics made it false: `[N]int` names no type
+   * parameter in its element and is still not a type until `N` is fixed. Missing that is not a
+   * missing feature but a wrong answer, since a caller then resolves the signature under an empty
+   * substitution and reports the length as not constant.
    */
   protected def mentions(ref: TypeRef, tps: Set[String]): Boolean = ref match
     case NamedType(n, args) => tps(n) || args.exists(mentions(_, tps))
     case PtrType(inner)     => mentions(inner, tps)
     case RefType(inner, _)  => mentions(inner, tps)
     case WeakType(inner)    => mentions(inner, tps)
-    case ArrayType(_, elem, _) => mentions(elem, tps)
+    case ArrayType(len, elem, _) =>
+      len.exists(lengthMentions(_, tps)) || mentions(elem, tps)
     case VolatileType(inner) => mentions(inner, tps)
     case TupleType(parts, _) => parts.exists(mentions(_, tps))
     case f: FnType          => mentions(f.asTrait, tps)
     case CFnType(params, ret) => params.exists(mentions(_, tps)) || mentions(ret, tps)
+
+  /** Whether an array **length** names one of the parameters being solved — a value parameter
+   * standing for the length itself (`10 §9`), or a type parameter reached through a measurement
+   * such as `[sizeof(T)]u8`.
+   *
+   * It walks the shapes `fold` walks, and no others: the set of expressions a length may be is
+   * closed, so anything outside it cannot name a parameter because it cannot be a length at all.
+   */
+  private def lengthMentions(e: Expr, tps: Set[String]): Boolean = e match
+    case Ident(n)               => tps(n)
+    case LayoutOf(_, tr)        => mentions(tr, tps)
+    case Unary(_, operand)      => lengthMentions(operand, tps)
+    case Binary(_, l, r)        => lengthMentions(l, tps) || lengthMentions(r, tps)
+    case Compare(List(l, r), _) => lengthMentions(l, tps) || lengthMentions(r, tps)
+    case Call(_, args)          => args.exists(lengthMentions(_, tps))
+    case _                      => false
 
   /** Resolves one bound — a trait, with whatever arguments it was applied to — under the
    * substitution the declaration that wrote it is being read at.
@@ -250,7 +271,11 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
    * silently keeps the name as written, and the parameter goes on carrying a promise that no
    * conformance check can match against the same bound resolved properly.
    */
-  protected def abstractSubst(tparams: List[String], bounds: Map[String, List[BoundRef]]): Map[String, Type] = {
+  protected def abstractSubst(
+      tparams: List[String],
+      bounds: Map[String, List[BoundRef]],
+      values: Map[String, TypeRef] = Map.empty,
+  ): Map[String, Type] = {
     def build(tp: String, seen: Set[String]): Type.Abstract =
       Type.Abstract(
         tp,
@@ -265,7 +290,14 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
           bounds.getOrElse(tp, Nil).map(b => recorded(Type.Bound(b.name, Nil))(resolveBound(b, here))),
       )
 
-    tparams.map(tp => tp -> build(tp, Set.empty)).toMap
+    // A **value parameter** stands in as a zero rather than as an `Abstract` (`10 §9`). It is not a
+    // type, so nothing may ask what it implements — and standing at a value is what lets the one
+    // walk that checks the generic body read `[N]T` as an array and `N` as a `usize` without a
+    // second mechanism. Zero is the same placeholder `[sizeof(T)]u8` already resolves to for this
+    // walk, whose tree is discarded; every real length is built per instantiation.
+    tparams.map(tp =>
+      tp -> values.get(tp).fold[Type](build(tp, Set.empty))(tr =>
+        Type.ConstArg(0, recover(Type.Unknown)(resolveType(tr, Map.empty))))).toMap
   }
 
   /** Resolves a **result** type, which is the one position the two valueless types may appear in —

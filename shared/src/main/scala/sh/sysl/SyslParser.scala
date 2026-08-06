@@ -21,16 +21,35 @@ import scala.util.parsing.input.Position
 /** What a `[T, U: Show, V = int]` list says, kept as one value because every generic declaration
   * parses the same list and hands all three parts to the node it builds. A parameter carrying
   * neither a bound nor a default is simply absent from both maps.
+  *
+  * **A parameter may stand for a value rather than a type** (`10 §9`), written `[const N: usize]`.
+  * Those share `names` with the type parameters, because they share one list, one namespace and one
+  * argument position — what marks one out is an entry in `values` giving the type its argument must
+  * have. A value parameter carries no bound (a bound is a trait, and a value does not implement one)
+  * and its default, where it has one, is an expression rather than a type.
   */
 case class TypeParams(
     names: List[String],
     bounds: Map[String, List[BoundRef]] = Map.empty,
     defaults: Map[String, TypeRef] = Map.empty,
+    values: Map[String, TypeRef] = Map.empty,
+    valueDefaults: Map[String, Expr] = Map.empty,
 )
 
 object TypeParams {
   val none: TypeParams = TypeParams(Nil)
 }
+
+/** One entry of a `[…]` parameter list, before the list is folded into `TypeParams`. The two shapes
+  * are kept apart here rather than in maps because the grammar reading them is what tells them
+  * apart, and a fold that had to guess would be the ambiguity `const` exists to remove.
+  */
+sealed trait ParamSpec { def name: String }
+
+case class TypeParamSpec(name: String, bounds: List[BoundRef], default: Option[TypeRef])
+    extends ParamSpec
+
+case class ValueParamSpec(name: String, typ: TypeRef, default: Option[Expr]) extends ParamSpec
 
 /** The sysl parser: a packrat combinator grammar over the materialized token list from
  * `SyslLexical` (see design/front-end.md).
@@ -582,17 +601,36 @@ class SyslParser(val source: Source) extends DeclParser {
    * can say so with the declaration under the message.
    */
   protected lazy val boundedTypeParams: Parser[TypeParams] =
-    op("[") ~> commaList1(boundedTypeParam) <~ op("]") ^^ { ps =>
+    op("[") ~> commaList1(valueParam | boundedTypeParam) <~ op("]") ^^ { ps =>
       TypeParams(
-        ps.map(_._1),
-        ps.collect { case (n, bs, _) if bs.nonEmpty => n -> bs }.toMap,
-        ps.collect { case (n, _, Some(d)) => n -> d }.toMap,
+        ps.map(_.name),
+        ps.collect { case p: TypeParamSpec if p.bounds.nonEmpty => p.name -> p.bounds }.toMap,
+        ps.collect { case p: TypeParamSpec if p.default.nonEmpty => p.name -> p.default.get }.toMap,
+        ps.collect { case p: ValueParamSpec => p.name -> p.typ }.toMap,
+        ps.collect { case p: ValueParamSpec if p.default.nonEmpty => p.name -> p.default.get }.toMap,
       )
     }
 
-  protected lazy val boundedTypeParam: Parser[(String, List[BoundRef], Option[TypeRef])] =
+  /** `[const N: usize]` — a parameter standing for a **value** (`10 §9`).
+   *
+   * The type is required and the marker is what makes it readable: without `const` this is
+   * `ident ':' name`, which is exactly a bounded type parameter, and only name resolution could say
+   * which was meant. Then a trait name misspelled into a type name would quietly change what kind of
+   * parameter it is. The word is not a new one — `13 §7` already spells a compile-time constant
+   * `const NAME: Type = expr`, and this is that with the initializer left to the caller.
+   *
+   * A **default is an expression here**, not a type, which is the second thing the marker buys: one
+   * slot, two grammars, and no way to parse it without knowing which parameter is being read.
+   */
+  protected lazy val valueParam: Parser[ValueParamSpec] =
+    op("const") ~> ident ~ (op(":") ~> typeRef) ~ opt(op("=") ~> expression) ^^ {
+      case n ~ t ~ d => ValueParamSpec(n, t, d)
+    } | op("const") ~> err("a value parameter needs the type its argument must have, as " +
+      "'const N: usize' — the type is what says which values may stand there")
+
+  protected lazy val boundedTypeParam: Parser[TypeParamSpec] =
     ident ~ opt(op(":") ~> rep1sep(boundRef, op("+"))) ~ opt(op("=") ~> typeRef) ^^ {
-      case n ~ bs ~ d => (n, bs.getOrElse(Nil), d)
+      case n ~ bs ~ d => TypeParamSpec(n, bs.getOrElse(Nil), d)
     }
 
   protected lazy val boundRef: Parser[BoundRef] =

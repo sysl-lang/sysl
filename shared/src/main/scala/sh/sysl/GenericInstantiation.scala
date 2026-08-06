@@ -353,10 +353,20 @@ trait GenericInstantiation extends ConstFolding {
       actual match
         case Type.Slice(e, _) => unify(elem, e, tparams, sub)
         case _                => ()
-    case ArrayType(Some(_), elem, _) =>
+    // The **length binds a value parameter** the way the element binds a type one (`10 §9`): a
+    // `[N]T` parameter handed a `[3]int` reads 3 off the argument's type, which is where the length
+    // already lives. Only a bare name is read — a length written as arithmetic over a parameter,
+    // `[N + 1]T`, is refused at resolution rather than solved here, since inverting an expression is
+    // the type-level arithmetic that section excludes.
+    case ArrayType(Some(len), elem, _) =>
       actual match
-        case Type.Array(_, e) => unify(elem, e, tparams, sub)
-        case _                => ()
+        case Type.Array(n, e) =>
+          len match
+            case Ident(v) if tparams(v) => sub.getOrElseUpdate(v, Type.ConstArg(n, Type.Usize))
+            case _                      => ()
+
+          unify(elem, e, tparams, sub)
+        case _ => ()
     case VolatileType(inner) => unify(inner, Type.unqualified(actual), tparams, sub)
     case TupleType(parts, _) =>
       actual match

@@ -58,7 +58,7 @@ trait DeclParser extends ExprParser {
       (op("(") ~> paramList <~ op(")")) ~ opt(op("->") ~> resultRef) ~ funcBody <~ endName(name) ^^ {
         case ((params, variadic)) ~ ret ~ body =>
           FuncDecl(name, tp.names, params, ret, body, tp.bounds, variadic, tdefaults = tp.defaults,
-                   conv = conv)
+                   tvalues = tp.values, conv = conv)
       }
     }
 

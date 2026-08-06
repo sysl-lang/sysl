@@ -375,6 +375,22 @@ trait ExprAnalysis
             s"for one; where the address of code is what is wanted, that is written '&$name'",
       )
 
+    /** A **value parameter** (`10 §9`), folded into its use exactly as a declared constant is —
+     * which is what it is, a `const` whose value the instantiation supplied. The substitution holds
+     * a `ConstArg` for it wherever the body is walked: the real argument at an instantiation, and a
+     * zero placeholder during the walk that checks the generic body, where there is no argument yet
+     * and the tree built is discarded. An array length written `[sizeof(T)]u8` already stands at
+     * zero for that same walk and for the same reason.
+     *
+     * **A local of the same name still wins**, which is why the scope is asked first: a parameter is
+     * the outermost binding of its name, not the only one.
+     */
+    case Ident(name)
+        if lookupOpt(name).isEmpty && tsubst.get(name).exists(_.isInstanceOf[Type.ConstArg]) =>
+      val Type.ConstArg(v, ty) = tsubst(name): @unchecked
+
+      analyzeExpr(IntLit(v, None), Some(ty))
+
     case Ident(name) =>
       lookupOpt(name) match
         // A captured name is a name the scope knows and the frame does not hold: what it reaches is

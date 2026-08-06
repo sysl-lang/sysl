@@ -299,6 +299,24 @@ object Type {
     def llvm: String = s"[$length x ${elem.llvm}]"
   }
 
+  /** The argument bound to a **value** parameter (`10 §9`) — `3` where the declaration wrote
+   * `[const N: usize]`.
+   *
+   * It is a `Type` because a declaration's parameters are one list, one namespace and one argument
+   * position, so the substitution that answers "what is this parameter?" answers for both kinds and
+   * is keyed by name for both. Rust models the same thing the same way, as a `GenericArg` that is a
+   * type or a const. What is awkward is only that the map's value type is spelled `Type`.
+   *
+   * Like `Abstract`, it is a **diagnostic and substitution type, never a lowered one**: a value
+   * argument is folded into the length or the expression that names it before anything is laid out,
+   * so reaching codegen means a substitution was dropped rather than that this needs a
+   * representation.
+   */
+  case class ConstArg(value: BigInt, ty: Type) extends Type {
+    def llvm: String =
+      throw new IllegalStateException(s"the value argument '$value' reached codegen")
+  }
+
   /** A view of elements someone else owns: the reference that keeps the storage alive, the first
    * element, and how many there are. Every view has that same layout, so the element type shows
    * up only in the instructions that reach through it — which is what lets a slice and a string
@@ -422,6 +440,9 @@ object Type {
     case Slice(elem, ro)          => s"[]${if ro then "const " else ""}${show(elem)}"
     case Volatile(inner)          => s"volatile ${show(inner)}"
     case Abstract(n, _)           => n
+    // A value argument is shown as the value, since that is what a reader wrote and what tells two
+    // instantiations apart: `len[3]` and `len[4]` differ by this and nothing else (`10 §9`).
+    case ConstArg(v, _)           => v.toString
     // A call trait is spelled the way it is written rather than the way it is filed, so nothing a
     // reader is told names the arity-carrying declaration behind it (`12 §6`).
     case Trait(n, args) =>
@@ -767,6 +788,10 @@ object Type {
     case Ref(inner, true)  => s"sync.${mangleOne(inner)}"
     case Weak(inner)       => s"weak.${mangleOne(inner)}"
     case Array(n, elem)    => s"arr$n.${mangleOne(elem)}"
+    // **A value argument is part of the mangled name**, for exactly the reason a type argument is:
+    // two instantiations that differ only in it are two bodies, and a name that dropped it would let
+    // `total` at length 3 share a body with `total` at length 4 (`10 §9`).
+    case ConstArg(v, _)    => s"c$v"
     // The bit is mangled even though both forms have one layout and one set of instructions, so
     // that a generic instantiated at `[]const T` never shares a body with one instantiated at
     // `[]T` — the bodies would be identical machine code, but only one of them had its writes

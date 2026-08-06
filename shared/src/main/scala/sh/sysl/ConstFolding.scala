@@ -173,7 +173,14 @@ trait ConstFolding extends ImportResolution {
     case l: CharLit  => Some(l)
     case l: StrLit   => Some(l)
 
-    case Ident(n) => constKey(n).map(k => constLiteral(k))
+    // A **value parameter** is asked before a declared constant, and shadows one of the same name
+    // for the same reason a type parameter shadows a type: the nearer binding is the one written
+    // where the name is (`10 §9`). During the walk that checks a generic body there is no argument
+    // bound yet, so the name simply is not in the substitution and falls through — `constInt`'s
+    // caller reads that as awaiting instantiation, exactly as it already does for `sizeof(T)`.
+    case Ident(n) =>
+      subst.get(n).collect { case Type.ConstArg(v, _) => IntLit(v, None) }
+        .orElse(constKey(n).map(k => constLiteral(k)))
 
     case Unary("-", operand) =>
       fold(operand, subst).collect {
@@ -241,6 +248,11 @@ trait ConstFolding extends ImportResolution {
       Type.underlying(resolveType(tr, subst)) match
         case _: Type.Abstract => true
         case _                => false
+    // A **value parameter** during the walk that checks the generic body: it is bound to the same
+    // `Abstract` stand-in a type parameter gets, so it does not fold and is not an error either
+    // (`10 §9`). A name bound to a `ConstArg` is not here, because that one folds.
+    case Ident(n) =>
+      subst.get(n).exists(_.isInstanceOf[Type.Abstract])
     case Unary(_, operand)             => awaitsInstantiation(operand, subst)
     case Binary(_, l, r)               => awaitsInstantiation(l, subst) || awaitsInstantiation(r, subst)
     case Compare(List(l, r), _)        => awaitsInstantiation(l, subst) || awaitsInstantiation(r, subst)
