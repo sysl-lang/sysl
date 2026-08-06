@@ -324,10 +324,13 @@ class TupleTests extends AnyFreeSpec with ParseSupport with RunSupport with Code
     // Arity is a shape and nothing can be generic over one, so the library stops somewhere — and
     // where it stopped is the only useful thing to say, since the fix is a struct rather than a
     // fourth implementation.
-    "and beyond the widest arity the library declares, the advice is a struct" in {
-      err("print((1, 2, 3, 4) == (1, 2, 3, 4))") should include(
-        s"the library provides '${lib("Eq")}' for tuples of up to 3 parts and this one has 4",
-      )
+    /** There is no widest arity, and there used to be. The rows are written over a type pack
+     * (`10 §10`) and cover every tuple, so what a wide one is told is what any other type is told:
+     * which of its parts does not implement the trait. The sentence that named the ceiling and sent
+     * the reader to write a struct went with the ceiling.
+     */
+    "and a tuple wider than three implements the catalog like any other" in {
+      run("print((1, 2, 3, 4) == (1, 2, 3, 4))") shouldBe "true\n"
     }
   }
 
@@ -377,11 +380,21 @@ class TupleTests extends AnyFreeSpec with ParseSupport with RunSupport with Code
 
     // §13 says a user may not write `impl Eq for (int, string)` — and that this is the existing
     // rule producing the expected answer rather than a new one. The message is the shape rule's.
+    /** §13's own words for this case: *"the trait and the type are both the library's — that is the
+     * existing rule producing the expected answer, not a new one."* The rule that answers is
+     * coherence, and it is what the reader needs: the fix is a trait of their own or a type of their
+     * own in the subject, not a differently-worded second row.
+     *
+     * It used to be answered by the *duplicate* check instead, because the library's row was filed
+     * under this arity's shape and the lookup found it there. The row is under the pack's key now
+     * (`10 §10`), so the arity's shape holds nothing and coherence is reached first — which is the
+     * rule §13 names.
+     */
     "and the library's own rows may not be given a second implementation" in {
       err("""impl Eq for (int, int)
             |    eq(self, rhs: Self) -> bool = true
             |print(1)
-            |""".stripMargin) should include(s"every tuple of 2 parts already implements '${lib("Eq")}'")
+            |""".stripMargin) should include("so this one has no home")
     }
   }
 

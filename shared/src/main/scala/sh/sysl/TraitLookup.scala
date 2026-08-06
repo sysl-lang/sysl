@@ -688,24 +688,12 @@ trait TraitLookup extends MemberVisibility {
           .headOption)
       yield s"the 'impl' that covers it asks '${unmet.show}' of ${show(arg)}, which does not implement it"
 
-    wrongArgs.headOption.orElse(unmetCondition).orElse(tooWide(tr, t))
-
-  /** Why a **tuple** does not implement one of the traits the library provides structurally: not
-   * because of what its parts are, but because of how many there are.
-   *
-   * Arity is a shape (`00 §13`), and there is no way to be generic over one — so the library writes
-   * an implementation per arity and stops somewhere. Saying where it stopped is the whole of the
-   * advice, since the fix is not another `impl` but a type with a name.
-   */
-  private def tooWide(tr: Type.Bound, t: Type): Option[String] = t match
-    case tup: Type.Tuple =>
-      for
-        widest <- (2 to 16).filter(n => implsOf(tr.name, Type.Tuple.shape(n)).nonEmpty).lastOption
-        if tup.targs.length > widest
-      yield s"the library provides '${Modules.show(tr.name)}' for tuples of up to " +
-        s"${quantity(widest, "part")} and this one has ${tup.targs.length}, so a product this wide " +
-        "wants a struct of its own"
-    case _ => None
+    // A **tuple** used to get a sentence of its own after these two, saying which arity the library
+    // stopped writing rows at and that a product wider than that wants a struct with names. There is
+    // no arity to stop at now: the rows are written over a type pack and cover every tuple
+    // (`10 §10`), so what is left to say about one is what is said about every other type — which of
+    // its parts does not implement the trait, which `unmetCondition` says by name.
+    wrongArgs.headOption.orElse(unmetCondition)
 
   /** The same, for a trait that takes no arguments. */
   protected def unmetBound(traitName: String, t: Type): Option[String] =

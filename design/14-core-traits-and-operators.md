@@ -788,7 +788,8 @@ exactly (`§5`), one row further down the catalog.
   with nothing added here**, because the index is the trait's own argument: `impl Index[(int, int),
   E]` reads by a pair, `IndexSet` writes by one, and `img[(x, y)]` is ordinary. The other two shapes
   are not wanted — a per-arity trait is the tuple's arity written into a name, which is the trade
-  `00 §13` already made once and lost.
+  `00 §13` already made once and lost, and which `10 §10` has since bought back for the catalog's
+  own rows.
 
 - **~~The iteration protocol.~~ Built, and `s.chars` is what decided its shape.**
 
@@ -924,6 +925,15 @@ exactly (`§5`), one row further down the catalog.
   would be the first one, and it arrives with that whole question attached: automatic for every
   enum, and therefore a member a program cannot replace without shadowing it, or asked for by
   something written at the declaration. Nothing here decides that.
+
+  **Half of the machinery exists now, and the deciding question is untouched.** `10 §10`'s `for
+  const` is a loop the compiler unrolls, whose body is type-checked once per copy — which is exactly
+  what doing something per part of a declaration needs, and it is what let the library's tuple rows
+  become one block each instead of one per arity. What it has nothing to walk *here* is the list: a
+  tuple's parts are reached by position, and an enum's variants and a struct's fields have names, so
+  what is missing is a way to name one of those lists. That is a smaller gap than it was. It is not
+  progress on this item's actual question, though — automatic against asked-for is a choice about
+  what a program can replace, and no mechanism decides it.
 - **An `Option` is not equatable, whatever it holds.** The catalog's memberships are written one
   type at a time and the library's own generic enums have none, so `a == b` over two `Option[u8]`s
   is refused and "is this the same link" is written by taking both sides apart in a `match`.

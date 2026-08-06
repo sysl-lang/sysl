@@ -123,7 +123,8 @@ split: a slice of your struct is your business, and `Option` is not.
 **A type parameter is not a local type**, so `impl[T: Display] Display for []T` is refused however
 its bound is written. That is the case with two unrelated modules each supplying a different row for
 one type, which is what the rule exists to stop; making every printable slice printable is the
-library's to do, and the library's own rows for tuples are written exactly that way.
+library's to do, and the library's own rows for tuples are written exactly that way — over a **type
+pack** since `10 §10`, so one block covers every arity rather than one block covering each.
 
 **Open: whether a trait *argument* licenses a block.** Rust counts one — `impl ForeignTrait<Local>
 for i32` is allowed there — and sysl does not, so `impl Mul[Complex] for int` has no home. Nothing

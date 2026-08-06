@@ -270,7 +270,9 @@ type by the time its members are hoisted and the type has a `len`; `impl[T] Size
 `Self` yet — the element is still a parameter — so the same question found nothing to ask, and the
 block was accepted and then never reached, which is the outcome the refusal exists to prevent. The
 shape is asked directly now, and the shapes that have a provided member are the two written with
-brackets, `len` being the whole of what a sequence gets. A tuple's shape is its arity and has none.
+brackets, `len` being the whole of what a sequence gets. A tuple has no provided member either: its
+shape is its arity, and the parts a `for const` walks are reached by position rather than by a name
+the compiler supplies (`10 §10`).
 
 ### A type with no name still has members
 
