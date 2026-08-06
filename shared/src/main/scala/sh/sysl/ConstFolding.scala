@@ -110,6 +110,34 @@ trait ConstFolding extends ImportResolution {
     case _: StrLit   => "a string"
     case _           => "not a constant"
 
+  /** The literal a bound **value parameter** stands for, which is decided by the type it was
+   * declared with (`10 §9`).
+   *
+   * The argument travels as a `BigInt` because that is what a type's identity needs — something
+   * that compares and mangles — and the declared type is what says how to read it back. A `bool`
+   * whose parameter folded to an `IntLit` would be a `0` where the body wrote `B`, so the type is
+   * not decoration here: it is the half of the pair that makes the number mean something.
+   */
+  protected def constArgLiteral(c: Type.ConstArg): Expr = c.ty match
+    case Type.Bool => BoolLit(c.value != 0)
+    case Type.Char => CharLit(c.value.toInt)
+    case _         => IntLit(c.value, None)
+
+  /** The other direction: the number a written value argument stands for, or `None` where it is not
+   * a value an identity can be made of.
+   *
+   * The admissible set is `10 §9`'s and the reason is one sentence — a value in a type's identity
+   * must compare and must mangle. An integer, a `bool` and a `char` each do; a float does not
+   * (`NaN != NaN` would make a type unequal to itself) and a string does not until two spellings of
+   * one text are one value.
+   */
+  protected def constArgValue(e: Expr, subst: Map[String, Type] = Map.empty): Option[BigInt] =
+    fold(e, subst).collect {
+      case IntLit(v, _)  => v
+      case BoolLit(b)    => if b then BigInt(1) else BigInt(0)
+      case CharLit(c)    => BigInt(c)
+    }
+
   /** A compile-time integer, for the two positions where a literal was previously the only thing
    * accepted: an array bound and an enum discriminant (`13 §7`).
    */
@@ -179,7 +207,7 @@ trait ConstFolding extends ImportResolution {
     // bound yet, so the name simply is not in the substitution and falls through — `constInt`'s
     // caller reads that as awaiting instantiation, exactly as it already does for `sizeof(T)`.
     case Ident(n) =>
-      subst.get(n).collect { case Type.ConstArg(v, _) => IntLit(v, None) }
+      subst.get(n).collect { case c: Type.ConstArg => constArgLiteral(c) }
         .orElse(constKey(n).map(k => constLiteral(k)))
 
     case Unary("-", operand) =>

@@ -473,6 +473,28 @@ The rest are excluded for reasons rather than for now:
 - **Structs** are the step Rust has left unstable for years (`adt_const_params`), and nothing here
   wants them yet.
 
+### A parameter's kind is the declaration's to state
+
+Whichever kind a parameter is, writing the other one is **refused rather than guessed at**:
+
+```
+f[T](xs: [T]int)                   // REFUSED: 'T' is a type; a length is a value
+impl[N, T] Tag for [N]T            // REFUSED: the same, one declaration form over
+var b: Buf[int]                    // REFUSED: 'int' is a type, and this slot wrote 'const'
+var b: Box[4]                      // REFUSED: a value stands here, and this argument is a type
+```
+
+The first two are the ones worth stating, because they used to be accepted. A bare name in a length
+position could not mean anything before this feature, so it stood at **zero** — harmless while
+nothing could put a name there, and a silent wrong answer the day something could. `impl[N, T] Tag
+for [N]T` quietly became an implementation for `[0]T`.
+
+The function case has to be caught at the **declaration** rather than where the type is built,
+because by then the two kinds are no longer distinguishable: inference reads a length off the
+argument's type and binds `T` to what it found, so `T` arrives at resolution holding a value and
+looking exactly like a parameter that was declared `const`. The declaration is the last place the
+distinction still exists.
+
 ### What may be written with `N`, and what may not
 
 `N` is a `usize` (or whatever its declared type is) and may be used as one: as an array length in a
@@ -562,10 +584,11 @@ first.
 - **c. `where` clauses.** An out-of-line bound syntax for readability when the inline `[T: A +
   B]` list grows long or involves relations between parameters. All of Rust/Swift/Kotlin have
   one; a candidate ergonomic addition, not a day-one need.
-- **d. Value generics** — **designed, and no longer an open question: see §9**, which settles the
-  spelling (`[const N: usize]`), the admissible value types and why they are staged, what may be
-  written with the parameter, and how inference and monomorphization reach it. It remains
-  **unbuilt**, which is a different thing from undecided.
+- ~~**d. Value generics**~~ — **built: see §9**, which settles the spelling (`[const N: usize]`), the
+  admissible value types and why they are staged, what may be written with the parameter, and how
+  inference and monomorphization reach it. A function, an `impl`, a struct and an enum may each
+  declare one, and the library's `impl[const N: usize, T: Display] Display for [N]T` is what it was
+  for. Type-level arithmetic over a value parameter stays excluded, and §9 says why.
 
   **The name is the one part worth keeping here, because it was nearly wrong.** Rust calls this
   *const generics*, and that is what this entry said until the feature was taken up. The word is

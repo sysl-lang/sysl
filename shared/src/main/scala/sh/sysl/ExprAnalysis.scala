@@ -430,9 +430,18 @@ trait ExprAnalysis
      */
     case Ident(name)
         if lookupOpt(name).isEmpty && tsubst.get(name).exists(_.isInstanceOf[Type.ConstArg]) =>
-      val Type.ConstArg(v, ty) = tsubst(name): @unchecked
+      val c = tsubst(name).asInstanceOf[Type.ConstArg]
 
-      analyzeExpr(IntLit(v, None), Some(ty))
+      c.ty match
+        // A **simple enum's** argument travels as its tag, and what the body wants back is the
+        // variant — so the name is handed to the ordinary variant path rather than reconstructed
+        // here, and everything a written `Fast` gets (its type, its scope, its exhaustiveness)
+        // follows from that.
+        case en: Type.Enum =>
+          en.variants.find(_.tag == c.value.toInt) match
+            case Some(v) => analyzeExpr(Ident(v.name), Some(en))
+            case None    => err(s"'$name' stands for no variant of ${show(en)}")
+        case ty => analyzeExpr(constArgLiteral(c), Some(ty))
 
     case Ident(name) =>
       lookupOpt(name) match

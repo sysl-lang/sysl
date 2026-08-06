@@ -456,6 +456,14 @@ object Type {
     case Abstract(n, _)           => n
     // A value argument is shown as the value, since that is what a reader wrote and what tells two
     // instantiations apart: `len[3]` and `len[4]` differ by this and nothing else (`10 §9`).
+    //
+    // **Shown the way it was written, not the way it travels.** A `bool`, a `char` and an enum
+    // variant all reach here as the number that makes their type's identity, and a diagnostic
+    // reading `Run[1]` names something no program wrote — the reader has to know an internal tag to
+    // recognise their own type.
+    case ConstArg(v, Bool)        => (v != 0).toString
+    case ConstArg(v, Char)        => s"'${v.toInt.toChar}'"
+    case ConstArg(v, e: Enum)     => e.variants.find(_.tag == v.toInt).fold(v.toString)(_.name)
     case ConstArg(v, _)           => v.toString
     // A call trait is spelled the way it is written rather than the way it is filed, so nothing a
     // reader is told names the arity-carrying declaration behind it (`12 §6`).

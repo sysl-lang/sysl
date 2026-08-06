@@ -325,8 +325,8 @@ trait MemberLowering extends TypeResolution {
       // `make(...)` has nothing to anchor on. Asked after the member is registered, so a mistake
       // here does not also erase the member it is about.
       recover(())(at(m.pos)(checkSignatureRules(fd.name, fd.params, fd.retType, fd.variadic)))
-      recover(())(at(m.pos)(
-        checkValueParamArithmetic(fd.tvalues.keySet, fd.params.map(_.typ) ::: fd.retType.toList)))
+      recover(())(at(m.pos)(checkValueParamArithmetic(
+        fd.tvalues.keySet, fd.params.map(_.typ) ::: fd.retType.toList, fd.tparams.toSet)))
 
     lowered.toList
   }

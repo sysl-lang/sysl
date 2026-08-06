@@ -172,8 +172,14 @@ class AnalyzerTypeErrorTests extends AnyFreeSpec with CodegenSupport {
       err("var a = [1, 2]\nprint(a.size)") should include("cannot read field 'size'")
     }
 
-    "are not printable, since printing is scalars only" in {
-      err("var a = [1, 2]\nprint(a)") should include("cannot print a [2]int value")
+    // An array of a printable element **does** print, through the library's one block over `[N]T`
+    // (`10 §9`). What is refused is an array of something that does not render, and the message
+    // names the element rather than the array, which is the part a reader can act on.
+    "print an array of anything printable, and name the element when they do not" in {
+      err("""struct P
+            |    v: int
+            |var a: [2]P = [P(1), P(2)]
+            |print(a)""".stripMargin) should include("which does not implement it")
     }
 
     "have no zero value when their elements have none" in {
@@ -265,8 +271,12 @@ class AnalyzerTypeErrorTests extends AnyFreeSpec with CodegenSupport {
             |    B
             |end E
             |print(str(A))""".stripMargin) should include("cannot make a string of a")
-      err("""var a = [1, 2, 3]
-            |print(str(a))""".stripMargin) should include("cannot make a string of a [3]int value")
+      // An array of a printable element renders, so the container that does not is one whose
+      // *element* does not — and the message names the element.
+      err("""struct Q
+            |    v: int
+            |var a: [3]Q = [Q(1), Q(2), Q(3)]
+            |print(str(a))""".stripMargin) should include("which does not implement it")
     }
 
     "will not render a reference or a raw pointer" in {

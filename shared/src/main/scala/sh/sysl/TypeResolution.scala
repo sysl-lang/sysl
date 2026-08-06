@@ -176,6 +176,27 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
   private def checkLengthArithmetic(len: Expr, subst: Map[String, Type]): Unit =
     lengthArithmetic(len, subst.collect { case (n, _: Type.ConstArg) => n }.toSet)
 
+  /** Refuses a **type** parameter written where an array's length belongs — `f[T](xs: [T]int)` and
+   * `impl[N, T] Tag for [N]T`.
+   *
+   * A length is a value, and a parameter standing for one is declared `const` (`10 §9`). Before
+   * that spelling existed, the only thing here that could legitimately fail to fold was a
+   * measurement *over* a type parameter — `[sizeof(T)]u8` — and that one reaches the length through
+   * `sizeof` rather than as a bare name. So `awaitsInstantiation` stood a bare name at zero, which
+   * was harmless while no bare name could mean anything, and became a silent wrong answer the day
+   * one could: `impl[N, T] Tag for [N]T` quietly became an implementation for `[0]T`, and
+   * `f[T](xs: [T]int)` compiled with a length nobody wrote.
+   *
+   * A bare name bound to a **type** has no reading at all, which is what makes this a sentence
+   * rather than a fallback.
+   */
+  private def checkLengthNotAType(len: Expr, subst: Map[String, Type]): Unit = len match
+    case Ident(n) =>
+      for a <- subst.get(n).collect { case a: Type.Abstract => a } do
+        err(s"'${a.name}' is a type parameter, and an array's length is a value rather than a " +
+          s"type — a parameter that stands for a length is declared 'const ${a.name}: usize'")
+    case _ => ()
+
   /** The same refusal made at the **declaration**, from the names alone and with no substitution —
    * which is where the mistake is, and the only place one position can be told about it at all.
    *
@@ -184,13 +205,24 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
    * unhelpful, since what cannot be inferred is not something the caller can fix. Asked here, the
    * declaration is what reports, and a declaration nothing ever calls reports too.
    */
-  protected def checkValueParamArithmetic(names: Set[String], types: List[TypeRef]): Unit = {
+  protected def checkValueParamArithmetic(
+      names: Set[String],
+      types: List[TypeRef],
+      tparams: Set[String] = Set.empty,
+  ): Unit = {
     def walk(t: TypeRef): Unit = t match
-      case ArrayType(len, elem, _) => len.foreach(lengthArithmetic(_, names)); walk(elem)
+      case ArrayType(len, elem, _) =>
+        len.foreach { l =>
+          lengthArithmetic(l, names)
+          lengthIsNotAType(l, tparams -- names)
+        }
+        walk(elem)
       case NamedType(_, args)      => args.foreach(walk)
       // A written value argument is held to the same rule a length is, and for the same reason:
       // `Buf[N + 1]` puts a computation where an identity belongs.
-      case ValueArgType(e)         => lengthArithmetic(e, names)
+      case ValueArgType(e) =>
+        lengthArithmetic(e, names)
+        lengthIsNotAType(e, tparams -- names)
       case PtrType(inner)          => walk(inner)
       case RefType(inner, _)       => walk(inner)
       case WeakType(inner)         => walk(inner)
@@ -199,8 +231,22 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
       case f: FnType               => f.params.foreach(walk); walk(f.ret)
       case CFnType(params, ret)    => params.foreach(walk); walk(ret)
 
-    if names.nonEmpty then types.foreach(walk)
+    if names.nonEmpty || tparams.nonEmpty then types.foreach(walk)
   }
+
+  /** The declaration-time half of `checkLengthNotAType`, asked of the parameter *names* rather than
+   * of a substitution — which is what reaches the case resolution cannot.
+   *
+   * `f[T](xs: [T]int)` is solved before it is resolved: `unify` reads a length off the argument's
+   * type and binds `T` to the 2 it found there, so by the time the signature resolves, `T` is a
+   * value and looks like one that was declared `const`. The declaration is where the two are still
+   * distinguishable, so the declaration is where this is asked.
+   */
+  private def lengthIsNotAType(len: Expr, tparams: Set[String]): Unit = len match
+    case Ident(n) if tparams(n) =>
+      err(s"'$n' is a type parameter, and an array's length is a value rather than a type — a " +
+        s"parameter that stands for a length is declared 'const $n: usize'")
+    case _ => ()
 
   private def lengthArithmetic(len: Expr, names: Set[String]): Unit = {
     def valueParams(e: Expr): List[String] = e match
@@ -514,6 +560,7 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     // pass, where the measurement answers.
     case ArrayType(Some(len), elem, _) =>
       checkLengthArithmetic(len, subst)
+      checkLengthNotAType(len, subst)
 
       val n = constInt(len, subst) match
         case Some(v) if v >= 0 && v.isValidInt => v.toInt
@@ -637,12 +684,39 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
         err(s"this argument stands where the declaration wrote 'const', so a value belongs here " +
           s"rather than a type — one of ${show(ty)}")
       case Some(e) =>
-        constInt(e, subst) match
-          case Some(v)                              => Type.ConstArg(v, ty)
+        constArgValue(e, subst).orElse(variantTag(e, ty)) match
+          case Some(v)                               => Type.ConstArg(v, ty)
           case None if awaitsInstantiation(e, subst) => Type.ConstArg(0, ty)
+          // A name that turns out to be a **type** is the likely mistake in this position, and it
+          // gets its own sentence: `Buf[int]` reads as an argument list of types until the
+          // declaration says otherwise, so the reader is told which of the two this slot is.
           case None =>
-            err("a value argument must be a constant — a literal, or a 'const' naming one")
+            e match
+              case Ident(n) if typeKey(n).isDefined || scalarType(n).isDefined =>
+                err(s"'$n' is a type, and this argument stands where the declaration wrote " +
+                  s"'const' — so a value of ${show(ty)} belongs here")
+              case _ =>
+                err("a value argument must be a constant — a literal, or a 'const' naming one")
   }
+
+  /** The tag a **simple enum's variant** stands for, where the value parameter's declared type is
+   * that enum (`10 §9`).
+   *
+   * A simple enum's value *is* its identity — there is nothing else telling two of its variants
+   * apart (`09`) — so its tag is exactly the number a type's identity wants. It is read off the
+   * instantiated enum rather than recomputed from the declaration, so an explicit discriminant and
+   * the gap after it are the ones the rest of the compiler already agreed on.
+   *
+   * A **data** enum needs no case and gets none: its variants carry values, so a number does not
+   * tell two of them apart and there is no identity to be made of one.
+   */
+  private def variantTag(e: Expr, ty: Type): Option[BigInt] = (e, ty) match
+    case (Ident(n), en: Type.Enum) if en.simple =>
+      variantKey(n)
+        .filter(k => variantOwner.get(k).contains(en.base))
+        .flatMap(_ => en.variant(n.split('.').last))
+        .map(v => BigInt(v.tag))
+    case _ => None
 
   /** The `Type.Constrained` a subtype name stands for, built once and cached. Building resolves the
    * base, evaluates the `within` bounds to constants, and validates them — an out-of-range or

@@ -45,8 +45,13 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
             |print(p)""".stripMargin) should include("cannot print a &P value")
     }
 
-    "refuses an array, which has no one text of its own" in {
-      err("var a = [1, 2]\nprint(a)") should include("cannot print a [2]int value")
+    // An array renders at every length, through one library block over `[N]T` (`10 §9`) — so what
+    // it refuses is an array whose *element* does not render, and it says which element.
+    "refuses an array only when its element does not render" in {
+      err("""struct P
+            |    v: int
+            |var a: [2]P = [P(1), P(2)]
+            |print(a)""".stripMargin) should include("which does not implement it")
     }
 
     "refuses a trait object, which has forgotten what it renders as" in {

@@ -199,9 +199,10 @@ class ImplShapeRunTests extends AnyFreeSpec with RunSupport {
 
   "an array of any element" - {
 
-    // Without const generics (`10 § Open e`) the length is not something a parameter can stand for,
-    // so it stays part of the shape: `[2]T` and `[3]T` are two shapes, each covering every element
-    // type at its own length.
+    // A length written out is a shape of its own: `[2]T` and `[3]T` are two, each covering every
+    // element type at its own length. Value generics (`10 §9`) added a second shape *below* these
+    // rather than replacing them — `[N]T` covers every length, and is asked second, so a block
+    // naming a length still answers first for the arrays of that length.
     "is a shape per length" in {
       run(
         """trait Tag

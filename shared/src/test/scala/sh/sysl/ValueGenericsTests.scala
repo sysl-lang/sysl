@@ -102,6 +102,171 @@ class ValueGenericsTests extends AnyFreeSpec with RunSupport with CodegenSupport
     }
   }
 
+  /** `10 §9` admits **integers, `bool`, `char` and enum values** on day one, for one reason: a value
+   * in a type's identity must compare and must mangle, and each of those does. The argument travels
+   * as a number whichever it is, and the parameter's declared type is what reads it back — which is
+   * why a `bool` parameter is a `bool` in a body rather than the `0` it is stored as.
+   *
+   * Floats and strings are excluded by that same rule, and §9 says why: `NaN != NaN` would make a
+   * type unequal to itself, and two spellings of one text are not one value until strings intern.
+   */
+  "the admissible types" - {
+    "take a bool, written out" in {
+      run("""struct Flag[const B: bool]
+            |    v: int
+            |var a: Flag[true] = Flag(1)
+            |print(a.v)""".stripMargin) shouldBe "1\n"
+    }
+
+    // The half that a `BigInt` alone would have got wrong: read back in the body, `B` has to be the
+    // `bool` it was declared, not the number it travelled as.
+    "and reads it back as a bool, not as the number it travelled as" in {
+      run("""struct Flag[const B: bool]
+            |    v: int
+            |impl[const B: bool] Display for Flag[B]
+            |    display(self, out: *Writer, fmt: FormatSpec) =
+            |        display_str(if B then "on" else "off", out, fmt)
+            |var a: Flag[true] = Flag(1)
+            |var b: Flag[false] = Flag(2)
+            |print(a)
+            |print(b)""".stripMargin) shouldBe "on\noff\n"
+    }
+
+    "a char" in {
+      run("""struct Sep[const C: char]
+            |    v: int
+            |var a: Sep['x'] = Sep(1)
+            |print(a.v)""".stripMargin) shouldBe "1\n"
+    }
+
+    /** A **simple** enum's value *is* its identity (`09`) — there is nothing else telling two of its
+     * variants apart — so its tag is exactly the number a type's identity wants.
+     */
+    "and a simple enum's variant" in {
+      run("""enum Mode
+            |    Fast
+            |    Slow
+            |struct Run[const M: Mode]
+            |    v: int
+            |var a: Run[Fast] = Run(1)
+            |print(a.v)""".stripMargin) shouldBe "1\n"
+    }
+
+    // Two variants are two types, and the diagnostic names them **as written**. A message reading
+    // `Run[1]` would name something no program wrote — the reader would have to know an internal
+    // tag to recognise their own type.
+    "so two variants are two types, named the way they were written" in {
+      val e = err("""enum Mode
+                    |    Fast
+                    |    Slow
+                    |struct Run[const M: Mode]
+                    |    v: int
+                    |var a: Run[Fast] = Run(1)
+                    |var b: Run[Slow] = a
+                    |print(b.v)""".stripMargin)
+
+      e should include("declared Run[Slow] but the value is Run[Fast]")
+    }
+
+    // And the parameter is that enum inside a body, which this pins through the one thing `Mode`
+    // does not have: the complaint is about `Mode`, so `M` was read as one.
+    "and inside a body the parameter is a value of that enum" in {
+      err("""enum Mode
+            |    Fast
+            |    Slow
+            |struct Run[const M: Mode]
+            |    v: int
+            |impl[const M: Mode] Display for Run[M]
+            |    display(self, out: *Writer, fmt: FormatSpec) =
+            |        display_str(if M == Fast then "y" else "n", out, fmt)
+            |var a: Run[Fast] = Run(1)
+            |print(a)""".stripMargin) should include("'==' is not defined for Mode")
+    }
+  }
+
+  /** A parameter's **kind** is the declaration's to state, and getting it wrong is refused rather
+   * than guessed at. Both of these compiled silently before they were caught, which is the worst
+   * outcome available: an array standing at a length nobody wrote.
+   */
+  "a type parameter where a value belongs" - {
+    "is refused in a function's signature" in {
+      err("""f[T](xs: [T]int) -> usize = 0
+            |var a: [2]int = [1, 2]
+            |print(f(a))""".stripMargin) should
+        include("'T' is a type parameter, and an array's length is a value rather than a type")
+    }
+
+    /** The function case is caught at the **declaration** and has to be: `unify` reads a length off
+     * the argument's type and binds `T` to the 2 it found there, so by the time the signature
+     * resolves, `T` holds a value and is indistinguishable from one declared `const`.
+     */
+    "and the message names the spelling that was meant" in {
+      err("""f[T](xs: [T]int) -> usize = 0
+            |var a: [2]int = [1, 2]
+            |print(f(a))""".stripMargin) should include("declared 'const T: usize'")
+    }
+
+    "and in an 'impl', where it silently became a block for '[0]T'" in {
+      err("""trait Tag
+            |    tag(self) -> string
+            |impl[N, T] Tag for [N]T
+            |    tag(self) -> string = "any"
+            |var a: [2]int = [1, 2]
+            |print(a.tag())""".stripMargin) should
+        include("'N' is a type parameter, and an array's length is a value rather than a type")
+    }
+
+    // The other direction: a type written where the declaration wrote `const`. A type-argument list
+    // reads as types until the declaration says otherwise, so this is the likely mistake and gets
+    // its own sentence rather than the generic "must be a constant".
+    "while a type written as a value argument says which of the two the slot is" in {
+      err("""struct Buf[const N: usize]
+            |    data: [N]byte
+            |var b: Buf[int] = Buf([])
+            |print(b.data.len)""".stripMargin) should
+        include("'int' is a type, and this argument stands where the declaration wrote 'const'")
+    }
+
+    "and a value written where a type argument belongs says the same in reverse" in {
+      err("""struct Box[T]
+            |    v: T
+            |var b: Box[4] = Box(1)
+            |print(b.v)""".stripMargin) should
+        include("a value stands here, and this argument is a type")
+    }
+  }
+
+  "the ordinary cases that have to keep working" - {
+    "two value parameters at once" in {
+      run("""f[const A: usize, const B: usize](xs: [A]int, ys: [B]int) -> usize = A + B
+            |var p: [2]int = [1, 2]
+            |var q: [3]int = [1, 2, 3]
+            |print(f(p, q))""".stripMargin) shouldBe "5\n"
+    }
+
+    // A parameter is the outermost binding of its name, not the only one.
+    "a local of the same name shadows the parameter" in {
+      run("""f[const N: usize](xs: [N]int) -> usize
+            |    var N: usize = 99usize
+            |    N
+            |var a: [3]int = [1, 2, 3]
+            |print(f(a))""".stripMargin) shouldBe "99\n"
+    }
+
+    // Zero is the placeholder the abstract walk stands a value parameter at, so an array that is
+    // *really* empty is the one case where the placeholder and the answer coincide.
+    "and the empty array reaches the library's block like any other" in {
+      run("var a: [0]int = []\nprint(a)") shouldBe "[]\n"
+    }
+
+    "while a negative length is refused as it always was" in {
+      err("""struct Buf[const N: usize]
+            |    data: [N]byte
+            |var b: Buf[-1] = Buf([])
+            |print(b.data.len)""".stripMargin) should include("an array cannot have -1 elements")
+    }
+  }
+
   /** The whole point of the feature: one `impl[const N: usize, T: Display] Display for [N]T` in the
    * library, so a fixed array prints the way every slice already does.
    *
