@@ -467,10 +467,67 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |print(f"[${r[..]}%12s]")""".stripMargin) shouldBe "[    [a rect]]\n"
     }
 
-    // A fixed array is not a slice, and the diagnostic says which block covers what and why this
-    // value fails it rather than telling the reader to write an `impl` that would be refused.
-    "while a fixed-size array is not one, and is told so" in {
-      err("var a = [1, 2, 3]\nprint(a)") should include("nothing renders a [3]int")
+    /** A fixed array is not a slice, and the diagnostic says which block covers what and why this
+     * value fails it rather than telling the reader to write an `impl` that would be refused.
+     *
+     * **It also has to say `[..]`**, which is the whole fix and which this message did not mention
+     * for a release: the advice was written when nothing rendered a slice either, and printing the
+     * elements by hand really was all there was. Once the library covered every slice the same
+     * words sent a reader to a wrapper struct to avoid typing one character.
+     */
+    "while a fixed-size array is not one, and is told to take the view" in {
+      val e = err("var a = [1, 2, 3]\nprint(a)")
+
+      e should include("nothing renders a [3]int")
+      e should include("one 'impl' cannot cover every length")
+      e should include("print the whole-array view '[..]'")
+    }
+
+    // The same array, one character later. The advice above is worth only what this is worth.
+    "and taking that view is the whole of the fix" in {
+      run("var a = [1, 2, 3]\nprint(a[..])") shouldBe "[1, 2, 3]\n"
+    }
+
+    /** An array whose *elements* do not render is **not** sent to the view, and that is the whole
+     * reason the advice above is conditional on the elements rendering. `[..]` would fail again for
+     * the element's reason, so it is one step down a path ending in this same message.
+     *
+     * The nested case is what settles it rather than taste: `[..]` on a `[2][1]P` yields a
+     * `[][1]P`, whose element is an array again, and no view reaches the bottom of that. So these
+     * keep the coherence-aware advice — the block the program may actually write.
+     */
+    "while an array whose elements do not render is not sent to the view" in {
+      val e = err("""struct P
+                    |    v: int
+                    |var p: [1]P = [P(1)]
+                    |print(p)""".stripMargin)
+
+      e should include(s"write an 'impl ${lib("Display")} for [1]P'")
+      e should not include "whole-array view"
+    }
+
+    "and a nested one, which no view could reach the bottom of, the same way" in {
+      val e = err("""struct P
+                    |    v: int
+                    |var p: [2][1]P = [[P(1)], [P(2)]]
+                    |print(p)""".stripMargin)
+
+      e should include(s"write an 'impl ${lib("Display")} for [2][1]P'")
+      e should not include "whole-array view"
+    }
+
+    /** An array of a type that *does* render is answered by the view even though an
+     * `impl Display for [1]P` would be legal here — coherence allows that block, because `P` is
+     * this module's. The advice still names the view: it is what the reader asked for, and one
+     * character beats a block.
+     */
+    "and an array of a printable user type is told the same thing" in {
+      err("""struct P
+            |    v: int
+            |impl Display for P
+            |    display(self, out: *Writer, fmt: FormatSpec) = display_str("p", out, fmt)
+            |var p: [1]P = [P(1)]
+            |print(p)""".stripMargin) should include("print the whole-array view '[..]'")
     }
 
     // The element type is where the bound bites, and the message names the element rather than the
