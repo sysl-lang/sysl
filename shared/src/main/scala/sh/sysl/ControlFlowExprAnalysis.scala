@@ -17,8 +17,8 @@ trait ControlFlowExprAnalysis extends ExprSupport {
    * that the match below is exhaustive over exactly what the dispatch sends here.
    */
   protected def controlExpr(
-      expr: IfExpr | MatchExpr | While | DoWhile | Loop | CFor | For | Quantifier | TryExpr |
-        RangeExpr | ResultList | Lambda | Tuple,
+      expr: IfExpr | MatchExpr | While | DoWhile | Loop | CFor | For | ConstFor | Quantifier |
+        TryExpr | RangeExpr | ResultList | Lambda | Tuple,
       expected: Option[Type],
       discarded: Boolean,
   ): TExpr = expr match
@@ -100,6 +100,55 @@ trait ControlFlowExprAnalysis extends ExprSupport {
       checkedLoop(ctx,
                   TCFor(tinit, tcond, tstep, tbody, telse,
                         if tcond.isEmpty then endlessResultType(ctx) else loopResultType(ctx, telse)))
+
+    /** `for const i in 0..<A.len` — the loop the compiler **unrolls** (`10 §10`).
+     *
+     * The body is analyzed once per value of the range, each copy on its own, with the name standing
+     * at a `ConstArg` for the length of that copy — which is exactly what a value parameter stands
+     * at (`10 §9`), so the name folds into its uses through the machinery that already exists and
+     * `self.i` selects a part through the same constant.
+     *
+     * **Analyzing each copy separately is the whole feature**, and it is why this cannot be a
+     * desugaring into an ordinary `for`: the parts of a tuple have different types, so one written
+     * line type-checks differently at each position and there is no single typed body to run.
+     *
+     * What comes out is a `TSeq` of the copies, so nothing downstream of the analyzer ever meets an
+     * unrolled loop. It yields `unit` for the same reason: there is no loop for a `break` to carry a
+     * value out of, and a range known at compile time has nothing to say by finishing.
+     */
+    case ConstFor(name, iter, body) =>
+      val (lo, hi) = iter match
+        case RangeExpr(Some(l), Some(h), inclusive) =>
+          val ends =
+            for
+              a <- constInt(l, tsubst)
+              b <- constInt(h, tsubst)
+            yield (a, if inclusive then b else b - 1)
+
+          ends.getOrElse(err("a 'for const' is unrolled, so its range must be known at compile " +
+            "time — 'A.len' for a type pack, a 'const', or a literal. A range computed at run time " +
+            "is what the ordinary 'for' walks"))
+
+        case _ =>
+          err("a 'for const' walks a range with both ends written, as '0..<A.len' — it is unrolled " +
+            "into one copy of its body per value, so there is nothing else for it to iterate")
+
+      if hi - lo > ConstFor.maxCopies then
+        err(s"a 'for const' over ${hi - lo + 1} values would emit that many copies of its body, and " +
+          s"${ConstFor.maxCopies} is the most one is unrolled to — a loop this long is a run-time " +
+          "'for', which costs one copy whatever it counts to")
+
+      val saved = tsubst
+
+      try
+        TSeq((lo to hi).toList.map { v =>
+          // The name is a compile-time constant for this copy and nothing else is: a pack's own
+          // binding stays, since `A.len` is what the range was counted from and the copies do not
+          // change it.
+          tsubst = saved + (name -> Type.ConstArg(v, Type.Usize))
+          TBlockExpr(analyzeValueBlock(body, None, discarded = true))
+        })
+      finally tsubst = saved
 
     case For(label, name, iter, body, elseOpt) =>
       iter match

@@ -113,6 +113,8 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     case v: ValueArgType                    => v
     case VolatileType(inner)                => VolatileType(spellSelf(inner, selfRef))
     case TupleType(parts, r)                => TupleType(parts.map(spellSelf(_, selfRef)), r)
+    // A pack names a parameter of the block it is declared by, which `Self` never is.
+    case p: PackType                        => p
     case f: FnType =>
       f.copy(params = f.params.map(spellSelf(_, selfRef)), ret = spellSelf(f.ret, selfRef))
     case CFnType(params, ret) => CFnType(params.map(spellSelf(_, selfRef)), spellSelf(ret, selfRef))
@@ -137,6 +139,8 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     case ValueArgType(e)     => lengthMentions(e, tps)
     case VolatileType(inner) => mentions(inner, tps)
     case TupleType(parts, _) => parts.exists(mentions(_, tps))
+    // A pack is a parameter, so `(..A)` is no more a type than `Box[T]` is until `A` is bound.
+    case PackType(n)         => tps(n)
     case f: FnType          => mentions(f.asTrait, tps)
     case CFnType(params, ret) => params.exists(mentions(_, tps)) || mentions(ret, tps)
 
@@ -209,7 +213,16 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
       names: Set[String],
       types: List[TypeRef],
       tparams: Set[String] = Set.empty,
+      packs: Set[String] = Set.empty,
   ): Unit = {
+    def declaredPack(n: String): Unit =
+      if !packs(n) then
+        if tparams(n) then
+          err(s"'$n' stands for one type, and '(..$n)' spreads a list of them — a parameter that " +
+            s"stands for a list is declared '..$n'")
+        else
+          err(s"'..$n' names no type pack — a pack is declared in the parameter list, as '[..$n]'")
+
     def walk(t: TypeRef): Unit = t match
       case ArrayType(len, elem, _) =>
         len.foreach { l =>
@@ -227,11 +240,26 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
       case RefType(inner, _)       => walk(inner)
       case WeakType(inner)         => walk(inner)
       case VolatileType(inner)     => walk(inner)
-      case TupleType(parts, _)     => parts.foreach(walk)
+      // A name spread as a pack has to have been **declared** as one, and this is the only place
+      // that can be said (`10 §10`). Left to resolution it is never said at all: inference binds
+      // whatever `(..T)` matched, so a `T` declared as one type quietly starts standing for a list
+      // and the mistake becomes an implementation for a shape nobody wrote. That is `[N]T`'s bare
+      // name one kind up, and it is caught here for the same reason.
+      case TupleType(List(p: PackType), _) => declaredPack(p.name)
+      case TupleType(parts, _)             => parts.foreach(walk)
+      // A pack reached anywhere *else* is one written outside the tuple that is the only place for
+      // it. Said here rather than at resolution, which a signature nothing ever calls never reaches.
+      case PackType(n) =>
+        declaredPack(n)
+        err(s"'..$n' is a type pack and not a type — the only place one may be written is inside " +
+          s"a tuple, as '(..$n)'")
       case f: FnType               => f.params.foreach(walk); walk(f.ret)
       case CFnType(params, ret)    => params.foreach(walk); walk(ret)
 
-    if names.nonEmpty || tparams.nonEmpty then types.foreach(walk)
+    // Walked unconditionally, because a *pack* spelled where none was declared is a mistake in a
+    // signature that declares no parameters at all — the two rules above have nothing to say about
+    // one, and skipping the walk is what would leave it unsaid.
+    types.foreach(walk)
   }
 
   /** The declaration-time half of `checkLengthNotAType`, asked of the parameter *names* rather than
@@ -391,10 +419,17 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
       tparams: List[String],
       bounds: Map[String, List[BoundRef]],
       values: Map[String, TypeRef] = Map.empty,
+      packs: Set[String] = Set.empty,
   ): Map[String, Type] = {
-    def build(tp: String, seen: Set[String]): Type.Abstract =
+    def build(tp: String, seen: Set[String]): Type.Abstract = named(tp, tp, seen)
+
+    /** The stand-in for one parameter, under a name that may differ from it — which is what a pack's
+      * members need, since two of them stand for one parameter and two types that compared equal
+      * would defeat the walk they exist for (`Abstract` is identified by its name).
+      */
+    def named(as: String, tp: String, seen: Set[String]): Type.Abstract =
       Type.Abstract(
-        tp,
+        as,
         if seen(tp) then Nil
         else
           val inner: Map[String, Type] = tparams.map(p => p -> build(p, seen + tp)).toMap
@@ -411,9 +446,24 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     // walk that checks the generic body read `[N]T` as an array and `N` as a `usize` without a
     // second mechanism. Zero is the same placeholder `[sizeof(T)]u8` already resolves to for this
     // walk, whose tree is discarded; every real length is built per instantiation.
+    //
+    // A **pack** stands at **two** types (`10 §10`), each carrying the pack's own bounds, because an
+    // unrolled loop has no fixed length for this walk to run at. Two rather than one is what makes
+    // the walk worth doing: the body of `for const` is one piece of source repeated, so a copy that
+    // checks at one position checks at every position — and at two the *between* is covered as
+    // well, which is where a separator is emitted and where a body that only works on the first part
+    // gives itself away. Two is also the smallest tuple there is (`00 §13`), so the shape being
+    // checked is one that really exists.
+    //
+    // The members are named with a `#`, which no identifier may hold, so nothing a program writes
+    // can collide with one and a diagnostic naming `A#0` is plainly the compiler's own stand-in.
     tparams.map(tp =>
-      tp -> values.get(tp).fold[Type](build(tp, Set.empty))(tr =>
-        Type.ConstArg(0, recover(Type.Unknown)(resolveType(tr, Map.empty))))).toMap
+      tp -> (
+        if packs(tp) then Type.Pack(List(named(s"$tp#0", tp, Set.empty), named(s"$tp#1", tp, Set.empty)))
+        else
+          values.get(tp).fold[Type](build(tp, Set.empty))(tr =>
+            Type.ConstArg(0, recover(Type.Unknown)(resolveType(tr, Map.empty))))
+      )).toMap
   }
 
   /** Resolves a **result** type, which is the one position the two valueless types may appear in —
@@ -569,9 +619,29 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
         case None => err("an array length must be a constant — a literal, or a 'const' naming one")
       Type.Array(n, addressable(resolveQualified(elem, subst), "an array"))
 
+    // `(..A)` — the tuple of a pack (`10 §10`). The pack is looked up rather than resolved, because
+    // what stands for it in the substitution is already the list of parts: for the walk that checks
+    // a generic body that is the two stand-ins, and for an instantiation it is the parts the subject
+    // matched. Either way the tuple built here is an ordinary one, so nothing downstream of this
+    // point knows a pack was written.
+    case TupleType(List(PackType(n)), _) =>
+      subst.get(n) match
+        case Some(Type.Pack(elems)) => tupleType(elems)
+        case Some(other) =>
+          err(s"'..$n' is written as a type pack, and '$n' stands for ${show(other)} — a pack is " +
+            "declared '[..A]' and a single type '[A]'")
+        case None =>
+          err(s"'..$n' names no type pack — a pack is declared in the parameter list, as '[..$n]'")
+
     // A tuple holds its parts the way a struct holds its fields, so a part is resolved exactly as a
     // field is — a `unit` part included, which the layout skips and the parts after it shift past.
     case TupleType(parts, false) => tupleType(parts.map(resolveType(_, subst)))
+
+    // A pack outside the one place it may be written. `(..A)` is caught by the case above, so
+    // reaching here means a bare `..A` stood where a type belongs.
+    case PackType(n) =>
+      err(s"'..$n' is a type pack and not a type — the only place one may be written is inside a " +
+        s"tuple, as '(..$n)'")
 
     // C's function pointer, which is a type wherever any other is: it is one word, it is copied by
     // being copied, and nothing about it is counted. Its parts are held to exactly what an `extern`
@@ -931,6 +1001,8 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     case _: ValueArgType     => false
     case VolatileType(i)     => mentionsAny(i, names)
     case TupleType(parts, _) => parts.exists(mentionsAny(_, names))
+    // A pack names one of the block's own parameters, so it is named here exactly as `T` would be.
+    case PackType(n)         => names(n)
     case f: FnType           => mentionsAny(f.asTrait, names)
     case CFnType(ps, r)      => ps.exists(mentionsAny(_, names)) || mentionsAny(r, names)
 

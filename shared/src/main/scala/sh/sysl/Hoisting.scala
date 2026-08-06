@@ -280,7 +280,7 @@ trait Hoisting extends HoistMembers {
            f.retType.map(t => recover(Type.Unknown)(resolveReturn(t, Map.empty))).getOrElse(Type.Unit))
       checkSignatureRules(f.name, f.params, f.retType, f.variadic)
       checkValueParamArithmetic(f.tvalues.keySet, f.params.map(_.typ) ::: f.retType.toList,
-        f.tparams.toSet)
+        f.tparams.toSet, f.tpacks)
       checkBoundNames(f.name, f.bounds)
       checkSolvedDefaults("the function", f.name, f.tdefaults)
       // A `@test` is registered here with everything else a declaration says about itself, so that

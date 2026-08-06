@@ -144,6 +144,9 @@ object TreeWalk {
     case TTry(v, _, _, _, _, _)     => List(v)
     case TField(r, _, _)            => List(r)
     case TIf(c, t, el, _)           => condExprs(c) ::: t.result.toList ::: el.flatMap(_.result).toList
+    // One copy of an unrolled `for const` (`10 §10`). Its value is what the block yields, exactly as
+    // an `if` branch's is — the statements are reached the way every other block's are.
+    case TBlockExpr(b)              => b.result.toList
     case TMatch(s, arms, _)         => s :: arms.flatMap(a => a.guard.toList ::: a.body.result.toList)
     // A loop's own sub-expressions plus its `else` value; the `break` values are reached through the
     // body statements, so they are not repeated here.

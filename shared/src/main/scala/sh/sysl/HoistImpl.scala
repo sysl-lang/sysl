@@ -75,7 +75,7 @@ trait HoistImpl extends ImplConformance {
     // the one every comparison below has to be made under for the two sides to mean the same thing.
     val subject =
       if impl.tparams.isEmpty then ty
-      else sandboxed(resolveType(impl.forType, abstractSubst(impl.tparams, impl.bounds, impl.tvalues)))
+      else sandboxed(resolveType(impl.forType, abstractSubst(impl.tparams, impl.bounds, impl.tvalues, impl.tpacks)))
 
     // Keyed by the type rather than by the spelling, so `impl Show for int` and `impl Show for i32`
     // are the one implementation they are, and so are `[]int` and `[]i32`. A generic type has one
@@ -373,7 +373,7 @@ trait HoistImpl extends ImplConformance {
     // The block's parameters resolve to themselves so that naming one here is caught as the thing it
     // is, rather than reported as an unknown type — which would send the reader looking for a
     // declaration rather than at the argument they meant to fix.
-    val declared = abstractSubst(impl.tparams, impl.bounds, impl.tvalues)
+    val declared = abstractSubst(impl.tparams, impl.bounds, impl.tvalues, impl.tpacks)
     val written  = impl.traitArgs.map(resolveType(_, declared))
     val subject  = sandboxed(resolveType(impl.forType, declared))
 
@@ -411,7 +411,7 @@ trait HoistImpl extends ImplConformance {
     home.outer ++ {
       if home.tparams.isEmpty then home.self
       else
-        val abstracts = abstractSubst(home.tparams, home.bounds, home.tvalues)
+        val abstracts = abstractSubst(home.tparams, home.bounds, home.tvalues, home.tpacks)
 
         abstracts + (selfName -> resolveType(home.selfRef, abstracts))
     }
@@ -473,7 +473,7 @@ trait HoistImpl extends ImplConformance {
         // The block's parameters stand in for themselves while the subject is resolved, so a shape
         // written with one comes back as the shape it is — `[]T` as a slice of something — rather
         // than through a complaint about a name that means nothing outside this block.
-        val abstracts = abstractSubst(impl.tparams, impl.bounds, impl.tvalues)
+        val abstracts = abstractSubst(impl.tparams, impl.bounds, impl.tvalues, impl.tpacks)
 
         // Resolved rather than taken as written, so the key is the type's one canonical name and
         // two spellings of one type are one implementation.
@@ -530,7 +530,7 @@ trait HoistImpl extends ImplConformance {
           // is `slice.show.int`, which the written `[]int`'s `slice.int.show` cannot collide with.
           (Type.Unknown,
            MemberHome(shape, ref.show, blanket.fold(shapeSymbol(ty, shape))(blanketSymbol), head, ref, order,
-             impl.bounds, Set.empty, "field", Map.empty, tvalues = impl.tvalues))
+             impl.bounds, Set.empty, "field", Map.empty, tvalues = impl.tvalues, tpacks = impl.tpacks))
   }
 
   /** The **closed** bound a type parameter carries, where it carries one — which is what makes a
@@ -635,6 +635,9 @@ trait HoistImpl extends ImplConformance {
     case _: ValueArgType     => Set(None)
     case VolatileType(inner) => subjectHomes(inner)
     case TupleType(parts, _) => Set(None) ++ parts.flatMap(subjectHomes)
+    // A pack is the block's own parameter, which is not a local type and so is no home — the same
+    // answer `impl[T: Display] Display for []T` gets for its `T` (`02 § coherence`).
+    case _: PackType         => Set(None)
     case f: FnType           => subjectHomes(f.asTrait)
     // A function pointer belongs to no module — its parts may, so they are what is asked.
     case CFnType(ps, r)      => Set(None) ++ (ps :+ r).flatMap(subjectHomes)
@@ -668,6 +671,9 @@ trait HoistImpl extends ImplConformance {
     // A blanket covers a family the compiler names, and the family's own name is what a reader
     // knows it by — there is no shape to describe, so the bound is the description.
     else if head.startsWith("@bound:") then s"every '${qn(head.drop("@bound:".length))}'"
+    // Every tuple at *any* arity, which is the block whose parts are a pack — as against `(,)`,
+    // every pair, which the branch after this reads off the key (`10 §10`).
+    else if head == Type.Tuple.pack then "every tuple"
     else if head.startsWith("(") then s"every tuple of ${head.count(_ == ',') + 1} parts"
     else s"every array of ${head.drop(1).dropRight(1)}"
 
@@ -681,6 +687,9 @@ trait HoistImpl extends ImplConformance {
     // arguments an instantiation appends: `arr.c3.int.display` is where a `[3]int` arrives.
     case _: Type.Array if shape == Type.Array.shape => "arr"
     case Type.Array(n, _)                           => s"arr$n"
+    // A block covering every arity leaves the arity off with the parts, since the pack is the one
+    // argument an instantiation appends: `tuple.pk2.int.string.display` is where a pair arrives.
+    case _: Type.Tuple if shape == Type.Tuple.pack  => "tuple"
     case t: Type.Tuple                              => s"tuple${t.targs.length}"
     case other                                      => Type.mangle(other)
 
@@ -749,7 +758,22 @@ trait HoistImpl extends ImplConformance {
    */
   protected def implShape(impl: ImplDecl, ty: Type): Option[String] =
     if lengthParam(impl).isDefined then Some(Type.Array.shape)
+    // `(..A)` covers every tuple at every arity, and the subject it resolved to is an ordinary pair
+    // — a pack stands at two types for the walk that checks the body (`10 §10`) — so only the syntax
+    // says which was written. Exactly the reason a length gets the branch above.
+    else if packParam(impl).isDefined then Some(Type.Tuple.pack)
     else shapeOwners(ty).headOption.map(_._1)
+
+  /** The block's own **pack** parameter, where the subject is `(..A)` and `A` is one — which is what
+   * makes the block cover every arity rather than the two its stand-ins happen to resolve to.
+   *
+   * It asks `tpacks` rather than `tparams`, so a plain type parameter written as `(..T)` is not
+   * quietly read as this; that subject is refused by the pack's own resolution, which is where a
+   * name that stands for one type standing where a list belongs is worth reporting.
+   */
+  protected def packParam(impl: ImplDecl): Option[String] = impl.forType match
+    case TupleType(List(PackType(n)), _) if impl.tpacks.contains(n) => Some(n)
+    case _                                                          => None
 
   /** The block's own **value** parameter standing for an array's length, where the subject is an
    * array whose length was written as one — which is what makes the block cover every length rather
@@ -773,17 +797,23 @@ trait HoistImpl extends ImplConformance {
    */
   protected def shapeArgs(impl: ImplDecl, ty: Type, shape: String): List[String] = {
     val declared = impl.tparams.toSet
-    val matched  = shapeOwners(ty).head._2.map {
-      case Type.Abstract(n, _) if declared(n) => n
-      case other =>
-        err(s"'${show(other)}' fixes the element type, and an 'impl' with type parameters covers " +
-          s"${everyShape(shape)} — write one of the block's own parameters here")
-    }
+    // A block covering every tuple applies **one** argument, the pack, and reads it off what was
+    // written for the reason a length is read that way: the pack stands at two types for this walk,
+    // so the subject is a pair and no longer knows which parameter made it one (`10 §10`).
+    val matched  =
+      if packParam(impl).isDefined then Nil
+      else
+        shapeOwners(ty).head._2.map {
+          case Type.Abstract(n, _) if declared(n) => n
+          case other =>
+            err(s"'${show(other)}' fixes the element type, and an 'impl' with type parameters covers " +
+              s"${everyShape(shape)} — write one of the block's own parameters here")
+        }
 
     // A block covering every array applies **two** arguments, the length before the element, and the
     // length is read from what was written rather than from what it resolved to: a value parameter
     // stands at zero for this walk, so the subject no longer knows which parameter put it there.
-    val names = lengthParam(impl).toList ::: matched
+    val names = lengthParam(impl).toList ::: packParam(impl).toList ::: matched
 
     if declared != names.toSet then
       err(s"'${(declared -- names).mkString("', '")}' is declared by this 'impl' but does not " +

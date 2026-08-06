@@ -179,6 +179,7 @@ trait ImplConformance extends MemberLowering {
       home.bounds ++ m.bounds,
       m.variadic,
       tvalues = home.tvalues,
+      tpacks = home.tpacks,
     ).setPos(m.pos)
   }
 

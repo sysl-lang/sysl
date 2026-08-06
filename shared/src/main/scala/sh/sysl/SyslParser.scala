@@ -34,6 +34,7 @@ case class TypeParams(
     defaults: Map[String, TypeRef] = Map.empty,
     values: Map[String, TypeRef] = Map.empty,
     valueDefaults: Map[String, Expr] = Map.empty,
+    packs: Set[String] = Set.empty,
 )
 
 object TypeParams {
@@ -50,6 +51,13 @@ case class TypeParamSpec(name: String, bounds: List[BoundRef], default: Option[T
     extends ParamSpec
 
 case class ValueParamSpec(name: String, typ: TypeRef, default: Option[Expr]) extends ParamSpec
+
+/** `..A: Display` — a parameter standing for a **list** of types (`10 §10`). Its bound distributes
+  * over the members, which is why the bounds go in the same map a type parameter's do: everything
+  * downstream that asks what a name is bounded by gets the same answer, and only the walk that
+  * matches a subject needs to know this one is a pack.
+  */
+case class PackParamSpec(name: String, bounds: List[BoundRef]) extends ParamSpec
 
 /** The sysl parser: a packrat combinator grammar over the materialized token list from
  * `SyslLexical` (see design/front-end.md).
@@ -536,6 +544,10 @@ class SyslParser(val source: Source) extends DeclParser {
         // alternative below picks up what is left.
         softVolatile ~> coreType ^^ VolatileType.apply |
         tupleType |
+        // A bare `..A` parses so that the analyzer can say what a pack is and where one may be
+        // written (`10 §10`). Left to the grammar it would be a stray token, and the reader would
+        // be told a newline was expected rather than told about the feature they were reaching for.
+        op("..") ~> ident ^^ PackType.apply |
         qualifiedName ~ opt(typeArgs) ^^ { case n ~ args => NamedType(n, args.getOrElse(Nil)) },
     )
 
@@ -544,12 +556,24 @@ class SyslParser(val source: Source) extends DeclParser {
    * somebody writes when they mean a one-tuple, and there is no such type (`00 §13`).
    */
   protected lazy val tupleType: Parser[TypeRef] =
-    (op("(") ~> commaList1(typeRef) <~ op(")")) >> {
+    packTuple | (op("(") ~> commaList1(typeRef) <~ op(")")) >> {
       case List(one) =>
         err(s"'(${one.show})' is a type in parentheses, and a tuple has two or more parts — " +
           s"a product of one thing is that thing, so write '${one.show}'")
       case parts => success(TupleType(parts))
     }
+
+  /** `(..A)` — the tuple of a type pack (`10 §10`), which matches a tuple of any arity.
+   *
+   * Tried before the ordinary tuple, and the two cannot both parse: a pack is the whole of what is
+   * between the parentheses. Mixing one with written-out parts — `(..A, int)` — is pack *expansion*
+   * and is not built, so it is refused by name rather than left to fail as a type called `..A`.
+   */
+  protected lazy val packTuple: Parser[TypeRef] =
+    (op("(") ~> op("..") ~> ident <~ (op(")") | op(",") ~> err(
+      "a type pack is the whole of the tuple it stands for — '(..A, T)' appends to a pack, which " +
+        "is not built; write '(..A)' and reach the parts with 'for const'",
+    ))) ^^ { n => TupleType(List(PackType(n))) }
 
   /** A function's declared result: one type, or several separated by commas (`12 §5b`).
    *
@@ -610,13 +634,17 @@ class SyslParser(val source: Source) extends DeclParser {
    * can say so with the declaration under the message.
    */
   protected lazy val boundedTypeParams: Parser[TypeParams] =
-    op("[") ~> commaList1(valueParam | boundedTypeParam) <~ op("]") ^^ { ps =>
+    op("[") ~> commaList1(valueParam | packParam | boundedTypeParam) <~ op("]") ^^ { ps =>
       TypeParams(
         ps.map(_.name),
-        ps.collect { case p: TypeParamSpec if p.bounds.nonEmpty => p.name -> p.bounds }.toMap,
+        ps.collect {
+          case p: TypeParamSpec if p.bounds.nonEmpty => p.name -> p.bounds
+          case p: PackParamSpec if p.bounds.nonEmpty => p.name -> p.bounds
+        }.toMap,
         ps.collect { case p: TypeParamSpec if p.default.nonEmpty => p.name -> p.default.get }.toMap,
         ps.collect { case p: ValueParamSpec => p.name -> p.typ }.toMap,
         ps.collect { case p: ValueParamSpec if p.default.nonEmpty => p.name -> p.default.get }.toMap,
+        ps.collect { case p: PackParamSpec => p.name }.toSet,
       )
     }
 
@@ -644,6 +672,21 @@ class SyslParser(val source: Source) extends DeclParser {
       "there")) ~ opt(op("=") ~> expression) ^^ {
       case n ~ t ~ d => ValueParamSpec(n, t, d)
     }
+
+  /** `..A: Display` — a **type pack** (`10 §10`), whose bound distributes over its members.
+   *
+   * The `..` is the marker, and it is in front for the same reason `const` is: without it `A: Display`
+   * is an ordinary bounded type parameter and nothing in the grammar could say which was meant. It
+   * reads the way the use does — `(..A)` — so a signature says pack in both places with one spelling.
+   *
+   * A pack takes **no default**: a default is one type, and there is no way to write a list of them.
+   * Refused here rather than by an alternative written after the form, so the sentence is raised at
+   * the `=` and outranks the generic complaint about what follows it.
+   */
+  protected lazy val packParam: Parser[PackParamSpec] =
+    op("..") ~> ident ~ opt(op(":") ~> rep1sep(boundRef, op("+"))) ~ opt(op("=") ~> err(
+      "a type pack takes no default — a default is one type, and a pack stands for a list of them",
+    )) ^^ { case n ~ bs ~ _ => PackParamSpec(n, bs.getOrElse(Nil)) }
 
   protected lazy val boundedTypeParam: Parser[TypeParamSpec] =
     ident ~ opt(op(":") ~> rep1sep(boundRef, op("+"))) ~ opt(op("=") ~> typeRef) ^^ {
@@ -974,7 +1017,18 @@ class SyslParser(val source: Source) extends DeclParser {
   private lazy val quantifierKind: Parser[Boolean] =
     softWord("all") ^^^ true | softWord("some") ^^^ false
 
-  protected lazy val forExpr: PackratParser[Expr] = cForExpr | forInExpr
+  protected lazy val forExpr: PackratParser[Expr] = constForExpr | cForExpr | forInExpr
+
+  /** `for const i in 0..<A.len` — the loop the compiler unrolls (`10 §10`).
+   *
+   * Tried first, and unambiguous against the other two: neither of them may have `const` after the
+   * `for`. There is no label and no `else` clause, because there is no loop at run time for a
+   * `break` to leave or for an `else` to follow — the copies are what the analyzer produces.
+   */
+  protected lazy val constForExpr: PackratParser[Expr] =
+    (op("for") ~> op("const") ~> ident) ~ (op("in") ~> expression) ~ body("do") ~ opt(endMarker("for")) ^^ {
+      case n ~ it ~ b ~ _ => ConstFor(n, it, b)
+    }
 
   protected lazy val forInExpr: PackratParser[Expr] =
     opt(labelRef) ~ (op("for") ~> ident) ~ (op("in") ~> expression) ~ body("do") ~ opt(elseClause) ~ opt(

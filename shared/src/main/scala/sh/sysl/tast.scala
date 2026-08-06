@@ -526,6 +526,16 @@ case class TStructPattern(struct: Type.Struct, args: List[TPattern]) extends TPa
  */
 case class TBlock(stmts: List[TStmt], result: Option[TExpr], ty: Type)
 
+/** A block standing where an expression does, which is what one copy of an unrolled `for const`
+ * becomes (`10 §10`).
+ *
+ * `if` and `match` carry their blocks in their own nodes because the branch is part of what they
+ * are; an unrolled loop has no node of its own by the time this exists — it has become its copies —
+ * so each copy needs to be an expression in its own right. It is a scope like any other block, which
+ * is what keeps a `var` written inside the loop from being one variable redeclared per copy.
+ */
+case class TBlockExpr(block: TBlock) extends TExpr { def ty: Type = block.ty }
+
 sealed trait TStmt
 
 case class TVarDecl(name: String, ty: Type, init: TExpr) extends TStmt

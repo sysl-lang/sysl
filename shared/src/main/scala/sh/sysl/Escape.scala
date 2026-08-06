@@ -262,6 +262,9 @@ private class Escape(program: TProgram) {
       case TStr(a)              => views(a)
       case TStore(_, v, _)      => views(v)
       case TIf(_, t, e, _)      => blockValue(t) ++ View.any(e.map(blockValue))
+      // One copy of an unrolled `for const` (`10 §10`) — a block, so it views whatever its own
+      // value views, exactly as an `if` branch does.
+      case TBlockExpr(b)        => blockValue(b)
       case TMatch(_, arms, _)   => View.any(arms.map(a => blockValue(a.body)))
       // A loop's value comes from its `break`s and its `else`, so it views the frame when any of
       // those do — a `break` of a frame-backed slice out of the loop is the same escape route as

@@ -263,6 +263,9 @@ trait SignatureVisibility extends TypeResolution {
     case _: ValueArgType     => Nil
     case VolatileType(inner) => namesIn(inner, skip)
     case TupleType(parts, _) => parts.flatMap(namesIn(_, skip))
+    // A pack names a parameter of the declaration being checked, never a declaration of its own, so
+    // a signature can expose nothing through one.
+    case _: PackType         => Nil
     // A callable mentions the library's call trait, which is public and is nobody's to hide; what a
     // signature can expose through one is its parameters and its result, so those are what is walked.
     case f: FnType           => (f.params :+ f.ret).flatMap(namesIn(_, skip))

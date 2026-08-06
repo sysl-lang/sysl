@@ -45,6 +45,23 @@ trait MemberExprAnalysis extends ExprSupport {
         case Some(_) => err(s"'$f' is an associated function of '${qn(n)}' — call it with '$written.$f(…)'")
         case None    => err(s"type '${qn(n)}' has no member '$f' — and '${qn(n)}' is a type, not a value")
 
+    /** `A.len` — how many types a **pack** stands for (`10 §10`), which is what an unrolled loop
+     * counts against. It is a compile-time integer and folds into its use as one, exactly as an
+     * array's length does where the length is known: the tuple `(..A)` denotes is the same length,
+     * so the two spellings agree by construction.
+     *
+     * `len` and no other name, because a pack is not a value and has no other member to read. A pack
+     * bound to nothing cannot reach here — the substitution holds one wherever the body is walked.
+     */
+    case Field(Ident(written), f)
+        if lookupOpt(written).isEmpty && tsubst.get(written).exists(_.isInstanceOf[Type.Pack]) =>
+      val pack = tsubst(written).asInstanceOf[Type.Pack]
+
+      if f == "len" then TIntLit(BigInt(pack.elems.length), Type.Usize)
+      else
+        err(s"'..$written' is a type pack, and 'len' — how many types it stands for — is the whole " +
+          s"of what one offers; there is no '$written.$f'")
+
     case Field(Ident(written), f)
         if lookupOpt(written).isEmpty && typeKey(written).exists(constrainedDecls.contains) =>
       constrainedMember(typeKey(written).get, written, f)
@@ -95,12 +112,30 @@ trait MemberExprAnalysis extends ExprSupport {
         // selection. An index past the end is worth its own complaint: nothing about "no property
         // '3'" tells a reader that what they wrote was one part too far.
         case t: Type.Tuple =>
-          val idx = t.fieldIndex(f)
-          if idx >= 0 then TField(tr, idx, t.fields(idx)._2)
-          else if f.forall(_.isDigit) then
-            err(s"${show(t)} has ${quantity(t.fields.length, "part")}, so there is no '.$f' — " +
-              s"the parts are numbered from 0")
-          else readProperty(tr, t, f, via)
+          // A **compile-time constant** selects a part by its value, which is what makes one written
+          // line cover parts of different types inside a `for const` (`10 §10`). It is the same
+          // selection `t.0` already is, with the position arriving as a constant rather than as a
+          // literal — so an index past the end is the same complaint, said about the name that
+          // carried it.
+          constSelector(f) match
+            case Some(v) if v >= 0 && v < t.fields.length => TField(tr, v, t.fields(v)._2)
+            case Some(v) =>
+              err(s"'$f' is $v here, and ${show(t)} has ${quantity(t.fields.length, "part")} — " +
+                s"the parts are numbered from 0")
+            case None =>
+              val idx = t.fieldIndex(f)
+              if idx >= 0 then TField(tr, idx, t.fields(idx)._2)
+              else if f.forall(_.isDigit) then
+                err(s"${show(t)} has ${quantity(t.fields.length, "part")}, so there is no '.$f' — " +
+                  s"the parts are numbered from 0")
+              else readProperty(tr, t, f, via)
+
+        // A struct's fields have names, and a number does not address one — so a compile-time index
+        // is refused here rather than falling through to a complaint about a missing property, which
+        // would send a reader looking for a field they never meant to name (`10 §10`).
+        case s: Type.Struct if constSelector(f).isDefined && s.fieldIndex(f) < 0 =>
+          err(s"'$f' is a compile-time index, and ${show(s)} is a struct — its fields are reached " +
+            "by name, and a position addresses the parts of a tuple")
 
         case s: Type.Struct =>
           val idx = s.fieldIndex(f)
@@ -302,6 +337,19 @@ trait MemberExprAnalysis extends ExprSupport {
    * The absent-member wording is the one difference between the kinds: a struct's `x` could have
    * been either a field or a property, while an enum and a built-in have no fields to have meant.
    */
+  /** The value a selector stands for where it names a **compile-time constant** rather than a field
+   * — the loop variable of a `for const`, or a value parameter (`10 §9`, `10 §10`).
+   *
+   * A local of the same name is not consulted and does not shadow this, because a selector is not a
+   * name being read: `t.i` asks for a part of `t`, and what a variable called `i` happens to hold at
+   * run time could not be the answer. That is the one place this differs from an `Ident`, which asks
+   * the scope first for exactly the opposite reason.
+   */
+  protected def constSelector(f: String): Option[Int] =
+    tsubst.get(f).collect {
+      case Type.ConstArg(v, _: Type.Integer) if v.isValidInt => v.toInt
+    }
+
   protected def readProperty(tr: TExpr, ty: Type, f: String, via: Set[String] = Set.empty): TExpr = {
     val (base, _) = memberKey(ty, f)
     // A property takes no arguments, so where two implementations of one trait both supply one there

@@ -348,6 +348,9 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     // its argument is folded into the length or the expression naming it while the instantiation is
     // still being built, so nothing is ever laid out at one.
     case _: Type.ConstArg => sys.error("unreachable zero of a value parameter")
+    // A **pack** never reaches codegen either: `(..A)` becomes the ordinary tuple of whatever the
+    // subject matched while the instantiation is still being built, so nothing is laid out at one.
+    case _: Type.Pack     => sys.error("unreachable zero of a type pack")
     // A result list belongs to a signature. The analyzer's one funnel turns it into the tuple its
     // parts lay out as before anything holds it, so codegen is only ever handed that tuple.
     case _: Type.Results  => sys.error("unreachable zero of a result list")
@@ -1033,6 +1036,12 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
 
     case TSeq(exprs) =>
       exprs.foreach(genExpr); ""
+
+    // One copy of an unrolled `for const` (`10 §10`), which is a block wherever it stands. A copy
+    // that yields nothing is emitted for its effects, which is what every copy of a loop body does.
+    case TBlockExpr(b) =>
+      if Type.zeroSized(b.ty) then { genBlockVoid(b); "" }
+      else genBlockValue(b)
 
     // A function's address is the symbol it is defined under, which is a constant — there is nothing
     // to compute and nothing to load, the way there is for the address of a variable.

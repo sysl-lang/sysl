@@ -324,11 +324,13 @@ trait TraitLookup extends MemberVisibility {
     // are instantiated from that pair the way a slice's are from one.
     case Type.Array(n, elem) =>
       List((s"[$n]", List(elem)), (Type.Array.shape, List(Type.ConstArg(n, Type.Usize), elem)))
-    // A tuple's shape is its **arity**, since that is the whole of what an implementation can be
-    // written for at once: there is no way to be generic over how many parts a tuple has, so a
-    // pair and a triple are two shapes and the library writes one implementation for each.
-    case t: Type.Tuple => List((Type.Tuple.shape(t.targs.length), t.targs))
-    case _             => Nil
+    // A tuple has **two** shapes, and the order between them is what makes a block written for one
+    // arity beat one written for every arity — the same ladder an array gained one line up, one
+    // kind further out. The arity's shape hands the parts back as separate arguments; the pack's
+    // hands them back as one list, which is what `(..A)` binds `A` to (`10 §10`).
+    case t: Type.Tuple =>
+      List((Type.Tuple.shape(t.targs.length), t.targs), (Type.Tuple.pack, List(Type.Pack(t.targs))))
+    case _ => Nil
 
   /** Where a member of that name is filed for a type: under the type's own key, or — when only a
    * shape-matched block supplies it — under the shape's, with the arguments this type matched at.
@@ -513,6 +515,15 @@ trait TraitLookup extends MemberVisibility {
    */
   protected def satisfies(tr: Type.Bound, t: Type): Boolean = t match
     case a: Type.Abstract => a.bounds.exists(b => traitClosure(b, selfBinding(a)).exists(_.key == tr.key))
+    // **A bound on a pack distributes over its members** (`10 §10`), which is the whole of the bound
+    // syntax a pack needs: `[..A: Display]` is the ordinary `[T: Display]` read over a list. It is
+    // what makes the membership answerable before instantiation — a tuple implements `Display` when
+    // every part does, so a call is refused where it is written rather than inside a body that has
+    // already been committed to.
+    //
+    // Empty is vacuously true and cannot arise: there is no zero-tuple (`00 §13`), so a pack bound
+    // by matching one always has parts.
+    case Type.Pack(elems) => elems.forall(satisfies(tr, _))
     // A compiler-provided membership is **homogeneous**, and that is `01`'s rule about the scalars
     // rather than a limitation of this one: no operator promotes, so an `int` is `Mul[int]` and is
     // not `Mul` at anything else. The arguments are compared the way an assignment compares two

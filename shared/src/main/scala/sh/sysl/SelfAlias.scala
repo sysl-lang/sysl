@@ -66,6 +66,8 @@ object SelfAlias {
       case TRecheck(a, _, _, _) => carries(a)
       case TSeq(exprs)          => exprs.lastOption.exists(carries)
       case TIf(_, t, el, _)     => t.result.exists(carries) || el.flatMap(_.result).exists(carries)
+      // One copy of an unrolled `for const` carries whatever its own value carries (`10 §10`).
+      case TBlockExpr(b)        => b.result.exists(carries)
       case TMatch(_, arms, _)   => arms.exists(_.body.result.exists(carries))
       // A loop's value comes from its `break`s and its `else`, so a pointer carried out of the loop
       // is carried out of whatever the loop's value is used for.

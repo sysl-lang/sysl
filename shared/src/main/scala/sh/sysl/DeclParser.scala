@@ -58,7 +58,7 @@ trait DeclParser extends ExprParser {
       (op("(") ~> paramList <~ op(")")) ~ opt(op("->") ~> resultRef) ~ funcBody <~ endName(name) ^^ {
         case ((params, variadic)) ~ ret ~ body =>
           FuncDecl(name, tp.names, params, ret, body, tp.bounds, variadic, tdefaults = tp.defaults,
-                   tvalues = tp.values, conv = conv)
+                   tvalues = tp.values, tpacks = tp.packs, conv = conv)
       }
     }
 
@@ -136,6 +136,21 @@ trait DeclParser extends ExprParser {
    */
   protected lazy val opaqueKw: Parser[Unit] = softWord("opaque")
 
+  /** A **type pack** stands for a list of types and there is one place to write the list out —
+   * `(..A)`, the tuple of it (`10 §10`). A declaration whose parameters *are* its shape has nothing
+   * to do with one: a struct of a pack would be a tuple with a name, which is the thing a program
+   * writes instead when the arity stops being incidental.
+   *
+   * Raised where the parameter list closes rather than left to fail on the pack's use, since the use
+   * is what a reader would then be sent to look at.
+   */
+  protected def noPacks(tp: TypeParams, what: String): Parser[Unit] =
+    if tp.packs.isEmpty then success(())
+    else
+      err(s"'..${tp.packs.head}' is a type pack, and $what has no way to spread one over its own " +
+        s"shape — a product of however many parts is a tuple, and '(..${tp.packs.head})' is how an " +
+        "'impl' or a function takes one")
+
   protected lazy val structDecl: PackratParser[Stmt] =
     opt(opaqueKw) ~ (op("struct") ~> ident) ~ opt(boundedTypeParams) >> { case hidden ~ name ~ tps =>
       val tp     = tps.getOrElse(TypeParams.none)
@@ -147,7 +162,7 @@ trait DeclParser extends ExprParser {
       // reached furthest — so the sentence below, raised back at the declaration, would lose to it
       // and a struct with a mistake in its body would be reported as having no body. Neither guard
       // consumes, so both are asked at the same position and at most one of them can succeed.
-      (opt(guard(newline ~ indent)) ~ opt(guard(opt(newlines) ~> softEnd))) >> {
+      noPacks(tp, "a struct") ~> (opt(guard(newline ~ indent)) ~ opt(guard(opt(newlines) ~> softEnd))) >> {
         case Some(_) ~ _ =>
           (newline ~> indent ~> opt(newlines) ~> repsep(structItem, newlines) <~ opt(newlines) <~ dedent) <~
             endName(name) ^^ { items =>
@@ -298,7 +313,7 @@ trait DeclParser extends ExprParser {
     op("enum") ~> ident ~ opt(boundedTypeParams) ~ opt(op(":") ~> typeRef) >> { case name ~ tps ~ under =>
       val tp = tps.getOrElse(TypeParams.none)
 
-      (newline ~> indent ~> opt(newlines) ~> repsep(enumItem, newlines) <~ opt(newlines) <~ dedent) <~ endName(name) ^^ {
+      noPacks(tp, "an enum") ~> (newline ~> indent ~> opt(newlines) ~> repsep(enumItem, newlines) <~ opt(newlines) <~ dedent) <~ endName(name) ^^ {
         items =>
           val variants = items.collect { case Left(v)  => v }
           val members  = items.collect { case Right(m) => m }
@@ -395,7 +410,8 @@ trait DeclParser extends ExprParser {
         def decl(methods: List[MethodDecl]) =
           TraitDecl(name, tp.names, methods, tp.bounds, supers.getOrElse(Nil), tdefaults = tp.defaults)
 
-        if supers.isEmpty then body ^^ decl else opt(body) ^^ (m => decl(m.getOrElse(Nil)))
+        noPacks(tp, "a trait") ~>
+          (if supers.isEmpty then body ^^ decl else opt(body) ^^ (m => decl(m.getOrElse(Nil))))
     }
 
   /** A line inside a trait body. A **definition** is tried first, since it is a signature with more
@@ -453,7 +469,8 @@ trait DeclParser extends ExprParser {
         val tp = tps.getOrElse(TypeParams.none)
 
         (implBody | success(Nil)) <~ endTypeRef(forType) ^^ { methods =>
-          ImplDecl(tname, forType, methods, tp.names, tp.bounds, targs, tp.defaults, ov, tp.values)
+          ImplDecl(tname, forType, methods, tp.names, tp.bounds, targs, tp.defaults, ov, tp.values,
+                   tp.packs)
         }
     }
 

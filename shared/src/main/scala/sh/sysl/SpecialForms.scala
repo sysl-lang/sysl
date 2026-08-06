@@ -217,7 +217,7 @@ trait SpecialForms extends Closures {
     if implsOf(displayTrait, ownerKey(t.ty)).nonEmpty then t.ty else Type.underlying(t.ty)
   } match
     case a: Type.Abstract =>
-      if !satisfies(displayTrait, a) then boundErr(s"'$op' needs '${a.name}: ${qn(displayTrait)}'")
+      if !satisfies(displayTrait, a) then boundErr(s"'$op' needs '${show(a)}: ${qn(displayTrait)}'")
       (displayMethod, t, None)
 
     case Type.Ptr(o: Type.Trait) => objectRenderer(t, o, op)

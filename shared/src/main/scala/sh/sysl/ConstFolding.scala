@@ -210,6 +210,13 @@ trait ConstFolding extends ImportResolution {
       subst.get(n).collect { case c: Type.ConstArg => constArgLiteral(c) }
         .orElse(constKey(n).map(k => constLiteral(k)))
 
+    // `A.len` — how many types a **pack** stands for (`10 §10`), which is a compile-time integer and
+    // folds as one. It is here as well as in the analyzer because the range of a `for const` is read
+    // *before* anything is analyzed: the loop has to know how many copies to make before it can make
+    // one. During the walk that checks a generic body the pack stands at two, so this is 2 there.
+    case Field(Ident(n), "len") =>
+      subst.get(n).collect { case Type.Pack(elems) => IntLit(BigInt(elems.length), None) }
+
     case Unary("-", operand) =>
       fold(operand, subst).collect {
         case IntLit(v, _)   => IntLit(-v, None)

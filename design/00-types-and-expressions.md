@@ -962,9 +962,10 @@ knowing which of the three the right side is, which is the point of spelling the
 - **Destructured by pattern**, in a `match` arm and at a binding: `(a, b)` binds both, `(a, _)`
   binds one, and a nested tuple pattern nests. This is `09`'s positional struct pattern with the
   name left off, so it needs no new pattern machinery.
-- **Each arity is its own type**, and there is no way to be generic over how many parts a tuple
-  has. So a pair and a triple are two *shapes* in `02`'s sense — an `impl` covers one of them at a
-  time, and `impl[A, B] T for (A, B)` says nothing about a triple.
+- **Each arity is its own type.** A pair and a triple are two *shapes* in `02`'s sense, so
+  `impl[A, B] T for (A, B)` says nothing about a triple. Being generic over the arity is a third
+  shape rather than a relaxation of that one: `impl[..A] T for (..A)` covers every tuple through
+  `10 §10`'s type packs, and the written-out block still beats it.
 
 ### Who owns a tuple's traits
 
@@ -972,24 +973,26 @@ A tuple type has no declaration and so no module, which looks like `02`'s orphan
 to bite on. It is the same question `int` already answers: **a built-in type is the library's**, and
 the library is where its catalog rows live. So:
 
-- **The library provides `Eq`, `Ord`, `Hash` and `Display` structurally**, for each arity it
-  declares, whenever every component has the row. Ordering is lexicographic — first component first
-  — which is the only ordering a positional product has a claim to.
+- **The library provides `Eq`, `Ord`, `Hash` and `Display` structurally**, at every arity, whenever
+  every component has the row. Ordering is lexicographic — first component first — which is the only
+  ordering a positional product has a claim to.
 - **A user may write `impl MyTrait for (int, string)`**, because their trait is local and that is
   the half of the orphan rule that permits it.
 - **A user may not write `impl Eq for (int, string)`**, because the trait and the type are both the
   library's. That is the existing rule producing the expected answer, not a new one.
 
-The one implementation consequence is that structural rows are **written per arity** rather than
-once, because sysl has no way to be generic over arity and is not getting one. **The stated maximum
-is three.** Beyond it a program writes a struct, which it should have been doing anyway — and the
-compiler says so in those words rather than reporting a missing membership, since the fix is a type
-with a name and not a fourth `impl`.
+**There is no stated maximum, and there used to be.** The rows were written per arity — two and
+three, eight blocks, and a tuple of four parts implementing none of them — because being generic
+over an arity was a thing the language could not do. This paragraph said it was "not getting one",
+which lasted until somebody asked what would give tuples what value generics had just given arrays.
+`10 §10` is the answer: a **type pack** matches a tuple of any arity, a bound on it distributes over
+the parts, and an unrolled loop walks them. The eight blocks are four.
 
-None of these rows is compiler-generated. They are eight ordinary `impl` blocks in the library,
-written in sysl over `(A, B)` and `(A, B, C)` and reached by `02`'s existing shape rule — which is
-the strongest form the claim above could take: the library owns a tuple's catalog because it can
-simply *write* it.
+None of these rows is compiler-generated. They are four ordinary `impl` blocks in the library,
+written in sysl over `(..A)` and reached by `02`'s existing shape rule — which is the strongest form
+the claim above could take: the library owns a tuple's catalog because it can simply *write* it.
+That was the argument for eight blocks and it is the same argument for four; what changed is only
+how much had to be written to make it.
 
 ## Open at the basics level (not yet decided)
 

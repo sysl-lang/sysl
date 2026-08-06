@@ -372,11 +372,22 @@ trait GenericInstantiation extends ConstFolding {
     // terms — which is where every other structural disagreement is reported.
     case _: ValueArgType     => ()
     case VolatileType(inner) => unify(inner, Type.unqualified(actual), tparams, sub)
+    // `(..A)` binds the pack to **every** part at once, at whatever arity the argument has — which
+    // is the whole of the inference this feature needs (`10 §10`). It is `[N]T` reading a length off
+    // an argument one kind up: nothing is written at the call, and a tuple of three parts and a
+    // tuple of five each solve the one parameter.
+    case TupleType(List(PackType(n)), _) =>
+      actual match
+        case t: Type.Tuple if tparams(n) => sub(n) = Type.Pack(t.targs)
+        case _                           => ()
     case TupleType(parts, _) =>
       actual match
         case t: Type.Tuple if t.targs.length == parts.length =>
           parts.zip(t.targs).foreach { case (r, a) => unify(r, a, tparams, sub) }
         case _ => ()
+    // A bare pack stands where no type does, so nothing here can be matched against it. Its own
+    // resolution is what reports that, in the terms of what was written.
+    case _: PackType => ()
     // A callable's parameters and result are matched through the trait they name, so a `&Fn(A) -> R`
     // parameter binds `A` and `R` from a `&Fn(int) -> bool` argument exactly as any other applied
     // trait binds its arguments. A closure's own type is a struct that says nothing about either, so

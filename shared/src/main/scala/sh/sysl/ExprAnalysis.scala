@@ -845,7 +845,8 @@ trait ExprAnalysis
     // Control flow that yields a value (`00 §10`), and the forms that carry several at once.
     // `ControlFlowExprAnalysis`.
     case e @ (_: IfExpr | _: MatchExpr | _: While | _: DoWhile | _: Loop | _: CFor | _: For |
-        _: Quantifier | _: TryExpr | _: RangeExpr | _: ResultList | _: Lambda | _: Tuple) =>
+        _: ConstFor | _: Quantifier | _: TryExpr | _: RangeExpr | _: ResultList | _: Lambda |
+        _: Tuple) =>
       controlExpr(e, expected, discarded)
 
     // Reached only where an `is` was written somewhere a condition's terms are not read one by one:

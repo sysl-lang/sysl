@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 25
+  val Version: Int = 26
 
   private val Magic = "sysl-ast"
 
@@ -233,6 +233,7 @@ object AstCodec {
         case ArrayType(len, elem, ro) => tok("ta"); opt(len)(expr); typ(elem); bool(ro)
         case VolatileType(inner)  => tok("tv"); typ(inner)
         case TupleType(ps, res)   => tok("tt"); list(ps)(typ); bool(res)
+        case PackType(n)          => tok("pk"); sref(n)
         case FnType(ps, ret, bar) => tok("tf"); list(ps)(typ); typ(ret); bool(bar)
         case CFnType(ps, ret)     => tok("tc"); list(ps)(typ); typ(ret)
         case ValueArgType(v)      => tok("tva"); expr(v)
@@ -291,6 +292,7 @@ object AstCodec {
         case DoWhile(l, b, c, e2)    => tok("dwl"); opt(l)(sref); list(b)(stmt); expr(c); opt(e2)(x => list(x)(stmt))
         case Loop(l, b)              => tok("lop"); opt(l)(sref); list(b)(stmt)
         case For(l, n, it, b, e2)    => tok("for"); opt(l)(sref); sref(n); expr(it); list(b)(stmt); opt(e2)(x => list(x)(stmt))
+        case ConstFor(n, it, b)      => tok("ufor"); sref(n); expr(it); list(b)(stmt)
         case CFor(l, i, c, s, b, e2) =>
           tok("cfor"); opt(l)(sref); opt(i)(stmt); opt(c)(expr); opt(s)(stmt); list(b)(stmt)
           opt(e2)(x => list(x)(stmt))
@@ -328,9 +330,10 @@ object AstCodec {
         case Invariant(c, m)              => tok("inv"); expr(c); opt(m)(sref)
         case Variant(e)                   => tok("vnt"); expr(e)
 
-        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, tvs, t, cv, tr, pu, gh) =>
+        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, tvs, tpk, t, cv, tr, pu, gh) =>
           tok("fn"); sref(n); list(tps)(sref); list(ps)(param); opt(rt)(typ); list(b)(stmt)
-          bounds(bs); bool(va); vis(vs); tdefaults(tds); tdefaults(tvs); opt(t)(testAttr)
+          bounds(bs); bool(va); vis(vs); tdefaults(tds); tdefaults(tvs); list(tpk.toList)(sref)
+          opt(t)(testAttr)
           opt(cv)(c => { pos(c); sref(c.name); opt(c.arg)(sref) }); bool(tr); bool(pu); bool(gh)
 
         case ExternDecl(n, ps, rt, va, lk, vs) =>
@@ -354,9 +357,9 @@ object AstCodec {
           tok("trt"); sref(n); list(tps)(sref); list(ms)(method); bounds(bs); list(sups)(bound)
           vis(vs); tdefaults(tds)
 
-        case ImplDecl(tn, ft, ms, tps, bs, targs, tds, ov, tvs) =>
+        case ImplDecl(tn, ft, ms, tps, bs, targs, tds, ov, tvs, tpk) =>
           tok("impl"); sref(tn); typ(ft); list(ms)(method); list(tps)(sref); bounds(bs)
-          list(targs)(typ); tdefaults(tds); bool(ov); tdefaults(tvs)
+          list(targs)(typ); tdefaults(tds); bool(ov); tdefaults(tvs); list(tpk.toList)(sref)
     }
   }
 
@@ -621,6 +624,7 @@ object AstCodec {
         case "ta"  => ArrayType(opt(expr()), typ(), bool())
         case "tv"  => VolatileType(typ())
         case "tt"  => TupleType(list(typ()), bool())
+        case "pk"  => PackType(sref())
         case "tf"  => FnType(list(typ()), typ(), bool())
         case "tc"  => CFnType(list(typ()), typ())
         case "tva" => ValueArgType(expr())
@@ -680,6 +684,7 @@ object AstCodec {
         case "dwl"  => DoWhile(opt(sref()), list(stmt()), expr(), opt(list(stmt())))
         case "lop"  => Loop(opt(sref()), list(stmt()))
         case "for"  => For(opt(sref()), sref(), expr(), list(stmt()), opt(list(stmt())))
+        case "ufor" => ConstFor(sref(), expr(), list(stmt()))
         case "cfor" => CFor(opt(sref()), opt(stmt()), opt(expr()), opt(stmt()), list(stmt()), opt(list(stmt())))
         case "qnt"  => Quantifier(bool(), sref(), expr(), expr())
         case other  => fail(s"'$other' is not an expression tag")
@@ -709,7 +714,7 @@ object AstCodec {
         case "vnt"  => Variant(expr())
         case "fn" =>
           FuncDecl(sref(), list(sref()), list(param()), opt(typ()), list(stmt()),
-            bounds(), bool(), vis(), tdefaults(), tdefaults(), opt(testAttr()),
+            bounds(), bool(), vis(), tdefaults(), tdefaults(), list(sref()).toSet, opt(testAttr()),
             opt(at(CallConv(sref(), opt(sref())))), bool(), bool(), bool())
         case "ext" =>
           ExternDecl(sref(), list(param()), opt(typ()), bool(), opt(sref()), vis())
@@ -727,7 +732,7 @@ object AstCodec {
           TraitDecl(sref(), list(sref()), list(method()), bounds(), list(bound()), vis(), tdefaults())
         case "impl" =>
           ImplDecl(sref(), typ(), list(method()), list(sref()), bounds(), list(typ()), tdefaults(), bool(),
-            tdefaults())
+            tdefaults(), list(sref()).toSet)
         case other => fail(s"'$other' is not a statement tag")
     }
   }

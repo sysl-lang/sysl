@@ -63,54 +63,61 @@ trait Ord
 // A tuple is comparable, hashable and printable exactly when its parts are, which is what these
 // rows say: the membership is *structural*, so nothing has to be written per tuple type.
 //
-// They are written out per arity rather than derived because a tuple's arity is part of its type
-// and there is no variadic `impl` to write. Two and three cover what a program reaches for; a wider
-// tuple is a struct with names, which is the better thing to have written anyway.
+// One block each, at every arity, because a tuple's parts are a **type pack** (`10 §10`) and the
+// loop that walks them is unrolled -- so `self.i` is an ordinary part selection at whatever type
+// that part has, and one written line covers all of them. These were eight blocks over `(A, B)` and
+// `(A, B, C)` before the pack existed, and a tuple of four parts implemented none of them.
 
-impl[A: Eq, B: Eq] Eq for (A, B)
-    eq(self, rhs: Self) -> bool = self.0 == rhs.0 && self.1 == rhs.1
+impl[..A: Eq] Eq for (..A)
+    eq(self, rhs: Self) -> bool
+        for const i in 0..<A.len
+            if self.i != rhs.i then return false
 
-impl[A: Eq, B: Eq, C: Eq] Eq for (A, B, C)
-    eq(self, rhs: Self) -> bool = self.0 == rhs.0 && self.1 == rhs.1 && self.2 == rhs.2
+        true
+    end eq
 
 // Lexicographic, and written as a ladder rather than as `<` on each part in turn because deciding a
 // position takes *two* comparisons: this one is less, or it is greater, or the two agree and the
-// next position decides.
-impl[A: Ord, B: Ord] Ord for (A, B)
+// next position decides. Every position runs the same ladder and all-tied ends `false` -- a tuple is
+// not less than one it agrees with everywhere. Written per arity this needed a last position that
+// ended with a bare `<`, having no next position to fall through to; the loop has no such case.
+impl[..A: Ord] Ord for (..A)
     lt(self, rhs: Self) -> bool
-        if self.0 < rhs.0 then return true
-        if rhs.0 < self.0 then return false
-        self.1 < rhs.1
-    end lt
+        for const i in 0..<A.len
+            if self.i < rhs.i then return true
+            if rhs.i < self.i then return false
 
-impl[A: Ord, B: Ord, C: Ord] Ord for (A, B, C)
-    lt(self, rhs: Self) -> bool
-        if self.0 < rhs.0 then return true
-        if rhs.0 < self.0 then return false
-        if self.1 < rhs.1 then return true
-        if rhs.1 < self.1 then return false
-        self.2 < rhs.2
+        false
     end lt
 
 // Mixed with the same FNV prime the string hash uses, so that the parts' order matters -- `(1, 2)`
-// and `(2, 1)` are different keys, and a plain XOR would make them the same one.
-impl[A: Hash, B: Hash] Hash for (A, B)
-    hash(self) -> u64 = hash_u64(self.0.hash() * 0x100000001b3u64 ^ self.1.hash())
+// and `(2, 1)` are different keys, and a plain XOR would make them the same one. The fold starts at
+// the FNV offset basis rather than at the first part's hash, which is what lets one loop cover every
+// arity rather than treating the first position as the seed.
+impl[..A: Hash] Hash for (..A)
+    hash(self) -> u64
+        var h = 0xcbf29ce484222325u64
 
-impl[A: Hash, B: Hash, C: Hash] Hash for (A, B, C)
-    hash(self) -> u64 =
-        hash_u64((self.0.hash() * 0x100000001b3u64 ^ self.1.hash()) * 0x100000001b3u64 ^ self.2.hash())
+        for const i in 0..<A.len
+            h = h * 0x100000001b3u64 ^ self.i.hash()
+
+        hash_u64(h)
+    end hash
 
 // Rendered as one field, which is why the parts are gathered before anything is padded: `14 §2`'s
 // rule is that a specifier describes the field the *whole* value occupies, so `%8s` on a pair pads
 // the pair and not its first element.
-impl[A: Display, B: Display] Display for (A, B)
-    display(self, out: *Writer, fmt: FormatSpec) =
-        display_pad(("(" + str(self.0) + ", " + str(self.1) + ")").bytes, out, fmt)
+impl[..A: Display] Display for (..A)
+    display(self, out: *Writer, fmt: FormatSpec)
+        var s = "("
 
-impl[A: Display, B: Display, C: Display] Display for (A, B, C)
-    display(self, out: *Writer, fmt: FormatSpec) =
-        display_pad(("(" + str(self.0) + ", " + str(self.1) + ", " + str(self.2) + ")").bytes, out, fmt)
+        for const i in 0..<A.len
+            if i > 0usize then s = s + ", "
+
+            s = s + str(self.i)
+
+        display_pad((s + ")").bytes, out, fmt)
+    end display
 
 // A sink that keeps the length of what it was given and drops the bytes, which is how a slice
 // honours a width without gathering: the elements are rendered twice and stored nowhere, rather

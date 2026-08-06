@@ -324,6 +324,10 @@ object WhyML {
         if inTerm then throw Unsupported("a sequence of expressions in a contract")
         es.map(expr(_, inTerm)).mkString("(", "; ", ")")
 
+      // One copy of an unrolled `for const` (`10 §10`), which is a block wherever it stands. A block
+      // in a term is what the line above refuses for a sequence, and for the same reason.
+      case _: TBlockExpr => throw Unsupported("a 'for const' in a contract")
+
       case TCall(name, args, _, _) =>
         if !ownNames(name) then
           throw Unsupported(s"a call to '${Modules.show(name)}', which this module does not declare")

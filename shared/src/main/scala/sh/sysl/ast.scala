@@ -230,6 +230,7 @@ sealed trait TypeRef extends Positioned {
     case VolatileType(inner)              => s"volatile ${inner.show}"
     case TupleType(parts, false)          => s"(${parts.map(_.show).mkString(", ")})"
     case TupleType(parts, true)           => parts.map(_.show).mkString(", ")
+    case PackType(n)                      => s"..$n"
     case FnType(List(one), ret, true)     => s"${one.show} -> ${ret.show}"
     case FnType(params, ret, true)        => s"(${params.map(_.show).mkString(", ")}) -> ${ret.show}"
     case FnType(params, ret, false)       => s"Fn(${params.map(_.show).mkString(", ")}) -> ${ret.show}"
@@ -300,6 +301,15 @@ case class ResultList(values: List[Expr]) extends Expr
  * type in parentheses, and a product of one thing is the thing.
  */
 case class TupleType(parts: List[TypeRef], results: Boolean = false) extends TypeRef
+
+/** `..A` — a **type pack**, one name standing for a list of types (`10 §10`).
+ *
+ * It is a `TypeRef` for the reason `ValueArgType` is one: a declaration's parameters are one list
+ * whichever kind each of them is, and a pack stands in that list. It is never a type on its own —
+ * the only place it may be written is inside a tuple, as `(..A)`, which is the tuple of whatever the
+ * pack was bound to.
+ */
+case class PackType(name: String) extends TypeRef
 
 /** The type of a callable (`12 §6`) — the parameters it is called with and the result it yields.
  *
@@ -642,6 +652,31 @@ case class Loop(label: Option[String], body: List[Stmt]) extends Expr
 case class For(label: Option[String], name: String, iter: Expr, body: List[Stmt], elseBody: Option[List[Stmt]])
     extends Expr
 
+/** `for const name in iter body` — the loop the compiler **unrolls** (`10 §10`).
+ *
+ * `iter` is a range whose ends are compile-time constants, and the body is repeated once per value
+ * with `name` folded in as that value. The copies are type-checked *separately*, which is the whole
+ * point: `self.0` and `self.1` have different types and one written line covers both.
+ *
+ * It carries no label and no `else`, and neither is an omission. There is no loop at run time for a
+ * `break` to leave or for an `else` to run after — what the analyzer produces is the copies in a
+ * block, so nothing downstream of it ever meets this node.
+ */
+case class ConstFor(name: String, iter: Expr, body: List[Stmt]) extends Expr
+
+object ConstFor {
+
+  /** How many copies one `for const` may be unrolled into.
+   *
+   * A bound rather than no bound, because the cost is in the *emitted program* and not in a number a
+   * reader can see: `for const i in 0..<100000` is one line and a hundred thousand copies of
+   * whatever is under it. The limit is generous against what the feature is for — a tuple wide
+   * enough to reach it is one nobody should be writing (`00 §13`) — and a loop that genuinely counts
+   * that high is the ordinary `for`, which costs one copy however far it goes.
+   */
+  val maxCopies: Int = 64
+}
+
 /** `['label] for init; cond; step` — the three-clause loop, written without parentheses as Go
  * writes it, since every other header in the language is parenthesis-free.
  *
@@ -805,6 +840,8 @@ case class FuncDecl(
       * list, one namespace and one argument position; this map is what tells them apart.
       */
     tvalues: Map[String, TypeRef] = Map.empty,
+    /** Which of `tparams` stand for a **list** of types — `[..A: Display]` (`10 §10`). */
+    tpacks: Set[String] = Set.empty,
     test: Option[TestAttr] = None,
     conv: Option[CallConv] = None,
     /** `@tailrec` — see `TFunc.tailrec`. */
@@ -1046,6 +1083,12 @@ case class ImplDecl(
       * and `[0]T` resolve alike and only the syntax says which was written.
       */
     tvalues: Map[String, TypeRef] = Map.empty,
+    /** Which of `tparams` stand for a **list** of types rather than one — `impl[..A: Eq] Eq for
+      * (..A)` (`10 §10`). Recorded for the reason `tvalues` is: a pack stands at two types for the
+      * walk that checks the body, so `(..A)` and a written-out pair resolve alike and only the
+      * syntax says which was meant.
+      */
+    tpacks: Set[String] = Set.empty,
 ) extends Stmt
 
 /** The `module a.b.c` header a file carries, naming the module the file contributes to. The name is

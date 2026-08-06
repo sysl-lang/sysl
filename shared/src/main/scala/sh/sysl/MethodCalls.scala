@@ -574,7 +574,7 @@ trait MethodCalls extends FuncAddress {
       case Nil =>
         boundErr(s"'${a.name}' is a type parameter, and no trait declares an associated function " +
           s"'$mname' that a bound could promise")
-      case one :: Nil => boundErr(s"'$mname' needs '${a.name}: $one'")
+      case one :: Nil => boundErr(s"'$mname' needs '${show(a)}: $one'")
       case many =>
         boundErr(s"'$mname' needs a bound on '${a.name}' — it is declared by ${many.mkString("'", "', '", "'")}")
 
@@ -633,7 +633,7 @@ trait MethodCalls extends FuncAddress {
         boundErr(s"'${a.name}' is a type parameter, so it has no fields to read — a field is layout, " +
           s"and no trait declares a property '$name' that a bound could promise instead")
       case one :: Nil =>
-        boundErr(s"'$name' needs '${a.name}: $one'")
+        boundErr(s"'$name' needs '${show(a)}: $one'")
       case many =>
         boundErr(s"'$name' needs a bound on '${a.name}' — it is declared by ${many.mkString("'", "', '", "'")}")
 
@@ -714,7 +714,7 @@ trait MethodCalls extends FuncAddress {
       case Nil =>
         boundErr(s"no trait declares a method '$mname', so no bound on '${a.name}' could license this call")
       case one :: Nil =>
-        boundErr(s"'$mname' needs '${a.name}: $one'")
+        boundErr(s"'$mname' needs '${show(a)}: $one'")
       case many =>
         boundErr(s"'$mname' needs a bound on '${a.name}' — it is declared by ${many.mkString("'", "', '", "'")}")
 }

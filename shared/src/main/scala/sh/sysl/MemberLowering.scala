@@ -91,6 +91,11 @@ trait MemberLowering extends TypeResolution {
       fromTrait: Option[String] = None,
       overrides: Boolean = false,
       tvalues: Map[String, TypeRef] = Map.empty,
+      /** Which of `tparams` stand for a **list** of types (`10 §10`) — carried for the reason
+        * `tvalues` is, so a member's body is walked with the pack standing at what a pack stands at
+        * rather than at one `Abstract` that has no parts for `self.i` to reach.
+        */
+      tpacks: Set[String] = Set.empty,
   ) {
 
     /** Everything a member's signature resolves against that a call does not supply: the trait's
@@ -326,7 +331,7 @@ trait MemberLowering extends TypeResolution {
       // here does not also erase the member it is about.
       recover(())(at(m.pos)(checkSignatureRules(fd.name, fd.params, fd.retType, fd.variadic)))
       recover(())(at(m.pos)(checkValueParamArithmetic(
-        fd.tvalues.keySet, fd.params.map(_.typ) ::: fd.retType.toList, fd.tparams.toSet)))
+        fd.tvalues.keySet, fd.params.map(_.typ) ::: fd.retType.toList, fd.tparams.toSet, fd.tpacks)))
 
     lowered.toList
   }

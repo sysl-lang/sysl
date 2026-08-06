@@ -541,10 +541,169 @@ Which key a block is filed under is decided by the subject **as written**, not b
 resolves to. A value parameter stands at zero for the walk that checks a generic body, so `[N]T` and
 `[0]T` resolve to the same array; only the syntax says which was meant.
 
-**It does not retire the tuple arity rule.** A tuple's shape is how many parts it has *and what each
-one is*, which is not one value of one type, so `Eq`/`Ord`/`Hash`/`Display` at arity 2 and 3 stay
-hand-written. Value generics and variadic generics are different features and this is only the
-first.
+**It does not retire the tuple arity rule** — §10 does. A tuple's shape is how many parts it has
+*and what each one is*, which is not one value of one type, so nothing here reaches it: a length is
+one `usize` and an arity is a list of types. The two are different features and this was the first
+of them.
+
+---
+
+## 10. Type packs, and the loop that walks one
+
+A parameter may stand for **several types at once**, which is what lets one declaration cover every
+tuple:
+
+```
+impl[..A: Display] Display for (..A)
+    display(self, out: *Writer, fmt: FormatSpec)
+        var s = "("
+
+        for const i in 0..<A.len
+            if i > 0usize then s = s + ", "
+            s = s + str(self.i)
+
+        display_pad((s + ")").bytes, out, fmt)
+```
+
+`..A` is a **pack**: one name standing for a list of types, of a length the instantiation decides.
+`(..A)` is the tuple of them, and it matches a tuple of any arity. `for const` is the loop that
+walks the parts — unrolled at monomorphization, so `i` is a compile-time integer and `self.i` is an
+ordinary field selection at whatever type that part has.
+
+The two halves are separable in principle and are taken together because neither is useful alone.
+A pack with no loop can match a tuple and not say anything about its parts; a loop with no pack has
+nothing to walk. §9's value parameters are the near neighbour and the contrast is the whole
+distinction: **a value parameter is one value of one type, and a pack is a list of types.** An
+array's length is the first, a tuple's arity is the second, and that is why one feature did not
+reach the other.
+
+C++11 has parameter packs, Swift took them in 5.9, D pairs its tuple templates with `static
+foreach`, and Zig writes exactly this loop as `inline for` over `@typeInfo`. **Rust is the
+instructive one for having neither**: its standard library implements each trait for tuples up to
+arity twelve by macro, twelve near-copies per trait, and stops there — which is the position sysl
+was in with two hand-written arities, differing only in where the ceiling sits.
+
+### A bound on a pack distributes over its members
+
+`[..A: Display]` says every type in `A` implements `Display`, and that is the whole of the bound
+syntax: no new spelling, no quantifier, no `where` clause. It is the ordinary `[T: Display]` read
+over a list instead of over one name.
+
+This is what makes the membership answerable *before* instantiation, which is the property a bounded
+generic exists to have. A tuple satisfies `Display` when every part does — so `print(p)` on a
+`(int, string)` resolves, `print(p)` on a tuple holding something unprintable is refused where it is
+written, and neither answer waits for a body to be compiled. Getting that wrong is what a language
+with templates and no bounds has instead of diagnostics.
+
+**A pack may carry no default and no value bound.** A default would have to be a list of types with
+no way to write one, and §9's `const` marks a different kind of parameter entirely; a parameter is
+one of the three kinds and says which.
+
+### `for const` — the loop the compiler unrolls
+
+```
+for const i in 0..<A.len
+```
+
+The range's ends must be compile-time constants, which `A.len` is: a pack knows its length once the
+instantiation binds it, exactly as §9's `N` knows its value. A range whose end is not constant is
+refused by name — the loop cannot be unrolled against a count nobody has yet, and the ordinary `for`
+is what that program wants.
+
+Each iteration is a **separate copy of the body**, type-checked on its own, which is the whole point:
+`self.0` and `self.1` have different types and the same source line covers both. `i` is a compile-time
+`usize` inside each copy and folds into its uses the way a value parameter does (§9), so `if i >
+0usize` is decided at compile time and costs nothing at run time.
+
+`return` out of the loop works and is what `Eq` and `Ord` are written with — an unrolled loop is
+straight-line code in the enclosing function, so a `return` in it is an ordinary one. **`break` and
+`continue` are refused**, with a sentence saying why: there is no loop at run time for either to act
+on, and the shape that wants them is a `for` over a range of values rather than over a list of types.
+
+### What `self.i` means
+
+A tuple's parts are fields named for their positions (`00 §13`), so `self.i` at a compile-time `i` is
+field selection and not a new form — the same selection `self.0` already is, with the position
+arriving as a constant rather than as a literal. It is refused where the index is not compile-time
+constant, and refused where the receiver is not a tuple, because a struct's fields have names that a
+number does not address.
+
+The bound is what makes the part usable. Inside `impl[..A: Display]`, every `self.i` has a type known
+to implement `Display`, so `self.i.display(…)` resolves through the bound exactly as `x.display(…)`
+does under `[T: Display]`.
+
+### The body is checked at a representative arity of two
+
+A generic body is walked once, abstractly, before any instantiation exists — and an unrolled loop has
+no fixed length to be walked at. **The pack stands at two types for that walk**, which is §9's "a
+value parameter stands at zero" one kind up.
+
+Two is not arbitrary and the choice is what makes the walk worth doing. The body of an unrolled loop
+is one piece of source repeated, and every copy sees a part whose type carries the pack's bound and
+nothing else — so a copy that checks at any position checks at every position. What two buys over one
+is the *between*: at arity two both `i > 0usize` branches occur, a separator is emitted once, and the
+bound is demanded of a part that is not the first. Arity two is also the smallest tuple there is
+(`00 §13`), so the walk is checking a shape that really exists.
+
+**What it reports is what the bounds do not license, and only that.** That is the pass's existing
+rule and not a limitation of this one: every other complaint is dropped there, because a mistake in
+the concrete part of a generic body is found at each instantiation and reporting it here as well
+would report it against a body no call site may ever ask for. So `for const i in 0..<A.len` with an
+unbounded `A` is told at the declaration that it wants `A: Display`, and a loop that runs past the
+arity is told at the call, by the instantiation that has a real arity to be past.
+
+The walk is a check and its tree is discarded; every instantiation is analyzed at its own arity, so
+nothing about a real tuple is inferred from the representative one.
+
+### Where a pack may be written
+
+- **An `impl` subject** — `impl[..A: Eq] Eq for (..A)`, which is what the feature is for.
+- **A function's parameter or result** — `widest[..A: Display](t: (..A)) -> usize`, since a free
+  function over any tuple is the same need one step out of the catalog.
+
+And nowhere else, day one. In particular there is **no pack expansion in an expression**: no
+`f(..a)` spreading a tuple into an argument list, and no `(..A, int)` appending to a pack in a type.
+Both are real features in the languages that have packs and neither is needed by anything here — the
+unrolled loop is what replaces expansion, and it replaces it in the one direction the catalog wants.
+
+**This is not variadic *functions*, and does not touch `va_arg`.** A variadic body reads a C-ABI
+argument tail (`12`), which is a runtime walk over untyped storage; a pack is a compile-time list of
+types. Making the first out of the second is a plausible future and is not this.
+
+### Inference, monomorphization, and what this retires
+
+**A pack is inferred by unifying `(..A)` against the argument's type**, by §4's existing rule: a
+`(int, string, bool)` matched against `(..A)` binds `A` to those three, exactly as `[3]int` against
+`[N]int` binds `N` to 3. There is nothing to write at a call.
+
+**Monomorphization keys on the pack's members** (§7), so a `(int, string)` and a `(int, bool)` are
+two instantiations of one block and two functions in the object file — the same trade every generic
+makes, and the reason the loop costs nothing at run time.
+
+**A written-out block still beats a pack, and a fixed arity beats both.** A tuple now has three keys
+consulted most specific first: its own type, its arity's shape, and the pack's. `impl Display for
+(int, string)` beats `impl[A: Display, B: Display] Display for (A, B)` beats `impl[..A: Display]
+Display for (..A)`, which is `02 § override`'s "written-out beats a parameter" applied twice down one
+ladder. §9 introduced the second rung for arrays and this adds the third for tuples.
+
+**It retires the arity ceiling, which is what it was for.** The library implemented `Eq`, `Ord`,
+`Hash` and `Display` at arity two and three — eight blocks, four of them near-copies of the other
+four — and a tuple of four parts implemented none of them. Those eight become four, no arity is
+special, and the diagnostic that existed to explain where the ceiling sat (*"the library provides
+'sysl.Display' for tuples of up to 3 parts"*) goes with it.
+
+Two of the four also come out **better** rather than merely shorter. `Ord`'s lexicographic ladder no
+longer special-cases its last position — it ran the two-test ladder at every position but the last,
+which ended with a bare `<` because there was no next position to fall through to, and the loop ends
+with `false` instead: all positions tied means not less. `Eq` gains an early exit it wrote as a `&&`
+chain. **`Hash` changes the values it produces**, deliberately: the hand-written rows seeded the fold
+from `self.0.hash()`, and a loop needs a constant to start from, so the FNV offset basis is now the
+seed. Nothing persists a hash, so this is a note rather than a migration.
+
+**It does not reach structs.** `for const` over a struct's fields would give the derived `Display`
+that `14 §8` records as wanted, and the loop form is the half of that which is now built — but a
+struct's fields have names rather than positions, so `self.i` does not address them and what is
+missing is a way to name a field list. That is the deriving question, and `14 §8` still holds it.
 
 ---
 

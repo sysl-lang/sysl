@@ -911,7 +911,7 @@ trait ProgramWalk
 
   /** One generic body, analyzed with each of its type parameters substituted by itself. */
   private def checkAbstractBody(f: FuncDecl): Unit = at(f.pos) {
-    val subst: Map[String, Type] = withSelf(f.name, abstractSubst(f.tparams, f.bounds, f.tvalues))
+    val subst: Map[String, Type] = withSelf(f.name, abstractSubst(f.tparams, f.bounds, f.tvalues, f.tpacks))
     val params = f.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, subst))))
     val rtype  = f.retType.map(t => recover(Type.Unknown)(resolveReturn(t, subst))).getOrElse(Type.Unit)
 

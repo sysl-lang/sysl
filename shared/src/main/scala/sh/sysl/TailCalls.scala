@@ -98,6 +98,10 @@ object TailCalls {
   private def nested(f: TFunc, e: TExpr, deferred: Boolean): List[TCall] = e match
     case TIf(_, t, els, _)  => stmts(f, t.stmts, deferred)._1 ::: els.toList.flatMap(b => stmts(f, b.stmts, deferred)._1)
     case TMatch(_, arms, _) => arms.flatMap(a => stmts(f, a.body.stmts, deferred)._1)
+    // A copy of an unrolled `for const` may `return`, and its own value is not in tail position:
+    // the copies are a sequence, so only the last of them could be, and `TSeq` is not followed here
+    // for the same reason a loop's body is not (`10 §10`).
+    case TBlockExpr(b)      => stmts(f, b.stmts, deferred)._1
 
     // A loop's body may return, and none of it is in tail position however the loop ends: the value
     // a `break` carries is the loop's, and the loop's value is what the expression around it goes on

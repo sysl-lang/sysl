@@ -146,7 +146,7 @@ trait OperatorCalls extends MethodCalls {
     else
       ty match
         case a: Type.Abstract =>
-          if !satisfies(tr, a) then boundErr(s"'$op' needs '${a.name}: ${showBound(tr, a)}'")
+          if !satisfies(tr, a) then boundErr(s"'$op' needs '${show(a)}: ${showBound(tr, a)}'")
           Some(reached(TDispatch(s"$trName.$method", swap, negate)))
         // The implementation is named by the rule a method call uses, which for a generic type is
         // the instantiation the receiver's own arguments make — `a + b` on a `Box[int]` reaches the

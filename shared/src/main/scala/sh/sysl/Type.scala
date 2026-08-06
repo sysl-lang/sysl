@@ -331,6 +331,23 @@ object Type {
       throw new IllegalStateException(s"the value argument '$value' reached codegen")
   }
 
+  /** The list bound to a **type pack** (`10 §10`) — `int, string` where the declaration wrote
+   * `[..A]` and the subject matched a `(int, string)`.
+   *
+   * A `Type` for the reason `ConstArg` is one: a declaration's parameters are one list keyed by
+   * name, whichever kind each of them is, so the substitution answering "what is this parameter?"
+   * has to be able to answer with a list. `(..A)` is the only place one may be written, and
+   * resolving that spelling against a substitution holding this is what produces the ordinary
+   * `Tuple` everything downstream sees.
+   *
+   * Like `Abstract` and `ConstArg` it is a **substitution type and never a lowered one** — reaching
+   * codegen means the tuple it stands for was never formed.
+   */
+  case class Pack(elems: List[Type]) extends Type {
+    def llvm: String =
+      throw new IllegalStateException(s"a type pack of ${elems.length} reached codegen")
+  }
+
   /** A view of elements someone else owns: the reference that keeps the storage alive, the first
    * element, and how many there are. Every view has that same layout, so the element type shows
    * up only in the instructions that reach through it — which is what lets a slice and a string
@@ -453,7 +470,11 @@ object Type {
     case Array(n, elem)           => s"[$n]${show(elem)}"
     case Slice(elem, ro)          => s"[]${if ro then "const " else ""}${show(elem)}"
     case Volatile(inner)          => s"volatile ${show(inner)}"
-    case Abstract(n, _)           => n
+    // A **pack member**'s stand-in is named `A#0` so that two of them are two types (`Abstract` is
+    // identified by its name), and shown as `A` because that is the parameter the reader wrote —
+    // the number is the compiler's bookkeeping and names nothing a program can refer to. `#` is in
+    // no identifier, so this cannot shorten a name somebody chose.
+    case Abstract(n, _)           => n.takeWhile(_ != '#')
     // A value argument is shown as the value, since that is what a reader wrote and what tells two
     // instantiations apart: `len[3]` and `len[4]` differ by this and nothing else (`10 §9`).
     //
@@ -465,6 +486,9 @@ object Type {
     case ConstArg(v, Char)        => s"'${v.toInt.toChar}'"
     case ConstArg(v, e: Enum)     => e.variants.find(_.tag == v.toInt).fold(v.toString)(_.name)
     case ConstArg(v, _)           => v.toString
+    // A pack is shown as the list it stands for, with no parentheses: the only place one is written
+    // is inside a tuple, so whatever is naming this has already supplied them (`10 §10`).
+    case Pack(es)                 => es.map(show).mkString(", ")
     // A call trait is spelled the way it is written rather than the way it is filed, so nothing a
     // reader is told names the arity-carrying declaration behind it (`12 §6`).
     case Trait(n, args) =>
@@ -640,6 +664,12 @@ object Type {
      * the shape reads: `(,)` for a pair, `(,,)` for a triple.
      */
     def shape(n: Int): String = "(" + "," * (n - 1) + ")"
+
+    /** The key an `impl` written for **every tuple at every arity** is filed under (`10 §10`) — the
+     * third and least specific rung of the ladder a tuple's own type and its arity's shape begin.
+     * `[N]` is the same rung one kind down, which is why it is spelled to match.
+     */
+    val pack: String = "(..)"
   }
 
   /** Several results as a **signature** carries them (`12 §5b`) — `-> int, int`.
@@ -814,6 +844,11 @@ object Type {
     // two instantiations that differ only in it are two bodies, and a name that dropped it would let
     // `total` at length 3 share a body with `total` at length 4 (`10 §9`).
     case ConstArg(v, _)    => s"c$v"
+    // A pack carries its length as well as its members, so that two instantiations of one block at
+    // two arities are two bodies — the same reason a value argument is mangled (`10 §10`). The
+    // members alone would already differ, and the count is what keeps the boundary between them
+    // unambiguous when a member's own mangling contains a dot.
+    case Pack(es)          => s"pk${es.length}.${es.map(mangleOne).mkString(".")}"
     // The bit is mangled even though both forms have one layout and one set of instructions, so
     // that a generic instantiated at `[]const T` never shares a body with one instantiated at
     // `[]T` — the bodies would be identical machine code, but only one of them had its writes
