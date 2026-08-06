@@ -299,6 +299,20 @@ object Type {
     def llvm: String = s"[$length x ${elem.llvm}]"
   }
 
+  object Array {
+
+    /** The key an `impl` written for **every** array is filed under, whatever the length — the block
+     * whose length is a value parameter (`10 §9`), `impl[const N: usize, T: Display] Display for [N]T`.
+     *
+     * An array filed under it keeps its per-length key as well, and that one is asked first: a block
+     * that wrote `[3]T` covers every array of three, and one that wrote `[N]T` covers every array at
+     * all, so the first is the more specific of the two. That is "written-out beats a parameter"
+     * (`02 § override`) applied to a length, which is what the length became when it stopped being
+     * part of the shape and started being an argument to it.
+     */
+    val shape: String = "[N]"
+  }
+
   /** The argument bound to a **value** parameter (`10 §9`) — `3` where the declaration wrote
    * `[const N: usize]`.
    *

@@ -247,22 +247,12 @@ trait SpecialForms extends Closures {
             s"write an 'impl[$tps] $tr for ${qn(n.base)}[$tps]' to say how it renders"
           case n: Type.Named => s"write an 'impl $tr for ${show(n)}' to say how it renders"
 
-          // An array is answered by the **view**, not by an implementation of its own, and that is
-          // why it is taken before the composed cases below. The library covers every slice and can
-          // cover no array: a length is not something a block can be generic over, so `[3]T` and
-          // `[4]T` are two shapes and stopping at some length would be coverage that looks general
-          // and is not. The whole-array view costs nothing and the slice block renders it, so the
-          // fix is one character rather than nine lines.
-          case Type.Array(_, elem) if satisfies(displayTrait, elem) =>
-            s"one 'impl' cannot cover every length, so nothing renders a ${show(ty)} itself — " +
-              "print the whole-array view '[..]', which the block covering slices renders"
-
-          // An array whose *elements* do not render falls through to the composed cases below, and
-          // deliberately: the view would fail for the element's reason, so sending the reader to it
-          // is one step down a path ending in this same message. `[2][1]P` is the case that settles
-          // it — `[..]` yields a `[][1]P` whose element is an array again, and no view reaches the
-          // bottom of that. What such a program is owed is the block it may write, which is what
-          // the coherence-aware advice below already gives it.
+          // An **array** no longer reaches any of this, and nothing here needs a case for one: the
+          // library covers every array whose element renders, so `unmetBound` above answers first
+          // and names the element that fails that block's condition — the same answer a slice gets,
+          // and the part a reader can act on. What used to stand here was advice to take the
+          // whole-array view, written when a length was part of an array's shape and no block could
+          // be generic over it (`10 §9`).
 
           // A composed type is the module's when anything named in it is (`02 § Coherence`), so
           // the advice holds for a `[]Point` and is impossible for a `[]int`: `Display` is the

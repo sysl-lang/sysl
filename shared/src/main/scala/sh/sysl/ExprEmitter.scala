@@ -344,6 +344,10 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     // for diagnostics and throws its tree away, and monomorphization substitutes a concrete type
     // before anything is emitted.
     case _: Type.Abstract => sys.error("unreachable zero of a type parameter")
+    // A **value** parameter reaches codegen from nowhere for the same reason and one step earlier:
+    // its argument is folded into the length or the expression naming it while the instantiation is
+    // still being built, so nothing is ever laid out at one.
+    case _: Type.ConstArg => sys.error("unreachable zero of a value parameter")
     // A result list belongs to a signature. The analyzer's one funnel turns it into the tuple its
     // parts lay out as before anything holds it, so codegen is only ever handed that tuple.
     case _: Type.Results  => sys.error("unreachable zero of a result list")

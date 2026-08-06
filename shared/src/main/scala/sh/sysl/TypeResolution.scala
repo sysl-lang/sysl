@@ -151,6 +151,69 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     case Call(_, args)          => args.exists(lengthMentions(_, tps))
     case _                      => false
 
+  /** Refuses arithmetic on a **value parameter** inside a type (`10 §9`) — `[N + 1]int`.
+   *
+   * A value parameter may *stand* as a length, and a body may compute with it as freely as with any
+   * other `usize`. What neither may do is put the result of a computation in a type. A type carrying
+   * `N + 1` needs the compiler to decide when two *expressions* denote one length — that `N + 1` and
+   * `1 + N` are one type, and that `2 * N` and `N + N` are — which is type-level arithmetic and a
+   * feature of its own. Rust draws the line in the same place and has kept `generic_const_exprs`
+   * unstable long after const generics shipped.
+   *
+   * A length measuring a **type** parameter is untouched and stays legal: `[sizeof(T) * 3 + 1]u8` is
+   * arithmetic on a number the type argument fixes outright, not on a length anything has to solve
+   * an equation for.
+   *
+   * Refusing is the whole point rather than a limitation admitted reluctantly. Left alone the length
+   * resolves to whatever the placeholder made it, so the array is silently the wrong size — and a
+   * wrong answer is worse than the refusal that names the feature it would need.
+   */
+  private def checkLengthArithmetic(len: Expr, subst: Map[String, Type]): Unit =
+    lengthArithmetic(len, subst.collect { case (n, _: Type.ConstArg) => n }.toSet)
+
+  /** The same refusal made at the **declaration**, from the names alone and with no substitution —
+   * which is where the mistake is, and the only place one position can be told about it at all.
+   *
+   * `[N + 1]int` as a **parameter** never reaches the resolution above: nothing unifies with it, so
+   * the call fails first and the reader is told the argument cannot be inferred. That is true and
+   * unhelpful, since what cannot be inferred is not something the caller can fix. Asked here, the
+   * declaration is what reports, and a declaration nothing ever calls reports too.
+   */
+  protected def checkValueParamArithmetic(names: Set[String], types: List[TypeRef]): Unit = {
+    def walk(t: TypeRef): Unit = t match
+      case ArrayType(len, elem, _) => len.foreach(lengthArithmetic(_, names)); walk(elem)
+      case NamedType(_, args)      => args.foreach(walk)
+      case PtrType(inner)          => walk(inner)
+      case RefType(inner, _)       => walk(inner)
+      case WeakType(inner)         => walk(inner)
+      case VolatileType(inner)     => walk(inner)
+      case TupleType(parts, _)     => parts.foreach(walk)
+      case f: FnType               => f.params.foreach(walk); walk(f.ret)
+      case CFnType(params, ret)    => params.foreach(walk); walk(ret)
+      case _                       => ()
+
+    if names.nonEmpty then types.foreach(walk)
+  }
+
+  private def lengthArithmetic(len: Expr, names: Set[String]): Unit = {
+    def valueParams(e: Expr): List[String] = e match
+      case Ident(n) if names(n)   => List(n)
+      case Unary(_, operand)      => valueParams(operand)
+      case Binary(_, l, r)        => valueParams(l) ::: valueParams(r)
+      case Compare(List(l, r), _) => valueParams(l) ::: valueParams(r)
+      case Call(_, args)          => args.flatMap(valueParams)
+      case _                      => Nil
+
+    len match
+      // The length that *is* the parameter, which is the whole of what a type may say about one.
+      case _: Ident =>
+      case other =>
+        for n <- valueParams(other).distinct.headOption do
+          err(s"this length does arithmetic on '$n', and a type may name a value parameter but not " +
+            s"compute with one — deciding that two such lengths are one type is type-level " +
+            s"arithmetic, which is a separate feature. A body may compute with '$n' freely")
+  }
+
   /** Resolves one bound — a trait, with whatever arguments it was applied to — under the
    * substitution the declaration that wrote it is being read at.
    *
@@ -443,6 +506,8 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     // length zero for that one walk; every array the program actually gets is built by the later
     // pass, where the measurement answers.
     case ArrayType(Some(len), elem, _) =>
+      checkLengthArithmetic(len, subst)
+
       val n = constInt(len, subst) match
         case Some(v) if v >= 0 && v.isValidInt => v.toInt
         case Some(v)                           => err(s"an array cannot have $v elements")

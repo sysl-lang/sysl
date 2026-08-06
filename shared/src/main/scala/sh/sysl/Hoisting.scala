@@ -279,6 +279,7 @@ trait Hoisting extends HoistMembers {
           (f.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty)))),
            f.retType.map(t => recover(Type.Unknown)(resolveReturn(t, Map.empty))).getOrElse(Type.Unit))
       checkSignatureRules(f.name, f.params, f.retType, f.variadic)
+      checkValueParamArithmetic(f.tvalues.keySet, f.params.map(_.typ) ::: f.retType.toList)
       checkBoundNames(f.name, f.bounds)
       checkSolvedDefaults("the function", f.name, f.tdefaults)
       // A `@test` is registered here with everything else a declaration says about itself, so that
@@ -578,7 +579,7 @@ trait Hoisting extends HoistMembers {
       currentPos = pos
       recover(()) {
         val covering =
-          shapeOwner(ty).flatMap((k, ta) => implAt(bound, k, ty, ta))
+          shapeOwners(ty).view.flatMap((k, ta) => implAt(bound, k, ty, ta)).headOption
             .orElse(blanketOwners(ty).view.flatMap((k, ta) => implAt(bound, k, ty, ta)).headOption)
 
         if covering.isEmpty then

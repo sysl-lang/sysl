@@ -158,7 +158,7 @@ trait TraitLookup extends MemberVisibility {
       val (key, targs) = memberOwner(subject)
 
       matching(key, targs)
-        .orElse(shapeOwner(subject).flatMap((k, ta) => matching(k, ta)))
+        .orElse(shapeOwners(subject).view.flatMap((k, ta) => matching(k, ta)).headOption)
         .orElse(blanketOwners(subject).view.flatMap((k, ta) => matching(k, ta)).headOption)
   }
 
@@ -294,32 +294,41 @@ trait TraitLookup extends MemberVisibility {
   /** The key alone — what an `impl` is filed under, and what a trait bound looks up. */
   protected def ownerKey(t: Type): String = memberOwner(t)._1
 
-  /** The **shape** of a composed type, where it has one: the key a block matching every type of that
-   * shape is filed under, and the type arguments this particular one matched at.
+  /** The **shapes** of a composed type: the keys a block matching every type of that shape is filed
+   * under, each with the type arguments this particular one matched at, **most specific first**.
    *
    * A composed type is filed under the whole of itself — `[]int`, not `[]` — because that is the
    * type a written `impl` is for and the name a diagnostic gives it. A shape-matched block is for
    * something else, so it needs a key of its own, and dropping the arguments is exactly what makes
-   * one: every slice shares `[]`, and every array shares its length with the arrays of that length,
-   * since without value generics (`10 §9`) the length is part of the shape rather than an
-   * argument to it.
+   * one: every slice shares `[]`.
+   *
+   * There is a **list** of them because an array has two, and the order between them is the whole
+   * reason this is not a single answer. Every argument a shape drops is one a block may be generic
+   * over, and value generics (`10 §9`) made an array's length one of those — so `[3]T` and `[N]T`
+   * are both blocks covering a `[3]int`, and the first covers less. Asking the keys in order is how
+   * the more specific one answers, which is the same ordering `memberKey` applies between a type's
+   * own key and its shape.
    *
    * A `string` is not a slice and has no shape here. It is a view of bytes that are valid UTF-8, and
    * that invariant is the whole difference between it and a `[]u8` — a block written for every slice
    * has said nothing about it.
    */
-  protected def shapeOwner(t: Type): Option[(String, List[Type])] = t match
+  protected def shapeOwners(t: Type): List[(String, List[Type])] = t match
     // Both views share the one shape, and for the reason the shape exists: a block written for
     // every slice is written against what a slice *is* — a pointer and a count of `T` — and whether
     // this one may be written through is not part of that. A block that does write is caught where
     // it writes, which is a better place to say so than a missing implementation.
-    case Type.Slice(elem, _) => Some(("[]", List(elem)))
-    case Type.Array(n, elem) => Some((s"[$n]", List(elem)))
+    case Type.Slice(elem, _) => List(("[]", List(elem)))
+    // The length is dropped from the second key and handed back as an **argument**, exactly as the
+    // element type is: a `[3]int` matches `[N]T` at `N = 3` and `T = int`, and the block's members
+    // are instantiated from that pair the way a slice's are from one.
+    case Type.Array(n, elem) =>
+      List((s"[$n]", List(elem)), (Type.Array.shape, List(Type.ConstArg(n, Type.Usize), elem)))
     // A tuple's shape is its **arity**, since that is the whole of what an implementation can be
     // written for at once: there is no way to be generic over how many parts a tuple has, so a
     // pair and a triple are two shapes and the library writes one implementation for each.
-    case t: Type.Tuple       => Some((Type.Tuple.shape(t.targs.length), t.targs))
-    case _                   => None
+    case t: Type.Tuple => List((Type.Tuple.shape(t.targs.length), t.targs))
+    case _             => Nil
 
   /** Where a member of that name is filed for a type: under the type's own key, or — when only a
    * shape-matched block supplies it — under the shape's, with the arguments this type matched at.
@@ -337,7 +346,7 @@ trait TraitLookup extends MemberVisibility {
     if memberDecls.contains((own._1, mname)) then own
     else
       widened(t).filter(w => memberDecls.contains((w._1, mname)))
-        .orElse(shapeOwner(t).filter(s => memberDecls.contains((s._1, mname))))
+        .orElse(shapeOwners(t).find(s => memberDecls.contains((s._1, mname))))
         // A blanket's members are filed under its key exactly as a shape's are under `[]`, and this
         // is what a *call* finds them by. Without it a blanket would conform and have nothing
         // callable: `memberFuncName` reads the pair this returns and instantiates from it, so a
@@ -608,7 +617,9 @@ trait TraitLookup extends MemberVisibility {
   protected def implKey(tr: Type.Bound, t: Type): Option[(List[Type], TraitImpl)] = {
     def at(k: (String, List[Type])) = implAt(tr, k._1, t, k._2).map((k._2, _))
 
-    at(memberOwner(t)).orElse(shapeOwner(t).flatMap(at)).orElse(blanketOwners(t).view.flatMap(at).headOption)
+    at(memberOwner(t))
+      .orElse(shapeOwners(t).view.flatMap(at).headOption)
+      .orElse(blanketOwners(t).view.flatMap(at).headOption)
   }
 
   /** The suffix the members of a type's implementation of one particular trait-at-arguments carry,
@@ -644,7 +655,7 @@ trait TraitLookup extends MemberVisibility {
     // `impl`, at the arguments the bound asked for, beside the ones already there.
     val wrongArgs =
       for
-        (key, targs) <- List(memberOwner(t)) ::: shapeOwner(t).toList ::: blanketOwners(t)
+        (key, targs) <- List(memberOwner(t)) ::: shapeOwners(t) ::: blanketOwners(t)
         impls = implsOf(tr.name, key)
         if impls.nonEmpty && implAt(tr, key, t, targs).isEmpty
       yield s"it implements ${conjoin(impls.map(ti => s"'${showBound(suppliedBound(ti, tr.name, t, targs), t)}'"))}"

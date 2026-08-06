@@ -211,21 +211,22 @@ class ImplComposedErrorTests extends AnyFreeSpec with CodegenSupport with RunSup
       ) should include("type '[]int' has no method 'show'")
     }
 
-    // A **slice** no longer reaches this advice at all, because the library implements `Display` for
-    // every slice: what a `[]P` fails is that block's condition, so the diagnostic names the element
-    // that does not render rather than telling the reader to write a block. An **array** is where
-    // the advice still lives, since one `impl` cannot cover every length and nothing covers arrays.
-    "printing a composed type points at the impl to write, where one could be written" in {
+    /** Neither a slice nor an array reaches this advice any more, and for one reason: the library
+      * covers both. What a `[]P` or a `[2]P` fails is that block's **condition**, so the diagnostic
+      * names the element that does not render rather than telling the reader to write a block.
+      *
+      * The advice itself still has a home — a named generic type, which no library block covers —
+      * and the tests below it are what keep it honest.
+      */
+    "printing a composed type names the element its covering block asks about" in {
       err("""struct P
             |    v: int
             |var a = [P(1), P(2)]
             |print(a)""".stripMargin) should
-        include(s"write an 'impl ${lib("Display")} for [2]P' to say how it renders")
+        include(s"the 'impl' that covers it asks '${lib("Display")}' of P, which does not implement it")
     }
 
-    // The slice half of the same question, which is now a condition rather than a missing block —
-    // and the better answer, since the element is the part a reader can act on.
-    "while a slice names the element its covering block asks about" in {
+    "and the slice of them says the same thing" in {
       err("""struct P
             |    v: int
             |var a = [P(1), P(2)]
@@ -233,26 +234,22 @@ class ImplComposedErrorTests extends AnyFreeSpec with CodegenSupport with RunSup
         include(s"the 'impl' that covers it asks '${lib("Display")}' of P, which does not implement it")
     }
 
-    "and an array of them the same way, through however many shapes it takes" in {
-      val e = err("""struct P
-                    |    v: int
-                    |var a = [[P(1)], [P(2)]]
-                    |print(a)""".stripMargin)
-
-      e should include(s"write an 'impl ${lib("Display")} for [2][1]P' to say how it renders")
+    // One level at a time, through however many shapes it takes: the block covering `[2][1]P` asks
+    // about `[1]P`, and the block covering that one is what asks about `P`.
+    "and an array of them names the array, not the bottom of it" in {
+      err("""struct P
+            |    v: int
+            |var a = [[P(1)], [P(2)]]
+            |print(a)""".stripMargin) should
+        include(s"the 'impl' that covers it asks '${lib("Display")}' of [1]P, which does not implement it")
     }
 
-    /** A `[]int` prints, so the case is an **array** of a built-in: nothing covers arrays and
-      * nothing in `[2]int` is the program's, which would leave the reader with a block they could
-      * not write. What they are given instead is the whole-array view, which needs no block at all
-      * — the assertion that matters here is still that no impossible `impl` is named.
+    /** The case the pair above used to guard: a `[2]int`, where nothing in the subject is the
+      * program's, so any block named as advice would be one coherence refuses. It now prints, which
+      * is the strongest possible form of not naming an impossible block.
       */
-    "but where nothing in the subject is this module's, it names no block at all" in {
-      val e = err("var a = [1, 2]\nprint(a)")
-
-      e should include("print the whole-array view '[..]'")
-      e should not include s"write an 'impl ${lib("Display")} for"
-      e should not include "no home outside the library"
+    "while an array of a built-in simply prints" in {
+      run("var a = [1, 2]\nprint(a)") shouldBe "[1, 2]\n"
     }
 
     /** The defect the pair above exists for. Both diagnostics used to arrive in the same run — the
@@ -271,12 +268,21 @@ class ImplComposedErrorTests extends AnyFreeSpec with CodegenSupport with RunSup
       e should not include s"write an 'impl ${lib("Display")} for"
     }
 
-    // The same advice reaches the other renderer, since both ask one function for it.
-    "and an interpolation is told the same thing print is" in {
-      val e = err("var a = [1, 2]\nprint(f\"${a}\")")
+    // Both renderers ask one function, so an interpolation gets whatever print gets — which for an
+    // array is now the rendering itself.
+    "and an interpolation renders an array as print does" in {
+      run("var a = [1, 2]\nprint(f\"${a}\")") shouldBe "[1, 2]\n"
+    }
+
+    // The unprintable element reaches the interpolation the same way, and says the same thing.
+    "while an unprintable element reaches it as the same condition" in {
+      val e = err("""struct P
+                    |    v: int
+                    |var a = [P(1), P(2)]
+                    |print(f"${a}")""".stripMargin)
 
       e should include("cannot make a string of")
-      e should include("print the whole-array view '[..]'")
+      e should include(s"asks '${lib("Display")}' of P, which does not implement it")
     }
 
     // A memory mode is one of the shapes an `impl` may not be for, so there is nothing to suggest.

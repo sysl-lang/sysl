@@ -1012,6 +1012,13 @@ case class ImplDecl(
     traitArgs: List[TypeRef] = Nil,
     tdefaults: Map[String, TypeRef] = Map.empty,
     overrides: Boolean = false,
+    /** Which of `tparams` stand for **values** rather than types, and the type each argument must
+      * have — `impl[const N: usize, T: Display] Display for [N]T` (`10 §9`). It is what tells a
+      * block covering every array length from one covering the length it named, which the resolved
+      * subject cannot: a value parameter stands at zero for the walk that checks the body, so `[N]T`
+      * and `[0]T` resolve alike and only the syntax says which was written.
+      */
+    tvalues: Map[String, TypeRef] = Map.empty,
 ) extends Stmt
 
 /** The `module a.b.c` header a file carries, naming the module the file contributes to. The name is

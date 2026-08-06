@@ -53,6 +53,8 @@ trait MemberLowering extends TypeResolution {
    *     generic `impl`'s, **in the order the implementing type applies them**, so that instantiating
    *     a member from a receiver's type arguments substitutes them positionally. `bounds` is what
    *     was asked of them where they were declared, and it is what the members may assume.
+   *     `tvalues` says which of them stand for **values** (`10 §9`) and at what type, since a
+   *     member's body reads one of those as the constant it is rather than as an opaque type.
    *   - `taken` are the names already spoken for inside the body (a struct's fields, an enum's
    *     variants), and `noun` what a diagnostic calls one of those.
    *   - `self` is what `Self` means inside these members, empty where the answer waits for an
@@ -88,6 +90,7 @@ trait MemberLowering extends TypeResolution {
       alt: String = "",
       fromTrait: Option[String] = None,
       overrides: Boolean = false,
+      tvalues: Map[String, TypeRef] = Map.empty,
   ) {
 
     /** Everything a member's signature resolves against that a call does not supply: the trait's
@@ -322,6 +325,8 @@ trait MemberLowering extends TypeResolution {
       // `make(...)` has nothing to anchor on. Asked after the member is registered, so a mistake
       // here does not also erase the member it is about.
       recover(())(at(m.pos)(checkSignatureRules(fd.name, fd.params, fd.retType, fd.variadic)))
+      recover(())(at(m.pos)(
+        checkValueParamArithmetic(fd.tvalues.keySet, fd.params.map(_.typ) ::: fd.retType.toList)))
 
     lowered.toList
   }

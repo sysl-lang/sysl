@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 23
+  val Version: Int = 24
 
   private val Magic = "sysl-ast"
 
@@ -353,9 +353,9 @@ object AstCodec {
           tok("trt"); sref(n); list(tps)(sref); list(ms)(method); bounds(bs); list(sups)(bound)
           vis(vs); tdefaults(tds)
 
-        case ImplDecl(tn, ft, ms, tps, bs, targs, tds, ov) =>
+        case ImplDecl(tn, ft, ms, tps, bs, targs, tds, ov, tvs) =>
           tok("impl"); sref(tn); typ(ft); list(ms)(method); list(tps)(sref); bounds(bs)
-          list(targs)(typ); tdefaults(tds); bool(ov)
+          list(targs)(typ); tdefaults(tds); bool(ov); tdefaults(tvs)
     }
   }
 
@@ -724,7 +724,8 @@ object AstCodec {
         case "trt" =>
           TraitDecl(sref(), list(sref()), list(method()), bounds(), list(bound()), vis(), tdefaults())
         case "impl" =>
-          ImplDecl(sref(), typ(), list(method()), list(sref()), bounds(), list(typ()), tdefaults(), bool())
+          ImplDecl(sref(), typ(), list(method()), list(sref()), bounds(), list(typ()), tdefaults(), bool(),
+            tdefaults())
         case other => fail(s"'$other' is not a statement tag")
     }
   }

@@ -452,7 +452,7 @@ trait DeclParser extends ExprParser {
         val tp = tps.getOrElse(TypeParams.none)
 
         (implBody | success(Nil)) <~ endTypeRef(forType) ^^ { methods =>
-          ImplDecl(tname, forType, methods, tp.names, tp.bounds, targs, tp.defaults, overrides = ov)
+          ImplDecl(tname, forType, methods, tp.names, tp.bounds, targs, tp.defaults, ov, tp.values)
         }
     }
 
