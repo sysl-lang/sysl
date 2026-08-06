@@ -456,8 +456,15 @@ trait HoistImpl extends ImplConformance {
 
           // A generic type has no one instantiation to be, and nothing that reaches this needs one:
           // an implementation covers every `Box` at once, and each member is made real per receiver.
+          //
+          // Which of the block's parameters stand for **values** travels with them, exactly as it
+          // does for a block matching a shape. Without it the definition-time pass walks the members
+          // with the name of a value parameter standing for nothing at all — `impl[const M: Mode]
+          // Display for Run[M]` reading `M` in a body — and the complaint it makes was invisible
+          // only because that pass used to drop everything it said about a name.
           (Type.Unknown,
-           MemberHome(key, qn(key), key, None, ref, order, impl.bounds, taken, noun, Map.empty))
+           MemberHome(key, qn(key), key, None, ref, order, impl.bounds, taken, noun, Map.empty,
+             tvalues = impl.tvalues, tpacks = impl.tpacks))
 
       case NamedType(n, Nil) if n == selfName =>
         err("'Self' is the type an 'impl' is for, so it cannot also be the type it names")

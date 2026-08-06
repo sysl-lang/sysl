@@ -309,6 +309,27 @@ class ValueGenericsTests extends AnyFreeSpec with RunSupport with CodegenSupport
             |print(a)""".stripMargin) shouldBe "[1, 2]\n"
     }
 
+    /** An `impl` on a **named** generic type, whose members read the value parameter — which is a
+     * different `MemberHome` from the one a block matching a *shape* builds, and the two had to be
+     * told separately which parameters stand for values.
+     *
+     * The assertion is the *run*, not a diagnostic, because what went wrong was silent: the members
+     * were walked at their definition with the parameter's name standing for nothing, and the
+     * complaint about that was dropped by the very pass making it. Nothing failed until an unrelated
+     * change stopped the pass swallowing what it says about a name.
+     */
+    "an 'impl' on a named generic type reads its value parameter in a member" in {
+      run("""struct Run[const N: usize]
+            |    v: int
+            |impl[const N: usize] Display for Run[N]
+            |    display(self, out: *Writer, fmt: FormatSpec) =
+            |        display_str(str(self.v) + "/" + str(N), out, fmt)
+            |var a: Run[3] = Run(7)
+            |var b: Run[5] = Run(8)
+            |print(a)
+            |print(b)""".stripMargin) shouldBe "7/3\n8/5\n"
+    }
+
     // The length reaches the *symbol*, so two lengths are two emitted bodies rather than one
     // compiled at whichever arrived first — the same thing `mangleOne` pins for a function.
     "renders an array of arrays, which is two lengths at once" in {
