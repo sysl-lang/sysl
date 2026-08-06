@@ -32,6 +32,48 @@ The same write, spelled any other way, is refused — and the diagnostics are go
 | `ref r = c.n` then `r = 5` | refused: *…so assignment has nothing to write through* |
 | **`c.bump()` where `bump(*self)`** | **accepted, and the mutation sticks** |
 
+## It is a soundness hole, not an ergonomics one
+
+A module-level `val` is emitted as `constant`, and the hole hands its address to a mutating method:
+
+```sysl
+struct Counter
+    n: int
+
+    bump(*self) = self.n += 1
+end Counter
+
+val shared: Counter = Counter(0)
+
+main()
+    print(shared.n)
+    shared.bump()
+    print(shared.n)
+```
+
+```
+0
+0
+```
+
+The increment vanished. The emitted module says why:
+
+```llvm
+@shared = private constant %struct.Counter { i32 0 }
+...
+call void @Counter.bump(ptr @shared)      ; the address of rodata
+store i32 %t4, ptr %t2                    ; ...written through, inside bump
+```
+
+**A store into a symbol the compiler declared `constant` is undefined behaviour in LLVM's own terms**,
+and LLVM is entitled to assume it never happens — which is exactly why the two loads folded to the
+initial value and the program printed `0` twice. Nothing in the source is unsafe; there is no `*T`,
+no `extern`, no `unsafe` anything.
+
+So one spelling has three behaviours, none of them diagnosed: on a local it mutates, at module scope
+it silently does nothing, and on a target that really protects the page it would fault. That is the
+reason to close this, and it is a stronger reason than `val` meaning less than the chapter says.
+
 ## Which side is the defect
 
 `design/03-memory-model.md`, under *What may be written*, settles it rather than leaving it to taste:
