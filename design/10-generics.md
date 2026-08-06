@@ -428,12 +428,31 @@ never by a covariant container.
 - **c. `where` clauses.** An out-of-line bound syntax for readability when the inline `[T: A +
   B]` list grows long or involves relations between parameters. All of Rust/Swift/Kotlin have
   one; a candidate ergonomic addition, not a day-one need.
-- **d. Const generics.** Parameterizing over a *value* — most importantly an array length,
+- **d. Value generics.** Parameterizing over a *value* — most importantly an array length,
   `[N: usize]` — so a function can be generic over `[N]T`. Not implemented (array sizes are
-  literals today); a clear eventual want for fixed-size numeric and buffer code, deferred until
-  the array story calls for it. It is what an `impl` matching an array's **shape** is missing:
-  `impl[T] Total for [3]T` covers every element type at length 3, and each other length needs its
-  own block (`02`).
+  literals today); a clear eventual want for fixed-size numeric and buffer code. It is what an
+  `impl` matching an array's **shape** is missing: `impl[T] Total for [3]T` covers every element
+  type at length 3, and each other length needs its own block (`02`).
+
+  **Not "const generics", which is Rust's name for it and the wrong one here.** `const` in sysl
+  already means a read-only view (`[]const u8`, `03 §1`), and a word that means *immutable* in one
+  place and *known at compile time* in another is the kind of collision this design does not make
+  elsewhere. `static` is taken too (`13 §7`). C++ calls it a non-type template parameter, which
+  defines the thing by what it is not; Ada 83 — the oldest of these by a decade — calls it a
+  **generic formal object**, and *value* is that word said shorter.
+
+  **The name is general on purpose, and the admissible types are staged.** A value parameter puts a
+  value into a type's identity: `[3]T` and `[4]T` are different types, so the compiler has to decide
+  when two parameter values are the same value, and that needs an equality it can compute and a
+  mangling it can write. So the first set is **integers, `bool`, `char`, and enum values** — every
+  one of which already mangles (`Type.mangleOne`) and compares structurally.
+
+  Widening is a later question and each step has a reason to be taken separately: **strings** want
+  interning before they can be compared as identities; **structs** are what Rust has left unstable
+  for years under `adt_const_params`; **floats** may not be admitted without first writing down that
+  the comparison is on the bit pattern, since `NaN != NaN` would otherwise make a type not equal to
+  itself. Naming the feature after its general shape and admitting types one at a time is the path
+  every language here took, and none of them had to rename it afterwards.
 - **e. Higher-kinded parameters.** Parameterizing over a *type constructor* (`F[_]`) is
   **excluded**, not merely deferred: it pushes inference toward undecidable, and no target use
   (an OS, drivers, embedded) needs it. Abstraction over containers is served by traits and
