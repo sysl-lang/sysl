@@ -56,6 +56,11 @@ trait HoistMembers extends HoistImpl {
         taken,
         noun,
         self,
+        // Which of those parameters stand for **values** rather than types, for the same reason an
+        // `impl`'s members are told: the definition-time pass walks a member's body with the
+        // parameters standing in for themselves, and a value parameter stands at a value. Without
+        // it the `N` of `struct Buf[const N: usize]` names nothing inside the type's own methods.
+        tvalues = nominalValues(tname),
       ),
       members,
       out,

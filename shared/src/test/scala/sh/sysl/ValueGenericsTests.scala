@@ -330,6 +330,20 @@ class ValueGenericsTests extends AnyFreeSpec with RunSupport with CodegenSupport
             |print(b)""".stripMargin) shouldBe "7/3\n8/5\n"
     }
 
+    /** And a type's **own** method reading its own value parameter, which is a third `MemberHome`
+     * from a third file — the hole was in each of them separately, so each is pinned separately.
+     */
+    "a type's own method reads the type's value parameter" in {
+      run("""struct Buf[const N: usize]
+            |    used: usize
+            |    room(self) -> usize = N - self.used
+            |end Buf
+            |var a: Buf[8] = Buf(3usize)
+            |var b: Buf[2] = Buf(1usize)
+            |print(a.room())
+            |print(b.room())""".stripMargin) shouldBe "5\n1\n"
+    }
+
     // The length reaches the *symbol*, so two lengths are two emitted bodies rather than one
     // compiled at whichever arrived first — the same thing `mangleOne` pins for a function.
     "renders an array of arrays, which is two lengths at once" in {
