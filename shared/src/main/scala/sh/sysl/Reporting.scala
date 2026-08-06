@@ -54,6 +54,42 @@ trait Reporting {
       finally currentPos = saved
     }
 
+  /** Where the **call** is, while a parameter's default is being filled in at one (`12 §2a`).
+   *
+   * A default is analyzed in the declaration's terms and evaluated at the call, and those are two
+   * different places — which nothing had to tell apart until a built-in could report where it was
+   * written (`ReservedNames`). Diagnostics still point at the default itself, because a default that
+   * does not typecheck is wrong where it was written; `__FILE__` and `__LINE__` read this instead,
+   * because a default "stands exactly where the argument would have been written" and that is the
+   * caller's line.
+   *
+   * Absent everywhere else, which is what makes a built-in in an ordinary body report its own line.
+   */
+  protected var callSite: Option[Pos] = None
+
+  /** Runs `body` with `p` as the call a default is being filled at.
+   *
+   * **The outermost call wins.** A default that itself calls something and leaves *that* argument
+   * out is a second filling, whose call site is inside the first default — a position in the
+   * declaration's file, which is precisely the answer this exists to avoid giving. So a filling
+   * already under way is left alone, and every built-in in the whole nest reports the one place a
+   * reader actually wrote a call.
+   */
+  protected def atCallSite[T](p: Option[Pos])(body: => T): T =
+    if p.isEmpty || callSite.nonEmpty then body
+    else {
+      val saved = callSite
+
+      callSite = p
+      try body
+      finally callSite = saved
+    }
+
+  /** Where a built-in that reports a source location should say it is: the call a default is being
+   * filled at, or failing that the node itself.
+   */
+  protected def reportedPos: Option[Pos] = callSite.orElse(currentPos)
+
   protected def err(msg: String): Nothing = throw AnalyzerError(msg, currentPos)
 
   /** Abandons the current region without reporting, because whatever led here already did. */

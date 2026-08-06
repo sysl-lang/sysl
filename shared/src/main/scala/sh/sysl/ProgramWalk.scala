@@ -125,6 +125,14 @@ trait ProgramWalk
     //
     // Hoisting runs at the top level, where there is no enclosing position to return to, so each
     // pass simply moves the cursor to the declaration it is registering.
+    // The reserved shape is refused before anything is registered, so a declaration that tried to
+    // take one is answered by *that* rather than by the consequences of a name the rest of the
+    // compiler then could not resolve (`ReservedNames`). One diagnostic per offending name rather
+    // than one per declaration: a struct with two reserved fields made two mistakes.
+    for (_, stmt) <- body; (name, what, pos) <- ReservedNames.declaredIn(stmt) do
+      currentPos = pos
+      recover(())(at(pos)(refuseReserved(name, what)))
+
     for (scope, stmt) <- body do
       currentPos = stmt.pos
       inScope(scope)(recover(())(hoistType(stmt)))
@@ -1067,6 +1075,10 @@ trait ProgramWalk
       declaredResult: Type,
   ): TFunc = {
     resetFunction()
+    // Set from the *declaration* rather than from `name`, which is the instantiation's mangled key:
+    // `__FUNCTION__` reports what a reader wrote, and one written function is one name however many
+    // times a generic was lowered.
+    currentFunctionName = Modules.bare(f.name)
     // A member's body sees `Self` alongside whatever type parameters it was instantiated with, so
     // the one substitution answers both questions and nothing downstream has to know the difference.
     tsubst = subst ++ memberSelf.getOrElse(name, Map.empty)
