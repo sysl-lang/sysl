@@ -289,6 +289,43 @@ trait ExprAnalysis
 
     case _ => t
 
+  /** What a reserved identifier stands for, folded into the use as the literal it names
+   * (`ReservedNames`).
+   *
+   * The location three of them report is `reportedPos`, which is the node's own place everywhere
+   * except while a parameter's default is being filled in — there it is the **call**, because a
+   * default stands exactly where the argument would have been written (`12 §2a`). That one
+   * substitution is the whole mechanism behind a checking function that names its caller's line
+   * without any caller having written one down, and it is why sysl needs no `#[track_caller]`: the
+   * call-site behaviour falls out of what a default already was.
+   *
+   * `__LINE__` and `__COLUMN__` go through `intLiteral`, so each takes the integer type its context
+   * asks for and is range-checked like any other literal — a parameter declared `i32` gets an `i32`,
+   * and one declared `u8` is told where a line number will not fit rather than wrapping.
+   */
+  private def builtin(name: String, expected: Option[Type]): TExpr = {
+    def where: Pos = reportedPos.getOrElse(
+      err(s"'$name' reports where it is written, and this is a node with no place in any file"))
+
+    name match
+      case "__FILE__" => TStrLit(where.source.name)
+      case "__LINE__" => intLiteral(BigInt(where.line), None, expected)
+      // The column of the **file**, which is not the one the lexer counted when the text it lexed had
+      // its left margin taken off: a literate program's code sits four columns in (`Source`).
+      // `Pos.location` adds the offset back for the same reason, and the two have to agree — a
+      // diagnostic and a program that disagreed about one place would be worse than either alone.
+      case "__COLUMN__" => intLiteral(BigInt(where.col + where.source.columnOffset), None, expected)
+      // **Empty outside any body, rather than an error.** A module's storage is filled before any
+      // function runs, so there is genuinely no function to name there — and refusing it would also
+      // refuse a *default* of `__FUNCTION__`, which is checked once at its declaration where there
+      // is no caller yet and is the one place this is most worth writing. An empty string is the
+      // honest answer to "which function is this"; a stale one would not be, and was the bug.
+      case "__FUNCTION__" => TStrLit(currentFunctionName)
+      case "__DATE__" => TStrLit(ReservedNames.date(ReservedNames.stamp))
+      case "__TIME__" => TStrLit(ReservedNames.time(ReservedNames.stamp))
+      case _          => err(ReservedNames.unknown(name))
+  }
+
   private def analyzeValue(expr: Expr, expected: Option[Type], discarded: Boolean = false): TExpr =
     at(expr.pos)(analyzeValueAt(expr, expected, discarded)).setPos(expr.pos)
 
@@ -321,6 +358,12 @@ trait ExprAnalysis
     // minimum is writable even though its magnitude overflows the positive range.
     case Unary("-", IntLit(v, suffix))   => intLiteral(-v, suffix, expected)
     case Unary("-", FloatLit(t, suffix)) => floatLiteral("-" + t, suffix, expected)
+
+    // A reserved identifier is the compiler's to answer and no scope is consulted: the shape may not
+    // be declared at all (`ReservedNames`), so there is nothing a lookup could find and nothing that
+    // could shadow one. That is the difference between these and `result` below, which is a
+    // *contextual* keyword precisely because an ordinary binding of that name is allowed to win.
+    case Ident(name) if ReservedNames.shaped(name) => builtin(name, expected)
 
     // `result` is a contextual keyword: it names the returned value inside an `ensure`, but a
     // real binding of that name (a parameter or local) still shadows it, so the lookup comes first.
@@ -517,8 +560,8 @@ trait ExprAnalysis
     // A parameter's default, spliced in where the argument was not written (`12 §2a`). It is
     // analyzed in the declaration's own terms and with nothing local in scope, which is what makes
     // it mean the same thing from every module that calls the function.
-    case DefaultArg(owner, e) =>
-      at(e.pos)(filling(e.pos)(inDefault(owner)(analyzeExpr(e, expected))))
+    case d @ DefaultArg(owner, e) =>
+      atCallSite(d.pos)(at(e.pos)(filling(e.pos)(inDefault(owner)(analyzeExpr(e, expected)))))
 
     // Argument binding replaces every one of these before a call's arguments are looked at, so one
     // arriving here was written where nothing is being called by name — in an array literal, on the

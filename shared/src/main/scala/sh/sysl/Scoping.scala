@@ -650,7 +650,38 @@ trait Scoping extends DeclTables {
       n
     }
 
+  /** The reserved names this compilation has already refused, so one mistake gets one diagnostic.
+   *
+   * A top-level `var` is both a declaration the hoisting pass registers and a binding the entry
+   * point's statements later make, so without this it is answered twice — and the second answer is
+   * the worse one, since a binding carries no position of its own and reports against wherever the
+   * analyzer happened to be. The `Analyzer` is built once per compilation, so this needs no reset.
+   */
+  private val reservedRefused = mutable.Set.empty[String]
+
+  /** Refuses a name for having the reserved shape, and remembers that it did (`ReservedNames`). */
+  protected def refuseReserved(name: String, what: String): Nothing = {
+    reservedRefused += name
+    err(ReservedNames.refuseDeclaration(name, what))
+  }
+
+  /** Binds a name in the innermost scope.
+   *
+   * **Every local binding the language has comes through here** — a `var`, a `val`, a parameter, a
+   * `for`'s element, a pattern's captures, a closure's parameters — which is what makes it the one
+   * place the reserved shape has to be refused for all of them (`ReservedNames`). Doing it here
+   * rather than at each binding form is also what covers the ones that are not written as
+   * declarations at all: a lambda parameter buried in an argument list binds a name without any
+   * statement saying so.
+   *
+   * A name the hoisting pass has already refused is abandoned rather than reported again: it said
+   * so where the declaration is, with the position and the noun that declaration had, and this
+   * would only repeat it from somewhere less useful.
+   */
   protected def declare(name: String, ty: Type): String = {
+    if ReservedNames.shaped(name) then
+      if reservedRefused(name) then poisoned() else refuseReserved(name, "binding")
+
     val unique = freshName(name)
     scopes.head(name) = (unique, ty)
     unique

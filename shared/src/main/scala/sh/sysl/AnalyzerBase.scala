@@ -142,7 +142,26 @@ trait AnalyzerBase extends Scoping {
   /** Numbers the variant slots so two loops in one function cannot share storage. */
   protected var variantSeq: Int = 0
 
+  /** The name of the function whose body is being analyzed, as it was written — what `__FUNCTION__`
+   * reports (`ReservedNames`).
+   *
+   * The **bare** name rather than the module-qualified key, because it is read by a program printing
+   * a diagnostic about itself and a reader following one back to a file wants the name in that file.
+   * It is also the name a generic's instantiations share: what a reader wrote is one function
+   * however many times it was lowered, and reporting a mangled key would leak the lowering into the
+   * program's own output.
+   *
+   * Empty outside any body — a module `val`'s initializer, an `extern`'s default — where there is no
+   * function to name and `__FUNCTION__` says so rather than borrowing whichever was analyzed last.
+   */
+  protected var currentFunctionName: String = ""
+
   protected def resetFunction(): Unit = {
+    // Cleared here rather than left to whoever sets it, because "outside any body" has to be a state
+    // the analyzer can actually be in. Left uncleared it held the last name analyzed, so a module
+    // `val`'s `__FUNCTION__` silently reported some unrelated function that a *previous pass* had
+    // walked — the definition-time pass of `14 §4`, which runs before any storage is laid down.
+    currentFunctionName = ""
     resetLocals()
     loops = Nil
     pendingVariant = None

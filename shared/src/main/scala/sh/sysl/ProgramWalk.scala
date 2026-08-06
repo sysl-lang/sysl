@@ -125,6 +125,14 @@ trait ProgramWalk
     //
     // Hoisting runs at the top level, where there is no enclosing position to return to, so each
     // pass simply moves the cursor to the declaration it is registering.
+    // The reserved shape is refused before anything is registered, so a declaration that tried to
+    // take one is answered by *that* rather than by the consequences of a name the rest of the
+    // compiler then could not resolve (`ReservedNames`). One diagnostic per offending name rather
+    // than one per declaration: a struct with two reserved fields made two mistakes.
+    for (_, stmt) <- body; (name, what, pos) <- ReservedNames.declaredIn(stmt) do
+      currentPos = pos
+      recover(())(at(pos)(refuseReserved(name, what)))
+
     for (scope, stmt) <- body do
       currentPos = stmt.pos
       inScope(scope)(recover(())(hoistType(stmt)))
@@ -962,8 +970,15 @@ trait ProgramWalk
     val savedOuter    = outerNested
     val savedDeclares = blockDeclares
 
+    // A closure has no name a reader wrote, so `__FUNCTION__` in one names the function it is
+    // written in — which means carrying the enclosing name across the reset rather than letting the
+    // body see the empty state that reset establishes. Restored below with everything else, since
+    // this walk interrupts a function that is still going.
+    val savedFuncName = currentFunctionName
+
     try
       resetFunction()
+      currentFunctionName = savedFuncName
       retTy = declaredResult.getOrElse(Type.Unknown)
       retIsList = false
       // A nested function states its own signature, so a `...` on one is its own tail to walk; a
@@ -1035,6 +1050,7 @@ trait ProgramWalk
 
       (TFunc(name, tparams, result, tbody, variadic, requires, ensures, olds), result)
     finally
+      currentFunctionName = savedFuncName
       scopes = savedScopes
       used.clear(); used ++= savedUsed
       readOnlyLocals.clear(); readOnlyLocals ++= savedReadOnly
@@ -1067,6 +1083,10 @@ trait ProgramWalk
       declaredResult: Type,
   ): TFunc = {
     resetFunction()
+    // Set from the *declaration* rather than from `name`, which is the instantiation's mangled key:
+    // `__FUNCTION__` reports what a reader wrote, and one written function is one name however many
+    // times a generic was lowered.
+    currentFunctionName = Modules.bare(f.name)
     // A member's body sees `Self` alongside whatever type parameters it was instantiated with, so
     // the one substitution answers both questions and nothing downstream has to know the difference.
     tsubst = subst ++ memberSelf.getOrElse(name, Map.empty)

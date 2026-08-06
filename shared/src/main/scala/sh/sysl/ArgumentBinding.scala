@@ -100,16 +100,27 @@ trait ArgumentBinding extends TraitLookup {
     filled.flatten ::: tail
   }
 
-  /** A default wrapped in the scope it is to be read in.
+  /** A default wrapped in the scope it is to be read in, and positioned at the call it is being
+   * filled at.
    *
    * One that already carries a scope keeps it and is not wrapped again: it is a **trait's** default,
    * copied onto an implementing type's method, and the trait is where it was written however far
    * from it the implementation sits. Wrapping twice would also make the same written default appear
    * to be filled inside itself, which is precisely what the cycle guard exists to refuse.
+   *
+   * **The wrapper's own position is the call's, and the expression inside it keeps the
+   * declaration's.** Those are the two places a default belongs to (`12 §2a`) and both are wanted:
+   * the inner one is where a complaint about the default goes, since that is where it was written,
+   * and the outer one is what `__FILE__` and `__LINE__` report, since a default stands where the
+   * argument would have. Nothing needed to tell them apart until a built-in could ask.
+   *
+   * A trait's copy is re-wrapped by `copy()` rather than assigned to, because `setPos` keeps the
+   * first position a node is given and that node is shared by every call to the method — the copy is
+   * what lets two call sites in different files each report their own.
    */
   private def scoped(owner: Option[String], d: Expr): Expr = d match
-    case already: DefaultArg => already
-    case _                   => DefaultArg(owner, d).setPos(d.pos)
+    case already: DefaultArg => already.copy().setPos(currentPos.orElse(already.pos))
+    case _                   => DefaultArg(owner, d).setPos(currentPos.orElse(d.pos))
 
   /** How many arguments a declaration takes, said in a phrase that accounts for its defaults — the
    * value-level twin of `arityPhrase`, and worded the same way for the same reason.

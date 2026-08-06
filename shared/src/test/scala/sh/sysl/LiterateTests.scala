@@ -25,6 +25,19 @@ class LiterateTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |""".stripMargin) shouldBe "Hello, sysl!\n"
     }
 
+    // `__LINE__` and `__COLUMN__` report the position in the **file the reader has open**, not in the
+    // text the lexer saw after the four-column margin was taken off (`Source.columnOffset`).
+    // `Pos.location` adds the same offset back, and a diagnostic and a program that disagreed about
+    // one place would be worse than either alone — so the agreement is pinned rather than assumed.
+    "a built-in reports the column of the file, margin included" in {
+      runOf("where.lsysl" ->
+        """Locating
+          |--------
+          |
+          |    print(__LINE__, __COLUMN__)
+          |""".stripMargin) shouldBe "4 21\n"
+    }
+
     "a paragraph inside a function body leaves one function" in {
       // The case the format exists for. Were each indented run its own unit, a body could not be
       // explained a step at a time — which is the only reason to want prose in a source file at all.
