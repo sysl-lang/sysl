@@ -211,8 +211,6 @@ object CoreTraits {
     // A **pointer or reference** is left out because its `==` is address equality, so a hash of one
     // would be a hash of where the allocator happened to put something — and an address is not a
     // number this language lets a program compute with, which is where the matter rests.
-    case "Hash" => t.isInstanceOf[Type.Integer] || t == Type.Char || t == Type.Bool || t == Type.Str
-
     // **Every integer type, and nothing else — the family named by what it ranges over.**
     //
     // This is the membership a *blanket* `impl` is written over, which is the whole reason it

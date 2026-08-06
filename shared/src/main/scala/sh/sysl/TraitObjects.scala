@@ -49,12 +49,12 @@ trait TraitObjects extends TypeResolution {
 
       // A value where a counted object was expected is boxed first, exactly as a plain `&T` context
       // boxes one — the allocation is the construction, and the erasure rides on top of it.
-      case (Type.Ref(_, sync), inner) if implements(tr.bound, inner) =>
+      case (Type.Ref(_, sync), inner) if conforms(tr.bound, inner) =>
         erase(TBox(t, Type.Ref(inner, sync)).setPos(t.pos), tr, inner, want, boxed = true)
 
       // A concrete value where a *raw* object was expected has no address of its own to hand over,
       // and taking one silently would be putting a pointer to a temporary in a program.
-      case (Type.Ptr(_), inner) if implements(tr.bound, inner) =>
+      case (Type.Ptr(_), inner) if conforms(tr.bound, inner) =>
         at(t.pos)(err(s"a ${show(want)} points at a value, so it needs an address — write '&' " +
           s"in front of the ${show(inner)} to take one"))
 
@@ -70,9 +70,18 @@ trait TraitObjects extends TypeResolution {
       // thing about this value that is true, and send the reader looking for the conformance they
       // already have. What a built-in cannot do is fill a table slot, since what the compiler
       // provides is an instruction or a rendering rather than a member anything can point at.
+      //
+      // **What still arrives here is the operator catalog at written arguments.** `Display` and
+      // `Hash` both left, each by gaining written `impl`s over a closed `Integer` bound, and the
+      // rest of the catalog is out of reach for a different reason — `Eq`, `Ord`, `Bits` and
+      // `Signed` all name `Self` away from the receiver, so object safety refuses the *type* before
+      // a value gets this far. An operator trait at written arguments does not: `Add[int, int]`
+      // declares `add(self, rhs: int) -> int`, which is a formable object, so `3` as an
+      // `&Add[int, int]` reaches this line and this is what it is told.
+      //
       // `tr.name` is a key and `CoreTraits` speaks spellings, so the question goes through
-      // `Library.spelling` — asking the catalog `sysl$Display` finds nothing, and the value would
-      // fall through to the plain mismatch this case exists to replace.
+      // `Library.spelling` — asking the catalog `sysl$Add` finds nothing, and the value would fall
+      // through to the plain mismatch this case exists to replace.
       case (_, inner) if Library.spelling(tr.name).exists(CoreTraits.builtin(_, inner)) =>
         at(t.pos)(err(s"${show(inner)} is a '${tr.bound.show}' by the compiler's rule rather than " +
           s"through an 'impl', and a ${show(want)} holds a table of functions — what the compiler " +
@@ -82,19 +91,6 @@ trait TraitObjects extends TypeResolution {
       case _ => t
   }
 
-  /** Whether a type may be erased to a trait: an `impl` written for it, and not a membership the
-   * compiler provides.
-   *
-   * The difference matters because a table holds function pointers, and a compiler-provided
-   * membership has no functions — a scalar's `add` is an instruction.
-   *
-   * It is a rule of its own, and not, as an earlier reading had it, a consequence of object safety
-   * refusing the operator catalog. `Display` is the counter-example and the reason the distinction
-   * has to be drawn here: it is compiler-provided and object-safe both, so nothing upstream stops an
-   * `int` reaching this point. What stops it is this predicate, and the caller says so by name.
-   */
-  private def implements(tr: Type.Bound, t: Type): Boolean = conforms(tr, t)
-
   private def erase(t: TExpr, tr: Type.Trait, inner: Type, want: Type, boxed: Boolean): TExpr = {
     // A `&sync Trait` has forgotten what it points at, so what `06` asks of the pointee cannot be
     // asked where the type is written. It is asked here, which is the one place the type is known.
@@ -102,7 +98,7 @@ trait TraitObjects extends TypeResolution {
       case Type.Ref(_, true) => at(t.pos)(Sharing.complaint(inner).foreach(err))
       case _                 => ()
 
-    if !implements(tr.bound, inner) then
+    if !conforms(tr.bound, inner) then
       // A type an implementation covers is told what that implementation asked of it, since the
       // reason it does not conform is a condition rather than an absence.
       val why = unmetBound(tr.bound, inner).fold("")(reason => s" — $reason")

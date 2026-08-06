@@ -512,6 +512,34 @@ class MathTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       run("print(min(nan(), 1.0).is_nan(), min(1.0, nan()), max(nan(), 1.0).is_nan(), max(1.0, nan()))")
         .shouldBe("true 1 true 1\n")
     }
+
+    // The comparison a test of a computation actually wants: binary floating point does not hold
+    // `0.1 + 0.2 == 0.3`, and asserting it does is how a correct program fails its own suite.
+    "approx_eq holds two values to an absolute tolerance" in {
+      run("print(approx_eq(0.1 + 0.2, 0.3, 1e-12), approx_eq(1.0, 1.5, 0.1), approx_eq(1.0, 1.5, 0.6))")
+        .shouldBe("true false true\n")
+    }
+
+    // Both of these come from the equality test in front of the subtraction, and both would be
+    // wrong without it: `inf - inf` is a NaN, so the difference alone calls a value unequal to
+    // itself, and an exact match would depend on the tolerance rather than on being exact.
+    "identical infinities are close, and a NaN is close to nothing" in {
+      run("print(approx_eq(infinity(), infinity(), 0.0), approx_eq(nan(), nan(), 1.0), " +
+        "approx_eq(nan(), 1.0, 1e9))").shouldBe("true false false\n")
+    }
+
+    // The test to use when the magnitude is not known in advance: a thousand is nothing beside a
+    // quintillion and everything beside a one, and only the relative form says so.
+    "approx_eq_rel scales the tolerance to the larger operand" in {
+      run("print(approx_eq_rel(1e18, 1e18 + 1000.0, 1e-6), approx_eq_rel(1.0, 1.5, 1e-6))")
+        .shouldBe("true false\n")
+    }
+
+    // Scaled by the larger of the two, so the answer cannot depend on which was written first.
+    "and does not depend on the order of its arguments" in {
+      run("print(approx_eq_rel(100.0, 100.001, 1e-4), approx_eq_rel(100.001, 100.0, 1e-4))")
+        .shouldBe("true true\n")
+    }
   }
 
   // What the module does where the mathematics runs out. None of these is an error: IEEE 754 says

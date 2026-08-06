@@ -131,6 +131,35 @@ class HashTraitTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
   }
 
+  // **What the written blocks buy, and the reason they replaced the rule.** A method table points at
+  // functions, and a membership the compiler hands out has none — so before these blocks a built-in
+  // could satisfy a `Hash` bound and still not be erasable to a `&Hash`. This is the capability
+  // `Display` gained when it made the same move (`14 §5`).
+  "a built-in erases to a trait object, its membership being a real function now" - {
+    "and a heterogeneous collection of them each hashes through its own impl" in {
+      val src =
+        "val xs: [3]&Hash = [7, \"abc\", true]\n" +
+          "for h in xs do print(str(h.hash() == h.hash()))"
+
+      run(src) shouldBe "true\ntrue\ntrue\n"
+    }
+
+    "while still separating the values it holds" in {
+      val src = "val xs: [2]&Hash = [7, 8]\nprint(str(xs[0].hash() == xs[1].hash()))"
+
+      run(src) shouldBe "false\n"
+    }
+  }
+
+  // The refusal this trait used to produce, which now belongs to the operator catalog alone. It is
+  // pinned here because `Hash` leaving is what made the case rare: `Display` and `Hash` were the two
+  // object-safe compiler-provided memberships, and with both of them written as `impl`s the only
+  // types still reaching it are the operators at written arguments.
+  "the refusal it left behind still fires for the operator catalog" in {
+    err("val a: &Add[int, int] = 3\nprint(1)") should
+      include("by the compiler's rule rather than through an 'impl'")
+  }
+
   "what is deliberately not a member" - {
     // Rust's reason, and it is sysl's: `NaN != NaN` breaks the reflexivity a lookup assumes, and
     // `-0.0 == 0.0` holds across two different bit patterns.
@@ -187,8 +216,11 @@ class HashTraitTests extends AnyFreeSpec with CodegenSupport with RunSupport {
   }
 
   "what it refuses" - {
+    // The ordinary member-call diagnostic, naming the receiver and counting both sides — which is
+    // what a built-in gets now that its membership is a written `impl` rather than a rule. The
+    // bespoke wording this used to assert belonged to the special case that no longer exists.
     "arguments, there being none to take" in {
-      err("print(str(7.hash(1)))") should include("takes no arguments")
+      err("print(str(7.hash(1)))") should include("'int.hash' takes 0 arguments")
     }
 
     "and a second impl for a type that already has one" in {

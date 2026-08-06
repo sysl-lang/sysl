@@ -35,3 +35,33 @@ max[T: Ord](a: T, b: T) -> T = if a < b then b else a
 // bound is nearly always a constant or a length at the call site, and a contract (`16`) is the
 // tool for saying so where it is not.
 clamp[T: Ord](x: T, low: T, high: T) -> T = if x < low then low else if high < x then high else x
+
+// Whether two floats are within `tol` of each other -- an **absolute** tolerance, which is what a
+// delta comparison is.
+//
+// **The equality test in front is not an optimisation.** It is what makes two identical infinities
+// answer `true`: `inf - inf` is a NaN, and every comparison against a NaN is false, so the
+// subtraction alone would call a value unequal to itself. It also makes the exact case exact, which
+// a caller checking a computation against a written-down constant is entitled to.
+//
+// **A NaN is close to nothing, including another NaN**, whatever the tolerance. That falls out of
+// the comparisons rather than being decided here, and it agrees with `==`, which is the property
+// worth having: nothing in this module makes a NaN behave like a number.
+//
+// This is the wrong test for values whose magnitudes differ wildly -- `1e18` and `1e18 + 1` are a
+// long way apart in absolute terms and identical to within one part in a million. `approx_eq_rel`
+// is that test.
+approx_eq[F: Float](a: F, b: F, tol: F) -> bool = a == b || (a - b).abs() <= tol
+
+// Whether two floats agree to within `tol` **relative to the larger of them**, which is the test to
+// use when the values could be of any size: `tol` reads as a fraction, so `0.001` means "within a
+// tenth of a percent" at every magnitude.
+//
+// Scaled by the larger magnitude rather than by `a`, so that the answer does not depend on which
+// argument was written first. Near zero it becomes strict -- the scale goes to zero with the
+// operands, so only exact equality passes -- and that is the case `approx_eq` and an absolute
+// tolerance are for. A caller who needs both writes both, which is what Python's `isclose` bundles
+// into one call with two tolerances; here they are two functions because a caller who needed the
+// combined form always knew they did.
+approx_eq_rel[F: Float](a: F, b: F, tol: F) -> bool =
+    a == b || (a - b).abs() <= tol * max(a.abs(), b.abs())
