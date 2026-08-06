@@ -491,4 +491,11 @@ trait DeclTables extends Reporting {
    */
   protected def nominalBounds(base: String): Map[String, List[BoundRef]] =
     structDecls.get(base).map(_.bounds).orElse(enumDecls.get(base).map(_.bounds)).getOrElse(Map.empty)
+
+  /** Which of a nominal type's parameters stand for **values** (`10 §9`), and at what type — the
+   * `N` of `struct Buf[const N: usize]`. Empty for every type that declares none, which is most of
+   * them, and answered without the caller knowing which kind of declaration it is asking about.
+   */
+  protected def nominalValues(base: String): Map[String, TypeRef] =
+    structDecls.get(base).map(_.tvalues).orElse(enumDecls.get(base).map(_.tvalues)).getOrElse(Map.empty)
 }

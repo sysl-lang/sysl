@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 24
+  val Version: Int = 25
 
   private val Magic = "sysl-ast"
 
@@ -235,6 +235,7 @@ object AstCodec {
         case TupleType(ps, res)   => tok("tt"); list(ps)(typ); bool(res)
         case FnType(ps, ret, bar) => tok("tf"); list(ps)(typ); typ(ret); bool(bar)
         case CFnType(ps, ret)     => tok("tc"); list(ps)(typ); typ(ret)
+        case ValueArgType(v)      => tok("tva"); expr(v)
     }
 
     // ------------------------------------------------------------ patterns
@@ -338,13 +339,13 @@ object AstCodec {
         case ExternVarDecl(n, t, lk, vs) =>
           tok("extv"); sref(n); typ(t); opt(lk)(sref); vis(vs)
 
-        case StructDecl(n, tps, fs, ms, bs, invs, vs, tds, op) =>
+        case StructDecl(n, tps, fs, ms, bs, invs, vs, tds, op, tvs) =>
           tok("sd"); sref(n); list(tps)(sref); list(fs)(param); list(ms)(method)
-          bounds(bs); list(invs)(expr); vis(vs); tdefaults(tds); bool(op)
+          bounds(bs); list(invs)(expr); vis(vs); tdefaults(tds); bool(op); tdefaults(tvs)
 
-        case EnumDecl(n, tps, und, vars, ms, bs, vs, tds) =>
+        case EnumDecl(n, tps, und, vars, ms, bs, vs, tds, tvs) =>
           tok("ed"); sref(n); list(tps)(sref); opt(und)(typ); list(vars)(variant); list(ms)(method)
-          bounds(bs); vis(vs); tdefaults(tds)
+          bounds(bs); vis(vs); tdefaults(tds); tdefaults(tvs)
 
         case TypeDecl(n, base, der, rng, pred, vs) =>
           tok("td"); sref(n); typ(base); bool(der); opt(rng)(rangeBound); opt(pred)(expr); vis(vs)
@@ -622,6 +623,7 @@ object AstCodec {
         case "tt"  => TupleType(list(typ()), bool())
         case "tf"  => FnType(list(typ()), typ(), bool())
         case "tc"  => CFnType(list(typ()), typ())
+        case "tva" => ValueArgType(expr())
         case other => fail(s"'$other' is not a type tag")
     }
 
@@ -715,10 +717,10 @@ object AstCodec {
           ExternVarDecl(sref(), typ(), opt(sref()), vis())
         case "sd" =>
           StructDecl(sref(), list(sref()), list(param()), list(method()),
-            bounds(), list(expr()), vis(), tdefaults(), bool())
+            bounds(), list(expr()), vis(), tdefaults(), bool(), tdefaults())
         case "ed" =>
           EnumDecl(sref(), list(sref()), opt(typ()), list(variant()), list(method()),
-            bounds(), vis(), tdefaults())
+            bounds(), vis(), tdefaults(), tdefaults())
         case "td" =>
           TypeDecl(sref(), typ(), bool(), opt(rangeBound()), opt(expr()), vis())
         case "trt" =>

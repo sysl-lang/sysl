@@ -155,7 +155,7 @@ trait DeclParser extends ExprParser {
               val members    = items.collect { case StructPart.Mem(m)  => m }
               val invariants = items.collect { case StructPart.Inv(e)  => e }
               StructDecl(name, tp.names, fields, members, tp.bounds, invariants,
-                         tdefaults = tp.defaults, opaque = opaque)
+                         tdefaults = tp.defaults, opaque = opaque, tvalues = tp.values)
             }
 
         // A struct with **no fields**, whose emptiness is *written* rather than inferred from an
@@ -166,7 +166,7 @@ trait DeclParser extends ExprParser {
         // has always been, and still says so below.
         case None ~ Some(_) =>
           endName(name) ^^^ StructDecl(name, tp.names, Nil, Nil, tp.bounds, Nil,
-                                       tdefaults = tp.defaults, opaque = opaque)
+                                       tdefaults = tp.defaults, opaque = opaque, tvalues = tp.values)
 
         // A struct with **no body at all**, which only an `opaque` one may be: it is C's incomplete
         // type, `struct sqlite3;`, and it is what a handle from a C library should be declared as.
@@ -174,7 +174,7 @@ trait DeclParser extends ExprParser {
         // declaration exists to give `*sqlite3` a type of its own that a `*u8` cannot be mistaken for.
         case _ if opaque =>
           success(StructDecl(name, tp.names, Nil, Nil, tp.bounds, Nil,
-                             tdefaults = tp.defaults, opaque = true))
+                             tdefaults = tp.defaults, opaque = true, tvalues = tp.values))
 
         case _ =>
           err(s"'struct $name' declares no fields — a struct's body is indented under it, a type " +
@@ -302,7 +302,8 @@ trait DeclParser extends ExprParser {
         items =>
           val variants = items.collect { case Left(v)  => v }
           val members  = items.collect { case Right(m) => m }
-          EnumDecl(name, tp.names, under, variants, members, tp.bounds, tdefaults = tp.defaults)
+          EnumDecl(name, tp.names, under, variants, members, tp.bounds, tdefaults = tp.defaults,
+                   tvalues = tp.values)
       }
     }
 

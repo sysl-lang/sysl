@@ -885,8 +885,12 @@ trait ProgramWalk
    * from one walk would answer the next walk's question with the first one's bounds.
    */
   private def checkAbstractLayouts(): Unit = {
-    def abstracts(tparams: List[String], bounds: Map[String, List[BoundRef]]): List[Type] = {
-      val subst = abstractSubst(tparams, bounds)
+    def abstracts(
+        tparams: List[String],
+        bounds: Map[String, List[BoundRef]],
+        values: Map[String, TypeRef],
+    ): List[Type] = {
+      val subst = abstractSubst(tparams, bounds, values)
 
       tparams.map(subst)
     }
@@ -898,11 +902,11 @@ trait ProgramWalk
     // not bounded by the trait it is bounded by.
     for (n, d) <- structDecls if d.tparams.nonEmpty do
       currentPos = d.pos
-      inDecl(n)(recover(())(sandboxed(instantiateStruct(n, abstracts(d.tparams, d.bounds)))))
+      inDecl(n)(recover(())(sandboxed(instantiateStruct(n, abstracts(d.tparams, d.bounds, d.tvalues)))))
 
     for (n, d) <- enumDecls if d.tparams.nonEmpty do
       currentPos = d.pos
-      inDecl(n)(recover(())(sandboxed(instantiateEnum(n, abstracts(d.tparams, d.bounds)))))
+      inDecl(n)(recover(())(sandboxed(instantiateEnum(n, abstracts(d.tparams, d.bounds, d.tvalues)))))
   }
 
   /** One generic body, analyzed with each of its type parameters substituted by itself. */

@@ -367,6 +367,10 @@ trait GenericInstantiation extends ConstFolding {
 
           unify(elem, e, tparams, sub)
         case _ => ()
+    // A value argument written out fixes nothing. `Buf[4]` handed a `Buf[4]` has nothing to solve,
+    // and handed anything else is a mismatch the instantiated signature reports in both types'
+    // terms — which is where every other structural disagreement is reported.
+    case _: ValueArgType     => ()
     case VolatileType(inner) => unify(inner, Type.unqualified(actual), tparams, sub)
     case TupleType(parts, _) =>
       actual match

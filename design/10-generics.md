@@ -397,7 +397,7 @@ never by a covariant container.
 
 ## 9. Value generics
 
-**Designed, not yet built.** A parameter may stand for a **value** rather than a type, which is what
+A parameter may stand for a **value** rather than a type, which is what
 lets one declaration cover every array length:
 
 ```
@@ -502,11 +502,22 @@ and `N = 4` are two functions, exactly as `id` at `int` and `real` are two. Noth
 model changes, and the length is a constant inside each copy — which is what already makes every
 index checkable against one.
 
-**It retires the array-shape workaround.** An `impl` matching an array today is filed under a key
-that includes the length — `[3]`, `[4]` — because there is no way to be generic over one, so a block
-covers every element type at *one* length and each other length needs its own. That is why the
-library implements `Display` for every slice and for no array, and why printing a fixed array is
-answered by the whole-array view instead (`14 §6`). One block over `[N]T` is what replaces it.
+**It retired the array-shape workaround, which is what it was for.** An `impl` matching an array
+used to be filed under a key that included the length — `[3]`, `[4]` — because there was no way to
+be generic over one, so a block covered every element type at *one* length and each other length
+needed its own. That is why the library implemented `Display` for every slice and for no array, and
+why printing a fixed array was answered by the whole-array view instead.
+
+An array now keeps that per-length key **and** gains a second one under which the length is an
+argument beside the element type. Both are consulted, most specific first, so a block written for
+`[2]T` still beats one written for `[N]T` — which is `02 § override`'s "written-out beats a
+parameter" one level up from where it used to apply. The library's one block is
+`impl[const N: usize, T: Display] Display for [N]T`, and it delegates to the block for slices rather
+than repeating it.
+
+Which key a block is filed under is decided by the subject **as written**, not by the type it
+resolves to. A value parameter stands at zero for the walk that checks a generic body, so `[N]T` and
+`[0]T` resolve to the same array; only the syntax says which was meant.
 
 **It does not retire the tuple arity rule.** A tuple's shape is how many parts it has *and what each
 one is*, which is not one value of one type, so `Eq`/`Ord`/`Hash`/`Display` at arity 2 and 3 stay

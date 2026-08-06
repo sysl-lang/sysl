@@ -109,6 +109,8 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     case RefType(inner, sync)               => RefType(spellSelf(inner, selfRef), sync)
     case WeakType(inner)                    => WeakType(spellSelf(inner, selfRef))
     case ArrayType(len, elem, ro)           => ArrayType(len, spellSelf(elem, selfRef), ro)
+    // A value argument names no type, so there is no `Self` in it to spell.
+    case v: ValueArgType                    => v
     case VolatileType(inner)                => VolatileType(spellSelf(inner, selfRef))
     case TupleType(parts, r)                => TupleType(parts.map(spellSelf(_, selfRef)), r)
     case f: FnType =>
@@ -130,6 +132,9 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     case WeakType(inner)    => mentions(inner, tps)
     case ArrayType(len, elem, _) =>
       len.exists(lengthMentions(_, tps)) || mentions(elem, tps)
+    // A value argument is not a type and is still not *fixed* until whatever it names is:
+    // `Buf[N]` inside a block declaring `N` is as unresolved as `Box[T]` is.
+    case ValueArgType(e)     => lengthMentions(e, tps)
     case VolatileType(inner) => mentions(inner, tps)
     case TupleType(parts, _) => parts.exists(mentions(_, tps))
     case f: FnType          => mentions(f.asTrait, tps)
@@ -183,6 +188,9 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     def walk(t: TypeRef): Unit = t match
       case ArrayType(len, elem, _) => len.foreach(lengthArithmetic(_, names)); walk(elem)
       case NamedType(_, args)      => args.foreach(walk)
+      // A written value argument is held to the same rule a length is, and for the same reason:
+      // `Buf[N + 1]` puts a computation where an identity belongs.
+      case ValueArgType(e)         => lengthArithmetic(e, names)
       case PtrType(inner)          => walk(inner)
       case RefType(inner, _)       => walk(inner)
       case WeakType(inner)         => walk(inner)
@@ -190,7 +198,6 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
       case TupleType(parts, _)     => parts.foreach(walk)
       case f: FnType               => f.params.foreach(walk); walk(f.ret)
       case CFnType(params, ret)    => params.foreach(walk); walk(ret)
-      case _                       => ()
 
     if names.nonEmpty then types.foreach(walk)
   }
@@ -547,10 +554,17 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
       err(s"'${parts.map(_.show).mkString(", ")}' is a result list, which a signature has and a " +
         s"value does not — write '(${parts.map(_.show).mkString(", ")})' for the type")
 
+    // A written value argument that reached here is one in a position where no parameter is a value
+    // parameter — `int[4]`, or an argument of a type whose declaration takes types. The declaration
+    // is what decides, and `resolveArgs` has already read it, so what is left is to say so.
+    case ValueArgType(_) =>
+      err("a value stands here, and this argument is a type — a value argument belongs where the " +
+        "declaration wrote 'const', and nowhere else")
+
     case NamedType(n, argRefs) =>
       if argRefs.isEmpty && subst.contains(n) then subst(n)
       else
-        val targs = argRefs.map(resolveType(_, subst))
+        val targs = resolveArgs(n, argRefs, subst)
         scalarType(n) match
           case Some(s) => plain(n, targs, s)
           // A declared type is named in this module's terms — its own, or a module's it names in
@@ -576,6 +590,59 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
                 err(s"'$n' is a trait, so it describes behaviour rather than a layout — write '*$n' or " +
                   s"'&$n' for a trait object, or bound a type parameter with '[T: $n]'")
               case None => err(s"unknown type '$n'")
+
+  /** A written argument list, resolved **against the declaration whose parameters they fill** —
+   * because which argument is a type and which is a value is the declaration's fact and nothing the
+   * grammar can see.
+   *
+   * `Buf[4]` and `Buf[int]` are the same shape to a parser, and so are `Buf[N]` and `Box[T]`: a bare
+   * name is a type as far as the syntax goes. So a name standing in a value position is read here as
+   * the expression it is, which is what lets one value parameter be passed straight to another —
+   * `Buf[N]` inside a block declaring `const N`. Rust resolves a bare path in a const-argument
+   * position the same way, for the same reason.
+   *
+   * An argument that could not be a type at all arrives as a `ValueArgType` and is folded. One in a
+   * position the declaration made a *type* parameter is refused by `resolveShape`, which is where
+   * every other "this is not a type" is said.
+   */
+  private def resolveArgs(n: String, argRefs: List[TypeRef], subst: Map[String, Type]): List[Type] = {
+    val values = typeKey(n).fold(Map.empty[String, TypeRef])(nominalValues)
+
+    if values.isEmpty then argRefs.map(resolveType(_, subst))
+    else
+      val tparams = typeKey(n).fold(List.empty[String])(nominalTparams)
+
+      argRefs.zipWithIndex.map { (ref, i) =>
+        tparams.lift(i).filter(values.contains) match
+          case Some(tp) => valueArg(ref, recover(Type.Unknown)(resolveType(values(tp), Map.empty)), subst)
+          case None     => resolveType(ref, subst)
+      }
+  }
+
+  /** One **value** argument: the expression it was written as, folded to the constant that goes in
+   * the type's identity.
+   *
+   * A value parameter of the *enclosing* declaration stands at zero here for the walk that checks a
+   * generic body, exactly as an array length written over one does — there is no argument yet, and
+   * the tree that walk builds is discarded.
+   */
+  private def valueArg(ref: TypeRef, ty: Type, subst: Map[String, Type]): Type = {
+    val written = ref match
+      case ValueArgType(e)      => Some(e)
+      case NamedType(name, Nil) => Some(Ident(name))
+      case _                    => None
+
+    written match
+      case None =>
+        err(s"this argument stands where the declaration wrote 'const', so a value belongs here " +
+          s"rather than a type — one of ${show(ty)}")
+      case Some(e) =>
+        constInt(e, subst) match
+          case Some(v)                              => Type.ConstArg(v, ty)
+          case None if awaitsInstantiation(e, subst) => Type.ConstArg(0, ty)
+          case None =>
+            err("a value argument must be a constant — a literal, or a 'const' naming one")
+  }
 
   /** The `Type.Constrained` a subtype name stands for, built once and cached. Building resolves the
    * base, evaluates the `within` bounds to constants, and validates them — an out-of-range or
@@ -785,6 +852,9 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     case RefType(i, _)       => mentionsAny(i, names)
     case WeakType(i)         => mentionsAny(i, names)
     case ArrayType(_, e, _)  => mentionsAny(e, names)
+    // The question this answers is about erasure — whether a **type** is named — and a value
+    // argument names none, so it can hold no forgotten one.
+    case _: ValueArgType     => false
     case VolatileType(i)     => mentionsAny(i, names)
     case TupleType(parts, _) => parts.exists(mentionsAny(_, names))
     case f: FnType           => mentionsAny(f.asTrait, names)

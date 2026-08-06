@@ -14,10 +14,12 @@ class ValueGenericsTests extends AnyFreeSpec with RunSupport with CodegenSupport
             |print(f(a))""".stripMargin) shouldBe "3\n"
     }
 
-    // The alternative backtracks instead of committing, so what arrives is the generic 'newline
-    // expected' rather than the sentence written for this. A value parameter with no type is a
-    // reader who has understood the feature and mis-spelled it, which is the case worth a word.
-    "wants the type its argument must have" ignore {
+    /** A value parameter with no type is a reader who has understood the feature and mis-spelled it,
+     * which is the case worth a sentence. Getting one required raising it where the `:` belongs
+     * rather than after the whole form: two failures are ranked by how far each got, so an
+     * alternative written after the form is beaten by the form's own failure further along the line.
+     */
+    "wants the type its argument must have" in {
       err("f[const N](xs: [N]int) = 0\nprint(1)") should include("a value parameter needs the type")
     }
   }
@@ -47,14 +49,57 @@ class ValueGenericsTests extends AnyFreeSpec with RunSupport with CodegenSupport
     }
   }
 
-  // A type-argument list reads types, so the `4` is not yet accepted where the argument is written
-  // out rather than inferred from a value. A function never hits this, because its arguments are
-  // solved from the call (§4) and there is no list to write.
-  "a struct may carry one" ignore {
-    run("""struct Buf[const N: usize]
-          |    data: [N]byte
-          |var b = Buf[4](data: [0u8, 0u8, 0u8, 0u8])
-          |print(b.data.len)""".stripMargin) shouldBe "4\n"
+  /** A **struct** carries value parameters too, and its arguments are written out rather than
+   * inferred — which is the one place the grammar cannot tell which kind of argument it is reading.
+   * `Buf[4]` and `Buf[int]` are one shape to a parser, so the declaration decides.
+   */
+  "a struct" - {
+    "may carry a value parameter, written out at the use" in {
+      run("""struct Buf[const N: usize]
+            |    data: [N]byte
+            |var b: Buf[4] = Buf([0u8, 0u8, 0u8, 0u8])
+            |print(b.data.len)""".stripMargin) shouldBe "4\n"
+    }
+
+    // Two lengths are two types, which is the whole of what putting a value in a type identity
+    // means: the layouts differ and neither stands where the other is wanted.
+    "at two lengths is two types" in {
+      run("""struct Buf[const N: usize]
+            |    data: [N]byte
+            |var a: Buf[2] = Buf([1u8, 2u8])
+            |var b: Buf[4] = Buf([1u8, 2u8, 3u8, 4u8])
+            |print(a.data.len + b.data.len)""".stripMargin) shouldBe "6\n"
+    }
+
+    "and does not accept one for the other" in {
+      err("""struct Buf[const N: usize]
+            |    data: [N]byte
+            |var a: Buf[2] = Buf([1u8, 2u8])
+            |var b: Buf[4] = a
+            |print(b.data.len)""".stripMargin) should include("Buf[2]")
+    }
+
+    // A bare name in a value-argument position is read as the value it names, which is what lets one
+    // declaration's parameter be passed straight to another's.
+    "takes an enclosing block's value parameter as its argument" in {
+      run("""struct Buf[const N: usize]
+            |    data: [N]byte
+            |wrap[const N: usize](xs: [N]byte) -> usize
+            |    var b: Buf[N] = Buf(xs)
+            |    b.data.len
+            |var a: [3]byte = [1u8, 2u8, 3u8]
+            |print(wrap(a))""".stripMargin) shouldBe "3\n"
+    }
+
+    // And a declared constant, since a value parameter is a `const` whose value the use supplies
+    // and the two are the same kind of thing (`13 §7`).
+    "and a declared constant" in {
+      run("""const SIZE: usize = 3usize
+            |struct Buf[const N: usize]
+            |    data: [N]byte
+            |var b: Buf[SIZE] = Buf([1u8, 2u8, 3u8])
+            |print(b.data.len)""".stripMargin) shouldBe "3\n"
+    }
   }
 
   /** The whole point of the feature: one `impl[const N: usize, T: Display] Display for [N]T` in the

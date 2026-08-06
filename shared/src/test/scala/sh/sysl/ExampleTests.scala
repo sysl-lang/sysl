@@ -62,6 +62,7 @@ class ExampleTests extends AnyFreeSpec with Matchers {
         |balance: 140 true
         |items: 3 a
         |primes: 4 2 14
+        |arrays: [2, 3, 5, 7] [4, 6, 10, 14]
         |total: 17
         |slices: 36 6 10 15
         |filled: 2 0 0 5

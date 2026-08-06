@@ -366,12 +366,19 @@ the bodies are checked once at their definition against the bounds alone.
 
 Two things are the shape's own. **A composed type is filed under the whole of itself** — `[]int`,
 not `[]` — so a shape needs a key that the types it covers do not have, and dropping the arguments
-is what makes one; a lookup that finds nothing under the type's own key falls back to it. And
-because an **array's length is not something a parameter can stand for** (`10 §9` — value generics
-are designed and not built), the length stays part of the shape: `[2]T` and `[3]T` are two shapes,
-each covering every element type at its own length. That is the arrangement `[const N: usize]`
-replaces when it lands, and until then it is why the library implements `Display` for every slice
-and for no array at all.
+is what makes one; a lookup that finds nothing under the type's own key falls back to it. And an
+**array has two shapes rather than one**, because its length may be a value parameter (`10 §9`):
+
+```
+impl[T] Tag for [2]T                       // every array of two
+impl[const N: usize, T] Tag for [N]T       // every array, at any length
+```
+
+Both cover a `[2]int`, and the per-length one is asked first — a length written out beats one
+standing for every length, which is the override ordering below applied one level up. Before value
+generics only the first form could be written, each length was its own shape, and that is why the
+library implemented `Display` for every slice and for no array at all. It now implements it for
+every array too, in one block.
 
 A `string` is **not** covered by `[]T`. It is a view of bytes that are valid UTF-8, and that
 invariant is the whole difference between it and a `[]u8` — a block written for every slice has said

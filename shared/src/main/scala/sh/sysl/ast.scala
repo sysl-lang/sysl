@@ -234,6 +234,11 @@ sealed trait TypeRef extends Positioned {
     case FnType(params, ret, true)        => s"(${params.map(_.show).mkString(", ")}) -> ${ret.show}"
     case FnType(params, ret, false)       => s"Fn(${params.map(_.show).mkString(", ")}) -> ${ret.show}"
     case CFnType(params, ret)             => s"*extern(${params.map(_.show).mkString(", ")}) -> ${ret.show}"
+    // A value argument is repeated where it can be read back plainly and elided where it cannot,
+    // which is what the length of an array already does one line up.
+    case ValueArgType(IntLit(v, _))       => v.toString
+    case ValueArgType(Ident(n))           => n
+    case ValueArgType(_)                  => "…"
 }
 
 /** A named type, optionally applied to type arguments: `int`, `Box[int]`,
@@ -241,6 +246,20 @@ sealed trait TypeRef extends Positioned {
  * declaration; the analyzer decides which from the substitution in scope.
  */
 case class NamedType(name: String, args: List[TypeRef] = Nil) extends TypeRef
+
+/** A **value** argument as it was written — the `4` in `Buf[4]` (`10 §9`).
+ *
+ * It is a `TypeRef` because it stands in an argument list of them, which is the same reason
+ * `Type.ConstArg` is a `Type`: a declaration's parameters are one list and one argument position,
+ * whichever kind each parameter is. It is never a type, and nothing that walks a written type does
+ * anything with one but pass it along to be folded.
+ *
+ * Only an argument that could not be a type arrives here. `Buf[N]` parses as a `NamedType` even
+ * where `N` is a value parameter, because a bare name is a type as far as the grammar can see — what
+ * it means is decided against the declaration, where the parameter's kind is known. Rust resolves a
+ * bare path in a const-argument position the same way and for the same reason.
+ */
+case class ValueArgType(value: Expr) extends TypeRef
 
 /** `*T` — a raw pointer to `T`. */
 case class PtrType(inner: TypeRef) extends TypeRef
@@ -892,6 +911,10 @@ case class StructDecl(
     vis: Visibility = Visibility.Public,
     tdefaults: Map[String, TypeRef] = Map.empty,
     opaque: Boolean = false,
+    /** Which of `tparams` stand for **values** rather than types, and the type each argument must
+      * have — `struct Buf[const N: usize]` (`10 §9`).
+      */
+    tvalues: Map[String, TypeRef] = Map.empty,
 ) extends Stmt
 
 /** One variant of an `enum`. A variant with `fields` is a data-carrying (tagged-union)
@@ -914,7 +937,11 @@ case class EnumDecl(name: String, tparams: List[String], underlying: Option[Type
                     variants: List[EnumVariantDecl], members: List[MethodDecl] = Nil,
                     bounds: Map[String, List[BoundRef]] = Map.empty,
                     vis: Visibility = Visibility.Public,
-                    tdefaults: Map[String, TypeRef] = Map.empty) extends Stmt
+                    tdefaults: Map[String, TypeRef] = Map.empty,
+                    /** Which of `tparams` stand for **values** rather than types (`10 §9`), and the
+                      * type each argument must have.
+                      */
+                    tvalues: Map[String, TypeRef] = Map.empty) extends Stmt
 
 /** The `within lo..hi` clause of a constrained subtype. `exclusiveHi` marks `..<`, which excludes
  * the upper endpoint; a plain `..` includes it. Bounds are literal expressions — an integer, a

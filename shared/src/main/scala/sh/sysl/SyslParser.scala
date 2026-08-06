@@ -567,7 +567,16 @@ class SyslParser(val source: Source) extends DeclParser {
    * a trait's — a trait takes its arguments the same way and in the same place.
    */
   protected lazy val typeArgs: Parser[List[TypeRef]] =
-    op("[") ~> commaList1(typeRef) <~ op("]")
+    op("[") ~> commaList1(typeArg) <~ op("]")
+
+  /** One argument of that list, which may stand for a **value** (`10 §9`) — `Buf[4]`.
+   *
+   * A type is tried first and an expression only where nothing could be a type, so a bare `N` is
+   * read as a name and left for the declaration to interpret: the grammar cannot tell a type
+   * parameter's name from a value parameter's, and the declaration can.
+   */
+  protected lazy val typeArg: Parser[TypeRef] =
+    typeRef | (expression ^^ ValueArgType.apply)
 
   protected lazy val softSync: Parser[Unit] =
     accept("'sync'", { case t: lexical.Identifier if t.chars == "sync" => () })
@@ -621,12 +630,20 @@ class SyslParser(val source: Source) extends DeclParser {
    *
    * A **default is an expression here**, not a type, which is the second thing the marker buys: one
    * slot, two grammars, and no way to parse it without knowing which parameter is being read.
+   *
+   * **The missing type is refused where the `:` belongs, not by an alternative written after the
+   * whole form**, and the difference is not stylistic. An alternative fails at the position it gets
+   * to, and a combinator picking between two failures keeps the one that got *further*: the form
+   * above reaches the `]` before it notices, so its failure outranks any error raised back at the
+   * `const`, and the reader gets the generic complaint about whatever came next. Raised here the two
+   * are at one position, and the one carrying a sentence wins.
    */
   protected lazy val valueParam: Parser[ValueParamSpec] =
-    op("const") ~> ident ~ (op(":") ~> typeRef) ~ opt(op("=") ~> expression) ^^ {
+    op("const") ~> ident ~ (op(":") ~> typeRef | err("a value parameter needs the type its " +
+      "argument must have, as 'const N: usize' — the type is what says which values may stand " +
+      "there")) ~ opt(op("=") ~> expression) ^^ {
       case n ~ t ~ d => ValueParamSpec(n, t, d)
-    } | op("const") ~> err("a value parameter needs the type its argument must have, as " +
-      "'const N: usize' — the type is what says which values may stand there")
+    }
 
   protected lazy val boundedTypeParam: Parser[TypeParamSpec] =
     ident ~ opt(op(":") ~> rep1sep(boundRef, op("+"))) ~ opt(op("=") ~> typeRef) ^^ {

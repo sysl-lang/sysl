@@ -251,9 +251,10 @@ before they appear and may be mutually recursive).
   its own: a composed type is filed under the whole of itself (`[]int`), so a shape gets a key by
   dropping the arguments (`[]`, `[3]`) that a member lookup falls back to, and a symbol the same way
   (`slice.show` instantiated at `int` is `slice.show.int`, which the written `[]int`'s
-  `slice.int.show` cannot be mistaken for). An array's length is part of the shape, since no
-  parameter can stand for it (`10 §9`, designed and unbuilt). A `string` is not a slice and is not
-  covered. A shape
+  `slice.int.show` cannot be mistaken for). An array has **two** such keys, since its length may be
+  a value parameter (`10 §9`): the per-length `[3]`, and one under which the length is an argument
+  like the element type, whose symbol drops it the same way — `arr.display.c3.int`. The per-length
+  key is asked first. A `string` is not a slice and is not covered. A shape
   and a type of that shape written out in full are **two implementations for one type**, so whichever
   is written second is refused — sysl has no rule that picks between two, and that goes for member
   *names* across the two as well, since a type's members are one namespace.

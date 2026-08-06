@@ -258,6 +258,9 @@ trait SignatureVisibility extends TypeResolution {
     case RefType(inner, _)  => namesIn(inner, skip)
     case WeakType(inner)    => namesIn(inner, skip)
     case ArrayType(_, elem, _) => namesIn(elem, skip)
+    // A value argument names no declaration, so a signature can expose nothing through one — the
+    // same reason an array's length is not walked one line up.
+    case _: ValueArgType     => Nil
     case VolatileType(inner) => namesIn(inner, skip)
     case TupleType(parts, _) => parts.flatMap(namesIn(_, skip))
     // A callable mentions the library's call trait, which is public and is nobody's to hide; what a

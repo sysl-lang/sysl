@@ -880,9 +880,9 @@ Two things a constant is **not**, so the boundaries stay where the rest of the d
   length as the type-safe replacement for a pile of `const`s. A constant is one dimension, not a
   family of them; if a second constant would be the obvious neighbour of the first, the declaration
   wanted was an `enum`.
-- **Not value generics.** Parameterizing over a length is `10 §9`, which is designed and unbuilt —
-  but it is worth recording that this is its prerequisite, since a value cannot be passed as an
-  argument before it can be named. That chapter takes the point further than it was left here: a
+- **Not value generics.** Parameterizing over a length is `10 §9` — but it is worth recording that
+  this is its prerequisite, since a value cannot be passed as an argument before it can be named.
+  That chapter takes the point further than it was left here: a
   value **parameter** is spelled `[const N: usize]`, which is this declaration with the initializer
   left to the caller, so the two are one idea in two positions rather than two features.
 

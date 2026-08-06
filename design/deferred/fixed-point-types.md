@@ -95,16 +95,18 @@ fixed-point intrinsics:
 
 The *general* `fixed[B, F]` form needs two things the basics language may not yet have:
 
-- **Value-generic parameters** (`10 §9`) — a type parameterized by a compile-time *integer*
-  (`F`), not just by a type. Array sizes (`[16]byte`) already parameterize on a compile-time int, so
-  the machinery is partly present, but user-type value generics are a larger step.
+- ~~**Value-generic parameters**~~ (`10 §9`) — **built**. A struct may be parameterized by a
+  compile-time integer, so `fixed[B, F]` can be spelled.
 - **A little type-level arithmetic** — the multiply rule computing `F₁ + F₂` and choosing a
-  wide-enough backing type at compile time.
+  wide-enough backing type at compile time. **This is the half that remains**, and `10 §9` excludes
+  it deliberately: a type may name a value parameter but not compute with one, since deciding that
+  two expressions denote one type is a separate feature. Rust has kept the same half unstable long
+  after const generics shipped.
 
 ### The fork
 
 - **General, compile-time-checked fixed-point** — the `fixed[B, F]` design above. Requires
-  value generics + type-level scale arithmetic. Safest; the type tracks scale for you.
+  value generics (built) + type-level scale arithmetic (not). Safest; the type tracks scale for you.
 - **Curated Q-format types** — ship `q7` / `q15` / `q31` as built-ins with explicit rescale
   operators (the CMSIS model). No value generics needed; scale is managed by hand. Less
   general, but completely usable for audio and shippable without new type-system machinery.
