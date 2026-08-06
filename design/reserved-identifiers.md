@@ -122,6 +122,18 @@ it does not look like ordinary sysl, and it should not, because it is not.
 context asks for and is range-checked with it: a parameter declared `i32` receives an `i32`, and one
 declared `u8` is told where a line number will not fit rather than wrapping.
 
+**`__FUNCTION__` is empty outside any body, and that is an answer rather than an error.** A module's
+`val` and `var` storage is filled before any function runs, so there is genuinely no function to
+name. Refusing it there would also refuse a *default* of `__FUNCTION__` — a default is analyzed once
+at its declaration, where no caller exists yet, and that is the single place it is most worth
+writing. In a **closure** it names the function the closure is written in, since a closure has no
+name a reader chose.
+
+Getting this wrong was the one real bug in the feature: left uncleared, the field held whichever
+function the definition-time pass of `14 §4` had walked last, so a module `val`'s `__FUNCTION__`
+silently reported an unrelated library function. A stale answer is worse than either an error or an
+empty string, and it is the failure mode a "current thing" variable invites.
+
 `__COLUMN__` reports the column of the **file**, which is not the column the lexer counted: a
 literate program's code sits four columns in, and `Source.columnOffset` is added back. `Pos.location`
 does the same for the same reason, and the two have to agree — a diagnostic and a program that

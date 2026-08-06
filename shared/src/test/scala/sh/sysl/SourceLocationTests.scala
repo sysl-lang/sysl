@@ -32,6 +32,23 @@ class SourceLocationTests extends AnyFreeSpec with RunSupport {
           |""".stripMargin) shouldBe "adds_two\n"
   }
 
+  // A module's storage is filled before any function runs, so there is genuinely no function to
+  // name. The empty answer is the honest one — and it used to be a *stale* one, silently reporting
+  // whichever function the definition-time pass had walked last.
+  "__FUNCTION__ is empty outside any body" in {
+    run("""val here: string = __FUNCTION__
+          |print(here.len)
+          |""".stripMargin) shouldBe "0\n"
+  }
+
+  // A closure has no name a reader wrote, so it reports the function it is written in.
+  "__FUNCTION__ in a closure names the function the closure is written in" in {
+    run("""apply(f: () -> string) -> string = f()
+          |outer() -> string = apply(() -> __FUNCTION__)
+          |print(outer())
+          |""".stripMargin) shouldBe "outer\n"
+  }
+
   "a built-in in an ordinary body reports its own line, not its caller's" in {
     run("""f() -> int = __LINE__
           |print(f())

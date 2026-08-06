@@ -315,11 +315,12 @@ trait ExprAnalysis
       // `Pos.location` adds the offset back for the same reason, and the two have to agree — a
       // diagnostic and a program that disagreed about one place would be worse than either alone.
       case "__COLUMN__" => intLiteral(BigInt(where.col + where.source.columnOffset), None, expected)
-      case "__FUNCTION__" =>
-        if currentFunctionName.isEmpty then
-          err("'__FUNCTION__' names the function it is written in, and this is not inside one — a " +
-            "module's 'val' and 'var' initializers are the module's, and run before any function does")
-        TStrLit(currentFunctionName)
+      // **Empty outside any body, rather than an error.** A module's storage is filled before any
+      // function runs, so there is genuinely no function to name there — and refusing it would also
+      // refuse a *default* of `__FUNCTION__`, which is checked once at its declaration where there
+      // is no caller yet and is the one place this is most worth writing. An empty string is the
+      // honest answer to "which function is this"; a stale one would not be, and was the bug.
+      case "__FUNCTION__" => TStrLit(currentFunctionName)
       case "__DATE__" => TStrLit(ReservedNames.date(ReservedNames.stamp))
       case "__TIME__" => TStrLit(ReservedNames.time(ReservedNames.stamp))
       case _          => err(ReservedNames.unknown(name))

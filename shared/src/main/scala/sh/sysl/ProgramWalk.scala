@@ -970,8 +970,15 @@ trait ProgramWalk
     val savedOuter    = outerNested
     val savedDeclares = blockDeclares
 
+    // A closure has no name a reader wrote, so `__FUNCTION__` in one names the function it is
+    // written in — which means carrying the enclosing name across the reset rather than letting the
+    // body see the empty state that reset establishes. Restored below with everything else, since
+    // this walk interrupts a function that is still going.
+    val savedFuncName = currentFunctionName
+
     try
       resetFunction()
+      currentFunctionName = savedFuncName
       retTy = declaredResult.getOrElse(Type.Unknown)
       retIsList = false
       // A nested function states its own signature, so a `...` on one is its own tail to walk; a
@@ -1043,6 +1050,7 @@ trait ProgramWalk
 
       (TFunc(name, tparams, result, tbody, variadic, requires, ensures, olds), result)
     finally
+      currentFunctionName = savedFuncName
       scopes = savedScopes
       used.clear(); used ++= savedUsed
       readOnlyLocals.clear(); readOnlyLocals ++= savedReadOnly

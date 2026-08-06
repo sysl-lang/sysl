@@ -160,6 +160,10 @@ class ReservedNameTests extends AnyFreeSpec with CodegenSupport {
     message should include("__TIME__")
   }
 
+  "a location is a literal, and is range-checked as one" in {
+    err(("\n" * 300) + "var n: u8 = __LINE__\n") should include("does not fit")
+  }
+
   "the build stamp" - {
     "renders the epoch in C's formats" in {
       ReservedNames.date(0L) shouldBe "Jan  1 1970"

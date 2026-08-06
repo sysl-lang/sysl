@@ -157,6 +157,11 @@ trait AnalyzerBase extends Scoping {
   protected var currentFunctionName: String = ""
 
   protected def resetFunction(): Unit = {
+    // Cleared here rather than left to whoever sets it, because "outside any body" has to be a state
+    // the analyzer can actually be in. Left uncleared it held the last name analyzed, so a module
+    // `val`'s `__FUNCTION__` silently reported some unrelated function that a *previous pass* had
+    // walked — the definition-time pass of `14 §4`, which runs before any storage is laid down.
+    currentFunctionName = ""
     resetLocals()
     loops = Nil
     pendingVariant = None
