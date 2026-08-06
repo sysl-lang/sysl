@@ -127,11 +127,16 @@ literate program's code sits four columns in, and `Source.columnOffset` is added
 does the same for the same reason, and the two have to agree — a diagnostic and a program that
 disagreed about one place would be worse than either alone.
 
-`__FILE__` is the **short** name, not an absolute path. Swift ended up splitting `#file` from
-`#filePath` because absolute paths were bloating binaries and leaking build-machine paths into
-shipped code, and that pressure is sharper here: the first customer for this is a checking function
-called from hundreds of sites in an image that may have 64K of flash. A path variant can be added if
-something asks; the space is reserved for it.
+`__FILE__` is the file **as the compiler was told about it** — the same string a diagnostic prints,
+which is `Source.name`, which is the path the driver was given. So it is emphatically *not*
+guaranteed to be short: `sysl build /Users/me/proj/blink.sysl` puts that whole path into `__FILE__`,
+and therefore into the binary, once per use.
+
+**That is a known sharp edge rather than a settled answer**, and it is the one place this feature is
+behind Swift, which split `#file` from `#fileID` and `#filePath` for exactly this reason: absolute
+paths bloat binaries and leak build-machine paths into shipped code. The pressure is sharper here
+than it was there, because the first customer is a checking function called from hundreds of sites in
+an image that may have 64K of flash. See *Open*.
 
 ## How the caller's line falls out of a default
 
@@ -183,7 +188,10 @@ would ever reproduce.
 - **The argument's source text.** C# added `[CallerArgumentExpression]` so that `check(x > 3)` can
   report `x > 3` and not merely a line. It needs no macros either — the compiler has the text — and
   it is the natural next thing to want here. Not built.
-- **A path variant of `__FILE__`**, if something ever needs one. The short name is the default
-  deliberately, and the reserved space means adding `__FILE_PATH__` later breaks nothing.
+- **A basename variant of `__FILE__`** — `__FILE_NAME__`, say. Today `__FILE__` is whatever path the
+  driver was handed, so an absolutely-invoked build embeds absolute paths, once per use. That is
+  fine on a hosted target and is a real cost on a small one, which is where this feature is headed.
+  The reserved space means adding it later breaks nothing, which is exactly the property the shape
+  rule was for — so this is a thing to do when it bites, not something to guess at now.
 - **Digits in the shape.** The rule admits capitals and underscores only, so `__F16__` is an ordinary
   name. Nothing wants one yet, and widening the shape later is the direction that stays compatible.
