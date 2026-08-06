@@ -61,7 +61,7 @@ object NativeSources {
    */
   def build(trees: List[List[Source]], target: Target = Target.default,
             level: String = Toolchain.defaultOptimization,
-            paths: SearchPaths = SearchPaths.none): Either[String, Built] =
+            paths: SearchPaths = SearchPaths.none, verbose: Boolean = false): Either[String, Built] =
     if trees.isEmpty then Right(none)
     else
       val staging = createTempDirectory("sysl-c-")
@@ -76,7 +76,7 @@ object NativeSources {
       val scratch = named.map(_._2) ::: staged.map(_._1) ::: List(staging)
 
       named.foldLeft[Either[String, Unit]](Right(()))((so_far, entry) =>
-        so_far.flatMap(_ => Toolchain.compileC(entry._1.name, entry._2, target, level, paths))) match
+        so_far.flatMap(_ => Toolchain.compileC(entry._1.name, entry._2, target, level, paths, verbose))) match
         case Left(err) => scratch.foreach(Project.discard); Left(err)
         case Right(_)  => Right(Built(named.map(_._2), scratch))
 }

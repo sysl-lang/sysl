@@ -247,11 +247,15 @@ object Toolchain {
   def build(ir: String, exe: String, target: Target = Target.default,
             archives: List[String] = Nil, level: String = defaultOptimization,
             links: List[String] = Nil, objects: List[String] = Nil,
-            paths: SearchPaths = SearchPaths.none): Either[String, Unit] = {
+            paths: SearchPaths = SearchPaths.none, verbose: Boolean = false): Either[String, Unit] = {
     val ll = createTempFile("sysl-", ".ll")
     writeFile(ll, ir)
 
-    val result = exec(linkCommand(ll, archives, exe, target, level, links, objects, paths))
+    val command = linkCommand(ll, archives, exe, target, level, links, objects, paths)
+
+    if verbose then trace(s"link: ${command.mkString(" ")}")
+
+    val result = exec(command)
     deleteFile(ll)
 
     if result.exitCode == 0 then Right(())
@@ -402,9 +406,13 @@ object Toolchain {
    */
   def compileC(source: String, obj: String, target: Target = Target.default,
                level: String = defaultOptimization,
-               paths: SearchPaths = SearchPaths.none): Either[String, Unit] = {
-    val result = exec(Seq("clang", s"--target=${target.triple}", flag(level)) ++ paths.includeFlags ++
-      Seq("-ffunction-sections", "-fdata-sections", "-c", source, "-o", obj))
+               paths: SearchPaths = SearchPaths.none, verbose: Boolean = false): Either[String, Unit] = {
+    val command = Seq("clang", s"--target=${target.triple}", flag(level)) ++ paths.includeFlags ++
+      Seq("-ffunction-sections", "-fdata-sections", "-c", source, "-o", obj)
+
+    if verbose then trace(s"compile: ${command.mkString(" ")}")
+
+    val result = exec(command)
 
     if result.exitCode == 0 then Right(())
     else Left(s"$source did not compile (exit ${result.exitCode}):\n${result.stderr.trim}")

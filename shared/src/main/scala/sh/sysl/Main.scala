@@ -87,6 +87,7 @@ case class Config(
     file: String = "",
     output: Option[String] = None,
     explainEscapes: Boolean = false,
+    verbose: Boolean = false,
     target: Option[String] = None,
     libs: List[String] = Nil,
     std: Boolean = false,
@@ -202,6 +203,10 @@ private[sysl] val parser = {
       opt[Unit]("help")
         .action((_, c) => c.copy(command = "help"))
         .text("print this usage text"),
+      opt[Unit]('v', "verbose")
+        .action((_, c) => c.copy(verbose = true))
+        .text("report what the build decided: which standard module was used and why, the files " +
+          "read, the search paths, and the clang and linker command lines"),
       opt[Unit]("explain-escapes")
         .action((_, c) => c.copy(explainEscapes = true))
         .text("report every local array promoted to the heap, and the view that forced it"),
@@ -289,6 +294,11 @@ private[sysl] def execute(cfg: Config): Int = {
 
   if sources.isEmpty then return fail(s"${cfg.file} holds no sysl source files")
 
+  // The files, in the order the walk found them, which is the order the compiler reads them in.
+  if cfg.verbose then
+    trace(s"${sources.length} source file(s) under ${cfg.file}")
+    sources.foreach(src => trace(s"  read ${src.name}"))
+
   val project = readPackageConfig(cfg.file) match
     case Left(err) => return fail(err)
     case Right(p)  => p
@@ -325,6 +335,15 @@ private[sysl] def execute(cfg: Config): Int = {
   val Stdlib.Resolved(std, coreSymbols, coreArchive) = Stdlib.resolve(stdChoice(cfg), target) match
     case Left(err) => return fail(err)
     case Right(c)  => c
+
+  // **Which standard module this compilation got, and by which route.** An artifact that was read
+  // and one that was rejected and rebuilt reach here looking identical, and the difference is the
+  // first thing anybody diagnosing a stale library wants: `Stdlib.resolve` announces a *rebuild* on
+  // its own, so what is added here is the quiet case.
+  if cfg.verbose then
+    coreArchive match
+      case Some(archive) => trace(s"standard module linked from $archive")
+      case None          => trace("standard module compiled from source, not linked from an artifact")
 
   // Building a library stops here — there is no program to link it into. An artifact is **for a
   // machine**, exactly as an rlib is, because half of it is compiled object code; the generic half
@@ -407,10 +426,15 @@ private[sysl] def execute(cfg: Config): Int = {
   // link, and a build given only one of them fails at whichever step comes first.
   val paths = SearchPaths(cfg.linkPaths, cfg.includePaths)
 
+  if cfg.verbose then
+    for lib <- cfg.libs do trace(s"library: $lib")
+    for dir <- cfg.linkPaths do trace(s"link path: $dir")
+    for dir <- cfg.includePaths do trace(s"include path: $dir")
+
   val native =
     if links(cfg.command) then
       NativeSources.build(NativeSources.of(cfg.file :: roots ::: fetched.roots), target, cfg.optimize,
-        paths) match
+        paths, cfg.verbose) match
         case Left(err)    => return fail(err)
         case Right(built) => built
     else NativeSources.none
@@ -453,7 +477,7 @@ private[sysl] def execute(cfg: Config): Int = {
       val exe = cfg.output.getOrElse(defaultOutput(cfg.file))
 
       Toolchain.build(compiled.ir, exe, target, archives, cfg.optimize, compiled.links, native.objects,
-        paths) match
+        paths, cfg.verbose) match
         case Left(err) => fail(err)
         case Right(_)  => Console.err.println(s"wrote $exe"); 0
 
@@ -461,7 +485,7 @@ private[sysl] def execute(cfg: Config): Int = {
       val exe = createTempFile("sysl-", "")
 
       Toolchain.build(compiled.ir, exe, target, archives, cfg.optimize, compiled.links, native.objects,
-        paths) match
+        paths, cfg.verbose) match
         case Left(err) => Project.discard(exe); fail(err)
         case Right(_) =>
           val result = exec(exe :: cfg.programArgs)
@@ -826,6 +850,13 @@ private def defaultOutputName(file: String): String = {
   val base = if dot > 0 then name.substring(0, dot) else name
   if base.isEmpty then "a.out" else base
 }
+
+/** What `--verbose` says, on stderr so that it never lands in what a build was for.
+ *
+ * It is prefixed rather than bare because these lines arrive in the middle of whatever else the
+ * terminal is doing, and a reader needs to know which of the programs in front of them is talking.
+ */
+private[sysl] def trace(what: String): Unit = Console.err.println(s"sysl: $what")
 
 /** A driver failure — something that went wrong around the compiler rather than inside it. */
 private def fail(msg: String): Int = {
