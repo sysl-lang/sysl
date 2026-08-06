@@ -840,22 +840,24 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // sentence `02` already carried, now reachable through a required trait rather than only
     // through the operator catalog.
     //
-    // **`Hash` is the case, and it is the last one.** It is the only trait left that a built-in
-    // joins by rule and that is object-safe as well; every other compiler-provided trait takes
-    // `Self` away from the receiver and is stopped a step earlier by object safety. `Display` was
-    // the other, until its membership became a blanket `impl` and a slot had something to point at.
+    // **What is left that a built-in joins by rule *and* that is object-safe is the operator catalog
+    // at written arguments**, and only that. `Add[int, int]` declares `add(self, rhs: int) -> int`
+    // with no `Self` anywhere, so it is a formable object type and an `int` belongs to it by rule.
+    // `Display` and `Hash` both used to be refused in these words and are ordinary code now, each
+    // having gained written `impl`s; the rest of the catalog names `Self` away from the receiver and
+    // is stopped a step earlier by object safety.
     "a built-in that satisfies a required trait by rule cannot be erased" in {
       err(
-        """trait Tagged: Hash
+        """trait Tagged: Add[int, int]
           |    tag(self) -> int
           |impl Tagged for i32
           |    tag(self) -> int = 7
           |var o: &Tagged = 1i32""".stripMargin,
-      ) should include("implements 'sysl.Hash' by the compiler's own rule rather than through an 'impl'")
+      ) should include("implements 'sysl.Add' by the compiler's own rule rather than through an 'impl'")
     }
 
-    // The counterpart, and the reason the rule above is now about `Hash` alone: the same shape over
-    // `Display` used to be refused in exactly these words and is ordinary code.
+    // The counterpart, and the reason the rule above is about the operators alone: the same shape
+    // over `Display` used to be refused in exactly those words and is ordinary code.
     "while one that satisfies it through an impl erases and dispatches" in {
       run(
         """trait Tagged: Display
@@ -865,6 +867,19 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |var o: &Tagged = 1i32
           |print(o, o.tag())""".stripMargin,
       ) shouldBe "1 7\n"
+    }
+
+    // `Hash` joined it, which is what this release changed: a built-in reaches the trait through an
+    // `impl` now, so a slot has something to point at and the object forms.
+    "and so does one that requires Hash, which used to be the counter-example" in {
+      run(
+        """trait Tagged: Hash
+          |    tag(self) -> int
+          |impl Tagged for i32
+          |    tag(self) -> int = 7
+          |var o: &Tagged = 1i32
+          |print(o.hash() != 0u64, o.tag())""".stripMargin,
+      ) shouldBe "true 7\n"
     }
 
     // The object-safety diagnostic has two names to get right and they are different names: the
