@@ -137,11 +137,125 @@ class TypePackTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |f([1, 2])""".stripMargin) should include("walks a range with both ends written")
     }
 
+    /** There is no loop at run time for either to act on: what the analyzer produces is the copies
+     * in a block, so a `break` written here would silently leave whatever loop the `for const`
+     * happens to sit inside — which is the wrong answer rather than a missing feature.
+     */
+    "refuses 'break'" in {
+      err("""f[..A: Display](t: (..A))
+            |    for const i in 0..<A.len
+            |        break
+            |f((1, 2))""".stripMargin) should include("there is no loop for")
+    }
+
+    "refuses 'continue'" in {
+      err("""f[..A: Display](t: (..A))
+            |    for const i in 0..<A.len
+            |        continue
+            |f((1, 2))""".stripMargin) should include("there is no loop for")
+    }
+
+    /** The copies are a sequence in the enclosing block, so a `break` in one of them would leave the
+     * *outer* loop — silently, and one copy at a time. Refused for that reason and not because an
+     * unrolled loop has no use for the word.
+     */
+    "allows a real loop written inside the body to break" in {
+      run("""f[..A: Display](t: (..A))
+            |    for const i in 0..<A.len
+            |        for n in 0..<5
+            |            if n > 0 then break
+            |            print(t.i)
+            |f((1, 2))""".stripMargin) shouldBe "1\n2\n"
+    }
+
+    "refuses 'break' even inside an enclosing loop" in {
+      err("""f[..A: Display](t: (..A))
+            |    for n in 0..<2
+            |        for const i in 0..<A.len
+            |            break
+            |f((1, 2))""".stripMargin) should include("there is no loop for")
+    }
+
     "refuses a range longer than it will unroll" in {
       err("""f()
             |    for const i in 0..<100
             |        print(i)
             |f()""".stripMargin) should include("is the most one is unrolled to")
+    }
+  }
+
+  "the edges" - {
+    /** Zero copies, which is what an empty range unrolls to. There is no zero-tuple to reach this
+     * from a pack (`00 §13`), so it takes a written range — and it is worth pinning that the answer
+     * is nothing rather than a copy at some default.
+     */
+    "an empty range unrolls to nothing" in {
+      run("""f()
+            |    print("before")
+            |    for const i in 0..<0
+            |        print("never")
+            |    print("after")
+            |f()""".stripMargin) shouldBe "before\nafter\n"
+    }
+
+    "nested unrolled loops multiply" in {
+      run("""f[..A: Display](t: (..A))
+            |    for const i in 0..<A.len
+            |        for const j in 0..<A.len
+            |            print(t.i, t.j)
+            |f((1, 2))""".stripMargin) shouldBe "1 1\n1 2\n2 1\n2 2\n"
+    }
+
+    "one pack may stand in two parameters, at one arity" in {
+      run("""zip_len[..A: Display](x: (..A), y: (..A)) -> usize = A.len
+            |print(zip_len((1, 2), (3, 4)))""".stripMargin) shouldBe "2\n"
+    }
+
+    "and refuses two arities for one pack" in {
+      err("""zip_len[..A: Display](x: (..A), y: (..A)) -> usize = A.len
+            |print(zip_len((1, 2), (3, 4, 5)))""".stripMargin) should not be empty
+    }
+
+    /** Every part is counted, so the parts of a tuple rendered through the pack's block are retained
+     * and released exactly as a struct's fields are (`03`). Strings built at run time are what makes
+     * this a real question rather than a formality — a literal owns nothing to get wrong.
+     */
+    "counts the parts of a tuple whose members are refcounted" in {
+      run("""var a = "x" + "y"
+            |var b = "p" + "q"
+            |val t = (a, b, a + b)
+            |print(t)
+            |print(t)""".stripMargin) shouldBe "(xy, pq, xypq)\n(xy, pq, xypq)\n"
+    }
+
+    "reaches the parts through a reference receiver" in {
+      run("""trait Tag
+            |    tag(self) -> string
+            |impl[..A: Display] Tag for (..A)
+            |    tag(self) -> string
+            |        var s = ""
+            |        for const i in 0..<A.len
+            |            s = s + str(self.i)
+            |        s
+            |var t = (1, 2, 3)
+            |var r = &t
+            |print(r.tag())""".stripMargin) shouldBe "123\n"
+    }
+  }
+
+  "a pack in a signature" - {
+    "may be the result" in {
+      run("""pair[..A](t: (..A)) -> (..A) = t
+            |print(pair((1, "x")))""".stripMargin) shouldBe "(1, x)\n"
+    }
+
+    /** Spreading a pack into an *argument list* is expansion, which is not built — the unrolled loop
+     * is what replaces it, and in the one direction the catalog wants.
+     */
+    "is not spread into a call's arguments" in {
+      err("""f[..A: Display](t: (..A))
+            |    print(..t)
+            |f((1, 2))""".stripMargin) should not be empty
     }
   }
 

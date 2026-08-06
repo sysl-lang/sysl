@@ -167,12 +167,25 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
   private def resolveLoop(keyword: String, label: Option[String]): (LoopCtx, Int) = label match
     case None =>
       loops match
-        case ctx :: _ => (ctx, 0)
-        case Nil      => err(s"'$keyword' is only allowed inside a loop")
+        case ctx :: _         => (ctx, 0)
+        case Nil if inConstFor => notInAnUnrolledLoop(keyword)
+        case Nil              => err(s"'$keyword' is only allowed inside a loop")
     case Some(l) =>
       loops.indexWhere(_.label.contains(l)) match
-        case -1 => err(s"no enclosing loop is labeled '$l")
-        case i  => (loops(i), i)
+        case -1 if inConstFor => notInAnUnrolledLoop(keyword)
+        case -1               => err(s"no enclosing loop is labeled '$l")
+        case i                => (loops(i), i)
+
+  /** Why a `for const` body takes neither `break` nor `continue` (`10 §10`).
+   *
+   * There is no loop at run time for either to act on: the copies are straight-line code in the
+   * enclosing function, so a `break` here would leave whatever loop the `for const` happens to sit
+   * inside — silently, and one copy at a time. That is a wrong answer rather than a missing feature,
+   * which is why this is refused rather than lowered to something.
+   */
+  private def notInAnUnrolledLoop(keyword: String): Nothing =
+    err(s"a 'for const' is unrolled into one copy of its body per value, so there is no loop for " +
+      s"'$keyword' to act on — a loop that is walked at run time is the ordinary 'for'")
 
   /** The result type of a loop: every `break` value and the `else` value must meet at one type.
    * With no `else`, normal completion yields `unit`, so a value-carrying `break` has nothing to

@@ -134,6 +134,15 @@ trait AnalyzerBase extends Scoping {
     var variant: Option[(String, Type)] = None
   protected var loops: List[LoopCtx] = Nil
 
+  /** Whether the statement being analyzed sits directly in the body of a `for const` (`10 §10`).
+   *
+   * The unrolled loop hides the enclosing loops while its copies are analyzed, so `loops` is empty
+   * there whatever the loop is written inside — and that is the whole mechanism, since a `break`
+   * with no loop to find is already an error. This flag only decides *which* sentence it gets: the
+   * one about there being no loop, or the one about the loop the reader can see being unrolled.
+   */
+  protected var inConstFor: Boolean = false
+
   /** A loop body's `variant` on its way out to the context above, set after the body's own
    * statements are analyzed so that a nested loop has already taken and cleared its own.
    */

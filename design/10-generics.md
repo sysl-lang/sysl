@@ -620,6 +620,12 @@ straight-line code in the enclosing function, so a `return` in it is an ordinary
 `continue` are refused**, with a sentence saying why: there is no loop at run time for either to act
 on, and the shape that wants them is a `for` over a range of values rather than over a list of types.
 
+That refusal is not tidiness. The copies are straight-line code *inside whatever the `for const` was
+written in*, so an unlabelled `break` would leave the enclosing loop — silently, and one copy at a
+time. The enclosing loops are therefore **hidden** while the copies are analyzed, which turns the
+wrong answer into no answer; a real loop written inside the body pushes onto the emptied stack and
+breaks out of itself exactly as it always did.
+
 ### What `self.i` means
 
 A tuple's parts are fields named for their positions (`00 §13`), so `self.i` at a compile-time `i` is

@@ -138,7 +138,16 @@ trait ControlFlowExprAnalysis extends ExprSupport {
           s"${ConstFor.maxCopies} is the most one is unrolled to — a loop this long is a run-time " +
           "'for', which costs one copy whatever it counts to")
 
-      val saved = tsubst
+      val saved      = tsubst
+      val savedLoops = loops
+      val savedFlag  = inConstFor
+
+      // The enclosing loops are **hidden** while the copies are analyzed, which is what stops an
+      // unlabelled `break` in one of them from silently leaving a loop the `for const` sits inside.
+      // A real loop written *within* the body pushes onto the emptied stack and works as it always
+      // did; what is left with nothing to find is exactly the case that had to be refused.
+      loops = Nil
+      inConstFor = true
 
       try
         TSeq((lo to hi).toList.map { v =>
@@ -148,7 +157,10 @@ trait ControlFlowExprAnalysis extends ExprSupport {
           tsubst = saved + (name -> Type.ConstArg(v, Type.Usize))
           TBlockExpr(analyzeValueBlock(body, None, discarded = true))
         })
-      finally tsubst = saved
+      finally
+        tsubst = saved
+        loops = savedLoops
+        inConstFor = savedFlag
 
     case For(label, name, iter, body, elseOpt) =>
       iter match
