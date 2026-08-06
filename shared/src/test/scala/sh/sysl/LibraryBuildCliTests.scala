@@ -33,14 +33,19 @@ class LibraryBuildCliTests extends LibraryCliSupport {
         case Left(why) => fail(why)
     }
 
-    "names the artifact after the root when no output is given" in {
+    "names the artifact after the root when no output is given, and writes it inside it" in {
       // The default matters because it is what a reader gets when they follow the help text, and
       // an extension that did not match `--lib`'s test would make the two halves disagree.
-      val root = libraryRoot()
+      //
+      // **Inside the root, not beside the caller.** The name is the root's, so writing it into the
+      // working directory made the artifact's path depend on where the build was started — and for
+      // `sysl build-lib .` the name was `.`, which produced `..syslib`: a hidden file, in somebody
+      // else's directory, named after nothing. `OutputPathTests` holds the whole rule; this is the
+      // half of it a library build meets.
+      val root     = libraryRoot()
+      val expected = s"$root/${Project.basename(root)}${LibraryArtifact.extension}"
 
       succeeds(Config(command = "build-lib", file = root))
-
-      val expected = Project.basename(root) + LibraryArtifact.extension
 
       isFile(expected) shouldBe true
       deleteFile(expected)
