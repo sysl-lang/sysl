@@ -122,6 +122,14 @@ object ReservedNames {
       case t: TraitDecl =>
         named(t.name, "trait", t.pos) ::: tparams(t.tparams, t.pos) ::: t.methods.flatMap(method)
       case i: ImplDecl => i.methods.flatMap(method)
+      // An alias binds a name without declaring anything, and binds it through the import tables
+      // rather than through `Scoping.declare` — so this is the only pass that can see it. Left out,
+      // `import sysl.text as __TEXT__` would sit in the space the shape exists to keep clear, which
+      // is the one outcome the whole rule is for.
+      // A wildcard binds no name of its own, so only its selectors and the bare-path form are asked.
+      case i: ImportDecl =>
+        (if i.wildcard then Nil else named(i.bound, "import", i.pos)) :::
+          i.selectors.flatMap(s => named(s.bound, "import", s.pos))
       // `static` says where the storage lives and nothing about the name, so the declaration inside
       // it is checked exactly as it would have been written on its own (`13 §7`).
       case s: StaticDecl => declaredIn(s.inner)

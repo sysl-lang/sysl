@@ -93,6 +93,17 @@ class ReservedNameTests extends AnyFreeSpec with CodegenSupport {
       err("""extern "puts" __P__(s: *u8) -> i32""") should include("declaration")
       err("""extern "puts" p(__S__: *u8) -> i32""") should include("parameter")
     }
+
+    // An alias binds through the import tables rather than through `declare`, so this pass is the
+    // only thing that can see one — and an alias squatting in the reserved space is exactly the
+    // collision a later built-in would hit.
+    "an import alias" in {
+      err("import sysl.text as __TEXT__\nprint(1)") should include("import")
+    }
+
+    "an alias inside a selector list" in {
+      err("import sysl.{text as __T__}\nprint(1)") should include("import")
+    }
   }
 
   "nor may anything that binds a name inside a body" - {
@@ -112,6 +123,24 @@ class ReservedNameTests extends AnyFreeSpec with CodegenSupport {
     "a closure's parameter, which no declaration form would have caught" in {
       err("apply(f: int -> int) -> int = f(1)\nprint(apply(__X__ -> __X__))") should
         include("reserved for names the compiler answers")
+    }
+  }
+
+  "a reserved name where no built-in could stand" - {
+    "in a type position" in {
+      err("var x: __FOO__ = 1") should include("__FOO__")
+    }
+
+    "assigned to" in {
+      err("__FILE__ = 1") should include("__FILE__")
+    }
+
+    "called" in {
+      err("print(__FILE__())") should include("__FILE__")
+    }
+
+    "at a type it is not" in {
+      err("var n: int = __FILE__") should include("string")
     }
   }
 
