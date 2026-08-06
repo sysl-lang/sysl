@@ -242,13 +242,17 @@ class ImplComposedErrorTests extends AnyFreeSpec with CodegenSupport with RunSup
       e should include(s"write an 'impl ${lib("Display")} for [2][1]P' to say how it renders")
     }
 
-    // A `[]int` prints, so the case is an **array** of a built-in: nothing covers arrays and nothing
-    // in `[2]int` is the program's, which leaves the reader with a block they could not write.
-    "but where nothing in the subject is this module's, it says there is no home for one" in {
+    /** A `[]int` prints, so the case is an **array** of a built-in: nothing covers arrays and
+      * nothing in `[2]int` is the program's, which would leave the reader with a block they could
+      * not write. What they are given instead is the whole-array view, which needs no block at all
+      * — the assertion that matters here is still that no impossible `impl` is named.
+      */
+    "but where nothing in the subject is this module's, it names no block at all" in {
       val e = err("var a = [1, 2]\nprint(a)")
 
-      e should include("no home outside the library")
+      e should include("print the whole-array view '[..]'")
       e should not include s"write an 'impl ${lib("Display")} for"
+      e should not include "no home outside the library"
     }
 
     /** The defect the pair above exists for. Both diagnostics used to arrive in the same run — the
@@ -272,7 +276,7 @@ class ImplComposedErrorTests extends AnyFreeSpec with CodegenSupport with RunSup
       val e = err("var a = [1, 2]\nprint(f\"${a}\")")
 
       e should include("cannot make a string of")
-      e should include("no home outside the library")
+      e should include("print the whole-array view '[..]'")
     }
 
     // A memory mode is one of the shapes an `impl` may not be for, so there is nothing to suggest.

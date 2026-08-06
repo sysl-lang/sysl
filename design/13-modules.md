@@ -880,7 +880,7 @@ Two things a constant is **not**, so the boundaries stay where the rest of the d
   length as the type-safe replacement for a pile of `const`s. A constant is one dimension, not a
   family of them; if a second constant would be the obvious neighbour of the first, the declaration
   wanted was an `enum`.
-- **Not const generics.** Parameterizing over a length is `10 § Open d` and stays deferred — but it
+- **Not value generics.** Parameterizing over a length is `10 § Open d` and stays deferred — but it
   is worth recording that this is its prerequisite, since a value cannot be passed as an argument
   before it can be named.
 

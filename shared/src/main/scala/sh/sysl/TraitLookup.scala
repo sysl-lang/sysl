@@ -301,7 +301,7 @@ trait TraitLookup extends MemberVisibility {
    * type a written `impl` is for and the name a diagnostic gives it. A shape-matched block is for
    * something else, so it needs a key of its own, and dropping the arguments is exactly what makes
    * one: every slice shares `[]`, and every array shares its length with the arrays of that length,
-   * since without const generics (`10 § Open d`) the length is part of the shape rather than an
+   * since without value generics (`10 § Open d`) the length is part of the shape rather than an
    * argument to it.
    *
    * A `string` is not a slice and has no shape here. It is a view of bytes that are valid UTF-8, and
