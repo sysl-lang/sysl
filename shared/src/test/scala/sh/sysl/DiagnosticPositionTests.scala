@@ -16,18 +16,6 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class DiagnosticPositionTests extends AnyFreeSpec with CodegenSupport {
 
-  /** The column a caret sits in, read out of the rendered diagnostic — which is what a reader sees,
-   * rather than the position the compiler recorded.
-   */
-  private def caret(src: String): Int = {
-    val lines = err(src).linesIterator.toList
-    val at    = lines.indexWhere(_.trim.startsWith("^"))
-
-    if at < 0 then fail(s"no caret in:\n${lines.mkString("\n")}")
-
-    lines(at).indexOf('^') - lines(at).takeWhile(_ != '|').length
-  }
-
   /** The 1-based column the caret points at in the source line above it. */
   private def column(src: String): Int = {
     val rendered = err(src)
