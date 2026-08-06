@@ -61,6 +61,32 @@ class GenericsClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport
     }
   }
 
+  /** The definition-time pass is not only about **bounds**. A body is analyzed there, so everything
+   * analyzing a body would say belongs there too — and a name that names nothing is the plainest of
+   * those.
+   *
+   * The control is what makes each of these a defect rather than a design choice: the same mistake
+   * one word away from being generic is caught, so genericity is what turns the check off.
+   */
+  "an uncalled generic is checked for more than its bounds" - {
+
+    "a name in the body that names nothing is refused" in {
+      err("f[T](y: T) -> usize = nosuchthing") should include("nosuchthing")
+    }
+
+    "and so is the same name in a body nothing makes generic" in {
+      err("g(y: int) -> usize = nosuchthing") should include("nosuchthing")
+    }
+
+    "a type in the signature that names nothing is refused" in {
+      err("f[T](xs: []Nope, y: T) -> usize = 0") should include("Nope")
+    }
+
+    "and so is the same type where there is no parameter to make it generic" in {
+      err("g(xs: []Nope) -> usize = 0") should include("Nope")
+    }
+  }
+
   "a bound licenses the subscript, which is what makes the refusal a rule rather than a ban" - {
 
     """a parameter bounded by 'Index' is subscripted and dispatches through it — this only ever

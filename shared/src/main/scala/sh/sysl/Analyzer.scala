@@ -74,7 +74,7 @@ object Analyzer {
     val outcome =
       try Right(analyzer.analyze())
       catch
-        case AnalyzerError(msg, pos) => Left(List(Diagnostic.render(msg, pos)))
+        case AnalyzerError(msg, pos, _) => Left(List(Diagnostic.render(msg, pos)))
         // A poisoned region carries no message of its own: it means an error was already
         // recorded, and those are what the caller is told about.
         case Poisoned() => Left(Nil)

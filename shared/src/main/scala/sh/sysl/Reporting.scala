@@ -10,7 +10,8 @@ import scala.collection.mutable
  * declaration — which is caught at the nearest recovery point so the analyzer can go on to find
  * the mistakes further down the file.
  */
-case class AnalyzerError(message: String, pos: Option[Pos]) extends RuntimeException(message)
+case class AnalyzerError(message: String, pos: Option[Pos], unresolved: Boolean = false)
+    extends RuntimeException(message)
 
 /** Raised where a value derives from something that was already reported.
  *
@@ -92,6 +93,24 @@ trait Reporting {
 
   protected def err(msg: String): Nothing = throw AnalyzerError(msg, currentPos)
 
+  /** Reports a name — of a value or of a type — that names nothing at all.
+   *
+   * It is an ordinary `AnalyzerError` in every respect but one: the abstract pass keeps it. That
+   * pass drops a body's complaints because each is found again at every instantiation, and the trade
+   * is a good one for anything whose answer depends on what the parameters turn out to be. **A name
+   * that names nothing does not depend on them.** It is wrong at every instantiation and wrong at
+   * none, so a declaration nothing instantiates is the one place the mistake could hide — and it
+   * did: `f[T](y: T) = nosuchthing` compiled while the same line one word away from being generic
+   * did not.
+   *
+   * Raised by throwing rather than recorded outright, unlike `boundErr`, because several callers
+   * resolve a name speculatively and catch the failure to mean *absent* — a member lookup falling
+   * back to the next candidate, an `impl` deciding a subject is not one it covers. Those still catch
+   * it and still say nothing; what changes is only what `recover` does with one that reaches it.
+   */
+  protected def unresolvedErr(msg: String): Nothing =
+    throw AnalyzerError(msg, currentPos, unresolved = true)
+
   /** Abandons the current region without reporting, because whatever led here already did. */
   protected def poisoned(): Nothing = throw Poisoned()
 
@@ -137,7 +156,7 @@ trait Reporting {
   protected def reported[T](body: => T): T =
     try body
     catch
-      case AnalyzerError(msg, pos) =>
+      case AnalyzerError(msg, pos, _) =>
         found += ((msg, pos))
         poisoned()
 
@@ -152,7 +171,7 @@ trait Reporting {
   protected def recorded[T](fallback: => T)(body: => T): T =
     try body
     catch
-      case AnalyzerError(msg, pos) =>
+      case AnalyzerError(msg, pos, _) =>
         found += ((msg, pos))
         fallback
       case Poisoned() => fallback
@@ -188,8 +207,11 @@ trait Reporting {
   protected def recover[T](fallback: => T)(body: => T): T =
     try body
     catch
-      case AnalyzerError(msg, pos) =>
-        if !abstractPass then found += ((msg, pos))
+      // A name that names nothing is kept even here, because the reason the rest are dropped does
+      // not reach it: it is wrong whatever the parameters turn out to be, so no instantiation will
+      // find it again — and a declaration nothing instantiates would otherwise never be told.
+      case AnalyzerError(msg, pos, unresolved) =>
+        if !abstractPass || unresolved then found += ((msg, pos))
         fallback
       case Poisoned() => fallback
 

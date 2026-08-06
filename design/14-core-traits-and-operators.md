@@ -544,6 +544,16 @@ concrete type satisfying the bound supplies each of those, instantiation cannot 
 definition passed. (An instantiation may still fail for a reason unrelated to the parameter, as
 any concrete code can.)
 
+**That parenthetical is what the abstract pass leans on when it drops a complaint, and it holds for
+everything except a name that names nothing.** A body's other mistakes depend on what the parameters
+turn out to be, so reporting them from a pass where the parameters stand for themselves would blame
+a body no call site may ever ask for — they are left to the instantiation, which is where they can be
+said in concrete terms. A name that resolves to nothing has no such second chance: it is wrong at
+every instantiation and wrong at none, so **an undefined name and an unknown type are reported at the
+definition, whatever the pass**. Otherwise a generic nothing instantiates is checked nowhere, which
+is the one shape in which `f[T](y: T) = nosuchthing` used to compile while the same line one word
+away from being generic did not.
+
 ### What this changes about existing generics
 
 A generic function that today relies on the template model to use an *unbounded* parameter for

@@ -706,7 +706,7 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
               case None if traitKey(n).isDefined =>
                 err(s"'$n' is a trait, so it describes behaviour rather than a layout — write '*$n' or " +
                   s"'&$n' for a trait object, or bound a type parameter with '[T: $n]'")
-              case None => err(s"unknown type '$n'")
+              case None => unresolvedErr(s"unknown type '$n'")
 
   /** A written argument list, resolved **against the declaration whose parameters they fill** —
    * because which argument is a type and which is a value is the declaration's fact and nothing the

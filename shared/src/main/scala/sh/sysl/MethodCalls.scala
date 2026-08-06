@@ -301,7 +301,7 @@ trait MethodCalls extends FuncAddress {
     sandboxed {
       try Some(body)
       catch
-        case AnalyzerError(_, _) => None
+        case AnalyzerError(_, _, _) => None
         case Poisoned()          => None
     }
 

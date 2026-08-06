@@ -477,7 +477,7 @@ trait ExprAnalysis
                     case None if blockDeclares(name) =>
                       err(s"'$name' is declared below this, and a name is in scope from where it " +
                         "is bound onward")
-                    case None => err(s"undefined name '${qn(name)}'")
+                    case None => unresolvedErr(s"undefined name '${qn(name)}'")
 
     case Binary(op @ ("&&" | "||"), l, r) =>
       TLogical(op, analyzeBool(l), analyzeBool(r))
