@@ -298,6 +298,28 @@ finding some `n` at the call site: the parameters are bound by the very call bei
 default that read one would fix an evaluation order among arguments that nothing else in the language
 fixes.
 
+**Analyzed in the declaration's scope; positioned at the call site.** Those are two different
+questions and this section used to answer only the first, because until an expression could ask
+*where it was written* nothing needed the second. The paragraph above is about **name resolution**
+and is unchanged: a default names what the declaration's file names, wherever it is called from. Where
+a default **is**, on the other hand, is the call — which is what "standing exactly where the argument
+would have been written" says, and what makes
+
+```
+check(cond: bool, file: string = __FILE__, line: int = __LINE__)
+```
+
+report the *caller's* file and line (`reserved-identifiers.md`). Nothing in that feature knows what a
+caller is; the whole of it is an expression that reports its own position, and a default that
+positions it at the call. It is why sysl needs no equivalent of Rust's `#[track_caller]` — Rust bolts
+a call-site mechanism onto the call path because its `assert!` is a macro, and Swift, which has
+call-site-evaluated defaults as this does, needs no such thing either.
+
+**A default filling another default reports the outermost call.** Where a default calls something and
+leaves *that* argument out, the inner filling's call site is a position inside the first default —
+a line in the declaration's file, which is precisely the answer this is for avoiding. So the first
+call entered wins, and every built-in in the nest names the one place a reader actually wrote a call.
+
 **A closure literal is not yet one of the expressions a default may be**, though "standing exactly
 where the argument would have been written" says it should be: an argument there takes the
 parameter's declared type as what it is being used as, and a default does not, so `f: int -> int = y

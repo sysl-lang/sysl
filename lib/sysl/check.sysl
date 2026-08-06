@@ -18,12 +18,39 @@ module sysl
 // Under `sysl test` either one fails the test it is written in, since a test's verdict is whether it
 // came back and neither of these comes back.
 
-panic(msg: string) -> never
-    print("panic:", msg)
+// Where the caller was. Both take these and neither is ever given them: a default is evaluated at the
+// call, standing exactly where the argument would have been written (`12 §2a`), so `__FILE__` and
+// `__LINE__` written here report the line that called `assert` rather than this line
+// (`reserved-identifiers.md`).
+//
+// **This is why `assert`'s message is now optional, and it used to be required.** The comment that
+// stood here said the message could not be defaulted "because the condition's source is not
+// available to print" -- true when it was written, and a workaround stated as a principle. A check
+// that names its own line does not need to be told in prose which check it was.
+
+// The location is **streamed** rather than interpolated, and that is not a style choice: an f-string
+// builds a string, and building one makes heap storage, which would put `panic` and everything
+// through it out of reach of a module that declared `@no_alloc` (`capabilities.md`). An assertion is
+// exactly what an allocator-free module wants most, so it is composed out of `prints` and `printi`,
+// each of which goes straight to `putbytes`. Caught by the `@no_alloc` test that already existed.
+panic(msg: string, file: string = __FILE__, line: long = __LINE__) -> never
+    prints("panic: ")
+    prints(msg)
+    prints(" (")
+    prints(file)
+    prints(":")
+    printi(line)
+    prints(")\n")
     exit(1)
 
-// The condition is checked and nothing else is: a false one names the message it was given and stops.
-// The message is required rather than defaulted because the condition's *source* is not available to
-// print -- a failure that says only "assertion failed" sends its reader looking for which one.
-assert(cond: bool, msg: string)
-    if !cond then panic(msg)
+// The condition is checked and nothing else is: a false one names where it was written, and the
+// message if it was given one.
+//
+// **`file` and `line` are passed on explicitly**, which is the one thing about this that is easy to
+// get wrong: letting `panic` fill its own defaults would report *this* line, in this file, for every
+// assertion in every program -- the call that fills them would be the one three lines down rather
+// than the reader's. Forwarding them is how a location travels through a helper.
+assert(cond: bool, msg: string = "", file: string = __FILE__, line: long = __LINE__)
+    if !cond then
+        if msg.len == 0 then panic("assertion failed", file, line)
+        else panic(msg, file, line)

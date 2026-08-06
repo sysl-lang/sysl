@@ -128,7 +128,19 @@ Both are in the standard module (`lib/sysl/check.sysl`), and the tests needed th
 is a promise about a *call*, checked on entry, and a test's fifth statement has no contract to
 hang a claim on. They stop the program the way `unwrap` does — a line naming what happened,
 then the hosted exit — rather than with `llvm.trap`, because a check a *program* makes is one
-the compiler cannot see, and the message is the whole point of it.
+the compiler cannot see, and saying which one is the whole point of it.
+
+**`assert`'s message is optional**, and used to be required. The reason it was required was that a
+failure could not say *where* it happened, so a message was the only thing distinguishing one
+assertion from another — which made the message a workaround, and `check.sysl` said as much in the
+words of a principle. Both functions now take `file: string = __FILE__, line: long = __LINE__` and
+report the caller's line (`reserved-identifiers.md`), so `assert(x == 2)` is a complete assertion. A
+message is still worth writing where it says something the condition does not; it is no longer
+carrying the whole burden of identifying the check.
+
+The location is composed with `prints` and `printi` rather than an interpolated string, because
+building a string makes heap storage and an assertion is exactly what a module under `@no_alloc`
+wants most.
 
 **Summary:** Tier 1 = static (fast, most tests, including IR-shape); Tier 2 = the compiler's
 own run-it tests (Scala-authored); Tier 3 = the language's test framework (sysl-authored).

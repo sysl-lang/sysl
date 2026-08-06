@@ -101,6 +101,26 @@ class SourceLocationTests extends AnyFreeSpec with RunSupport {
             |""".stripMargin) shouldBe "3\n"
     }
 
+    // The standard module is the first customer for this, and the reason the feature exists: its
+    // `assert` required a message because the condition's source could not be printed. It can now.
+    "the standard module's 'assert' names where it failed" in {
+      panics("""var x = 1
+               |assert(x == 2)
+               |""".stripMargin, "assertion failed (<input>:2)")
+    }
+
+    "and still carries a message where one is given" in {
+      panics("""assert(1 == 2, "one is not two")
+               |""".stripMargin, "panic: one is not two (<input>:1)")
+    }
+
+    // `assert` forwards its own file and line to `panic` rather than letting `panic` fill them, so
+    // the location is the reader's call and not the line inside `check.sysl` that calls `panic`.
+    "a location forwarded through a helper stays the caller's" in {
+      panics("""panic("direct")
+               |""".stripMargin, "panic: direct (<input>:1)")
+    }
+
     "a method's default reports its call site too" in {
       run("""struct P
             |    x: int
