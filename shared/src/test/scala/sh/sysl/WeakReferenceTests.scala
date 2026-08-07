@@ -131,8 +131,9 @@ class WeakReferenceTests extends AnyFreeSpec with CodegenSupport with RunSupport
       out should include("'weak Node' is already a weak edge to a counted Node")
       out should not include "'&&Node'"
 
-      // The parser is why: the advice that used to be given cannot be typed.
-      err(node + "var r: &&Node = Node(1)") should include("newline expected")
+      // The parser is why: the advice that used to be given cannot be typed. `&&` is one token, so
+      // what the sigil is told it wants is the type name that is not behind it.
+      err(node + "var r: &&Node = Node(1)") should include("identifier expected")
     }
 
     "'null' is not the empty weak reference, and the message says what is" in {

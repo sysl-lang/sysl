@@ -87,10 +87,13 @@ class ClosureParserTests extends AnyFreeSpec with ParseSupport {
       // `00 §9` — a bracket suspends the off-side rule until it closes, so the lexer emits no
       // indent inside one and there is no block for the body to be. The fix is a name to bind the
       // closure to, and the limit is recorded in `12 §5` rather than worked around here.
+      //
+      // The body is therefore the one expression `log(x)`, and the argument list is still open when
+      // the next line starts: what is missing at `print` is the `)` that would have closed it.
       progError("""xs.each(x ->
                   |    log(x)
                   |    print(x))
-                  |""".stripMargin) should include("newline expected")
+                  |""".stripMargin) should include("')' expected")
     }
   }
 

@@ -77,12 +77,44 @@ The parser is a `PackratParsers` grammar with `type Elem = Token`, fed the `List
   revisited — because the tokens are fixed before parsing starts.
 
 **The accepted cost — and its mitigation.** The real combinator weakness packrat does *not*
-fix is **error-message quality and recovery**: ordered choice reports failures at confusing
-positions, and there is no built-in multi-error recovery. We accept this and mitigate it where
-it matters, with explicit `failure` / `err` messages and commit points on the productions
-whose diagnostics users hit most (statement heads, type positions, block openers). The trade
-buys a large amount of **development speed**, letting effort go to the language — types, memory
-model, semantics — rather than parser plumbing.
+fix is **error-message quality and recovery**: ordered choice ranks failures by how far each
+candidate got rather than by what the writer meant, and there is no built-in multi-error
+recovery. We accept this and mitigate it where it matters, with explicit `failure` / `err`
+messages and commit points on the productions whose diagnostics users hit most (statement
+heads, type positions, block openers). The trade buys a large amount of **development speed**,
+letting effort go to the language — types, memory model, semantics — rather than parser
+plumbing.
+
+**Confusing *positions*, though, were a defect of ours and not a property of the technique.**
+The library ranks by position correctly and carries the furthest failure through a rule that
+backtracked and then succeeded; `at`, which every production is wrapped in, rebuilt the result
+and so discarded that record on the way past. What was left to report came from outside the
+outermost production, which put the caret at the top of the enclosing block however far down
+the mistake was. `at` now stamps the node in place and hands the result back untouched.
+
+What ordered choice does still decide is the *message*, and a handful of combinators shape it.
+`describe` renames a production's refusal where the production consumed nothing, so a token that can
+begin no expression is told `expression expected` rather than named after whichever candidate
+happened to sit last in the ladder; `expression`, `unary`, `pattern` and the attribute list carry it.
+
+The rest exist because **an absence must not be spoken of as an expectation**. An optional construct
+that is simply not there still records what it wanted, and that expectation then competes with — and,
+being further into the file or merely recorded earlier, outranks — the real mistake:
+
+- `skipNewlines` reads blank lines and cannot fail.
+- `asOneToken` reports a refusal back at the token the production began at, for a construct being
+  *looked for* rather than required: what the search crossed to find out is not the reader's mistake.
+  `onNextLine` is that over blank lines, for a continuation keyword such as `match` or `else`.
+- `maybe` is `opt`, and `repeatedly` is `rep`, for a construct whose absence is ordinary — a module
+  header, the attributes under one. Both drop a refusal at the first token and keep one after it, so
+  a construct that was *started* still answers for how it goes on.
+
+Two shapes in the grammar itself follow from the same rule. A **lookahead is placed at the commit
+point** rather than after it, so a loop's label is only read where a loop keyword follows it and a
+stray one is not reported as a loop nobody was writing. And an **indented block takes `rep1sep`, not
+`repsep`**: the lexer emits no `indent` for an empty block, so a block that parsed no items has an
+item that would not parse, and letting that refusal stand says more than the `dedent` the block was
+going to want next.
 
 ## Source positions
 

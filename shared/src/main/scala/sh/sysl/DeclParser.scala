@@ -44,9 +44,9 @@ trait DeclParser extends ExprParser {
       case n ~ r => Param(n, FnType(Nil, r, bare = true), byName = true)
     })
 
-  /** A struct's field, which has no default to declare. Said here rather than left to the
-   * "newline expected" a grammar with no place for one would give, because `= v` after a field is a
-   * reasonable thing to try and the reason it is refused is not guessable from the failure.
+  /** A struct's field, which has no default to declare. Said here rather than left to whatever the
+   * grammar happened to want where the `= v` was written, because writing one is a reasonable thing
+   * to try and the reason it is refused is not guessable from a complaint about shape.
    */
   protected lazy val fieldParam: Parser[Param] =
     param <~ (op("=") ~> err("a field declares no default — what an unwritten field gets is decided " +
@@ -181,9 +181,9 @@ trait DeclParser extends ExprParser {
       // reached furthest — so the sentence below, raised back at the declaration, would lose to it
       // and a struct with a mistake in its body would be reported as having no body. Neither guard
       // consumes, so both are asked at the same position and at most one of them can succeed.
-      noPacks(tp, "a struct") ~> (opt(guard(newline ~ indent)) ~ opt(guard(opt(newlines) ~> softEnd))) >> {
+      noPacks(tp, "a struct") ~> (opt(guard(newline ~ indent)) ~ opt(guard(onNextLine(softEnd)))) >> {
         case Some(_) ~ _ =>
-          (newline ~> indent ~> opt(newlines) ~> repsep(structItem, newlines) <~ opt(newlines) <~ dedent) <~
+          (newline ~> indent ~> skipNewlines ~> rep1sep(structItem, newlines) <~ skipNewlines <~ dedent) <~
             endName(name) ^^ { items =>
               val fields     = items.collect { case StructPart.Fld(f)  => f }
               val members    = items.collect { case StructPart.Mem(m)  => m }
@@ -238,8 +238,8 @@ trait DeclParser extends ExprParser {
 
   /** The refusal a trait's member and an `impl`'s share (`08 § Visibility`). Both are reached at the
    * reach the *trait* has — one asks for the member and the other supplies what was asked — so
-   * there is nothing here for a modifier to decide, and saying that is worth more than the
-   * "newline expected" a grammar with no place for one would give.
+   * there is nothing here for a modifier to decide, and saying that is worth more than whatever the
+   * grammar happened to want where the modifier was written.
    */
   protected lazy val noVisibility: Parser[Unit] =
     op("private") ~> err("a trait's members and an 'impl' block's carry no visibility of their own — a " +
@@ -332,7 +332,7 @@ trait DeclParser extends ExprParser {
     op("enum") ~> ident ~ opt(boundedTypeParams) ~ opt(op(":") ~> typeRef) >> { case name ~ tps ~ under =>
       val tp = tps.getOrElse(TypeParams.none)
 
-      noPacks(tp, "an enum") ~> (newline ~> indent ~> opt(newlines) ~> repsep(enumItem, newlines) <~ opt(newlines) <~ dedent) <~ endName(name) ^^ {
+      noPacks(tp, "an enum") ~> (newline ~> indent ~> skipNewlines ~> rep1sep(enumItem, newlines) <~ skipNewlines <~ dedent) <~ endName(name) ^^ {
         items =>
           val variants = items.collect { case Left(v)  => v }
           val members  = items.collect { case Right(m) => m }
@@ -423,7 +423,7 @@ trait DeclParser extends ExprParser {
       case name ~ tps ~ supers =>
         val tp = tps.getOrElse(TypeParams.none)
         val body =
-          (newline ~> indent ~> opt(newlines) ~> repsep(traitMember, newlines) <~ opt(newlines) <~ dedent) <~
+          (newline ~> indent ~> skipNewlines ~> rep1sep(traitMember, newlines) <~ skipNewlines <~ dedent) <~
             endName(name)
 
         def decl(methods: List[MethodDecl]) =
@@ -511,7 +511,7 @@ trait DeclParser extends ExprParser {
       qualifiedName ~ opt(typeArgs) ^^ { case n ~ args => (n, args.getOrElse(Nil)) }
 
   protected lazy val implBody: PackratParser[List[MethodDecl]] =
-    newline ~> indent ~> opt(newlines) ~> repsep(implMember, newlines) <~ opt(newlines) <~ dedent
+    newline ~> indent ~> skipNewlines ~> rep1sep(implMember, newlines) <~ skipNewlines <~ dedent
 
   /** A member of an `impl` block, which is the one place a member may say `override` — the trait it
    * implements is the only thing a member of a type can be replacing a body from.
@@ -523,7 +523,7 @@ trait DeclParser extends ExprParser {
    * keyword; the trailing name must equal the declaration's own name, or it is a parse error.
    */
   protected def endName(name: String): Parser[Unit] =
-    opt(opt(newlines) ~> softEnd ~> checkedEndName(name)) ^^^ (())
+    opt(onNextLine(softEnd) ~> checkedEndName(name)) ^^^ (())
 
   protected def checkedEndName(expected: String): Parser[Unit] =
     ident >> { n =>
@@ -535,7 +535,7 @@ trait DeclParser extends ExprParser {
    * resolved either of them yet and matching the spelling is all this marker was ever doing.
    */
   protected def endTypeRef(expected: TypeRef): Parser[Unit] =
-    opt(opt(newlines) ~> softEnd ~> (typeRef >> { t =>
+    opt(onNextLine(softEnd) ~> (typeRef >> { t =>
       if t == expected then success(()) else err(s"'end ${t.show}' does not match '${expected.show}'")
     })) ^^^ (())
 

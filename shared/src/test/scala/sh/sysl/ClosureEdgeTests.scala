@@ -407,8 +407,11 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // function that does not exist until a call names its types. So there is nothing for an arrow to
     // declare them for. What the grammar says today is only that it cannot read one.
     "a closure of its own may not be generic, because its call trait's member may not be" in {
+      // `[T]` reads as an index of `T` and `(x` as a call on the result, so the refusal lands on
+      // the `:` that neither of those admits — the grammar has no reading in which the brackets
+      // before an arrow declare anything.
       err("""var f = [T](x: T) -> x
-            |""".stripMargin) should include("newline expected")
+            |""".stripMargin) should include("')' expected")
 
       err("""trait Maps
             |    over[T](self, x: T) -> T

@@ -548,7 +548,9 @@ class ImportTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
     }
 
     "an empty selector list does not parse" in {
-      errIn(("", "main.sysl", "import geom.{}\nprint(1)"), geom) should include("newline expected")
+      // The refusal is inside the braces, where a name would have gone, rather than at the end of
+      // the line the braces are on.
+      errIn(("", "main.sysl", "import geom.{}\nprint(1)"), geom) should include("identifier expected")
     }
   }
 
