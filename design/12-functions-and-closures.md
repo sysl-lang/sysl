@@ -1026,14 +1026,20 @@ expected type settles them**, by the same unification a call site uses on its ar
 declared signature is matched against the `*extern` wanted, and the instantiation that solves it is
 what has the address.
 
-**The flat refusal this replaces was too broad, and what it cost was a library's ability to offer a
-callback helper at all.** Every C interface that calls back pairs the function pointer with a `void
-*userdata` — C's encoding of a closure — and the trampoline that unpacks it must be generic over the
-state type. That state type belongs to the **application**, not to the binding, so a binding could
-ship nothing reusable: every program wanting a callback wrote its own trampoline and its own
-unchecked `ptr_cast`. The refusal's stated reason was that there is "no one body to name", and the
-sentence after it — that a wrapper calling it at the arguments wanted is what has an address —
-describes precisely what an instantiation is.
+**The flat refusal this replaces was too broad.** Its stated reason was that there is "no one body to
+name", and the sentence after it — that a wrapper calling it at the arguments wanted is what has an
+address — describes precisely what an instantiation is. What it cost was every *generic* function
+being unusable as a callback, however completely the context described the one wanted: a comparison
+written once over `*T` could not be handed to `qsort`, and a program needing it wrote a concrete copy
+per element type.
+
+**What this does NOT reach is the `void *userdata` pattern**, and the boundary is worth stating
+because it is the case a reader will assume is covered. Every C interface that calls back pairs the
+pointer with an untyped `void *`, and a trampoline for one has the signature C fixed — `(*u8, Event)
+-> bool`. The state type appears nowhere in it, so there is nothing for the expected type to solve,
+and such a trampoline is refused by the very rule below about a parameter the signature does not
+mention. Recovering the state means a `ptr_cast` from `*u8`, which is a promise rather than a
+deduction. A concrete trampoline per state type is still what that pattern takes.
 
 **There is no written form, `&f[T]`, and that is a grammar fact rather than a preference.** `&f[T]`
 and `&xs[i]` are the same shape — a name, a bracket, something inside — and only knowing whether the

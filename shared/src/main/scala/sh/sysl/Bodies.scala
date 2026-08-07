@@ -156,18 +156,15 @@ object Bodies {
         walk(it, bound)
         walk(p, bound + n)
         bound
-      // A backticked name in a pattern is a **read** (`09`) — the one way a pattern reaches a name
-      // rather than introducing one — and it resolves against what was bound before the arm, since
-      // the quoting says it names something already declared.
-      case EqPattern(n) =>
-        if !bound(n) then found += n
-        bound
       case MatchArm(ps, guard, b) =>
         val inArm = bound ++ ps.flatMap(patternNames)
 
-        // Walked for what they *read*, which until quoted names existed was nothing: every other
-        // pattern form either binds a name or holds a literal.
-        ps.foreach(walk(_, bound))
+        // What the patterns *read* — the backticked names, which reference rather than bind (`09`).
+        // A walk of its own rather than the general one, which would also descend into a
+        // `LitPattern`'s expression and could call a name there free: a change to every match arm
+        // rather than to the form that is new.
+        for n <- ps.flatMap(patternReads) do if !bound(n) then found += n
+
         guard.foreach(walk(_, inArm))
         walk(b, inArm)
         bound
@@ -178,6 +175,18 @@ object Bodies {
     walk(f.body, f.params.map(_.name).toSet)
     found.toSet
   }
+
+  /** Every name a pattern **reads** — the backticked ones, which reference something already
+   * declared rather than binding it (`09`). Almost always empty, which is the point: every other
+   * form binds a name or holds a literal.
+   */
+  private def patternReads(p: Pattern): List[String] = p match
+    case EqPattern(n)          => List(n)
+    case BindPattern(_, inner) => patternReads(inner)
+    case VariantPattern(_, ps) => ps.flatMap(patternReads)
+    case TuplePattern(ps)      => ps.flatMap(patternReads)
+    case StructPattern(_, fs)  => fs.flatMap((_, sub) => patternReads(sub))
+    case _                     => Nil
 
   /** Every name a pattern binds, which shadows for the arm it introduces. */
   private def patternNames(p: Pattern): List[String] = p match
