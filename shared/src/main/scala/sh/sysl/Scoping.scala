@@ -649,15 +649,26 @@ trait Scoping extends DeclTables {
     importStack = List(Imports.empty)
   }
 
-  protected def freshName(base: String): String =
-    if !used(base) then { used += base; base }
+  protected def freshName(base: String): String = {
+    /* A backtick-quoted name may hold characters LLVM will not accept in an identifier, and a local
+     * reaches the IR as `%name.addr` — so the escaping happens here, once, rather than at the
+     * several emitters that build that string.
+     *
+     * A name the compiler made for itself is left alone, and is told by its leading separator:
+     * `$parts` and `$env0` are already safe, and running them through the escape would rewrite
+     * that separator and change IR that has not otherwise moved.
+     */
+    val safe = if base.nonEmpty && base.head == Modules.sep then base else LlvmName.escape(base)
+
+    if !used(safe) then { used += safe; safe }
     else {
       var k = 1
-      while used(s"$base.$k") do k += 1
-      val n = s"$base.$k"
+      while used(s"$safe.$k") do k += 1
+      val n = s"$safe.$k"
       used += n
       n
     }
+  }
 
   /** The reserved names this compilation has already refused, so one mistake gets one diagnostic.
    *

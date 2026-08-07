@@ -30,9 +30,21 @@ object Modules {
    */
   val root: String = ""
 
-  /** The key a declaration named `name` in `module` is filed under. */
+  /** The key a declaration named `name` in `module` is filed under.
+   *
+   * **The name is escaped here**, which is where a backtick-quoted identifier (`09`) stops being a
+   * problem for everything downstream: a key is still the emitted symbol, as the note above says,
+   * so a name carrying a space had to become LLVM-safe somewhere, and this is the one place every
+   * declaration passes through. `LlvmName.escape` is the identity on every name the ordinary
+   * identifier grammar can produce, so no key that existed before this moves.
+   *
+   * **`split` still recovers the module**, although the escape's marker is the separator itself.
+   * The escape can only introduce a `$` *after* the separator is written, and a module path holds
+   * no quoted segment — refused where a module path is read, precisely so that the first `$` in a
+   * key remains the one this function put there.
+   */
   def qualify(module: String, name: String): String =
-    if module.isEmpty then name else s"$module$sep$name"
+    if module.isEmpty then LlvmName.escape(name) else s"$module$sep${LlvmName.escape(name)}"
 
   /** The module a key belongs to, and everything after it — which for a member or an
    * instantiation is itself a dotted name (`Point.dist`, `f.int`) and is left as one.

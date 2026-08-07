@@ -77,8 +77,20 @@ trait PatternParser extends ExprParser {
       variantPattern |
       tuplePattern |
       wildcard ^^^ WildcardPattern |
+      quotedRef ^^ EqPattern.apply |
       qualifiedName ^^ IdentPattern.apply |
       patternLit ^^ LitPattern.apply
+
+  /** A backtick-quoted name in pattern position, `` `limit` `` or `` sdl.`SCANCODE_A` `` — a
+   * reference rather than a binding.
+   *
+   * It sits above the bare-name alternative because the two overlap: `ident` takes either spelling,
+   * so a quoted name would otherwise be read as an `IdentPattern` and bind. What distinguishes them
+   * is the *final* segment, since that is the one naming the thing — a qualifier is dropped by the
+   * analyzer either way.
+   */
+  private lazy val quotedRef: Parser[String] =
+    rep(ident <~ op(".")) ~ quotedIdent ^^ { case ps ~ n => (ps :+ n).mkString(".") }
 
   protected lazy val variantPattern: Parser[Pattern] =
     qualifiedName ~ (op("(") ~> commaList(pattern) <~ op(")")) ^^ { case n ~ ps => VariantPattern(n, ps) }

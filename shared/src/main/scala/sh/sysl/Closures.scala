@@ -449,9 +449,19 @@ trait Closures extends CallAnalysis {
         walk(it, bound)
         walk(p, bound + n)
         bound
+      // A backticked name in a pattern is a **read** (`09`), which is the one way a pattern can
+      // reach a name rather than introduce one. It resolves against what was bound *before* the
+      // arm, since the quoting says it names something already declared — so a pattern that both
+      // binds `a` and references `` `a` `` reads the outer one.
+      case EqPattern(n) =>
+        if !bound(n) && lookupOpt(n).isDefined then found += n
+        bound
       case MatchArm(ps, guard, b) =>
         val inArm = bound ++ ps.flatMap(patternNames)
 
+        // Walked for what they *read*, which until quoted names existed was nothing — every other
+        // pattern form either binds a name or holds a literal.
+        ps.foreach(walk(_, bound))
         guard.foreach(walk(_, inArm))
         scoped(b, inArm)
         bound

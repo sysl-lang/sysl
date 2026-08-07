@@ -153,9 +153,18 @@ object Bodies {
         walk(it, bound)
         walk(p, bound + n)
         bound
+      // A backticked name in a pattern is a **read** (`09`) — the one way a pattern reaches a name
+      // rather than introducing one — and it resolves against what was bound before the arm, since
+      // the quoting says it names something already declared.
+      case EqPattern(n) =>
+        if !bound(n) then found += n
+        bound
       case MatchArm(ps, guard, b) =>
         val inArm = bound ++ ps.flatMap(patternNames)
 
+        // Walked for what they *read*, which until quoted names existed was nothing: every other
+        // pattern form either binds a name or holds a literal.
+        ps.foreach(walk(_, bound))
         guard.foreach(walk(_, inArm))
         walk(b, inArm)
         bound

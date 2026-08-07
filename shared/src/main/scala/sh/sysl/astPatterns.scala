@@ -25,6 +25,21 @@ case object WildcardPattern extends Pattern
  */
 case class IdentPattern(name: String) extends Pattern
 
+/** `` `limit` `` — a backtick-quoted name, which **references** what the name already stands for
+ * and tests the value against it, rather than binding a new one.
+ *
+ * It is the one pattern form that never binds, and that is the whole of why the quoting is there:
+ * a bare name binds unless something answers to it, so a reader cannot tell a test from a binding
+ * without knowing what is in scope. The backticks say which was meant, at the site.
+ *
+ * A `const` folds to the literal test it always did (`13 §Constants`). Anything else — a `val`, an
+ * `extern` variable, a local, a parameter — is storage read where the match runs, so the arm
+ * becomes a runtime equality against whatever it holds then. That is a test the compiler cannot
+ * reason about, so such an arm contributes nothing to exhaustiveness and a catch-all stays
+ * required.
+ */
+case class EqPattern(name: String) extends Pattern
+
 /** `Circle(r)`, `Wrap(Val(v))` — matches a data-enum variant and recurses into its fields.
  * Each sub-pattern matches the field at that position (a binding, a nested variant, `_`, or a
  * literal). Against a *struct* value the same positional form destructures every field in

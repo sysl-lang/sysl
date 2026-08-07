@@ -549,6 +549,14 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
         "and a binding has no other arm to take when the value has another")
       Nil
 
+    // A quoted name is a *reference*, so it tests rather than binds (`09 §`). It earns its own
+    // sentence because the fix is not the one the other refusals want: the name here is almost
+    // always the name that was meant, and it is the backticks that are wrong.
+    case EqPattern(n) =>
+      err(s"a binding cannot test a value — '`$n`' names something already declared, and a binding " +
+        s"has no other arm to take when the value turns out to differ; write '$n' to bind a new name")
+      Nil
+
   /** Most statements are one statement. The two comma forms are the exception, and the only reason
    * this hands back a list: a binding that names several things is several declarations.
    */
