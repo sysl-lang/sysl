@@ -172,14 +172,24 @@ trait Literals extends TypeResolution {
    * asking for a conversion rather than a silent widening. `+` on two strings concatenates,
    * allocating a fresh buffer; it is deliberately strict, so `s + 5` is an error asking for
    * interpolation rather than a silent `str(5)`.
+   *
+   * `rhs` is where the **right operand** was written, and it is where a mismatch is reported. An
+   * expression's position is otherwise its start, which is what every other diagnostic here uses —
+   * but a message naming two types and complaining about the second is one the reader answers by
+   * editing that operand, so the caret goes under it. The dispatched path already did this
+   * (`OperatorCalls.checkOperand`), and the two disagreed until this took a position: `1 + "x"`
+   * pointed at the `1` while a `Box[int] + string` pointed at the `string`.
+   *
+   * Only the mismatch moves. "operator is not defined for" below is about the operator and the type
+   * it was applied to rather than about one operand, so it keeps the expression's own position.
    */
-  protected def arithType(op: String, a: Type, b: Type): Type = {
+  protected def arithType(op: String, a: Type, b: Type, rhs: Option[Pos]): Type = {
     // Operands must agree on their *representation*: a transparent subtype meets its base and other
     // subtypes over it, while a derived type meets only itself (`repr` keeps it distinct). The
     // result is that shared representation — except two values of one derived type stay in it, since
     // arithmetic on a derived numeric yields the same derived numeric.
     val ra = Type.repr(a)
-    if ra != Type.repr(b) then err(s"'$op' needs matching types, got ${show(a)} and ${show(b)}")
+    if ra != Type.repr(b) then at(rhs)(err(s"'$op' needs matching types, got ${show(a)} and ${show(b)}"))
     val result = a match
       case c: Type.Constrained if c.derived && a == b => a
       case _                                          => ra

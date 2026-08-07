@@ -251,7 +251,7 @@ trait AnalyzerBase extends Scoping {
   protected def invCheckFor(place: TExpr): List[(TExpr, Type.Struct, String)]
   protected def describe(target: Expr): String
   protected def indexes(traitName: String, receiver: Expr): Boolean
-  protected def arithType(op: String, a: Type, b: Type): Type
+  protected def arithType(op: String, a: Type, b: Type, rhs: Option[Pos]): Type
   protected def constraintOf(t: Type): Option[Type.Constrained]
   protected def updateExpected(op: String, placeTy: Type): Option[Type]
   protected def updateDispatch(op: String, place: TExpr, value: TExpr): Option[TDispatch]

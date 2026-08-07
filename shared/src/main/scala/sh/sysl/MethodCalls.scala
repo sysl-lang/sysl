@@ -482,7 +482,7 @@ trait MethodCalls extends FuncAddress {
       val (_, op, kind)    = CoreTraits.required(trName)
 
       kind match
-        case CoreTraits.Kind.Arith   => produced(TBinary(op, self, ts.head, arithType(op, self.ty, ts.head.ty)))
+        case CoreTraits.Kind.Arith   => produced(TBinary(op, self, ts.head, arithType(op, self.ty, ts.head.ty, ts.head.pos)))
         case CoreTraits.Kind.Compare => TCompare(List(self, ts.head), List(TCmp(op)))
         case CoreTraits.Kind.Prefix  => produced(TUnary(op, self, unaryType(self.ty)))
     }

@@ -10,9 +10,14 @@ import org.scalatest.freespec.AnyFreeSpec
  * mutable object does, the reader is looking in the wrong place several times.
  *
  * It is **not** a rule about every diagnostic. An expression's position is its start, deliberately,
- * which is why `1 + "x"` points at the `1` and why an `if` keeps the column of its keyword
- * (`DiagnosticTests` pins that one). What is asserted here is narrower: where the message says a
- * name, the caret is under that name.
+ * which is why an `if` keeps the column of its keyword (`DiagnosticTests` pins that one). What is
+ * asserted here is narrower: where the message names the thing to change, the caret is under it.
+ *
+ * A binary operator's mismatch is the second case of that, and it is a message naming *two* types
+ * and complaining about the second. It points at the right operand — the one the reader edits —
+ * rather than at the start of the expression. The dispatched path had always done so; the scalar
+ * path pointed at the start, so `1 + "x"` and a `Box[int] + string` disagreed about where a mismatch
+ * lives. They agree here.
  */
 class DiagnosticPositionTests extends AnyFreeSpec with CodegenSupport {
 
@@ -59,15 +64,35 @@ class DiagnosticPositionTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
+  "a binary operator's mismatch points at the operand that is wrong" - {
+
+    // The message is about `+` and names `int and string`; the operand to change is `"x"`, at
+    // column 11. Column 7 is the `1`, which is what this used to say and is the one thing in the
+    // expression nobody is complaining about.
+    "the right operand, not the start of the expression" in {
+      column("print(1 + \"x\")") shouldBe 11
+    }
+
+    // The operand's own position, not the operator's — a wide expression puts them far apart, and
+    // it is the operand a reader edits.
+    "wherever that operand was written" in {
+      column("print(1     +     \"x\")") shouldBe 19
+    }
+
+    // The same rule through the compound-assignment path, which reaches `arithType` by a different
+    // route and would not have moved on its own.
+    "and through a compound assignment, at the value" in {
+      column("var n = 1\nn += \"x\"") shouldBe 6
+    }
+  }
+
   "what deliberately keeps the older convention" - {
 
-    // An expression's position is its start. This is the case the rule above does *not* extend to,
-    // and it is asserted so that a later change to the member rule does not quietly take this with
-    // it — `1 + "x"` naming `'+'` while pointing at the `1` is a decision, recorded in a ticket.
-    "a binary operator's mismatch points at the start of the expression" in {
-      val src = "print(1 + \"x\")"
-
-      column(src) shouldBe 7
+    // An expression's position is its start, and this message is about the operator and the type it
+    // was applied to rather than about one operand — there is no offending operand to point at, so
+    // the caret stays where the expression begins.
+    "an operator that the type does not have" in {
+      column("var a = [1, 2, 3]\nprint(a * a)") shouldBe 7
     }
   }
 }

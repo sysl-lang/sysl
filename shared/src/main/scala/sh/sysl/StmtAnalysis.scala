@@ -368,7 +368,7 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
         val tv     = part.getOrElse(analyzeExpr(written, updateExpected(binSym, place.ty)))
         val d      = updateDispatch(binSym, place, tv)
 
-        if d.isEmpty && disagree(arithType(binSym, place.ty, tv.ty), place.ty) then
+        if d.isEmpty && disagree(arithType(binSym, place.ty, tv.ty, tv.pos), place.ty) then
           err(s"'${m.op}' would change the type of ${describe(target)}")
         TWrite(place, m.op, tv, d, invCheckFor(place), constraintOf(place.ty))
 

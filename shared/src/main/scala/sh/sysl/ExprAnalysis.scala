@@ -486,7 +486,7 @@ trait ExprAnalysis
       val List(tl, provisional) = analyzeOperands(List(l, r), expected.filter(Type.isNumeric))
       val tr                    = operandRhs(op, tl, r, provisional)
 
-      operatorCall(op, tl, tr).getOrElse(produced(TBinary(op, tl, tr, arithType(op, tl.ty, tr.ty))))
+      operatorCall(op, tl, tr).getOrElse(produced(TBinary(op, tl, tr, arithType(op, tl.ty, tr.ty, tr.pos))))
 
     // The operand's *base* decides which operators there are — a subtype narrows which values a type
     // has, never which operations it has — so the match reads through it and the node is typed by
@@ -617,7 +617,7 @@ trait ExprAnalysis
       // the suppression a poisoned type wants: a place whose type could not be worked out has been
       // complained about once already, and saying its `+=` changes a type is a second complaint
       // about the consequence.
-      if d.isEmpty && disagree(arithType(binSym, place.ty, tv.ty), place.ty) then
+      if d.isEmpty && disagree(arithType(binSym, place.ty, tv.ty, tv.pos), place.ty) then
         err(s"'$op' would change the type of ${describe(target)}")
 
       withInvCheck(place, TUpdate(place, op, tv, place.ty, d, constraintOf(place.ty)))
