@@ -50,17 +50,10 @@ class TimeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |print(bad)""".stripMargin) shouldBe "0\n"
     }
 
-    // The two rules that are not "every fourth year", each with the year that proves it.
-    "the century rule and the four-century exception" in {
-      run(
-        imp +
-          """print(str(leap_year(2000)), str(leap_year(1900)), str(leap_year(2024)), str(leap_year(2023)))
-            |print(days_in_month(2000, 2), days_in_month(1900, 2))""".stripMargin) shouldBe
-        "true false true false\n29 28\n"
-    }
-
-    // …and the same fact reached through the calendar rather than through the predicate, which is
-    // what a program actually does with it.
+    // The two rules that are not "every fourth year" are asserted in the library itself, where the
+    // calendar is — `lib/sysl/time/tests.sysl`, "the leap-year rules, as a predicate and as a month
+    // length". What stays here is the same fact reached through the *calendar* rather than through
+    // the predicate, because it is a claim about arithmetic on serials rather than about a rule.
     "which the day numbers agree with" in {
       run(
         imp +
@@ -85,13 +78,6 @@ class TimeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         "2026-03-03\n2026-03-10\n"
     }
 
-    "the day of the year counts from one" in {
-      run(
-        imp +
-          """print(day_of_year(date_at(2026, 1, 1)), day_of_year(date_at(2026, 3, 1)))
-            |print(day_of_year(date_at(2024, 3, 1)), day_of_year(date_at(2026, 12, 31)))""".stripMargin) shouldBe
-        "1 60\n61 365\n"
-    }
   }
 
   "adding to a calendar" - {
@@ -197,15 +183,6 @@ class TimeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     // The parts and the remainders are different questions and the test says so: three and a half
     // hours is 210 whole minutes and 30 odd ones.
-    "the whole parts and the odd ones are different questions" in {
-      run(
-        imp +
-          """var d = hours(3i64) + minutes(30i64)
-            |print(whole_minutes(d), odd_minutes(d))
-            |print(whole_days(hours(50i64)), odd_hours(hours(50i64)))""".stripMargin) shouldBe
-        "210 30\n2 2\n"
-    }
-
     "instants and durations compare" in {
       run(
         imp +
@@ -320,38 +297,19 @@ class TimeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  /** What a parse refuses.
+    *
+    * **The out-of-range family moved into the library**, where the calendar it is about lives:
+    * `lib/sysl/time/tests.sysl` asserts a day the month does not have, the leap day accepted only in
+    * a leap year, and each of month, hour, minute and second — with the same messages, since a
+    * parser that answered "day is out of range" to a bad month refuses the right inputs for the
+    * wrong reason.
+    *
+    * What stays is what is about the **format** rather than about the calendar: a shape that is not
+    * the format at all, text left over after a good parse, and the offset grammar. Those are claims
+    * about a scanner, and they sit beside the rest of the parsing surface here.
+    */
   "what a parse refuses" - {
-    /** **The calendar is checked, not only the shape.** `2026-02-30` has the right digits in the
-      * right places and is not a date; without this check the civil conversion accepts it silently
-      * and hands back the 2nd of March, which a caller has no way to notice.
-      */
-    "a day the month does not have" in {
-      run(
-        imp +
-          """print(str(parse_date("2026-02-30").unwrap_err()))
-            |print(str(parse_date("2024-02-30").unwrap_err()))""".stripMargin) shouldBe
-        "day is out of range\nday is out of range\n"
-    }
-
-    // …and the leap day itself is accepted in the year that has one and refused in the year that
-    // does not, which is what says the check reads the real length.
-    "while the leap day is a date exactly when it is one" in {
-      run(
-        imp +
-          """print(str(parse_date("2024-02-29").is_ok()), str(parse_date("2026-02-29").is_ok()))""") shouldBe
-        "true false\n"
-    }
-
-    "a month, hour, minute or second out of range" in {
-      run(
-        imp +
-          """print(str(parse_date("2026-13-01").unwrap_err()))
-            |print(str(parse_time("24:00").unwrap_err()))
-            |print(str(parse_time("12:60").unwrap_err()))
-            |print(str(parse_time("12:00:60").unwrap_err()))""".stripMargin) shouldBe
-        "month is out of range\nhour is out of range\nminute is out of range\nsecond is out of range\n"
-    }
-
     "a shape that is not the format" in {
       run(
         imp +

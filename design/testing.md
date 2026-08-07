@@ -93,14 +93,26 @@ at the link; work two tests share belongs in an ordinary function they both call
 
 ### What is dropped, and when
 
-`sysl run`, `sysl build`, `sysl emit-llvm` and `sysl build-lib` all drop the tests, and drop
-them **after** analysis — so a `@test` that does not compile is an error in a build that would
-never have run it, and a module's capability clause (`13 §4`) reaches its tests like any other
-member. That ordering is what lets a test sit beside what it tests: a library's tests do not
-travel in the library, a program's do not run when it runs, and neither stops being checked.
+`sysl run`, `sysl build` and `sysl emit-llvm` drop the tests, and drop them **after** analysis —
+so a `@test` that does not compile is an error in a build that would never have run it, and a
+module's capability clause (`13 §4`) reaches its tests like any other member. That ordering is
+what lets a test sit beside what it tests: a program's tests do not run when it runs, and they do
+not stop being checked.
 
 A helper only a test calls leaves with it, because it becomes unreachable and pruning notices;
 a helper the program also calls stays, because the program still calls it.
+
+**`sysl build-lib` is the exception and drops them *before* analysis.** An artifact is the one
+output that outlives the compilation that made it, and analysis is not a passive reading: a test
+naming `Buf[int]` **creates** the whole of `Buf` at `int`, and a monomorphization is an ordinary
+library function afterwards — nothing in one records which declaration demanded it. Dropping the
+test from the typed tree therefore removes the test and keeps everything it caused, and the
+artifact ships instantiations no caller of the library ever asked for. Its contents become a fact
+about its tests.
+
+What that gives up is `build-lib` reporting a library test that does not compile. The net moved
+rather than went: `sysl test --std` compiles the library's tests and runs them, and the compiler's
+own suite runs *that*, which is a better place for it than a command whose subject is the artifact.
 
 ### `@tests` — a file of scaffolding
 
@@ -162,6 +174,7 @@ pruning leaves them: a type is emitted for its layout rather than for anything t
 sysl test <path>
 sysl test <path> --filter <text>
 sysl test <path> --fail-fast
+sysl test <path> --std
 ```
 
 **One build, one process per test.** The tree is compiled once, into a binary whose entry point
@@ -175,6 +188,38 @@ after it. The compile is the slow half and there is only ever one of it.
 
 Exit status is 0 iff every test that ran passed. A tree with no tests, and a filter that matched
 none of the tests there are, both exit 0 and say which happened.
+
+### `--std` — testing the standard library itself
+
+The compiler supplies `sysl` to every compilation, so pointing the runner at `lib/` means the
+library arriving twice: once as the tree in front of the compiler and once as the copy it hands
+over. Every declaration is already declared, and the whole library is refused.
+
+`--std` says the tree **is** the standard module. It is the same word `build-lib` has used for the
+same reason since libraries existed, and it carries the same set of module names through to the
+analyzer, which is what suppresses the collision.
+
+**Nothing infers it.** A build says so, because a build that guessed would turn a crisp refusal —
+a program with a `sysl` directory of its own, which is nearly always a mistake — into a link-time
+collision.
+
+```
+sysl test lib --std
+sysl test lib --std --filter sysl.time
+```
+
+This is what makes the first half of Tier 3's claim true. Testing "the standard library and
+language behavior" had until then reached only the second half, because there was no way to point
+the runner at the library at all.
+
+**What belongs in a library `@test` and what does not.** A `@test` runs code the compiler under
+test produced and asserts with `assert_eq`, which that same compiler produced — so a miscompiled
+`==` makes the assertion pass. A sysl test is therefore the right place for what is true of the
+**library** (that `fields` collapses a run of blanks, that 1900 was not a leap year) and the wrong
+place for what is true of the **language**. A claim like "an `f32` computes at `f32`'s width"
+stays in Tier 1 or 2, where the expectation is written in another language and compared by another
+runtime: a compiler that had quietly widened everything to binary64 would compile the sysl
+assertion into the same widening and pass it.
 
 ### `assert` and `panic`
 

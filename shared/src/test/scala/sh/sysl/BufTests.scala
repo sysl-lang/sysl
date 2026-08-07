@@ -40,13 +40,6 @@ class BufTests extends AnyFreeSpec with RunSupport {
       ) shouldBe "5 0 16\n"
     }
 
-    "a fresh one is empty and holds nothing" in {
-      run(
-        """var b: &Buf[int] = buf()
-          |print(b.len(), b.cap(), b.is_empty(), b.pop().is_none())""".stripMargin
-      ) shouldBe "0 0 true true\n"
-    }
-
     "set writes an element that is there" in {
       run(
         """var b: &Buf[int] = buf()
@@ -109,28 +102,11 @@ class BufTests extends AnyFreeSpec with RunSupport {
   // A list somebody *leaves*: taking an element out of the middle, and cutting a length down to a
   // number. `remove` is written in terms of `truncate`, which is what `07 § Not yet` said it should
   // be, and `clear` is `truncate(0)` — so all three shorten a buffer the one way.
+  // What `truncate` does to the *length* — cutting to a number, and a number past the end being a
+  // no-op rather than a panic — is asserted in `lib/sysl/buf/tests.sysl`, where the buffer is. What
+  // stays here is what the length cannot show: the storage that survives a truncation, and the
+  // counted elements it lets go of.
   "shortening one" - {
-    "truncate cuts the length down to what was asked for" in {
-      run(
-        """var b: &Buf[int] = buf()
-          |for i in 0..<5 do b.push(i)
-          |b.truncate(2)
-          |print(b.len(), b.at(0), b.at(1))""".stripMargin
-      ) shouldBe "2 0 1\n"
-    }
-
-    // Asking for a length there is not is a request to cut nothing, which is a no-op rather than a
-    // panic: unlike an index, a length past the end names no element and so cannot read one.
-    "a length past the end changes nothing" in {
-      run(
-        """var b: &Buf[int] = buf()
-          |for i in 0..<3 do b.push(i)
-          |b.truncate(9)
-          |b.truncate(3)
-          |print(b.len(), b.at(2))""".stripMargin
-      ) shouldBe "3 2\n"
-    }
-
     "truncating to nothing is what clear does" in {
       run(
         """var b: &Buf[int] = buf()
@@ -412,16 +388,8 @@ class BufTests extends AnyFreeSpec with RunSupport {
             |print(b.len(), b.at(0), b.at(1), b.at(40))""".stripMargin) shouldBe "41 7 0 39\n"
     }
 
-    // An empty run has no first element to repeat into new storage, which is the one case the
-    // implementation has to leave early for rather than merely handle.
-    "an empty run is a no-op rather than a trap" in {
-      run("""var b: &Buf[int] = buf()
-            |b.push(1)
-            |var none: []int = []
-            |b.extend(none)
-            |print(b.len(), b.at(0))""".stripMargin) shouldBe "1 1\n"
-    }
-
+    // The empty run — the one case `extend` has to leave early for, since it has no first element to
+    // repeat into new storage — is asserted in `lib/sysl/buf/tests.sysl`.
     "extending an empty buffer works the same as filling one" in {
       run("""var b: &Buf[int] = buf()
             |b.extend([9, 8])
