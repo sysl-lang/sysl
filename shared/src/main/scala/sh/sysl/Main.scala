@@ -164,6 +164,9 @@ private[sysl] val parser = {
           opt[Unit]("fail-fast")
             .action((_, c) => c.copy(failFast = true))
             .text("stop at the first test that fails"),
+          opt[Unit]("std")
+            .action((_, c) => c.copy(std = true))
+            .text("this tree is sysl's own standard module, which the compiler otherwise supplies"),
         ),
       cmd("emit-llvm")
         .action((_, c) => c.copy(command = "emit-llvm"))

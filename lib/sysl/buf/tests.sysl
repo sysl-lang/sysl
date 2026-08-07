@@ -1,0 +1,205 @@
+module sysl.buf
+@tests
+
+// What a `Buf` promises, asserted in sysl rather than beside it in Scala.
+//
+// The header says the file is scaffolding: every build but `sysl test` drops all of it, and nothing
+// outside a test may name any of it. These run under `sysl test lib --std`, where the tree in front
+// of the compiler is the standard module itself rather than a program compiled against one.
+//
+// **What belongs here is what is true of the buffer**, not what is true of the compiler. That a
+// generic method dispatches, that a `*self` receiver may be written, that an `Option` returned by
+// value round-trips -- those are language claims, and they are asserted in Scala against an
+// independent oracle. Asserting them here would ask the compiler under test whether it had compiled
+// itself correctly.
+
+// -- growth ---------------------------------------------------------------------------------------
+
+@test("a fresh buffer is empty and holds nothing")
+fresh_is_empty()
+    var b: Buf[int] = buf()
+
+    assert_eq(b.len(), 0usize)
+    assert(b.is_empty())
+end fresh_is_empty
+
+@test("pushing raises the length and the element comes back")
+push_then_read()
+    var b: Buf[int] = buf()
+
+    b.push(7)
+    b.push(9)
+
+    assert_eq(b.len(), 2usize)
+    assert_eq(b[0usize], 7)
+    assert_eq(b[1usize], 9)
+end push_then_read
+
+// The doubling is the whole reason `push` is amortized constant, and the empty buffer is the case
+// with no length to double -- it starts at eight rather than at twice nothing.
+@test("capacity grows geometrically from a first push")
+capacity_doubles()
+    var b: Buf[int] = buf()
+
+    assert_eq(b.cap(), 0usize)
+
+    b.push(1)
+    assert_eq(b.cap(), 8usize)
+
+    for i in 0..<8 do b.push(i)
+
+    assert_eq(b.len(), 9usize)
+    assert_eq(b.cap(), 16usize)
+end capacity_doubles
+
+// `extend` sizes once for the whole run rather than asking the capacity question per element, and
+// the growth stays geometric -- sizing exactly to fit would make a loop of `extend` calls quadratic.
+@test("extend appends a whole slice and grows once")
+extend_appends()
+    var b: Buf[int] = buf()
+
+    b.extend([1, 2, 3])
+    b.extend([4, 5])
+
+    assert_eq(b.len(), 5usize)
+    assert_slice_eq(b.view(), [1, 2, 3, 4, 5])
+end extend_appends
+
+// The early return in `extend` is not a shortcut: an array is made by repeating a value and a
+// generic `T` has no zero, so the empty run is the one case with no element in hand to repeat.
+@test("extending by nothing leaves the buffer alone")
+extend_by_empty()
+    var b: Buf[int] = buf()
+    var none: []int = []
+
+    b.push(1)
+    b.extend(none)
+
+    assert_eq(b.len(), 1usize)
+end extend_by_empty
+
+// -- shrinking ------------------------------------------------------------------------------------
+
+@test("pop answers with the last element and shortens")
+pop_returns_last()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.push(2)
+
+    assert_eq(b.pop().unwrap(), 2)
+    assert_eq(b.len(), 1usize)
+end pop_returns_last
+
+// The empty case answers rather than trapping, which is what makes `pop` the one shrinking operation
+// a caller may reach for without checking first.
+@test("popping an empty buffer answers None")
+pop_empty_is_none()
+    var b: Buf[int] = buf()
+
+    assert(b.pop().is_none())
+end pop_empty_is_none
+
+// Truncation moves the count and leaves the storage, so what it costs is nothing and what it frees
+// is nothing either. The capacity staying put is the observable half of that.
+@test("truncate drops the tail and keeps the storage")
+truncate_keeps_capacity()
+    var b: Buf[int] = buf()
+
+    b.extend([1, 2, 3, 4])
+
+    var before = b.cap()
+
+    b.truncate(2usize)
+
+    assert_eq(b.len(), 2usize)
+    assert_eq(b.cap(), before)
+    assert_slice_eq(b.view(), [1, 2])
+end truncate_keeps_capacity
+
+// Asking for more than there is is not an error -- `truncate` says "no longer than", and a buffer
+// already shorter than the bound is already that.
+@test("truncating past the end changes nothing")
+truncate_past_end()
+    var b: Buf[int] = buf()
+
+    b.extend([1, 2])
+    b.truncate(9usize)
+
+    assert_eq(b.len(), 2usize)
+end truncate_past_end
+
+@test("clear empties the buffer")
+clear_empties()
+    var b: Buf[int] = buf()
+
+    b.extend([1, 2, 3])
+    b.clear()
+
+    assert(b.is_empty())
+    assert_eq(b.len(), 0usize)
+end clear_empties
+
+@test("remove takes the element out and closes the gap")
+remove_closes_gap()
+    var b: Buf[int] = buf()
+
+    b.extend([1, 2, 3, 4])
+
+    assert_eq(b.remove(1usize), 2)
+    assert_slice_eq(b.view(), [1, 3, 4])
+end remove_closes_gap
+
+// -- what the bounds refuse -----------------------------------------------------------------------
+//
+// Each refusal is written beside the call that is *not* refused, because a `should_trap` test passes
+// for any failure at all -- including one in its own setup. The pair is what makes it a measurement:
+// one call over the line, one call up to it, and the difference between them is the check.
+
+@test(should_trap)
+reading_past_the_count_traps()
+    var b: Buf[int] = buf()
+
+    b.extend([1, 2, 3])
+    b.truncate(1usize)
+
+    // The slot is still allocated -- `truncate` moved the count and left the storage -- so this
+    // reads a live element of the backing slice and must still be refused.
+    b.at(1usize)
+end reading_past_the_count_traps
+
+@test("but reading up to the count is not refused")
+reading_within_the_count_is_fine()
+    var b: Buf[int] = buf()
+
+    b.extend([1, 2, 3])
+    b.truncate(1usize)
+
+    assert_eq(b.at(0usize), 1)
+end reading_within_the_count_is_fine
+
+@test(should_trap)
+writing_past_the_count_traps()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.set(1usize, 5)
+end writing_past_the_count_traps
+
+@test("but writing up to the count is not refused")
+writing_within_the_count_is_fine()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.set(0usize, 5)
+
+    assert_eq(b[0usize], 5)
+end writing_within_the_count_is_fine
+
+@test(should_trap)
+removing_past_the_count_traps()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.remove(1usize)
+end removing_past_the_count_traps

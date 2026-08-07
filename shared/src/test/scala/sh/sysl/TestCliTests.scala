@@ -24,9 +24,13 @@ class TestCliTests extends AnyFreeSpec with Matchers {
 
   /** The same run with stdout left where it was, for `ran` below. Everything else throws it away —
    * the report `sysl test` prints is this suite's subject, not something to read off the console.
+   *
+   * A test that says `--std` is one *about* the standard module and is run exactly as written — the
+   * same opt-out `LibraryCliSupport.mentionsCore` makes, for the same reason: the default below
+   * would otherwise rewrite the premise of the very tests that exist to pin it.
    */
   private def driver(cfg: Config): Int =
-    sh.sysl.execute(cfg.copy(noStdLib = true))
+    sh.sysl.execute(if cfg.std then cfg else cfg.copy(noStdLib = true))
 
   private def program(text: String): String = {
     val path = createTempFile("sysl-test-cli-", ".sysl")
@@ -152,6 +156,48 @@ class TestCliTests extends AnyFreeSpec with Matchers {
           status shouldBe 1
           errs should include("not this machine")
       }
+    }
+  }
+
+  /** `--std`: the tree in front of the compiler **is** the standard module.
+   *
+   * Tier 3 exists to test "the standard library and language behavior" (`testing.md`), and until this
+   * flag there was no way to point `sysl test` at the library at all — the compiler supplies `sysl`
+   * to every compilation, so the library's own tree collided with itself, every declaration already
+   * declared. `build-lib` has said `--std` for the same reason since libraries existed; this is the
+   * word arriving at the command that runs the tests.
+   *
+   * `StdSelfTests` is what runs the library's tests. What is pinned here is the **flag**: that it is
+   * what makes the difference, asserted from both sides.
+   */
+  "--std" - {
+
+    // The refusal is the whole reason the flag exists, so it is asserted rather than assumed. Note
+    // this is also the check that nothing has quietly started inferring it: `ProgramWalk` is explicit
+    // that a build says so and never guesses, because a guess turns this crisp refusal into a
+    // link-time collision.
+    "without it, the library's own tree collides with the copy the compiler supplies" in {
+      val root = StdRoot.root
+
+      assume(root.isDefined, "lib/ is not reachable from the working directory")
+
+      val (status, _, errs) = ran(Config(command = "test", file = root.get))
+
+      status shouldBe 1
+      errs should include("is the module every program is compiled against")
+    }
+
+    "with it, the same tree compiles and its tests run" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val root = StdRoot.root
+
+      assume(root.isDefined, "lib/ is not reachable from the working directory")
+
+      val (status, out, errs) = ran(Config(command = "test", file = root.get, std = true))
+
+      withClue(s"$out\n$errs")(status shouldBe 0)
+      out should include("passed")
     }
   }
 }

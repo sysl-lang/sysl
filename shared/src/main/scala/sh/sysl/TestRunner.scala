@@ -45,6 +45,12 @@ object TestRunner {
    * gets it on the same footing as a `build` does, and has to: a package's tests are exactly what
    * exercises the shims it ships, so a test run that dropped them would fail at the link on the one
    * tree most likely to hold C.
+   *
+   * **`--std` is what lets the standard library's own tests run**, and it is the same word
+   * `build-lib` uses for the same reason: the tree in front of the compiler *is* the library rather
+   * than a program compiled against one. Testing sysl's own library is what `testing.md` says Tier 3
+   * is for, and without this the tree collides with the copy the compiler supplies — every
+   * declaration already declared, because it is the same declaration twice.
    */
   def run(cfg: Config, sources: List[Source], libraries: List[Program], target: Target,
           precompiled: Set[String], std: Stdlib, archives: List[String],
@@ -52,7 +58,10 @@ object TestRunner {
     if !Target.host.contains(target) then
       return fail(s"'test' runs what it builds, and '${target.name}' is not this machine")
 
-    val (built, tests) = Compiler.compileTests(sources, libraries, target, precompiled, Some(std)) match
+    val building = if cfg.std then LibraryArtifact.std else Set.empty[String]
+
+    val (built, tests) =
+      Compiler.compileTests(sources, libraries, target, precompiled, Some(std), building) match
       case Left(err)     => return report(err)
       case Right(result) => result
 

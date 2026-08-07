@@ -151,9 +151,17 @@ object Compiler {
    * and the tests come back beside the IR because the runner needs both: the binary to execute and
    * the list to execute it for. Working the list out twice, once here and once by reading the tree
    * again, is how the two come to disagree about what a test is called.
+   *
+   * `building` names the modules this compilation is **producing** rather than being handed, exactly
+   * as `compileLibrary` means it. Without it a tree that declares `sysl` or one of its submodules is
+   * read as a program *adding to* the library and collides with every declaration it holds, which is
+   * what testing the standard library from its own source amounts to. It is the caller that says so
+   * and never inferred, for the reason `ProgramWalk.checkLibraryModules` gives: a build that guessed
+   * would turn a crisp refusal into a link-time collision.
    */
   def compileTests(sources: List[Source], libraries: List[Program], target: Target = Target.default,
-                   precompiled: Set[String] = Set.empty, std: Option[Stdlib] = None)
+                   precompiled: Set[String] = Set.empty, std: Option[Stdlib] = None,
+                   building: Set[String] = Set.empty)
       : Either[String, (Compiled, List[TTest])] = {
     val parsed = sources.map(SyslParser.parse(_, target))
 
@@ -164,7 +172,7 @@ object Compiler {
         val whole = carried(std, target)
 
         for
-          typed    <- Analyzer.analyze(units, std = whole, target = target)
+          typed    <- Analyzer.analyze(units, building, whole, target)
           promoted <- Escape.check(typed)
           _        <- TailCalls.check(typed)
         yield
