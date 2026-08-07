@@ -1,0 +1,70 @@
+module sysl.encoding
+
+import sysl.text.Ascii
+import sysl.buf.byte_sink
+
+// Bytes as hexadecimal text, and back.
+//
+// **The two directions are shaped differently, and deliberately.** Encoding writes to a `Writer`, so
+// a caller sending hex to a file or to standard output pays for no intermediate string; decoding
+// writes into a slice the caller supplies, because the output length is known before anything is
+// read. Neither allocates, which is what keeps this module usable where there is no allocator. The
+// `_string` and `_buf` conveniences beside them are for the hosted case, and are the only things here
+// that do allocate.
+
+// The lower-case digits. Encoding emits these; decoding accepts either case, since `digit_value`
+// does and a hex string arriving from elsewhere is as likely to be upper.
+private const DIGITS: string = "0123456789abcdef"
+
+// Two characters per byte, written straight through to the sink.
+hex_encode(bytes: []const u8, out: *Writer)
+    val digits = DIGITS.bytes
+    var pair: [2]u8
+
+    for i in 0..<bytes.len
+        val b = bytes[i]
+
+        pair[0] = digits[usize(b >> 4)]
+        pair[1] = digits[usize(b & 0xf)]
+
+        out.write(pair[..])
+
+// The same, gathered into a string. Every byte emitted above is an ASCII digit, so the result is
+// valid UTF-8 by construction and needs no validating pass.
+hex_string(bytes: []const u8) -> string
+    var sink = byte_sink()
+    var w: *Writer = &sink
+
+    hex_encode(bytes, w)
+
+    from_utf8_unchecked(sink.text())
+
+// How many bytes `hex_decode` will write, so a caller can size the slice it lends.
+//
+// Answers for the length alone and does not look at the content: a text of odd length has no whole
+// number of bytes in it and `hex_decode` refuses it, but the halving is still the right size to have
+// reserved.
+hex_decoded_len(text: []const u8) -> usize = text.len / 2
+
+// The bytes the text spells, written into `out`, and how many there were.
+hex_decode(text: []const u8, out: []u8) -> Result[usize, DecodeError]
+    if text.len % 2 != 0 then return Err(BadLength)
+
+    val n = text.len / 2
+
+    if out.len < n then return Err(Short(n))
+
+    for i in 0..<n
+        val hi = digit_at(text, i * 2)?
+        val lo = digit_at(text, i * 2 + 1)?
+
+        out[i] = u8(hi * 16 + lo)
+
+    Ok(n)
+
+// One digit, or the offset that was not one. Split out so both halves of a byte report the position
+// they actually failed at rather than the position of the pair.
+private digit_at(text: []const u8, at: usize) -> Result[int, DecodeError] =
+    text[at].digit_value(16) match
+        Some(v) -> Ok(v)
+        None -> Err(BadByte(at))

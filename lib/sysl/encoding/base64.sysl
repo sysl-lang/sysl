@@ -1,0 +1,152 @@
+module sysl.encoding
+
+import sysl.buf.byte_sink
+
+// Bytes as base64 text, and back (RFC 4648).
+//
+// **Two axes, and they are parameters rather than four function names.** The alphabet and the padding
+// are independent, so naming every combination ends at `base64_encode_urlsafe_nopad`. An enum and a
+// `bool` say the same thing and compose.
+//
+// **Decoding accepts either alphabet without being told**, which costs nothing: `+/` and `-_` do not
+// overlap, so there is no input the two readings disagree about. Padding is optional on input and
+// checked when it is there. That asymmetry is deliberate -- a writer should be exact and a reader
+// should be forgiving about what cannot be ambiguous.
+
+// Which of RFC 4648's two alphabets. They differ only in the last two characters: `+/` reads badly in
+// a URL and in a filename, which is the whole reason the second exists.
+enum Alphabet
+    Standard
+    UrlSafe
+
+private const STANDARD_CHARS: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+private const URLSAFE_CHARS: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+// Three bytes become four characters. The tail -- one or two bytes left over -- becomes two or three
+// characters, padded out to four with `=` when padding was asked for.
+base64_encode(bytes: []const u8, out: *Writer, alphabet: Alphabet, pad: bool)
+    val chars = alphabet match
+        Standard -> STANDARD_CHARS
+        UrlSafe -> URLSAFE_CHARS
+
+    val table = chars.bytes
+    var quad: [4]u8
+    var i: usize = 0
+
+    while i + 3 <= bytes.len
+        val n = (u32(bytes[i]) << 16) | (u32(bytes[i + 1]) << 8) | u32(bytes[i + 2])
+
+        quad[0] = table[usize((n >> 18) & 63)]
+        quad[1] = table[usize((n >> 12) & 63)]
+        quad[2] = table[usize((n >> 6) & 63)]
+        quad[3] = table[usize(n & 63)]
+
+        out.write(quad[..])
+        i += 3
+
+    val rest = bytes.len - i
+
+    if rest == 1
+        val n = u32(bytes[i]) << 16
+
+        quad[0] = table[usize((n >> 18) & 63)]
+        quad[1] = table[usize((n >> 12) & 63)]
+        quad[2] = u8('=')
+        quad[3] = u8('=')
+
+        out.write(if pad then quad[..] else quad[0..<2])
+    elif rest == 2
+        val n = (u32(bytes[i]) << 16) | (u32(bytes[i + 1]) << 8)
+
+        quad[0] = table[usize((n >> 18) & 63)]
+        quad[1] = table[usize((n >> 12) & 63)]
+        quad[2] = table[usize((n >> 6) & 63)]
+        quad[3] = u8('=')
+
+        out.write(if pad then quad[..] else quad[0..<3])
+
+// The same, gathered into a string. Every character emitted is ASCII, so the bytes are valid UTF-8 by
+// construction.
+base64_string(bytes: []const u8, alphabet: Alphabet, pad: bool) -> string
+    var sink = byte_sink()
+    var w: *Writer = &sink
+
+    base64_encode(bytes, w, alphabet, pad)
+
+    from_utf8_unchecked(sink.text())
+
+// How many bytes `base64_decode` will write, so a caller can size the slice it lends. Trailing
+// padding is discounted, so this answers the same number for the padded and unpadded spellings of one
+// input.
+base64_decoded_len(text: []const u8) -> usize
+    val n = unpadded_len(text)
+
+    n / 4 * 3 + n % 4 * 3 / 4
+
+// The text's length with any trailing `=` removed.
+private unpadded_len(text: []const u8) -> usize
+    var n = text.len
+
+    while n > 0 && text[n - 1] == u8('=')
+        n -= 1
+
+    n
+
+// The bytes the text spells, written into `out`, and how many there were.
+//
+// **Six bits at a time into an accumulator**, rather than a four-character group at a time, because
+// the unpadded spellings end mid-group and a group-at-a-time reader needs a special case for each of
+// them. Whole bytes fall out of the accumulator as they complete, and the two or four leftover bits
+// at the end are the padding bits, which are discarded.
+base64_decode(text: []const u8, out: []u8) -> Result[usize, DecodeError]
+    val end = unpadded_len(text)
+    val pads = text.len - end
+
+    // At most two `=` can ever be needed, and a padded input is a whole number of groups.
+    if pads > 2 then return Err(BadPadding(end))
+    if pads > 0 && text.len % 4 != 0 then return Err(BadLength)
+
+    // One character alone carries six bits, which is not a byte and cannot be the tail of anything.
+    if end % 4 == 1 then return Err(BadLength)
+
+    val need = end / 4 * 3 + end % 4 * 3 / 4
+
+    if out.len < need then return Err(Short(need))
+
+    var acc: u32 = 0
+    var bits: u32 = 0
+    var w: usize = 0
+
+    for i in 0..<end
+        // An `=` before the end is padding somewhere it cannot be, and is worth saying so rather than
+        // reporting it as an unknown character.
+        if text[i] == u8('=') then return Err(BadPadding(i))
+
+        val v = value_of(text[i]) match
+            Some(x) -> x
+            None -> return Err(BadByte(i))
+
+        acc = acc << 6 | u32(v)
+        bits += 6
+
+        if bits >= 8
+            bits -= 8
+            out[w] = u8(acc >> bits & 255)
+            w += 1
+
+    Ok(w)
+
+// A character's six-bit value, under either alphabet. Written as comparisons rather than as a
+// 256-entry table because a table would be module storage this module otherwise does not need, and
+// the branches are predictable.
+private value_of(b: u8) -> Option[int]
+    if b >= u8('A') && b <= u8('Z') then return Some(int(b - u8('A')))
+    if b >= u8('a') && b <= u8('z') then return Some(int(b - u8('a')) + 26)
+    if b >= u8('0') && b <= u8('9') then return Some(int(b - u8('0')) + 52)
+
+    // The one place the alphabets differ, and both spellings are taken.
+    if b == u8('+') || b == u8('-') then return Some(62)
+    if b == u8('/') || b == u8('_') then return Some(63)
+
+    None

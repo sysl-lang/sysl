@@ -1,0 +1,239 @@
+module sysl.encoding
+@tests
+
+// What `sysl.encoding` claims, asserted in sysl.
+//
+// **The vectors are RFC 4648 §10's own**, which is the set that matters: `""`, `"f"`, `"fo"`, `"foo"`,
+// `"foob"`, `"fooba"`, `"foobar"` walks every residue of three and so exercises every padding case
+// exactly once. A codec tested only on inputs whose length divides evenly is a codec whose tail
+// handling nothing has run.
+
+// -- hex ------------------------------------------------------------------------------------------
+
+@test("hex encodes RFC 4648's vectors")
+hex_encodes_the_vectors()
+    assert_eq(hex_string("".bytes), "")
+    assert_eq(hex_string("f".bytes), "66")
+    assert_eq(hex_string("fo".bytes), "666f")
+    assert_eq(hex_string("foo".bytes), "666f6f")
+    assert_eq(hex_string("foob".bytes), "666f6f62")
+    assert_eq(hex_string("fooba".bytes), "666f6f6261")
+    assert_eq(hex_string("foobar".bytes), "666f6f626172")
+end hex_encodes_the_vectors
+
+@test("and decodes them back, in either case")
+hex_decodes_the_vectors()
+    var out: []u8 = [0; 16]
+
+    assert_eq(hex_decode("666f6f626172".bytes, out).unwrap(), 6)
+    assert_eq(from_utf8_unchecked(out[0..<6]), "foobar")
+
+    // Upper case is accepted on input even though it is never emitted: a hex string arriving from
+    // elsewhere is as likely to be upper as lower, and the two cannot be confused.
+    assert_eq(hex_decode("666F6F626172".bytes, out).unwrap(), 6)
+    assert_eq(from_utf8_unchecked(out[0..<6]), "foobar")
+
+    assert_eq(hex_decode("".bytes, out).unwrap(), 0)
+end hex_decodes_the_vectors
+
+@test("the decoded length is answered before anything is read")
+hex_decoded_len_is_half()
+    assert_eq(hex_decoded_len("666f6f".bytes), 3)
+    assert_eq(hex_decoded_len("".bytes), 0)
+end hex_decoded_len_is_half
+
+@test("an odd length, a byte outside the alphabet, and a slice too small are each refused")
+hex_refusals()
+    var out: []u8 = [0; 16]
+    var tiny: []u8 = [0; 2]
+
+    val odd = hex_decode("666".bytes, out) match
+        Err(BadLength) -> true
+        _ -> false
+
+    // The offset is the byte that was wrong, not the pair it sat in.
+    val bad = hex_decode("66zz".bytes, out) match
+        Err(BadByte(at)) -> at == 2
+        _ -> false
+
+    // And `Short` says how much would have been enough, so a caller can resize once.
+    val short = hex_decode("666f6f626172".bytes, tiny) match
+        Err(Short(needed)) -> needed == 6
+        _ -> false
+
+    assert(odd)
+    assert(bad)
+    assert(short)
+end hex_refusals
+
+// -- base64 ---------------------------------------------------------------------------------------
+
+@test("base64 encodes RFC 4648's vectors, padded")
+base64_encodes_the_vectors()
+    assert_eq(base64_string("".bytes, Standard, true), "")
+    assert_eq(base64_string("f".bytes, Standard, true), "Zg==")
+    assert_eq(base64_string("fo".bytes, Standard, true), "Zm8=")
+    assert_eq(base64_string("foo".bytes, Standard, true), "Zm9v")
+    assert_eq(base64_string("foob".bytes, Standard, true), "Zm9vYg==")
+    assert_eq(base64_string("fooba".bytes, Standard, true), "Zm9vYmE=")
+    assert_eq(base64_string("foobar".bytes, Standard, true), "Zm9vYmFy")
+end base64_encodes_the_vectors
+
+@test("and unpadded, which is the same text with the equals signs dropped")
+base64_encodes_unpadded()
+    assert_eq(base64_string("f".bytes, Standard, false), "Zg")
+    assert_eq(base64_string("fo".bytes, Standard, false), "Zm8")
+    assert_eq(base64_string("foo".bytes, Standard, false), "Zm9v")
+    assert_eq(base64_string("fooba".bytes, Standard, false), "Zm9vYmE")
+end base64_encodes_unpadded
+
+// The two alphabets differ only in the last two characters, so a test using bytes that never reach
+// index 62 or 63 would pass against either table.
+@test("the URL-safe alphabet differs exactly where it says it does")
+base64_urlsafe_differs_in_two_characters()
+    var bytes: []u8 = [0xfb, 0xff, 0xbf]
+
+    assert_eq(base64_string(bytes, Standard, true), "+/+/")
+    assert_eq(base64_string(bytes, UrlSafe, true), "-_-_")
+end base64_urlsafe_differs_in_two_characters
+
+@test("decoding takes either alphabet and either padding, without being told which")
+base64_decodes_the_vectors()
+    var out: []u8 = [0; 16]
+
+    assert_eq(base64_decode("Zm9vYmFy".bytes, out).unwrap(), 6)
+    assert_eq(from_utf8_unchecked(out[0..<6]), "foobar")
+
+    assert_eq(base64_decode("Zm9vYmE=".bytes, out).unwrap(), 5)
+    assert_eq(from_utf8_unchecked(out[0..<5]), "fooba")
+
+    // The same input without its padding.
+    assert_eq(base64_decode("Zm9vYmE".bytes, out).unwrap(), 5)
+    assert_eq(from_utf8_unchecked(out[0..<5]), "fooba")
+
+    assert_eq(base64_decode("Zg==".bytes, out).unwrap(), 1)
+    assert_eq(out[0], u8('f'))
+
+    assert_eq(base64_decode("".bytes, out).unwrap(), 0)
+
+    // Both alphabets read back to the bytes that produced them.
+    assert_eq(base64_decode("+/+/".bytes, out).unwrap(), 3)
+    assert_eq(out[0], 0xfb)
+    assert_eq(base64_decode("-_-_".bytes, out).unwrap(), 3)
+    assert_eq(out[0], 0xfb)
+end base64_decodes_the_vectors
+
+@test("the decoded length discounts padding, so both spellings answer the same")
+base64_decoded_len_ignores_padding()
+    assert_eq(base64_decoded_len("Zm9vYmE=".bytes), 5)
+    assert_eq(base64_decoded_len("Zm9vYmE".bytes), 5)
+    assert_eq(base64_decoded_len("Zm9vYmFy".bytes), 6)
+    assert_eq(base64_decoded_len("Zg==".bytes), 1)
+    assert_eq(base64_decoded_len("".bytes), 0)
+end base64_decoded_len_ignores_padding
+
+@test("bad alphabet, bad padding, an impossible length and a short slice are each refused")
+base64_refusals()
+    var out: []u8 = [0; 16]
+    var tiny: []u8 = [0; 2]
+
+    val bad = base64_decode("Zm9v*mFy".bytes, out) match
+        Err(BadByte(at)) -> at == 4
+        _ -> false
+
+    // An `=` before the end is padding where padding cannot be, and says so rather than reading as an
+    // unknown character.
+    val misplaced = base64_decode("Zm=vYmFy".bytes, out) match
+        Err(BadPadding(at)) -> at == 2
+        _ -> false
+
+    // One character alone carries six bits, which is not a byte and cannot end anything.
+    val stray = base64_decode("Zm9vY".bytes, out) match
+        Err(BadLength) -> true
+        _ -> false
+
+    // Padding present means the input must be whole groups.
+    val ragged = base64_decode("Zm9vYmE=x".bytes, out) match
+        Err(BadLength) -> true
+        _ -> false
+
+    val short = base64_decode("Zm9vYmFy".bytes, tiny) match
+        Err(Short(needed)) -> needed == 6
+        _ -> false
+
+    assert(bad)
+    assert(misplaced)
+    assert(stray)
+    assert(ragged)
+    assert(short)
+end base64_refusals
+
+@test("a round trip survives every residue of three, at both alphabets")
+base64_round_trips()
+    var out: []u8 = [0; 32]
+    var source: []u8 = [0; 7]
+
+    for i in 0..<7
+        source[i] = u8(i * 37 + 3)
+
+    // Every prefix length from empty to the whole fixture, so all three residues of three are covered
+    // twice over. The bound comes from `source.len` so the counter is a `usize` without saying so.
+    for n in 0..<(source.len + 1)
+        val text = base64_string(source[0..<n], UrlSafe, true).bytes
+
+        assert_eq(base64_decode(text, out).unwrap(), n)
+
+        for i in 0..<n
+            assert_eq(out[i], source[i])
+end base64_round_trips
+
+// -- binary ---------------------------------------------------------------------------------------
+
+// Every byte of the fixture is distinct, so a transposition of any two of them changes the answer --
+// which a value like `1` or `0xffff` would not have caught.
+@test("the two byte orders are each other's reverse, at every width")
+binary_reads_both_orders()
+    var b: []u8 = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]
+
+    assert_eq(get_u16_le(b).unwrap(), 0x2211)
+    assert_eq(get_u16_be(b).unwrap(), 0x1122)
+    assert_eq(get_u32_le(b).unwrap(), 0x44332211)
+    assert_eq(get_u32_be(b).unwrap(), 0x11223344)
+    assert_eq(get_u64_le(b).unwrap(), 0x8877665544332211)
+    assert_eq(get_u64_be(b).unwrap(), 0x1122334455667788)
+end binary_reads_both_orders
+
+@test("and writing then reading gives the value back, at every width and order")
+binary_round_trips()
+    var b: []u8 = [0; 8]
+
+    assert(put_u16_le(b, 0xbeef))
+    assert_eq(get_u16_le(b).unwrap(), 0xbeef)
+    assert(put_u16_be(b, 0xbeef))
+    assert_eq(get_u16_be(b).unwrap(), 0xbeef)
+
+    assert(put_u32_le(b, 0xdeadbeef))
+    assert_eq(get_u32_le(b).unwrap(), 0xdeadbeef)
+    assert(put_u32_be(b, 0xdeadbeef))
+    assert_eq(get_u32_be(b).unwrap(), 0xdeadbeef)
+
+    assert(put_u64_le(b, 0x0123456789abcdef))
+    assert_eq(get_u64_le(b).unwrap(), 0x0123456789abcdef)
+    assert(put_u64_be(b, 0x0123456789abcdef))
+    assert_eq(get_u64_be(b).unwrap(), 0x0123456789abcdef)
+end binary_round_trips
+
+@test("a slice one byte short is refused rather than trapping, in both directions")
+binary_refuses_a_short_slice()
+    var one: []u8 = [0; 1]
+    var three: []u8 = [0; 3]
+    var seven: []u8 = [0; 7]
+
+    assert(get_u16_le(one).is_none())
+    assert(get_u32_le(three).is_none())
+    assert(get_u64_le(seven).is_none())
+
+    assert(!put_u16_le(one, 1))
+    assert(!put_u32_be(three, 1))
+    assert(!put_u64_be(seven, 1))
+end binary_refuses_a_short_slice
