@@ -30,15 +30,31 @@
 //     That assertion is a real property of a scheduler rather than a stand-in, and it is the one a
 //     `weak` edge would not have made for it: a run that stops with a task still blocked is a bug in
 //     the schedule whether or not the cycle would have been collected.
-//   * **A `Buf` grows and shrinks at its end and nowhere else.** Taking a waiter out of the middle
-//     of a list is `drop_one` below: compact, then pop the tail down to the new length, because
-//     there is no `remove` and no `truncate` to say it in one step. Every list a scheduler keeps is
-//     one that things leave from the middle of.
-//   * **A task is fifteen fields with no names at the call site and no defaults.** `task` below
-//     exists only to spell the five zeroes, the three `None`s and the empty list that every new
-//     task starts life holding, and a reader of the constructor call cannot see which argument is
-//     which. A task control block is exactly the shape that pays for this: it is mostly state that
-//     starts empty and is written later by somebody else.
+//   * **A `Buf` grew and shrank at its end and nowhere else — answered.** Every list a scheduler
+//     keeps is one that things leave from the *middle* of, and taking a waiter out was `drop_one`
+//     below: compact the survivors down, then pop the tail to the new length, because there was no
+//     `remove` and no `truncate` to say it in one step.
+//
+//     `Buf` has `remove`, `truncate`, `clear` and `pop` now, so `drop_one` is a search and one call.
+//     What that exposed is worth more than the six lines it saved: the hand-written version removed
+//     **every** copy of the value, because compacting keeps whatever does not match, while the name
+//     said one and the callers all meant one. A scheduler never has a task in a list twice — a
+//     second take of a held lock faults — so nothing was wrong, and nothing was checked either.
+//     A library function is a decision somebody else has already made carefully, which is most of
+//     why reaching for one beats writing the loop.
+//   * **A task is fifteen fields with no names at the call site and no defaults — half answered.**
+//     A task control block is exactly the shape that pays for this: it is mostly state that starts
+//     empty and is written later by somebody else.
+//
+//     **The names arrived.** A constructor's fields are named parameters like any other (`12 §2a`),
+//     so `task` below writes all fifteen by name and a reader sees which is which — which is worth
+//     most for the four that are the same bare `0` and would swap without anything noticing.
+//
+//     **The defaults did not**, and that half is a decision rather than an absence: a field declares
+//     no default, on the grounds that what an unwritten field gets is the constructor's business
+//     and not the field's. So `task` still exists to spell the five zeroes, the three `None`s and
+//     the empty list — it is now a function whose body says what it is doing, rather than a row of
+//     fifteen positional arguments standing in for one.
 //   * **A nullary generic cannot be told what it is making.** `buf[&Mutex]()` is not the syntax —
 //     call-site type arguments are deliberately absent (`10 § Open a`), since a type-argument list
 //     and an index are the same grammar. Where the value lands somewhere already typed there is
@@ -47,12 +63,22 @@
 //     enough that the compiler used to answer it with "the thing being called must be a name"; it
 //     now names the rule and the annotation instead, which was this program's one change to the
 //     compiler rather than to itself.
-//   * **No enum renders itself.** `str` on one is refused — helpfully, naming the `impl Display`
-//     that would answer it — and that is true of a data-carrying enum and of a plain one alike. So
-//     `describe_state` below is a hand-written match from six variants to their own six names,
-//     which the compiler already knows: they are the words the match arms are written with. Other
-//     programs in the set write a `describe` too, but for a *message* built out of a variant's
-//     payload; this is the first one whose rendering is nothing but the name.
+//   * **No enum renders itself — and for the name-only case it did not have to.** `str` on an enum
+//     is refused, helpfully, naming the `impl Display` that would answer it, and that is true of a
+//     data-carrying enum and a plain one alike. This program used to carry a `describe_state`: a
+//     hand-written match from six variants to their own six names, which the compiler already knows,
+//     because they are the words the match arms are written with.
+//
+//     It knows them where they can be asked for. A simple enum's name answers `T::Image(v)` with the
+//     variant's name as a `string` (`09 §2`), so the six-line function is gone and the checks read
+//     `State::Image(t.state)`. What that attribute gives is the name **as declared** — `Blocked`,
+//     not `blocked` — which is the fact rather than a rendering of it, and any program wanting other
+//     words is back to writing them.
+//
+//     The absence that stands is the *data* enum: `Fault::Image` is refused in as many words, since
+//     a value there is a variant plus a payload and a name answers for half of it. That is also why
+//     the other programs' `describe` functions are a different ask — a fault's message is built out
+//     of its payload and only a person can write it.
 //   * **`&T` is `Eq`, and that is what identity costs — nothing.** Address equality (`14 §2`) is
 //     what "is this the lock you actually hold" and "did the heap take its own root off the end"
 //     are written with. Worth recording as a positive, because a language without it forces a
@@ -86,14 +112,6 @@ enum State
     Done
     Faulted
 end State
-
-describe_state(s: State) -> string = s match
-    Fresh -> "fresh"
-    Ready -> "ready"
-    Blocked -> "blocked"
-    Sleeping -> "sleeping"
-    Done -> "done"
-    Faulted -> "faulted"
 
 // What a task can get wrong. Both are about a lock, because a lock is the only thing in this
 // machine that a task can hold an opinion about which the machine is in a position to check.
@@ -170,8 +188,28 @@ struct Task
 end Task
 
 // A new task, with the five zeroes and the three `None`s every task starts life holding.
+//
+// Every field is written by name. A constructor's fields are named parameters like any other
+// (`12 §2a`), so the fifteen of them below say which is which at the point a reader is looking —
+// which matters most for the four that are the same literal `0` and could be swapped without
+// anything noticing.
 task(name: string, prio: int, arrive: int, steps: []Step) -> &Task
-    Task(name, prio, prio, arrive, steps, 0usize, 0, 0, 0, None, Fresh, 0, buf(), None, None)
+    Task(
+        name = name,
+        base = prio,
+        prio = prio,
+        arrive = arrive,
+        steps = steps,
+        pc = 0,
+        did = 0,
+        ran = 0,
+        seq = 0,
+        slot = None,
+        state = Fresh,
+        wake = 0,
+        holds = buf(),
+        blocked_on = None,
+        fault = None)
 end task
 
 // A lock. `owner` and the owner's `holds` are the same fact written from both ends, which is what
@@ -186,19 +224,19 @@ mutex(name: string) -> &Mutex
     Mutex(name, None, buf())
 end mutex
 
-// Take one element out of a list that only grows and shrinks at its end: shift the survivors down,
-// then drop the tail. `Buf` has neither a remove nor a truncate, so both halves are written out —
-// and both are needed, since leaving the tail alone would leave the last element in twice.
+// Take one element out of a list. `Buf.remove` takes an index, so the whole of what a scheduler
+// adds is finding it: a wait list is short and unordered, which is the same trade `most_urgent`
+// below makes.
+//
+// This used to compact the survivors down and pop the tail, because `Buf` had neither a remove nor
+// a truncate. It has both, and the difference is not only length — the hand-written version walked
+// the list whatever it found, while this one stops at the element it came for.
 drop_one[T: Eq](b: &Buf[T], v: T)
-    var k = 0usize
-
     for i in 0..<b.len()
-        if b[i] != v
-            b.set(k, b[i])
-            k += 1usize
+        if b[i] == v
+            b.remove(i)
 
-    while b.len() > k
-        b.pop()
+            return
 end drop_one
 
 // The waiter a lock should be handed to. A wait list is short and is walked rather than kept in

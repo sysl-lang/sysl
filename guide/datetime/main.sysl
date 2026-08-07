@@ -43,16 +43,24 @@ import sysl.time.*
 //     consequence is worth stating, because it is one-way. A type that ships must arrive with the
 //     renderings it will ever have. `sysl.time` renders one now, in the same words this file
 //     checked before.
-//   * **The difference of two moments cannot be spelled `-`.** Every operator row is
-//     `op(self, rhs: Rhs) -> Self`, so an implementation says what it *takes* and never what it
-//     *produces*. `Instant + Duration`, `Instant - Duration` and `Duration ± Duration` all write
-//     themselves; `Instant - Instant -> Duration` is refused, because `Sub`'s result is fixed to
-//     the type on the left. Three quarters of an algebra is spellable and the quarter that is not
-//     is the operation the library exists to provide, so it is a named function called `since`.
-//     Dispatching on the pair does not rescue it: the two implementations would differ in what
-//     they produce, which no row can say. Moving the types into `sysl.time` moved this finding
-//     with them rather than answering it — the shipped module carries the same named function, for
-//     the same reason, which makes the gap a public one instead of one program's.
+//   * **The difference of two moments could not be spelled `-` — answered.** Every operator row was
+//     `op(self, rhs: Rhs) -> Self`, so an implementation said what it *took* and never what it
+//     *produced*. `Instant + Duration`, `Instant - Duration` and `Duration ± Duration` all wrote
+//     themselves; `Instant - Instant -> Duration` was refused, because `Sub`'s result was fixed to
+//     the type on the left. Three quarters of an algebra was spellable and the quarter that was not
+//     was the operation the library exists to provide, so it was a named function called `since`.
+//
+//     An operator trait carries its result as `Out` now, as well as its operand as `Rhs` (`14 §7`),
+//     and that is the same change `guide/matrix` was written for: a vector space needs `Vector *
+//     Vector -> real` and a timeline needs `Instant - Instant -> Duration`, which are one feature
+//     asked for by two problems. `sysl.time` writes both rows of `Sub` on `Instant`, told apart by
+//     the type of the right operand and nothing else, so the checks below subtract two instants
+//     with `-` like any other arithmetic. `since` stays as the named spelling, because
+//     `later - earlier` is right and `earlier - later` is just as easy to write.
+//
+//     **The finding moved into the library with the types and was answered there**, which is the
+//     part worth keeping: a gap that becomes a shipped module's gap is fixed once for everybody
+//     instead of worked around once per program that wants a date.
 //   * **A derived scalar and a one-field struct are exactly complementary, and neither is what a
 //     quantity wants.** `type Instant = new i64` inherits its base's whole catalog for free — `==`,
 //     `<`, `+`, `str` — and may replace none of it, so it arrives with `Instant + Instant`, which
@@ -77,10 +85,22 @@ import sysl.time.*
 //     ordinary enum and the compiler's coverage checking is what makes a caller handle all three.
 //     The axis the problem was chosen for turns out to be covered by the machinery that was already
 //     there — which is the useful thing to know before designing a library around it.
-//   * **An enum still cannot render its own variant names**, third program to report it. `ZoneId`
-//     and `Resolution` each carry a hand-written map from variant to word, and so does the
-//     library's `Weekday` — the move did not make that go away, it only moved one of the three
-//     tables behind an import.
+//   * **An enum cannot render its own variant names — and the three tables this reported turn out
+//     to be three different asks.** A simple enum's name answers `T::Image(v)` with the word the
+//     variant is spelled with (`09 §2`), so the name-only case never needed a table: the library's
+//     `weekday_name` is that case and is now one attribute read, which is the one of the three the
+//     move behind an import actually fixed.
+//
+//     Neither of this program's own two is that case, and saying why is worth more than the
+//     original complaint. `ZoneId` maps `NewYork` to `"America/New_York"` — a tz identifier, which
+//     is a fact about the database and not about the declaration, so nothing but a table can hold
+//     it. `Resolution` is a **data** enum, where `Image` is refused in as many words, because a
+//     value there is a variant plus a payload and a name answers for half of it — and this
+//     program's renderer builds its sentence out of the payload anyway.
+//
+//     What is left of the finding is the narrow thing: `str` on an enum is still refused, so a
+//     value that is nothing but its name is printed by asking for the name rather than by rendering
+//     the value.
 //   * **A `val` could not be sliced**, third program to report that, and the report was acted on:
 //     a view of read-only storage is a `[]const T`, which carries the property rather than losing
 //     it. The two transition tables are still reached through a function whose whole body is an
@@ -101,7 +121,11 @@ print("-- instants and durations")
 var t = Instant(1000000i64)
 check("an instant moved by a duration", str((t + hours(2i64)).us), "7201000000")
 check("and moved back", str((t + hours(2i64) - hours(2i64)).us), "1000000")
-check("the difference of two instants", str(whole_hours(since(t + hours(3i64), t))), "3")
+// Both rows of `Sub` on one type, in two lines: the right operand is a `Duration` above and an
+// `Instant` here, and that is the whole of what selects between landing on the timeline and
+// measuring across it.
+check("the difference of two instants", str(whole_hours(t + hours(3i64) - t)), "3")
+check("and the named spelling agrees", str(whole_hours(since(t + hours(3i64), t))), "3")
 check("an offset renders", offset_text(Offset(330)), "+05:30")
 check("a negative one", offset_text(Offset(-300)), "-05:00")
 check("and zero is not an offset at all", offset_text(Offset(0)), "Z")
