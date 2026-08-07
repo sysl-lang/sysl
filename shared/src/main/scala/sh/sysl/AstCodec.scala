@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 28
+  val Version: Int = 29
 
   private val Magic = "sysl-ast"
 
@@ -254,6 +254,7 @@ object AstCodec {
       case RangePattern(lo, h, i) => tok("prng"); expr(lo); expr(h); bool(i)
       case WildcardPattern        => tok("pwld")
       case IdentPattern(n)        => tok("pid"); sref(n)
+      case EqPattern(n)           => tok("peq"); sref(n)
       case VariantPattern(n, as)  => tok("pvar"); sref(n); list(as)(pattern)
       case StructPattern(n, fs)   => tok("pstr"); sref(n); list(fs) { (f, sub) => sref(f); pattern(sub) }
       case TuplePattern(as)       => tok("ptup"); list(as)(pattern)
@@ -333,6 +334,11 @@ object AstCodec {
         case Continue(l)                  => tok("cnt"); opt(l)(sref)
         case Defer(s)                     => tok("dfr"); stmt(s)
         case AsmStmt(arms)                => tok("asm"); list(arms)(asmArm)
+        // Carried rather than dropped, although the library's own build has already settled it. A
+        // consumer re-checks it against the target *it* is building for, which is the answer that
+        // matters: `sizeof` is per target, so a layout a library verified on one machine is not a
+        // layout verified on the consumer's.
+        case AssertDecl(c, m)             => tok("asrt"); expr(c); opt(m)(sref)
         case Require(c, m)                => tok("req"); expr(c); opt(m)(sref)
         case Ensure(c, m)                 => tok("ens"); expr(c); opt(m)(sref)
         case Invariant(c, m)              => tok("inv"); expr(c); opt(m)(sref)
@@ -650,6 +656,7 @@ object AstCodec {
       case "prng" => RangePattern(expr(), expr(), bool())
       case "pwld" => WildcardPattern
       case "pid"  => IdentPattern(sref())
+      case "peq"  => EqPattern(sref())
       case "pvar" => VariantPattern(sref(), list(pattern()))
       case "pstr" => StructPattern(sref(), list { val f = sref(); (f, pattern()) })
       case "ptup" => TuplePattern(list(pattern()))
@@ -720,6 +727,7 @@ object AstCodec {
         case "cnt"  => Continue(opt(sref()))
         case "dfr"  => Defer(stmt())
         case "asm"  => AsmStmt(list(asmArm()))
+        case "asrt" => AssertDecl(expr(), opt(sref()))
         case "req"  => Require(expr(), opt(sref()))
         case "ens"  => Ensure(expr(), opt(sref()))
         case "inv"  => Invariant(expr(), opt(sref()))

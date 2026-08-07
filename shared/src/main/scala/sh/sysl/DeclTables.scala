@@ -188,6 +188,21 @@ trait DeclTables extends Reporting {
    */
   protected val constDecls = mutable.LinkedHashMap.empty[String, ConstDecl]
 
+  /** `@assert` conditions, in the order they were read, each with the scope that read it.
+   *
+   * A list rather than a map, because an assert declares no name: there is nothing to key it by,
+   * nothing can refer to one, and two saying the same thing are two checks rather than a duplicate.
+   * Like a constant it never reaches codegen — a true one emits nothing, and a false one stops the
+   * compilation.
+   *
+   * **The scope travels with it**, which every other table gets for free from `declScope` and this
+   * one cannot, having no key to file under. It is not optional: the check runs long after the walk
+   * has left the file, so an assert naming a constant in its own module would otherwise be resolved
+   * in whatever module the walk happened to be in — and would report that the condition is not a
+   * constant expression, which is both wrong and misleading.
+   */
+  protected val assertDecls = mutable.ListBuffer.empty[(AssertDecl, Scope)]
+
   /** Declared module-level `val`s by key (`13 §7`). Unlike a constant, this one reaches codegen: it
    * is storage, and every use of it is a read through an address rather than a copy of a literal.
    */

@@ -119,17 +119,51 @@ trait PatternAnalysis extends TypeResolution {
             // cannot arise. It is refused rather than quietly shadowed, which leaves the reader the
             // choice of a different name or an equality test.
             case None if globalKey(written).isDefined =>
-              err(s"'$written' is a 'val', which is read while the program runs, so a pattern cannot " +
-                s"match against it — compare it in a guard, or bind a different name")
+              err(s"'$written' is a 'val', which is read while the program runs, so a bare name here " +
+                s"would bind rather than match — write it as '`$name`' to test the value it holds, " +
+                s"or bind a different name")
             // An `extern` variable is storage too, and storage the linker fills — so there is even
             // less of a value here to match against than a `val` offers.
             case None if externVarKey(written).isDefined =>
               err(s"'$written' is an 'extern' variable, which is read while the program runs, so a " +
-                s"pattern cannot match against it — compare it in a guard, or bind a different name")
+                s"bare name here would bind rather than match — write it as '`$name`' to test the " +
+                s"value it holds, or bind a different name")
             case None if written != name =>
               err(s"'$written' names no variant of ${show(ty)} and no constant, and a qualified " +
                 s"name cannot bind — write the name a program can declare")
             case None => TBindPattern(bindOnce(name, ty), ty)
+
+    /* `` `name` `` — the quoting says a reference was meant, so this never binds.
+     *
+     * The three answers are the three kinds of thing a name can stand for here. A nullary variant
+     * is the same test the bare form gives, and quoting it is merely explicit. A `const` folds to
+     * the literal it always did. Everything else is *storage* — a `val`, an `extern` variable, a
+     * local, a parameter — and becomes an ordinary equality against whatever it holds when the
+     * match runs; that is a test rather than a shape, so it tells exhaustiveness nothing and the
+     * arm still needs a catch-all after it.
+     *
+     * A name that resolves to nothing is a diagnostic and not a new local, which is the reading a
+     * qualified name already gets above: the quoting has said this is a reference, so failing to
+     * find one is a mistake rather than an invitation to declare it.
+     */
+    case EqPattern(written) =>
+      val name = written.substring(written.lastIndexOf('.') + 1)
+
+      ty match
+        case en: Type.Enum if en.variant(name).exists(_.fields.isEmpty) =>
+          TVariantPattern(en, en.variant(name).get, Nil)
+        case en: Type.Enum if en.variant(name).isDefined =>
+          err(s"variant '$name' carries data — match it as '$name(…)'")
+        case _ =>
+          constKey(written) match
+            case Some(key) => analyzePattern(LitPattern(constLiteral(key)), ty)
+            case None =>
+              val t = analyzeExpr(Ident(written), Some(ty))
+
+              if t.ty != ty then err(s"pattern is ${show(t.ty)} but the value is ${show(ty)}")
+              if !Type.isEquatable(ty) then
+                err(s"a ${show(ty)} value cannot be matched against a name — there is no '==' to test it with")
+              TLitPattern(t)
 
     // A variant is named within the scrutinee's own enum, so a module prefix on the pattern is
     // repeating what the value already settled — it is dropped, and the type is what decides.

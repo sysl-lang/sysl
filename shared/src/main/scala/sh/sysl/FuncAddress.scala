@@ -1,5 +1,7 @@
 package sh.sysl
 
+import scala.collection.mutable
+
 /** A function's address, and a call through one — the two halves of `12 §6a`.
  *
  * This is the seam a C library reaches back through. `extern` (`12 §1`) lets sysl call outward, and
@@ -25,15 +27,16 @@ trait FuncAddress extends CallCore {
    * spelling that meant a sysl callable in one slot and a C address in another would be a silent
    * choice between two representations that share nothing.
    */
-  protected def functionAddress(written: String, key: String): TExpr = {
+  protected def functionAddress(written: String, key: String, expected: Option[Type] = None): TExpr = {
     val decl = funcDecls(key)
 
-    // Which copy of it? A generic function is not code until a call names its arguments (`10 §7`),
-    // so there is no single body an address could name.
-    if decl.tparams.nonEmpty then
-      err(s"'$written' is generic, so it is not one function but a copy per set of type arguments, " +
-        "and an address names one body — a wrapper that calls it at the arguments wanted is what " +
-        "has an address")
+    // Which copy of it? A generic function is not code until its arguments are settled (`10 §7`), so
+    // there is no single body to name until they are — but the *expected type* settles them wherever
+    // there is one, exactly as a call's arguments do, and an instantiation is one body like any
+    // other. Refusing outright was too broad: it is what stopped a library offering a callback
+    // helper at all, since a trampoline's state type belongs to the application rather than to the
+    // binding, so every application had to hand-roll one and cast the userdata itself.
+    val instKey = if decl.tparams.isEmpty then key else instantiationFor(written, decl, expected)
 
     // A `...` is read relative to the last named argument, so a caller has to know where the named
     // ones stop. A `*extern` says only what it is called with, which is what makes it callable at
@@ -54,7 +57,7 @@ trait FuncAddress extends CallCore {
         "function anything calls — there is no body for an address to name. A sysl function that " +
         "calls it is what has one")
 
-    val (params, ret) = funcInsts(key)
+    val (params, ret) = funcInsts(instKey)
     val ptypes        = params.map(_._2)
 
     // The address is of *code*, and the code has to be the code C would call. Where every part of
@@ -72,10 +75,48 @@ trait FuncAddress extends CallCore {
           "uses — so this address would be of a function C cannot call correctly. A wrapper taking " +
           "the parts behind a '*T' is what has an address")
 
-    funcsUsed += key
-    if externDecls.contains(key) then externsUsed += key
+    funcsUsed += instKey
+    if externDecls.contains(instKey) then externsUsed += instKey
 
-    TFuncAddr(key, key, Type.CFn(ptypes, ret))
+    TFuncAddr(instKey, instKey, Type.CFn(ptypes, ret))
+  }
+
+  /** Which copy of a generic function this address names, read off the type the context wants.
+   *
+   * There is no written form for the arguments and deliberately so: `&f[T]` cannot be told from
+   * `&xs[i]` by the grammar — both are a name, a bracket and something inside it — and only knowing
+   * whether the name is a generic function separates them. The expected type carries the same
+   * information without the ambiguity, and it is the information a caller has anyway: a `*extern`
+   * is being handed to something whose signature is already fixed.
+   *
+   * The match is against the **signature as declared**, so it solves exactly what a call site's
+   * arguments would. A parameter the signature does not mention cannot be solved, which is a real
+   * limit rather than an oversight — nothing in the expected type says what it should be.
+   */
+  private def instantiationFor(written: String, decl: FuncDecl, expected: Option[Type]): String = {
+    val want = expected.flatMap(cfnOf).getOrElse(
+      err(s"'$written' is generic, so which copy of it this addresses depends on its type " +
+        s"arguments, and nothing here says what they are — write the type: " +
+        s"'var f: *extern(…) -> … = &$written'"))
+
+    if want.params.length != decl.params.length then
+      err(s"'$written' takes ${quantity(decl.params.length, "parameter")}, and the " +
+        s"${show(want)} wanted here takes ${want.params.length}")
+
+    val tparams = decl.tparams.toSet
+    val sub     = mutable.Map.empty[String, Type]
+
+    for (p, a) <- decl.params.zip(want.params) do unify(p.typ, a, tparams, sub)
+    for r <- decl.retType do unify(r, want.ret, tparams, sub)
+
+    val unsolved = decl.tparams.filterNot(sub.contains)
+
+    if unsolved.nonEmpty then
+      err(s"'$written' is generic, and the ${show(want)} wanted here does not say what " +
+        s"${unsolved.map(t => s"'$t'").mkString(" or ")} should be — a type parameter the signature " +
+        "does not mention cannot be settled by the type of the address")
+
+    instantiateFunc(decl, decl.tparams.map(sub))
   }
 
   /** Whether a type is handed over to C as the thing it is, so a sysl definition of that signature

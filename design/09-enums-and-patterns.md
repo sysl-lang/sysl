@@ -242,6 +242,7 @@ The pattern forms the implementation accepts, each a decision this chapter ratif
 | Literal | `0`, `'a'`, `"hi"`, `true` | a value equal to the literal (see the type rule below) |
 | Range | `3..7`, `0..<10`, `'a'..'z'` | a value in the range, inclusive `..` / exclusive `..<` per `00` |
 | Bind | `r`, `other` | anything, and binds the value to the name |
+| Reference | `` `limit` ``, `` sdl.`SCANCODE_A` `` | a value equal to what the name already stands for; binds nothing |
 | Variant | `Circle(r)`, `Empty`, `Shape.Empty` | the named variant, binding each sub-pattern to a field |
 | Nested | `Wrap(Val(v))` | a variant whose payload itself matches a sub-pattern |
 | Struct, positional | `Point(a, b)` | a struct, binding every field by position |
@@ -273,6 +274,62 @@ bare name that happens to be a *data* variant is a diagnostic — `variant 'Circ
 a misspelled or data-carrying variant silently becomes a catch-all binding. This is the same
 resolution Rust and Swift reach; sysl makes the data-variant case a hard error rather than a
 lint.
+
+**A backticked name is a REFERENCE, and never a binding (settled).** The rule above resolves a bare
+name against a narrow set — the scrutinee's nullary variants, then the constants — and binds
+otherwise. That set is deliberately narrow, and the cost of narrowness is that everything outside it
+is unreachable: a `val`, an `extern` variable, a local, a parameter. Each of those is storage read
+while the program runs, so there is no value for a *compile-time* pattern to compare against — which
+is the reasoning that refused them, and which holds only for as long as the pattern has to be
+decided at compile time.
+
+Quoting the name says the test was meant, so the arm becomes an ordinary equality against whatever
+the name holds when the match runs:
+
+```
+val limit: int = read_setting()
+
+n match
+    `limit` -> "at the limit"        -- tests; n == limit
+    limit   -> "anything at all"     -- binds; a new local named limit, matching everything
+    else "elsewhere"
+```
+
+**The two spellings are the whole of the difference, and that is the point.** Rust's documented trap
+is that a name in a pattern silently changes meaning with what happens to be in scope; sysl's
+narrow resolution avoids it by refusing the ambiguous cases outright, and the backticks reopen them
+*with the meaning written at the site*. A reader does not have to know what is in scope to know
+which was meant.
+
+**Three consequences follow rather than needing rules of their own.** A quoted name that resolves to
+nothing is a diagnostic, not a new local — the reading a qualified name already gets below. A
+`const` still folds to its literal, so quoting one changes nothing but the reader's certainty. And a
+runtime equality tells exhaustiveness nothing, so an arm written this way never discharges a case
+and a catch-all stays required — the same position a literal pattern over a non-`bool` is already
+in.
+
+**A pattern is now a place a name is READ, which it never was before.** Every other form either
+binds a name or holds a literal, so a walk over an arm could take the patterns for their bindings
+and look for reads only in the guard and the body. A quoted name breaks that, and the consequence is
+visible in the language rather than only in the compiler: a **closure or a nested function captures
+a name it mentions nowhere but in a pattern** (`12 §5a`, `§7`), because that mention is a read of the
+enclosing frame like any other.
+
+```
+outer() -> string
+    val limit = 10
+
+    inner(n: int) -> string
+        n match
+            `limit` -> "at the limit"    -- captures `limit`, though nothing else names it
+            else "elsewhere"
+
+    inner(10)
+```
+
+**It cannot stand at an irrefutable binding.** `` val `limit` = 3 `` is refused for the reason every
+testing pattern is: a binding has no other arm to take when the value differs. The diagnostic says
+to drop the quoting, because at a binding the name is nearly always the name that was wanted.
 
 **A qualified name is a pattern wherever a bare one is.** `isa.Halt` and `Op.Bare` match exactly
 as `Halt` and `Bare` do — the prefix is dropped, since the scrutinee's type already settled which

@@ -452,6 +452,17 @@ trait Closures extends CallAnalysis {
       case MatchArm(ps, guard, b) =>
         val inArm = bound ++ ps.flatMap(patternNames)
 
+        // What the patterns *read*, which until quoted names existed was nothing. Collected by a
+        // walk of its own rather than by turning the general one loose on the patterns: that would
+        // also descend into a `LitPattern`'s expression and could call a name there a capture,
+        // which is a change to every match arm in the language rather than to the new form.
+        //
+        // Resolved against what was bound *before* the arm, since the quoting says the name is
+        // something already declared — so a pattern that both binds `a` and references `` `a` ``
+        // reads the outer one.
+        for n <- ps.flatMap(patternReads) do
+          if !bound(n) && lookupOpt(n).isDefined then found += n
+
         guard.foreach(walk(_, inArm))
         scoped(b, inArm)
         bound
@@ -467,6 +478,21 @@ trait Closures extends CallAnalysis {
     scoped(body, bound)
     found.toList
   }
+
+  /** Every name a pattern **reads** — the backticked ones, which reference something already
+   * declared rather than binding it (`09`).
+   *
+   * It is almost always empty, and that is the point of having it: every other pattern form binds a
+   * name or holds a literal, so this is exactly the set the new form added and nothing else changes
+   * meaning.
+   */
+  private def patternReads(p: Pattern): List[String] = p match
+    case EqPattern(n)          => List(n)
+    case BindPattern(_, inner) => patternReads(inner)
+    case VariantPattern(_, ps) => ps.flatMap(patternReads)
+    case TuplePattern(ps)      => ps.flatMap(patternReads)
+    case StructPattern(_, fs)  => fs.flatMap((_, sub) => patternReads(sub))
+    case _                     => Nil
 
   /** Every name a pattern binds, which shadows inside the arm it introduces. */
   private def patternNames(p: Pattern): List[String] = p match

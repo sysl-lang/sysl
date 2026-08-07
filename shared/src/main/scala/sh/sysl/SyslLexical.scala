@@ -57,6 +57,18 @@ class SyslLexical
     def chars: String = s"'$name"
   }
 
+  /** A backtick-quoted identifier, `` `like this` `` — a name the ordinary identifier grammar would
+   * refuse: a reserved word, or one carrying spaces and punctuation.
+   *
+   * It is its own token rather than an `Identifier` for two reasons. The soft keywords — `end`,
+   * `sync`, `volatile`, `Fn` — match `Identifier` by its text, so they reject a quoted one for free,
+   * and `` `end` `` is therefore a name rather than a block terminator. And a pattern has to tell a
+   * reference from a binding, which is the whole of what the quoting means there.
+   */
+  case class QuotedIdent(name: String) extends Token {
+    def chars: String = name
+  }
+
   /** A string literal, holding its decoded value. */
   case class StrLit(value: String) extends Token {
     def chars: String = value
@@ -236,9 +248,10 @@ class SyslLexical
   }
 
   override def token: Parser[Token] =
-    interpString | cString | identifier | number | label | character | string | (elem(EofCh) ^^^ EOF) | delim | failure(
-      "illegal character",
-    )
+    interpString | cString | identifier | number | label | character | string | quotedIdent |
+      (elem(EofCh) ^^^ EOF) | delim | failure(
+        "illegal character",
+      )
 
   private def isDigit(c: Char): Boolean    = c >= '0' && c <= '9'
   private def isHexDigit(c: Char): Boolean = isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
@@ -396,6 +409,31 @@ class SyslLexical
 
       if (!after.atEnd && after.first == '\'') Failure("not a label", in)
       else Success(Label(name), after)
+    }
+  }
+
+  /** A backtick-quoted identifier: everything up to the closing backtick, taken literally.
+   *
+   * There are no escapes inside, so a name can never carry a backtick — which is what keeps the
+   * scan a single `takeWhile` and the form unambiguous to a reader. A newline ends the search
+   * rather than the name, so an unclosed quote is reported at the line it opened on instead of
+   * swallowing the rest of the file.
+   *
+   * **A `.` is refused**, and that is a restriction on the name rather than on the lexer's ability
+   * to read it: a qualified name is carried through the compiler as a dotted string, so a dot
+   * inside a segment would be indistinguishable from the separator between two.
+   */
+  private lazy val quotedIdent: Parser[Token] = Parser { in =>
+    if (in.atEnd || in.first != '`') Failure("not a quoted identifier", in)
+    else {
+      val (name, rest) = takeWhile(in.rest, c => c != '`' && c != '\n')
+
+      if (rest.atEnd || rest.first != '`') Success(errorToken("unterminated quoted identifier"), rest)
+      else if (name.isEmpty) Success(errorToken("a quoted identifier needs a name between the backticks"), rest.rest)
+      else if (name.contains('.'))
+        Success(errorToken("a quoted identifier may not contain '.', which separates the parts of a " +
+          "qualified name"), rest.rest)
+      else Success(QuotedIdent(name), rest.rest)
     }
   }
 

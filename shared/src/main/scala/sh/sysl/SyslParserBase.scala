@@ -116,8 +116,31 @@ trait SyslParserBase extends PackratParsers {
   protected def op(sym: String): Parser[String] =
     accept(s"'$sym'", { case t: lexical.Keyword if t.chars == sym => sym })
 
+  /** A name, however it was written — bare, or backtick-quoted.
+   *
+   * The two forms are one token here because every position that names something takes either: a
+   * quoted name is a name, and nothing about a parameter, a field or a call cares how it was
+   * spelled. The places that *do* care are the ones matching a specific `Identifier` by its text —
+   * the soft keywords `end`, `sync`, `volatile` and `Fn` — and they get the distinction for free by
+   * naming the bare token, which is why `` `end` `` is a name rather than a block terminator.
+   */
   protected lazy val ident: Parser[String] =
+    accept("identifier", {
+      case t: lexical.Identifier   => t.chars
+      case t: lexical.QuotedIdent  => t.name
+    })
+
+  /** A name that was written without quoting, and only that — what a **module path** is made of. */
+  protected lazy val bareIdent: Parser[String] =
     accept("identifier", { case t: lexical.Identifier => t.chars })
+
+  /** A name that was written backtick-quoted, and only that.
+   *
+   * One production reads it: a pattern, where the quoting is what says the name is a reference to
+   * something already declared rather than a new binding (`09`).
+   */
+  protected lazy val quotedIdent: Parser[String] =
+    accept("quoted identifier", { case t: lexical.QuotedIdent => t.name })
 
   /** `_`, which the lexer hands over as an ordinary identifier.
    *

@@ -549,6 +549,14 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
         "and a binding has no other arm to take when the value has another")
       Nil
 
+    // A quoted name is a *reference*, so it tests rather than binds (`09 §`). It earns its own
+    // sentence because the fix is not the one the other refusals want: the name here is almost
+    // always the name that was meant, and it is the backticks that are wrong.
+    case EqPattern(n) =>
+      err(s"a binding cannot test a value — '`$n`' names something already declared, and a binding " +
+        s"has no other arm to take when the value turns out to differ; write '$n' to bind a new name")
+      Nil
+
   /** Most statements are one statement. The two comma forms are the exception, and the only reason
    * this hands back a list: a binding that names several things is several declarations.
    */
@@ -724,5 +732,21 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
       err("a 'variant' belongs at the head of a loop's body, where it is what decreases from one " +
         "iteration to the next, or in a function's contract block, where it is what decreases at " +
         "each recursive call")
+
+    /* `@assert` reaches here in the entry file, whose top level is a body (`13 §7`) rather than a
+     * run of declarations — so this is the same assert a module file hoists, met as a statement.
+     *
+     * **It is settled here rather than deferred**, and the two paths do not overlap: a module file's
+     * asserts are declarations, are collected by hoisting, and are checked by the walk over
+     * `assertDecls`; one written in the entry file is a statement, is never hoisted, and would
+     * otherwise be checked by nobody. Both settle after every constant has folded, which is the one
+     * ordering the condition needs — it may name a constant declared below it.
+     *
+     * It emits nothing either way: a true assertion is not code, and a false one has already
+     * stopped the compilation.
+     */
+    case a: AssertDecl =>
+      checkAssert(a)
+      Nil
 
 }

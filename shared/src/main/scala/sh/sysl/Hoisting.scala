@@ -128,6 +128,12 @@ trait Hoisting extends HoistMembers {
       constrainedDecls(key) = t.copy(name = key).setPos(t.pos)
       declScope(key) = currentScope
       recordAccess(key, t.vis)
+    // An assert declares no name, so there is nothing to register and nothing for it to collide
+    // with — it is only collected, and settled in the same window a constant's value is. That
+    // window is exactly what it needs: the condition may name a constant declared below it, just as
+    // one constant may be written in terms of another.
+    case a: AssertDecl => assertDecls += ((a, currentScope))
+
     // A constant is registered with the types rather than with the functions, because an array
     // bound and an enum discriminant may both name one and both are resolved between the two passes
     // (`13 §7`). Its *value* is not evaluated here — a constant may be written in terms of one

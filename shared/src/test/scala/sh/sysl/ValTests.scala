@@ -985,10 +985,16 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     }
 
     // `13 §7` argues that sysl cannot have Rust's trap where a name in a pattern quietly binds
-    // instead of matching. A `val` is the one thing that could have reintroduced it.
-    "matching against one, which would bind instead of compare" in {
+    // instead of matching. A `val` is the one thing that could have reintroduced it, so a **bare**
+    // name is refused — and the diagnostic now names the backticked form, which says the test was
+    // meant (`09`).
+    "matching against one with a bare name, which would bind instead of compare" in {
       err("static val n: int = 1\nvar x = 2\nx match\n    n -> print(1)\n    else print(2)") should
-        include("cannot match against it")
+        include("would bind rather than match")
+    }
+
+    "and the backticked form is what tests it" in {
+      run("static val n: int = 1\nvar x = 2\nx match\n    `n` -> print(1)\n    else print(2)") shouldBe "2\n"
     }
   }
 

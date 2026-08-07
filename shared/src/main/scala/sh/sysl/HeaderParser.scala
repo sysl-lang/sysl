@@ -8,8 +8,27 @@ package sh.sysl
  */
 trait HeaderParser extends AttrParser {
 
-  /** A dotted name — a module path. */
+  /** A dotted name — the general form, whose segments may be backtick-quoted because they may name
+   * declarations (`09`).
+   */
   protected lazy val dottedName: Parser[List[String]] = rep1sep(ident, op("."))
+
+  /** A **module path**, whose segments may not be quoted.
+   *
+   * Two reasons, and the second is the load-bearing one. A module names a *directory* (`13 §1`), so
+   * a path is the one name that is not purely the programmer's to choose. And `Modules.split`
+   * recovers a module from a key by finding its **first** `$` — an invariant that survives quoting
+   * only because the escape `Modules.qualify` applies can introduce a `$` after the separator and
+   * never before it. A quoted module segment would put one before it, and the key would be read as
+   * belonging to a module nobody declared.
+   */
+  protected lazy val modulePath: Parser[List[String]] =
+    rep1sep(
+      bareIdent | quotedIdent >> (n =>
+        err(s"'$n' is backtick-quoted, and a module path is written with plain names — a module " +
+          "names a directory, and its parts are what the file system holds")),
+      op("."),
+    )
 
   /** A name that may be reached through the module it belongs to: `File`, `std.fs.File`.
    *
@@ -25,7 +44,7 @@ trait HeaderParser extends AttrParser {
    * than an alternative within it.
    */
   protected lazy val moduleHeader: Parser[ModuleName] =
-    at(op("module") ~> dottedName ^^ ModuleName.apply)
+    at(op("module") ~> modulePath ^^ ModuleName.apply)
 
   /** A file-header attribute: `@no_alloc`, `@requires(os, posix)`, `@link("z")`, `@tests` (`13 §4`,
    * `15 §8`, `capabilities.md`, `testing.md`).
@@ -114,7 +133,7 @@ trait HeaderParser extends AttrParser {
    * scoped to it, for a name wanted in one function only.
    */
   protected lazy val importDecl: Parser[ImportDecl] =
-    op("import") ~> dottedName ~ opt(importTail) ~ opt(op("as") ~> ident) ^^ {
+    op("import") ~> modulePath ~ opt(importTail) ~ opt(op("as") ~> ident) ^^ {
       case path ~ None ~ alias          => ImportDecl(path, alias = alias)
       case path ~ Some(Left(_)) ~ alias => ImportDecl(path, wildcard = true, alias = alias)
       case path ~ Some(Right(sels)) ~ alias => ImportDecl(path, sels, alias = alias)

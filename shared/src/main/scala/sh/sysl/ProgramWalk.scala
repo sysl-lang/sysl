@@ -174,6 +174,14 @@ trait ProgramWalk
       currentPos = constDecls(key).pos
       recover(())(constLiteral(key))
 
+    // The asserts go directly after, and the order is what makes them useful: every constant has
+    // been folded by now, so a condition may name one wherever it was declared. Each is its own
+    // recovery region for the reason a constant is — a program with two bad asserts should be told
+    // about both rather than about whichever came first.
+    for (a, scope) <- assertDecls do
+      currentPos = a.pos
+      recover(())(inScope(scope)(checkAssert(a)))
+
     // A non-generic type is instantiated eagerly, so it is emitted whether or not it is used;
     // a generic one only exists once something asks for a concrete instantiation.
     //

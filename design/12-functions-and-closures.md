@@ -1013,13 +1013,55 @@ announces, and it is the same promise every raw pointer makes.
 **`null` is a `*extern`**, since "there is no callback, use the default" is a state several C
 interfaces have, and two compare by address so a program can ask whether one is installed.
 
+### A generic function's address — the instantiation is read off the type
+
+```
+read_it[S](s: *S, bump: i32) -> i32 = …
+
+val f: *extern(*State, i32) -> i32 = &read_it        -- S := State
+```
+
+**A generic function is a body per set of type arguments, so an address needs them settled — and the
+expected type settles them**, by the same unification a call site uses on its arguments. The
+declared signature is matched against the `*extern` wanted, and the instantiation that solves it is
+what has the address.
+
+**The flat refusal this replaces was too broad.** Its stated reason was that there is "no one body to
+name", and the sentence after it — that a wrapper calling it at the arguments wanted is what has an
+address — describes precisely what an instantiation is. What it cost was every *generic* function
+being unusable as a callback, however completely the context described the one wanted: a comparison
+written once over `*T` could not be handed to `qsort`, and a program needing it wrote a concrete copy
+per element type.
+
+**What this does NOT reach is the `void *userdata` pattern**, and the boundary is worth stating
+because it is the case a reader will assume is covered. Every C interface that calls back pairs the
+pointer with an untyped `void *`, and a trampoline for one has the signature C fixed — `(*u8, Event)
+-> bool`. The state type appears nowhere in it, so there is nothing for the expected type to solve,
+and such a trampoline is refused by the very rule below about a parameter the signature does not
+mention. Recovering the state means a `ptr_cast` from `*u8`, which is a promise rather than a
+deduction. A concrete trampoline per state type is still what that pattern takes.
+
+**There is no written form, `&f[T]`, and that is a grammar fact rather than a preference.** `&f[T]`
+and `&xs[i]` are the same shape — a name, a bracket, something inside — and only knowing whether the
+name is a generic function separates them. The expected type carries the same information with no
+ambiguity, and is information the caller has anyway: a `*extern` is handed to something whose
+signature is already fixed. Written anyway, `&f[T]` is answered by a message saying where the
+arguments come from.
+
+**Two things it does not do.** Where nothing says what is wanted — `var f = &ident` — the arguments
+cannot be settled and the message asks for the type. And a type parameter the *signature* never
+mentions cannot be settled by anything in the expected type, which is an honest limit of reading an
+instantiation off a type rather than an omission.
+
 ### What has no address, and why
 
 Each of these is refused because the address would not be an address of what its type says, and
 nothing downstream could notice:
 
-- **A generic function.** It is a body per set of type arguments (`10 §7`), so there is no one body
-  to name. A wrapper calling it at the arguments wanted is what has an address.
+- **A generic function whose arguments nothing settles.** It is a body per set of type arguments
+  (`10 §7`), so there is no one body to name *until they are known* — and where the context wants a
+  particular `*extern`, they are. See below: this used to be a flat refusal, and the flat refusal
+  was too broad.
 - **A variadic function.** C reads a tail relative to the last named argument, and a `*extern` states
   the arguments a call passes. A signature that fixed the tail would not be describing a variadic
   function.

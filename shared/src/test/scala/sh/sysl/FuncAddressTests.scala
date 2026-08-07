@@ -242,16 +242,29 @@ class FuncAddressTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  // This used to be refused, and the refusal was too broad: a generic function is a body per set of
+  // type arguments, but the *expected type* settles them, and an instantiation is one body like any
+  // other. `GenericFuncAddressTests` holds the rest; what is kept here is the case this suite has
+  // always been about, now answering rather than refusing.
+  "a generic function's address, at the instantiation the type asks for" in {
+    run("""first[T](a: T, b: T) -> T = a
+          |
+          |val f: *extern(i32, i32) -> i32 = &first
+          |print(f(7i32, 9i32))
+          |""".stripMargin) shouldBe "7\n"
+  }
+
   "what is refused, and why" - {
-    // Which copy would the address name? A generic function is a body per set of type arguments.
-    "a generic function, which is a body per instantiation" in {
+    // What survives of the old refusal: with nothing to read the arguments off, there is still no
+    // one body to name.
+    "a generic function with nothing to say which copy" in {
       val e = err("""first[T](a: T, b: T) -> T = a
                     |
-                    |var f: *extern(i32, i32) -> i32 = &first
+                    |var f = &first
                     |""".stripMargin)
 
       e should include("'first' is generic")
-      e should include("a copy per set of type arguments")
+      e should include("nothing here says what they are")
     }
 
     // A `...` is read relative to the last named argument, and a signature that fixed the tail would

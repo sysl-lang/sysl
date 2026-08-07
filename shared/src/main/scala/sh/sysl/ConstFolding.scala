@@ -102,7 +102,7 @@ trait ConstFolding extends ImportResolution {
     case (StrLit(_), Type.Str)                               => ()
     case _ => at(pos)(err(s"$what is declared ${show(ty)} but its value is ${literalKind(value)}"))
 
-  private def literalKind(e: Expr): String = e match
+  protected def literalKind(e: Expr): String = e match
     case _: IntLit   => "an integer"
     case _: FloatLit => "a float"
     case _: BoolLit  => "a boolean"
@@ -185,6 +185,33 @@ trait ConstFolding extends ImportResolution {
 
     inDecl(key)(resolveType(decl.typ, Map.empty))
   })
+
+  /** `@assert(cond)` / `@assert(cond, "why")` — settles the condition, and stops the compilation if
+   * it is false.
+   *
+   * Three outcomes, and each is a different mistake to report. A condition that does not fold is
+   * not a constant expression, and the reader has asked the compiler to settle something it cannot;
+   * one that folds to a value that is not a `bool` is an assertion about nothing; and one that folds
+   * to `false` is the assertion doing its job.
+   *
+   * The message is the reader's own where they wrote one, because they know what the number *means*
+   * — that a struct matches its C counterpart, that a table is the size the protocol fixes — and the
+   * expression alone says only that two numbers differ.
+   */
+  protected def checkAssert(a: AssertDecl): Unit =
+    fold(a.cond) match
+      case Some(BoolLit(true))  => ()
+      case Some(BoolLit(false)) =>
+        err(a.message match
+          case Some(m) => s"assertion failed: $m"
+          case None    => "assertion failed")
+      case Some(other) =>
+        err(s"'@assert' takes a condition, and this is ${literalKind(other)} — an assertion is " +
+          "something that can be true or false")
+      case None =>
+        err("'@assert' is settled while compiling, so its condition has to be a constant " +
+          "expression — a literal, a 'const', 'sizeof', 'alignof', or the arithmetic and " +
+          "comparisons over them, and never a call")
 
   /** Folds a constant expression to the literal it denotes, or `None` where it is not one.
    *
