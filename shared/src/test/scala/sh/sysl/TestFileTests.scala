@@ -239,20 +239,21 @@ class TestFileTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       }
     }
 
-    /** A library's tests are not analyzed at all, so one that does not compile is **not** a build
-      * error — and that is a thing given up on purpose rather than an oversight.
+    /** A library's tests are **parsed but never analyzed**, and these three pin exactly where that
+      * line falls — which is not where "`build-lib` no longer checks a library's tests" would put it.
       *
-      * It used to be reported here, and the reason it cannot be is that analysis is not a passive
-      * reading: a test naming `Buf[int]` *creates* the whole of `Buf` at `int`, and an instantiation
-      * is an ordinary library function afterwards, with nothing in it recording which declaration
-      * demanded it. Analyze the tests and the artifact ships what they caused, however carefully the
-      * declarations themselves are filtered out afterwards — so `Tests.stripSource` runs first and
-      * there is nothing left to report on.
+      * What is given up is everything *after* the parse: name resolution, types, visibility,
+      * capabilities, `@test` well-formedness, generic instantiation. It was given up because
+      * analysis is not a passive reading — a test naming `Buf[int]` *creates* the whole of `Buf` at
+      * `int`, and an instantiation is an ordinary library function afterwards, with nothing in it
+      * recording which declaration demanded it. Analyze the tests and the artifact ships what they
+      * caused, however carefully the declarations are filtered out afterwards.
       *
-      * Where a broken library test *is* reported is `sysl test` — `--std` for the standard library,
-      * which `StdSelfTests` runs as part of this suite, and a plain `sysl test` for anybody else's.
+      * Where a library test's real errors *are* reported is `sysl test` — `--std` for the standard
+      * library, which `StdSelfTests` runs as part of this suite, and plain `sysl test` for anyone
+      * else's.
       */
-    "and a broken test in one is no longer a build error, because it is never analyzed" in {
+    "an undefined name in one is no longer a build error, because it is never analyzed" in {
       val sources = List(
         Source("demo/lib.sysl", "module demo\n\ndouble(n: int) -> int = n * 2\n", List("demo")),
         Source("demo/tests.sysl", "module demo\n@tests\n\nbad() -> int = nosuchthing()\n", List("demo")),
@@ -264,10 +265,30 @@ class TestFileTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       }
     }
 
-    // Discriminating against the above, and the reason it is a pair: a `build-lib` that had stopped
-    // analyzing the library *altogether* would pass the test above for entirely the wrong reason.
+    /** **The other side of the line, and the one most likely to be got wrong when reading the rule
+      * back.** `LibraryArtifact.build` parses every source and returns on the first `Left` before
+      * `compileLibrary` is reached, so a `@tests` file that is not well-formed *text* still stops
+      * the build — the strip never sees it, because there is no tree to strip from.
+      *
+      * Worth a test of its own because the natural summary of this change — "a library's tests are
+      * not checked" — implies this file builds clean, and it does not.
+      */
+    "but a syntax error in one still is, because the strip happens after the parse" in {
+      val sources = List(
+        Source("demo/lib.sysl", "module demo\n\ndouble(n: int) -> int = n * 2\n", List("demo")),
+        Source("demo/tests.sysl", "module demo\n@tests\n\n@test\nbad( = )\n", List("demo")),
+      )
+
+      LibraryArtifact.build(sources) match {
+        case Right(_) => fail("a library whose test file does not parse built without a word")
+        case Left(e)  => e should include("demo/tests.sysl")
+      }
+    }
+
+    // Discriminating against the first of these, and the reason they are a set: a `build-lib` that
+    // had stopped analyzing the library *altogether* would pass it for entirely the wrong reason.
     // The same undefined name, in a declaration that is not a test, is still a build error.
-    "while an ordinary declaration that does not compile still is" in {
+    "while an ordinary declaration with the same undefined name still is" in {
       val sources = List(
         Source("demo/lib.sysl", "module demo\n\nordinary() -> int = nosuchthing()\n", List("demo")),
       )
@@ -275,6 +296,40 @@ class TestFileTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       LibraryArtifact.build(sources) match {
         case Right(_) => fail("a library with a broken ordinary declaration built without a word")
         case Left(e)  => e should include("nosuchthing")
+      }
+    }
+
+    /** **The other end of the trade, and the assertion that justifies making it.**
+      *
+      * Everything the three above give up, a test build has to still catch, or "the net moved rather
+      * than went" is a sentence with nothing behind it. The demanding case is a helper in a `@tests`
+      * file that **no test calls**: nothing reaches it, so a checker that worked outwards from the
+      * tests would never look at it, and it is precisely the declaration `build-lib` used to be the
+      * only thing looking at.
+      *
+      * Both are asserted in one compilation because the analyzer reports every mistake it finds, so
+      * a pass that had stopped at the first would show up as the second going missing.
+      */
+    "but a test build still analyzes all of it, including a helper nothing calls" in {
+      val sources = List(
+        Source("demo/lib.sysl", "module demo\n\ndouble(n: int) -> int = n * 2\n", List("demo")),
+        Source("demo/tests.sysl",
+               """module demo
+                 |@tests
+                 |
+                 |unreached() -> int = nosuchthing()
+                 |
+                 |@test
+                 |bad() = assert_eq(double(nowhere()), 4)
+                 |""".stripMargin,
+               List("demo")),
+      )
+
+      Compiler.compileTests(sources, Nil) match {
+        case Right(_) => fail("a test build compiled a tree whose test file names two undefined functions")
+        case Left(e) =>
+          e should include("nosuchthing")
+          e should include("nowhere")
       }
     }
 

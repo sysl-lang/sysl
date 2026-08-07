@@ -23,10 +23,18 @@ package sh.sysl
  * declarations first is what keeps an artifact's contents a fact about the library rather than about
  * its tests.
  *
- * What that gives up is `build-lib` reporting a library test that does not compile. The safety net
- * moved rather than went: `sysl test --std` compiles the library's tests and runs them, and it is
- * itself run by the suite, which is a better place for it than a command whose subject is the
- * artifact.
+ * **The line this draws is between PARSING and ANALYSIS, and it is worth stating exactly**, because
+ * "`build-lib` no longer checks a library's tests" is wrong in both directions. `LibraryArtifact.build`
+ * parses every source and returns on the first `Left` before `compileLibrary` is reached, so a
+ * **syntax** error in a `@tests` file still stops the build. What such a file no longer gets is
+ * everything *after* the parse — name resolution, types, visibility, capabilities, the `@test`
+ * well-formedness checks `problem` and `resultProblem` make from `Hoisting`, generic instantiation,
+ * escape analysis, the tail-call check. Not merely type-checking.
+ *
+ * So what is given up is narrower than it sounds and sharper: a library test that is *well-formed
+ * text* and wrong in every other way builds clean. `sysl test --std` compiles the library's tests
+ * properly and runs them, and the suite runs that — a better place for the check than a command
+ * whose subject is the artifact.
  */
 object Tests {
 

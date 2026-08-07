@@ -110,9 +110,16 @@ test from the typed tree therefore removes the test and keeps everything it caus
 artifact ships instantiations no caller of the library ever asked for. Its contents become a fact
 about its tests.
 
-What that gives up is `build-lib` reporting a library test that does not compile. The net moved
-rather than went: `sysl test --std` compiles the library's tests and runs them, and the compiler's
-own suite runs *that*, which is a better place for it than a command whose subject is the artifact.
+**The line falls between parsing and analysis, and is worth stating exactly** — "`build-lib` no
+longer checks a library's tests" is wrong in both directions. Every source is parsed before the
+strip is reached, so a **syntax** error in a `@tests` file still stops the build. What such a file
+no longer gets is everything after the parse: name resolution, types, visibility, capabilities, the
+`@test` well-formedness rules above, generic instantiation, escape analysis, the tail-call check.
+
+So what is given up is narrower than it sounds and sharper: a library test that is well-formed text
+and wrong in every other way builds clean. The net moved rather than went — `sysl test --std`
+compiles the library's tests properly and runs them, and the compiler's own suite runs *that*, which
+is a better place for the check than a command whose subject is the artifact.
 
 ### `@tests` — a file of scaffolding
 
