@@ -1142,6 +1142,27 @@ case class CapabilityClause(direction: CapabilityDirection, name: String) extend
  */
 case class LinkClause(name: String) extends Positioned
 
+/** `@tests` — the file holds a module's tests and the scaffolding they need, and no build but
+ * `sysl test` keeps any of it (`testing.md`).
+ *
+ * It says nothing about the declarations under it beyond where they go: a helper in such a file is
+ * an ordinary function, written and analyzed exactly as it would be anywhere else. What the header
+ * buys is the pair of rules the declarations could not state for themselves — every build but a test
+ * build drops them, and nothing outside a test may name them.
+ *
+ * It carries no argument. What a *test* says about itself is `@test`'s to say, and this is a
+ * property of the file rather than of any declaration in it.
+ */
+case class TestsClause() extends Positioned
+
+/** What one `@` line of a file's header may turn out to be (`13 §4`, `15 §8`, `testing.md`).
+ *
+ * They are gathered as one list because they are read as one run of lines, and separated by what
+ * each means once the file is parsed rather than by which rule matched — `@requires` alone yields
+ * several, so the list is not one clause per line either way.
+ */
+type HeaderClause = CapabilityClause | LinkClause | TestsClause
+
 /** One file's parse: the module it contributes to, the capabilities and link requirements its header
  * declares, its statements, and the source it came from.
  *
@@ -1160,6 +1181,11 @@ case class LinkClause(name: String) extends Positioned
  *
  * `source` is carried because a file is the unit several module rules are stated over, and a
  * diagnostic about one has to name it even where the file holds nothing to point at.
+ *
+ * `testOnly` is `@tests` (`TestsClause`): the file is scaffolding for the module's tests, kept by
+ * `sysl test` and dropped by every other build. It is a `Boolean` rather than the clause because
+ * nothing downstream has anything to ask of it but whether it was written — the position a
+ * diagnostic wants belongs to the declaration it is about, not to the header.
  */
 case class Program(
     body: List[Stmt],
@@ -1167,4 +1193,5 @@ case class Program(
     capabilities: List[CapabilityClause],
     links: List[LinkClause],
     source: Source,
+    testOnly: Boolean = false,
 )

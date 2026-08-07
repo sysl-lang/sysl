@@ -143,6 +143,16 @@ trait DeclTables extends Reporting {
    */
   protected val tests = mutable.ListBuffer.empty[TTest]
 
+  /** Everything declared in a file whose header said `@tests` (`testing.md`), by the module-qualified
+   * key every other table here uses.
+   *
+   * It is filled from the **parsed** files rather than from hoisting, because the question is about
+   * where a declaration was written and hoisting is where declarations stop remembering that. A set
+   * rather than a list: nothing asks what order test scaffolding was declared in, only whether a
+   * given name is some.
+   */
+  protected val testOnlyDecls = mutable.Set.empty[String]
+
   /** Types whose *declaration* was reported as a mistake, so that using one does not report it
    * again. A declaration is instantiated eagerly and therefore judged once, but a name can be
    * mentioned any number of times afterwards, and each mention would otherwise rebuild the same

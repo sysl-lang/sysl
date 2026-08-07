@@ -896,4 +896,16 @@ case class TProgram(
      * before anything names it — the same ordering the precompiled declarations need.
      */
     externVars: List[TExternVar] = Nil,
+    /** Everything declared in a file that said `@tests` — the scaffolding a module's tests are
+     * written against (`testing.md`).
+     *
+     * Keys rather than declarations, because what is carried here is asked of several lists at once:
+     * a test file may declare functions, storage and `extern`s, and `Tests.strip` drops all three by
+     * the same question. The names are the module-qualified ones every other table uses.
+     *
+     * A test build keeps them and every other build drops them, which is the whole of what the
+     * header said. The analyzer has already held them to the other half — that nothing outside a
+     * test names one — so by the time a tree reaches here, dropping them can leave nothing dangling.
+     */
+    testOnly: Set[String] = Set.empty,
 )

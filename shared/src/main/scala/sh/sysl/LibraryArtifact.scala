@@ -235,9 +235,19 @@ object LibraryArtifact {
             // The C files are fingerprinted with the sysl ones and not apart from them. A library's
             // shims are as much its source as its modules are, and an artifact that did not change
             // when one of them was edited is a stale artifact nothing would notice was stale.
+            // The **whole** set is compiled, `@tests` files and all, so that a broken test in a
+            // library is a mistake reported here rather than one waiting for whoever next runs the
+            // suite — the same reason `Tests.strip` runs after analysis rather than before it.
+            //
+            // Only the metadata is filtered, and it is filtered because that is what a consumer
+            // reads: the ASTs travel so a generic can be instantiated in the program that fixes its
+            // type arguments, and shipping a test file's would leave a package's scaffolding
+            // nameable by everything that links it. The compiled half needs no filtering — the same
+            // `Tests.strip` has already taken those declarations out of what is emitted.
             Compiler.compileLibrary(units, target, building, std)
               .map((ir, compiled) =>
-                (ir, metadata(units, compiled, fingerprint(sources ::: native), target)))
+                (ir, metadata(units.filterNot(_.testOnly), compiled,
+                              fingerprint(sources ::: native), target)))
   }
 
   /** What one of a library's C files is called inside the archive.

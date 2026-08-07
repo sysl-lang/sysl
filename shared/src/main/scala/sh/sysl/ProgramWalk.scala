@@ -24,6 +24,7 @@ trait ProgramWalk
     with ConventionCheck
     with NoAlloc
     with Purity
+    with TestScope
     with Ghost
     with GatedModules
     with InitOrder
@@ -118,6 +119,24 @@ trait ProgramWalk
         case _ =>
 
     val body = (library ::: files).flatMap((u, s) => contributed(u).map((s, _)))
+
+    // What a `@tests` file declares, before anything is hoisted, because hoisting is where a
+    // declaration stops remembering which file wrote it (`testing.md`). The library's files go
+    // through it too: they are files of modules like any other, and the standard module having no
+    // test files today is a fact about today.
+    for (u, s) <- library ::: files if u.testOnly do
+      testOnlyDecls ++= contributed(u).flatMap(Tests.declaredNames).map(Modules.qualify(s.module, _))
+
+      // An `impl` block is the one declaration a test file may not write, and the reason is that it
+      // does not declare a *name* — it puts an entry in a method table, which is a claim about a
+      // trait and a type that the rest of the program reads without naming anything at all. Kept in
+      // a test build and dropped everywhere else, it would mean a trait resolved one way while the
+      // tests ran and another way in the program that shipped. The impl belongs beside the type.
+      for i <- contributed(u).collect { case i: ImplDecl => i } do
+        currentPos = i.pos
+        recover(())(err("an 'impl' block may not sit in a file that said '@tests' — a test build " +
+          "would keep it and every other build would drop it, so a trait would answer one way while " +
+          "the tests ran and another way in the program that ships. It belongs beside the type"))
 
     // Each declaration, each function body, and each statement is a **recovery region**: a
     // failure inside one is recorded and the region abandoned, and the walk resumes at the next.
@@ -387,6 +406,10 @@ trait ProgramWalk
     // erasing one sound.
     checkGhost(allFuncs, tmain)
 
+    // And who may name what a `@tests` file declared (`testing.md`), which is the rule that makes
+    // dropping one sound in the same way.
+    checkTestScope(allFuncs, tmain, testOnlyDecls.toSet, tests.map(_.func).toSet)
+
     TProgram(
       structInsts.values.filterNot(abstracted).toList,
       enumInsts.values.filterNot(e => e.simple || abstracted(e)).toList,
@@ -403,6 +426,11 @@ trait ProgramWalk
       // matches — which reads as a test that vanished rather than as the error already printed.
       tests = tests.filter(t => allFuncs.exists(_.name == t.func)).toList,
       externVars = externVarsUsed.toList.map(k => TExternVar(externVarDecls(k).symbol, externVarType(k))),
+      // Everything a `@tests` file declared, whether or not analysis kept it — unlike the tests
+      // above, this is asked of a *tree that is about to be dropped*, so a name that reached no
+      // typed declaration costs a set entry nothing will match rather than a dispatcher arm nothing
+      // answers.
+      testOnly = testOnlyDecls.toSet,
     )
   }
 

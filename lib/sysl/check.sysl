@@ -54,3 +54,73 @@ assert(cond: bool, msg: string = "", file: string = __FILE__, line: long = __LIN
     if !cond then
         if msg.len == 0 then panic("assertion failed", file, line)
         else panic(msg, file, line)
+
+// What an equality assertion adds over `assert(a == b)` is the two **values**, and that is the whole
+// of why it is worth a function. A failed `assert` names the line, which says *which* check broke; a
+// reader then has to run the thing again to find out what the values were, and running it again is
+// exactly what the report could have saved them.
+//
+// The message could be written by hand -- `assert(a == b, s"got $a, want $b")` -- and that is the
+// form this replaces. It evaluates each side twice, and it builds a string, which makes heap storage
+// and so is unavailable to the modules that want an assertion most (`capabilities.md`). Rendering
+// through `Display` into `stdout()` costs neither.
+//
+// One function rather than one per type: `Eq` says the comparison means something and `Display` says
+// the value can be shown, which together are the whole of what a report needs.
+
+// The head and the tail of a report, shared by the three below so that one failure reads like
+// another. They are separate because what goes between them is each assertion's own -- a pair of
+// values, a pair of lengths, an index -- and none of it can be handed over as a `string` without
+// building one.
+private[sysl] report_head(msg: string)
+    prints("panic: ")
+
+    if msg.len > 0 then
+        prints(msg)
+        prints(": ")
+
+private[sysl] report_tail(file: string, line: long) -> never
+    prints(" (")
+    prints(file)
+    prints(":")
+    printi(line)
+    prints(")\n")
+    exit(1)
+
+private[sysl] show[T: Display](v: T) = v.display(stdout(), FormatSpec(0, -1, false))
+
+// `got` and `want` in that order, which is Go's and the order a failure is read in: what happened,
+// then what was meant to.
+assert_eq[T: Eq + Display](got: T, want: T, msg: string = "", file: string = __FILE__,
+                           line: long = __LINE__)
+    if got != want then
+        report_head(msg)
+        prints("got ")
+        show(got)
+        prints(", want ")
+        show(want)
+        report_tail(file, line)
+
+// The same for a slice, which needs more than `==` to be useful: a report saying two slices differ
+// sends its reader to find out where, and finding out where is a loop nobody wants to write at each
+// call. Length first, since a length mismatch explains every index after the shorter one.
+assert_slice_eq[T: Eq + Display](got: []const T, want: []const T, msg: string = "",
+                                 file: string = __FILE__, line: long = __LINE__)
+    if got.len != want.len then
+        report_head(msg)
+        prints("got ")
+        printu(ulong(got.len))
+        prints(" elements, want ")
+        printu(ulong(want.len))
+        report_tail(file, line)
+
+    for i in 0..<got.len
+        if got[i] != want[i] then
+            report_head(msg)
+            prints("got ")
+            show(got[i])
+            prints(", want ")
+            show(want[i])
+            prints(" at index ")
+            printu(ulong(i))
+            report_tail(file, line)

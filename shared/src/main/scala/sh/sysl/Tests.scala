@@ -57,6 +57,33 @@ object Tests {
         s"'${Type.show(retTy)}' — a test's result is whether it came back, so there is nothing to read a " +
         "value with")
 
+  /** Every name one top-level declaration binds, unqualified — what a `@tests` file has to be read
+   * for, so that what it declared can be recognised again once hoisting has flattened the files
+   * together (`TestScope`).
+   *
+   * It answers for a declaration rather than for a statement: everything below is something a file
+   * may say at its top level, and everything a file may say at its top level that binds a name is
+   * below. An `impl` binds none — which is exactly why such a file may not write one — so its
+   * absence here and its refusal there are the same fact said twice.
+   *
+   * A binding that names several things, written either as a list or as a pattern, is absent for a
+   * different reason: neither can be a module member at all, since its parts have nowhere to write a
+   * type (`12 §5b`), and `Hoisting` reports one at a file's top level rather than registering it. So
+   * there is no key for this to answer with.
+   */
+  def declaredNames(stmt: Stmt): List[String] = stmt match
+    case d: FuncDecl      => List(d.name)
+    case d: StructDecl    => List(d.name)
+    case d: EnumDecl      => List(d.name)
+    case d: TraitDecl     => List(d.name)
+    case d: TypeDecl      => List(d.name)
+    case d: ConstDecl     => List(d.name)
+    case d: ValDecl       => List(d.name)
+    case d: VarDecl       => List(d.name)
+    case d: ExternDecl    => List(d.name)
+    case d: ExternVarDecl => List(d.name)
+    case _                => Nil
+
   /** What the runner is told about one test: the key that calls it, the name that reports it, and
    * where the attribute was written.
    *
@@ -74,21 +101,41 @@ object Tests {
       attr.pos.map(_.line).getOrElse(0),
     )
 
-  /** The same program with every test dropped — the tree a build that is not `sysl test` lowers.
+  /** The same program with every test and every test file dropped — the tree a build that is not
+   * `sysl test` lowers.
    *
    * Dropping the functions is what keeps a test out of the output; dropping the list is what keeps
    * anything downstream from believing there are tests to dispatch to. Both, because either alone is
    * a tree that contradicts itself.
    *
-   * A test's *callees* are not dropped here and do not need to be: a helper only a test calls becomes
-   * unreachable the moment the test does, and `Reachability.prune` is what notices. What that leaves
-   * is exact — a helper the program also calls stays, because the program still calls it.
+   * **A `@tests` file goes with them, and this is the one place that can drop it.** A test's callees
+   * needed no help while every build that could reach one was a program: a helper only a test calls
+   * becomes unreachable the moment the test does, and `Reachability.prune` notices. A **library**
+   * prunes nothing — it has no `main` to lower outwards from, so every public declaration is emitted
+   * (`Compiler.compileLibrary`) — and a helper would ride into the artifact and be advertised out of
+   * it. Naming the file is what answers that, since a file is what the author marked.
+   *
+   * Dropping it here is safe rather than lucky: `TestScope` has already held every reference into
+   * such a file to coming from something dropped in the same builds, so what is left behind can
+   * hold no reference to what went.
+   *
+   * The **types** it declared are left, exactly as `Reachability.prune` leaves them: a type is
+   * emitted for its layout rather than for anything that runs, so an unused one costs a definition
+   * nothing reads and no code at all.
    */
   def strip(program: TProgram): TProgram = {
     val tests = program.tests.map(_.func).toSet
+    val gone  = tests ++ program.testOnly
 
-    if tests.isEmpty then program
-    else program.copy(funcs = program.funcs.filterNot(f => tests(f.name)), tests = Nil)
+    if gone.isEmpty then program
+    else
+      program.copy(
+        funcs = program.funcs.filterNot(f => gone(f.name)),
+        vals = program.vals.filterNot(v => gone(v.symbol)),
+        externs = program.externs.filterNot(e => gone(e.name)),
+        tests = Nil,
+        testOnly = Set.empty,
+      )
   }
 
   /** The same program lowered **as** a test build: the tests kept, and the program's own entry point

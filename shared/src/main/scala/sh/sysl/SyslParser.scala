@@ -268,8 +268,8 @@ class SyslParser(val source: Source) extends DeclParser {
   private lazy val unknownAttr: PackratParser[Attr] =
     op("@") ~> ident >> (n =>
       err(s"'$n' is not an annotation a declaration takes — '@test', '@tailrec', '@pure' and " +
-        "'@ghost' are the four. '@no_<capability>', '@requires(...)' and '@link(\"...\")' belong in " +
-        "the file's header"))
+        "'@ghost' are the four. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' " +
+        "belong in the file's header"))
 
   /** `#test` where `@test` was meant — the sigil a reader arriving from Rust or C reaches for first.
    *
@@ -395,8 +395,8 @@ class SyslParser(val source: Source) extends DeclParser {
   protected lazy val moduleHeader: Parser[ModuleName] =
     at(op("module") ~> dottedName ^^ ModuleName.apply)
 
-  /** A file-header attribute: `@no_alloc`, `@requires(os, posix)`, `@link("z")` (`13 §4`,
-   * `15 §8`, `capabilities.md`).
+  /** A file-header attribute: `@no_alloc`, `@requires(os, posix)`, `@link("z")`, `@tests` (`13 §4`,
+   * `15 §8`, `capabilities.md`, `testing.md`).
    *
    * **These are attributes rather than grammar, and that is the point of the spelling.** A capability
    * and a library name are things said *about* a module, not constructs the language executes, so
@@ -409,8 +409,20 @@ class SyslParser(val source: Source) extends DeclParser {
    *
    * One attribute may yield several clauses, because `@requires` takes a list.
    */
-  private lazy val headerAttr: Parser[List[CapabilityClause | LinkClause]] =
-    op("@") ~> (noAttr | requiresAttr | linkAttr)
+  private lazy val headerAttr: Parser[List[HeaderClause]] =
+    op("@") ~> (noAttr | requiresAttr | linkAttr | testsAttr)
+
+  /** `@tests` — the file is the module's test scaffolding (`testing.md`).
+   *
+   * It sits with the capability clauses rather than above a declaration because it is a property of
+   * the **file**: what it governs is every declaration in it at once, and a mark that had to be
+   * repeated on each would be a mark somebody forgets on the twentieth helper. That is also the
+   * answer to why it is not spelled `@test` — one word for two scopes reads as though the file were
+   * itself a test, and the two say genuinely different things: `@test` names something the runner
+   * calls, this names something no build but the runner's keeps.
+   */
+  private lazy val testsAttr: Parser[List[HeaderClause]] =
+    at(attrWord("tests") ^^ (_ => TestsClause())) ^^ (List(_))
 
   /** `@no_alloc` and its siblings — the module narrowing itself below what the target offers.
    *
@@ -422,7 +434,7 @@ class SyslParser(val source: Source) extends DeclParser {
    * One word per capability rather than `@no(alloc)` follows Rust's `#![no_std]`, which is the
    * nearest precedent and reads the way the thing is spoken.
    */
-  private lazy val noAttr: Parser[List[CapabilityClause | LinkClause]] =
+  private lazy val noAttr: Parser[List[HeaderClause]] =
     at(attrWordPrefixed("no_") ^^ (CapabilityClause(CapabilityDirection.Narrows, _))) ^^ (List(_))
 
   /** `@requires(os)`, `@requires(threads, posix)` — what the module cannot be built without.
@@ -432,7 +444,7 @@ class SyslParser(val source: Source) extends DeclParser {
    * both `threads` and `posix`, and writing that as two attributes would be two lines saying one
    * thing.
    */
-  private lazy val requiresAttr: Parser[List[CapabilityClause | LinkClause]] =
+  private lazy val requiresAttr: Parser[List[HeaderClause]] =
     attrWord("requires") ~> op("(") ~>
       rep1sep(at(ident ^^ (CapabilityClause(CapabilityDirection.Requires, _))), op(",")) <~ op(")")
 
@@ -442,7 +454,7 @@ class SyslParser(val source: Source) extends DeclParser {
    * sysl, exactly as an `extern`'s symbol is, and because plenty of real ones are not identifiers at
    * all. `stdc++` is the everyday example.
    */
-  private lazy val linkAttr: Parser[List[CapabilityClause | LinkClause]] =
+  private lazy val linkAttr: Parser[List[HeaderClause]] =
     at(attrWord("link") ~> op("(") ~> linkName <~ op(")") ^^ LinkClause.apply) ^^ (List(_))
 
   /** A header attribute written where a statement goes, which is refused for the reason
@@ -454,7 +466,8 @@ class SyslParser(val source: Source) extends DeclParser {
    * though the statements above it were outside its reach.
    */
   protected lazy val misplacedHeaderAttr: Parser[Nothing] =
-    guard(op("@") ~ (attrWordPrefixed("no_") | attrWord("requires") | attrWord("link"))) ~> err(
+    guard(op("@") ~ (attrWordPrefixed("no_") | attrWord("requires") | attrWord("link") |
+      attrWord("tests"))) ~> err(
       "this attribute belongs in the file's header, on the lines directly after 'module' and before " +
         "everything else — it is a property of the whole module, not of the statements below it")
 
@@ -1184,7 +1197,7 @@ class SyslParser(val source: Source) extends DeclParser {
       // show and what keeps `module m @no_alloc @requires(os)` from being a line anyone has to read.
       // The exception is a file that declares no module: the root module is a module like any other,
       // and there is no header for its attributes to sit below, so there they may open the file.
-      val lead = if m.isDefined then success(List.empty[CapabilityClause | LinkClause])
+      val lead = if m.isDefined then success(List.empty[HeaderClause])
                  else opt(headerAttr) ^^ (_.toList.flatten)
 
       lead ~ rep(newlines ~> headerAttr) ~ statements ^^ {
@@ -1194,7 +1207,8 @@ class SyslParser(val source: Source) extends DeclParser {
           Program(body, m,
                   clauses.collect { case c: CapabilityClause => c },
                   clauses.collect { case l: LinkClause => l },
-                  source)
+                  source,
+                  clauses.exists(_.isInstanceOf[TestsClause]))
       }
     }
 

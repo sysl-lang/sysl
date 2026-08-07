@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 26
+  val Version: Int = 27
 
   private val Magic = "sysl-ast"
 
@@ -142,6 +142,12 @@ object AstCodec {
       // stops working the moment it ships as an artifact — which is the worst shape the bug could
       // take, since the build that breaks is the one nobody ran.
       list(p.links)(l => { pos(l); sref(l.name) })
+      // `@tests` travels for completeness rather than for use: `LibraryArtifact.build` drops such a
+      // file before any of this runs, which is what keeps a package's scaffolding out of what it
+      // ships. Writing the flag anyway is what keeps this a *codec* — a tree that came back
+      // different from the one that went in is the failure `Version` exists to catch, and a field
+      // silently defaulted is exactly that failure with nobody to notice it.
+      bool(p.testOnly)
       list(p.body)(stmt)
       body.append('\n')
     }
@@ -555,8 +561,9 @@ object AstCodec {
         case "req" => CapabilityClause(CapabilityDirection.Requires, sref())
         case t     => fail(s"'$t' is not a capability clause's direction")))
       val links = list(at(LinkClause(sref())))
+      val tests = bool()
 
-      Program(list(stmt()), module, caps, links, sources(s))
+      Program(list(stmt()), module, caps, links, sources(s), tests)
     }
 
     // -------------------------------------------------------------- pieces
