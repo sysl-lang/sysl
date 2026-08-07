@@ -15,7 +15,8 @@ trait AttrParser extends ExprParser {
    * itself so that the annotation's own position is the `@`, which is the line a test report names.
    */
   protected lazy val attribute: PackratParser[Attr] =
-    testAttr ^^ Attr.Test.apply | tailrecAttr | pureAttr | ghostAttr | unknownAttr | hashAttr
+    testAttr ^^ Attr.Test.apply | tailrecAttr | pureAttr | ghostAttr | readsAttr | writesAttr |
+      unknownAttr | hashAttr
 
   /** `@test`, and the three things it may say about the test: the name a report gives it, that it is
    * a run which should not come back, and the text such a run should have printed on its way out.
@@ -44,11 +45,37 @@ trait AttrParser extends ExprParser {
   protected lazy val ghostAttr: PackratParser[Attr] =
     op("@") ~> attrWord("ghost") ^^ (_ => Attr.Ghost)
 
+  /** `@reads(a, b)` and `@writes(c)` — which module-level variables the function may touch
+   * (`17 §7`). The parentheses are mandatory and may be empty, because `@reads()` is a real and
+   * different claim from writing nothing at all: the first says the function reads no module
+   * storage, the second says nobody has written down what it does.
+   *
+   * The argument list is raised **inside** the parentheses rather than after the closing one, per
+   * the rule a dead `err` taught: a form that gets further along the line outranks an alternative
+   * that failed earlier, so a message written past the point of divergence is never the one
+   * reported. Here the only way to fail after `@reads` is the parenthesis, so that is where the
+   * sentence goes — otherwise `unknownAttr` below wins by position and says `reads` is not an
+   * annotation, which is both wrong and unhelpful.
+   */
+  protected lazy val readsAttr: PackratParser[Attr] =
+    op("@") ~> attrWord("reads") ~> (frameNames ^^ Attr.Reads.apply | frameErr("reads"))
+
+  protected lazy val writesAttr: PackratParser[Attr] =
+    op("@") ~> attrWord("writes") ~> (frameNames ^^ Attr.Writes.apply | frameErr("writes"))
+
+  private lazy val frameNames: Parser[List[String]] =
+    op("(") ~> repsep(ident, op(",")) <~ op(")")
+
+  private def frameErr(w: String): Parser[Attr] =
+    err(s"'@$w' names the module variables it covers, in parentheses — '@$w(count)', or '@$w()' " +
+      "for none. The parentheses are what tell a frame that covers nothing from a function that " +
+      "never said")
+
   private lazy val unknownAttr: PackratParser[Attr] =
     op("@") ~> ident >> (n =>
-      err(s"'$n' is not an annotation a declaration takes — '@test', '@tailrec', '@pure' and " +
-        "'@ghost' are the four. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' " +
-        "belong in the file's header"))
+      err(s"'$n' is not an annotation a declaration takes — '@test', '@tailrec', '@pure', " +
+        "'@ghost', '@reads(...)' and '@writes(...)' are the six. '@no_<capability>', " +
+        "'@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header"))
 
   /** `#test` where `@test` was meant — the sigil a reader arriving from Rust or C reaches for first.
    *
@@ -85,6 +112,11 @@ trait AttrParser extends ExprParser {
       },
     )
 
+  /** Whether an attribute is one half of a frame, for the refusal of `@pure` beside one. */
+  protected def frame(a: Attr): Boolean = a match
+    case _: Attr.Reads | _: Attr.Writes => true
+    case _                              => false
+
   /** The attribute written twice, where one is, for the refusal above. */
   protected def duplicated(as: List[Attr]): Option[String] =
     as.map(_.word).groupBy(identity).collectFirst { case (w, ws) if ws.length > 1 => w }
@@ -95,6 +127,8 @@ trait AttrParser extends ExprParser {
       case (d, Attr.TailRec) => d.copy(tailrec = true)
       case (d, Attr.Pure)    => d.copy(pure = true)
       case (d, Attr.Ghost)   => d.copy(ghost = true)
+      case (d, Attr.Reads(ns))  => d.copy(reads = Some(ns))
+      case (d, Attr.Writes(ns)) => d.copy(writes = Some(ns))
     }
 
   private lazy val testArgs: Parser[TestAttr] =

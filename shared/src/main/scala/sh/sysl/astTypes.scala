@@ -163,4 +163,13 @@ case class Param(
     typ: TypeRef,
     vis: Visibility = Visibility.Public,
     default: Option[Expr] = None,
+    /** Written `x: -> T`: the argument is an expression the *call* does not evaluate, and the body
+      * evaluates at each use (`12 § A parameter may be passed by name`).
+      *
+      * It is a property of the **parameter** rather than of its type, and that is the whole of why
+      * this is cheap. The type is `Fn() -> T` exactly as `x: () -> T` is, so nothing downstream —
+      * the bound, the monomorphization, the absence of an allocation — has a new case to learn. What
+      * differs is only how the call site binds it, which is where the desugar lives.
+      */
+    byName: Boolean = false,
 ) extends Positioned

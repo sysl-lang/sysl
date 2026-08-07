@@ -399,6 +399,13 @@ case class FuncDecl(
     pure: Boolean = false,
     /** `@ghost` — see `TFunc.ghost`. */
     ghost: Boolean = false,
+    /** `@reads(…)` — see `TFunc.reads`. `None` is a function that wrote no frame at all, which is
+      * a different thing from one that wrote an empty one: the first says nothing about its effects
+      * and the second says it has none (`17 §7`).
+      */
+    reads: Option[List[String]] = None,
+    /** `@writes(…)` — see `TFunc.writes`. `None`/`Some(Nil)` divide as they do for `reads`. */
+    writes: Option[List[String]] = None,
 ) extends Stmt
 
 /** What `@test` says about the function it is written above (`testing.md`).
@@ -428,6 +435,14 @@ enum Attr(val word: String) {
   case TailRec              extends Attr("tailrec")
   case Pure                 extends Attr("pure")
   case Ghost                extends Attr("ghost")
+
+  /** `@reads(a, b)` and `@writes(c)` — the module storage this function may touch (`17 §7`).
+    *
+    * They carry a list rather than a set so the refusal of a name written twice can name the
+    * position it was written at a second time; the check turns them into sets once it has looked.
+    */
+  case Reads(names: List[String])  extends Attr("reads")
+  case Writes(names: List[String]) extends Attr("writes")
 }
 
 /** `extern name(params) -> ret` — a function this program does not define but may call, resolved

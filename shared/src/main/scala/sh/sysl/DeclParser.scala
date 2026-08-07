@@ -23,7 +23,26 @@ trait DeclParser extends ExprParser {
    * questions about meaning rather than about shape.
    */
   protected lazy val funcParam: Parser[Param] =
-    at(param ~ opt(op("=") ~> expression) ^^ { case p ~ d => p.copy(default = d.map(Placeholders.lift)) })
+    at((byNameParam | param) ~ opt(op("=") ~> expression) ^^ {
+      case p ~ d => p.copy(default = d.map(Placeholders.lift))
+    })
+
+  /** `x: -> T` — a parameter passed **by name** (`12 § A parameter may be passed by name`).
+   *
+   * The arrow with nothing on its left is the nullary case of the bare-arrow sugar a parameter
+   * already has: `f: A -> B` is `[F: Fn(A) -> B](f: F)`, and this is that at arity zero. So the type
+   * it builds is the one `x: () -> T` builds, and only `byName` separates them — the second is a
+   * callable the caller constructs, the first is an expression the caller writes bare and the call
+   * does not evaluate.
+   *
+   * It belongs to `funcParam` rather than to `param`, so a **struct field** cannot be written this
+   * way. A field is storage, and storage holding an unevaluated expression is a different feature
+   * from this one.
+   */
+  private lazy val byNameParam: Parser[Param] =
+    at(ident ~ (op(":") ~> op("->") ~> typeRef) ^^ {
+      case n ~ r => Param(n, FnType(Nil, r, bare = true), byName = true)
+    })
 
   /** A struct's field, which has no default to declare. Said here rather than left to the
    * "newline expected" a grammar with no place for one would give, because `= v` after a field is a

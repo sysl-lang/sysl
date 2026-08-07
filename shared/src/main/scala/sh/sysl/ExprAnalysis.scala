@@ -445,6 +445,13 @@ trait ExprAnalysis
 
     case Ident(name) =>
       lookupOpt(name) match
+        // A by-name parameter is read by **calling** it: the caller wrote an expression and the
+        // compiler made it a nullary closure, so naming it here is where that closure runs. Doing it
+        // at the read is what gives the feature its defining behaviour — each use is an evaluation,
+        // because each use is a call — and it costs nothing else, since a call on a callable is the
+        // ordinary method call `callCallable` already performs.
+        case Some((u, ty)) if byNameLocals(u) =>
+          callCallable(capturedFields.getOrElse(u, TLoad(u, ty)), Nil, expected)
         // A captured name is a name the scope knows and the frame does not hold: what it reaches is
         // the field of the closure the body is now a member of (`12 §7`).
         case Some((u, ty)) => capturedFields.getOrElse(u, TLoad(u, ty))

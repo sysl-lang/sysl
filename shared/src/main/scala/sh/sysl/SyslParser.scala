@@ -171,6 +171,13 @@ class SyslParser(val source: Source)
       duplicated(as) match
         case Some(dup) =>
           err(s"'@$dup' is written twice above one declaration, and it says nothing the once does not")
+        // `@pure` *is* `@reads() @writes()` plus the further bans of `17 §6`, so the two together say
+        // one thing twice — and worse, they could be made to disagree, which would leave nothing to
+        // say which of the two claims the function was held to.
+        case None if as.exists(_ == Attr.Pure) && as.exists(frame) =>
+          err("'@pure' already says '@reads()' and '@writes()', so a frame beside it says one thing " +
+            "twice — write the frame alone if the function touches module storage, and '@pure' alone " +
+            "if it touches none")
         case None =>
           (visibility ~ funcDecl) ^^ {
             case Visibility.Public ~ (f: FuncDecl) => attributed(f, as)

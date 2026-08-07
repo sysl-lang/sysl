@@ -24,6 +24,7 @@ trait ProgramWalk
     with ConventionCheck
     with NoAlloc
     with Purity
+    with Frames
     with TestScope
     with Ghost
     with GatedModules
@@ -401,6 +402,11 @@ trait ProgramWalk
 
     // And what a `@pure` function promised, asked of the same tree for the same reason (`17 §6`).
     checkPurity(allFuncs, externs)
+
+    // And what a `@reads`/`@writes` frame promised (`17 §7`). It runs beside purity rather than
+    // inside it because the two answer different questions about the same nodes: purity asks whether
+    // a caller could observe anything at all, a frame asks which storage in particular.
+    checkFrames(allFuncs, externs)
 
     // And where a `@ghost` function may be called from (`17 §8`), which is the rule that makes
     // erasing one sound.
@@ -1171,7 +1177,7 @@ trait ProgramWalk
     // And which of the body's own names hold one of them, for the members reached through a value
     // rather than through the parameter's name. Only a parameter written as the bare type parameter
     // qualifies: a `Box[T]` is a `Box`, and what its members mean is the `Box`'s question.
-    pbounds = f.params.collect { case Param(n, NamedType(w, Nil), _, _) if f.bounds.contains(w) => n -> w }.toMap
+    pbounds = f.params.collect { case Param(n, NamedType(w, Nil), _, _, _) if f.bounds.contains(w) => n -> w }.toMap
 
     // A result list is the signature's, and the body produces the tuple its parts lay out as — so
     // the body is analyzed against that tuple, with the list itself recorded beside it as the one
@@ -1184,6 +1190,13 @@ trait ProgramWalk
     retTy = rtype
     variadicFn = f.variadic
     val tparams = params.map { case (n, t) => (declare(n, t), t) }
+    // Which of those uniqued names came from a by-name parameter, so a read of one becomes the call
+    // the sugar promises (`12 § A parameter may be passed by name`). Matched by written name rather
+    // than by position, since what `params` holds is not always the declaration's list unchanged.
+    val byNameWritten = f.params.filter(_.byName).map(_.name).toSet
+    byNameLocals =
+      if byNameWritten.isEmpty then Set.empty
+      else params.zip(tparams).collect { case ((n, _), (u, _)) if byNameWritten(n) => u }.toSet
     val (contracts, rest) =
       f.body.span { case _: Require | _: Ensure | _: Variant => true; case _ => false }
     val (requires, ensures, olds, variant) = analyzeContracts(rtype, contracts)
@@ -1212,7 +1225,8 @@ trait ProgramWalk
     // function, and only the second answers for an instantiation; a symbol is file-private if either
     // says so, since both name the one declaration.
     TFunc(name, tparams, rtype, tbody, f.variadic, requires, ensures, olds,
-      fileLocal(name) || fileLocal(f.name), f.conv, f.tailrec, variant, f.pure, f.ghost)
+      fileLocal(name) || fileLocal(f.name), f.conv, f.tailrec, variant, f.pure, f.ghost,
+      frameSymbols(f.reads, "reads"), frameSymbols(f.writes, "writes"))
   }
 
   /** Typechecks the leading `require`/`ensure` clauses. Both conditions must be `bool`. `result`

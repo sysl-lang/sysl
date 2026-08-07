@@ -33,9 +33,40 @@ trait ArgumentBinding extends TraitLookup {
   ): List[Expr] = {
     val names = args.collect { case n: NamedArg => n }
 
-    if names.isEmpty && !params.exists(_.default.isDefined) then args
-    else bind(shown, owner, params, args, variadic, names)
+    val bound =
+      if names.isEmpty && !params.exists(_.default.isDefined) then args
+      else bind(shown, owner, params, args, variadic, names)
+
+    thunked(params, bound)
   }
+
+  /** Wraps each argument standing at a by-name parameter in the closure the parameter's type asks
+   * for (`12 § A parameter may be passed by name`).
+   *
+   * **This is the whole of the feature, and it is deliberately a desugar over the untyped tree.**
+   * `x: -> T` is typed `Fn() -> T`, so an argument that arrives as a closure is a thing the analyzer
+   * already knows how to bind, monomorphize and inline; turning the expression into that closure
+   * here means nothing downstream learns a new shape. What the reader gets is the call site: the
+   * argument is not evaluated where it is written, and the body evaluates it at each use.
+   *
+   * It runs after binding rather than before, so a by-name parameter reached by name or filled from
+   * a default is thunked exactly as a positional one is — the argument lists have been made to
+   * correspond by then, which is the only point at which a parameter and its argument are known to
+   * be a pair.
+   *
+   * A defaulted by-name parameter is thunked here too, so the default is an expression the callee
+   * evaluates at each use rather than one the caller evaluated before the call.
+   */
+  private def thunked(params: List[Param], args: List[Expr]): List[Expr] =
+    if !params.exists(_.byName) then args
+    else
+      args.zipWithIndex.map { (a, i) =>
+        // A variadic call has arguments past the last declared parameter, and those stand at no
+        // parameter at all — `lift` is what says so rather than an index check written out.
+        params.lift(i) match
+          case Some(p) if p.byName => Lambda(Nil, List(ExprStmt(a))).setPos(a.pos)
+          case _                   => a
+      }
 
   private def bind(
       shown: String,
