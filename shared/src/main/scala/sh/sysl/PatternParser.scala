@@ -25,7 +25,7 @@ trait PatternParser extends ExprParser {
    */
   protected lazy val matchExpr: PackratParser[Expr] =
     assignment ~ rep(onNextLine(op("match")) ~>
-      (newline ~> indent ~> skipNewlines ~> repsep(matchArm, newlines) <~ skipNewlines <~ dedent)) ^^ {
+      (newline ~> indent ~> skipNewlines ~> rep1sep(matchArm, newlines) <~ skipNewlines <~ dedent)) ^^ {
       case scrut ~ chain => chain.foldLeft(scrut)((e, arms) => MatchExpr(e, arms).setPos(e.pos))
     }
 
@@ -56,7 +56,7 @@ trait PatternParser extends ExprParser {
    * the form nest: `outer @ Wrap(inner @ Val(v))` is two of these.
    */
   override protected lazy val pattern: Parser[Pattern] =
-    bindPattern | unboundPattern
+    describe("a pattern")(bindPattern | unboundPattern)
 
   /** `n @ pat` — the value bound whole, and taken apart, in one pattern.
    *

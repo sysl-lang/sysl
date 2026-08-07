@@ -118,13 +118,69 @@ class ParseDiagnosticTests extends AnyFreeSpec with ParseSupport {
     // something to report either. This said `'module' expected` against a line that had one problem
     // and it was not the header.
     "nor is a file that opens badly told it is missing a module header" in {
-      refusal(")\nprint(1)\n")._1 should not include "'module'"
+      refusal(")\nprint(1)\n") shouldBe ("expression expected", "<input>:1:1")
+    }
+
+    // The same for the attributes that may follow a header, which is a repetition rather than an
+    // option: `rep` records what one more of them would have wanted, and it recorded it *before* the
+    // statement that actually failed, so it won the tie. Both spellings of the header are covered
+    // because they take different paths through `program`.
+    "nor one whose first statement fails after a module header" in {
+      refusal("module m\n)\nprint(1)\n") shouldBe ("expression expected", "<input>:2:1")
+    }
+
+    "nor one after a leading attribute" in {
+      refusal("@no_alloc\n)\nprint(1)\n") shouldBe ("expression expected", "<input>:2:1")
     }
 
     // The assignment form is `place = value`, tried at every expression and abandoned wherever there
     // is no `=`. The last of the operators it looks for was the one reported.
     "nor is a statement that runs on told about an assignment operator" in {
       refusal("val x = 1 2\n")._1 should not include "'>>='"
+    }
+
+    // A loop's label is written immediately before the loop's keyword, so every labelled form used
+    // to take a stray label and then ask for its keyword on the token after it — a `for` nobody was
+    // writing, reported a line further on than the label that is the actual problem.
+    "and a stray label is not told a loop keyword is missing" in {
+      refusal("break 'a 'b\n") shouldBe ("newline expected", "<input>:1:10")
+    }
+  }
+
+  "the other alternations that answered with their last candidate" - {
+
+    // Each of these is `describe` at work, or an indented block that must hold at least one item
+    // and so lets the item's own refusal stand instead of the block's closing `dedent`.
+    "an attribute with no name" in {
+      refusal("@\nprint(1)\n") shouldBe ("an attribute expected", "<input>:1:2")
+    }
+
+    "an arm with no pattern" in {
+      refusal("x match\n    -> 1\n") shouldBe ("a pattern expected", "<input>:2:5")
+    }
+
+    "a field with no name" in {
+      refusal("struct S\n    : int\nend S\n") shouldBe ("identifier expected", "<input>:2:5")
+    }
+  }
+
+  "the forms these could have broken still parse" - {
+
+    // `repeatedly`, the label lookahead and the `rep1sep` blocks all sit on paths every file takes.
+    "a header with attributes under it, blank lines and all" in {
+      prog("module m.n\n\n@no_alloc\n@requires(os)\n\n@tests\n\nprint(1)\n") should not be empty
+    }
+
+    "attributes with no header above them" in {
+      prog("@no_alloc\n@requires(os)\nprint(1)\n") should not be empty
+    }
+
+    "a labelled loop, and a break that names it" in {
+      prog("'outer for i in 0..<3 do\n    break 'outer\nend for\n") should not be empty
+    }
+
+    "a loop whose label is the only thing before it" in {
+      prog("'a loop do\n    break 'a\nend loop\n") should not be empty
     }
   }
 

@@ -159,9 +159,18 @@ trait SyslParserBase extends PackratParsers {
    * being further into the file, it would outrank the real mistake and be the one message shown.
    * `print(1)` followed by a stray `)` was reported as `'match' expected` against the `)`.
    */
-  protected def onNextLine[T](p: => Parser[T]): Parser[T] =
+  protected def onNextLine[T](p: => Parser[T]): Parser[T] = asOneToken(skipNewlines ~> p)
+
+  /** Reports `p`'s refusal back at the token `p` began at, whatever `p` crossed before noticing.
+   *
+   * For a construct that is being *looked for* rather than required: what the search crossed is not
+   * the reader's mistake, and a refusal recorded past it would outrank the real one by sitting
+   * further into the file. Where the enclosing rule is a [[maybe]] or a [[repeatedly]], reporting at
+   * the start is also what lets them recognise the construct as absent and say nothing at all.
+   */
+  protected def asOneToken[T](p: => Parser[T]): Parser[T] =
     Parser { in =>
-      (skipNewlines ~> p)(in) match {
+      p(in) match {
         case f: Failure => Failure(f.msg, in)
         case other      => other
       }
@@ -178,11 +187,27 @@ trait SyslParserBase extends PackratParsers {
   protected def maybe[T](p: => Parser[T]): Parser[Option[T]] =
     Parser { in =>
       p(in) match {
-        case s: Success[?]                     => s.map(Some(_)).asInstanceOf[ParseResult[Option[T]]]
+        case s @ Success(_, _)                 => s.map(Some(_))
+        // Past the first token the writer had started the construct, so the complaint is worth
+        // keeping — and `append` onto a `Success` is how the library itself records one.
         case f: Failure if in.pos < f.next.pos => f.append(Success(None, in))
         case _: Failure                        => Success(None, in)
         case e: Error                          => e
       }
+    }
+
+  /** `rep(p)` for a construct whose **absence is ordinary** — the repeated form of [[maybe]].
+   *
+   * A repetition ends by `p` failing, and `rep` records that failure: the list of header attributes
+   * a file may open with therefore left behind an expectation of one more attribute, on the very
+   * line whose real problem was something else entirely. Ties are settled in favour of whichever was
+   * recorded first, and this one is recorded before the statement that will actually fail — so it
+   * won, and a file opening with a stray bracket was told `newline expected`.
+   */
+  protected def repeatedly[T](p: => Parser[T]): Parser[List[T]] =
+    maybe(p) >> {
+      case Some(x) => repeatedly(p) ^^ (x :: _)
+      case None    => success(Nil)
     }
 
   // --- reached across the grammar's areas -----------------------------------------------

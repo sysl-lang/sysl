@@ -42,7 +42,7 @@ trait HeaderParser extends AttrParser {
    * One attribute may yield several clauses, because `@requires` takes a list.
    */
   protected lazy val headerAttr: Parser[List[HeaderClause]] =
-    op("@") ~> (noAttr | requiresAttr | linkAttr | testsAttr)
+    op("@") ~> describe("an attribute")(noAttr | requiresAttr | linkAttr | testsAttr)
 
   /** `@tests` — the file is the module's test scaffolding (`testing.md`).
    *

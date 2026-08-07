@@ -92,15 +92,29 @@ and so discarded that record on the way past. What was left to report came from 
 outermost production, which put the caret at the top of the enclosing block however far down
 the mistake was. `at` now stamps the node in place and hands the result back untouched.
 
-What ordered choice does still decide is the *message*, and four combinators shape it. `describe`
-renames a production's refusal where the production consumed nothing, so a token that can begin no
-expression is told `expression expected` rather than named after whichever candidate happened to
-sit last in the ladder. The other three exist because **an absence must not be spoken of as an
-expectation**: an optional construct that is simply not there records what it wanted, and that
-expectation then competes with — and, being further into the file, outranks — the real mistake.
-`skipNewlines` reads blank lines and cannot fail; `onNextLine` looks past them for a continuation
-keyword and reports its absence back where the search began; `maybe` is `opt` for a construct whose
-absence is ordinary, dropping a refusal at the first token and keeping one after it.
+What ordered choice does still decide is the *message*, and a handful of combinators shape it.
+`describe` renames a production's refusal where the production consumed nothing, so a token that can
+begin no expression is told `expression expected` rather than named after whichever candidate
+happened to sit last in the ladder; `expression`, `unary`, `pattern` and the attribute list carry it.
+
+The rest exist because **an absence must not be spoken of as an expectation**. An optional construct
+that is simply not there still records what it wanted, and that expectation then competes with — and,
+being further into the file or merely recorded earlier, outranks — the real mistake:
+
+- `skipNewlines` reads blank lines and cannot fail.
+- `asOneToken` reports a refusal back at the token the production began at, for a construct being
+  *looked for* rather than required: what the search crossed to find out is not the reader's mistake.
+  `onNextLine` is that over blank lines, for a continuation keyword such as `match` or `else`.
+- `maybe` is `opt`, and `repeatedly` is `rep`, for a construct whose absence is ordinary — a module
+  header, the attributes under one. Both drop a refusal at the first token and keep one after it, so
+  a construct that was *started* still answers for how it goes on.
+
+Two shapes in the grammar itself follow from the same rule. A **lookahead is placed at the commit
+point** rather than after it, so a loop's label is only read where a loop keyword follows it and a
+stray one is not reported as a loop nobody was writing. And an **indented block takes `rep1sep`, not
+`repsep`**: the lexer emits no `indent` for an empty block, so a block that parsed no items has an
+item that would not parse, and letting that refusal stand says more than the `dedent` the block was
+going to want next.
 
 ## Source positions
 

@@ -164,7 +164,7 @@ trait DeclParser extends ExprParser {
       // consumes, so both are asked at the same position and at most one of them can succeed.
       noPacks(tp, "a struct") ~> (opt(guard(newline ~ indent)) ~ opt(guard(onNextLine(softEnd)))) >> {
         case Some(_) ~ _ =>
-          (newline ~> indent ~> skipNewlines ~> repsep(structItem, newlines) <~ skipNewlines <~ dedent) <~
+          (newline ~> indent ~> skipNewlines ~> rep1sep(structItem, newlines) <~ skipNewlines <~ dedent) <~
             endName(name) ^^ { items =>
               val fields     = items.collect { case StructPart.Fld(f)  => f }
               val members    = items.collect { case StructPart.Mem(m)  => m }
@@ -313,7 +313,7 @@ trait DeclParser extends ExprParser {
     op("enum") ~> ident ~ opt(boundedTypeParams) ~ opt(op(":") ~> typeRef) >> { case name ~ tps ~ under =>
       val tp = tps.getOrElse(TypeParams.none)
 
-      noPacks(tp, "an enum") ~> (newline ~> indent ~> skipNewlines ~> repsep(enumItem, newlines) <~ skipNewlines <~ dedent) <~ endName(name) ^^ {
+      noPacks(tp, "an enum") ~> (newline ~> indent ~> skipNewlines ~> rep1sep(enumItem, newlines) <~ skipNewlines <~ dedent) <~ endName(name) ^^ {
         items =>
           val variants = items.collect { case Left(v)  => v }
           val members  = items.collect { case Right(m) => m }
@@ -404,7 +404,7 @@ trait DeclParser extends ExprParser {
       case name ~ tps ~ supers =>
         val tp = tps.getOrElse(TypeParams.none)
         val body =
-          (newline ~> indent ~> skipNewlines ~> repsep(traitMember, newlines) <~ skipNewlines <~ dedent) <~
+          (newline ~> indent ~> skipNewlines ~> rep1sep(traitMember, newlines) <~ skipNewlines <~ dedent) <~
             endName(name)
 
         def decl(methods: List[MethodDecl]) =
@@ -492,7 +492,7 @@ trait DeclParser extends ExprParser {
       qualifiedName ~ opt(typeArgs) ^^ { case n ~ args => (n, args.getOrElse(Nil)) }
 
   protected lazy val implBody: PackratParser[List[MethodDecl]] =
-    newline ~> indent ~> skipNewlines ~> repsep(implMember, newlines) <~ skipNewlines <~ dedent
+    newline ~> indent ~> skipNewlines ~> rep1sep(implMember, newlines) <~ skipNewlines <~ dedent
 
   /** A member of an `impl` block, which is the one place a member may say `override` — the trait it
    * implements is the only thing a member of a type can be replacing a body from.

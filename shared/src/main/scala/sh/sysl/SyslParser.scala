@@ -409,7 +409,7 @@ class SyslParser(val source: Source)
   protected lazy val asmArmBody: Parser[AsmBody] =
     (softWord("unavailable") ~> asmText ^^ AsmUnavailable.apply) |
       (asmText ^^ (line => AsmCode(List(line), Nil, Nil))) |
-      (newline ~> indent ~> skipNewlines ~> repsep(asmItem, newlines) <~ skipNewlines <~ dedent ^^ gatherAsm) |
+      (newline ~> indent ~> skipNewlines ~> rep1sep(asmItem, newlines) <~ skipNewlines <~ dedent ^^ gatherAsm) |
       success(AsmCode(Nil, Nil, Nil))
 
   /** A line inside an arm: an instruction, an operand, or what the arm destroys. They are collected
@@ -457,6 +457,19 @@ class SyslParser(val source: Source)
   protected lazy val labelRef: Parser[String] =
     accept("label", { case t: lexical.Label => t.name })
 
+  /** The label a loop may carry, which is written immediately before the loop's own keyword and
+   * nowhere else.
+   *
+   * Reading it only where one of those follows is what keeps a stray label from being reported as a
+   * loop nobody was writing. Without the lookahead, every labelled form takes the label and then asks
+   * for its keyword on the token after it — so `break 'a 'b`, whose real problem is the second label,
+   * was told `'for' expected` against the end of the line. The lookahead is `asOneToken` for the same
+   * reason: what it crossed to find out is the label, and a refusal recorded past that would be the
+   * same complaint one token along.
+   */
+  protected lazy val loopLabel: Parser[Option[String]] =
+    opt(asOneToken(labelRef <~ guard(op("for") | op("while") | op("loop") | op("do"))))
+
   /** `if cond then a else b` — an expression. Its branches are statement lists whose trailing
    * expression is the branch value; `elif` nests into the else branch, and the `else` is
    * optional (a missing one gives an open branch that only the analyzer's unit rule allows).
@@ -495,7 +508,7 @@ class SyslParser(val source: Source)
    * `if`, sitting after the body and before any `end while`.
    */
   protected lazy val whileExpr: PackratParser[Expr] =
-    opt(labelRef) ~ (op("while") ~> expression) ~ body("do") ~ opt(elseClause) ~ opt(endMarker("while")) ^^ {
+    loopLabel ~ (op("while") ~> expression) ~ body("do") ~ opt(elseClause) ~ opt(endMarker("while")) ^^ {
       case lbl ~ c ~ b ~ e ~ _ => While(lbl, c, b, e)
     }
 
@@ -516,7 +529,7 @@ class SyslParser(val source: Source)
    * be closing a block that has just been closed.
    */
   protected lazy val doWhileExpr: PackratParser[Expr] =
-    opt(labelRef) ~ (op("do") ~> (suite | inlineBody)) ~ (skipNewlines ~> op("while") ~> expression) ~
+    loopLabel ~ (op("do") ~> (suite | inlineBody)) ~ (skipNewlines ~> op("while") ~> expression) ~
       opt(elseClause) ^^ {
         case lbl ~ b ~ c ~ e => DoWhile(lbl, b, c, e)
       }
@@ -528,7 +541,7 @@ class SyslParser(val source: Source)
    * not have to change shape when its condition goes away.
    */
   protected lazy val loopExpr: PackratParser[Expr] =
-    opt(labelRef) ~ (op("loop") ~> body("do")) ~ opt(endMarker("loop")) ^^ { case lbl ~ b ~ _ => Loop(lbl, b) }
+    loopLabel ~ (op("loop") ~> body("do")) ~ opt(endMarker("loop")) ^^ { case lbl ~ b ~ _ => Loop(lbl, b) }
 
   /** `for all i in 0..<n do a[i] > 0`, `for some k in 0..n do a[k] == t` — a quantifier over an
    * integer range (`17 §2`).
@@ -567,7 +580,7 @@ class SyslParser(val source: Source)
     }
 
   protected lazy val forInExpr: PackratParser[Expr] =
-    opt(labelRef) ~ (op("for") ~> ident) ~ (op("in") ~> expression) ~ body("do") ~ opt(elseClause) ~ opt(
+    loopLabel ~ (op("for") ~> ident) ~ (op("in") ~> expression) ~ body("do") ~ opt(elseClause) ~ opt(
       endMarker("for"),
     ) ^^ {
       case lbl ~ n ~ it ~ b ~ e ~ _ => For(lbl, n, it, b, e)
@@ -584,7 +597,7 @@ class SyslParser(val source: Source)
    * the long way; `loop` says it better and this does not forbid it.
    */
   protected lazy val cForExpr: PackratParser[Expr] =
-    opt(labelRef) ~ (op("for") ~> opt(forClause) <~ op(";")) ~ (opt(expression) <~ op(";")) ~ opt(forClause) ~
+    loopLabel ~ (op("for") ~> opt(forClause) <~ op(";")) ~ (opt(expression) <~ op(";")) ~ opt(forClause) ~
       body("do") ~ opt(elseClause) ~ opt(endMarker("for")) ^^ {
         case lbl ~ init ~ cond ~ step ~ b ~ e ~ _ => CFor(lbl, init, cond, step, b, e)
       }
@@ -612,7 +625,7 @@ class SyslParser(val source: Source)
       val lead = if m.isDefined then success(List.empty[HeaderClause])
                  else maybe(headerAttr) ^^ (_.toList.flatten)
 
-      lead ~ rep(newlines ~> headerAttr) ~ statements ^^ {
+      lead ~ repeatedly(asOneToken(newlines ~> headerAttr)) ~ statements ^^ {
         case first ~ rest ~ body =>
           val clauses = first ::: rest.flatten
 
