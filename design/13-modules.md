@@ -8,7 +8,8 @@ full, the `import` statement in all five of its forms shortening that path for t
 that writes it, `private` / `private[M]` deciding which of those spellings a given file is allowed
 to write at all, no declaration allowed to name in its signature a type that does not reach as far
 as it does, and the graph those references make held to being acyclic. **§4 is built too** — the
-header attributes `@no_alloc`, `@requires(...)` and `@link("...")` parse, a module whose files
+header attributes `@no_alloc`, `@requires(...)` and `@link("...")` parse — as does `@tests`, which
+belongs to `testing.md` rather than to this chapter and shares only the position — a module whose files
 disagree about a narrowing is rejected, the requirement propagates over the import graph as the
 single reverse-topological sweep §6 makes available, and the finer-than-declaration `alloc` check
 this section ends on reports the *call* rather than the import. Two claims this paragraph used to
