@@ -36,7 +36,7 @@ trait FuncAddress extends CallCore {
     // other. Refusing outright was too broad: it is what stopped a library offering a callback
     // helper at all, since a trampoline's state type belongs to the application rather than to the
     // binding, so every application had to hand-roll one and cast the userdata itself.
-    val instKey = if decl.tparams.isEmpty then key else instantiationFor(written, decl, key, expected)
+    val instKey = if decl.tparams.isEmpty then key else instantiationFor(written, decl, expected)
 
     // A `...` is read relative to the last named argument, so a caller has to know where the named
     // ones stop. A `*extern` says only what it is called with, which is what makes it callable at
@@ -93,8 +93,7 @@ trait FuncAddress extends CallCore {
    * arguments would. A parameter the signature does not mention cannot be solved, which is a real
    * limit rather than an oversight — nothing in the expected type says what it should be.
    */
-  private def instantiationFor(written: String, decl: FuncDecl, key: String,
-                               expected: Option[Type]): String = {
+  private def instantiationFor(written: String, decl: FuncDecl, expected: Option[Type]): String = {
     val want = expected.flatMap(cfnOf).getOrElse(
       err(s"'$written' is generic, so which copy of it this addresses depends on its type " +
         s"arguments, and nothing here says what they are — write the type: " +

@@ -334,6 +334,11 @@ object AstCodec {
         case Continue(l)                  => tok("cnt"); opt(l)(sref)
         case Defer(s)                     => tok("dfr"); stmt(s)
         case AsmStmt(arms)                => tok("asm"); list(arms)(asmArm)
+        // Carried rather than dropped, although the library's own build has already settled it. A
+        // consumer re-checks it against the target *it* is building for, which is the answer that
+        // matters: `sizeof` is per target, so a layout a library verified on one machine is not a
+        // layout verified on the consumer's.
+        case AssertDecl(c, m)             => tok("asrt"); expr(c); opt(m)(sref)
         case Require(c, m)                => tok("req"); expr(c); opt(m)(sref)
         case Ensure(c, m)                 => tok("ens"); expr(c); opt(m)(sref)
         case Invariant(c, m)              => tok("inv"); expr(c); opt(m)(sref)
@@ -722,6 +727,7 @@ object AstCodec {
         case "cnt"  => Continue(opt(sref()))
         case "dfr"  => Defer(stmt())
         case "asm"  => AsmStmt(list(asmArm()))
+        case "asrt" => AssertDecl(expr(), opt(sref()))
         case "req"  => Require(expr(), opt(sref()))
         case "ens"  => Ensure(expr(), opt(sref()))
         case "inv"  => Invariant(expr(), opt(sref()))
