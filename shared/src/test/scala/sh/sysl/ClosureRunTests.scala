@@ -370,7 +370,7 @@ class ClosureRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
                      |print(apply(x -> x + 1, 5))
                      |""".stripMargin)
 
-      out should include("%struct.$closure0 = type {  }")
+      envs(out) shouldBe List("")
     }
 
     "a write through a captured name reaches the closure's own field" in {

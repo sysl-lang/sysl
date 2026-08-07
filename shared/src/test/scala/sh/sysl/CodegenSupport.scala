@@ -38,6 +38,42 @@ trait CodegenSupport extends Matchers { this: Assertions =>
       case Left(e)    => fail(e)
     }
 
+  /** The environment structs of the closures **this program** declared, in index order, with the
+   * library's own filtered out.
+   *
+   * **Never assert `%struct.$closure0`.** The counter runs over the whole compilation and `lib/` is
+   * lowered first, so a program's own closures begin at whatever index the library leaves free. That
+   * index moved by four the day `sysl.slices` arrived, four of its functions passing
+   * `(a, b) -> a < b` to a bare-arrow parameter — and five assertions broke for a reason that had
+   * nothing to do with what they were testing.
+   *
+   * **The silent direction is the worse one, and it happened at the same time.** An assertion that
+   * `%struct.$closure0` merely *exists* went on passing while testing nothing at all, because the
+   * library now supplies one. That is the failure this file's own opening docstring warns about, in
+   * its exact words: an expectation with the name baked in either fails for an unrelated reason, or
+   * "quietly stops testing anything at all".
+   *
+   * Asking which environments are *this program's* is what all of these tests always meant, and it
+   * cannot drift again: a closure added to `lib/` changes the baseline and the difference, equally.
+   */
+  protected def envs(out: String): List[String] = {
+    val defs = envDefs(out)
+
+    (defs.keySet -- libraryEnvs).toList.sortBy(_.drop("$closure".length).toInt).map(defs)
+  }
+
+  /** Every closure environment in some IR, as name to field list. `type {  }` yields `""`. */
+  private def envDefs(out: String): Map[String, String] =
+    """%struct\.(\$closure\d+) = type \{ ?(.*?) ?\}""".r
+      .findAllMatchIn(out)
+      .map(m => m.group(1) -> m.group(2))
+      .toMap
+
+  /** The closures the library lowers before a program's own, measured from a program that declares
+   * none. Compiled once — it is the slowest thing here, and every call wants the same answer.
+   */
+  private lazy val libraryEnvs: Set[String] = envDefs(ir("print(1)\n")).keySet
+
   /** The IR for a program built for a machine other than this one (`targets.md`). Reading the text
    * is the whole of what a cross-target test can do — there is nothing here to run the result on —
    * and it is enough, because what a target decides is what instructions come out.

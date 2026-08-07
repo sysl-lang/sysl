@@ -157,7 +157,7 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
                              |""".stripMargin)
 
       // `b` is never named, so it is not a field; `c` comes first because it is named first.
-      out should include("%struct.$closure0 = type { i32, i32 }")
+      envs(out) shouldBe List("i32, i32")
     }
   }
 
@@ -233,7 +233,7 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
                      |print(apply(k -> k + LIMIT, 1))
                      |""".stripMargin)
 
-      out should include("%struct.$closure0 = type {  }")
+      envs(out) shouldBe List("")
     }
 
     "a local declared inside the body itself, which is not a capture at all" in {
@@ -244,7 +244,7 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
                      |print(f(1))
                      |""".stripMargin)
 
-      out should include("%struct.$closure0 = type {  }")
+      envs(out) shouldBe List("")
     }
   }
 
@@ -628,8 +628,15 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       val out = ir(apply + """print(apply(x -> x + 1, 1), apply(x -> x * 2, 1))
                              |""".stripMargin)
 
-      out should include("%struct.$closure0")
-      out should include("%struct.$closure1")
+      // **Two environments, not one.** Both closures are written `x -> …` over no captures, so both
+      // are empty structs — and the claim is that they are nonetheless two *types*, one specialising
+      // `apply` each, rather than one shared representation.
+      //
+      // This pair used to assert that `$closure0` and `$closure1` existed, which stopped being a
+      // claim about this program the moment the library began lowering closures of its own: both
+      // names were then present whatever the program did, and the test passed while asserting
+      // nothing. Counting *this program's* environments is the thing that was always meant.
+      envs(out) shouldBe List("", "")
     }
 
     "an inlined callable is called directly and a boxed one through its table" in {
