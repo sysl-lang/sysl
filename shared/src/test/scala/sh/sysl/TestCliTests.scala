@@ -187,6 +187,18 @@ class TestCliTests extends AnyFreeSpec with Matchers {
       errs should include("is the module every program is compiled against")
     }
 
+    // The two flags contradict each other, and the refusal has to say so in the words the reader
+    // used: `--std` reached only `build-lib` before, and the message named that command, which is
+    // about something they had not typed.
+    "and asking for a prebuilt standard module at the same time is refused" in {
+      val (status, _, errs) =
+        ran(Config(command = "test", file = program(passing), std = true, stdLib = Some("x.syslib")))
+
+      status shouldBe 1
+      errs should include("a compilation cannot be both")
+      errs should not include "build-lib"
+    }
+
     "with it, the same tree compiles and its tests run" in {
       assume(Toolchain.clangAvailable, "clang not available")
 

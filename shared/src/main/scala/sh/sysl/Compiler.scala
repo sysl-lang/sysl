@@ -229,6 +229,7 @@ object Compiler {
       // artifact holds: it monomorphizes whatever generics the test names, and an instantiation is an
       // ordinary function afterwards — so a strip made on the typed tree removes the test and ships
       // everything it caused.
+      //
       // Nothing runs `strip` afterwards, and nothing needs to: conditional compilation is gating by
       // line and is over before the lexer, so a declaration is either at a file's top level or is
       // not a declaration. There is no branch a `@test` could be hiding inside for the typed pass to

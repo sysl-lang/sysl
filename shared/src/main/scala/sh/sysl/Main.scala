@@ -321,11 +321,16 @@ private[sysl] def execute(cfg: Config): Int = {
   if unmet.nonEmpty then
     return fail(s"this package requires '${unmet.head}', and '${target.name}' does not provide it")
 
-  // Building the standard module against a prebuilt copy of itself is the one combination that
+  // Compiling the standard module against a prebuilt copy of itself is the one combination that
   // cannot mean anything: the declarations being compiled are the ones the artifact holds. Refused
   // rather than ignored, since ignoring it leaves a command line that reads as though it were used.
+  //
+  // Named by what the two flags say rather than by the command that used to be the only one able to
+  // say it — `test` takes `--std` as well now, and a message answering it with `build-lib` would be
+  // about a command the reader had not typed.
   if cfg.std && cfg.stdLib.isDefined then
-    return fail("--std-lib compiles against the standard module, and 'build-lib --std' is what builds it")
+    return fail("--std says this tree is the standard module and --std-lib names a prebuilt one to " +
+      "compile against — a compilation cannot be both")
 
   // Naming an artifact and refusing all of them at once has no reading either way round, and the two
   // spellings are near enough that a typo produces exactly this line. Refused rather than resolved by
