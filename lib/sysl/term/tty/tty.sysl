@@ -1,0 +1,113 @@
+module sysl.term.tty
+@requires(posix)
+
+import sysl.text.{cstring, from_cstring}
+
+// Whether escapes should be written at all.
+//
+// `sysl.term` names the sequences and deliberately answers nothing about them, because the answer
+// needs the process and its environment and a capability requirement is module-wide -- one function
+// asking for `posix` beside those constants would have taken every one of them away from the
+// `@no_alloc` program that only wanted to name a colour, which is the case that module is arranged
+// for. So the question lives here, one directory down, and the split is visible in the import: a
+// hosted program writes both, and a freestanding one writes neither this line nor this dependency.
+//
+// `posix` rather than `os` because `isatty(3)` is POSIX and saying so is what the clause is for.
+// `posix` implies `os`, so nothing is given up by being exact.
+//
+// ## What the answer is made of
+//
+// Three questions, and a program that skips any of them gets it wrong in a way somebody eventually
+// files a bug about:
+//
+// - **Is it a terminal at all?** Output redirected to a file or a pipe wants no escapes, and this is
+//   the one that matters most: a build log full of `ESC [ 3 1 m` is what not asking looks like.
+// - **Has the user said no?** `NO_COLOR` set to anything non-empty means no, whatever the terminal
+//   is. The convention is deliberately about the variable being *there* rather than about its value,
+//   so a program reading it as a boolean and looking for `"1"` has misread it.
+// - **Can the terminal do it?** `TERM=dumb` is a terminal that cannot, and Emacs' shell buffer is the
+//   one everybody meets.
+//
+// `color()` asks all three about standard output, which is the ordinary case and the one worth
+// making a single word. The other three names exist because the ordinary case is not the only one: a
+// program colouring its diagnostics asks about standard error, and one drawing a progress bar wants
+// `is_tty` on its own, since a bar is worth suppressing on a pipe whether or not colour is.
+//
+// **Ask once and keep the answer.** Every one of these is a system call or an environment scan, and
+// the answer cannot change under a running program in any way that matters:
+//
+//     val paint = color()
+//
+//     print(f"{if paint then red else ''}error{if paint then reset else ''}: {msg}")
+
+// `isatty` answers about a descriptor rather than a `FILE *`, which is why nothing here needs
+// `fileno` and no C global has to be named across the boundary. The library already works in
+// descriptors -- `sysl.io`'s `stdin` is `fd_reader(0)` -- so this is the shape that was already here.
+//
+// Declared in this file rather than added to `sysl.sys`, following `sysl.fs`: `sysl.sys` is the
+// printing-and-reading core, it carries no capability, and a POSIX-only symbol in it would be a
+// requirement filed where nothing declares one.
+private[sysl] extern "isatty" c_isatty(fd: int) -> int
+private[sysl] extern "getenv" c_getenv(name: *u8) -> *u8
+
+// The two descriptors POSIX fixes. Named rather than written as 1 and 2 at each call, so no caller
+// has to know which is which.
+private stdout_fd() -> int = 1
+private stderr_fd() -> int = 2
+
+// Whether a descriptor is attached to a terminal.
+//
+// This is the whole of what C answers, and it is separate from the colour question because a program
+// can want it on its own: a progress bar, a spinner, a prompt, and a full-screen redraw are all worth
+// suppressing when output is a pipe, and none of them is about colour.
+is_tty(fd: int) -> bool = c_isatty(fd) != 0
+
+// What the environment says, as the pointer C hands back -- null where the name is unset, which is a
+// different thing from set-and-empty and is why the two callers below check different things.
+private env(name: string) -> *u8
+    val n = cstring(name)
+
+    c_getenv(n.ptr)
+end env
+
+// `NO_COLOR` disables colour by being **present and non-empty**, whatever it contains. A program
+// looking for a particular value has misread the convention: `NO_COLOR=0` means no colour.
+private no_color() -> bool
+    val p = env("NO_COLOR")
+
+    p != null && p[0] != 0
+end no_color
+
+// A terminal that cannot render an escape says so as `TERM=dumb`.
+//
+// Ill-formed bytes are read as *not* dumb rather than as an error: the variable is somebody's
+// environment rather than the program's input, this is a question with only two useful answers, and
+// refusing to colour because a locale wrote a non-UTF-8 `TERM` would be a worse outcome than either.
+private dumb_term() -> bool
+    val p = env("TERM")
+
+    if p == null then return false
+
+    from_cstring(p) match
+        Ok(s)  -> s == "dumb"
+        Err(_) -> false
+end dumb_term
+
+// The environment's half of the answer: whether colour is wanted here at all, said without reference
+// to any descriptor.
+//
+// It is public rather than folded into `color_on` because the two halves are genuinely separate
+// questions and a program can want this one alone -- a `--color=always` flag overrides the
+// descriptor and not the user's `NO_COLOR`, which is exactly this function. It is also the half that
+// can be asked without a terminal, which is what makes it answerable in a test.
+color_wanted() -> bool = !no_color() && !dumb_term()
+
+// All three questions, about whichever descriptor is asked about.
+color_on(fd: int) -> bool = is_tty(fd) && color_wanted()
+
+// Standard output, which is where a program that prints its results writes them.
+color() -> bool = color_on(stdout_fd())
+
+// Standard error, which is where a program that prints diagnostics writes those -- and the two
+// genuinely differ, since `prog > file` leaves one a file and the other a terminal.
+color_err() -> bool = color_on(stderr_fd())
