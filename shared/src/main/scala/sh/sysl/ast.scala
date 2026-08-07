@@ -14,6 +14,13 @@ package sh.sysl
  * Every node carries the source position the parser found it at (`Positioned`), which is what
  * lets a diagnostic quote the line and point at the column. The position is deliberately not a
  * constructor parameter, so structural equality is unaffected by it.
+ *
+ * **The tree spans five files, and which node is in which is not a matter of taste.** `Expr`,
+ * `Stmt`, `Pattern` and `TypeRef` are each sealed, so each one's nodes have to sit together: this
+ * file holds `Expr` and every expression — the loops and `match` among them, since those yield a
+ * value — while `astPatterns.scala`, `astTypes.scala` and `astStmts.scala` hold the other three.
+ * `astFile.scala` holds what is not a node at all: `Program`, and the clauses a file's header
+ * carries.
  */
 
 /** Every expression node is a **case class**, and saying so in the type is what lets a walk that has
