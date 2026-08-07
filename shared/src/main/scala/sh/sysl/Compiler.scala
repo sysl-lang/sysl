@@ -220,11 +220,20 @@ object Compiler {
   def compileLibrary(units: List[Program], target: Target = Target.default, building: Set[String] = Set.empty,
                      std: Option[Stdlib] = None): Either[String, (String, Set[String])] =
     for
-      analysed <- Analyzer.analyze(units, building, carried(std, target), target)
       // A library ships no tests. They are the library author's, they run against the sources rather
       // than against the artifact, and emitting them would put a function nothing can call into every
       // program that links it — with the helpers only it reaches dragged in behind.
-      typed    = Tests.strip(analysed)
+      //
+      // **Before the analysis rather than after it**, which is the one place a library differs from
+      // every other build (`Tests.stripSource`). Analyzing a test body is enough to change what the
+      // artifact holds: it monomorphizes whatever generics the test names, and an instantiation is an
+      // ordinary function afterwards — so a strip made on the typed tree removes the test and ships
+      // everything it caused.
+      // Nothing runs `strip` afterwards, and nothing needs to: conditional compilation is gating by
+      // line and is over before the lexer, so a declaration is either at a file's top level or is
+      // not a declaration. There is no branch a `@test` could be hiding inside for the typed pass to
+      // catch, and a second removal that can never find anything reads as though there were.
+      typed    <- Analyzer.analyze(Tests.stripSource(units), building, carried(std, target), target)
       promoted <- Escape.check(typed)
       _        <- TailCalls.check(typed)
     yield

@@ -9,11 +9,24 @@ package sh.sysl
  * *caller* — `sysl test` builds an entry point that calls one of them by name, and the program's own
  * entry point is not built at all.
  *
- * **A test is not part of the program it is written in.** `sysl run`, `sysl build`, `sysl emit-llvm`
- * and `sysl build-lib` all drop them, and drop them *after* analysis, so a test that does not compile
- * is still a compilation error in a build that would never have run it. That is the one property
- * worth stating twice, because it is what lets a test sit beside what it tests: a library's tests do
- * not travel in the library, and a program's do not run when it runs.
+ * **A test is not part of the program it is written in.** `sysl run`, `sysl build` and
+ * `sysl emit-llvm` all drop them, and drop them *after* analysis, so a test that does not compile is
+ * still a compilation error in a build that would never have run it. That is what lets a test sit
+ * beside what it tests: a library's tests do not travel in the library, and a program's do not run
+ * when it runs.
+ *
+ * **`sysl build-lib` is the exception, and drops them before analysis instead** — `stripSource`
+ * rather than `strip`. An artifact is the one output that outlives the compilation that made it, and
+ * analyzing a test body is enough to change what it holds: a test over a `Buf[int]` monomorphizes
+ * the whole of `Buf` at `int`, and those instantiations are ordinary library functions by the time
+ * `strip` runs, so nothing downstream can tell them from ones the library asked for. Stripping the
+ * declarations first is what keeps an artifact's contents a fact about the library rather than about
+ * its tests.
+ *
+ * What that gives up is `build-lib` reporting a library test that does not compile. The safety net
+ * moved rather than went: `sysl test --std` compiles the library's tests and runs them, and it is
+ * itself run by the suite, which is a better place for it than a command whose subject is the
+ * artifact.
  */
 object Tests {
 
@@ -137,6 +150,31 @@ object Tests {
         testOnly = Set.empty,
       )
   }
+
+  /** The same removal made on the **untyped** tree, for the one build whose output outlives it.
+   *
+   * `strip` above cannot serve a library, and the reason is that analysis is not a passive reading:
+   * a test body that names `Buf[int]` *creates* the whole of `Buf` at `int`, and a monomorphization
+   * is an ordinary function by the time it reaches `strip` — nothing in it records which declaration
+   * demanded it. Dropping the test after the fact therefore drops the test and keeps everything it
+   * caused, and the artifact ships instantiations no caller of the library ever asked for.
+   *
+   * Two shapes to remove, because `@tests` and `@test` mark different things. A file with the header
+   * is scaffolding **whole** — its ordinary helpers exist only for the tests below them, and it is
+   * exactly what `Reachability.prune` could not answer for in a library, since a library prunes
+   * nothing. A `@test` written in an ordinary file is one declaration, and the rest of that file is
+   * the library.
+   */
+  def stripSource(units: List[Program]): List[Program] =
+    units.filterNot(_.testOnly).map(u => u.copy(body = u.body.filter(kept)))
+
+  /** Whether a top-level statement survives into a library. Only a `@test` function does not — an
+   * `impl` may not sit in a `@tests` file at all (`testing.md`), so nothing here has to reason about
+   * a method table with a slot filled by something that is about to go.
+   */
+  private def kept(stmt: Stmt): Boolean = stmt match
+    case f: FuncDecl => f.test.isEmpty
+    case _           => true
 
   /** The same program lowered **as** a test build: the tests kept, and the program's own entry point
    * put aside.

@@ -147,8 +147,20 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
     }
 
     "and it carries the same declarations, so the comparison is between equals" in {
-      decoded.units.map(_.source.name) shouldBe Library.carried.units.map(_.source.name)
-      decoded.decls.length shouldBe Library.carried.decls.length
+      // **Minus the library's own test files**, which an artifact does not carry and should not: a
+      // `@tests` file is scaffolding for `sysl test --std`, and a consumer reading this metadata for
+      // generic instantiation has no use for a declaration nothing outside a test may name.
+      //
+      // Written as a filter rather than as a list of the files there are, so that packing another
+      // module with tests does not come back here. What is being compared is still every shipping
+      // file, which is what makes the IR match below a result: it was `filterNot` on one side and
+      // nothing at all on the other that would make this vacuous.
+      val shipped = Library.carried.units.filterNot(_.testOnly)
+
+      shipped.length should be < Library.carried.units.length
+
+      decoded.units.map(_.source.name) shouldBe shipped.map(_.source.name)
+      decoded.decls.length shouldBe shipped.flatMap(_.body).length
     }
   }
 
@@ -478,6 +490,13 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
       // `Buf[string]` of its own, and neither is what a program asking for a `Buf[int]` needs. The
       // pair is the discriminating part: the same declaration is linked at one argument and compiled
       // at another, in one program.
+      //
+      // **`int` is also the argument `lib/sysl/buf/tests.sysl` uses throughout**, which makes this
+      // the regression test for `Tests.stripSource`. Analyzing a test body monomorphizes whatever it
+      // names, and an instantiation is an ordinary library function afterwards — so a library that
+      // stripped its tests from the *typed* tree would ship the whole of `Buf[int]` here and fail on
+      // the line below. That the library's own tests exercise a type its shipping code does not is
+      // the luck; that the artifact is unmoved by them is the claim.
       val ir = linked("import sysl.buf.*\n\nvar b: Buf[int] = buf()\nb.push(1)\nprint(b.len())\n")
 
       precompiled should contain(s"${Library.key("Buf")}.push.byte")
