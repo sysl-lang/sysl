@@ -246,6 +246,46 @@ class PackageBuildTests extends PackageCacheSupport {
         s"""d { path = "$deep" }""")) shouldBe "42\n"
     }
 
+    /** A namespaced package's own modules reaching each other — the *other* half of `packagePath`,
+     * where the path is the package's own tree rather than a dependency's binding.
+     *
+     * "a package whose own modules call each other" above covers the same branch with **bare** names,
+     * where the head and the whole name are one thing — so the segment that travels past the head is
+     * invisible there, and a package with two namespaced modules is the shape that would have caught
+     * it. No package in the org has two yet, which is exactly why it is written down here.
+     */
+    "a namespaced package's own modules reach each other by import" in {
+      val root = createTempDirectory("sysl-pkg-ns-")
+
+      writeFile(s"$root/${PackageConfig.FileName}", manifest("ns", "1.0.0"))
+      createDirectories(s"$root/sh/sysl/inner")
+      createDirectories(s"$root/sh/sysl/outer")
+      writeFile(s"$root/sh/sysl/inner/inner.sysl",
+        "module sh.sysl.inner\n\ndouble(n: int) -> int = n * 2\n")
+      writeFile(s"$root/sh/sysl/outer/outer.sysl",
+        "module sh.sysl.outer\n\nimport sh.sysl.inner.double\n\n" +
+          "quadruple(n: int) -> int = double(double(n))\n")
+
+      run(app("""print(sh.sysl.outer.quadruple(10))""", s"""n { path = "$root" }""")) shouldBe "40\n"
+    }
+
+    // And by qualified reference, which takes a different route: an import goes through `inPackage`
+    // and a reference through `throughModule`, and it was `throughModule` that asked with the head
+    // alone.
+    "and by qualified reference" in {
+      val root = createTempDirectory("sysl-pkg-ns2-")
+
+      writeFile(s"$root/${PackageConfig.FileName}", manifest("ns", "1.0.0"))
+      createDirectories(s"$root/sh/sysl/inner")
+      createDirectories(s"$root/sh/sysl/outer")
+      writeFile(s"$root/sh/sysl/inner/inner.sysl",
+        "module sh.sysl.inner\n\ndouble(n: int) -> int = n * 2\n")
+      writeFile(s"$root/sh/sysl/outer/outer.sysl",
+        "module sh.sysl.outer\n\ntriple(n: int) -> int = sh.sysl.inner.double(n) + n\n")
+
+      run(app("""print(sh.sysl.outer.triple(14))""", s"""n { path = "$root" }""")) shouldBe "42\n"
+    }
+
     // The mount is untouched by any of it: a name the consumer chose has no tree to be read off, so
     // it still hangs the whole package under one segment.
     "and a mount still hangs the whole tree under one segment" in {
