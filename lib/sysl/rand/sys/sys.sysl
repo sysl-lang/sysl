@@ -1,0 +1,39 @@
+module sysl.rand.sys
+@requires(posix)
+
+import sysl.slices.as_mut_ptr
+import sysl.encoding.get_u64_le
+
+// A seed taken from the host, for a program that wants a different sequence on every run.
+//
+// **This is a module of its own so that `sysl.rand` is not.** A directory is a module, so a second
+// file under `rand/` would *be* `sysl.rand` and importing the generator would drag an operating
+// system in behind it -- and the generator is deliberately usable on a target that has none. A
+// freestanding program imports `sysl.rand` and never names this. It is the same split `sysl.term` and
+// `sysl.term.tty` already make, for the same reason.
+//
+// **This is entropy for seeding, not a cryptographic generator.** What it feeds is PCG32, whose whole
+// output is computable by anyone who sees a few of its values. Seeding a predictable generator
+// unpredictably does not make it unpredictable, and nothing here should be mistaken for a source of
+// key material.
+
+// `getentropy(2)`: at most 256 bytes, straight from the kernel's pool, with no file to open and no
+// descriptor to run out of. It is on macOS 10.12 and later, glibc 2.25 and later, and the BSDs.
+// Reading `/dev/urandom` would be the portable-to-older-systems alternative and needs an open file,
+// which is a great deal more to go wrong for eight bytes.
+private extern "getentropy" c_getentropy(buf: *u8, n: usize) -> int
+
+// Eight bytes of host entropy as a seed, or `None` where the host would not supply them.
+//
+// **Answers an `Option` rather than trapping.** A program that cannot get entropy usually has a
+// reasonable fallback -- a fixed seed, and a line in its log saying so -- and a library that aborted
+// would take that choice away.
+seed_from_os() -> Option[u64]
+    var b: [8]u8
+
+    if c_getentropy(as_mut_ptr(b[..]), b.len) != 0 then return None
+
+    // Byte order is immaterial for a seed; `get_u64_le` is named rather than hand-rolled because the
+    // library now has it, and eight bytes of shifting written out again would be the workaround this
+    // release exists to remove.
+    get_u64_le(b[..])

@@ -1,0 +1,174 @@
+module sysl.rand
+@tests
+
+// What `sysl.rand` claims, asserted in sysl.
+
+// **The test that says this is PCG32 and not merely something PCG-shaped.**
+//
+// These are the first six outputs of the reference implementation's own demo, seeded
+// `pcg32_srandom_r(&rng, 42, 54)`. A generator with the right structure and a mistyped constant, a
+// wrong shift, or the two initialization steps in the wrong order still produces a stream that looks
+// perfectly random and passes every statistical test here -- and does not produce these numbers. It
+// is the same reasoning as the `REG_EXTENDED` test in the regex binding.
+@test("the published vector reproduces, which is what identifies the algorithm")
+the_reference_vector()
+    var g = rng(42, 54)
+
+    assert_eq(g.next_u32(), 0xa15c02b7)
+    assert_eq(g.next_u32(), 0x7b47f409)
+    assert_eq(g.next_u32(), 0xba1d3330)
+    assert_eq(g.next_u32(), 0x83d2f293)
+    assert_eq(g.next_u32(), 0xbfa4784b)
+    assert_eq(g.next_u32(), 0xcbed606e)
+end the_reference_vector
+
+@test("one seed gives one sequence, however many times it is asked for")
+seeding_reproduces()
+    var a = rng(12345, 1)
+    var b = rng(12345, 1)
+
+    for i in 0..<50
+        assert_eq(a.next_u32(), b.next_u32())
+end seeding_reproduces
+
+// The stream selector is not the seed, and a generator that ignored it would pass every other test
+// in this file.
+@test("and a different stream from the same seed is a different sequence")
+streams_are_independent()
+    var a = rng(12345, 1)
+    var b = rng(12345, 2)
+    var same = 0
+
+    for i in 0..<50
+        if a.next_u32() == b.next_u32() then same += 1
+
+    // Fifty coincidences would be a generator ignoring `seq`; a handful would be chance.
+    assert(same < 3)
+end streams_are_independent
+
+// -- below ----------------------------------------------------------------------------------------
+
+@test("below stays inside its bound, and the degenerate bounds answer what they must")
+below_is_in_range()
+    var g = rng(7, 7)
+
+    for i in 0..<200
+        assert(g.below(6) < 6)
+
+    for i in 0..<20
+        assert_eq(g.below(1), 0)
+
+    // No value exists below zero, and this is the input a caller should not write.
+    assert_eq(g.below(0), 0)
+end below_is_in_range
+
+// A biased `below` is the defect this module exists to prevent, so it is tested rather than assumed.
+// The band is generous -- this is a fixed seed, so the test is deterministic and cannot flake, but a
+// modulo-biased implementation skews the low residues far outside it.
+@test("below is uniform, not merely in range")
+below_is_unbiased()
+    var g = rng(99, 3)
+    var counts: []int = [0; 6]
+    val draws = 6000
+
+    for i in 0..<draws
+        counts[usize(g.below(6))] += 1
+
+    for i in 0..<6
+        assert(counts[i] > 850)
+        assert(counts[i] < 1150)
+end below_is_unbiased
+
+@test("a range is half-open, and an empty one answers its own start")
+range_is_half_open()
+    var g = rng(4, 4)
+
+    for i in 0..<200
+        val v = g.range(-5, 5)
+
+        assert(v >= -5)
+        assert(v < 5)
+
+    assert_eq(g.range(3, 3), 3)
+    assert_eq(g.range(3, 1), 3)
+end range_is_half_open
+
+// -- unit and boolean -----------------------------------------------------------------------------
+
+@test("unit is in [0, 1), and never reaches the top")
+unit_is_half_open()
+    var g = rng(11, 11)
+    var saw_low = false
+    var saw_high = false
+
+    for i in 0..<500
+        val u = g.unit()
+
+        assert(u >= 0.0)
+        assert(u < 1.0)
+
+        if u < 0.5 then saw_low = true
+        if u >= 0.5 then saw_high = true
+
+    // Both halves turn up, so the value is not stuck at one end.
+    assert(saw_low)
+    assert(saw_high)
+end unit_is_half_open
+
+@test("a boolean is both values, not one of them")
+boolean_is_both()
+    var g = rng(21, 5)
+    var trues = 0
+
+    for i in 0..<400
+        if g.boolean() then trues += 1
+
+    assert(trues > 150)
+    assert(trues < 250)
+end boolean_is_both
+
+// -- shuffle --------------------------------------------------------------------------------------
+
+// A shuffle is a permutation: the multiset survives. That is the property a sort-by-random would also
+// have, which is why the vector test above matters -- together they say the order is produced by this
+// generator and nothing was lost doing it.
+@test("a shuffle keeps every element, and moves them")
+shuffle_permutes()
+    var g = rng(2024, 1)
+    var xs: []int = [0; 20]
+
+    for i in 0..<20
+        xs[i] = int(i)
+
+    g.shuffle(xs)
+
+    // Every value still present exactly once.
+    var seen: []int = [0; 20]
+
+    for i in 0..<20
+        seen[usize(xs[i])] += 1
+
+    for i in 0..<20
+        assert_eq(seen[i], 1)
+
+    // And it did something: twenty elements landing back in place is not a shuffle.
+    var fixed = 0
+
+    for i in 0..<20
+        if xs[i] == int(i) then fixed += 1
+
+    assert(fixed < 20)
+end shuffle_permutes
+
+@test("shuffling nothing, or one thing, changes nothing")
+shuffle_of_the_short_cases()
+    var g = rng(5, 5)
+    var empty: []int = [0; 0]
+    var one: []int = [9]
+
+    g.shuffle(empty)
+    g.shuffle(one)
+
+    assert_eq(one[0], 9)
+    assert_eq(empty.len, 0)
+end shuffle_of_the_short_cases
