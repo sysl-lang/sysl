@@ -1161,6 +1161,12 @@ Five consequences worth stating, because each is a thing a reader would otherwis
 - **Nothing is pruned when a library is built.** A program is lowered from `main` outwards because
   what it cannot reach is dead; a library has no `main` and every public declaration is a potential
   entry, so all of them are emitted and the *linker* discards what a given program never calls.
+
+  The one thing removed is its **tests**, and they are removed before the analysis rather than by a
+  pruner afterwards — a `@tests` file whole, and a `@test` declaration out of an ordinary one
+  (`testing.md`). That is not an exception to the rule so much as the reason the rule needs stating:
+  because nothing is pruned, a test left in would be emitted and advertised, and so would every
+  generic instantiation its body had demanded.
 - **A library defines its own declarations and nobody else's.** The compilation is handed the
   standard library too, and a library that prints reaches `printi` and `putbytes` exactly as a
   program does — but emitting *those* would put a copy of the printing surface in every artifact, so

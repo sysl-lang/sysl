@@ -239,18 +239,58 @@ class TestFileTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       }
     }
 
-    "and a broken test in one is still a mistake the library build reports" in {
-      // The other half of the same decision: the file is dropped from what ships and not from what
-      // is analyzed, so `build-lib` is where its author hears about it rather than whoever next runs
-      // the suite. This is `Tests.strip` running after analysis, asked of a library.
+    /** A library's tests are not analyzed at all, so one that does not compile is **not** a build
+      * error — and that is a thing given up on purpose rather than an oversight.
+      *
+      * It used to be reported here, and the reason it cannot be is that analysis is not a passive
+      * reading: a test naming `Buf[int]` *creates* the whole of `Buf` at `int`, and an instantiation
+      * is an ordinary library function afterwards, with nothing in it recording which declaration
+      * demanded it. Analyze the tests and the artifact ships what they caused, however carefully the
+      * declarations themselves are filtered out afterwards — so `Tests.stripSource` runs first and
+      * there is nothing left to report on.
+      *
+      * Where a broken library test *is* reported is `sysl test` — `--std` for the standard library,
+      * which `StdSelfTests` runs as part of this suite, and a plain `sysl test` for anybody else's.
+      */
+    "and a broken test in one is no longer a build error, because it is never analyzed" in {
       val sources = List(
         Source("demo/lib.sysl", "module demo\n\ndouble(n: int) -> int = n * 2\n", List("demo")),
         Source("demo/tests.sysl", "module demo\n@tests\n\nbad() -> int = nosuchthing()\n", List("demo")),
       )
 
       LibraryArtifact.build(sources) match {
-        case Right(_) => fail("a library with a broken test file built without a word")
+        case Right(_) => succeed
+        case Left(e)  => fail(s"a library's own tests should not be compiled by build-lib: $e")
+      }
+    }
+
+    // Discriminating against the above, and the reason it is a pair: a `build-lib` that had stopped
+    // analyzing the library *altogether* would pass the test above for entirely the wrong reason.
+    // The same undefined name, in a declaration that is not a test, is still a build error.
+    "while an ordinary declaration that does not compile still is" in {
+      val sources = List(
+        Source("demo/lib.sysl", "module demo\n\nordinary() -> int = nosuchthing()\n", List("demo")),
+      )
+
+      LibraryArtifact.build(sources) match {
+        case Right(_) => fail("a library with a broken ordinary declaration built without a word")
         case Left(e)  => e should include("nosuchthing")
+      }
+    }
+
+    // The same again for a `@test` written in an ordinary file rather than a `@tests` one, since
+    // `stripSource` removes the two by different rules — a file whole, and a declaration out of a
+    // file that stays.
+    "and a broken '@test' in an ordinary file is not a build error either" in {
+      val sources = List(
+        Source("demo/lib.sysl",
+               "module demo\n\ndouble(n: int) -> int = n * 2\n\n@test\nbad() = nosuchthing()\n",
+               List("demo")),
+      )
+
+      LibraryArtifact.build(sources) match {
+        case Right((ir, _)) => ir should not include "bad"
+        case Left(e)        => fail(s"a '@test' in a library should not be compiled by build-lib: $e")
       }
     }
   }

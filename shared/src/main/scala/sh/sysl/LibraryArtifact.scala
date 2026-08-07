@@ -235,15 +235,24 @@ object LibraryArtifact {
             // The C files are fingerprinted with the sysl ones and not apart from them. A library's
             // shims are as much its source as its modules are, and an artifact that did not change
             // when one of them was edited is a stale artifact nothing would notice was stale.
-            // The **whole** set is compiled, `@tests` files and all, so that a broken test in a
-            // library is a mistake reported here rather than one waiting for whoever next runs the
-            // suite — the same reason `Tests.strip` runs after analysis rather than before it.
+            //
+            // **The fingerprint is over every file, test files included**, while the metadata below
+            // is over the shipping ones — and the two are allowed to disagree because a fingerprint
+            // is a question about the *source a library was built from*, which is what decides
+            // whether an artifact is stale. `Stdlib.read` compares it against `Std.fingerprint`,
+            // computed the same way over the same tree, so editing a library's tests correctly
+            // invalidates the artifact even though nothing in it would have changed.
             //
             // Only the metadata is filtered, and it is filtered because that is what a consumer
             // reads: the ASTs travel so a generic can be instantiated in the program that fixes its
             // type arguments, and shipping a test file's would leave a package's scaffolding
-            // nameable by everything that links it. The compiled half needs no filtering — the same
-            // `Tests.strip` has already taken those declarations out of what is emitted.
+            // nameable by everything that links it.
+            //
+            // The compiled half needs no filtering here because `compileLibrary` never analyzed the
+            // tests in the first place (`Tests.stripSource`). That is the one build whose drop comes
+            // *before* the analysis, and the reason is that analyzing a test body creates generic
+            // instantiations, which are ordinary library functions afterwards — so a filter applied
+            // here, however thorough, would be too late to keep them out.
             Compiler.compileLibrary(units, target, building, std)
               .map((ir, compiled) =>
                 (ir, metadata(units.filterNot(_.testOnly), compiled,
