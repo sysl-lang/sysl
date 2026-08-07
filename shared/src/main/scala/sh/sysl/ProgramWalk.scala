@@ -24,6 +24,7 @@ trait ProgramWalk
     with ConventionCheck
     with NoAlloc
     with Purity
+    with Frames
     with TestScope
     with Ghost
     with GatedModules
@@ -401,6 +402,11 @@ trait ProgramWalk
 
     // And what a `@pure` function promised, asked of the same tree for the same reason (`17 §6`).
     checkPurity(allFuncs, externs)
+
+    // And what a `@reads`/`@writes` frame promised (`17 §7`). It runs beside purity rather than
+    // inside it because the two answer different questions about the same nodes: purity asks whether
+    // a caller could observe anything at all, a frame asks which storage in particular.
+    checkFrames(allFuncs, externs)
 
     // And where a `@ghost` function may be called from (`17 §8`), which is the rule that makes
     // erasing one sound.
@@ -1212,7 +1218,8 @@ trait ProgramWalk
     // function, and only the second answers for an instantiation; a symbol is file-private if either
     // says so, since both name the one declaration.
     TFunc(name, tparams, rtype, tbody, f.variadic, requires, ensures, olds,
-      fileLocal(name) || fileLocal(f.name), f.conv, f.tailrec, variant, f.pure, f.ghost)
+      fileLocal(name) || fileLocal(f.name), f.conv, f.tailrec, variant, f.pure, f.ghost,
+      frameSymbols(f.reads, "reads"), frameSymbols(f.writes, "writes"))
   }
 
   /** Typechecks the leading `require`/`ensure` clauses. Both conditions must be `bool`. `result`

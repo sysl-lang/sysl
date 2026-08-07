@@ -161,9 +161,9 @@ it survives the jump intact and a `@tailrec` function may carry one.
 ## 5. Module invariants
 
 **This section and `§7` waited on mutable module state to be about, and it has arrived: `13 §7`'s
-module `var` is built.** `§7` (`@reads`/`@writes`) is now a build with no decision in front of it, and
-is the more useful of the two, since a frame is what makes a call something other than an eraser to a
-prover. **This section has one open question and it is not a technical one:** the check below runs on
+module `var` is built.** `§7` (`@reads`/`@writes`) **is now built**, and was the more useful of the
+two, since a frame is what makes a call something other than an eraser to a prover. This section is
+what remains. **This section has one open question and it is not a technical one:** the check below runs on
 return from every public function of the module, which is complete exactly when the module's own
 functions are the only writers — and a public module `var` is writable by anyone, from another module
 or from a program's own statements, with no check anywhere. `§ Open f`
@@ -276,18 +276,22 @@ that less mechanical than it looks.
 
 ## 7. `@reads` and `@writes`
 
-**Specified and not built — and it is no longer waiting on anything.** This section used to say sysl
-had no module-level mutable variables for a frame to name. It has them: `13 §7`'s `static var` is
-built, and `§5` above says so. What is left is the work, and there is no decision in front of it,
-which makes this the most build-ready item in the chapter.
+**Built.** This section used to say sysl had no module-level mutable variables for a frame to name,
+then that it had them and the work was outstanding. The work is done: `Frames` holds every annotated
+function to the three rules below, and `FrameTests` is the evidence.
 
-Two things bound what it would cover, and both come from `§5`'s finding rather than from this
-section. The storage a frame could name is the **entry file's**, since that is where a `static var`
-may be written — so a frame is as general as module state is, and today that is less general than
-this section's prose assumes. And an `extern` variable (`12 §1`) is module-level storage a function
-can reach without being module state in the sense a prover wants: a frame over `errno` and `optind`
-would be a real feature and a very small one, and it is not the feature described here, because what
-a prover needs a frame *for* is reasoning about the module's own state across a call.
+**A frame reaches every kind of module storage, not only the entry file's.** An earlier draft of this
+paragraph said it could name the entry file's `static var` alone, because that was the only mutable
+module storage there was when it was written; `13 §7`'s module `var` arrived after it and the
+sentence was never revised. It is resolved through the same lookup a body's own reference to the
+variable goes through, so the two cannot disagree — a `var` in a module of its own is nameable in a
+frame, and there is a test that says so.
+
+An `extern` variable (`12 §1`) is the one piece of module-level storage a frame deliberately does
+**not** cover: it is storage a function can reach without being module state in the sense a prover
+wants. A frame over `errno` and `optind` would be a real feature and a very small one, and it is not
+this one, because what a prover needs a frame *for* is reasoning about the module's own state across
+a call.
 
 The looser sibling: a function that is not pure, but that says which module-level variables it
 touches.
@@ -295,13 +299,23 @@ touches.
 ```
 var buffer: [256]u8
 var pos = 0
+var limit = 256
 
-@reads(buffer)
-@writes(pos)
+@reads(limit)
+@writes(buffer, pos)
 write_byte(b: u8)
-    buffer[pos] = b
-    pos += 1
+    if pos < limit
+        buffer[pos] = b
+        pos += 1
 ```
+
+**`buffer` is under `@writes` rather than `@reads`, and the earlier draft of this example had it the
+other way round** — which the rules three paragraphs below refuse, and the implementation duly
+refused when it was first run against them. Writing *any part* of a variable is writing the
+variable: after `buffer[pos] = b` the storage holds something different, and whether it changed
+across the call is the only question a prover is asking. Naming it under `@reads` would have been a
+frame that covered less than the body does, which is worse than no frame at all, because a reader
+trusts it. `pos` needs no `@reads` beside its `@writes` for the same reason the rules give below.
 
 This is SPARK's `Global` aspect with its three modes collapsed to two, and it exists because a prover
 cannot reason about a call without it. Given `f()` with no frame, the weakest precondition of

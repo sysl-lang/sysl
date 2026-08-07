@@ -757,6 +757,24 @@ case class TFunc(
      * give one program two meanings.
      */
     ghost: Boolean = false,
+    /** `@reads(…)` and `@writes(…)`: the module-level storage this function may touch (`17 §7`).
+      *
+      * **`None` and `Some(Nil)` are different claims and the distinction carries the whole design.**
+      * A function with no annotation has effects nobody has written down — it may call and be called
+      * by anything, exactly as before frames existed — while `@reads()` is the positive assertion
+      * that it touches no module storage at all. That is what lets adoption run from the leaves up:
+      * the first leaf to gain a frame forces its annotated callers to gain one, and everything
+      * unannotated is undisturbed.
+      *
+      * The names are resolved symbols rather than what was written, so a frame means the same thing
+      * from inside the module and from outside it.
+      *
+      * `writes` is included in the readable set rather than being disjoint from it — `count += 1` is
+      * a read and a write of one variable, and a form that common should not have to say so twice.
+      * SPARK's `Output`/`In_Out` split, which this collapses, is `17 § Open b`.
+      */
+    reads: Option[Set[String]] = None,
+    writes: Option[Set[String]] = None,
 )
 
 /** A function the linker supplies, which the module declares rather than defines. Only the ones
