@@ -279,7 +279,30 @@ trait ConstFolding extends ImportResolution {
     // which is a name the reader can see is declared right there.
     case LayoutOf(what, tr) => layoutBytes(what, resolveType(tr, subst)).map(n => IntLit(n, None))
 
+    // `T::Min` and `T::Max` on a built-in integer are constants for the same reason `sizeof` is:
+    // the answer is a property of the type and is known once the type is. Folding them here is what
+    // puts them in a `const` initializer, an `@assert` and an array bound — the positions this
+    // folder serves, and the ones where a bound is most worth naming.
+    //
+    // A type **parameter** is not folded: `T::Max` inside a generic has no width until the body is
+    // compiled for a concrete `T`, and `subst` is what supplies one. Falling through to `None` here
+    // is the same deferral `sizeof(T)` gets, and `awaitsInstantiation` reports it the same way.
+    case TypeAttr(Ident(name), attr) =>
+      for
+        i     <- substScalar(name, subst).collect { case i: Type.Integer => i }
+        value <- attr match
+                   case "Min" => Some(Type.minOf(i))
+                   case "Max" => Some(Type.maxOf(i))
+                   case _     => None
+      yield IntLit(value, None)
+
     case _ => None
+
+  /** The integer a name stands for while folding, looking through a generic's substitution first so
+   * that `T::Max` in an instantiated body measures the argument rather than the parameter's name.
+   */
+  private def substScalar(name: String, subst: Map[String, Type]): Option[Type] =
+    subst.get(name).map(Type.underlying).orElse(scalarType(name))
 
   /** The bytes `sizeof(T)` / `alignof(T)` answer with, or `None` where the type has no answer here.
    *

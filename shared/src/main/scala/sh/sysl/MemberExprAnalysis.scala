@@ -197,8 +197,20 @@ trait MemberExprAnalysis extends ExprSupport {
     case TypeAttr(Ident(name), attr) if lookupOpt(name).isEmpty && typeKey(name).isDefined =>
       typeAttr(typeKey(name).get, attr, Nil)
 
+    case TypeAttr(Ident(name), attr) if lookupOpt(name).isEmpty && builtinInteger(name).isDefined =>
+      integerAttr(builtinInteger(name).get, name, attr, Nil)
+
     case TypeAttr(_, attr) =>
       err(s"'::$attr' is a type attribute, so its left side must be a type name")
+
+  /** The integer type a **built-in** scalar name stands for, which is where `Min`/`Max` are asked.
+   *
+   * Separate from `typeKey` because that resolves *declared* types only — a struct, an enum, a
+   * constrained subtype. `u32` and `u10000` are declared nowhere: the `iN`/`uN` family is open and
+   * recognised by width, so it has no table to be in and no key to be looked up by.
+   */
+  protected def builtinInteger(written: String): Option[Type.Integer] =
+    scalarType(written).collect { case i: Type.Integer => i }
 
   /** A constrained subtype's name with a member selected from it. The name is a **type**, and this
    * case exists so that it is never reported as an undefined *name* — which is what analyzing the
@@ -296,6 +308,34 @@ trait MemberExprAnalysis extends ExprSupport {
       case "Pred"  => val x = oneArg(c); ranged; TConstrainedStep(x, c, up = false, c)
       case "Range" => err(s"'${qn(key)}::Range' is only meaningful as the iterable of a 'for' loop")
       case _       => err(s"'${qn(key)}' has no attribute '$attr'")
+  }
+
+  /** The attributes a **built-in integer type** exposes: its bounds, `Min` and `Max`.
+   *
+   * A `within`-ranged subtype has answered `First`/`Last` since `16 §5`, and the integer it is
+   * declared *over* answered nothing — so a type derived from `u32` could state its bounds and
+   * `u32` could not. This closes that, and does it under different names on purpose: `First` and
+   * `Last` are the ends of a *declared sequence*, `Min` and `Max` the numeric extremes a type can
+   * hold. They agree on an integer and part company on an enum, whose first-declared variant need
+   * not carry the smallest discriminant.
+   *
+   * Both fold to a literal here, which is what lets them appear in a `const` initializer and in an
+   * `@assert` condition — neither admits a call (`13 §5`), so an attribute that resolved as one
+   * would be unusable in the two places bounds are most wanted.
+   */
+  protected def integerAttr(i: Type.Integer, written: String, attr: String, args: List[Expr]): TExpr = {
+    def noArgs(): Unit = if args.nonEmpty then err(s"'$written::$attr' takes no arguments")
+
+    attr match
+      case "Min" => noArgs(); TIntLit(Type.minOf(i), i)
+      case "Max" => noArgs(); TIntLit(Type.maxOf(i), i)
+      case "First" | "Last" =>
+        err(s"'$written' is an integer, not a declared sequence — its extremes are " +
+          s"'$written::Min' and '$written::Max'. 'First' and 'Last' name the ends of an enum's " +
+          s"variants or of a 'within' range, which is a different question")
+      case _ =>
+        err(s"'$written' has no attribute '$attr' — an integer type answers '$written::Min' and " +
+          s"'$written::Max'")
   }
 
   /** The attributes a simple enum exposes: its endpoints (`First`/`Last`), the ordinal maps

@@ -577,14 +577,25 @@ object Type {
     case Bool | _: Ptr | _: Ref | _: CFn => true
     case _                               => isOrdered(t)
 
+  /** The extremes an integer type can hold — what `T::Min` and `T::Max` answer with (`01`).
+   *
+   * These are questions about **magnitude**, which is why they are not spelled `First` and `Last`:
+   * those name the ends of a declared sequence, and for an enum with explicit discriminants the
+   * first-declared variant need not be the smallest. The two coincide on an integer and only there.
+   *
+   * The open family is the reason these must be computed rather than tabulated. A program can write
+   * `4294967295` for a `u32` and cannot write the largest `u10000` at all — it is 3,011 digits — so
+   * for a wide member of the family the attribute is not a convenience but the only way to name a
+   * value the type obviously has.
+   */
+  def minOf(t: Integer): BigInt = if t.signed then -(BigInt(1) << (t.bits - 1)) else BigInt(0)
+
+  def maxOf(t: Integer): BigInt = (BigInt(1) << (if t.signed then t.bits - 1 else t.bits)) - 1
+
   /** Whether a literal value is representable in an integer type. Out of range is an error
    * rather than a wrap: the width is the programmer's statement of intent.
    */
-  def fits(value: BigInt, t: Integer): Boolean =
-    if t.signed then
-      val limit = BigInt(1) << (t.bits - 1)
-      value >= -limit && value < limit
-    else value >= 0 && value < (BigInt(1) << t.bits)
+  def fits(value: BigInt, t: Integer): Boolean = value >= minOf(t) && value <= maxOf(t)
 
   /** A value reduced to what an integer type can hold, as a **written** conversion does it: the low
    * bits are kept and the rest discarded, with the result read back signed where the target is
