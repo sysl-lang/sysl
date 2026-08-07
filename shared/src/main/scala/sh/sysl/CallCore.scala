@@ -53,9 +53,24 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
 
         provisional.zip(srcs.padTo(provisional.length, None)).zip(params).map {
           case ((t, src), (_, pty)) =>
-            if src.exists(isLiteral) then analyzeExpr(src.get, Some(pty)) else coerce(t, pty)
+            if src.exists(isLiteral) || src.isDefined && becomesSlice(t.ty, pty) then
+              analyzeExpr(src.get, Some(pty))
+            else coerce(t, pty)
         }
       case None => args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
+
+    // A **written-out array standing where a slice is asked for**, which is a conversion the
+    // *analysis* performs rather than one `coerce` repairs afterwards: `[1, 2, 3]` becomes a slice
+    // because the position it was written in said so, and by the time there is a `[3]int` to coerce
+    // the moment has passed. A non-generic call never meets this — its parameter type is known, so
+    // the argument is analyzed against it in the first place — and a generic one analyzed the
+    // argument before the solution existed, which is exactly what this re-does.
+    //
+    // Asked of the two **types** rather than of the argument's shape, so a named array gets the same
+    // answer as a literal: re-analyzing `a` against `[]const int` reports what a non-generic call
+    // reports for `plain(a)`, which is that an array does not convert on its own and `a[..]` is how
+    // it is written. Matching on the syntax would have made a literal work and a variable fail with
+    // a *different* message for the same rule.
 
     // The complaint is about one argument, so it is reported where that argument is written
     // rather than at the call as a whole.

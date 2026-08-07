@@ -352,6 +352,17 @@ trait GenericInstantiation extends ConstFolding {
     case ArrayType(None, elem, _) =>
       actual match
         case Type.Slice(e, _) => unify(elem, e, tparams, sub)
+        // **An array is matched too, because an array coerces to a slice at the call.** A `[]T`
+        // parameter handed a `[3]int` is an ordinary call — a non-generic `[]const int` parameter
+        // takes `[1, 2, 3]` and always has — so inference not following the coercion left `T`
+        // unbound and answered a perfectly good call with "cannot infer the type argument". The
+        // length is the array's own and binds nothing here; only the element is read.
+        //
+        // This is the leniency `&T` and `weak T` are given four cases up, for the same reason: each
+        // matches the shapes a call will convert *to* its own, so that what the reader wrote is what
+        // gets read. Following a coercion inference already permits is not widening what compiles —
+        // the argument is still checked against the instantiated signature afterwards.
+        case Type.Array(_, e) => unify(elem, e, tparams, sub)
         case _                => ()
     // The **length binds a value parameter** the way the element binds a type one (`10 §9`): a
     // `[N]T` parameter handed a `[3]int` reads 3 off the argument's type, which is where the length

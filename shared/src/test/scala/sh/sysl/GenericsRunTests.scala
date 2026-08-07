@@ -130,6 +130,65 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |""".stripMargin) shouldBe "3 go\n2 go\n1 go\n"
   }
 
+  /** An array written where a slice is asked for, at a generic callee.
+   *
+   * A non-generic `plain(xs: []const int)` has always taken `plain([1, 2, 3])`: the literal is
+   * analyzed against the parameter, and a written-out array in a slice position becomes one. A
+   * generic callee analyzes its arguments **before** any parameter type is known, so the same
+   * argument arrived as a `[3]int` at a parameter nothing had solved yet — and answered a perfectly
+   * ordinary call with "cannot infer the type argument 'T'".
+   *
+   * It needed both halves. `unify` never matched an array against a `[]T` parameter, so `T` stayed
+   * unbound; and once it was bound, the call path still had a `[3]int` in hand where `coerce` cannot
+   * help, because becoming a slice is something the *analysis* does and not a repair afterwards.
+   */
+  "an array where a slice is asked for" - {
+    "a literal solves the element type and becomes the slice" in {
+      run("""count[T](xs: []T) -> int = int(xs.len)
+            |print(count([1, 2, 3]))
+            |""".stripMargin) shouldBe "3\n"
+    }
+
+    "the same for a 'const' view, which is what a library parameter is written as" in {
+      run("""total[T: Add](xs: []const T, zero: T) -> T
+            |    var n = zero
+            |
+            |    for x in xs
+            |        n = n + x
+            |
+            |    n
+            |end total
+            |print(total([1, 2, 3], 0))
+            |""".stripMargin) shouldBe "6\n"
+    }
+
+    "the element type is read off the literal rather than defaulted" in {
+      run("""kind[T](xs: []T, probe: T) -> T = probe
+            |print(kind([1.5, 2.5], 0.25))
+            |""".stripMargin) shouldBe "0.25\n"
+    }
+
+    // The rule the fix must not have widened: an array does not convert on its own, and `a[..]` is
+    // how one is written. A generic callee now reports that in the same terms a non-generic one
+    // does, where before it reported a failure to infer — a different message for the same rule.
+    "while a named array is refused exactly as a non-generic call refuses it" in {
+      val out = err("""gen[T](xs: []const T) -> int = int(xs.len)
+                      |var a = [1, 2, 3]
+                      |print(gen(a))
+                      |""".stripMargin)
+
+      out should include("'xs' of 'gen' is []const int, but [3]int was given")
+      out should not include "cannot infer"
+    }
+
+    "and the array parameter it could have been confused with still binds its length" in {
+      run("""len[const N: usize, T](xs: [N]T) -> usize = N
+            |var a = [1, 2, 3]
+            |print(len(a))
+            |""".stripMargin) shouldBe "3\n"
+    }
+  }
+
   /** `01` lists the parameter type at a call among the positions that fix an unsuffixed literal,
    * and says nothing about the callee being generic — so a parameter written `usize` fixes one
    * whether or not the declaration beside it also has a `T` to solve. What makes this its own group

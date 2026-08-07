@@ -32,12 +32,13 @@ class AssertEqTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       run("assert_eq(\"ab\" + \"c\", \"abc\")\nprint(\"through\")") shouldBe "through\n"
     }
 
-    // The arguments are written `a[..]` rather than as literals because an array literal in an
-    // argument position does not drive inference of a slice parameter's element type — `count[T](xs:
-    // []T)` called as `count([1, 2, 3])` is refused with "cannot infer the type argument 'T'", and
-    // called as `count(a[..])` is not. That is a fact about inference rather than about this
-    // function, and it is the same for a `[]const T` parameter.
     "and for a slice, element by element" in {
+      run("assert_slice_eq([1, 2, 3], [1, 2, 3])\nprint(\"through\")") shouldBe "through\n"
+    }
+
+    // Both spellings, because both are what a caller reaches for: the literal at a call written out
+    // in place, and the slice of something named that a real comparison usually has in hand.
+    "written either as a literal or as a slice of something named" in {
       run("var a = [1, 2, 3]\nvar b = [1, 2, 3]\nassert_slice_eq(a[..], b[..])\nprint(\"through\")") shouldBe
         "through\n"
     }
@@ -74,19 +75,19 @@ class AssertEqTests extends AnyFreeSpec with CodegenSupport with RunSupport {
   "a slice reports which element, and a length before any of them" - {
 
     "the first index the two disagree at" in {
-      val (_, out) = stopped("var a = [1, 2, 3]\nvar b = [1, 5, 3]\nassert_slice_eq(a[..], b[..])")
+      val (_, out) = stopped("assert_slice_eq([1, 2, 3], [1, 5, 3])")
 
       out should include("got 2, want 5 at index 1")
     }
 
     "the lengths, when those are what differ" in {
-      val (_, out) = stopped("var a = [1, 2]\nvar b = [1, 2, 3]\nassert_slice_eq(a[..], b[..])")
+      val (_, out) = stopped("assert_slice_eq([1, 2], [1, 2, 3])")
 
       out should include("got 2 elements, want 3")
     }
 
     "and a length mismatch is reported instead of an index, not as well" in {
-      val (_, out) = stopped("var a = [9]\nvar b = [1, 2, 3]\nassert_slice_eq(a[..], b[..])")
+      val (_, out) = stopped("assert_slice_eq([9], [1, 2, 3])")
 
       out should include("got 1 elements, want 3")
       out should not include "at index"

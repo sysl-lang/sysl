@@ -260,6 +260,19 @@ trait AnalyzerBase extends Scoping {
   protected def autoDeref(t: TExpr): TExpr
   protected def isPlace(t: TExpr): Boolean
 
+  /** Whether an argument of one type, standing where the other is asked for, is a case the
+   * *analysis* settles rather than one `coerce` repairs — an array written where a slice goes.
+   *
+   * It exists for the generic call path, which analyzes its arguments before it knows what the
+   * parameters are and so can arrive at a `[3]int` for a position that turned out to want a
+   * `[]const int`. A non-generic call never reaches it, having analyzed the argument against the
+   * parameter in the first place (`CallCore`).
+   */
+  protected def becomesSlice(actual: Type, expected: Type): Boolean =
+    (Type.unqualified(actual), Type.unqualified(expected)) match
+      case (_: Type.Array, _: Type.Slice) => true
+      case _                              => false
+
   /** Whether a place is one a write may not reach — a `val`, or a field or element of one.
    * Declared here because both callers are: assignment and `&` ask it in `ExprAnalysis`, and a
    * `*self` receiver asks it in `CallAnalysis`, which is the same question about the same place.
