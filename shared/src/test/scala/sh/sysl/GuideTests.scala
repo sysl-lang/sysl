@@ -244,7 +244,7 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
     val out = guide("datetime")
 
     out should not include "FAIL"
-    checks(out) shouldBe 158
+    checks(out) shouldBe 159
     sections(out) shouldBe List(
       "-- instants and durations",
       "-- days and civil dates",

@@ -917,24 +917,44 @@ exactly (`§5`), one row further down the catalog.
   `sysl.math`'s `Float` declares seven such members, which is what lets its `signum` and `recip` be
   defaults and what lets a routine generic over the width start a running minimum at `T.infinity()`.
 
-  What is left is exactly the original ask, one step smaller: **no trait in the catalog declares a
-  zero**, so `total[T: Add](xs: []T) -> T` still seeds from `xs[0]`. Writing `trait Zero` with
-  `zero() -> Self` is ordinary code today, so this is no longer a question about what the language
-  can express — it is `§8 a`'s question about whether the compiler supplies the membership for the
-  open `iN` / `uN` families, since no finite list of `impl`s covers them.
+  What is left is smaller again, and the membership question it used to turn on has an answer.
+  **`Integer` is that membership** — it names the open `iN` / `uN` family, it is the compiler's and
+  not something a program can join, and `display.sysl` is written over it. So a sum over the
+  built-in widths needs no zero promised to it at all: a literal takes its type from where it sits,
+  and `total[T: Integer + Add](xs: []T) -> T` starts at `var acc: T = 0`.
 
-- **An enum cannot render its own variant names.** `str` on one is refused and the diagnostic is a
-  good one — it names the `impl Display` to write — but for the commonest case what that impl says
-  is already in the source: a match from each variant to the word the variant is spelled with.
-  `guide/scheduler`'s six-state `State` has a renderer that is six lines of exactly that, and a
-  scheduler is a program whose most useful output *is* its states. This is **not** the same ask as
-  the `describe` functions the other guide programs write: a fault's message is built out of the
-  variant's payload and only a person can write it, while a variant's name is a fact the compiler
-  is already holding. What it wants is a derived `Display` for the name-only case — and the reason
-  it is recorded rather than designed is that sysl has **no deriving mechanism at all**, so this
-  would be the first one, and it arrives with that whole question attached: automatic for every
+  **No trait in the catalog declares a zero** still, and what that now costs is one case rather than
+  the general one: a body serving the integers *and* a type of somebody else's — `guide/fft`'s sum
+  over a width and a `Complex` — cannot reach both through `Integer`, so it declares a trait of its
+  own and writes an `impl` per type. Whether the catalog should carry the identity that would join
+  them is the open question; the families themselves are covered.
+
+- **An enum cannot render its own variant names — and most of what this asked for was already
+  answered one chapter over.** `str` on an enum is refused and the diagnostic is a good one: it names
+  the `impl Display` to write. What this item then argued was that for the commonest case the impl's
+  contents are already in the source — a match from each variant to the word it is spelled with —
+  and that the compiler is holding that fact.
+
+  It is, and it hands it over: **`T::Image(v)` is a simple enum's variant name as a `string`**
+  (`09 §2`), sitting in the same attribute set as `First`, `Pos` and `Succ` and out of the member
+  namespace for the same reason. `guide/scheduler`'s six-state `State` was this item's worked
+  example, with a six-line renderer; that renderer is gone and its checks read `State::Image`.
+  The library's `weekday_name` is one attribute read for the same reason. This item was written as
+  though the fact were unreachable, and it never was.
+
+  **Two things are left, and they are narrower than what was recorded here.** A **data** enum has no
+  `Image` — refused in as many words, because a value there is a variant plus a payload and a name
+  answers for half of it — which is also why the `describe` functions the guide programs write are a
+  different ask: a fault's message is built out of the payload and only a person can write it. And
+  `str` on an enum is still not the name, so a program that wants the value to *render* as its name
+  asks for the name and prints that.
+
+  Whether the second should close — a derived `Display` for the name-only case — is the question that
+  stands, and it is the one this item should always have been about. It arrives with the whole
+  deriving question attached, since sysl has **no deriving mechanism at all**: automatic for every
   enum, and therefore a member a program cannot replace without shadowing it, or asked for by
-  something written at the declaration. Nothing here decides that.
+  something written at the declaration. Nothing here decides that. What has changed is the stake —
+  with `Image` reachable, a derived `Display` saves the *asking*, not the table.
 
   **Half of the machinery exists now, and the deciding question is untouched.** `10 §10`'s `for
   const` is a loop the compiler unrolls, whose body is type-checked once per copy — which is exactly
