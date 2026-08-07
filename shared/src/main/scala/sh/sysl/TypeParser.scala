@@ -1,0 +1,231 @@
+package sh.sysl
+
+/** The type grammar: a type as it is written, and the `[…]` parameter list a declaration
+ * carries.
+ *
+ * It is its own area because a type is written in places that have nothing else in common — a
+ * field, a parameter, a result, a cast, a type argument — so every one of them reaches the same
+ * rule rather than each admitting its own subset.
+ *
+ * The parameter list sits here rather than with the declarations that carry it because what it
+ * reads is types and bounds, and every declaration form reads the identical list.
+ */
+trait TypeParser extends ExprParser {
+
+  /** A type: a memory-mode sigil applied to a type, or a name optionally applied to type
+   * arguments (`Box[int]`, `Result[T, string]`). `sync` stays a soft keyword — it is only
+   * special immediately after `&`, and the `&sync T` alternative is tried first so that a
+   * reference to a type actually named `sync` still parses.
+   *
+   * `weak` is a reserved word rather than a sigil, since a mode a program reaches for only for a
+   * genuine back-reference (`03`) is better read than punctuated.
+   */
+  protected lazy val typeRef: Parser[TypeRef] =
+    at(coreType ~ opt(op("->") ~> typeRef) ^^ {
+      case t ~ None                        => t
+      case TupleType(parts, false) ~ Some(r) => FnType(parts, r, bare = true)
+      case t ~ Some(r)                     => FnType(List(t), r, bare = true)
+    })
+
+  /** A type with no arrow on it — everything a bare-arrow callable is written *out of*.
+   *
+   * The arrow is a suffix on this rather than an alternative among these, so `(A, B) -> C` reads its
+   * left side as the parenthesized list it looks like and only then learns it was a parameter list.
+   * That is what keeps one production for `(A, B)` whether a tuple or a callable was meant, and it
+   * is why the two cannot disagree about how a comma inside parentheses is read.
+   */
+  protected lazy val coreType: Parser[TypeRef] =
+    at(
+      // `Fn(A) -> R`, the callable's type written out (`12 §6`). It comes first because `Fn` is an
+      // ordinary identifier: without this the name alternative below would take it and leave the
+      // parameter list stranded.
+      (fnWord ~> op("(") ~> commaList(typeRef) <~ op(")")) ~ (op("->") ~> typeRef) ^^ {
+        case ps ~ r => FnType(ps, r, bare = false)
+      } |
+        // `() -> R` — a callable of no arguments. Empty parentheses are not a type, so this is the
+        // one place they may be written, and the arrow is what says so.
+        (op("(") ~> op(")") ~> op("->") ~> typeRef) ^^ (r => FnType(Nil, r, bare = true)) |
+        // `*extern(A) -> R`, C's function pointer (`12 §6a`). It comes before the general `*` so the
+        // `extern` is read as part of this spelling rather than as a type named `extern` — which it
+        // could not be anyway, the word being reserved, but the alternative below would reach the
+        // name production and complain about the wrong thing.
+        ((op("*") ~> op("extern") ~> op("(") ~> commaList(typeRef) <~ op(")")) ~ (op("->") ~> typeRef) ^^ {
+          case ps ~ r => CFnType(ps, r)
+        }) |
+        op("*") ~> op("extern") ~> err("'*extern' is a foreign function's address, so it is written " +
+          "with the signature that address is called at — '*extern(int) -> int', and '*extern() -> unit' " +
+          "for one that takes nothing and yields nothing") |
+        op("*") ~> coreType ^^ PtrType.apply |
+        op("&") ~> softSync ~> coreType ^^ (t => RefType(t, sync = true)) |
+        op("&") ~> coreType ^^ (t => RefType(t, sync = false)) |
+        op("weak") ~> softSync ~> err("an atomic reference has no weak form yet — 'weak sync T' " +
+          "wants the concurrency model of '06', which is not built") |
+        op("weak") ~> coreType ^^ WeakType.apply |
+        ((op("[") ~> opt(expression) <~ op("]")) ~ opt(op("const")) ~ coreType >> {
+          // `const` after the brackets says the *view* refuses writes, so a length in them is a
+          // contradiction: an array is storage rather than a view of it, and storage that is written
+          // once is what `val` declares. Somebody reaching for one is owed that word rather than a
+          // parse error, since the two spellings are a bracketed number apart.
+          case Some(_) ~ Some(_) ~ t =>
+            err(s"'const' says a view refuses writes, and an array is storage rather than a view of " +
+              s"one — read-only storage is declared with 'val', as 'val name: [N]${t.show}'")
+          case n ~ ro ~ t => success(ArrayType(n, t, readOnly = ro.isDefined))
+        }) |
+        // `volatile T` (`03 § Device memory`). It stays a soft word like `sync`, so it is special
+        // only in front of another type — a program with a type of its own named `volatile` still
+        // parses, since this alternative needs a second type after the word and the name
+        // alternative below picks up what is left.
+        softVolatile ~> coreType ^^ VolatileType.apply |
+        tupleType |
+        // A bare `..A` parses so that the analyzer can say what a pack is and where one may be
+        // written (`10 §10`). Left to the grammar it would be a stray token, and the reader would
+        // be told a newline was expected rather than told about the feature they were reaching for.
+        op("..") ~> ident ^^ PackType.apply |
+        qualifiedName ~ opt(typeArgs) ^^ { case n ~ args => NamedType(n, args.getOrElse(Nil)) },
+    )
+
+  /** `(A, B)` — a tuple type. A single part is refused rather than read as a grouping, because the
+   * two spellings would then differ by a comma and mean different things; `(T)` is the shape
+   * somebody writes when they mean a one-tuple, and there is no such type (`00 §13`).
+   */
+  protected lazy val tupleType: Parser[TypeRef] =
+    packTuple | (op("(") ~> commaList1(typeRef) <~ op(")")) >> {
+      case List(one) =>
+        err(s"'(${one.show})' is a type in parentheses, and a tuple has two or more parts — " +
+          s"a product of one thing is that thing, so write '${one.show}'")
+      case parts => success(TupleType(parts))
+    }
+
+  /** `(..A)` — the tuple of a type pack (`10 §10`), which matches a tuple of any arity.
+   *
+   * Tried before the ordinary tuple, and the two cannot both parse: a pack is the whole of what is
+   * between the parentheses. Mixing one with written-out parts — `(..A, int)` — is pack *expansion*
+   * and is not built, so it is refused by name rather than left to fail as a type called `..A`.
+   */
+  protected lazy val packTuple: Parser[TypeRef] =
+    (op("(") ~> op("..") ~> ident <~ (op(")") | op(",") ~> err(
+      "a type pack is the whole of the tuple it stands for — '(..A, T)' appends to a pack, which " +
+        "is not built; write '(..A)' and reach the parts with 'for const'",
+    ))) ^^ { n => TupleType(List(PackType(n))) }
+
+  /** A function's declared result: one type, or several separated by commas (`12 §5b`).
+   *
+   * A result list is a property of the signature and not a type, so it is spelled here rather than
+   * in `typeRef` — nothing that asks for a *type* can reach one, which is what keeps `-> int, int`
+   * and a field or a parameter apart with no rule of its own.
+   */
+  protected lazy val resultRef: Parser[TypeRef] =
+    typeRef ~ rep(op(",") ~> typeRef) ^^ {
+      case t ~ Nil  => t
+      case t ~ more => TupleType(t :: more, results = true)
+    }
+
+  /** The `[int, string]` argument list of an applied generic name, whether the name is a type's or
+   * a trait's — a trait takes its arguments the same way and in the same place.
+   */
+  protected lazy val typeArgs: Parser[List[TypeRef]] =
+    op("[") ~> commaList1(typeArg) <~ op("]")
+
+  /** One argument of that list, which may stand for a **value** (`10 §9`) — `Buf[4]`.
+   *
+   * A type is tried first and an expression only where nothing could be a type, so a bare `N` is
+   * read as a name and left for the declaration to interpret: the grammar cannot tell a type
+   * parameter's name from a value parameter's, and the declaration can.
+   */
+  protected lazy val typeArg: Parser[TypeRef] =
+    typeRef | (expression ^^ ValueArgType.apply)
+
+  protected lazy val softSync: Parser[Unit] =
+    accept("'sync'", { case t: lexical.Identifier if t.chars == "sync" => () })
+
+  protected lazy val softVolatile: Parser[Unit] =
+    accept("'volatile'", { case t: lexical.Identifier if t.chars == "volatile" => () })
+
+  /** `Fn` stays a soft word for the reason `sync` does: it is only special immediately before a
+   * parenthesized parameter list, so a program with a type of its own named `Fn` still parses.
+   */
+  protected lazy val fnWord: Parser[Unit] =
+    accept("'Fn'", { case t: lexical.Identifier if t.chars == "Fn" => () })
+
+  /** A type-parameter list where a parameter may carry a trait bound: `[T, U: Show, V: Ord + Hash]`.
+   * It yields the parameter names alongside a name-keyed map of the bounds, so an unbounded
+   * parameter is simply absent from the map.
+   *
+   * Every declaration that may be generic over types it does not know parses this one list — a
+   * function, an `impl` block, a struct, an enum, a trait — because a bound means the same thing in
+   * each: it is what the declaration assumes of the parameter, and what everything applying it must
+   * supply.
+   *
+   * A bound is a trait **applied**, so it takes type arguments where the trait declares any:
+   * `[E: From[IoError]]`. The arguments are types and parse as such, which is what lets one mention
+   * another of the parameters being declared.
+   *
+   * A parameter may also carry a **default**, `[Rhs = Self]`, which stands in where the declaration
+   * is applied to fewer arguments than it declares. The bound comes first and the default last, so
+   * `[R: Show = Self]` reads as the two clauses it is; both are optional and independent. Whether a
+   * default means anything in the position being parsed is the analyzer's question, since only it
+   * can say so with the declaration under the message.
+   */
+  protected lazy val boundedTypeParams: Parser[TypeParams] =
+    op("[") ~> commaList1(valueParam | packParam | boundedTypeParam) <~ op("]") ^^ { ps =>
+      TypeParams(
+        ps.map(_.name),
+        ps.collect {
+          case p: TypeParamSpec if p.bounds.nonEmpty => p.name -> p.bounds
+          case p: PackParamSpec if p.bounds.nonEmpty => p.name -> p.bounds
+        }.toMap,
+        ps.collect { case p: TypeParamSpec if p.default.nonEmpty => p.name -> p.default.get }.toMap,
+        ps.collect { case p: ValueParamSpec => p.name -> p.typ }.toMap,
+        ps.collect { case p: ValueParamSpec if p.default.nonEmpty => p.name -> p.default.get }.toMap,
+        ps.collect { case p: PackParamSpec => p.name }.toSet,
+      )
+    }
+
+  /** `[const N: usize]` — a parameter standing for a **value** (`10 §9`).
+   *
+   * The type is required and the marker is what makes it readable: without `const` this is
+   * `ident ':' name`, which is exactly a bounded type parameter, and only name resolution could say
+   * which was meant. Then a trait name misspelled into a type name would quietly change what kind of
+   * parameter it is. The word is not a new one — `13 §7` already spells a compile-time constant
+   * `const NAME: Type = expr`, and this is that with the initializer left to the caller.
+   *
+   * A **default is an expression here**, not a type, which is the second thing the marker buys: one
+   * slot, two grammars, and no way to parse it without knowing which parameter is being read.
+   *
+   * **The missing type is refused where the `:` belongs, not by an alternative written after the
+   * whole form**, and the difference is not stylistic. An alternative fails at the position it gets
+   * to, and a combinator picking between two failures keeps the one that got *further*: the form
+   * above reaches the `]` before it notices, so its failure outranks any error raised back at the
+   * `const`, and the reader gets the generic complaint about whatever came next. Raised here the two
+   * are at one position, and the one carrying a sentence wins.
+   */
+  protected lazy val valueParam: Parser[ValueParamSpec] =
+    op("const") ~> ident ~ (op(":") ~> typeRef | err("a value parameter needs the type its " +
+      "argument must have, as 'const N: usize' — the type is what says which values may stand " +
+      "there")) ~ opt(op("=") ~> expression) ^^ {
+      case n ~ t ~ d => ValueParamSpec(n, t, d)
+    }
+
+  /** `..A: Display` — a **type pack** (`10 §10`), whose bound distributes over its members.
+   *
+   * The `..` is the marker, and it is in front for the same reason `const` is: without it `A: Display`
+   * is an ordinary bounded type parameter and nothing in the grammar could say which was meant. It
+   * reads the way the use does — `(..A)` — so a signature says pack in both places with one spelling.
+   *
+   * A pack takes **no default**: a default is one type, and there is no way to write a list of them.
+   * Refused here rather than by an alternative written after the form, so the sentence is raised at
+   * the `=` and outranks the generic complaint about what follows it.
+   */
+  protected lazy val packParam: Parser[PackParamSpec] =
+    op("..") ~> ident ~ opt(op(":") ~> rep1sep(boundRef, op("+"))) ~ opt(op("=") ~> err(
+      "a type pack takes no default — a default is one type, and a pack stands for a list of them",
+    )) ^^ { case n ~ bs ~ _ => PackParamSpec(n, bs.getOrElse(Nil)) }
+
+  protected lazy val boundedTypeParam: Parser[TypeParamSpec] =
+    ident ~ opt(op(":") ~> rep1sep(boundRef, op("+"))) ~ opt(op("=") ~> typeRef) ^^ {
+      case n ~ bs ~ d => TypeParamSpec(n, bs.getOrElse(Nil), d)
+    }
+
+  protected lazy val boundRef: Parser[BoundRef] =
+    at(qualifiedName ~ opt(typeArgs) ^^ { case n ~ args => BoundRef(n, args.getOrElse(Nil)) })
+}

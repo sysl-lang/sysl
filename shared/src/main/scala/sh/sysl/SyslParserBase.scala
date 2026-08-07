@@ -112,6 +112,14 @@ trait SyslParserBase extends PackratParsers {
   /** A block introduced by a keyword, written inline after it or indented under it. */
   protected def body(keyword: String): Parser[List[Stmt]]
 
+  /** A block written on one line, which is the single statement it holds. */
+  protected def inlineBody: PackratParser[List[Stmt]]
+
+  /** The quoted symbol an `extern` or a `@link` names, where that differs from the word the program
+   * calls it by (`15 §8`).
+   */
+  protected def linkName: Parser[String]
+
   /** One pattern, as a `match` arm writes it. Declared here because a condition may test one too
    * (`09 §12`), and the two spellings must be the same grammar rather than two that drift.
    */
@@ -144,6 +152,11 @@ trait SyslParserBase extends PackratParsers {
 
   /** `private`, `private[M]`, or nothing at all — which is public (`13 §2`). */
   protected def visibility: Parser[Visibility]
+
+  /** The string a contract clause or a `@test` carries — the sentence a reader is shown when the
+   * check fails, or the name a test report gives the function.
+   */
+  protected def contractMsg: Parser[String]
 
   /** A statement written on the same line as the keyword that introduces it. */
   protected def inlineStatement: PackratParser[Stmt]
