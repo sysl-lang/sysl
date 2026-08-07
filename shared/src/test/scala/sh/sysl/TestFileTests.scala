@@ -299,6 +299,40 @@ class TestFileTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       }
     }
 
+    /** **The other end of the trade, and the assertion that justifies making it.**
+      *
+      * Everything the three above give up, a test build has to still catch, or "the net moved rather
+      * than went" is a sentence with nothing behind it. The demanding case is a helper in a `@tests`
+      * file that **no test calls**: nothing reaches it, so a checker that worked outwards from the
+      * tests would never look at it, and it is precisely the declaration `build-lib` used to be the
+      * only thing looking at.
+      *
+      * Both are asserted in one compilation because the analyzer reports every mistake it finds, so
+      * a pass that had stopped at the first would show up as the second going missing.
+      */
+    "but a test build still analyzes all of it, including a helper nothing calls" in {
+      val sources = List(
+        Source("demo/lib.sysl", "module demo\n\ndouble(n: int) -> int = n * 2\n", List("demo")),
+        Source("demo/tests.sysl",
+               """module demo
+                 |@tests
+                 |
+                 |unreached() -> int = nosuchthing()
+                 |
+                 |@test
+                 |bad() = assert_eq(double(nowhere()), 4)
+                 |""".stripMargin,
+               List("demo")),
+      )
+
+      Compiler.compileTests(sources, Nil) match {
+        case Right(_) => fail("a test build compiled a tree whose test file names two undefined functions")
+        case Left(e) =>
+          e should include("nosuchthing")
+          e should include("nowhere")
+      }
+    }
+
     // The same again for a `@test` written in an ordinary file rather than a `@tests` one, since
     // `stripSource` removes the two by different rules — a file whole, and a declaration out of a
     // file that stays.
