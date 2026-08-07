@@ -59,6 +59,33 @@ class LayoutCheckTests extends LibraryCliSupport {
       |size_t pair_size(void) { return sizeof(struct pair); }
       |""".stripMargin
 
+  /* A binding **is** a library, so a layout check has to survive `build-lib` — which means the
+   * artifact carries the assertion rather than dropping it.
+   *
+   * Carried rather than dropped on purpose: `sizeof` is per target, so a layout a library verified
+   * when it was built is not a layout verified for whatever the consumer is building for. The
+   * consumer re-settles it.
+   */
+  "an assertion survives a library artifact" - {
+    "a true one, built and consumed" in {
+      val root = rootOf("shape",
+        """module shape
+          |
+          |struct Pair
+          |    a: i32
+          |    b: i32
+          |end Pair
+          |
+          |@assert(sizeof(Pair) == 8, "Pair must match struct pair")
+          |
+          |width() -> usize = sizeof(Pair)
+          |""".stripMargin)
+
+      ran(Config(command = "run", file = program("print(shape.width())\n"),
+                 libs = List(artifactOf(root)))) shouldBe "8\n"
+    }
+  }
+
   "both halves agree" in {
     assume(Toolchain.clangAvailable, "clang not available")
 
