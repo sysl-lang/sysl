@@ -190,6 +190,27 @@ class GenericsClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport
         include("cannot infer the type argument 'T' of 'empty' here — annotate the expected type")
     }
 
+    // A parameter left unsolved because the expected type could not itself be worked out is a
+    // consequence of a mistake already reported, and saying so twice sends the reader to the wrong
+    // line. Here `IoError` was never imported: the honest answer is that the name is unknown, with
+    // the caret under the name, and asking for an annotation on a return type that is already as
+    // annotated as it can be is not a second answer but a wrong one.
+    "while one left unsolved by a type that is not there says only that the type is not there" in {
+      val rendered = err("f() -> Result[unit, IoError] = Ok(())")
+
+      rendered should include("unknown type 'IoError'")
+      rendered should not include "cannot infer the type argument"
+    }
+
+    // The same suppression through an argument rather than through the expected type, which reaches
+    // the unsolved parameter by the other route.
+    "and one left unsolved by an argument that is not a type says the same" in {
+      val rendered = err("id[T](x: T) -> T = x\n\nval v: IoError = ()\n\nprint(id(v))")
+
+      rendered should include("unknown type 'IoError'")
+      rendered should not include "cannot infer the type argument"
+    }
+
     """a LITERAL is consulted last, so an argument that knows its type settles the parameter and the
       |literals are then read against it""".stripMargin in {
       run("pick[T](a: T, b: T, c: T) -> T = c\nprint(pick(1, 2, 250u8))") shouldBe "250\n"

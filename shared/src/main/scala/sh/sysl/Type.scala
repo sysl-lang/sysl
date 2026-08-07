@@ -533,6 +533,26 @@ object Type {
     case CFn(ps, r)       => ps.exists(mentionsAbstract) || mentionsAbstract(r)
     case _                => false
 
+  /** Whether a type is built out of one that could not be worked out. `Unknown` is only ever
+   * produced where the thing that would have decided the type was already reported, so a check
+   * that reaches one is a check whose answer is a consequence of a mistake the reader has already
+   * been told about — and a second diagnostic about the consequence sends them somewhere else.
+   *
+   * The shape is `mentionsAbstract`'s, and for the same reason: a poisoned type is nearly always
+   * nested inside a good one, as `Result[unit, <unknown>]` is when its error type was misspelled.
+   */
+  def mentionsUnknown(t: Type): Boolean = t match
+    case Unknown          => true
+    case n: Named         => n.targs.exists(mentionsUnknown)
+    case Ptr(inner)       => mentionsUnknown(inner)
+    case Ref(inner, _)    => mentionsUnknown(inner)
+    case Weak(inner)      => mentionsUnknown(inner)
+    case Array(_, elem)   => mentionsUnknown(elem)
+    case Slice(elem, _)   => mentionsUnknown(elem)
+    case Volatile(inner)  => mentionsUnknown(inner)
+    case CFn(ps, r)       => ps.exists(mentionsUnknown) || mentionsUnknown(r)
+    case _                => false
+
   def isNumeric(t: Type): Boolean = underlying(t) match
     case _: Integer | _: Floating => true
     case _                        => false

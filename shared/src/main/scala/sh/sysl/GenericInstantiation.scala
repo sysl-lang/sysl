@@ -469,8 +469,23 @@ trait GenericInstantiation extends ConstFolding {
     if sub.size < tparams.length then
       for ((r, t), adaptable) <- pairs if adaptable do unify(r, t, tps, sub)
 
+    // A parameter left unsolved because what would have solved it could not itself be worked out is
+    // a consequence, not a mistake. `f() -> Result[unit, IoError] = Ok(())` with `IoError` never
+    // imported has already been told that the name is unknown, with the caret under the name; the
+    // return type it recovers to is `Result[unit, <unknown>]`, which then leaves `E` unsolved. Left
+    // to report, that says "annotate the expected type" about a return type the reader annotated as
+    // fully as they could, and points at the expression rather than at the word to change.
+    //
+    // Suppressing is safe by construction rather than by judgement: `Type.Unknown` exists only where
+    // an error was already recorded, so there is no input that reaches here poisoned and silent.
+    def unsolvable = expected.exists(Type.mentionsUnknown) || argTys.exists(Type.mentionsUnknown)
+
     tparams.map(tp =>
-      sub.getOrElse(tp, err(s"cannot infer the type argument '$tp' of '$what' here — annotate the expected type")),
+      sub.getOrElse(
+        tp,
+        if unsolvable then poisoned()
+        else err(s"cannot infer the type argument '$tp' of '$what' here — annotate the expected type"),
+      ),
     )
   }
 
