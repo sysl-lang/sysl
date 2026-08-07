@@ -11,6 +11,7 @@ import sysl.math.tau
 import sysl.math.Bits
 import sysl.math.is_power_of_two
 import sysl.math.complex.Complex
+import sysl.slices.sort_stable_by
 
 enum Fault
     Empty
@@ -201,27 +202,26 @@ impl Ord for Bin
 impl Eq for Bin
     eq(self, rhs: Bin) -> bool = self.mag == rhs.mag
 
-// Insertion sort, strongest first, and stable — bins of equal energy keep their frequency order,
-// which is what makes the answer to "which bins" reproducible for a real signal, where every bin
-// has a mirror of exactly the same magnitude.
-private strongest_first[T: Ord](xs: []T)
-    for i in 1..<xs.len
-        var v = xs[i]
-        var j = i
-
-        while j > 0usize && xs[j - 1usize] < v
-            xs[j] = xs[j - 1usize]
-            j -= 1usize
-
-        xs[j] = v
-end strongest_first
-
+// Strongest first, and **stable** — bins of equal energy keep their frequency order, which is what
+// makes the answer to "which bins" reproducible for a real signal, where every bin has a mirror of
+// exactly the same magnitude.
+//
+// **This used to be a hand-written insertion sort here**, because the library had no sorting at all.
+// It now has two, and the choice between them is exactly the distinction this function cared about:
+// `sort` is faster and unstable, and would let the mirrored pair come back either way round.
+// `sort_stable` is the one whose promise this depends on, and it merges through scratch the caller
+// supplies rather than allocating — so the storage is visible here, which is the honest cost of a
+// stable sort and was hidden while the insertion sort paid it in time instead.
+//
+// Descending by passing the comparison the other way round. Equal bins satisfy neither ordering, so
+// they keep the order they arrived in, which is the whole point.
 peaks(xs: []Complex[real]) -> []Bin
-    var bins: []Bin = [Bin(0usize, 0.0); xs.len]
+    var bins: []Bin = [Bin(0, 0.0); xs.len]
+    var scratch: []Bin = [Bin(0, 0.0); xs.len]
 
     for i in 0..<xs.len do bins[i] = Bin(i, xs[i].abs())
 
-    strongest_first(bins)
+    sort_stable_by(bins, scratch, (a, b) -> b < a)
 
     bins
 end peaks
