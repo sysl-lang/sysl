@@ -109,6 +109,35 @@ class TermTtyTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  /** The shape both this module's header and the library page put in front of a reader. It is
+   * asserted rather than only written down because a documented call site that does not compile is
+   * worse than no example — and the nested spelling in particular had nothing else in the tree
+   * exercising a string literal inside an interpolation.
+   */
+  "the documented way to write a coloured diagnostic" - {
+
+    "binds the two escapes first, and writes nothing when output is not a terminal" in {
+      tty("""import sysl.term.{red, reset}
+            |
+            |val paint = color()
+            |val on    = if paint then red else ""
+            |val off   = if paint then reset else ""
+            |
+            |print(f"${on}error${off}: not found")""".stripMargin) shouldBe "error: not found\n"
+    }
+
+    // The same thing said inline. A `"` inside `${…}` closes nothing, which is the part worth
+    // pinning: the two spellings have to stay interchangeable for the shorter one to be publishable.
+    "and says the same inline, where the escape is chosen inside the interpolation" in {
+      tty("""import sysl.term.{red, reset}
+            |
+            |val paint = color()
+            |
+            |print(f"${if paint then red else ""}error${if paint then reset else ""}: not found")"""
+        .stripMargin) shouldBe "error: not found\n"
+    }
+  }
+
   "either half refusing is enough" - {
 
     "NO_COLOR beats a capable terminal" in {
