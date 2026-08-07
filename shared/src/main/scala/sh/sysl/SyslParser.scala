@@ -163,7 +163,7 @@ class SyslParser(val source: Source)
    * answered with the sentence rather than with the list of forms the grammar could still have read.
    */
   protected lazy val attributedDecl: PackratParser[Stmt] =
-    rep1(attribute <~ opt(newlines)) >> { as =>
+    rep1(attribute <~ skipNewlines) >> { as =>
       // Once an attribute has been read the statement is committed to being an attributed
       // declaration, which is what `>>` buys: everything after it is read against that, so a
       // declaration that cannot carry one is answered with the sentence below rather than with the
@@ -390,8 +390,8 @@ class SyslParser(val source: Source)
    * fall-through to an expression statement is exact rather than a matter of ordering.
    */
   protected lazy val asmStmt: PackratParser[Stmt] =
-    softWord("asm") ~> newline ~> indent ~> opt(newlines) ~>
-      repsep(asmArm, newlines) <~ opt(newlines) <~ dedent ^^ AsmStmt.apply
+    softWord("asm") ~> newline ~> indent ~> skipNewlines ~>
+      repsep(asmArm, newlines) <~ skipNewlines <~ dedent ^^ AsmStmt.apply
 
   /** `[x86_64, aarch64]` and what answers for them. The architecture names are not checked here —
    * the grammar has no idea which processors exist, and a name outside the set is a diagnostic
@@ -409,7 +409,7 @@ class SyslParser(val source: Source)
   protected lazy val asmArmBody: Parser[AsmBody] =
     (softWord("unavailable") ~> asmText ^^ AsmUnavailable.apply) |
       (asmText ^^ (line => AsmCode(List(line), Nil, Nil))) |
-      (newline ~> indent ~> opt(newlines) ~> repsep(asmItem, newlines) <~ opt(newlines) <~ dedent ^^ gatherAsm) |
+      (newline ~> indent ~> skipNewlines ~> repsep(asmItem, newlines) <~ skipNewlines <~ dedent ^^ gatherAsm) |
       success(AsmCode(Nil, Nil, Nil))
 
   /** A line inside an arm: an instruction, an operand, or what the arm destroys. They are collected
@@ -477,19 +477,19 @@ class SyslParser(val source: Source)
     accept("'end'", { case t: lexical.Identifier if t.chars == "end" => () })
 
   protected def endMarker(construct: String): Parser[Unit] =
-    opt(newlines) ~> softEnd ~> op(construct) ^^^ (())
+    onNextLine(softEnd) ~> op(construct) ^^^ (())
 
   /** `elif cond then …` is sugar for `else if cond then …` — each one nests into the else
    * branch of the previous, so no distinct AST node is needed.
    */
   protected lazy val elifClause: Parser[(Expr, List[Stmt])] =
-    opt(newlines) ~> op("elif") ~> expression ~ body("then") ^^ { case c ~ b => (c, b) }
+    onNextLine(op("elif")) ~> expression ~ body("then") ^^ { case c ~ b => (c, b) }
 
   /** `else` sits on a fresh line after a block body, or on the same line after an inline
    * one — so any intervening `Newline` is optional.
    */
   protected lazy val elseClause: Parser[List[Stmt]] =
-    opt(newlines) ~> op("else") ~> (suite | inlineBody)
+    onNextLine(op("else")) ~> (suite | inlineBody)
 
   /** `while cond body [else …]` — an expression. The optional `else` reuses the same clause as
    * `if`, sitting after the body and before any `end while`.
@@ -516,7 +516,7 @@ class SyslParser(val source: Source)
    * be closing a block that has just been closed.
    */
   protected lazy val doWhileExpr: PackratParser[Expr] =
-    opt(labelRef) ~ (op("do") ~> (suite | inlineBody)) ~ (opt(newlines) ~> op("while") ~> expression) ~
+    opt(labelRef) ~ (op("do") ~> (suite | inlineBody)) ~ (skipNewlines ~> op("while") ~> expression) ~
       opt(elseClause) ^^ {
         case lbl ~ b ~ c ~ e => DoWhile(lbl, b, c, e)
       }
@@ -596,7 +596,7 @@ class SyslParser(val source: Source)
 
 
   protected lazy val statements: PackratParser[List[Stmt]] =
-    opt(newlines) ~> repsep(statement, newlines) <~ opt(newlines)
+    skipNewlines ~> repsep(statement, newlines) <~ skipNewlines
 
   /** A file: an optional module header, the clauses that go with it, then its statements. A file
    * with no header contributes to the anonymous root module, which is what lets a one-file program
@@ -604,13 +604,13 @@ class SyslParser(val source: Source)
    * module is a module like any other.
    */
   protected lazy val program: PackratParser[Program] =
-    opt(newlines) ~> opt(moduleHeader) >> { m =>
+    skipNewlines ~> maybe(moduleHeader) >> { m =>
       // An attribute goes on a line of its own, which is what both `13 §4` and `capabilities.md`
       // show and what keeps `module m @no_alloc @requires(os)` from being a line anyone has to read.
       // The exception is a file that declares no module: the root module is a module like any other,
       // and there is no header for its attributes to sit below, so there they may open the file.
       val lead = if m.isDefined then success(List.empty[HeaderClause])
-                 else opt(headerAttr) ^^ (_.toList.flatten)
+                 else maybe(headerAttr) ^^ (_.toList.flatten)
 
       lead ~ rep(newlines ~> headerAttr) ~ statements ^^ {
         case first ~ rest ~ body =>

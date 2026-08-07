@@ -54,12 +54,52 @@ trait SyslParserBase extends PackratParsers {
    * never overwrites what an inner one already recorded — so a rule that merely passes its
    * operand through costs nothing, and only the rule that actually built the node decides where
    * it points. `p` is by-name so a rule may wrap a `lazy val` declared later in the file.
+   *
+   * **The node is stamped in place and `p`'s own result is handed back**, rather than a fresh
+   * `Success` around it. A `Success` carries the furthest failure the parse reached on its way here
+   * (`lastFailure`), which is what a parser that backtracks and then succeeds knows about the file
+   * and nothing else does — and it is what `phrase` reports when the whole parse stops short. That
+   * field has no public constructor, so rebuilding the result silently emptied it: every rule in the
+   * grammar is wrapped in this one, so what survived to be reported was whatever failed *outside*
+   * the outermost `at`, which is a position near the top of the file rather than near the mistake.
+   *
+   * **A failure the rule did not get past is dropped, and only one further on is kept.** A rule that
+   * ends in an optional tail — `logicalOr ~ assignOp ~ expression | logicalOr`, or any `opt` — leaves
+   * behind a failure at exactly the token it stopped before, saying which of the tail's spellings it
+   * looked for last. That is a road not taken rather than a reason, and it is at the position the
+   * enclosing rule is about to complain about itself, with a message about what it actually wanted.
+   * `val x = 1 2` reported `'>>=' expected` from an assignment nobody was writing; the token the
+   * statement wanted there is a newline, and dropping the road not taken is what lets it say so.
+   * Rebuilding the result is how the field is emptied, since it cannot be written.
    */
   protected def at[T <: Positioned](p: => Parser[T]): Parser[T] =
     Parser { in =>
       p(in) match {
-        case Success(t, rest) => Success(t.setPos(posOf(in)), rest)
-        case other            => other
+        case s @ Success(t, rest) =>
+          t.setPos(posOf(in))
+
+          if s.lastFailure.exists(f => !(rest.pos < f.next.pos)) then Success(t, rest) else s
+        case other => other
+      }
+    }
+
+  /** Renames the failure `p` reports when it fails **without consuming anything**, so the reader is
+   * told what was wanted rather than which candidate the grammar happened to try last.
+   *
+   * The precedence ladder is a stack of alternations, and `Failure.append` keeps the *last* of the
+   * candidates that failed at one position. A token that can begin no expression at all fails every
+   * level of the ladder at the same place, so what was reported was whatever sits at the bottom of
+   * the last alternative tried — which is why four unrelated mistakes all used to say `'..' expected`
+   * and mention a range nobody had written.
+   *
+   * The rename fires only at the rule's own start. A failure further along is the grammar having got
+   * somewhere and then found something specific missing, and that message is the better one.
+   */
+  protected def describe[T](what: String)(p: => Parser[T]): Parser[T] =
+    Parser { in =>
+      p(in) match {
+        case f: Failure if !(in.pos < f.next.pos) => Failure(s"$what expected", in)
+        case other                                => other
       }
     }
 
@@ -93,6 +133,57 @@ trait SyslParserBase extends PackratParsers {
   protected val dedent: Parser[Unit]  = accept("dedent", { case lexical.Dedent => () })
 
   protected def newlines: Parser[Unit] = rep1(newline) ^^^ (())
+
+  /** Blank lines, however many, including none — the spelling to reach for wherever a construct
+   * tolerates them rather than requires them.
+   *
+   * It cannot fail, and that is the point rather than a convenience. `opt(newlines)` reads the same
+   * tokens, but on a line that starts with something else it first *records* a failure saying a
+   * newline was expected, and that expectation then competes with the real one: a file whose first
+   * statement will not parse was reported as `newline expected` against a line where a newline would
+   * have been no help at all. Nothing is ever owed a newline here, so nothing should say it was.
+   */
+  protected def skipNewlines: Parser[Unit] = Parser { in =>
+    var rest = in
+
+    while (!rest.atEnd && rest.first == lexical.Newline) rest = rest.rest
+
+    Success((), rest)
+  }
+
+  /** A continuation the writer *may* have put on a following line — a `match`, an `else`, an `end`.
+   *
+   * Blank lines are crossed to look for it, and where it is not there the refusal is reported back
+   * at the token the search started from. Reporting it where the search ended would be a demand for
+   * a keyword nobody was writing, at a line the reader had not connected to this construct — and,
+   * being further into the file, it would outrank the real mistake and be the one message shown.
+   * `print(1)` followed by a stray `)` was reported as `'match' expected` against the `)`.
+   */
+  protected def onNextLine[T](p: => Parser[T]): Parser[T] =
+    Parser { in =>
+      (skipNewlines ~> p)(in) match {
+        case f: Failure => Failure(f.msg, in)
+        case other      => other
+      }
+    }
+
+  /** `opt(p)` for a construct whose **absence is ordinary**, such as a file's module header.
+   *
+   * `opt` records what `p` wanted even when `p` never began, so a file that opens with something the
+   * grammar cannot read at all was told `'module' expected` — a header nobody omits by mistake, and
+   * a demand that would not have helped. Here a refusal at the first token is dropped: the construct
+   * simply is not there. A refusal *after* one is kept, exactly as `opt` keeps it, because by then
+   * the writer had started the construct and the complaint is about how it goes on.
+   */
+  protected def maybe[T](p: => Parser[T]): Parser[Option[T]] =
+    Parser { in =>
+      p(in) match {
+        case s: Success[?]                     => s.map(Some(_)).asInstanceOf[ParseResult[Option[T]]]
+        case f: Failure if in.pos < f.next.pos => f.append(Success(None, in))
+        case _: Failure                        => Success(None, in)
+        case e: Error                          => e
+      }
+    }
 
   // --- reached across the grammar's areas -----------------------------------------------
   //

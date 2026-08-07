@@ -77,12 +77,30 @@ The parser is a `PackratParsers` grammar with `type Elem = Token`, fed the `List
   revisited — because the tokens are fixed before parsing starts.
 
 **The accepted cost — and its mitigation.** The real combinator weakness packrat does *not*
-fix is **error-message quality and recovery**: ordered choice reports failures at confusing
-positions, and there is no built-in multi-error recovery. We accept this and mitigate it where
-it matters, with explicit `failure` / `err` messages and commit points on the productions
-whose diagnostics users hit most (statement heads, type positions, block openers). The trade
-buys a large amount of **development speed**, letting effort go to the language — types, memory
-model, semantics — rather than parser plumbing.
+fix is **error-message quality and recovery**: ordered choice ranks failures by how far each
+candidate got rather than by what the writer meant, and there is no built-in multi-error
+recovery. We accept this and mitigate it where it matters, with explicit `failure` / `err`
+messages and commit points on the productions whose diagnostics users hit most (statement
+heads, type positions, block openers). The trade buys a large amount of **development speed**,
+letting effort go to the language — types, memory model, semantics — rather than parser
+plumbing.
+
+**Confusing *positions*, though, were a defect of ours and not a property of the technique.**
+The library ranks by position correctly and carries the furthest failure through a rule that
+backtracked and then succeeded; `at`, which every production is wrapped in, rebuilt the result
+and so discarded that record on the way past. What was left to report came from outside the
+outermost production, which put the caret at the top of the enclosing block however far down
+the mistake was. `at` now stamps the node in place and hands the result back untouched.
+
+What ordered choice does still decide is the *message*, and four combinators shape it. `describe`
+renames a production's refusal where the production consumed nothing, so a token that can begin no
+expression is told `expression expected` rather than named after whichever candidate happened to
+sit last in the ladder. The other three exist because **an absence must not be spoken of as an
+expectation**: an optional construct that is simply not there records what it wanted, and that
+expectation then competes with — and, being further into the file, outranks — the real mistake.
+`skipNewlines` reads blank lines and cannot fail; `onNextLine` looks past them for a continuation
+keyword and reports its absence back where the search began; `maybe` is `opt` for a construct whose
+absence is ordinary, dropping a refusal at the first token and keeping one after it.
 
 ## Source positions
 

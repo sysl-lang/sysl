@@ -25,7 +25,9 @@ trait ExprParser extends SyslParserBase {
    * alternative is also the ordinary fall-through to `assignment`.
    */
   lazy val expression: PackratParser[Expr] =
-    at(lambda | quantifier | ifExpr | whileExpr | doWhileExpr | loopExpr | forExpr | matchExpr)
+    describe("expression")(
+      at(lambda | quantifier | ifExpr | whileExpr | doWhileExpr | loopExpr | forExpr | matchExpr),
+    )
 
   /** `x -> x + 1` — a closure literal (`12 §5`).
    *
@@ -174,11 +176,17 @@ trait ExprParser extends SyslParserBase {
   lazy val multiplicative: PackratParser[Expr] =
     at(chainl1(unary, binOp("*") | binOp("/") | binOp("%") | binOp("<<") | binOp(">>")))
 
+  /** The operand every binary level is written over, and so the rule that answers for a token
+   * appearing where a value was wanted: `1 +` runs out here rather than at [[expression]], which was
+   * entered back at the `1`. Both carry the same name for the same reason.
+   */
   lazy val unary: PackratParser[Expr] =
-    at(
-      (op("-") | op("!") | op("~") | op("*") | op("&")) ~ unary ^^ { case o ~ e => Unary(o, e) } |
-        (op("++") | op("--")) ~ unary ^^ { case o ~ e => PreIncDec(o, e) } |
-        postfix,
+    describe("expression")(
+      at(
+        (op("-") | op("!") | op("~") | op("*") | op("&")) ~ unary ^^ { case o ~ e => Unary(o, e) } |
+          (op("++") | op("--")) ~ unary ^^ { case o ~ e => PreIncDec(o, e) } |
+          postfix,
+      ),
     )
 
   lazy val postfix: PackratParser[Expr] =
