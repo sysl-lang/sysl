@@ -140,7 +140,8 @@ class SyslParser(val source: Source)
    * nothing, which is what `private val` there has always done.
    */
   protected lazy val declaration: PackratParser[Stmt] =
-    attributedDecl |
+    assertDecl |
+      attributedDecl |
       implVisibility |
       misplacedOverride |
       staticDecl |
@@ -320,6 +321,27 @@ class SyslParser(val source: Source)
     op("const") ~> ident ~ (op(":") ~> typeRef) ~ (op("=") ~> expression) ^^ {
       case n ~ t ~ v => ConstDecl(n, t, v)
     }
+
+  /** `@assert(cond)`, `@assert(cond, "why")` — a condition checked while compiling.
+   *
+   * It reads its own `@` and stands where a declaration stands, which is what tells it apart from
+   * the annotations of `AttrParser`: those describe the function written under them, and this
+   * describes nothing but itself. That is also why it must be tried **before** `attributedDecl` —
+   * that rule ends in a refusal saying an annotation marks a function, which is exactly the wrong
+   * thing to say about this one.
+   *
+   * The message is raised **inside** the parentheses rather than after them, by the rule a dead
+   * `err` taught: a form that reaches further along the line outranks one that failed earlier, so a
+   * sentence written past the point of divergence is never the one reported.
+   */
+  protected lazy val assertDecl: PackratParser[Stmt] =
+    at(op("@") ~> attrWord("assert") ~> op("(") ~>
+      (expression ~ opt(op(",") ~> strLit) | err(
+        "'@assert' takes a condition the compiler can settle, and an optional message: " +
+          "'@assert(sizeof(T) == 16, \"why\")'")) <~ op(")") ^^ {
+      case (e: Expr) ~ (m: Option[?]) =>
+        AssertDecl(e, m.collect { case StrLit(s) => s })
+    })
 
   /** `val name [: type] = value` — a binding that is written once (`07`, `13 §7`).
    *

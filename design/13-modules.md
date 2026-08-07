@@ -908,6 +908,49 @@ refuses is a name that is not a constant, and a **`val`** is the instructive cas
 running, so it cannot size a type any more than it can stand in a pattern. Recorded from the other side
 in `16`, where the rest of the constrained-subtype design lives.
 
+### `@assert` — a condition settled while compiling
+
+```
+@assert(sizeof(FRect) == 16, "FRect must match SDL_FRect")
+@assert(max_tasks <= 64)
+```
+
+**The condition is a constant expression**, exactly the set above, folded by the same machinery a
+`const` initializer goes through — so it may name constants, `sizeof`, `alignof`, and the arithmetic
+and comparisons over them, and it may name a constant declared below it. A false one is a compile
+error quoting the message; a true one emits nothing at all. The message is optional and is the
+*reader's* sentence, because they know what the number means and the expression alone says only that
+two of them differ.
+
+**It exists because `require` is a runtime check and there was no compile-time one.** `17` is
+explicit that a `require` is still compiled, still branches and still traps, so nothing in the
+language could fail a build on a fact already known while compiling. That is a gap on its own terms
+— a table whose size a protocol fixes had no way to say so — but the case that forced it is a
+binding to C.
+
+**What it buys: a C struct layout that is CHECKED rather than transcribed.** `15 §1` lays every
+struct out in declaration order and claims C compatibility by construction, and `15 §7` refuses
+transcription on the grounds that nothing verifies the claim — *"sysl's own `sizeof` would report
+what sysl laid out, not what C did, so even that comparison is a tautology."* It stops being a
+tautology once both sides are pinned to the same number. The C half was always writable, since a
+`.c` in the tree is compiled with it and for the same target:
+
+```c
+_Static_assert(sizeof(SDL_FRect) == 16, "SDL_FRect size moved");
+_Static_assert(offsetof(SDL_FRect, w) == 8, "SDL_FRect.w moved");
+```
+
+That pins what the *header* says. `@assert(sizeof(FRect) == 16)` pins what *sysl* laid out. Neither
+can drift without the build stopping, and the number is in the source where a reader can see it.
+
+**An attribute rather than a word**, for the reason the capability clauses are (`§4`): it says
+something *about* the module rather than being a construct the language executes. A reserved word
+would also have cost the lexer, the reference's reserved-word table and its stated count, and the
+highlighting grammar, to buy nothing the sigil does not.
+
+**It declares no name**, which is why it is not in the visibility table and why two saying the same
+thing are two checks rather than a duplicate. Nothing can refer to one.
+
 **A constant has no address.** It is folded into each use and occupies no storage, which is why it
 needs no initialization order, why a `no alloc` module may hold one, and why `&capacity` is not a
 thing to write. That is also exactly what rules it out for the *other* half of what the guide

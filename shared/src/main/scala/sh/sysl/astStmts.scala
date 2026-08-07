@@ -90,6 +90,28 @@ case class VarDecl(name: String, typ: Option[TypeRef], init: Option[Expr],
  */
 case class ConstDecl(name: String, typ: TypeRef, value: Expr, vis: Visibility = Visibility.Public) extends Stmt
 
+/** `@assert(cond)`, `@assert(cond, "why")` — a condition checked while compiling.
+ *
+ * The condition is a constant expression (`13 §Constants`) folded by the same machinery a `const`
+ * initializer goes through, so it may name constants, `sizeof`, `alignof` and the arithmetic over
+ * them. A false one is a compile error quoting the message; a true one emits nothing at all.
+ *
+ * **It exists because `require` is the wrong tool and there was no right one.** A `require` is a
+ * *runtime* precondition — `17` is explicit that it is still compiled, still branches and still
+ * traps — so nothing could fail a build on a fact known while compiling. What wants that most is a
+ * binding to C: sysl lays a struct out in declaration order and claims C compatibility by
+ * construction (`15 §1`), and the claim was unverifiable from inside sysl, because `sizeof` reports
+ * what sysl laid out rather than what the header says. Paired with a `_Static_assert` in a `.c`
+ * beside it — which `15 §7` already compiles, for the target — the two pin both sides to one
+ * number and neither can drift silently.
+ *
+ * It is an **attribute rather than a word** for the reason the capability clauses are (`13 §4`): it
+ * says something *about* the module rather than being a construct the language executes, and a
+ * reserved word would have cost the lexer, the reference's reserved-word table and its stated count,
+ * and the highlighting grammar — in two repositories — to buy nothing a sigil does not.
+ */
+case class AssertDecl(cond: Expr, message: Option[String]) extends Stmt
+
 /** `static val`, `static var`, `static f() -> …` — a declaration in the file the program starts in
  * that belongs to the **module** rather than to that file's body (`13 §7`).
  *

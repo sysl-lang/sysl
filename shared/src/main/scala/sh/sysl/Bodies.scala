@@ -34,7 +34,10 @@ object Bodies {
    */
   def isDeclaration(s: Stmt): Boolean = s match
     case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl |
-        _: ExternVarDecl | _: ImportDecl | _: ConstDecl | _: ValDecl | _: TypeDecl | _: StaticDecl =>
+        _: ExternVarDecl | _: ImportDecl | _: ConstDecl | _: ValDecl | _: TypeDecl | _: StaticDecl |
+        // An `@assert` runs nothing: it is settled while compiling and emits no code, so a file
+        // holding one is still a file of pure declarations and does not become the entry file.
+        _: AssertDecl =>
       true
     case _ => false
 
