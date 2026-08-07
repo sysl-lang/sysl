@@ -34,7 +34,7 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * prevent. A floor is the cheap guard: it needs no maintenance as tests are added, and it fails
    * loudly if a whole file stops being collected.
    */
-  private val floor = 12
+  private val floor = 60
 
   /** The library, compiled as a **test build of itself**.
    *

@@ -1,0 +1,202 @@
+module sysl.math
+@tests
+
+// What `sysl.math` computes, asserted in sysl.
+//
+// The arithmetic identities are what belongs here: that `gcd` is symmetric, that `pow` at zero is
+// one, that a float rounds half away from zero. What is deliberately **not** here is the claim these
+// tests would be least able to make -- that one spelling reaches both widths, and that an `f32` is
+// really computing at `f32`'s width. Those are claims about generic dispatch and about codegen, and
+// `MathTests` keeps them because its expectation is written in another language: a compiler that had
+// quietly widened everything to binary64 would compile the `f32` assertions here into binary64 ones
+// and pass them.
+
+// -- comparison ------------------------------------------------------------------------------------
+
+@test("min and max pick the right end")
+min_max_pick()
+    assert_eq(min(3, 7), 3)
+    assert_eq(max(3, 7), 7)
+    assert_eq(min(-3, -7), -7)
+end min_max_pick
+
+// The equal case is the one where an implementation can differ from itself: `if b < a` and
+// `if b <= a` give the same answer for distinct arguments and disagree about which of two equal ones
+// comes back. It matters for a non-`int` `T` whose values can be equal without being identical.
+@test("min and max of equal arguments answer with that value")
+min_max_equal()
+    assert_eq(min(4, 4), 4)
+    assert_eq(max(4, 4), 4)
+end min_max_equal
+
+@test("clamp holds a value inside the range")
+clamp_holds()
+    assert_eq(clamp(5, 1, 10), 5)
+    assert_eq(clamp(0, 1, 10), 1)
+    assert_eq(clamp(99, 1, 10), 10)
+end clamp_holds
+
+@test("and a value already at a bound stays there")
+clamp_at_bounds()
+    assert_eq(clamp(1, 1, 10), 1)
+    assert_eq(clamp(10, 1, 10), 10)
+end clamp_at_bounds
+
+// -- integer arithmetic -------------------------------------------------------------------------------
+
+@test("pow raises to the exponent")
+pow_raises()
+    assert_eq(pow(2, 10u32), 1024)
+    assert_eq(pow(3, 3u32), 27)
+end pow_raises
+
+// Anything to the zero is one, including zero -- the convention, and the case a loop written as
+// "multiply n times starting from the base" gets wrong.
+@test("anything to the zero is one")
+pow_zero()
+    assert_eq(pow(2, 0u32), 1)
+    assert_eq(pow(0, 0u32), 1)
+end pow_zero
+
+@test("gcd is the greatest common divisor")
+gcd_value()
+    assert_eq(gcd(12, 18), 6)
+    assert_eq(gcd(17, 5), 1)
+end gcd_value
+
+// Zero is the identity, which falls out of the Euclidean algorithm rather than being written into
+// it -- and is the case that loops forever if the recursion is the wrong way round.
+@test("gcd with zero is the other argument")
+gcd_zero()
+    assert_eq(gcd(0, 5), 5)
+    assert_eq(gcd(5, 0), 5)
+end gcd_zero
+
+@test("gcd does not care which way round its arguments are")
+gcd_symmetric()
+    assert_eq(gcd(12, 18), gcd(18, 12))
+end gcd_symmetric
+
+@test("lcm is the least common multiple")
+lcm_value()
+    assert_eq(lcm(4, 6), 12)
+    assert_eq(lcm(7, 3), 21)
+end lcm_value
+
+@test("divmod answers with both halves of a division")
+divmod_both()
+    var q, r = divmod(17, 5)
+
+    assert_eq(q, 3)
+    assert_eq(r, 2)
+end divmod_both
+
+// -- powers of two ---------------------------------------------------------------------------------
+//
+// One is a power of two and zero is not, and the usual one-line test -- `x & (x - 1) == 0` -- says
+// the opposite about zero. That is the whole reason this is a library function rather than something
+// each caller writes.
+
+@test("a power of two is recognised")
+power_of_two_yes()
+    assert(is_power_of_two(1))
+    assert(is_power_of_two(2))
+    assert(is_power_of_two(1024))
+end power_of_two_yes
+
+@test("and zero and a non-power are not")
+power_of_two_no()
+    assert(!is_power_of_two(0))
+    assert(!is_power_of_two(3))
+    assert(!is_power_of_two(-4))
+end power_of_two_no
+
+@test("the next power of two is the one at or above")
+next_power_at_or_above()
+    assert_eq(next_power_of_two(5).unwrap(), 8)
+    assert_eq(next_power_of_two(1).unwrap(), 1)
+    assert_eq(next_power_of_two(8).unwrap(), 8)
+end next_power_at_or_above
+
+// -- bit counting ------------------------------------------------------------------------------------
+
+@test("the ones and the zeros account for the whole width")
+bits_account_for_the_width()
+    var x = 5
+
+    assert_eq(x.count_ones(), 2u32)
+    assert_eq(x.count_ones() + x.count_zeros(), 32u32)
+end bits_account_for_the_width
+
+@test("the leading and trailing runs are counted from the ends they name")
+bit_runs()
+    assert_eq(4.trailing_zeros(), 2u32)
+    assert_eq(1.leading_zeros(), 31u32)
+end bit_runs
+
+// -- floating point ------------------------------------------------------------------------------------
+
+@test("the roots are the roots")
+roots()
+    assert_approx_eq(9.0.sqrt(), 3.0, 1.0e-12)
+    assert_approx_eq(27.0.cbrt(), 3.0, 1.0e-12)
+end roots
+
+// The exponent and the logarithm undo each other, which is worth asserting as a pair: either one
+// alone could be scaled by a constant and still look plausible.
+@test("the exponential and the logarithm undo each other")
+exp_ln_inverse()
+    assert_approx_eq(e.ln(), 1.0, 1.0e-12)
+    assert_approx_eq(1.0.exp(), e, 1.0e-12)
+    assert_approx_eq(5.0.ln().exp(), 5.0, 1.0e-12)
+end exp_ln_inverse
+
+@test("the circle constants agree with the trigonometry")
+trig_at_the_constants()
+    assert_approx_eq(pi.sin(), 0.0, 1.0e-12)
+    assert_approx_eq(pi.cos(), -1.0, 1.0e-12)
+    assert_approx_eq((pi / 2.0).sin(), 1.0, 1.0e-12)
+end trig_at_the_constants
+
+// The four roundings differ only on a negative fraction and on a tie, so that is where they are
+// asserted -- on 2.5 and -2.5 they give four different answers.
+@test("the four roundings differ where they are supposed to")
+roundings_differ()
+    assert_eq((-2.5).floor(), -3.0)
+    assert_eq((-2.5).ceil(), -2.0)
+    assert_eq((-2.5).trunc(), -2.0)
+    assert_eq((-2.5).round(), -3.0)
+end roundings_differ
+
+@test("round goes half away from zero")
+round_half_away()
+    assert_eq(2.5.round(), 3.0)
+    assert_eq(3.5.round(), 4.0)
+end round_half_away
+
+// The two values no literal spells, and the reason `is_nan` exists at all: NaN is the one value not
+// equal to itself, so `x == x` is the test and `x == nan()` is never true.
+@test("NaN is not equal to itself")
+nan_is_not_itself()
+    var x = nan()
+
+    assert(x.is_nan())
+    assert(!(x == x))
+end nan_is_not_itself
+
+@test("infinity is beyond every finite value")
+infinity_is_beyond()
+    assert(infinity().is_infinite())
+    assert(infinity() > real.max_value())
+    assert(!1.0.is_infinite())
+end infinity_is_beyond
+
+// `approx_eq` takes an absolute tolerance and `approx_eq_rel` a relative one, and the pair only
+// earns its keep where the two disagree -- at a large magnitude, where a fixed tolerance is far too
+// tight and a proportional one is right.
+@test("an absolute tolerance and a relative one are different questions")
+absolute_and_relative()
+    assert(approx_eq(1.0, 1.0 + 1.0e-15, 1.0e-12))
+    assert(!approx_eq(1.0e9, 1.0e9 + 1.0, 1.0e-12))
+    assert(approx_eq_rel(1.0e9, 1.0e9 + 1.0, 1.0e-6))
+end absolute_and_relative

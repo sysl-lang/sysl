@@ -1,0 +1,180 @@
+module sysl.time
+@tests
+
+// What `sysl.time` computes, asserted in sysl.
+//
+// Calendar arithmetic is the strongest case in the library for tests written here rather than in
+// Scala: every claim is a fact about the Gregorian calendar, the answers are constants a reader can
+// check against a wall calendar, and none of it is about the compiler. A `days_from_civil` that had
+// drifted by a day would be caught by a date whose weekday everybody knows, and by nothing else.
+
+// -- the civil <-> serial round trip ---------------------------------------------------------------
+//
+// The whole of the date machinery rests on Howard Hinnant's `days_from_civil`, which is a closed
+// form rather than a table -- so the way it fails is by being off by one somewhere far from the
+// epoch, in a leap year, or across a century boundary. Each case below is one of those places.
+
+@test("the epoch is day zero")
+epoch_is_zero()
+    assert_eq(date_at(1970, 1, 1).day, 0)
+end epoch_is_zero
+
+@test("a date and its serial round-trip")
+civil_round_trip()
+    var d = date_at(2026, 8, 6)
+
+    assert_eq(year_of(d), 2026)
+    assert_eq(month_of(d), 8)
+    assert_eq(day_of(d), 6)
+end civil_round_trip
+
+// Before the epoch the serial goes negative, which is where a formula using truncating division
+// instead of flooring division comes apart -- `floor_div` exists for exactly this.
+@test("a date before the epoch round-trips too")
+before_epoch_round_trip()
+    var d = date_at(1900, 2, 28)
+
+    assert(d.day < 0)
+    assert_eq(year_of(d), 1900)
+    assert_eq(month_of(d), 2)
+    assert_eq(day_of(d), 28)
+end before_epoch_round_trip
+
+// -- leap years ------------------------------------------------------------------------------------
+//
+// The three rules, each with the case that distinguishes it from the rule above. 1900 and 2000 are
+// the pair that matters: both divisible by 100, and only one of them a leap year.
+
+@test("the divisible-by-four rule")
+leap_by_four()
+    assert(leap_year(2024))
+    assert(!leap_year(2023))
+end leap_by_four
+
+@test("the century exception, and the exception to it")
+leap_centuries()
+    assert(!leap_year(1900))
+    assert(leap_year(2000))
+end leap_centuries
+
+@test("February has the day only in a leap year")
+february_length()
+    assert_eq(days_in_month(2024, 2), 29)
+    assert_eq(days_in_month(2023, 2), 28)
+    assert_eq(days_in_month(1900, 2), 28)
+    assert_eq(days_in_month(2000, 2), 29)
+end february_length
+
+@test("the other months do not vary")
+month_lengths()
+    assert_eq(days_in_month(2023, 1), 31)
+    assert_eq(days_in_month(2023, 4), 30)
+    assert_eq(days_in_month(2023, 12), 31)
+end month_lengths
+
+// The 29th of February exists as a date only in a leap year, and the serial round trip is what says
+// so -- a formula that admitted it in 2023 would answer with the 1st of March.
+@test("the leap day round-trips in a leap year")
+leap_day_round_trip()
+    var d = date_at(2024, 2, 29)
+
+    assert_eq(month_of(d), 2)
+    assert_eq(day_of(d), 29)
+end leap_day_round_trip
+
+// -- day of year and weekday ------------------------------------------------------------------------
+
+@test("the day of the year counts from one")
+day_of_year_counts()
+    assert_eq(day_of_year(date_at(2023, 1, 1)), 1)
+    assert_eq(day_of_year(date_at(2023, 12, 31)), 365)
+    assert_eq(day_of_year(date_at(2024, 12, 31)), 366)
+end day_of_year_counts
+
+// The epoch was a Thursday. That single fact is what anchors the weekday computation, and it is
+// checkable against any calendar, which is what makes it worth asserting rather than deriving.
+@test("the epoch was a Thursday")
+epoch_weekday()
+    assert_eq(weekday_name(weekday(date_at(1970, 1, 1))), "Thursday")
+end epoch_weekday
+
+@test("and the weekday advances with the date")
+weekday_advances()
+    assert_eq(weekday_name(weekday(date_at(1970, 1, 2))), "Friday")
+    assert_eq(weekday_name(weekday(date_at(1970, 1, 4))), "Sunday")
+end weekday_advances
+
+// -- durations ---------------------------------------------------------------------------------------
+//
+// A duration is microseconds under the surface, and the pair of accessors is where that shows: the
+// `whole_*` family says how many of a unit fit in the whole span, and `odd_*` says what is left over
+// after the unit above it. Asserting only one of the two would leave a `%` and a `/` swapped.
+
+@test("the units convert as they say")
+duration_units()
+    assert_eq(whole_seconds(minutes(2i64)), 120i64)
+    assert_eq(whole_minutes(hours(3i64)), 180i64)
+    assert_eq(whole_hours(days(2i64)), 48i64)
+end duration_units
+
+@test("the whole count and the odd remainder are different questions")
+duration_whole_and_odd()
+    var d = seconds(3661i64)
+
+    assert_eq(whole_hours(d), 1i64)
+    assert_eq(odd_minutes(d), 1i64)
+    assert_eq(odd_seconds(d), 1i64)
+
+    // The discriminating pair: 3661 seconds is one hour, but it is also 3661 seconds.
+    assert_eq(whole_seconds(d), 3661i64)
+end duration_whole_and_odd
+
+@test("the span between two instants is their difference")
+duration_since()
+    var start = from_offset(datetime_at(2026, 1, 1, 0, 0, 0), Offset(0))
+    var later = from_offset(datetime_at(2026, 1, 1, 1, 0, 0), Offset(0))
+
+    assert_eq(whole_minutes(since(later, start)), 60i64)
+end duration_since
+
+// -- parsing ------------------------------------------------------------------------------------------
+
+@test("a date parses from its written form")
+parse_date_value()
+    var d = parse_date("2026-08-06").unwrap()
+
+    assert_eq(year_of(d), 2026)
+    assert_eq(month_of(d), 8)
+    assert_eq(day_of(d), 6)
+end parse_date_value
+
+// A date that is well-formed and does not exist is the interesting refusal -- the shape is right and
+// only the calendar says no, which a parser checking syntax alone would let through.
+@test("a date that the calendar does not have is refused")
+parse_date_refuses_impossible()
+    assert(parse_date("2023-02-29").is_err())
+    assert(parse_date("2026-13-01").is_err())
+    assert(parse_date("2026-00-10").is_err())
+end parse_date_refuses_impossible
+
+@test("and so is one that is not a date at all")
+parse_date_refuses_malformed()
+    assert(parse_date("").is_err())
+    assert(parse_date("2026-08").is_err())
+    assert(parse_date("today").is_err())
+end parse_date_refuses_malformed
+
+@test("a time parses from its written form")
+parse_time_value()
+    var t = parse_time("13:45:07").unwrap()
+
+    assert_eq(hour_of(t), 13)
+    assert_eq(minute_of(t), 45)
+    assert_eq(second_of(t), 7)
+end parse_time_value
+
+@test("an hour the clock does not have is refused")
+parse_time_refuses()
+    assert(parse_time("24:00:00").is_err())
+    assert(parse_time("12:60:00").is_err())
+end parse_time_refuses

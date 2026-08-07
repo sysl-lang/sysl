@@ -1,0 +1,176 @@
+module sysl.text
+@tests
+
+// What `sysl.text` promises, asserted in sysl.
+//
+// These are the clearest case for a library test rather than a Scala one: every claim below is about
+// a string operation and none is about the compiler. `split` on an empty separator, `fields` over
+// runs of blanks, a parse that overflows -- a reader wanting to know what the function does can read
+// the answer here, in the module, rather than in a suite written in another language.
+
+// -- splitting and joining ------------------------------------------------------------------------
+
+@test("split cuts at every separator")
+split_cuts()
+    assert_slice_eq(split("a,b,c", ","), ["a", "b", "c"])
+end split_cuts
+
+// The empty pieces are the point: `split` reports the gaps it found rather than tidying them away,
+// which is what makes it invertible with `join`.
+@test("split keeps the empty pieces at both ends")
+split_keeps_empties()
+    assert_slice_eq(split(",a,", ","), ["", "a", ""])
+end split_keeps_empties
+
+@test("a separator that does not occur yields the whole string")
+split_without_separator()
+    assert_slice_eq(split("abc", ","), ["abc"])
+end split_without_separator
+
+@test("a multi-byte separator is matched whole")
+split_multibyte_separator()
+    assert_slice_eq(split("a::b", "::"), ["a", "b"])
+end split_multibyte_separator
+
+// `fields` is the other splitter and is deliberately not `split` on a space: it treats a *run* of
+// blanks as one, and ignores those at the ends, which is what makes it right for a line of input and
+// wrong for a record.
+@test("fields treats a run of blanks as one separator")
+fields_collapses_runs()
+    assert_slice_eq(fields("  a   b  "), ["a", "b"])
+end fields_collapses_runs
+
+@test("fields of nothing but blanks is empty")
+fields_of_blanks()
+    var got = fields("   ")
+
+    assert_eq(got.len, 0usize)
+end fields_of_blanks
+
+@test("join puts the separator between and not around")
+join_between()
+    assert_eq(join(["a", "b", "c"], ", "), "a, b, c")
+end join_between
+
+@test("joining one piece is that piece")
+join_single()
+    assert_eq(join(["a"], ", "), "a")
+end join_single
+
+@test("joining nothing is nothing")
+join_empty()
+    var none: []string = []
+
+    assert_eq(join(none, ", "), "")
+end join_empty
+
+// The pair that says the two are inverses, which is the property a reader actually relies on.
+@test("split and join undo each other")
+split_join_round_trip()
+    assert_eq(join(split("a,b,,c", ","), ","), "a,b,,c")
+end split_join_round_trip
+
+// -- rewriting ------------------------------------------------------------------------------------
+
+@test("repeat concatenates n copies")
+repeat_copies()
+    assert_eq(repeat("ab", 3usize), "ababab")
+end repeat_copies
+
+@test("repeating nothing times is the empty string")
+repeat_zero()
+    assert_eq(repeat("ab", 0usize), "")
+end repeat_zero
+
+@test("replace_all rewrites every occurrence")
+replace_every()
+    assert_eq(replace_all("a.b.c", ".", "-"), "a-b-c")
+end replace_every
+
+// The overlapping case: replacing "aa" in "aaa" finds one match and leaves the odd one, rather than
+// rescanning what it just wrote.
+@test("replace_all does not rescan what it wrote")
+replace_no_rescan()
+    assert_eq(replace_all("aaa", "aa", "b"), "ba")
+end replace_no_rescan
+
+@test("replacing something absent leaves the string alone")
+replace_absent()
+    assert_eq(replace_all("abc", "z", "y"), "abc")
+end replace_absent
+
+// Case mapping is ASCII-only by design -- the Unicode layer does encoding and display width, and
+// case mapping waits on vendoring a table. A byte above ASCII must therefore pass through untouched
+// rather than be mangled, which is the half of the decision worth pinning.
+@test("case mapping is ASCII, and leaves other bytes alone")
+case_is_ascii()
+    assert_eq(to_upper("abc"), "ABC")
+    assert_eq(to_lower("ABC"), "abc")
+    assert_eq(to_upper("é"), "é")
+end case_is_ascii
+
+// -- parsing --------------------------------------------------------------------------------------
+
+@test("an integer parses to its value")
+parse_int_value()
+    assert_eq(parse_int("42").unwrap(), 42)
+    assert_eq(parse_int("-7").unwrap(), -7)
+end parse_int_value
+
+@test("a base is honoured")
+parse_int_base_honoured()
+    assert_eq(parse_int_base("ff", 16).unwrap(), 255)
+    assert_eq(parse_int_base("101", 2).unwrap(), 5)
+end parse_int_base_honoured
+
+// Each of these is a *different* way to not be a number, and a parser that answered `0` for any of
+// them would be the classic silent-wrong-answer. The `Result` is what makes each sayable.
+@test("what is not a number is refused rather than guessed at")
+parse_int_refuses()
+    assert(parse_int("").is_err())
+    assert(parse_int("abc").is_err())
+    assert(parse_int("12x").is_err())
+    assert(parse_int(" 12").is_err())
+end parse_int_refuses
+
+@test("a bool parses from its two spellings and nothing else")
+parse_bool_values()
+    assert(parse_bool("true").unwrap())
+    assert(!parse_bool("false").unwrap())
+    assert(parse_bool("True").is_err())
+    assert(parse_bool("1").is_err())
+end parse_bool_values
+
+// Exact rather than approximate, and deliberately so: 1.5 is a dyadic rational and binary64 holds
+// it exactly, so a tolerance here would be hiding a defect rather than allowing for one. It is also
+// why this test does not reach for `assert_approx_eq` -- that lives in `sysl.math`, and a `sysl.text`
+// test has no business pulling a second module in to compare a number that is exact.
+@test("a real parses to its value")
+parse_real_value()
+    assert_eq(parse_real("1.5").unwrap(), 1.5)
+    assert(parse_real("x").is_err())
+end parse_real_value
+
+// -- display width --------------------------------------------------------------------------------
+//
+// The whole reason `columns` exists: a byte count, a character count and a column count are three
+// different numbers, and only the third lays out a table. Each case below is one where two of the
+// three disagree.
+
+@test("ASCII is one column per byte")
+columns_ascii()
+    assert_eq(columns("abc".bytes), 3usize)
+end columns_ascii
+
+@test("a wide character takes two columns and more than one byte")
+columns_wide()
+    // Three bytes, one character, two columns -- all three numbers different at once.
+    assert_eq(columns("世".bytes), 2usize)
+end columns_wide
+
+@test("an accented letter is two bytes and one column")
+columns_accented()
+    // U+00E9 precomposed: one character, two bytes, one column. The narrow case where a byte count
+    // overstates the width, which is the mistake `columns` was written to stop a table making.
+    assert_eq(columns("é".bytes), 1usize)
+end columns_accented
