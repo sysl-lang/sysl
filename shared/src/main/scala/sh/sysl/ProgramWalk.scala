@@ -426,6 +426,12 @@ trait ProgramWalk
     // `allFuncs`: a closure written inside a generic is a body to report allocation, purity and frame
     // violations against exactly like any other, and only the *emission* is wrong.
     //
+    // **`orderVals` is given `allFuncs` and not this**, which is the one place the distinction has
+    // teeth rather than being tidiness. It settles the order module-level `val`s are initialized in,
+    // from what each initializer *reaches* — so narrowing what it can see would drop edges out of that
+    // graph and could reorder initialization, which is a silent, program-wide behaviour change and
+    // exactly what this fix must not be. Analysis sees everything; only the backend sees less.
+    //
     // **It escapes on the library path alone**, which is why it went unnoticed. A program instantiates
     // the enclosing generic and gets a concrete copy beside the abstract one, so the abstract one is
     // dead weight the backend never asks about; `build-lib` strips `@tests` *before* analysis
@@ -441,7 +447,7 @@ trait ProgramWalk
       enumInsts.values.filterNot(e => e.simple || abstracted(e)).toList,
       vtables.values.toList,
       externs,
-      orderVals(tvals.toList, emitted, vtables.values.toList),
+      orderVals(tvals.toList, allFuncs, vtables.values.toList),
       emitted,
       tmain,
       tentry,

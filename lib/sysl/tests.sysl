@@ -1,0 +1,89 @@
+module sysl
+@tests
+
+// What the root module claims, asserted in sysl.
+//
+// **Decimal rendering is what this file exists for so far.** `impl[T: Integer] Display for T` renders
+// in chunks of up to nineteen digits rather than one digit at a time, which is a real algorithm
+// where a peel-one-digit loop was obvious, and the cases below are the ones that tell a correct
+// implementation from a plausible one. They agree digit for digit with what the old loop produced;
+// that agreement is the whole specification.
+//
+// What is deliberately **not** here is the speed the change was made for. A timing is not an
+// assertion — it is a property of the machine the suite happens to run on — and the numbers are in
+// the ticket where they can be reproduced deliberately.
+
+// The narrow widths, where the chunk is smaller than a `u64` and the divisor-computing loop stops
+// early: `u8` caps at 100, so a three-digit value takes two chunks and exercises the padding.
+@test("an unsigned byte renders across the chunk boundary its own width imposes")
+u8_renders()
+    assert_eq(str(0u8), "0")
+    assert_eq(str(7u8), "7")
+    assert_eq(str(105u8), "105")
+    assert_eq(str(255u8), "255")
+end u8_renders
+
+// **The most negative value of a width is the case a magnitude would get wrong**, its magnitude
+// being one larger than the width holds. Nothing here negates, which is what makes it come out.
+@test("a signed byte renders, including the value that has no positive twin")
+i8_renders()
+    assert_eq(str(-128i8), "-128")
+    assert_eq(str(-7i8), "-7")
+    assert_eq(str(0i8), "0")
+    assert_eq(str(127i8), "127")
+end i8_renders
+
+@test("the middle widths render")
+u16_and_u32_render()
+    assert_eq(str(65535u16), "65535")
+    assert_eq(str(1000u16), "1000")
+    assert_eq(str(4294967295u32), "4294967295")
+    assert_eq(str(-2147483648i32), "-2147483648")
+end u16_and_u32_render
+
+// At `u64` the chunk is the whole value, so this is the single-chunk path — and it is the path
+// ordinary code takes, so it is the one that must not have regressed.
+@test("the whole 64-bit range renders, at both signednesses")
+u64_and_i64_render()
+    assert_eq(str(18446744073709551615u64), "18446744073709551615")
+    assert_eq(str(-9223372036854775808i64), "-9223372036854775808")
+    assert_eq(str(9223372036854775807i64), "9223372036854775807")
+    assert_eq(str(0u64), "0")
+end u64_and_i64_render
+
+// **The pair that catches the one real subtlety.** These differ only in a digit that lives inside an
+// interior chunk, and a renderer that does not pad such a chunk to its full nineteen digits drops it
+// silently — producing a number that is wrong and looks entirely reasonable. The first draft of this
+// algorithm got exactly this wrong.
+@test("a zero inside an interior chunk survives, which is what the padding is for")
+interior_zeros_survive()
+    assert_eq(str(10000000000000000000000000u128), "10000000000000000000000000")
+    assert_eq(str(10000000000000000000000001u128), "10000000000000000000000001")
+
+    // And a value whose every interior chunk is zero but whose top is not.
+    assert_eq(str(100000000000000000000u128), "100000000000000000000")
+end interior_zeros_survive
+
+// A width past two chunks, so that "interior" means more than one chunk and the loop is genuinely
+// iterating rather than doing a first and a last.
+@test("a value spanning three chunks renders")
+wide_values_render()
+    assert_eq(str(123456789012345678901234567890123456789u128),
+              "123456789012345678901234567890123456789")
+    assert_eq(str(-170141183460469231731687303715884105728i128),
+              "-170141183460469231731687303715884105728")
+end wide_values_render
+
+// Interpolation goes through `display` into a real sink rather than through `str`, so this walks the
+// whole path a program actually takes rather than the one the assertions above take.
+//
+// **Padding is deliberately not asserted here.** `display_digits` does that and is untouched by the
+// change; reaching it from a test would need a gathering sink, and `sysl.buf` is built on this module
+// and so cannot be reached from it. What chunking could have broken is *which digits come out*, and
+// that is what every case in this file asks.
+@test("a chunked rendering survives interpolation, which is the path a program takes")
+chunked_digits_interpolate()
+    assert_eq(s"${105u8}", "105")
+    assert_eq(s"${10000000000000000000000001u128}", "10000000000000000000000001")
+    assert_eq(s"n = ${-128i8}", "n = -128")
+end chunked_digits_interpolate
