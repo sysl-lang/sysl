@@ -523,8 +523,24 @@ trait ExprAnalysis
     // A function is not a place — nothing holds it, and there is no slot to point at — so its
     // address is taken here rather than by the walk below, which asks for one (`12 §6a`). A local
     // shadowing the name is an ordinary value and keeps the ordinary reading.
+    // The expected type is handed on because it is what settles a *generic* function's arguments:
+    // there is no written form for them here, and a `*extern` being asked for already fixes the
+    // signature (`12 §6a`).
     case Unary("&", Ident(name)) if lookupOpt(name).isEmpty && !ownValueName(name) && funcKey(name).isDefined =>
-      functionAddress(name, funcKey(name).get)
+      functionAddress(name, funcKey(name).get, expected)
+
+    // `&f[T]` — the spelling a reader arrives with, from a language that writes the arguments here.
+    // Without this the brackets read as an *index*, and the complaint is about `f` not being a value:
+    // true, unhelpful, and it sends the reader to `&f`, which on its own is a second error.
+    //
+    // The form is refused rather than supported because the grammar cannot tell it from `&xs[i]` —
+    // a name, a bracket, and something inside — and only knowing whether the name is a generic
+    // function separates the two (`12 §6a`).
+    case Unary("&", Index(Ident(name), _))
+        if lookupOpt(name).isEmpty && funcKey(name).exists(k => funcDecls.get(k).exists(_.tparams.nonEmpty)) =>
+      err(s"the type arguments of '$name' are not written here — an address reads them from the " +
+        s"type it is wanted at, so write 'var f: *extern(…) -> … = &$name'. The brackets after a " +
+        "name are an index, and there is nothing here to index")
 
     // A nested function's environment is the frame it was declared in (`12 §5a`), and an address is
     // a way of carrying it out of that frame — the same reason the name is not a value either.
