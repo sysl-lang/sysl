@@ -356,7 +356,7 @@ private[sysl] def execute(cfg: Config): Int = {
   // Building a library stops here — there is no program to link it into. An artifact is **for a
   // machine**, exactly as an rlib is, because half of it is compiled object code; the generic half
   // travels as trees because there is nothing to compile until a caller fixes its type arguments.
-  if cfg.command == "build-lib" then return buildLibrary(cfg, sources, target, std)
+  if cfg.command == "build-lib" then return buildLibrary(cfg, sources, target, std, project.name)
 
   // Running the result is what makes `run` different from `build`, and only this machine can do
   // that — so a cross target is refused here rather than built and then failed to execute.
@@ -482,7 +482,7 @@ private[sysl] def execute(cfg: Config): Int = {
       stdout(compiled.ir); 0
 
     case "build" =>
-      val exe = cfg.output.getOrElse(defaultOutput(cfg.file))
+      val exe = cfg.output.getOrElse(defaultOutput(cfg.file, project.name))
 
       Toolchain.build(compiled.ir, exe, target, archives, cfg.optimize, compiled.links, native.objects,
         paths, cfg.verbose) match
@@ -571,7 +571,8 @@ private def moduleName(path: String): String = {
  * program is compiled against* — into an artifact that builds and then collides with the built-in
  * copy at whatever link tried to use it.
  */
-private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std: Stdlib): Int = {
+private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std: Stdlib,
+                         named: Option[String]): Int = {
   // Before the library is compiled rather than after. Compiling it is the slow part and the archiver
   // is not needed until the end, so discovering it late would make "there is no llvm-ar" a thing a
   // user waited for the whole build to be told.
@@ -601,7 +602,7 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
       val out =
         cfg.output.getOrElse(
           if cfg.std then cfg.stdSearch.getOrElse(LibraryArtifact.stdDefault)
-          else defaultOutput(cfg.file, LibraryArtifact.extension))
+          else defaultOutput(cfg.file, named, LibraryArtifact.extension))
 
       Project.parentOf(out).foreach(createDirectories)
 
@@ -846,9 +847,20 @@ private def listTargets(): Int = {
  * **The point is that the answer stops depending on where the build was started.** `sysl build .`,
  * `sysl build test` and `sysl build ../test` are three ways of naming one project, and all three now
  * write `test/test` rather than three different paths, one of which was the project.
+ *
+ * **`named` is `package.name` where the project wrote one**, and it answers the question of what a
+ * directory project *is*: today a directory is a project because it happens to hold `.sysl` files,
+ * and nothing gives one an identity of its own. Requiring a `package.hocon` would give every project
+ * one and cost every project the ceremony — 15 directories in this repo have none, and neither does
+ * a scratch directory anybody makes in thirty seconds. So a bare directory goes on building and is
+ * named for itself, and a project that wants to be called something says so.
+ *
+ * A **file** project is deliberately left out of this. Its name comes from a path the caller typed,
+ * and a config sitting beside it quietly moving `foo.sysl`'s executable would be a worse surprise
+ * than the thing this exists to fix.
  */
-private def defaultOutput(file: String, suffix: String = ""): String =
-  if isDirectory(file) then s"$file/${Project.nameOf(file)}$suffix"
+private def defaultOutput(file: String, named: Option[String], suffix: String = ""): String =
+  if isDirectory(file) then s"$file/${named.getOrElse(Project.nameOf(file))}$suffix"
   else defaultOutputName(file) + suffix
 
 /** The name a **file** project's output takes: its own, with the extension dropped. */

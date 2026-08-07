@@ -88,10 +88,30 @@ Four blocks, and each answers a question somebody already has:
 
 | block | answers | who reads it |
 |---|---|---|
-| `package` | who this is, under what version | a consumer's resolver; nothing in a leaf program |
+| `package` | who this is, under what version | a consumer's resolver; and the driver, for `name` |
 | `targets` | which machines, and what each provides | the driver, then `capabilities.md`'s checks |
 | `requires` | what this package needs of its environment | a consumer, at `sysl add` and again at compile time |
 | `dependencies` | what to fetch and what to call it | the resolver and the module-name resolution in §9 |
+
+**`package.name` is what a directory project's output is called**, and it is the answer to a question
+this file could have answered a heavier way. A directory is a project because it holds `.sysl` files,
+not because anybody said so — `Project.collect` walks whatever it is pointed at — so a project has no
+identity of its own unless this block gives it one. *Requiring* the file would have supplied one to
+every project and charged every project the ceremony: fifteen directories in sysl's own repo have no
+`package.hocon`, every `guide/` and `examples/` program among them, and neither does a scratch
+directory anybody makes in thirty seconds. So the bare case stays bare and is named for its
+directory, and a project that wants to be called something says so here.
+
+What is given up by answering it this way, rather than being fixed: there is still no refusal when
+the compiler is pointed at a directory nobody meant, and a project that does not opt in still has no
+identity. Both were arguments for requiring the file; both are paid rather than solved.
+
+A **file** project is deliberately outside this. Its name comes from the path the caller typed, and a
+config sitting beside it silently moving `foo.sysl`'s executable would be a worse surprise than
+anything it fixes. The name reaches the filesystem, so it must be a single path segment: `.`, `..`,
+anything holding a separator, and the empty string are refused when the file is read rather than
+sanitized, because a project that named its output was expecting an answer and both silent repairs
+write a different executable without saying so.
 
 **`targets` extends the fixed registry rather than replacing it.** `targets.md` deliberately does
 not carry capabilities, because a target's capabilities are exactly the part a project has an

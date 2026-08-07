@@ -115,6 +115,53 @@ class OutputPathTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  /** A directory is a project because it holds `.sysl` files, and nothing gives one an identity of
+   * its own. Requiring a `package.hocon` would supply one and charge every project the ceremony —
+   * every `guide/` and `examples/` directory in this repo has none, and neither does a scratch
+   * directory anybody makes in thirty seconds. So a bare directory is still a project and is still
+   * named for itself; a project that wants to be called something says so.
+   */
+  "a project that names itself is called what it says" - {
+
+    "rather than what its directory happens to be called" in {
+      project { dir =>
+        writeFile(s"$dir/${PackageConfig.FileName}", "package {\n  name = \"tool\"\n}\n")
+
+        cli(Config(command = "build", file = dir)) shouldBe 0
+
+        isFile(s"$dir/tool") shouldBe true
+        isFile(s"$dir/${Project.basename(dir)}") shouldBe false
+      }
+    }
+
+    // The name follows the project rather than the spelling of the path, exactly as the directory
+    // name already did.
+    "from wherever the build was started" in {
+      project { dir =>
+        writeFile(s"$dir/${PackageConfig.FileName}", "package {\n  name = \"tool\"\n}\n")
+
+        cli(Config(command = "build", file = s"$dir/.")) shouldBe 0
+
+        isFile(s"$dir/tool") shouldBe true
+      }
+    }
+
+    // A file project keeps taking its name from the path the caller typed. A config beside it
+    // quietly moving the executable would be a worse surprise than the bug this file exists for.
+    "while a file project is untouched by one" in {
+      project { dir =>
+        writeFile(s"$dir/${PackageConfig.FileName}", "package {\n  name = \"tool\"\n}\n")
+
+        cli(Config(command = "build", file = s"$dir/main.sysl")) shouldBe 0
+
+        isFile("main") shouldBe true
+        isFile("tool") shouldBe false
+
+        deleteFile("main")
+      }
+    }
+  }
+
   // `build-lib` had the same defect wearing a different symptom: the extension is appended to the
   // name, so `sysl build-lib .` wrote `..syslib` — a hidden file, in the caller's directory, named
   // after nothing.

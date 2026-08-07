@@ -70,6 +70,7 @@ object PackageConfig {
       // The structure is what the file means; the path API is a convenience that does not fit here.
       for
         pkg     <- block(root, "package")
+        _       <- checkName(pkg.flatMap(string(_, "name")))
         targets <- readTargets(root)
         needed  <- readCapabilityFlags(block2(root, "requires"), "requires")
         deps    <- readDependencies(root)
@@ -85,6 +86,25 @@ object PackageConfig {
       // Every way HOCON can be wrong arrives as one of these, and the driver wants a line rather
       // than a stack trace. The message is the library's own, which already says where it was.
       case e: HoconException => Left(s"$FileName: ${e.getMessage}")
+
+  /** A package's name is what a directory project's output is called, so it reaches the filesystem
+   * and has to be a single path segment.
+   *
+   * Refused rather than quietly ignored, and refused rather than sanitized: a file saying
+   * `name = "build/tool"` was written by somebody who expected an answer, and both of the silent
+   * options — falling back to the directory name, or flattening the separator away — write a
+   * different executable from the one they asked for and say nothing about it. `.` and `..` are here
+   * for the same reason: each is a legal segment that names a directory rather than a file, so the
+   * link would fail at the far end with a message about a path rather than about this line.
+   */
+  private def checkName(name: Option[String]): Either[String, Unit] = name match
+    case None => Right(())
+    case Some(n) =>
+      if n.isEmpty then Left(s"$FileName: 'package.name' is empty")
+      else if n == "." || n == ".." || n.exists(c => c == '/' || c == '\\') then
+        Left(s"$FileName: 'package.name' is what this project's output is called, so '$n' cannot " +
+          "be one — it names a path rather than a name")
+      else Right(())
 
   /** A named sub-object, refusing a key that holds something else. */
   private def block(o: ConfigObject, key: String): Either[String, Option[ConfigObject]] =

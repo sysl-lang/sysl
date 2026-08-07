@@ -47,6 +47,34 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
     "and neither is required" in {
       read("targets { default = \"x86_64-linux\" }").name shouldBe None
     }
+
+    /** The name is what a directory project's output is called, so it reaches the filesystem. Each
+     * of these is refused rather than sanitized: a file that names its output was written by
+     * somebody expecting an answer, and both silent repairs — falling back to the directory name, or
+     * flattening the separator — write a different executable and say nothing.
+     */
+    "a name that is a path rather than a name is refused" in {
+      refused("package { name = \"build/tool\" }") should include("names a path rather than a name")
+      refused("package { name = \"..\\\\tool\" }") should include("names a path rather than a name")
+    }
+
+    // Both are legal path segments and neither names a file, so the link would fail at the far end
+    // with a message about a directory instead of about this line.
+    "and so are the two segments that name a directory" in {
+      refused("package { name = \".\" }") should include("names a path rather than a name")
+      refused("package { name = \"..\" }") should include("names a path rather than a name")
+    }
+
+    "an empty name is refused as its own mistake" in {
+      refused("package { name = \"\" }") should include("is empty")
+    }
+
+    // A name with spaces or dots in it is awkward rather than wrong, and the shell can quote it.
+    // Refusing it would be this check deciding what a project may call itself, which is not its job.
+    "while an unusual but usable name is left alone" in {
+      read("package { name = \"my tool\" }").name shouldBe Some("my tool")
+      read("package { name = \"tool.v2\" }").name shouldBe Some("tool.v2")
+    }
   }
 
   "targets" - {
