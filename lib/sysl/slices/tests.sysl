@@ -1,0 +1,348 @@
+module sysl.slices
+@tests
+
+// What `sysl.slices` claims, asserted in sysl.
+//
+// **The private algorithms are reached directly**, which a test file in the same module may do. That
+// matters for `heap_sort`: it is the fallback `sort` enters only on input adversarial enough to drive
+// the recursion past its depth limit, and constructing such an input against a median-of-three pivot
+// is a research problem. Calling it is the honest way to cover it, and leaving it uncovered because
+// the public path is hard to steer would be the wrong trade.
+
+// -- as_ptr ---------------------------------------------------------------------------------------
+
+@test("a pointer to the first element is the first element's address")
+as_ptr_points_at_the_front()
+    var xs = [10, 20, 30]
+    val p = as_ptr(xs[..])
+
+    assert_eq(*p, 10)
+end as_ptr_points_at_the_front
+
+@test("an empty slice has no first element, and answers null rather than trapping")
+as_ptr_of_empty_is_null()
+    var xs = [10, 20, 30]
+
+    assert(as_ptr(xs[0..<0]) == null)
+end as_ptr_of_empty_is_null
+
+@test("the mutable form yields a pointer that writes through to the slice")
+as_mut_ptr_writes_through()
+    var xs = [10, 20, 30]
+    val p = as_mut_ptr(xs[..])
+
+    *p = 99
+
+    assert_eq(xs[0], 99)
+    assert(as_mut_ptr(xs[0..<0]) == null)
+end as_mut_ptr_writes_through
+
+// A byte-only test could never catch an address computed at the wrong stride, and being usable at any
+// element type is the whole reason this is generic -- a binding passing `[]f32` vertices or `[]u32`
+// indices wants the same function.
+//
+// The later elements are reached by slicing rather than by adding to the pointer, because a pointer is
+// not an arithmetic type here: `p + 1` is refused with *"'+' needs matching types, got *ulong and
+// usize"*. Offsetting is what a slice is for, and C does its own arithmetic on the far side.
+@test("and it is generic, at the element type's own stride")
+as_ptr_is_generic()
+    var xs: []u64 = [7, 8, 9]
+
+    assert_eq(*as_ptr(xs), 7)
+    assert_eq(*as_ptr(xs[1..]), 8)
+    assert_eq(*as_ptr(xs[2..]), 9)
+end as_ptr_is_generic
+
+// -- the plain operations -------------------------------------------------------------------------
+
+@test("swap exchanges two elements and leaves the rest alone")
+swap_exchanges()
+    var xs = [1, 2, 3, 4]
+
+    swap(xs[..], 0, 3)
+
+    assert(equal(xs[..], [4, 2, 3, 1][..]))
+end swap_exchanges
+
+@test("reverse turns the slice around, at both parities of length")
+reverse_turns_around()
+    var even = [1, 2, 3, 4]
+    var odd = [1, 2, 3]
+    var one = [1]
+
+    reverse(even[..])
+    reverse(odd[..])
+    reverse(one[..])
+
+    assert(equal(even[..], [4, 3, 2, 1][..]))
+    assert(equal(odd[..], [3, 2, 1][..]))
+    assert(equal(one[..], [1][..]))
+end reverse_turns_around
+
+@test("fill writes one value everywhere")
+fill_writes_everywhere()
+    var xs = [1, 2, 3]
+
+    fill(xs[..], 7)
+
+    assert(equal(xs[..], [7, 7, 7][..]))
+end fill_writes_everywhere
+
+// The two directions differ only where the value repeats, which is why the fixture repeats one.
+@test("index_of and last_index_of find the first and the last")
+finding_a_value()
+    var xs = [1, 2, 3, 2, 5]
+
+    assert_eq(index_of(xs[..], 2).unwrap(), 1)
+    assert_eq(last_index_of(xs[..], 2).unwrap(), 3)
+    assert(index_of(xs[..], 99).is_none())
+    assert(last_index_of(xs[..], 99).is_none())
+    assert(contains(xs[..], 5))
+    assert(!contains(xs[..], 4))
+end finding_a_value
+
+@test("the extremes are answered as indices, and ties go to the first")
+extremes()
+    var xs = [3, 1, 4, 1, 5]
+
+    assert_eq(min_index(xs[..]).unwrap(), 1)
+    assert_eq(max_index(xs[..]).unwrap(), 4)
+
+    // Both ones are minima; the earlier index is the answer.
+    var tied = [2, 2, 2]
+
+    assert_eq(min_index(tied[..]).unwrap(), 0)
+    assert_eq(max_index(tied[..]).unwrap(), 0)
+
+    assert(min_index(xs[0..<0]).is_none())
+    assert(max_index(xs[0..<0]).is_none())
+end extremes
+
+@test("equal compares length first, then elements")
+equality()
+    var a = [1, 2, 3]
+    var b = [1, 2, 3]
+    var c = [1, 2]
+    var d = [1, 2, 4]
+
+    assert(equal(a[..], b[..]))
+    assert(!equal(a[..], c[..]))
+    assert(!equal(a[..], d[..]))
+    assert(equal(a[0..<0], c[0..<0]))
+end equality
+
+@test("a prefix and a suffix are the ends they name, and the empty one is both")
+prefixes_and_suffixes()
+    var xs = [1, 2, 3, 4]
+
+    assert(starts_with(xs[..], [1, 2][..]))
+    assert(!starts_with(xs[..], [2, 3][..]))
+    assert(ends_with(xs[..], [3, 4][..]))
+    assert(!ends_with(xs[..], [3, 5][..]))
+
+    // Longer than the slice is a refusal rather than a trap.
+    assert(!starts_with(xs[..], [1, 2, 3, 4, 5][..]))
+    assert(!ends_with(xs[..], [1, 2, 3, 4, 5][..]))
+
+    assert(starts_with(xs[..], xs[0..<0]))
+    assert(ends_with(xs[..], xs[0..<0]))
+end prefixes_and_suffixes
+
+// -- sorting --------------------------------------------------------------------------------------
+
+// The shapes that break a naive quicksort: already in order, exactly backwards, and every element
+// the same. All three are common in real input and all three are where a first-or-last pivot goes
+// quadratic, which is what the median of three is for.
+@test("the degenerate shapes sort, at a length past the insertion-sort threshold")
+sorting_the_awkward_shapes()
+    val n: usize = 64
+    var ascending: []int = [0; 64]
+    var descending: []int = [0; 64]
+    var constant: []int = [0; 64]
+
+    for i in 0..<n
+        ascending[i] = int(i)
+        descending[i] = int(n - i)
+        constant[i] = 5
+
+    sort(ascending)
+    sort(descending)
+    sort(constant)
+
+    assert(is_sorted(ascending))
+    assert(is_sorted(descending))
+    assert(is_sorted(constant))
+    assert_eq(descending[0], 1)
+    assert_eq(constant[0], 5)
+end sorting_the_awkward_shapes
+
+@test("the short cases, on both sides of the insertion-sort threshold")
+sorting_short_slices()
+    var empty: []int = [0; 0]
+    var one = [1]
+    var two = [2, 1]
+    var small = [5, 3, 8, 1, 9, 2, 7]
+
+    sort(empty)
+    sort(one[..])
+    sort(two[..])
+    sort(small[..])
+
+    assert(is_sorted(empty))
+    assert(is_sorted(one[..]))
+    assert(equal(two[..], [1, 2][..]))
+    assert(equal(small[..], [1, 2, 3, 5, 7, 8, 9][..]))
+end sorting_short_slices
+
+@test("a sort is a permutation, not merely an ordering")
+sorting_keeps_every_element()
+    var xs = [5, 3, 8, 3, 1, 9, 3]
+
+    sort(xs[..])
+
+    assert(is_sorted(xs[..]))
+
+    // The repeated element survives in the right number: an ordering test alone would pass on a sort
+    // that dropped a duplicate.
+    var threes = 0
+
+    for i in 0..<xs.len
+        if xs[i] == 3 then threes += 1
+
+    assert_eq(threes, 3)
+    assert_eq(xs.len, 7)
+end sorting_keeps_every_element
+
+@test("a comparison of the caller's own reverses the order")
+sorting_by_a_comparison()
+    var xs = [1, 5, 3, 2]
+
+    sort_by(xs[..], (a, b) -> b < a)
+
+    assert(equal(xs[..], [5, 3, 2, 1][..]))
+end sorting_by_a_comparison
+
+// `heap_sort` is the fallback the public path enters only under an adversarial input, so it is
+// called directly. Without this it would be the one branch of `sort` that nothing covers.
+@test("the heapsort fallback sorts on its own")
+heapsort_alone()
+    var xs = [5, 3, 8, 1, 9, 2, 7, 4, 6]
+
+    heap_sort(xs[..], (a, b) -> a < b)
+
+    assert(equal(xs[..], [1, 2, 3, 4, 5, 6, 7, 8, 9][..]))
+
+    var empty: []int = [0; 0]
+
+    heap_sort(empty, (a, b) -> a < b)
+
+    assert(is_sorted(empty))
+end heapsort_alone
+
+@test("the depth limit is twice the base-two logarithm, at the width usize actually has")
+depth_limit_is_two_log_n()
+    assert_eq(depth_limit(0), 0)
+    assert_eq(depth_limit(1), 0)
+    assert_eq(depth_limit(2), 2)
+    assert_eq(depth_limit(15), 6)
+    assert_eq(depth_limit(16), 8)
+    assert_eq(depth_limit(1024), 20)
+end depth_limit_is_two_log_n
+
+// -- stability ------------------------------------------------------------------------------------
+
+// **The one thing `sort_stable` promises that `sort` does not**, and the only test here that would
+// still pass if the merge took its tie from the wrong side. The keys repeat and the payloads are
+// distinct, so the original order among equals is observable.
+@test("a stable sort leaves equal elements in the order they arrived")
+stable_keeps_the_original_order()
+    var xs = [(2, 1), (1, 1), (2, 2), (1, 2), (2, 3)]
+    var scratch = [(0, 0); 5]
+
+    assert(sort_stable_by(xs[..], scratch[..], (a, b) -> a.0 < b.0))
+
+    // Keys ascending, and within each key the payloads in their original order.
+    assert(equal(xs[..], [(1, 1), (1, 2), (2, 1), (2, 2), (2, 3)][..]))
+end stable_keeps_the_original_order
+
+@test("a stable sort orders, at a length needing several merge passes")
+stable_sorts()
+    val n: usize = 40
+    var xs: []int = [0; 40]
+    var scratch: []int = [0; 40]
+
+    // A shape that is neither sorted nor reversed, so every pass has real work.
+    for i in 0..<n
+        xs[i] = int((i * 37) % n)
+
+    assert(sort_stable(xs, scratch))
+    assert(is_sorted(xs))
+    assert_eq(xs[0], 0)
+end stable_sorts
+
+@test("a scratch shorter than the slice is refused, and nothing is disturbed")
+stable_refuses_a_short_scratch()
+    var xs = [3, 1, 2]
+    var scratch = [0, 0]
+
+    assert(!sort_stable(xs[..], scratch[..]))
+    assert(equal(xs[..], [3, 1, 2][..]))
+end stable_refuses_a_short_scratch
+
+// -- searching ------------------------------------------------------------------------------------
+
+@test("a binary search answers where a value is, and where a missing one belongs")
+binary_search_answers_both()
+    var xs = [1, 3, 5, 7, 9]
+
+    val (found_5, at_5) = binary_search(xs[..], 5)
+
+    assert(found_5)
+    assert_eq(at_5, 2)
+
+    // A miss answers the insertion point, which is the half a bare Option would throw away.
+    val (found_4, at_4) = binary_search(xs[..], 4)
+
+    assert(!found_4)
+    assert_eq(at_4, 2)
+
+    val (found_0, at_0) = binary_search(xs[..], 0)
+
+    assert(!found_0)
+    assert_eq(at_0, 0)
+
+    val (found_10, at_10) = binary_search(xs[..], 10)
+
+    assert(!found_10)
+    assert_eq(at_10, 5)
+end binary_search_answers_both
+
+@test("and it answers the first of several equal elements")
+binary_search_finds_the_first()
+    var xs = [1, 2, 2, 2, 3]
+
+    val (found, at) = binary_search(xs[..], 2)
+
+    assert(found)
+    assert_eq(at, 1)
+
+    var empty: []int = [0; 0]
+    val (found_e, at_e) = binary_search(empty, 1)
+
+    assert(!found_e)
+    assert_eq(at_e, 0)
+end binary_search_finds_the_first
+
+@test("is_sorted agrees with what the sorts produce")
+is_sorted_agrees()
+    var sorted = [1, 2, 2, 3]
+    var not_sorted = [1, 3, 2]
+    var one = [1]
+    var empty: []int = [0; 0]
+
+    assert(is_sorted(sorted[..]))
+    assert(!is_sorted(not_sorted[..]))
+    assert(is_sorted(one[..]))
+    assert(is_sorted(empty))
+    assert(is_sorted_by(not_sorted[..], (a, b) -> b < a) == false)
+end is_sorted_agrees

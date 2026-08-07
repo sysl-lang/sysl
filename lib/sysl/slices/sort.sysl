@@ -1,0 +1,286 @@
+module sysl.slices
+
+import sysl.math.Bits
+
+// Putting a slice in order, and finding a value in one that already is.
+//
+// **Two sorts, and neither allocates.** `sort` is unstable and works in the slice it was given;
+// `sort_stable` is stable and merges through a buffer **the caller supplies**. A stable sort needs
+// somewhere to merge into, and the library cannot decide to allocate on a caller's behalf -- this
+// module is reachable from a target with no allocator, which is the whole reason `sysl.slices` asks
+// for no capability. Making the scratch a parameter keeps both sorts available there and puts the
+// choice where the caller can see it.
+//
+// **Written in sysl rather than bound to `qsort`, and that was measured rather than assumed.**
+// `qsort` wants a comparison function pointer, which at a generic element type means the address of
+// a per-instantiation trampoline -- and `&f[T]` is refused by the compiler today. There is also no
+// portable stable sort in a C library: `mergesort` and `heapsort` are BSD extensions, present on
+// Darwin and absent from glibc, and ISO C has only the unstable `qsort`. Even with the address
+// operator in hand it would be the wrong trade: an indirect call per comparison, where a
+// monomorphized `[T: Ord]` body inlines the comparison, and a libc dependency on a module that
+// otherwise has none.
+//
+// **Each sort comes in a pair**: the `Ord` form, and a `_by` form taking a comparison. The `_by` form
+// is where the work is, and the `Ord` form is one line handing it `<`. A bare arrow (`12 §6`) is a
+// bound rather than a boxed value, so the comparison is monomorphized and inlined and the pair costs
+// nothing over one function.
+
+// Below this many elements, insertion sort. It is where the recursion bottoms out and where a simple
+// quadratic sort genuinely wins -- the constant factor is small and the data is in cache.
+const INSERTION_LIMIT: usize = 16
+
+// -- Asking ---------------------------------------------------------------------------------------
+
+// Whether the slice is already in order. Worth having on its own, and it is also the sorts' own
+// postcondition, which is what the tests assert against.
+is_sorted[T: Ord](xs: []const T) -> bool = is_sorted_by(xs, (a, b) -> a < b)
+
+is_sorted_by[T](xs: []const T, lt: (T, T) -> bool) -> bool
+    if xs.len < 2 then return true
+
+    for i in 1..<xs.len
+        if lt(xs[i], xs[i - 1]) then return false
+
+    true
+
+// -- The unstable sort ----------------------------------------------------------------------------
+
+// The slice in order, in place, using no extra storage.
+//
+// **Introsort**: quicksort for the general case, insertion sort for the small one, and heapsort once
+// the recursion has gone deeper than a well-behaved input ever would. The last of those is what holds
+// the worst case at O(n log n) -- a plain quicksort degrades to O(n²) on input chosen to defeat its
+// pivot, and a library sort must not have an input that makes it quadratic.
+//
+// **Equal elements may come back in any order.** That is what "unstable" means and it is only
+// observable for a type whose equality does not mean identity -- a record ordered on one field. A
+// caller who cares wants `sort_stable`, which says so in its name.
+sort[T: Ord](xs: []T) = sort_by(xs, (a, b) -> a < b)
+
+sort_by[T](xs: []T, lt: (T, T) -> bool)
+    if xs.len > 1 then intro_sort(xs, lt, depth_limit(xs.len))
+
+// Twice the base-two logarithm of the length, which is the depth a healthy quicksort reaches. Past
+// it, the pivots have been bad enough for long enough that the input is presumed adversarial and
+// heapsort takes over.
+// Visible to the module rather than to this file, so `tests.sysl` can assert its arithmetic directly.
+// The alternative was inferring it from how a large sort behaved, which is not an assertion.
+private[slices] depth_limit(n: usize) -> u32
+    if n < 2 then return 0
+
+    // The width comes from the pair that sums to it rather than from a literal, which is what makes
+    // this right on a target where `usize` is 32 bits as well as on one where it is 64. `next_power_
+    // _of_two` reads its width the same way and for the same reason. `leading_zeros` answers the
+    // width for zero, so the guard above is what keeps the subtraction meaningful.
+    val width: u32 = n.count_ones() + n.count_zeros()
+    val floor_log2: u32 = width - 1 - n.leading_zeros()
+
+    2 * floor_log2
+
+// **Recursion on the smaller side, iteration on the larger**, which is the detail that makes this
+// safe on a small stack and is the easy one to leave out. A quicksort recursing on both sides goes
+// O(n) deep when the partitions are lopsided, and on a freestanding target that is not slowness but a
+// crash. Taking the smaller half first bounds the depth at O(log n) -- under 64 frames for any slice
+// that can exist -- because each recursive call is on at most half of what its caller held.
+private intro_sort[T](xs: []T, lt: (T, T) -> bool, limit: u32)
+    var s = xs
+    var d = limit
+
+    while s.len > INSERTION_LIMIT
+        if d == 0
+            heap_sort(s, lt)
+            return
+
+        d -= 1
+
+        val p = partition(s, lt)
+        val left = p
+        val right = s.len - p - 1
+
+        if left < right
+            intro_sort(s[0..<p], lt, d)
+            s = s[(p + 1)..]
+        else
+            intro_sort(s[(p + 1)..], lt, d)
+            s = s[0..<p]
+
+    insertion_sort(s, lt)
+
+// Lomuto's partition around a median-of-three pivot, answering where the pivot ended up.
+//
+// **The median of the first, middle and last elements** rather than any one of them: a slice that is
+// already sorted, or sorted backwards, is the input that makes a first-or-last pivot quadratic, and
+// those two are far and away the most common shapes a real program hands a sort.
+private partition[T](xs: []T, lt: (T, T) -> bool) -> usize
+    val last = xs.len - 1
+    val mid = xs.len / 2
+
+    // The three put in order, so the median is at `mid`, and then moved out of the way to the end
+    // where the scan below treats it as the pivot.
+    if lt(xs[mid], xs[0]) then swap(xs, 0, mid)
+    if lt(xs[last], xs[0]) then swap(xs, 0, last)
+    if lt(xs[last], xs[mid]) then swap(xs, mid, last)
+
+    swap(xs, mid, last)
+
+    val pivot = xs[last]
+    var i: usize = 0
+
+    for j in 0..<last
+        if lt(xs[j], pivot)
+            swap(xs, i, j)
+            i += 1
+
+    swap(xs, i, last)
+
+    i
+
+// Straight insertion, for the short runs the recursion bottoms out into.
+private insertion_sort[T](xs: []T, lt: (T, T) -> bool)
+    if xs.len < 2 then return
+
+    for i in 1..<xs.len
+        var j = i
+
+        while j > 0 && lt(xs[j], xs[j - 1])
+            swap(xs, j, j - 1)
+            j -= 1
+
+// Heapsort: the fallback that makes the worst case O(n log n). In place, no scratch, and no recursion
+// -- `sift_down` iterates -- so reaching it costs no stack at all.
+// Visible to the module, so `tests.sysl` can drive it directly: the public path reaches it only on an
+// input adversarial enough to exhaust the depth limit, and constructing one against a median-of-three
+// pivot is a research problem rather than a test fixture.
+private[slices] heap_sort[T](xs: []T, lt: (T, T) -> bool)
+    val n = xs.len
+
+    if n < 2 then return
+
+    var i = n / 2
+
+    while i > 0
+        i -= 1
+        sift_down(xs, lt, i, n)
+
+    var end = n
+
+    while end > 1
+        end -= 1
+        swap(xs, 0, end)
+        sift_down(xs, lt, 0, end)
+
+private sift_down[T](xs: []T, lt: (T, T) -> bool, start: usize, end: usize)
+    var root = start
+
+    while root * 2 + 1 < end
+        var child = root * 2 + 1
+
+        if child + 1 < end && lt(xs[child], xs[child + 1]) then child += 1
+
+        if !lt(xs[root], xs[child]) then return
+
+        swap(xs, root, child)
+        root = child
+
+// -- The stable sort ------------------------------------------------------------------------------
+
+// The slice in order, with equal elements left in the order they were given, merged through storage
+// the caller supplies.
+//
+// Answers `false` and changes nothing when the scratch is shorter than the slice, which is the one
+// way it can refuse. `scratch` needs `xs.len` elements; anything beyond that is ignored.
+//
+// **Bottom-up rather than recursive.** The passes double in width -- 1, 2, 4, 8 -- merging adjacent
+// runs, so there is no recursion and the stack does not grow at all. A top-down merge sort would add
+// O(log n) frames for the same result.
+sort_stable[T: Ord](xs: []T, scratch: []T) -> bool = sort_stable_by(xs, scratch, (a, b) -> a < b)
+
+sort_stable_by[T](xs: []T, scratch: []T, lt: (T, T) -> bool) -> bool
+    val n = xs.len
+
+    if scratch.len < n then return false
+    if n < 2 then return true
+
+    // Which of the two holds the data at the start of a pass. Each pass reads from one and writes to
+    // the other, so this alternates and the last one decides whether a copy back is owed.
+    var in_scratch = false
+    var width: usize = 1
+
+    while width < n
+        var i: usize = 0
+
+        while i < n
+            val mid = if i + width < n then i + width else n
+            val hi = if i + 2 * width < n then i + 2 * width else n
+
+            if in_scratch then
+                merge(scratch, xs, i, mid, hi, lt)
+            else
+                merge(xs, scratch, i, mid, hi, lt)
+
+            i = i + 2 * width
+
+        in_scratch = !in_scratch
+        width = width * 2
+
+    if in_scratch
+        for k in 0..<n
+            xs[k] = scratch[k]
+
+    true
+
+// Two adjacent sorted runs, `[lo, mid)` and `[mid, hi)`, merged into the same span of `dst`.
+//
+// **The tie goes to the left run, and that single choice is the whole of stability.** Written
+// `!lt(src[j], src[i])` -- take from the left unless the right is strictly smaller -- so two equal
+// elements keep the order they arrived in. Written the other way round it would sort just as
+// correctly and would not be stable, and no test of the ordering alone would notice.
+private merge[T](src: []const T, dst: []T, lo: usize, mid: usize, hi: usize, lt: (T, T) -> bool)
+    var i = lo
+    var j = mid
+    var k = lo
+
+    while k < hi
+        if i < mid && (j >= hi || !lt(src[j], src[i]))
+            dst[k] = src[i]
+            i += 1
+        else
+            dst[k] = src[j]
+            j += 1
+
+        k += 1
+
+// -- Searching ------------------------------------------------------------------------------------
+
+// Where a value is in a sorted slice, and where it would go if it is not there.
+//
+// **Answers a pair rather than an `Option`, because the index is wanted either way.** A caller that
+// found the value wants its position; a caller that did not wants the place to insert it, which is
+// the expensive half of the answer and is already computed. `Option[usize]` throws that away and
+// `Result[usize, usize]` -- Rust's spelling -- calls a miss a failure, which it is not.
+//
+// **The index of the FIRST equal element**, where the slice holds several. That makes the answer
+// depend on the values rather than on how the search happened to land, which is what lets two
+// searches of the same slice be compared.
+//
+// The slice must be sorted by the same order being searched with. Nothing checks it -- that would
+// cost a linear scan on every search, defeating the point -- and the answer for an unsorted slice is
+// unspecified rather than wrong in some particular way.
+binary_search[T: Ord](xs: []const T, x: T) -> (bool, usize) =
+    binary_search_by(xs, x, (a, b) -> a < b)
+
+binary_search_by[T](xs: []const T, x: T, lt: (T, T) -> bool) -> (bool, usize)
+    var lo: usize = 0
+    var hi = xs.len
+
+    // Narrows to the first position whose element is not below `x`. Written `lo + (hi - lo) / 2`
+    // rather than `(lo + hi) / 2` because the latter overflows once the two are large enough, which
+    // is the oldest bug in binary search.
+    while lo < hi
+        val mid = lo + (hi - lo) / 2
+
+        if lt(xs[mid], x) then lo = mid + 1 else hi = mid
+
+    // `lo` is now that position. The value is there exactly when the element sitting at it is not
+    // above `x` either -- two comparisons in total, and no equality operator required of `T`.
+    if lo < xs.len && !lt(x, xs[lo]) then (true, lo) else (false, lo)
