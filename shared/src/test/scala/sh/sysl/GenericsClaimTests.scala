@@ -236,4 +236,61 @@ class GenericsClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport
   "a parameter may stand wherever a type may" in {
     run("local[T](x: T) -> T\n    var here: T = x\n    here\nprint(local(\"s\"), local(9))") shouldBe "s 9\n"
   }
+
+  /** What a bound over the **open** integer family can and cannot do.
+   *
+   * `guide/fft` reported that no trait sysl ships declares a zero, so a generic sum had to seed from
+   * `xs[0]`. `Integer` is the membership that answers it for the built-in widths — and the shape of
+   * what it does *not* answer is exactly what keeps that program's own identity trait, so both
+   * halves are pinned here rather than left to the prose that now claims them.
+   */
+  "a bound over the open integer family" - {
+
+    "seeds an accumulator from a bare literal, at every width, with no member promising a zero" in {
+      val total =
+        """total[T: Integer + Add](xs: []T) -> T
+          |    var acc: T = 0
+          |
+          |    for i in 0..<xs.len do acc = acc + xs[i]
+          |
+          |    acc
+          |""".stripMargin
+
+      run(total + "print(total([1, 2, 3]))") shouldBe "6\n"
+      run(total + "print(total([1u8, 2u8, 3u8]))") shouldBe "6\n"
+    }
+
+    "carries a blanket implementation's method onto every one of them" in {
+      run("""trait Show
+            |    tag(self) -> int
+            |
+            |impl[T: Integer] Show for T
+            |    tag(self) -> int = 7
+            |
+            |print(5.tag(), 5u8.tag())""".stripMargin) shouldBe "7 7\n"
+    }
+
+    /** The asymmetry that keeps a program's own identity trait in the picture: a blanket subject is a
+     * parameter, and a receiverless member has no name to be reached through. Refused where it is
+     * written rather than at some instantiation, which is `§5`'s rule holding here too.
+     */
+    "but not a receiverless one, there being no name a call could reach it through" in {
+      err("""trait Additive
+            |    identity() -> Self
+            |
+            |impl[T: Integer] Additive for T
+            |    identity() -> T = 0
+            |
+            |print(int.identity())""".stripMargin) should
+        include("'T' is not a name a call could reach it through")
+    }
+
+    "and nothing may join the family, since the compiler settles who is in it" in {
+      err("""struct Mine
+            |    v: int
+            |
+            |impl Integer for Mine""".stripMargin) should
+        include("names a family of types the compiler settles")
+    }
+  }
 }
