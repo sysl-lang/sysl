@@ -160,14 +160,38 @@ it survives the jump intact and a `@tailrec` function may carry one.
 
 ## 5. Module invariants
 
-**This section and `§7` waited on mutable module state to be about, and it has arrived: `13 §7`'s
-module `var` is built.** `§7` (`@reads`/`@writes`) **is now built**, and was the more useful of the
-two, since a frame is what makes a call something other than an eraser to a prover. This section is
-what remains. **This section has one open question and it is not a technical one:** the check below runs on
-return from every public function of the module, which is complete exactly when the module's own
-functions are the only writers — and a public module `var` is writable by anyone, from another module
-or from a program's own statements, with no check anywhere. `§ Open f`
-carries the dependency.
+**DECLINED, 2026-08-07 — specified here and deliberately not built.** This section and `§7` both
+waited on mutable module state to be about, and it arrived with `13 §7`'s module `var`. `§7`
+(`@reads`/`@writes`) was then built. This one was weighed on the same question and came out the other
+way, and the reasoning is kept because the *difference* between the two is the reusable part.
+
+**A module invariant is derivable and a frame is not.** An `invariant I` over a module's state is
+exactly `require I` plus `ensure I` on each of its public functions, and both of those are built — so
+what this buys is not repeating the predicate, plus not forgetting it on the next function added.
+Real ergonomics, no new reasoning power. A frame buys reasoning power that exists nowhere else:
+without one the weakest precondition after any call is `true`, so every call erases what was known.
+**"It saves repetition" and "it is the only way to say this at all" are not the same argument**, and
+this chapter should not make them in the same breath.
+
+**It is also not what stands between `sysl prove` and being useful.** `§ Open j` is: the fragment
+`§9` translates is scalars, so nothing can be said about a slice. Polishing the vocabulary for module
+state while the prover cannot describe an array is optimizing the part that is not the bottleneck.
+
+**And it would carry a cost with no escape.** An invariant relating two module variables traps
+mid-update exactly as `16` describes for a struct — but none of `16`'s four answers has a
+module-level equivalent. Reordering the writes sometimes works; there is no redundant field to find
+in general, and there is **no whole-module assignment**, so the last resort that rescues a struct is
+simply unavailable.
+
+**The question it would have had to answer first, recorded so a revival starts from it rather than
+rediscovering it:** the check below runs on return from every public function, which is complete
+exactly when the module's own functions are the only writers — and a **public** module `var` is
+writable from another module or from a program's own statements with no check anywhere (`§ Open f`).
+The recommendation stood at refusing a public `var` in a module carrying an invariant, since that
+makes the check complete with no new machinery and can be relaxed later without breaking anything
+written under it.
+
+Everything below is the specification as it stood, kept for that revival.
 
 An `invariant` written at the top level of a file is a predicate over the module's own state:
 
