@@ -155,7 +155,9 @@ object AstCodec {
     // -------------------------------------------------------------- pieces
 
     private def param(p: Param): Unit = {
-      pos(p); sref(p.name); typ(p.typ); vis(p.vis); opt(p.default)(expr)
+      // `byName` is carried because it is not recoverable from the type: `x: -> T` and `x: () -> T`
+      // are the same `Fn() -> T`, and only this says which of the two a caller was written against.
+      pos(p); sref(p.name); typ(p.typ); vis(p.vis); opt(p.default)(expr); bool(p.byName)
     }
 
     private def bound(b: BoundRef): Unit = { pos(b); sref(b.name); list(b.args)(typ) }
@@ -571,7 +573,7 @@ object AstCodec {
 
     // -------------------------------------------------------------- pieces
 
-    private def param(): Param  = at(Param(sref(), typ(), vis(), opt(expr())))
+    private def param(): Param  = at(Param(sref(), typ(), vis(), opt(expr()), bool()))
     private def bound(): BoundRef = at(BoundRef(sref(), list(typ())))
     private def bounds(): Map[String, List[BoundRef]] = map(list(bound()))
     private def tdefaults(): Map[String, TypeRef]     = map(typ())

@@ -380,9 +380,15 @@ restriction above is worth: having added ref returns and ref fields it spent sev
 building the escape analysis (`scoped`, ref-safety contexts) that keeping the form local avoids
 entirely.
 
-Scala's by-name parameter is the thing this is **not**. `x: => T` re-evaluates at every use; a ref
-evaluates once and remembers what it found. Re-evaluation would be the wrong answer twice over — it
-would save no check, and it would silently make `t` follow a later change to `i`.
+A by-name parameter is the thing this is **not**, and sysl has one: `12 § A parameter may be passed
+by name`, spelled `x: -> T`. It re-evaluates at every use; a ref evaluates once and remembers what it
+found. Re-evaluation would be the wrong answer twice over *here* — it would save no check, and it
+would silently make `t` follow a later change to `i`.
+
+**That is a statement about the ref binding and not about by-name parameters**, which answer a
+different question and are wanted for it: a ref names a place so the walk to it happens once, and a
+by-name parameter puts off the work until somebody asks for it. An earlier draft of this paragraph
+cited Scala's `=> T` in a way that read as a rejection of the form, which it never was.
 
 ## Recursive types
 

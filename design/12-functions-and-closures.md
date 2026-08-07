@@ -869,6 +869,44 @@ costs nothing, and it is the spelling for the overwhelming majority of higher-or
 `filter`, `fold`, a comparator passed to `sort`. It is Rust's `impl Fn`, written the way the
 closure literal is written.
 
+### A parameter may be passed by name
+
+A parameter written `x: -> T` — the arrow with **nothing on its left** — takes an expression the call
+does not evaluate, and the body evaluates at each use.
+
+```
+log(on: bool, m: -> string)
+    if on then print(m)
+
+log(false, expensive())        // `expensive()` never runs
+```
+
+**It is the nullary case of the bare arrow above, and that is the whole of why it is cheap.** Its
+type is `Fn() -> T`, so it lowers to the same bounded type parameter — `log[M: Fn() -> string](on:
+bool, m: M)` — and inherits everything that came with it: monomorphized, called directly, **no
+allocation**. Scala's `x: => T` builds a `Function0`; this builds nothing, because the argument
+became an ordinary closure literal and a closure literal that does not escape costs nothing.
+
+Two things happen at the seams, and they are mirror images:
+
+- **At the call**, an argument standing at a by-name parameter is wrapped in the closure the type
+  asks for. The caller writes the expression bare and never writes `() ->`.
+- **In the body**, naming the parameter *calls* it. The callee writes `m`, not `m()`.
+
+**Each use is an evaluation**, because each use is a call. That is the property the form exists for
+and the one that surprises people: `x + x` on a by-name `x` runs the argument twice. A body wanting
+one evaluation binds it to a `val` first, which is the ordinary spelling for "I meant once".
+
+**`x: () -> T` is the neighbouring form and keeps its meaning exactly.** Same type, different call
+site: there the caller constructs the callable and the body calls it. So the shorter spelling is not
+a replacement, and a caller who wants to hand over a callable rather than an expression writes the
+one that says so. A **struct field** may not be written `-> T` at all — a field is storage, and
+storage holding an unevaluated expression is a different feature from this one.
+
+**Only a parameter of arity zero can be by name, and the rule needs no exception for it.** `f: A -> B`
+has no bare expression to wrap, because `A` is not bound at the call site — so there is nowhere else
+for the wrapping to apply, rather than somewhere it is forbidden.
+
 ### Where a concrete type is required, the callable is a boxed `&Fn`
 
 A bare arrow is available **only in a parameter**, because only there is a fresh type parameter

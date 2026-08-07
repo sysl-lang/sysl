@@ -83,6 +83,15 @@ trait AnalyzerBase extends Scoping {
    */
   protected var pbounds: Map[String, String] = Map.empty
 
+  /** The body's own names standing for a **by-name** parameter (`12 § A parameter may be passed by
+   * name`).
+   *
+   * They are the **uniqued** names the scope hands back rather than what was written, which is what
+   * makes shadowing need no rule of its own: a local declared over a by-name parameter is a
+   * different name here, so reading it stays an ordinary read.
+   */
+  protected var byNameLocals: Set[String] = Set.empty
+
   /** The traits a type parameter was bounded by, as keys — what a use inside the body may reach
    * through it whether or not the file also imported them, since the signature has named them.
    */
@@ -172,6 +181,7 @@ trait AnalyzerBase extends Scoping {
     // walked — the definition-time pass of `14 §4`, which runs before any storage is laid down.
     currentFunctionName = ""
     resetLocals()
+    byNameLocals = Set.empty
     loops = Nil
     pendingVariant = None
     variantSeq = 0
