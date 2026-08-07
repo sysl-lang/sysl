@@ -164,6 +164,26 @@ class ParseDiagnosticTests extends AnyFreeSpec with ParseSupport {
     }
   }
 
+  // Both landed on dev while this branch was open, and both are the shape that produces the
+  // artifact: a form that consumes tokens before discovering it is the wrong one.
+  "the grammar that arrived alongside this" - {
+
+    // `x: -> T` and `x: T` share their first two tokens, so an ordinary parameter is reached only
+    // after the by-name form has taken the name and the colon and found no arrow. That refusal sits
+    // before the point the parameter finished at, which is what `at` drops.
+    "a by-name parameter's backtrack does not leave an arrow behind it" in {
+      refusal("f(a: 1) -> int = 1\n")._1 should not include "'->'"
+    }
+
+    "and both spellings still parse" in {
+      prog("f(x: -> int) -> int = x\ng(x: int) -> int = x\nprint(1)\n") should not be empty
+    }
+
+    "a frame list that runs on wants its closing bracket" in {
+      refusal("@reads(a b)\nf() -> int = 1\n")._1 shouldBe "')' expected"
+    }
+  }
+
   "the forms these could have broken still parse" - {
 
     // `repeatedly`, the label lookahead and the `rep1sep` blocks all sit on paths every file takes.

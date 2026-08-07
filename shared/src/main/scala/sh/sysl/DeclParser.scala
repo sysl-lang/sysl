@@ -44,9 +44,9 @@ trait DeclParser extends ExprParser {
       case n ~ r => Param(n, FnType(Nil, r, bare = true), byName = true)
     })
 
-  /** A struct's field, which has no default to declare. Said here rather than left to the
-   * "newline expected" a grammar with no place for one would give, because `= v` after a field is a
-   * reasonable thing to try and the reason it is refused is not guessable from the failure.
+  /** A struct's field, which has no default to declare. Said here rather than left to whatever the
+   * grammar happened to want where the `= v` was written, because writing one is a reasonable thing
+   * to try and the reason it is refused is not guessable from a complaint about shape.
    */
   protected lazy val fieldParam: Parser[Param] =
     param <~ (op("=") ~> err("a field declares no default — what an unwritten field gets is decided " +
@@ -238,8 +238,8 @@ trait DeclParser extends ExprParser {
 
   /** The refusal a trait's member and an `impl`'s share (`08 § Visibility`). Both are reached at the
    * reach the *trait* has — one asks for the member and the other supplies what was asked — so
-   * there is nothing here for a modifier to decide, and saying that is worth more than the
-   * "newline expected" a grammar with no place for one would give.
+   * there is nothing here for a modifier to decide, and saying that is worth more than whatever the
+   * grammar happened to want where the modifier was written.
    */
   protected lazy val noVisibility: Parser[Unit] =
     op("private") ~> err("a trait's members and an 'impl' block's carry no visibility of their own — a " +

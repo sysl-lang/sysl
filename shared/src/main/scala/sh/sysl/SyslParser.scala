@@ -659,8 +659,8 @@ class SyslParser(val source: Source)
    * A lexical error is reported ahead of whatever the grammar made of the tokens around it, because
    * the parser's expectation is a *reaction* to the damage rather than a description of it: an
    * unterminated string literal is a token the grammar has no rule for, so the failure surfaces
-   * wherever the longest partial match happened to stop — `print("oops` reported "newline expected"
-   * at the paren, having taken `print` alone as a complete statement. The lexer already knew the
+   * wherever the longest partial match happened to stop — for `print("oops`, a complaint about the
+   * argument list, having taken `print` alone as much as it could read. The lexer already knew the
    * answer and said so; this is what carries it out.
    */
   def firstLexicalError: Option[(String, Position)] =

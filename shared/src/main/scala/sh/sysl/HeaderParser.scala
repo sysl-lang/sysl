@@ -91,7 +91,7 @@ trait HeaderParser extends AttrParser {
 
   /** A header attribute written where a statement goes, which is refused for the reason
    * `noVisibility` is: it has a place, and a reader who writes it in the wrong one should be told
-   * which place that is rather than answered with "newline expected".
+   * which place that is rather than answered with a complaint about the shape of the line.
    *
    * It is a *header*, not a statement, because it is a property of the module and the module is
    * settled before anything in the file runs — and because one part-way down a file would read as
