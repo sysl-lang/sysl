@@ -123,6 +123,18 @@ class QuotedIdentTests extends AnyFreeSpec with Matchers with CodegenSupport wit
       run(src) shouldBe "42\n"
     }
 
+    // A bare identifier is ASCII by construction, so the escape's non-ASCII path is reachable only
+    // through quoting. One byte becomes `$XX`; a codepoint above it becomes `$uXXXXXX` per UTF-16
+    // unit, which is injective even though a supplementary character takes two of them.
+    "a name outside ASCII, which only quoting can reach" in {
+      val src =
+        """var `café` = 3
+          |`café` += 1
+          |print(`café`)""".stripMargin
+
+      run(src) shouldBe "4\n"
+    }
+
     "as a struct and its fields" in {
       val src =
         """struct `Grid Cell`
