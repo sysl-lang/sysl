@@ -416,13 +416,33 @@ trait ProgramWalk
     // dropping one sound in the same way.
     checkTestScope(allFuncs, tmain, testOnlyDecls.toSet, tests.map(_.func).toSet)
 
+    // A closure lowered while a **generic body** was analyzed carries that body's type parameters in
+    // its own signature, and no value at run time has such a type. It is the same case as the struct
+    // and enum instantiations dropped two lines below, and it is dropped for the same reason:
+    // `Type.Abstract.llvm` has no layout to give `T` and says so by throwing, so a backend must never
+    // be handed one.
+    //
+    // **The checks above still see it**, which is why this filters here rather than narrowing
+    // `allFuncs`: a closure written inside a generic is a body to report allocation, purity and frame
+    // violations against exactly like any other, and only the *emission* is wrong.
+    //
+    // **It escapes on the library path alone**, which is why it went unnoticed. A program instantiates
+    // the enclosing generic and gets a concrete copy beside the abstract one, so the abstract one is
+    // dead weight the backend never asks about; `build-lib` strips `@tests` *before* analysis
+    // (`Compiler.compileLibrary`), so in a library nothing instantiates the generic at all and the
+    // abstract closure is the only copy there is. `sysl.slices`' `sort[T: Ord](xs) = sort_by(xs, (a,
+    // b) -> a < b)` is the shape that found it, and `12 §6` names a comparator passed to a sort as the
+    // bare arrow's motivating case — so this is a shape the language invites.
+    val emitted = allFuncs.filterNot(f =>
+      f.params.exists((_, t) => Type.mentionsAbstract(t)) || Type.mentionsAbstract(f.retTy))
+
     TProgram(
       structInsts.values.filterNot(abstracted).toList,
       enumInsts.values.filterNot(e => e.simple || abstracted(e)).toList,
       vtables.values.toList,
       externs,
-      orderVals(tvals.toList, allFuncs, vtables.values.toList),
-      allFuncs,
+      orderVals(tvals.toList, emitted, vtables.values.toList),
+      emitted,
       tmain,
       tentry,
       noAllocModules = moduleNarrows.collect { case (m, caps) if caps.contains(Capability.Alloc) => m }.toSet,

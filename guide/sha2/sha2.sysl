@@ -7,6 +7,8 @@
 // an argument, because SHA-224 and SHA-256 are the same word type and a type may implement a trait
 // once.
 
+import sysl.encoding.hex_string
+
 enum Fault
     NotStarted
     DigestTooSmall
@@ -188,29 +190,21 @@ new_sha512() -> Sha[u64]
     s
 end new_sha512
 
-val hexdigits: [16]u8 = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 97, 98, 99, 100, 101, 102]
-
-// A byte is not a character, so each nibble reaches text through `str(char(…))` — there is still
-// no way to build a string out of bytes a program computed.
-hex(d: []const u8) -> string
-    var s = ""
-
-    for i in 0..<d.len
-        s += str(char(hexdigits[usize(d[i] >> 4)]))
-        s += str(char(hexdigits[usize(d[i] & 15)]))
-
-    s
-end hex
-
+// **This program used to carry its own `hex` and its own table of digits**, under a finding that read
+// *"a byte is not a character, so each nibble reaches text through `str(char(…))` — there is still no
+// way to build a string out of bytes a program computed."* That absence has been filled:
+// `sysl.encoding.hex_string` renders bytes as hexadecimal, and the string it builds comes from
+// `from_utf8_unchecked` over the bytes it emitted rather than from concatenating one character at a
+// time. The sixteen-entry table and the loop that indexed it are gone with it.
 digest_of[T: Word](s: Sha[T], data: []const u8) -> string
     var h = s
-    // Storage the *buffer* owns rather than the frame, because the rendered digest is what leaves:
-    // a slice of a local array cannot outlive it, and `05` has no way to know that `hex` copies.
-    var out: []u8 = [0u8; 64]
+    // Storage the *buffer* owns rather than the frame, because the rendered digest is what leaves: a
+    // slice of a local array cannot outlive it, and `05` has no way to know that `hex_string` copies.
+    var out: []u8 = [0; 64]
 
     h.update(data)
     h.finish(out[0..<h.dlen]).expect("a digest buffer sized from the hasher itself")
-    hex(out[0..<h.dlen])
+    hex_string(out[0..<h.dlen])
 end digest_of
 
 sha224(data: []const u8) -> string = digest_of(new_sha224(), data)

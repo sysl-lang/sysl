@@ -33,8 +33,13 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * whose test files had been deleted, which is exactly the silent-green this test exists to
    * prevent. A floor is the cheap guard: it needs no maintenance as tests are added, and it fails
    * loudly if a whole file stops being collected.
+   *
+   * **Raise it when a batch adds a module's worth of tests**, or it stops doing its job: a floor far
+   * below the real count still passes with a whole file missing, which is the one thing it is for.
+   * Raised from 60 to 120 when `sysl.slices`, `sysl.encoding` and `sysl.rand` took the library from
+   * 89 collected tests to 136.
    */
-  private val floor = 60
+  private val floor = 120
 
   /** The library, compiled as a **test build of itself**.
    *

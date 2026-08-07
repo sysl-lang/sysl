@@ -427,6 +427,48 @@ class LibraryBuildCliTests extends LibraryCliSupport {
       before should not be after
     }
   }
+  /** A closure lowered inside a **generic** body carries that body's type parameters in its own
+    * signature, and no value at run time has such a type — so it must never reach a backend.
+    *
+    * **A library is the only place it can escape**, which is why this sat undetected. In a program the
+    * enclosing generic is instantiated and a concrete copy is emitted beside the abstract one, which
+    * nothing then asks about; `compileLibrary` strips `@tests` *before* analysis, so in a library
+    * nothing instantiates the generic at all and the abstract closure is the only copy there is. It
+    * crashed rather than diagnosing — `IllegalStateException: the type parameter 'T' reached codegen`
+    * out of `Type.Abstract.llvm` — which is never a correct answer to legal input.
+    *
+    * The shape is `sysl.slices`' own, and `12 §6` names a comparator passed to a sort as the bare
+    * arrow's motivating case, so it is one the language invites rather than an exotic corner.
+    */
+  "a closure written inside a generic, which nothing in the library instantiates" - {
+
+    "is dropped rather than reaching a backend that has no layout for its type parameter" in {
+      val root = rootOf("cmp",
+        """module cmp
+          |
+          |sorted[T: Ord](xs: []const T) -> bool = sorted_by(xs, (a, b) -> a < b)
+          |
+          |sorted_by[T](xs: []const T, lt: (T, T) -> bool) -> bool
+          |    for i in 1..<xs.len
+          |        if lt(xs[i], xs[i - 1]) then return false
+          |
+          |    true
+          |""".stripMargin)
+
+      val out = createTempFile("sysl-cli-generic-closure-", LibraryArtifact.extension)
+
+      succeeds(Config(command = "build-lib", file = root, output = Some(out)))
+
+      // And what came out is a readable artifact carrying the module, not merely a command that
+      // exited zero.
+      LibraryArtifact.metadataOf(out, readBytes(out)).flatMap(LibraryArtifact.read(out, _, Target.default)) match
+        case Right((trees, _, _)) => trees.flatMap(_.module.map(_.show)) shouldBe List("cmp")
+        case Left(err)            => fail(err)
+
+      deleteFile(out)
+    }
+  }
+
   "build-lib --std" - {
 
     "builds the standard module, which nothing else may declare" in {
