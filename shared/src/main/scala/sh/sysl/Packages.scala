@@ -31,13 +31,29 @@ case class Packages(of: Map[Source, String] = Map.empty, imports: Map[String, Ma
   /** The canonical prefix of the package a file belongs to, or the empty one for the project. */
   def prefixOf(file: Source): String = of.getOrElse(file, "")
 
-  /** What a name at the head of an import line means, written in a file of the package `prefix`.
+  /** What a written module path means, in a file of the package `prefix`.
    *
    * Per-package, which is the whole point: a dependency's own source says `json` and means whatever
    * *it* calls `json`, while a consumer of that dependency says `json` and may mean something else.
    * Both arrive at one canonical name without ever having to agree on a spelling.
+   *
+   * **The whole path is offered and not its first segment**, because what a package binds is a module
+   * path — `sh.sysl.table` for one namespaced by reverse DNS, whose `sh/` holds no source and is
+   * therefore no module of its own (`13 §1`). A single-segment lookup could only ever have found
+   * `sh`, which every such package would claim and none of them declares.
+   *
+   * The match is by longest key, so a name reaches the most specific package that offers it and
+   * anything under that name comes with it: `sh.sysl.table.sub` is answered by `sh.sysl.table` and
+   * keeps its tail. At most one key can match at all — resolution refuses two packages whose paths
+   * nest — so the longest is a tie-break that never has a tie to break, and is written that way so
+   * that a bug in the refusal is a wrong answer rather than an arbitrary one.
    */
-  def mounted(prefix: String, name: String): Option[String] = imports.get(prefix).flatMap(_.get(name))
+  def mounted(prefix: String, written: String): Option[String] =
+    imports.get(prefix).flatMap { table =>
+      table.keys.filter(k => written == k || written.startsWith(s"$k."))
+        .maxByOption(_.length)
+        .map(k => table(k) + written.drop(k.length))
+    }
 
   /** Whether there is anything here at all — asked before any of the work below is done, since a
    * program with no dependencies is the ordinary case.

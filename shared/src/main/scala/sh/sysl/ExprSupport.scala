@@ -54,14 +54,22 @@ trait ExprSupport extends SpecialForms with PatternAnalysis with StmtAnalysis {
    * `import std.fs` a prefix everywhere a written path is — and failing that, as a name the
    * **package** binds, which is what makes `sqlite.open` reach a dependency's module without an
    * import and without the coordinate it is really named under (`packages.md § 9`).
+   *
+   * **The package layer is asked with the whole chain and the import layer with its head**, and the
+   * asymmetry is the two layers' own. An import binds one name, so only a head can answer to it. A
+   * package binds a module *path* — `sh.sysl.table` for one namespaced by reverse DNS, since a
+   * directory holding no source is no module (`13 §1`) — so a head is not enough to find it, and
+   * offering only the head is what made `sh.sysl.table.of(…)` read as a field of an undefined `sh`
+   * while `import sh.sysl.table` beside it resolved.
    */
   protected def throughModule(e: Expr): Option[Expr] =
     for
       written <- chain(e) if written.length > 1 && lookupOpt(written.head).isEmpty
+      whole = written.mkString(".")
       path = if namesModule(written.head) then written
-             else importedModule(written.head)
-               .orElse(Option(inPackage(written.head)).filter(_ != written.head))
-               .fold(written)(_.split('.').toList ::: written.tail)
+             else importedModule(written.head).map(_.split('.').toList ::: written.tail)
+               .orElse(Option(inPackage(whole)).filter(_ != whole).map(_.split('.').toList))
+               .getOrElse(written)
       k <- (path.length - 1).to(1, -1).find(n => moduleNames(path.take(n).mkString(".")))
     yield
       val module = path.take(k).mkString(".")

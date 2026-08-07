@@ -190,7 +190,7 @@ class ResolveTests extends PackageCacheSupport {
 
       val e = resolveRefused(root, cache)
 
-      e should include("is the root name of two packages")
+      e should include("claim the same module")
       e should include("mount")
     }
 
@@ -217,7 +217,7 @@ class ResolveTests extends PackageCacheSupport {
 
       val root = project(manifest("app", "0.1.0", dep("a", "github.com/e/one", "1.0.0")), "json")
 
-      resolveRefused(root, cache) should include("is both a directory in this project")
+      resolveRefused(root, cache) should include("is both a module of this project")
     }
 
     "and a directory that is not a module does not collide with anything" in {
@@ -225,9 +225,76 @@ class ResolveTests extends PackageCacheSupport {
 
       publishedModule(cache, "github.com/e/one", Version(1, 0, 0), "json", name = "one")
 
+      val root = bare(manifest("app", "0.1.0", dep("a", "github.com/e/one", "1.0.0")), "json")
+
+      resolve(root, cache).packages.head.imports shouldBe Map("json" -> "github.com.e.one.json")
+    }
+
+    "nor does a dot directory, which is never walked at all" in {
+      val cache = emptyCache()
+
+      publishedModule(cache, "github.com/e/one", Version(1, 0, 0), "json", name = "one")
+
       val root = project(manifest("app", "0.1.0", dep("a", "github.com/e/one", "1.0.0")), ".git")
 
       resolve(root, cache).packages.head.imports shouldBe Map("json" -> "github.com.e.one.json")
+    }
+
+    // The case the whole path rule exists for. Two packages laid out by the convention
+    // `packages.md § 9` recommends share `sh` and `sh.sysl`, and neither declares either — a
+    // directory holding no source is not a module. Binding the top-level directory made every
+    // namespaced package claim `sh`, so no project could depend on two of them.
+    "two packages namespaced under one prefix are not a collision" in {
+      val cache = emptyCache()
+
+      publishedModule(cache, "github.com/sysl-lang/sqlite3", Version(0, 2, 0), "sh/sysl/sqlite",
+        name = "sqlite3")
+      publishedModule(cache, "github.com/sysl-lang/table", Version(0, 1, 2), "sh/sysl/table",
+        name = "table")
+
+      val root = project(manifest("app", "0.1.0",
+        s"${dep("sqlite3", "github.com/sysl-lang/sqlite3", "0.2.0")}, " +
+          s"${dep("table", "github.com/sysl-lang/table", "0.1.2")}"))
+
+      resolve(root, cache).packages.head.imports shouldBe Map(
+        "sh.sysl.sqlite" -> "github.com.sysl-lang.sqlite3.sh.sysl.sqlite",
+        "sh.sysl.table" -> "github.com.sysl-lang.table.sh.sysl.table",
+      )
+    }
+
+    // Nesting is refused as well as equality, because a written path that two entries could answer
+    // is the silent winner this rule exists to forbid — picking the longer would be a rule nobody
+    // wrote down.
+    "but a package offering a path INSIDE another's is" in {
+      val cache = emptyCache()
+
+      publishedModule(cache, "github.com/e/outer", Version(1, 0, 0), "sh/sysl", name = "outer")
+      publishedModule(cache, "github.com/e/inner", Version(1, 0, 0), "sh/sysl/table", name = "inner")
+
+      val root = project(manifest("app", "0.1.0",
+        s"${dep("a", "github.com/e/outer", "1.0.0")}, ${dep("b", "github.com/e/inner", "1.0.0")}"))
+
+      resolveRefused(root, cache) should include("claim the same module")
+    }
+
+    // A project namespacing itself the same way is held to the same rule, and at the same depth:
+    // its own `sh/sysl/table` collides, and an unrelated `sh/sysl/other` does not.
+    "a project's own namespaced module collides only at the path it actually declares" in {
+      val cache = emptyCache()
+
+      publishedModule(cache, "github.com/sysl-lang/table", Version(0, 1, 2), "sh/sysl/table",
+        name = "table")
+
+      val clash = project(manifest("app", "0.1.0",
+        dep("table", "github.com/sysl-lang/table", "0.1.2")), "sh/sysl/table")
+
+      resolveRefused(clash, cache) should include("is both a module of this project")
+
+      val fine = project(manifest("app", "0.1.0",
+        dep("table", "github.com/sysl-lang/table", "0.1.2")), "sh/sysl/other")
+
+      resolve(fine, cache).packages.head.imports shouldBe
+        Map("sh.sysl.table" -> "github.com.sysl-lang.table.sh.sysl.table")
     }
   }
 

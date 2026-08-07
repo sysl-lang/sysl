@@ -180,29 +180,45 @@ object Resolve {
    * when no mount overrides it, and is exactly the thing one pass would have got wrong.
    */
   private def tableOf(owner: String, ownerRoot: String, deps: List[Dependency], state: State)
-      : Either[String, Map[String, String]] =
-    deps.foldLeft(Right(Map.empty[String, String]): Either[String, Map[String, String]]) { (acc, dep) =>
+      : Either[String, Map[String, String]] = {
+    // Which package put each name there, carried beside the name it resolves to and dropped at the
+    // end. The collision test is about *packages* — two of them wanting one name — and the target
+    // alone cannot answer that, since a mount stores the coordinate where an unmounted binding
+    // stores the coordinate and the module both.
+    type Table = Map[String, (String, String)]
+
+    deps.foldLeft(Right(Map.empty): Either[String, Table]) { (acc, dep) =>
       for
         table <- acc
         dir   <- theirRoot(dep, state)
         added <- bindings(dep, dir).left.map(e => s"$owner: $e")
         _     <- collect(added.keys.toList.sorted)(local => noCollision(owner, ownerRoot, table, local, dep))
-      yield table ++ added
-    }
+      yield table ++ added.map((k, v) => k -> (v, dep.canonical))
+    }.map(_.map((k, v) => k -> v._1))
+  }
 
   /** What a dependency binds in the manifest that named it (`§ 9`).
    *
-   * **With no mount, a package's top-level modules come in under their own names.** That is what
-   * makes the mount optional in the sense the section argues for: mandatory mounting was rejected
-   * because it "would make every project's import lines differ from the library's own
-   * documentation", and an import line only matches the documentation if `sqlite.open` is what a
-   * consumer writes — which it is not if every name is silently prefixed by something. The section's
-   * own collision example says the same thing from the other side: it is a project with a `json/`
-   * directory meeting "a dependency preferring `json`", and `json` there is a *directory* name.
+   * **With no mount, a package's modules come in under their own names.** That is what makes the
+   * mount optional in the sense the section argues for: mandatory mounting was rejected because it
+   * "would make every project's import lines differ from the library's own documentation", and an
+   * import line only matches the documentation if `sqlite.open` is what a consumer writes — which it
+   * is not if every name is silently prefixed by something. The section's own collision example says
+   * the same thing from the other side: it is a project with a `json/` directory meeting "a
+   * dependency preferring `json`", and `json` there is a module name.
+   *
+   * **A name here is a module path and not a directory**, which is what `Project.modules` settles and
+   * is the difference between this working and not. A package namespaced by reverse DNS offers
+   * `sh.sysl.table`; its `sh/` and `sh/sysl/` hold no source, so neither is a module and neither is a
+   * name it can be asked for. Binding the top-level directory instead made every namespaced package
+   * claim `sh`, so any two of them refused to resolve together — with the convention `§ 9` recommends
+   * being what guaranteed it, and the mount it sent people to being the tax that section refuses to
+   * levy.
    *
    * **A mount hangs the whole package under one segment**, which is the escape hatch for exactly the
-   * case that example describes: mount it as `ejson` and its `json` is reached as `ejson.json`,
-   * leaving the project's own `json` alone.
+   * case the collision example describes: mount it as `ejson` and its `json` is reached as
+   * `ejson.json`, leaving the project's own `json` alone. It is unchanged by any of the above — a
+   * mount is a name the consumer chose, so there is no tree to read it off.
    *
    * `package.name` is deliberately not consulted. It names the *package*, which is a unit of
    * distribution, and what an import line writes is a *module*, which is a unit of code — sqlite3's
@@ -213,11 +229,11 @@ object Resolve {
     dep.mount match
       case Some(mount) => Right(Map(mount -> dep.canonical))
       case None =>
-        val modules = topLevel(dir)
+        val modules = Project.modules(dir)
 
         if modules.isEmpty then
-          Left(s"'${dep.label}' has no modules — a package is a tree of directories, each of them a " +
-            "module, and there is nothing here to import")
+          Left(s"'${dep.label}' has no modules — a package is a tree of directories holding source, " +
+            "each of them a module, and there is nothing here to import")
         else Right(modules.map(m => m -> Packages.qualify(dep.canonical, m)).toMap)
 
   /** Where the version of `dep` that is being built has its source, which for a git dependency is the
@@ -233,26 +249,45 @@ object Resolve {
           entry   <- state.manifests.get((coordinate, version)).toRight(s"'$coordinate' was never read")
         yield entry._1
 
-  /** The two ways one root name can be claimed twice, both refused rather than resolved by order.
+  /** The two ways one module name can be claimed twice, both refused rather than resolved by order.
    *
    * This is `§ 9`'s load-bearing rule: a collision is an error and never a silent winner. The JVM
    * classpath is the counter-example the chapter names — the same package in two jars is decided by
    * jar order, quietly, and what results is a program somebody has to bisect to understand.
+   *
+   * **What is compared is the module path**, so two packages that both namespace themselves under
+   * `sh.sysl` and offer `sh.sysl.sqlite` and `sh.sysl.linenoise` do not collide, because no import
+   * line can be read as either. The names they share are `sh` and `sh.sysl`, and neither package
+   * declares those — a directory holding no source is not a module (`13 §1`).
    */
-  private def noCollision(owner: String, ownerRoot: String, table: Map[String, String], local: String,
-                          dep: Dependency): Either[String, Unit] =
-    table.get(local) match
-      case Some(other) if other != dep.canonical =>
-        Left(s"$owner: '$local' is the root name of two packages — $other and ${dep.canonical}. " +
-          s"Give one of them a 'mount' in ${PackageConfig.FileName} to say which name it takes here")
+  private def noCollision(owner: String, ownerRoot: String, table: Map[String, (String, String)],
+                          local: String, dep: Dependency): Either[String, Unit] =
+    table.find((name, _) => overlap(name, local)) match
+      case Some((name, (_, other))) if other != dep.canonical =>
+        Left(s"$owner: '$local' and '$name' cannot both be imported — $other and ${dep.canonical} " +
+          s"claim the same module. Give one of them a 'mount' in ${PackageConfig.FileName} to say " +
+          "which name it takes here")
 
       case _ =>
         // The consumer's own modules are in the same name space, and a project with a `json`
-        // directory at its root taking a dependency that prefers `json` is the common case rather
+        // directory at its root taking a dependency that offers `json` is the common case rather
         // than an exotic one. Refused in the same words, because it is the same collision.
-        Either.cond(!topLevel(ownerRoot).contains(local), (),
-          s"$owner: '$local' is both a directory in this project and the root name of " +
-            s"${dep.canonical} — give the dependency a 'mount' to say what it is called here")
+        Either.cond(!Project.modules(ownerRoot).exists(overlap(_, local)), (),
+          s"$owner: '$local' is both a module of this project and one ${dep.canonical} offers — " +
+            "give the dependency a 'mount' to say what it is called here")
+
+  /** Whether two module paths claim ground the other needs: the same name, or one a path **inside**
+   * the other.
+   *
+   * The nesting half is what keeps the table unambiguous rather than merely unique. A package
+   * offering `sh.sysl` and another offering `sh.sysl.table` share no name, but `sh.sysl.table` read
+   * as an import answers to both — and picking the longer would be the silent winner this whole rule
+   * exists to refuse. So it is a collision, and it is one the reverse-DNS convention makes very
+   * unlikely, since a package that namespaces itself puts nothing at `sh/sysl/` for the shorter name
+   * to come from.
+   */
+  private def overlap(a: String, b: String): Boolean =
+    a == b || a.startsWith(s"$b.") || b.startsWith(s"$a.")
 
   /** A package's manifest, where it has one. A package with no file is a package that said nothing,
    * exactly as `§ 1` has it for a project.
@@ -265,13 +300,6 @@ object Resolve {
       try PackageConfig.read(readFile(path)).left.map(e => s"$root: $e")
       catch case e: Exception => Left(s"cannot read $path: ${e.getMessage}")
   }
-
-  /** The directory names directly under a project root, which are exactly the modules it declares at
-   * top level (`13 §1`) and therefore the names a dependency must not silently take.
-   */
-  private def topLevel(root: String): Set[String] =
-    try listFiles(root).filter(isDirectory).map(Project.basename).filterNot(_.startsWith(".")).toSet
-    catch case _: Exception => Set.empty
 
   /** Every item, or the first thing wrong — the same shape the config parser uses, and for the same
    * reason: these are not independent failures, and a list of them describes one broken graph

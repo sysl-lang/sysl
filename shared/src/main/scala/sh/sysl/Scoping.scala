@@ -335,7 +335,7 @@ trait Scoping extends DeclTables {
     val head = written.takeWhile(_ != '.')
 
     if namesModule(head) then written
-    else packagePath(head).map(_ + written.drop(head.length)).getOrElse(written)
+    else packagePath(written).getOrElse(written)
   }
 
   /** The same question one layer out: what a written path's leading segment means in the **package**
@@ -352,14 +352,23 @@ trait Scoping extends DeclTables {
    * a dependency that happens to prefer one of its names — and the collision that would be is
    * already refused when the graph is resolved, so this order is what that refusal is worth.
    *
+   * The two halves read the written path differently, and each is right for what it is asking. A
+   * package's **own** modules are reached by qualifying the leading segment, because the path is
+   * already relative to that package's root and everything after the head travels unchanged. A
+   * **dependency's** are reached by offering the whole path, because what a dependency binds is a
+   * module path rather than a segment — `sh.sysl.table` and not `sh`, since a directory holding no
+   * source is no module (`13 §1`).
+   *
    * The project being built has an empty prefix and no table, so both lookups miss and a path is
    * read exactly as it was before any of this existed.
    */
-  private def packagePath(head: String): Option[String] = {
+  private def packagePath(written: String): Option[String] = {
     val prefix = currentFile.map(packages.prefixOf).getOrElse("")
+    val head   = written.takeWhile(_ != '.')
 
     Option.when(prefix.nonEmpty)(Packages.qualify(prefix, head)).filter(namesModule)
-      .orElse(packages.mounted(prefix, head))
+      .map(_ + written.drop(head.length))
+      .orElse(packages.mounted(prefix, written))
   }
 
   /** The module a name was imported as, searching the open blocks before the file. */

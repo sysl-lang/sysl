@@ -52,6 +52,37 @@ object Project {
   def cSources(path: String): List[Source] =
     if isDirectory(path) then walk(path, Nil, List(".c")) else Nil
 
+  /** The modules a tree offers to something outside it: the shallowest directories under `root` that
+   * hold source, as dotted paths (`13 §1`).
+   *
+   * **A directory holding no source is not a module**, which is the same rule `walk` applies and is
+   * why this lives here rather than beside its caller. A package namespaced by reverse DNS puts its
+   * source at `sh/sysl/table/`, so `sh` and `sh/sysl` hold nothing and the module it offers is
+   * `sh.sysl.table` — one name, three segments. Reading the top-level *directories* instead would
+   * answer `sh` for that package and for every other one namespaced the same way, which is not a
+   * name any of them declares and is the same name for all of them.
+   *
+   * **Shallowest and not every module**, because what a binding has to cover is a name and everything
+   * under it: a consumer writing `sh.sysl.table.sub` is answered by the entry for `sh.sysl.table`,
+   * and an entry of its own would say the same thing twice. It also keeps the guarantee the collision
+   * check rests on — no path here is inside another, so at most one can answer any written path.
+   *
+   * A file sitting directly in `root` belongs to the anonymous root module, which has no name to
+   * import and so is not offered.
+   */
+  def modules(root: String): Set[String] = {
+    def under(path: String, dir: List[String]): List[String] = {
+      val entries = try listFiles(path).toList.sorted catch case _: Exception => Nil
+
+      if dir.nonEmpty && entries.exists(f => isFile(f) && sysl.exists(f.endsWith)) then List(dir.mkString("."))
+      else
+        entries.filter(isDirectory).filterNot(d => basename(d).startsWith("."))
+          .flatMap(d => under(d, dir :+ basename(d)))
+    }
+
+    under(root, Nil).toSet
+  }
+
   /** One directory of the project: its own files of the wanted kinds, then the sub-directories under
    * it. A directory holding no source is not a module and contributes nothing; it is still walked,
    * since modules further down are reached through it.

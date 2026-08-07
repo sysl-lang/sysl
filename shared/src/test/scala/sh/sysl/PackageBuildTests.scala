@@ -18,14 +18,19 @@ class PackageBuildTests extends PackageCacheSupport {
 
   /** A package on disk: a manifest, one module in a directory of its own, and whatever else it
    * carries — which for the suite below is C, written at a path relative to the package root.
+   *
+   * `module` may be a path, which is how a package namespaced by reverse DNS is laid out —
+   * `sh/sysl/table` declares the single module `sh.sysl.table` and leaves `sh` and `sh/sysl` holding
+   * no source, and therefore declaring nothing.
    */
   private def packageOf(name: String, module: String, text: String, deps: String = "",
                         files: (String, String)*): String = {
     val root = createTempDirectory("sysl-pkg-")
+    val leaf = Project.basename(module)
 
     writeFile(s"$root/${PackageConfig.FileName}", manifest(name, "1.0.0", deps))
     createDirectories(s"$root/$module")
-    writeFile(s"$root/$module/$module.sysl", s"module $module\n\n$text\n")
+    writeFile(s"$root/$module/$leaf.sysl", s"module ${module.replace('/', '.')}\n\n$text\n")
 
     for (path, body) <- files do
       Project.parentOf(s"$root/$path").foreach(createDirectories)
@@ -170,7 +175,7 @@ class PackageBuildTests extends PackageCacheSupport {
       val two = packageOf("two", "json", "tag() -> int = 2")
 
       refused(app("""print(json.tag())""",
-        s"""a { path = "$one" }, b { path = "$two" }""")) should include("is the root name of two packages")
+        s"""a { path = "$one" }, b { path = "$two" }""")) should include("claim the same module")
     }
 
     "and a mount settles it" in {
@@ -190,7 +195,64 @@ class PackageBuildTests extends PackageCacheSupport {
       createDirectories(s"$root/json")
       writeFile(s"$root/json/json.sysl", "module json\n\nmine() -> int = 2\n")
 
-      refused(root) should include("is both a directory in this project")
+      refused(root) should include("is both a module of this project")
+    }
+  }
+
+  /** The convention `packages.md § 9` recommends, from the consuming side — and the case it was
+   * recommended *for*.
+   *
+   * A package that namespaces itself by reverse DNS puts its source at `sh/sysl/<name>/`, so `sh`
+   * and `sh/sysl` hold none and neither is a module it declares. Binding the top-level **directory**
+   * made every such package claim the one name `sh`, so any two of them refused to resolve together
+   * and a project could depend on at most one — with the convention that was supposed to make
+   * collisions "close to never" being exactly what guaranteed one.
+   *
+   * Nothing in the suite could have caught it: every other package here declares a bare module at
+   * its root, which is the one shape the old rule got right.
+   */
+  "packages namespaced under a shared prefix" - {
+
+    "are all reachable at once, under the names their own documentation shows" in {
+      val sqlite = packageOf("sqlite3", "sh/sysl/sqlite", "answer() -> int = 40")
+      val table  = packageOf("table", "sh/sysl/table", "answer() -> int = 2")
+
+      run(app("""print(sh.sysl.sqlite.answer() + sh.sysl.table.answer())""",
+        s"""s { path = "$sqlite" }, t { path = "$table" }""")) shouldBe "42\n"
+    }
+
+    "and are imported without a mount, which is the whole point of the convention" in {
+      val sqlite = packageOf("sqlite3", "sh/sysl/sqlite", "double(n: int) -> int = n * 2")
+      val table  = packageOf("table", "sh/sysl/table", "half(n: int) -> int = n / 2")
+
+      run(app(
+        """import sh.sysl.sqlite.double
+          |import sh.sysl.table.half
+          |
+          |print(double(half(42)))""".stripMargin,
+        s"""s { path = "$sqlite" }, t { path = "$table" }""")) shouldBe "42\n"
+    }
+
+    // A binding covers the module it names and everything under it, so a package needs one entry
+    // however deep its tree goes.
+    "a module below a bound one comes with it" in {
+      val deep = packageOf("deep", "sh/sysl/outer", "double(n: int) -> int = n * 2")
+
+      createDirectories(s"$deep/sh/sysl/outer/inner")
+      writeFile(s"$deep/sh/sysl/outer/inner/inner.sysl",
+        "module sh.sysl.outer.inner\n\ntriple(n: int) -> int = n * 3\n")
+
+      run(app("""print(sh.sysl.outer.double(15) + sh.sysl.outer.inner.triple(4))""",
+        s"""d { path = "$deep" }""")) shouldBe "42\n"
+    }
+
+    // The mount is untouched by any of it: a name the consumer chose has no tree to be read off, so
+    // it still hangs the whole package under one segment.
+    "and a mount still hangs the whole tree under one segment" in {
+      val table = packageOf("table", "sh/sysl/table", "answer() -> int = 42")
+
+      run(app("""print(tb.sh.sysl.table.answer())""",
+        s"""t { path = "$table", mount = "tb" }""")) shouldBe "42\n"
     }
   }
 

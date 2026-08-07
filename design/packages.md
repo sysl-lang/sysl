@@ -286,17 +286,27 @@ Two ways out, and sysl takes the second:
    dependency's own tree still follows `13 § 1` relative to *its* root; the manifest says where that
    root hangs in yours.
 
-**The mount is optional.** A dependency states a preferred root name; a consumer writes `mount` only
-when it collides. Mandatory mounting was rejected because it would make every project's import lines
+**The mount is optional.** A dependency states its preferred names; a consumer writes `mount` only
+when one collides. Mandatory mounting was rejected because it would make every project's import lines
 differ from the library's own documentation — a permanent tax paid for an occasional problem.
 
-**What a package offers is its own top-level module names, and that is settled by the paragraph
-above.** A package's top-level directories are its modules (`13 §1`), so those are the names a
-consumer writes: a package holding `sqlite/` is reached as `sqlite.open`, which is what its
-documentation shows. Prefixing them by something — the package's name, the coordinate — would be
-mandatory mounting under another name, and would fail the test this section already set. The
-collision example below says the same thing from the other side, since the `json` a project's own
-`json/` directory collides with is a *directory* name.
+**What a package offers is its own module names, and that is settled by the paragraph above.** A
+module is a directory **of source files** (`13 §1`), so those are the names a consumer writes: a
+package holding `sqlite/` is reached as `sqlite.open`, which is what its documentation shows.
+Prefixing them by something — the package's name, the coordinate — would be mandatory mounting under
+another name, and would fail the test this section already set. The collision example below says the
+same thing from the other side, since the `json` a project's own `json/` directory collides with is a
+module name.
+
+**A name here is a module PATH and not a leading segment**, and the distinction is load-bearing
+rather than pedantic. A package laid out as `sh/sysl/table/` offers the one name `sh.sysl.table`: its
+`sh/` and `sh/sysl/` hold no source, so neither is a module and neither is a name it can be asked
+for. Reading the top-level *directory* instead would answer `sh` — a name that package does not
+declare, and the same name every other package namespaced the same way would answer with. The
+subsection below is why that matters, and it is where this was got wrong.
+
+A binding covers the module it names and everything under it, so one entry answers for a whole
+subtree: `sh.sysl.table.style` reaches the package that offers `sh.sysl.table`, keeping its tail.
 
 **`package.name` is deliberately not what a consumer writes.** It names the package, which is a unit
 of distribution; an import line names a module, which is a unit of code. sqlite3 is the case that
@@ -308,11 +318,18 @@ reached as `ejson.json`, which leaves the consumer's own `json` alone. That is t
 it is per-consumer: two projects mounting one package differently still link one copy of it.
 
 **What makes "optional" safe is the rule that a collision is an error, never a silent winner.** Two
-dependencies resolving to one root name refuse to compile, and the diagnostic says which one to
-mount. This is the thing the JVM classpath gets wrong — the same package in two jars is resolved by
-jar order, quietly, and the program that results is one somebody has to bisect to understand.
+dependencies claiming one module path refuse to compile, and the diagnostic says which one to mount.
+This is the thing the JVM classpath gets wrong — the same package in two jars is resolved by jar
+order, quietly, and the program that results is one somebody has to bisect to understand.
 **Collisions include the consumer's own modules**, which is in fact the common case: a project with a
-`json/` directory at its root and a dependency preferring `json` is not an exotic scenario.
+`json/` directory at its root and a dependency offering `json` is not an exotic scenario.
+
+**Nesting collides as well as equality.** A package offering `sh.sysl` and one offering
+`sh.sysl.table` share no name, but an import of `sh.sysl.table` could be read as either — and
+resolving it to the longer would be a silent winner under a rule nobody wrote down. So one path
+inside another is refused in the same words. It is a case the convention below makes very unlikely,
+since a package that namespaces itself puts no source at `sh/sysl/` for the shorter name to come
+from.
 
 ### A package may namespace itself, and the published ones do
 
@@ -320,9 +337,9 @@ Everything above is about what the **tool** may impose, and the answer there is 
 prefix would make every import line differ from the library's own documentation, which is the tax
 this section refuses to levy. It says nothing about what a package may choose for **itself**.
 
-A package's top-level directories are its modules, so a package that wants a namespaced name simply
-has namespaced directories. The packages published under `sysl-lang` do exactly that, by convention
-rather than by rule:
+A package's directories holding source are its modules, so a package that wants a namespaced name
+simply has namespaced directories. The packages published under `sysl-lang` do exactly that, by
+convention rather than by rule:
 
 ```
 sh/sysl/monocypher/         →  module sh.sysl.monocypher
@@ -339,6 +356,19 @@ picked a bare name — but a consumer whose dependencies are all namespaced will
 and will not meet the consumer's-own-module case either, since a project is unlikely to have an `sh/`
 directory of its own. The optional mount was the right call precisely because the common case can be
 arranged not to need it; this is a package author arranging that.
+
+**That paragraph was false for two months, and the way it was false is worth keeping.** Resolution
+bound a dependency's top-level **directories** rather than its modules, so every package following
+this convention claimed the single name `sh` — and any two of them refused to resolve together with
+a diagnostic telling the reader to mount one. The convention recommended here to make collisions
+"close to never" was the thing that guaranteed one, and the escape hatch it sent people to produced
+`import tb.sh.sysl.table`, which is precisely the tax on import lines this section refuses to levy.
+
+**It survived because nothing had two dependencies.** Every package in the org was consumed alone,
+and a single namespaced dependency binds `sh` with nothing to collide with — so the one shape that
+fails is the shape nobody had written yet. It was found the day a program wanted three of them, and
+the fix is the sentence this subsection already rested on: a directory holding no source is not a
+module, so `sh` was never a name any of those packages offered.
 
 **A convention, deliberately, and not a rule.** Enforcing it would be mandatory mounting wearing a
 different hat, and would refuse a perfectly good single-purpose package that wants a short name in a
@@ -418,14 +448,14 @@ code reaches.
 
 ## Open (not yet decided)
 
-- **~~a. Where a preferred root name comes from when there is no manifest.~~ CLOSED by §9's own
-  rule.** The worry was that a package with no manifest has nothing to state a preference with, and
-  that defaulting to a directory name would be magic — but the names a package offers are its
-  **top-level module** directories rather than the directory it was checked out into, and those are
-  decisions its author made and `13 §1` already makes load-bearing. So a manifest is not what names
-  a package's modules, and a `path` dependency into a plain tree needs no `mount`. What *is* refused
-  is a package with no top-level directories at all: it offers nothing, and a dependency on it can
-  only be a mistake.
+- **~~a. Where a preferred name comes from when there is no manifest.~~ CLOSED by §9's own rule.**
+  The worry was that a package with no manifest has nothing to state a preference with, and that
+  defaulting to a directory name would be magic — but the names a package offers are its **module
+  paths** rather than the directory it was checked out into, and those are decisions its author made
+  and `13 §1` already makes load-bearing. So a manifest is not what names a package's modules, and a
+  `path` dependency into a plain tree needs no `mount`. What *is* refused is a package with no
+  modules at all: it offers nothing, and a dependency on it can only be a mistake. A tree of
+  directories holding no source is that case, and says so rather than offering their names.
 - **b. Whether module names ever become globally qualified.** §9 chose local names, but the
   alternative is a real design and not a strawman.
 - **c. Whether a package's `link` directives are reported at add time.** The information is already

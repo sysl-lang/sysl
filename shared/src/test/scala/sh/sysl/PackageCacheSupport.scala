@@ -42,15 +42,22 @@ trait PackageCacheSupport extends AnyFreeSpec with Matchers {
 
   /** The usual case: a package in the cache holding one module, in a directory of its own.
    *
-   * A package's top-level directories are its modules (`13 §1`) and are therefore the names it
-   * offers a consumer, so a package with none offers nothing — which makes this, rather than
-   * `published`, what almost every test wants.
+   * A package's modules are the directories of it that **hold source** (`13 §1`) and are therefore
+   * the names it offers a consumer, so a package with none offers nothing — which makes this, rather
+   * than `published`, what almost every test wants.
+   *
+   * `module` may be a path, which is how a package that namespaces itself by reverse DNS is laid
+   * out: `sh/sysl/table` puts the source three directories down, so `sh` and `sh/sysl` hold none and
+   * the single module offered is `sh.sysl.table`.
    */
   protected def publishedModule(cache: String, coordinate: String, version: Version, module: String,
-                                name: String = "", deps: String = ""): String =
+                                name: String = "", deps: String = ""): String = {
+    val leaf = Project.basename(module)
+
     published(cache, coordinate, version,
-      manifest(if name.isEmpty then module else name, version.toString, deps),
-      s"$module/$module.sysl" -> s"module $module\n")
+      manifest(if name.isEmpty then leaf else name, version.toString, deps),
+      s"$module/$leaf.sysl" -> s"module ${module.replace('/', '.')}\n")
+  }
 
   /** The hash a fetch would have recorded beside a cached package, computed from what is there. */
   protected def record(cache: String, coordinate: String, version: Version): String = {
@@ -63,8 +70,28 @@ trait PackageCacheSupport extends AnyFreeSpec with Matchers {
     hash
   }
 
-  /** A project on disk: a `package.hocon` and whatever directories it has of its own. */
+  /** A project on disk: a `package.hocon` and whatever **modules** it has of its own.
+   *
+   * Each name gets a source file in it, because a directory holding none is not a module (`13 §1`)
+   * and so is not a name anything can collide with — which is a case worth testing deliberately
+   * (`bare`) rather than one every caller should get by accident.
+   */
   protected def project(config: String, dirs: String*): String = {
+    val root = createTempDirectory("sysl-pkg-project-")
+
+    if config.nonEmpty then writeFile(s"$root/${PackageConfig.FileName}", config)
+
+    for d <- dirs do
+      createDirectories(s"$root/$d")
+      writeFile(s"$root/$d/${Project.basename(d)}.sysl", s"module ${d.replace('/', '.')}\n")
+
+    root
+  }
+
+  /** A project whose named directories are **empty**, holding no source and therefore declaring no
+   * module.
+   */
+  protected def bare(config: String, dirs: String*): String = {
     val root = createTempDirectory("sysl-pkg-project-")
 
     if config.nonEmpty then writeFile(s"$root/${PackageConfig.FileName}", config)
