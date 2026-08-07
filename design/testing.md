@@ -102,6 +102,60 @@ travel in the library, a program's do not run when it runs, and neither stops be
 A helper only a test calls leaves with it, because it becomes unreachable and pruning notices;
 a helper the program also calls stays, because the program still calls it.
 
+### `@tests` — a file of scaffolding
+
+Pruning answers for a **program** and does not answer for a **library**. A library has no `main`
+to lower outwards from, so every public declaration is a potential entry and all of them are
+emitted; a helper only a test called would ride into the artifact and be advertised out of it,
+nameable by everything that links it. Nothing about the declaration says it is scaffolding, and
+nothing could — it is an ordinary function, which is the point of it.
+
+So the **file** says it, in its header, beside the capability clauses:
+
+```
+module sysl.text
+@tests
+
+fixture() -> Layout = ...
+
+@test("a column is measured with its header")
+header_counts() =
+    assert_eq(fixture().width(), 12)
+```
+
+It is `@tests` and not `@test` because the two say different things: `@test` names something the
+runner calls, and this names something no build but the runner's keeps. One word for both would
+read as though the file were itself a test.
+
+**Every build but `sysl test` drops everything such a file declares**, and — the other half of
+the same rule — **nothing outside a test may name any of it**. Either alone is unsound. Dropping
+without restricting leaves a program that called a helper compiling here and failing at the
+link, with a message about a missing symbol rather than about the line that named it.
+
+The restriction is stated over the **referring declaration** and not over the file it sits in,
+and the case that forces this is the one above: a test may sit beside what it tests. So a
+`@test` function may name scaffolding wherever it was written, and a declaration in another
+`@tests` file may, and nothing else may. That the two agree is what makes the drop safe rather
+than lucky — every reference into such a file comes from something dropped in exactly the builds
+the file is, so a stripped tree can hold no reference to what went with it.
+
+It stops at the **package boundary**, and that is not a taste: a package is compiled from source
+and a library arrives as an artifact whose test files were never encoded, so a rule that let the
+reference cross would compile against one and fail against the other. A test-support library
+meant to be imported — sysl's `harness`, old sysl's `std.testing` — is therefore ordinary code
+that ships, and is a different thing from a file of scaffolding inside a package.
+
+An **`impl` block may not sit in one**. It declares no name; it puts an entry in a method table,
+which the rest of the program reads without naming anything. Kept in a test build and dropped
+everywhere else, it would mean a trait answering one way while the tests ran and another way in
+the program that shipped. The impl belongs beside the type. What that buys, beyond the rule
+itself, is that a declaration in a test file is never a trait method — so a dispatch through a
+table can never reach one, and the reference check has three node kinds to look at rather than
+five.
+
+The **types** such a file declares are left in the tree when its functions go, exactly as
+pruning leaves them: a type is emitted for its layout rather than for anything that runs.
+
 ### The runner
 
 ```
@@ -141,6 +195,37 @@ carrying the whole burden of identifying the check.
 The location is composed with `prints` and `printi` rather than an interpolated string, because
 building a string makes heap storage and an assertion is exactly what a module under `@no_alloc`
 wants most.
+
+### `assert_eq`, and why it is a function rather than advice
+
+What it adds over `assert(a == b)` is the two **values**. A failed `assert` names the line, which
+says which check broke; its reader then runs the thing again to find out what the values were, and
+running it again is exactly what the report could have saved them.
+
+```
+assert_eq[T: Eq + Display](got: T, want: T, msg = "", …)
+assert_slice_eq[T: Eq + Display](got: []const T, want: []const T, msg = "", …)
+```
+
+The message could be written by hand — `assert(a == b, s"got $a, want $b")` — and that spelling is
+what these replace. It evaluates each side twice, and it builds a string, which makes heap storage
+and so is unavailable to the modules that want an assertion most. Rendering through `Display` into
+`stdout()` costs neither, which is why this is a function in the library rather than a sentence in a
+guide telling people to interpolate.
+
+**One function and not one per type.** `Eq` says the comparison means something and `Display` says
+the value can be shown, which together are the whole of what a report needs. Old sysl's `std.testing`
+had twelve, and said why in its own prose: it had no ad-hoc polymorphism on parameter types.
+
+The slice form earns its place differently. `assert_eq` on two slices would say they differ and send
+its reader to find out where; this reports the length when the lengths are what differ, and otherwise
+the first index they disagree at with both elements at it.
+
+**The float pair lives in `sysl.math`**, as `assert_approx_eq` and `assert_approx_eq_rel`, because
+`==` is the wrong question to ask about a float and `approx_eq` is where the right one already is.
+That placement is forced rather than chosen: `Float` is declared in `sysl.math` and reaches `Eq`,
+`Ord` and the arithmetic traits in the root, so `sysl.math` depends on `sysl` — and a float assertion
+in `check.sysl` would put an edge back the other way, which `13 §6` refuses.
 
 **Summary:** Tier 1 = static (fast, most tests, including IR-shape); Tier 2 = the compiler's
 own run-it tests (Scala-authored); Tier 3 = the language's test framework (sysl-authored).

@@ -34,6 +34,18 @@ and passes by not coming back, so a trap is an observation there rather than the
 which is what lets a refusal be stated in sysl, beside the code it is about. `guide/ring` was the
 first to need this and `guide/ring/tests.sysl` is where that half of its evidence lives.
 
+**Such a file opens with `@tests`**, which says the whole of it is scaffolding: every build but
+`sysl test` drops what it declares, and nothing outside a test may name any of it. A program did not
+strictly need the header — a helper only a test calls is pruned anyway — but the file is reading
+material, and a fixture like `guide/ring`'s `filled_ring` is an ordinary function that says nothing
+about existing only for the tests under it. The header is where it says so.
+
+**A check that compares two values is `assert_eq`, not `assert(a == b)`.** The difference is what a
+failure prints: `assert` names the line, and `assert_eq` names the line and both values, so nobody
+has to run the program a second time to find out what it actually returned. The `check(name, got,
+want)` helper several programs define is a different thing and stays — it *prints* every line rather
+than stopping at the first, because in those programs the whole of stdout is the assertion.
+
 **Write every refusal beside the call that is not refused.** A `should_trap` test passes for any
 failure at all, its own setup included, so alone it cannot tell "the contract fired" from "nothing
 worked". One call over the line and one call up to it, and the difference between them is the
