@@ -736,6 +736,15 @@ writing it `int` would be right on every machine anyone is likely to use and wro
 `char` is a Unicode scalar value and becomes `uint32_t`, never C's `char`, which would be wrong by a
 factor of four.
 
+**The one fact C cannot take from a type name is divergence**, since `never` and `unit` both spell as
+`void`. A function returning `never` is therefore annotated — `SYSL_NORETURN void spin(void)` — where
+the macro resolves to C11's `_Noreturn`, C++11's `[[noreturn]]`, or nothing on a compiler older than
+either. It is written as a macro because the header serves both languages and `_Noreturn` is not valid
+C++; the empty definition makes a weaker declaration rather than an invalid one. What the annotation
+buys the caller is real: code after the call is dead, and a path ending in it needs no return value.
+
+**The header assumes C99 or any C++**, which the three includes already did before anything said so.
+
 **What the archive does not hold is what this build's own libraries supply**, and the driver says so
 rather than leaving it to be found at the C project's link, where an unresolved sysl symbol reads as
 a missing definition rather than as a missing archive. `--no-std-lib` folds the library's source into

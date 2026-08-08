@@ -206,6 +206,20 @@ class ExportTests extends AnyFreeSpec with CodegenSupport {
       headerFor("module demo\n\n@export\ntick(a: i32)\n    print(a)\n") should include("void tick(int32_t a);")
     }
 
+    // `never` and `unit` both spell as `void`, so the annotation is the only thing carrying the
+    // difference across — that control does not come back, rather than merely that no value does.
+    "annotates a function that does not return, which a bare 'void' would not say" in {
+      val h = headerFor("module demo\n\n@export\nspin() -> never =\n    loop\n        print(1)\n")
+
+      h should include("SYSL_NORETURN void spin(void);")
+      h should include("#define SYSL_NORETURN _Noreturn")
+      h should include("[[noreturn]]")
+    }
+
+    "and the macro is absent from a header with nothing that diverges" in {
+      headerFor("module demo\n\n@export\ntick(a: i32)\n    print(a)\n") should not include "SYSL_NORETURN"
+    }
+
     "spells a pointer as a pointer" in {
       headerFor("module demo\n\n@export\nhead(p: *u8) -> *u8 = p\n") should
         include("uint8_t * head(uint8_t * p);")
