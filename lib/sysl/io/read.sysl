@@ -2,7 +2,7 @@ module sysl.io
 
 import sysl.buf.{Buf, buf}
 import sysl.sys.{sysl_memchr, sysl_read}
-import sysl.text.from_utf8
+import sysl.text.{from_utf8, Utf8Error}
 
 // The input half of the byte surface, and the line cursor over it.
 //
@@ -26,6 +26,22 @@ import sysl.text.from_utf8
 // and forget to apply it to the other. Returning empty says end of input and nothing more -- whether
 // input *ended badly* is what `failed` is for, and the two questions are separate because a caller
 // that does not care should not have to ask.
+//
+// **A TERMINAL IS NOT COVERED HERE, and the failure is silent, which is why it is said out loud.**
+// The line cursor below splits on `\n`, which is right for a file and for a pipe. A terminal sends a
+// bare `\r` when Enter is pressed, so a program reading lines from a serial console or a raw-mode
+// terminal never sees a line at all: it waits forever, prints nothing, and looks hung. There is no
+// diagnostic to grep for, because nothing has gone wrong -- the line has not ended.
+//
+// Two more things a console needs that a file does not, both for the same reason. A terminal in raw
+// mode has **no echo**, so nothing appears as it is typed; and with no echo there is no editing
+// either, so a mistake cannot be corrected. Neither is a line cursor's business, and both have to
+// come from somewhere.
+//
+// So a program reading from a console reads bytes through `Reader` and assembles lines itself,
+// treating CR, LF and CRLF alike -- with the CRLF case straddling two reads, since a bare-CR terminal
+// never sends the LF and waiting for it inside a read hangs until the next keystroke.
+// `sh.sysl.pico2.read_line` is a worked example of the whole of that, editing included.
 trait Reader: Fallible
     read(*self, into: []u8) -> []const u8
 
@@ -67,19 +83,34 @@ end FdReader
 impl Fallible for FdReader
     override failed(*self) -> bool = self.bad
 
-// Bytes to text at the boundary they arrive at, which is where `04` puts the check. Ill-formed input
-// stops the program the way an ill-formed argument does, and that is the right severity *because*
-// the layer underneath is public: a caller who would rather inspect than trap reads bytes through
-// `Reader` and validates them itself. A trailing `\r` goes with the `\n`, so input written on one
-// system reads the same on the other -- `bufio.Scanner`'s choice rather than C `getline`'s.
+// Bytes to text at the boundary they arrive at, which is where `04` puts the check. A trailing `\r`
+// goes with the `\n`, so input written on one system reads the same on the other --
+// `bufio.Scanner`'s choice rather than C `getline`'s.
+//
+// Ill-formed input stops the program the way an ill-formed argument does, and that is the right
+// severity for a program reading a file it expects to be text: there is nothing sensible for it to
+// do with the rest, and carrying on would put the mistake a long way from its cause.
+//
+// **Where that is the wrong severity, `try_line_text` is the same conversion without it.** Input off
+// a wire, out of a serial port, or from a file somebody else wrote carries whatever was sent, and a
+// program reading that wants to be told rather than stopped -- as does anything running where there
+// is nowhere to exit *to*, since a freestanding `exit` is a halt with no supervisor to notice it.
 line_text(b: []const u8) -> string
-    var n = if b.len > 0 && b[b.len - 1] == 13 then b.len - 1 else b.len
-
-    from_utf8(b[0..<n]) match
+    try_line_text(b) match
         Ok(s) -> s
         Err(e) ->
             print("panic: a line read from input is not UTF-8 at byte", e.offset, "of the line")
             exit(1)
+
+// The same conversion, reporting rather than stopping.
+//
+// It exists so that the choice is the caller's without their having to drop to `Reader` and
+// re-implement line splitting to get it. Which of the two is right is a property of where the bytes
+// came from, and the library cannot know that -- so both are here and the caller says which.
+try_line_text(b: []const u8) -> Result[string, Utf8Error]
+    var n = if b.len > 0 && b[b.len - 1] == 13 then b.len - 1 else b.len
+
+    from_utf8(b[0..<n])
 
 // A cursor that yields one line at a time.
 //
@@ -111,7 +142,24 @@ struct Lines
     held: &Buf[u8]
     done: bool
 
+    // The next line, or nothing once the input has ended. Ill-formed bytes stop the program, which
+    // is `line_text`'s severity and its reasoning -- `try_getline` below is the same walk without it.
     getline(*self) -> Option[string]
+        self.try_getline() match
+            None -> None
+            Some(line) ->
+                line match
+                    Ok(s) -> Some(s)
+                    Err(e) ->
+                        print("panic: a line read from input is not UTF-8 at byte", e.offset,
+                          "of the line")
+                        exit(1)
+    end getline
+
+    // The whole of the line-finding, so that the two forms cannot come to disagree about where a
+    // line ends. There are two answers to distinguish and they nest: the outer `Option` says whether
+    // there was a line at all, and the inner `Result` says whether it was text.
+    try_getline(*self) -> Option[Result[string, Utf8Error]]
         loop
             var rest = self.have[self.at..]
 
@@ -119,7 +167,7 @@ struct Lines
                 Some(i) ->
                     self.at += i + 1
 
-                    if self.held.is_empty() then return Some(line_text(rest[0..<i]))
+                    if self.held.is_empty() then return Some(try_line_text(rest[0..<i]))
 
                     for b in rest[0..<i] do self.held.push(b)
                     return Some(self.held_line())
@@ -134,10 +182,10 @@ struct Lines
                 return Some(self.held_line())
 
             self.refill()
-    end getline
+    end try_getline
 
-    held_line(*self) -> string
-        var s = line_text(self.held.view())
+    held_line(*self) -> Result[string, Utf8Error]
+        var s = try_line_text(self.held.view())
 
         self.held.clear()
         s

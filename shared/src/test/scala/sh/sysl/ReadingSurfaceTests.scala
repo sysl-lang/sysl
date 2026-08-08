@@ -495,6 +495,51 @@ class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
 
       run(src) shouldBe "2\n"
     }
+
+    // The escape hatch that does not cost the caller the line splitting. The same bytes that stop the
+    // program above are reported here, and the loop carries on afterwards — which is the whole
+    // difference, and the reason a program with nowhere to exit to can read lines at all.
+    "the same input read through the reporting cursor is inspectable, and reading continues" in {
+      val src =
+        s"""$byteReader
+           |var raw: [8]u8
+           |
+           |raw[0] = 111u8
+           |raw[1] = 107u8
+           |raw[2] = 10u8
+           |raw[3] = 97u8
+           |raw[4] = 255u8
+           |raw[5] = 10u8
+           |raw[6] = 122u8
+           |raw[7] = 10u8
+           |
+           |var r = bytes_reader(raw[..])
+           |var c = lines(&r)
+           |
+           |loop
+           |    c.try_getline() match
+           |        None -> break
+           |        Some(line) ->
+           |            line match
+           |                Ok(s) -> print("[", s, "]")
+           |                Err(e) -> print("< bad at", e.offset, ">")""".stripMargin
+
+      run(src) shouldBe "[ ok ]\n< bad at 1 >\n[ z ]\n"
+    }
+
+    // `line_text` is the trapping conversion and `try_line_text` is the same one reporting, so the
+    // pair has to agree about the bytes that are text — including the carriage return both drop.
+    "try_line_text is line_text without the trap, and answers the same on good input" in {
+      val src =
+        """var good: [4]u8 = [104, 105, 13, 0]
+          |var bad: [2]u8 = [97, 255]
+          |
+          |print(try_line_text(good[0..<3]).unwrap())
+          |print(try_line_text(bad[..]).is_err())
+          |print(line_text(good[0..<3]))""".stripMargin
+
+      run(src) shouldBe "hi\ntrue\nhi\n"
+    }
   }
 
   /** `Lines` borrows its reader instead of owning it, and these are why: a `for` iterates a copy, so
