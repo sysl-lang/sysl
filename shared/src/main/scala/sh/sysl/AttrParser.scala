@@ -16,7 +16,28 @@ trait AttrParser extends ExprParser {
    */
   protected lazy val attribute: PackratParser[Attr] =
     testAttr ^^ Attr.Test.apply | tailrecAttr | pureAttr | ghostAttr | readsAttr | writesAttr |
-      unknownAttr | hashAttr
+      packedAttr | alignAttr | unknownAttr | hashAttr
+
+  /** `@packed` — fields at their declared offsets with no interior padding, and an aggregate that
+   * needs no alignment of its own (`15 §1`). It takes no arguments: there is nothing to configure
+   * about the absence of a gap.
+   */
+  protected lazy val packedAttr: PackratParser[Attr] =
+    op("@") ~> attrWord("packed") ^^ (_ => Attr.Packed)
+
+  /** `@align(n)` — the boundary storage of this type must begin on, which may only be raised.
+   *
+   * The bound is an expression because it is folded rather than lexed: `@align(CACHE_LINE)` is the
+   * form worth writing, and a program that had to repeat the number would be stating the same fact
+   * in two places. What it may be is the constant set of `13 §5`.
+   */
+  protected lazy val alignAttr: PackratParser[Attr] =
+    op("@") ~> attrWord("align") ~> (op("(") ~> expression <~ op(")") ^^ Attr.Align.apply | alignErr)
+
+  private def alignErr: Parser[Attr] =
+    err("'@align' names the boundary in parentheses — '@align(64)', or '@align(CACHE_LINE)' for a " +
+      "constant that says what the number is for. There is no bare form: an alignment with no " +
+      "number is not a weaker claim, it is no claim")
 
   /** `@test`, and the three things it may say about the test: the name a report gives it, that it is
    * a run which should not come back, and the text such a run should have printed on its way out.
@@ -74,7 +95,8 @@ trait AttrParser extends ExprParser {
   private lazy val unknownAttr: PackratParser[Attr] =
     op("@") ~> ident >> (n =>
       err(s"'$n' is not an annotation a declaration takes — '@test', '@tailrec', '@pure', " +
-        "'@ghost', '@reads(...)' and '@writes(...)' are the six. '@no_<capability>', " +
+        "'@ghost', '@reads(...)' and '@writes(...)' mark a function, and '@packed' and " +
+        "'@align(n)' mark a struct's layout. '@no_<capability>', " +
         "'@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header"))
 
   /** `#test` where `@test` was meant — the sigil a reader arriving from Rust or C reaches for first.
@@ -129,6 +151,10 @@ trait AttrParser extends ExprParser {
       case (d, Attr.Ghost)   => d.copy(ghost = true)
       case (d, Attr.Reads(ns))  => d.copy(reads = Some(ns))
       case (d, Attr.Writes(ns)) => d.copy(writes = Some(ns))
+      // A layout attribute never reaches here: the grammar routes a declaration carrying one to a
+      // struct, and refuses the mix. Listed so that a new attribute makes this fold fail to compile
+      // rather than silently drop what it was asked to record.
+      case (d, Attr.Packed | _: Attr.Align) => d
     }
 
   private lazy val testArgs: Parser[TestAttr] =

@@ -465,6 +465,21 @@ enum Attr(val word: String) {
     */
   case Reads(names: List[String])  extends Attr("reads")
   case Writes(names: List[String]) extends Attr("writes")
+
+  /** The two that qualify a **layout** rather than a function, and the only attributes a struct
+    * takes (`15 §1`).
+    *
+    * They are two axes and compose: `@packed` removes the padding *between* fields and drops the
+    * aggregate's own alignment to one, `@align(n)` raises where the aggregate must *start*. Written
+    * together they mean "no interior gaps, but begin on an `n` boundary", which is a real shape and
+    * not a contradiction — a wire header that has to sit in a DMA-capable buffer is both.
+    *
+    * `@align` carries the expression rather than a number because the bound is folded, not lexed:
+    * `@align(CACHE_LINE)` is the form a program actually wants, and `13 §5` already admits a
+    * `const` and the arithmetic over it wherever a constant is required.
+    */
+  case Packed                extends Attr("packed")
+  case Align(bound: Expr)    extends Attr("align")
 }
 
 /** `extern name(params) -> ret` — a function this program does not define but may call, resolved
@@ -538,6 +553,12 @@ case class StructDecl(
       * have — `struct Buf[const N: usize]` (`10 §9`).
       */
     tvalues: Map[String, TypeRef] = Map.empty,
+    /** `@packed` — fields at their declared offsets with no interior padding (`15 §1`). */
+    packed: Boolean = false,
+    /** `@align(n)` — the boundary this type's storage must begin on, as written. Folded by the
+      * analyzer rather than the parser, so what is held here is the expression.
+      */
+    alignment: Option[Expr] = None,
 ) extends Stmt
 
 /** One variant of an `enum`. A variant with `fields` is a data-carrying (tagged-union)

@@ -322,7 +322,7 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
       "-- allocating and releasing",
       "-- a released block is the one handed out next",
       "-- exhaustion answers rather than trapping",
-      "-- the alignment the language cannot ask for",
+      "-- the alignment an allocator rounds up to anyway",
     )
   }
 

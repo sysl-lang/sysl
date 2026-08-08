@@ -233,11 +233,38 @@ trait Aliasing extends RefBindings {
    * walk and checked. What is refused is the pointer that drops the name on the way out.
    */
   protected def checkAddressable(place: TExpr): Unit =
+    checkPackedField(place)
+
     for (s, read) <- severed(place) do
       err(s"'&' here makes a '*${show(place.ty)}' pointing inside ${show(s)}, whose invariant reads " +
         s"'${read.mkString(".")}' — and a '*${show(place.ty)}' names no ${show(s)}, so a write through " +
         s"it would break the clause with nothing left to re-check it against. Take the address of the " +
         s"${show(s)} itself, which keeps the invariant in its type, or make the change through a method")
+
+  /** `&` of a field inside a `@packed` struct, refused (`15 §1`).
+   *
+   * A packed field sits at its declared offset, which is very often not a multiple of its own
+   * alignment — the whole point of the attribute. A `*u32` is a `*u32` wherever it came from, and
+   * every later use of one is entitled to assume the address is aligned: the back end may widen a
+   * load, choose an instruction that faults on a misaligned address, or hand it to a function that
+   * does. So the pointer is not merely unusual, it is a promise the storage cannot keep, and the
+   * mistake surfaces arbitrarily far from the `&` that made it.
+   *
+   * **Reading and writing the field are untouched**, because those go through the struct and the
+   * back end knows the offset is unaligned; it is only the escaped address that loses that. That is
+   * why this refuses the pointer rather than the packing.
+   */
+  private def checkPackedField(place: TExpr): Unit = place match
+    case TField(receiver, _, ty) =>
+      Type.underlying(receiver.ty) match
+        case s: Type.Struct if s.packed =>
+          err(s"'&' here makes a '*${show(ty)}' into ${show(s)}, which is '@packed' — its fields sit " +
+            s"at their declared offsets, so this one need not be on a '${show(ty)}' boundary, and " +
+            s"every use of a '*${show(ty)}' is entitled to assume that it is. Read or write the " +
+            s"field through the struct, which is where the offset is known, or take the address of " +
+            s"the ${show(s)} itself")
+        case _ => ()
+    case _ => ()
 
   /** The same refusal for the other way to reach storage that outlives the expression: a view of it
    * that may be written. A `[]const T` is left alone, since giving up the write is exactly what makes

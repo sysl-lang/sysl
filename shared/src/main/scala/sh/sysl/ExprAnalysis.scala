@@ -700,6 +700,11 @@ trait ExprAnalysis
     case Call(TypeAttr(Ident(name), attr), args) if lookupOpt(name).isEmpty && typeKey(name).isDefined =>
       typeAttr(typeKey(name).get, attr, args)
 
+    // An integer's attributes take no argument, so this reaches `integerAttr` only to be refused
+    // there by name — which is a better answer than the generic "not callable" this would fall to.
+    case Call(TypeAttr(Ident(name), attr), args) if lookupOpt(name).isEmpty && builtinInteger(name).isDefined =>
+      integerAttr(builtinInteger(name).get, name, attr, args)
+
     case Call(Ident(name), args) if lookupOpt(name).isEmpty && variantKey(name).isDefined =>
       constructVariant(variantKey(name).get, args, expected)
 

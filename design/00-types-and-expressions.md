@@ -1012,18 +1012,22 @@ work:
   beyond that shared representation; and whether packed structs lay out an `i5` field in exactly 5
   bits (the bitfield / hardware register payoff), since it is about a *field* rather than a
   standalone value.
-- **Storage declared at a required alignment**, the sibling of the packed question above and the
-  direction nothing covers: `packed` would lower a struct's alignment, and there is no way to *raise*
-  a declaration's. `guide/slab` is the customer. A `[N]u8` region is aligned to one, because that is
-  what a byte needs, so a region declared the obvious way is aligned for nothing that could be carved
-  out of it — and the allocator rounds its own base up, paying up to `alignof(T) - 1` bytes of the
-  region and one block of capacity for a fact the declaration could have stated. The rounding is what
-  a real allocator does anyway, since its *caller's* region is wherever it is, so nothing is blocked
-  — which is why this is recorded rather than urgent. What it costs today is that no program can
-  promise an alignment it needs: a DMA buffer on a cache-line boundary and a page-aligned table are
-  both unwritable, and neither has a workaround, because rounding up inside a region you were given
-  is not the same as *being* aligned. C spells it `alignas` and Rust `#[repr(align(N))]`; it wants to
-  be the same attribute mechanism `packed` wants, which is why the two are recorded together.
+- ~~**Storage declared at a required alignment.**~~ **Settled: `@align(n)` on a struct, and
+  `@packed` beside it** (`15 §1`). They arrived together because they were always one question about
+  two directions — `@packed` lowers a struct's alignment to one and removes the padding between its
+  fields, `@align(n)` raises where the aggregate must begin and rounds the size so an array of them
+  keeps every element on the boundary. The bound is folded rather than lexed, so `@align(CACHE_LINE)`
+  is what a program writes, and it must be a power of two.
+
+  What this cost while it was open is worth keeping: no program could promise an alignment it needed,
+  so a DMA buffer on a cache-line boundary and a page-aligned table were both unwritable, and neither
+  had a workaround — rounding up inside a region you were given is not the same as *being* aligned.
+  `guide/slab` was the customer, paying up to `alignof(T) - 1` bytes of its region and one block of
+  capacity for a fact its declaration could have stated.
+
+  The one thing the pair does **not** answer is the sub-byte case above: an `iN` field still occupies
+  its allocated width inside a `@packed` struct, so a hardware register's five-bit field is still
+  shifts and masks. That is the bitfield question, and it stays open on its own.
 - ~~**Statement/block grammar:** which keywords open indented blocks (`then` / `do` / `=`).~~
   **Settled, and settled the same way for all of them:** an introducer is **required for a one-line
   body and optional before an indented block**, since the `Newline`+`Indent` the lexer emits already

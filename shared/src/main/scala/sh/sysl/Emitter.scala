@@ -19,6 +19,17 @@ trait Emitter {
 
   protected val globals  = new mutable.StringBuilder
   private var strId      = 0
+
+  /** The emitted name of every struct that asked for a boundary of its own, and the boundary
+   * (`15 §1`). Consulted wherever storage is created, which is the only place an alignment can be
+   * *said* — LLVM's textual form gives a named type no alignment, so `@align` has to be stamped onto
+   * each alloca and global rather than declared once with the type.
+   *
+   * Keyed by the emitted name because that is all a slot has to go on: `emitAlloca` is handed a type
+   * string, and threading a `Type` to all forty-six of its callers would be a large change to say a
+   * thing that only ever applies to a handful of them.
+   */
+  protected val raisedAligns = mutable.Map.empty[String, Int]
   protected var boolStrs = false
   protected var charBuf  = false
   protected var traps    = false
@@ -334,8 +345,25 @@ trait Emitter {
    * a loop from growing the stack on every iteration.
    */
   protected def emitAlloca(name: String, ty: String): String = {
-    prologue ++= s"  $name = alloca $ty\n"
+    prologue ++= s"  $name = alloca $ty${alignSuffix(ty)}\n"
     name
+  }
+
+  /** `, align n` where the type this storage holds asked for a boundary, and nothing otherwise —
+   * LLVM's own choice is the natural alignment, which is right for everything that did not ask.
+   *
+   * An array is covered by the same lookup: `[8 x %struct.Frame]` names the struct it is made of, so
+   * a region of aligned elements begins where its first element must, which is what makes an aligned
+   * type usable as a buffer rather than only as a single value.
+   */
+  protected def alignSuffix(ty: String): String = {
+    val at = ty.indexOf("%struct.")
+
+    if at < 0 then ""
+    else
+      val name = ty.drop(at).takeWhile(c => c.isLetterOrDigit || c == '.' || c == '_' || c == '%')
+
+      raisedAligns.get(name).map(n => s", align $n").getOrElse("")
   }
 
   /** Emits a block terminator (`br` / `ret` / `unreachable`) and marks the block closed. */

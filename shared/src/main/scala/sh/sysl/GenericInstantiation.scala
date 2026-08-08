@@ -149,7 +149,10 @@ trait GenericInstantiation extends ConstFolding {
         // The `finally` is what keeps the resolver's own bookkeeping honest whatever happens
         // here: an entry left in `inProgress` would make the next mention of this type look
         // like a cycle, which is a diagnostic about nothing at all.
-        try s.fields = decl.fields.map(f => (f.name, recover(Type.Unknown)(resolveQualified(f.typ, subst))))
+        try
+          s.fields = decl.fields.map(f => (f.name, recover(Type.Unknown)(resolveQualified(f.typ, subst))))
+          s.packed = decl.packed
+          s.minAlign = decl.alignment.flatMap(a => recover(Option.empty[Int])(alignBound(decl.name, a)))
         finally
           resolving -= key
           inProgress -= key
@@ -157,6 +160,30 @@ trait GenericInstantiation extends ConstFolding {
         structInsts(key) = s
         s
   }
+
+  /** `@align(n)` folded to the boundary it names, with the two things that are not alignments
+   * refused here rather than left to produce a layout nobody asked for.
+   *
+   * A **power of two** is what an alignment is, in the ABI and in LLVM both: an address is aligned
+   * by having low bits clear, so a boundary of six is not a weaker claim than eight but an
+   * unsatisfiable one. And a **non-constant** is refused because layout is fixed at compile time —
+   * `15 §1` makes it part of the module's interface, which a value computed at run time could not be.
+   *
+   * Whether it is *above* the natural alignment is not asked here: the floor is applied by taking
+   * the larger of the two, so a struct that asks for less than its fields need simply keeps what
+   * they need. That is a redundant annotation rather than a wrong one, and refusing it would make
+   * `@align(8)` an error on a struct that happens to hold a pointer today and legal again tomorrow.
+   */
+  private def alignBound(name: String, bound: Expr): Option[Int] =
+    fold(bound) match
+      case Some(IntLit(n, _)) if n > 0 && (n & (n - 1)) == 0 && n <= (1 << 29) => Some(n.toInt)
+      case Some(IntLit(n, _)) =>
+        err(s"'@align($n)' on '$name' is not an alignment — a boundary is a power of two, since an " +
+          "address is aligned by having low bits clear")
+      case _ =>
+        err(s"'@align' on '$name' needs a constant — a literal, a 'const', or the arithmetic over " +
+          "them. A layout is fixed while compiling and is part of what this module publishes, so " +
+          "it cannot wait on a value")
 
   /** The one canonical tuple over these parts, registered so codegen lays its aggregate down.
    *
