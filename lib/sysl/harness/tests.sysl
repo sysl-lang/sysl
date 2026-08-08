@@ -1,0 +1,153 @@
+module sysl.harness
+@tests
+
+// The framework's own tests.
+//
+// **They are written against `sysl test` rather than against the framework**, which is the only
+// honest way round: a suite that checked the harness by running the harness would pass whenever both
+// halves were wrong together. So the `@test` functions below are the compiler's, `assert` is the
+// root module's, and what they inspect is the harness's counters.
+//
+// Every one of them opens with `reset()` and `quiet = true`. The reset is because the state is the
+// module's and lives for the whole run; the quiet is because most of these fail a check on purpose,
+// and a suite whose expected output is full of its own failure reports is a suite nobody reads.
+
+private passes() = check(true)
+
+private fails() = check(false, "on purpose")
+
+private fails_twice()
+    check(false, "the first")
+    check(false, "the second, which must not be counted")
+
+private compares_unequal() = check_eq(3, 4)
+
+private compares_equal() = check_eq(4, 4)
+
+private slices_differ() = check_slice_eq([1, 2, 3][..], [1, 9, 3][..])
+
+private slices_differ_in_length() = check_slice_eq([1, 2][..], [1, 2, 3][..])
+
+private slices_agree() = check_slice_eq([1, 2, 3][..], [1, 2, 3][..])
+
+// A name past the sixty-four bytes the buffer holds. It is truncated rather than refused, and what
+// this pins is that the copy stays inside the array -- a test whose only symptom would otherwise be
+// whatever sat after it in the image.
+private named_at_length() = check(true)
+
+@test("a test that passes is counted, and is not counted as a failure")
+a_test_that_passes()
+    reset()
+    quiet = true
+    run("passes", &passes)
+    assert(tests_run() == 1, "one test ran")
+    assert(failures() == 0, "and none of them failed")
+    assert(finish() == 0, "so the verdict is zero")
+end a_test_that_passes
+
+@test("a test that fails is counted as both run and failed")
+a_test_that_fails()
+    reset()
+    quiet = true
+    run("fails", &fails)
+    assert(tests_run() == 1, "the test still ran")
+    assert(failures() == 1, "and it failed")
+    assert(finish() == 1, "so the verdict is one")
+end a_test_that_fails
+
+// The rule that keeps a report readable: a test says what went wrong once, because the checks after
+// the first are usually the same fault seen again through worse state.
+@test("only the first failure in a test is counted")
+only_the_first_failure()
+    reset()
+    quiet = true
+    run("fails_twice", &fails_twice)
+    assert(failures() == 1, "two failed checks in one test are one failed test")
+end only_the_first_failure
+
+@test("each test starts from a clean verdict")
+a_clean_verdict()
+    reset()
+    quiet = true
+    run("fails", &fails)
+    run("passes", &passes)
+    assert(tests_run() == 2, "both ran")
+    assert(failures() == 1, "and the failure did not carry into the test after it")
+end a_clean_verdict
+
+@test("check_eq fails when the values differ, and passes when they agree")
+check_eq_compares()
+    reset()
+    quiet = true
+    run("compares_unequal", &compares_unequal)
+    assert(failures() == 1, "3 is not 4")
+
+    reset()
+    run("compares_equal", &compares_equal)
+    assert(failures() == 0, "4 is 4")
+end check_eq_compares
+
+@test("check_slice_eq fails on a differing element, on a differing length, and passes on neither")
+check_slice_eq_compares()
+    reset()
+    quiet = true
+    run("slices_differ", &slices_differ)
+    assert(failures() == 1, "the second element differs")
+
+    reset()
+    run("slices_differ_in_length", &slices_differ_in_length)
+    assert(failures() == 1, "a prefix is not the whole")
+
+    reset()
+    run("slices_agree", &slices_agree)
+    assert(failures() == 0, "and equal slices are equal")
+end check_slice_eq_compares
+
+// A differing slice must fail its test **once**, exactly as a differing value does. The loop is the
+// reason this is worth its own test: an implementation that reported at every index would count one
+// test as one failure anyway -- `failing` sees to that -- but would print the rest of the slice
+// underneath a report that had already been made.
+@test("a slice that differs everywhere still reports once")
+a_slice_reports_once()
+    reset()
+    quiet = true
+    run("slices_differ", &slices_differ)
+    run("slices_differ", &slices_differ)
+    assert(tests_run() == 2, "both ran")
+    assert(failures() == 2, "one failure each, not one per index")
+end a_slice_reports_once
+
+@test("a skipped test is neither a pass nor a failure")
+a_skipped_test()
+    reset()
+    quiet = true
+    run("passes", &passes)
+    skip("needs_the_other_board", "no ADC fitted")
+    assert(tests_run() == 1, "a skip is not a run")
+    assert(skipped() == 1, "it is a skip")
+    assert(failures() == 0, "and it is certainly not a failure")
+    assert(finish() == 0, "so a suite that skipped everything still passes")
+end a_skipped_test
+
+@test("a name longer than the buffer is truncated rather than overrun")
+a_long_name()
+    reset()
+    quiet = true
+    run("a_name_of_considerably_more_than_sixty_four_bytes_which_the_buffer_cannot_hold_and_must_cut",
+        &named_at_length)
+    assert(tests_run() == 1, "the test ran")
+    assert(failures() == 0, "and nothing about the name failed it")
+end a_long_name
+
+@test("reset clears a run, so a board may loop over its self-test")
+reset_clears_a_run()
+    reset()
+    quiet = true
+    run("fails", &fails)
+    skip("skipped")
+    reset()
+    assert(tests_run() == 0, "the count went back to nothing")
+    assert(failures() == 0, "and so did the failures")
+    assert(skipped() == 0, "and so did the skips")
+    assert(finish() == 0, "so a second pass starts from a clean verdict")
+end reset_clears_a_run

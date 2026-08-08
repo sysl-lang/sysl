@@ -39,7 +39,7 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * Raised from 60 to 120 when `sysl.slices`, `sysl.encoding` and `sysl.rand` took the library from
    * 89 collected tests to 136.
    */
-  private val floor = 120
+  private val floor = 145
 
   /** The library, compiled as a **test build of itself**.
    *

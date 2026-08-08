@@ -37,16 +37,23 @@ trait QemuSupport extends Matchers {
    */
   private val boot = "shared/src/test/resources/qemu"
 
-  /** What it takes to boot one board: the emulator, the arguments before the image, the startup and
-   * the script. A target with no entry here has no recipe, and asking for one cancels rather than
-   * guessing — a wrong `-M` produces a program that hangs, not one that fails.
+  /** What it takes to boot one board: the emulator, the arguments before the image, the startup, the
+   * support package and the linker script. A target with no entry here has no recipe, and asking for
+   * one cancels rather than guessing — a wrong `-M` produces a program that hangs, not one that
+   * fails.
+   *
+   * **`bsp` is what the board owes the library**, and it is not scaffolding for the tests: a
+   * freestanding sysl program names `putchar` whenever anything prints and `free` whenever ARC can
+   * reach a release, and neither is something the language supplies. A real bare-metal project has
+   * the same file under another name — pico-sdk's, or newlib-nano's. The two files say the rest.
    */
-  private case class Board(qemu: String, machine: List[String], startup: String, script: String)
+  private case class Board(qemu: String, machine: List[String], startup: String, bsp: String,
+                           script: String)
 
   private val boards: Map[String, Board] = Map(
     Target.riscv32Freestanding.name ->
       Board("qemu-system-riscv32", List("-M", "virt", "-bios", "none", "-nographic", "-kernel"),
-        "start_rv32.s", "rv32.ld"),
+        "start_rv32.s", "bsp_rv32.c", "rv32.ld"),
 
     // The Arm half of the same board. It has no `sifive_test`, so the result channel is semihosting
     // — which has to be asked for, and a run without `-semihosting-config` reports nothing and
@@ -55,8 +62,81 @@ trait QemuSupport extends Matchers {
       Board("qemu-system-arm",
         List("-M", "mps2-an505", "-nographic", "-semihosting-config", "enable=on,target=native",
           "-kernel"),
-        "start_thumb.s", "thumb.ld")
+        "start_thumb.s", "bsp_thumb.c", "thumb.ld")
   )
+
+
+  /** The board's console, as a sysl module a test program imports.
+   *
+   * **It is a module rather than part of the program's root file, and it has to be.** A root file's
+   * top-level `val` and `var` are bindings in the statement stream, and an `impl` member can reach
+   * neither one of them nor any root function that touches one — so a `Writer` whose `write` needs
+   * the device pointer, or a `putc` built on it, cannot be written there at all. One directory down
+   * it is ordinary code.
+   *
+   * `console()` both enables the device and hands back the sink, so a program's whole arrangement is
+   * one line. `virt`'s 16550 takes a byte at offset zero and needs no setting up; the MPS2's CMSDK
+   * takes a *word* and **transmits nothing until it is enabled** — a program that writes to it cold
+   * produces no output at all, and QEMU says so only under `-d guest_errors`.
+   *
+   * `Console` has no fields, so the pointer the sink is built on addresses nothing and nothing ever
+   * reads through it — `sysl.print`'s `Stdout` uses the same trick, and for the same reason: a
+   * destination fixed at compile time keeps no state.
+   */
+  protected def boardModule(t: Target, extra: String = ""): Source = {
+    val regs = t.name match
+      case n if n == Target.riscv32Freestanding.name =>
+        """struct Uart
+          |    data: volatile u8
+          |
+          |val UART: usize = 0x10000000
+          |val regs: *Uart = ptr_cast(UART)
+          |
+          |putc(c: u8)
+          |    regs.data = c
+          |
+          |console() -> *Writer = uart
+          |""".stripMargin
+
+      case n if n == Target.thumbFreestanding.name =>
+        """struct Uart
+          |    data: volatile u32
+          |    state: volatile u32
+          |    ctrl: volatile u32
+          |    intstatus: volatile u32
+          |    bauddiv: volatile u32
+          |
+          |val UART: usize = 0x40200000
+          |val regs: *Uart = ptr_cast(UART)
+          |
+          |putc(c: u8)
+          |    regs.data = u32(c)
+          |
+          |console() -> *Writer
+          |    regs.bauddiv = 16
+          |    regs.ctrl = 1
+          |    uart
+          |""".stripMargin
+
+      case n => cancel(s"no console source for $n")
+
+    val console =
+      """
+        |struct Console
+        |end Console
+        |
+        |impl Fallible for Console
+        |
+        |impl Writer for Console
+        |    write(*self, bytes: []const u8)
+        |        for b in bytes do putc(b)
+        |end Console
+        |
+        |val uart: *Console = ptr_cast(0usize)
+        |""".stripMargin
+
+    Source("board.sysl", s"module board\n\n$regs$console$extra", List("board"))
+  }
 
   /** Whether a program exists to be run. `--version` rather than `which`, because a name on the
    * PATH that will not start is the failure this is meant to catch.
@@ -69,9 +149,16 @@ trait QemuSupport extends Matchers {
    * runs until something kills it — which, in a suite, is the suite. `perl -e 'alarm'` is the
    * portable way to put a bound on it: perl ships with macOS and with every CI image, and `exec`
    * replaces the shell so the signal reaches the emulator rather than a wrapper.
+   *
+   * **The emulator's own standard error is folded into the guest's output**, which is deliberate and
+   * is what makes a dead board explain itself. QEMU reports a fault the guest cannot survive on its
+   * own stderr and then aborts — `Lockup: can't escalate 3 to HardFault` — so a test that reads only
+   * the guest's stdout sees an empty string and a status of 134, which names nothing. The two
+   * streams are ordered against each other this way too, so the last thing the program printed sits
+   * immediately above what killed it.
    */
   private def bounded(seconds: Int, command: List[String]): List[String] =
-    "perl" :: "-e" :: "alarm shift; exec @ARGV" :: seconds.toString :: command
+    "perl" :: "-e" :: "alarm shift; open(STDERR, '>&STDOUT'); exec @ARGV" :: seconds.toString :: command
 
   /** Builds `src` for `t`, boots it, and answers with what the board said and what it exited with.
    *
@@ -81,7 +168,19 @@ trait QemuSupport extends Matchers {
    * `-fuse-ld=lld`, because these are ELF images and the system linker on a Mac is not an ELF
    * linker.
    */
-  protected def bootUnderQemu(t: Target, src: String, seconds: Int = 20): (Int, String) = {
+  protected def bootUnderQemu(t: Target, src: String, seconds: Int = 20): (Int, String) =
+    bootUnderQemu(t, List(Source("p.sysl", src)), seconds)
+
+  /** The same, for a program that is more than one file.
+   *
+   * A program whose console is its own module needs this, and **why it has to be its own module is
+   * worth knowing**: a root file's top-level `val` and `var` are bindings in the program's statement
+   * stream, in scope from where they are written onward, and an `impl` member can reach neither one
+   * of them nor any root function that touches one. A `Writer` that talks to a memory-mapped device
+   * is exactly a member that must, so a board's console cannot be written at the root at all. One
+   * directory down it is ordinary code.
+   */
+  protected def bootUnderQemu(t: Target, sources: List[Source], seconds: Int): (Int, String) = {
     val board = boards.getOrElse(t.name, cancel(s"no QEMU recipe for ${t.name}"))
     val cc    = Toolchain.findClang(t).getOrElse(cancel(s"no clang here has a back end for ${t.name}"))
 
@@ -91,12 +190,15 @@ trait QemuSupport extends Matchers {
     // The compiler's own message, not a summary of it: a diagnostic swallowed here is a diagnostic
     // that has to be rediscovered by hand, and this tier's programs are written for a machine the
     // author is not sitting at.
-    val ir = Compiler.compile(List(Source("p.sysl", src)), t) match
+    val shown = sources.map(s => s"---- ${s.name}\n${s.text}").mkString("\n")
+
+    val ir = Compiler.compile(sources, t) match
       case Right(ir) => ir
-      case Left(e)   => fail(s"did not compile for ${t.name}:\n$e\n\nthe program was:\n$src")
+      case Left(e)   => fail(s"did not compile for ${t.name}:\n$e\n\nthe program was:\n$shown")
 
     val prog  = createTempFile("sysl-qemu-", ".o")
     val start = createTempFile("sysl-qemu-start-", ".o")
+    val bsp   = createTempFile("sysl-qemu-bsp-", ".o")
     val image = createTempFile("sysl-qemu-", ".elf")
 
     try {
@@ -106,8 +208,16 @@ trait QemuSupport extends Matchers {
 
       withClue(s"assembling ${board.startup}:\n${asm.stderr}")(asm.exitCode shouldBe 0)
 
+      // `-ffreestanding` says there is no hosted library here, which is what makes it legal to
+      // define `putchar` and `malloc`; without it clang knows those names and objects to the
+      // definitions. `-Os` because the arena and the UART are the whole file and none of it is hot.
+      val sup = exec(Seq(cc, s"--target=${t.triple}", "-ffreestanding", "-Os", "-c",
+        s"$boot/${board.bsp}", "-o", bsp))
+
+      withClue(s"compiling ${board.bsp}:\n${sup.stderr}")(sup.exitCode shouldBe 0)
+
       val link = exec(Seq(cc, s"--target=${t.triple}", "-nostdlib", "-fuse-ld=lld",
-        "-T", s"$boot/${board.script}", start, prog, "-o", image))
+        "-T", s"$boot/${board.script}", start, prog, bsp, "-o", image))
 
       withClue(s"linking the image:\n${link.stderr}")(link.exitCode shouldBe 0)
 
@@ -115,6 +225,15 @@ trait QemuSupport extends Matchers {
 
       (ran.exitCode, ran.stdout)
     } finally
-      for f <- List(prog, start, image) do try deleteFile(f) catch case _: Exception => ()
+      // `SYSL_QEMU_KEEP=<dir>` copies the linked image there before it goes, which is the only way
+      // to get a disassembly of a board program that misbehaved -- the temporary is deleted on exit,
+      // so reading the path out of a log is too late. Nothing reads the variable in an ordinary run.
+      envVar("SYSL_QEMU_KEEP") match
+        case Some(dir) =>
+          val kept = s"$dir/${t.cpu.symbol}-${image.split('/').last}"
+          exec(Seq("cp", image, kept))
+          println(s"[qemu] kept $kept")
+        case None =>
+      for f <- List(prog, start, bsp, image) do try deleteFile(f) catch case _: Exception => ()
   }
 }

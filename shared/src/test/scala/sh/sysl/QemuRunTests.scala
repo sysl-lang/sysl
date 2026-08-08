@@ -109,21 +109,17 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
         out should include("53")
       }
 
-      /* Indices, and the bounds check around them. `widenIndex` widened an index to a fixed sixty-four
-       * bits before comparing it against a length, which is exactly the shape that verifies and then
-       * compares two different numbers.
-       *
-       * **This cannot run yet, and the reason has nothing to do with widths.** Passing a slice to a
-       * function makes its release reachable, ARC's release path calls `@free` by name, and a bare
-       * board has no allocator to link against — so the image does not link. `NoAllocEmissionTests`
-       * has the diagnosis and the chapter text it contradicts; the assertions here are what this test
-       * should say once the free path is indirect.
-       *
-       * The neighbouring tests take slices too and link, which is not a contradiction: `-O2` deletes
-       * an internal function nothing reaches, so a slice whose release is never *called* costs the
-       * link nothing.
-       */
-      "indexes through a bounds check the machine can express" ignore {
+      // Indices, and the bounds check around them. `widenIndex` widened an index to a fixed sixty-four
+      // bits before comparing it against a length, which is exactly the shape that verifies and then
+      // compares two different numbers.
+      //
+      // **Passing a slice to a function makes its release reachable, so this image names `free`** —
+      // and links, because the board supplies one. That is the ordinary arrangement and not a way
+      // round anything: a program compiled under the default capabilities may allocate, so a board
+      // running it owes it an allocator. What ticket 0037 says is a narrower and still-open thing —
+      // that a module declaring `@no_alloc` emits the same call — and `NoAllocEmissionTests` is
+      // where that claim is pinned.
+      "indexes through a bounds check the machine can express" in {
         val src =
           s"""$uart
              |
@@ -186,6 +182,55 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
 
         withClue(s"the board said: '$out'")(status shouldBe 0)
         out should include("y")
+      }
+
+      // A `Writer` of the program's own, which is what everything above a `putc` is built on: a
+      // rendering writes into a sink rather than returning a string, so a board that can store a
+      // byte can print anything the library can render. The integers are the case worth pinning,
+      // because `Display` for them is sysl all the way down — `printi` would reach `snprintf`, which
+      // this board has not got — and because rendering divides, which is where a 32-bit machine
+      // differs from the host that ran the other tiers.
+      //
+      // **The console is a module of its own, and has to be**: an `impl` member cannot see a root
+      // file's bindings, so `write` could reach neither the device pointer nor a `putc` built on it.
+      "renders through a Writer of its own, on the machine that computed the digits" in {
+        val src = List(
+          Source("p.sysl",
+            """import board.*
+              |
+              |val w = console()
+              |
+              |w.write("n=".bytes)
+              |val n: usize = 1000
+              |n.display(w, FormatSpec(0, -1, false))
+              |""".stripMargin),
+          boardModule(t))
+
+        val (status, out) = bootUnderQemu(t, src, 20)
+
+        withClue(s"the board said: '$out'")(status shouldBe 0)
+        out should include("n=1000")
+      }
+
+      // Module storage that starts at zero starts at zero. It is `.bss`, which occupies no bytes in
+      // the file, so what a program finds there is whatever the RAM held unless the startup zeroes
+      // it — and a `*Writer` that should be null but is not sends the first call through its method
+      // table to an address nobody chose.
+      "finds a module var that starts at zero already zero" in {
+        val src = List(
+          Source("p.sysl",
+            """import board.*
+              |
+              |val w = console()
+              |
+              |if zeroed() then w.write("zero".bytes) else w.write("junk".bytes)
+              |""".stripMargin),
+          boardModule(t, "\nvar counter: int = 0\n\nzeroed() -> bool = counter == 0\n"))
+
+        val (status, out) = bootUnderQemu(t, src, 20)
+
+        withClue(s"the board said: '$out'")(status shouldBe 0)
+        out should include("zero")
       }
     }
 }
