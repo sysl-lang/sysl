@@ -128,6 +128,21 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
       out should not include "64-bit"
     }
 
+    // The refusal and the listing are read by one person minutes apart, so they say one thing. They
+    // did not: `sysl targets` annotated the row "(32-bit -- not yet supported)" from a sentence of
+    // its own, which went on being printed after `thumb-freestanding` and `riscv32-freestanding`
+    // shipped and made the width no reason at all. Asserting the *reason* rather than either
+    // wording is what holds them together -- a second copy of a sentence is what drifted.
+    "gives the listing the same reason the refusal gives" in {
+      val why = Target.x86Linux.unsupported.getOrElse(fail("x86-linux cannot be built for"))
+
+      Target.named("x86-linux").left.getOrElse("") should include(why)
+      why should include("no C calling convention has been measured for x86")
+      why should not include "not yet supported"
+
+      for t <- Target.all if t.supported do t.unsupported shouldBe None
+    }
+
     "is case-sensitive, since the name is written down and not guessed at" in {
       Target.named("X86_64-Linux").isLeft shouldBe true
     }

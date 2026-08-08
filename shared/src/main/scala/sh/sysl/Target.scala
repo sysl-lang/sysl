@@ -70,6 +70,18 @@ case class Target(
    * which reads as a typo.
    */
   def supported: Boolean = Cpu.buildable.contains(cpu)
+
+  /** Why not, where not — `None` for a target that builds.
+   *
+   * **It is here rather than at either reader because there are two of them**, and the same person
+   * reads both minutes apart: `Target.named` refusing `--target x86-linux`, and `sysl targets`
+   * annotating the row. A list that gives a different reason from the refusal is worse than a list
+   * that gives none, and that is what this was — the row read *"32-bit — not yet supported"* after
+   * two 32-bit targets had shipped, because it was a separate sentence with nothing to hold it to
+   * the other.
+   */
+  def unsupported: Option[String] =
+    Option.unless(supported)(s"no C calling convention has been measured for ${cpu.symbol}")
 }
 
 /** How wide an address is on the target, and the one fact about a machine that reaches into the
@@ -279,8 +291,7 @@ object Target {
     byName.get(name) match
       case Some(t) if t.supported => Right(t)
       case Some(t) =>
-        Left(s"sysl knows '$name' and cannot build for it: no C calling convention has been " +
-          s"measured for ${t.cpu.symbol}")
+        Left(s"sysl knows '$name' and cannot build for it: ${t.unsupported.get}")
       case None =>
         Left(s"unknown target '$name' — sysl knows ${all.map(_.name).mkString(", ")}")
 

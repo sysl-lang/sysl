@@ -822,7 +822,7 @@ private def listTargets(): Int = {
 
   for t <- Target.all do
     val here  = if Target.host.contains(t) then "  (this machine)" else ""
-    val limit = if t.supported then "" else s"  (${t.pointerBits}-bit — not yet supported)"
+    val limit = t.unsupported.fold("")(why => s"  ($why)")
 
     stdout(s"${t.name.padTo(width, ' ')}  ${t.triple}$here$limit\n")
 
