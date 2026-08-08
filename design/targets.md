@@ -125,9 +125,9 @@ agree.
 
 A scalar crosses as itself; an `i32` is one register everywhere. An aggregate does not, and **LLVM
 applies no C classification to one of its own accord** — given a struct type in a signature it
-assigns one register per element, which is not what any of the four conventions asks for. So a
+assigns one register per element, which is not what any of the five conventions asks for. So a
 foreign declaration names the *coerced* types the convention specifies and the call converts each
-value into and out of that shape. The four:
+value into and out of that shape. The five:
 
 - **AAPCS64** asks first whether the aggregate is a homogeneous floating aggregate — up to four
   members all of one floating width, however deeply nested — because those go in floating registers
@@ -141,14 +141,26 @@ value into and out of that shape. The four:
   two.
 - **RISC-V** flattens the narrow floating cases: one or two floating members travel as themselves,
   and one floating member beside one integer member travels in one register of each. A pointer beside
-  a float is not that case.
+  a float is not that case. **It is one rule at both widths**, written in terms of XLEN — LP64D and
+  ILP32 are the same function with a different word, which is why adding RV32 added a parameter and
+  not a convention.
+- **AAPCS32** is the one whose two directions disagree about *memory itself*, and it is the only
+  convention here that does. An HFA travels as the struct type itself in both directions — the
+  opposite of AAPCS64, which coerces to an array. Otherwise a **result** of four bytes or fewer is
+  an integer of its own width and anything larger is returned through `sret`, **always**; while an
+  **argument** goes in registers *at any size* — a sixty-four-byte struct is `[16 x i32]`. So an
+  aggregate too big to return is still not too big to pass, and a target where an argument is never
+  indirect is a target where the indirect case is unreachable.
 - **The Microsoft convention** is the simplest: one, two, four or eight bytes in one integer
   register, anything else by address. No floating case at all.
 
-Two details are worth stating because no document states them and only the measurement finds them.
+Three details are worth stating because no document states them and only the measurement finds them.
 System V names an integer chunk after **the member that starts it** when that member is all the chunk
-carries — the `u8` after an `i64` is an `i8`, not the register it will travel in. And both AAPCS64
+carries — the `u8` after an `i64` is an `i8`, not the register it will travel in. Both AAPCS64
 and RISC-V name a sixteen-byte aggregate `i128` rather than two `i64`s once it is aligned to sixteen.
+And AAPCS32 picks its register *element* by the aggregate's alignment rather than by the word:
+eight-aligned gives `[n x i64]` on a machine whose registers are four bytes, because what LLVM is
+being told is the shape to copy and not the registers to use.
 
 Only the boundary is affected. A struct handed over **by address** needs none of this, which is why
 that was the workaround while the boundary was broken, and a sysl-to-sysl call is untouched.
@@ -159,7 +171,11 @@ C's `va_list` is a different type on every target and is passed three different 
 the address of the walk — the only thing sysl has — crosses over as:
 
 - **loaded** — the storage holds one pointer-sized value and the call passes *that value*. Darwin
-  arm64, where `va_list` *is* `char *`; Windows x64; RISC-V.
+  arm64, where `va_list` *is* `char *`; Windows x64; RISC-V at both widths; and AAPCS32, whose
+  `va_list` is a one-member struct that clang declares as `[1 x i32]`. **That last one looks like a
+  fourth answer and is not** — a struct of one word passed in one core register is what *loaded*
+  already describes, and compiling the call both ways gives the identical instruction. It was
+  checked rather than assumed, after a fourth case had already been written.
 - **address** — the storage is an array of one struct, which decays, so the call passes the
   address of the storage itself. x86-64 System V.
 - **copied** — the storage is a struct passed indirectly, so the call passes the address of a
@@ -176,18 +192,33 @@ of a sysroot — instead of quietly producing a host binary.
 
 ## What a target does not decide
 
-**Layout.** Every target in the registry is 64-bit, and on a 64-bit target the questions `Layout`
-answers have one answer: scalars are their own width and aligned to it, an address is eight
-bytes, an aggregate is laid out in declaration order with each member on its own alignment and
-the whole rounded up to the widest. That is C's rule and LLVM's. `Layout` therefore takes no
-`Target` — and the registry refuses a 32-bit one precisely because that is where the agreement
-would end.
+**Layout — which depends on the word, and on nothing else a target carries.** The questions
+`Layout` answers have one answer per address width: scalars are their own width and aligned to it,
+an address is one word, an aggregate is laid out in declaration order with each member on its own
+alignment and the whole rounded up to the widest. That is C's rule and LLVM's. So `Layout` takes a
+`Word` rather than a `Target`.
+
+**That is a stronger statement than taking nothing, and it is worth saying why.** This page used to
+claim `Layout` needed no target at all, resting it on every target in the registry being 64-bit —
+which stopped being true the moment `thumb-freestanding` and `riscv32-freestanding` were added. A
+claim that something depends on *nothing* is only ever as good as the registry that makes it
+vacuous; naming what it depends on survives the registry growing. The operating system, the
+`va_list` walk and the calling convention are all still outside it: two targets of one width lay
+every aggregate out identically, and `TargetTests` asserts exactly that by emitting one program for
+each of them.
+
+**A width's reach is narrow, which is the other half of the same point.** Only one LLVM *type* in
+the language mentions it: a view is `{ ptr, ptr, iN }`, because its length is a `usize`. An
+aggregate of fixed-width scalars, an array, a data enum's union region and a `va_list` are spelled
+identically at both widths — so the types that move between a 64-bit module and a 32-bit one are
+exactly the ones with a view somewhere inside them, and `TargetTests` asserts that from both ends.
 
 That is worth separating from the section above, because the two are easy to run together: **where a
 member sits inside an aggregate is one question and which register the aggregate travels in is
-another.** Every target answers the first identically, which is why `Layout` needs no target; all
-four disagree about the second, which is why the classification does. The classification is built
-*on* the layout — it asks which members share an eightbyte, and that is the layout's answer.
+another.** Targets of one width answer the first identically, which is why `Layout` needs no more
+than that width; they disagree about the second whatever their width, which is why the
+classification takes the whole target. The classification is built *on* the layout — it asks which
+members share an eightbyte, and that is the layout's answer.
 
 **The storage a `va_list` occupies.** Sysl reserves the widest any target needs (32 bytes,
 AAPCS64's) for all of them. The waste is a few bytes of one stack slot in a variadic function,
@@ -244,7 +275,7 @@ marker disturbs nothing.
 | kind | symbols |
 |---|---|
 | operating system | `macos`, `linux`, `windows`, `freestanding` |
-| processor | `aarch64`, `x86_64`, `riscv64`, `x86` |
+| processor | `aarch64`, `x86_64`, `riscv64`, `riscv32`, `thumb`, `x86` |
 | derived | `hosted` (not `freestanding`), `posix` (`macos` or `linux`) |
 
 That is the whole vocabulary. There is no `#define`, nothing a project can add, and **no dependence
@@ -322,8 +353,17 @@ the trees a library ships are now a per-target answer. `13 §8` has the rest.
   is what let it be built while the config is still open. Asking `#if no alloc` is a coherent thing
   to want and belongs with the config that would define it — and it is where the two `posix` senses
   above would have to be told apart in the syntax.
-- **32-bit targets.** The emitted code assumes a 64-bit address in places nothing has been asked
-  to parameterize. `x86-linux` is in the registry so the refusal has something to name.
+- ~~**32-bit targets.**~~ **Built.** `thumb-freestanding` and `riscv32-freestanding` are in the
+  registry and build. What this item described — the emitted code assuming a 64-bit address in
+  places nothing had been asked to parameterize — was real, and the parameter is `Word`: `Layout`
+  takes one, `Type.llvm` takes one, and there is deliberately **no default**, so a site that needs a
+  width and was not given one fails to compile rather than quietly emitting a 64-bit type. Six such
+  sites existed and every one of them was a `usize` spelled `i64`.
+
+  `x86-linux` is still in the registry and still refused, but **the reason changed**: not that it is
+  32-bit, which no longer disqualifies anything, but that no C calling convention has been measured
+  for i386. That is the honest statement of what is missing, and it is the same sentence the
+  compiler now prints.
 - **Cross-linking.** Building for another machine emits a correct module and then hands it to a
   `clang` that has no sysroot for it. That is the toolchain's problem to solve and sysl's to
   report clearly, not to work around.
