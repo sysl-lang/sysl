@@ -241,5 +241,20 @@ object Std {
    */
   private[sysl] def cachedTargets: Int = cache.synchronized(cache.size)
 
+  /** Whether a second ask for one target answers from memory, decided **without letting go of the
+   * lock between the two asks**.
+   *
+   * A test cannot settle this by calling `parsed` twice and comparing, because only one target's
+   * trees are kept: another suite asking for a different target in between clears the slot, and the
+   * second ask reparses through no fault of the memo. The suites run concurrently and several sweep
+   * every target, so that is an ordinary interleaving rather than a rare one — it reproduces against
+   * `CrossTargetBuildTests` and `TargetTests` every time.
+   *
+   * Holding the lock across both is what makes the question answerable at all. It asks the memo
+   * exactly what it promises: that a caller staying on one target parses once.
+   */
+  private[sysl] def memoAnswersTwice(target: Target): Boolean =
+    cache.synchronized { parsed(target) eq parsed(target) }
+
   def decls(target: Target): List[Stmt] = parsed(target).flatMap(_.body)
 }

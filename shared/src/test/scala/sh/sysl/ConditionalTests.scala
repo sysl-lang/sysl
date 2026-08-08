@@ -238,8 +238,13 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
       // What replaced a `lazy val` when the library became a per-target question. Parsing the whole
       // standard module is on the path of every compilation with no artifact to read instead, so a
       // memo that missed would be a real cost and not only an inelegance.
-      Stdlib.fromSource(macos) should be theSameInstanceAs Stdlib.fromSource(macos)
-      Std.parsed(linux) should be theSameInstanceAs Std.parsed(linux)
+      //
+      // Asked through the memo's own lock rather than by calling twice and comparing. Only one
+      // target's copy is kept, so a suite running beside this one and asking for another target
+      // clears the slot between two bare calls and the second reparses — which says nothing about
+      // the memo. That is an ordinary interleaving, not a rare one.
+      Stdlib.memoAnswersTwice(macos) shouldBe true
+      Std.memoAnswersTwice(linux) shouldBe true
     }
 
     "two targets get two" in {

@@ -257,6 +257,12 @@ object Stdlib {
    */
   private val cache = collection.mutable.Map.empty[Target, Stdlib]
 
+  /** Whether a second ask for one target answers from memory, decided without releasing the lock
+   * between the two asks — `Std.memoAnswersTwice`'s reason, for the slot one layer up.
+   */
+  private[sysl] def memoAnswersTwice(target: Target): Boolean =
+    cache.synchronized { fromSource(target) eq fromSource(target) }
+
   /** A standard module read out of the metadata half of an artifact (`LibraryArtifact`).
    *
    * The trees arrive already decoded, which is the whole point, and nothing downstream can tell
