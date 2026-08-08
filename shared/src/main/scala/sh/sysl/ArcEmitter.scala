@@ -134,21 +134,21 @@ trait ArcEmitter extends Emitter {
       case s: Type.Struct => each(s.fields, s.llvm, p)
 
       case Type.Array(n, elem) =>
-        val i = emitAlloca(freshTemp(), "i64")
-        emit(s"store i64 0, ptr $i")
+        val i = emitAlloca(freshTemp(), word)
+        emit(s"store $word 0, ptr $i")
         val condL = freshLabel("arc.each")
         val bodyL = freshLabel("arc.elem")
         val endL  = freshLabel("arc.done")
         emitTerm(s"br label %$condL")
         emitLabel(condL)
-        val iv   = freshTemp(); emit(s"$iv = load i64, ptr $i")
-        val more = freshTemp(); emit(s"$more = icmp ult i64 $iv, $n")
+        val iv   = freshTemp(); emit(s"$iv = load $word, ptr $i")
+        val more = freshTemp(); emit(s"$more = icmp ult $word $iv, $n")
         emitTerm(s"br i1 $more, label %$bodyL, label %$endL")
         emitLabel(bodyL)
-        val ep = freshTemp(); emit(s"$ep = getelementptr ${elem.llvm}, ptr $p, i64 $iv")
+        val ep = freshTemp(); emit(s"$ep = getelementptr ${elem.llvm}, ptr $p, $word $iv")
         walkAt(elem, ep, retain)
-        val nxt = freshTemp(); emit(s"$nxt = add i64 $iv, 1")
-        emit(s"store i64 $nxt, ptr $i")
+        val nxt = freshTemp(); emit(s"$nxt = add $word $iv, 1")
+        emit(s"store $word $nxt, ptr $i")
         emitTerm(s"br label %$condL")
         emitLabel(endL)
 
@@ -232,22 +232,22 @@ trait ArcEmitter extends Emitter {
       case Type.Array(n, elem) =>
         val buf = emitAlloca(freshTemp(), ty.llvm)
         emit(s"store ${ty.llvm} $v, ptr $buf")
-        val i = emitAlloca(freshTemp(), "i64")
-        emit(s"store i64 0, ptr $i")
+        val i = emitAlloca(freshTemp(), word)
+        emit(s"store $word 0, ptr $i")
         val condL = freshLabel("arc.each")
         val bodyL = freshLabel("arc.elem")
         val endL  = freshLabel("arc.done")
         emitTerm(s"br label %$condL")
         emitLabel(condL)
-        val iv   = freshTemp(); emit(s"$iv = load i64, ptr $i")
-        val more = freshTemp(); emit(s"$more = icmp ult i64 $iv, $n")
+        val iv   = freshTemp(); emit(s"$iv = load $word, ptr $i")
+        val more = freshTemp(); emit(s"$more = icmp ult $word $iv, $n")
         emitTerm(s"br i1 $more, label %$bodyL, label %$endL")
         emitLabel(bodyL)
-        val ep = freshTemp(); emit(s"$ep = getelementptr ${elem.llvm}, ptr $buf, i64 $iv")
+        val ep = freshTemp(); emit(s"$ep = getelementptr ${elem.llvm}, ptr $buf, $word $iv")
         val ev = freshTemp(); emit(s"$ev = load ${elem.llvm}, ptr $ep")
         if retain then retainValue(elem, ev) else releaseValue(elem, ev)
-        val nxt = freshTemp(); emit(s"$nxt = add i64 $iv, 1")
-        emit(s"store i64 $nxt, ptr $i")
+        val nxt = freshTemp(); emit(s"$nxt = add $word $iv, 1")
+        emit(s"store $word $nxt, ptr $i")
         emitTerm(s"br label %$condL")
         emitLabel(endL)
 
@@ -285,16 +285,16 @@ trait ArcEmitter extends Emitter {
     val v     = if layout.indirect(inner) then "" else genExpr(value)
 
     val end  = freshTemp(); emit(s"$end = getelementptr $bn, ptr null, i32 1")
-    val size = freshTemp(); emit(s"$size = ptrtoint ptr $end to i64")
-    val p    = freshTemp(); emit(s"$p = call ptr @malloc(i64 $size)")
+    val size = freshTemp(); emit(s"$size = ptrtoint ptr $end to $word")
+    val p    = freshTemp(); emit(s"$p = call ptr @malloc($word $size)")
 
-    emit(s"store i64 1, ptr $p")
+    emit(s"store $word 1, ptr $p")
     val hook = freshTemp(); emit(s"$hook = getelementptr $bn, ptr $p, i32 0, i32 1")
     emit(s"store ptr ${dropFn(inner)}, ptr $hook")
     // One weak share stands for every strong reference together, so the storage outlives the
     // object exactly as long as some weak reference is still asking about it (`03`).
     val wc = freshTemp(); emit(s"$wc = getelementptr $bn, ptr $p, i32 0, i32 2")
-    emit(s"store i64 1, ptr $wc")
+    emit(s"store $word 1, ptr $wc")
 
     val slot = freshTemp(); emit(s"$slot = getelementptr $bn, ptr $p, i32 0, i32 $headerFields")
 
@@ -330,7 +330,7 @@ trait ArcEmitter extends Emitter {
       "@" + request(s"arc.dropbuf.$m") {
         inFunction(s"define private void @arc.dropbuf.$m(ptr %p)") {
           val lenp = freshTemp(); emit(s"$lenp = getelementptr $bn, ptr %p, i32 0, i32 $headerFields")
-          val n    = freshTemp(); emit(s"$n = load i64, ptr $lenp")
+          val n    = freshTemp(); emit(s"$n = load $word, ptr $lenp")
           val data = freshTemp(); emit(s"$data = getelementptr $bn, ptr %p, i32 0, i32 ${headerFields + 1}")
 
           eachElement(elem, data, n) { ep =>
@@ -356,22 +356,22 @@ trait ArcEmitter extends Emitter {
    * thing that may be large here.
    */
   protected def eachElement(elem: Type, data: String, n: String)(body: String => Unit): Unit = {
-    val i     = emitAlloca(freshTemp(), "i64")
+    val i     = emitAlloca(freshTemp(), word)
     val condL = freshLabel("buf.test")
     val bodyL = freshLabel("buf.elem")
     val endL  = freshLabel("buf.done")
 
-    emit(s"store i64 0, ptr $i")
+    emit(s"store $word 0, ptr $i")
     emitTerm(s"br label %$condL")
     emitLabel(condL)
-    val iv   = freshTemp(); emit(s"$iv = load i64, ptr $i")
-    val more = freshTemp(); emit(s"$more = icmp ult i64 $iv, $n")
+    val iv   = freshTemp(); emit(s"$iv = load $word, ptr $i")
+    val more = freshTemp(); emit(s"$more = icmp ult $word $iv, $n")
     emitTerm(s"br i1 $more, label %$bodyL, label %$endL")
     emitLabel(bodyL)
-    val ep = freshTemp(); emit(s"$ep = getelementptr ${elem.llvm}, ptr $data, i64 $iv")
+    val ep = freshTemp(); emit(s"$ep = getelementptr ${elem.llvm}, ptr $data, $word $iv")
     body(ep)
-    val nxt = freshTemp(); emit(s"$nxt = add i64 $iv, 1")
-    emit(s"store i64 $nxt, ptr $i")
+    val nxt = freshTemp(); emit(s"$nxt = add $word $iv, 1")
+    emit(s"store $word $nxt, ptr $i")
     emitTerm(s"br label %$condL")
     emitLabel(endL)
   }
@@ -580,16 +580,23 @@ object ArcEmitter {
   def core(target: Target): String = {
     val tls = if target.hasThreadLocalStorage then "thread_local " else ""
 
-    s"""%arc.header = type { i64, ptr, i64 }
+    // The two counts are pointer-width. Nothing forces that — a reference count is not an address —
+    // but the alternative is a fixed `i64`, which costs sixteen bytes of header on a machine whose
+    // whole point is having very little memory. What *is* forced is that this agrees with the stores
+    // the emitter makes into these fields, which is why both spell it the same way: a count written
+    // as one width and read as another is not a type error anywhere, it is a leak or a double free.
+    val word = target.word.llvm
+
+    s"""%arc.header = type { $word, ptr, $word }
       |
       |@arc.worklist = internal ${tls}global ptr null
       |@arc.draining = internal ${tls}global i1 false
       |
       |define private void @arc.retain(ptr %p) {
       |entry:
-      |  %c = load i64, ptr %p
-      |  %n = add i64 %c, 1
-      |  store i64 %n, ptr %p
+      |  %c = load $word, ptr %p
+      |  %n = add $word %c, 1
+      |  store $word %n, ptr %p
       |  ret void
       |}
       |
@@ -610,10 +617,10 @@ object ArcEmitter {
       |define private void @arc.unshare(ptr %p) {
       |entry:
       |  %w = getelementptr %arc.header, ptr %p, i32 0, i32 2
-      |  %c = load i64, ptr %w
-      |  %n = sub i64 %c, 1
-      |  store i64 %n, ptr %w
-      |  %z = icmp eq i64 %n, 0
+      |  %c = load $word, ptr %w
+      |  %n = sub $word %c, 1
+      |  store $word %n, ptr %w
+      |  %z = icmp eq $word %n, 0
       |  br i1 %z, label %gone, label %kept
       |gone:
       |  call void @free(ptr %p)
@@ -639,7 +646,7 @@ object ArcEmitter {
       |step:
       |  %next = load ptr, ptr %q
       |  store ptr %next, ptr @arc.worklist
-      |  store i64 0, ptr %q
+      |  store $word 0, ptr %q
       |  call void @arc.destroy(ptr %q)
       |  br label %loop
       |finish:
@@ -651,10 +658,10 @@ object ArcEmitter {
       |
       |define private void @arc.release(ptr %p) {
       |entry:
-      |  %c = load i64, ptr %p
-      |  %n = sub i64 %c, 1
-      |  store i64 %n, ptr %p
-      |  %z = icmp eq i64 %n, 0
+      |  %c = load $word, ptr %p
+      |  %n = sub $word %c, 1
+      |  store $word %n, ptr %p
+      |  %z = icmp eq $word %n, 0
       |  br i1 %z, label %reap, label %live
       |reap:
       |  call void @arc.reap(ptr %p)
@@ -673,16 +680,18 @@ object ArcEmitter {
    * handed nothing instead of an address. A live count is taken, which is why the answer is a
    * reference the caller owns rather than one it has to be careful with.
    */
-  val weak: String =
-    """define private void @arc.weak_retain(ptr %p) {
+  def weak(target: Target): String =
+    val word = target.word.llvm
+
+    s"""define private void @arc.weak_retain(ptr %p) {
       |entry:
       |  %empty = icmp eq ptr %p, null
       |  br i1 %empty, label %done, label %live
       |live:
       |  %w = getelementptr %arc.header, ptr %p, i32 0, i32 2
-      |  %c = load i64, ptr %w
-      |  %n = add i64 %c, 1
-      |  store i64 %n, ptr %w
+      |  %c = load $word, ptr %w
+      |  %n = add $word %c, 1
+      |  store $word %n, ptr %w
       |  ret void
       |done:
       |  ret void
@@ -704,12 +713,12 @@ object ArcEmitter {
       |  %empty = icmp eq ptr %p, null
       |  br i1 %empty, label %gone, label %check
       |check:
-      |  %c = load i64, ptr %p
-      |  %z = icmp eq i64 %c, 0
+      |  %c = load $word, ptr %p
+      |  %z = icmp eq $word %c, 0
       |  br i1 %z, label %gone, label %live
       |live:
-      |  %n = add i64 %c, 1
-      |  store i64 %n, ptr %p
+      |  %n = add $word %c, 1
+      |  store $word %n, ptr %p
       |  ret ptr %p
       |gone:
       |  ret ptr null
@@ -718,17 +727,19 @@ object ArcEmitter {
       |""".stripMargin
 
   /** The atomic pair, emitted only into a module that has a `&sync` in it. */
-  val atomic: String =
-    """define private void @arc.retain_sync(ptr %p) {
+  def atomic(target: Target): String =
+    val word = target.word.llvm
+
+    s"""define private void @arc.retain_sync(ptr %p) {
       |entry:
-      |  %o = atomicrmw add ptr %p, i64 1 monotonic
+      |  %o = atomicrmw add ptr %p, $word 1 monotonic
       |  ret void
       |}
       |
       |define private void @arc.release_sync(ptr %p) {
       |entry:
-      |  %o = atomicrmw sub ptr %p, i64 1 release
-      |  %z = icmp eq i64 %o, 1
+      |  %o = atomicrmw sub ptr %p, $word 1 release
+      |  %z = icmp eq $word %o, 1
       |  br i1 %z, label %reap, label %live
       |reap:
       |  fence acquire
@@ -740,7 +751,11 @@ object ArcEmitter {
       |
       |""".stripMargin
 
-  /** The null-tolerant pair, emitted only into a module that holds a view of something. */
+  /** The null-tolerant pair, emitted only into a module that holds a view of something.
+   *
+   * Alone among the four blocks this one names no count, so it needs no width: it is a null check
+   * and a delegation, and the two functions it calls are the ones that know how wide a count is.
+   */
   val maybe: String =
     """define private void @arc.retain_maybe(ptr %p) {
       |entry:

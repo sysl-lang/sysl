@@ -30,6 +30,17 @@ trait Emitter {
    */
   protected given layout: Layout = Layout(target)
 
+  /** The LLVM integer exactly one address wide — `i64` or `i32` — which is what a **length, a size,
+   * an index, or anything else that is a `usize`** must be spelled as.
+   *
+   * Reach for this rather than writing `i64`, and the test that says whether you got it right is
+   * `CrossTargetBuildTests`: a module mixing the two is text like any other and only clang will say
+   * so. A loop counter internal to a helper may honestly be either, since nothing outside sees it —
+   * but it is compared against a length often enough that using this everywhere is both simpler and
+   * harder to get wrong.
+   */
+  protected def word: String = target.word.llvm
+
   protected val globals  = new mutable.StringBuilder
   private var strId      = 0
 

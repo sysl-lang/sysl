@@ -265,7 +265,7 @@ trait ScalarEmitter extends StringEmitter {
       boolStrs = true
       val v   = genExpr(arg)
       val ptr = freshTemp(); emit(s"$ptr = select i1 $v, ptr @.true, ptr @.false")
-      val len = freshTemp(); emit(s"$len = select i1 $v, i64 4, i64 5")
+      val len = freshTemp(); emit(s"$len = select i1 $v, $word 4, $word 5")
       strView("null", ptr, len)
 
     case Type.Char =>
@@ -350,7 +350,7 @@ trait ScalarEmitter extends StringEmitter {
   private def strView(owner: String, ptr: String, len: String): String = {
     val v0 = freshTemp(); emit(s"$v0 = insertvalue ${Type.Str.llvm} undef, ptr $owner, 0")
     val v1 = freshTemp(); emit(s"$v1 = insertvalue ${Type.Str.llvm} $v0, ptr $ptr, 1")
-    val v2 = freshTemp(); emit(s"$v2 = insertvalue ${Type.Str.llvm} $v1, i64 $len, 2")
+    val v2 = freshTemp(); emit(s"$v2 = insertvalue ${Type.Str.llvm} $v1, $word $len, 2")
     v2
   }
 }

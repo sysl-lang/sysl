@@ -181,9 +181,9 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       case Type.Ptr(e) => (genExpr(receiver), None, e)
       case other       => sys.error(s"unreachable index into ${other.llvm}")
 
-    val i = widen64(index)
+    val i = widenIndex(index)
     for l <- len do boundsCheck(i, l)
-    val r = freshTemp(); emit(s"$r = getelementptr ${elem.llvm}, ptr $base, i64 $i"); r
+    val r = freshTemp(); emit(s"$r = getelementptr ${elem.llvm}, ptr $base, $word $i"); r
   }
 
   /** Takes a view of some of an array's, a slice's, or a string's elements. The base is evaluated
@@ -226,7 +226,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       case _: Type.Ptr                => ("null", genExpr(base), None)
       case other                      => sys.error(s"unreachable slice of ${other.llvm}")
 
-    val start = lo.map(widen64).getOrElse("0")
+    val start = lo.map(widenIndex).getOrElse("0")
 
     // The check is on the half-open interval the view ends up naming. An inclusive high end
     // additionally has to name an element that exists, which is also what stops `hi + 1` from
@@ -234,19 +234,19 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val end = hi match
       case None => len.getOrElse(sys.error("unreachable open-ended slice of a pointer"))
       case Some(h) =>
-        val v = widen64(h)
+        val v = widenIndex(h)
         if !inclusive then v
         else
           for l <- len do
-            val within = freshTemp(); emit(s"$within = icmp ult i64 $v, $l")
+            val within = freshTemp(); emit(s"$within = icmp ult $word $v, $l")
             trapUnless(within, "bounds")
-          val e = freshTemp(); emit(s"$e = add i64 $v, 1"); e
+          val e = freshTemp(); emit(s"$e = add $word $v, 1"); e
 
     for l <- len if hi.isDefined && !inclusive do
-      val fits = freshTemp(); emit(s"$fits = icmp ule i64 $end, $l")
+      val fits = freshTemp(); emit(s"$fits = icmp ule $word $end, $l")
       trapUnless(fits, "bounds")
 
-    val ordered = freshTemp(); emit(s"$ordered = icmp ule i64 $start, $end")
+    val ordered = freshTemp(); emit(s"$ordered = icmp ule $word $start, $end")
     trapUnless(ordered, "bounds")
 
     // A substring has to be a string, so both ends must fall between characters. This runs after
@@ -258,8 +258,8 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       trapUnless(strBoundary(first, l, start), "boundary")
       trapUnless(strBoundary(first, l, end), "boundary")
 
-    val p = freshTemp(); emit(s"$p = getelementptr ${elem.llvm}, ptr $first, i64 $start")
-    val n = freshTemp(); emit(s"$n = sub i64 $end, $start")
+    val p = freshTemp(); emit(s"$p = getelementptr ${elem.llvm}, ptr $first, $word $start")
+    val n = freshTemp(); emit(s"$n = sub $word $end, $start")
 
     emit(s"call void @arc.retain_maybe(ptr $ownerV)")
     maybeHeap = true
@@ -267,7 +267,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
 
     val withOwner = freshTemp(); emit(s"$withOwner = insertvalue ${sliceTy.llvm} zeroinitializer, ptr $ownerV, 0")
     val withPtr   = freshTemp(); emit(s"$withPtr = insertvalue ${sliceTy.llvm} $withOwner, ptr $p, 1")
-    val whole     = freshTemp(); emit(s"$whole = insertvalue ${sliceTy.llvm} $withPtr, i64 $n, 2")
+    val whole     = freshTemp(); emit(s"$whole = insertvalue ${sliceTy.llvm} $withPtr, $word $n, 2")
 
     ownTemp(whole, sliceTy)
   }
@@ -350,9 +350,9 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     case TIndex(r, index, _) =>
       val Type.Array(n, elem) = r.ty: @unchecked
       val base = addressUnder(r, root, at)
-      val i    = widen64(index)
+      val i    = widenIndex(index)
       boundsCheck(i, n.toString)
-      val x = freshTemp(); emit(s"$x = getelementptr ${elem.llvm}, ptr $base, i64 $i")
+      val x = freshTemp(); emit(s"$x = getelementptr ${elem.llvm}, ptr $base, $word $i")
       x
 
     case other => address(other)
@@ -362,31 +362,35 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     checked = true
 
     val e1   = freshTemp(); emit(s"$e1 = getelementptr ${elem.llvm}, ptr null, i64 1")
-    val esz  = freshTemp(); emit(s"$esz = ptrtoint ptr $e1 to i64")
+    val esz  = freshTemp(); emit(s"$esz = ptrtoint ptr $e1 to $word")
     val h1   = freshTemp(); emit(s"$h1 = getelementptr $bn, ptr null, i32 0, i32 ${headerFields + 1}")
-    val hsz  = freshTemp(); emit(s"$hsz = ptrtoint ptr $h1 to i64")
+    val hsz  = freshTemp(); emit(s"$hsz = ptrtoint ptr $h1 to $word")
 
-    val mul   = freshTemp(); emit(s"$mul = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 $n, i64 $esz)")
-    val bytes = freshTemp(); emit(s"$bytes = extractvalue { i64, i1 } $mul, 0")
-    val over1 = freshTemp(); emit(s"$over1 = extractvalue { i64, i1 } $mul, 1")
-    val add   = freshTemp(); emit(s"$add = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 $bytes, i64 $hsz)")
-    val total = freshTemp(); emit(s"$total = extractvalue { i64, i1 } $add, 0")
-    val over2 = freshTemp(); emit(s"$over2 = extractvalue { i64, i1 } $add, 1")
+    // The overflow intrinsics carry their width in the **name** as well as in the signature, so a
+    // size computed at the machine's own width has to name the matching overload — and getting that
+    // wrong is not a type error LLVM would catch, it is a call to a function that does not exist.
+    val pair  = s"{ $word, i1 }"
+    val mul   = freshTemp(); emit(s"$mul = call $pair @llvm.umul.with.overflow.$word($word $n, $word $esz)")
+    val bytes = freshTemp(); emit(s"$bytes = extractvalue $pair $mul, 0")
+    val over1 = freshTemp(); emit(s"$over1 = extractvalue $pair $mul, 1")
+    val add   = freshTemp(); emit(s"$add = call $pair @llvm.uadd.with.overflow.$word($word $bytes, $word $hsz)")
+    val total = freshTemp(); emit(s"$total = extractvalue $pair $add, 0")
+    val over2 = freshTemp(); emit(s"$over2 = extractvalue $pair $add, 1")
     val over  = freshTemp(); emit(s"$over = or i1 $over1, $over2")
     val fits  = freshTemp(); emit(s"$fits = xor i1 $over, true")
     trapUnless(fits, "size")
 
-    val p   = freshTemp(); emit(s"$p = call ptr @malloc(i64 $total)")
+    val p   = freshTemp(); emit(s"$p = call ptr @malloc($word $total)")
     val got = freshTemp(); emit(s"$got = icmp ne ptr $p, null")
     trapUnless(got, "alloc")
 
-    emit(s"store i64 1, ptr $p")
+    emit(s"store $word 1, ptr $p")
     val hook = freshTemp(); emit(s"$hook = getelementptr $bn, ptr $p, i32 0, i32 1")
     emit(s"store ptr ${dropBufFn(elem)}, ptr $hook")
     val wc   = freshTemp(); emit(s"$wc = getelementptr $bn, ptr $p, i32 0, i32 2")
-    emit(s"store i64 1, ptr $wc")
+    emit(s"store $word 1, ptr $wc")
     val lenp = freshTemp(); emit(s"$lenp = getelementptr $bn, ptr $p, i32 0, i32 $headerFields")
-    emit(s"store i64 $n, ptr $lenp")
+    emit(s"store $word $n, ptr $lenp")
     val data = freshTemp(); emit(s"$data = getelementptr $bn, ptr $p, i32 0, i32 ${headerFields + 1}")
 
     (p, data)
@@ -400,23 +404,28 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
 
     val withOwner = freshTemp(); emit(s"$withOwner = insertvalue ${sliceTy.llvm} zeroinitializer, ptr $box, 0")
     val withPtr   = freshTemp(); emit(s"$withPtr = insertvalue ${sliceTy.llvm} $withOwner, ptr $data, 1")
-    val whole     = freshTemp(); emit(s"$whole = insertvalue ${sliceTy.llvm} $withPtr, i64 $n, 2")
+    val whole     = freshTemp(); emit(s"$whole = insertvalue ${sliceTy.llvm} $withPtr, $word $n, 2")
 
     ownTemp(whole, sliceTy)
   }
 
-  /** An index at 64 bits, keeping its signedness so a negative one stays negative through the
-   * widening and then fails the unsigned bounds test.
+  /** An index at **the machine's own width**, keeping its signedness so a negative one stays
+   * negative through the widening and then fails the unsigned bounds test.
+   *
+   * It is the address width rather than a fixed sixty-four because what it is about to be compared
+   * against is a length, and a length is a `usize`. Widening to a constant 64 was right for as long
+   * as every target was — and produced an `icmp` between an `i64` and an `i32` the moment one was
+   * not, which is what `CrossTargetBuildTests` caught.
    */
-  protected def widen64(index: TExpr): String = Type.underlying(index.ty) match
-    case i: Type.Integer => convert(i, Type.Integer(64, i.signed), genExpr(index))
+  protected def widenIndex(index: TExpr): String = Type.underlying(index.ty) match
+    case i: Type.Integer => convert(i, Type.Integer(target.word.bits, i.signed), genExpr(index))
     case other           => sys.error(s"unreachable index of type ${other.llvm}")
 
-  /** Traps unless `i` names an element that exists. The comparison is unsigned at 64 bits, so a
-   * negative index arrives as a very large one and fails the same test.
+  /** Traps unless `i` names an element that exists. The comparison is unsigned at the address width,
+   * so a negative index arrives as a very large one and fails the same test.
    */
   protected def boundsCheck(i: String, len: String): Unit = {
-    val ok = freshTemp(); emit(s"$ok = icmp ult i64 $i, $len")
+    val ok = freshTemp(); emit(s"$ok = icmp ult $word $i, $len")
     trapUnless(ok, "bounds")
   }
 

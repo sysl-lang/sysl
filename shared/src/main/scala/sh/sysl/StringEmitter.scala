@@ -18,7 +18,7 @@ trait StringEmitter extends Emitter {
    * NUL can also appear *inside* one as an ordinary byte.
    */
   protected def stringValue(s: String): String =
-    s"{ ptr null, ptr ${stringGlobal(s)}, i64 ${s.getBytes("UTF-8").length} }"
+    s"{ ptr null, ptr ${stringGlobal(s)}, $word ${s.getBytes("UTF-8").length} }"
 
   /** The bytes of a string and how many there are — what every operation on its content needs. */
   protected def strBytes(v: String): (String, String) = {

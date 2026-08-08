@@ -209,6 +209,64 @@ object Toolchain {
    */
   private lazy val searched: Option[String] = arCandidates.find(runs)
 
+  /** Where a `clang` is looked for, in the order tried. The same list as `arCandidates` and for the
+   * same reason: Homebrew keeps its LLVM off the PATH so as not to shadow the system clang, so on a
+   * Mac the capable compiler is commonly installed, working, and invisible to `which`.
+   */
+  private val clangCandidates: List[String] =
+    List(
+      "clang",
+      "/opt/homebrew/opt/llvm/bin/clang",
+      "/usr/local/opt/llvm/bin/clang",
+    )
+
+  /** The back ends a clang has, as `-print-targets` lists them — or an empty set if it cannot be run
+   * at all, which the caller tells apart by there being no candidate that answers.
+   *
+   * Cached per path because it is a process, and a test suite asks this of the same clang thousands
+   * of times.
+   */
+  private val backendCache = collection.mutable.Map.empty[String, Set[String]]
+
+  private def backends(path: String): Set[String] = backendCache.getOrElseUpdate(path, {
+    val r = exec(Seq(path, "-print-targets"))
+
+    if r.exitCode != 0 then Set.empty
+    // Each line is `    name  - Description`, and the name is the first word.
+    else r.stdout.linesIterator.map(_.trim.takeWhile(!_.isWhitespace)).filter(_.nonEmpty).toSet
+  })
+
+  /** The clang to build for `target` with, or why there is none.
+   *
+   * **The PATH's clang is preferred and is nearly always the answer** — a host build must not quietly
+   * change compiler because some other LLVM happens to be installed. What sends the search further is
+   * a target the PATH clang has no back end for, which on a Mac is every RISC-V one: Apple's clang is
+   * trimmed to Apple's processors, so it can parse `-target riscv32-unknown-elf` and then fail to
+   * produce an object for it. That failure is not a compiler bug and reads exactly like one.
+   *
+   * A named one is **not** searched past and not fallen back from, by the rule `findAr` states: a
+   * person who wrote down which compiler to use is owed an error rather than a different one.
+   */
+  def findClang(target: Target, named: Option[String] = None): Either[String, String] = named match
+    case Some(path) =>
+      if !runs(path) then Left(s"cannot run '$path' — --cc names the clang to build with")
+      else
+        Either.cond(backends(path).contains(target.cpu.backend), path,
+          s"'$path' has no '${target.cpu.backend}' back end, so it cannot build for " +
+            s"'${target.name}' — it registers ${shown(backends(path))}")
+    case None =>
+      clangCandidates.find(p => runs(p) && backends(p).contains(target.cpu.backend)).toRight(
+        clangCandidates.find(runs) match
+          case Some(found) =>
+            s"no clang here has the '${target.cpu.backend}' back end that '${target.name}' needs. " +
+              s"'$found' registers ${shown(backends(found))} — a vendor's clang is often trimmed to " +
+              "that vendor's processors. Install LLVM ('brew install llvm'), or name one with --cc"
+          case None =>
+            "cannot find clang, which building needs — install LLVM, or name one with --cc")
+
+  private def shown(bs: Set[String]): String =
+    if bs.isEmpty then "none" else bs.toList.sorted.mkString(", ")
+
   private def runs(path: String): Boolean =
     try exec(Seq(path, "--version")).exitCode == 0
     catch case _: Exception => false
@@ -248,18 +306,20 @@ object Toolchain {
             archives: List[String] = Nil, level: String = defaultOptimization,
             links: List[String] = Nil, objects: List[String] = Nil,
             paths: SearchPaths = SearchPaths.none, verbose: Boolean = false): Either[String, Unit] = {
-    val ll = createTempFile("sysl-", ".ll")
-    writeFile(ll, ir)
+    findClang(target).flatMap { cc =>
+      val ll = createTempFile("sysl-", ".ll")
+      writeFile(ll, ir)
 
-    val command = linkCommand(ll, archives, exe, target, level, links, objects, paths)
+      val command = linkCommand(ll, archives, exe, target, level, links, objects, paths, cc)
 
-    if verbose then trace(s"link: ${command.mkString(" ")}")
+      if verbose then trace(s"link: ${command.mkString(" ")}")
 
-    val result = exec(command)
-    deleteFile(ll)
+      val result = exec(command)
+      deleteFile(ll)
 
-    if result.exitCode == 0 then Right(())
-    else Left(s"clang failed (exit ${result.exitCode}):\n${result.stderr.trim}")
+      if result.exitCode == 0 then Right(())
+      else Left(s"$cc failed (exit ${result.exitCode}):\n${result.stderr.trim}")
+    }
   }
 
   /** The whole of what is handed to the driver to link one program, as a list, so that what a target
@@ -284,8 +344,9 @@ object Toolchain {
   private[sysl] def linkCommand(ll: String, archives: List[String], exe: String, target: Target,
                                 level: String = defaultOptimization,
                                 links: List[String] = Nil, objects: List[String] = Nil,
-                                paths: SearchPaths = SearchPaths.none): List[String] =
-    List("clang", s"--target=${target.triple}", "-Wno-override-module", flag(level)) ::: deadStrip(target) :::
+                                paths: SearchPaths = SearchPaths.none,
+                                cc: String = "clang"): List[String] =
+    List(cc, s"--target=${target.triple}", "-Wno-override-module", flag(level)) ::: deadStrip(target) :::
       paths.linkFlags ::: List(ll) ::: objects ::: archives ::: libraryFlags(links, target) :::
       List("-o", exe)
 
@@ -370,15 +431,17 @@ object Toolchain {
    */
   def compileObject(ir: String, obj: String, target: Target = Target.default,
                     level: String = defaultOptimization): Either[String, Unit] = {
-    val ll = createTempFile("sysl-", ".ll")
-    writeFile(ll, ir)
+    findClang(target).flatMap { cc =>
+      val ll = createTempFile("sysl-", ".ll")
+      writeFile(ll, ir)
 
-    val result = exec(Seq("clang", s"--target=${target.triple}", "-Wno-override-module", flag(level),
-      "-ffunction-sections", "-fdata-sections", "-c", ll, "-o", obj))
-    deleteFile(ll)
+      val result = exec(Seq(cc, s"--target=${target.triple}", "-Wno-override-module", flag(level),
+        "-ffunction-sections", "-fdata-sections", "-c", ll, "-o", obj))
+      deleteFile(ll)
 
-    if result.exitCode == 0 then Right(())
-    else Left(s"clang failed (exit ${result.exitCode}):\n${result.stderr.trim}")
+      if result.exitCode == 0 then Right(())
+      else Left(s"$cc failed (exit ${result.exitCode}):\n${result.stderr.trim}")
+    }
   }
 
   /** Compiles one of a library's C files into a relocatable object, to be archived beside the
@@ -407,15 +470,17 @@ object Toolchain {
   def compileC(source: String, obj: String, target: Target = Target.default,
                level: String = defaultOptimization,
                paths: SearchPaths = SearchPaths.none, verbose: Boolean = false): Either[String, Unit] = {
-    val command = Seq("clang", s"--target=${target.triple}", flag(level)) ++ paths.includeFlags ++
-      Seq("-ffunction-sections", "-fdata-sections", "-c", source, "-o", obj)
+    findClang(target).flatMap { cc =>
+      val command = Seq(cc, s"--target=${target.triple}", flag(level)) ++ paths.includeFlags ++
+        Seq("-ffunction-sections", "-fdata-sections", "-c", source, "-o", obj)
 
-    if verbose then trace(s"compile: ${command.mkString(" ")}")
+      if verbose then trace(s"compile: ${command.mkString(" ")}")
 
-    val result = exec(command)
+      val result = exec(command)
 
-    if result.exitCode == 0 then Right(())
-    else Left(s"$source did not compile (exit ${result.exitCode}):\n${result.stderr.trim}")
+      if result.exitCode == 0 then Right(())
+      else Left(s"$source did not compile (exit ${result.exitCode}):\n${result.stderr.trim}")
+    }
   }
 
   /** Compiles, links, and runs a source program, returning its exit code and captured

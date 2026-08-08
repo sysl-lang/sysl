@@ -120,6 +120,23 @@ enum Cpu(val bits: Int) {
     case Riscv32 => "riscv32"
     case Thumb   => "thumb"
     case X86     => "x86"
+
+  /** The name LLVM registers this processor's back end under, which is what `clang -print-targets`
+   * lists and so what says whether a given clang can produce objects for this target at all.
+   *
+   * **It is not `symbol`, and the difference is not cosmetic.** `symbol` is what a *program* writes
+   * in a `#if` or an `asm` arm and is sysl's to choose; this is LLVM's, and LLVM spells the 64-bit
+   * x86 back end `x86-64` where a source file says `x86_64`. Deriving one from the other would work
+   * for five processors out of six and fail for that one, silently, in the form of a clang that
+   * looks incapable of a target it handles perfectly well.
+   */
+  def backend: String = this match
+    case Aarch64 => "aarch64"
+    case X86_64  => "x86-64"
+    case Riscv64 => "riscv64"
+    case Riscv32 => "riscv32"
+    case Thumb   => "thumb"
+    case X86     => "x86"
 }
 
 object Cpu {

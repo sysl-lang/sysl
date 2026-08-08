@@ -66,13 +66,16 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     out ++= s"target triple = \"${target.triple}\"\n\n"
 
     if traps then out ++= "declare void @llvm.trap()\n"
+    // `malloc` and `snprintf` take a `size_t`, and the two overflow intrinsics carry their width in
+    // the **name** as well as the signature — so all of these are the machine's word rather than
+    // eight bytes, and naming the wrong overload is a call to a function that does not exist.
     if heap then
-      out ++= "declare ptr @malloc(i64)\n"
+      out ++= s"declare ptr @malloc($word)\n"
       out ++= "declare void @free(ptr)\n"
     if checked then
-      out ++= "declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)\n"
-      out ++= "declare { i64, i1 } @llvm.uadd.with.overflow.i64(i64, i64)\n"
-    if usesSnprintf then out ++= "declare i32 @snprintf(ptr, i64, ptr, ...)\n"
+      out ++= s"declare { $word, i1 } @llvm.umul.with.overflow.$word($word, $word)\n"
+      out ++= s"declare { $word, i1 } @llvm.uadd.with.overflow.$word($word, $word)\n"
+    if usesSnprintf then out ++= s"declare i32 @snprintf(ptr, $word, ptr, ...)\n"
     // The test dispatcher's one dependency, and the only thing in a test build that is not also in an
     // ordinary one. It is declared from the shape of the program rather than from a flag set while
     // emitting, because the entry point is emitted after this line runs.
@@ -145,12 +148,16 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
     // A box is the strong count, the function that destroys it, the weak count, and the payload —
     // so ARC works the same everywhere, and an object frees itself into whichever heap made it.
+    // The two counts are the machine's word, and must stay in step with `%arc.header` — the runtime
+    // reads these very fields through that type, so a disagreement is not a type error anywhere,
+    // it is a count read at the wrong width.
     for (name, payload) <- boxes do
-      out ++= s"$name = type { i64, ptr, i64, ${payload.llvm} }\n"
+      out ++= s"$name = type { $word, ptr, $word, ${payload.llvm} }\n"
     // A buffer is the same box with the element count in front of elements there may be any number
-    // of, so the hook — which is reached with no static type — can still find them all.
+    // of, so the hook — which is reached with no static type — can still find them all. That count
+    // is a `usize` like any other length.
     for (name, elem) <- bufs do
-      out ++= s"$name = type { i64, ptr, i64, i64, [0 x ${elem.llvm}] }\n"
+      out ++= s"$name = type { $word, ptr, $word, $word, [0 x ${elem.llvm}] }\n"
     if boxes.nonEmpty || bufs.nonEmpty then out ++= "\n"
 
     // A library's own functions are declared here rather than up with the `extern`s, and it has to be
@@ -186,9 +193,9 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
     if charBuf then out ++= ScalarEmitter.utf8Encoder
     if heap then out ++= ArcEmitter.core(target)
-    if syncHeap then out ++= ArcEmitter.atomic
+    if syncHeap then out ++= ArcEmitter.atomic(target)
     if maybeHeap then out ++= ArcEmitter.maybe
-    if weakHeap then out ++= ArcEmitter.weak
+    if weakHeap then out ++= ArcEmitter.weak(target)
     for t <- runtimeTexts do out ++= t; out ++= "\n"
 
     for t <- funcTexts do out ++= t; out ++= "\n"

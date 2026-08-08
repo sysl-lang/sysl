@@ -481,7 +481,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       for (el, i) <- elems.zipWithIndex do
         val p = freshTemp()
 
-        emit(s"$p = getelementptr ${arrayTy.elem.llvm}, ptr $dest, i64 $i")
+        emit(s"$p = getelementptr ${arrayTy.elem.llvm}, ptr $dest, $word $i")
         genBorrowedInto(p, el)
 
     // The tag, and then the variant's own fields written into the region every variant shares.
@@ -536,22 +536,22 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
 
   /** Runs `each` once per element of an array laid down at `base`, with the element's address. */
   private def fillLoop(base: String, arrayTy: Type.Array)(each: String => Unit): Unit = {
-    val i     = emitAlloca(freshTemp(), "i64")
+    val i     = emitAlloca(freshTemp(), word)
     val condL = freshLabel("fill.test")
     val bodyL = freshLabel("fill.elem")
     val endL  = freshLabel("fill.done")
 
-    emit(s"store i64 0, ptr $i")
+    emit(s"store $word 0, ptr $i")
     emitTerm(s"br label %$condL")
     emitLabel(condL)
-    val iv   = freshTemp(); emit(s"$iv = load i64, ptr $i")
-    val more = freshTemp(); emit(s"$more = icmp ult i64 $iv, ${arrayTy.length}")
+    val iv   = freshTemp(); emit(s"$iv = load $word, ptr $i")
+    val more = freshTemp(); emit(s"$more = icmp ult $word $iv, ${arrayTy.length}")
     emitTerm(s"br i1 $more, label %$bodyL, label %$endL")
     emitLabel(bodyL)
-    val ep = freshTemp(); emit(s"$ep = getelementptr ${arrayTy.elem.llvm}, ptr $base, i64 $iv")
+    val ep = freshTemp(); emit(s"$ep = getelementptr ${arrayTy.elem.llvm}, ptr $base, $word $iv")
     each(ep)
-    val nxt = freshTemp(); emit(s"$nxt = add i64 $iv, 1")
-    emit(s"store i64 $nxt, ptr $i")
+    val nxt = freshTemp(); emit(s"$nxt = add $word $iv, 1")
+    emit(s"store $word $nxt, ptr $i")
     emitTerm(s"br label %$condL")
     emitLabel(endL)
   }
@@ -605,7 +605,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
 
       for (v, i) <- vals.zipWithIndex do
         retainValue(sliceTy.elem, v)
-        val ep = freshTemp(); emit(s"$ep = getelementptr ${sliceTy.elem.llvm}, ptr $data, i64 $i")
+        val ep = freshTemp(); emit(s"$ep = getelementptr ${sliceTy.elem.llvm}, ptr $data, $word $i")
         emit(s"store ${sliceTy.elem.llvm} $v, ptr $ep")
 
       bufferView(sliceTy, box, data, vals.length.toString)
@@ -615,7 +615,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     // be zero and the call still happen.
     case TBufFill(value, count, sliceTy) =>
       val v           = genExpr(value)
-      val n           = widen64(count)
+      val n           = widenIndex(count)
       val (box, data) = genBuffer(sliceTy.elem, n)
 
       fillElements(sliceTy.elem, data, n, v)
@@ -801,7 +801,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
         case Some(n) =>
           val vt   = freshTemp(); emit(s"$vt = extractvalue ${Type.fatPointer} $v, 0")
           val data = freshTemp(); emit(s"$data = extractvalue ${Type.fatPointer} $v, 1")
-          val e    = freshTemp(); emit(s"$e = getelementptr ptr, ptr $vt, i64 $n")
+          val e    = freshTemp(); emit(s"$e = getelementptr ptr, ptr $vt, $word $n")
           val fn   = freshTemp(); emit(s"$fn = load ptr, ptr $e")
 
           emit(s"call void $fn(ptr $data, ${Type.fatPointer} $w, ${spec.ty.llvm} $s)")
@@ -1090,7 +1090,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       val table   = freshTemp(); emit(s"$table = extractvalue ${Type.fatPointer} $obj, 0")
       val data    = freshTemp(); emit(s"$data = extractvalue ${Type.fatPointer} $obj, 1")
       val argVals = argList(args)
-      val entry   = freshTemp(); emit(s"$entry = getelementptr ptr, ptr $table, i64 $slot")
+      val entry   = freshTemp(); emit(s"$entry = getelementptr ptr, ptr $table, $word $slot")
       val fn      = freshTemp(); emit(s"$fn = load ptr, ptr $entry")
       genSyslCall(s"${syslResult(ty)} $fn", s"ptr $data" :: argVals, ty, None)
 
