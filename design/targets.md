@@ -43,23 +43,58 @@ of what makes it different from `build`.
 | `aarch64-freestanding` | `aarch64-none-elf` | copied | yes |
 | `x86_64-freestanding` | `x86_64-unknown-none-elf` | address | yes |
 | `riscv64-freestanding` | `riscv64-unknown-elf` | loaded | **no** |
-| `x86-linux` | `i386-unknown-linux-gnu` | *32-bit — not yet supported* | |
+| `thumb-freestanding` | `thumbv8m.main-none-eabihf` | loaded | yes |
+| `riscv32-freestanding` | `riscv32-unknown-elf` | loaded | **no** |
+| `x86-linux` | `i386-unknown-linux-gnu` | *no measured C ABI* | |
 
-**Bare-metal RISC-V is the one target with no floating registers to pass arguments in.** The hosted
-triple is built for the D extension and this one is not, which is clang's default for each — and
-since sysl hands its own triple to clang, the two have to make the same assumption about the same
-triple or the call disagrees. It reaches exactly one decision, whether a small aggregate of floating
-members is flattened into registers, and that is why it is recorded rather than derived.
+**The last two are 32-bit, and they are the two halves of one board.** The RP2350 boots either a
+pair of Cortex-M33s or a pair of RV32IMAC Hazard3 cores, and both are here because a
+microcontroller is what *freestanding* is mostly for: the three 64-bit freestanding rows reach
+kernels and hypervisors, which is a different audience from the one writing embedded C, and nearly
+all of that is 32-bit.
+
+`thumb` rather than `arm` names the Arm half, and the reason is the assembly arm rather than the
+architecture family — a Cortex-M executes Thumb only, so an arm written for A32 would assemble for a
+machine that cannot run it. One spelling serves `#if` and `asm` alike, as for every other processor.
+
+**Neither bare-metal RISC-V has floating registers to pass arguments in, at either width.** The
+hosted 64-bit triple is built for the D extension and the bare ones are not, which is clang's default
+for each — and since sysl hands its own triple to clang, the two have to make the same assumption
+about the same triple or the call disagrees. At 32 bits it is firmer than a default: the Hazard3 is
+RV32IMAC and has no F extension to use. It reaches exactly one decision, whether a small aggregate of
+floating members is flattened into registers, and that is why it is recorded rather than derived.
+
+The Cortex-M33 goes the other way and needed checking rather than assuming: `eabihf` selects the
+hard-float convention, and clang gives `thumbv8m.main` an `fpv5-d16` unasked, so arguments really do
+cross in VFP registers. `-mcpu=cortex-m33` refines instruction selection to the exact core and
+changes nothing about the ABI — it is the sub-architecture question left open at the bottom of this
+page, and it is not needed for a correct call.
 
 **`Freestanding` is a real answer, not a missing one.** A kernel or a bare-metal program has no
 operating system, and the ABI of a freestanding ELF target is fully specified; it differs from a
 hosted target on the same processor only where the OS is what fixed the convention. That is the
 target a `no alloc` module (`capabilities.md`) is eventually built for.
 
-**A target sysl knows and cannot build for is listed anyway.** `x86-linux` is refused with a
-message saying it is 32-bit, because a reader told the name is *unknown* would go looking for a
-typo that is not there. The limit is the compiler's, not the machine's — see *What a target does
-not decide*.
+**Freestanding does not mean self-contained, and the difference is a link error rather than a
+diagnostic.** A program still names C symbols the target's runtime is expected to define — `putchar`
+wherever anything prints, `free` wherever ARC can reach a release, `memcpy` and `memset` for a
+structure assignment the source never wrote — and none of them is a *sysl* dependency the compiler
+could report on: they are what any C compiler emits for the same code. A bare board therefore owes a
+support package, which is what pico-sdk and newlib-nano are.
+
+**The one that surprises is arithmetic.** A `long` is sixty-four bits on every target, so a 32-bit
+machine without a 64-bit divider — which is all of them — turns rendering one into a call to a
+compiler-rt builtin: `__divdi3` on RISC-V, `__aeabi_ldivmod` under the ARM EABI. The language decided
+nothing here; the width of `long` is the language's answer and the instruction set is the machine's,
+and where the two do not meet the runtime is what closes the gap, exactly as it does for C. Real
+toolchains link `libgcc` or compiler-rt without being asked, which is why the requirement is
+invisible until a cross-build has neither.
+
+**A target sysl knows and cannot build for is listed anyway.** `x86-linux` is refused with a message
+saying what is missing, because a reader told the name is *unknown* would go looking for a typo that
+is not there. **What is missing is no longer its width** — this page said "it is 32-bit" until 32-bit
+targets arrived — but a C calling convention measured against clang, which *Adding one* says is the
+only way a target's answers may be arrived at. The limit is the compiler's, not the machine's.
 
 ### Adding one
 
@@ -105,9 +140,9 @@ agree.
 
 A scalar crosses as itself; an `i32` is one register everywhere. An aggregate does not, and **LLVM
 applies no C classification to one of its own accord** — given a struct type in a signature it
-assigns one register per element, which is not what any of the four conventions asks for. So a
+assigns one register per element, which is not what any of the five conventions asks for. So a
 foreign declaration names the *coerced* types the convention specifies and the call converts each
-value into and out of that shape. The four:
+value into and out of that shape. The five:
 
 - **AAPCS64** asks first whether the aggregate is a homogeneous floating aggregate — up to four
   members all of one floating width, however deeply nested — because those go in floating registers
@@ -121,14 +156,39 @@ value into and out of that shape. The four:
   two.
 - **RISC-V** flattens the narrow floating cases: one or two floating members travel as themselves,
   and one floating member beside one integer member travels in one register of each. A pointer beside
-  a float is not that case.
+  a float is not that case. **It is one rule at both widths**, written in terms of XLEN — LP64D and
+  ILP32 are the same function with a different word, which is why adding RV32 added a parameter and
+  not a convention.
+- **AAPCS32** is the one whose two directions disagree about *memory itself*, and it is the only
+  convention here that does. An HFA travels as the struct type itself in both directions — the
+  opposite of AAPCS64, which coerces to an array. Otherwise a **result** of four bytes or fewer is
+  an integer of its own width and anything larger is returned through `sret`, **always**; while an
+  **argument** goes in registers *at any size* — a sixty-four-byte struct is `[16 x i32]`. So an
+  aggregate too big to return is still not too big to pass, and a target where an argument is never
+  indirect is a target where the indirect case is unreachable.
 - **The Microsoft convention** is the simplest: one, two, four or eight bytes in one integer
   register, anything else by address. No floating case at all.
 
-Two details are worth stating because no document states them and only the measurement finds them.
+Three details are worth stating because no document states them and only the measurement finds them.
 System V names an integer chunk after **the member that starts it** when that member is all the chunk
-carries — the `u8` after an `i64` is an `i8`, not the register it will travel in. And both AAPCS64
+carries — the `u8` after an `i64` is an `i8`, not the register it will travel in. Both AAPCS64
 and RISC-V name a sixteen-byte aggregate `i128` rather than two `i64`s once it is aligned to sixteen.
+And AAPCS32 picks its register *element* by the aggregate's alignment rather than by the word:
+eight-aligned gives `[n x i64]` on a machine whose registers are four bytes, because what LLVM is
+being told is the shape to copy and not the registers to use.
+
+A fourth is worth stating for a different reason — it is the one this page's own rule caught rather
+than the measurement. **A `byval` alignment is the stack slot's and not the type's**: System V
+aligns an argument passed in memory to eight whatever the aggregate is made of, so a `char[64]` is
+`align 8` and only a type that demands more gets more. Sysl said the type's alignment until
+`AbiAgainstClangTests` asked clang and found the two disagreeing. The generated code was identical,
+because the back end applies the minimum on its own — which is exactly why it survived every tier
+below this one, and exactly why *measure it against clang* is a rule and not a habit.
+
+**That test is the rule made mechanical.** Every convention above is now re-derived from clang on
+every run: the equivalent C is compiled for the same triple and the `declare` it produces has to be
+the one sysl produces. A table written by reading clang once is only as good as the reading, and a
+misreading is pinned by its own test exactly as firmly as a correct one.
 
 Only the boundary is affected. A struct handed over **by address** needs none of this, which is why
 that was the workaround while the boundary was broken, and a sysl-to-sysl call is untouched.
@@ -139,7 +199,11 @@ C's `va_list` is a different type on every target and is passed three different 
 the address of the walk — the only thing sysl has — crosses over as:
 
 - **loaded** — the storage holds one pointer-sized value and the call passes *that value*. Darwin
-  arm64, where `va_list` *is* `char *`; Windows x64; RISC-V.
+  arm64, where `va_list` *is* `char *`; Windows x64; RISC-V at both widths; and AAPCS32, whose
+  `va_list` is a one-member struct that clang declares as `[1 x i32]`. **That last one looks like a
+  fourth answer and is not** — a struct of one word passed in one core register is what *loaded*
+  already describes, and compiling the call both ways gives the identical instruction. It was
+  checked rather than assumed, after a fourth case had already been written.
 - **address** — the storage is an array of one struct, which decays, so the call passes the
   address of the storage itself. x86-64 System V.
 - **copied** — the storage is a struct passed indirectly, so the call passes the address of a
@@ -156,18 +220,33 @@ of a sysroot — instead of quietly producing a host binary.
 
 ## What a target does not decide
 
-**Layout.** Every target in the registry is 64-bit, and on a 64-bit target the questions `Layout`
-answers have one answer: scalars are their own width and aligned to it, an address is eight
-bytes, an aggregate is laid out in declaration order with each member on its own alignment and
-the whole rounded up to the widest. That is C's rule and LLVM's. `Layout` therefore takes no
-`Target` — and the registry refuses a 32-bit one precisely because that is where the agreement
-would end.
+**Layout — which depends on the word, and on nothing else a target carries.** The questions
+`Layout` answers have one answer per address width: scalars are their own width and aligned to it,
+an address is one word, an aggregate is laid out in declaration order with each member on its own
+alignment and the whole rounded up to the widest. That is C's rule and LLVM's. So `Layout` takes a
+`Word` rather than a `Target`.
+
+**That is a stronger statement than taking nothing, and it is worth saying why.** This page used to
+claim `Layout` needed no target at all, resting it on every target in the registry being 64-bit —
+which stopped being true the moment `thumb-freestanding` and `riscv32-freestanding` were added. A
+claim that something depends on *nothing* is only ever as good as the registry that makes it
+vacuous; naming what it depends on survives the registry growing. The operating system, the
+`va_list` walk and the calling convention are all still outside it: two targets of one width lay
+every aggregate out identically, and `TargetTests` asserts exactly that by emitting one program for
+each of them.
+
+**A width's reach is narrow, which is the other half of the same point.** Only one LLVM *type* in
+the language mentions it: a view is `{ ptr, ptr, iN }`, because its length is a `usize`. An
+aggregate of fixed-width scalars, an array, a data enum's union region and a `va_list` are spelled
+identically at both widths — so the types that move between a 64-bit module and a 32-bit one are
+exactly the ones with a view somewhere inside them, and `TargetTests` asserts that from both ends.
 
 That is worth separating from the section above, because the two are easy to run together: **where a
 member sits inside an aggregate is one question and which register the aggregate travels in is
-another.** Every target answers the first identically, which is why `Layout` needs no target; all
-four disagree about the second, which is why the classification does. The classification is built
-*on* the layout — it asks which members share an eightbyte, and that is the layout's answer.
+another.** Targets of one width answer the first identically, which is why `Layout` needs no more
+than that width; they disagree about the second whatever their width, which is why the
+classification takes the whole target. The classification is built *on* the layout — it asks which
+members share an eightbyte, and that is the layout's answer.
 
 **The storage a `va_list` occupies.** Sysl reserves the widest any target needs (32 bytes,
 AAPCS64's) for all of them. The waste is a few bytes of one stack slot in a variadic function,
@@ -224,7 +303,7 @@ marker disturbs nothing.
 | kind | symbols |
 |---|---|
 | operating system | `macos`, `linux`, `windows`, `freestanding` |
-| processor | `aarch64`, `x86_64`, `riscv64`, `x86` |
+| processor | `aarch64`, `x86_64`, `riscv64`, `riscv32`, `thumb`, `x86` |
 | derived | `hosted` (not `freestanding`), `posix` (`macos` or `linux`) |
 
 That is the whole vocabulary. There is no `#define`, nothing a project can add, and **no dependence
@@ -302,8 +381,17 @@ the trees a library ships are now a per-target answer. `13 §8` has the rest.
   is what let it be built while the config is still open. Asking `#if no alloc` is a coherent thing
   to want and belongs with the config that would define it — and it is where the two `posix` senses
   above would have to be told apart in the syntax.
-- **32-bit targets.** The emitted code assumes a 64-bit address in places nothing has been asked
-  to parameterize. `x86-linux` is in the registry so the refusal has something to name.
+- ~~**32-bit targets.**~~ **Built.** `thumb-freestanding` and `riscv32-freestanding` are in the
+  registry and build. What this item described — the emitted code assuming a 64-bit address in
+  places nothing had been asked to parameterize — was real, and the parameter is `Word`: `Layout`
+  takes one, `Type.llvm` takes one, and there is deliberately **no default**, so a site that needs a
+  width and was not given one fails to compile rather than quietly emitting a 64-bit type. Six such
+  sites existed and every one of them was a `usize` spelled `i64`.
+
+  `x86-linux` is still in the registry and still refused, but **the reason changed**: not that it is
+  32-bit, which no longer disqualifies anything, but that no C calling convention has been measured
+  for i386. That is the honest statement of what is missing, and it is the same sentence the
+  compiler now prints.
 - **Cross-linking.** Building for another machine emits a correct module and then hands it to a
   `clang` that has no sysroot for it. That is the toolchain's problem to solve and sysl's to
   report clearly, not to work around.

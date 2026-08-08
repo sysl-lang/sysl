@@ -130,9 +130,18 @@ object Stdlib {
         case Choice.FromSource      => Right(Resolved(fromSource(target), Set.empty, None))
         case Choice.Artifact(named) => load(named, target)
         case Choice.Default(search) =>
-          val path = search.getOrElse(LibraryArtifact.stdDefault)
+          val path = search.getOrElse(LibraryArtifact.stdDefault(target))
 
-          resolved.synchronized(resolved.getOrElseUpdate((path, target), found(path, target)))
+          resolved.synchronized {
+            resolved.get((path, target)) match
+              case Some(answer) => answer
+              case None         =>
+                val answer = found(path, target)
+
+                resolved.clear()
+                resolved((path, target)) = answer
+                answer
+          }
 
   /** The default path's answer, kept — for the reason `fromSource`'s copy is kept, and with the same
    * lock: a caller that resolves repeatedly would otherwise decode an unchanged artifact each time,
@@ -143,8 +152,16 @@ object Stdlib {
    * than the file — a stale answer under one key is not reachable. A **named** artifact is
    * deliberately not kept: someone who wrote down which artifact to use may be rebuilding it, and
    * answering from memory would hand them the one they replaced.
+   *
+   * **One answer is kept, not one per key**, and this is the largest of the three single-slot memos
+   * because a `Resolved` carries a whole decoded `Stdlib`. The key has a target in it and the path
+   * has the target in it too, so a test walking `Target.all` produced an entry per target and held
+   * every one of them.
    */
   private val resolved = collection.mutable.Map.empty[(String, Target), Either[String, Resolved]]
+
+  /** How many answers are held, so a test can pin the bound. See `Std.cachedTargets`. */
+  private[sysl] def cachedResolutions: Int = resolved.synchronized(resolved.size)
 
   /** The standard module at the path both ends agree on, **built there when what is there is not
    * one.**
@@ -219,8 +236,21 @@ object Stdlib {
    * consistency: the library may gate on the machine (`Conditional`), so a copy parsed for one
    * target is not the library another target has.
    */
+  /** **One target's copy is kept**, for the reason `Std.parsed` keeps one — a caller loops over a
+   * target rather than alternating, and a test that iterates `Target.all` otherwise leaves every
+   * target's standard module resident for the life of the process.
+   */
   def fromSource(target: Target): Stdlib =
-    cache.synchronized(cache.getOrElseUpdate(target, new Stdlib(Std.parsed(target))))
+    cache.synchronized {
+      cache.get(target) match
+        case Some(std) => std
+        case None =>
+          val std = new Stdlib(Std.parsed(target))
+
+          cache.clear()
+          cache(target) = std
+          std
+    }
 
   /** Locked for the reason `Std.parsed`'s is: this was a `lazy val`, which is initialized once
    * however many threads reach it, and a bare mutable `Map` is not.

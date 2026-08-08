@@ -11,15 +11,10 @@ package sh.sysl
 sealed trait Type {
 
   /** The LLVM type this lowers to. */
-  def llvm: String
+  def llvm(using Word): String
 }
 
 object Type {
-
-  /** The pointer width of the target, which is what `usize` and `isize` measure. Bring-up
-   * compiles for the 64-bit host only; a target description will own this.
-   */
-  val pointerBits: Int = 64
 
   /** The widest integer the back end lowers, which is LLVM's own `iN` maximum.
    *
@@ -37,12 +32,12 @@ object Type {
    * match on this one — converting between the two is a cast the programmer writes.
    */
   case class Integer(bits: Int, signed: Boolean, pointerWidth: Boolean = false) extends Type {
-    def llvm: String = s"i$bits"
+    def llvm(using Word): String = s"i$bits"
   }
 
   /** An IEEE binary floating-point type: `f16`, `f32`, `f64`. A closed set, not a family. */
   case class Floating(bits: Int) extends Type {
-    def llvm: String = bits match
+    def llvm(using Word): String = bits match
       case 16 => "half"
       case 32 => "float"
       case _  => "double"
@@ -51,10 +46,10 @@ object Type {
   /** A Unicode scalar value. Layout-compatible with `u32` but not type-compatible: it has
    * equality and ordering and no arithmetic at all, so reaching a codepoint means casting.
    */
-  case object Char extends Type { def llvm = "i32" }
+  case object Char extends Type { def llvm(using Word) = "i32" }
 
-  case object Bool extends Type { def llvm = "i1"  }
-  case object Unit extends Type { def llvm = "void" }
+  case object Bool extends Type { def llvm(using Word) = "i1"  }
+  case object Unit extends Type { def llvm(using Word) = "void" }
 
   /** The state of a walk through a variadic function's tail (`12 §9`) — C's `va_list`.
    *
@@ -64,7 +59,7 @@ object Type {
    * prefix the ABI defines is ever touched — over-reserving a stack slot costs nothing, while
    * under-reserving would be silent corruption.
    */
-  case object VaList extends Type { def llvm = "[4 x ptr]" }
+  case object VaList extends Type { def llvm(using Word) = "[4 x ptr]" }
 
   /** The type of an expression that does not finish — a call to something that never returns, and
    * so the arm of a `match` or `if` that aborts rather than yielding a value.
@@ -78,7 +73,7 @@ object Type {
    * about. Nothing is ever *of* type `never` at run time — there is no value of it — so it lowers
    * to `void` and takes no slot, no register, and no `phi`.
    */
-  case object Never extends Type { def llvm = "void" }
+  case object Never extends Type { def llvm(using Word) = "void" }
 
   /** The type of something whose real type could not be worked out, because the thing that would
    * have decided it was already reported as an error.
@@ -89,7 +84,7 @@ object Type {
    * reaches codegen — a program with an error is never lowered — and touching a value of it
    * raises `Poisoned`, which abandons the statement without reporting a second time.
    */
-  case object Unknown extends Type { def llvm = "void" }
+  case object Unknown extends Type { def llvm(using Word) = "void" }
 
   /** A type parameter as the body that declares it sees it: opaque, and licensed to do exactly
    * what `bounds` promise (`14 §4`).
@@ -104,7 +99,7 @@ object Type {
    * a representation for a type that has none.
    */
   case class Abstract(name: String, bounds: List[Bound]) extends Type {
-    def llvm: String =
+    def llvm(using Word): String =
       throw new IllegalStateException(s"the type parameter '$name' reached codegen")
 
     /** Identity is the **name**, and deliberately not the bounds, for the reason `Bound.key` is a
@@ -155,7 +150,7 @@ object Type {
      */
     def bound: Bound = Bound(name, args)
 
-    def llvm: String =
+    def llvm(using Word): String =
       throw new IllegalStateException(s"the trait '$name' reached codegen as a type of its own")
   }
 
@@ -204,7 +199,7 @@ object Type {
    * sigil is so a reader can find every place a program takes on C's risks.
    */
   case class Ptr(inner: Type) extends Type {
-    def llvm: String = if inner.isInstanceOf[Trait] then fatPointer else "ptr"
+    def llvm(using Word): String = if inner.isInstanceOf[Trait] then fatPointer else "ptr"
   }
 
   /** `*extern(A, B) -> R` — the address of a function that obeys the machine's C convention, which
@@ -221,7 +216,7 @@ object Type {
    * promise the `*` announces, the same one every raw pointer announces.
    */
   case class CFn(params: List[Type], ret: Type) extends Type {
-    def llvm: String = "ptr"
+    def llvm(using Word): String = "ptr"
 
     /** The written spelling, so a debug rendering reads the way the program does. What a diagnostic
      * shows goes through `show`, and what the emitter writes in front of an indirect callee is the
@@ -243,7 +238,7 @@ object Type {
    * it looks like. What the qualifier changes is the instruction that reaches it, and only that.
    */
   case class Volatile(inner: Type) extends Type {
-    def llvm: String = inner.llvm
+    def llvm(using Word): String = inner.llvm
   }
 
   /** A type with any `volatile` taken off the front of it — the type of the **value** read out of a
@@ -274,7 +269,7 @@ object Type {
    * conversion either way: atomicity is fixed when the object is allocated.
    */
   case class Ref(inner: Type, sync: Boolean) extends Type {
-    def llvm: String = if inner.isInstanceOf[Trait] then fatPointer else "ptr"
+    def llvm(using Word): String = if inner.isInstanceOf[Trait] then fatPointer else "ptr"
   }
 
   /** `weak T` — a reference that does not keep its referent alive (`03`).
@@ -285,7 +280,7 @@ object Type {
    * is still there and handed back an `Option[&T]`.
    */
   case class Weak(inner: Type) extends Type {
-    def llvm: String = if inner.isInstanceOf[Trait] then fatPointer else "ptr"
+    def llvm(using Word): String = if inner.isInstanceOf[Trait] then fatPointer else "ptr"
 
     /** The reference this weakens, which is what `get()` yields and what makes one. */
     def strong: Ref = Ref(inner, sync = false)
@@ -296,7 +291,7 @@ object Type {
    * lets every index be checked against a constant.
    */
   case class Array(length: Int, elem: Type) extends Type {
-    def llvm: String = s"[$length x ${elem.llvm}]"
+    def llvm(using Word): String = s"[$length x ${elem.llvm}]"
   }
 
   object Array {
@@ -327,7 +322,7 @@ object Type {
    * representation.
    */
   case class ConstArg(value: BigInt, ty: Type) extends Type {
-    def llvm: String =
+    def llvm(using Word): String =
       throw new IllegalStateException(s"the value argument '$value' reached codegen")
   }
 
@@ -344,7 +339,7 @@ object Type {
    * codegen means the tuple it stands for was never formed.
    */
   case class Pack(elems: List[Type]) extends Type {
-    def llvm: String =
+    def llvm(using Word): String =
       throw new IllegalStateException(s"a type pack of ${elems.length} reached codegen")
   }
 
@@ -356,7 +351,10 @@ object Type {
   sealed trait View extends Type {
     def elem: Type
 
-    def llvm: String = "{ ptr, ptr, i64 }"
+    /** Three words: where the elements are, where they end, and how many there are. The length is a
+     * `usize`, so this is the one LLVM type in the language whose text depends on the machine.
+     */
+    def llvm(using w: Word): String = s"{ ptr, ptr, ${w.llvm} }"
   }
 
   /** `[]T` — a view of any elements at all, and `[]const T` when the elements may not be written
@@ -421,21 +419,24 @@ object Type {
   val Real: Floating = Floating(64)
 
   val Byte:  Integer = Integer(8, signed = false)
-  val Usize: Integer = Integer(pointerBits, signed = false, pointerWidth = true)
-  val Isize: Integer = Integer(pointerBits, signed = true, pointerWidth = true)
 
-  /** The scalar type names that are not systematic — the pointer-width pair, the
-   * non-numeric primitives, and the friendly aliases over the common integer and float
-   * widths. The `iN` / `uN` / `fN` spellings are recognised by width instead, so the open
-   * integer family needs no table.
+  /** `usize` and `isize`, which are pointer-width **by definition** — so unlike every other scalar
+   * their width is the target's answer rather than a number this file can hold. That is the whole of
+   * why they are functions and `byte` is a value.
    */
-  val scalars: Map[String, Type] = Map(
+  def usize(using w: Word): Integer = Integer(w.bits, signed = false, pointerWidth = true)
+  def isize(using w: Word): Integer = Integer(w.bits, signed = true, pointerWidth = true)
+
+  /** The scalar type names that are not systematic — the non-numeric primitives and the friendly
+   * aliases over the common integer and float widths. The `iN` / `uN` / `fN` spellings are
+   * recognised by width instead, so the open integer family needs no table, and the pointer-width
+   * pair is added by `scalars` because only it depends on the machine.
+   */
+  private val fixedScalars: Map[String, Type] = Map(
     "bool"   -> Bool,
     "char"   -> Char,
     "string" -> Str,
     "unit"   -> Unit,
-    "usize"  -> Usize,
-    "isize"  -> Isize,
     "int"    -> Integer(32, signed = true),
     "short"  -> Integer(16, signed = true),
     "long"   -> Integer(64, signed = true),
@@ -447,10 +448,16 @@ object Type {
     "va_list" -> VaList,
   )
 
-  /** The alias a diagnostic prefers when a width has a friendly name. */
+  /** Every scalar name, for the machine being compiled for. */
+  def scalars(using Word): Map[String, Type] =
+    fixedScalars + ("usize" -> usize) + ("isize" -> isize)
+
+  /** The alias a diagnostic prefers when a width has a friendly name. `usize` and `isize` are not
+   * here and must not be: on a target where they are the same width as `uint` and `int` they would
+   * displace those names for a type that is deliberately distinct from them.
+   */
   private val friendly: Map[Type, String] =
-    scalars.collect { case (name, t: Integer) if !t.pointerWidth => (t, name) } ++
-      Map(Floating(64) -> "real")
+    fixedScalars.collect { case (name, t: Integer) => (t, name) } ++ Map(Floating(64) -> "real")
 
   private def canonicalName(t: Type): String = t match
     case Integer(_, signed, true) => if signed then "isize" else "usize"
@@ -495,7 +502,13 @@ object Type {
       Fn.parts(n, args) match
         case Some((ps, r)) => s"Fn(${ps.map(show).mkString(", ")}) -> ${show(r)}"
         case None          => qualified(Modules.show(n), args)
-    case other                    => other.llvm
+    // Every type a programmer can write is above, and `show` has already taken the named ones, so
+    // nothing reaches this. It answers with the case class rather than with an LLVM type because a
+    // **diagnostic must not have to know the machine**: a view's LLVM form is the one form that
+    // does, and a view is spelled `[]T` or `string` several lines up, so it could not arrive here
+    // in any case. Threading the width this far to render an unreachable message would have put a
+    // `using Word` on every diagnostic in the compiler.
+    case other                    => other.toString
 
   /** Whether a type carries no value at run time: `unit`, whose only value is nothing at all, and
    * `never`, which has no values. Both lower to `void`, so neither ever needs a merge slot, a
@@ -657,7 +670,7 @@ object Type {
 
     def name: String = qualified(base, targs)
 
-    def llvm: String = s"%struct.${mangled(base, targs)}"
+    def llvm(using Word): String = s"%struct.${mangled(base, targs)}"
 
     def fieldIndex(field: String): Int = fields.indexWhere(_._1 == field)
 
@@ -727,7 +740,7 @@ object Type {
    * the typed tree, and nothing in codegen, ever meets one.
    */
   final class Results(val parts: Tuple) extends Type {
-    def llvm: String = parts.llvm
+    def llvm(using Word): String = parts.llvm
 
     override def equals(other: Any): Boolean = other match
       case r: Results => r.parts == parts
@@ -777,14 +790,14 @@ object Type {
 
     def name: String = qualified(base, targs)
 
-    def llvm: String = if simple then underlying.llvm else s"%enum.${mangled(base, targs)}"
+    def llvm(using Word): String = if simple then underlying.llvm else s"%enum.${mangled(base, targs)}"
 
     /** The type a discriminant is compared at. A simple enum **is** its discriminant, so the width
      * is whatever its `: iN` annotation said; a data enum keeps its tag in the aggregate's first
      * field, which is always `i32`. Reading it off the enum rather than assuming `i32` is what
      * keeps a narrow simple enum's variant test well-typed.
      */
-    def tagLlvm: String = if simple then underlying.llvm else "i32"
+    def tagLlvm(using Word): String = if simple then underlying.llvm else "i32"
 
     def variant(v: String): Option[EnumVariant] = variants.find(_.name == v)
 
@@ -818,7 +831,7 @@ object Type {
       exclusiveHi: Boolean,
       predFn: Option[String],
   ) extends Type {
-    def llvm: String = base.llvm
+    def llvm(using Word): String = base.llvm
   }
 
   /** A transparent constrained subtype seen as its base — the identity for type *agreement*, so a

@@ -314,7 +314,7 @@ trait ConstFolding extends ImportResolution {
    */
   protected def layoutBytes(what: String, ty: Type): Option[Int] = Type.underlying(ty) match
     case _: Type.Abstract | Type.Unknown => None
-    case t                               => Some(if what == "sizeof" then Layout.size(t) else Layout.align(t))
+    case t                               => Some(if what == "sizeof" then layout.size(t) else layout.align(t))
 
   /** Whether a constant expression does not fold **yet** rather than not folding at all: it measures
    * a type that is still a parameter, and every instantiation will supply one that is not.

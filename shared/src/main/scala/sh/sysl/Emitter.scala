@@ -11,11 +11,35 @@ import scala.collection.mutable
  */
 trait Emitter {
 
-  /** The machine this module is being emitted for (`targets.md`). Almost nothing consults it —
-   * a 64-bit target's layout is the same everywhere sysl runs — and what does is the handful of
-   * places where the C ABI genuinely differs, each of which says so where it reads this.
+  /** The machine this module is being emitted for (`targets.md`). Little consults it directly: what
+   * does is the handful of places where the C ABI genuinely differs, each of which says so where it
+   * reads this, plus the two derived values below that every emitter uses without naming a target
+   * at all.
    */
   protected def target: Target
+
+  /** How wide an address is, given to every `Type.llvm` in scope. A view's length is a `usize`, so
+   * an emitter cannot write the LLVM form of a slice without it — and because there is no default
+   * anywhere, an emitter that somehow had no target would not compile rather than quietly writing
+   * a 64-bit type for a 32-bit machine.
+   */
+  protected given Word = target.word
+
+  /** What this machine's types cost, which is the same question with the same one answer in it.
+   * A `given` because `CAbi` asks for one, and an emitter has exactly one to give.
+   */
+  protected given layout: Layout = Layout(target)
+
+  /** The LLVM integer exactly one address wide — `i64` or `i32` — which is what a **length, a size,
+   * an index, or anything else that is a `usize`** must be spelled as.
+   *
+   * Reach for this rather than writing `i64`, and the test that says whether you got it right is
+   * `CrossTargetBuildTests`: a module mixing the two is text like any other and only clang will say
+   * so. A loop counter internal to a helper may honestly be either, since nothing outside sees it —
+   * but it is compared against a length often enough that using this everywhere is both simpler and
+   * harder to get wrong.
+   */
+  protected def word: String = target.word.llvm
 
   protected val globals  = new mutable.StringBuilder
   private var strId      = 0
@@ -184,22 +208,22 @@ trait Emitter {
    *
    * A result that fits in registers is returned as itself, as it always was. One that does not is
    * written straight into storage the caller supplies, so it is never a first-class LLVM value at
-   * either end — which is the whole of what `Layout.indirect` buys. It is the same `sret` the
+   * either end — which is the whole of what `layout.indirect` buys. It is the same `sret` the
    * foreign boundary has always used (`ForeignEmitter`), asked for the same reason on a call that
    * happens to have this compiler on both sides.
    */
   protected def syslSret(retTy: Type): Option[String] =
-    Option.when(Layout.indirect(retTy))(s"ptr noalias sret(${retTy.llvm}) align ${Layout.align(retTy)}")
+    Option.when(layout.indirect(retTy))(s"ptr noalias sret(${retTy.llvm}) align ${layout.align(retTy)}")
 
   /** What a sysl `define`, `declare` and `call` name as the result type. */
   protected def syslResult(retTy: Type): String =
-    if Type.noValue(retTy) || Layout.indirect(retTy) then "void" else retTy.llvm
+    if Type.noValue(retTy) || layout.indirect(retTy) then "void" else retTy.llvm
 
   /** How a parameter is declared. A **large** one arrives as the address of storage the caller
    * holds; the callee makes its own copy at entry, which is the copy it always made — the only
    * difference is that the value crosses the boundary in memory rather than in registers.
    */
-  protected def syslParam(ty: Type): String = if Layout.indirect(ty) then "ptr" else ty.llvm
+  protected def syslParam(ty: Type): String = if layout.indirect(ty) then "ptr" else ty.llvm
 
   /** The name the out-pointer takes inside a function that has one. */
   protected val sretParam = "%sret.out"

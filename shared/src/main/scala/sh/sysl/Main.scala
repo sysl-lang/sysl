@@ -709,7 +709,7 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
       // the library without depending on where the caller happened to be standing.
       val out =
         cfg.output.getOrElse(
-          if cfg.std then cfg.stdSearch.getOrElse(LibraryArtifact.stdDefault)
+          if cfg.std then cfg.stdSearch.getOrElse(LibraryArtifact.stdDefault(target))
           else defaultOutput(cfg.file, named, LibraryArtifact.extension))
 
       Project.parentOf(out).foreach(createDirectories)
@@ -930,7 +930,7 @@ private def listTargets(): Int = {
 
   for t <- Target.all do
     val here  = if Target.host.contains(t) then "  (this machine)" else ""
-    val limit = if t.supported then "" else s"  (${t.pointerBits}-bit — not yet supported)"
+    val limit = t.unsupported.fold("")(why => s"  ($why)")
 
     stdout(s"${t.name.padTo(width, ' ')}  ${t.triple}$here$limit\n")
 

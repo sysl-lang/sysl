@@ -17,24 +17,45 @@ class InlineAssemblyTests extends AnyFreeSpec with Matchers with CodegenSupport 
   private val risc  = Target.riscv64Freestanding
 
   /** Every arm an exhaustive statement needs, so a test about one processor does not have to spell
-   * the other two to get past the coverage rule.
+   * the rest to get past the coverage rule.
+   *
+   * **Read off `Cpu.buildable` rather than written out**, because the coverage rule is exhaustive
+   * over exactly that: adding a processor to the registry adds an arm every `asm` in the language
+   * owes, and a written-out list here would turn one registry entry into twenty stale fixtures. It
+   * did, once — `thumb` and `riscv32` arriving broke twenty tests in this file that had nothing to
+   * do with either.
    */
   private def others(kept: String*): String =
-    List("x86_64", "aarch64", "riscv64").filterNot(kept.contains)
+    Cpu.buildable.map(_.symbol).filterNot(kept.contains)
       .map(a => s"""        [$a] unavailable "not this test's business"""").mkString("\n")
+
+  /** The same thing for a fixture that gives every processor the *same* instruction: the arms that
+   * are not the subject of the test still have to say something, and here that something is real
+   * assembly rather than a refusal.
+   */
+  private def rest(insn: String)(kept: String*): String =
+    Cpu.buildable.map(_.symbol).filterNot(kept.contains)
+      .map(a => s"""        [$a] "$insn"""").mkString("\n")
+
+  /** One arm covering every processor the test is not about, with a reason of its own — for the
+   * fixtures whose subject *is* the reason, and which would say nothing if it were boilerplate.
+   */
+  private def unavailable(reason: String)(kept: String*): String =
+    s"""        [${Cpu.buildable.map(_.symbol).filterNot(kept.contains).mkString(", ")}]""" +
+      s""" unavailable "$reason""""
 
   "selecting an arm" - {
 
     "each processor takes its own instructions and carries none of the others" in {
       val src =
-        """halt()
-          |    asm
-          |        [x86_64]  "hlt"
-          |        [aarch64] "wfi"
-          |        [riscv64] "wfi"
-          |
-          |halt()
-          |""".stripMargin
+        s"""halt()
+           |    asm
+           |        [x86_64]  "hlt"
+           |        [aarch64] "wfi"
+           |${rest("wfi")("x86_64", "aarch64")}
+           |
+           |halt()
+           |""".stripMargin
 
       irFor(intel, src) should include("""asm sideeffect "hlt"""")
       irFor(intel, src) should not include "wfi"
@@ -58,14 +79,16 @@ class InlineAssemblyTests extends AnyFreeSpec with Matchers with CodegenSupport 
 
     "an arm with nothing under it emits nothing, and is not an error" in {
       val src =
-        """barrier()
-          |    asm
-          |        [x86_64]
-          |        [aarch64] "dmb ish"
-          |        [riscv64] "fence rw, rw"
-          |
-          |barrier()
-          |""".stripMargin
+        s"""barrier()
+           |    asm
+           |        [x86_64]
+           |        [aarch64] "dmb ish"
+           |        [riscv64] "fence rw, rw"
+           |        [riscv32] "fence rw, rw"
+           |        [thumb]   "dmb ish"
+           |
+           |barrier()
+           |""".stripMargin
 
       irFor(intel, src) should not include "asm sideeffect"
       irFor(arm, src) should include("""asm sideeffect "dmb ish"""")
@@ -102,32 +125,41 @@ class InlineAssemblyTests extends AnyFreeSpec with Matchers with CodegenSupport 
       val e = errFor(intel, src)
 
       e should include("no arm for")
-      e should include("'aarch64'")
-      e should include("'riscv64'")
+
+      // Every processor a target can be built for, named — so a registry that grows is a diagnostic
+      // that grows with it, and the reader is never left to work out which one was meant.
+      for c <- Cpu.buildable if c != Cpu.X86_64 do withClue(c.symbol)(e should include(s"'${c.symbol}'"))
+
+      // And named as a *list*: commas up to the last, which takes the "or". Joining them all with
+      // "or" was fine while three processors meant an arm was rarely missing more than two; a bare
+      // block now names five, and "'a' or 'b' or 'c' or 'd' or 'e'" is parsed rather than read.
+      val listed = Cpu.buildable.filterNot(_ == Cpu.X86_64).map(c => s"'${c.symbol}'")
+
+      e should include(s"no arm for ${listed.init.mkString(", ")} or ${listed.last}.")
     }
 
     "'unavailable' covers a processor, so the ones with an answer still build" in {
       val src =
-        """port_out()
-          |    asm
-          |        [x86_64] "outb %al, %dx"
-          |        [aarch64, riscv64] unavailable "port I/O is x86-only; devices are reached through memory"
-          |
-          |port_out()
-          |""".stripMargin
+        s"""port_out()
+           |    asm
+           |        [x86_64] "outb %al, %dx"
+           |${unavailable("port I/O is x86-only; devices are reached through memory")("x86_64")}
+           |
+           |port_out()
+           |""".stripMargin
 
       irFor(intel, src) should include("""asm sideeffect "outb %al, %dx"""")
     }
 
     "and carries its reason to the processor that has none" in {
       val src =
-        """port_out()
-          |    asm
-          |        [x86_64] "outb %al, %dx"
-          |        [aarch64, riscv64] unavailable "port I/O is x86-only; devices are reached through memory"
-          |
-          |port_out()
-          |""".stripMargin
+        s"""port_out()
+           |    asm
+           |        [x86_64] "outb %al, %dx"
+           |${unavailable("port I/O is x86-only; devices are reached through memory")("x86_64")}
+           |
+           |port_out()
+           |""".stripMargin
 
       val e = errFor(arm, src)
 
@@ -165,16 +197,21 @@ class InlineAssemblyTests extends AnyFreeSpec with Matchers with CodegenSupport 
       errFor(intel, src) should include("already has an arm above this one")
     }
 
-    "32-bit x86 is not required, since no target can be built for it" in {
+    // The coverage rule is exhaustive over `Cpu.buildable`, not over `Cpu`: `x86` is in the enum
+    // because `x86-linux` is in the registry, and no arm is owed for it because no target can be
+    // built for it. That was once the same sentence as "32-bit is not supported" and is not any
+    // more — `riscv32` and `thumb` are 32-bit and every `asm` in the language owes them an arm.
+    "a processor no target can be built for is not one an arm is owed" in {
       val src =
-        """f()
-          |    asm
-          |        [x86_64]  "nop"
-          |        [aarch64] "nop"
-          |        [riscv64] "nop"
-          |
-          |f()
-          |""".stripMargin
+        s"""f()
+           |    asm
+           |${rest("nop")()}
+           |
+           |f()
+           |""".stripMargin
+
+      src should not include "[x86]"
+      src should include("[riscv32]")
 
       irFor(intel, src) should include("asm sideeffect")
     }

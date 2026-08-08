@@ -191,14 +191,26 @@ object LibraryArtifact {
    * **`./.sysl` remains the answer where there is no cache directory to be had** — a machine with no
    * home, which is a real state for a build container. The compilation then behaves exactly as it did
    * before, rather than failing over somewhere nobody can write.
+   *
+   * **The key names the TARGET too, and leaving it out cost a rebuild on every alternation.** An
+   * artifact is object code for one machine and a tree parsed as that machine sees it (`Conditional`),
+   * which is why `read` refuses one built for another target by name. Sharing one path between them
+   * therefore never produced a wrong answer — it produced a *rebuild*: the cross build refused the
+   * host's artifact and overwrote it, the next host build refused that one and overwrote it back, and
+   * each announced itself on stderr in the words of a fault. Keying by target makes them separate
+   * entries that both stay warm, which is the whole point of a cache keyed by anything.
    */
-  lazy val stdDefault: String =
+  def stdDefault(target: Target): String =
     cacheDirectory
-      .map(c => s"$c/sysl/${BuildInfo.version}-${Std.fingerprint}/std$extension")
+      .map(c => s"$c/sysl/${BuildInfo.version}-${Std.fingerprint}-${target.name}/std$extension")
       .getOrElse(stdLocal)
 
   /** The project-local artifact path, which is what `stdDefault` was before it moved to the cache and
    * what it falls back to where a machine has no cache directory.
+   *
+   * It is **not** keyed by target, because it is one file in one project rather than a cache with
+   * room for entries: a machine without a cache directory gets the behaviour it had before the cache
+   * existed, including a rebuild when the target changes.
    */
   val stdLocal: String = s".sysl/std$extension"
 

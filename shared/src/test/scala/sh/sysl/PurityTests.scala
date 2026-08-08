@@ -227,17 +227,22 @@ class PurityTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     "contain an asm block" in {
-      err("""@pure
-            |f() -> int
-            |    asm
-            |        [x86_64]  "nop"
-            |        [aarch64] "nop"
-            |        [riscv64] "nop"
-            |
-            |    1
-            |
-            |print(f())
-            |""".stripMargin) should include("'asm' block")
+      // One arm naming every processor a target can be built for, read from the registry rather than
+      // spelled out. Spelled out, this stopped being a test of purity the moment the 32-bit targets
+      // arrived: the block was then missing two arms, so the answer was about exhaustiveness and the
+      // `@pure` rule was never reached. A fixture whose subject is one rule must not be able to trip
+      // another one on its way there.
+      val arms = Cpu.buildable.map(_.symbol).mkString("[", ", ", "]")
+
+      err(s"""@pure
+             |f() -> int
+             |    asm
+             |        $arms "nop"
+             |
+             |    1
+             |
+             |print(f())
+             |""".stripMargin) should include("'asm' block")
     }
 
     // The clauses are the function's own code and run on every call, so they are held to the same

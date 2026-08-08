@@ -8,22 +8,35 @@ package sh.sysl
  * emitted text as a literal, so the compiler has to be able to say how wide the widest variant is
  * before LLVM sees the module.
  *
- * The numbers here are the ones **every 64-bit target the compiler supports agrees on**: scalars
- * are their own width and aligned to it, an address is eight bytes, an aggregate is laid out in
- * declaration order with each member on its own alignment and the whole rounded up to the widest
- * member's. That is C's rule and LLVM's, which is why this object takes no `Target` (`targets.md`)
- * — every target in the registry answers these questions the same way, and the registry refuses a
- * 32-bit one precisely because this is where it would stop being true. The emitted module states
- * its triple and LLVM derives the data layout from that, so nothing here has to be written down
- * twice.
+ * Every rule here is one **every target agrees on**: scalars are their own width and aligned to it,
+ * an aggregate is laid out in declaration order with each member on its own alignment and the whole
+ * rounded up to the widest member's. That is C's rule and LLVM's. Exactly one input varies, and it
+ * is the one a 32-bit target changes — **how wide an address is** — so this is a value built from a
+ * target rather than an object with eight bytes written into it (`targets.md`).
+ *
+ * That distinction is worth stating precisely, because it is easy to read as more than it is: the
+ * *rules* are target-independent and the *width they are applied to* is not. Nothing here asks the
+ * target anything else, and a second question would be a sign something is being decided in the
+ * wrong place — the emitted module states its triple and LLVM derives the data layout from it, so
+ * everything but this one number is written down once, by LLVM.
  *
  * The language's `sizeof` and `alignof` (`03 § Reinterpreting storage`) are these two functions asked
  * from outside, so the answer a program gets and the width the compiler writes into a union agree by
  * construction rather than by being kept in step. Everything reaches them through
  * `ConstFolding.layoutBytes`, which is where the two operands with no answer — a type parameter
  * standing in for itself, and a type already complained about — are turned away before they arrive.
+ *
+ * @param word how wide an address is, and the whole of what a target contributes here.
  */
-object Layout {
+case class Layout(word: Word) {
+
+  given Word = word
+
+  /** How wide an address is. */
+  def pointerBytes: Int = word.bytes
+
+  /** The two words a fat pointer costs — an erased reference, and a trait object's data and table. */
+  private def fat: Int = pointerBytes * 2
 
   /** The bytes a value of `t` occupies, including the padding an aggregate carries at its end so
    * that an array of them keeps every element aligned. So `size` is also the stride.
@@ -40,36 +53,23 @@ object Layout {
     // union a data enum lays out, and answering is what lets the *real* diagnostic be the one the
     // reader sees instead of a stack trace about a type they were already told about.
     case Type.Unknown                    => 0
-    case Type.VaList                     => 32
-    case t2 @ (_: Type.Ptr | _: Type.Ref) => if Type.erased(t2) then 16 else 8
+    // Sysl's own storage for a walk, not any target's `va_list`: the widest a target needs, given
+    // to all of them (`targets.md`). What is per-target is how many bytes are *copied* out of it.
+    // Four words, which is what `Type.VaList.llvm` writes, so the two cannot drift.
+    case Type.VaList                     => pointerBytes * 4
+    case t2 @ (_: Type.Ptr | _: Type.Ref) => if Type.erased(t2) then fat else pointerBytes
     // A weak reference is an address like the other two, and a weak trait object is the same pair
     // of words an erased `&T` is — the count it takes is the box's business, not the value's.
-    case Type.Weak(inner)                => if inner.isInstanceOf[Type.Trait] then 16 else 8
+    case Type.Weak(inner)                => if inner.isInstanceOf[Type.Trait] then fat else pointerBytes
     // One word, and the reason it is one rather than the two a `*Fn` costs: there is no table beside
     // it, because the signature is in the type rather than in the value.
-    case _: Type.CFn                     => 8
-    case _: Type.View                    => 24
+    case _: Type.CFn                     => pointerBytes
+    // Three: an address, a length and a capacity.
+    case _: Type.View                    => pointerBytes * 3
     case Type.Array(n, elem)             => n * size(elem)
     case s: Type.Struct                  => structLayout(s)._1
     case e: Type.Enum                    => if e.simple then size(e.underlying) else enumSize(e)
     case other                           => sys.error(s"unreachable size of ${other.llvm}")
-
-  /** The widest an aggregate may be and still be handed about as a first-class LLVM value.
-   *
-   * Below it a value is a value: LLVM carries it in registers, and the handful of `insertvalue` and
-   * `extractvalue` instructions that build and read one cost the optimizer nothing. Above it the
-   * back end is copying memory whatever the IR says, and a first-class value only obliges every
-   * pass to reason about each byte of it — which does not stay linear. `guide/kernel` builds a
-   * 20 KB struct and hands it about as a value at thirty-five call sites; that one module took
-   * **408 seconds** to compile at `-O1` and **0.88 seconds** once the same program was lowered
-   * through memory, with the whole of the difference inside InstCombine's walk over the allocas.
-   *
-   * The number is a judgement rather than a rule someone else wrote down. It is well above every
-   * aggregate the language itself uses — a slice and a string are twenty-four bytes, a trait object
-   * sixteen — so nothing in ordinary code changes shape, and far below the sizes at which the
-   * optimizer starts to struggle.
-   */
-  val DirectBytes = 128
 
   /** Whether a value of `t` is handed about through memory rather than as a first-class LLVM value:
    * built where it is going to live, copied with `llvm.memcpy`, read a field at a time through its
@@ -79,8 +79,8 @@ object Layout {
    * back-end problem of a different kind, and pretending it were a struct would not help.
    */
   def indirect(t: Type): Boolean = Type.underlying(t) match
-    case _: Type.Struct | _: Type.Array => size(t) > DirectBytes
-    case e: Type.Enum                   => !e.simple && size(t) > DirectBytes
+    case _: Type.Struct | _: Type.Array => size(t) > Layout.DirectBytes
+    case e: Type.Enum                   => !e.simple && size(t) > Layout.DirectBytes
     case _                              => false
 
   /** The address a value of `t` must start at. */
@@ -91,11 +91,11 @@ object Layout {
     case f: Type.Floating                => f.bits / 8
     case Type.Unit | Type.Never          => 1
     case Type.Unknown                    => 1
-    case Type.VaList                     => 8
-    case _: Type.Ptr | _: Type.Ref       => 8
-    case _: Type.Weak                    => 8
-    case _: Type.CFn                     => 8
-    case _: Type.View                    => 8
+    case Type.VaList                     => pointerBytes
+    case _: Type.Ptr | _: Type.Ref       => pointerBytes
+    case _: Type.Weak                    => pointerBytes
+    case _: Type.CFn                     => pointerBytes
+    case _: Type.View                    => pointerBytes
     case Type.Array(_, elem)             => align(elem)
     case s: Type.Struct                  => structLayout(s)._2
     case e: Type.Enum                    => if e.simple then align(e.underlying) else enumAlign(e)
@@ -188,4 +188,28 @@ object Layout {
   }
 
   private def enumAlign(e: Type.Enum): Int = math.max(4, payloadAlign(e))
+}
+
+object Layout {
+
+  /** The widest an aggregate may be and still be handed about as a first-class LLVM value.
+   *
+   * Below it a value is a value: LLVM carries it in registers, and the handful of `insertvalue` and
+   * `extractvalue` instructions that build and read one cost the optimizer nothing. Above it the
+   * back end is copying memory whatever the IR says, and a first-class value only obliges every
+   * pass to reason about each byte of it — which does not stay linear. `guide/kernel` builds a
+   * 20 KB struct and hands it about as a value at thirty-five call sites; that one module took
+   * **408 seconds** to compile at `-O1` and **0.88 seconds** once the same program was lowered
+   * through memory, with the whole of the difference inside InstCombine's walk over the allocas.
+   *
+   * The number is a judgement rather than a rule someone else wrote down. It is well above every
+   * aggregate the language itself uses — a slice and a string are three words and a trait object
+   * two — so nothing in ordinary code changes shape, and far below the sizes at which the optimizer
+   * starts to struggle. It is bytes rather than words on purpose: what it is protecting against is
+   * the optimizer's walk over the *storage*, which a narrower machine does not make cheaper.
+   */
+  val DirectBytes = 128
+
+  /** The layout a given machine gives its types. */
+  def apply(target: Target): Layout = Layout(target.word)
 }

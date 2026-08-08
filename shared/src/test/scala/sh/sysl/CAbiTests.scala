@@ -59,6 +59,8 @@ class CAbiTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   private val rv      = Target.riscv64Linux
   private val rvBare  = Target.riscv64Freestanding
   private val win     = Target.x86_64Windows
+  private val rv32    = Target.riscv32Freestanding
+  private val thumb   = Target.thumbFreestanding
 
   "AAPCS64 packs a small aggregate into whole registers" - {
 
@@ -328,6 +330,109 @@ class CAbiTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       shape(rvBare, "    a: f32\n    b: f32") shouldBe ("declare i64 @give()", "declare void @take(i64)")
       shape(rvBare, "    a: f64\n    b: f64") shouldBe
         ("declare [2 x i64] @give()", "declare void @take([2 x i64])")
+    }
+  }
+
+  /** RV32 is not a second convention. It is the RISC-V rule above with XLEN of four rather than
+   * eight, and `CAbi.riscv` takes that width as a parameter — one function, two targets. What is
+   * asserted here is that the *rule* survives the substitution: the shapes that were one register
+   * and two registers and memory on RV64 are one register and two registers and memory here too,
+   * at half the size each.
+   *
+   * The Hazard3 is RV32IMAC with no F extension, so nothing flattens and the size rule is the whole
+   * of it — the same as `rvBare` above, and for the same reason.
+   */
+  "RV32 is the same rule with a narrower word" - {
+
+    "one word or less is one register" in {
+      shape(rv32, "    a: u8") shouldBe ("declare i32 @give()", "declare void @take(i32)")
+      shape(rv32, "    a: u8\n    b: u8\n    c: u8") shouldBe ("declare i32 @give()", "declare void @take(i32)")
+      shape(rv32, "    a: i32") shouldBe ("declare i32 @give()", "declare void @take(i32)")
+      shape(rv32, "    p: *u8") shouldBe ("declare i32 @give()", "declare void @take(i32)")
+    }
+
+    // Two words is two registers, and how they are *named* is the aggregate's alignment rather than
+    // its size: eight bytes aligned to eight is one `i64`, and the same eight bytes aligned to four
+    // are two `i32`s. RV64 has the identical asymmetry one width up, where sixteen bytes aligned to
+    // sixteen become an `i128`.
+    "two words are named by the alignment, not by the size" in {
+      shape(rv32, "    a: i32\n    b: i32") shouldBe ("declare [2 x i32] @give()", "declare void @take([2 x i32])")
+      shape(rv32, "    p: *u8\n    q: *u8") shouldBe ("declare [2 x i32] @give()", "declare void @take([2 x i32])")
+      shape(rv32, "    a: i64") shouldBe ("declare i64 @give()", "declare void @take(i64)")
+    }
+
+    "and past two words it is memory, by address in both directions" in {
+      shape(rv32, "    a: i64\n    b: u8") shouldBe
+        ("declare void @give(ptr sret(%struct.S) align 8)", "declare void @take(ptr)")
+      shape(rv32, "    a: i32\n    b: i32\n    c: i32") shouldBe
+        ("declare void @give(ptr sret(%struct.S) align 4)", "declare void @take(ptr)")
+    }
+
+    // No floating registers to flatten into, so a float is bytes like any other. `f64` beside `f64`
+    // is sixteen bytes here and was two registers on RV64 -- the shape did not change, the word did.
+    "a float is bytes, there being no floating registers on this core" in {
+      shape(rv32, "    a: f32") shouldBe ("declare i32 @give()", "declare void @take(i32)")
+      shape(rv32, "    a: f64") shouldBe ("declare i64 @give()", "declare void @take(i64)")
+      shape(rv32, "    a: f32\n    b: f32") shouldBe ("declare [2 x i32] @give()", "declare void @take([2 x i32])")
+    }
+  }
+
+  /** AAPCS32 is the one convention whose two directions disagree about **memory itself**, which is
+   * why `Shape.Split` exists beside `Memory` and `Registers`: a result larger than four bytes goes
+   * through `sret` *always*, while an argument goes in registers *at any size*. Sixty-four bytes is
+   * `[16 x i32]` going out and an `sret` coming back, and no other convention here does that.
+   *
+   * A consequence worth stating, because it decides whether a code path is reachable at all:
+   * **`Param.Indirect` cannot happen on this target.** Every argument is registers.
+   *
+   * Measured against clang 21 for `thumbv8m.main-none-eabihf`, not read out of a document.
+   */
+  "AAPCS32 returns through memory long before it passes through it" - {
+
+    "a result of one word or less is an integer of its own width" in {
+      shape(thumb, "    a: u8") shouldBe ("declare i8 @give()", "declare void @take([1 x i32])")
+      shape(thumb, "    a: u8\n    b: u8") shouldBe ("declare i16 @give()", "declare void @take([1 x i32])")
+      shape(thumb, "    a: u8\n    b: u8\n    c: u8") shouldBe ("declare i32 @give()", "declare void @take([1 x i32])")
+      shape(thumb, "    a: i32") shouldBe ("declare i32 @give()", "declare void @take([1 x i32])")
+    }
+
+    // Five bytes is already too much to return and nowhere near too much to pass. This is the pair
+    // that `Shape.Split` was added for, and reading only the result would say "memory" about a call
+    // that puts every byte in a register.
+    "and one byte more than that is memory coming back and registers going out" in {
+      shape(thumb, "    a: [5]u8") shouldBe
+        ("declare void @give(ptr sret(%struct.S) align 1)", "declare void @take([2 x i32])")
+      shape(thumb, "    a: i32\n    b: i32") shouldBe
+        ("declare void @give(ptr sret(%struct.S) align 4)", "declare void @take([2 x i32])")
+      shape(thumb, "    p: *u8\n    q: *u8") shouldBe
+        ("declare void @give(ptr sret(%struct.S) align 4)", "declare void @take([2 x i32])")
+    }
+
+    // The register *element* is the aggregate's alignment and not the machine's word, which is the
+    // detail no document states: a machine whose registers are four bytes is told `[2 x i64]`,
+    // because what LLVM is being given is the shape to copy rather than the registers to use.
+    "an eight-aligned aggregate is named in eights, on a machine whose registers are four" in {
+      shape(thumb, "    a: i64\n    b: i32") shouldBe
+        ("declare void @give(ptr sret(%struct.S) align 8)", "declare void @take([2 x i64])")
+    }
+
+    // No size at all ends the register case, which is the sentence that separates this convention
+    // from every other one here.
+    "and an aggregate far past any register file still goes out in registers" in {
+      shape(thumb, "    a: [64]u8") shouldBe
+        ("declare void @give(ptr sret(%struct.S) align 1)", "declare void @take([16 x i32])")
+    }
+
+    // An HFA travels as the struct type itself in **both** directions -- the opposite of AAPCS64,
+    // which coerces the argument to an array of its element. Same idea, different spelling, and a
+    // convention copied from the neighbouring one would be wrong in the direction that is hardest
+    // to see.
+    "a homogeneous floating aggregate is the struct type, going out and coming back" in {
+      shape(thumb, "    a: f32") shouldBe ("declare %struct.S @give()", "declare void @take(%struct.S)")
+      shape(thumb, "    a: f32\n    b: f32") shouldBe
+        ("declare %struct.S @give()", "declare void @take(%struct.S)")
+      shape(thumb, "    a: f64\n    b: f64\n    c: f64\n    d: f64") shouldBe
+        ("declare %struct.S @give()", "declare void @take(%struct.S)")
     }
   }
 

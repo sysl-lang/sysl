@@ -154,7 +154,7 @@ trait ControlFlowExprAnalysis extends ExprSupport {
           // The name is a compile-time constant for this copy and nothing else is: a pack's own
           // binding stays, since `A.len` is what the range was counted from and the copies do not
           // change it.
-          tsubst = saved + (name -> Type.ConstArg(v, Type.Usize))
+          tsubst = saved + (name -> Type.ConstArg(v, Type.usize))
           TBlockExpr(analyzeValueBlock(body, None, discarded = true))
         })
       finally

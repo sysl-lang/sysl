@@ -83,10 +83,18 @@ trait AsmAnalysis extends TypeResolution {
    */
   private def checkExhaustive(stmt: AsmStmt): Unit = {
     val covered = stmt.arms.flatMap(_.archs).toSet
-    val missing = Cpu.buildable.filterNot(c => covered(c.symbol))
+    val missing = Cpu.buildable.filterNot(c => covered(c.symbol)).map(c => s"'${c.symbol}'")
 
+    // Commas up to the last, which takes the "or". Joining the lot with "or" was fine while the
+    // registry had three processors and an arm was rarely missing more than two; a bare `asm` block
+    // now names five, and "'a' or 'b' or 'c' or 'd' or 'e'" is a list a reader has to parse rather
+    // than read. The registry is what grew, so the sentence is what has to give.
     if missing.nonEmpty then
-      err(s"this assembly has no arm for ${missing.map(c => s"'${c.symbol}'").mkString(" or ")}. " +
+      val named =
+        if missing.length == 1 then missing.head
+        else s"${missing.init.mkString(", ")} or ${missing.last}"
+
+      err(s"this assembly has no arm for $named. " +
         "Every processor needs an answer, so that one without instructions is found here rather " +
         "than by whoever first builds for it — write the instructions, write an empty arm if none " +
         "are needed there, or write 'unavailable' with the reason there is nothing to write")

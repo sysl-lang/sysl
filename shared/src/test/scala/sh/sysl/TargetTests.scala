@@ -26,10 +26,25 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
         }
     }
 
-    // Every target that can be built for is 64-bit, which is what lets `Layout` answer without one.
-    "supports every 64-bit target it lists, and no other" in {
-      Target.all.filter(_.supported).map(_.pointerBits).distinct shouldBe List(64)
+    // What decides whether a target can be built for is whether a C calling convention has been
+    // measured for its processor -- not how wide its addresses are. Both widths are now built for,
+    // and `x86-linux` is refused for the reason it was always really refused for.
+    "builds for both address widths, and refuses only what it has no convention for" in {
+      Target.all.filter(_.supported).map(_.pointerBits).distinct.sorted shouldBe List(32, 64)
       Target.all.filterNot(_.supported).map(_.name) shouldBe List("x86-linux")
+
+      Target.all.filterNot(_.supported).map(_.cpu).distinct shouldBe List(Cpu.X86)
+      Cpu.buildable should not contain Cpu.X86
+    }
+
+    // A processor's width is the processor's, and every target on one agrees about it -- which is
+    // what lets `Layout` and `Type.llvm` take a `Word` rather than a whole `Target`.
+    "reads each target's word off its processor" in {
+      for t <- Target.all do
+        withClue(t.name) {
+          t.word.bits shouldBe t.cpu.bits
+          t.pointerBytes shouldBe t.cpu.bits / 8
+        }
     }
 
     // Each was read off `clang -S -emit-llvm` for the triple, not out of an ABI document.
@@ -46,17 +61,22 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
       Target.aarch64Freestanding.vaList shouldBe VaListAbi.Copied
     }
 
-    // The one storage `Type.VaList` reserves has to hold whatever `va_start` writes into it on any
-    // of them, so the widest is the number that matters and it is 32 bytes.
+    // The storage `Type.VaList` reserves has to hold whatever `va_start` writes into it, and it is
+    // four *words* — so this is a claim per target rather than one number, and on a 32-bit machine
+    // it is sixteen bytes against a `va_list` of four. Asserting the old single figure of 32 would
+    // now be asserting it of machines that do not have it.
     "reserves storage wide enough for every target's own va_list" in {
-      Target.all.map(_.vaListBytes).max shouldBe Layout.size(Type.VaList)
+      for t <- Target.all do
+        withClue(t.name)(Layout(t).size(Type.VaList) should be >= t.vaListBytes)
     }
 
-    // Bare-metal RISC-V is not built for the floating extension and every other target is, which is
-    // clang's default for each of these triples and therefore has to be sysl's — the two are handed
-    // the same triple and have to make the same assumption about it (`CAbi`).
+    // Neither bare-metal RISC-V is built for the floating extension and every other target is, which
+    // is clang's default for each of these triples and therefore has to be sysl's — the two are
+    // handed the same triple and have to make the same assumption about it (`CAbi`). At 32 bits it
+    // is firmer than a default: the RP2350's Hazard3 is RV32IMAC, with no F extension to use.
     "records which targets have floating registers to pass arguments in" in {
-      Target.all.filterNot(_.hardFloat).map(_.name) shouldBe List("riscv64-freestanding")
+      Target.all.filterNot(_.hardFloat).map(_.name) shouldBe
+        List("riscv64-freestanding", "riscv32-freestanding")
     }
 
     // Whether a thread's storage is laid down before `main` is a fact about the system and not about
@@ -64,7 +84,13 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
     // storage, and a bare one has no loader, no libc, and nothing that writes the thread pointer.
     "records which targets have thread-local storage set up before main" in {
       Target.all.filterNot(_.hasThreadLocalStorage).map(_.name) shouldBe
-        List("aarch64-freestanding", "x86_64-freestanding", "riscv64-freestanding")
+        List(
+          "aarch64-freestanding",
+          "x86_64-freestanding",
+          "riscv64-freestanding",
+          "thumb-freestanding",
+          "riscv32-freestanding"
+        )
     }
 
     // Two machines differing only in their OS are two targets, which is the point of recording the
@@ -91,12 +117,30 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
     }
 
     // A machine sysl knows and cannot build for is worth a message of its own: told the name is
-    // unknown, a reader would look for a typo that is not there.
+    // unknown, a reader would look for a typo that is not there. And it says what is actually
+    // missing -- a measured calling convention -- rather than the width, which is no longer the
+    // reason and would send a reader looking for a limit that is not there either.
     "says why a target it knows cannot be built for" in {
       val out = Target.named("x86-linux").left.getOrElse(fail("expected a complaint"))
 
-      out should include("32-bit target")
-      out should include("sysl lowers 64-bit targets only")
+      out should include("sysl knows 'x86-linux' and cannot build for it")
+      out should include("no C calling convention has been measured for x86")
+      out should not include "64-bit"
+    }
+
+    // The refusal and the listing are read by one person minutes apart, so they say one thing. They
+    // did not: `sysl targets` annotated the row "(32-bit -- not yet supported)" from a sentence of
+    // its own, which went on being printed after `thumb-freestanding` and `riscv32-freestanding`
+    // shipped and made the width no reason at all. Asserting the *reason* rather than either
+    // wording is what holds them together -- a second copy of a sentence is what drifted.
+    "gives the listing the same reason the refusal gives" in {
+      val why = Target.x86Linux.unsupported.getOrElse(fail("x86-linux cannot be built for"))
+
+      Target.named("x86-linux").left.getOrElse("") should include(why)
+      why should include("no C calling convention has been measured for x86")
+      why should not include "not yet supported"
+
+      for t <- Target.all if t.supported do t.unsupported shouldBe None
     }
 
     "is case-sensitive, since the name is written down and not guessed at" in {
@@ -243,20 +287,104 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
   private def typeLines(t: Target): List[String] =
     irFor(t, shapes).linesIterator.filter(_.contains("= type")).toList
 
-  /** `targets.md § What a target does not decide` rests the whole of `Layout` on one claim: every
-   * target in the registry answers a layout question the same way, so the object that answers them
-   * takes no `Target`. `LayoutTests` measures those answers against *this machine*, which is a
-   * statement about a machine rather than about targets — the agreement itself can only be made by
-   * emitting one program for more than one of them.
+  /** `targets.md § What a target does not decide` used to rest the whole of `Layout` on one claim:
+   * every target in the registry answers a layout question the same way, so the object that answers
+   * them takes no `Target`. **A 32-bit target falsifies that**, and what replaced it is narrower and
+   * says more: a layout question is answered by the *word*, and by nothing else a target carries.
+   *
+   * So `Layout` takes a `Word` rather than a `Target` — which is a stronger statement than taking
+   * none, because it names what the answer depends on instead of asserting it depends on nothing.
+   * `LayoutTests` measures those answers against *this machine*; the agreement between machines can
+   * only be made by emitting one program for more than one of them, which is what is here.
    */
   "what a target does not decide" - {
-    "every target lays an aggregate out the same way, which is why Layout takes none" in {
-      val supported = Target.all.filter(_.supported)
-      val host      = typeLines(supported.head)
+    "targets of one width lay an aggregate out the same way, which is why Layout takes a Word" in {
+      for (word, group) <- Target.all.filter(_.supported).groupBy(_.word) do
+        val first = typeLines(group.head)
 
-      host should not be empty
+        first should not be empty
 
-      for t <- supported.tail do withClue(t.name)(typeLines(t) shouldBe host)
+        for t <- group.tail do withClue(s"${t.name} against ${group.head.name} at ${word.bits}-bit")(
+          typeLines(t) shouldBe first
+        )
+    }
+
+    // And the OS is not one of the things it depends on: two targets on one processor differ in
+    // their `va_list` walk and in nothing a layout can see. That is the claim the old single-group
+    // version was really making, and it survives the split.
+    "and an operating system decides no part of a layout" in {
+      val aarch64 = Target.all.filter(t => t.cpu == Cpu.Aarch64 && t.supported)
+
+      aarch64.map(_.os).distinct.length should be > 1
+      aarch64.map(typeLines).distinct.length shouldBe 1
+    }
+
+    // A width's reach is narrow, which is the other half of the same point. The shapes above hold
+    // no pointer -- fixed scalars, an array, a data enum's union region, and a `va_list`, which is
+    // `[4 x ptr]` in every module because the *spelling* is width-free even where the bytes are not.
+    // So they are laid out identically at both widths, and a machine of another width changes
+    // nothing about any of them.
+    "and a width reaches only what actually holds a pointer or a usize" in {
+      val mine  = Set("Padded", "Nested", "Payload", "va_list")
+      val ours  = (t: Target) => typeLines(t).filter(l => mine.exists(l.contains))
+      val heads = Target.all.filter(_.supported).groupBy(_.word).values.map(g => ours(g.head)).toList
+
+      heads.head should not be empty
+      withClue(heads.map(_.mkString("\n")).mkString("\n---- against ----\n"))(heads.distinct.length shouldBe 1)
+    }
+
+    // And the claim stated from the other end, over the standard library's types rather than the
+    // four above: **a width decides how wide a machine word is, and decides nothing else.** The two
+    // modules declare exactly the same types, in the same order -- nothing appears at one width and
+    // not the other -- and every body that differs holds a word.
+    //
+    // Written three times before it was right, and each failure was the finding:
+    //
+    //   - "the whole modules agree" -- no, because the module carries the library's types too, and
+    //     plenty of those hold a `usize`.
+    //   - "everything that moves has a view in it" -- no: `%sysl$Option.usize.Some = type { i32 }`
+    //     holds a `usize` with no view anywhere near it.
+    //   - "a differing body is an i64 against an i32, token for token" -- no, and this is the one
+    //     worth keeping. A data enum's payload region is a **blob of words**, so
+    //     `%enum.sysl$Result...File.IoError` is `[1 x i64]` at 64 bits and `[2 x i32]` at 32: the
+    //     same eight bytes, spelled with a different element *and* a different count. A width can
+    //     change the shape of a union region, which is not what "only the integer widths move"
+    //     would have led anyone to expect.
+    "and a width decides how wide a word is, and nothing else about a type" in {
+      val widths = Target.all.filter(_.supported).groupBy(_.word).toList.sortBy(_._1.bits)
+      val lines  = widths.map((_, g) => typeLines(g.head))
+
+      widths.map(_._1.bits) shouldBe List(32, 64)
+
+      val (narrow, wide) = (lines.head, lines.last)
+      val name           = (s: String) => s.takeWhile(_ != '=').trim
+
+      narrow.map(name) shouldBe wide.map(name)
+
+      val moved = narrow.zip(wide).filter(_ != _)
+
+      withClue("no type moved at all, so this proved nothing")(moved should not be empty)
+
+      for (n, w) <- moved do
+        withClue(s"\n$n\n$w") {
+          n should include("i32")
+          w should include("i64")
+        }
+    }
+
+    // What a width *does* decide, stated where it is visible: a view carries its length as a
+    // `usize`, so it is one word narrower on a 32-bit machine. This is the single target-dependent
+    // LLVM type in the language, and the reason `Type.llvm` takes a `Word` at all.
+    "while a view's length is the width, which is the one type that is" in {
+      val slice = "count(xs: []const int) -> usize\n    xs.len\nvar n = count([1, 2, 3])"
+
+      for t <- Target.all if t.supported do
+        given Word = t.word
+
+        withClue(t.name) {
+          Type.Slice(Type.Integer(64, true)).llvm shouldBe s"{ ptr, ptr, i${t.word.bits} }"
+          irFor(t, slice) should include(s"{ ptr, ptr, i${t.word.bits} }")
+        }
     }
 
     // And the agreement is worth something only because the modules themselves disagree: these same
@@ -268,14 +396,20 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
       supported.map(t => irFor(t, shapes)).distinct.length should be > 1
     }
 
-    // The width is `Layout`'s, not the target's: a module built for a machine whose own `va_list` is
-    // eight bytes still reserves the widest any of them needs.
-    "and a va_list is spelled one way in every module, the widest any target needs" in {
+    // The storage is sysl's rather than the target's: a module built for a machine whose own
+    // `va_list` is eight bytes still reserves four words. The *spelling* is one string on every
+    // target — `[4 x ptr]` — and it is the pointer inside it that makes the bytes differ, which is
+    // why this asserts the text and the section above asserts the width.
+    "and a va_list is spelled one way in every module, four words wide" in {
       Target.all.filter(_.supported).map(_.vaListBytes).distinct.length should be > 1
-      Layout.size(Type.VaList) shouldBe 32
 
       for t <- Target.all if t.supported do
-        withClue(t.name)(irFor(t, shapes) should include(s"alloca ${Type.VaList.llvm}"))
+        given Word = t.word
+
+        withClue(t.name) {
+          Layout(t).size(Type.VaList) shouldBe t.pointerBytes * 4
+          irFor(t, shapes) should include(s"alloca ${Type.VaList.llvm}")
+        }
     }
   }
 

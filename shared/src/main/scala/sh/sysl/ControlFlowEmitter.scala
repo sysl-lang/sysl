@@ -608,23 +608,23 @@ trait ControlFlowEmitter extends PlaceEmitter {
         (p, l)
       case other => sys.error(s"unreachable iteration over ${other.llvm}")
 
-    val idx   = emitAlloca(freshTemp(), "i64")
+    val idx   = emitAlloca(freshTemp(), word)
     val condL = freshLabel("each.cond")
     val bodyL = freshLabel("each.body")
     val stepL = freshLabel("each.step")
     val endL  = freshLabel("each.end")
     val elseL = if elseBlock.isDefined then freshLabel("each.else") else endL
     val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
-    emit(s"store i64 0, ptr $idx")
+    emit(s"store $word 0, ptr $idx")
     genLoops = GenLoop(endL, stepL, slot, ty, owned.length, tempStack.length) :: genLoops
 
     emitTerm(s"br label %$condL")
     emitLabel(condL)
-    val iv   = freshTemp(); emit(s"$iv = load i64, ptr $idx")
-    val more = freshTemp(); emit(s"$more = icmp ult i64 $iv, $len")
+    val iv   = freshTemp(); emit(s"$iv = load $word, ptr $idx")
+    val more = freshTemp(); emit(s"$more = icmp ult $word $iv, $len")
     emitTerm(s"br i1 $more, label %$bodyL, label %$elseL")
     emitLabel(bodyL)
-    val ep = freshTemp(); emit(s"$ep = getelementptr ${elemTy.llvm}, ptr $base, i64 $iv")
+    val ep = freshTemp(); emit(s"$ep = getelementptr ${elemTy.llvm}, ptr $base, $word $iv")
     val ev = freshTemp(); emit(s"$ev = load ${elemTy.llvm}, ptr $ep")
     emitAlloca(s"%$name.addr", elemTy.llvm)
     retainValue(elemTy, ev)
@@ -635,8 +635,8 @@ trait ControlFlowEmitter extends PlaceEmitter {
     popOwned()
     emitTerm(s"br label %$stepL")
     emitLabel(stepL)
-    val nxt = freshTemp(); emit(s"$nxt = add i64 $iv, 1")
-    emit(s"store i64 $nxt, ptr $idx")
+    val nxt = freshTemp(); emit(s"$nxt = add $word $iv, 1")
+    emit(s"store $word $nxt, ptr $idx")
     emitTerm(s"br label %$condL")
 
     genLoops = genLoops.tail

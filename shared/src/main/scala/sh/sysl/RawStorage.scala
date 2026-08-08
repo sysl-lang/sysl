@@ -27,7 +27,7 @@ trait RawStorage extends ExprSupport {
    * poisoned type has been complained about already, so neither placeholder is ever emitted.
    */
   protected def layoutOf(what: String, tr: TypeRef): TExpr =
-    TIntLit(layoutBytes(what, resolveType(tr, tsubst)).getOrElse(0), Type.Usize)
+    TIntLit(layoutBytes(what, resolveType(tr, tsubst)).getOrElse(0), Type.usize)
 
   /** `ptr_cast(x)` — an address read as a pointer to something else.
    *

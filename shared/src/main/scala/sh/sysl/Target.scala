@@ -24,10 +24,14 @@ case class Target(
     softFloat: Boolean = false,
 ) {
 
-  /** How wide an address is, which is the one thing about a target the emitted code assumes
-   * wholesale rather than asks about — see `Target.unsupported`.
+  /** How wide an address is, as a value that can be handed to the two places that need it — the
+   * layout of anything holding a pointer or a length, and the LLVM type of a view (`Word`).
    */
+  def word: Word = Word(cpu.bits)
+
   def pointerBits: Int = cpu.bits
+
+  def pointerBytes: Int = cpu.bits / 8
 
   /** Whether floating-point values travel in floating-point registers. This is a question only
    * RISC-V answers two ways: a hosted RISC-V system is built for the D extension and passes them
@@ -65,36 +69,101 @@ case class Target(
    * is worth naming: the diagnostic then says what is missing instead of leaving the name unknown,
    * which reads as a typo.
    */
-  def supported: Boolean = pointerBits == 64
+  def supported: Boolean = Cpu.buildable.contains(cpu)
+
+  /** Why not, where not — `None` for a target that builds.
+   *
+   * **It is here rather than at either reader because there are two of them**, and the same person
+   * reads both minutes apart: `Target.named` refusing `--target x86-linux`, and `sysl targets`
+   * annotating the row. A list that gives a different reason from the refusal is worse than a list
+   * that gives none, and that is what this was — the row read *"32-bit — not yet supported"* after
+   * two 32-bit targets had shipped, because it was a separate sentence with nothing to hold it to
+   * the other.
+   */
+  def unsupported: Option[String] =
+    Option.unless(supported)(s"no C calling convention has been measured for ${cpu.symbol}")
 }
 
-/** The processor, and the only thing about it the compiler asks: how wide an address is. */
+/** How wide an address is on the target, and the one fact about a machine that reaches into the
+ * *types* the compiler writes rather than only into the calls it makes.
+ *
+ * Almost nothing about lowering depends on the target. A struct's members sit at the same offsets
+ * everywhere, an `i32` is an `i32`, and the emitted module states its triple so LLVM derives the
+ * data layout rather than sysl writing it down twice. **One thing is not like that**: a view is
+ * `{ ptr, ptr, iN }` where `N` is the address width, because its length is a `usize` — so the LLVM
+ * form of a slice, and of anything containing one, cannot be written without knowing the machine.
+ *
+ * It is a parameter rather than a global for the reason `targets.md` gives for the target itself: a
+ * compiler that reads the width from somewhere ambient can be wrong about it silently, and one that
+ * is handed it cannot compile at all until every caller has said which machine it means.
+ */
+case class Word(bits: Int) {
+  def bytes: Int = bits / 8
+
+  /** The integer that is exactly one address wide — what `usize` and `isize` lower to, and what a
+   * view's length is.
+   */
+  def llvm: String = s"i$bits"
+}
+
+/** The processor, and the two things about it the compiler asks: how wide an address is, and which
+ * C calling convention its aggregates cross under (`CAbi`).
+ */
 enum Cpu(val bits: Int) {
   case Aarch64 extends Cpu(64)
   case X86_64  extends Cpu(64)
   case Riscv64 extends Cpu(64)
+  case Riscv32 extends Cpu(32)
+  case Thumb   extends Cpu(32)
   case X86     extends Cpu(32)
 
   /** How a source file names this processor — in a `#if` condition and in an assembly arm alike.
    * One spelling for both, so a program that gates on a processor and one that writes instructions
    * for it are naming the same thing.
+   *
+   * `thumb` rather than `arm` because it is the instruction set, not the architecture family, that
+   * an assembly arm has to be right about: a Cortex-M executes Thumb only, and an arm written for
+   * A32 would assemble for a machine that cannot run it.
    */
   def symbol: String = this match
     case Aarch64 => "aarch64"
     case X86_64  => "x86_64"
     case Riscv64 => "riscv64"
+    case Riscv32 => "riscv32"
+    case Thumb   => "thumb"
+    case X86     => "x86"
+
+  /** The name LLVM registers this processor's back end under, which is what `clang -print-targets`
+   * lists and so what says whether a given clang can produce objects for this target at all.
+   *
+   * **It is not `symbol`, and the difference is not cosmetic.** `symbol` is what a *program* writes
+   * in a `#if` or an `asm` arm and is sysl's to choose; this is LLVM's, and LLVM spells the 64-bit
+   * x86 back end `x86-64` where a source file says `x86_64`. Deriving one from the other would work
+   * for five processors out of six and fail for that one, silently, in the form of a clang that
+   * looks incapable of a target it handles perfectly well.
+   */
+  def backend: String = this match
+    case Aarch64 => "aarch64"
+    case X86_64  => "x86-64"
+    case Riscv64 => "riscv64"
+    case Riscv32 => "riscv32"
+    case Thumb   => "thumb"
     case X86     => "x86"
 }
 
 object Cpu {
 
   /** The processors a target can actually be built for, which is what an exhaustive set of assembly
-   * arms has to cover (`inline-assembly.md §2`). `x86` is nameable and not yet lowerable — the same
-   * fact `Target.supported` reads — so requiring an arm for it would be requiring an answer to a
-   * question nobody can ask. When 32-bit arrives it joins this list, and the arms that do not cover
-   * it become errors, which is the work of supporting it.
+   * arms has to cover (`inline-assembly.md §2`).
+   *
+   * `x86` is nameable and not lowerable, and **the reason is no longer its width** — 32-bit targets
+   * build. It is that nothing has measured i386's C calling convention against clang, which is what
+   * `targets.md § Adding one` says a target's answers have to come from. Requiring an assembly arm
+   * for a processor no program can be built for would be requiring an answer to a question nobody
+   * can ask; when the convention is measured it joins this list, and the arms that do not cover it
+   * become errors, which is the work of supporting it.
    */
-  def buildable: List[Cpu] = values.filter(_.bits == 64).toList
+  def buildable: List[Cpu] = values.filterNot(_ == X86).toList
 }
 
 /** The system conventions the processor is used under. `Freestanding` is a target with no operating
@@ -121,6 +190,13 @@ enum Os {
  *
  * The distinction is invisible in the emitted types — all three pass one `ptr` — which is exactly
  * why it has to be recorded: nothing downstream could recover it from the IR.
+ *
+ * **AAPCS32 needs no case of its own, and that was measured rather than assumed.** Its `va_list` is
+ * `struct { void * }`, which clang declares as `[1 x i32]` because the aggregate rule reaches a
+ * one-word struct — so it looks at first like a fourth answer. It is not: compiling a call both ways
+ * for `thumbv8m.main-none-eabihf` gives the identical `ldr r1, [r1]`, because one word in a core
+ * register is one word in a core register whichever type names it. `Loaded` already says exactly
+ * that, and a fourth case would have been a distinction with no instruction behind it.
  */
 enum VaListAbi {
   case Loaded, Address, Copied
@@ -160,10 +236,31 @@ object Target {
     Target("riscv64-freestanding", "riscv64-unknown-elf", Cpu.Riscv64, Os.Freestanding, VaListAbi.Loaded, 8,
       softFloat = true)
 
-  /** A 32-bit target is listed and cannot be built for. It is here rather than left out because the
-   * limit is the compiler's and not the machine's — the emitted code assumes a 64-bit address in
-   * places nothing has yet been asked to parameterize — and a reader who names it deserves to be
-   * told that rather than told the name is unknown.
+  /** The RP2350's Arm personality: a Cortex-M33, which is Armv8-M Mainline and executes Thumb only.
+   *
+   * The triple carries the whole of what the ABI needs — `eabihf` selects the hard-float convention
+   * and clang gives `thumbv8m.main` an `fpv5-d16` by default, so arguments cross in VFP registers
+   * and `softFloat` stays false. `-mcpu=cortex-m33` refines instruction selection to the exact core
+   * and changes nothing here; it is the sub-architecture question this registry still leaves open.
+   */
+  val thumbFreestanding: Target =
+    Target("thumb-freestanding", "thumbv8m.main-none-eabihf", Cpu.Thumb, Os.Freestanding,
+      VaListAbi.Loaded, 4)
+
+  /** The RP2350's other personality: a Hazard3, which is RV32IMAC and has no F extension at all —
+   * so, like bare-metal RISC-V at 64 bits, there are no floating registers to pass arguments in.
+   */
+  val riscv32Freestanding: Target =
+    Target("riscv32-freestanding", "riscv32-unknown-elf", Cpu.Riscv32, Os.Freestanding,
+      VaListAbi.Loaded, 4, softFloat = true)
+
+  /** A target that is listed and cannot be built for. It is here rather than left out because the
+   * limit is the compiler's and not the machine's, and a reader who names it deserves to be told
+   * what is missing rather than told the name is unknown.
+   *
+   * **The limit is no longer its width.** 32-bit targets build; what i386 has not got is a C calling
+   * convention measured against clang, which is the only way `targets.md § Adding one` allows one to
+   * be arrived at.
    */
   val x86Linux: Target =
     Target("x86-linux", "i386-unknown-linux-gnu", Cpu.X86, Os.Linux, VaListAbi.Address, 4)
@@ -180,6 +277,8 @@ object Target {
       aarch64Freestanding,
       x86_64Freestanding,
       riscv64Freestanding,
+      thumbFreestanding,
+      riscv32Freestanding,
       x86Linux,
     )
 
@@ -192,7 +291,7 @@ object Target {
     byName.get(name) match
       case Some(t) if t.supported => Right(t)
       case Some(t) =>
-        Left(s"'$name' is a ${t.pointerBits}-bit target, and sysl lowers 64-bit targets only")
+        Left(s"sysl knows '$name' and cannot build for it: ${t.unsupported.get}")
       case None =>
         Left(s"unknown target '$name' — sysl knows ${all.map(_.name).mkString(", ")}")
 

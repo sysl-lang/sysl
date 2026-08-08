@@ -323,7 +323,7 @@ trait TraitLookup extends MemberVisibility {
     // element type is: a `[3]int` matches `[N]T` at `N = 3` and `T = int`, and the block's members
     // are instantiated from that pair the way a slice's are from one.
     case Type.Array(n, elem) =>
-      List((s"[$n]", List(elem)), (Type.Array.shape, List(Type.ConstArg(n, Type.Usize), elem)))
+      List((s"[$n]", List(elem)), (Type.Array.shape, List(Type.ConstArg(n, Type.usize), elem)))
     // A tuple has **two** shapes, and the order between them is what makes a block written for one
     // arity beat one written for every arity — the same ladder an array gained one line up, one
     // kind further out. The arity's shape hands the parts back as separate arguments; the pack's

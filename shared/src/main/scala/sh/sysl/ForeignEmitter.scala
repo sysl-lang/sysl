@@ -122,7 +122,7 @@ trait ForeignEmitter extends ArcEmitter {
    */
   private def spread(v: String, t: Type, pieces: List[CAbi.Arg]): List[String] = {
     val holder = if pieces.length == 1 then pieces.head.llvm else s"{ ${pieces.map(_.llvm).mkString(", ")} }"
-    val slot   = reinterpret(v, t.llvm, holder, Layout.size(t))
+    val slot   = reinterpret(v, t.llvm, holder, layout.size(t))
 
     if pieces.length == 1 then
       val r = freshTemp()
@@ -142,7 +142,7 @@ trait ForeignEmitter extends ArcEmitter {
 
   /** A value that arrived in the registers `llvm` names, read back as the `t` it stands for. */
   private def gather(v: String, llvm: String, t: Type): String = {
-    val slot = reinterpret(v, llvm, t.llvm, Layout.size(t))
+    val slot = reinterpret(v, llvm, t.llvm, layout.size(t))
     val r    = freshTemp()
 
     emit(s"$r = load ${t.llvm}, ptr $slot")
