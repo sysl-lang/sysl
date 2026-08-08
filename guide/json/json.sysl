@@ -21,6 +21,11 @@
 //     gathers into one sink and converts once at the end, and an escape writes the bytes it encodes
 //     to instead of being rendered into a string that is immediately concatenated away. The
 //     structure that had been forced is now the structure that is wanted.
+//   * **And then there was no way to ask what those bytes *were*.** The gap above was only half
+//     closed: bytes could become text, and a `char` could not become bytes, so `\uXXXX` went out
+//     through `display_char` — the *renderer*, called with a format specification for output nobody
+//     was formatting, because it was the only encoder in reach. Answered: `encode_utf8` writes a
+//     character into a caller's buffer and is what `display_char` itself now calls.
 //   * **There were no constants** when this was written, so a value shared by several functions had
 //     to be a nullary function. `const` was added afterwards, for a reason this program did not
 //     turn up on its own: a nullary function reads perfectly well *in an expression*, and what it
@@ -85,8 +90,13 @@ end parse
 // How deep a document may nest before the scanner gives up.
 private const max_depth: int = 64
 
-// The neutral specifier: an escape's bytes are written as themselves, with no field around them.
-private plain() -> FormatSpec = FormatSpec(0, -1, false)
+// A character written to a sink as the bytes it encodes to, which is the whole of what a `\uXXXX`
+// escape means. Four bytes is the most any character needs, so the buffer is a local array and the
+// encoding costs no allocation.
+private put_char(out: *Writer, c: char)
+    var b: [4]u8
+
+    out.write(b[0..<encode_utf8(c, b[0..<4])])
 
 // The scanner is a position in a source text, and both spellings of the text are kept: the bytes to
 // decide by, and the `string` to cut pieces out of. Nothing here can turn the one back into the
@@ -216,8 +226,8 @@ private struct Scanner
             '"' -> Ok(out.write("\"".bytes))
             '\\' -> Ok(out.write("\\".bytes))
             '/' -> Ok(out.write("/".bytes))
-            'b' -> Ok(out.write([8]))
-            'f' -> Ok(out.write([12]))
+            'b' -> Ok(out.write("\b".bytes))
+            'f' -> Ok(out.write("\f".bytes))
             'n' -> Ok(out.write("\n".bytes))
             'r' -> Ok(out.write("\r".bytes))
             't' -> Ok(out.write("\t".bytes))
@@ -226,13 +236,17 @@ private struct Scanner
     end unescape
 
     // A code point reaches the output as the bytes it encodes to, which is what an escape always
-    // meant. This used to be `str(char(n))` — a *rendering* function standing in for a constructor,
-    // because no way to make bytes into text existed. `display_char` is the encoder the prelude
-    // already had, and `from_utf8` is what makes writing into a sink an option at all.
+    // meant, and `encode_utf8` is now the one function that says what those bytes are.
+    //
+    // It has been written three ways as the library caught up. First `str(char(n))` — a *rendering*
+    // function standing in for a constructor, because no way to make bytes into text existed at all.
+    // Then `display_char(c, out, plain())`, which was the encoder the prelude happened to have, and
+    // still a renderer being asked a question about encoding: the `plain()` in that call is a format
+    // specification for output nobody is formatting.
     unescape_hex(*self, out: *Writer) -> Result[unit, Fault]
         var hi = self.hex4()?
 
-        if hi < 0xD800 || hi > 0xDFFF then return Ok(display_char(char(hi), out, plain()))
+        if hi < 0xD800 || hi > 0xDFFF then return Ok(put_char(out, char(hi)))
         if hi > 0xDBFF then return Err(BadEscape(self.at))
         if !self.at_byte(u8('\\')) then return Err(BadEscape(self.at))
         self.bump()
@@ -242,7 +256,7 @@ private struct Scanner
         var lo = self.hex4()?
 
         if lo < 0xDC00 || lo > 0xDFFF then return Err(BadEscape(self.at))
-        Ok(display_char(char(0x10000 + (hi - 0xD800) * 0x400 + (lo - 0xDC00)), out, plain()))
+        Ok(put_char(out, char(0x10000 + (hi - 0xD800) * 0x400 + (lo - 0xDC00))))
     end unescape_hex
 
     hex4(*self) -> Result[int, Fault]
@@ -379,11 +393,11 @@ end quote
 private escape_of(b: u8) -> string
     if b == u8('"') then "\\\""
     else if b == u8('\\') then "\\\\"
-    else if b == 8 then "\\b"
-    else if b == 12 then "\\f"
-    else if b == 10 then "\\n"
-    else if b == 13 then "\\r"
-    else if b == 9 then "\\t"
+    else if b == u8('\b') then "\\b"
+    else if b == u8('\f') then "\\f"
+    else if b == u8('\n') then "\\n"
+    else if b == u8('\r') then "\\r"
+    else if b == u8('\t') then "\\t"
     else if b < 32 then "\\u00" + hex_of(b >> 4) + hex_of(b & 15)
     else ""
 end escape_of

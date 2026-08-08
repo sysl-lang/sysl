@@ -94,6 +94,10 @@ sysl build-c mylib -o libmylib.a   # writes libmylib.a and libmylib.a.h
 clang main.c libmylib.a -o app
 ```
 
+That archive is self-contained: whatever of the standard library the module reaches is compiled into
+it, because a `.syslib` is not something a C link line can be handed. Libraries you chose — `libm`,
+anything `@link` named — are still yours to pass, and `build-c` prints which.
+
 **Binding a library your package manager installed takes two flags**, because a toolchain searches
 its own directories and nothing else — on a Mac that means `/opt/homebrew` is invisible to it:
 
