@@ -37,6 +37,8 @@ class StringLiteralTests extends AnyFreeSpec with Matchers with CodegenSupport w
       l.bare("'\\n'") shouldBe List(l.CharLit('\n'.toInt))
       l.bare("'\\t'") shouldBe List(l.CharLit('\t'.toInt))
       l.bare("'\\r'") shouldBe List(l.CharLit('\r'.toInt))
+      l.bare("'\\b'") shouldBe List(l.CharLit(8))
+      l.bare("'\\f'") shouldBe List(l.CharLit(12))
       l.bare("'\\0'") shouldBe List(l.CharLit(0))
       l.bare("'\\\\'") shouldBe List(l.CharLit('\\'.toInt))
       l.bare("'\\''") shouldBe List(l.CharLit('\''.toInt))
@@ -45,11 +47,19 @@ class StringLiteralTests extends AnyFreeSpec with Matchers with CodegenSupport w
 
     "the same table applies inside a string" in withLexer { l =>
       l.bare("\"a\\nb\\tc\\r\\\\\\\"d\"") shouldBe List(l.StrLit("a\nb\tc\r\\\"d"))
+      l.bare("\"a\\bb\\fc\"") shouldBe List(l.StrLit("a" + 8.toChar + "b" + 12.toChar + "c"))
     }
 
     "an escape the table does not name" in withLexer { l =>
       l.bad("'\\q'") should include("unknown escape sequence '\\q'")
       l.bad("\"a\\qb\"") should include("unknown escape sequence")
+    }
+
+    // `\e` is what ANSI terminal code reaches for, and it is a GNU extension rather than standard
+    // C — refused on purpose, so that the language's set is the one every other language shares.
+    "the escape character has no shorthand" in withLexer { l =>
+      l.bad("'\\e'") should include("unknown escape sequence '\\e'")
+      l.bare("'\\u{1b}'") shouldBe List(l.CharLit(0x1b))
     }
 
     "a backslash with nothing after it" in withLexer { l =>
@@ -143,6 +153,7 @@ class StringLiteralTests extends AnyFreeSpec with Matchers with CodegenSupport w
     "escapes survive to the output" in {
       run("""print("a\tb")""") shouldBe "a\tb\n"
       run("""print("quote:\"", "back:\\")""") shouldBe "quote:\" back:\\\n"
+      run("""print("a\bb\fc")""") shouldBe "a" + 8.toChar + "b" + 12.toChar + "c\n"
     }
 
     "non-ASCII text round-trips as UTF-8" in {

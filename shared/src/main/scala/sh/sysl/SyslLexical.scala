@@ -809,6 +809,14 @@ class SyslLexical
       else Right((c.toInt, in.rest))
     }
 
+  /** The escapes a character or string literal accepts: `\n` `\t` `\r` `\b` `\f` `\0` `\\` `\'`
+   * `\"`, and `\u{...}` for anything else. The named ones are the set C fixed and every language
+   * since has carried, so a programmer arriving from one of them finds what they reach for.
+   *
+   * `\e` for the escape character is deliberately absent, though ANSI terminal code wants it more
+   * than it wants any of the above: it is a GNU extension rather than standard C, and a program
+   * that needs it writes `'\u{1b}'` once and gives it a name.
+   */
   private def scanEscape(in: Reader[Char]): Either[(String, Reader[Char]), (Int, Reader[Char])] =
     if (in.atEnd) Left(("incomplete escape sequence", in))
     else
@@ -816,6 +824,8 @@ class SyslLexical
         case 'n'                  => Right(('\n'.toInt, in.rest))
         case 't'                  => Right(('\t'.toInt, in.rest))
         case 'r'                  => Right(('\r'.toInt, in.rest))
+        case 'b'                  => Right((0x08, in.rest))
+        case 'f'                  => Right((0x0c, in.rest))
         case '0'                  => Right((0, in.rest))
         case '\\' | '\'' | '"'    => Right((in.first.toInt, in.rest))
         case 'u'                  => scanBracedCodepoint(in.rest)

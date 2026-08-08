@@ -139,6 +139,8 @@ The same table serves character and string literals.
 | `\n` | line feed, U+000A |
 | `\t` | tab, U+0009 |
 | `\r` | carriage return, U+000D |
+| `\b` | backspace, U+0008 |
+| `\f` | form feed, U+000C |
 | `\0` | NUL, U+0000 |
 | `\\` | backslash |
 | `\'` | single quote |
@@ -148,6 +150,12 @@ The same table serves character and string literals.
 `\u{…}` is braced rather than fixed-width because a codepoint needs up to six hex digits.
 Its value must be a Unicode scalar value: at most `0x10FFFF` and not a surrogate. Any other
 escape letter is an error — there is no "unknown escapes pass through" rule.
+
+**The named set is C's, and is deliberately no larger.** Every language a programmer is likely
+to arrive from carries exactly these, so the one they reach for is the one that is here. The
+notable absence is **`\e`** for the escape character, U+001B, which several shells and Perl
+accept: it is a GNU extension rather than standard C, and Rust and Go both refuse it. Terminal
+code, which wants it more than anything else does, writes `'\u{1b}'` and gives it a name.
 
 ### Character literals
 
