@@ -129,6 +129,13 @@ class InlineAssemblyTests extends AnyFreeSpec with Matchers with CodegenSupport 
       // Every processor a target can be built for, named — so a registry that grows is a diagnostic
       // that grows with it, and the reader is never left to work out which one was meant.
       for c <- Cpu.buildable if c != Cpu.X86_64 do withClue(c.symbol)(e should include(s"'${c.symbol}'"))
+
+      // And named as a *list*: commas up to the last, which takes the "or". Joining them all with
+      // "or" was fine while three processors meant an arm was rarely missing more than two; a bare
+      // block now names five, and "'a' or 'b' or 'c' or 'd' or 'e'" is parsed rather than read.
+      val listed = Cpu.buildable.filterNot(_ == Cpu.X86_64).map(c => s"'${c.symbol}'")
+
+      e should include(s"no arm for ${listed.init.mkString(", ")} or ${listed.last}.")
     }
 
     "'unavailable' covers a processor, so the ones with an answer still build" in {
