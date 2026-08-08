@@ -47,10 +47,36 @@ downstream, and it is still *there*. §9 is that second axis given a name of its
 
 **The cost, stated plainly:** a careless field order silently wastes memory, and nothing packs it
 back. The mitigation is a lint that reports a struct's padding and suggests an ordering — the
-programmer reorders once, and the layout stays predictable afterward. Padding *suppression* (a
-`packed` attribute placing fields at declared offsets with no interior padding, for register
-blocks and wire formats) is a separate axis and remains open in `00` §Open, along with the
-bitfield question it drags in.
+programmer reorders once, and the layout stays predictable afterward.
+
+**Two attributes move a struct off that default, and they are separate axes.**
+
+`@packed` places the fields at their declared offsets with **no interior padding**, and drops the
+aggregate's own alignment to one. It lowers to LLVM's `<{ }>`, so the offsets the back end computes
+are the ones this file's rules computed rather than a second opinion that agrees right up until a
+field needs padding in front of it. A register block, and a C struct that has to match one, are what
+it is for.
+
+`@align(n)` raises where the aggregate must **begin**, and rounds the size up to a multiple of `n` so
+an array of them keeps every element on the boundary. It may only raise: asking for less than the
+fields already require changes nothing, since lowering is what `@packed` is for and a type that
+under-promised would be unsound to pass. The bound is folded rather than lexed, so `@align(CACHE_LINE)`
+is available wherever a program has a name for the number, and it must be a power of two — an address
+is aligned by having low bits clear, so a boundary of six is unsatisfiable rather than merely weak.
+
+They compose, because the gaps *between* fields and the boundary the whole thing *starts* on are
+different questions: a wire header that has to live in a DMA-capable buffer is `@packed @align(64)`.
+
+**A packed field has no address.** `&s.f` is refused where `s` is packed, and so is any `*T` into
+one. The field sits at its declared offset, which is very often not a multiple of its own alignment —
+that is the point of the attribute — while a `*u32` is a `*u32` wherever it came from, and every use
+of one is entitled to assume the address is aligned. Reading and writing the field are untouched:
+those go through the struct, where the offset is known. Only the escaped address loses that, and it
+loses it arbitrarily far from the `&` that made it.
+
+**Sub-byte fields are not part of this.** Whether a `@packed` struct lays an `i5` field out in
+exactly five bits — the bitfield and hardware-register payoff — remains open in `00` §Open. Today an
+`iN` field occupies its allocated width wherever it sits, packed or not.
 
 ## 2. Symbol names carry the module path
 

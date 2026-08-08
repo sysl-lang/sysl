@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 29
+  val Version: Int = 30
 
   private val Magic = "sysl-ast"
 
@@ -359,9 +359,13 @@ object AstCodec {
         case ExternVarDecl(n, t, lk, vs) =>
           tok("extv"); sref(n); typ(t); opt(lk)(sref); vis(vs)
 
-        case StructDecl(n, tps, fs, ms, bs, invs, vs, tds, op, tvs) =>
+        case StructDecl(n, tps, fs, ms, bs, invs, vs, tds, op, tvs, pk, al) =>
           tok("sd"); sref(n); list(tps)(sref); list(fs)(param); list(ms)(method)
           bounds(bs); list(invs)(expr); vis(vs); tdefaults(tds); bool(op); tdefaults(tvs)
+          // A layout travels with the declaration: an importing module computes an instantiation's
+          // layout for itself (`15 §4`), so a struct whose padding or alignment an attribute decided
+          // would otherwise be laid out two different ways either side of an artifact.
+          bool(pk); opt(al)(expr)
 
         case EnumDecl(n, tps, und, vars, ms, bs, vs, tds, tvs) =>
           tok("ed"); sref(n); list(tps)(sref); opt(und)(typ); list(vars)(variant); list(ms)(method)
@@ -743,7 +747,7 @@ object AstCodec {
           ExternVarDecl(sref(), typ(), opt(sref()), vis())
         case "sd" =>
           StructDecl(sref(), list(sref()), list(param()), list(method()),
-            bounds(), list(expr()), vis(), tdefaults(), bool(), tdefaults())
+            bounds(), list(expr()), vis(), tdefaults(), bool(), tdefaults(), bool(), opt(expr()))
         case "ed" =>
           EnumDecl(sref(), list(sref()), opt(typ()), list(variant()), list(method()),
             bounds(), vis(), tdefaults(), tdefaults())

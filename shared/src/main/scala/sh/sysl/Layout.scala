@@ -50,7 +50,7 @@ object Layout {
     case _: Type.CFn                     => 8
     case _: Type.View                    => 24
     case Type.Array(n, elem)             => n * size(elem)
-    case s: Type.Struct                  => aggregate(s.stored.map(_._2))._1
+    case s: Type.Struct                  => structLayout(s)._1
     case e: Type.Enum                    => if e.simple then size(e.underlying) else enumSize(e)
     case other                           => sys.error(s"unreachable size of ${other.llvm}")
 
@@ -97,7 +97,7 @@ object Layout {
     case _: Type.CFn                     => 8
     case _: Type.View                    => 8
     case Type.Array(_, elem)             => align(elem)
-    case s: Type.Struct                  => aggregate(s.stored.map(_._2))._2
+    case s: Type.Struct                  => structLayout(s)._2
     case e: Type.Enum                    => if e.simple then align(e.underlying) else enumAlign(e)
     case other                           => sys.error(s"unreachable alignment of ${other.llvm}")
 
@@ -131,6 +131,29 @@ object Layout {
       offset = roundUp(offset, align(m)) + size(m)
 
     (roundUp(offset, widest), widest)
+  }
+
+  /** A struct's size and alignment, with its layout attributes applied (`15 §1`).
+   *
+   * `@packed` lays the fields end to end with no interior padding and drops the aggregate's own
+   * alignment to one — what a register block, and a C struct that has to match one, need.
+   * `@align(n)` then raises where the whole may *start*, and the size is rounded to a multiple of it
+   * so that an array of them keeps every element on the boundary the declaration asked for.
+   *
+   * They are applied in that order because they are separate axes, and the other order would let the
+   * packing undo an alignment written beside it. A struct may carry both: a wire header that has to
+   * live in a DMA-capable buffer is exactly that shape.
+   */
+  private def structLayout(s: Type.Struct): (Int, Int) = {
+    val members = s.stored.map(_._2)
+
+    val (bytes, alignment) =
+      if s.packed then (math.max(members.map(size).sum, 1), 1)
+      else aggregate(members)
+
+    s.minAlign match
+      case Some(n) if n > alignment => (math.max(roundUp(bytes, n), n), n)
+      case _                        => (bytes, alignment)
   }
 
   private def roundUp(n: Int, to: Int): Int = (n + to - 1) / to * to

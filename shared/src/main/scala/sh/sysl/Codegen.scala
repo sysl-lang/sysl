@@ -113,8 +113,19 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // do, since the only thing mangling collapses is a subtype into the base it is stored as.
     val structs = program.structs.distinctBy(_.llvm)
 
+    // `@packed` is LLVM's `<{ }>`, which is the same declaration order with every interior gap
+    // removed and the aggregate's own alignment dropped to one — so the offsets the back end
+    // computes are the ones `Layout` computed, rather than two answers that agree until a field
+    // needs padding in front of it.
+    //
+    // `@align` is *not* written here. A type carries no alignment in LLVM's textual form: the
+    // boundary is stated where storage is created, which is what `alignAttr` stamps onto an alloca
+    // and a global below.
     for s <- structs do
-      out ++= s"${s.llvm} = type { ${s.stored.map(_._2.llvm).mkString(", ")} }\n"
+      val fields = s.stored.map(_._2.llvm).mkString(", ")
+
+      out ++= (if s.packed then s"${s.llvm} = type <{ $fields }>\n" else s"${s.llvm} = type { $fields }\n")
+      s.minAlign.filter(_ > 1).foreach(raisedAligns(s.llvm) = _)
     if structs.nonEmpty then out ++= "\n"
 
     // A data enum is the tag and **one** payload region, wide enough and aligned for whichever

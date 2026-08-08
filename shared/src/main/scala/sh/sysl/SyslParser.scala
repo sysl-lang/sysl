@@ -179,6 +179,22 @@ class SyslParser(val source: Source)
           err("'@pure' already says '@reads()' and '@writes()', so a frame beside it says one thing " +
             "twice — write the frame alone if the function touches module storage, and '@pure' alone " +
             "if it touches none")
+        // A layout annotation and a function annotation describe different kinds of thing, so one
+        // declaration cannot carry both — and saying which pair collided is more use than the
+        // grammar's complaint about whichever alternative it went on to try.
+        case None if as.exists(layout) && as.exists(!layout(_)) =>
+          err("'@packed' and '@align' describe a layout and the rest mark a function, so they " +
+            "cannot stand above one declaration — a struct has no body to be tail-recursive or " +
+            "pure in, and a function has no fields to lay out")
+        case None if as.forall(layout) =>
+          (visibility ~ structDecl) ^^ {
+            case Visibility.Public ~ (s: StructDecl) => laidOut(s, as)
+            case v ~ (s: StructDecl)                 => restrict(v, laidOut(s, as))
+            case _ ~ other                           => other
+          } | err(
+            "'@packed' and '@align' describe how fields are laid out, so they mark a struct — an " +
+              "enum's layout follows from its variants and a scalar's is the target's",
+          )
         case None =>
           (visibility ~ funcDecl) ^^ {
             case Visibility.Public ~ (f: FuncDecl) => attributed(f, as)
@@ -186,8 +202,22 @@ class SyslParser(val source: Source)
             case _ ~ other                         => other
           } | err(
             "an annotation marks a function, and only a function — neither what 'sysl test' calls " +
-              "nor what recurses is anything a declaration of another kind supplies",
+              "nor what recurses is anything a declaration of another kind supplies. '@packed' " +
+              "and '@align(n)' are the two that mark a struct instead",
           )
+    }
+
+  /** Whether an attribute describes a **layout** rather than a function. */
+  private def layout(a: Attr): Boolean = a match
+    case Attr.Packed | _: Attr.Align => true
+    case _                           => false
+
+  /** The struct these layout annotations describe, folded onto its declaration. */
+  private def laidOut(s: StructDecl, as: List[Attr]): StructDecl =
+    as.foldLeft(s) {
+      case (d, Attr.Packed)   => d.copy(packed = true)
+      case (d, Attr.Align(n)) => d.copy(alignment = Some(n))
+      case (d, _)             => d
     }
 
 

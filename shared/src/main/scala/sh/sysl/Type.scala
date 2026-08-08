@@ -640,6 +640,21 @@ object Type {
   class Struct(val base: String, val targs: List[Type]) extends Named {
     var fields: List[(String, Type)] = Nil
 
+    /** `@packed` — fields sit at their declared offsets with no interior padding, and the aggregate
+      * needs no alignment of its own (`15 §1`).
+      *
+      * The two layout facts are separate because they are separate axes: this one is about the gaps
+      * *between* fields, `minAlign` about where the whole thing may *start*. A struct may be both,
+      * which is what a wire header living in a DMA buffer is.
+      */
+    var packed: Boolean = false
+
+    /** `@align(n)` — a floor under the aggregate's alignment, once folded. Never below what the
+      * fields already require: the attribute may raise an alignment and may not lower one, since
+      * lowering is what `packed` is for and a type that under-promised would be unsound to pass.
+      */
+    var minAlign: Option[Int] = None
+
     def name: String = qualified(base, targs)
 
     def llvm: String = s"%struct.${mangled(base, targs)}"
