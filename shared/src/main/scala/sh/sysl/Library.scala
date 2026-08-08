@@ -10,8 +10,8 @@ package sh.sysl
  * source: `?` needs `Option`'s variants, `print` needs the renderers, a format string needs
  * `FormatSpec`.
  *
- * Both were once answered in place, by asking a prelude directly and by spelling library keys as
- * bare names. That worked only while the library was a string inside the compiler keyed under the
+ * Both were once answered in place, by asking the declarations directly and by spelling library keys
+ * as bare names. That worked only while the library was a string inside the compiler keyed under the
  * anonymous root module, where a library key *is* its own spelling. It stopped working the moment a
  * declaration moved into a module of its own, where `FormatSpec` is filed under `sysl$FormatSpec`
  * and nothing spelled `FormatSpec` is found — and it would have stopped working at every one of

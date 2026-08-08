@@ -1023,7 +1023,7 @@ trait ExprAnalysis
       // the difference is which tier the reader is in: `&v[0]` is a `*T` the moment it is written,
       // and `03` says in as many words that the guarantees stop there and that this is how a view
       // reaches a C function taking a pointer and a length. `printf("%.*s")` is exactly that call
-      // and so is `memchr`, which is what the prelude's own `find_byte` is. Refusing it would leave
+      // and so is `memchr`, which is what `sysl.io`'s own `find_byte` is. Refusing it would leave
       // a type that cannot do the job it was added for, while buying nothing: `*T` is greppable, and
       // a program that has none still cannot reach these bytes.
       case TIndex(recv, _, _) if writes && Type.readOnlyView(recv.ty) && recv.ty != Type.Str =>

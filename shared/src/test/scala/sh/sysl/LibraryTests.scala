@@ -16,9 +16,16 @@ class LibraryTests extends LibrarySeamSupport {
 
   "whose declaration it is" - {
 
+    // **Both questions are asked of one `Stdlib`**, and that is not tidiness. `Library.carried`
+    // parses the library afresh whenever the single-slot memo underneath it has been cleared — which
+    // another suite asking for a different target does — so two asks can hand back two copies, and
+    // `owns` compares the `Source` a declaration came from. Asking twice would then report every
+    // declaration as not the library's, which is the memo working exactly as designed.
     "every declaration the library ships is its own" in {
-      Library.decls should not be empty
-      Library.decls.filterNot(Library.carried.owns) shouldBe empty
+      val std = Library.carried
+
+      std.decls should not be empty
+      std.decls.filterNot(std.owns) shouldBe empty
     }
 
     "nothing a program declares is" in {
@@ -89,9 +96,15 @@ class LibraryTests extends LibrarySeamSupport {
       // The two halves used to be checked against each other here. There is one half now, so what
       // is left to say is that it is not empty and that all of it is the library's — the second is
       // what `Library.owns` answers, and an empty module would make it vacuously true.
-      Std.decls(Target.default) should not be empty
-      Std.decls(Target.default).forall(Library.carried.owns) shouldBe true
-      Library.decls shouldBe Std.decls(Target.default)
+      //
+      // One `Stdlib` again, for the reason the first test in this file records. The last line
+      // compares **spellings** rather than trees for the same reason: two parses of the same source
+      // are two sets of `Source` objects, and a position carries one.
+      val std = Library.carried
+
+      std.decls should not be empty
+      std.decls.forall(std.owns) shouldBe true
+      Library.names(std.decls) shouldBe Library.names(Std.decls(Target.default))
     }
 
     "is a module every file may write the names of without importing it" in {
@@ -242,7 +255,7 @@ class LibraryTests extends LibrarySeamSupport {
       ir.isRight shouldBe true
     }
 
-    // `Option` was the last name a program could not take: the prelude held it in the root module a
+    // `Option` was the last name a program could not take: it was held in the root module a
     // headerless program is also in, so declaring one was a clash rather than shadowing. It moved,
     // and the clash went with it — which is worth a test of its own because `?` reaches the
     // library's `Option` by a route no program writes, so this is where picking the program's would

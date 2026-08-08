@@ -19,7 +19,7 @@ import io.github.edadma.cross_platform.*
  * that path, so what broke named what was wrong.
  *
  * **The source is real files, under `lib/sysl`, and the compiler reads them off disk.** That is what
- * a prelude could never be: a string literal has no other form, while these are ordinary sysl files
+ * the string inside the compiler could never be: a literal has no other form, while these are files
  * a driver reads exactly as it reads a user's library — which is what `sysl build-lib` is pointed
  * at, and what makes the library's own source something a reader can open, edit, and rebuild
  * against.
