@@ -190,36 +190,56 @@ object Std {
    */
   lazy val fingerprint: String = LibraryArtifact.fingerprint(sources)
 
-  /** The parsed standard module, **for a target**, parsed once per target.
+  /** The parsed standard module, **for a target** — and the trees of **one** target are kept, not
+   * every target's.
    *
    * The library is sysl source like any other and may gate on the machine it is being built for
    * (`Conditional`), so which trees it comes to is a question with a target in it. Two targets may
-   * therefore see two different standard modules — that is the point of the feature — and each is
-   * memoized because this is on the path of every compilation that has no artifact to read instead.
+   * therefore see two different standard modules — that is the point of the feature — and the answer
+   * is memoized because this is on the path of every compilation that has no artifact to read
+   * instead.
    *
-   * Not a `Map` from the registry built up front: a run compiles for one target and would pay for
-   * ten.
+   * **What is memoized is the LAST target asked for, and that bound is the whole point.** The
+   * paragraph this replaces argued that the table should not be built from the registry up front
+   * because *"a run compiles for one target and would pay for ten"* — which is true of a run, and
+   * stopped being true of the **suite** the moment a test iterated `Target.all`. Filling it lazily
+   * costs exactly what filling it eagerly costs, only later: `AbiAgainstClangTests` walks every
+   * supported target, so it arrived at ten parsed standard modules held for the life of the process,
+   * and a Scala Native test agent that had run it could not then run anything else.
+   *
+   * A single slot keeps every bit of the benefit for the access pattern the comment describes — a
+   * loop over one target hits every time — and costs a re-parse only where the caller alternates,
+   * which is the case that was never meant to be cached anyway.
    */
   def parsed(target: Target): List[Program] =
-    cache.synchronized(
-      cache.getOrElseUpdate(
-        target,
-        sources.map(s =>
-          SyslParser.parse(s, target) match
-            case Right(p) => p
-            case Left(e)  => sys.error(s"the standard module does not parse: $e"),
-        ),
-      ),
-    )
+    cache.synchronized {
+      cache.get(target) match
+        case Some(programs) => programs
+        case None =>
+          val programs = sources.map(s =>
+            SyslParser.parse(s, target) match
+              case Right(p) => p
+              case Left(e)  => sys.error(s"the standard module does not parse: $e"),
+          )
+
+          cache.clear()
+          cache(target) = programs
+          programs
+    }
 
   /** **Locked, and it is not decoration.** This was a `lazy val` before it took a target, and a
    * `lazy val` is initialized exactly once however many threads reach it. A bare mutable `Map` is
-   * not: two compilations for two targets, running at once, can be inside `getOrElseUpdate` together
-   * and leave the table itself broken — which is not a wrong answer but a corrupted one, and it
-   * would show up as something unrelated much later. The suite compiles for several targets from
-   * several threads, so this is a live case rather than a hypothetical one.
+   * not: two compilations for two targets, running at once, can be inside it together and leave the
+   * table itself broken — which is not a wrong answer but a corrupted one, and it would show up as
+   * something unrelated much later. The suite compiles for several targets from several threads, so
+   * this is a live case rather than a hypothetical one.
    */
   private val cache = collection.mutable.Map.empty[Target, List[Program]]
+
+  /** How many targets' trees are held. Exists so a test can pin the bound the comment above claims —
+   * a memory property has no other observable surface, and this one regressed a whole release.
+   */
+  private[sysl] def cachedTargets: Int = cache.synchronized(cache.size)
 
   def decls(target: Target): List[Stmt] = parsed(target).flatMap(_.body)
 }
