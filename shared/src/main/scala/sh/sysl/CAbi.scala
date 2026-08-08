@@ -104,7 +104,19 @@ object CAbi {
       shape(t, target) match
         case Shape.Memory =>
           // Only System V wants the copy made on the caller's stack; the rest take an address.
-          Param.Indirect(t.llvm, l.align(t), byval = target.cpu == Cpu.X86_64 && target.os != Os.Windows)
+          val byval = target.cpu == Cpu.X86_64 && target.os != Os.Windows
+
+          // A `byval` alignment is the **stack slot's**, not the type's, and System V aligns an
+          // argument passed in memory to eight whatever the aggregate is made of — so clang says
+          // `align 8` for a `char[64]`, and only says more when the type itself demands more
+          // (`align 16` for a pair of `__int128`s). Measured, like every other answer here.
+          //
+          // Saying the type's alignment instead generated identical code, because the back end
+          // applies the minimum on its own. It was still worth fixing: the attribute is a claim
+          // about the ABI, a claim that disagrees with clang's is wrong whether or not this year's
+          // back end acts on it, and `AbiAgainstClangTests` now asks clang every run rather than
+          // trusting that somebody read it right once.
+          Param.Indirect(t.llvm, if byval then math.max(l.align(t), 8) else l.align(t), byval)
         case Shape.Registers(_, passed) => Param.Coerced(passed)
         case Shape.Split(passed)        => Param.Coerced(passed)
 

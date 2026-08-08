@@ -162,6 +162,19 @@ And AAPCS32 picks its register *element* by the aggregate's alignment rather tha
 eight-aligned gives `[n x i64]` on a machine whose registers are four bytes, because what LLVM is
 being told is the shape to copy and not the registers to use.
 
+A fourth is worth stating for a different reason — it is the one this page's own rule caught rather
+than the measurement. **A `byval` alignment is the stack slot's and not the type's**: System V
+aligns an argument passed in memory to eight whatever the aggregate is made of, so a `char[64]` is
+`align 8` and only a type that demands more gets more. Sysl said the type's alignment until
+`AbiAgainstClangTests` asked clang and found the two disagreeing. The generated code was identical,
+because the back end applies the minimum on its own — which is exactly why it survived every tier
+below this one, and exactly why *measure it against clang* is a rule and not a habit.
+
+**That test is the rule made mechanical.** Every convention above is now re-derived from clang on
+every run: the equivalent C is compiled for the same triple and the `declare` it produces has to be
+the one sysl produces. A table written by reading clang once is only as good as the reading, and a
+misreading is pinned by its own test exactly as firmly as a correct one.
+
 Only the boundary is affected. A struct handed over **by address** needs none of this, which is why
 that was the workaround while the boundary was broken, and a sysl-to-sysl call is untouched.
 
