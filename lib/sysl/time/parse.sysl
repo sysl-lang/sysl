@@ -74,7 +74,7 @@ end expect
 // a year outside 0..9999 has no ISO spelling without a sign prefix, and that extension is not here.
 parse_date(s: string) -> Result[LocalDate, TimeParseError]
     var b = s.bytes
-    var d = date_from(b, 0usize)?
+    var d = date_from(b, 0)?
 
     if d.1 != b.len then return Err(Trailing(d.1))
 
@@ -83,23 +83,23 @@ end parse_date
 
 // The date, and where reading it stopped — which is what lets a date-time reuse it.
 private date_from(b: []const u8, at: usize) -> Result[(LocalDate, usize), TimeParseError]
-    var y = digits(b, at, 4usize)?
-    expect(b, at + 4usize, 45u8)?
-    var m = digits(b, at + 5usize, 2usize)?
-    expect(b, at + 7usize, 45u8)?
-    var d = digits(b, at + 8usize, 2usize)?
+    var y = digits(b, at, 4)?
+    expect(b, at + 4, 45)?
+    var m = digits(b, at + 5, 2)?
+    expect(b, at + 7, 45)?
+    var d = digits(b, at + 8, 2)?
 
     if m < 1 || m > 12 then return Err(OutOfRange("month"))
     if d < 1 || d > days_in_month(y, m) then return Err(OutOfRange("day"))
 
-    Ok((date_at(y, m, d), at + 10usize))
+    Ok((date_at(y, m, d), at + 10))
 end date_from
 
 // `HH:MM`, `HH:MM:SS`, or `HH:MM:SS.ffffff` — the seconds and the fraction each optional, on the
 // same terms `time_text` writes them.
 parse_time(s: string) -> Result[LocalTime, TimeParseError]
     var b = s.bytes
-    var t = time_from(b, 0usize)?
+    var t = time_from(b, 0)?
 
     if t.1 != b.len then return Err(Trailing(t.1))
 
@@ -107,43 +107,43 @@ parse_time(s: string) -> Result[LocalTime, TimeParseError]
 end parse_time
 
 private time_from(b: []const u8, at: usize) -> Result[(LocalTime, usize), TimeParseError]
-    var h = digits(b, at, 2usize)?
-    expect(b, at + 2usize, 58u8)?
-    var mi = digits(b, at + 3usize, 2usize)?
+    var h = digits(b, at, 2)?
+    expect(b, at + 2, 58)?
+    var mi = digits(b, at + 3, 2)?
 
     if h > 23 then return Err(OutOfRange("hour"))
     if mi > 59 then return Err(OutOfRange("minute"))
 
     var us = long(h) * us_per_hour + long(mi) * us_per_minute
-    var next = at + 5usize
+    var next = at + 5
 
     // A seconds field is present only where a colon follows, and a fraction only where a dot
     // follows that. Anything else ends the time, which is what lets a date-time read an offset off
     // the tail without this having to know one is coming.
-    if next >= b.len || b[next] != 58u8 then return Ok((LocalTime(us), next))
+    if next >= b.len || b[next] != 58 then return Ok((LocalTime(us), next))
 
-    var sec = digits(b, next + 3usize - 2usize, 2usize)?
+    var sec = digits(b, next + 3 - 2, 2)?
 
     if sec > 59 then return Err(OutOfRange("second"))
 
     us = us + long(sec) * us_per_second
-    next = next + 3usize
+    next = next + 3
 
-    if next >= b.len || b[next] != 46u8 then return Ok((LocalTime(us), next))
+    if next >= b.len || b[next] != 46 then return Ok((LocalTime(us), next))
 
     // Up to six digits of fraction, each worth ten times less than the last. Fewer than six is legal
     // and means what it says: `.5` is half a second, not five microseconds.
     var scale = us_per_second
-    var i = next + 1usize
-    var seen = 0usize
+    var i = next + 1
+    var seen: usize = 0
 
-    while i < b.len && b[i] >= 48u8 && b[i] <= 57u8 && seen < 6usize
-        scale = scale / 10i64
+    while i < b.len && b[i] >= 48 && b[i] <= 57 && seen < 6
+        scale = scale / 10
         us = us + long(int(b[i]) - 48) * scale
-        i = i + 1usize
-        seen = seen + 1usize
+        i = i + 1
+        seen = seen + 1
 
-    if seen == 0usize then return Err(BadShape(next + 1usize))
+    if seen == 0 then return Err(BadShape(next + 1))
 
     Ok((LocalTime(us), i))
 end time_from
@@ -152,12 +152,12 @@ end time_from
 // ISO 8601 says `T`, and `datetime_text` writes a space because that is what a person reads.
 parse_datetime(s: string) -> Result[LocalDateTime, TimeParseError]
     var b = s.bytes
-    var d = date_from(b, 0usize)?
+    var d = date_from(b, 0)?
 
     if d.1 >= b.len then return Err(BadShape(d.1))
-    if b[d.1] != 32u8 && b[d.1] != 84u8 then return Err(BadShape(d.1))
+    if b[d.1] != 32 && b[d.1] != 84 then return Err(BadShape(d.1))
 
-    var t = time_from(b, d.1 + 1usize)?
+    var t = time_from(b, d.1 + 1)?
 
     if t.1 != b.len then return Err(Trailing(t.1))
 
@@ -167,7 +167,7 @@ end parse_datetime
 // `Z`, `+05:30`, `-08:00`. The `Z` is zero, which is the spelling `offset_text` writes it back as.
 parse_offset(s: string) -> Result[Offset, TimeParseError]
     var b = s.bytes
-    var o = offset_from(b, 0usize)?
+    var o = offset_from(b, 0)?
 
     if o.1 != b.len then return Err(Trailing(o.1))
 
@@ -177,18 +177,18 @@ end parse_offset
 // The offset, and where reading it stopped — which is what lets a timestamp read one off its tail.
 private offset_from(b: []const u8, at: usize) -> Result[(Offset, usize), TimeParseError]
     if at >= b.len then return Err(BadShape(at))
-    if b[at] == 90u8 then return Ok((Offset(0), at + 1usize))
-    if b[at] != 43u8 && b[at] != 45u8 then return Err(BadShape(at))
+    if b[at] == 90 then return Ok((Offset(0), at + 1))
+    if b[at] != 43 && b[at] != 45 then return Err(BadShape(at))
 
-    var sign = if b[at] == 45u8 then -1 else 1
-    var h = digits(b, at + 1usize, 2usize)?
-    expect(b, at + 3usize, 58u8)?
-    var m = digits(b, at + 4usize, 2usize)?
+    var sign = if b[at] == 45 then -1 else 1
+    var h = digits(b, at + 1, 2)?
+    expect(b, at + 3, 58)?
+    var m = digits(b, at + 4, 2)?
 
     if h > 23 then return Err(OutOfRange("offset hour"))
     if m > 59 then return Err(OutOfRange("offset minute"))
 
-    Ok((Offset(sign * (h * 60 + m)), at + 6usize))
+    Ok((Offset(sign * (h * 60 + m)), at + 6))
 end offset_from
 
 // A whole timestamp, straight to the point on the timeline it names — which is the thing a program
@@ -201,12 +201,12 @@ end offset_from
 // what arrives was written by somebody else. Liberal in what it accepts, strict in what it sends.
 parse_timestamp(s: string) -> Result[Instant, TimeParseError]
     var b = s.bytes
-    var d = date_from(b, 0usize)?
+    var d = date_from(b, 0)?
 
     if d.1 >= b.len then return Err(BadShape(d.1))
-    if b[d.1] != 32u8 && b[d.1] != 84u8 then return Err(BadShape(d.1))
+    if b[d.1] != 32 && b[d.1] != 84 then return Err(BadShape(d.1))
 
-    var t = time_from(b, d.1 + 1usize)?
+    var t = time_from(b, d.1 + 1)?
     var o = offset_from(b, t.1)?
 
     if o.1 != b.len then return Err(Trailing(o.1))

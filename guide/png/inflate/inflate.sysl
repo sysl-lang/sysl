@@ -95,14 +95,14 @@ end describe
 // The zlib checksum: two running sums, the second over the first, both taken modulo the largest
 // prime below 65536. Cheap where a CRC is thorough, which is the trade the wrapper format made.
 adler32(data: []const u8) -> u32
-    var a = 1u32
-    var b = 0u32
+    var a: u32 = 1
+    var b: u32 = 0
 
     for x in data
-        a = (a + u32(x)) % 65521u32
-        b = (b + a) % 65521u32
+        a = (a + u32(x)) % 65521
+        b = (b + a) % 65521
 
-    b << 16u32 | a
+    b << 16 | a
 end adler32
 
 // A zlib stream: two header bytes, a deflate stream, and a big-endian checksum of everything the
@@ -113,14 +113,14 @@ zlib(src: []u8, out: []u8) -> Result[usize, Fault]
     var cmf = src[0]
     var flg = src[1]
 
-    if cmf & 15u8 != 8u8 then return Err(BadMethod(cmf & 15u8))
-    if cmf >> 4u8 > 7u8 then return Err(BadWindow)
+    if cmf & 15 != 8 then return Err(BadMethod(cmf & 15))
+    if cmf >> 4 > 7 then return Err(BadWindow)
 
     // The two header bytes read as one big-endian number are a multiple of 31 — a check digit, and
     // the reason a zlib stream almost always begins `78`. `FDICT` would mean a preset dictionary
     // this decoder does not have.
-    if (u32(cmf) << 8u32 | u32(flg)) % 31u32 != 0u32 then return Err(BadFlags)
-    if flg & 32u8 != 0u8 then return Err(Preset)
+    if (u32(cmf) << 8 | u32(flg)) % 31 != 0 then return Err(BadFlags)
+    if flg & 32 != 0 then return Err(Preset)
 
     var n = raw(src[2..<src.len - 4], out)?
     var want = be32(src, src.len - 4)
@@ -133,14 +133,14 @@ end zlib
 
 // A bare deflate stream, with no wrapper and no checksum.
 raw(src: []u8, out: []u8) -> Result[usize, Fault]
-    var inf = Inf(src, out, 0usize, 0u32, 0u32, 0usize)
+    var inf = Inf(src, out, 0, 0, 0, 0)
 
     inf.blocks()?
     Ok(inf.n)
 end raw
 
 private be32(b: []u8, i: usize) -> u32
-    u32(b[i]) << 24u32 | u32(b[i + 1]) << 16u32 | u32(b[i + 2]) << 8u32 | u32(b[i + 3])
+    u32(b[i]) << 24 | u32(b[i + 1]) << 16 | u32(b[i + 2]) << 8 | u32(b[i + 3])
 
 // Fill in a table from a list of code lengths. The check that matters is the one for a table that
 // is *over*-subscribed — lengths needing more codes than a binary tree of that depth has room for —
@@ -152,11 +152,11 @@ private be32(b: []u8, i: usize) -> u32
 // would have to be allocated. Slices of somebody else's storage are what the language offers for
 // "look at these bytes, do not own them", and here that is exactly the relationship.
 private table(counts: []u16, symbols: []u16, lengths: []u8, n: usize) -> Result[unit, Fault]
-    for i in 0usize..max_bits
-        counts[i] = 0u16
+    for i in 0..max_bits
+        counts[i] = 0
 
-    for i in 0usize..<n
-        counts[usize(lengths[i])] += 1u16
+    for i in 0..<n
+        counts[usize(lengths[i])] += 1
 
     var left = 1
 
@@ -170,10 +170,10 @@ private table(counts: []u16, symbols: []u16, lengths: []u8, n: usize) -> Result[
     for len in 1..<int(max_bits)
         offset[len + 1] = offset[len] + usize(counts[len])
 
-    for i in 0usize..<n
-        if lengths[i] != 0u8
+    for i in 0..<n
+        if lengths[i] != 0
             symbols[offset[usize(lengths[i])]] = u16(i)
-            offset[usize(lengths[i])] += 1usize
+            offset[usize(lengths[i])] += 1
 
     Ok(())
 end table
@@ -197,10 +197,10 @@ private struct Inf
             if self.pos >= self.src.len then return Err(Truncated)
 
             self.acc |= u32(self.src[self.pos]) << self.cnt
-            self.pos += 1usize
-            self.cnt += 8u32
+            self.pos += 1
+            self.cnt += 8
 
-        var v = self.acc & 1u32 << k - 1u32
+        var v = self.acc & 1 << k - 1
 
         self.acc >>= k
         self.cnt -= k
@@ -211,7 +211,7 @@ private struct Inf
         if self.n >= self.out.len then return Err(NoRoom)
 
         self.out[self.n] = b
-        self.n += 1usize
+        self.n += 1
         Ok(())
     end put
 
@@ -225,7 +225,7 @@ private struct Inf
         var index = 0
 
         for len in 1..int(max_bits)
-            code |= int(self.bits(1u32)?)
+            code |= int(self.bits(1)?)
 
             var count = int(counts[len])
 
@@ -241,17 +241,17 @@ private struct Inf
     // An uncompressed block. The bit accumulator is discarded rather than drained: what is left in
     // it is padding to the next byte boundary by definition.
     stored(*self) -> Result[unit, Fault]
-        self.acc = 0u32
-        self.cnt = 0u32
+        self.acc = 0
+        self.cnt = 0
 
         if self.pos + 4 > self.src.len then return Err(Truncated)
 
         var len = usize(self.src[self.pos]) + usize(self.src[self.pos + 1]) << 8
         var nlen = usize(self.src[self.pos + 2]) + usize(self.src[self.pos + 3]) << 8
 
-        self.pos += 4usize
+        self.pos += 4
 
-        if len + nlen != 65535usize then return Err(BadStored)
+        if len + nlen != 65535 then return Err(BadStored)
         if self.pos + len > self.src.len then return Err(Truncated)
 
         for i in 0..<len
@@ -267,7 +267,7 @@ private struct Inf
         var lengths: [fixed_lit]u8
 
         for i in 0..<fixed_lit
-            lengths[i] = if i < 144 then 8u8 else if i < 256 then 9u8 else if i < 280 then 7u8 else 8u8
+            lengths[i] = if i < 144 then 8 else if i < 256 then 9 else if i < 280 then 7 else 8
 
         var lcounts: [max_bits + 1]u16
         var lsymbols: [fixed_lit]u16
@@ -277,7 +277,7 @@ private struct Inf
         table(lcounts[..], lsymbols[..], lengths[..], fixed_lit)?
 
         for i in 0..<max_dist
-            lengths[i] = 5u8
+            lengths[i] = 5
 
         table(dcounts[..], dsymbols[..], lengths[..], max_dist)?
         self.codes(lcounts[..], lsymbols[..], dcounts[..], dsymbols[..])
@@ -286,16 +286,16 @@ private struct Inf
     // A block carrying its own two tables, themselves Huffman-coded by a third table whose lengths
     // arrive in the `order` above.
     dynamic(*self) -> Result[unit, Fault]
-        var nlen = usize(self.bits(5u32)?) + 257
-        var ndist = usize(self.bits(5u32)?) + 1
-        var ncode = usize(self.bits(4u32)?) + 4
+        var nlen = usize(self.bits(5)?) + 257
+        var ndist = usize(self.bits(5)?) + 1
+        var ncode = usize(self.bits(4)?) + 4
 
         if nlen > max_lit || ndist > max_dist then return Err(BadTable)
 
         var lengths: [max_lengths]u8
 
         for i in 0..<ncode
-            lengths[order[i]] = u8(self.bits(3u32)?)
+            lengths[order[i]] = u8(self.bits(3)?)
 
         var ccounts: [max_bits + 1]u16
         var csymbols: [max_code]u16
@@ -307,27 +307,27 @@ private struct Inf
         //
         // A `while` rather than a counted loop, because a symbol advances the cursor by one length
         // or by a whole run of them: how far this goes each time is what it just read.
-        var i = 0usize
+        var i: usize = 0
 
         while i < nlen + ndist
             var sym = self.symbol(ccounts[..], csymbols[..])?
 
             if sym < 16
                 lengths[i] = u8(sym)
-                i += 1usize
+                i += 1
             else
-                var value = 0u8
-                var count = 0usize
+                var value: u8 = 0
+                var count: usize = 0
 
                 if sym == 16
-                    if i == 0usize then return Err(BadTable)
+                    if i == 0 then return Err(BadTable)
 
                     value = lengths[i - 1]
-                    count = usize(self.bits(2u32)?) + 3
+                    count = usize(self.bits(2)?) + 3
                 else if sym == 17
-                    count = usize(self.bits(3u32)?) + 3
+                    count = usize(self.bits(3)?) + 3
                 else
-                    count = usize(self.bits(7u32)?) + 11
+                    count = usize(self.bits(7)?) + 11
 
                 if i + count > nlen + ndist then return Err(BadTable)
 
@@ -379,15 +379,15 @@ private struct Inf
 
     blocks(*self) -> Result[unit, Fault]
         loop
-            var last = self.bits(1u32)?
-            var kind = self.bits(2u32)?
+            var last = self.bits(1)?
+            var kind = self.bits(2)?
 
             kind match
-                0u32 -> self.stored()?
-                1u32 -> self.fixed()?
-                2u32 -> self.dynamic()?
+                0 -> self.stored()?
+                1 -> self.fixed()?
+                2 -> self.dynamic()?
                 else return Err(BadBlock)
 
-            if last == 1u32 then return Ok(())
+            if last == 1 then return Ok(())
     end blocks
 end Inf
