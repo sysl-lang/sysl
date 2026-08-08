@@ -29,12 +29,35 @@ loud on one that had it yesterday.
 program that never reaches the exit device would otherwise run until the suite is killed, and perl
 ships everywhere this builds.
 
+## thumb — `qemu-system-arm -M mps2-an505 -nographic -semihosting-config enable=on,target=native -kernel <elf>`
+
+A Cortex-M33, the RP2350's Arm core. Three things differ from the RISC-V half and **every one of
+them was measured rather than read**, because each fails in a way that blames the wrong thing.
+
+**The result channel is semihosting `SYS_EXIT_EXTENDED` — `0x20`, not `0x18`.** On AArch32 the
+plain `SYS_EXIT` takes its reason in `r1` and **always reports zero**, so a `main` returning 7
+arrives as 0 and every assertion made against the status is worthless while looking fine. The
+extended call takes a pointer to `{0x20026, code}`. Semihosting also has to be asked for: without
+`-semihosting-config` the `bkpt` is a debug event nobody handles.
+
+**The startup sets `sp` itself.** A Cortex-M boots through a vector table and `start_thumb.s` has
+one, but QEMU's `-kernel` enters at the **ELF entry point** and does not load `SP` from it. A
+program that trusts the table runs with a junk `SP` and faults on the first push — *inside* whatever
+it called first, so the register dump blames the callee.
+
+**Everything lives in the code SRAM at 0x00000000, stack included.** The board does have an SRAM at
+`0x20000000`, and it is small: a store at `0x20000000` succeeds and one at `0x20008000` faults. A
+script claiming megabytes there gives you a stack pointer backed by nothing, which on M-profile is a
+HardFault with no handler, which escalates to `Lockup: can't escalate 3 to HardFault`. The code
+region is proven mapped by the program running out of it.
+
+**The UART is the CMSDK one at 0x40200000, and it transmits nothing until it is enabled.** Its
+registers are *words*, not bytes: `DATA` at 0x00, `CTRL` at 0x08, `BAUDDIV` at 0x10. Set `BAUDDIV`
+to at least 16 and `CTRL` to 1 before writing. A program that writes to it cold produces **no output
+and no error** — QEMU says `transmit data write with Tx disabled`, and only under `-d guest_errors`.
+
 ## What is still owed
 
-- **The Thumb half.** `qemu-system-arm -M mps2-an505` is a Cortex-M33, the RP2350's exact core. It
-  has no `sifive_test`, so the result channel there is semihosting `SYS_EXIT` — `bkpt 0xAB` with
-  `r0 = 0x18` and `r1` pointing at `{0x20026, code}` — and it boots through a vector table rather
-  than a bare entry point. Its UART is the CMSDK one at 0x40004000.
 - **A freestanding entry point takes `argc` and `argv`.** `define i32 @main(i32 %argc, ptr %argv)`
   is emitted for `thumb-freestanding` and `riscv32-freestanding` alike, which is a hosted
   convention on a machine that has nobody to pass them. The startup here passes zeros. It is a

@@ -1,7 +1,6 @@
 package sh.sysl
 
 import io.github.edadma.cross_platform.*
-import org.scalatest.Assertions.*
 import org.scalatest.matchers.should.Matchers
 
 /** Running a freestanding program **on the machine it was built for**, under QEMU.
@@ -47,7 +46,16 @@ trait QemuSupport extends Matchers {
   private val boards: Map[String, Board] = Map(
     Target.riscv32Freestanding.name ->
       Board("qemu-system-riscv32", List("-M", "virt", "-bios", "none", "-nographic", "-kernel"),
-        "start_rv32.s", "rv32.ld")
+        "start_rv32.s", "rv32.ld"),
+
+    // The Arm half of the same board. It has no `sifive_test`, so the result channel is semihosting
+    // — which has to be asked for, and a run without `-semihosting-config` reports nothing and
+    // exits as though the program had said zero.
+    Target.thumbFreestanding.name ->
+      Board("qemu-system-arm",
+        List("-M", "mps2-an505", "-nographic", "-semihosting-config", "enable=on,target=native",
+          "-kernel"),
+        "start_thumb.s", "thumb.ld")
   )
 
   /** Whether a program exists to be run. `--version` rather than `which`, because a name on the
