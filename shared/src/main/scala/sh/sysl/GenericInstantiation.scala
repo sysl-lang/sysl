@@ -400,7 +400,7 @@ trait GenericInstantiation extends ConstFolding {
       actual match
         case Type.Array(n, e) =>
           len match
-            case Ident(v) if tparams(v) => sub.getOrElseUpdate(v, Type.ConstArg(n, Type.Usize))
+            case Ident(v) if tparams(v) => sub.getOrElseUpdate(v, Type.ConstArg(n, Type.usize))
             case _                      => ()
 
           unify(elem, e, tparams, sub)

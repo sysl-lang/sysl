@@ -92,7 +92,7 @@ trait ArcEmitter extends Emitter {
 
   /** Takes a share of everything the value **at an address** refers to, and gives one back.
    *
-   * The pair exists for a type `Layout.indirect` calls large, which never becomes a first-class
+   * The pair exists for a type `layout.indirect` calls large, which never becomes a first-class
    * value: there is nothing to hand `retainValue`, and loading one so that there were would undo
    * the whole point of lowering it through memory. Everything smaller is read out and walked as
    * before, so the two forms agree on what they count — only on where they read it from.
@@ -103,7 +103,7 @@ trait ArcEmitter extends Emitter {
 
   private def walkAt(ty: Type, p: String, retain: Boolean): Unit =
     if containsRef(ty) then
-      if Layout.indirect(ty) then emit(s"call void @${slotHelper(ty, retain)}(ptr $p)")
+      if layout.indirect(ty) then emit(s"call void @${slotHelper(ty, retain)}(ptr $p)")
       else
         val v = freshTemp(); emit(s"$v = load ${ty.llvm}, ptr $p")
         if retain then retainValue(ty, v) else releaseValue(ty, v)
@@ -282,7 +282,7 @@ trait ArcEmitter extends Emitter {
     // reason every other destination has: the value would be a first-class aggregate of kilobytes
     // for the length of one instruction. The address is not known until the box exists, so this is
     // the one destination that cannot be handed over before the expression runs.
-    val v     = if Layout.indirect(inner) then "" else genExpr(value)
+    val v     = if layout.indirect(inner) then "" else genExpr(value)
 
     val end  = freshTemp(); emit(s"$end = getelementptr $bn, ptr null, i32 1")
     val size = freshTemp(); emit(s"$size = ptrtoint ptr $end to i64")
@@ -298,7 +298,7 @@ trait ArcEmitter extends Emitter {
 
     val slot = freshTemp(); emit(s"$slot = getelementptr $bn, ptr $p, i32 0, i32 $headerFields")
 
-    if Layout.indirect(inner) then genOwnedInto(slot, value)
+    if layout.indirect(inner) then genOwnedInto(slot, value)
     else
       retainValue(inner, v)
       emit(s"store ${inner.llvm} $v, ptr $slot")

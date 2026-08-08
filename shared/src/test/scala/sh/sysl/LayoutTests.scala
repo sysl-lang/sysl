@@ -19,20 +19,31 @@ class LayoutTests extends AnyFreeSpec with Matchers with CodegenSupport with Run
     s
   }
 
+  /** The machine every assertion in this file is about unless it says otherwise. `Layout` takes a
+   * target now (`targets.md`), so a bare number here is a claim about *a* machine and has to say
+   * which — the 32-bit answers are pinned in their own section at the bottom.
+   */
+  private val at64 = Layout(Word(64))
+
+  /** The other one, for the section checking that a narrower address changes exactly what it should
+   * and nothing else.
+   */
+  private val at32 = Layout(Word(32))
+
   private val u8  = Type.Integer(8, false)
   private val i64 = Type.Integer(64, true)
 
   "a scalar is its own width, aligned to it" in {
-    Layout.size(Type.Bool) shouldBe 1
-    Layout.size(u8) shouldBe 1
-    Layout.size(Type.Integer(32, true)) shouldBe 4
-    Layout.size(i64) shouldBe 8
-    Layout.size(Type.Floating(32)) shouldBe 4
-    Layout.size(Type.Char) shouldBe 4
+    at64.size(Type.Bool) shouldBe 1
+    at64.size(u8) shouldBe 1
+    at64.size(Type.Integer(32, true)) shouldBe 4
+    at64.size(i64) shouldBe 8
+    at64.size(Type.Floating(32)) shouldBe 4
+    at64.size(Type.Char) shouldBe 4
 
-    Layout.align(Type.Bool) shouldBe 1
-    Layout.align(Type.Char) shouldBe 4
-    Layout.align(i64) shouldBe 8
+    at64.align(Type.Bool) shouldBe 1
+    at64.align(Type.Char) shouldBe 4
+    at64.align(i64) shouldBe 8
   }
 
   /** A width that is not a whole number of bytes is the case `bits / 8` gets wrong, and it was wrong
@@ -43,18 +54,18 @@ class LayoutTests extends AnyFreeSpec with Matchers with CodegenSupport with Run
    * notice — `Layout` is the only thing that ever says how wide the region is.
    */
   "an odd width costs what LLVM makes it cost, not its bit count over eight" in {
-    Layout.size(Type.Integer(1, false)) shouldBe 1
-    Layout.size(Type.Integer(5, false)) shouldBe 1
-    Layout.size(Type.Integer(12, false)) shouldBe 2
-    Layout.size(Type.Integer(20, false)) shouldBe 4
-    Layout.size(Type.Integer(96, false)) shouldBe 16
-    Layout.size(Type.Integer(128, false)) shouldBe 16
+    at64.size(Type.Integer(1, false)) shouldBe 1
+    at64.size(Type.Integer(5, false)) shouldBe 1
+    at64.size(Type.Integer(12, false)) shouldBe 2
+    at64.size(Type.Integer(20, false)) shouldBe 4
+    at64.size(Type.Integer(96, false)) shouldBe 16
+    at64.size(Type.Integer(128, false)) shouldBe 16
 
-    Layout.align(Type.Integer(5, false)) shouldBe 1
-    Layout.align(Type.Integer(12, false)) shouldBe 2
-    Layout.align(Type.Integer(20, false)) shouldBe 4
-    Layout.align(Type.Integer(96, false)) shouldBe 16
-    Layout.align(Type.Integer(128, false)) shouldBe 16
+    at64.align(Type.Integer(5, false)) shouldBe 1
+    at64.align(Type.Integer(12, false)) shouldBe 2
+    at64.align(Type.Integer(20, false)) shouldBe 4
+    at64.align(Type.Integer(96, false)) shouldBe 16
+    at64.align(Type.Integer(128, false)) shouldBe 16
   }
 
   "a payload region wide enough for a variant of odd-width fields" in {
@@ -87,52 +98,52 @@ class LayoutTests extends AnyFreeSpec with Matchers with CodegenSupport with Run
   }
 
   "an address is one word, and a view of one is three" in {
-    Layout.size(Type.Ptr(u8)) shouldBe 8
-    Layout.size(Type.Ref(u8, false)) shouldBe 8
-    Layout.size(Type.Slice(u8)) shouldBe 24
-    Layout.size(Type.Str) shouldBe 24
+    at64.size(Type.Ptr(u8)) shouldBe 8
+    at64.size(Type.Ref(u8, false)) shouldBe 8
+    at64.size(Type.Slice(u8)) shouldBe 24
+    at64.size(Type.Str) shouldBe 24
   }
 
   // A trait object is a pair — the value and the table it dispatches through — so a mode pointing
   // at one is twice the width of a mode pointing at a concrete type.
   "and an address to a trait is two, since it carries its table" in {
-    Layout.size(Type.Ptr(Type.Trait("Show"))) shouldBe 16
-    Layout.align(Type.Ptr(Type.Trait("Show"))) shouldBe 8
+    at64.size(Type.Ptr(Type.Trait("Show"))) shouldBe 16
+    at64.align(Type.Ptr(Type.Trait("Show"))) shouldBe 8
   }
 
   "a zero-sized type occupies nothing" in {
-    Layout.size(Type.Unit) shouldBe 0
-    Layout.align(Type.Unit) shouldBe 1
+    at64.size(Type.Unit) shouldBe 0
+    at64.align(Type.Unit) shouldBe 1
   }
 
   "a struct pads each field onto its own alignment" in {
-    Layout.size(struct("a" -> u8, "b" -> i64)) shouldBe 16
-    Layout.align(struct("a" -> u8, "b" -> i64)) shouldBe 8
+    at64.size(struct("a" -> u8, "b" -> i64)) shouldBe 16
+    at64.align(struct("a" -> u8, "b" -> i64)) shouldBe 8
   }
 
   // The padding at the end is what makes size and stride the same number, which is what an array of
   // them relies on: without it the second element would start unaligned.
   "and carries the padding at its end that an array of it needs" in {
-    Layout.size(struct("a" -> i64, "b" -> u8)) shouldBe 16
-    Layout.size(Type.Array(3, struct("a" -> i64, "b" -> u8))) shouldBe 48
+    at64.size(struct("a" -> i64, "b" -> u8)) shouldBe 16
+    at64.size(Type.Array(3, struct("a" -> i64, "b" -> u8))) shouldBe 48
   }
 
   "a field that occupies nothing changes neither" in {
-    Layout.size(struct("a" -> i64, "n" -> Type.Unit)) shouldBe 8
-    Layout.align(struct("a" -> i64, "n" -> Type.Unit)) shouldBe 8
+    at64.size(struct("a" -> i64, "n" -> Type.Unit)) shouldBe 8
+    at64.align(struct("a" -> i64, "n" -> Type.Unit)) shouldBe 8
   }
 
   "an array is its elements end to end" in {
-    Layout.size(Type.Array(4, Type.Integer(32, true))) shouldBe 16
-    Layout.align(Type.Array(4, Type.Integer(32, true))) shouldBe 4
-    Layout.size(Type.Array(0, i64)) shouldBe 0
+    at64.size(Type.Array(4, Type.Integer(32, true))) shouldBe 16
+    at64.align(Type.Array(4, Type.Integer(32, true))) shouldBe 4
+    at64.size(Type.Array(0, i64)) shouldBe 0
   }
 
   "a constrained subtype is laid out as the type it constrains" in {
     val within = Type.Constrained("TaskId", u8, true, Some(BigDecimal(0)), Some(BigDecimal(200)), true, None)
 
-    Layout.size(within) shouldBe 1
-    Layout.align(within) shouldBe 1
+    at64.size(within) shouldBe 1
+    at64.align(within) shouldBe 1
   }
 
   "what the emitter writes down agrees with the model" - {
@@ -247,6 +258,57 @@ class LayoutTests extends AnyFreeSpec with Matchers with CodegenSupport with Run
             |for i in 0..<3
             |    print(which(t[usize(i)]))
             |""".stripMargin) shouldBe "32\n7\n24\n"
+    }
+  }
+
+  /** What a 32-bit machine changes, and — the half that matters more — what it does not.
+   *
+   * `Layout` takes a target for exactly one reason: an address is four bytes rather than eight. Every
+   * other rule is C's and LLVM's and is the same everywhere, so a change that made a scalar or an
+   * aggregate's *packing* differ by machine would be a bug, and the second block below is what would
+   * catch it.
+   */
+  "a 32-bit target" - {
+    "makes an address, and everything measured in addresses, half the width" in {
+      at32.size(Type.Ptr(u8)) shouldBe 4
+      at32.align(Type.Ptr(u8)) shouldBe 4
+      at32.size(Type.CFn(Nil, Type.Unit)) shouldBe 4
+
+      // A slice is three words wherever it is: an owner, a first element, and a count.
+      at32.size(Type.Slice(u8)) shouldBe 12
+      at64.size(Type.Slice(u8)) shouldBe 24
+      at32.size(Type.Str) shouldBe 12
+
+      // The walk's storage is four words, which is what `Type.VaList.llvm` writes — the two are the
+      // same claim and a drift between them would size a `va_start` region wrong.
+      at32.size(Type.VaList) shouldBe 16
+      at64.size(Type.VaList) shouldBe 32
+    }
+
+    "leaves every scalar, and every rule about packing, exactly where it was" in {
+      for t <- List[Type](Type.Bool, u8, Type.Char, i64, Type.Integer(32, true), Type.Floating(32),
+                          Type.Floating(64), Type.Integer(12, false), Type.Integer(96, true)) do
+        withClue(Type.show(t)) {
+          at32.size(t) shouldBe at64.size(t)
+          at32.align(t) shouldBe at64.align(t)
+        }
+
+      // The interior padding rule is C's, so a struct of scalars lays out identically on both.
+      val s = struct("a" -> u8, "b" -> Type.Integer(32, true), "c" -> u8)
+
+      at32.size(s) shouldBe at64.size(s)
+      at32.align(s) shouldBe at64.align(s)
+    }
+
+    "puts a pointer field on a four-byte boundary, which changes the struct around it" in {
+      // The one place the width reaches an *aggregate*: `{ u8, *u8 }` is 16 bytes at 64 and 8 at 32,
+      // and it is the alignment rather than the pointer's own size that does most of it.
+      val p = struct("tag" -> u8, "at" -> Type.Ptr(u8))
+
+      at64.size(p) shouldBe 16
+      at64.align(p) shouldBe 8
+      at32.size(p) shouldBe 8
+      at32.align(p) shouldBe 4
     }
   }
 }

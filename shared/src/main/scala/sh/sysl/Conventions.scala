@@ -49,13 +49,21 @@ object Conventions {
    */
   def interruptForm(cpu: Cpu): Option[Form] = cpu match
     case Cpu.X86_64  => Some(Form.Convention("x86_intrcc"))
-    case Cpu.Riscv64 => Some(Form.Attribute("interrupt"))
+    // Both RISC-V widths spell it the same way, because it is the same attribute: the privilege
+    // modes below are the architecture's rather than the register width's.
+    case Cpu.Riscv64 | Cpu.Riscv32 => Some(Form.Attribute("interrupt"))
     // Exception entry on AArch64 goes through a vector table the processor indexes by cause, and
     // each entry is a fixed-size slot of instructions — so the entry point is assembly by
     // construction and there is nothing for a convention on a sysl function to describe.
     case Cpu.Aarch64 => None
-    // 32-bit x86 has the convention, but no 32-bit target is lowerable at all (`Target.supported`),
-    // so nothing can reach this and saying so is better than implying support.
+    // **A Cortex-M handler is an ordinary function, and that is the whole answer rather than a gap.**
+    // Armv8-M enters an exception with the caller-saved registers already stacked by the hardware
+    // and `EXC_RETURN` in the link register, so a plain AAPCS function returning normally is a
+    // correct handler — which is why the vector table can just hold its address. A convention or an
+    // attribute here would describe a prologue the processor has already written.
+    case Cpu.Thumb => None
+    // 32-bit x86 has the convention, but i386 is not lowerable for want of a measured C ABI
+    // (`Target.supported`), so nothing can reach this and saying so is better than implying support.
     case Cpu.X86 => None
 
   /** The privilege modes RISC-V distinguishes, in the spelling the attribute takes. `machine` is the

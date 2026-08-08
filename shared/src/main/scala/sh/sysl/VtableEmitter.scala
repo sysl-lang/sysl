@@ -59,7 +59,7 @@ trait VtableEmitter extends ArcEmitter {
         val self = slot.recv match
           // A large receiver is passed at its address like any other large argument, so the
           // implementation makes the copy it was always going to make and the adapter makes none.
-          case RecvMode.ByValue if Layout.indirect(vt.forType) => s"ptr $payload"
+          case RecvMode.ByValue if layout.indirect(vt.forType) => s"ptr $payload"
           case RecvMode.ByValue =>
             val v = freshTemp(); emit(s"$v = load ${vt.forType.llvm}, ptr $payload")
             s"${vt.forType.llvm} $v"

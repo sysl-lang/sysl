@@ -152,7 +152,7 @@ trait CollectionExprAnalysis extends ExprSupport {
 
       Type.element(tr.ty) match
         case Some(elem) =>
-          val ti = analyzeExpr(index, Some(Type.Usize))
+          val ti = analyzeExpr(index, Some(Type.usize))
 
           // A transparent constrained subtype stands where its base does, so an `Index within 0..<n`
           // indexes without a cast. A derived one does not: `new` is nominal, and reaching the base
@@ -188,7 +188,7 @@ trait CollectionExprAnalysis extends ExprSupport {
 
   /** One end of a slice range: an index like any other, so any integer will do. */
   protected def bound(e: Expr): TExpr = {
-    val t = analyzeExpr(e, Some(Type.Usize))
+    val t = analyzeExpr(e, Some(Type.usize))
 
     t.ty match
       case i: Type.Integer => checkedIndexWidth(t, i)
@@ -206,9 +206,9 @@ trait CollectionExprAnalysis extends ExprSupport {
    * conversion that can lose information is.
    */
   protected def checkedIndexWidth(t: TExpr, i: Type.Integer): TExpr =
-    if i.bits <= 64 then t
+    if i.bits <= target.pointerBits then t
     else
-      err(s"an index is reached at ${Type.pointerBits} bits and ${show(t.ty)} is wider, so it cannot " +
+      err(s"an index is reached at ${target.pointerBits} bits and ${show(t.ty)} is wider, so it cannot " +
         "be one without losing what it holds — write 'usize(i)' to say which value is meant")
 
   /** Whether a subscript on this type reaches one of the two indexing traits, asked of a type that

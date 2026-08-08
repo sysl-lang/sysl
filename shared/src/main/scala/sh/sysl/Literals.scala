@@ -201,7 +201,7 @@ trait Literals extends TypeResolution {
       // neither operand's type nor their shared representation. It counts *elements*, so it is the
       // inverse of `&p[n]` (`03`) — which is why the pointee decides the stride and why two pointers
       // into different objects are the programmer's business, exactly as `p[i]` already is.
-      case (Type.Ptr(_), "-")                                                             => Type.Isize
+      case (Type.Ptr(_), "-")                                                             => Type.isize
       case _ => err(s"operator '$op' is not defined for ${show(a)}")
   }
 

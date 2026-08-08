@@ -27,6 +27,11 @@ import scala.collection.mutable
  */
 object CAbi {
 
+  /** A layout already knows how wide an address is, so anything here with one in scope can write an
+   * LLVM type without being handed the width a second time — and cannot be handed a *different* one.
+   */
+  private given (using l: Layout): Word = l.word
+
   /** What a call names as its result type, and how the value comes back. */
   enum Result {
 
@@ -77,30 +82,31 @@ object CAbi {
    * A **zero-sized** aggregate is left alone. C passes nothing for one and LLVM assigns an empty
    * aggregate no register either, so the two already agree and there is nothing to coerce.
    */
-  def aggregate(t: Type): Boolean = Type.underlying(t) match {
-    case _: Type.Struct => Layout.size(t) > 0
-    case _: Type.Array  => Layout.size(t) > 0
+  def aggregate(t: Type)(using l: Layout): Boolean = Type.underlying(t) match {
+    case _: Type.Struct => l.size(t) > 0
+    case _: Type.Array  => l.size(t) > 0
     case _: Type.View   => true
     case Type.VaList    => true
     case e: Type.Enum   => !e.simple
     case p              => Type.erased(p) || erasedWeak(p)
   }
 
-  def result(t: Type, target: Target): Result =
+  def result(t: Type, target: Target)(using l: Layout): Result =
     if !aggregate(t) then Result.Plain
     else
       shape(t, target) match
-        case Shape.Memory                 => Result.Sret(t.llvm, Layout.align(t))
-        case Shape.Registers(returned, _) => Result.Coerced(returned)
+        case Shape.Memory | Shape.Split(_)  => Result.Sret(t.llvm, l.align(t))
+        case Shape.Registers(returned, _)   => Result.Coerced(returned)
 
-  def param(t: Type, target: Target): Param =
+  def param(t: Type, target: Target)(using l: Layout): Param =
     if !aggregate(t) then Param.Plain
     else
       shape(t, target) match
         case Shape.Memory =>
           // Only System V wants the copy made on the caller's stack; the rest take an address.
-          Param.Indirect(t.llvm, Layout.align(t), byval = target.cpu == Cpu.X86_64 && target.os != Os.Windows)
+          Param.Indirect(t.llvm, l.align(t), byval = target.cpu == Cpu.X86_64 && target.os != Os.Windows)
         case Shape.Registers(_, passed) => Param.Coerced(passed)
+        case Shape.Split(passed)        => Param.Coerced(passed)
 
   /** The registers an aggregate occupies, named twice — because a result and an argument may spell
    * the same registers differently, which is AAPCS64's case throughout and nobody else's.
@@ -108,6 +114,13 @@ object CAbi {
   private enum Shape {
     case Memory
     case Registers(returned: String, passed: List[Arg])
+
+    /** AAPCS32's case, and the reason `Memory` is not enough on its own: that convention returns
+     * anything wider than a register through storage while still passing the very same aggregate
+     * **in whole words**, at any size at all. A sixty-four-byte struct is an `sret` result and a
+     * `[16 x i32]` argument, so the two answers cannot be read off one verdict.
+     */
+    case Split(passed: List[Arg])
   }
 
   /** Where a result and an argument name the same registers the same way, which is every convention
@@ -120,15 +133,18 @@ object CAbi {
       pieces.map(Arg(_)),
     )
 
-  private def shape(t: Type, target: Target): Shape = {
-    val size = Layout.size(t)
+  private def shape(t: Type, target: Target)(using l: Layout): Shape = {
+    val size = l.size(t)
 
     target.cpu match
       case Cpu.Aarch64                           => aapcs64(t, size, target.os == Os.MacOS)
       case Cpu.X86_64 if target.os == Os.Windows => windows(size)
       case Cpu.X86_64                            => sysv(t, size)
-      case Cpu.Riscv64                           => riscv(t, size, target.hardFloat)
-      // A 32-bit target is refused at the registry (`Target.supported`), so nothing reaches here.
+      case Cpu.Riscv64                           => riscv(t, size, target.hardFloat, xlen = 8)
+      case Cpu.Riscv32                           => riscv(t, size, target.hardFloat, xlen = 4)
+      case Cpu.Thumb                             => aapcs32(t, size)
+      // i386 is refused at the registry (`Target.supported`) for want of exactly this, so nothing
+      // reaches here — and when its convention is measured, this is the line that gains it.
       case Cpu.X86                               => Shape.Memory
   }
 
@@ -144,8 +160,8 @@ object CAbi {
    * address is named in addresses, so that what a pointer carries beyond its bits survives being
    * handed over.
    */
-  private def aapcs64(t: Type, size: Int, macOS: Boolean): Shape = {
-    val ls        = leaves(t).map(l => Type.underlying(l._2))
+  private def aapcs64(t: Type, size: Int, macOS: Boolean)(using l: Layout): Shape = {
+    val ls        = leaves(t).map(l2 => Type.underlying(l2._2))
     val addresses = ls.nonEmpty && ls.forall(address)
 
     hfa(ls) match
@@ -157,7 +173,7 @@ object CAbi {
         Shape.Registers(s"i${size * 8}", List(Arg(if addresses then "ptr" else "i64")))
       // Two registers, and what names them is the *alignment*: sixteen bytes wanting sixteen-byte
       // alignment is one `i128`, which is a register pair, where eight-byte alignment is two of them.
-      case None if size <= 16 && Layout.align(t) >= 16 => alike(List("i128"))
+      case None if size <= 16 && l.align(t) >= 16 => alike(List("i128"))
       case None if size <= 16 =>
         Shape.Registers("[2 x i64]", List(Arg(if addresses then "[2 x ptr]" else "[2 x i64]")))
       case None => Shape.Memory
@@ -167,10 +183,46 @@ object CAbi {
    * because that is how many registers the convention sets aside for one; a fifth member makes the
    * whole thing an ordinary aggregate again, however small it is.
    */
-  private def hfa(ls: List[Type]): Option[(String, Int)] =
+  private def hfa(ls: List[Type])(using Word): Option[(String, Int)] =
     Option.when(ls.nonEmpty && ls.length <= 4 && ls.forall(floating) && ls.distinct.length == 1)(
       (ls.head.llvm, ls.length),
     )
+
+  // --- AAPCS32 ---------------------------------------------------------------------------
+
+  /** AAPCS32 with the hard-float variant, which is the Cortex-M convention — and the one that breaks
+   * the shape every other convention here has, because **its two directions disagree about memory
+   * itself** rather than merely about how to name the same registers.
+   *
+   * A result wider than one register goes through storage, at any size. An argument **never** does:
+   * whatever its size, it is named as whole words and the back end puts the surplus on the stack
+   * itself. So a sixty-four-byte struct is an `sret` result and a `[16 x i32]` argument, which is
+   * `Shape.Split`, and it is why `Param.Indirect` is unreachable on this target.
+   *
+   * The word an argument is counted in follows the aggregate's **alignment**, not its size: eight
+   * bytes of alignment makes `{ long long, int }` a `[2 x i64]` where four would have made it
+   * `[4 x i32]`. And a result of four bytes or fewer is named by a whole power-of-two width — one
+   * byte is `i8`, two `i16`, and three as well as four `i32`.
+   *
+   * All of it read off `clang -target thumbv8m.main-none-eabihf -S -emit-llvm`.
+   */
+  private def aapcs32(t: Type, size: Int)(using l: Layout): Shape = {
+    val ls = leaves(t).map(l2 => Type.underlying(l2._2))
+
+    hfa(ls) match
+      // An HFA crosses as the struct type itself in both directions: one VFP register per member is
+      // what the convention asks for and what LLVM does with a struct unaided, so the two agree and
+      // there is nothing to coerce. That is the opposite of AAPCS64, which names the same registers
+      // as an array — and the difference is clang's, not a choice available here.
+      case Some(_) => Shape.Registers(t.llvm, List(Arg(t.llvm)))
+      case None =>
+        val unit  = if l.align(t) >= 8 then 8 else 4
+        val words = List(Arg(s"[${roundUp(size, unit) / unit} x i${unit * 8}]"))
+
+        if size <= 4 then
+          Shape.Registers(if size <= 2 then s"i${size * 8}" else "i32", words)
+        else Shape.Split(words)
+  }
 
   // --- System V x86-64 -------------------------------------------------------------------
 
@@ -178,7 +230,7 @@ object CAbi {
    * belongs to a floating member travels in a floating register, anything else in an integer one.
    * Past two eightbytes there are no registers left for it and the whole thing goes in memory.
    */
-  private def sysv(t: Type, size: Int): Shape =
+  private def sysv(t: Type, size: Int)(using l: Layout): Shape =
     if size > 16 then Shape.Memory
     else
       val ls = leaves(t)
@@ -186,9 +238,9 @@ object CAbi {
       alike((0 until (size + 7) / 8).toList.map { i =>
         val lo   = i * 8
         val hi   = math.min(size, lo + 8)
-        val here = ls.filter((off, m) => off < hi && off + Layout.size(m) > lo)
+        val here = ls.filter((off, m) => off < hi && off + l.size(m) > lo)
 
-        if here.nonEmpty && here.forall(l => floating(l._2)) then floatingChunk(here)
+        if here.nonEmpty && here.forall(m => floating(m._2)) then floatingChunk(here)
         else integerChunk(ls, lo, hi, size)
       })
 
@@ -197,7 +249,7 @@ object CAbi {
    * nothing beside it — as itself. A chunk two *different* floating widths share has no such name,
    * and clang falls back to a whole `double`.
    */
-  private def floatingChunk(here: List[(Int, Type)]): String = {
+  private def floatingChunk(here: List[(Int, Type)])(using Word): String = {
     val kinds = here.map(l => Type.underlying(l._2).llvm).distinct
 
     if kinds.length > 1 then "double"
@@ -212,9 +264,9 @@ object CAbi {
    * carries more than the member starting it, there is no one member to name it after and it is the
    * bytes that are left: eight of them, or fewer in the tail.
    */
-  private def integerChunk(ls: List[(Int, Type)], lo: Int, hi: Int, size: Int): String = {
+  private def integerChunk(ls: List[(Int, Type)], lo: Int, hi: Int, size: Int)(using l: Layout): String = {
     val starts = ls.find(_._1 == lo).map(_._2)
-    val width  = starts.map(Layout.size).getOrElse(0)
+    val width  = starts.map(l.size).getOrElse(0)
     val alone  = !ls.exists((off, _) => off >= lo + width && off < math.min(lo + 8, size))
 
     // An address fills its chunk and is named as one, which changes nothing about the call — an
@@ -225,25 +277,38 @@ object CAbi {
     else s"i${(hi - lo) * 8}"
   }
 
-  // --- RISC-V LP64D ----------------------------------------------------------------------
+  // --- RISC-V, LP64D and ILP32 -----------------------------------------------------------
 
-  /** RISC-V's hardware-float convention, which **flattens** the narrow cases: an aggregate of one or
-   * two floating members travels in floating registers, and one floating member beside one integer
-   * member travels in one of each. Anything else falls back to size — including a pointer beside a
-   * float, which the convention does not count as the integer case.
+  /** RISC-V's convention, which is **one rule with the register width in it** rather than two: every
+   * threshold below is a count of `XLEN`, so LP64D and ILP32 are the same function with `xlen` at
+   * eight and at four. That is not a convenience — it is what the specification says, and writing
+   * the 32-bit case out separately would be inviting the two to drift.
    *
-   * A bare-metal RISC-V target has no floating registers to flatten into (`Target.hardFloat`), so
-   * there the size rule is the whole of it.
+   * The hardware-float variant **flattens** the narrow cases: an aggregate of one or two floating
+   * members travels in floating registers, and one floating member beside one integer member travels
+   * in one of each. Anything else falls back to size — including a pointer beside a float, which the
+   * convention does not count as the integer case.
+   *
+   * Neither bare-metal RISC-V has floating registers to flatten into (`Target.hardFloat`), at either
+   * width, so on both of them the size rule is the whole of it — the RP2350's Hazard3 is RV32IMAC
+   * with no F extension at all.
+   *
+   * Two registers are named by the aggregate's **alignment**: a two-word span aligned to two words is
+   * one double-width integer, and otherwise it is an array of two. Verified against
+   * `clang -target riscv32-unknown-elf -march=rv32imac -mabi=ilp32`, where `{ double }` comes back as
+   * `i64` and `{ int, int }` as `[2 x i32]` — same eight bytes, different alignment, different name.
    */
-  private def riscv(t: Type, size: Int, hardFloat: Boolean): Shape = {
-    val ls   = leaves(t).map(l => Type.underlying(l._2))
+  private def riscv(t: Type, size: Int, hardFloat: Boolean, xlen: Int)(using l: Layout): Shape = {
+    val ls   = leaves(t).map(l2 => Type.underlying(l2._2))
     val fps  = ls.count(floating)
-    val ints = ls.count(m => integral(m) && Layout.size(m) <= 8)
+    val ints = ls.count(m => integral(m) && l.size(m) <= xlen)
+    val one  = s"i${xlen * 8}"
 
     if hardFloat && ls.length <= 2 && fps >= 1 && fps + ints == ls.length then
-      alike(ls.map(m => if floating(m) then m.llvm else s"i${Layout.size(m) * 8}"))
-    else if size <= 8 then alike(List("i64"))
-    else if size <= 16 then alike(List(if Layout.align(t) >= 16 then "i128" else "[2 x i64]"))
+      alike(ls.map(m => if floating(m) then m.llvm else s"i${l.size(m) * 8}"))
+    else if size <= xlen then alike(List(one))
+    else if size <= xlen * 2 then
+      alike(List(if l.align(t) >= xlen * 2 then s"i${xlen * 16}" else s"[2 x $one]"))
     else Shape.Memory
   }
 
@@ -266,25 +331,25 @@ object CAbi {
    * rather than the one a program wrote — a zero-sized field occupies nothing and is not a member
    * here.
    */
-  def leaves(t: Type): List[(Int, Type)] = {
+  def leaves(t: Type)(using Layout): List[(Int, Type)] = {
     val acc = mutable.ListBuffer.empty[(Int, Type)]
 
     walk(t, 0, acc)
     acc.toList
   }
 
-  private def walk(t: Type, at: Int, acc: mutable.ListBuffer[(Int, Type)]): Unit =
+  private def walk(t: Type, at: Int, acc: mutable.ListBuffer[(Int, Type)])(using l: Layout): Unit =
     Type.underlying(t) match {
       case s: Type.Struct =>
         var off = at
 
         for (_, f) <- s.stored do
-          off = roundUp(off, Layout.align(f))
+          off = roundUp(off, l.align(f))
           walk(f, off, acc)
-          off += Layout.size(f)
+          off += l.size(f)
 
       case Type.Array(n, elem) =>
-        val stride = Layout.size(elem)
+        val stride = l.size(elem)
 
         for i <- 0 until n do walk(elem, at + i * stride, acc)
 
@@ -293,26 +358,29 @@ object CAbi {
       // never homogeneous and never all-floating, which is right: a union of a float and an integer
       // has to travel somewhere both of them fit.
       case e: Type.Enum if !e.simple =>
-        val unit  = math.max(1, Layout.payloadAlign(e))
+        val unit  = math.max(1, l.payloadAlign(e))
         val start = at + roundUp(4, unit)
 
         acc += ((at, Type.Integer(32, signed = true)))
-        for i <- 0 until (Layout.payloadSize(e) + unit - 1) / unit do
+        for i <- 0 until (l.payloadSize(e) + unit - 1) / unit do
           acc += ((start + i * unit, Type.Integer(unit * 8, signed = false)))
 
       // A view is the owner, the first element, and the count; a trait object is the table and the
       // value. Both are addresses and, for the view, a number — which is all the ABI needs of them.
+      // The strides are words rather than eights: on a 32-bit machine these members sit at 0, 4, 8.
       case _: Type.View =>
+        val w = l.pointerBytes
+
         acc += ((at, Type.Ptr(Type.Byte)))
-        acc += ((at + 8, Type.Ptr(Type.Byte)))
-        acc += ((at + 16, Type.Usize))
+        acc += ((at + w, Type.Ptr(Type.Byte)))
+        acc += ((at + w * 2, Type.usize))
 
       case Type.VaList =>
-        for i <- 0 until 4 do acc += ((at + i * 8, Type.Ptr(Type.Byte)))
+        for i <- 0 until 4 do acc += ((at + i * l.pointerBytes, Type.Ptr(Type.Byte)))
 
       case p if Type.erased(p) || erasedWeak(p) =>
         acc += ((at, Type.Ptr(Type.Byte)))
-        acc += ((at + 8, Type.Ptr(Type.Byte)))
+        acc += ((at + l.pointerBytes, Type.Ptr(Type.Byte)))
 
       case scalar => acc += ((at, scalar))
     }

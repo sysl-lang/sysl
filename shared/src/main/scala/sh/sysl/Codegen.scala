@@ -139,7 +139,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     for e <- enums do
       for v <- e.variants if v.carries do
         out ++= s"${e.payloadLlvm(v)} = type { ${v.stored.map(_._2.llvm).mkString(", ")} }\n"
-      val (unit, count) = Layout.payloadArea(e)
+      val (unit, count) = layout.payloadArea(e)
       out ++= s"${e.llvm} = type { i32, [$count x $unit] }\n"
     if enums.nonEmpty then out ++= "\n"
 
@@ -343,10 +343,10 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       emitAlloca(s"%$name.addr", ty.llvm)
       // A large one arrived as an address, so the copy the callee makes for itself is a copy of
       // bytes and the count it takes is taken at the slot rather than off a value it never had.
-      if Layout.indirect(ty) then
+      if layout.indirect(ty) then
         usesMemcpy = true
-        emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align ${Layout.align(ty)} %$name.addr, " +
-          s"ptr align ${Layout.align(ty)} %$name.param, i64 ${Layout.size(ty)}, i1 false)")
+        emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align ${layout.align(ty)} %$name.addr, " +
+          s"ptr align ${layout.align(ty)} %$name.param, i64 ${layout.size(ty)}, i1 false)")
         retainAt(ty, s"%$name.addr")
       else
         emit(s"store ${ty.llvm} %$name.param, ptr %$name.addr")
@@ -391,7 +391,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // A `never` result is `void` like `unit`: the body's trailing expression diverges, so it has
     // already terminated the block and the `ret` emitted here is dropped.
     f.body.result match
-      case Some(r) if Layout.indirect(f.retTy) => genIndirectReturn(r)
+      case Some(r) if layout.indirect(f.retTy) => genIndirectReturn(r)
       case Some(r) if !Type.noValue(f.retTy) =>
         val v = genExpr(r)
         retainValue(f.retTy, v)
@@ -402,7 +402,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
         genExpr(r); emitEnsures(None); releaseAll(); emitTerm("ret void")
       case None if Type.noValue(f.retTy) =>
         emitEnsures(None); releaseAll(); emitTerm("ret void")
-      case None if Layout.indirect(f.retTy) =>
+      case None if layout.indirect(f.retTy) =>
         emit(s"store ${f.retTy.llvm} zeroinitializer, ptr $sretParam")
         releaseAll(); emitTerm("ret void")
       case None =>
@@ -542,7 +542,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
     case TReturn(opt) =>
       opt match
-        case Some(t) if Layout.indirect(t.ty) => genIndirectReturn(t)
+        case Some(t) if layout.indirect(t.ty) => genIndirectReturn(t)
         case Some(t) =>
           val v = genExpr(t)
           retainValue(t.ty, v)

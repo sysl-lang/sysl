@@ -34,6 +34,21 @@ case class Poisoned() extends RuntimeException
  */
 trait Reporting {
 
+  /** The machine this compilation is **for** (`targets.md`), which reaches the analyzer and not only
+   * codegen because two of the language's types are answers about it: `usize` and `isize` are
+   * pointer-width by definition, so what they resolve to is the target's business.
+   *
+   * It sits at the root of the analyzer's trait chain for the same reason the diagnostics do — every
+   * layer needs it, and a layer handed it separately is a layer that could be handed a different one.
+   */
+  protected def target: Target
+
+  /** How wide an address is, given to every `Type.llvm` and `Type.usize` below this point. */
+  protected given Word = target.word
+
+  /** What this machine's types cost. */
+  protected given layout: Layout = Layout(target)
+
   /** Where the analyzer currently is. Every recursive entry point (a statement, an expression, a
    * type reference, a declaration) sets this to the node it is about to work on and restores it
    * afterwards, so an error raised *after* the children are done still points at the parent that

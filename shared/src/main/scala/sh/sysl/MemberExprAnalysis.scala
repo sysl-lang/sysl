@@ -57,7 +57,7 @@ trait MemberExprAnalysis extends ExprSupport {
         if lookupOpt(written).isEmpty && tsubst.get(written).exists(_.isInstanceOf[Type.Pack]) =>
       val pack = tsubst(written).asInstanceOf[Type.Pack]
 
-      if f == "len" then TIntLit(BigInt(pack.elems.length), Type.Usize)
+      if f == "len" then TIntLit(BigInt(pack.elems.length), Type.usize)
       else
         err(s"'..$written' is a type pack, and 'len' — how many types it stands for — is the whole " +
           s"of what one offers; there is no '$written.$f'")
@@ -159,7 +159,7 @@ trait MemberExprAnalysis extends ExprSupport {
         // as a `[]u8`, dropping only the validity guarantee, and `chars` a cursor over the scalar
         // values those bytes encode. `chars` is the one that cannot be a view — the decoding is
         // what makes the characters — so it is the library's `Chars`, positioned at the start.
-        case _: Type.Array | _: Type.View if f == "len" => TLen(tr)
+        case _: Type.Array | _: Type.View if f == "len" => TLen(tr, Type.usize)
         case Type.Str if f == "bytes"                   => TBytes(tr)
         case Type.Str if f == "chars"                   => callLibrary("chars_of", TBytes(tr))
 

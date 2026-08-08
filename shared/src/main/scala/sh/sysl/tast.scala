@@ -90,8 +90,13 @@ case class TIndex(receiver: TExpr, index: TExpr, ty: Type) extends TExpr
 
 /** `a.len` — how many elements, as a `usize`. Constant for an array, a word of the view for a
  * slice or a string, where it counts bytes.
+ *
+ * The type is carried rather than computed, and it is the only node in this tree where that is so.
+ * A `usize` is pointer-width by definition, so its width is the target's answer — and a node that
+ * worked its own type out would have to be told the machine to do it, which is a thing a typed tree
+ * should already be past. The analyzer knows the target and writes it down once.
  */
-case class TLen(receiver: TExpr) extends TExpr { def ty: Type = Type.Usize }
+case class TLen(receiver: TExpr, ty: Type) extends TExpr
 
 /** `s.bytes` — a string's bytes, as a `[]const u8`. The same three words the string already is, so
  * this reinterprets rather than converts; only the validity guarantee is given up.

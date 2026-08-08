@@ -76,7 +76,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       val slot = emitAlloca(freshTemp(), other.ty.llvm)
       // A large one is written into the slot rather than produced and then stored into it — the
       // slot is what it was going to end up in either way.
-      if Layout.indirect(other.ty) then genBorrowedInto(slot, other)
+      if layout.indirect(other.ty) then genBorrowedInto(slot, other)
       else emit(s"store ${other.ty.llvm} ${genExpr(other)}, ptr $slot")
       slot
 
@@ -90,7 +90,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     // for the purpose. The order is the same one the value form keeps and for the same reason: the
     // count for the arriving value is taken first, so assigning something to itself never briefly
     // drops the last one.
-    else if Layout.indirect(ty) && q.isEmpty then
+    else if layout.indirect(ty) && q.isEmpty then
       retainValue(ty, v)
       releaseAt(ty, p)
       emit(s"store ${ty.llvm} $v, ptr $p")

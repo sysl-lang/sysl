@@ -46,17 +46,22 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
       Target.aarch64Freestanding.vaList shouldBe VaListAbi.Copied
     }
 
-    // The one storage `Type.VaList` reserves has to hold whatever `va_start` writes into it on any
-    // of them, so the widest is the number that matters and it is 32 bytes.
+    // The storage `Type.VaList` reserves has to hold whatever `va_start` writes into it, and it is
+    // four *words* — so this is a claim per target rather than one number, and on a 32-bit machine
+    // it is sixteen bytes against a `va_list` of four. Asserting the old single figure of 32 would
+    // now be asserting it of machines that do not have it.
     "reserves storage wide enough for every target's own va_list" in {
-      Target.all.map(_.vaListBytes).max shouldBe Layout.size(Type.VaList)
+      for t <- Target.all do
+        withClue(t.name)(Layout(t).size(Type.VaList) should be >= t.vaListBytes)
     }
 
-    // Bare-metal RISC-V is not built for the floating extension and every other target is, which is
-    // clang's default for each of these triples and therefore has to be sysl's — the two are handed
-    // the same triple and have to make the same assumption about it (`CAbi`).
+    // Neither bare-metal RISC-V is built for the floating extension and every other target is, which
+    // is clang's default for each of these triples and therefore has to be sysl's — the two are
+    // handed the same triple and have to make the same assumption about it (`CAbi`). At 32 bits it
+    // is firmer than a default: the RP2350's Hazard3 is RV32IMAC, with no F extension to use.
     "records which targets have floating registers to pass arguments in" in {
-      Target.all.filterNot(_.hardFloat).map(_.name) shouldBe List("riscv64-freestanding")
+      Target.all.filterNot(_.hardFloat).map(_.name) shouldBe
+        List("riscv64-freestanding", "riscv32-freestanding")
     }
 
     // Whether a thread's storage is laid down before `main` is a fact about the system and not about
@@ -268,14 +273,20 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
       supported.map(t => irFor(t, shapes)).distinct.length should be > 1
     }
 
-    // The width is `Layout`'s, not the target's: a module built for a machine whose own `va_list` is
-    // eight bytes still reserves the widest any of them needs.
-    "and a va_list is spelled one way in every module, the widest any target needs" in {
+    // The storage is sysl's rather than the target's: a module built for a machine whose own
+    // `va_list` is eight bytes still reserves four words. The *spelling* is one string on every
+    // target — `[4 x ptr]` — and it is the pointer inside it that makes the bytes differ, which is
+    // why this asserts the text and the section above asserts the width.
+    "and a va_list is spelled one way in every module, four words wide" in {
       Target.all.filter(_.supported).map(_.vaListBytes).distinct.length should be > 1
-      Layout.size(Type.VaList) shouldBe 32
 
       for t <- Target.all if t.supported do
-        withClue(t.name)(irFor(t, shapes) should include(s"alloca ${Type.VaList.llvm}"))
+        given Word = t.word
+
+        withClue(t.name) {
+          Layout(t).size(Type.VaList) shouldBe t.pointerBytes * 4
+          irFor(t, shapes) should include(s"alloca ${Type.VaList.llvm}")
+        }
     }
   }
 

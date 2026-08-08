@@ -121,7 +121,7 @@ object TreeWalk {
     case TBufLit(elems, _)          => elems
     case TBufFill(v, n, _)          => List(v, n)
     case TIndex(r, i, _)            => List(r, i)
-    case TLen(r)                    => List(r)
+    case TLen(r, _)                    => List(r)
     case TBytes(r)                  => List(r)
     case TStr(a)                    => List(a)
     // The string it yields owns a copy, so nothing of the argument's storage survives in it — the

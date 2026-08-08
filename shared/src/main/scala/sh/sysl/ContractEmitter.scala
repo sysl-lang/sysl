@@ -89,7 +89,7 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
     popTemps()
 
     for (name, ty, keep) <- saved do
-      if Layout.indirect(ty) then memcpy(s"%$name.addr", keep, ty)
+      if layout.indirect(ty) then memcpy(s"%$name.addr", keep, ty)
       else
         val back = freshTemp(); emit(s"$back = load ${ty.llvm}, ptr $keep")
         emit(s"store ${ty.llvm} $back, ptr %$name.addr")
@@ -102,8 +102,8 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
 
   private def memcpy(dst: String, src: String, ty: Type): Unit = {
     usesMemcpy = true
-    emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align ${Layout.align(ty)} $dst, " +
-      s"ptr align ${Layout.align(ty)} $src, i64 ${Layout.size(ty)}, i1 false)")
+    emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align ${layout.align(ty)} $dst, " +
+      s"ptr align ${layout.align(ty)} $src, i64 ${layout.size(ty)}, i1 false)")
   }
 
   /** Emits a contract clause as a trap-on-false check, discarding any temporaries the condition

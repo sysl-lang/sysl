@@ -43,23 +43,43 @@ of what makes it different from `build`.
 | `aarch64-freestanding` | `aarch64-none-elf` | copied | yes |
 | `x86_64-freestanding` | `x86_64-unknown-none-elf` | address | yes |
 | `riscv64-freestanding` | `riscv64-unknown-elf` | loaded | **no** |
-| `x86-linux` | `i386-unknown-linux-gnu` | *32-bit — not yet supported* | |
+| `thumb-freestanding` | `thumbv8m.main-none-eabihf` | loaded | yes |
+| `riscv32-freestanding` | `riscv32-unknown-elf` | loaded | **no** |
+| `x86-linux` | `i386-unknown-linux-gnu` | *no measured C ABI* | |
 
-**Bare-metal RISC-V is the one target with no floating registers to pass arguments in.** The hosted
-triple is built for the D extension and this one is not, which is clang's default for each — and
-since sysl hands its own triple to clang, the two have to make the same assumption about the same
-triple or the call disagrees. It reaches exactly one decision, whether a small aggregate of floating
-members is flattened into registers, and that is why it is recorded rather than derived.
+**The last two are 32-bit, and they are the two halves of one board.** The RP2350 boots either a
+pair of Cortex-M33s or a pair of RV32IMAC Hazard3 cores, and both are here because a
+microcontroller is what *freestanding* is mostly for: the three 64-bit freestanding rows reach
+kernels and hypervisors, which is a different audience from the one writing embedded C, and nearly
+all of that is 32-bit.
+
+`thumb` rather than `arm` names the Arm half, and the reason is the assembly arm rather than the
+architecture family — a Cortex-M executes Thumb only, so an arm written for A32 would assemble for a
+machine that cannot run it. One spelling serves `#if` and `asm` alike, as for every other processor.
+
+**Neither bare-metal RISC-V has floating registers to pass arguments in, at either width.** The
+hosted 64-bit triple is built for the D extension and the bare ones are not, which is clang's default
+for each — and since sysl hands its own triple to clang, the two have to make the same assumption
+about the same triple or the call disagrees. At 32 bits it is firmer than a default: the Hazard3 is
+RV32IMAC and has no F extension to use. It reaches exactly one decision, whether a small aggregate of
+floating members is flattened into registers, and that is why it is recorded rather than derived.
+
+The Cortex-M33 goes the other way and needed checking rather than assuming: `eabihf` selects the
+hard-float convention, and clang gives `thumbv8m.main` an `fpv5-d16` unasked, so arguments really do
+cross in VFP registers. `-mcpu=cortex-m33` refines instruction selection to the exact core and
+changes nothing about the ABI — it is the sub-architecture question left open at the bottom of this
+page, and it is not needed for a correct call.
 
 **`Freestanding` is a real answer, not a missing one.** A kernel or a bare-metal program has no
 operating system, and the ABI of a freestanding ELF target is fully specified; it differs from a
 hosted target on the same processor only where the OS is what fixed the convention. That is the
 target a `no alloc` module (`capabilities.md`) is eventually built for.
 
-**A target sysl knows and cannot build for is listed anyway.** `x86-linux` is refused with a
-message saying it is 32-bit, because a reader told the name is *unknown* would go looking for a
-typo that is not there. The limit is the compiler's, not the machine's — see *What a target does
-not decide*.
+**A target sysl knows and cannot build for is listed anyway.** `x86-linux` is refused with a message
+saying what is missing, because a reader told the name is *unknown* would go looking for a typo that
+is not there. **What is missing is no longer its width** — this page said "it is 32-bit" until 32-bit
+targets arrived — but a C calling convention measured against clang, which *Adding one* says is the
+only way a target's answers may be arrived at. The limit is the compiler's, not the machine's.
 
 ### Adding one
 

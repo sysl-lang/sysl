@@ -48,7 +48,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    * evaluating the arguments a second time would run whatever they do twice.
    */
   protected def argValue(a: TExpr): Option[(Type, Either[String, String])] =
-    if Layout.indirect(a.ty) then Some((a.ty, Left(address(a))))
+    if layout.indirect(a.ty) then Some((a.ty, Left(address(a))))
     else
       val v = genExpr(a)
 
@@ -82,7 +82,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     val staged =
       tailParams.zip(args).map { case ((_, ty), a) =>
         if Type.zeroSized(ty) then { genExpr(a); None }
-        else if Layout.indirect(ty) then
+        else if layout.indirect(ty) then
           val slot = emitAlloca(freshTemp(), ty.llvm)
 
           genOwnedInto(slot, a)
@@ -113,8 +113,8 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
         // parameter's, so nothing is retained here and nothing released.
         case Left(slot) =>
           usesMemcpy = true
-          emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align ${Layout.align(ty)} %$name.addr, " +
-            s"ptr align ${Layout.align(ty)} $slot, i64 ${Layout.size(ty)}, i1 false)")
+          emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align ${layout.align(ty)} %$name.addr, " +
+            s"ptr align ${layout.align(ty)} $slot, i64 ${layout.size(ty)}, i1 false)")
 
         case Right(v) => emit(s"store ${ty.llvm} $v, ptr %$name.addr")
 
@@ -256,7 +256,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       case Some(_) =>
         val slot = dest.getOrElse(emitAlloca(freshTemp(), ty.llvm))
 
-        emit(s"call $callee(${(s"ptr sret(${ty.llvm}) align ${Layout.align(ty)} $slot" :: argVals).mkString(", ")})")
+        emit(s"call $callee(${(s"ptr sret(${ty.llvm}) align ${layout.align(ty)} $slot" :: argVals).mkString(", ")})")
 
         if dest.isDefined then ""
         else
@@ -420,7 +420,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
 
   // --- writing a value where it is going to live ----------------------------------------
   //
-  // A **large** aggregate (`Layout.indirect`) is built, copied and returned through memory, so the
+  // A **large** aggregate (`layout.indirect`) is built, copied and returned through memory, so the
   // two forms below exist beside `genExpr`: they take the address the value is wanted at and write
   // it there, instead of handing back a register the caller then stores. That is the difference
   // between a struct literal that is fourteen `insertvalue` instructions over multi-kilobyte SSA
@@ -434,7 +434,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    * every reference inside, which is what a slot that will later release them needs.
    */
   protected def genOwnedInto(dest: String, e: TExpr): Unit =
-    if !Layout.indirect(e.ty) then
+    if !layout.indirect(e.ty) then
       val v = genExpr(e)
 
       retainValue(e.ty, v)
@@ -514,8 +514,8 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       val src = address(place)
 
       usesMemcpy = true
-      emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align ${Layout.align(e.ty)} $dest, " +
-        s"ptr align ${Layout.align(e.ty)} $src, i64 ${Layout.size(e.ty)}, i1 false)")
+      emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align ${layout.align(e.ty)} $dest, " +
+        s"ptr align ${layout.align(e.ty)} $src, i64 ${layout.size(e.ty)}, i1 false)")
 
     case _ =>
       val v = genExpr(e)
@@ -575,7 +575,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
 
     // A large one is built where it is going to live and read back out only because this caller
     // asked for a value; a small one is the `insertvalue` chain it always was.
-    case e @ TArrayLit(_, arrayTy) if Layout.indirect(arrayTy) => throughSlot(e)
+    case e @ TArrayLit(_, arrayTy) if layout.indirect(arrayTy) => throughSlot(e)
 
     case TArrayLit(elems, arrayTy) =>
       val vals = elems.map(genExpr)
@@ -628,7 +628,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     case TSlice(base, lo, hi, inclusive, sliceTy) =>
       genSlice(base, lo, hi, inclusive, sliceTy)
 
-    case TLen(receiver) =>
+    case TLen(receiver, _) =>
       receiver.ty match
         case Type.Array(n, _) => genExpr(receiver); n.toString
         case w: Type.View =>
@@ -825,18 +825,18 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       */
     case TBinary("-", l, r, _) if Type.underlying(l.ty).isInstanceOf[Type.Ptr] =>
       val stride = Type.underlying(l.ty) match
-        case Type.Ptr(e) => Layout.size(e)
+        case Type.Ptr(e) => layout.size(e)
         case _           => 1
       val (lv, rv) = (genExpr(l), genExpr(r))
       val (la, ra) = (freshTemp(), freshTemp())
-      emit(s"$la = ptrtoint ptr $lv to ${Type.Isize.llvm}")
-      emit(s"$ra = ptrtoint ptr $rv to ${Type.Isize.llvm}")
+      emit(s"$la = ptrtoint ptr $lv to ${Type.isize.llvm}")
+      emit(s"$ra = ptrtoint ptr $rv to ${Type.isize.llvm}")
       val bytes = freshTemp()
-      emit(s"$bytes = sub ${Type.Isize.llvm} $la, $ra")
+      emit(s"$bytes = sub ${Type.isize.llvm} $la, $ra")
       if stride <= 1 then bytes
       else
         val n = freshTemp()
-        emit(s"$n = sdiv ${Type.Isize.llvm} $bytes, $stride")
+        emit(s"$n = sdiv ${Type.isize.llvm} $bytes, $stride")
         n
 
     case TBinary(op, l, r, _) =>
@@ -879,7 +879,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       val vs   = ops.map(genExpr)
       val ll   = at.llvm
       val ordr = Atomics.llvm(ord)
-      val al   = Layout.align(at)
+      val al   = layout.align(at)
 
       op match
         case "atomic_load" =>
@@ -1137,9 +1137,9 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       val s = genExpr(src)
       emit(s"call void @llvm.va_copy.p0(ptr $d, ptr $s)"); ""
 
-    case e @ TStructNew(struct, _) if Layout.indirect(struct) => throughSlot(e)
+    case e @ TStructNew(struct, _) if layout.indirect(struct) => throughSlot(e)
 
-    case e @ TEnumNew(en, _, _) if !en.simple && Layout.indirect(en) => throughSlot(e)
+    case e @ TEnumNew(en, _, _) if !en.simple && layout.indirect(en) => throughSlot(e)
 
     case TStructNew(struct, args) =>
       val vals = args.map(genExpr)
@@ -1184,7 +1184,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     // So is a field of a **large** struct, for a reason that is arithmetic rather than hardware:
     // lifting one field out of a value means producing the whole value first, and for a receiver of
     // kilobytes that is a first-class aggregate emitted to read four bytes out of it.
-    case e @ TField(receiver, _, ty) if Layout.indirect(receiver.ty) && hasAddress(receiver) =>
+    case e @ TField(receiver, _, ty) if layout.indirect(receiver.ty) && hasAddress(receiver) =>
       val p = address(e)
       val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $p"); r
 
