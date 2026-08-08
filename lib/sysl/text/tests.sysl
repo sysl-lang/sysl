@@ -174,3 +174,70 @@ columns_accented()
     // overstates the width, which is the mistake `columns` was written to stop a table making.
     assert_eq(columns("é".bytes), 1)
 end columns_accented
+
+// -- UTF-8, both directions -------------------------------------------------------------------------
+//
+// The encoder is `sysl.encode_utf8` rather than one of this module's, and it is asserted here because
+// this is where the decoder it has to agree with lives: a round trip is the only test that catches
+// the two drifting apart.
+
+@test("a character encodes to the bytes its length says")
+encode_widths()
+    var b: [4]u8
+
+    assert_eq(encode_utf8('A', b[0..<4]), 1)
+    assert_eq(b[0], 65)
+
+    assert_eq(encode_utf8('é', b[0..<4]), 2)
+    assert_eq(b[0], 195)
+    assert_eq(b[1], 169)
+
+    assert_eq(encode_utf8('世', b[0..<4]), 3)
+    assert_eq(encode_utf8('\u{1F600}', b[0..<4]), 4)
+end encode_widths
+
+@test("every character round-trips through the encoder and the decoder")
+encode_round_trip()
+    var b: [4]u8
+    var out = str_builder()
+
+    for c in "aé世\u{1F600}".chars
+        var n = encode_utf8(c, b[0..<4])
+
+        // Through the *strict* decoder, so the bytes have to be well-formed and not merely the right
+        // count -- an encoder that dropped a continuation byte would still agree with itself.
+        out.push(from_utf8(b[0..<n]).unwrap())
+
+    assert_eq(out.finish(), "aé世\u{1F600}")
+end encode_round_trip
+
+@test("valid bytes decode lossily to themselves")
+lossy_keeps_valid()
+    assert_eq(from_utf8_lossy("héllo ☃".bytes), "héllo ☃")
+end lossy_keeps_valid
+
+// One replacement per ill-formed run, not one per byte: `E2 82` is a euro sign missing its last
+// byte, which Unicode asks be reported as a single U+FFFD.
+@test("a truncated sequence becomes one replacement character")
+lossy_truncated_is_one()
+    var bad: [3]u8 = [97, 226, 130]
+
+    assert_eq(from_utf8_lossy(bad[0..<3]), "a\u{FFFD}")
+end lossy_truncated_is_one
+
+@test("a byte that can never begin a character is replaced on its own")
+lossy_stray_byte()
+    var bad: [3]u8 = [97, 255, 98]
+
+    assert_eq(from_utf8_lossy(bad[0..<3]), "a\u{FFFD}b")
+end lossy_stray_byte
+
+// The same bytes the strict form refuses, which is the pair that says the two agree about what is
+// text and differ only in what they do about it.
+@test("the strict form refuses what the lossy form repairs")
+lossy_and_strict_agree()
+    var bad: [2]u8 = [97, 255]
+
+    assert(from_utf8(bad[0..<2]).is_err())
+    assert_eq(from_utf8_lossy(bad[0..<2]), "a\u{FFFD}")
+end lossy_and_strict_agree

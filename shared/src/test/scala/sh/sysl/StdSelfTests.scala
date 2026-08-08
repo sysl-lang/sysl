@@ -37,9 +37,10 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * **Raise it when a batch adds a module's worth of tests**, or it stops doing its job: a floor far
    * below the real count still passes with a whole file missing, which is the one thing it is for.
    * Raised from 60 to 120 when `sysl.slices`, `sysl.encoding` and `sysl.rand` took the library from
-   * 89 collected tests to 136.
+   * 89 collected tests to 136, and to 155 when the UTF-8 encoder, `Buf.insert` and the sub-second
+   * durations took it to 163.
    */
-  private val floor = 145
+  private val floor = 155
 
   /** The library, compiled as a **test build of itself**.
    *

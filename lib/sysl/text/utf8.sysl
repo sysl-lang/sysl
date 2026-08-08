@@ -38,49 +38,130 @@ struct Utf8Error
 // `[]u8`, and the compiler supplies just `from_utf8_unchecked`, the primitive that says "these bytes
 // are a string now".
 //
-// The validator is Unicode's own well-formedness table rather than a decode-and-range-check, which
-// is what makes the four ways of being ill-formed -- overlong, a surrogate, a value past `10FFFF`,
-// and a byte that can never appear -- fall out of the lead byte's row instead of each needing a test
-// of its own.
+// The validation is `scan_at` below, which is also what the lossy form walks -- one table, so that
+// the two can never come to disagree about which bytes are text.
 from_utf8(b: []const u8) -> Result[string, Utf8Error]
     var i: usize = 0
+
     while i < b.len
-        var c = b[i]
-        var need: usize = 0
-        var lo: u8 = 128
-        var hi: u8 = 191
-
-        if c < 128 then
-            need = 1
-        elif c < 194 then
-            return Err(Utf8Error(i, false))
-        elif c < 224 then
-            need = 2
-        elif c < 240 then
-            need = 3
-            if c == 224 then lo = 160
-            if c == 237 then hi = 159
-        elif c < 245 then
-            need = 4
-            if c == 240 then lo = 144
-            if c == 244 then hi = 143
-        else
-            return Err(Utf8Error(i, false))
-
-        var have = b.len - i
-        var k: usize = 1
-        while k < need && k < have
-            var t = b[i + k]
-            var min: u8 = if k == 1 then lo else 128
-            var max: u8 = if k == 1 then hi else 191
-            if t < min || t > max then return Err(Utf8Error(i, false))
-            k += 1
-
-        if have < need then return Err(Utf8Error(i, true))
-        i += need
+        scan_at(b, i) match
+            Valid(n) -> i += n
+            Truncated(_) -> return Err(Utf8Error(i, true))
+            Invalid(_) -> return Err(Utf8Error(i, false))
 
     Ok(from_utf8_unchecked(b))
 end from_utf8
+
+// What one step of the walk found, and how far it reaches.
+//
+// The two failures are separated for the reason `Utf8Error` separates them -- input that merely
+// *ended* mid-sequence is fixed by more bytes and input that cannot be rescued is not -- and both
+// carry a length, which is what a caller substituting rather than refusing needs. That length is
+// the **maximal ill-formed subsequence**: the bytes that were consistent with a longer sequence
+// before the one that was not. Unicode asks for one replacement character per such run rather than
+// one per byte, and getting that right is the whole reason a length is reported at all.
+private enum Scan
+    Valid(len: usize)
+    Invalid(len: usize)
+    Truncated(len: usize)
+end Scan
+
+// The well-formedness table, walked one character at a time.
+//
+// It is Unicode's own table rather than a decode-and-range-check, which is what makes the four ways
+// of being ill-formed -- overlong, a surrogate, a value past `10FFFF`, and a byte that can never
+// appear -- fall out of the lead byte's row instead of each needing a test of its own.
+private scan_at(b: []const u8, i: usize) -> Scan
+    var c = b[i]
+    var need: usize = 0
+    var lo: u8 = 128
+    var hi: u8 = 191
+
+    if c < 128 then
+        return Valid(1)
+    elif c < 194 then
+        return Invalid(1)
+    elif c < 224 then
+        need = 2
+    elif c < 240 then
+        need = 3
+        if c == 224 then lo = 160
+        if c == 237 then hi = 159
+    elif c < 245 then
+        need = 4
+        if c == 240 then lo = 144
+        if c == 244 then hi = 143
+    else
+        return Invalid(1)
+
+    var have = b.len - i
+    var k: usize = 1
+
+    while k < need
+        if k >= have then return Truncated(k)
+
+        var t = b[i + k]
+        var min: u8 = if k == 1 then lo else 128
+        var max: u8 = if k == 1 then hi else 191
+
+        if t < min || t > max then return Invalid(k)
+
+        k += 1
+
+    Valid(need)
+end scan_at
+
+// What a decoder is expected to do with bytes that are not text: keep what is well-formed and put
+// U+FFFD where the rest was, rather than refusing the whole input.
+//
+// **It is the right answer for untrusted bytes and the wrong one for bytes that ought to be valid**,
+// which is why it sits beside `from_utf8` rather than replacing it. Text coming off a wire, out of a
+// file somebody else wrote, or from a serial port carries whatever was sent; a caller reading that
+// wants a string it can show a person, and a `Result` there only moves the substitution one line up.
+// A caller decoding its own output wants to be told, and `from_utf8` tells it.
+//
+// One replacement character per **maximal ill-formed subsequence**, which is what Unicode recommends
+// and what `scan_at` reports: a truncated three-byte sequence at the end of the input is one U+FFFD
+// and not two.
+//
+// Valid input costs one walk and no allocation at all -- the bytes are handed over as they are, which
+// is the case a caller who cannot know has most of the time.
+from_utf8_lossy(b: []const u8) -> string
+    var i: usize = 0
+
+    while i < b.len
+        scan_at(b, i) match
+            Valid(n) -> i += n
+            _ -> return lossy_from(b, i)
+
+    from_utf8_unchecked(b)
+end from_utf8_lossy
+
+// The rebuilding half, entered at the first fault so that the valid prefix is copied once rather
+// than walked twice.
+private lossy_from(b: []const u8, from: usize) -> string
+    var out = str_builder()
+
+    out.bytes.extend(b[0..<from])
+
+    var i = from
+
+    while i < b.len
+        scan_at(b, i) match
+            Valid(n) ->
+                out.bytes.extend(b[i..<i + n])
+                i += n
+            Invalid(n) ->
+                out.push_char(replacement)
+                i += n
+            Truncated(n) ->
+                out.push_char(replacement)
+                i += n
+
+    out.finish()
+end lossy_from
+
+private const replacement: char = '\u{FFFD}'
 
 // A `string` copied out of the NUL-terminated bytes a C function handed back -- the other direction
 // of `cstring`, and the one every binding needs the moment a C library reports anything in words.

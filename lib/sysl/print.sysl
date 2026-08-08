@@ -112,27 +112,49 @@ end printr
 
 printb(b: bool) = prints(if b then "true" else "false")
 
-// A `char` is encoded here rather than handed to `snprintf`, which has no conversion that takes a
-// code point.
+// A character's UTF-8 bytes, written into storage the caller owns, answering how many were written.
+// No character needs more than four, so `var b: [4]u8` is always enough and always on the stack --
+// which is what keeps this usable where there is no allocator.
+//
+// The caller supplying the buffer is what makes that true, and it is the same shape every other
+// place in the library takes when a result has a known bound. A slice with fewer than the four bytes
+// is a mistake in the program rather than a truncation, and the bounds check says so: how many bytes
+// are needed is not known until the character has been looked at, so there is no honest way to
+// answer "it did not fit" that is cheaper than having room.
+//
+// **It lives in `sysl` rather than beside `from_utf8` in `sysl.text`, and that is forced.** A
+// submodule may name the standard module freely and `sysl` may not name back (`13 §6`), so an
+// encoder over in `sysl.text` would be one `printc` below could not call -- and the second encoder
+// that would then have to be written for it is exactly the hand-rolled copy this function exists to
+// prevent. One encoder in an odd place beats two in tidy ones.
+encode_utf8(ch: char, into: []u8) -> usize
+    var cp = uint(ch)
+
+    if cp < 128 then
+        into[0] = u8(cp)
+        return 1
+
+    if cp < 2048 then
+        into[0] = u8(192 | (cp >> 6))
+        into[1] = u8(128 | (cp & 63))
+        return 2
+
+    if cp < 65536 then
+        into[0] = u8(224 | (cp >> 12))
+        into[1] = u8(128 | ((cp >> 6) & 63))
+        into[2] = u8(128 | (cp & 63))
+        return 3
+
+    into[0] = u8(240 | (cp >> 18))
+    into[1] = u8(128 | ((cp >> 12) & 63))
+    into[2] = u8(128 | ((cp >> 6) & 63))
+    into[3] = u8(128 | (cp & 63))
+    4
+end encode_utf8
+
+// A `char` is encoded rather than handed to `snprintf`, which has no conversion that takes a code
+// point.
 printc(ch: char)
     var buf: [4]u8
-    var cp = uint(ch)
-    if cp < 128 then
-        buf[0] = u8(cp)
-        putbytes(buf[0..<1])
-    elif cp < 2048 then
-        buf[0] = u8(192 | (cp >> 6))
-        buf[1] = u8(128 | (cp & 63))
-        putbytes(buf[0..<2])
-    elif cp < 65536 then
-        buf[0] = u8(224 | (cp >> 12))
-        buf[1] = u8(128 | ((cp >> 6) & 63))
-        buf[2] = u8(128 | (cp & 63))
-        putbytes(buf[0..<3])
-    else
-        buf[0] = u8(240 | (cp >> 18))
-        buf[1] = u8(128 | ((cp >> 12) & 63))
-        buf[2] = u8(128 | ((cp >> 6) & 63))
-        buf[3] = u8(128 | (cp & 63))
-        putbytes(buf[0..<4])
-end printc
+
+    putbytes(buf[0..<encode_utf8(ch, buf[0..<4])])
