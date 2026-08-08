@@ -101,6 +101,18 @@ class IntegerAttrRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
+  "a ranged subtype answers both pairs" - {
+    // They are different questions that agree on a range written in order. Refusing `Min` on the one
+    // kind of type whose whole purpose is bounds would be the odd outcome.
+    "Min and Max read the same numbers First and Last do" in {
+      run("type Age = int within 0..150\nprint(Age::Min, Age::Max, Age::First, Age::Last)") shouldBe
+        "0 150 0 150\n"
+    }
+    "and an exclusive upper is one below, for both spellings" in {
+      run("type Prob = int within 0..<10\nprint(Prob::Max, Prob::Last)") shouldBe "9 9\n"
+    }
+  }
+
   "they answer in the type they are the bounds of" - {
     "a maximum assigns to its own width without a cast" in {
       run("val x: u8 = u8::Max\nprint(x)") shouldBe "255\n"

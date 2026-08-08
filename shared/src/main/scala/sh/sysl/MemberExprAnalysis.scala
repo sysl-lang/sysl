@@ -303,6 +303,13 @@ trait MemberExprAnalysis extends ExprSupport {
     attr match
       case "First" => noArgs(); TIntLit(ranged._1.toBigInt, c)
       case "Last"  => noArgs(); val (_, hi) = ranged; TIntLit((if c.exclusiveHi then hi - 1 else hi).toBigInt, c)
+      // A ranged subtype answers **both** pairs, and they are the same two numbers here. They are
+      // different questions that happen to agree: `First`/`Last` are the ends of the range as
+      // written, `Min`/`Max` the extremes the type can hold. Refusing `Min` on the one type whose
+      // whole purpose is bounds would be the odd outcome — and a reader who learned `Min` on `u32`
+      // should not have to learn that a subtype of `u32` renamed it.
+      case "Min" => noArgs(); TIntLit(ranged._1.toBigInt, c)
+      case "Max" => noArgs(); val (_, hi) = ranged; TIntLit((if c.exclusiveHi then hi - 1 else hi).toBigInt, c)
       case "Valid" => val x = oneArg(base); ranged; TConstrainedValid(x, c)
       case "Succ"  => val x = oneArg(c); ranged; TConstrainedStep(x, c, up = true, c)
       case "Pred"  => val x = oneArg(c); ranged; TConstrainedStep(x, c, up = false, c)

@@ -249,10 +249,20 @@ what a `within`-ranged integer subtype offers:
 |---|---|---|
 | `T::First` | the lower bound | a `T`, a constant, no argument |
 | `T::Last` | the upper bound | a `T`; one *below* the written bound where the range is exclusive |
+| `T::Min` / `T::Max` | the same two numbers | the *magnitude* question, which agrees with the ordinal one here — see below |
 | `T::Valid(x)` | whether `x` is in range | takes the **base**; a `bool`, and **total** — it never traps, which is what makes it the question form |
 | `T::Succ(x)` | the next value | a `T` from a `T`; traps at `T::Last` |
 | `T::Pred(x)` | the previous value | a `T` from a `T`; traps at `T::First` |
 | `T::Range` | the range itself | only as a `for` loop's iterable, `First..Last` inclusive, the variable a `T` |
+
+**`Min`/`Max` are not aliases of `First`/`Last`, and the reason matters where they are not equal.**
+`First` and `Last` name the ends of a *declared sequence*; `Min` and `Max` the extremes a type can
+hold. A `within` range is written in order, so the two questions have the same answer here and both
+are offered — refusing `Min` on the one kind of type whose entire purpose is bounds would be the odd
+outcome, and a reader who learned `Min` on `u32` (`01`) should not find it renamed on a subtype of
+`u32`. A simple enum answers only `First`/`Last`, because that is the case where they come apart:
+discriminants may be explicit and non-contiguous, so the first-declared variant need not carry the
+smallest one (`09 §2`).
 
 **Every attribute but `Valid` speaks the subtype.** A bound of `T` is a value of `T`, the step from
 one `T` is another, and the values `Range` walks are `T`'s. This is invisible on a transparent

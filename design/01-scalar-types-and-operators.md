@@ -30,6 +30,26 @@ are for aarch64 (LP64, little-endian, 64-bit pointers).
 - `iN` / `uN` is an open family (`00` §5); the fixed-width aliases are common-width names over
   it. On the LP64 ABI each alias matches its C namesake's width; `isize` / `usize` match
   `size_t` / `ptrdiff_t` on *every* target.
+- **An integer type's name answers `T::Min` and `T::Max`**, the extremes it can hold, in the same
+  `::` spelling and for the same reason a constrained subtype's attributes use it (`16` §5): `::`
+  keeps them out of the member namespace, so no `impl` can shadow one and `u32::Max` cannot collide
+  with a `max` function. Both are **constants** taking no argument, so they fold — which is what puts
+  them in a `const` initializer, an `@assert` condition and an array bound, none of which admits a
+  call (`13` §5).
+
+  **The open family is why these must exist rather than be written out.** A program can spell
+  `4294967295` for a `u32`; the largest `u10000` is 3,011 digits and cannot be written at all, so for
+  a wide member of the family the attribute is the only way to name a value the type obviously has.
+  It is also why they cannot be a library table the way C's `UINT8_MAX` is — there is no finite set of
+  integer types to tabulate.
+
+  **They are `Min`/`Max` and not `First`/`Last` because those ask a different question.** `First` and
+  `Last` name the ends of a *declared sequence* — an enum's variants, a written range — and an enum's
+  discriminants may be explicit and non-contiguous, so its first-declared variant need not carry the
+  smallest value. The two coincide on an integer and only there. Asking an integer for `First` is
+  refused, with the diagnostic naming `Min`. A **ranged subtype answers both**, since there the two
+  questions agree, and a reader who learned `Min` on `u32` should not find it renamed on a subtype
+  of `u32`.
 - **`N ≥ 1` has no exception at `N = 1`.** `u1` holds `{0, 1}` and `i1` holds `{-1, 0}`, the single
   bit being the sign bit — degenerate, entirely consistent, and special-cased nowhere. `abs` at `i1`
   answers `-1` because `-1` *is* that width's most negative value, and `signum` never has to produce
