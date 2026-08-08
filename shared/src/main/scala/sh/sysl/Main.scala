@@ -63,6 +63,10 @@ import scopt.OParser
  * coming up empty. Taken silently it would be taken always, because then nobody would have any
  * reason to build an artifact at all.
  *
+ * **`build-c` and `emit-header` are the exception and take the source unasked**, because what they
+ * write is read by a C linker and a `.syslib` is not something one can be given. That is a property
+ * of the consumer rather than a preference, which is why it is not left to a flag.
+ *
  * **Everything after a bare `--` belongs to the program being run**, not to sysl: it is passed
  * straight through to the executable, which is what lets `sysl run prog.sysl -- -v file` reach a
  * `main(args: []string)` without sysl having to decide whether `-v` was meant for it. The split is
@@ -357,6 +361,14 @@ private[sysl] def execute(cfg: Config): Int = {
   if cfg.noStdLib && cfg.stdLib.isDefined then
     return fail("--no-std-lib and --std-lib ask for different standard modules")
 
+  // Refused rather than ignored, because it is the shape of the request that is wrong: an archive a C
+  // project links cannot refer to a `.syslib`, so there is nothing a named one could do here but be
+  // silently discarded. Said now rather than at the C project's link, where the symptom is an
+  // undefined `sysl$` symbol and the cause is a flag on a command that ran successfully.
+  if cLibrary(cfg.command) && cfg.stdLib.isDefined then
+    return fail(s"${cfg.command} compiles the standard module into what it writes, since a C link " +
+      "line cannot carry a '.syslib' — so --std-lib has nothing to name here")
+
   // Which standard module this compilation is compiled against — an error if there is none, the same
   // as any other missing library.
   val Stdlib.Resolved(std, coreSymbols, coreArchive) = Stdlib.resolve(stdChoice(cfg), target) match
@@ -560,10 +572,16 @@ private def cLibrary(command: String): Boolean = command == "build-c" || command
  * is the entry point, which `cLibrary` above suppressed, and the ending: an archive rather than a
  * link.
  *
- * **What is NOT in the archive is what this build's own libraries supply**, and the report says so
- * rather than leaving it to be discovered at the C project's link. The standard module is a
- * `.syslib` on that link line like any other archive — or `--no-std-lib` folds the library's source
- * into this object and the archive stands alone, which is the trade a caller makes knowingly.
+ * **The standard module is compiled into the archive**, always, and this is the one thing `build-c`
+ * decides differently from every other command. A `.syslib` is not something a C project can link:
+ * an archive referring to code no reachable file contains fails at the C link naming `sysl$prints`,
+ * which is a symbol its author has no way to place. So the archive stands alone or it is not an
+ * artifact. See `stdChoice`.
+ *
+ * **What is NOT in the archive is what this build's own libraries supply** — `libm`, and whatever
+ * `@link` named — and the report says so rather than leaving it to be discovered at the C project's
+ * link. Those are libraries the author chose and can be given to a linker, which is exactly the
+ * distinction the standard module fails.
  */
 private def buildForC(cfg: Config, compiled: Compiled, target: Target, named: Option[String]): Int = {
   // Before the compile rather than after, exactly as `build-lib` does it: the archiver is not needed
@@ -770,9 +788,15 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
  *
  * `build-lib --std` takes the source, and has to: it is the command that *produces* the artifact, so
  * consulting one would be a deadlock with nothing to break it.
+ *
+ * **`build-c` takes the source too, and for a reason that is about its consumer rather than about
+ * this compilation.** What it writes is linked by a C project, and an artifact is only an artifact if
+ * that link succeeds — a `.syslib` cannot go on a C link line, so an archive referring to one is
+ * unusable by the only tool that was ever going to read it. Folding the library in is what
+ * `--no-std-lib` asks for everywhere else; here there is nothing else to ask for.
  */
 private def stdChoice(cfg: Config): Stdlib.Choice =
-  if cfg.noStdLib || cfg.std then Stdlib.Choice.FromSource
+  if cfg.noStdLib || cfg.std || cLibrary(cfg.command) then Stdlib.Choice.FromSource
   else
     cfg.stdLib match
       case Some(named) => Stdlib.Choice.Artifact(named)

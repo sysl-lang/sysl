@@ -745,10 +745,21 @@ buys the caller is real: code after the call is dead, and a path ending in it ne
 
 **The header assumes C99 or any C++**, which the three includes already did before anything said so.
 
-**What the archive does not hold is what this build's own libraries supply**, and the driver says so
-rather than leaving it to be found at the C project's link, where an unresolved sysl symbol reads as
-a missing definition rather than as a missing archive. `--no-std-lib` folds the library's source into
-the object and the archive then stands alone, which is the trade a caller makes knowingly.
+**The standard module is compiled into the archive**, which is the one thing `build-c` decides
+differently from every other command. A `.syslib` is not something a C link line can carry, so an
+archive referring to one fails at that link naming `sysl$prints` — a symbol whose author has no way
+to place it. An archive stands alone or it is not an artifact, and there is nothing here for a flag
+to choose between: `--std-lib` is refused rather than discarded, and `--no-std-lib` asks for what
+already happens.
+
+The cost, which is accepted: two `build-c` archives linked into one program each carry the reachable
+part of the library, and duplicate whatever they share.
+
+**What the archive does not hold is what this build's own libraries supply** — `libm`, and whatever
+`@link` named — and the driver says so rather than leaving it to be found at the C project's link,
+where an unresolved symbol reads as a missing definition rather than as a missing archive. Those are
+libraries the author chose and can hand to a linker, which is exactly the distinction the standard
+module fails.
 
 ## Open (not yet decided)
 

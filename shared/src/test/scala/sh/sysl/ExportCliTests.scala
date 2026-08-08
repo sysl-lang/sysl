@@ -32,6 +32,22 @@ class ExportCliTests extends LibraryCliSupport {
       |helper(n: i32) -> i32 = n + 1
       |""".stripMargin
 
+  /** A module that reaches the standard library, which the one above never does.
+   *
+   * **Everything in `boundary` lowers to instructions**, so its archive stands alone whatever the
+   * compilation did with the standard module — which is why a suite built entirely on it could be
+   * green while every archive sysl wrote was unlinkable. One `print` is the difference: the object
+   * then refers to `sysl$prints`, and whether that symbol is *in* the archive is the only question a
+   * C project ever asks of this command.
+   */
+  private val talkative =
+    """module mylib
+      |
+      |@export("mylib_greet")
+      |greet(n: i32) =
+      |    print("hello", n)
+      |""".stripMargin
+
   private def built(text: String = boundary): (String, String) = {
     val root = rootOf("mylib", text)
     val out  = s"$root/libmylib.a"
@@ -111,5 +127,42 @@ class ExportCliTests extends LibraryCliSupport {
 
     withClue(run.stderr)(run.exitCode shouldBe 0)
     run.stdout.trim shouldBe "5 20"
+  }
+
+  "a C program links an export that uses the standard library, which is the case a '.syslib' cannot serve" in {
+    val (archive, header) = built(talkative)
+    val dir               = createTempDirectory("sysl-c-printing-")
+    val source            = s"$dir/main.c"
+    val exe               = s"$dir/caller"
+
+    writeFile(source,
+      s"""#include "$header"
+         |
+         |int main(void) {
+         |    mylib_greet(7);
+         |    return 0;
+         |}
+         |""".stripMargin)
+
+    val build = exec(Seq("clang", source, archive, "-o", exe))
+
+    withClue(build.stderr)(build.exitCode shouldBe 0)
+
+    val run = exec(Seq(exe))
+
+    withClue(run.stderr)(run.exitCode shouldBe 0)
+    run.stdout.trim shouldBe "hello 7"
+  }
+
+  // The flag has a reading everywhere else and none here, so it is refused rather than discarded:
+  // taking it silently would produce the unlinkable archive this command exists not to write.
+  "naming a prebuilt standard module is refused, since a C link line cannot carry one" in {
+    val root = rootOf("mylib", boundary)
+
+    val (status, notes) = diagnostics(Config(command = "build-c", file = root,
+      output = Some(s"$root/libmylib.a"), stdLib = Some(s"$root/std.syslib")))
+
+    status should not be 0
+    notes should include("--std-lib has nothing to name here")
   }
 }
