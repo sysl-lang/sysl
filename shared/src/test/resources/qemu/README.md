@@ -17,18 +17,42 @@ unconditional form is both simpler and the one that was observed to work. `main`
 Link with `-nostdlib -T rv32.ld`, and `-fuse-ld=lld`: this is an ELF target and the system linker
 on a Mac is not one.
 
+## Wired into the suite
+
+`QemuSupport` and `QemuRunTests` are the Scala side: the support trait links the module against
+these files, boots it, and answers with the exit status and the UART's output; the suite makes the
+claims. **Missing tools cancel the test by name rather than passing it** — cancelled shows in
+scalatest's count where a pass does not, so the gate stays honest on a machine with no QEMU and
+loud on one that had it yesterday.
+
+**QEMU has no wall-clock limit of its own**, so the emulator is run under `perl -e 'alarm'`. A
+program that never reaches the exit device would otherwise run until the suite is killed, and perl
+ships everywhere this builds.
+
 ## What is still owed
 
 - **The Thumb half.** `qemu-system-arm -M mps2-an505` is a Cortex-M33, the RP2350's exact core. It
   has no `sifive_test`, so the result channel there is semihosting `SYS_EXIT` — `bkpt 0xAB` with
   `r0 = 0x18` and `r1` pointing at `{0x20026, code}` — and it boots through a vector table rather
   than a bare entry point. Its UART is the CMSDK one at 0x40004000.
-- **A `QemuSupport` in the test tree**, analogous to `RunSupport`: link, run, capture both channels,
-  fail the Scala test on a non-zero status and attach the output to the failure.
 - **A freestanding entry point takes `argc` and `argv`.** `define i32 @main(i32 %argc, ptr %argv)`
   is emitted for `thumb-freestanding` and `riscv32-freestanding` alike, which is a hosted
   convention on a machine that has nobody to pass them. The startup here passes zeros. It is a
   design question rather than something to paper over.
+
+## What this tier found on its first run
+
+**Releasing a slice calls `@free`, so a bare-board program that passes one to a function does not
+link.** ARC's release path names the allocator directly, and an `@no_alloc` module emits it too —
+while `capabilities.md` puts slices *in* the no-alloc subset, says the free path "goes through the
+object's own hook", and calls such a module allocator-free and portable to every target.
+
+**Nothing below this tier could have seen it.** Every other cross-target test stops at an object
+file, and a call to a function nothing defines makes a perfectly good object. Freestanding targets
+had been in the registry for months with no program ever linked for one.
+
+`NoAllocEmissionTests` carries the diagnosis, and the two tests that need the fix are `ignore`d with
+the assertions they should make.
 
 ## Printed output, which needs no semihosting at all
 
