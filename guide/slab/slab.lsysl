@@ -25,15 +25,28 @@ is a different allocator, and the other two need a heap this program is written 
 What writing it found
 ---------------------
 
-**The language cannot demand that storage be aligned.** A `[N]u8` is aligned to one, because that is
-what its element needs, and there is no `alignas`. So a region declared the obvious way is not
-aligned for anything carved out of it, and every load through the resulting pointer is unaligned —
-which x86 tolerates and which faults on some of the targets this language is for. The allocator
-therefore rounds its own base up, exactly as a real one does, paying up to `alignof(T) - 1` bytes of
-the region for it. That is the right behaviour for an allocator and the wrong reason to have written
-it: an allocator rounds up because its *caller's* region is wherever it is, not because the language
-could not say what it wanted. `alignof` made the rounding writable; a declaration attribute would
-have made it unnecessary here.
+**The language could not demand that storage be aligned. Now it can, and this is what that looked
+like before.** A `[N]u8` is aligned to one, because that is what its element needs. So a region
+declared the obvious way was not aligned for anything carved out of it, and every load through the
+resulting pointer was unaligned — which x86 tolerates and which faults on some of the targets this
+language is for. The allocator therefore rounds its own base up, exactly as a real one does, paying
+up to `alignof(T) - 1` bytes of the region for it.
+
+**`@align(n)` is the answer, and it is written on a type** (`15 §1`). A region that has to begin on a
+boundary says so by being a type that does:
+
+```
+@align(64)
+struct Region
+    bytes: [4096]u8
+```
+
+**The rounding below stays, and that is the point rather than an oversight.** This allocator takes a
+slice it did not declare, so its caller's region is wherever the caller put it — an allocator rounds
+up for that reason, which was always the right behaviour. What was wrong was the *reason it had to
+be written*: the language could not state the requirement anywhere at all, so even a caller who knew
+what it needed had no way to say so. That is what changed, and the fix belongs at the reader's
+declaration rather than in this code.
 
 **`sizeof` is what makes a container generic, and `alignof` is what makes it correct.** With only the
 first, a slab over any `T` still lays its blocks at whatever offset the region began at. The two
