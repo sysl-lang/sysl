@@ -1,0 +1,116 @@
+package sh.sysl
+
+/** The two things about `@export` that only the whole program can answer (`15 §12`).
+ *
+ * `ExportCheck` holds each declaration to a *shape* C can call, which is a question one declaration
+ * answers on its own and is asked where the declarations are. These three are not:
+ *
+ *   - **whether the parameters and result are types C can spell**, which needs them resolved — and a
+ *     short name resolves against the scope its declaration sits in, which the typed tree has
+ *     already worked out;
+ *   - **whether an exported function reaches a computed module `val`**, which is a question about the
+ *     call graph, and so exists only once every body has been analyzed;
+ *   - **whether two exports claim one symbol**, which is a question about the set of them.
+ *
+ * All three run from `Compiler.analyzed`, beside `Escape.check` and `TailCalls.check`, for the reason
+ * those do: the typed tree is what they read, and a program that has not got one has nothing for
+ * them to say.
+ */
+object Exports {
+
+  def check(program: TProgram): Either[String, Unit] = {
+    val exported = program.funcs.filter(_.exported.isDefined)
+    val refused  = exported.flatMap(signature) ::: duplicates(exported) ::: storage(exported, program)
+
+    if refused.nonEmpty then Left(Diagnostic.report(refused)) else Right(())
+  }
+
+  /** A parameter or a result C has no way to spell.
+   *
+   * A scalar and a pointer are one register on every machine sysl lowers for, and nothing has to be
+   * decided about them. An aggregate is the opposite: each ABI says which registers a struct arrives
+   * in, LLVM applies no rule of its own, and `CAbi` exists precisely because sysl's own lowering and
+   * C's published one differ. Passing one by value would be a **corrupt call rather than a link
+   * error**, which is why it is refused here instead of lowered hopefully.
+   *
+   * Every refusal carries the shape to write instead, because there always is one — a slice becomes
+   * the pointer and length C's own buffer functions already take, an aggregate becomes a pointer to
+   * itself. That is what makes the boundary layer writable rather than merely restricted.
+   */
+  private def signature(f: TFunc): List[String] = {
+    val bad = f.params.filterNot((_, t) => ExportCheck.crosses(t))
+
+    val params = bad.map { (name, t) =>
+      Diagnostic.render(
+        s"'$name' of the exported '${Modules.show(f.name)}' is ${Type.show(t)}, which C has no way " +
+          s"to spell — an exported function takes ${ExportCheck.spellable}. ${ExportCheck.advice(t)}",
+        None)
+    }
+
+    val result =
+      Option.when(!Type.noValue(f.retTy) && !ExportCheck.crosses(f.retTy))(
+        Diagnostic.render(
+          s"the exported '${Modules.show(f.name)}' returns ${Type.show(f.retTy)}, which C has no way " +
+            s"to spell — an exported function returns that or nothing at all. ${ExportCheck.advice(f.retTy)}",
+          None))
+
+    params ::: result.toList
+  }
+
+  /** Two definitions exporting one symbol.
+   *
+   * The linker would report this itself, as a duplicate definition, naming a symbol that appears in
+   * no sysl file — `mylib_parse` where the reader wrote `parse` twice in two modules. Saying it here
+   * costs one grouping and names both declarations, which is the difference between a diagnostic and
+   * an archaeology exercise.
+   */
+  private def duplicates(exported: List[TFunc]): List[String] =
+    exported
+      .groupBy(_.exported.get)
+      .toList
+      .sortBy(_._1)
+      .collect { case (symbol, fs) if fs.length > 1 =>
+        Diagnostic.render(
+          s"'$symbol' is exported by ${fs.map(f => s"'${Modules.show(f.name)}'").sorted.mkString(" and ")} " +
+            "— one symbol is one definition, and the linker has no way to tell which was meant",
+          None)
+      }
+
+  /** An exported function that reaches a **computed** module `val`.
+   *
+   * Module storage is filled by the entry point (`13 §7`), and a C project linking this artifact
+   * supplies its own `main` — so nothing here runs before the C side calls in, and the storage a
+   * computed initializer would have written is whatever the loader left. That is a silent wrong
+   * answer rather than a link error, which is why it is refused.
+   *
+   * **A `val` whose initializer is constant data is fine and is not looked at**, because nothing
+   * runs to fill it: `TVal.computed` is exactly that distinction, and a constant tree is written
+   * straight into the object file. This is the rule C already has for a static-storage initializer,
+   * so a reader arriving from that side needs no explaining — and it is the reason the restriction
+   * bites so rarely in practice.
+   *
+   * The walk is `Reachability`'s, so what it reports is the storage reached *transitively*: the
+   * `val` may be three calls down inside the library, and the function that named it is what the
+   * author has to look at.
+   */
+  private def storage(exported: List[TFunc], program: TProgram): List[String] = {
+    val computed = program.vals.filter(_.computed).map(_.symbol).toSet
+
+    if computed.isEmpty || exported.isEmpty then Nil
+    else
+      exported.flatMap { f =>
+        val reached = Reachability.reachedFrom(List(f), program.funcs, program.vtables).vals & computed
+
+        Option.when(reached.nonEmpty)(
+          Diagnostic.render(
+            s"'${Modules.show(f.name)}' is exported and reaches " +
+              s"${reached.toList.sorted.map(v => s"'${Modules.show(v)}'").mkString(", ")}, which is " +
+              "module storage an initializer fills before the program's own statements run. A C " +
+              "project linking this supplies its own 'main', so nothing fills it and the function " +
+              "would read whatever the loader left. A module 'val' whose initializer is constant " +
+              "data is laid straight into the object file and is fine here — it is a computed one " +
+              "that has nowhere to be computed",
+            None))
+      }
+  }
+}

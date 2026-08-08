@@ -16,7 +16,7 @@ trait AttrParser extends ExprParser {
    */
   protected lazy val attribute: PackratParser[Attr] =
     testAttr ^^ Attr.Test.apply | tailrecAttr | pureAttr | ghostAttr | readsAttr | writesAttr |
-      packedAttr | alignAttr | unknownAttr | hashAttr
+      packedAttr | alignAttr | exportAttr | unknownAttr | hashAttr
 
   /** `@packed` — fields at their declared offsets with no interior padding, and an aggregate that
    * needs no alignment of its own (`15 §1`). It takes no arguments: there is nothing to configure
@@ -38,6 +38,26 @@ trait AttrParser extends ExprParser {
     err("'@align' names the boundary in parentheses — '@align(64)', or '@align(CACHE_LINE)' for a " +
       "constant that says what the number is for. There is no bare form: an alignment with no " +
       "number is not a weaker claim, it is no claim")
+
+  /** `@export` and `@export("mylib_parse")` — the definition is C-callable, under its own name or
+   * under the symbol named (`15 §12`).
+   *
+   * The parenthesised form takes a **string** rather than an identifier, exactly as `extern`'s link
+   * name does, and for the same reason: it is a symbol the other side chose and it is not required to
+   * be anything sysl could lex. The two are one mechanism read in opposite directions, so they are
+   * spelled alike.
+   *
+   * The refusal is raised **inside** the parentheses, per the rule a dead `err` taught: an
+   * alternative that fails at the `(` is outranked by one that got past it, so a sentence written
+   * after the closing parenthesis would never be the one reported.
+   */
+  protected lazy val exportAttr: PackratParser[Attr] =
+    at(op("@") ~> attrWord("export") ~> opt(op("(") ~> (linkName | exportErr) <~ op(")"))
+      ^^ (s => ExportAttr(s))) ^^ Attr.Export.apply
+
+  private def exportErr: Parser[String] =
+    err("'@export' names the C symbol as a string — '@export(\"mylib_parse\")' — or takes no " +
+      "parentheses at all, which exports the function under its own name")
 
   /** `@test`, and the three things it may say about the test: the name a report gives it, that it is
    * a run which should not come back, and the text such a run should have printed on its way out.
@@ -95,7 +115,7 @@ trait AttrParser extends ExprParser {
   private lazy val unknownAttr: PackratParser[Attr] =
     op("@") ~> ident >> (n =>
       err(s"'$n' is not an annotation a declaration takes — '@test', '@tailrec', '@pure', " +
-        "'@ghost', '@reads(...)' and '@writes(...)' mark a function, and '@packed' and " +
+        "'@ghost', '@export', '@reads(...)' and '@writes(...)' mark a function, and '@packed' and " +
         "'@align(n)' mark a struct's layout. '@no_<capability>', " +
         "'@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header"))
 
@@ -151,6 +171,7 @@ trait AttrParser extends ExprParser {
       case (d, Attr.Ghost)   => d.copy(ghost = true)
       case (d, Attr.Reads(ns))  => d.copy(reads = Some(ns))
       case (d, Attr.Writes(ns)) => d.copy(writes = Some(ns))
+      case (d, Attr.Export(e))  => d.copy(exported = Some(e))
       // A layout attribute never reaches here: the grammar routes a declaration carrying one to a
       // struct, and refuses the mix. Listed so that a new attribute makes this fold fail to compile
       // rather than silently drop what it was asked to record.

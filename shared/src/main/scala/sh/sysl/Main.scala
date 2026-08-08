@@ -114,6 +114,10 @@ case class Config(
     filter: Option[String] = None,
     failFast: Boolean = false,
     optimize: String = Toolchain.defaultOptimization,
+    /** `build-c --header` — where the generated C header goes, when somewhere other than beside the
+      * archive (`15 §12`).
+      */
+    header: Option[String] = None,
     /** `prove --emit-whyml` — print the translation instead of running the prover (`17 §9`). */
     emitWhyML: Boolean = false,
     /** `prove --overflow` — whether staying in an integer's range is a proof obligation. */
@@ -153,6 +157,21 @@ private[sysl] val parser = {
             .action((_, c) => c.copy(std = true))
             .text("this library is sysl's own standard module, which the compiler otherwise supplies"),
         ),
+      cmd("build-c")
+        .action((_, c) => c.copy(command = "build-c"))
+        .text("compile a sysl module to a static archive and a C header, for an existing C " +
+          "project to link against")
+        .children(
+          arg[String]("<path>").required().action((f, c) => c.copy(file = f)),
+          opt[String]('o', "output").action((o, c) => c.copy(output = Some(o))).text("output archive path"),
+          opt[String]("header")
+            .action((h, c) => c.copy(header = Some(h)))
+            .text("where to write the C header; defaults to the archive's path with a '.h' suffix"),
+        ),
+      cmd("emit-header")
+        .action((_, c) => c.copy(command = "emit-header"))
+        .text("print the C header for what a module exports")
+        .children(arg[String]("<path>").required().action((f, c) => c.copy(file = f))),
       cmd("test")
         .action((_, c) => c.copy(command = "test"))
         .text("run the '@test' functions of a sysl module")
@@ -469,7 +488,7 @@ private[sysl] def execute(cfg: Config): Int = {
   // rather than being printed from inside the compiler, which has no business writing to a console.
   val compiled =
     Compiler.compiledWith(librarySources ::: sources, libraryTrees, target, precompiled, Some(std),
-      provides, packages) match
+      provides, packages, entryPoint = !cLibrary(cfg.command)) match
     case Left(err) => return report(err)
     case Right(result) =>
       if cfg.explainEscapes then
@@ -480,6 +499,12 @@ private[sysl] def execute(cfg: Config): Int = {
   val status = cfg.command match
     case "emit-llvm" =>
       stdout(compiled.ir); 0
+
+    case "emit-header" =>
+      stdout(CHeader.render(compiled.exports, project.name.getOrElse(Project.nameOf(cfg.file)))); 0
+
+    case "build-c" =>
+      buildForC(cfg, compiled, target, project.name)
 
     case "build" =>
       val exe = cfg.output.getOrElse(defaultOutput(cfg.file, project.name))
@@ -516,6 +541,89 @@ private[sysl] def execute(cfg: Config): Int = {
  * own C rather than linking it.
  */
 private def links(command: String): Boolean = command == "build" || command == "run" || command == "test"
+
+/** Whether a subcommand is producing something a **C project** links, which is what decides that the
+ * module is emitted with no entry point (`15 §12`).
+ *
+ * Both commands here are one compilation with two things read off it, which is why they share this
+ * rather than each answering for itself: `emit-header` prints what `build-c` writes beside the
+ * archive, and a header describing a different compilation from the archive it sits next to is the
+ * one failure a C project cannot diagnose.
+ */
+private def cLibrary(command: String): Boolean = command == "build-c" || command == "emit-header"
+
+/** `sysl build-c` — the static archive and the C header a C project is handed (`15 §12`).
+ *
+ * **This is `build-lib`'s shape with a different destination.** The compilation is the ordinary one
+ * rather than a library build, because what is wanted is a module lowered for *this* target with its
+ * calls resolved, not a tree of declarations somebody else will compile. What differs from `build`
+ * is the entry point, which `cLibrary` above suppressed, and the ending: an archive rather than a
+ * link.
+ *
+ * **What is NOT in the archive is what this build's own libraries supply**, and the report says so
+ * rather than leaving it to be discovered at the C project's link. The standard module is a
+ * `.syslib` on that link line like any other archive — or `--no-std-lib` folds the library's source
+ * into this object and the archive stands alone, which is the trade a caller makes knowingly.
+ */
+private def buildForC(cfg: Config, compiled: Compiled, target: Target, named: Option[String]): Int = {
+  // Before the compile rather than after, exactly as `build-lib` does it: the archiver is not needed
+  // until the end, so discovering it late would make "there is no llvm-ar" a thing somebody waited
+  // the whole build for.
+  val ar = Toolchain.findAr(cfg.ar) match
+    case Left(err)   => return fail(err)
+    case Right(path) => path
+
+  val native = Project.cSources(cfg.file)
+
+  LibraryArtifact.collisions(native) match
+    case Some(err) => return fail(err)
+    case None      => ()
+
+  val out    = cfg.output.getOrElse(defaultOutput(cfg.file, named, ".a"))
+  val header = cfg.header.getOrElse(s"$out.h")
+
+  Project.parentOf(out).foreach(createDirectories)
+  Project.parentOf(header).foreach(createDirectories)
+
+  // Named members for `build-lib`'s reason: an archive holds the same names wherever it was built,
+  // and `ar t` then shows a reader something they can make sense of.
+  val staging = createTempDirectory("sysl-c-")
+  val code    = s"$staging/${LibraryArtifact.codeMember}"
+  val objects = native.map(s => s -> s"$staging/${LibraryArtifact.nativeMember(s)}")
+
+  val outcome =
+    for
+      _ <- Toolchain.compileObject(compiled.ir, code, target, cfg.optimize)
+      _ <- objects.foldLeft[Either[String, Unit]](Right(()))((so_far, entry) =>
+             so_far.flatMap(_ => Toolchain.compileC(entry._1.name, entry._2, target, cfg.optimize,
+               SearchPaths(cfg.linkPaths, cfg.includePaths), cfg.verbose)))
+      _ <- Toolchain.archive(code :: objects.map(_._2), out, ar)
+    yield ()
+
+  (code :: objects.map(_._2) ::: List(staging)).foreach(Project.discard)
+
+  outcome match
+    case Left(err) => fail(err)
+    case Right(_)  =>
+      writeFile(header, CHeader.render(compiled.exports, named.getOrElse(Project.nameOf(cfg.file))))
+      Console.err.println(s"wrote $out")
+      Console.err.println(s"wrote $header")
+
+      // A build that exported nothing produced an archive with no way in, and the author almost
+      // certainly meant to mark something. It is a warning rather than a refusal because an archive
+      // of pure C shims is a real thing to want, and because the header says the same on its face.
+      if compiled.exports.isEmpty then
+        Console.err.println("sysl: warning: nothing in this module is marked '@export', so the " +
+          "archive has no C entry point")
+
+      // The libraries this object still needs, which the C project's link line has to carry. Said
+      // here because nothing downstream will say it: an unresolved sysl symbol at that link reads
+      // as a missing definition rather than as a missing archive.
+      if compiled.links.nonEmpty then
+        Console.err.println(s"sysl: link this against: ${compiled.links.mkString(", ")}")
+
+      0
+}
 
 /** `sysl prove` — the module as WhyML, and what Why3 made of it (`17 §9`).
  *

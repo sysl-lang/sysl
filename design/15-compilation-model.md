@@ -81,8 +81,9 @@ exactly five bits — the bitfield and hardware-register payoff — remains open
 ## 2. Symbol names carry the module path
 
 A sysl definition is mangled with **its module path**, so there is no global symbol namespace and
-two modules may each declare an `init` without colliding. An `extern` is the exception and is not
-mangled at all — it emits the raw C symbol, or its explicit link name (`12` §1).
+two modules may each declare an `init` without colliding. Two declarations are the exception and are
+not mangled at all: an `extern`, which emits the raw C symbol or its explicit link name (`12` §1),
+and a definition marked `@export`, which is that same rule read the other way (§12).
 
 Mangling extends the convention `codegen.md` already fixes (a memory mode spelled as a word,
 `ptr.` / `ref.` / `sync.`, since a sigil is not an LLVM name character).
@@ -614,12 +615,134 @@ for a document is harmless. Here it turns every declaration below it into an ill
 diagnostic the author would get is about something incomplete further up — their missing half never
 enters the story. Refused at the line that opened it, which is the line to go and look at.
 
+## 12. `@export` makes a definition C-callable
+
+**`@export` is `12` §1's `extern` read the other way.** An `extern` names a symbol the linker has and
+states the signature the other side published; an `@export` publishes a symbol and states the
+signature C may call it at. Neither invents a shape the other end could not spell, and they are
+spelled alike:
+
+```
+extern exit(code: int) -> never          -- resolves the symbol 'exit'
+extern "opendir" c_opendir(p: *u8) -> *Dir   -- resolves 'opendir', under another sysl name
+
+@export                                  -- publishes the symbol 'add'
+add(a: i32, b: i32) -> i32 = a + b
+
+@export("mylib_parse")                   -- publishes 'mylib_parse'
+parse(text: *u8, n: usize) -> i32
+```
+
+**The rename is the form that matters rather than a convenience.** A C library's symbols share a
+prefix so that linking two of them is not a coin toss, and the sysl side has a module path doing that
+job already. `parse` in module `mylib` is the name to write inside sysl and `mylib_parse` is the name
+to publish; requiring the function to be *called* `mylib_parse` everywhere would be spelling the
+module path twice. **A sysl caller is unaffected** — it still names `mylib.parse` and simply arrives
+at a different label.
+
+**`@export` implies the C convention and says nothing about any other**, which is `12` §5's rule for
+`extern` in the other direction. Whether §10's convention annotation composes with it is left until
+something needs a convention other than C; §10 was built so that adding one is a change to what the
+analyzer accepts rather than to every tree that holds a function.
+
+### Why this direction exists at all
+
+A C replacement is adopted **incrementally**, and until now only one of the two directions was
+possible. Putting sysl on top and keeping the C underneath — adding libraries one `@link` at a time —
+works and is what every package in the org does. But a C shop with an existing program and an
+existing build had no way in: `build-lib` makes a `.syslib` for sysl consumers, and every definition
+carried its module path, so there was nothing to hand a C linker and no symbol for it to resolve.
+
+### A boundary layer, not an arbitrary function
+
+**What gets written is a facade** — one file whose job is the export surface, where the author
+restricts themselves on purpose to signatures C can spell. That is the same thing a Scala program
+exposing itself to Java or JS grows, and it is why the refusals below cost so little: they fire only
+inside a file somebody wrote to be the boundary, where the restriction is the point rather than a
+surprise.
+
+**The marking is per-definition even so**, because the symbol name has to be. A file-level mark could
+not name `mylib_parse` and `mylib_free` separately, so it would have needed a second per-definition
+attribute beside it, and one mechanism beats two. `@export` is an ordinary declaration attribute,
+carrying an optional parenthesised argument exactly as `@align(n)` does.
+
+### What cannot be exported
+
+None of these is a decision — each is a consequence, and the work is only in saying so where somebody
+tries:
+
+| refused | because |
+|---|---|
+| a **generic** | an exported symbol is one function at one signature, and there is no way to say which instantiation the linker holds |
+| a **member** | C has no receiver to hand it. The grammar refuses this before any rule does: an attribute is read at statement position only, so `@test` and `@pure` are as unavailable on a method |
+| a **`private`** definition | `private` emits the symbol `internal` (§3), which promises every caller is inside the module; an export promises the opposite, and a definition cannot make both claims |
+| a **`@ghost`** | it is erased before codegen (`17` §8), so there is no symbol at all |
+| a **`@test`** | only `sysl test` builds one, and an exported symbol has to be in the artifact a C project links |
+| a **variadic** | what a C caller promotes into the tail is decided by the prototype it compiled against, not by this declaration. A `va_list` parameter states the same thing and is what C's own `v` variants do |
+| a parameter or result that is **not a scalar, a pointer or a function pointer** | see below |
+| a symbol that is **not a C identifier** | there would be nothing a C declaration could spell |
+
+**The type rule is `CAbi`'s existence stated as a restriction.** A scalar and a pointer are one
+register on every machine sysl lowers for and nothing has to be decided about them. An aggregate is
+the opposite: each ABI says which registers a struct arrives in, LLVM applies no rule of its own, and
+`CAbi` exists precisely because sysl's own lowering and C's published one differ. Passing one by
+value would be a **corrupt call rather than a link error**, which is the worst available outcome, so
+it is refused rather than lowered hopefully. Every refusal names the shape to write instead — a slice
+becomes the pointer and length C's own buffer functions already take, an aggregate becomes a pointer
+to itself — because there always is one, and that is what makes the boundary writable rather than
+merely restricted.
+
+### Module storage: a computed `val` cannot be reached
+
+Module storage is filled by the entry point (`13` §7), and **a C project supplies its own `main`** —
+so nothing sysl emitted runs before the C side calls in. An exported function that reached storage a
+computed initializer would have written would read whatever the loader left, which is a silent wrong
+answer rather than a link error. It is refused, and the walk is transitive: the `val` may be three
+calls down, and the diagnostic names the export that reached it.
+
+**A `val` whose initializer is constant data is fine and is not looked at**, because nothing runs to
+fill it — a constant tree is written straight into the object file. That is the rule C already has
+for a static-storage initializer, so it needs no explaining to the audience it is for, and it is why
+the restriction bites so rarely. A `const` has no storage at all and never arises.
+
+There is no generated `sysl_init()` the host must call, and no `llvm.global_ctors` registration.
+The first is silent zeroed storage when somebody forgets it; the second trades the diagnostic for a
+link-order dependency that does not exist on every target. Either can be added later without
+invalidating anything here.
+
+### What the driver produces
+
+`sysl build-c` is `build-lib`'s shape with a different destination — a **static archive** holding the
+module's object and the objects of any C the tree carries (§7), plus a **C header** beside it:
+
+```
+sysl build-c mylib -o libmylib.a       # writes libmylib.a and libmylib.a.h
+sysl emit-header mylib                 # the same declarations, on stdout
+```
+
+The compilation is the ordinary one rather than a library build, because what is wanted is a module
+lowered for *this* target with its calls resolved. What differs from `build` is the **entry point**,
+which is suppressed — the same switch a library build has always used, reached from a second command
+— and the ending, an archive rather than a link.
+
+**An exported function is a reachability root**, exactly as an interrupt handler is (§10) and for the
+same reason: nothing inside the program calls it, and the whole point is that something outside will.
+A build with no entry point is what makes this load bearing, since every other root is absent there.
+
+**The header is a translation and holds no decisions**, which is why it is the cheapest of the three
+pieces: the marking is what does the work. It uses `<stdint.h>`'s fixed-width names because sysl's
+integers say what they *are* where C's say what they are *at least* — an `i32` is `int32_t`, and
+writing it `int` would be right on every machine anyone is likely to use and wrong as a claim. A
+`char` is a Unicode scalar value and becomes `uint32_t`, never C's `char`, which would be wrong by a
+factor of four.
+
+**What the archive does not hold is what this build's own libraries supply**, and the driver says so
+rather than leaving it to be found at the C project's link, where an unresolved sysl symbol reads as
+a missing definition rather than as a missing archive. `--no-std-lib` folds the library's source into
+the object and the archive then stands alone, which is the trade a caller makes knowingly.
+
 ## Open (not yet decided)
 
-- **a. Export to C.** The reverse of `12` §1's `extern`: mangling suppression plus §10's annotation,
-  applied to a *definition* so existing C can call into sysl. A C replacement is adopted
-  incrementally, so this direction matters as much as the importing one — and §10 built the half of
-  it that decides how a definition states its convention, leaving the mangling question.
 - **b. The symbol-length threshold** at which §2 truncates and appends a hash.
 - **c. Recording file discovery.** Whether the `readdir` of step 1 is written into a build log, so
   that adding a file to a module is a *visible* change for reproducible or sandboxed builds rather

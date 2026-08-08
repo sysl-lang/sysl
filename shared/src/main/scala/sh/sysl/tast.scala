@@ -775,6 +775,17 @@ case class TFunc(
       */
     reads: Option[Set[String]] = None,
     writes: Option[Set[String]] = None,
+    /** `@export` — the symbol this definition is C-callable under, mangling suppressed (`15 §12`).
+      *
+      * It carries the **resolved** symbol rather than what was written, so `@export` and
+      * `@export("mylib_parse")` are one thing by the time anything downstream looks: the first
+      * resolves to the function's declared name, and neither codegen nor the header writer has a
+      * second case to get wrong.
+      *
+      * Like an interrupt handler, an exported function is a **root** for reachability — nothing in
+      * the program calls it, and the whole point is that something outside will (`Reachability`).
+      */
+    exported: Option[String] = None,
 )
 
 /** A function the linker supplies, which the module declares rather than defines. Only the ones

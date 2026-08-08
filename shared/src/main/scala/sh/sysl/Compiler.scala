@@ -18,7 +18,13 @@ package sh.sysl
  * could not work it out by reading it: an `extern` says which symbol it wants and never which
  * library has it, which is the whole reason `15 §8` exists.
  */
-case class Compiled(ir: String, notes: List[String], links: List[String])
+/** `exports` is the lowered tree's exported functions, which is what a C header is written from
+ * (`15 §12`). It is carried here rather than recomputed because the two would then be two answers to
+ * one question: a header naming a function the object does not define, or missing one it does, is
+ * exactly the failure a C project cannot diagnose — it links, and calls something that is not there.
+ */
+case class Compiled(ir: String, notes: List[String], links: List[String],
+                    exports: List[TFunc] = Nil)
 
 object Compiler {
 
@@ -69,14 +75,14 @@ object Compiler {
   def compiledWith(sources: List[Source], libraries: List[Program], target: Target = Target.default,
                    precompiled: Set[String] = Set.empty, std: Option[Stdlib] = None,
                    provides: Set[String] = Capability.core.toSet,
-                   packages: Packages = Packages.none)
+                   packages: Packages = Packages.none, entryPoint: Boolean = true)
       : Either[String, Compiled] = {
     val parsed = sources.map(SyslParser.parse(_, target))
 
     parsed.collect { case Left(e) => e } match
       case Nil =>
         compiledTrees(parsed.collect { case Right(p) => p }, libraries, target, precompiled, std,
-          provides, packages)
+          provides, packages, entryPoint)
       case errs => Left(errs.mkString("\n"))
   }
 
@@ -89,9 +95,10 @@ object Compiler {
   def compiledTrees(units: List[Program], libraries: List[Program] = Nil,
                     target: Target = Target.default, precompiled: Set[String] = Set.empty,
                     std: Option[Stdlib] = None, provides: Set[String] = Capability.core.toSet,
-                    packages: Packages = Packages.none)
+                    packages: Packages = Packages.none, entryPoint: Boolean = true)
       : Either[String, Compiled] =
-    analyzed(libraries ::: units, target, precompiled, carried(std, target), provides, packages)
+    analyzed(libraries ::: units, target, precompiled, carried(std, target), provides, packages,
+      entryPoint)
 
   /** The same compilation stopped at the **typed tree**, which is what `sysl prove` reads (`17 §9`).
    *
@@ -291,13 +298,14 @@ object Compiler {
    */
   private def analyzed(units: List[Program], target: Target, precompiled: Set[String],
                        std: Stdlib, provides: Set[String] = Capability.core.toSet,
-                       packages: Packages = Packages.none)
+                       packages: Packages = Packages.none, entryPoint: Boolean = true)
       : Either[String, Compiled] =
     for
       typed    <- Analyzer.analyze(units, std = std, target = target, provides = provides,
                     packages = packages)
       promoted <- Escape.check(typed)
       _        <- TailCalls.check(typed)
+      _        <- Exports.check(typed)
     yield
       // Pruning still runs, and still from `main`: a library function this program never calls is
       // dropped from the tree exactly as before. What `precompiled` changes is only what happens to
@@ -312,7 +320,13 @@ object Compiler {
       // The std's units are asked as well as the program's, and this is what makes an artifact's
       // directives mean anything: the standard module arrives as `Stdlib` rather than in `units`, so a
       // collection that read only the latter would drop every directive the library ships with.
-      Compiled(Codegen.generate(pruned.copy(precompiled = precompiled), promoted, target),
+      // `entryPoint = false` is what makes a C-callable artifact possible at all (`15 §12`): the
+      // module is emitted with no `main`, so the C project supplies its own and this object is
+      // something its linker takes rather than something that wanted to be a program. It is the same
+      // switch a library build has always used, reached from a second command.
+      Compiled(Codegen.generate(pruned.copy(precompiled = precompiled, entryPoint = entryPoint),
+                                promoted, target),
                promoted.explanations,
-               LinkDirectives.required(units ::: std.units))
+               LinkDirectives.required(units ::: std.units),
+               pruned.funcs.filter(_.exported.isDefined))
 }

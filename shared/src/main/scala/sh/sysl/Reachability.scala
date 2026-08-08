@@ -51,9 +51,17 @@ object Reachability {
     //
     // Its **body** is walked with the others, so whatever a handler calls survives because the
     // handler does. Only its own name has to be added by hand, since nothing names it.
+    //
+    // **An `@export`ed function is a root for the same reason** (`15 §12`). Nothing inside the
+    // program need ever call it — the whole point is that something outside the program will, and
+    // this compilation cannot see that caller any more than it can see the processor. A build with
+    // no entry point at all is the case that makes this load bearing: every root above is absent
+    // there, so an export that were not one would prune the artifact down to nothing.
     val handlers = program.funcs.filter(_.conv.isDefined)
-    val roots    = List(program.main, program.vals, program.vtables, program.entry, handlers)
-    val live     = reachedFrom(roots, program.funcs, program.vtables).calls ++ handlers.map(_.name)
+    val exported = program.funcs.filter(_.exported.isDefined)
+    val entries  = handlers ::: exported
+    val roots    = List(program.main, program.vals, program.vtables, program.entry, entries)
+    val live     = reachedFrom(roots, program.funcs, program.vtables).calls ++ entries.map(_.name)
 
     program.copy(
       externs = program.externs.filter(e => live(e.name)),

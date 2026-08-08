@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 30
+  val Version: Int = 31
 
   private val Magic = "sysl-ast"
 
@@ -344,7 +344,7 @@ object AstCodec {
         case Invariant(c, m)              => tok("inv"); expr(c); opt(m)(sref)
         case Variant(e)                   => tok("vnt"); expr(e)
 
-        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, tvs, tpk, t, cv, tr, pu, gh, rd, wr) =>
+        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, tvs, tpk, t, cv, tr, pu, gh, rd, wr, ex) =>
           tok("fn"); sref(n); list(tps)(sref); list(ps)(param); opt(rt)(typ); list(b)(stmt)
           bounds(bs); bool(va); vis(vs); tdefaults(tds); tdefaults(tvs); list(tpk.toList)(sref)
           opt(t)(testAttr)
@@ -352,6 +352,10 @@ object AstCodec {
           // A frame is carried as written rather than as resolved: an archive holds declarations, and
           // the names are resolved against the importing program's view exactly as the body's are.
           opt(rd)(ns => list(ns)(sref)); opt(wr)(ns => list(ns)(sref))
+          // `@export` travels for the reason a layout does: a module has to publish the same symbol
+          // whether it was compiled from source or read back from an artifact, and one that dropped
+          // the mark would quietly mangle the name again.
+          opt(ex)(e => { pos(e); opt(e.symbol)(sref) })
 
         case ExternDecl(n, ps, rt, va, lk, vs) =>
           tok("ext"); sref(n); list(ps)(param); opt(rt)(typ); bool(va); opt(lk)(sref); vis(vs)
@@ -740,7 +744,7 @@ object AstCodec {
           FuncDecl(sref(), list(sref()), list(param()), opt(typ()), list(stmt()),
             bounds(), bool(), vis(), tdefaults(), tdefaults(), list(sref()).toSet, opt(testAttr()),
             opt(at(CallConv(sref(), opt(sref())))), bool(), bool(), bool(),
-            opt(list(sref())), opt(list(sref())))
+            opt(list(sref())), opt(list(sref())), opt(at(ExportAttr(opt(sref())))))
         case "ext" =>
           ExternDecl(sref(), list(param()), opt(typ()), bool(), opt(sref()), vis())
         case "extv" =>

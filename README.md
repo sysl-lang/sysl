@@ -84,6 +84,16 @@ sysl run prog.sysl --lib /tmp/it.syslib            # or an artifact
 Ordinarily a program names one in `package.hocon` instead and `sysl build` fetches it, which is what
 `design/packages.md` is about.
 
+**The boundary runs both ways.** `@export` publishes a definition under a plain, unmangled C symbol,
+and `sysl build-c` writes a static archive and a C header for an existing C project to link — so
+sysl can sit underneath a C program as readily as it sits on top of a C library
+(`design/15 §12`):
+
+```bash
+sysl build-c mylib -o libmylib.a   # writes libmylib.a and libmylib.a.h
+clang main.c libmylib.a -o app
+```
+
 **Binding a library your package manager installed takes two flags**, because a toolchain searches
 its own directories and nothing else — on a Mac that means `/opt/homebrew` is invisible to it:
 

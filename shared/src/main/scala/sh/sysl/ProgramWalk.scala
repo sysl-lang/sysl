@@ -22,6 +22,7 @@ trait ProgramWalk
     with Capabilities
     with LinkRequirements
     with ConventionCheck
+    with ExportCheck
     with NoAlloc
     with Purity
     with Frames
@@ -308,6 +309,8 @@ trait ProgramWalk
     // Read off the declarations rather than the bodies, so that a handler nothing instantiates and
     // nothing reaches is judged exactly as one that does (`15 §10`).
     checkConventions()
+    // Read off the declarations for the same reason (`15 §12`).
+    checkExports()
 
     val (fromLibrary, ours) = funcDecls.values.toList
       .filter(f => f.tparams.isEmpty && !externDecls.contains(f.name))
@@ -1260,7 +1263,11 @@ trait ProgramWalk
     // says so, since both name the one declaration.
     TFunc(name, tparams, rtype, tbody, f.variadic, requires, ensures, olds,
       fileLocal(name) || fileLocal(f.name), f.conv, f.tailrec, variant, f.pure, f.ghost,
-      frameSymbols(f.reads, "reads"), frameSymbols(f.writes, "writes"))
+      frameSymbols(f.reads, "reads"), frameSymbols(f.writes, "writes"),
+      // `@export` becomes a symbol here, where the declared name is still in hand. An unwritten one
+      // is the function's **bare** name: the module path is what mangling adds, and suppressing the
+      // mangling is the whole of what the attribute does.
+      f.exported.map(_.symbol.getOrElse(Modules.bare(f.name))))
   }
 
   /** Typechecks the leading `require`/`ensure` clauses. Both conditions must be `bool`. `result`

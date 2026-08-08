@@ -428,7 +428,24 @@ case class FuncDecl(
     reads: Option[List[String]] = None,
     /** `@writes(…)` — see `TFunc.writes`. `None`/`Some(Nil)` divide as they do for `reads`. */
     writes: Option[List[String]] = None,
+    /** `@export` — see `ExportAttr`. */
+    exported: Option[ExportAttr] = None,
 ) extends Stmt
+
+/** What `@export` says about the function it is written above (`15 §12`).
+ *
+ * `symbol` is the name the linker files the definition under, and `None` means the function's own.
+ * That is `extern` read the other way: `extern exit(code: int)` resolves the symbol `exit`, and
+ * `extern "opendir" c_opendir(…)` renames it — so `@export` and `@export("mylib_parse")` are the
+ * same pair pointing the other direction, and neither side invents a spelling the other lacks.
+ *
+ * The rename is the form a real C API wants rather than a convenience. A library's symbols share a
+ * prefix so that linking two of them is not a coin toss, and the sysl side has a module path doing
+ * that job already — so `parse` in module `mylib` is the name to write and `mylib_parse` is the name
+ * to export, and requiring the function to be *called* `mylib_parse` everywhere inside would be
+ * spelling the module path twice.
+ */
+case class ExportAttr(symbol: Option[String]) extends Positioned
 
 /** What `@test` says about the function it is written above (`testing.md`).
  *
@@ -480,6 +497,11 @@ enum Attr(val word: String) {
     */
   case Packed                extends Attr("packed")
   case Align(bound: Expr)    extends Attr("align")
+
+  /** `@export` and `@export("mylib_parse")` — the definition is C-callable under an unmangled
+    * symbol (`15 §12`). See `ExportAttr` for why the rename is the form that matters.
+    */
+  case Export(attr: ExportAttr) extends Attr("export")
 }
 
 /** `extern name(params) -> ret` — a function this program does not define but may call, resolved

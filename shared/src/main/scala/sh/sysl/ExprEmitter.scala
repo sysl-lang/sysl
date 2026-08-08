@@ -224,6 +224,11 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
 
   private val symbols: Map[String, String] =
     program.externs.collect { case e if e.symbol != e.name => e.name -> e.symbol }.toMap ++
+      // `@export` is the same substitution an `extern`'s link name is, pointing the other way: the
+      // definition and every sysl call to it name the C symbol rather than the mangled key
+      // (`15 §12`). Nothing else about the function changes — a caller inside sysl still resolves it
+      // by its module path and simply arrives at a different label.
+      program.funcs.collect { case f if f.exported.isDefined => f.name -> f.exported.get }.toMap ++
       program.entry.map(_.func -> entrySymbol)
 
   /** What a definition and every call to it name. */
