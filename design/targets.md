@@ -75,6 +75,21 @@ operating system, and the ABI of a freestanding ELF target is fully specified; i
 hosted target on the same processor only where the OS is what fixed the convention. That is the
 target a `no alloc` module (`capabilities.md`) is eventually built for.
 
+**Freestanding does not mean self-contained, and the difference is a link error rather than a
+diagnostic.** A program still names C symbols the target's runtime is expected to define — `putchar`
+wherever anything prints, `free` wherever ARC can reach a release, `memcpy` and `memset` for a
+structure assignment the source never wrote — and none of them is a *sysl* dependency the compiler
+could report on: they are what any C compiler emits for the same code. A bare board therefore owes a
+support package, which is what pico-sdk and newlib-nano are.
+
+**The one that surprises is arithmetic.** A `long` is sixty-four bits on every target, so a 32-bit
+machine without a 64-bit divider — which is all of them — turns rendering one into a call to a
+compiler-rt builtin: `__divdi3` on RISC-V, `__aeabi_ldivmod` under the ARM EABI. The language decided
+nothing here; the width of `long` is the language's answer and the instruction set is the machine's,
+and where the two do not meet the runtime is what closes the gap, exactly as it does for C. Real
+toolchains link `libgcc` or compiler-rt without being asked, which is why the requirement is
+invisible until a cross-build has neither.
+
 **A target sysl knows and cannot build for is listed anyway.** `x86-linux` is refused with a message
 saying what is missing, because a reader told the name is *unknown* would go looking for a typo that
 is not there. **What is missing is no longer its width** — this page said "it is 32-bit" until 32-bit
