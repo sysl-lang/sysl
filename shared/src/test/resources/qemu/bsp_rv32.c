@@ -66,3 +66,29 @@ void *memset(void *dst, int c, size_t n) {
 
     return dst;
 }
+
+/* Sixty-four bit division, which RV32 has no instruction for and asks for by these four names. A
+ * `long` is sixty-four bits on every target, so rendering one divides by ten and lands here.
+ * `divmod64.h` says why this is the board's job rather than the compiler's.
+ */
+#include "divmod64.h"
+
+unsigned long long __udivdi3(unsigned long long a, unsigned long long b) {
+    return sysl_udivmod64(a, b, 0);
+}
+
+unsigned long long __umoddi3(unsigned long long a, unsigned long long b) {
+    unsigned long long r;
+
+    sysl_udivmod64(a, b, &r);
+    return r;
+}
+
+long long __divdi3(long long a, long long b) { return sysl_divmod64(a, b, 0); }
+
+long long __moddi3(long long a, long long b) {
+    long long r;
+
+    sysl_divmod64(a, b, &r);
+    return r;
+}

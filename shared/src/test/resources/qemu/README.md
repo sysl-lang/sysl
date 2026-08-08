@@ -17,11 +17,20 @@ are named by name, and a bare board has to supply them or the image does not lin
 | `putchar` | `sysl.putbytes`, so every `print` and every `Display` rendering onto standard output |
 | `free` | ARC's release path, **whether or not it is ever reached** — a call to a function nothing defines is a link error on a path never taken (ticket 0037) |
 | `memcpy`, `memset` | a structure assignment and zeroing, whatever the source said |
+| 64-bit division | rendering a `long`, which divides by ten — and neither core has the instruction |
 
-`bsp_rv32.c` and `bsp_thumb.c` supply all four plus a bump arena. That is what a real bare-metal
+`bsp_rv32.c` and `bsp_thumb.c` supply all of them plus a bump arena. That is what a real bare-metal
 project has too, under another name: pico-sdk's, or newlib-nano's. **It is not a way round anything**
 — a program compiled under the default capabilities may allocate, so a board running it owes it an
 allocator, and one that prints needs somewhere to print.
+
+**The division is the one that arrives as a surprise, and its name depends on the architecture.**
+RISC-V asks for `__divdi3`; the ARM EABI asks for `__aeabi_ldivmod`, which answers the quotient *and*
+the remainder in registers no C signature can name, so it is a naked wrapper around an ordinary
+helper. `divmod64.h` has the arithmetic and both files spell their own names. A real project links
+`libgcc` or compiler-rt for these and never sees them; this machine has **no cross builtins at all**,
+which is why they are here. Nothing below a link would have said so — a call to a function nothing
+defines makes a perfectly good object file, which is this tier's argument in one sentence again.
 
 ## The startup zeroes `.bss`, and that is not optional
 
@@ -69,17 +78,44 @@ arrives as 0 and every assertion made against the status is worthless while look
 extended call takes a pointer to `{0x20026, code}`. Semihosting also has to be asked for: without
 `-semihosting-config` the `bkpt` is a debug event nobody handles.
 
-**The startup sets `sp` itself.** A Cortex-M boots through a vector table and `start_thumb.s` has
-one, but QEMU's `-kernel` enters at the **ELF entry point** and does not load `SP` from it. A
-program that trusts the table runs with a junk `SP` and faults on the first push — *inside* whatever
-it called first, so the register dump blames the callee.
+**The image is linked at 0x10000000, the SECURE alias of the code SRAM, and this is the single most
+important line in this directory.** An ARMv8-M core comes out of reset in the secure state and reads
+its initial `SP` and reset vector from the *secure* vector table; the board's IDAU splits the map by
+bit 28, so `0x0xxxxxxx` is the non-secure view of the same memory and `0x1xxxxxxx` is the secure one.
+Linked at zero, the address the CPU actually reads is full of zeros.
 
-**Everything lives in the code SRAM at 0x00000000, stack included**, which is a measurement rather
-than a preference. The board does have an SRAM at `0x20000000`, and it is small: a store at
-`0x20000000` succeeds and one at `0x20008000` faults, so a script claiming a few megabytes there
-gives a stack pointer backed by nothing. The code region is proven mapped by the program running out
-of it. Moving the stack to that 32K SRAM was tried and changed nothing either way, so the simpler
-map stayed.
+**What that cost was not a board that refused to boot, which is exactly why it survived so long.**
+With `SP` and `PC` both read as zero the core faults at once, escalates to a secure HardFault whose
+vector is also zero, and branches to `0x1` — address zero with the Thumb bit — where it starts
+executing the vector table and the unwind tables *as instructions*, runs off the end of them, and
+falls into `_start`, which sets a real stack and calls `main`. The program then runs and prints the
+right answer. It does that whenever the bytes ahead of the entry point happen to decode as harmless
+Thumb, which is a property of how many functions the image has and what the linker put in
+`.ARM.exidx` — so this directory spent a long time believing the board was *"sensitive to the image's
+layout"*, with two tests `ignore`d for it and a warning in `start_thumb.s` never to grow the vector
+table.
+
+**One command said so, and it was the first line of every run all along:**
+
+```
+$ qemu-system-arm -M mps2-an505 -nographic -semihosting-config enable=on,target=native -d int -kernel <elf>
+Loaded reset SP 0x0 PC 0x0 from vector table
+Taking exception 18 [v7M INVSTATE UsageFault] on CPU 0
+...taking pending secure exception 3
+...loading from element 3 of secure vector table at 0x1000000c
+...loaded new PC 0x1
+ok
+```
+
+`0x1000000c` is the fourth word of the table the CPU wanted, and it names the address the image
+should have been at. **The lesson is about the evidence rather than the board**: the healthy runs
+printed those same lines, and the reason nobody read them is that they were healthy. A trace was only
+ever taken of a failing run, where three lines of prologue look like part of the failure.
+
+**The stack is at the top of the code region.** The board also has a small SRAM at `0x20000000` — a
+store there succeeds and one at `0x20008000` faults, so it is 32K and a script claiming megabytes
+would hand out a stack backed by nothing. Putting the stack there was tried and changed nothing, so
+the simpler map stayed.
 
 **The UART is the CMSDK one at 0x40200000, and it transmits nothing until it is enabled.** Its
 registers are *words*, not bytes: `DATA` at 0x00, `CTRL` at 0x08, `BAUDDIV` at 0x10. Set `BAUDDIV`
@@ -90,40 +126,16 @@ and no error** — QEMU says `transmit data write with Tx disabled`, and only un
 with the Thumb bit already set, so adding one clears it, and a reset arriving through the table
 enters in ARM state — which a Cortex-M cannot do. What that looks like is `UsageFault INVSTATE`
 (`CFSR` bit 17) and a lockup reported wherever the CPU wandered to, which is nowhere near the vector
-table. The reset entry was `_start+1` for a long time and the board tolerated it, because QEMU
-usually enters at the ELF entry instead; it is `_start` now, which is correct either way.
+table. This mattered less than it looked while nothing was reading the table; it matters now.
 
-### The MPS2's boot is sensitive to the image's LAYOUT, and this is the open problem
-
-Two changes, neither of which alters what any program does, each turn **every** thumb program here
-from green to a lockup:
-
-- growing `.vectors` from two words to seven, to give the fault vectors a handler;
-- discarding `.ARM.exidx`, the unwind tables nothing reads, which otherwise land as an orphan section
-  **between the vector table and the code**.
-
-So the arrangement that boots is: a two-word `.vectors`, then `.ARM.exidx`, then `.text` — which
-puts the vector table and the unwind tables in one read-only segment and the code in another. Change
-either and QEMU starts executing at address 0 in ARM state, which `-d in_asm` shows directly:
-
-```
-Loaded reset SP 0x0 PC 0x0 from vector table
-IN: 0x00000000:  20008000  andhs r8, r0, r0
-Taking exception 18 [v7M INVSTATE UsageFault] on CPU 0
-```
-
-`virt` runs the identical sources with none of this. **What is ruled out**: it is not the compiler
-(the same program in a different shape compiles to the same code and boots), not `.bss` (zeroed
-since), not the stack's size or position (moving it to the other SRAM changed nothing), and not
-signedness or width in the program. One test in `QemuHarnessTests` is `ignore`d for it — the largest
-image the suite builds — with the assertions it should make.
-
-**The cost of not having the fault handlers is worth stating**, since the temptation is to add them
-back: a fault with no handler escalates to HardFault, whose vector is past the end of a two-word
-table, so the CPU branches into whatever follows and QEMU reports `Lockup: can't escalate 3 to
-HardFault` at a meaningless address — **the same report for every possible cause**. Wiring five
-vectors to a handler that prints `CFSR`/`HFSR`/`MMFAR` *does* work, and is how the `INVSTATE` above
-was identified; it just cannot be left in.
+**The faults have a handler, and it exits rather than reporting.** Without one they all say the same
+thing: a fault with no vector escalates to HardFault, the CPU branches into whatever follows the
+table, and QEMU says `Lockup: can't escalate 3 to HardFault` at a meaningless address — for every
+possible cause, and only after the wall-clock alarm has run out. The handler leaves through the same
+semihosting exit a clean run does, with status **99**, so a faulting program stops immediately and
+the suite reports a board fault instead of a timeout. It deliberately does not print `CFSR`: that
+needs the UART enabled and a hex routine, which is a program to get wrong inside the thing that
+reports other programs going wrong, and `-d int` says it better for nothing.
 
 ## Wired into the suite
 
@@ -146,6 +158,11 @@ immediately above what killed it.
 get a disassembly of a board program that misbehaved: the image is a temporary that goes when the JVM
 exits, so reading its path out of a log is too late. Nothing reads the variable in an ordinary run.
 
+**Keep an image that PASSES too, and run `-d int` on it.** The boot bug above was invisible for as
+long as it was because every trace ever taken was of a failing run, where three lines of exception
+prologue read as part of the failure. Side by side with a healthy run's — identical, up to the point
+where one of them recovered — they name the cause in a sentence.
+
 ## What is still owed
 
 - **A freestanding entry point takes `argc` and `argv`.** `define i32 @main(i32 %argc, ptr %argv)`
@@ -166,6 +183,12 @@ own hook", and calls such a module allocator-free and portable to every target.
 `NoAllocEmissionTests` carries the diagnosis and the contrast; the claim about `@no_alloc` is
 `ignore`d with the assertion it should make.
 
-**Nothing below this tier could have seen it.** Every other cross-target test stops at an object
-file, and a call to a function nothing defines makes a perfectly good object. Freestanding targets
-had been in the registry for months with no program ever linked for one.
+**Rendering a `long` needs the board to supply 64-bit division.** A `long` is sixty-four bits on
+every target and neither of the RP2350's cores has the instruction, so `lib/sysl/display.sysl`
+dividing by ten becomes a call to `__divdi3` or `__aeabi_ldivmod`. That is not a defect in anything —
+C does the same here — but it is a link error with no other warning, and a real project only never
+sees it because pico-sdk has already linked `libgcc`.
+
+**Nothing below this tier could have seen either of them.** Every other cross-target test stops at an
+object file, and a call to a function nothing defines makes a perfectly good object. Freestanding
+targets had been in the registry for months with no program ever linked for one.

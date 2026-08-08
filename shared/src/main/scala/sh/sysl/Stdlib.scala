@@ -130,7 +130,7 @@ object Stdlib {
         case Choice.FromSource      => Right(Resolved(fromSource(target), Set.empty, None))
         case Choice.Artifact(named) => load(named, target)
         case Choice.Default(search) =>
-          val path = search.getOrElse(LibraryArtifact.stdDefault)
+          val path = search.getOrElse(LibraryArtifact.stdDefault(target))
 
           resolved.synchronized(resolved.getOrElseUpdate((path, target), found(path, target)))
 

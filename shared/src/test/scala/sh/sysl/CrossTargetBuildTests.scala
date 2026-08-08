@@ -49,6 +49,30 @@ class CrossTargetBuildTests extends AnyFreeSpec with Matchers {
         |extern "take" take(p: Pair) -> int
         |var r = take(Pair(1, 2))
         |""".stripMargin,
+    // A string that exists at run time rather than as a literal, which is a different half of the
+    // compiler: a literal is three words the emitter writes down, and every one of these reaches a
+    // *runtime* helper instead — `sysl.str.concat`, `sysl.str.from_bytes`, a per-width integer
+    // renderer, `sysl.str.cmp`, and the three `snprintf` wrappers behind a format specifier. Those
+    // helpers are IR templates rather than generated code, so a `usize` in one of them is a
+    // hardwired `i64` until something makes it verify for a machine that has not got one.
+    "a string built at run time, and the renderers behind it" ->
+      """var greeting = "he" + "llo"
+        |var counted = str(greeting.len) + str('!')
+        |var padded = f"${greeting}%8s ${greeting.len}%d ${0.5}%6.2f"
+        |var same = greeting == "hello"
+        |var back = from_utf8_unchecked(greeting.bytes)
+        |""".stripMargin,
+    // Rendering into a growable buffer, which is the one sink the compiler writes rather than the
+    // library: `str` of anything that is not a primitive writes itself through its `Display` into a
+    // stack slot that grows on the heap, and what landed there becomes the string. Nothing above
+    // reaches it, because every value above is a primitive or already a string.
+    "a value that renders itself into a growable buffer" ->
+      """struct P
+        |    x: int
+        |impl Display for P
+        |    display(self, w: *Writer, spec: FormatSpec) = str(self.x).display(w, spec)
+        |var s = str(P(6))
+        |""".stripMargin,
   )
 
   for t <- Target.all if t.supported do
@@ -60,8 +84,9 @@ class CrossTargetBuildTests extends AnyFreeSpec with Matchers {
           val cc = Toolchain.findClang(t).getOrElse(cancel(s"no clang for ${t.name}"))
 
           val obj = createTempFile("sysl-cross-", ".o")
-          val ir  = Compiler.compile(List(Source("p.sysl", src)), t)
-            .getOrElse(fail(s"did not compile for ${t.name}"))
+          val ir  = Compiler.compile(List(Source("p.sysl", src)), t) match
+            case Right(ir) => ir
+            case Left(why) => fail(s"did not compile for ${t.name}: $why")
 
           withClue(s"$cc, ${t.triple}: ")(Toolchain.compileObject(ir, obj, t) shouldBe Right(()))
         }

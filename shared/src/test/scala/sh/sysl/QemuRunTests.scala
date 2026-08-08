@@ -212,6 +212,62 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
         out should include("n=1000")
       }
 
+      // A string the program did not have when it started, which is a different half of the
+      // compiler from a literal: a literal is three words the emitter writes down, and every one of
+      // these reaches a runtime helper instead — `sysl.str.concat`, `sysl.str.from_bytes`, the
+      // integer renderer, and `sysl.str.cmp`. Those helpers are IR *templates* rather than generated
+      // code, so a length in one of them is a hardwired width until something makes it verify and
+      // then run somewhere that has not got sixty-four bits.
+      //
+      // **The comparison is what makes this more than an assembly check.** Concatenation reads a
+      // length, allocates the sum, and copies two runs by it; a length loaded at the wrong width
+      // produces a string of the right shape and the wrong bytes, and only reading them back says
+      // so. `CrossTargetBuildTests` proves the same program *verifies* for this triple and cannot
+      // see any of that.
+      "builds a string at run time and reads back what it built" in {
+        val src = List(
+          Source("p.sysl",
+            """import board.*
+              |
+              |val w = console()
+              |
+              |val greeting = "he" + "llo"
+              |val counted = greeting + "=" + str(greeting.len)
+              |
+              |w.write(counted.bytes)
+              |if counted == "hello=5" then w.write(" same".bytes) else w.write(" differs".bytes)
+              |""".stripMargin),
+          boardModule(t))
+
+        val (status, out) = bootUnderQemu(t, src, 20)
+
+        withClue(s"the board said: '$out'")(status shouldBe 0)
+        out should include("hello=5 same")
+      }
+
+      // A `long` is sixty-four bits on a machine whose registers are thirty-two, so every division
+      // rendering it performs is a call to a compiler-rt builtin rather than an instruction. That is
+      // ordinary — it is what C does here too — but it is the one thing in the library that needs
+      // something from the board beyond memory and a character out, and nothing below a link would
+      // say so: the object file is perfectly good and names a symbol.
+      "renders a long, whose division the board has to supply" in {
+        val src = List(
+          Source("p.sysl",
+            """import board.*
+              |
+              |val w = console()
+              |val n: long = 9007199254740993
+              |
+              |n.display(w, FormatSpec(0, -1, false))
+              |""".stripMargin),
+          boardModule(t))
+
+        val (status, out) = bootUnderQemu(t, src, 20)
+
+        withClue(s"the board said: '$out'")(status shouldBe 0)
+        out should include("9007199254740993")
+      }
+
       // Module storage that starts at zero starts at zero. It is `.bss`, which occupies no bytes in
       // the file, so what a program finds there is whatever the RAM held unless the startup zeroes
       // it — and a `*Writer` that should be null but is not sends the first call through its method

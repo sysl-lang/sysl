@@ -774,7 +774,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       val v   = genExpr(arg)
       val p   = freshTemp(); emit(s"$p = extractvalue ${arg.ty.llvm} $v, 1")
       val n   = freshTemp(); emit(s"$n = extractvalue ${arg.ty.llvm} $v, 2")
-      val r   = freshTemp(); emit(s"$r = call ${Type.Str.llvm} @$fn(ptr $p, i64 $n)")
+      val r   = freshTemp(); emit(s"$r = call ${Type.Str.llvm} @$fn(ptr $p, $word $n)")
       ownTemp(r, Type.Str)
 
     // Rendering into a buffer: a zeroed stack slot becomes the sink, the value writes itself into

@@ -1,24 +1,30 @@
     .syntax unified
     .thumb
 
-    // A Cortex-M boots through a vector table rather than a bare entry point, so one is here even
-    // though QEMU's `-kernel` normally enters at the ELF entry instead. Two words: the initial stack
-    // pointer and the reset handler.
+    // A Cortex-M boots through a vector table, and **this one is read**: the image is linked at the
+    // secure alias 0x10000000, which is where an ARMv8-M core coming out of reset looks. `thumb.ld`
+    // explains what linking it at 0x00000000 did instead, and why that looked like a working board.
     //
     // **`.word _start`, and NOT `_start+1`.** The linker resolves a `.thumb_func` symbol with the
-    // Thumb bit already set, so adding one clears it -- and a reset that did come through this table
-    // would then enter in ARM state, which a Cortex-M cannot do. What that looks like is
-    // `UsageFault INVSTATE` (`CFSR` bit 17) and a lockup, reported at whatever address the CPU
-    // wandered to rather than at this line.
+    // Thumb bit already set, so adding one clears it, and the reset then enters in ARM state -- which
+    // a Cortex-M cannot do. What that looks like is `UsageFault INVSTATE` (`CFSR` bit 17) and a
+    // lockup reported at whatever address the CPU wandered to, rather than at this line.
     //
-    // **Do not grow this table.** Wiring the five fault vectors to a handler -- the obvious way to
-    // find out what a faulting program did, and one that works in the sense that the handler runs
-    // and prints `CFSR` -- makes *every* image on this board fail to boot instead. So QEMU's entry
-    // into a program here is sensitive to this section's size in a way that is not yet understood,
-    // and two words is the size that boots. `README.md` records what was measured.
+    // The faults are wired to a handler for one reason: **without one they all report the same
+    // thing.** A fault with no vector escalates to HardFault, whose vector would be past the end of
+    // a short table, so the CPU branches into whatever follows and QEMU says `Lockup: can't escalate
+    // 3 to HardFault` at a meaningless address -- for every possible cause, and only after the whole
+    // wall-clock alarm has expired. Handled, a faulting program stops at once with a status of its
+    // own, and a suite that expected output gets a failure naming the board rather than a timeout.
     .section .vectors, "a"
     .word _stack_top
     .word _start
+    .word fault_handler         // NMI
+    .word fault_handler         // HardFault
+    .word fault_handler         // MemManage
+    .word fault_handler         // BusFault
+    .word fault_handler         // UsageFault
+    .word fault_handler         // SecureFault
 
     .section .text
     .thumb_func
@@ -61,3 +67,26 @@ _start:
     bkpt 0xAB
 
 1:  b 1b
+
+    // A fault leaves through the same door as a clean exit, with a status nothing else uses, so the
+    // suite reads "the board faulted" rather than waiting out its alarm and reading nothing. It does
+    // not try to say *which* fault: `CFSR` is a register a handler can print, and printing needs the
+    // UART enabled and a hex routine, which is a program to get wrong inside the thing that reports
+    // other programs going wrong. `-d int` says it better and costs nothing to turn on.
+    //
+    // The exit block is a constant rather than the stack's: the fault may well be a stack that has
+    // run somewhere unusable, and building the argument on it would fault again inside the handler.
+    .thumb_func
+    .global fault_handler
+fault_handler:
+    ldr  r1, =fault_exit
+    movs r0, #0x20
+    bkpt 0xAB
+
+2:  b 2b
+
+    .section .rodata
+    .align 2
+fault_exit:
+    .word 0x20026
+    .word 99

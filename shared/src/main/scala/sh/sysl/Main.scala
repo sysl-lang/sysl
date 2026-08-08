@@ -601,7 +601,7 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
       // the library without depending on where the caller happened to be standing.
       val out =
         cfg.output.getOrElse(
-          if cfg.std then cfg.stdSearch.getOrElse(LibraryArtifact.stdDefault)
+          if cfg.std then cfg.stdSearch.getOrElse(LibraryArtifact.stdDefault(target))
           else defaultOutput(cfg.file, named, LibraryArtifact.extension))
 
       Project.parentOf(out).foreach(createDirectories)

@@ -22,10 +22,11 @@ class QemuHarnessTests extends AnyFreeSpec with QemuSupport {
   /** A whole program: the board's module, and a root file that declares its tests, points the
    * framework at the board's console, and then runs them.
    *
-   * **The declarations come first and every statement after**, which is how a suite reads anyway and
-   * is not merely tidiness: a root file's statements interleaved with its declarations produce an
-   * image that does not boot on the MPS2, and only on the MPS2. `resources/qemu/README.md` has what
-   * was measured; the shape is pinned by an `ignore`d test below rather than left as a habit.
+   * The declarations come first and every statement after, which is how a suite reads. That is all
+   * it is now — it was written down here as a *requirement*, because the other arrangement produced
+   * an image that would not boot on the MPS2 and only on the MPS2, and that turned out to be a
+   * linker script pointing at the wrong alias rather than anything about where a statement sits.
+   * `thumb.ld` has the account, and the last test below is the one that used to fail.
    */
   private def program(t: Target, decls: String, stmts: String): List[Source] =
     List(
@@ -112,18 +113,9 @@ class QemuHarnessTests extends AnyFreeSpec with QemuSupport {
       }
 
       // A suite is more than one test, and the counters have to survive across them — module storage
-      // on a board is a fixed area of the image rather than anything an allocator handed out.
-      /* Three verdicts in one run, which is also the largest image this suite builds — and on the
-       * MPS2 it does not boot.
-       *
-       * **The MPS2's boot is sensitive to the image's layout, and that is measured rather than
-       * inferred.** Growing the vector table from two words to seven, and discarding the unwind
-       * tables that otherwise sit between it and the code, each turn *every* thumb program here from
-       * green to a lockup — while changing nothing any program does. `virt` runs the identical
-       * source. `resources/qemu/README.md` has the full account and what was ruled out; the
-       * assertions below are what this should say once the board is understood.
-       */
-      "runs several tests and counts passes, failures and skips apart" ignore {
+      // on a board is a fixed area of the image rather than anything an allocator handed out. Three
+      // verdicts in one run, which is also the largest image this suite builds.
+      "runs several tests and counts passes, failures and skips apart" in {
         val (status, out) = bootUnderQemu(t, program(t,
           """good()
             |    check(true)
@@ -144,17 +136,17 @@ class QemuHarnessTests extends AnyFreeSpec with QemuSupport {
         out should include("2 tests, 1 failed, 1 skipped")
       }
 
-      /* The same suite with one statement moved above the declarations, which is the shape
-       * `program` exists to avoid.
+      /* The same suite with one statement written above the declarations rather than below them.
        *
-       * **It faults on the MPS2 and only on the MPS2**, with `CFSR` reporting `UsageFault INVSTATE`
-       * — a branch to an address whose Thumb bit is clear — and it is sensitive to the *shape* of
-       * the program rather than to its meaning, which is not how a compiler bug behaves. The same
-       * source is fine on `virt`, and the same shape without the framework is fine on both. What is
-       * known and what was ruled out is in `resources/qemu/README.md`; this is here so the claim is
-       * a test rather than a habit, and so that whoever fixes the board finds it already written.
+       * This was `ignore`d for months as *"the MPS2 faults on this shape and only on the MPS2"* —
+       * which was true and was not about the shape at all. The board was never booting through its
+       * vector table, so what ran before `main` was the image's own leading bytes decoded as
+       * instructions, and anything that moved them decided whether the program survived.
+       * `thumb.ld` has the account. Kept, now that it passes, because the claim is worth having:
+       * where a statement sits among the declarations is not something a program's meaning depends
+       * on, and a tier that once said otherwise should go on saying it does not.
        */
-      "reports the same failure when a statement is written above the declarations" ignore {
+      "reports the same failure when a statement is written above the declarations" in {
         val (status, out) = bootUnderQemu(t, program(t,
           """""".stripMargin,
           """adds()

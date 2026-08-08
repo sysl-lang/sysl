@@ -325,7 +325,7 @@ trait ScalarEmitter extends StringEmitter {
     if FormatSpec.isStr(c) then
       val fn     = request("sysl.str.fmt_s")(StringEmitter.fmtStr)
       val (p, n) = strBytes(genExpr(arg))
-      emit(s"$r = call ${Type.Str.llvm} @$fn(ptr $fmt, ptr $p, i64 $n)")
+      emit(s"$r = call ${Type.Str.llvm} @$fn(ptr $fmt, ptr $p, $word $n)")
     else if FormatSpec.isFloat(c) then
       val fn = request("sysl.str.fmt_f")(StringEmitter.fmtFloat)
       val v  = convert(Type.underlying(arg.ty).asInstanceOf[Type.Floating], Type.Real, genExpr(arg))

@@ -350,7 +350,7 @@ class LibraryCliTests extends LibraryCliSupport {
         // defers the path to the moment it is used.
         Config().stdSearch shouldBe None
         stdChoice(Config()) shouldBe Stdlib.Choice.Default(None)
-        LibraryArtifact.stdDefault should endWith(LibraryArtifact.extension)
+        LibraryArtifact.stdDefault(Target.default) should endWith(LibraryArtifact.extension)
       }
 
       /* Where that default *is* moved out of the project and into the user's cache when the compiler
@@ -363,7 +363,7 @@ class LibraryCliTests extends LibraryCliSupport {
         // different path rather than a stale hit at the same one.
         assume(cacheDirectory.isDefined, "this machine has no cache directory")
 
-        LibraryArtifact.stdDefault should include(Std.fingerprint)
+        LibraryArtifact.stdDefault(Target.default) should include(Std.fingerprint)
       }
 
       "and by the compiler too, so an upgrade cannot read back what its predecessor built" in {
@@ -377,26 +377,44 @@ class LibraryCliTests extends LibraryCliSupport {
         // release which changes nothing for the people it is for.
         assume(cacheDirectory.isDefined, "this machine has no cache directory")
 
-        LibraryArtifact.stdDefault should include(BuildInfo.version)
+        LibraryArtifact.stdDefault(Target.default) should include(BuildInfo.version)
       }
 
-      "and names them in one path, both halves, in that order" in {
-        // Pinned whole rather than by two `include`s, because what matters is that the two are one
-        // directory: a layout putting them in separate segments would satisfy both assertions above
+      "and by the target, so a cross build and a host build do not overwrite each other" in {
+        // An artifact is object code for one machine, and a tree parsed as that machine sees it, so
+        // `Stdlib.read` refuses one built for another target by name. Sharing a path between two
+        // targets therefore never gave a wrong answer -- it gave a *rebuild*, each way round, every
+        // time: the cross build refused the host's artifact and overwrote it, the next host build
+        // refused that one and overwrote it back, and each announced itself on stderr in the words
+        // of a fault. Nothing was wrong and nothing was cached.
+        assume(cacheDirectory.isDefined, "this machine has no cache directory")
+
+        val host  = LibraryArtifact.stdDefault(Target.default)
+        val board = LibraryArtifact.stdDefault(Target.thumbFreestanding)
+
+        host should include(Target.default.name)
+        board should include(Target.thumbFreestanding.name)
+        host should not be board
+      }
+
+      "and names all three in one path, in that order" in {
+        // Pinned whole rather than by three `include`s, because what matters is that they are one
+        // directory: a layout putting them in separate segments would satisfy every assertion above
         // and give each release its own tree of every library it ever saw.
         assume(cacheDirectory.isDefined, "this machine has no cache directory")
 
-        LibraryArtifact.stdDefault shouldBe
-          s"${cacheDirectory.get}/sysl/${BuildInfo.version}-${Std.fingerprint}/std${LibraryArtifact.extension}"
+        LibraryArtifact.stdDefault(Target.default) shouldBe
+          s"${cacheDirectory.get}/sysl/${BuildInfo.version}-${Std.fingerprint}-${Target.default.name}" +
+            s"/std${LibraryArtifact.extension}"
       }
 
       "and it sits under the cache directory rather than in the project" in {
         assume(cacheDirectory.isDefined, "this machine has no cache directory")
 
-        LibraryArtifact.stdDefault should startWith(s"${cacheDirectory.get}/sysl/")
+        LibraryArtifact.stdDefault(Target.default) should startWith(s"${cacheDirectory.get}/sysl/")
         // The specific regression: a compilation must not write into whatever directory it was run
         // in. `sysl run notes.sysl` in a downloads folder used to leave a `.sysl/` there.
-        LibraryArtifact.stdDefault should not startWith LibraryArtifact.stdLocal
+        LibraryArtifact.stdDefault(Target.default) should not startWith LibraryArtifact.stdLocal
       }
 
       "while a machine with no cache directory still has the project-local answer" in {
