@@ -11,7 +11,7 @@
   <img alt="Scala Native Version" src="https://img.shields.io/badge/Scala_Native-0.5.12-blue.svg">
 </p>
 
-A modern, ref-counted, general-purpose systems language — easier than Rust.
+A modern, ref-counted, general-purpose systems language.
 
 > **Status: design-first, and it runs.** This repository is a clean reimplementation of the sysl
 > language — not a port of the earlier prototype, which survives only as a source of lessons. The
