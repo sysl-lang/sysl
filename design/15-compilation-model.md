@@ -713,7 +713,8 @@ invalidating anything here.
 ### What the driver produces
 
 `sysl build-c` is `build-lib`'s shape with a different destination — a **static archive** holding the
-module's object and the objects of any C the tree carries (§7), plus a **C header** beside it:
+module's object and the objects of any C the compilation's trees carry (§7), plus a **C header**
+beside it:
 
 ```
 sysl build-c mylib -o libmylib.a       # writes libmylib.a and libmylib.a.h
@@ -754,6 +755,14 @@ already happens.
 
 The cost, which is accepted: two `build-c` archives linked into one program each carry the reachable
 part of the library, and duplicate whatever they share.
+
+**Every tree of §7's table is walked here, and "objects on the link line" means archive members**,
+since this is the command whose link line the archive *is*. So a `--lib` source root's C and a
+dependency's C land beside the project's own, and a package can carry a shim a C consumer will
+resolve — which is most of what §7 is for. The archive being one flat namespace is what decides the
+one refusal: `LibraryArtifact.nativeMember` names a member after the path within its own tree, so two
+trees that hold a C file at the same internal path map to one name, and that is reported rather than
+letting `ar r` replace by name and ship an archive quietly missing half of what one of them defined.
 
 **What the archive does not hold is what this build's own libraries supply** — `libm`, and whatever
 `@link` named — and the driver says so rather than leaving it to be found at the C project's link,
