@@ -230,6 +230,31 @@ class ArcRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "6750000\n"
   }
 
+  /** The `StrBuf` a concatenation builds is a box like any other, and its storage comes back through
+   * the hook its header carries.
+   *
+   * That hook was **null** for as long as `arc.unshare` freed every box itself, and correctly so:
+   * raw bytes hold no references, so there was nothing for a destructor to walk. When the free moved
+   * into the hook, a null one stopped meaning "nothing to walk" and started meaning "nothing frees
+   * this" — so every string a program built would have leaked, silently, because one iteration of it
+   * looks exactly like a correct one.
+   *
+   * Over a long loop it is not silent: a leak grows RSS without bound. `str(i % 10)` builds a second
+   * box per iteration, and one whose length is not a constant, so nothing here folds away.
+   */
+  "a string built in a loop is freed exactly once" in {
+    val src =
+      """var i = 0
+        |var n = 0
+        |while i < 200000
+        |    val s = "n=" + str(i % 10)
+        |    n += int(s.len)
+        |    i++
+        |print(n)""".stripMargin
+
+    run(src) shouldBe "600000\n"
+  }
+
   // A deep field-path store a.b.c through two levels of &T indirection must reach the innermost
   // reference and release the C it replaced — not the wrong hop, and not nothing. Over a long
   // loop a missed release grows RSS; peak RSS was separately confirmed flat. seed = i%7, new =
