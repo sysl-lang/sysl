@@ -106,11 +106,20 @@ class StringCodegenTests extends AnyFreeSpec with CodegenSupport {
     out should include("define private { ptr, ptr, i64 } @sysl.str.concat")
   }
 
+  /** The buffer a join builds is an ARC box, so it carries a header and a hook like any other.
+   *
+   * The hook was **null** here for as long as `arc.unshare` freed every box itself: raw bytes hold
+   * no references, so there was nothing for a destructor to walk. Once the free became the hook's
+   * job, a null one would have meant a string whose bytes are never given back — so what it installs
+   * now is the hook that frees and does nothing else. `ArcRunTests` builds two hundred thousand of
+   * these in a loop, which is the only place the difference is visible.
+   */
   "a joined string owns a heap buffer, so the module links an allocator and counts references" in {
     val out = ir("""print("a" + "b")""")
 
     out should include("declare ptr @malloc(i64)")
-    out should include("store ptr null, ptr %hook")
+    out should include("store ptr @arc.drop.plain, ptr %hook")
+    out should include("define private void @arc.drop.plain(ptr %p, i1 %storage) {")
     out should include("define private void @arc.release_maybe(ptr %p) {")
   }
 
