@@ -577,17 +577,34 @@ object Type {
   def isOrdered(t: Type): Boolean = { val u = underlying(t); isNumeric(u) || u == Char || u == Str }
 
   /** Whether `==` and `!=` are defined. Everything ordered, plus the types that have equality
-   * without an ordering: `bool`, and the two pointer-shaped modes, which compare by address.
+   * without an ordering: `bool`, the two pointer-shaped modes, which compare by address, and a
+   * **simple** enum.
    *
    * A trait object is two words rather than one, and only the second of them is an address — two
    * objects over the same value through different traits are the same value and different tables —
    * so what "equal" would mean is a question the trait has to answer, not the machine.
+   *
+   * **A simple enum is a member for the reason the open `iN` family is: there is nothing else it
+   * could mean, and no finite list an `impl` could be written over.** Every variant is dataless, so
+   * the value *is* its discriminant and the comparison is the integer compare already emitted for
+   * the `: iN` it lowers to — nothing to walk, nothing to decide. What it replaces is a few lines
+   * per enum-shaped API saying what the declaration had already fixed: a hand-written `eq` over a
+   * conversion, an `int(a) == int(b)`, or a two-armed `match` answering one question.
+   *
+   * **A data enum is deliberately not here.** Structural equality over payloads needs every payload
+   * type to be `Eq` itself, which is a real feature and a different one; `simple` is exactly the
+   * line between the two, and it is the same line the lowering already draws.
+   *
+   * There is no matching `Ord`. The declaration order is an order and it is not a *meaning* — `Srgb
+   * < Linear` is not a claim anybody wants a language to make on their behalf — so an enum that
+   * genuinely has one says so with an `impl`.
    */
   def isEquatable(t: Type): Boolean = t match
     case _ if erased(t)                  => false
     // A function pointer is one word and compares by it, which is what makes "is a callback
     // installed" answerable — the question every C interface with a null default asks.
     case Bool | _: Ptr | _: Ref | _: CFn => true
+    case e: Enum                         => e.simple
     case _                               => isOrdered(t)
 
   /** The extremes an integer type can hold — what `T::Min` and `T::Max` answer with (`01`).

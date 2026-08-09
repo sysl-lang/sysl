@@ -143,7 +143,13 @@ trait ScalarEmitter extends StringEmitter {
     // caller because every caller wants it: an ordinary `n < 6` arrives already reduced, and a
     // pattern's test does not, which is what left `n match 1..6` reaching a signedness question
     // asked of a type that has no answer to it.
-    val ty = Type.underlying(base)
+    // A **simple** enum is its discriminant — `Type.Enum.llvm` delegates to the storage integer, so
+    // the value in hand is already one — and equality on it is that integer's compare. Read here for
+    // the same reason a constrained subtype is: every caller wants it, and the signedness question
+    // has no answer asked of the enum itself.
+    val ty = Type.underlying(base) match
+      case e: Type.Enum if e.simple => e.underlying
+      case other                    => other
 
     // Two strings are ordered by their bytes, which is a call rather than an instruction; every
     // operator then reads the same -1 / 0 / 1 the way it would read a subtraction.

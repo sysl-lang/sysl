@@ -46,8 +46,20 @@ trait HoistImpl extends ImplConformance {
     // decides: a catalog trait's arguments default to the implementing type, so an `impl Mul for
     // int` that wrote none of them is the one the compiler already provides, while one that wrote
     // an argument is asking for something else entirely.
+    // **The one type reaching this that a program declared is a simple enum**, whose `Eq` the
+    // compiler supplies for the reason it supplies the open integer family's: the value *is* its
+    // discriminant, so there is one thing equality could mean. The rule is the same and the reader
+    // is different — somebody who wrote the enum four lines up is owed why their own type is on the
+    // compiler's side of this line, not only that it is.
     if written.isEmpty && Library.spelling(impl.traitName).exists(CoreTraits.builtin(_, ty)) then
-      err(s"'${outer.label}' already implements '${qn(impl.traitName)}' — the compiler provides it")
+      val because = ty match
+        case e: Type.Enum if e.simple =>
+          " — no variant of it carries anything, so its value is its discriminant and '==' is that " +
+            "comparison. Delete the block; a variant that needs an equality of its own has to carry " +
+            "something for it to be about"
+        case _ => " — the compiler provides it"
+
+      err(s"'${outer.label}' already implements '${qn(impl.traitName)}'$because")
 
     // A **closed** trait names a family rather than a promise, so there is nothing for a block to
     // supply: it declares no member, and an `impl` of it could only be a claim to belong to the

@@ -335,6 +335,92 @@ class CoreTraitRunTests extends AnyFreeSpec with RunSupport with CodegenSupport 
             |""".stripMargin) shouldBe "true false false true\n"
     }
 
+    /** A **simple** enum — every variant dataless — is `Eq` by the rule the open `iN` family is, and
+     * for the same reason: the value *is* its discriminant, so there is one thing equality could
+     * mean and no finite list an `impl` could be written over.
+     *
+     * The workarounds it replaces were all short, which is the tell rather than the reassurance:
+     * a hand-written `eq` over a conversion, an `int(a) == int(b)`, or a two-armed `match` answering
+     * one question. Every enum-shaped API wrote one of them.
+     */
+    "a simple enum is equatable, and a data enum is not" - {
+
+      "two of them compare by their discriminant" in {
+        run("""enum Colorspace
+              |    Srgb
+              |    Linear
+              |var a = Srgb
+              |var b = Linear
+              |print(a == a, a == b, a != b, b != b)""".stripMargin) shouldBe
+          "true false true false\n"
+      }
+
+      // The comparison happens at the storage type the annotation named, not at `int` — a width the
+      // compare was emitted at wrongly would answer for a discriminant the enum does not have.
+      "at the width the ': iN' annotation gave it" in {
+        run("""enum Small: u8
+              |    A = 1
+              |    B = 255
+              |var a = A
+              |var b = B
+              |print(a == b, b == b)""".stripMargin) shouldBe "false true\n"
+      }
+
+      // The membership has to satisfy the `Eq` **bound**, not merely make the token typecheck —
+      // which is the difference between this and a special case in the operator path. `satisfies`
+      // consults the same predicate, so a bounded generic takes one.
+      "and it satisfies an 'Eq' bound, so a bounded generic takes one" in {
+        run("""enum Colorspace
+              |    Srgb
+              |    Linear
+              |same[T: Eq](a: T, b: T) -> bool = a == b
+              |print(same(Srgb, Srgb), same(Srgb, Linear))""".stripMargin) shouldBe "true false\n"
+      }
+
+      // Structural equality over payloads needs every payload type to be `Eq` itself, which is a
+      // real feature and a different one. `simple` is the line, and it is the same line the lowering
+      // already draws.
+      "while an enum that carries data is refused, as it was" in {
+        err("""enum Shape
+              |    Dot
+              |    Line(n: int)
+              |print(Dot == Dot)""".stripMargin) should include("'==' is not defined for Shape")
+      }
+
+      // `14 §5`'s rule about a built-in's memberships, reaching the first type a *program* declares.
+      // Refused rather than silently ignored — the operator lowers to the compare whatever the block
+      // says, so a block left standing would be dead code that reads as the thing being called.
+      "and writing the 'impl' by hand is refused, saying why the type is already a member" in {
+        val e = err("""enum Colorspace
+                      |    Srgb
+                      |    Linear
+                      |impl Eq for Colorspace
+                      |    eq(self, rhs: Colorspace) -> bool = int(self) == int(rhs)
+                      |print(Srgb == Srgb)""".stripMargin)
+
+        e should include("already implements")
+        e should include("its value is its discriminant")
+      }
+
+      // The same block over an enum that carries something is untouched, which is what keeps the
+      // refusal about the membership rather than about enums.
+      "while a data enum may still be given one by hand" in {
+        run("""enum Shape
+              |    Dot
+              |    Line(n: int)
+              |impl Eq for Shape
+              |    eq(self, rhs: Shape) -> bool = self match
+              |        Dot -> rhs match
+              |            Dot -> true
+              |            Line(_) -> false
+              |        Line(a) -> rhs match
+              |            Dot -> false
+              |            Line(b) -> a == b
+              |print(Dot == Dot, Line(1) == Line(1), Line(1) == Line(2))""".stripMargin) shouldBe
+          "true true false\n"
+      }
+    }
+
     "both equality operators derive from one 'eq'" in {
       val src =
         """struct Money

@@ -186,10 +186,16 @@ class ValueGenericsTests extends AnyFreeSpec with RunSupport with CodegenSupport
       e should include("declared Run[Slow] but the value is Run[Fast]")
     }
 
-    // And the parameter is that enum inside a body, which this pins through the one thing `Mode`
-    // does not have: the complaint is about `Mode`, so `M` was read as one.
+    /** And the parameter is that enum inside a body, pinned by comparing it against a variant and
+     * reading the answer.
+     *
+     * **This used to assert a refusal**, because a dataless enum had no `==` at all — so the claim
+     * "`M` was read as a `Mode`" rested on the complaint naming `Mode`. A simple enum is now `Eq`
+     * (card 0033), which makes the same claim answerable directly and much more strongly: the
+     * program runs, and it prints the branch the argument chose.
+     */
     "and inside a body the parameter is a value of that enum" in {
-      err("""enum Mode
+      run("""enum Mode
             |    Fast
             |    Slow
             |struct Run[const M: Mode]
@@ -198,7 +204,8 @@ class ValueGenericsTests extends AnyFreeSpec with RunSupport with CodegenSupport
             |    display(self, out: *Writer, fmt: FormatSpec) =
             |        display_str(if M == Fast then "y" else "n", out, fmt)
             |var a: Run[Fast] = Run(1)
-            |print(a)""".stripMargin) should include("'==' is not defined for Mode")
+            |var b: Run[Slow] = Run(2)
+            |print(a, b)""".stripMargin) shouldBe "y n\n"
     }
   }
 
