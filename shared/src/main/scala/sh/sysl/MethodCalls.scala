@@ -73,8 +73,17 @@ trait MethodCalls extends FuncAddress {
               bindArgs(s"method '$base.$chosen'", Some(base), m.params, args, m.variadic), expected)
           case Some(m) if m.receiver.isDefined =>
             checkMemberVisible(base, chosen, m)
-            val fname           = memberFuncName(rty, chosen)
-            val (params, rtype) = funcInsts(fname)
+            val fname = memberFuncName(rty, chosen)
+            // **A member whose own signature did not resolve is registered and has no lowered
+            // form**, which is `MemberLowering`'s deliberate order — the declaration is filed
+            // before the signature is built, so that a mistake in the signature does not also erase
+            // the member it is about. What that leaves is a call whose callee has nothing to be
+            // checked against, and the mistake has already been reported at the declaration where
+            // it belongs. So the call is abandoned in silence rather than complained about twice —
+            // and rather than, as it did until this line, taking the compiler down with a missing
+            // key. Which of the two happened used to depend on declaration order alone: a caller
+            // written *above* its callee reached here before the signature failed to be recorded.
+            val (params, rtype) = funcInsts.getOrElse(fname, poisoned())
             // A closure's `call` is not a method a program wrote, so a complaint about one names
             // the callable and the argument's position rather than the member behind it (`12 §6`).
             val callable = mname == "call" && callableOf(rty).isDefined

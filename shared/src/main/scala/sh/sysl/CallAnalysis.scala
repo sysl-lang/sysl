@@ -83,8 +83,13 @@ trait CallAnalysis extends OperatorCalls {
         genericMembers.get((tname, chosen)) match
           case Some(fd) => callGenericAssociated(tname, fd, m, args, expected)
           case None =>
-            val fname           = s"$tname.$chosen"
-            val (params, rtype) = funcInsts(fname)
+            val fname = s"$tname.$chosen"
+            // The receiverless third of the same window `MethodCalls` and `MemberExprAnalysis`
+            // guard: a member is filed before its signature is built, so one whose signature did
+            // not resolve is a declaration with no lowered form. The mistake was reported at that
+            // declaration, so the call is abandoned in silence rather than reaching for a
+            // signature that was never recorded.
+            val (params, rtype) = funcInsts.getOrElse(fname, poisoned())
             checkArity(s"associated function '$fname'", params.length, m.variadic, args.length)
             val (declared, tail) = args.splitAt(params.length)
             val ts = declared.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }

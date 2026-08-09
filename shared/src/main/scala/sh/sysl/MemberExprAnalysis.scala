@@ -406,8 +406,12 @@ trait MemberExprAnalysis extends ExprSupport {
     memberDecls.get((base, chosen)) match
       case Some(m) if m.isProperty =>
         checkMemberVisible(base, chosen, m)
-        val fname      = memberFuncName(ty, chosen)
-        val (_, rtype) = funcInsts(fname)
+        val fname = memberFuncName(ty, chosen)
+        // A property whose own signature did not resolve is registered and has no lowered form, so
+        // the read is abandoned in silence — the mistake has been reported at the declaration, where
+        // it belongs. `MethodCalls` carries the same line for the same reason, and between them they
+        // are the whole of the surface a half-registered member is reachable through.
+        val (_, rtype) = funcInsts.getOrElse(fname, poisoned())
         funcsUsed += fname
         TCall(fname, List(tr), rtype)
       case Some(_) => err(s"'$f' is a method of '${show(ty)}' — call it with '$f(…)'")

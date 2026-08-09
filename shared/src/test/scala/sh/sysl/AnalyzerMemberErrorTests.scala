@@ -58,6 +58,73 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("no associated function 'make'")
     }
 
+    // **A member is filed before its signature is built**, so that a mistake in the signature does
+    // not also erase the member it is about — which leaves a window where the declaration is known
+    // and its lowered form is not. Everything reaching a member through that window has to report
+    // the signature error rather than go looking for a form that was never made, and whether it is
+    // reached at all depends on nothing but which of the two was written first: a use *above* its
+    // declaration arrives before the signature has failed to be recorded. Both orders are pinned,
+    // because the pair disagreeing is the bug — the second spelling of each took the compiler down
+    // with a missing key where the first reported properly.
+    "a call to a method whose signature does not resolve reports the signature" in {
+      err(
+        """struct S
+          |    n: int
+          |    inner(*self) -> Nonesuch = Nonesuch()
+          |    outer(*self) -> int
+          |        self.inner()
+          |        self.n
+          |var s = S(0)
+          |print(s.outer())""".stripMargin
+      ) should include("unknown type 'Nonesuch'")
+    }
+
+    "and the same where the call is written above the method" in {
+      err(
+        """struct S
+          |    n: int
+          |    outer(*self) -> int
+          |        self.inner()
+          |        self.n
+          |    inner(*self) -> Nonesuch = Nonesuch()
+          |var s = S(0)
+          |print(s.outer())""".stripMargin
+      ) should include("unknown type 'Nonesuch'")
+    }
+
+    "a read of a property whose signature does not resolve reports the signature" in {
+      err(
+        """struct P
+          |    x: int
+          |    inner -> Nonesuch = Nonesuch()
+          |    outer(self) -> int = self.inner
+          |var p = P(1)
+          |print(p.outer())""".stripMargin
+      ) should include("unknown type 'Nonesuch'")
+    }
+
+    "and the same where the read is written above the property" in {
+      err(
+        """struct P
+          |    x: int
+          |    outer(self) -> int = self.inner
+          |    inner -> Nonesuch = Nonesuch()
+          |var p = P(1)
+          |print(p.outer())""".stripMargin
+      ) should include("unknown type 'Nonesuch'")
+    }
+
+    "a call to an associated function whose signature does not resolve reports the signature" in {
+      err(
+        """struct P
+          |    x: int
+          |    outer(self) -> int = P.make()
+          |    make() -> Nonesuch = Nonesuch()
+          |var p = P(1)
+          |print(p.outer())""".stripMargin
+      ) should include("unknown type 'Nonesuch'")
+    }
+
     "a member may not share a name with a field" in {
       err(
         """struct P
