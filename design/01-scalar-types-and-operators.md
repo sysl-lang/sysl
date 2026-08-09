@@ -122,6 +122,13 @@ needing a suffix. It applies only to a literal with no suffix of its own: `1u8 <
 both operands from the suffix, and a **suffixed literal never adapts**. Two literals with
 nothing else to go on both take the default, so `1 << 2` is `int`.
 
+**Every position above is read through the type's *representation*.** A qualifier says how storage
+is reached and never what is in it, so a `volatile uint` field fixes a literal at `uint` — the value
+going into a register is not itself volatile — and a transparent constrained subtype (`16 §1`) fixes
+one at its base for the same reason it stands where the base is asked for. This is the identity the
+mismatch is judged by, and it has to be the same one: read any other way, a position would ask for
+exactly the type it then refused the literal for not having.
+
 This is not implicit promotion — the literal *is* that type from the start, and a value that
 does not fit it is an error asking for a wider one, never a silent wrap or widening.
 

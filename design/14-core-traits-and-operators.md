@@ -593,6 +593,15 @@ members"`). The mapping is the existing operator semantics of `01`, restated as 
 - **`Display` is not in this list for any of them, and that is the point of the next section:**
   every built-in reaches it through an `impl` — the closed families through blocks written per type,
   the integers through one blanket block over `Integer`. No type has `Display` by rule.
+- A **simple** enum — every variant dataless — is `Eq`, and is nothing else. It is the one type in
+  this list a *program* declares, and it is here for the reason the open integer family is: the
+  value is its discriminant (`09 §2`), so equality has one possible meaning, and the family has no
+  finite list a library could have written blocks over. It is deliberately **not `Ord`** — the
+  declaration order is an order and not a claim, and `Srgb < Linear` is not one anybody wants made
+  on their behalf — and deliberately not `Hash`, which is a separate promise a program can make
+  with an `impl` if it means it. A **data** enum is not a member: structural equality over payloads
+  needs every payload type to be `Eq` itself, which is a different feature, and `simple` is the same
+  line the lowering already draws.
 - The pointer modes `*T`/`&T` are `Eq` only (address equality; no ordering — `01`), and
   deliberately **not `Display`**: an address renders differently on every run, so a program that
   wants one in its output asks for it explicitly rather than getting it from `print(p)`. This is a

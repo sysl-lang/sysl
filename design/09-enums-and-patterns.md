@@ -127,8 +127,14 @@ the declaration order rather than adding one. Going the other way — a value's 
 the conversion above, `int(c)`.
 
 `Image` and `Value` are the printed-name pair, and they are what makes a simple enum observable:
-the type carries no `==` and no `Display` of its own, so a value is turned into a position or a
-name to be looked at.
+the type carries no `Display` of its own, so a value is turned into a position or a name to be
+looked at.
+
+**It does carry `==`.** Every variant of a simple enum is dataless, so the value *is* its
+discriminant and there is exactly one thing equality could mean — which is the same pair of facts
+that makes the open `iN` family a compiler-provided member of `Eq` rather than something a library
+could write blocks for (`14 §5`). It is `Eq` and not `Ord`: the declaration order is an order and
+not a *meaning*, and an enum whose order says something writes the `impl` that says it.
 
 These are for a **simple, non-generic** enum. A data enum's value is a variant plus a payload, so a
 position, a name and a neighbour are each questions about only half of it; a generic enum's name
