@@ -303,7 +303,7 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
   // trap that fired while a ring was being set up would fail those rather than quietly satisfying
   // the ones that expect it.
   "ring — the refusals, which the program's own run cannot assert" in {
-    guideTests("ring") should have length 18
+    guideTests("ring") should have length 19
   }
 
   // The one program that *makes* storage rather than being handed it. `guide/kernel` is

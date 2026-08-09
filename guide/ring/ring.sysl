@@ -45,18 +45,29 @@
 //     slot to tell a full ring from an empty one. That second one is what an interrupt-driven ring
 //     wants, because a producer and a consumer then write disjoint fields and neither has to touch
 //     a shared count. What the clause refuses is only the third design that keeps all of them.
-//   * **Where the fields genuinely cannot be ordered, the way out costs the whole struct.** Keeping
-//     `Tracked` anyway, the only form that moves two fields without being seen between them is
-//     whole-struct assignment — `*self = Tracked(self.buf, ...)`, which restates the buffer to move
-//     two bytes. For this ring that is thirty-two bytes copied per push against three written; for
-//     a ring sized like a real one it is the entire storage, per element. **An invariant across two
-//     fields makes the container's own update cost the size of the container**, and the check that
-//     `Ring` and `Tracked` agree is bought at exactly that price.
+//   * **Where the fields genuinely cannot be ordered, both are written at once — and this program
+//     used to say that cost the whole struct.** It did, when this was written. `16 § What to do when
+//     a struct cannot be updated one field at a time` has since gained a fourth answer, the
+//     multi-assignment of `00 §2`: `self.tail, self.count = wrap(self.tail), Count(…)` lands both
+//     writes before the invariant is consulted, so a pair that ends legal is legal even where each
+//     half alone would not be. `push`, `pop` and `clear` below are written that way.
+//
+//     What that answered is worth stating, because it was the finding this program came back with:
+//     the only form that moved two fields unseen used to be whole-struct assignment — `*self =
+//     Tracked(self.buf, …)`, which restates the buffer to move two bytes. For this ring that was
+//     thirty-two bytes copied per push against three written; for a ring sized like a real one it
+//     was the entire storage, per element. So *"an invariant across two fields makes the container's
+//     own update cost the size of the container"* was true and is not: it now costs the two fields,
+//     and the check that `Ring` and `Tracked` agree is no longer bought at that price.
+//
+//     Whole-struct assignment remains in `16` and is now the genuine last resort it is described as,
+//     with the multi-assignment in front of it: it is what a struct wants when the new value is
+//     computed as a whole rather than field by field.
 //   * **Ordering the writes is enough more often than it looks.** `Watermark` relates two fields
 //     too — `count <= high` — and needs none of the above, because raising the ceiling before the
-//     floor keeps every intermediate state legal. The whole-struct form is the last resort, not the
-//     first; the question to ask of a failing invariant is whether an order exists, and only then
-//     whether the representation is redundant.
+//     floor keeps every intermediate state legal. Writing the fields at once is what to reach for
+//     when no order works, not first; the question to ask of a failing invariant is whether an order
+//     exists, and only then whether the representation is redundant.
 //   * **A program's own run cannot check its contracts; a test can.** A violated `require` traps,
 //     so no check in `main.sysl` can be the one that breaks one — the program would die rather than
 //     report, and the run would look truncated instead of failed. Every refusal the *run* asserts
@@ -189,21 +200,22 @@ struct Tracked
         self.buf[usize(advance(self.head, Count(u8(i))))]
     end at
 
-    // Two fields have to move together and no order of the two is legal on its own, so the write
-    // is of the whole struct — which restates the buffer to move two bytes. Writing
+    // Two fields have to move together and no order of the two is legal on its own, so both are
+    // written at once: a multi-assignment lands every write before the invariant is consulted, so a
+    // pair that ends legal is legal even where each half alone would not be. Writing
     // `self.tail = wrap(self.tail)` and then `self.count = ...` traps at the first of them.
     push(*self, v: int)
         require !self.is_full()
         ensure self.len() == old(self.len()) + 1
         self.buf[usize(self.tail)] = v
-        *self = Tracked(self.buf, self.head, wrap(self.tail), Count(u8(usize(self.count) + 1)))
+        self.tail, self.count = wrap(self.tail), Count(u8(usize(self.count) + 1))
     end push
 
     pop(*self) -> int
         require !self.is_empty()
         ensure self.len() == old(self.len()) - 1
         var v = self.buf[usize(self.head)]
-        *self = Tracked(self.buf, wrap(self.head), self.tail, Count(u8(usize(self.count) - 1)))
+        self.head, self.count = wrap(self.head), Count(u8(usize(self.count) - 1))
         v
     end pop
 
@@ -222,7 +234,7 @@ struct Tracked
     // clearest single line of what the extra field costs: `Ring` writes `count` and is done.
     clear(*self)
         ensure self.is_empty()
-        *self = Tracked(self.buf, self.head, self.head, Count(0))
+        self.tail, self.count = self.head, Count(0)
     end clear
 
     contents(self) -> string

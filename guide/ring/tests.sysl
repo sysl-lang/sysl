@@ -132,9 +132,9 @@ the_total_forms_answer_where_the_checked_ones_trap() =
 // end and the length one at a time is seen between them, on a state that was on its way to a
 // perfectly good one. This is the trap that found the redundant field.
 //
-// **Neither order escapes it**, which is what rules out reordering as the fix here and leaves the
-// whole-struct write as the only way through. The two tests below are the naive push written both
-// ways round; the guide's own `push` is the third.
+// **Neither order escapes it**, which is what rules out reordering as the fix here and leaves
+// writing both fields at once as the way through. The two tests below are the naive push written
+// both ways round; the guide's own `push` is the third.
 @test(should_trap)
 moving_a_tracked_ring_s_end_before_its_length_traps() =
     var t = fresh_tracked()
@@ -149,10 +149,10 @@ and_moving_its_length_before_its_end_traps_too() =
     t.count = Count(u8(usize(t.count) + 1))
     t.tail = wrap(t.tail)
 
-// The form the program actually uses: the same two fields, one write, so there is no moment between
-// them for the clause to be asked about.
+// The form the program actually uses: the same two fields, one assignment, so there is no moment
+// between them for the clause to be asked about.
 @test
-while_assigning_the_whole_struct_moves_both_at_once() =
+while_assigning_both_fields_at_once_moves_them_together() =
     var t = fresh_tracked()
 
     t.push(1)
@@ -160,6 +160,24 @@ while_assigning_the_whole_struct_moves_both_at_once() =
 
     assert_eq(t.len(), 2, "both pushes landed")
     assert_eq(int(t.tail), 2, "and the end moved with them")
+
+// The same claim without the method around it, which is what actually pins the rule the two traps
+// above are the other half of: a multi-assignment lands every write before the invariant is
+// consulted, so the pair is judged on where it ends and not on where it passes through. The two
+// `should_trap` tests are the identical pair of writes in sequence, so together the three of them
+// measure exactly one thing -- the form, and nothing about the ring.
+//
+// It is worth pinning here rather than only in `16` because `Tracked` is the shape that made it
+// doubtful: its fields are `new` subtypes and its clause reads them back through `usize` and a
+// `% capacity`, none of which a plain-`int` probe would have exercised.
+@test
+a_multi_assignment_is_judged_on_where_it_ends() =
+    var t = fresh_tracked()
+
+    t.tail, t.count = wrap(t.tail), Count(u8(usize(t.count) + 1))
+
+    assert_eq(int(t.tail), 1, "the end moved")
+    assert_eq(int(t.count), 1, "and the length with it")
 
 // The ring the invariant argued for. With the end computed rather than stored there is no clause
 // relating two fields, so the same push is one ordinary write and there is nothing to break.
