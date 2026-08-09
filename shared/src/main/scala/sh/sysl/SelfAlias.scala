@@ -113,7 +113,7 @@ object SelfAlias {
           changed = true
 
       TreeWalk.forEachStmt(f.body.stmts) {
-        case TVarDecl(n, _, init)                  => bind(n, init)
+        case TVarDecl(n, _, init, _)                  => bind(n, init)
         // A `ref` into the receiver carries the receiver's storage under a new name, so the name
         // has to be tracked as one that does — otherwise `&r` would be the leak this pass exists to
         // catch, written one line longer and unseen.
@@ -156,7 +156,7 @@ object SelfAlias {
     TreeWalk.forEachStmt(f.body.stmts) {
       case TReturn(Some(v))  => gotOut(v, "is returned"); written(v)
       case TExprStmt(e)      => written(e)
-      case TVarDecl(_, _, e) => written(e)
+      case TVarDecl(_, _, e, _) => written(e)
       case TRefDecl(_, _, e) => written(e)
       case TBreak(Some(v), _) => written(v)
       case TMultiAssign(writes) =>

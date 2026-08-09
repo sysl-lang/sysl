@@ -769,8 +769,15 @@ trait ProgramWalk
     val static = isStatic(init)
 
     checkVal(ty, static, key)
-    TVal(key, ty, Some(init), !static)
+    TVal(key, ty, Some(init), !static, align = boundaryOf(key, decl.align))
   })
+
+  /** `@align(n)` above module storage, folded to the boundary it named — the same fold a struct's
+   * and a local's go through, reported against the name as a reader wrote it rather than against the
+   * key the module qualified it into.
+   */
+  private def boundaryOf(key: String, align: Option[Expr]): Option[Int] =
+    align.flatMap(a => recover(Option.empty[Int])(alignBound(qn(key), a)))
 
   /** One module `var`: module storage the program may write (`13 §7`), written `static var` in the
    * file the program starts in and plain `var` in any other.
@@ -811,7 +818,8 @@ trait ProgramWalk
         s"${show(ty)} is a type that takes one. The question is asked of the type here rather than " +
         "of the value, because a variable may be given a different value tomorrow")
 
-    TVal(key, ty, init, computed = init.exists(!isStatic(_)), writable = true)
+    TVal(key, ty, init, computed = init.exists(!isStatic(_)), writable = true,
+      align = boundaryOf(key, decl.align))
   })
 
   /** Holds a module-level `val` to a value that **owes no release** (`13 §7`).

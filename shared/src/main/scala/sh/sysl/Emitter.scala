@@ -367,9 +367,14 @@ trait Emitter {
   /** Emits a stack slot into the function's entry block rather than where it is needed.
    * Every name is unique within a function, so hoisting is safe — and it keeps a slot inside
    * a loop from growing the stack on every iteration.
+   *
+   * `align` is a boundary the **declaration** asked for (`@align(n)` on a `var` or `val`), and it
+   * wins over the one the type carries. It cannot ask for less: `@align` only ever raises, so the
+   * larger of the two is what satisfies both claims, and one written on the declaration is by that
+   * rule already at or above the type's.
    */
-  protected def emitAlloca(name: String, ty: String): String = {
-    prologue ++= s"  $name = alloca $ty${alignSuffix(ty)}\n"
+  protected def emitAlloca(name: String, ty: String, align: Option[Int] = None): String = {
+    prologue ++= s"  $name = alloca $ty${align.map(n => s", align $n").getOrElse(alignSuffix(ty))}\n"
     name
   }
 

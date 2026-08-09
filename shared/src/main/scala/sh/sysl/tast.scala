@@ -543,7 +543,14 @@ case class TBlockExpr(block: TBlock) extends TExpr { def ty: Type = block.ty }
 
 sealed trait TStmt
 
-case class TVarDecl(name: String, ty: Type, init: TExpr) extends TStmt
+/** A binding and the slot it needs.
+ *
+ * `align` is `@align(n)` folded to the boundary it named, and absent where nothing asked — LLVM's
+ * own choice is then the natural alignment, which is what a slot that asked for nothing wants. It is
+ * carried here rather than looked up the way a struct's is (`Emitter.alignSuffix`) because that
+ * lookup is by *emitted type name*, and a binding's storage has no name of its own.
+ */
+case class TVarDecl(name: String, ty: Type, init: TExpr, align: Option[Int] = None) extends TStmt
 case class TExprStmt(expr: TExpr)                         extends TStmt
 
 /** A loop's `invariant`, at the head of its body (`17 §3`) — a condition that traps on false, which
@@ -841,6 +848,10 @@ case class TVal(
     init: Option[TExpr],
     computed: Boolean,
     writable: Boolean = false,
+    /** `@align(n)` folded to the boundary it named. Absent means the natural alignment, which is
+      * what LLVM gives a global that asked for nothing.
+      */
+    align: Option[Int] = None,
 )
 
 /** The `main` a program declared, which runs after its top-level statements (`13 §7`).

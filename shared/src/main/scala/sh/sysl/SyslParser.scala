@@ -191,9 +191,14 @@ class SyslParser(val source: Source)
             case Visibility.Public ~ (s: StructDecl) => laidOut(s, as)
             case v ~ (s: StructDecl)                 => restrict(v, laidOut(s, as))
             case _ ~ other                           => other
-          } | err(
-            "'@packed' and '@align' describe how fields are laid out, so they mark a struct — an " +
-              "enum's layout follows from its variants and a scalar's is the target's",
+          } | storageDecl(as) | err(
+            if as.forall(aligns) then
+              "'@align(n)' marks a struct or one binding's storage, and this is neither — an enum's " +
+                "layout follows from its variants and a scalar's is the target's"
+            else
+              "'@packed' describes how a struct's fields are laid out, so it can only mark a struct " +
+                "— a 'var' or a 'val' has no fields to pack, and '@align(n)' is the one of the two " +
+                "that may stand above one",
           )
         case None =>
           (visibility ~ funcDecl) ^^ {
@@ -211,6 +216,62 @@ class SyslParser(val source: Source)
   private def layout(a: Attr): Boolean = a match
     case Attr.Packed | _: Attr.Align => true
     case _                           => false
+
+  /** Whether an attribute is one of the layout pair that a *binding* can carry, which is `@align`
+   * and only `@align`.
+   *
+   * `@packed` describes the arrangement of fields *within* an aggregate, and a `var` has none — so it
+   * is not merely unimplemented on a binding, it has nothing there to mean.
+   */
+  private def aligns(a: Attr): Boolean = a match
+    case _: Attr.Align => true
+    case _             => false
+
+  /** `@align(n)` above a `var` or a `val` — the boundary one object's storage begins on, which is C's
+   * `alignas` rather than Rust's `#[repr(align)]`.
+   *
+   * The capability was already reachable through the type: a struct carrying the attribute aligns
+   * every value of itself, and a named aligned type is reusable where a repeated attribute is not.
+   * What the type form costs is at the *use* site — a buffer wrapped in a struct is read as
+   * `region.bytes[i]` rather than `region[i]` — which is the whole argument for this spelling.
+   *
+   * All four forms take it, and they must: `static var` and `static val` are the entry file's
+   * spelling of the same declaration a plain `var` and `val` are in every other file (`13 §7`), so an
+   * attribute that reached one and not the other would mean different things in different files.
+   * `staticDecl` is tried first because it begins the same way and is settled by its own word.
+   *
+   * A **pattern** or a **comma list** is read and then refused, rather than left out of the forms
+   * offered. Both bind several names, so there is no one object for a boundary to be about — and a
+   * grammar that simply did not accept them would report against the enclosing line instead of
+   * against the binding, which is the diagnostic this whole shape exists to avoid.
+   */
+  private def storageDecl(as: List[Attr]): PackratParser[Stmt] =
+    if !as.forall(aligns) then failure("not an alignment")
+    else
+      (staticDecl | visibility ~ (valDecl | varDecl) ^^ {
+        case Visibility.Public ~ d => d
+        case v ~ d                 => restrict(v, d)
+      }) >> { d =>
+        if !oneBinding(d) then
+          err("'@align(n)' is the boundary one object's storage begins on, and a binding that names " +
+            "several has no one object for it to be about — declare them on lines of their own")
+        else success(as.foldLeft(d) { case (s, Attr.Align(n)) => aligned(s, n); case (s, _) => s })
+      }
+
+  /** Whether a binding names exactly one thing, reaching through the `static` wrapper. */
+  private def oneBinding(s: Stmt): Boolean = s match
+    case _: VarDecl | _: ValDecl => true
+    case StaticDecl(d)           => oneBinding(d)
+    case _                       => false
+
+  /** One layout attribute folded onto whichever binding it was written above, reaching through the
+   * `static` wrapper to the declaration inside it.
+   */
+  private def aligned(s: Stmt, bound: Expr): Stmt = s match
+    case d: VarDecl    => d.copy(align = Some(bound)).setPos(d.pos)
+    case d: ValDecl    => d.copy(align = Some(bound)).setPos(d.pos)
+    case StaticDecl(d) => StaticDecl(aligned(d, bound)).setPos(s.pos)
+    case other         => other
 
   /** The struct these layout annotations describe, folded onto its declaration. */
   private def laidOut(s: StructDecl, as: List[Attr]): StructDecl =

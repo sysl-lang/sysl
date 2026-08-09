@@ -498,14 +498,14 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
   private def genStmtBody(stmt: TStmt): Unit = stmt match
     // A zero-sized binding is not a slot: the initializer still runs, for its effect, and there is
     // nothing to keep afterwards. Every later read of the name yields nothing in the same way.
-    case TVarDecl(_, ty, init) if Type.zeroSized(ty) =>
+    case TVarDecl(_, ty, init, _) if Type.zeroSized(ty) =>
       genExpr(init)
 
     // An array a view of which gets out of this frame lives in a buffer instead of a slot, and
     // that is the whole of the difference: the name still means the address of the storage, so the
     // store below and every later use are the ones an unpromoted array gets. What the buffer adds
     // is an owner for the views to count against, and a release when the name goes out of scope.
-    case TVarDecl(name, ty @ Type.Array(n, elem), init) if promoted(name) =>
+    case TVarDecl(name, ty @ Type.Array(n, elem), init, _) if promoted(name) =>
       val v           = genExpr(init)
       val (box, data) = genBuffer(elem, n.toString)
 
@@ -517,8 +517,8 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
     // The slot is laid down **before** the initializer runs, because a large one is written into it
     // rather than handed to it: the callee of `val k = kernel()` needs somewhere to write.
-    case TVarDecl(name, ty, init) =>
-      emitAlloca(s"%$name.addr", ty.llvm)
+    case TVarDecl(name, ty, init, align) =>
+      emitAlloca(s"%$name.addr", ty.llvm, align)
       genOwnedInto(s"%$name.addr", init)
       ownSlot(name, ty)
 

@@ -441,7 +441,7 @@ object WhyML {
     private def stmts(list: List[TStmt], tail: => String): String = list match {
       case Nil => tail
 
-      case TVarDecl(n, _, init) :: rest =>
+      case TVarDecl(n, _, init, _) :: rest =>
         val i = code(init)
 
         refs += n

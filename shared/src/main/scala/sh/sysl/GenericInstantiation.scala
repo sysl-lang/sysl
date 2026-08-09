@@ -174,7 +174,7 @@ trait GenericInstantiation extends ConstFolding {
    * they need. That is a redundant annotation rather than a wrong one, and refusing it would make
    * `@align(8)` an error on a struct that happens to hold a pointer today and legal again tomorrow.
    */
-  private def alignBound(name: String, bound: Expr): Option[Int] =
+  protected def alignBound(name: String, bound: Expr): Option[Int] =
     fold(bound) match
       case Some(IntLit(n, _)) if n > 0 && (n & (n - 1)) == 0 && n <= (1 << 29) => Some(n.toInt)
       case Some(IntLit(n, _)) =>

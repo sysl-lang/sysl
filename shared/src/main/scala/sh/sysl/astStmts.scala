@@ -72,9 +72,14 @@ case class ImportDecl(
 /** `var name [: type] [= init]`. A declaration with a type and no initializer starts at that
  * type's zero value, which is how a scratch buffer is written; a type that has no zero value
  * (one containing a `&T`, which always points at a live object) must be initialized.
+ *
+ * `align` is `@align(n)` written above it — the boundary this storage must begin on, carried as the
+ * expression it was written as because the bound is folded rather than lexed, exactly as a struct's
+ * is. It is on the *declaration* and not on the type: `@align` on a struct says every value of that
+ * type is aligned, and this says this one object is.
  */
 case class VarDecl(name: String, typ: Option[TypeRef], init: Option[Expr],
-                   vis: Visibility = Visibility.Public) extends Stmt
+                   vis: Visibility = Visibility.Public, align: Option[Expr] = None) extends Stmt
 
 /** `const name: type = value` — a **module member** (`13 §7`). It is what a top-level `var` is not:
  * hoisted, order-free, and visible beyond its file under the ordinary rules, where a `var` at the
@@ -149,8 +154,8 @@ case class StaticDecl(inner: Stmt) extends Stmt
  * "anything visible outside its file states its types" applies. A local states nothing to anyone,
  * so it infers exactly as a `var` does.
  */
-case class ValDecl(name: String, typ: Option[TypeRef], value: Expr, vis: Visibility = Visibility.Public)
-    extends Stmt
+case class ValDecl(name: String, typ: Option[TypeRef], value: Expr, vis: Visibility = Visibility.Public,
+                   align: Option[Expr] = None) extends Stmt
 
 /** `ref name = place` — a name for a place rather than for a value (`03 § ref`).
  *

@@ -9,7 +9,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * and they are the same numbers the back end lays the aggregate out with, so a test that reads them
  * is testing the emitted layout and not a second opinion about it.
  */
-class LayoutAttrRunTests extends AnyFreeSpec with RunSupport {
+class LayoutAttrRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   private val plain =
     """|struct Head
@@ -72,6 +72,40 @@ class LayoutAttrRunTests extends AnyFreeSpec with RunSupport {
     }
     "the order they are written in does not matter" in {
       run("@align(16)\n@packed\n" + plain + "print(sizeof(Head), alignof(Head))") shouldBe "16 16\n"
+    }
+  }
+
+  /** `@align(n)` above a binding rather than above a type — C's `alignas` rather than Rust's
+   * `#[repr(align)]`.
+   *
+   * The capability was reachable through the type all along, so this is less a second way to align
+   * something than a second place to say it: a buffer wrapped in a struct is read as
+   * `region.bytes[i]` rather than `region[i]`, so the type form is not free at the use site either.
+   *
+   * The boundary is asserted from the **IR**, because there is nothing at run time to ask. `alignof`
+   * is a question about a type and this is a fact about one object, and an address's low bits are
+   * not readable from sysl — so what the back end was told is the whole of the claim.
+   */
+  "@align(n) marks one binding's storage" - {
+    "a local's slot begins on the boundary it asked for" in {
+      irMain("@align(64)\nvar buf: [8]u8\nprint(buf[0])") should include("alloca [8 x i8], align 64")
+    }
+    "a val's does too, the boundary being about storage rather than about writing" in {
+      irMain("@align(32)\nval n: int = 7\nprint(n)") should include("alloca i32, align 32")
+    }
+    "one that asks for nothing is left to the back end" in {
+      irMain("var n: int = 7\nprint(n)") should include("alloca i32\n")
+    }
+    "module storage carries it to the global it lays down" in {
+      irOf("m/m.sysl" -> "module m\n\n@align(4096)\nvar table: [4]u64\n",
+        "main.sysl" -> "print(m.table[0])\n") should include("align 4096")
+    }
+    "and so does the 'static' spelling of the same declaration" in {
+      ir("@align(128)\nstatic var ticks: u64 = 0u64\nprint(ticks)") should include("align 128")
+    }
+    "the bound may be a constant, exactly as a struct's may" in {
+      irMain("const LINE: int = 64\n@align(LINE)\nvar buf: [8]u8\nprint(buf[0])") should
+        include("alloca [8 x i8], align 64")
     }
   }
 

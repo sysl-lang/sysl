@@ -44,6 +44,45 @@ class LayoutAttrErrorTests extends AnyFreeSpec with CodegenSupport {
     err("@align(4)\n@align(8)\nstruct S\n    a: int\n") should include("written twice")
   }
 
+  /** `@align(n)` on a binding, and the four things it may not be. */
+  "@align on storage" - {
+    // `@packed` describes the arrangement of fields *within* an aggregate, and a binding has none —
+    // so it is not merely unimplemented there, it has nothing there to mean.
+    "'@packed' is not the one of the pair a binding takes" in {
+      val e = err("@packed\nvar n: int = 1\nprint(n)")
+
+      e should include("'@packed'")
+      e should include("'@align(n)' is the one of the two")
+    }
+
+    "a binding that names several has no one object for a boundary to be about" in {
+      err("@align(16)\nvar a, b = 1, 2\nprint(a)") should include("no one object")
+      err("@align(16)\nval (a, b) = (1, 2)\nprint(a)") should include("no one object")
+    }
+
+    // The refusal `05`'s promotion rule owes. The storage moves to the heap, where the boundary is
+    // the allocator's answer rather than this declaration's — so the annotation would go on standing
+    // above a slot that no longer honours it.
+    "an aligned array whose view outlives the frame is refused rather than quietly moved" in {
+      val e = err(
+        """|escaping() -> []u8
+           |    @align(4096)
+           |    var page: [8]u8
+           |    page[0..<8]
+           |
+           |print(escaping().len)
+           |""".stripMargin)
+
+      e should include("4096-byte boundary")
+      e should include("'@align'")
+    }
+
+    "the bound is held to the same rule a struct's is" in {
+      err("@align(6)\nvar n: int = 1\nprint(n)") should include("power of two")
+      err("var k: int = 8\n@align(k)\nvar n: int = 1\nprint(n)") should include("needs a constant")
+    }
+  }
+
   "a packed field has no address to give" - {
     // The rule that keeps `@packed` from being a footgun. The field sits at its declared offset, so
     // it need not be on its own boundary — and a `*u32` is entitled to assume that it is, arbitrarily

@@ -89,18 +89,19 @@ private class Escape(program: TProgram) {
       bodies.map { (who, stmts, result) =>
         val walk = new Walk(Map.empty, returningEscapes = true, localArrays(stmts), refBindings(stmts))
         walk.seed(stmts, result)
-        (who, walk)
+        (who, stmts, walk)
       }
 
-    val refused = borrowed ::: walks.flatMap(noAllocPromotion) ::: walks.flatMap(_._2.escape)
+    val refused = borrowed ::: walks.flatMap((who, _, w) => noAllocPromotion((who, w))) :::
+      walks.flatMap((_, stmts, w) => alignedPromotion(stmts, w)) ::: walks.flatMap(_._3.escape)
 
     if refused.nonEmpty then Left(Diagnostic.report(refused))
     else
       Right(
         Escape.Promotions(
-          walks.collect { case (Some(n), w) if w.promoted.nonEmpty => n -> w.promoted.toSet }.toMap,
-          walks.collectFirst { case (None, w) => w.promoted.toSet }.getOrElse(Set.empty),
-          walks.flatMap(_._2.why.toList),
+          walks.collect { case (Some(n), _, w) if w.promoted.nonEmpty => n -> w.promoted.toSet }.toMap,
+          walks.collectFirst { case (None, _, w) => w.promoted.toSet }.getOrElse(Set.empty),
+          walks.flatMap(_._3.why.toList),
         ),
       )
   }
@@ -346,7 +347,7 @@ private class Escape(program: TProgram) {
             changed = true
 
         forEachStmt(stmts) {
-          case TVarDecl(name, _, init)                  => bind(name, views(init))
+          case TVarDecl(name, _, init, _)                  => bind(name, views(init))
           // A `ref` name reaches the storage its place reached (`03 § ref`), so it views whatever
           // that place views. Without this the name would view nothing, and a slice taken through it
           // would look like a view of storage the frame does not own.
@@ -368,7 +369,7 @@ private class Escape(program: TProgram) {
 
     private def check(stmts: List[TStmt]): Unit = forEachStmt(stmts) {
       case TReturn(Some(v))  => returned(v)
-      case TVarDecl(_, _, e) => escaping(e)
+      case TVarDecl(_, _, e, _) => escaping(e)
       case TRefDecl(_, _, e) => escaping(e)
       case TExprStmt(e)      => escaping(e)
       // Each arm is a store, so each is walked as one: a view that lands anywhere but a plain local
@@ -482,13 +483,50 @@ private class Escape(program: TProgram) {
       )
   }
 
+  /** A promotion of storage that asked for a boundary of its own, refused for the reason the
+   * `@no_alloc` case above is refused: what promotion is allowed to be silent about is *where* the
+   * storage went, and here that is precisely what the declaration was about.
+   *
+   * `malloc` promises an alignment good for any fundamental type and nothing beyond it, so a request
+   * for a page is not something the heap path can answer. Not honouring it silently would be worse
+   * than refusing, because a boundary is only ever asked for when something else depends on it — a
+   * DMA engine, a page table, a cache line — and none of those report anything when the address is
+   * wrong.
+   *
+   * Reported against the view that leaves the frame, exactly as the `@no_alloc` refusal is: the
+   * declaration is fine, and what the reader has to change is where its contents go.
+   */
+  private def alignedPromotion(stmts: List[TStmt], w: Walk): List[String] = {
+    val asked = alignedArrays(stmts)
+
+    w.sites.toList.collect {
+      case (name, pos, how) if asked.contains(name) =>
+        Diagnostic.render(
+          s"this view of '$name' $how, so the array would move to the heap to outlive the frame — " +
+            s"and '$name' asked to begin on a ${asked(name)}-byte boundary, which is the allocator's " +
+            "to answer there rather than this declaration's. Keep the view inside the frame, or put " +
+            "the boundary on a struct with '@align', which every value of that type carries wherever " +
+            "its storage is",
+          pos,
+        )
+    }
+  }
+
+  /** The arrays a body declared with a boundary of their own, and the boundary each asked for. */
+  private def alignedArrays(stmts: List[TStmt]): Map[String, Int] = {
+    val found = mutable.Map.empty[String, Int]
+
+    forEachStmt(stmts) { case TVarDecl(name, _: Type.Array, _, Some(n)) => found(name) = n }
+    found.toMap
+  }
+
   /** The arrays a body declares for itself, which are the ones it may move to the heap. A `[N]T`
    * parameter is storage the caller laid out, so it is deliberately not here.
    */
   private def localArrays(stmts: List[TStmt]): Set[String] = {
     val found = mutable.Set.empty[String]
 
-    forEachStmt(stmts) { case TVarDecl(name, _: Type.Array, _) => found += name }
+    forEachStmt(stmts) { case TVarDecl(name, _: Type.Array, _, _) => found += name }
     found.toSet
   }
 

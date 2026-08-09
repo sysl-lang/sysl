@@ -24,10 +24,15 @@ trait StaticEmitter extends StringEmitter {
   protected def genVals(vals: List[TVal]): String =
     vals.map { v =>
       val kind = if v.computed || v.writable then "global" else "constant"
+      // `@align(n)` where the declaration asked for a boundary. Nothing otherwise, which leaves LLVM
+      // its own choice — the natural alignment, and the target's business rather than sysl's.
+      val at = v.align.map(n => s", align $n").getOrElse("")
 
       v.init match
-        case Some(init) if !v.computed => s"@${v.symbol} = private $kind ${v.ty.llvm} ${constantValue(init)}\n"
-        case _                         => s"@${v.symbol} = private $kind ${v.ty.llvm} zeroinitializer\n"
+        case Some(init) if !v.computed =>
+          s"@${v.symbol} = private $kind ${v.ty.llvm} ${constantValue(init)}$at\n"
+        case _ =>
+          s"@${v.symbol} = private $kind ${v.ty.llvm} zeroinitializer$at\n"
     }.mkString
 
   /** A `val`'s initializer as a **constant expression** — text laid straight into the object file,

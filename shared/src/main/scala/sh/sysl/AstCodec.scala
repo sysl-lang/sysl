@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 31
+  val Version: Int = 32
 
   private val Magic = "sysl-ast"
 
@@ -315,9 +315,9 @@ object AstCodec {
       s match
         case ImportDecl(path, sels, wild, alias) =>
           tok("imp"); list(path)(sref); list(sels)(selector); bool(wild); opt(alias)(sref)
-        case VarDecl(n, t, i, vs)         => tok("var"); sref(n); opt(t)(typ); opt(i)(expr); vis(vs)
+        case VarDecl(n, t, i, vs, al)     => tok("var"); sref(n); opt(t)(typ); opt(i)(expr); vis(vs); opt(al)(expr)
         case ConstDecl(n, t, v, vs)       => tok("cst"); sref(n); typ(t); expr(v); vis(vs)
-        case ValDecl(n, t, v, vs)         => tok("val"); sref(n); opt(t)(typ); expr(v); vis(vs)
+        case ValDecl(n, t, v, vs, al)     => tok("val"); sref(n); opt(t)(typ); expr(v); vis(vs); opt(al)(expr)
         // No token, and no version bump to give it one: `static` is legal only in the file a program
         // starts in, a library has no such file, and the analyzer has already said so by the time
         // anything is encoded. Reaching here would mean that check stopped running.
@@ -722,9 +722,9 @@ object AstCodec {
     private def stmt(): Stmt = at {
       tok() match
         case "imp"  => ImportDecl(list(sref()), list(selector()), bool(), opt(sref()))
-        case "var"  => VarDecl(sref(), opt(typ()), opt(expr()), vis())
+        case "var"  => VarDecl(sref(), opt(typ()), opt(expr()), vis(), opt(expr()))
         case "cst"  => ConstDecl(sref(), typ(), expr(), vis())
-        case "val"  => ValDecl(sref(), opt(typ()), expr(), vis())
+        case "val"  => ValDecl(sref(), opt(typ()), expr(), vis(), opt(expr()))
         case "ref"  => RefDecl(sref(), expr())
         case "masg" => MultiAssign(sref(), list(expr()), list(expr()))
         case "mdcl" => MultiDecl(list(sref()), bool(), list(expr()))

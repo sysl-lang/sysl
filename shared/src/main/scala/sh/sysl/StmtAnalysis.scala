@@ -44,8 +44,8 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
     // here made every such use report that it was "declared below" — from above it and from below it
     // alike, since the name was never bound at all.
     blockDeclares = savedDeclares ++ stmts.collect {
-      case VarDecl(n, _, _, _)  => List(n)
-      case ValDecl(n, _, _, _)  => List(n)
+      case VarDecl(n, _, _, _, _)  => List(n)
+      case ValDecl(n, _, _, _, _)  => List(n)
       case RefDecl(n, _)        => List(n)
       case MultiDecl(ns, _, _)  => ns
       case PatternDecl(p, _, _) => patternNames(p)
@@ -250,8 +250,8 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
    * the name into an "undefined name" of its own, and the real mistake is lost among them.
    */
   private def bindFailed(stmt: Stmt): Unit = stmt match
-    case VarDecl(name, _, _, _) => declare(name, Type.Unknown)
-    case ValDecl(name, _, _, _) => declareReadOnly(name, Type.Unknown)
+    case VarDecl(name, _, _, _, _) => declare(name, Type.Unknown)
+    case ValDecl(name, _, _, _, _) => declareReadOnly(name, Type.Unknown)
     // A ref whose place did not analyze binds the name at `Type.Unknown` like the other two, and
     // records no place: there is nothing to walk outward through, and a guard built from a poisoned
     // node would refuse assignments for a reason the program never gave.
@@ -557,6 +557,16 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
         s"has no other arm to take when the value turns out to differ; write '$n' to bind a new name")
       Nil
 
+  /** `@align(n)` above a binding, folded to the boundary it named.
+   *
+   * The same fold a struct's goes through, so a bound that is not a power of two or is not a
+   * constant is refused in the same words — one rule about what an alignment is, stated once. A
+   * refusal costs the annotation and not the declaration, which is what lets the rest of the
+   * function still be analyzed against a binding that exists.
+   */
+  private def boundary(name: String, align: Option[Expr]): Option[Int] =
+    align.flatMap(a => recover(Option.empty[Int])(alignBound(name, a)))
+
   /** Most statements are one statement. The two comma forms are the exception, and the only reason
    * this hands back a list: a binding that names several things is several declarations.
    */
@@ -572,7 +582,7 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
       importInBlock(i)
       List(TExprStmt(TUnitLit()))
 
-    case VarDecl(name, typOpt, Some(init), _) =>
+    case VarDecl(name, typOpt, Some(init), _, align) =>
       val declared = typOpt.map(rt)
       val ti       = analyzeExpr(init, declared)
       // A binding needs a value to hold, and an initializer that does not finish never produces
@@ -582,19 +592,19 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
       val declTy = declared.getOrElse(ti.ty)
       if declared.isDefined && disagree(ti.ty, declTy) then
         err(s"cannot initialize '$name': declared ${show(declTy)} but the value is ${show(ti.ty)}")
-      List(TVarDecl(declare(name, declTy), declTy, ti))
+      List(TVarDecl(declare(name, declTy), declTy, ti, boundary(name, align)))
 
     // A local `val` is a `var` that may not be assigned to again — same frame, same lifetime, same
     // code. Only the binding differs, so the two share everything below this line, and the read-only
     // half of the rule is enforced where an assignment target is checked rather than here.
-    case ValDecl(name, typOpt, init, _) =>
+    case ValDecl(name, typOpt, init, _, align) =>
       val declared = typOpt.map(rt)
       val ti       = analyzeExpr(init, declared)
       if ti.ty == Type.Never then err(s"cannot bind '$name' to an expression that never returns")
       val declTy = declared.getOrElse(ti.ty)
       if declared.isDefined && disagree(ti.ty, declTy) then
         err(s"cannot initialize '$name': declared ${show(declTy)} but the value is ${show(ti.ty)}")
-      List(TVarDecl(declareReadOnly(name, declTy), declTy, ti))
+      List(TVarDecl(declareReadOnly(name, declTy), declTy, ti, boundary(name, align)))
 
     // `ref name = place` (`03 § ref`). The place is analyzed once, here, and what the name means
     // afterwards is the storage it found — so neither the path nor the checks along it are repeated,
@@ -612,10 +622,10 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
 
       List(TRefDecl(declareRef(name, tp, refHazards(tp)), tp.ty, tp))
 
-    case VarDecl(name, typOpt, None, _) =>
+    case VarDecl(name, typOpt, None, _, align) =>
       val ty = typOpt.map(rt).getOrElse(err(s"'$name' needs either a type or an initial value"))
       if !hasZero(ty) then err(s"${show(ty)} has no zero value, so '$name' needs an initial value")
-      List(TVarDecl(declare(name, ty), ty, TZero(ty)))
+      List(TVarDecl(declare(name, ty), ty, TZero(ty), boundary(name, align)))
 
     // A statement's value is nobody's, so whatever branching it contains is analyzed knowing that.
     case ExprStmt(e) =>
