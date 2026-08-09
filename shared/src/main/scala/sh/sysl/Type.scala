@@ -934,10 +934,19 @@ object Type {
    * A declared type is named by the key its module gives it (`Modules`), which a reader spells
    * with a dot rather than the separator that keeps it apart from a member's name — so a
    * `geom$Point` is shown as the `geom.Point` a program would write.
+   *
+   * **A closure has no name and is not given one here.** The struct a closure literal lowers to is
+   * filed under a serial number, and that number is a fact about the whole compilation rather than
+   * about the program: the library is lowered first, so every closure a program writes is numbered
+   * after every closure `lib/` holds, and adding one closure literal to the standard library
+   * renumbers the closures in every program there is. A reader told `.closure4` has nothing to grep
+   * for and no question answered, so they are told what it is instead — the wording
+   * `Sharing.complaint` already uses for the same reason.
    */
   def show(t: Type): String = t match
     case r: Results     => r.parts.targs.map(show).mkString(", ")
     case t: Tuple       => t.name
+    case _ if Closures.literal(t) => "a closure"
     case n: Named       => qualified(Modules.show(n.base), n.targs)
     case c: Constrained => Modules.show(c.name)
     case other          => friendly.getOrElse(other, canonicalName(other))

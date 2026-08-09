@@ -509,6 +509,30 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       err(apply + """print(apply(k -> k + missing, 1))
                     |""".stripMargin) should include("undefined name 'missing'")
     }
+
+    /** A closure standing where a bare function address is asked for, which is the case a program
+     * meets at every C callback: `*extern(A) -> R` is one machine word (`12 §6a`) and a closure is a
+     * struct with an environment, so there is nothing to convert.
+     *
+     * **What the reader is told it gave has to be "a closure".** The struct is filed under a serial
+     * number that runs over the whole compilation with `lib/` lowered first, so the message used to
+     * read *"but .closure4 was given"* — a name nothing in the program is called, nothing can be
+     * grepped for, and whose digit moves whenever the standard library gains a closure literal of its
+     * own. That is not hypothetical: `sysl.slices` arriving with four of them broke five assertions
+     * here and turned a page of the site red at the next version bump.
+     */
+    "a closure where a bare function address is wanted is called a closure, not a number" in {
+      // The parameters are written out, so the closure has a type of its own to be complained
+      // about. Left bare it is refused a step earlier, for having nothing to read its parameter
+      // types from — a good message, and not this one.
+      val message = err("""take(f: *extern(int) -> int) -> int = f(1)
+                          |
+                          |print(take((x: int) -> x + 1))
+                          |""".stripMargin)
+
+      message should include("but a closure was given")
+      message should not include regex ("""closure\d""")
+    }
   }
 
   "the far corners" - {

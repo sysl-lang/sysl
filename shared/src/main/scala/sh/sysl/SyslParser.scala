@@ -682,9 +682,9 @@ class SyslParser(val source: Source)
       // The exception is a file that declares no module: the root module is a module like any other,
       // and there is no header for its attributes to sit below, so there they may open the file.
       val lead = if m.isDefined then success(List.empty[HeaderClause])
-                 else maybe(headerAttr) ^^ (_.toList.flatten)
+                 else maybe(committedHeaderAttr) ^^ (_.toList.flatten)
 
-      lead ~ repeatedly(asOneToken(newlines ~> headerAttr)) ~ statements ^^ {
+      lead ~ repeatedly(asOneToken(newlines ~> committedHeaderAttr)) ~ statements ^^ {
         case first ~ rest ~ body =>
           val clauses = first ::: rest.flatten
 

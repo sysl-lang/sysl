@@ -63,6 +63,34 @@ trait HeaderParser extends AttrParser {
   protected lazy val headerAttr: Parser[List[HeaderClause]] =
     op("@") ~> describe("an attribute")(noAttr | requiresAttr | linkAttr | testsAttr)
 
+  /** The words that make an `@` a **header** attribute rather than a declaration's.
+   *
+   * It is one list because two would drift, and both readers of it are about the boundary rather
+   * than about any one attribute: the commit point below, and the refusal of one written where a
+   * statement goes. `13 §4` and `capabilities.md` are where the vocabulary is documented; this is
+   * the grammar's single copy of it.
+   *
+   * **`@test` and `@tailrec` are deliberately not here.** The header's repetition runs before the
+   * statements, so it also sees the attributes written above the first declaration — a list that
+   * admitted a bare `@` would turn every one of those into a header-attribute parse error.
+   */
+  protected lazy val headerAttrWord: Parser[Any] =
+    attrWordPrefixed("no_") | attrWord("requires") | attrWord("link") | attrWord("tests")
+
+  /** A header attribute that, once its word is seen, **is** one — so its own refusal is the answer.
+   *
+   * A repetition ends when its element fails, so a `@requires(` that will not parse simply ended the
+   * header and handed the line to the statement grammar, where `misplacedHeaderAttr` matched it and
+   * said it belonged in the header. On line 1 of a file that is false advice with nowhere to act on
+   * it, and the message `headerAttr` had already produced — `')' expected`, under the parenthesis
+   * that was not closed — was thrown away to say it. Committing past the word keeps that message.
+   *
+   * The commit is at the **word** rather than at the `@`, which is what makes it safe: only the four
+   * spellings above reach it, so a declaration's own attribute is untouched.
+   */
+  protected lazy val committedHeaderAttr: Parser[List[HeaderClause]] =
+    guard(op("@") ~ headerAttrWord) ~> commit(headerAttr)
+
   /** `@tests` — the file is the module's test scaffolding (`testing.md`).
    *
    * It sits with the capability clauses rather than above a declaration because it is a property of
@@ -117,8 +145,7 @@ trait HeaderParser extends AttrParser {
    * though the statements above it were outside its reach.
    */
   protected lazy val misplacedHeaderAttr: Parser[Nothing] =
-    guard(op("@") ~ (attrWordPrefixed("no_") | attrWord("requires") | attrWord("link") |
-      attrWord("tests"))) ~> err(
+    guard(op("@") ~ headerAttrWord) ~> err(
       "this attribute belongs in the file's header, on the lines directly after 'module' and before " +
         "everything else — it is a property of the whole module, not of the statements below it")
 

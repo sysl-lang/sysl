@@ -70,6 +70,37 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
       e should include("directly after 'module'")
       e shouldNot include("newline expected")
     }
+
+    /** The advice above is good for the case it was written for and false for a clause that is
+     * already where it belongs and simply will not parse.
+     *
+     * **A repetition ends when its element fails**, so a `@requires(` that never closed used to end
+     * the header, hand the line to the statement grammar, and be told by the message above to move
+     * to the header — on line 1, which *is* the header, with nowhere to move it to. What the reader
+     * is owed is the complaint `headerAttr` had already made and that was being thrown away.
+     */
+    "a malformed one is refused where it is malformed, rather than told to move" in {
+      val e = err("@requires(\nprint(1)\n")
+
+      e should include("')' expected")
+      e shouldNot include("belongs in the file's header")
+    }
+
+    "the same under a module header, which is the other way a file opens" in {
+      val e = err("module m\n@requires(\nf() -> int = 1\n")
+
+      e should include("')' expected")
+      e shouldNot include("belongs in the file's header")
+    }
+
+    // The other attribute with an argument list, so the commit is pinned at the vocabulary rather
+    // than at one word of it.
+    "and a '@link' whose parenthesis never closed" in {
+      val e = err("@link(\"z\"\n\nf() -> int = 1\n")
+
+      e should include("')' expected")
+      e shouldNot include("belongs in the file's header")
+    }
   }
 
   "a clause that names nothing, or claims something unchecked, is refused" - {
