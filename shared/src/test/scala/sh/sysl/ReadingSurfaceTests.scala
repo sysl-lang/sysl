@@ -725,6 +725,161 @@ class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
     }
   }
 
+  /** A reader that hands back at most `bite` bytes at a time, so a test can choose exactly where a
+   * refill boundary falls. That is the whole point of it: the CRLF case a hand-rolled console reader
+   * gets wrong is the one where the `\r` is the last byte of one read and the `\n` the first byte of
+   * the next, and no reader with a buffer of its own can be made to land there on purpose.
+   */
+  private val chunkedReader =
+    """struct Chunked
+      |    src: []const u8
+      |    at: usize
+      |    bite: usize
+      |end Chunked
+      |
+      |chunked(b: []const u8, bite: usize) -> Chunked = Chunked(b, 0, bite)
+      |
+      |impl Fallible for Chunked
+      |
+      |impl Reader for Chunked
+      |    read(*self, into: []u8) -> []const u8
+      |        var n: usize = 0
+      |
+      |        while n < into.len && n < self.bite && self.at < self.src.len
+      |            into[n] = self.src[self.at]
+      |            self.at += 1
+      |            n += 1
+      |
+      |        into[0..<n]
+      |""".stripMargin
+
+  /** The terminator policy: `lines` splits on LF, and `console_lines` takes CR, LF and CRLF alike.
+   *
+   * The pair exists because a terminal sends a bare `\r` when Enter is pressed, so a cursor splitting
+   * on LF never sees a line at all — it waits forever and looks hung, with no diagnostic. Which
+   * policy is right is a property of where the bytes came from, so the caller says.
+   */
+  "how a line ends" - {
+    // The default is unchanged, and this is what says so: a `\r` in the middle of a pipe's line is a
+    // `\r`, and only a trailing one is trimmed.
+    "lines still splits on LF alone, and trims a trailing CR" in {
+      val src =
+        s"""$byteReader
+           |var r = bytes_reader("a\\r\\nb\\n".bytes)
+           |
+           |for line in lines(&r)
+           |    print("[", line, "]")""".stripMargin
+
+      run(src) shouldBe "[ a ]\n[ b ]\n"
+    }
+
+    "so a console's bare CR is not a line ending to it, and the whole input is one line" in {
+      val src =
+        s"""$byteReader
+           |var r = bytes_reader("one\\rtwo\\rthree\\n".bytes)
+           |var n = 0
+           |
+           |for line in lines(&r)
+           |    n += 1
+           |
+           |print("lines", n)""".stripMargin
+
+      run(src) shouldBe "lines 1\n"
+    }
+
+    "console_lines takes a bare CR as the end of a line" in {
+      val src =
+        s"""$byteReader
+           |var r = bytes_reader("one\\rtwo\\rthree\\r".bytes)
+           |
+           |for line in console_lines(&r)
+           |    print("[", line, "]")""".stripMargin
+
+      run(src) shouldBe "[ one ]\n[ two ]\n[ three ]\n"
+    }
+
+    "and LF, and CRLF, without producing an empty line between the two bytes" in {
+      val src =
+        s"""$byteReader
+           |var r = bytes_reader("a\\nb\\r\\nc\\rd\\n".bytes)
+           |
+           |for line in console_lines(&r)
+           |    print("[", line, "]")""".stripMargin
+
+      run(src) shouldBe "[ a ]\n[ b ]\n[ c ]\n[ d ]\n"
+    }
+
+    // **The case the whole policy is about.** A `\r\n` whose two bytes arrive in different reads is
+    // where a hand-rolled console reader produces a spurious empty line, because the debt owed by the
+    // `\r` has to outlive the read that carried it. One byte at a time puts every pair on a boundary.
+    "a CRLF split across a refill boundary is still one line ending" in {
+      val src =
+        s"""$chunkedReader
+           |var r = chunked("ab\\r\\ncd\\r\\n".bytes, 1)
+           |
+           |for line in console_lines(&r)
+           |    print("[", line, "]")""".stripMargin
+
+      run(src) shouldBe "[ ab ]\n[ cd ]\n"
+    }
+
+    // The debt is not written off by an *empty* read either, which is what a terminal produces
+    // between keystrokes: the reader below hands back nothing at all until asked again.
+    "and one whose LF arrives after the reader has ended the input is not a second line" in {
+      val src =
+        s"""$chunkedReader
+           |var r = chunked("ab\\r".bytes, 8)
+           |
+           |for line in console_lines(&r)
+           |    print("[", line, "]")""".stripMargin
+
+      run(src) shouldBe "[ ab ]\n"
+    }
+
+    // An empty line is a real line under either policy, and the CR/LF pair must not eat one.
+    "an empty line between two terminators is a line" in {
+      val src =
+        s"""$byteReader
+           |var r = bytes_reader("a\\r\\r\\nb\\n".bytes)
+           |
+           |for line in console_lines(&r)
+           |    print("[", line, "]")""".stripMargin
+
+      run(src) shouldBe "[ a ]\n[  ]\n[ b ]\n"
+    }
+
+    // A line longer than one read is gathered through the held buffer, which is the other path
+    // through `try_getline` — and it has to find a CR just as the in-place scan does.
+    "a CR-terminated line assembled out of refills is still one line" in {
+      val src =
+        s"""$chunkedReader
+           |var r = chunked("aaaaaaaaaa\\rbb\\r".bytes, 3)
+           |
+           |for line in console_lines(&r)
+           |    print("[", line, "]")""".stripMargin
+
+      run(src) shouldBe "[ aaaaaaaaaa ]\n[ bb ]\n"
+    }
+
+    // `lines_ending` is what makes the enum worth having: the two named constructors are it, applied.
+    "lines_ending is the two named cursors written out" in {
+      val src =
+        s"""$byteReader
+           |count(b: []const u8, e: LineEnding) -> int
+           |    var r = bytes_reader(b)
+           |    var n = 0
+           |
+           |    for line in lines_ending(&r, e)
+           |        n += 1
+           |
+           |    n
+           |
+           |print(count("x\\ry\\r".bytes, Lf), count("x\\ry\\r".bytes, CrOrLf))""".stripMargin
+
+      run(src) shouldBe "1 2\n"
+    }
+  }
+
   /** `stdin` is the descriptor the platform opens for a program, named so a caller does not have to
    * know it is zero. Nothing here can feed it — see `runReading` — so what is checked is that it is
    * that descriptor and that reading it is uneventful.

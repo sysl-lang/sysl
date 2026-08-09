@@ -247,6 +247,24 @@ object Target {
     Target("thumb-freestanding", "thumbv8m.main-none-eabihf", Cpu.Thumb, Os.Freestanding,
       VaListAbi.Loaded, 4)
 
+  /** The same core under the **other** float ABI, which is a sibling rather than a setting because
+   * the two cannot link together: GNU ld refuses the mix outright, saying one object "uses VFP
+   * register arguments" and the other "does not".
+   *
+   * It is here because the C project sysl joins picks the convention, and pico-sdk's default is this
+   * one — so without it `@export` dictated the float ABI of every build it entered, and
+   * `pico-scratch` had to set `PICO_HARD_FLOAT_ABI` to follow sysl rather than the other way round.
+   *
+   * **`softfp` is gcc's and pico-sdk's own spelling, and that is the whole argument for the name.**
+   * Somebody handed that linker message searches their build system for the word in it. It is not
+   * `soft`, which says something else: `-mfloat-abi=soft` means no FPU instructions at all, while
+   * `softfp` means the `fpv5-d16` is used and only the *calling convention* is in core registers —
+   * which is exactly what `softFloat` records.
+   */
+  val thumbFreestandingSoftfp: Target =
+    Target("thumb-freestanding-softfp", "thumbv8m.main-none-eabi", Cpu.Thumb, Os.Freestanding,
+      VaListAbi.Loaded, 4, softFloat = true)
+
   /** The RP2350's other personality: a Hazard3, which is RV32IMAC and has no F extension at all —
    * so, like bare-metal RISC-V at 64 bits, there are no floating registers to pass arguments in.
    */
@@ -278,6 +296,7 @@ object Target {
       x86_64Freestanding,
       riscv64Freestanding,
       thumbFreestanding,
+      thumbFreestandingSoftfp,
       riscv32Freestanding,
       x86Linux,
     )

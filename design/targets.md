@@ -44,10 +44,11 @@ of what makes it different from `build`.
 | `x86_64-freestanding` | `x86_64-unknown-none-elf` | address | yes |
 | `riscv64-freestanding` | `riscv64-unknown-elf` | loaded | **no** |
 | `thumb-freestanding` | `thumbv8m.main-none-eabihf` | loaded | yes |
+| `thumb-freestanding-softfp` | `thumbv8m.main-none-eabi` | loaded | **no** |
 | `riscv32-freestanding` | `riscv32-unknown-elf` | loaded | **no** |
 | `x86-linux` | `i386-unknown-linux-gnu` | *no measured C ABI* | |
 
-**The last two are 32-bit, and they are the two halves of one board.** The RP2350 boots either a
+**Three of those are 32-bit, and they are the two halves of one board.** The RP2350 boots either a
 pair of Cortex-M33s or a pair of RV32IMAC Hazard3 cores, and both are here because a
 microcontroller is what *freestanding* is mostly for: the three 64-bit freestanding rows reach
 kernels and hypervisors, which is a different audience from the one writing embedded C, and nearly
@@ -69,6 +70,19 @@ hard-float convention, and clang gives `thumbv8m.main` an `fpv5-d16` unasked, so
 cross in VFP registers. `-mcpu=cortex-m33` refines instruction selection to the exact core and
 changes nothing about the ABI — it is the sub-architecture question left open at the bottom of this
 page, and it is not needed for a correct call.
+
+**And it is the one machine here with two rows, because the float ABI is the C project's to pick
+rather than sysl's.** `thumb-freestanding-softfp` is the same Cortex-M33 with arguments crossing in
+core registers, which is what `-mfloat-abi=softfp` means and what pico-sdk builds by default. The two
+cannot be mixed — GNU ld refuses the link outright, saying one object "uses VFP register arguments"
+and the other "does not" — so a sysl object joining a C build has to agree with it, and offering only
+the hard-float row meant the *C* had to be rebuilt to follow sysl. That is backwards for a language
+whose `@export` claim is that it joins somebody else's build.
+
+`softfp` is gcc's and pico-sdk's own spelling, which is the whole argument for the name: somebody
+handed that linker message goes looking for the word in their build system, and it is that one. It is
+**not** `soft`, which means something else — no FPU instructions at all, where `softfp` uses the
+`fpv5-d16` and changes only the convention.
 
 **`Freestanding` is a real answer, not a missing one.** A kernel or a bare-metal program has no
 operating system, and the ABI of a freestanding ELF target is fully specified; it differs from a

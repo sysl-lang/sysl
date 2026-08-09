@@ -154,7 +154,7 @@ object CAbi {
       case Cpu.X86_64                            => sysv(t, size)
       case Cpu.Riscv64                           => riscv(t, size, target.hardFloat, xlen = 8)
       case Cpu.Riscv32                           => riscv(t, size, target.hardFloat, xlen = 4)
-      case Cpu.Thumb                             => aapcs32(t, size)
+      case Cpu.Thumb                             => aapcs32(t, size, target.hardFloat)
       // i386 is refused at the registry (`Target.supported`) for want of exactly this, so nothing
       // reaches here — and when its convention is measured, this is the line that gains it.
       case Cpu.X86                               => Shape.Memory
@@ -202,9 +202,13 @@ object CAbi {
 
   // --- AAPCS32 ---------------------------------------------------------------------------
 
-  /** AAPCS32 with the hard-float variant, which is the Cortex-M convention — and the one that breaks
+  /** AAPCS32, the Cortex-M convention, in **both** of its float variants — and the one that breaks
    * the shape every other convention here has, because **its two directions disagree about memory
    * itself** rather than merely about how to name the same registers.
+   *
+   * `hardFloat` selects the variant, and it changes exactly one thing: whether a homogeneous
+   * floating aggregate has floating registers to travel in. Everything below the HFA question is the
+   * same for `eabihf` and `eabi`, which is what makes this one function rather than two.
    *
    * A result wider than one register goes through storage, at any size. An argument **never** does:
    * whatever its size, it is named as whole words and the back end puts the surplus on the stack
@@ -216,12 +220,18 @@ object CAbi {
    * `[4 x i32]`. And a result of four bytes or fewer is named by a whole power-of-two width — one
    * byte is `i8`, two `i16`, and three as well as four `i32`.
    *
-   * All of it read off `clang -target thumbv8m.main-none-eabihf -S -emit-llvm`.
+   * All of it read off `clang -target thumbv8m.main-none-eabihf -S -emit-llvm`, and the softfp half
+   * off the same command with `-none-eabi`.
    */
-  private def aapcs32(t: Type, size: Int)(using l: Layout): Shape = {
+  private def aapcs32(t: Type, size: Int, hardFloat: Boolean)(using l: Layout): Shape = {
     val ls = leaves(t).map(l2 => Type.underlying(l2._2))
 
-    hfa(ls) match
+    // **The HFA rule is the hard-float variant's and belongs to it alone.** Under `softfp` there are
+    // no floating registers for an aggregate to travel in, so a struct of floats is an ordinary
+    // aggregate of its size and takes the rules below — which is why `struct { float; }` returns as
+    // an `i32` there and as the struct itself under `eabihf`. Measured against clang for both
+    // triples, and the three sizes that disagree are exactly the ones `AbiAgainstClangTests` names.
+    Option.when(hardFloat)(hfa(ls)).flatten match
       // An HFA crosses as the struct type itself in both directions: one VFP register per member is
       // what the convention asks for and what LLVM does with a struct unaided, so the two agree and
       // there is nothing to coerce. That is the opposite of AAPCS64, which names the same registers

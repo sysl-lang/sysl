@@ -70,13 +70,35 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
         withClue(t.name)(Layout(t).size(Type.VaList) should be >= t.vaListBytes)
     }
 
-    // Neither bare-metal RISC-V is built for the floating extension and every other target is, which
-    // is clang's default for each of these triples and therefore has to be sysl's — the two are
-    // handed the same triple and have to make the same assumption about it (`CAbi`). At 32 bits it
-    // is firmer than a default: the RP2350's Hazard3 is RV32IMAC, with no F extension to use.
+    // Neither bare-metal RISC-V is built for the floating extension, which is clang's default for
+    // each of these triples and therefore has to be sysl's — the two are handed the same triple and
+    // have to make the same assumption about it (`CAbi`). At 32 bits it is firmer than a default:
+    // the RP2350's Hazard3 is RV32IMAC, with no F extension to use. The Thumb sibling is the one
+    // that is here on purpose rather than by the triple's default, and the test below is about it.
     "records which targets have floating registers to pass arguments in" in {
       Target.all.filterNot(_.hardFloat).map(_.name) shouldBe
-        List("riscv64-freestanding", "riscv32-freestanding")
+        List("riscv64-freestanding", "thumb-freestanding-softfp", "riscv32-freestanding")
+    }
+
+    // The two Thumb targets are one machine under two calling conventions, and the pair exists so
+    // that sysl stops dictating which one a C project uses: pico-sdk's default is softfp, GNU ld
+    // refuses to link the two conventions together, and before this the only way to join such a
+    // build was to make the *C* follow sysl.
+    //
+    // So it is written down as a disagreement rather than left to be read off two rows. A sibling
+    // differing only in a suffix is exactly the shape somebody tidies away, and `AbiAgainstClang`
+    // would then go on measuring whatever was left against clang and stay green about it.
+    "keeps the two Thumb targets apart on the float ABI, and on nothing else" in {
+      val hard = Target.thumbFreestanding
+      val soft = Target.thumbFreestandingSoftfp
+
+      hard.hardFloat shouldBe true
+      soft.hardFloat shouldBe false
+      hard.triple should endWith("-eabihf")
+      soft.triple should endWith("-eabi")
+
+      (hard.cpu, hard.os, hard.vaList, hard.vaListBytes) shouldBe
+        (soft.cpu, soft.os, soft.vaList, soft.vaListBytes)
     }
 
     // Whether a thread's storage is laid down before `main` is a fact about the system and not about
@@ -89,6 +111,7 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
           "x86_64-freestanding",
           "riscv64-freestanding",
           "thumb-freestanding",
+          "thumb-freestanding-softfp",
           "riscv32-freestanding"
         )
     }

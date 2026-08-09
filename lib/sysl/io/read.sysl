@@ -27,23 +27,40 @@ import sysl.text.{from_utf8, Utf8Error}
 // input *ended badly* is what `failed` is for, and the two questions are separate because a caller
 // that does not care should not have to ask.
 //
-// **A TERMINAL IS NOT COVERED HERE, and the failure is silent, which is why it is said out loud.**
-// The line cursor below splits on `\n`, which is right for a file and for a pipe. A terminal sends a
-// bare `\r` when Enter is pressed, so a program reading lines from a serial console or a raw-mode
-// terminal never sees a line at all: it waits forever, prints nothing, and looks hung. There is no
-// diagnostic to grep for, because nothing has gone wrong -- the line has not ended.
+// **A TERMINAL DOES NOT END A LINE THE WAY A FILE DOES, and the failure used to be silent.** A
+// terminal sends a bare `\r` when Enter is pressed, so a cursor splitting on `\n` never sees a line
+// at all: it waits forever, prints nothing, and looks hung, with no diagnostic to grep for, because
+// nothing has gone wrong -- the line has not ended.
 //
-// Two more things a console needs that a file does not, both for the same reason. A terminal in raw
-// mode has **no echo**, so nothing appears as it is typed; and with no echo there is no editing
-// either, so a mistake cannot be corrected. Neither is a line cursor's business, and both have to
-// come from somewhere.
+// **`console_lines` is the answer, and `lines` is unchanged.** The policy is the caller's because
+// the right one is a property of where the bytes came from, which the library cannot know: a pipe
+// carrying `\r` in the middle of a line means a `\r`, and a console pressing Enter means a line. So
+// a file or a pipe keeps LF, and a console asks for CR, LF and CRLF alike.
 //
-// So a program reading from a console reads bytes through `Reader` and assembles lines itself,
-// treating CR, LF and CRLF alike -- with the CRLF case straddling two reads, since a bare-CR terminal
-// never sends the LF and waiting for it inside a read hangs until the next keystroke.
-// `sh.sysl.pico2.read_line` is a worked example of the whole of that, editing included.
+// **Echo and editing are still not covered here, and they are the rest of what a console needs.** A
+// terminal in raw mode shows nothing as it is typed, and with no echo a mistake cannot be corrected.
+// Neither is a line cursor's business -- one is about the *terminal* and the other about the *line*
+// -- and both still have to come from somewhere. `sh.sysl.pico2.read_line` is a worked example.
 trait Reader: Fallible
     read(*self, into: []u8) -> []const u8
+
+// What ends a line for a given cursor.
+//
+// Two policies rather than three: there is no CRLF-only setting, because a reader strict about
+// which of the two a sender used has a protocol rather than a line, and would want the bytes.
+enum LineEnding
+    // `\n` alone, with a trailing `\r` trimmed off the line -- a file or a pipe, and what
+    // `bufio.Scanner` does. The trim is what makes input written on one system read the same on the
+    // other.
+    Lf
+    // `\r`, `\n` or `\r\n`, each ending one line -- a terminal.
+    //
+    // **A bare `\r` ends the line immediately rather than waiting to see whether an `\n` follows**,
+    // because on a bare-CR terminal it never does, and waiting inside the read would hang until the
+    // next keystroke. What that costs is that the `\n` of a `\r\n` may arrive in a later read than
+    // its `\r`, so the cursor remembers it is owed one.
+    CrOrLf
+end LineEnding
 
 // A line is found with `memchr` rather than a byte loop because libc's reads a word at a time and
 // sysl's could not. This is the whole of what pointer difference is for: `memchr` answers *where*
@@ -141,6 +158,27 @@ struct Lines
     at: usize
     held: &Buf[u8]
     done: bool
+    ending: LineEnding
+    // Whether a `\n` arriving next belongs to the `\r` that already ended the previous line. It is a
+    // field rather than a local because the two bytes of a `\r\n` can arrive in different reads, and
+    // that is the case a hand-rolled console reader gets wrong.
+    owed_lf: bool
+
+    // Where the next line ends in `b`, which is the whole of what the policy decides.
+    //
+    // Under `CrOrLf` the CR is searched for only as far as the LF, so the second pass is never longer
+    // than the first and the answer is the earlier of the two either way.
+    line_end(self, b: []const u8) -> Option[usize]
+        self.ending match
+            Lf -> find_byte(b, 10)
+            CrOrLf ->
+                find_byte(b, 10) match
+                    Some(n) ->
+                        find_byte(b[0..<n], 13) match
+                            Some(c) -> Some(c)
+                            None -> Some(n)
+                    None -> find_byte(b, 13)
+    end line_end
 
     // The next line, or nothing once the input has ended. Ill-formed bytes stop the program, which
     // is `line_text`'s severity and its reasoning -- `try_getline` below is the same walk without it.
@@ -163,8 +201,19 @@ struct Lines
         loop
             var rest = self.have[self.at..]
 
-            find_byte(rest, 10) match
+            // The second half of a `\r\n`, which may be the first byte of a read made after the line
+            // its `\r` ended was already handed back. Nothing is consumed while there are no bytes
+            // to look at, so the debt survives the refill below rather than being written off by it.
+            if self.owed_lf && rest.len > 0
+                self.owed_lf = false
+
+                if rest[0] == 10
+                    self.at += 1
+                    rest = self.have[self.at..]
+
+            self.line_end(rest) match
                 Some(i) ->
+                    self.owed_lf = rest[i] == 13
                     self.at += i + 1
 
                     if self.held.is_empty() then return Some(try_line_text(rest[0..<i]))
@@ -202,4 +251,15 @@ end Lines
 impl Iterate[string] for Lines
     next(*self) -> Option[string] = self.getline()
 
-lines(r: *Reader) -> Lines = Lines(r, [0; 4096], [], 0, buf(), false)
+// A cursor over a file or a pipe: `\n` ends a line, and a trailing `\r` is trimmed.
+lines(r: *Reader) -> Lines = lines_ending(r, Lf)
+
+// A cursor over a terminal: `\r`, `\n` and `\r\n` each end a line.
+//
+// It is a name of its own rather than a flag on `lines` because the reason to reach for it is *where
+// the bytes come from* rather than a setting to be looked up, and "I am reading from a console" is
+// the thing a caller actually knows.
+console_lines(r: *Reader) -> Lines = lines_ending(r, CrOrLf)
+
+lines_ending(r: *Reader, ending: LineEnding) -> Lines =
+    Lines(r, [0; 4096], [], 0, buf(), false, ending, false)
