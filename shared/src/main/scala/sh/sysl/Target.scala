@@ -22,6 +22,23 @@ case class Target(
     vaList: VaListAbi,
     vaListBytes: Int,
     softFloat: Boolean = false,
+    /** Whether a C enumerated type here is the **smallest** type holding its values rather than
+      * always an `int` — AAPCS's rule, which GNU's `arm-none-eabi` implements by defaulting to
+      * `-fshort-enums`, and which clang does not default to for the same triple.
+      *
+      * Recorded for the reason `softFloat` is: sysl hands its triple to clang and is *joining* a C
+      * build rather than starting one, so where the two disagree about a convention it is sysl that
+      * follows. It reaches exactly one decision — the flag `Toolchain.compileC` passes for a
+      * package's C — because nothing sysl itself emits has a C enum in it.
+      *
+      * **The disagreement was being reported all along and went unread.** Every link of a Wi-Fi demo
+      * printed `uses 32-bit enums yet the output is to use variable-size enums; use of enum values
+      * across objects may fail`, once per object built out of the package tree, for two days.
+      * Nothing miscompiled only because nothing in `pico2` carries an enum across the boundary yet:
+      * the first shim taking one by value, or a struct with an enum field, is where it stops being a
+      * warning.
+      */
+    shortEnums: Boolean = false,
 ) {
 
   /** How wide an address is, as a value that can be handed to the two places that need it — the
@@ -245,7 +262,7 @@ object Target {
    */
   val thumbFreestanding: Target =
     Target("thumb-freestanding", "thumbv8m.main-none-eabihf", Cpu.Thumb, Os.Freestanding,
-      VaListAbi.Loaded, 4)
+      VaListAbi.Loaded, 4, shortEnums = true)
 
   /** The same core under the **other** float ABI, which is a sibling rather than a setting because
    * the two cannot link together: GNU ld refuses the mix outright, saying one object "uses VFP
@@ -263,7 +280,7 @@ object Target {
    */
   val thumbFreestandingSoftfp: Target =
     Target("thumb-freestanding-softfp", "thumbv8m.main-none-eabi", Cpu.Thumb, Os.Freestanding,
-      VaListAbi.Loaded, 4, softFloat = true)
+      VaListAbi.Loaded, 4, softFloat = true, shortEnums = true)
 
   /** The RP2350's other personality: a Hazard3, which is RV32IMAC and has no F extension at all —
    * so, like bare-metal RISC-V at 64 bits, there are no floating registers to pass arguments in.

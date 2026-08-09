@@ -486,12 +486,21 @@ object Toolchain {
    * `paths.defines` is the half the *include* flag cannot stand in for, and it is a step later
    * again: a header found at its path and compiled without the macros its project configures it with
    * is a header that refuses on its own terms. `SearchPaths.defineFlags` has the worked example.
+   *
+   * `-fshort-enums` where the target says so (`Target.shortEnums`), because a package's C is being
+   * compiled to link against a C project that sysl did not start. Clang and GNU's `arm-none-eabi`
+   * default opposite ways on the same triple, so passing nothing means whichever this clang prefers —
+   * and a linker that has to reconcile the two says `uses 32-bit enums yet the output is to use
+   * variable-size enums; use of enum values across objects may fail` and carries on. It is the same
+   * class of fact as the float ABI: a convention of the build sysl is joining, and therefore not
+   * sysl's to pick.
    */
   def compileC(source: String, obj: String, target: Target = Target.default,
                level: String = defaultOptimization,
                paths: SearchPaths = SearchPaths.none, verbose: Boolean = false): Either[String, Unit] = {
     findClang(target).flatMap { cc =>
-      val command = Seq(cc, s"--target=${target.triple}", flag(level)) ++ paths.defineFlags ++
+      val command = Seq(cc, s"--target=${target.triple}", flag(level)) ++
+        Option.when(target.shortEnums)("-fshort-enums") ++ paths.defineFlags ++
         paths.includeFlags ++
         Seq("-ffunction-sections", "-fdata-sections", "-c", source, "-o", obj)
 
