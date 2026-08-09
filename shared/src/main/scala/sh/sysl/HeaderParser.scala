@@ -60,8 +60,23 @@ trait HeaderParser extends AttrParser {
    *
    * One attribute may yield several clauses, because `@requires` takes a list.
    */
+  /** A header attribute, which **commits** once its word is seen — so its own refusal is the answer.
+   *
+   * A repetition ends when its element fails, so a `@requires(` that will not parse simply ended the
+   * header and handed the line to the statement grammar, where `misplacedHeaderAttr` matched it and
+   * said it belonged in the header. On line 1 of a file that is false advice with nowhere to act on
+   * it, and the message this rule had already produced — `')' expected`, under the parenthesis that
+   * was not closed — was thrown away to say it.
+   *
+   * **The commit is behind `describe` and after a guard that consumes nothing**, which is what makes
+   * it safe *and* keeps the message a bare `@` gets. The header's repetition runs before the
+   * statements, so it also sees the `@test` or `@tailrec` above the first declaration: those fail the
+   * guard without consuming, `describe` renames the refusal to "an attribute expected", and the
+   * repetition ends exactly as it always did. Only the four spellings below reach the commit.
+   */
   protected lazy val headerAttr: Parser[List[HeaderClause]] =
-    op("@") ~> describe("an attribute")(noAttr | requiresAttr | linkAttr | testsAttr)
+    op("@") ~> describe("an attribute")(
+      guard(headerAttrWord) ~> commit(noAttr | requiresAttr | linkAttr | testsAttr))
 
   /** The words that make an `@` a **header** attribute rather than a declaration's.
    *
@@ -76,20 +91,6 @@ trait HeaderParser extends AttrParser {
    */
   protected lazy val headerAttrWord: Parser[Any] =
     attrWordPrefixed("no_") | attrWord("requires") | attrWord("link") | attrWord("tests")
-
-  /** A header attribute that, once its word is seen, **is** one — so its own refusal is the answer.
-   *
-   * A repetition ends when its element fails, so a `@requires(` that will not parse simply ended the
-   * header and handed the line to the statement grammar, where `misplacedHeaderAttr` matched it and
-   * said it belonged in the header. On line 1 of a file that is false advice with nowhere to act on
-   * it, and the message `headerAttr` had already produced — `')' expected`, under the parenthesis
-   * that was not closed — was thrown away to say it. Committing past the word keeps that message.
-   *
-   * The commit is at the **word** rather than at the `@`, which is what makes it safe: only the four
-   * spellings above reach it, so a declaration's own attribute is untouched.
-   */
-  protected lazy val committedHeaderAttr: Parser[List[HeaderClause]] =
-    guard(op("@") ~ headerAttrWord) ~> commit(headerAttr)
 
   /** `@tests` — the file is the module's test scaffolding (`testing.md`).
    *
