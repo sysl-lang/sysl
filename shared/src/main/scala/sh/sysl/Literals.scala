@@ -10,6 +10,16 @@ trait Literals extends TypeResolution {
   /** An integer literal takes its type from its suffix, else from the type the context
    * expects, else `int`. The default is never magnitude-dependent: a value too large for the
    * type it landed in is an error asking for a suffix, not a silent widening.
+   *
+   * **The expected type is consulted through `repr`**, which is the same identity `disagree` uses,
+   * and the two have to be the same one or a literal is refused for having exactly the type the
+   * position asked for. A qualifier says how a place is reached and never what is in it, so the value
+   * a literal denotes is not `volatile` even where the field it is about to fill is: `Gpio(10, 0)`
+   * against `input: volatile uint` read the expected type as no integer at all, fell back to `int`,
+   * and was refused with *"'input' of 'Gpio' is volatile uint, but int was given"* — while
+   * `regs.input = 10` had always been fine, because assignment reaches the field's type through
+   * something that strips. A transparent constrained subtype is the same shape and was refused the
+   * same way whenever its base was not `int`.
    */
   protected def intLiteral(value: BigInt, suffix: Option[String], expected: Option[Type]): TExpr = {
     val ty = suffix match
@@ -18,7 +28,7 @@ trait Literals extends TypeResolution {
           case Some(i: Type.Integer) => i
           case _                     => err(s"'$s' is not an integer type")
       case None =>
-        expected match
+        expected.map(Type.repr) match
           case Some(i: Type.Integer) => i
           // A type **parameter**, during the definition-time pass of `14 §4`. It is opaque, so there
           // is no width to check against and no representation to pick — but it is still the type
@@ -38,6 +48,9 @@ trait Literals extends TypeResolution {
   /** A float literal takes its type from its suffix, else from the expected type when that is
    * a float, else `real`. An integer literal never becomes a float on its own — writing `1`
    * where a `real` is wanted is a type error, not a silent conversion.
+   *
+   * Read through `repr` for the reason `intLiteral` above gives: a `volatile f32` field is a place,
+   * and the value going into it is an `f32`.
    */
   protected def floatLiteral(text: String, suffix: Option[String], expected: Option[Type]): TExpr = {
     val ty = suffix match
@@ -46,7 +59,7 @@ trait Literals extends TypeResolution {
           case Some(f: Type.Floating) => f
           case _                      => err(s"'$s' is not a floating-point type")
       case None =>
-        expected match
+        expected.map(Type.repr) match
           case Some(f: Type.Floating) => f
           case Some(a: Type.Abstract) => a
           case _                      => Type.Real

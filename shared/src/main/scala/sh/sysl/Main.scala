@@ -516,7 +516,7 @@ private[sysl] def execute(cfg: Config): Int = {
       stdout(CHeader.render(compiled.exports, project.name.getOrElse(Project.nameOf(cfg.file)))); 0
 
     case "build-c" =>
-      buildForC(cfg, compiled, target, project.name)
+      buildForC(cfg, compiled, target, project.name, cfg.file :: roots ::: fetched.roots)
 
     case "build" =>
       val exe = cfg.output.getOrElse(defaultOutput(cfg.file, project.name))
@@ -582,8 +582,17 @@ private def cLibrary(command: String): Boolean = command == "build-c" || command
  * `@link` named — and the report says so rather than leaving it to be discovered at the C project's
  * link. Those are libraries the author chose and can be given to a linker, which is exactly the
  * distinction the standard module fails.
+ *
+ * **`roots` is every tree the compilation walked, not the project's own**, and it is a parameter for
+ * that reason. `15 §7` gives a source root named with `--lib` and a package a `dependencies` block
+ * brought in the same answer as the project itself: their C is compiled and reaches the link. This
+ * command reads that table exactly as `NativeSources` does for the commands that link, and the
+ * archive is where "the link line" lands when the consumer is a C project — an object the archive
+ * left out is one the C author has no way to supply and no way to hear about, since the sysl half
+ * compiled cleanly and only the C project's linker ever notices.
  */
-private def buildForC(cfg: Config, compiled: Compiled, target: Target, named: Option[String]): Int = {
+private def buildForC(cfg: Config, compiled: Compiled, target: Target, named: Option[String],
+                      roots: List[String]): Int = {
   // Before the compile rather than after, exactly as `build-lib` does it: the archiver is not needed
   // until the end, so discovering it late would make "there is no llvm-ar" a thing somebody waited
   // the whole build for.
@@ -591,7 +600,11 @@ private def buildForC(cfg: Config, compiled: Compiled, target: Target, named: Op
     case Left(err)   => return fail(err)
     case Right(path) => path
 
-  val native = Project.cSources(cfg.file)
+  // One flat list, because an archive is one flat namespace. `nativeMember` names a member after the
+  // path inside its own tree, so two trees can still land on one name — which `collisions` reports,
+  // rather than `ar r` replacing by name and shipping an archive quietly missing half of what one of
+  // them defined.
+  val native = roots.flatMap(Project.cSources)
 
   LibraryArtifact.collisions(native) match
     case Some(err) => return fail(err)

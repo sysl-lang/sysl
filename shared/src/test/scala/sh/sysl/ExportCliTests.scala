@@ -154,6 +154,103 @@ class ExportCliTests extends LibraryCliSupport {
     run.stdout.trim shouldBe "hello 7"
   }
 
+  /** Seven is a number only the C knows and the multiplication is only the sysl's, so an archive that
+   * dropped either object cannot answer 42 — and the one it drops is the one this section is about.
+   */
+  private val shim = "int demo_seven(void) { return 7; }\n"
+
+  private val callingC =
+    """module demo
+      |
+      |extern "demo_seven" c_seven() -> i32
+      |
+      |seven_times(n: i32) -> i32 = c_seven() * n
+      |""".stripMargin
+
+  private val exporting =
+    """module mylib
+      |
+      |@export("mylib_answer")
+      |answer() -> i32 = demo.seven_times(6)
+      |""".stripMargin
+
+  /** `15 §7`'s table gives a source root named with `--lib` the same answer as the project's own
+   * tree: its C is compiled and reaches the link. For this command the link line is the archive, so
+   * "reaches the link" means "is a member".
+   *
+   * **The failure this pins was silent in both directions.** `build-c` walked the project's tree
+   * alone, so a package carrying a shim built cleanly, wrote an archive, said nothing, and handed a
+   * C project a wall of undefined references from a linker that had never heard of the flag the
+   * omission came from. Nothing between the two ends could see it: the sysl compiled, the archive
+   * existed, and `ar t` was the only place the absence was visible.
+   */
+  "the C of a '--lib' source tree" - {
+
+    "is a member of the archive, exactly as the project's own is" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val lib  = rootWithC("demo", callingC, "shim.c" -> shim)
+      val root = rootOf("mylib", exporting)
+      val out  = s"$root/libmylib.a"
+
+      succeeds(Config(command = "build-c", file = root, output = Some(out), libs = List(lib)))
+
+      Ar.members(readBytes(out)) match
+        case Right(members) => members.map(_.name) should contain("demo.shim.o")
+        case Left(err)      => fail(err)
+    }
+
+    "and a C program links against it and gets the answer the shim computed" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val lib    = rootWithC("demo", callingC, "shim.c" -> shim)
+      val root   = rootOf("mylib", exporting)
+      val out    = s"$root/libmylib.a"
+      val header = s"$out.h"
+
+      succeeds(Config(command = "build-c", file = root, output = Some(out), libs = List(lib)))
+
+      val dir    = createTempDirectory("sysl-c-shim-")
+      val source = s"$dir/main.c"
+      val exe    = s"$dir/caller"
+
+      writeFile(source,
+        s"""#include <stdio.h>
+           |#include "$header"
+           |
+           |int main(void) {
+           |    printf("%d\\n", mylib_answer());
+           |    return 0;
+           |}
+           |""".stripMargin)
+
+      val build = exec(Seq("clang", source, out, "-o", exe))
+
+      withClue(build.stderr)(build.exitCode shouldBe 0)
+
+      val run = exec(Seq(exe))
+
+      withClue(run.stderr)(run.exitCode shouldBe 0)
+      run.stdout.trim shouldBe "42"
+    }
+
+    // The row of the table that already worked, kept beside the one that did not so that a change
+    // moving the collection cannot fix one end while quietly dropping the other.
+    "beside the project's own, which lands under a name of its own" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val lib  = rootWithC("demo", callingC, "shim.c" -> shim)
+      val root = rootWithC("mylib", exporting, "extra.c" -> "int mylib_unused(void) { return 0; }\n")
+      val out  = s"$root/libmylib.a"
+
+      succeeds(Config(command = "build-c", file = root, output = Some(out), libs = List(lib)))
+
+      Ar.members(readBytes(out)) match
+        case Right(members) => members.map(_.name) should contain allOf ("demo.shim.o", "mylib.extra.o")
+        case Left(err)      => fail(err)
+    }
+  }
+
   // The flag has a reading everywhere else and none here, so it is refused rather than discarded:
   // taking it silently would produce the unlinkable archive this command exists not to write.
   "naming a prebuilt standard module is refused, since a C link line cannot carry one" in {

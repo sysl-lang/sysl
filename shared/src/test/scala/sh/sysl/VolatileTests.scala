@@ -26,6 +26,16 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       |static val regs: *Uart = ptr_cast(UART)
       |""".stripMargin
 
+  /** A block held as an ordinary value, which is what makes it constructible: what a program may not
+   * write is a `volatile` *variable*, and a struct whose fields are qualified is not one.
+   */
+  private val gpio =
+    """struct Gpio
+      |    input:  volatile uint
+      |    output: volatile u8
+      |    shadow: usize
+      |""".stripMargin
+
   "a register block is a struct whose registers are qualified" - {
     "reading one is a load marked volatile" in {
       defineOf(ir(uart + "read() -> u32 = regs.status\nprint(read())"), "read") should
@@ -169,6 +179,65 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
       message should include("yields uint")
       message should not include "volatile"
+    }
+  }
+
+  /** A bare literal is typed by the position it stands in, and a qualified position gives it the
+   * same type an unqualified one does — `01`'s rule reaching a register block, which is the code
+   * that writes more literals than any other.
+   *
+   * **Construction and assignment used to disagree**, which is what makes this a section rather than
+   * a line: `regs.output = 0b0110` had always been accepted, and `Gpio(10, 0)` was refused with
+   * *"'input' of 'Gpio' is volatile uint, but int was given"*. The literal was being read against the
+   * expected type directly while the mismatch was being judged through `repr`, so the position asked
+   * for exactly the type the literal was then refused for not having. The only workaround was a
+   * suffix on every argument — noise in the one domain whose readers are least served by it.
+   */
+  "a bare literal takes the type of the register it is going into" - {
+
+    "in a constructor, exactly as it does for an ordinary field" in {
+      val src = gpio +
+        """var block = Gpio(10, 6, 3)
+          |print(block.input, block.output, block.shadow)""".stripMargin
+
+      run(src) shouldBe "10 6 3\n"
+    }
+
+    // The half that always worked, kept beside the half that did not: the point is that the two
+    // agree, so a change that fixed one and moved the other would still be a defect.
+    "and in an assignment to one, which is where the two have to agree" in {
+      val src = gpio +
+        """go() -> uint
+          |    var block = Gpio(0, 0, 0)
+          |    block.input = 0b0110
+          |    block.input
+          |print(go())""".stripMargin
+
+      run(src) shouldBe "6\n"
+    }
+
+    // Widths are the reason this was never cosmetic. Falling back to `int` made every argument's
+    // type wrong rather than merely unqualified, so a literal that does not fit `int` was refused
+    // for a range it was never going to be stored in.
+    "including one only the field's own width can hold" in {
+      val src =
+        """struct Counter
+          |    ticks: volatile u64
+          |var c = Counter(18446744073709551615)
+          |print(c.ticks)""".stripMargin
+
+      run(src) shouldBe "18446744073709551615\n"
+    }
+
+    // A float takes its type the same way and had the same fallback, to `real`.
+    "and a float literal at a qualified field" in {
+      val src =
+        """struct Sensor
+          |    reading: volatile f32
+          |var s = Sensor(1.5)
+          |print(s.reading)""".stripMargin
+
+      run(src) shouldBe "1.5\n"
     }
   }
 
