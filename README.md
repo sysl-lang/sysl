@@ -4,6 +4,7 @@
 
 <p align="center">
   <a href="https://sysl.sh/"><img alt="Site" src="https://img.shields.io/badge/docs-sysl.sh-6f1f9e"></a>
+  <a href="https://central.sonatype.com/artifact/sh.sysl/sysl_3"><img alt="Maven Central" src="https://img.shields.io/maven-central/v/sh.sysl/sysl_3"></a>
   <a href="https://github.com/sysl-lang/sysl/commits"><img alt="Last Commit" src="https://img.shields.io/github/last-commit/sysl-lang/sysl"></a>
   <img alt="License" src="https://img.shields.io/github/license/sysl-lang/sysl">
   <img alt="Scala Version" src="https://img.shields.io/badge/Scala-3.8.4-blue.svg">
@@ -172,8 +173,11 @@ unsaved buffer, a test with an inline program — has no file and no reason to m
 compiler is on Maven Central and takes a string:
 
 ```scala
-libraryDependencies += "sh.sysl" %% "sysl" % "0.0.8"   // %%% in a cross-project
+libraryDependencies += "sh.sysl" %% "sysl" % "0.0.37"   // %%% in a cross-project
 ```
+
+The Maven Central badge at the top of this page is the published version, so it is what to check this
+line against.
 
 ```scala
 import sh.sysl.api.Sysl
