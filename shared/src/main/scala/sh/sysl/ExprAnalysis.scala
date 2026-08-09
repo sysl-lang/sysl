@@ -786,7 +786,7 @@ trait ExprAnalysis
 
       if mname == "try" then enumTry(tname, args)
       else if enumDecls(tname).variants.exists(_.name == mname) then
-        constructVariant(Modules.qualify(Modules.moduleOf(tname), mname), args, expected)
+        constructVariant(Modules.qualify(Modules.moduleOf(tname), mname), args, expected, Some(tname))
       else if memberDecls.contains((tname, mname)) then callAssociated(tname, mname, args, expected)
       else err(s"enum '${qn(tname)}' has no variant or associated function '$mname'")
 

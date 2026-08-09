@@ -147,6 +147,34 @@ A data variant names an ordered, typed payload — `Circle(radius: int)`, `Rect(
 variant's payload; the compiler knows the set is closed, which is what makes exhaustiveness
 checkable.
 
+**A variant belongs to its enum, not to the module the enum was declared in (settled).** Two
+enums in one module may each name a variant `Failed`, and neither has to be renamed. This is
+Rust's arrangement rather than Haskell's or C's, where a constructor lands in the enclosing
+namespace and the second enum to want an ordinary word cannot have it — a module that
+accumulates enums otherwise runs out of `Failed`, `Done`, `Empty` and `Invalid` one at a time,
+and the pressure is towards either a worse name or a longer one.
+
+**What a bare name means is settled where it is used, by the type expected there.** That is
+where sysl parts company with Rust, which requires `Link::Failed` at every site unless a scope
+opts in with `use Link::*`. Nearly every site expects a type already — an argument, an annotated
+binding, a `return`, a field — so the bare form goes on reading as it always has, and the
+qualified `Link.Failed` is what a site with nothing to go on writes instead. **Where two enums
+answer and nothing says which, that is a diagnostic naming both**, never a choice made quietly:
+a construction that picked the first-declared enum would be a line whose meaning changed when
+somebody added an unrelated enum above it.
+
+Two other rules fall out of this and are worth saying, since both are asked about the moment the
+first one is:
+
+- **A variant may still not share a name with a constant, a `val`, a module `var` or an `extern`
+  variable.** Two variants of one name are told apart by the enum they belong to; a variant and a
+  constant have nothing to be told apart *by*, so that clash is real and is reported at the
+  declaration.
+- **Visibility follows the widest enum offering the name.** A `private enum Hidden` naming a
+  `Circle` does not stop a public `Shape.Circle` being reachable from elsewhere — and from
+  elsewhere the private enum is not a candidate at all, so a name that is ambiguous inside the
+  file declaring it can be perfectly clear outside.
+
 **Construction is calling the variant.** `Circle(3)` builds a `Shape`; `Empty` names the
 nullary one. There is no `Shape.Circle` qualification required at the construction site — a
 variant name is in scope as a constructor of its enum. Which memory mode the result takes

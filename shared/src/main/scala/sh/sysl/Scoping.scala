@@ -463,14 +463,53 @@ trait Scoping extends DeclTables {
 
     !funcDecls.contains(own) && visible(own) &&
     (constDecls.contains(own) || valDecls.contains(own) || externVarDecls.contains(own) ||
-      variantOwner.contains(own))
+      variantOwners.contains(own))
   }
 
   /** The key a written **enum variant** name resolves to. A variant is reachable unqualified — a
    * bare `Circle(5)` — so it is a name of the module its enum was declared in, which is why two
-   * modules may each have a `Circle` where one program could not have two.
+   * modules may each have a `Circle`.
+   *
+   * The key says which *module*, and not which enum: one module may declare two enums that each
+   * name a variant `Circle`, and `variantOwnerOf` is what picks between them at the use site.
    */
-  protected def variantKey(written: String): Option[String] = resolveName(written)(variantOwner.contains)
+  protected def variantKey(written: String): Option[String] = resolveName(written)(variantOwners.contains)
+
+  /** Which enum a variant name means here, where its module offers more than one answer (`09 §3`).
+   *
+   * **The expected type decides wherever there is one**, which is nearly always: an argument, a
+   * declared `val`, a `return` and an annotated field all supply it, so `val e: Link = Fault(rc)` is
+   * unambiguous however many other enums name a `Fault`. Failing that, the single candidate the
+   * reader can *see* decides — a private enum in the same module is a candidate and one in another
+   * module is not, so a name that is ambiguous inside the file declaring it can be perfectly clear
+   * outside.
+   *
+   * **`None` means neither rule settled it, and the caller reports that rather than choosing.**
+   * There is deliberately no fall back to "the first one declared": a construction that silently
+   * picked an enum would be a line whose meaning changed when somebody added an unrelated enum
+   * above it, which is the failure this whole arrangement exists to avoid.
+   */
+  protected def variantOwnerOf(key: String, expected: Option[Type]): Option[String] = {
+    val owners = variantOwners.getOrElse(key, Nil)
+
+    def named = expected.map(Type.repr).collect { case e: Type.Enum if owners.contains(e.base) => e.base }
+
+    def seen = owners.filter(visible) match
+      case one :: Nil => Some(one)
+      case _          => None
+
+    owners match
+      // One answer is one answer, and it is reported as itself: a lone variant that is out of reach,
+      // or that disagrees with the expected type, has a message of its own further down that says
+      // more than an ambiguity would.
+      case one :: Nil => Some(one)
+      case _          => named.orElse(seen)
+  }
+
+  /** Every enum offering a variant of this name, in declaration order — what an ambiguity message
+   * lists.
+   */
+  protected def variantOwnerList(key: String): List[String] = variantOwners.getOrElse(key, Nil)
 
   // --- reading a declaration in the terms it was written in -------------------------------
 

@@ -597,7 +597,7 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
   private def variantTag(e: Expr, ty: Type): Option[BigInt] = (e, ty) match
     case (Ident(n), en: Type.Enum) if en.simple =>
       variantKey(n)
-        .filter(k => variantOwner.get(k).contains(en.base))
+        .filter(k => variantOwnerList(k).contains(en.base))
         .flatMap(_ => en.variant(n.split('.').last))
         .map(v => BigInt(v.tag))
     case _ => None

@@ -26,11 +26,22 @@ trait Hoisting extends HoistMembers {
    * which is what makes the clash reported at whichever of them was written second.
    */
   protected def valueNameHolder(key: String): Option[String] =
+    storageNameHolder(key)
+      .orElse(variantOwners.get(key).map(owners => s"enum '${qn(owners.head)}'"))
+
+  /** The same question with the variants left out — what a *variant* registration asks, because a
+   * second enum naming a variant the first one also names is legal and everything else is not.
+   *
+   * The asymmetry is the whole of `09 §3`'s namespacing rule in one line. Two variants of that name
+   * are told apart by the enum they belong to, and a use site that cannot tell them apart says so at
+   * the use site; a variant and a constant of one name have nothing to be told apart *by*, so the
+   * clash is real and is reported where it is written.
+   */
+  private def storageNameHolder(key: String): Option[String] =
     if constDecls.contains(key) then Some("a constant")
     else if valDecls.contains(key) then Some("a 'val'")
     else if staticVarDecls.contains(key) then Some("a module 'var'")
     else if externVarDecls.contains(key) then Some("an 'extern' variable")
-    else if variantOwner.contains(key) then Some(s"enum '${qn(variantOwner(key))}'")
     else None
 
   /** Registers one type-shaped declaration: a struct, an enum, a trait, or an `impl`.
@@ -73,18 +84,30 @@ trait Hoisting extends HoistMembers {
       recordAccess(key, e.vis)
       for m <- e.members do at(m.pos)(recordMemberAccess(key, m.name, m.vis, s"${e.name}.${m.name}"))
       if libraryOffers(e, currentModule) then libraryNames(e.name) = key
-      // Variant names are unique **within a module** rather than across the program: a bare
-      // `Circle(5)` resolves against the module it is written in, so two modules may each name a
-      // variant `Circle` without either use site becoming ambiguous.
+      // **A variant belongs to its enum, not to the module** (`09 §3`), so two enums here may each
+      // name a variant `Failed` and the module-level name simply has two answers. What a bare use of
+      // it means is settled at the use site, by the type expected there; the qualified
+      // `Enum.Variant` spelling is what a site with nothing to go on writes instead.
+      //
+      // The key is still the module's, because that is what a bare name resolves through — the list
+      // under it is what makes two answers representable at all.
       for v <- e.variants do
         val vkey = Modules.qualify(currentModule, v.name)
 
-        for what <- valueNameHolder(vkey) do err(s"variant name '${v.name}' is already used by $what")
-        variantOwner(vkey) = key
+        for what <- storageNameHolder(vkey) do err(s"variant name '${v.name}' is already used by $what")
         // A variant is reached unqualified, so it is a name of the module in its own right — and it
         // carries its enum's visibility, since an enum nobody outside may name is not one whose
-        // variants they may construct.
-        recordAccess(vkey, e.vis)
+        // variants they may construct. Where the name already has an owner, the reach recorded is
+        // the **widest** of theirs: a public enum's variant does not stop being reachable because a
+        // private enum beside it happens to have named one the same, and the bare name outside the
+        // module could only ever have meant the public one.
+        if variantOwners.contains(vkey) then
+          if e.vis == Visibility.Public then declAccess.remove(vkey)
+          // Two restricted owners keep the first's reach. Comparing two `private[M]` scopes is a
+          // question the language has no ordering for, and erring narrow costs a diagnostic where
+          // erring wide would cost a leak.
+        else recordAccess(vkey, e.vis)
+        variantOwners(vkey) = variantOwners.getOrElse(vkey, Nil) :+ key
         if libraryOffers(e, currentModule) then libraryNames(v.name) = vkey
     case t: TraitDecl =>
       val key = Modules.qualify(currentModule, t.name)

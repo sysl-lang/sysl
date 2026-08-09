@@ -459,10 +459,19 @@ trait DeclTables extends Reporting {
    */
   protected val pending = mutable.Queue.empty[(String, FuncDecl, Map[String, Type])]
 
-  /** Every enum variant name maps to its declaring enum, so a bare `Circle(5)` or `Empty`
-   * resolves without qualification. Variant names are therefore unique across all enums.
+  /** Every enum variant name maps to the enums declaring one of that name, so a bare `Circle(5)` or
+   * `Empty` resolves without qualification.
+   *
+   * **It is a list because a variant belongs to its enum rather than to the module** (`09 §3`), so
+   * two enums in one module may each name a variant `Failed` and neither has to be renamed. What
+   * picks between them is `variantOwners.of`: the expected type where there is one, and otherwise
+   * the single visible candidate — a bare name with two answers and nothing to choose by is a
+   * diagnostic pointing at the qualified `Enum.Variant` spelling, never a guess.
+   *
+   * Declaration order is kept, which is what makes an ambiguity message name the candidates in the
+   * order the file declares them rather than in whatever order a hash produced.
    */
-  protected val variantOwner = mutable.LinkedHashMap.empty[String, String]
+  protected val variantOwners = mutable.LinkedHashMap.empty[String, List[String]]
 
   /** The bodies of the closures met so far, lowered where they were written (`12 §5`).
    *
