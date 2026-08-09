@@ -11,7 +11,8 @@ package sh.sysl
  * Both are settled before a single name is resolved, which is why they sit below the driver rather
  * than inside it: what a file contributes decides what there is to hoist.
  */
-trait ModuleFiles    extends Hoisting
+trait ModuleFiles
+    extends Hoisting
     with StmtAnalysis
     with SignatureVisibility
     with ModuleGraph

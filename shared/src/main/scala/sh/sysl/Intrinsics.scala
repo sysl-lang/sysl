@@ -43,13 +43,13 @@ object Intrinsics {
    * library source, which can disagree with LLVM's and has to be held to it before the verifier is
    * reached. `Bits` has no such declaration to check: its memberships cover an open family of
    * widths, so there was never a finite set of `extern`s, and the calls are built by the compiler
-   * from the receiver's own type (`ExprEmitter.intrinsic`). A signature the compiler constructs is
+   * from the receiver's own type (`ArithEmitter.intrinsic`). A signature the compiler constructs is
    * checked by every build that runs one, which is a stronger guarantee than a table could give and
    * the same one the checked arithmetic and the saturating casts already rely on.
    *
    * So this stays float-shaped, and stays about the library. **What no single place holds is the
    * list of `llvm.` names sysl itself emits** — they are here, in `Codegen`'s module header, in
-   * `ScalarEmitter`, and in `ExprEmitter`. That is a real gap, and it is not this table's to close
+   * `ScalarEmitter`, and in `ArithEmitter`. That is a real gap, and it is not this table's to close
    * while this table is about what a program may name.
    */
   private case class Shape(arity: Int)

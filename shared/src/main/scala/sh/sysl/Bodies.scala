@@ -29,7 +29,7 @@ object Bodies {
    *
    * **A `var` is deliberately not one of these**, because a binding with an initializer is something
    * that runs and a file carrying one really may be a body. Whether it is *this* program's body is a
-   * question about the other files too, so it is asked in `ProgramWalk.entryFile` rather than here —
+   * question about the other files too, so it is asked in `ModuleFiles.entryFile` rather than here —
    * see `isTopLevelBinding` below.
    */
   def isDeclaration(s: Stmt): Boolean = s match
@@ -47,7 +47,7 @@ object Bodies {
    * Everything else settles which file the program starts in on its own: a `print` runs and a
    * `struct` does not, whatever else the program contains. A `var` is the one form that does not,
    * because both readings are coherent — a local of the body it was written in, or storage the
-   * module owns — and nothing in the line itself chooses between them. `ProgramWalk.entryFile`
+   * module owns — and nothing in the line itself chooses between them. `ModuleFiles.entryFile`
    * chooses, by asking whether any file carries a statement that is not one of these.
    */
   def isTopLevelBinding(s: Stmt): Boolean = s.isInstanceOf[VarDecl]

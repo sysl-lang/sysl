@@ -7,7 +7,7 @@ package sh.sysl
  * anything in**. Everywhere else an instruction is selected and emitted into the block being built;
  * here there is no block yet, so a narrow float is rounded rather than `fptrunc`ed and a repeat is
  * written out rather than looped. The analyzer has already held a constant initializer to the small
- * set of trees that can be lowered this way (`ProgramWalk.isStatic`), which is what lets this fail
+ * set of trees that can be lowered this way (`ModuleStorage.isStatic`), which is what lets this fail
  * loudly on anything else instead of guessing.
  */
 trait StaticEmitter extends StringEmitter {
@@ -69,7 +69,7 @@ trait StaticEmitter extends StringEmitter {
 
     // A device address written as a number: `inttoptr` is a constant expression, so the pointer is
     // in the object file rather than stored into it by a prologue. Only an *integer* read as an
-    // address arrives here, which is what `ProgramWalk.isStatic` admits — a pointer reinterpreted as
+    // address arrives here, which is what `ModuleStorage.isStatic` admits — a pointer reinterpreted as
     // another pointer is a name rather than a literal, so it is code and never reaches this.
     case TCast(v, _) => s"inttoptr (${v.ty.llvm} ${constantValue(v)} to ptr)"
 

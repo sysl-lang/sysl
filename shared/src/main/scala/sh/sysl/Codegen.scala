@@ -14,8 +14,10 @@ import scala.collection.mutable
  * the two ends of the value world, `PlaceEmitter` addressing and composite values,
  * `ControlFlowEmitter` everything that makes a basic block, `StaticEmitter` the module-level storage
  * that is laid down before any block exists, `ForeignEmitter` the C boundary, `ContractEmitter`
- * everything that traps, `EnumAttrEmitter` the simple-enum attributes, and `ExprEmitter` the
- * expression dispatch they all call back into.
+ * everything that traps, `EnumAttrEmitter` the simple-enum attributes, `CallEmitter` the call seam
+ * and the writers that put a large value straight where it is going to live, `ArithEmitter`
+ * arithmetic and the scalar conversions, and `ExprEmitter` the expression dispatch they all call
+ * back into.
  *
  * What stays here is the spine, which is the part that needs the whole program rather than one
  * expression: the module's assembly in declaration order, the two function forms, and statements —

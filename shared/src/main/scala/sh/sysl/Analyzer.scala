@@ -9,8 +9,14 @@ package sh.sysl
  * resolves and instantiates types, `Literals` handles the scalar leaves, `Hoisting` registers
  * declarations, `StmtAnalysis` handles statements and blocks, `CallAnalysis` handles calls and
  * construction, `PatternAnalysis` handles `match`, `SpecialForms` holds the handful of call forms
- * the compiler resolves by name, `ProgramWalk` runs the passes in order and checks function bodies,
- * and `ExprAnalysis` is the expression dispatch and places.
+ * the compiler resolves by name, `ProgramWalk` runs the passes in order, and `ExprAnalysis` is the
+ * expression dispatch and places.
+ *
+ * `ProgramWalk` has four of its own underneath it, in the order the driver reaches them:
+ * `ModuleFiles` (what a file contributes to its module, and which file the program starts in),
+ * `ModuleStorage` (the `val`s, `var`s and `extern` variables a module lays down), `AbstractBodies`
+ * (`14 §4`'s definition-time check of every generic body) and `FunctionBodies` (what a body is
+ * checked against, and analyzing one inside another).
  *
  * What stays in this file is the class that mixes them together and the entry point that runs it.
  * The recursive entry points the traits call back into — `analyzeExpr`, `analyzePlace`,

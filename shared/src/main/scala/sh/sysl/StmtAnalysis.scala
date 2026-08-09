@@ -694,7 +694,7 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
     case a: AsmStmt => List(analyzeAsm(a))
 
     // A `const` written at the top of a file is hoisted and folded into its uses before anything
-    // runs, so it never reaches the statement walk — `ProgramWalk.entryPoint` filters it out with the
+    // runs, so it never reaches the statement walk — `ModuleFiles.entryPoint` filters it out with the
     // other declarations. One that reaches here was written **inside a body**, where there is nothing
     // to hoist it into, and is refused for the same reason the types below are.
     case _: ConstDecl =>

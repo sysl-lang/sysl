@@ -237,12 +237,12 @@ trait Emitter {
   protected def genExpr(expr: TExpr): String
 
   /** Lowers an expression into the storage at `dest`, leaving the destination owning what lands
-   * there — a count taken for every reference inside (`ExprEmitter`).
+   * there — a count taken for every reference inside (`CallEmitter`).
    */
   protected def genOwnedInto(dest: String, e: TExpr): Unit
 
   /** The same, taking no counts: what lands at `dest` is borrowed, exactly as the register
-   * `genExpr` hands back is (`ExprEmitter`).
+   * `genExpr` hands back is (`CallEmitter`).
    */
   protected def genBorrowedInto(dest: String, e: TExpr): Unit
 
