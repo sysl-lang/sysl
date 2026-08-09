@@ -71,3 +71,66 @@ def executablePath: Option[String] = {
 
   if raw == null || realpath(raw, resolved) == null then None else Some(fromCString(resolved))
 }
+
+/** A built program run as the driver's own foreground work — `Main`'s `run` command states the
+ * contract this answers to.
+ *
+ * The input is **copied** from `Console.in` rather than the child being handed this process's own
+ * descriptor, and two things follow that are both wanted: a caller that redirected its input has
+ * redirected the program's, which is what makes any of this observable from a test; and the copy is
+ * dynamically scoped, so it cannot be perturbed by another suite running beside this one the way a
+ * `System.setIn` would be.
+ */
+def runProgram(command: Seq[String]): Int =
+  try {
+    val proc = new ProcessBuilder(command*).start()
+    val feed = new Thread(() => feedInput(proc.getOutputStream))
+    val errs = new Thread(() => pumpOutput(proc.getErrorStream, Console.err))
+
+    // The reader is left where it is if the program never asked for what it was offered: it is
+    // blocked on an input nobody is going to write to, and a daemon thread is not one to wait for.
+    feed.setDaemon(true)
+    feed.start()
+    errs.start()
+    pumpOutput(proc.getInputStream, Console.out)
+    errs.join()
+    proc.waitFor()
+  } catch {
+    case e: java.io.IOException => Console.err.println(e.getMessage); -1
+  }
+
+private def feedInput(to: java.io.OutputStream): Unit = {
+  val chunk = new Array[Char](4096)
+
+  try {
+    var n = Console.in.read(chunk)
+
+    while n != -1 do {
+      to.write(new String(chunk, 0, n).getBytes("UTF-8"))
+      to.flush()
+      n = Console.in.read(chunk)
+    }
+  } catch {
+    // The program stopped reading and closed its end, which is an ordinary thing for a program to
+    // do — `head` does it — and is not something to report.
+    case _: java.io.IOException => ()
+  } finally
+    try to.close()
+    catch { case _: java.io.IOException => () }
+}
+
+/** Whatever the program has written so far, forwarded and **flushed**, for as long as it writes.
+ *
+ * Reading it all and printing the lot at the end is what `exec` does, and it is why the driver's own
+ * messages arrived before a program's however the program had ordered them.
+ */
+private def pumpOutput(from: java.io.InputStream, to: java.io.PrintStream): Unit = {
+  val chunk = new Array[Byte](8192)
+  var n     = from.read(chunk)
+
+  while n != -1 do {
+    to.print(new String(chunk, 0, n, "UTF-8"))
+    to.flush()
+    n = from.read(chunk)
+  }
+}

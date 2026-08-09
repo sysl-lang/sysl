@@ -41,3 +41,20 @@ def executablePath: Option[String] = {
     Option.when(argv.length > 1)(argv(1))
   }
 }
+
+/** A built program run as the driver's own foreground work — `Main`'s `run` command states the
+ * contract this answers to.
+ *
+ * Node has the whole of it in one word: `stdio = "inherit"` hands the child this process's own three
+ * descriptors, so its input is whatever Node's is and what it writes goes straight out. The other two
+ * platforms copy instead, which buys a seam a test can drive; nothing here needs one, because the JS
+ * build is not the one that runs programs.
+ */
+def runProgram(command: Seq[String]): Int = {
+  val childProcess = js.Dynamic.global.require("child_process")
+  val result       = childProcess.spawnSync(command.head, js.Array(command.tail*),
+    js.Dynamic.literal(stdio = "inherit"))
+  val status       = result.status
+
+  if status == null || js.isUndefined(status) then -1 else status.asInstanceOf[Int]
+}

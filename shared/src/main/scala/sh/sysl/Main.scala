@@ -541,11 +541,17 @@ private[sysl] def execute(cfg: Config): Int = {
         paths, cfg.verbose) match
         case Left(err) => Project.discard(exe); fail(err)
         case Right(_) =>
-          val result = exec(exe :: cfg.programArgs)
+          // `runProgram` and not `exec`, and the difference is the whole of what this command is
+          // for. `exec` runs a **tool** — `clang`, `git`, `llvm-ar` — whose output is a value the
+          // compiler goes on to inspect, so it closes the child's input and hands back two strings
+          // once the child has finished. A program the user asked to run is the opposite on every
+          // count: its input is the user's, and what it writes is for the user to read as it is
+          // written. Running one through `exec` handed it end-of-input at once, so `examples/wc.sysl`
+          // read nothing from a pipe and a console exited after its banner.
+          val status = runProgram(exe :: cfg.programArgs)
+
           Project.discard(exe)
-          stdout(result.stdout)
-          if result.stderr.nonEmpty then Console.err.print(result.stderr)
-          result.exitCode
+          status
 
     case other =>
       fail(s"unknown command '$other'")
