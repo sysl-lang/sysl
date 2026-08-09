@@ -117,6 +117,39 @@ class TermEditTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  /** **The claim a REPL's shape rests on**, and the reason the editor implements `Iterate[string]`
+   * rather than offering `getline` alone.
+   *
+   * A program that runs at a terminal and over a serial cable wants its session loop written once,
+   * with the platform deciding only where the lines come from: an `Editor` where nothing else is
+   * editing, a `Lines` where the kernel already is. That is one function taking a `*Iterate[string]`
+   * — but only if `Iterate` is object-safe and a `for` will walk one through a pointer, which is not
+   * something to assume of a trait with a type parameter.
+   */
+  "one loop serves either cursor" - {
+
+    "because Iterate[string] is a trait object, and an Editor and a Lines are both one" in {
+      edit("""import sysl.io.console_lines
+             |
+             |count(cursor: *Iterate[string]) -> int
+             |    var n = 0
+             |
+             |    for line in cursor do n += 1
+             |
+             |    n
+             |end count
+             |
+             |var typed = bytes_reader("x\ry\r".bytes)
+             |var out = bytes_writer()
+             |var ed = editor(&typed, &out)
+             |
+             |var piped = bytes_reader("p\nq\nr\n".bytes)
+             |var cursor = console_lines(&piped)
+             |
+             |print(count(&ed), count(&cursor))""".stripMargin) shouldBe "2 3\n"
+    }
+  }
+
   /** The property that makes this a library module rather than a board's package: it asks for
    * nothing. The editor is what a freestanding target most needs and least able to get from
    * elsewhere, so a capability requirement here would have put it out of reach of its main audience.
