@@ -46,14 +46,34 @@ import sysl.text.cstring
 // `sysl.term.edit` writes `\r\n` outright, which a board needs and which costs a redundant carriage
 // return here -- the cursor is moved to a column it is already in.
 
-// `system` runs a command through the shell and answers its exit status; `atexit` takes a function to
-// run when the program exits, which is what stands in for the destructor the language does not have.
+// `system` runs a command through the shell and answers its exit status. `atexit` and `signal` are
+// the two ways out of a program that this file has to catch, and between them they stand in for the
+// destructor the language does not have.
+//
+// **They catch different exits, and one is not a superset of the other.** `atexit` runs on `exit`,
+// which is every ordinary return and every panic; it does **not** run when a signal terminates the
+// process, because the default action for one is to die without unwinding anything. So a program that
+// left the terminal in cbreak and was then interrupted would leave it there, which is the exact case
+// a person testing this at a terminal reaches first.
+//
+// `signal` answers the previous handler, which nothing here wants -- but a declaration has to give
+// the type a name, so it comes back as an opaque pointer and is dropped.
 //
 // Declared here rather than in `sysl.sys`, following `sysl.fs` and the file beside this one:
 // `sysl.sys` is the printing-and-reading core, carries no capability, and a POSIX-only symbol in it
 // would be a requirement filed where nothing declares one.
 private[sysl] extern "system" c_system(cmd: *u8) -> int
 private[sysl] extern "atexit" c_atexit(f: *extern() -> unit) -> int
+private[sysl] extern "signal" c_signal(sig: int, f: *extern(int) -> unit) -> *u8
+
+// The two signals that end a program without running `atexit` and that a person actually causes.
+//
+// **The numbers are portable in a way most are not.** POSIX fixes `SIGINT` at 2 and `SIGTERM` at 15
+// on every system this compiles for, which is why they can be written here rather than read out of a
+// header the library has no way to include. The ones with platform-dependent numbers are exactly the
+// ones this does not need.
+private sigint() -> int = 2
+private sigterm() -> int = 15
 
 // The descriptor a terminal's input arrives on, named beside the two the file already names.
 private stdin_fd() -> int = 0
@@ -105,13 +125,22 @@ raw() -> bool
 
     entered = true
 
-    // **The hook is why a panic does not leave a wrecked terminal.** sysl has no destructor, so
-    // nothing runs on the way out of a function that stopped early -- and a program that exited with
-    // echo off leaves a shell that shows nothing as it is typed, which the user has to fix by typing
-    // `stty sane` blind. It is registered once, on first entry, and `cooked` is a no-op when the
-    // program restored the terminal itself.
+    // **The hooks are why a terminal is not left wrecked by an exit nobody wrote.** sysl has no
+    // destructor, so nothing runs on the way out of a function that stopped early -- and a program
+    // that ended with echo off leaves a shell showing nothing as it is typed, which the user has to
+    // fix by typing `stty sane` blind.
+    //
+    // Two are needed because they catch different exits. `atexit` covers `exit`, which is an ordinary
+    // return and every panic. The signals cover the way a *person* ends a program that is sitting at a
+    // prompt: this file deliberately leaves `isig` alone, so Ctrl-C still interrupts -- and the
+    // default action for that terminates the process without running a single `atexit` handler.
+    //
+    // Registered once, on first entry, and `cooked` is a no-op when the program restored the terminal
+    // itself, so nothing here fires twice.
     if !hooked
         c_atexit(&restore)
+        c_signal(sigint(), &restore_and_die)
+        c_signal(sigterm(), &restore_and_die)
         hooked = true
 
     true
@@ -133,3 +162,20 @@ end cooked
 // exit path wants exactly the ordinary restore.
 private restore()
     cooked()
+
+// What a signal runs: the same restore, and then the death the signal was asking for.
+//
+// **It exits rather than returning**, because returning from a handler resumes the program that was
+// interrupted -- so a Ctrl-C would tidy the terminal and then leave the session running with echo
+// off, which is worse than either outcome on its own.
+//
+// The status is the shell's convention for a program ended by a signal: 128 plus the number, so 130
+// for Ctrl-C. It is not re-raised with the default handler restored, which would be the more exact
+// spelling and needs `raise` and a second `signal` call for a difference only a parent inspecting
+// `WIFSIGNALED` can see.
+//
+// It takes the signal number because that is the shape C hands a handler, and ignores it because both
+// signals it is installed for want the same thing.
+private restore_and_die(sig: int)
+    cooked()
+    exit(128 + sig)
