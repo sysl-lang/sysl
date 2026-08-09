@@ -162,4 +162,59 @@ class TermTtyTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       e should include("posix")
     }
   }
+
+  /** Cbreak mode, which is what lets one program read a line at a macOS terminal and over a serial
+   * cable to a board.
+   *
+   * **Only the refusing half is reachable here, and that is the half worth pinning.** `RunSupport`
+   * hands a compiled program a *closed* standard input, so `is_tty(0)` is false for every run below
+   * and `raw` takes its early exit every time — which is precisely why these tests are safe to have
+   * at all. A suite that could reach the succeeding branch would be a suite that puts the developer's
+   * own terminal into cbreak partway through a run, and leaves it there if anything after it fails.
+   *
+   * What is therefore *not* covered is whether `stty` sets what it is meant to set. That needs a
+   * pseudo-terminal the harness has no way to make, and pretending otherwise by asserting on
+   * `system`'s exit status would assert that a shell ran rather than that a terminal changed.
+   */
+  "cbreak mode, where there is no terminal to put into it" - {
+
+    // The case a hosted program actually meets when its input is a pipe or a file. `false` is not a
+    // failure: it says the kernel is not in the way, so the editor is the wrong facility and
+    // `console_lines` is the right one.
+    "raw() refuses, because there is nothing to change" in {
+      tty("print(raw())") shouldBe "false\n"
+    }
+
+    // A refused `raw` must leave nothing behind for `cooked` to undo — otherwise a program taking the
+    // fallback path would restore settings it never altered, on a terminal it never touched.
+    "and cooked() afterwards does nothing, having nothing to put back" in {
+      tty("raw()\ncooked()\nprint(\"done\")") shouldBe "done\n"
+    }
+
+    // `cooked` on its own is what a program does when it exits down a path that never reached `raw`,
+    // which is every early return in a program that has one.
+    "as does cooked() on its own" in {
+      tty("cooked()\nprint(\"done\")") shouldBe "done\n"
+    }
+
+    // Asking twice is one question, not two. The second call sees `entered` already false and takes
+    // the same early exit rather than spawning a second shell.
+    "and asking twice answers the same and costs nothing more" in {
+      tty("print(raw(), raw())") shouldBe "false false\n"
+    }
+
+    // The shape a program is meant to be written in: ask, and pick a facility from the answer. This
+    // is here so that the fallback path is exercised end to end rather than only in the prose.
+    "so a program picks its reader from the answer" in {
+      tty("""import sysl.io.{stdin, console_lines}
+            |
+            |if raw()
+            |    print("editing")
+            |else
+            |    var input = stdin()
+            |    var cursor = console_lines(&input)
+            |
+            |    print("cooked")""".stripMargin) shouldBe "cooked\n"
+    }
+  }
 }

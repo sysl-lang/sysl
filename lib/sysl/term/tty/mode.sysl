@@ -1,0 +1,135 @@
+module sysl.term.tty
+@requires(posix)
+
+import sysl.text.cstring
+
+// Getting the kernel out of the way, so a program can read a terminal a keystroke at a time.
+//
+// **This is what makes one program run at a macOS terminal and over a serial cable to a board.** At a
+// shell the line discipline echoes what is typed, honours backspace, and releases a whole line at
+// Enter -- so `sysl.term.edit` would echo a second copy of every character and never see a keystroke
+// until it was too late to act on one. Over a USB CDC port there is no line discipline to begin with,
+// which is why the editor exists. These two functions are the difference between those situations,
+// and they are the *only* difference: with them the same program serves both.
+//
+// A program that wants whole lines and no editing wants none of this. `sysl.io.console_lines` reads a
+// cooked terminal, the kernel does the work, and that is the right facility for anything that is not
+// drawing its own line.
+//
+// ## It is `stty`, and that is a decision rather than an expedient
+//
+// The C way is `tcgetattr` / `cfmakeraw` / `tcsetattr`, and `struct termios` is caller-allocated --
+// so a binding needs either its size, which only the header knows, or a C shim to hold it. **The
+// standard library can have neither.** `sysl.fs` states the constraint the whole of `lib/sysl` is
+// written under -- everything is reached by symbol alone, no header included and no C structure
+// transcribed -- and it is why `stat` and `readdir` are absent there rather than merely unwritten.
+//
+// A shim would break something larger: the library works the same for every target *because* it is
+// one tree of sysl that every target compiles, and library C is compiled by sysl for the target, so a
+// `.c` here would need a C compiler and a sysroot on every target that did not prune it. That is a
+// guarantee traded for a convenience, and it is not a good trade for two flags.
+//
+// `system("stty …")` is one extern of `*u8 -> int`, reached by symbol alone, transcribing nothing.
+// The cost is a shell spawn, which for something called twice at the edges of a session is nothing.
+//
+// ## What it actually sets, which is **cbreak** and not raw
+//
+// `-icanon -echo` and nothing else. Full raw mode would also take over signals and output
+// translation, and both are worth keeping:
+//
+// - **Signals stay.** Ctrl-C still interrupts, which for a REPL is a feature rather than an
+//   oversight -- in full raw mode it arrives as byte 3 and the program has to grow a policy about it.
+// - **Output translation stays.** `\n` still becomes `\r\n` on the way out, so every `print` in the
+//   program goes on working. Under full raw mode a hosted program's output walks diagonally down the
+//   screen, and the fix is auditing every write in the program rather than this one call.
+//
+// `sysl.term.edit` writes `\r\n` outright, which a board needs and which costs a redundant carriage
+// return here -- the cursor is moved to a column it is already in.
+
+// `system` runs a command through the shell and answers its exit status; `atexit` takes a function to
+// run when the program exits, which is what stands in for the destructor the language does not have.
+//
+// Declared here rather than in `sysl.sys`, following `sysl.fs` and the file beside this one:
+// `sysl.sys` is the printing-and-reading core, carries no capability, and a POSIX-only symbol in it
+// would be a requirement filed where nothing declares one.
+private[sysl] extern "system" c_system(cmd: *u8) -> int
+private[sysl] extern "atexit" c_atexit(f: *extern() -> unit) -> int
+
+// The descriptor a terminal's input arrives on, named beside the two the file already names.
+private stdin_fd() -> int = 0
+
+// Whether this program has put the terminal into cbreak mode and not yet put it back.
+//
+// **It is module storage because the terminal is**: there is one of it per process, and a second
+// `raw()` while the first is in force is a program asking for something it already has rather than a
+// second thing to undo. It is also what keeps the exit hook honest -- a program that never called
+// `raw` must not have its terminal "restored" to settings it never chose.
+private var entered: bool = false
+
+// Whether the exit hook has been registered, so that repeated `raw()` calls register one hook rather
+// than one per call.
+private var hooked: bool = false
+
+// One `stty` invocation, answering whether it worked.
+//
+// It names no device. `stty` acts on **its own standard input**, which through `system` is the
+// shell's, which is this program's -- so there is no `-f` (BSD) against `-F` (GNU) divergence to
+// handle, and one command string serves both platforms. A program whose input is redirected gets a
+// failure here rather than a silent no-op, which is what `raw` reports on.
+private stty(args: string) -> bool
+    val c = cstring("stty " + args)
+
+    c_system(c.ptr) == 0
+end stty
+
+// Put the terminal into cbreak mode: keystrokes arrive as they are typed and nothing is echoed.
+//
+// **Answers whether it worked**, and a caller should look. It fails where there is no terminal to
+// change -- input redirected from a file or a pipe -- and that is not an error so much as a different
+// situation, in which `sysl.io.console_lines` is the facility that fits and no mode has to change.
+//
+//     if raw()
+//         var ed = editor(&input, &output)
+//         for line in ed do ...
+//         cooked()
+//
+// `min 1 time 0` is what makes a read block until at least one byte arrives instead of returning
+// immediately with none; without `icanon` the terminal has no other rule about when to answer, and a
+// reader spinning on empty reads is the shape that gets mistaken for a hung program.
+//
+// Calling it twice is not an error and does nothing the second time.
+raw() -> bool
+    if entered then return true
+    if !is_tty(stdin_fd()) then return false
+    if !stty("-icanon -echo min 1 time 0") then return false
+
+    entered = true
+
+    // **The hook is why a panic does not leave a wrecked terminal.** sysl has no destructor, so
+    // nothing runs on the way out of a function that stopped early -- and a program that exited with
+    // echo off leaves a shell that shows nothing as it is typed, which the user has to fix by typing
+    // `stty sane` blind. It is registered once, on first entry, and `cooked` is a no-op when the
+    // program restored the terminal itself.
+    if !hooked
+        c_atexit(&restore)
+        hooked = true
+
+    true
+end raw
+
+// Put back what `raw` changed, and only what it changed.
+//
+// **`icanon echo` rather than `stty sane`**, which would also reset everything else the terminal was
+// set to -- settings this program did not choose and has no business having an opinion about. Doing
+// nothing when `raw` was never called or has already been undone is part of the same rule.
+cooked()
+    if !entered then return
+
+    stty("icanon echo")
+    entered = false
+end cooked
+
+// What `atexit` runs. It is `cooked` under another name, because `atexit` wants a symbol and the
+// exit path wants exactly the ordinary restore.
+private restore()
+    cooked()
