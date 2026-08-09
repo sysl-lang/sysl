@@ -22,10 +22,11 @@ A modern, ref-counted, general-purpose systems language.
 ## What sysl is
 
 sysl is a general-purpose systems language that aims to keep the control a systems language is used
-for while being meaningfully easier to learn and work with than Rust. It is ref-counted rather than
-borrow-checked: memory is managed through explicit modes written on the type — `T` (value/stack),
-`&T` (ARC reference-counted heap), and `*T` (raw pointer) — with no garbage collector, plus `ref`,
-a local binding that gives a second name to storage something else already owns.
+for while being meaningfully easier to learn and work with than other languages. It is ref-counted
+rather than borrow-checked: memory is managed through explicit modes written on the type — `T`
+(value/stack), `&T` (ARC reference-counted heap), and `*T` (raw pointer) — with no garbage
+collector, plus `ref`, a local binding that gives a second name to storage something else already
+owns.
 
 ## Documentation
 
