@@ -45,8 +45,12 @@ class AnalyzerDeclErrorTests extends AnyFreeSpec with CodegenSupport {
       err(src) should include("no variant 'Square'")
     }
 
-    "a variant name may not be shared by two enums" in {
-      err("enum A\n    X\n    Y\nenum B\n    X\n    Z") should include("already used by enum 'A'")
+    // Two enums sharing a variant name is legal as of `09 §3`'s namespacing rule — what is refused
+    // is a *use* of the shared name with nothing to say which was meant. `VariantNamespaceTests`
+    // covers the rest of it.
+    "a variant name shared by two enums is ambiguous where nothing settles it" in {
+      err("enum A\n    X\n    Y\nenum B\n    X\n    Z\nvar v = X\nprint(1)") should
+        include("'X' is a variant of 'A' and 'B'")
     }
 
     "an enum value cannot be printed" in {

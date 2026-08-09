@@ -21,7 +21,7 @@ trait MemberExprAnalysis extends ExprSupport {
       val n = typeKey(written).get
 
       if enumDecls(n).variants.exists(_.name == f) then
-        constructVariant(Modules.qualify(Modules.moduleOf(n), f), Nil, expected)
+        constructVariant(Modules.qualify(Modules.moduleOf(n), f), Nil, expected, Some(n))
       else
         memberDecls.get((n, f)) match
           case Some(m) if m.isProperty =>

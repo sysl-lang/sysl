@@ -257,11 +257,19 @@ trait CallAnalysis extends OperatorCalls {
     else nnew
   }
 
-  protected def constructVariant(key: String, written: List[Expr], expected: Option[Type]): TExpr = {
+  /** A variant construction — `Circle(3)`, or a bare `Empty`.
+   *
+   * `owner` is the enum, where the site already knows it: a qualified `Shape.Circle` names it, and
+   * passing it through is what makes that spelling the answer to an ambiguity rather than another
+   * way of asking the same question. A bare name leaves it `None` and the enum is worked out from
+   * the expected type (`variantOwnerOf`).
+   */
+  protected def constructVariant(key: String, written: List[Expr], expected: Option[Type],
+                                 owner: Option[String] = None): TExpr = {
     // The key says which module's variant this is; the name inside the enum is what the enum's own
     // declaration and its instantiation both know it by.
     val name  = Modules.split(key)._2
-    val ename = variantOwner(key)
+    val ename = owner.orElse(variantOwnerOf(key, expected)).getOrElse(ambiguousVariant(name, key))
     val decl  = enumDecls(ename)
     val vdecl = decl.variants.find(_.name == name).get
 
@@ -292,6 +300,20 @@ trait CallAnalysis extends OperatorCalls {
     val en = instantiateEnum(ename, targs)
     val v  = en.variant(name).get
     TEnumNew(en, v, checkArgs(name, v.fields, args, pre))
+  }
+
+  /** A bare variant name that two enums answer to, at a site with nothing to choose by.
+   *
+   * The message names every candidate and shows the qualified spelling, because that is the fix —
+   * and it shows it on the **first** one rather than on all of them, since a reader who can see the
+   * form can apply it to whichever they meant.
+   */
+  private def ambiguousVariant(name: String, key: String): Nothing = {
+    val owners = variantOwnerList(key)
+    val which  = owners.map(o => s"'${qn(o)}'")
+
+    err(s"'$name' is a variant of ${which.init.mkString(", ")} and ${which.last}, and nothing here " +
+      s"says which — qualify it, as '${qn(owners.head)}.$name'")
   }
 
   /** A non-generic simple enum whose name appears in call position, for the two conversions from
