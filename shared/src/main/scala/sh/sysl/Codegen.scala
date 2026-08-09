@@ -55,8 +55,20 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
     // Emitting a runtime helper may ask for another (a destructor releases the references its
     // payload holds), so this runs until nothing new is requested.
+    //
+    // **A helper that reaches the allocator asks for the plain hook, and it is asked here rather
+    // than at the eight places that request one.** Every box a helper builds carries a hook that
+    // gives its storage back, and the ones built by the string runtime hold raw bytes, so the hook
+    // they install is the one that frees and does nothing else. Reading it off the helper's own text
+    // is what keeps that from being a list somebody has to remember to add to: a helper that starts
+    // allocating tomorrow brings its hook with it, and one that stops no longer asks.
     val runtimeTexts = mutable.ListBuffer.empty[String]
-    while runtimeQueue.nonEmpty do runtimeTexts += runtimeQueue.dequeue()()
+
+    while runtimeQueue.nonEmpty do
+      val text = runtimeQueue.dequeue()()
+
+      if text.contains("call ptr @malloc(") then plainDropFn
+      runtimeTexts += text
 
     val out = new mutable.StringBuilder
 

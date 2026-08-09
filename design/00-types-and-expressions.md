@@ -1019,6 +1019,21 @@ work:
   keeps every element on the boundary. The bound is folded rather than lexed, so `@align(CACHE_LINE)`
   is what a program writes, and it must be a power of two.
 
+  **`@align(n)` also marks a `var` or a `val`** — module-level, local, and the `static` spelling of
+  either — which is C's `alignas` beside Rust's `#[repr(align)]`. It says nothing the struct form
+  cannot: a boundary put on a type travels with every value of it, and a named aligned type is
+  reusable where a repeated attribute is not. What it saves is at the *use* site, where wrapping a
+  buffer in a struct turns `region[i]` into `region.bytes[i]`. `@packed` takes no such position — it
+  describes the arrangement of fields inside an aggregate, and a binding has none — and neither
+  attribute may stand above a binding that names several things, there being no one object for a
+  boundary to be about.
+
+  The one case it is **refused** in is the one where it could not be kept: an aligned array a view of
+  which outlives its frame is promoted to the heap, where the boundary is the allocator's answer
+  rather than the declaration's. Promotion is allowed to be silent about *where* storage went (`05`),
+  and here that is exactly what the declaration was about, so it is reported against the view that
+  leaves.
+
   What this cost while it was open is worth keeping: no program could promise an alignment it needed,
   so a DMA buffer on a cache-line boundary and a page-aligned table were both unwritable, and neither
   had a workaround — rounding up inside a region you were given is not the same as *being* aligned.

@@ -213,13 +213,14 @@ class HeapBufferTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       out should include("ret void")
     }
 
-    // Elements that hold nothing need no walk at all, so there is no hook to install — a buffer of
-    // bytes costs one null in its header and nothing else.
-    "and elements that hold nothing get no hook at all" in {
+    // Elements that hold nothing need no walk, so the buffer gets the plain hook rather than one of
+    // its own: it gives the storage back and does nothing else. It is not *no* hook — the free is
+    // the hook's job now, and a buffer of bytes has storage like any other.
+    "and elements that hold nothing get the hook that only frees" in {
       val out = ir("""f(n: usize) -> []u8 = [0; n]
                      |print(f(2usize).len)""".stripMargin)
 
-      out should include("store ptr null, ptr")
+      out should include("store ptr @arc.drop.plain, ptr")
       out should not include "arc.dropbuf"
     }
 

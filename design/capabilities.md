@@ -157,7 +157,11 @@ allows an allocator-free module the `malloc` and `free` it provides itself throu
 - bounds-checked indexing on arrays and slices;
 - string **literals** (static) and **non-escaping** closures (inlined, no box);
 - **holding, passing, and releasing** references and heap-backed slices created elsewhere —
-  retain and release need no allocator, and the free path goes through the object's own hook;
+  retain and release need no allocator, and the free path goes through the object's own hook. That
+  hook is the header's single function word, asked which of its two jobs is wanted: run over the
+  contents when the strong count reaches zero, and give the storage back when the weak count does.
+  It is installed by whoever built the box, so the bytes go back to the allocator that made them —
+  and a module that builds no box emits no hook, and therefore names no `free` at all;
 - manual `malloc` / `free` you provide yourself via `*T` — the allocator's own building blocks.
 
 What remains a compile error is *making* heap storage: `&T`, `weak T`, growable arrays, boxed

@@ -33,7 +33,9 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
 
     out should include regex raw"%t\d+ = call ptr @malloc\(i64 %t\d+\)"
     out should include regex raw"store i64 1, ptr %t\d+"
-    out should include("store ptr null, ptr")   // a payload holding nothing needs no destructor
+    // A payload holding nothing has no contents to walk, and still has storage to give back — so the
+    // hook is the plain one rather than none at all.
+    out should include("store ptr @arc.drop.plain, ptr")
   }
 
   // The weak count starts at one because the strong references hold one share between them
@@ -79,11 +81,13 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
     val src = "struct Node\n    value: int\n    next: Option[&Node]\nvar n: &Node = Node(1, None)"
     val out = ir(src)
 
-    out should include("define private void @arc.drop.Node(ptr %p) {")
+    out should include("define private void @arc.drop.Node(ptr %p, i1 %storage) {")
     out should include("call void @arc.dispose.Node(%struct.Node %t2)")
-    // The hook releases and returns; giving the storage back is `arc.destroy`'s, after it, because
-    // a weak reference may still be asking about the object the hook has just emptied.
+    // The hook is asked which of its two jobs is wanted. Walking the payload and giving the storage
+    // back happen at different moments — the strong count reaching zero and the weak count reaching
+    // zero — so the walk still ends in `ret void` and the free is the other arm.
     out should include regex raw"call void @arc\.dispose\.Node[^\n]*\n  ret void"
+    out should include("call void @free(ptr %p)")
     out should include("store ptr @arc.drop.Node, ptr")
   }
 

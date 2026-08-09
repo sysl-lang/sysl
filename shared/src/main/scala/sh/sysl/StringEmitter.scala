@@ -101,9 +101,17 @@ object StringEmitter {
     if w.bits > 32 then (s"  %n64 = sext i32 %n to ${w.llvm}", "%n64") else ("", "%n")
 
   /** The three header words every `StrBuf` starts with — a strong count of one, no deallocation
-   * hook because raw bytes hold no references, and a share count of one. The header's own layout is
-   * `ArcEmitter`'s `%arc.header`, and its size is taken from that type rather than written down, so
-   * a target that lays it out differently needs nothing changed here.
+   * hook that gives the bytes back and does nothing else, and a share count of one. The header's own
+   * layout is `ArcEmitter`'s `%arc.header`, and its size is taken from that type rather than written
+   * down, so a target that lays it out differently needs nothing changed here.
+   *
+   * **The hook cannot be null, and that is a change.** It used to be, because raw bytes hold no
+   * references and there was nothing for a destructor to walk — the storage came back from
+   * `arc.unshare`, which freed every box itself. The free is the hook's now (`ArcEmitter.dropFn`),
+   * so a null one here would mean a `StrBuf` whose bytes are never given back. `arc.drop.plain` is
+   * exactly the hook for a payload that holds nothing, and `Codegen` emits it into any module whose
+   * runtime helpers reach the allocator — which every helper embedding this one does, one line
+   * above.
    */
   private def strBufHeader(using w: Word): String = {
     val word = w.llvm
@@ -111,7 +119,7 @@ object StringEmitter {
     s"""  %p = call ptr @malloc($word %size)
        |  store $word 1, ptr %p
        |  %hook = getelementptr %arc.header, ptr %p, i32 0, i32 1
-       |  store ptr null, ptr %hook
+       |  store ptr @arc.drop.plain, ptr %hook
        |  %share = getelementptr %arc.header, ptr %p, i32 0, i32 2
        |  store $word 1, ptr %share
        |  %bytes = getelementptr %arc.header, ptr %p, i32 1""".stripMargin
