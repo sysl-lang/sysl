@@ -150,6 +150,43 @@ class TermEditTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  /** **The prompt problem, which no other test here can see.**
+   *
+   * A hosted sink buffers — `sysl.putbytes` goes through C's `putchar`, and C line-buffers a stream
+   * attached to a terminal — so a prompt written without a newline stays in the buffer until
+   * something writes one. What a person sees is a program printing nothing while they type and then
+   * producing the whole line at once, which reads as an editor that is not echoing at all. It was
+   * found at a real terminal: a pipe has no such buffer, and neither does a board.
+   *
+   * The editor therefore hands its sink a **zero-length write** before it waits for a keystroke, so a
+   * sink that buffers gets its chance to flush, and the obligation stays with the two places that
+   * know about buffers rather than with every caller that ever prints a prompt. Nothing about the
+   * bytes afterwards changes, so only a sink that *counts* its calls can observe it at all.
+   */
+  "the editor pokes its sink before it waits" - {
+
+    "so a buffering sink can put a prompt on the screen before a key is pressed" in {
+      edit("""struct Counting
+             |    n: int
+             |end Counting
+             |
+             |impl Fallible for Counting
+             |
+             |impl Writer for Counting
+             |    write(*self, bytes: []const u8)
+             |        self.n += 1
+             |end Counting
+             |
+             |var src = bytes_reader("".bytes)
+             |var out = Counting(0)
+             |var ed = editor(&src, &out)
+             |
+             |for line in ed do ()
+             |
+             |print(out.n)""".stripMargin) shouldBe "1\n"
+    }
+  }
+
   /** The property that makes this a library module rather than a board's package: it asks for
    * nothing. The editor is what a freestanding target most needs and least able to get from
    * elsewhere, so a capability requirement here would have put it out of reach of its main audience.

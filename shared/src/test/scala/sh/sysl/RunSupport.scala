@@ -78,6 +78,75 @@ trait RunSupport extends Matchers { this: Assertions =>
     finally deleteFile(path)
   }
 
+  /** Compile a program and run it **attached to a pseudo-terminal**, with `input` typed at it.
+   *
+   * **This is the only helper that can reach code gated on `is_tty`, and it exists because a whole
+   * facility was otherwise being merged unexercised.** Every other run here hands the program a
+   * closed standard input, so `sysl.term.tty.raw` takes its early exit and returns `false` — which
+   * makes the *refusing* branch the only one a suite could see, and the succeeding branch, the one
+   * that changes a real terminal's settings, unreachable. It is not a small branch: it spawns a
+   * shell, and getting it wrong once turned a Ctrl-C into a deadlock rather than a tidy exit.
+   *
+   * `script` is what supplies the terminal. Its arguments differ between the BSD one macOS ships and
+   * util-linux's, so the host decides which spelling to use — and a host with no `script` cancels the
+   * test rather than failing it, exactly as a missing `clang` does.
+   *
+   * **The input is delayed, and that is not superstition.** `script` writes whatever it is given to
+   * the terminal as soon as it has one, while the program is still starting; anything arriving before
+   * the program calls `stty` is handled by the line discipline that is still in canonical mode, and
+   * is then discarded when the mode changes. A person typing cannot lose that race and a pipe always
+   * wins it, so the sleep is what makes the harness behave like the situation being tested.
+   *
+   * The output carries `script`'s own noise — a `^D`, and the terminal's echo of the input while it
+   * was still cooked — so a caller should assert with `include` rather than against the whole string.
+   */
+  protected def runOnTty(src: String, input: String, after: String = ""): String = {
+    assume(Toolchain.clangAvailable, "clang not available")
+    assume(exec(List("sh", "-c", "command -v script")).exitCode == 0, "script not available")
+
+    val exe   = createTempFile("sysl-tty-", "")
+    val typed = createTempFile("sysl-typed-", ".txt")
+    // What runs *inside* the terminal, as a file rather than as a quoted argument: `script`'s two
+    // dialects disagree about how a command is passed, and nesting quotes through both of them is a
+    // way to be wrong on one platform only. `after` is how a test asks a question of the terminal
+    // once the program has left it — whether the mode was put back, which is the claim that matters
+    // most and cannot be asked from inside a program that has exited.
+    val session = createTempFile("sysl-session-", ".sh")
+
+    writeFile(typed, input)
+    writeFile(session, s"$exe\n$after\n")
+
+    val compiled = prebuiltStd match {
+      case Some(Stdlib.Resolved(std, precompiled, Some(archive))) =>
+        (Compiler.compiledWith(List(Source("<input>", src)), Nil, Target.default, precompiled,
+                               Some(std)), List(archive))
+      case _ =>
+        (Compiler.compiledWith(List(Source("<input>", src)), Nil, Target.default, Set.empty, None), Nil)
+    }
+
+    try
+      compiled._1.flatMap(c => Toolchain.build(c.ir, exe, Target.default, compiled._2,
+                                               Toolchain.defaultOptimization, c.links)) match {
+        case Left(err) => fail(err)
+        case Right(_)  =>
+          // BSD `script` takes the command as trailing words and the typescript first; util-linux
+          // takes the command through `-c` and the typescript last. Neither accepts the other's form.
+          val under =
+            if Target.default.name.contains("macos") then s"script -q /dev/null sh $session"
+            else s"script -qc 'sh $session' /dev/null"
+
+          // **The sleep is inside the subshell on purpose.** Written as `sleep 1; cat … | script …`
+          // it delays the whole pipeline, so the program starts *after* the wait and the input is
+          // still queued ahead of its `stty` — the exact race the delay exists to avoid, reinstated
+          // by precedence. Grouped, `script` starts at once and the typing arrives a second later.
+          exec(List("sh", "-c", s"( sleep 1; cat $typed ) | $under")).stdout
+      }
+    finally
+      deleteFile(exe)
+      deleteFile(typed)
+      deleteFile(session)
+  }
+
   /** A program's whole outcome — its status, its standard output and its standard error, kept
    * apart — for the runs where which stream something came out of is the thing being asserted.
    *

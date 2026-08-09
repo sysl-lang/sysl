@@ -150,6 +150,16 @@ struct Editor
         self.line.clear()
         self.at = 0
 
+        // **A zero-length write, whose whole purpose is to get the caller's prompt onto the screen.**
+        // A hosted sink buffers, and a prompt has no newline after it, so `prints("ogol> ")` sits in
+        // C's buffer until something writes one -- which is the next thing this function echoes, one
+        // keystroke too late. Handing the sink nothing gives it the chance to flush before the wait
+        // begins, and puts the obligation on the two places that know about buffers (the sink and
+        // this line) rather than on every caller that ever prints a prompt.
+        //
+        // It costs a board nothing: a sink with no buffer writes no bytes and returns.
+        self.put(self.chunk[0..<0])
+
         loop
             self.next_byte() match
                 // The input ended. Whatever was typed before it did is still a line; the next call
@@ -174,6 +184,32 @@ struct Editor
                             self.to_end()
                             self.new_line()
                             return Some(self.finish())
+                    elif b == 3
+                        // Ctrl-C, which arrives here as a byte rather than as a signal because
+                        // `sysl.term.tty.raw` disables `isig` -- and it does that because restoring a
+                        // terminal from a signal handler needs an allocation and a fork, neither of
+                        // which is async-signal-safe. On a board there was never a signal to disable,
+                        // so this is the only spelling that behaves the same in both places.
+                        //
+                        // **It abandons the line and answers an empty one**, which is deliberately
+                        // the same answer as pressing Enter on an empty line: a caller cannot meet a
+                        // case here that it does not already have, and it re-prompts of its own
+                        // accord rather than needing to be told an interruption happened.
+                        self.owed_lf = false
+                        self.to_end()
+                        self.new_line()
+                        self.line.clear()
+                        return Some(self.finish())
+                    elif b == 4
+                        // Ctrl-D, which ends the input **only on an empty line** -- the rule every
+                        // shell and every REPL follows, and the reason is that it is the one moment
+                        // where nothing is being thrown away. On a line with text in it, it is
+                        // ignored rather than treated as end of input, since a caller cannot tell a
+                        // discarded line from a finished one.
+                        if self.line.is_empty()
+                            self.new_line()
+                            self.done = true
+                            return None
                     else
                         self.owed_lf = false
                         self.edit(b)

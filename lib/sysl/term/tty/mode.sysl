@@ -32,48 +32,59 @@ import sysl.text.cstring
 // `system("stty …")` is one extern of `*u8 -> int`, reached by symbol alone, transcribing nothing.
 // The cost is a shell spawn, which for something called twice at the edges of a session is nothing.
 //
-// ## What it actually sets, which is **cbreak** and not raw
+// ## What it actually sets: `-icanon -echo -isig`, and what it deliberately leaves alone
 //
-// `-icanon -echo` and nothing else. Full raw mode would also take over signals and output
-// translation, and both are worth keeping:
+// **Output translation is asserted rather than assumed**, which is the one thing full raw mode takes
+// that is worth keeping. `opost onlcr` says `\n` becomes `\r\n` on the way out, so every `print` in
+// the program goes on working; without it a hosted program's output walks diagonally down the screen,
+// each line starting where the last one ended, and the fix for *that* is auditing every write in the
+// program rather than this one call.
 //
-// - **Signals stay.** Ctrl-C still interrupts, which for a REPL is a feature rather than an
-//   oversight -- in full raw mode it arrives as byte 3 and the program has to grow a policy about it.
-// - **Output translation stays.** `\n` still becomes `\r\n` on the way out, so every `print` in the
-//   program goes on working. Under full raw mode a hosted program's output walks diagonally down the
-//   screen, and the fix is auditing every write in the program rather than this one call.
+// **Naming them is not redundant, and this cost a session.** Nothing here turns output processing
+// off, so leaving the two out looked safe — and it is, on a terminal that still has them. A terminal
+// does **not** always still have them: a program killed before it could restore, a `stty` run
+// earlier, an emulator's own defaults. Under a fresh pty the omission is invisible, which is exactly
+// why the tests were green while a real terminal stair-stepped. A mode this sets should not depend on
+// the mode it found.
 //
 // `sysl.term.edit` writes `\r\n` outright, which a board needs and which costs a redundant carriage
-// return here -- the cursor is moved to a column it is already in.
+// return here — the cursor is moved to a column it is already in. That is also why the editor's own
+// output looked right while everything printed around it did not.
+//
+// **Signals go, and that is not the obvious choice.** Leaving `isig` alone would keep Ctrl-C
+// interrupting, which reads like a feature for a REPL. It cannot be had: a program interrupted in
+// cbreak mode must restore the terminal from a signal handler, and restoring means allocating a
+// command string and forking a shell, neither of which is async-signal-safe. Tried, and it did not
+// merely risk a deadlock — it hung every time.
+//
+// So `-isig`, and Ctrl-C arrives as **byte 3** for `sysl.term.edit` to decide about. What that costs
+// is real and should be said plainly: a program that has stopped responding can no longer be
+// interrupted from its own terminal, and the escape is `kill` from another one. What it buys is that
+// the terminal is never left broken, and that **a Mac behaves exactly like the board** — which has no
+// signals to disable in the first place.
 
-// `system` runs a command through the shell and answers its exit status. `atexit` and `signal` are
-// the two ways out of a program that this file has to catch, and between them they stand in for the
-// destructor the language does not have.
+// `system` runs a command through the shell and answers its exit status; `atexit` runs a function on
+// the way out, and stands in for the destructor the language does not have.
 //
-// **They catch different exits, and one is not a superset of the other.** `atexit` runs on `exit`,
-// which is every ordinary return and every panic; it does **not** run when a signal terminates the
-// process, because the default action for one is to die without unwinding anything. So a program that
-// left the terminal in cbreak and was then interrupted would leave it there, which is the exact case
-// a person testing this at a terminal reaches first.
+// **There is no signal handler here, and that is a decision this file paid for once.** `atexit` runs
+// on `exit` and not when a signal terminates a process, so an earlier version of this installed
+// handlers for SIGINT and SIGTERM that restored the terminal and exited. It **hung**, reliably, and
+// the reason is worth writing down: restoring means `cooked`, which means `stty`, which builds a
+// command string -- an **allocation** -- and hands it to `system`, which **forks**. Neither is
+// async-signal-safe. A handler that allocates while the interrupted code holds the allocator's lock
+// waits for a lock only the interrupted code can release, and a program that would merely have left
+// the terminal in a bad state instead stops responding entirely.
 //
-// `signal` answers the previous handler, which nothing here wants -- but a declaration has to give
-// the type a name, so it comes back as an opaque pointer and is dropped.
+// **Without `termios` there is no way to restore a terminal from a handler at all**, because every
+// route to it allocates or forks. So the signal is removed instead of handled: `-isig` below means
+// Ctrl-C never becomes one, and every exit is then an ordinary exit that `atexit` really does catch.
 //
 // Declared here rather than in `sysl.sys`, following `sysl.fs` and the file beside this one:
 // `sysl.sys` is the printing-and-reading core, carries no capability, and a POSIX-only symbol in it
 // would be a requirement filed where nothing declares one.
 private[sysl] extern "system" c_system(cmd: *u8) -> int
 private[sysl] extern "atexit" c_atexit(f: *extern() -> unit) -> int
-private[sysl] extern "signal" c_signal(sig: int, f: *extern(int) -> unit) -> *u8
-
-// The two signals that end a program without running `atexit` and that a person actually causes.
-//
-// **The numbers are portable in a way most are not.** POSIX fixes `SIGINT` at 2 and `SIGTERM` at 15
-// on every system this compiles for, which is why they can be written here rather than read out of a
-// header the library has no way to include. The ones with platform-dependent numbers are exactly the
-// ones this does not need.
-private sigint() -> int = 2
-private sigterm() -> int = 15
+private[sysl] extern "fflush" c_fflush(stream: *u8) -> int
 
 // The descriptor a terminal's input arrives on, named beside the two the file already names.
 private stdin_fd() -> int = 0
@@ -121,26 +132,24 @@ end stty
 raw() -> bool
     if entered then return true
     if !is_tty(stdin_fd()) then return false
-    if !stty("-icanon -echo min 1 time 0") then return false
+    if !stty("-icanon -echo -isig opost onlcr min 1 time 0") then return false
 
     entered = true
 
-    // **The hooks are why a terminal is not left wrecked by an exit nobody wrote.** sysl has no
+    // **The hook is why a terminal is not left wrecked by an exit nobody wrote.** sysl has no
     // destructor, so nothing runs on the way out of a function that stopped early -- and a program
     // that ended with echo off leaves a shell showing nothing as it is typed, which the user has to
     // fix by typing `stty sane` blind.
     //
-    // Two are needed because they catch different exits. `atexit` covers `exit`, which is an ordinary
-    // return and every panic. The signals cover the way a *person* ends a program that is sitting at a
-    // prompt: this file deliberately leaves `isig` alone, so Ctrl-C still interrupts -- and the
-    // default action for that terminates the process without running a single `atexit` handler.
+    // One hook is enough **because `-isig` removed the exits it could not have caught.** With signals
+    // off, Ctrl-C is a byte the editor reads rather than a death the program never hears about, so
+    // every way out of a program in cbreak mode is now an ordinary `exit` -- which is exactly what
+    // `atexit` covers.
     //
     // Registered once, on first entry, and `cooked` is a no-op when the program restored the terminal
     // itself, so nothing here fires twice.
     if !hooked
         c_atexit(&restore)
-        c_signal(sigint(), &restore_and_die)
-        c_signal(sigterm(), &restore_and_die)
         hooked = true
 
     true
@@ -148,13 +157,13 @@ end raw
 
 // Put back what `raw` changed, and only what it changed.
 //
-// **`icanon echo` rather than `stty sane`**, which would also reset everything else the terminal was
-// set to -- settings this program did not choose and has no business having an opinion about. Doing
-// nothing when `raw` was never called or has already been undone is part of the same rule.
+// **`icanon echo isig` rather than `stty sane`**, which would also reset everything else the terminal
+// was set to -- settings this program did not choose and has no business having an opinion about.
+// Doing nothing when `raw` was never called or has already been undone is part of the same rule.
 cooked()
     if !entered then return
 
-    stty("icanon echo")
+    stty("icanon echo isig")
     entered = false
 end cooked
 
@@ -163,19 +172,50 @@ end cooked
 private restore()
     cooked()
 
-// What a signal runs: the same restore, and then the death the signal was asking for.
+// ## Getting output out, which a terminal needs and a pipe does not
 //
-// **It exits rather than returning**, because returning from a handler resumes the program that was
-// interrupted -- so a Ctrl-C would tidy the terminal and then leave the session running with echo
-// off, which is worse than either outcome on its own.
+// **`print` does not reach the screen when you expect it to, and that breaks every prompt.**
+// `sysl.putbytes` -- the one sink all printing goes through -- writes with C's `putchar`, and C
+// line-buffers a stream attached to a terminal. So a prompt written without a newline sits in the
+// buffer, and so does every character an editor echoes, until something writes a `\n`. What a person
+// sees is a program that prints nothing while they type and then produces the whole line at once,
+// which reads as an editor that is not echoing at all.
 //
-// The status is the shell's convention for a program ended by a signal: 128 plus the number, so 130
-// for Ctrl-C. It is not re-raised with the default handler restored, which would be the more exact
-// spelling and needs `raise` and a second `signal` call for a difference only a parent inspecting
-// `WIFSIGNALED` can see.
+// A board never shows this, which is why it was found here and not there: its `putchar` is the SDK's
+// and has no buffer in front of it.
 //
-// It takes the signal number because that is the shape C hands a handler, and ignores it because both
-// signals it is installed for want the same thing.
-private restore_and_die(sig: int)
-    cooked()
-    exit(128 + sig)
+// **The exact fix would be `setvbuf(stdout, …)` once, and it cannot be written.** `setvbuf` needs
+// C's `stdout`, which is a global *variable*, and sysl has no `extern` form for one -- `15 §7` names
+// a layout, a `#define` and a by-value struct as the unreachables and does not mention this, so it is
+// a gap rather than a decision. `fflush(null)` is the way around it: it flushes every stream and so
+// needs to name none.
+
+// Push out everything the C library is holding, on every stream.
+//
+// **A caller needs this for its own prompt.** The editor's sink below flushes what the *editor*
+// writes; a prompt printed by the program before handing over is the program's own output, and
+// nothing has written a newline after it. `prints("ogol> ")` then `flush()` is the whole idiom.
+flush() = c_fflush(null)
+
+// Standard output as a sink that **flushes what it is given**, which is what an editor must write
+// through on a hosted terminal.
+//
+// It carries no state for the reason `Stdout` does not: a destination fixed at compile time keeps
+// none, so the pointer the sink is built on addresses nothing and `write` never looks at `self`.
+//
+// A program on a board passes its own port's writer and needs none of this. That asymmetry is real
+// and is the only one in the whole facility: the board has no buffer to defeat.
+struct TtyWriter
+end TtyWriter
+
+impl Fallible for TtyWriter
+
+impl Writer for TtyWriter
+    write(*self, bytes: []const u8)
+        putbytes(bytes)
+        c_fflush(null)
+end TtyWriter
+
+val tty_sink: *TtyWriter = ptr_cast(0usize)
+
+tty_writer() -> *Writer = tty_sink

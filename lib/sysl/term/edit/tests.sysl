@@ -117,6 +117,40 @@ backspace_at_start()
     assert_slice_eq(lines_of("\u{8}\u{8}ab\r").view(), ["ab"])
 end backspace_at_start
 
+// -- interrupting and ending ----------------------------------------------------------------------
+//
+// **These are keys and not signals here, and that is the whole of why the editor has to answer for
+// them.** `sysl.term.tty.raw` disables `isig`, because restoring a terminal from a signal handler
+// needs an allocation and a fork and neither is async-signal-safe -- so Ctrl-C arrives as byte 3 and
+// Ctrl-D as byte 4, exactly as they do over a serial cable where there was never a signal to
+// disable. One spelling, both platforms.
+
+// **The empty line is deliberate rather than a placeholder.** It is the same answer Enter on an empty
+// line already gives, so a caller cannot meet a case here it does not already have, and it re-prompts
+// of its own accord without being told an interruption happened.
+@test("Ctrl-C abandons what was typed and answers an empty line")
+ctrl_c_abandons_the_line()
+    assert_slice_eq(lines_of("abc\u{3}").view(), [""])
+end ctrl_c_abandons_the_line
+
+@test("and the line after an interrupted one is unaffected by it")
+ctrl_c_does_not_leak()
+    assert_slice_eq(lines_of("abc\u{3}xy\r").view(), ["", "xy"])
+end ctrl_c_does_not_leak
+
+@test("Ctrl-D on an empty line ends the input")
+ctrl_d_ends_input()
+    assert_slice_eq(lines_of("ab\rcd\r\u{4}").view(), ["ab", "cd"])
+end ctrl_d_ends_input
+
+// The rule every shell follows, and the reason is that an empty line is the one moment where ending
+// throws nothing away. On a line with text in it a caller could not tell a discarded line from a
+// finished one, so the key is ignored instead.
+@test("but Ctrl-D on a line with text in it is ignored")
+ctrl_d_mid_line_ignored()
+    assert_slice_eq(lines_of("ab\u{4}cd\r").view(), ["abcd"])
+end ctrl_d_mid_line_ignored
+
 @test("the left arrow moves the cursor, and typing inserts there")
 left_arrow_inserts()
     assert_slice_eq(lines_of("ac\u{1b}[Db\r").view(), ["abc"])

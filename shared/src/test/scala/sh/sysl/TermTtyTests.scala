@@ -217,4 +217,83 @@ class TermTtyTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |    print("cooked")""".stripMargin) shouldBe "cooked\n"
     }
   }
+
+  /** Cbreak mode **against a real terminal**, through `runOnTty`.
+   *
+   * **This section exists because the facility was merged with none of it exercised.** Everything
+   * above reaches only the branch that declines to change anything, so what shipped first — a signal
+   * handler that restored the terminal and exited — had never run once. It could not have: restoring
+   * means allocating a command and forking a shell, and a handler doing that while the interrupted
+   * code holds the allocator's lock waits forever. It hung on the first real keystroke.
+   *
+   * These are slower than the rest of the suite, by the second each spends letting the program reach
+   * its `stty` before anything is typed at it. That is the cost of testing the half of a terminal
+   * program that a pipe cannot show.
+   */
+  // The two keys that stopped being signals. Named rather than written as escapes because Scala has
+  // no `\u{3}` form and its `` is handled by the lexer before the string exists, which is a
+  // trap of its own — the character is what a test means, so the character is what it says.
+  private val ctrlC = 3.toChar.toString
+  private val ctrlD = 4.toChar.toString
+
+  "cbreak mode, against a terminal that is really there" - {
+
+    "raw() succeeds, where the tests above could only watch it decline" in {
+      runOnTty("import sysl.term.tty.{is_tty, raw, cooked}\n\n" +
+        "print(\"tty:\", is_tty(0))\nprint(\"raw:\", raw())\ncooked()\n", "") should include("raw: true")
+    }
+
+    // The whole point of the mode: bytes arrive as they are typed instead of at Enter, and nothing
+    // but the editor echoes them.
+    "and the editor then reads what is typed, a keystroke at a time" in {
+      val out = runOnTty("""import sysl.term.edit.editor
+                           |import sysl.io.stdin
+                           |import sysl.term.tty.{raw, cooked}
+                           |
+                           |var input = stdin()
+                           |
+                           |if raw()
+                           |    var ed = editor(&input, stdout())
+                           |
+                           |    for line in ed do print("got", line)
+                           |    cooked()""".stripMargin, "abc\r" + ctrlD)
+
+      out should include("got abc")
+    }
+
+    // **The regression test for the deadlock.** Ctrl-C is a byte here rather than a signal, so the
+    // program has to still be alive afterwards and go on reading — which is exactly what the version
+    // with a signal handler could not do.
+    "Ctrl-C abandons the line without ending the program" in {
+      val out = runOnTty("""import sysl.term.edit.editor
+                           |import sysl.io.stdin
+                           |import sysl.term.tty.{raw, cooked}
+                           |
+                           |var input = stdin()
+                           |
+                           |if raw()
+                           |    var ed = editor(&input, stdout())
+                           |
+                           |    for line in ed do print("got [" + line + "]")
+                           |    cooked()
+                           |    print("ended")""".stripMargin, "abc" + ctrlC + "xy\r" + ctrlD)
+
+      out should include("got []")
+      out should include("got [xy]")
+      out should include("ended")
+    }
+
+    // The claim a user feels the moment it is broken: a shell that shows nothing as you type. `after`
+    // asks the terminal itself, once the program has left it, because a program that has exited
+    // cannot be asked.
+    "and the terminal is put back when the program leaves it" in {
+      val out = runOnTty("""import sysl.term.tty.{raw, cooked}
+                           |
+                           |if raw() then cooked()""".stripMargin, "",
+        after = "stty -a | tr ' ' '\\n' | grep -c '^-echo$'")
+
+      // Zero occurrences of `-echo`: echo is on, which is what `cooked` promised to restore.
+      out should include("0")
+    }
+  }
 }
