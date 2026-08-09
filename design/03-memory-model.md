@@ -129,6 +129,19 @@ destroys it**, installed by whoever allocated it. Release decrements; at zero it
 the hook, which releases whatever the payload holds and then returns the storage to the heap
 the object came from.
 
+**Those are two jobs at two moments, so the hook is asked which one is wanted.** The payload is
+released when the **strong** count reaches zero and the storage goes back when the **weak** count
+does — a weak reference outliving the object being exactly the case that separates them. One word
+rather than two: a second slot would have been symmetric and cost a pointer per object on machines
+chosen for having very little memory, which is the same argument this header already makes about the
+counts being pointer-width.
+
+That the free is the *hook's* and not the release path's is what makes the rest of it work. The hook
+belongs to whoever allocated, so the bytes go back to the allocator that produced them — which is
+what lets a module with no allocator of its own hold, and let go of, a heap slice something else
+made (`capabilities`). A module that allocates nothing installs no hook, and so names no deallocator
+at all.
+
 **Teardown is iterative, so depth is bounded.** A destructor releases the references its payload
 holds, so destroying the head of a long `&T` chain — a linked list, a degenerate tree — would
 recurse one stack frame per node and overflow the stack. It does not: when a count reaches zero

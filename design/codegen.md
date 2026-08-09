@@ -516,7 +516,9 @@ arity.
    (built — `03`, and the count is a third header word); ~~there are no methods~~ (built — `08`);
    ~~a data enum reserves storage for every variant's payload at once~~ (it is a union — the tag
    and one region sized to the widest payload). What remains is the **deallocation hook**, which is
-   always the compiler's own or null, since there is still no way to write an allocator.
+   always the compiler's own, since there is still no way to write an allocator. It is never null on
+   a box the compiler built: a payload holding nothing has no contents to walk and still has storage
+   to give back, so it carries the hook that only frees.
 6. **Exhaustiveness is computed over all the arms at once**, as a matrix with one row per
    unguarded pattern and one column per value still being discriminated. A column whose type has
    a finite constructor set — an enum's variants, a struct's single shape, `bool`'s two values —
