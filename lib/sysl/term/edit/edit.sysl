@@ -1,0 +1,414 @@
+module sysl.term.edit
+
+import sysl.buf.{Buf, buf}
+import sysl.io.Reader
+import sysl.text.{char_columns, str_builder}
+
+// Reading a line from a terminal that will not do it for you.
+//
+// **A hosted program never writes this and a freestanding one has to.** At a shell, the kernel's line
+// discipline echoes what is typed, honours backspace, and hands the program a whole line at Enter;
+// `sysl.io.console_lines` is the right facility there, and this one would only echo a second copy of
+// every character. Over a USB CDC port there is no line discipline at all: nothing appears as it is
+// typed and a mistake cannot be corrected, which is not a program that reads badly but a program that
+// looks broken.
+//
+// The same is true of a hosted terminal put into **raw** mode, which is what makes this worth having
+// in the library rather than in one board's package: `sysl.term.tty.with_raw` and a serial cable are
+// two ways of arriving at the same situation, and one program should serve both.
+//
+// ## What it is not
+//
+// **It is deliberately the simple thing.** There is no history, no completion, no multi-line editing,
+// and no absolute cursor addressing. A program wanting those wants linenoise, which does them
+// properly and is a package. What is here is the set a REPL is unusable without.
+//
+// **A line that wraps past the terminal's width redraws wrong**, and that is the honest cost of
+// having no absolute addressing: the cursor is moved by writing `\b`, which stops at column zero
+// rather than climbing to the end of the row above. Fixing it means asking the terminal how wide it
+// is and emitting `ESC [ row ; col H`, which is a different design and a much larger one.
+//
+// ## What it needs
+//
+// **Nothing of the platform**, which is the property that lets one program run at a terminal and over
+// a cable. It reads bytes from a `Reader` and writes `\b`, spaces and the line's own characters to a
+// `Writer`; it *reads* `ESC [ …` for the arrow keys and *writes* no escape sequence at all. So it
+// declares no capability and carries no C, and every target compiles it on the same terms.
+//
+// It does allocate. The line is a `Buf[char]` and the answer is a `string`, so a target with no
+// allocator is not served here -- and could not be by this API, since building a `string` is where
+// the allocation is. That is a different facility rather than this one with a flag.
+
+// U+FFFD, what a decoder answers for input it cannot make sense of.
+private const replacement: char = '\u{FFFD}'
+
+// A line editor over a byte source and a place to echo to.
+//
+// **It borrows both rather than owning them**, for the reason `sysl.io.Lines` gives: a `for` loop
+// iterates a *copy* of its iterator, so an owned reader would latch its failure on a copy the caller
+// cannot reach, and `failed` would be decorative. Two parameters rather than one value implementing
+// both traits, because a source and a sink are usually two different things -- a file descriptor each
+// on a host -- and a caller with one value that is both hands it over twice.
+//
+// **Three pieces of state outlive a line, which is why this is a struct rather than a function.** The
+// CRLF debt straddles two lines by construction; the tail of the last read holds bytes that have been
+// taken from the reader and not yet looked at, which an escape sequence arriving in two pieces
+// depends on; and the `Buf[char]` is reused, so a session allocates once rather than once per line.
+struct Editor
+    src: *Reader
+    sink: *Writer
+    // The line being edited, as characters. **A character rather than a byte is what makes the cursor
+    // an index**: moving is `at - 1` and `at + 1`, and a half character can never be left behind by a
+    // backspace because a half character never enters the line.
+    line: Buf[char]
+    // Where the next insertion goes, counted in characters from the start of the line.
+    at: usize
+    // What a read is offered, and what the last one filled. The editor wants one byte at a time and
+    // `Reader` fills a slice, so the surplus is held here until it is asked for.
+    chunk: []u8
+    have: []const u8
+    pos: usize
+    // Whether a `\n` arriving next belongs to the `\r` that already ended the previous line. It has
+    // to survive the line boundary, because the two bytes of a CRLF are what straddle it.
+    owed_lf: bool
+    done: bool
+
+    // The next byte of input, refilling from the reader when what was read is spent.
+    //
+    // An empty read ends the input for good, which is right for the sources `read` serves: zero means
+    // end of input and a failure arrives through `failed` instead, so nothing is being conflated and
+    // a caller reading past the end gets `None` every time rather than a second chance.
+    next_byte(*self) -> Option[u8]
+        loop
+            if self.pos < self.have.len
+                val b = self.have[self.pos]
+
+                self.pos += 1
+                return Some(b)
+
+            if self.done then return None
+
+            self.have = self.src.read(self.chunk)
+            self.pos = 0
+
+            if self.have.len == 0
+                self.done = true
+                return None
+    end next_byte
+
+    // The character a byte begins, read the rest of the way off the source.
+    //
+    // It is a decode with the lead byte already in hand, which is the shape a line editor needs: the
+    // loop has to look at every byte to find the control keys, so by the time it knows a byte is
+    // ordinary text it has already taken it.
+    //
+    // **Malformed input answers U+FFFD rather than failing**, which is what a terminal does and what
+    // keeps one bad byte from ending a session. A continuation byte that is missing or out of range
+    // ends the character there rather than consuming what follows: the next byte is far likelier to
+    // start a fresh character than to be the rest of a broken one. The line is therefore valid text
+    // by construction, and `getline` has nothing left to validate.
+    char_from(*self, b0: u8) -> char
+        if b0 < 128 then return char(uint(b0))
+
+        var more = 0
+
+        if b0 & 224 == 192 then more = 1
+        elif b0 & 240 == 224 then more = 2
+        elif b0 & 248 == 240 then more = 3
+
+        // A continuation byte arriving where a leading byte belongs.
+        if more == 0 then return replacement
+
+        val mask = if more == 1 then 31 elif more == 2 then 15 else 7
+        var cp = uint(b0 & u8(mask))
+        var n = 0
+
+        while n < more
+            self.next_byte() match
+                None -> return replacement
+
+                Some(b) ->
+                    if b & 192 != 128 then return replacement
+
+                    cp = (cp << 6) | uint(b & 63)
+                    n += 1
+
+        char(cp)
+    end char_from
+
+    // One line, without its terminator, echoed as it is typed.
+    //
+    // **`\r`, `\n` and `\r\n` each end a line**, which is `sysl.io.LineEnding.CrOrLf`'s policy and for
+    // the same reason: a terminal sends a bare `\r` when Enter is pressed, so a reader waiting for an
+    // `\n` waits forever and prints nothing. A CR ends the line immediately rather than waiting to see
+    // whether an LF follows, because on a bare-CR terminal it never does and waiting would hang until
+    // the next keystroke -- so the debt is remembered instead, and outlives the call.
+    //
+    // **It cannot fail.** Every character came out of `char_from`, where a malformed byte already
+    // became U+FFFD, so there is nothing left to validate and no `Result` for a caller to unwrap.
+    getline(*self) -> Option[string]
+        self.line.clear()
+        self.at = 0
+
+        loop
+            self.next_byte() match
+                // The input ended. Whatever was typed before it did is still a line; the next call
+                // finds the line empty and ends the walk.
+                None ->
+                    if self.line.is_empty() then return None
+
+                    return Some(self.finish())
+
+                Some(b) ->
+                    if b == 13
+                        self.owed_lf = true
+                        self.to_end()
+                        self.new_line()
+                        return Some(self.finish())
+                    elif b == 10
+                        // The second half of a CRLF, whose first half already ended a line. Swallowed
+                        // rather than read as an empty line following it.
+                        if self.owed_lf then
+                            self.owed_lf = false
+                        else
+                            self.to_end()
+                            self.new_line()
+                            return Some(self.finish())
+                    else
+                        self.owed_lf = false
+                        self.edit(b)
+    end getline
+
+    // The characters gathered back into a `string`, which is one `StrBuilder` and no validation.
+    finish(*self) -> string
+        var out = str_builder()
+
+        for c in self.line.view() do out.push_char(c)
+
+        out.finish()
+    end finish
+
+    // One keystroke's worth of editing.
+    //
+    // Split from `getline` because that function is about *when a line ends* and this one is about
+    // what the line says -- two questions that were one function in the package this came from, until
+    // arrow keys arrived and it stopped fitting on a screen twice over.
+    edit(*self, b: u8)
+        if b == 27 then self.escape()
+        elif b == 8 || b == 127 then self.backspace()
+        elif b == 1 then self.to_start()                 // Ctrl-A
+        elif b == 5 then self.to_end()                   // Ctrl-E
+        elif b == 2 then self.left()                     // Ctrl-B
+        elif b == 6 then self.right()                    // Ctrl-F
+        elif b == 21 then self.kill_line()               // Ctrl-U
+        elif b == 11 then self.kill_to_end()             // Ctrl-K
+        elif b >= 32
+            val c = self.char_from(b)
+
+            self.insert(c)
+        // Any other control character would move the terminal's cursor without being in the line.
+    end edit
+
+    // An escape sequence, of which only `ESC [ …` is understood.
+    //
+    // **The bytes of a sequence arrive together**, so reading them with the same call the rest of the
+    // loop uses is safe in practice -- and safer here than in a reader taking one byte at a time,
+    // since a sequence split across two reads is held in `have` rather than lost. A lone Escape key is
+    // the exception: it waits for the next keystroke before deciding, which is what every terminal
+    // program does and for the same reason.
+    escape(*self)
+        self.next_byte() match
+            None -> ()
+
+            Some(bracket) ->
+                if bracket != u8('[') then return
+
+                self.next_byte() match
+                    None -> ()
+
+                    Some(c) ->
+                        if c == u8('D') then self.left()
+                        elif c == u8('C') then self.right()
+                        elif c == u8('H') then self.to_start()
+                        elif c == u8('F') then self.to_end()
+                        elif c == u8('3')
+                            // Delete arrives as `ESC [ 3 ~`, so the tilde has to be taken as well.
+                            self.next_byte()
+                            self.delete_at()
+                        // Up, down, and everything else with a longer form: swallowed rather than
+                        // echoed, since echoing it would move the terminal's cursor off the line.
+    end escape
+
+    // ## Writing
+    //
+    // Four primitives, and every movement below is built from them. **The cursor is moved by writing
+    // rather than by an escape sequence** -- a backspace goes one column left, and re-echoing the
+    // character under the cursor goes as far right as that character is wide. That needs no number
+    // formatting, and so no allocation per keystroke, and it is why this module emits no ANSI at all.
+
+    put(*self, bytes: []const u8)
+        self.sink.write(bytes)
+    end put
+
+    put_char(*self, c: char)
+        var tmp: [4]u8
+
+        self.sink.write(tmp[0..<encode_utf8(c, tmp[0..<4])])
+    end put_char
+
+    // `n` columns back, which is `n` backspaces.
+    back(*self, n: usize)
+        var i = n
+
+        while i > 0
+            self.put("\b".bytes)
+            i -= 1
+    end back
+
+    // `n` columns painted over.
+    blank(*self, n: usize)
+        var i = n
+
+        while i > 0
+            self.put(" ".bytes)
+            i -= 1
+    end blank
+
+    // CRLF, so that whatever the program prints next starts on a line of its own. Both bytes, because
+    // a terminal in raw mode does no translation and a bare `\n` would leave the cursor where the line
+    // ended.
+    new_line(*self)
+        self.put("\r\n".bytes)
+    end new_line
+
+    // ## Measuring
+    //
+    // **Columns rather than characters, everywhere a distance is wanted.** A wide character -- CJK,
+    // most emoji -- occupies two, and an editor counting characters erases half of one and leaves the
+    // other half on the screen. `sysl.text.char_columns` is the library's answer and it is 499 ranges
+    // out of the Unicode Character Database, which is exactly the kind of thing no editor should be
+    // carrying its own copy of.
+
+    // How wide the character at `i` is drawn.
+    width_at(self, i: usize) -> usize = char_columns(self.line.view()[i])
+
+    // How many columns the line occupies from `from` to its end.
+    columns_from(self, from: usize) -> usize
+        var n: usize = 0
+        var i = from
+
+        while i < self.line.len()
+            n += self.width_at(i)
+            i += 1
+
+        n
+    end columns_from
+
+    // ## Moving
+
+    // The line from `from` to its end, echoed where the cursor stands.
+    put_from(*self, from: usize)
+        var i = from
+
+        while i < self.line.len()
+            self.put_char(self.line.view()[i])
+            i += 1
+    end put_from
+
+    left(*self)
+        if self.at == 0 then return
+
+        self.at -= 1
+        self.back(self.width_at(self.at))
+    end left
+
+    right(*self)
+        if self.at >= self.line.len() then return
+
+        self.put_char(self.line.view()[self.at])
+        self.at += 1
+    end right
+
+    to_start(*self)
+        val n = self.columns_from(0) - self.columns_from(self.at)
+
+        self.back(n)
+        self.at = 0
+    end to_start
+
+    to_end(*self)
+        self.put_from(self.at)
+        self.at = self.line.len()
+    end to_end
+
+    // ## Changing
+    //
+    // After an edit at the cursor, everything to its right has moved, so the tail is written out again
+    // and the cursor walked back to where it belongs. `blanks` is how many columns the line no longer
+    // covers -- the width of what was removed, and none for an insertion.
+    redraw(*self, blanks: usize)
+        self.put_from(self.at)
+        self.blank(blanks)
+        self.back(self.columns_from(self.at) + blanks)
+    end redraw
+
+    insert(*self, c: char)
+        self.line.insert(self.at, c)
+        self.put_char(c)
+        self.at += 1
+        self.redraw(0)
+    end insert
+
+    backspace(*self)
+        if self.at == 0 then return
+
+        val w = self.width_at(self.at - 1)
+
+        self.line.remove(self.at - 1)
+        self.at -= 1
+        self.back(w)
+        self.redraw(w)
+    end backspace
+
+    delete_at(*self)
+        if self.at >= self.line.len() then return
+
+        val w = self.width_at(self.at)
+
+        self.line.remove(self.at)
+        self.redraw(w)
+    end delete_at
+
+    // Ctrl-U -- everything gone.
+    kill_line(*self)
+        self.to_start()
+
+        val w = self.columns_from(0)
+
+        self.line.clear()
+        self.redraw(w)
+    end kill_line
+
+    // Ctrl-K -- everything from the cursor on.
+    kill_to_end(*self)
+        val w = self.columns_from(self.at)
+
+        self.line.truncate(self.at)
+        self.redraw(w)
+    end kill_to_end
+end Editor
+
+impl Iterate[string] for Editor
+    next(*self) -> Option[string] = self.getline()
+
+// An editor over a byte source and a place to echo to.
+//
+// The two are separate parameters because on a host they are separate things -- a reader on one
+// descriptor and a writer on another. A caller whose console is one value that is both hands it over
+// twice.
+//
+// **It prints no prompt and is not told one.** Every movement here is relative, so the editor never
+// needs to know how far along the row the line starts, and a caller goes on printing its own prompt
+// exactly as it would before `console_lines`. That is what makes a continuation prompt -- a REPL
+// holding an unfinished expression -- a property of the caller rather than a field here.
+editor(r: *Reader, w: *Writer) -> Editor = Editor(r, w, buf(), 0, [0; 64], [], 0, false, false)

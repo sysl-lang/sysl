@@ -1,0 +1,266 @@
+module sysl.term.edit
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.io.{bytes_reader, bytes_reader_at_most, bytes_writer}
+import sysl.text.from_utf8
+
+// What the editor promises, asserted against a byte script instead of a keyboard.
+//
+// **This is the whole reason the editor is in the library.** It lived in one board's package, wired
+// directly to that board's `getchar`, and could therefore be exercised only by a person typing at a
+// serial cable -- which meant the redraw arithmetic, the part most worth checking, was never checked
+// at all. Over a `Reader` it is ordinary code, and a test is a string of bytes.
+//
+// The echo assertions are as important as the line assertions and are easy to undervalue. What a
+// caller *gets back* is only half of what an editor does; the other half is what the terminal was
+// told, and a cursor left one column out is invisible to any test that looks only at the answer.
+//
+// **The fixtures are `sysl.io`'s own `bytes_reader` and `bytes_writer` rather than types written
+// here**, and not by preference: an `impl` block may not sit in a file that said `@tests`, because a
+// test build would keep it and every other build would drop it. That refusal is what turned two
+// obvious library types into library types instead of scaffolding.
+
+// The lines a script yields, which is the shape nearly every test below wants.
+private lines_of(text: string) -> Buf[string]
+    var src = bytes_reader(text.bytes)
+    var out = bytes_writer()
+    var ed = editor(&src, &out)
+    var got: Buf[string] = buf()
+
+    for line in ed do got.push(line)
+
+    got
+end lines_of
+
+// The same, with the input arriving **one byte per read** -- which is how the cases that straddle a
+// read are reached, and they are the cases a hand-rolled reader gets wrong.
+private dribbled_lines_of(text: string) -> Buf[string]
+    var src = bytes_reader_at_most(text.bytes, 1)
+    var out = bytes_writer()
+    var ed = editor(&src, &out)
+    var got: Buf[string] = buf()
+
+    for line in ed do got.push(line)
+
+    got
+end dribbled_lines_of
+
+// What the terminal was told, for the tests whose subject is the redraw rather than the answer.
+private echo_of(text: string) -> string
+    var src = bytes_reader(text.bytes)
+    var out = bytes_writer()
+    var ed = editor(&src, &out)
+
+    for line in ed do ()
+
+    from_utf8(out.view()).unwrap_or("(not UTF-8)")
+end echo_of
+
+// -- ending a line --------------------------------------------------------------------------------
+
+@test("a bare CR ends a line, which is what a terminal sends")
+cr_ends_a_line()
+    assert_slice_eq(lines_of("hi\r").view(), ["hi"])
+end cr_ends_a_line
+
+@test("a bare LF ends a line")
+lf_ends_a_line()
+    assert_slice_eq(lines_of("hi\n").view(), ["hi"])
+end lf_ends_a_line
+
+// The case a hand-rolled reader gets wrong: the LF must be swallowed rather than read as an empty
+// line following the CR that already ended one.
+@test("CRLF is one line ending and not two")
+crlf_is_one_ending()
+    assert_slice_eq(lines_of("a\r\nb\r\n").view(), ["a", "b"])
+end crlf_is_one_ending
+
+// The same script with the reader handing back one byte at a time, so the CR and the LF arrive in
+// different reads and the debt has to outlive the call that returned the line.
+@test("CRLF is one line ending even when its two bytes arrive in different reads")
+crlf_split_across_reads()
+    assert_slice_eq(dribbled_lines_of("a\r\nb\r\n").view(), ["a", "b"])
+end crlf_split_across_reads
+
+@test("an empty line is a line")
+empty_line()
+    assert_slice_eq(lines_of("\r\r").view(), ["", ""])
+end empty_line
+
+// Input that stops without a terminator has still been typed, so it is a line -- and the walk ends
+// after it rather than yielding it twice.
+@test("input that ends without a terminator yields what was typed, once")
+unterminated_tail()
+    assert_slice_eq(lines_of("a\rbc").view(), ["a", "bc"])
+end unterminated_tail
+
+@test("input that ends cleanly yields nothing more")
+nothing_after_the_end()
+    assert_slice_eq(lines_of("a\r").view(), ["a"])
+end nothing_after_the_end
+
+// -- editing --------------------------------------------------------------------------------------
+
+@test("backspace removes the character before the cursor")
+backspace_removes()
+    assert_slice_eq(lines_of("abx\u{8}c\r").view(), ["abc"])
+end backspace_removes
+
+@test("delete is backspace's other half and both are accepted")
+del_removes()
+    assert_slice_eq(lines_of("abx\u{7f}c\r").view(), ["abc"])
+end del_removes
+
+@test("backspace at the start of the line does nothing")
+backspace_at_start()
+    assert_slice_eq(lines_of("\u{8}\u{8}ab\r").view(), ["ab"])
+end backspace_at_start
+
+@test("the left arrow moves the cursor, and typing inserts there")
+left_arrow_inserts()
+    assert_slice_eq(lines_of("ac\u{1b}[Db\r").view(), ["abc"])
+end left_arrow_inserts
+
+@test("the right arrow moves back over what the left arrow passed")
+right_arrow_moves()
+    assert_slice_eq(lines_of("ac\u{1b}[D\u{1b}[Cb\r").view(), ["acb"])
+end right_arrow_moves
+
+@test("an escape sequence split across two reads is still one sequence")
+escape_split_across_reads()
+    assert_slice_eq(dribbled_lines_of("ac\u{1b}[Db\r").view(), ["abc"])
+end escape_split_across_reads
+
+@test("Delete removes the character under the cursor, tilde and all")
+delete_key()
+    assert_slice_eq(lines_of("abXc\u{1b}[D\u{1b}[D\u{1b}[3~\r").view(), ["abc"])
+end delete_key
+
+@test("Home and End move to the ends of the line")
+home_and_end()
+    assert_slice_eq(lines_of("bc\u{1b}[Ha\u{1b}[Fd\r").view(), ["abcd"])
+end home_and_end
+
+@test("Ctrl-A and Ctrl-E are Home and End")
+ctrl_a_and_ctrl_e()
+    assert_slice_eq(lines_of("bc\u{1}a\u{5}d\r").view(), ["abcd"])
+end ctrl_a_and_ctrl_e
+
+@test("Ctrl-B and Ctrl-F are the arrows")
+ctrl_b_and_ctrl_f()
+    assert_slice_eq(lines_of("ac\u{2}b\r").view(), ["abc"])
+end ctrl_b_and_ctrl_f
+
+@test("Ctrl-U kills the whole line, wherever the cursor is")
+ctrl_u_kills_the_line()
+    assert_slice_eq(lines_of("abc\u{2}\u{15}xy\r").view(), ["xy"])
+end ctrl_u_kills_the_line
+
+@test("Ctrl-K kills from the cursor to the end")
+ctrl_k_kills_the_tail()
+    assert_slice_eq(lines_of("abcd\u{2}\u{2}\u{b}\r").view(), ["ab"])
+end ctrl_k_kills_the_tail
+
+// A control character with no meaning here would move the terminal's cursor without being in the
+// line, so it is dropped rather than echoed.
+@test("an unhandled control character is ignored")
+unhandled_control_ignored()
+    assert_slice_eq(lines_of("a\u{e}b\r").view(), ["ab"])
+end unhandled_control_ignored
+
+// An arrow with a longer form -- Up is `ESC [ A` -- is swallowed whole, so its final byte does not
+// land in the line as an `A`.
+@test("an unhandled escape sequence does not leak its last byte into the line")
+unhandled_escape_swallowed()
+    assert_slice_eq(lines_of("ab\u{1b}[A\r").view(), ["ab"])
+end unhandled_escape_swallowed
+
+// -- text -----------------------------------------------------------------------------------------
+
+@test("a multi-byte character is one character in the line")
+multibyte_is_one_character()
+    assert_slice_eq(lines_of("café\r").view(), ["café"])
+end multibyte_is_one_character
+
+// The bytes of one character arriving in separate reads is the ordinary case over a serial port, and
+// the decode has to keep asking rather than give up at the end of a read.
+@test("a multi-byte character split across reads is still one character")
+multibyte_split_across_reads()
+    assert_slice_eq(dribbled_lines_of("café\r").view(), ["café"])
+end multibyte_split_across_reads
+
+// Backspace removes a whole character rather than a byte, which is what holding the line as
+// characters buys: a half character can never be left behind because one never enters the line.
+@test("backspace removes a whole multi-byte character")
+backspace_removes_a_whole_character()
+    assert_slice_eq(lines_of("café\u{8}e\r").view(), ["cafe"])
+end backspace_removes_a_whole_character
+
+// One bad byte answers U+FFFD rather than ending the session, which is what a terminal does. The
+// line is therefore valid text by construction and `getline` has nothing left to validate.
+@test("a malformed byte becomes the replacement character")
+malformed_byte_replaced()
+    val bad: [4]u8 = [97, 255, 98, 13]
+
+    var src = bytes_reader(bad[..])
+    var out = bytes_writer()
+    var ed = editor(&src, &out)
+    var got: Buf[string] = buf()
+
+    for line in ed do got.push(line)
+
+    assert_slice_eq(got.view(), ["a\u{FFFD}b"])
+end malformed_byte_replaced
+
+// -- what the terminal was told -------------------------------------------------------------------
+
+@test("an ordinary line is echoed as it is typed, and Enter sends CRLF")
+echo_is_what_was_typed()
+    assert_eq(echo_of("ab\r"), "ab\r\n")
+end echo_is_what_was_typed
+
+// Inserting at the end costs the character and nothing else: there is no tail to redraw and no
+// column to walk back over.
+@test("an insertion at the end redraws nothing")
+insert_at_end_redraws_nothing()
+    assert_eq(echo_of("a\r"), "a\r\n")
+end insert_at_end_redraws_nothing
+
+// Inserting in the middle writes the character, then the tail that moved, then walks back over the
+// tail. `b` inserted before `c`: `b`, then `c`, then one backspace.
+//
+// **The final `c` is Enter moving the cursor to the end of the line before the CRLF**, and it is
+// deliberate: with the cursor left in the middle, the newline would be taken there and the tail would
+// stay on the screen above it. Moving right is re-echoing what is passed over, which is the whole of
+// how this editor moves a cursor without an escape sequence.
+@test("an insertion in the middle rewrites the tail and walks back over it")
+insert_in_middle_redraws_the_tail()
+    assert_eq(echo_of("ac\u{2}b\r"), "ac\b" + "b" + "c" + "\b" + "c" + "\r\n")
+end insert_in_middle_redraws_the_tail
+
+// A backspace at the end of the line: back one column, paint the vacated column, back over the paint.
+@test("a backspace at the end paints over the column it vacated")
+backspace_paints_the_column()
+    assert_eq(echo_of("ab\u{8}\r"), "ab" + "\b" + " " + "\b" + "\r\n")
+end backspace_paints_the_column
+
+// **The wide-character case, and the reason the editor counts columns rather than characters.** A
+// CJK character is drawn in two columns, so erasing it is two backspaces and two spaces. An editor
+// counting characters would leave half of it on the screen.
+@test("erasing a wide character clears both of its columns")
+backspace_over_a_wide_character()
+    assert_eq(echo_of("世\u{8}\r"), "世" + "\b\b" + "  " + "\b\b" + "\r\n")
+end backspace_over_a_wide_character
+
+// The same arithmetic on the way left: the cursor moves by the character's width, not by one.
+@test("the left arrow steps over a wide character in one move of two columns")
+left_over_a_wide_character()
+    assert_eq(echo_of("世\u{1b}[D\r"), "世" + "\b\b" + "世" + "\r\n")
+end left_over_a_wide_character
+
+// Ctrl-U walks back over what is drawn, paints it out, and walks back over the paint.
+@test("Ctrl-U paints out the whole line")
+ctrl_u_paints_out_the_line()
+    assert_eq(echo_of("ab\u{15}\r"), "ab" + "\b\b" + "  " + "\b\b" + "\r\n")
+end ctrl_u_paints_out_the_line

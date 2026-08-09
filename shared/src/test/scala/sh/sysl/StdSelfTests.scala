@@ -39,9 +39,10 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * Raised from 60 to 120 when `sysl.slices`, `sysl.encoding` and `sysl.rand` took the library from
    * 89 collected tests to 136, and to 155 when the UTF-8 encoder, `Buf.insert` and the sub-second
    * durations took it to 163, and to 165 when the duration unit properties and the arithmetic
-   * nothing had been exercising took it to 169.
+   * nothing had been exercising took it to 169, and to 195 when the line editor and the two
+   * in-memory stream types took it to 201.
    */
-  private val floor = 165
+  private val floor = 195
 
   /** The library, compiled as a **test build of itself**.
    *
