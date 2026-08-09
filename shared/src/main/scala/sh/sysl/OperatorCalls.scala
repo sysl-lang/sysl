@@ -220,17 +220,57 @@ trait OperatorCalls extends MethodCalls {
       arg    <- b.args.headOption
     yield arg
 
-  /** The right-hand operand of a binary operator, re-read where the left is a type parameter whose
-   * bounds name a different right-hand type.
+  /** The right-hand type a **concrete** type's own implementations of an operator's trait agree on,
+   * where they agree — the written counterpart of `boundRhs`, which asks the same question of a type
+   * parameter's promises.
    *
-   * A bare literal has already taken the parameter's own type by then, since that is what a literal
-   * does beside a typed neighbour. Reading it again against the bound's argument is what gives the
-   * `2.0` in a `[T: Mul[f64]]` body the `real` that bound asked for.
+   * A type may implement one operator at more than one right-hand type (`02 § A trait may be
+   * implemented at more than one argument list`), and there is nothing to read off when it does: a
+   * `Complex` that is both `Mul[Complex]` and `Mul[real]` leaves `c * 2` genuinely ambiguous, and
+   * guessing one would be worse than the diagnostic. So the answer is the **agreed** argument or
+   * nothing, which makes this a lookup for the ordinary case and silent for the interesting one.
+   */
+  private def implRhs(op: String, subject: Type): Option[Type] =
+    for
+      spelling <- CoreTraits.infix.get(op)
+      if !CoreTraits.builtin(spelling, subject)
+      trName = Library.key(spelling)
+      d <- traitDecls.get(trName) if d.tparams.nonEmpty
+      want <- agreedOperand(trName, subject, d)
+    yield want
+
+  /** Every argument list the subject's implementations of `trName` were written at, reduced to the
+   * one right-hand type they all name — the three owner kinds `implByOperand` searches, asked without
+   * a selector because the selector is the thing being worked out.
+   */
+  private def agreedOperand(trName: String, subject: Type, d: TraitDecl): Option[Type] = {
+    def wrote(owner: (String, List[Type])) =
+      implsOf(trName, owner._1).map(ti => suppliedBound(ti, trName, subject, owner._2))
+
+    val written = (memberOwner(subject) :: shapeOwners(subject) ::: blanketOwners(subject)).flatMap(wrote)
+    val heads   = written.filter(_.args.length == d.tparams.length).flatMap(_.args.headOption)
+
+    heads.headOption.filter(h => heads.forall(!disagree(_, h)))
+  }
+
+  /** The right-hand operand of a binary operator, re-read where the left operand's own
+   * implementation names a right-hand type the literal did not take.
+   *
+   * A bare literal beside a typed neighbour takes that neighbour's type, and for a dispatched
+   * operator that is the wrong reading twice over. Beside a **type parameter** it has already become
+   * the parameter's own type, and the bound is what says otherwise — the `2.0` in a `[T: Mul[f64]]`
+   * body is the `real` that bound asked for. Beside a **written type** it has nothing to take at all,
+   * since `Duration` is not an integer, so it falls back to `int` — and `d * 3` was then refused for
+   * wanting `Mul[int]` from a type that implements `Mul[long]`, which is a complaint about the
+   * literal's default rather than about anything the program said.
    */
   protected def operandRhs(op: String, l: TExpr, r: Expr, t: TExpr): TExpr =
     l.ty match
       case a: Type.Abstract if isLiteral(r) && t.ty == a =>
         boundRhs(op, a).filterNot(_ == a).fold(t)(want => analyzeExpr(r, Some(want)))
+      case _: Type.Abstract => t
+      case ty if isLiteral(r) =>
+        implRhs(op, ty).filter(disagree(t.ty, _)).fold(t)(want => analyzeExpr(r, Some(want)))
       case _ => t
 
   /** What a compound assignment's right-hand side is read as.
@@ -253,7 +293,10 @@ trait OperatorCalls extends MethodCalls {
         placeTy match
           case a: Type.Abstract                           => Some(boundRhs(op, a).getOrElse(a))
           case _ if CoreTraits.builtin(spelling, placeTy) => Some(Type.repr(placeTy))
-          case _                                          => None
+          // …and a written implementation says the same thing for a concrete place, which is what
+          // makes `d *= 3` read the `3` as the `long` the one `impl Mul` names rather than as the
+          // `int` a literal with nothing to take falls back to.
+          case _                                          => implRhs(op, placeTy)
       case _ => Some(placeTy)
 
   protected def updateDispatch(op: String, place: TExpr, value: TExpr): Option[TDispatch] =
