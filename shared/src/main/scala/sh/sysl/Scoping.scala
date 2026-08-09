@@ -309,18 +309,29 @@ trait Scoping extends DeclTables {
   protected def namesModule(name: String): Boolean =
     moduleNames(name) || moduleNames.exists(_.startsWith(s"$name."))
 
+  /** Whether a **whole written path** leads anywhere: it is a module, begins one, or names something
+   * a module declares.
+   *
+   * This is the question the readings below are chosen by, and asking it of the path rather than of
+   * its leading segment is the difference between them working and not. A segment is shared by
+   * everything a convention namespaces together — `packages.md § 9`'s reverse DNS puts every package
+   * in an org under `sh` — so `namesModule(head)` answers yes for a path that names nothing at all,
+   * and answers it on the strength of some unrelated tree that happens to sit under the same word.
+   */
+  protected def reachesModule(path: String): Boolean =
+    namesModule(path) || (path.lastIndexOf('.') > 0 && moduleNames(path.take(path.lastIndexOf('.'))))
+
   /** A written module path with its leading segment read through the imports, so that the `fs` of
    * `import std.fs` names `std.fs` wherever a path can be written.
    *
-   * A path whose head already begins a real module is left alone, and an import may not bind a
-   * name that does (`checkImportName`) — so the two can never both apply, and which is tried first
-   * decides nothing.
+   * An import may not bind a name that already begins a real module (`checkImportName`), so an
+   * import and a module can never both answer and which is asked first decides nothing. Everything
+   * after the import is `inPackage`'s to order.
    */
   protected def modulePath(written: String): String = {
     val head = written.takeWhile(_ != '.')
 
-    if namesModule(head) then written
-    else importedModule(head).map(_ + written.drop(head.length)).getOrElse(inPackage(written))
+    importedModule(head).map(_ + written.drop(head.length)).getOrElse(inPackage(written))
   }
 
   /** A written module path read through the **package** layer alone, leaving a file's own imports
@@ -330,46 +341,74 @@ trait Scoping extends DeclTables {
    * spelling and reading one through the spellings already in scope would let an import be written
    * in terms of another — a rename of a rename, which no language here offers and which would make
    * the order of a file's import lines change what they mean.
+   *
+   * **Three readings, in order, and the first that leads anywhere wins.** A path written inside a
+   * package means that package's own tree before it can mean anything else (`ownPackage`); failing
+   * that it is read as written; failing that it is offered to the packages the file's own manifest
+   * named (`mountedPackage`). A path that leads nowhere under any of them is handed back as written,
+   * so the caller's diagnostic quotes what was there rather than a rewriting of it.
    */
-  protected def inPackage(written: String): String = {
-    val head = written.takeWhile(_ != '.')
+  protected def inPackage(written: String): String =
+    ownPackage(written)
+      .orElse(Option.when(reachesModule(written))(written))
+      .orElse(mountedPackage(written))
+      .getOrElse(written)
 
-    if namesModule(head) then written
-    else packagePath(written).getOrElse(written)
-  }
-
-  /** The same question one layer out: what a written path's leading segment means in the **package**
-   * the file belongs to (`packages.md § 9`).
+  /** What a written path's leading segment means in the **package the file itself belongs to**
+   * (`packages.md § 9`).
    *
-   * Two things answer to it, and they are the two halves of that section. A package's own modules
-   * sit under its canonical prefix, so a file of `github.com/e/json` writing `json.Parser` means
-   * that package's `json` and nothing else — which is what makes a package's source read the same
-   * whoever depends on it. And a **dependency** of that package answers to whatever the manifest
-   * calls it: its own preferred name, or the `mount` a consumer wrote when two packages wanted one
-   * word.
+   * A package's own modules sit under its canonical prefix, so a file of `github.com/e/json` writing
+   * `json.Parser` means that package's `json` and nothing else — which is what makes a package's
+   * source read the same whoever depends on it. The leading segment is what gets qualified, because
+   * the path is already relative to that package's root and everything after the head travels
+   * unchanged.
    *
-   * Its own modules are asked first. A package cannot be made to mean something other than itself by
-   * a dependency that happens to prefer one of its names — and the collision that would be is
-   * already refused when the graph is resolved, so this order is what that refusal is worth.
+   * ==This is asked BEFORE the global question, and that order is the whole of a defect==
    *
-   * The two halves read the written path differently, and each is right for what it is asking. A
-   * package's **own** modules are reached by qualifying the leading segment, because the path is
-   * already relative to that package's root and everything after the head travels unchanged. A
-   * **dependency's** are reached by offering the whole path, because what a dependency binds is a
-   * module path rather than a segment — `sh.sysl.table` and not `sh`, since a directory holding no
-   * source is no module (`13 §1`).
+   * Whether a segment begins a module is a question about **every** module in the compilation, so a
+   * package writing its own `sh.sysl.pico.externs` was answered by an unrelated source root that
+   * merely happened to supply `sh.sysl.harness`: the head named a module, the path was left
+   * unqualified, and the package's own sub-module was no longer reachable from its own source. The
+   * convention `§ 9` recommends is what made it certain rather than unlucky — every package
+   * namespaced by reverse DNS shares the segment `sh`.
    *
-   * The project being built has an empty prefix and no table, so both lookups miss and a path is
-   * read exactly as it was before any of this existed.
+   * So a path written inside a package is read against that package first. It cannot mean anything
+   * else: unlike an import, which a file wrote and can rename, the prefix is added on the way in and
+   * the source has no spelling for it.
+   *
+   * **It answers only where the qualified path leads somewhere**, which is what keeps the claim from
+   * being about the segment. A package laid out at `sh/sysl/mine` owns the segment `sh` and its
+   * *dependencies* are namespaced under it too — so `sh.sysl.dep.open` qualifies to a path that
+   * package's tree has nothing at, and must fall through to the manifest that named the dependency
+   * rather than be swallowed by the ownership claim.
+   *
+   * The project being built has an empty prefix, so this misses and a path is read exactly as it was
+   * before any of this existed.
    */
-  private def packagePath(written: String): Option[String] = {
+  private def ownPackage(written: String): Option[String] = {
     val prefix = currentFile.map(packages.prefixOf).getOrElse("")
     val head   = written.takeWhile(_ != '.')
 
     Option.when(prefix.nonEmpty)(Packages.qualify(prefix, head)).filter(namesModule)
       .map(_ + written.drop(head.length))
-      .orElse(packages.mounted(prefix, written))
+      .filter(reachesModule)
   }
+
+  /** The other half: a **dependency** of the file's package, under whatever that package's manifest
+   * calls it.
+   *
+   * **The whole path is offered and not its leading segment**, which is the other half of `§ 9`
+   * reading a written path differently: what a dependency binds is a module path rather than a
+   * segment — `sh.sysl.table` and not `sh`, since a directory holding no source is no module
+   * (`13 §1`).
+   *
+   * This one is asked *after* the global question rather than before it, and the asymmetry with
+   * `ownPackage` is deliberate. A package's own modules are what its source is written in terms of
+   * and cannot be anything else; a dependency's are reached by a name the manifest chose, which is a
+   * binding like any other and has never taken precedence over a module that is simply there.
+   */
+  private def mountedPackage(written: String): Option[String] =
+    packages.mounted(currentFile.map(packages.prefixOf).getOrElse(""), written)
 
   /** The module a name was imported as, searching the open blocks before the file. */
   protected def importedModule(name: String): Option[String] = searchImports(_.moduleAs(name))

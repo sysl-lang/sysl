@@ -56,10 +56,26 @@ class PackageBuildTests extends PackageCacheSupport {
    */
   private def withCache[T](cache: String)(body: => T): T = Fetch.usingCache(cache)(body)
 
-  private def run(root: String): String = {
+  /** A plain source root of the kind `--lib` names: modules and no manifest, so its files join the
+   * compilation under the names they wrote rather than under a canonical prefix.
+   */
+  private def libRoot(modules: String*): String = {
+    val root = createTempDirectory("sysl-lib-")
+
+    for m <- modules do
+      val dir = m.replace('.', '/')
+
+      createDirectories(s"$root/$dir")
+      writeFile(s"$root/$dir/${Project.basename(dir)}.sysl", s"module $m\n\nunused() -> int = 0\n")
+
+    root
+  }
+
+  private def run(root: String, libs: List[String] = Nil): String = {
     val out    = new java.io.ByteArrayOutputStream
     val notes  = new java.io.ByteArrayOutputStream
-    val status = Console.withOut(out)(Console.withErr(notes)(sh.sysl.execute(Config(command = "run", file = root))))
+    val status = Console.withOut(out)(
+      Console.withErr(notes)(sh.sysl.execute(Config(command = "run", file = root, libs = libs))))
 
     if status != 0 then fail(s"the driver exited with $status:\n${out.toString}${notes.toString}")
 
@@ -284,6 +300,48 @@ class PackageBuildTests extends PackageCacheSupport {
         "module sh.sysl.outer\n\ntriple(n: int) -> int = sh.sysl.inner.double(n) + n\n")
 
       run(app("""print(sh.sysl.outer.triple(14))""", s"""n { path = "$root" }""")) shouldBe "42\n"
+    }
+
+    /** Both of those again, with an unrelated source root in the compilation that begins with the
+     * same segment — which is what broke them.
+     *
+     * Whether a segment begins a module was asked of **every** module being compiled, so a `--lib`
+     * root supplying `sh.sysl.other` made `sh` name one; the package's own path was then left
+     * unqualified and its sibling module was unreachable from its own source. The package was
+     * right and had not changed. What answered was a tree it has never heard of.
+     *
+     * It is the ordinary workflow rather than a corner. Developing an untagged package beside a
+     * project that depends on a released one is what `--lib` is for, and `§ 9`'s convention makes
+     * every package in an org share the segment — so this is guaranteed rather than unlucky, in
+     * the same way the top-level-directory binding above was.
+     */
+    "and neither is taken over by an unrelated source root sharing the segment" - {
+      def namespaced(outer: String): String = {
+        val root = createTempDirectory("sysl-pkg-ns3-")
+
+        writeFile(s"$root/${PackageConfig.FileName}", manifest("ns", "1.0.0"))
+        createDirectories(s"$root/sh/sysl/inner")
+        createDirectories(s"$root/sh/sysl/outer")
+        writeFile(s"$root/sh/sysl/inner/inner.sysl",
+          "module sh.sysl.inner\n\ndouble(n: int) -> int = n * 2\n")
+        writeFile(s"$root/sh/sysl/outer/outer.sysl", s"module sh.sysl.outer\n\n$outer\n")
+
+        root
+      }
+
+      "by import" in {
+        val root = namespaced("import sh.sysl.inner.double\n\nquadruple(n: int) -> int = double(double(n))")
+
+        run(app("""print(sh.sysl.outer.quadruple(10))""", s"""n { path = "$root" }"""),
+          List(libRoot("sh.sysl.other"))) shouldBe "40\n"
+      }
+
+      "by qualified reference" in {
+        val root = namespaced("triple(n: int) -> int = sh.sysl.inner.double(n) + n")
+
+        run(app("""print(sh.sysl.outer.triple(14))""", s"""n { path = "$root" }"""),
+          List(libRoot("sh.sysl.other"))) shouldBe "42\n"
+      }
     }
 
     // The mount is untouched by any of it: a name the consumer chose has no tree to be read off, so
