@@ -64,14 +64,25 @@ class AbiAgainstClangTests extends AnyFreeSpec with Matchers with CodegenSupport
    * exactly no attributes, and the first run of this test found sysl saying `align 1` where clang
    * says `align 8`.
    */
-  private def normalize(line: String): String =
+  private def normalize(t: Target, line: String): String =
     List("dso_local ", " #0", " #1", " #2", "noundef ", " noundef", "dead_on_unwind ", "writable ",
       "dead_on_return ", " dead_on_return")
       .foldLeft(line.trim)((s, junk) => s.replace(junk, ""))
       .replaceAll("\\s+", " ")
+      // A **coercion array of addresses** is spelled `[N x ptr]` by one LLVM and `[N x iW]` by
+      // another, and the two are the same argument: W is the pointer width, so both say "N
+      // pointer-sized pieces, in registers". Which one a clang prints is a fact about its LLVM
+      // version rather than about the convention — this is the same line the attribute list above
+      // draws, met from the other side. Only inside the brackets, so a real `ptr` argument (a
+      // `byval` slot, a `sret` address) is untouched, and only against **this target's** width, so
+      // `[2 x i32]` on a 32-bit machine is still a difference.
+      //
+      // CI went red on this and no local run did: `struct { char *p; char *q; }` at the three
+      // aarch64 targets, sysl saying `[2 x ptr]` and the runner's older clang `[2 x i64]`.
+      .replaceAll("""\[(\d+) x ptr\]""", s"[$$1 x ${t.word.llvm}]")
 
-  private def declaring(ir: String, symbol: String): Option[String] =
-    ir.linesIterator.find(l => l.startsWith("declare") && l.contains(s"@$symbol(")).map(normalize)
+  private def declaring(t: Target, ir: String, symbol: String): Option[String] =
+    ir.linesIterator.find(l => l.startsWith("declare") && l.contains(s"@$symbol(")).map(normalize(t, _))
 
   /** What clang makes of the shape, as the two `declare`s for it. The `go` body is what forces both
    * to be emitted — a declaration nothing calls is dropped.
@@ -91,7 +102,7 @@ class AbiAgainstClangTests extends AnyFreeSpec with Matchers with CodegenSupport
 
       withClue(s"clang refused the C for ${t.triple}:\n${r.stderr}")(r.exitCode shouldBe 0)
 
-      (declaring(r.stdout, "give"), declaring(r.stdout, "take"))
+      (declaring(t, r.stdout, "give"), declaring(t, r.stdout, "take"))
     } finally try deleteFile(src) catch case _: Exception => ()
   }
 
@@ -103,7 +114,7 @@ class AbiAgainstClangTests extends AnyFreeSpec with Matchers with CodegenSupport
          |extern take(v: S)
          |take(give())""".stripMargin)
 
-    (declaring(ir, "give"), declaring(ir, "take"))
+    (declaring(t, ir, "give"), declaring(t, ir, "take"))
   }
 
   for t <- Target.all if t.supported do
