@@ -65,8 +65,14 @@ object LibraryArtifact {
   /** The container's version, refused on mismatch. It is not `AstCodec.Version`: the layout here and
    * the tree encoding inside it change for different reasons, and either alone makes an artifact
    * unreadable, so each says so on its own.
+   *
+   * **It also covers the object code, which is why the ARC hook's shape moved it to 4.** A box's
+   * hook now takes the phase it is being called for (`ArcEmitter.dropFn`), so a member compiled
+   * before that installs a one-argument function where the runtime around it calls a two-argument
+   * one. Nothing about that is a type error to a linker, and what it produces is a wrong call at the
+   * moment an object is destroyed — the least observable place a mismatch could land.
    */
-  val Version: Int = 3
+  val Version: Int = 4
 
   /** The separator both byte formats here lean on: between the fields of a fingerprint, and around
    * the metadata marker.

@@ -183,21 +183,59 @@ trait ArcEmitter extends Emitter {
    * holds and then returns the storage. Installed in the box at construction, which is what
    * makes releasing a reference type-erased — a slice's owner has no static type to consult.
    */
-  protected def dropFn(payload: Type): String = {
-    if !containsRef(payload) then "null"
+  protected def dropFn(payload: Type): String =
+    if !containsRef(payload) then plainDropFn
     else
       val m  = Type.mangle(payload)
       val bn = boxName(payload)
 
       "@" + request(s"arc.drop.$m") {
-        inFunction(s"define private void @arc.drop.$m(ptr %p)") {
+        inFunction(s"define private void @arc.drop.$m(ptr %p, i1 %storage)") {
+          val give = freshLabel("arc.give")
+          val over = freshLabel("arc.over")
+
+          emitTerm(s"br i1 %storage, label %$give, label %$over")
+          emitLabel(over)
           val pa = freshTemp(); emit(s"$pa = getelementptr $bn, ptr %p, i32 0, i32 $headerFields")
           val v  = freshTemp(); emit(s"$v = load ${payload.llvm}, ptr $pa")
           releaseValue(payload, v)
           emitTerm("ret void")
+          emitLabel(give)
+          emitFree()
+          emitTerm("ret void")
         }
       }
-  }
+
+  /** The hook for a box whose payload holds nothing: there is no walk to make, so the only phase
+   * that does anything is the one that gives the storage back.
+   *
+   * One per module rather than one per payload type, because nothing in it depends on the payload —
+   * which keeps the commonest box of all, the one holding a plain number, from costing a function.
+   */
+  protected def plainDropFn: String =
+    "@" + request("arc.drop.plain") {
+      inFunction("define private void @arc.drop.plain(ptr %p, i1 %storage)") {
+        val give = freshLabel("arc.give")
+        val over = freshLabel("arc.over")
+
+        emitTerm(s"br i1 %storage, label %$give, label %$over")
+        emitLabel(over)
+        emitTerm("ret void")
+        emitLabel(give)
+        emitFree()
+        emitTerm("ret void")
+      }
+    }
+
+  /** The one place `free` is **called**. It sits inside a hook, so it reaches a module only where
+   * that module builds a box — which is a module that has already called `malloc`, and therefore
+   * has an allocator to give the bytes back to.
+   *
+   * The `declare` beside `malloc`'s stays where it was, under `heap`, and costs nothing: a
+   * declaration nothing calls names no symbol in the object file. What the linker was complaining
+   * about was the call, which is why the card counted calls rather than declarations.
+   */
+  private def emitFree(): Unit = emit("call void @free(ptr %p)")
 
   /** The retain / release helper for an aggregate type, which walks the fields that carry
    * references. Emitted once per type rather than inlined, since a data enum needs a tag test
@@ -319,16 +357,22 @@ trait ArcEmitter extends Emitter {
   }
 
   /** The function that destroys such a box: it lets go of each element it still holds and returns
-   * the storage. Elements that hold nothing need no walk, so the plain free is the hook.
+   * the storage. Elements that hold nothing need no walk, so the plain hook is enough — it still
+   * gives the bytes back, which is the phase every box needs whatever it holds.
    */
-  protected def dropBufFn(elem: Type): String = {
-    if !containsRef(elem) then "null"
+  protected def dropBufFn(elem: Type): String =
+    if !containsRef(elem) then plainDropFn
     else
       val m  = Type.mangle(elem)
       val bn = bufName(elem)
 
       "@" + request(s"arc.dropbuf.$m") {
-        inFunction(s"define private void @arc.dropbuf.$m(ptr %p)") {
+        inFunction(s"define private void @arc.dropbuf.$m(ptr %p, i1 %storage)") {
+          val give = freshLabel("arc.give")
+          val over = freshLabel("arc.over")
+
+          emitTerm(s"br i1 %storage, label %$give, label %$over")
+          emitLabel(over)
           val lenp = freshTemp(); emit(s"$lenp = getelementptr $bn, ptr %p, i32 0, i32 $headerFields")
           val n    = freshTemp(); emit(s"$n = load $word, ptr $lenp")
           val data = freshTemp(); emit(s"$data = getelementptr $bn, ptr %p, i32 0, i32 ${headerFields + 1}")
@@ -338,9 +382,11 @@ trait ArcEmitter extends Emitter {
             releaseValue(elem, ev)
           }
           emitTerm("ret void")
+          emitLabel(give)
+          emitFree()
+          emitTerm("ret void")
         }
       }
-  }
 
   /** Puts one value in every one of `n` slots, taking a share for each — the elements belong to the
    * buffer, and it is the hook above that eventually lets them go.
@@ -587,6 +633,17 @@ object ArcEmitter {
     // as one width and read as another is not a type error anywhere, it is a leak or a double free.
     val word = target.word.llvm
 
+    // The middle word is the object's **hook**, and it is asked to do two things at two different
+    // moments: run over the contents when the strong count reaches zero, and give the storage back
+    // when the weak count does. A second slot would have been symmetric and cost a pointer per
+    // object on machines chosen for having very little memory, which is the argument the comment
+    // above already makes about the counts — so the phase travels as an argument instead.
+    //
+    // The free is in the hook rather than in `arc.unshare` because `capabilities.md` says the free
+    // path goes through the object's own hook, and because it is the only arrangement under which
+    // the two halves of that chapter are both true: a module that allocates nothing emits no hook
+    // and so names no `free`, while one holding a heap slice something else made frees it with the
+    // allocator that made it.
     s"""%arc.header = type { $word, ptr, $word }
       |
       |@arc.worklist = internal ${tls}global ptr null
@@ -607,7 +664,7 @@ object ArcEmitter {
       |  %none = icmp eq ptr %f, null
       |  br i1 %none, label %after, label %run
       |run:
-      |  call void %f(ptr %p)
+      |  call void %f(ptr %p, i1 false)
       |  br label %after
       |after:
       |  call void @arc.unshare(ptr %p)
@@ -623,7 +680,12 @@ object ArcEmitter {
       |  %z = icmp eq $word %n, 0
       |  br i1 %z, label %gone, label %kept
       |gone:
-      |  call void @free(ptr %p)
+      |  %h = getelementptr %arc.header, ptr %p, i32 0, i32 1
+      |  %f = load ptr, ptr %h
+      |  %none = icmp eq ptr %f, null
+      |  br i1 %none, label %kept, label %give
+      |give:
+      |  call void %f(ptr %p, i1 true)
       |  ret void
       |kept:
       |  ret void

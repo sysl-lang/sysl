@@ -13,7 +13,7 @@ import org.scalatest.matchers.should.Matchers
  * freestanding target has been in the registry for months and nothing had ever linked a program for
  * one.
  */
-class NoAllocEmissionTests extends AnyFreeSpec with Matchers {
+class NoAllocEmissionTests extends AnyFreeSpec with Matchers with QemuSupport {
 
   private val uart =
     """struct Uart
@@ -50,36 +50,68 @@ class NoAllocEmissionTests extends AnyFreeSpec with Matchers {
       callsOf(s"$uart\nvar a = [u8('a'), u8('b')]\nvar i: usize = 1\nputc(a[i])\n") shouldBe empty
     }
 
-    // A slice is a shared view, so releasing one goes through ARC, and ARC's release path frees. On
-    // a target whose capability set includes `alloc` -- which is every target's default, since
-    // `Target` carries no capabilities and they come from the package config -- that is correct, and
-    // it is stated here so that the claim below is a contrast rather than an isolated complaint.
-    "calls free for a slice, which is right where the program may allocate" in {
-      callsOf(s"$uart\nvar a = [u8('a'), u8('b')]\nval s = a[..]\nputc(u8(s.len))\n") should contain("@free")
+    /* A slice is where this went wrong, and it is worth saying what the wrong answer was.
+     *
+     * Releasing a slice goes through ARC, and ARC's release path used to name `free` itself — in
+     * `@arc.unshare`, which every module that touches a view reaches, because merely extracting a
+     * view's owner word brings the runtime in. A view of an array on the *frame* did exactly that,
+     * and such a view's owner is null, so the call could never run. It still had to resolve.
+     *
+     * `capabilities.md` says three things that together made that wrong rather than merely
+     * wasteful: slices `[]T` are in the **no-alloc subset** (§ *What `alloc` gates, precisely*);
+     * holding, passing and releasing one needs no allocator because **"the free path goes through
+     * the object's own hook"**; and an `@no_alloc` module is *"allocator-free, enforced"* and
+     * *"portable across every target"*. The free is in the hook now, so all three are true.
+     */
+    "reaches no allocator for a slice of storage it did not allocate" in {
+      callsOf(s"$uart\nvar a = [u8('a'), u8('b')]\nval s = a[..]\nputc(u8(s.len))\n") shouldBe empty
     }
 
-    /* An `@no_alloc` module emits the same call, and that is the defect.
-     *
-     * `capabilities.md` says three things that together make this wrong rather than merely
-     * surprising: slices `[]T` are in the **no-alloc subset** (§ *What `alloc` gates, precisely*);
-     * holding, passing and releasing a slice needs no allocator because **"the free path goes
-     * through the object's own hook"**; and an `@no_alloc` module is *"allocator-free, enforced"*
-     * and *"portable across every target"*.
-     *
-     * What is emitted instead is `@arc.unshare` calling `@free` by name, so the headline promise
-     * fails at the link for any no-alloc program that touches a slice — which is most of them, a
-     * slice being the subset's main data structure.
-     *
-     * **The fix is the hook the chapter already names, and it is a design decision rather than a
-     * repair**: a no-alloc module may legitimately hold a heap-backed slice created elsewhere, so
-     * the free path cannot simply be deleted — it has to become indirect. That is why this is
-     * reported rather than fixed in the branch that found it.
-     */
-    "and an @no_alloc module reaches no allocator, a slice being in its subset" ignore {
+    "and none through a function that takes one" in {
+      callsOf(s"$uart\npick(xs: []const u8, i: usize) -> u8\n    xs[i]\n" +
+        "var a = [u8('a'), u8('b')]\nputc(pick(a[..], 1))\n") shouldBe empty
+    }
+
+    // `@no_alloc` is the same programs with the claim written down. It is stated separately because
+    // the promise is the chapter's headline one, and a rule that happens to hold is not the same
+    // thing as one the module is held to.
+    "an @no_alloc module reaches no allocator, a slice being in its subset" in {
       callsOf(s"@no_alloc\n$uart\nvar a = [u8('a'), u8('b')]\nval s = a[..]\nputc(u8(s.len))\n") shouldBe empty
 
       callsOf(s"@no_alloc\n$uart\npick(xs: []const u8, i: usize) -> u8\n    xs[i]\n" +
         "var a = [u8('a'), u8('b')]\nputc(pick(a[..], 1))\n") shouldBe empty
     }
+
+    // The contrast, and it is what keeps every case above from being vacuous: a program that really
+    // does put something on the heap calls both, and must. Promotion is what puts it there — a view
+    // of a local array outliving its frame — so this is the same slice as above, with the one
+    // difference that decides it.
+    "a program that does allocate calls both, which is what the cases above are the absence of" in {
+      val calls = callsOf(
+        s"$uart\nkeep() -> []const u8\n    var a = [u8('a'), u8('b')]\n    a[..]\n" +
+          "putc(keep()[0])\n")
+
+      calls should contain("@malloc")
+      calls should contain("@free")
+    }
+  }
+
+  /** The link, which is the only step that can fail on a symbol nothing defines — and the step no
+   * tier performed for a freestanding target without also linking a support package that defines
+   * `free`. That is why this survived months with these targets in the registry.
+   *
+   * **It is not the pin for that defect, and saying so is the point of this paragraph.** Run against
+   * the old emitter this case passes: the owner of a view of an array on the frame is provably null,
+   * so the release is unreachable and the optimizer deletes the call before the linker sees it. What
+   * failed on a real board was a program it could not do that to. So the cases above — which count
+   * calls in the module as emitted — are what catch the defect, and this catches the one thing they
+   * cannot: a call that survives to the link, on a board with no allocator to resolve it.
+   */
+  "and it links against the board's startup alone, with no allocator anywhere" in {
+    val (status, notes) = linksWithoutSupport(bare,
+      List(Source("p.sysl",
+        s"@no_alloc\n$uart\nvar a = [u8('a'), u8('b')]\nval s = a[..]\nputc(u8(s.len))\n")))
+
+    withClue(notes)(status shouldBe 0)
   }
 }

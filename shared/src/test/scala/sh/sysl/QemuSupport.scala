@@ -43,9 +43,13 @@ trait QemuSupport extends Matchers {
    * fails.
    *
    * **`bsp` is what the board owes the library**, and it is not scaffolding for the tests: a
-   * freestanding sysl program names `putchar` whenever anything prints and `free` whenever ARC can
-   * reach a release, and neither is something the language supplies. A real bare-metal project has
-   * the same file under another name — pico-sdk's, or newlib-nano's. The two files say the rest.
+   * freestanding sysl program names `putchar` whenever anything prints, and `malloc` and `free`
+   * whenever it puts something on the heap. Neither is something the language supplies. A real
+   * bare-metal project has the same file under another name — pico-sdk's, or newlib-nano's. The two
+   * files say the rest.
+   *
+   * A program that allocates **nothing** owes the board neither, and `linksWithoutSupport` is what
+   * holds the compiler to that.
    */
   private case class Board(qemu: String, machine: List[String], startup: String, bsp: String,
                            script: String)
@@ -180,6 +184,50 @@ trait QemuSupport extends Matchers {
    * is exactly a member that must, so a board's console cannot be written at the root at all. One
    * directory down it is ordinary code.
    */
+  /** The **link**, with the board's startup and nothing else — no support package, so no `putchar`,
+   * no `malloc` and no `free`. What comes back is the linker's status and what it said.
+   *
+   * ==This is the tier that was missing, and its absence is why 0037 lived for months==
+   *
+   * Every cross-target tier below QEMU stops at an object file, and a call to a function nothing
+   * defines makes a perfectly good object: it verifies, it assembles, and `clang -c` is happy. So a
+   * compiler that emitted `call @free` into every program that touched a slice was invisible to all
+   * of them. The QEMU tier does link — and links **against the support package**, which defines
+   * `free`, so it was invisible there too.
+   *
+   * Linking without that file is the only arrangement in which "this program needs no allocator" is
+   * a claim something can fail. A program that names one gets `undefined symbol: free`, which is the
+   * message the board build gave and the reason the card exists.
+   */
+  protected def linksWithoutSupport(t: Target, sources: List[Source]): (Int, String) = {
+    val board = boards.getOrElse(t.name, cancel(s"no QEMU recipe for ${t.name}"))
+    val cc    = Toolchain.findClang(t).getOrElse(cancel(s"no clang here has a back end for ${t.name}"))
+
+    if !present("ld.lld") then cancel(s"ld.lld is not installed, so a ${t.name} image cannot be linked")
+
+    val ir = Compiler.compile(sources, t) match
+      case Right(ir) => ir
+      case Left(e)   => fail(s"did not compile for ${t.name}:\n$e")
+
+    val prog  = createTempFile("sysl-link-", ".o")
+    val start = createTempFile("sysl-link-start-", ".o")
+    val image = createTempFile("sysl-link-", ".elf")
+
+    try {
+      withClue(s"compiling the module for ${t.triple}: ")(Toolchain.compileObject(ir, prog, t) shouldBe Right(()))
+
+      val asm = exec(Seq(cc, s"--target=${t.triple}", "-c", s"$boot/${board.startup}", "-o", start))
+
+      withClue(s"assembling ${board.startup}:\n${asm.stderr}")(asm.exitCode shouldBe 0)
+
+      val link = exec(Seq(cc, s"--target=${t.triple}", "-nostdlib", "-fuse-ld=lld",
+        "-T", s"$boot/${board.script}", start, prog, "-o", image))
+
+      (link.exitCode, link.stderr)
+    } finally
+      for f <- List(prog, start, image) do try deleteFile(f) catch case _: Exception => ()
+  }
+
   protected def bootUnderQemu(t: Target, sources: List[Source], seconds: Int): (Int, String) = {
     val board = boards.getOrElse(t.name, cancel(s"no QEMU recipe for ${t.name}"))
     val cc    = Toolchain.findClang(t).getOrElse(cancel(s"no clang here has a back end for ${t.name}"))
