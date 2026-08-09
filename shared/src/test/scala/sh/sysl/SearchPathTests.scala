@@ -149,24 +149,86 @@ class SearchPathTests extends LibraryCliSupport {
     }
   }
 
+  /** `--define`, which is a third step along the same path: the library is found, the header is
+   * found, and the header refuses because it has not been told how the host project configures it.
+   *
+   * The shim here `#error`s without its macro, which is what pico-sdk's `pico/cyw43_arch.h` does and
+   * is the case that found this — a real consumer where every include path was right and the build
+   * still stopped inside a header.
+   */
+  "a header that configures itself with a macro" - {
+
+    /** A project whose carried C refuses to compile until the host says what it is configured with —
+     * the shape of every real SDK header, written small.
+     */
+    def configured(): String = {
+      val root = createTempDirectory("sysl-configured-")
+
+      createDirectories(s"$root/m")
+      writeFile(s"$root/main.sysl", "print(m.scaled())\n")
+      writeFile(s"$root/m/m.sysl",
+        """module m
+          |@link("probe")
+          |
+          |extern "shim_scaled" c_scaled() -> int
+          |
+          |scaled() -> int = c_scaled()
+          |""".stripMargin)
+      writeFile(s"$root/m/shim.c",
+        "#include <probe.h>\n" +
+          "#ifndef PROBE_SCALE\n#error the host project has to say what scale it builds at\n#endif\n" +
+          "int shim_scaled(void) { return probe_answer() * PROBE_SCALE; }\n")
+      root
+    }
+
+    // The half that matters: every path is right and the build still stops, inside the header's own
+    // `#error`, which is a failure no amount of `--include-path` can answer.
+    "stops the build even with every path it asked for" in {
+      val (headers, lib) = guard()
+
+      val (status, notes) = diagnostics(Config(command = "run", file = configured(),
+        linkPaths = List(lib), includePaths = List(headers)))
+
+      status should not be 0
+      notes should include("what scale it builds at")
+    }
+
+    // 126 rather than 42 or 84: the macro reached the shim as a *value* and not merely as a defined
+    // name, so a `-D` that arrived empty would give a different number rather than a plausible one.
+    "and builds once --define supplies what the header wanted" in {
+      val (include, lib) = guard()
+
+      ran(Config(command = "run", file = configured(), linkPaths = List(lib),
+        includePaths = List(include), defines = List("PROBE_SCALE=3"))) shouldBe "126\n"
+    }
+  }
+
   /** The flags as a user types them. A `Config` built by hand never finds out whether the option is
    * spelled the way the shell has to spell it, which is why `parseArgs` exists.
    */
   "as written on a command line" - {
 
-    "both are repeatable, and keep the order given" in {
+    "all three are repeatable, and keep the order given" in {
       val c = parsed("run", "p.sysl", "--link-path", "/one", "--link-path", "/two",
-        "--include-path", "/inc")
+        "--include-path", "/inc", "--define", "A", "--define", "B=2")
 
       c.linkPaths shouldBe List("/one", "/two")
       c.includePaths shouldBe List("/inc")
+      c.defines shouldBe List("A", "B=2")
     }
 
-    "and a build that names neither carries neither" in {
+    // `-D` is what a C build system already writes, and a consumer copying its own flags across
+    // should not have to translate them.
+    "and --define has clang's own short spelling" in {
+      parsed("run", "p.sysl", "-D", "NDEBUG").defines shouldBe List("NDEBUG")
+    }
+
+    "and a build that names none of them carries none" in {
       val c = parsed("run", "p.sysl")
 
       c.linkPaths shouldBe empty
       c.includePaths shouldBe empty
+      c.defines shouldBe empty
     }
   }
 

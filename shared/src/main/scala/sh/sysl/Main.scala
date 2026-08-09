@@ -114,6 +114,7 @@ case class Config(
       */
     linkPaths: List[String] = Nil,
     includePaths: List[String] = Nil,
+    defines: List[String] = Nil,
     programArgs: List[String] = Nil,
     filter: Option[String] = None,
     failFast: Boolean = false,
@@ -265,6 +266,12 @@ private[sysl] val parser = {
         .action((d, c) => c.copy(includePaths = c.includePaths :+ d))
         .text("a directory to look in for a header the C beside a module includes; the other half " +
           "of --link-path, and needed by the same bindings; may be given more than once"),
+      opt[String]('D', "define")
+        .unbounded()
+        .action((d, c) => c.copy(defines = c.defines :+ d))
+        .text("a macro the C beside a module is compiled with, as 'NAME' or 'NAME=value' — what a " +
+          "host C project configures its own headers with, and which finding the header does not " +
+          "supply; may be given more than once"),
       opt[String]('O', "optimize")
         .action((o, c) => c.copy(optimize = o))
         .text(s"the optimization level to hand clang, as it spells one after the '-O': " +
@@ -463,12 +470,13 @@ private[sysl] def execute(cfg: Config): Int = {
   // value rather than two lists threaded separately, because the two halves are one setting: a
   // binding to a library outside the default prefix needs its headers to compile and its archive to
   // link, and a build given only one of them fails at whichever step comes first.
-  val paths = SearchPaths(cfg.linkPaths, cfg.includePaths)
+  val paths = SearchPaths(cfg.linkPaths, cfg.includePaths, cfg.defines)
 
   if cfg.verbose then
     for lib <- cfg.libs do trace(s"library: $lib")
     for dir <- cfg.linkPaths do trace(s"link path: $dir")
     for dir <- cfg.includePaths do trace(s"include path: $dir")
+    for d <- cfg.defines do trace(s"define: $d")
 
   val native =
     if links(cfg.command) then
@@ -627,7 +635,7 @@ private def buildForC(cfg: Config, compiled: Compiled, target: Target, named: Op
       _ <- Toolchain.compileObject(compiled.ir, code, target, cfg.optimize)
       _ <- objects.foldLeft[Either[String, Unit]](Right(()))((so_far, entry) =>
              so_far.flatMap(_ => Toolchain.compileC(entry._1.name, entry._2, target, cfg.optimize,
-               SearchPaths(cfg.linkPaths, cfg.includePaths), cfg.verbose)))
+               SearchPaths(cfg.linkPaths, cfg.includePaths, cfg.defines), cfg.verbose)))
       _ <- Toolchain.archive(code :: objects.map(_._2), out, ar)
     yield ()
 
@@ -761,7 +769,7 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
           // in anything else: because something left its symbol undefined.
           _ <- objects.foldLeft[Either[String, Unit]](Right(()))((so_far, entry) =>
                  so_far.flatMap(_ => Toolchain.compileC(entry._1.name, entry._2, target, cfg.optimize,
-                   SearchPaths(cfg.linkPaths, cfg.includePaths))))
+                   SearchPaths(cfg.linkPaths, cfg.includePaths, cfg.defines))))
           _ <- Toolchain.archive(code :: metadata :: objects.map(_._2), out, ar)
         yield ()
 

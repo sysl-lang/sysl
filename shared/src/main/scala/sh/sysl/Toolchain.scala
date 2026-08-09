@@ -53,7 +53,8 @@ import io.github.edadma.cross_platform.*
  * libraries would be wrong about a machine nobody here has, and the cost of being wrong is a link
  * that fails somewhere the author cannot reach.
  */
-case class SearchPaths(link: List[String] = Nil, include: List[String] = Nil) {
+case class SearchPaths(link: List[String] = Nil, include: List[String] = Nil,
+                       defines: List[String] = Nil) {
 
   /** What the linker is told, as clang spells it. Joined rather than passed as two arguments, which
    * is how `-L` has been written since cc and what a reader comparing this line against a hand-run
@@ -62,6 +63,21 @@ case class SearchPaths(link: List[String] = Nil, include: List[String] = Nil) {
   def linkFlags: List[String] = link.map(d => s"-L$d")
 
   def includeFlags: List[String] = include.map(d => s"-I$d")
+
+  /** The macros the C is compiled with, as clang spells them — `-DNAME` or `-DNAME=value`.
+   *
+   * **A header path is not enough to compile a header**, which is the whole reason this is here
+   * beside `include`. A C project of any size configures its own headers with macros, and one that
+   * has not been given them does not miss quietly: pico-sdk's `pico/cyw43_arch.h` answers a build
+   * with no `CYW43_LWIP` by `#error`ing on the spot, saying it cannot tell which architecture
+   * variant is meant. So a shim reachable at its path and compiled without the definitions its
+   * project builds with is a shim that fails one step *after* the include path was fixed.
+   *
+   * Nothing is inferred and nothing is defaulted, for the reason `link` gives about `/opt/homebrew`:
+   * what a project defines is the project's, and a compiler guessing at it would be wrong somewhere
+   * nobody here can reach.
+   */
+  def defineFlags: List[String] = defines.map(d => s"-D$d")
 }
 
 object SearchPaths {
@@ -466,12 +482,17 @@ object Toolchain {
    * directories (`SearchPaths`). This is the half of that setting the *link* flag cannot stand in
    * for: a binding to a library outside the default prefix fails here, at the `#include`, one step
    * before anything gets as far as a `-l`.
+   *
+   * `paths.defines` is the half the *include* flag cannot stand in for, and it is a step later
+   * again: a header found at its path and compiled without the macros its project configures it with
+   * is a header that refuses on its own terms. `SearchPaths.defineFlags` has the worked example.
    */
   def compileC(source: String, obj: String, target: Target = Target.default,
                level: String = defaultOptimization,
                paths: SearchPaths = SearchPaths.none, verbose: Boolean = false): Either[String, Unit] = {
     findClang(target).flatMap { cc =>
-      val command = Seq(cc, s"--target=${target.triple}", flag(level)) ++ paths.includeFlags ++
+      val command = Seq(cc, s"--target=${target.triple}", flag(level)) ++ paths.defineFlags ++
+        paths.includeFlags ++
         Seq("-ffunction-sections", "-fdata-sections", "-c", source, "-o", obj)
 
       if verbose then trace(s"compile: ${command.mkString(" ")}")
