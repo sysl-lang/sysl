@@ -168,12 +168,37 @@ An **`impl` block may not sit in one**. It declares no name; it puts an entry in
 which the rest of the program reads without naming anything. Kept in a test build and dropped
 everywhere else, it would mean a trait answering one way while the tests ran and another way in
 the program that shipped. The impl belongs beside the type. What that buys, beyond the rule
-itself, is that a declaration in a test file is never a trait method — so a dispatch through a
+itself, is that no declaration a test file *writes* is a trait method — so a dispatch through a
 table can never reach one, and the reference check has three node kinds to look at rather than
 five.
 
+A **closure** written in such a file is judged by the body it was written in rather than by the
+name it ends up under, and that needs saying because the two would otherwise disagree. Lowering
+one produces a function of its own, under a name the compiler made up, in no table that
+remembers which file it came from — so a lambda inside a test naming that test's own helper
+would be held to the rule about everything else while sitting inside one of the two things the
+rule exempts. It is the test's on both counts: it may name what the file declared, and it goes
+when the file does.
+
+The going matters as much as the naming. A closure is a struct and an `impl` of `Fn`, so
+lowering one inside a test writes a method table — and a table is something a program can read a
+function out of, which makes it a *root* for pruning rather than something pruning decides
+about. Left behind, it would hold the lowered body alive to call helpers the build had just
+removed. So a table whose slot names something the drop took goes with it, and a closure's own
+is the only slot such a name can fill.
+
+What must **not** be reported is a reference *to* one of those lowered names, and the standard
+library is where that shows: `is_sorted_by(xs, (a, b) -> a < b)` instantiates a library generic
+at the closure's own type, so the comparison inside that instantiation is a direct call on the
+test's closure — an ordinary library function naming it. A diagnostic there would name something
+the program does not contain, at a line in a file the reader did not write. Nothing is given up
+by staying quiet: an instantiation keyed on a test's closure type can only have been asked for
+by that test, so it is unreachable once the test goes and pruning removes it.
+
 The **types** such a file declares are left in the tree when its functions go, exactly as
-pruning leaves them: a type is emitted for its layout rather than for anything that runs.
+pruning leaves them: a type is emitted for its layout rather than for anything that runs. A
+closure's struct is one of those, so a stripped program still defines it and holds no body for
+it.
 
 ### The runner
 

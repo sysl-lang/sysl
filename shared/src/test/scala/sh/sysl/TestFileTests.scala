@@ -252,6 +252,21 @@ class TestFileTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       ran.map(o => o.test.display -> o.passed) shouldBe List("a_closure_inside_a_closure" -> true)
     }
 
+    /** A default is written at the declaration and analyzed outside every body, so which
+     * declaration it belongs to is something that pass has to say for itself. Getting it from
+     * whatever was analyzed last would file an ordinary function's default closure as a test's and
+     * drop it from the build that ships — a missing symbol at the link rather than a diagnostic.
+     */
+    "a parameter default's closure belongs to the declaration that wrote it" in {
+      runIn(
+        ("", "main.sysl", "import m.*\nprint(with_default(4))"),
+        ("m", "m.sysl",
+         "module m\n\napply(f: &Fn(int) -> int, n: int) -> int = f(n)\n\n" +
+           "with_default(n: int, f: &Fn(int) -> int = (v: int) -> v * 3) -> int = apply(f, n)"),
+        ("m", "tests.sysl", "module m\n@tests\n\nval fixture: int = 7"),
+      ) shouldBe "12\n"
+    }
+
     "an ordinary function's closure may NOT, exactly as the function itself may not" in {
       val e = errIn(
         ("", "main.sysl", "import m.*\nprint(twice_over(21))"),
