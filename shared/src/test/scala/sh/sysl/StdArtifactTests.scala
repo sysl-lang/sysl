@@ -146,21 +146,32 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
       Library.carried.owns(one) shouldBe false
     }
 
+    /** **Neither side carries the library's own tests, and that used to be true of only one of
+      * them.** A `@tests` file is scaffolding for `sysl test --std`; handed to a compilation as the
+      * standard module it is ordinary declarations, nameable and — the part that bites —
+      * *instantiable*, so a generic named by a test helper was monomorphized into every program
+      * compiled against the source std. `Stdlib.fromSource` strips them now, exactly as
+      * `LibraryArtifact` always did.
+      *
+      * It surfaced as an emitted-type **order** difference rather than a missing type, because the
+      * leaked instantiation happened to be one a later library function asks for anyway: it simply
+      * arrived earlier on the path that could see the tests. That is worth knowing, because the same
+      * defect with a type nothing else used would have been a plain divergence and far easier to
+      * read.
+      */
+    "and neither carries the library's own test scaffolding" in {
+      // Non-vacuous by construction: the files are there on disk, and the assertion is that *neither*
+      // way of reaching the library lets them through. Written against the parse rather than a list
+      // of the files there are, so that packing another module with tests does not come back here.
+      Std.parsed(Target.default).exists(_.testOnly) shouldBe true
+
+      Library.carried.units.exists(_.testOnly) shouldBe false
+      decoded.units.exists(_.testOnly) shouldBe false
+    }
+
     "and it carries the same declarations, so the comparison is between equals" in {
-      // **Minus the library's own test files**, which an artifact does not carry and should not: a
-      // `@tests` file is scaffolding for `sysl test --std`, and a consumer reading this metadata for
-      // generic instantiation has no use for a declaration nothing outside a test may name.
-      //
-      // Written as a filter rather than as a list of the files there are, so that packing another
-      // module with tests does not come back here. What is being compared is still every shipping
-      // file, which is what makes the IR match below a result: it was `filterNot` on one side and
-      // nothing at all on the other that would make this vacuous.
-      val shipped = Library.carried.units.filterNot(_.testOnly)
-
-      shipped.length should be < Library.carried.units.length
-
-      decoded.units.map(_.source.name) shouldBe shipped.map(_.source.name)
-      decoded.decls.length shouldBe shipped.flatMap(_.body).length
+      decoded.units.map(_.source.name) shouldBe Library.carried.units.map(_.source.name)
+      decoded.decls.length shouldBe Library.carried.units.flatMap(_.body).length
     }
   }
 

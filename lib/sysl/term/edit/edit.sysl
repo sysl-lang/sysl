@@ -245,7 +245,13 @@ struct Editor
         // Any other control character would move the terminal's cursor without being in the line.
     end edit
 
-    // An escape sequence, of which only `ESC [ …` is understood.
+    // An escape sequence -- **both of the two forms a terminal sends for the same key**.
+    //
+    // `ESC [ D` is CSI and `ESC O D` is SS3, and a terminal chooses between them by whether the
+    // *application cursor key* mode is on. Nothing here turns it on, so the CSI form is what a fresh
+    // terminal sends -- and reading only that is a bug rather than a simplification, because plenty of
+    // emulators are in the other mode by the time a program is started. Accepting `[` alone means a
+    // left arrow inserts a stray `D` into the line, which is what the absence looks like from a chair.
     //
     // **The bytes of a sequence arrive together**, so reading them with the same call the rest of the
     // loop uses is safe in practice -- and safer here than in a reader taking one byte at a time,
@@ -256,24 +262,57 @@ struct Editor
         self.next_byte() match
             None -> ()
 
-            Some(bracket) ->
-                if bracket != u8('[') then return
+            Some(intro) ->
+                if intro != u8('[') && intro != u8('O') then return
 
                 self.next_byte() match
                     None -> ()
 
                     Some(c) ->
-                        if c == u8('D') then self.left()
-                        elif c == u8('C') then self.right()
-                        elif c == u8('H') then self.to_start()
-                        elif c == u8('F') then self.to_end()
-                        elif c == u8('3')
-                            // Delete arrives as `ESC [ 3 ~`, so the tilde has to be taken as well.
-                            self.next_byte()
-                            self.delete_at()
-                        // Up, down, and everything else with a longer form: swallowed rather than
-                        // echoed, since echoing it would move the terminal's cursor off the line.
+                        if c >= u8('0') && c <= u8('9') then self.numbered(c) else self.final_key(c)
     end escape
+
+    // A parameterised sequence -- `ESC [ 3 ~` for Delete, and the numbered spellings of Home and End
+    // that some terminals send instead of the lettered ones.
+    //
+    // **It reads to the end of the sequence whatever the parameters are**, which is what keeps a key
+    // it does not act on from leaving its tail in the line. A final byte is anything from `@` to `~`,
+    // so `ESC [ 1 ; 5 D` -- Ctrl-Left on an xterm -- ends at the `D` and is treated as a plain left,
+    // which is a better answer than either ignoring it or inserting a `D`.
+    numbered(*self, first: u8)
+        var n = uint(first - u8('0'))
+
+        loop
+            self.next_byte() match
+                None -> return
+
+                Some(b) ->
+                    if b >= u8('0') && b <= u8('9')
+                        n = n * 10 + uint(b - u8('0'))
+                    elif b == u8(';')
+                        // A second parameter, which nothing here reads: the key is in the final byte.
+                        n = 0
+                    else
+                        if b == u8('~')
+                            if n == 3 then self.delete_at()
+                            elif n == 1 || n == 7 then self.to_start()
+                            elif n == 4 || n == 8 then self.to_end()
+                        else
+                            self.final_key(b)
+
+                        return
+    end numbered
+
+    // The last byte of a sequence, where the key is when it is not a number.
+    //
+    // Up and down are deliberately absent rather than forgotten: with no history to move through
+    // there is nothing for them to do, and echoing them would walk the terminal's cursor off the line.
+    final_key(*self, c: u8)
+        if c == u8('D') then self.left()
+        elif c == u8('C') then self.right()
+        elif c == u8('H') then self.to_start()
+        elif c == u8('F') then self.to_end()
+    end final_key
 
     // ## Writing
     //

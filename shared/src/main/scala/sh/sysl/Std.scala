@@ -256,5 +256,12 @@ object Std {
   private[sysl] def memoAnswersTwice(target: Target): Boolean =
     cache.synchronized { parsed(target) eq parsed(target) }
 
-  def decls(target: Target): List[Stmt] = parsed(target).flatMap(_.body)
+  /** What the standard module **declares**, which is not everything under `lib/`.
+   *
+   * The library's own `@tests` files are scaffolding for `sysl test --std` and are dropped by every
+   * other build, so a name only a test writes is not a name the standard module declares — and
+   * anything asking this question wants the shipping surface. `Stdlib.fromSource` strips the same
+   * way, so the two agree by construction rather than by coincidence.
+   */
+  def decls(target: Target): List[Stmt] = Tests.stripSource(parsed(target)).flatMap(_.body)
 }

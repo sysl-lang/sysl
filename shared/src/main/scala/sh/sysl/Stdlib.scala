@@ -239,13 +239,28 @@ object Stdlib {
   /** **One target's copy is kept**, for the reason `Std.parsed` keeps one — a caller loops over a
    * target rather than alternating, and a test that iterates `Target.all` otherwise leaves every
    * target's standard module resident for the life of the process.
+   *
+   * **The library's own tests are stripped before anybody compiles against it**, which is what
+   * `@tests` promises and what this path was quietly not doing. `Std.parsed` reads every file in
+   * `lib/`, `tests.sysl` included; handed to a compilation as the standard module, those files are
+   * ordinary declarations — nameable, and worse, *instantiable*. A generic named only by a test
+   * helper was being monomorphized into every program that compiled against the source std, so the
+   * library shipped instantiations no caller had asked for.
+   *
+   * `LibraryArtifact` already drops them (`Tests.stripSource`, and `15 §` on why the drop has to come
+   * *before* analysis rather than after), so this was also the one difference between the two ways a
+   * standard module reaches a compilation — which is exactly what `StdArtifactTests` compares. It
+   * surfaced as an emitted-type *order* difference rather than a missing type, because the leaked
+   * instantiation was one some later library function asks for anyway: it simply arrived earlier on
+   * the path that could see the tests. A test file that named a type nothing else used would have
+   * been a plain divergence instead.
    */
   def fromSource(target: Target): Stdlib =
     cache.synchronized {
       cache.get(target) match
         case Some(std) => std
         case None =>
-          val std = new Stdlib(Std.parsed(target))
+          val std = new Stdlib(Tests.stripSource(Std.parsed(target)))
 
           cache.clear()
           cache(target) = std

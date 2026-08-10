@@ -273,7 +273,13 @@ object LibraryArtifact {
             // here, however thorough, would be too late to keep them out.
             Compiler.compileLibrary(units, target, building, std)
               .map((ir, compiled) =>
-                (ir, metadata(units.filterNot(_.testOnly), compiled,
+                // **`stripSource` rather than `filterNot(_.testOnly)`**, so that what an artifact
+                // carries is exactly what `Stdlib.fromSource` carries. The two differ on one shape: a
+                // `@test` written inside an *ordinary* file, which `testOnly` does not see because the
+                // file itself is not scaffolding. Any difference between them is a difference between
+                // the two ways a standard module reaches a compilation, which is the one thing
+                // `StdArtifactTests` exists to refuse.
+                (ir, metadata(Tests.stripSource(units), compiled,
                               fingerprint(sources ::: native), target)))
   }
 
