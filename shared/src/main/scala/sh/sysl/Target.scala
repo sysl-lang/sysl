@@ -282,6 +282,35 @@ object Target {
     Target("thumb-freestanding-softfp", "thumbv8m.main-none-eabi", Cpu.Thumb, Os.Freestanding,
       VaListAbi.Loaded, 4, softFloat = true, shortEnums = true)
 
+  /** The **RP2040's** core: a Cortex-M0+, which is Armv6-M — Armv8-M's predecessor rather than a
+   * variant of it, and a strictly smaller Thumb.
+   *
+   * **The name carries the sub-architecture where its two siblings above do not**, because this is a
+   * different architecture and not a third float ABI. Armv6-M has no FPU to have a convention about,
+   * so `softFloat` here is not the choice it is on the M33 — it is the only thing the core can do.
+   *
+   * What differs is the instruction set: no Thumb-2 to speak of, no hardware divide, and no
+   * unaligned load or store. LLVM answers each of those with a libcall where it would emit an
+   * instruction on the M33, and they come from the toolchain's own runtime exactly as
+   * `__aeabi_ldivmod` already does for a `long` on any 32-bit board.
+   *
+   * **The one that does not come from the toolchain is atomics.** Armv6-M has no `ldrex`/`strex`, so
+   * LLVM cannot lower an `atomicrmw` inline and calls `__atomic_fetch_add_4` instead — a symbol
+   * nothing in a freestanding link defines. That reaches only `&sync T`, since `Codegen` emits the
+   * atomic retain pair only for a program that has one, so an ordinary program on this target needs
+   * nothing and links as it stands.
+   *
+   * A program that *does* share across the RP2040's **two** cores needs it, and the answer is the
+   * board's rather than the language's. Disabling interrupts is the obvious implementation and is
+   * the wrong one: `PRIMASK` is per-core, so it buys atomicity against this core's interrupts and
+   * nothing at all against the other core — and a lost refcount update is a premature free, which
+   * surfaces nowhere near the mistake. What the chip actually has is a hardware spinlock, which is
+   * a thing about the board and must not be something the compiler knows. The package carries it.
+   */
+  val thumbv6mFreestanding: Target =
+    Target("thumbv6m-freestanding", "thumbv6m-none-eabi", Cpu.Thumb, Os.Freestanding,
+      VaListAbi.Loaded, 4, softFloat = true, shortEnums = true)
+
   /** The RP2350's other personality: a Hazard3, which is RV32IMAC and has no F extension at all —
    * so, like bare-metal RISC-V at 64 bits, there are no floating registers to pass arguments in.
    */
@@ -314,6 +343,7 @@ object Target {
       riscv64Freestanding,
       thumbFreestanding,
       thumbFreestandingSoftfp,
+      thumbv6mFreestanding,
       riscv32Freestanding,
       x86Linux,
     )

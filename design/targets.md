@@ -45,14 +45,15 @@ of what makes it different from `build`.
 | `riscv64-freestanding` | `riscv64-unknown-elf` | loaded | **no** |
 | `thumb-freestanding` | `thumbv8m.main-none-eabihf` | loaded | yes |
 | `thumb-freestanding-softfp` | `thumbv8m.main-none-eabi` | loaded | **no** |
+| `thumbv6m-freestanding` | `thumbv6m-none-eabi` | loaded | **no** |
 | `riscv32-freestanding` | `riscv32-unknown-elf` | loaded | **no** |
 | `x86-linux` | `i386-unknown-linux-gnu` | *no measured C ABI* | |
 
-**Three of those are 32-bit, and they are the two halves of one board.** The RP2350 boots either a
-pair of Cortex-M33s or a pair of RV32IMAC Hazard3 cores, and both are here because a
-microcontroller is what *freestanding* is mostly for: the three 64-bit freestanding rows reach
-kernels and hypervisors, which is a different audience from the one writing embedded C, and nearly
-all of that is 32-bit.
+**Four of those are 32-bit, and they are the two Raspberry Pi microcontrollers.** The RP2350 boots
+either a pair of Cortex-M33s or a pair of RV32IMAC Hazard3 cores; the RP2040 — the original Pico —
+has a pair of Cortex-M0+. All are here because a microcontroller is what *freestanding* is mostly
+for: the three 64-bit freestanding rows reach kernels and hypervisors, which is a different audience
+from the one writing embedded C, and nearly all of that is 32-bit.
 
 `thumb` rather than `arm` names the Arm half, and the reason is the assembly arm rather than the
 architecture family — a Cortex-M executes Thumb only, so an arm written for A32 would assemble for a
@@ -83,6 +84,43 @@ whose `@export` claim is that it joins somebody else's build.
 handed that linker message goes looking for the word in their build system, and it is that one. It is
 **not** `soft`, which means something else — no FPU instructions at all, where `softfp` uses the
 `fpv5-d16` and changes only the convention.
+
+### Armv6-M, which is the RP2040 and is a different architecture
+
+`thumbv6m-freestanding` is the **third** Thumb row and the only one that is not that Cortex-M33. Its
+name carries the sub-architecture where the other two do not, because what separates it is not a
+calling convention: Armv6-M is Armv8-M's predecessor rather than a subset of its options.
+
+**The float column misleads here, and that is the reason to say so.** It reads `no` exactly as the
+`softfp` row does, for an unrelated reason. `softfp` is a *convention* chosen over an FPU that is
+present; the M0+ has no FPU at all, so there was never a choice to record. Two rows agreeing on that
+column agree about nothing.
+
+**The ABI is the same and needed no work**, which is the happy half: AAPCS32 under soft-float already
+described this core exactly, and the oracle of *Adding one* passed on the first run — the only
+convention question, whether a homogeneous floating aggregate travels in floating registers, has the
+same answer on a core with no such registers as on one whose convention declines to use them.
+
+What differs is everything below the convention. There is no Thumb-2, so a literal-pool load into
+`sp` and a store with writeback — both ordinary on the M33 — simply do not assemble. There is no
+divider, no 64-bit shift, and no widening multiply, so `/`, `>>` on a `long` and `*` on a `long` are
+all **calls**: `__aeabi_idiv`, `__aeabi_llsr`, `__aeabi_lmul` and their relatives. A real project
+gets those from the toolchain's runtime, and pico-sdk links one; sysl emits the same references any C
+compiler would for this triple, so nothing about them is sysl's to supply.
+
+**The one that is not the toolchain's is atomics, and it is a language question rather than an
+arithmetic one.** Armv6-M has no `ldrex`/`strex`, so LLVM cannot lower an `atomicrmw` inline and
+calls `__atomic_fetch_add_4` instead. That reaches exactly one construct: the atomic retain pair is
+emitted only for a program containing a `&sync T` (`memory.md`), so an ordinary program on this
+target emits no atomic at all and links as it stands.
+
+A program that *does* share across the RP2040's two cores needs an answer, and the answer is the
+board's. **Disabling interrupts is the obvious implementation and is the wrong one**: `PRIMASK` is
+per-core, so it buys atomicity against this core's interrupts and nothing whatever against the other
+core — and a lost reference-count update is a premature free, which surfaces nowhere near the
+mistake. What the chip has instead is a hardware spinlock, which is a fact about that board and must
+not be something the compiler knows. The package carries it, exactly as a package carries any other
+thing only the board can answer.
 
 **`Freestanding` is a real answer, not a missing one.** A kernel or a bare-metal program has no
 operating system, and the ABI of a freestanding ELF target is fully specified; it differs from a

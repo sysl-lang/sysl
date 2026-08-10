@@ -66,7 +66,17 @@ trait QemuSupport extends Matchers {
       Board("qemu-system-arm",
         List("-M", "mps2-an505", "-nographic", "-semihosting-config", "enable=on,target=native",
           "-kernel"),
-        "start_thumb.s", "bsp_thumb.c", "thumb.ld")
+        "start_thumb.s", "bsp_thumb.c", "thumb.ld"),
+
+    // Armv6-M, which is the RP2040's core and not a smaller setting of the one above. QEMU has no
+    // RP2040 machine, and this tier does not need one: what it is here to exercise is the
+    // *architecture* — no Thumb-2, no divider, no unaligned access — running instructions the back
+    // end actually chose. The micro:bit's nRF51822 is the Cortex-M0 QEMU does have.
+    Target.thumbv6mFreestanding.name ->
+      Board("qemu-system-arm",
+        List("-M", "microbit", "-nographic", "-semihosting-config", "enable=on,target=native",
+          "-kernel"),
+        "start_thumbv6m.s", "bsp_thumbv6m.c", "thumbv6m.ld")
   )
 
 
@@ -119,6 +129,38 @@ trait QemuSupport extends Matchers {
           |console() -> *Writer
           |    regs.bauddiv = 16
           |    regs.ctrl = 1
+          |    uart
+          |""".stripMargin
+
+      // The nRF51's transmitter is a peripheral to be started rather than a register to be written,
+      // and its ready flag is an *event* that has to be cleared before the next byte — a second
+      // write without clearing spins forever on a stale ready. `bsp_thumbv6m.c` says what each
+      // number is; the pin is the micro:bit's wiring and the rest is the chip's.
+      case n if n == Target.thumbv6mFreestanding.name =>
+        """struct Reg
+          |    v: volatile u32
+          |
+          |val UART: usize = 0x40002000
+          |
+          |val starttx: *Reg = ptr_cast(UART + 0x008)
+          |val txdrdy: *Reg = ptr_cast(UART + 0x11c)
+          |val enable: *Reg = ptr_cast(UART + 0x500)
+          |val pseltxd: *Reg = ptr_cast(UART + 0x50c)
+          |val txd: *Reg = ptr_cast(UART + 0x51c)
+          |val baudrate: *Reg = ptr_cast(UART + 0x524)
+          |
+          |putc(c: u8)
+          |    txdrdy.v = 0
+          |    txd.v = u32(c)
+          |
+          |    while txdrdy.v == 0
+          |        ()
+          |
+          |console() -> *Writer
+          |    pseltxd.v = 24
+          |    baudrate.v = 0x01d7e000
+          |    enable.v = 4
+          |    starttx.v = 1
           |    uart
           |""".stripMargin
 

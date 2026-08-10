@@ -77,7 +77,8 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
     // that is here on purpose rather than by the triple's default, and the test below is about it.
     "records which targets have floating registers to pass arguments in" in {
       Target.all.filterNot(_.hardFloat).map(_.name) shouldBe
-        List("riscv64-freestanding", "thumb-freestanding-softfp", "riscv32-freestanding")
+        List("riscv64-freestanding", "thumb-freestanding-softfp", "thumbv6m-freestanding",
+          "riscv32-freestanding")
     }
 
     // The two Thumb targets are one machine under two calling conventions, and the pair exists so
@@ -101,6 +102,33 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
         (soft.cpu, soft.os, soft.vaList, soft.vaListBytes)
     }
 
+    // The third Thumb target is a different *architecture* rather than a third convention, and that
+    // is worth writing down for the reason the pair above is: all three are `Cpu.Thumb` and read as
+    // near-duplicates in the registry, so the thing that separates this one lives in the triple
+    // alone. Armv6-M is not a smaller set of Armv8-M's options — it is the earlier architecture,
+    // with no Thumb-2, no hardware divide, no unaligned access and no `ldrex`/`strex`.
+    //
+    // The float ABI is where the resemblance would mislead. `thumbv6m` is soft like the `softfp`
+    // sibling, and for an unrelated reason: `softfp` is a *convention* chosen over an FPU that is
+    // there, and this core has no FPU at all. Reading the two rows as the same fact is what would
+    // make somebody collapse them.
+    "keeps the Armv6-M target apart from the Armv8-M pair on the architecture" in {
+      val m0  = Target.thumbv6mFreestanding
+      val m33 = Target.thumbFreestandingSoftfp
+
+      m0.triple should startWith("thumbv6m")
+      m33.triple should startWith("thumbv8m")
+
+      // Both soft, and neither says why — which is the point of the paragraph above.
+      m0.hardFloat shouldBe false
+      m33.hardFloat shouldBe false
+
+      // Everything the registry records other than the triple is the same, so the triple is the
+      // whole of the difference and there is nothing else for a reader to have missed.
+      (m0.cpu, m0.os, m0.vaList, m0.vaListBytes, m0.shortEnums) shouldBe
+        (m33.cpu, m33.os, m33.vaList, m33.vaListBytes, m33.shortEnums)
+    }
+
     // Whether a thread's storage is laid down before `main` is a fact about the system and not about
     // the processor, and it is the OS that records it: a hosted system starts a thread by giving it
     // storage, and a bare one has no loader, no libc, and nothing that writes the thread pointer.
@@ -112,6 +140,7 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
           "riscv64-freestanding",
           "thumb-freestanding",
           "thumb-freestanding-softfp",
+          "thumbv6m-freestanding",
           "riscv32-freestanding"
         )
     }

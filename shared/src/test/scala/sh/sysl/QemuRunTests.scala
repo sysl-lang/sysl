@@ -66,6 +66,36 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
         |regs.bauddiv = 16
         |regs.ctrl = 1
         |""".stripMargin,
+
+    // The nRF51's transmitter is *started* rather than enabled, and its ready flag is an event that
+    // has to be cleared before each byte — a second write without clearing spins on a stale ready.
+    // The registers are scattered across the map rather than adjacent, so each is its own pointer
+    // instead of one struct with a hundred words of padding in it.
+    Target.thumbv6mFreestanding.name ->
+      """struct Reg
+        |    v: volatile u32
+        |
+        |val UART: usize = 0x40002000
+        |
+        |val starttx: *Reg = ptr_cast(UART + 0x008)
+        |val txdrdy: *Reg = ptr_cast(UART + 0x11c)
+        |val enable: *Reg = ptr_cast(UART + 0x500)
+        |val pseltxd: *Reg = ptr_cast(UART + 0x50c)
+        |val txd: *Reg = ptr_cast(UART + 0x51c)
+        |val baudrate: *Reg = ptr_cast(UART + 0x524)
+        |
+        |putc(c: u8)
+        |    txdrdy.v = 0
+        |    txd.v = u32(c)
+        |
+        |    while txdrdy.v == 0
+        |        ()
+        |
+        |pseltxd.v = 24
+        |baudrate.v = 0x01d7e000
+        |enable.v = 4
+        |starttx.v = 1
+        |""".stripMargin,
   )
 
   /** The prelude a program on `t` needs before it can print, plus the one helper every test here
@@ -74,7 +104,7 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
   private def prelude(t: Target): String =
     uarts(t.name) + "\ndigit(n: usize)\n    putc(u8('0') + u8(n))\n"
 
-  for t <- List(Target.riscv32Freestanding, Target.thumbFreestanding) do
+  for t <- List(Target.riscv32Freestanding, Target.thumbFreestanding, Target.thumbv6mFreestanding) do
     s"a program on ${t.name}" - {
       val uart = prelude(t)
 
