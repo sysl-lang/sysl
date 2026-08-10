@@ -311,6 +311,38 @@ object Target {
     Target("thumbv6m-freestanding", "thumbv6m-none-eabi", Cpu.Thumb, Os.Freestanding,
       VaListAbi.Loaded, 4, softFloat = true, shortEnums = true)
 
+  /** The STM32s: Armv7E-M, which is where most of ST's parts land and which covers **two** boards
+   * with different silicon — a Cortex-M4F (STM32G491RE) and a Cortex-M7 (STM32H753ZI).
+   *
+   * **One row serves both, and that is a measurement rather than an assumption.** The M7 has a
+   * double-precision FPU and the M4F a single-precision one, so the two disagree about what they can
+   * compute:
+   *
+   * {{{
+   * cortex-m7:  +fp-armv8d16                 FPv5-D16, double
+   * cortex-m4:  -fp-armv8d16 +vfp4d16sp      FPv4-SP-D16, single only
+   * }}}
+   *
+   * Yet under `eabihf` both pass a `double` in `d0`/`d1` — checked by compiling a call and reading
+   * the assembly. What differs is whether double *arithmetic* is inline or a libcall, and that is a
+   * question about instruction selection rather than about the convention. So `softFloat` stays
+   * false and one row is the honest answer for the pair.
+   *
+   * **The bare triple behaves as the conservative subset**, emitting `vldr d0` like the M4F and no
+   * double-precision arithmetic. That is correct on both boards and leaves the H7's hardware double
+   * unit unused. Naming the exact core with `-mcpu` is what would recover it, and this registry has
+   * no field for a CPU — the sub-architecture question `thumbFreestanding` records as open. These
+   * two parts are where it stops being hypothetical, since they are one triple and different
+   * silicon.
+   *
+   * **Atomics need nothing from a board here**, unlike the RP2040 above: Armv7E-M has
+   * `ldrex`/`strex`, so an `atomicrmw` lowers inline and an object built from one carries no
+   * relocation against `__atomic_*` at all. `&sync T` works as it stands.
+   */
+  val thumbv7emFreestanding: Target =
+    Target("thumbv7em-freestanding", "thumbv7em-none-eabihf", Cpu.Thumb, Os.Freestanding,
+      VaListAbi.Loaded, 4, shortEnums = true)
+
   /** The RP2350's other personality: a Hazard3, which is RV32IMAC and has no F extension at all —
    * so, like bare-metal RISC-V at 64 bits, there are no floating registers to pass arguments in.
    */
@@ -344,6 +376,7 @@ object Target {
       thumbFreestanding,
       thumbFreestandingSoftfp,
       thumbv6mFreestanding,
+      thumbv7emFreestanding,
       riscv32Freestanding,
       x86Linux,
     )
