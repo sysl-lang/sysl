@@ -137,6 +137,38 @@ the suite reports a board fault instead of a timeout. It deliberately does not p
 needs the UART enabled and a hex routine, which is a program to get wrong inside the thing that
 reports other programs going wrong, and `-d int` says it better for nothing.
 
+## thumbv7em — `qemu-system-arm -M mps2-an500 …`
+
+A Cortex-M7, and the architecture the STM32 Nucleo boards use. Most of it is the AN505's board with
+two addresses changed; what is worth knowing is what **stops** applying, because the temptation is to
+copy the sibling wholesale.
+
+**The secure alias is gone, and with it the worst trap in this directory.** `thumb.ld` links at
+`0x10000000` because an ARMv8-M core boots secure and the AN505's IDAU splits the map at bit 28.
+**Armv7E-M has no TrustZone**, so there is one view of memory and `thumbv7em.ld` links at the real
+address — `mps.ssram1`, 4 MB of RAM at `0x00000000`. The vector table is also one entry shorter:
+slot 7 is SecureFault on an M33 and reserved here.
+
+**The UART is the same CMSDK device at `0x40004000`**, first of five in the APB region, and
+`-nographic` wires it to QEMU's stdout. Everything the AN505 section says about it still holds: word
+registers, and silence until `BAUDDIV` >= 16 and `CTRL` = 1.
+
+**The startup enables the FPU, which no other board here does.** The triple is
+`thumbv7em-none-eabihf`, so a `double` travels in `d0`/`d1` and the back end may reach for VFP
+anywhere — and a Cortex-M denies coprocessor access out of reset, so the first such instruction
+raises a UsageFault with the NOCP bit and the program dies somewhere arithmetic, **blaming the
+arithmetic**. `CPACR` is at `0xE000ED88`, bits 23:20. `start_thumb.s` omits this and has got away
+with it because nothing that has run on the AN505 used a float; that is a property of the test
+programs rather than of the board, and it is not one to inherit on a target whose whole reason for
+existing is its FPU.
+
+**The M4F end of this target is not wired up.** One row serves both Nucleo cores on the argument
+that an M4F and an M7 both pass a `double` in `d0`/`d1` under `eabihf` — and nothing here tests that,
+because `boards` is keyed by target and one target admits one recipe. `netduinoplus2` (an STM32F405)
+is the machine for it, and it needs more than an address: its flash is a **ROM** region at
+`0x08000000` aliased at zero, so `.data` has to be copied to SRAM by the startup, which no board
+here does yet.
+
 ## Wired into the suite
 
 `QemuSupport` links a module against these files, boots it, and answers with the exit status and the

@@ -40,7 +40,7 @@ class QemuHarnessTests extends AnyFreeSpec with QemuSupport {
            |""".stripMargin),
       boardModule(t))
 
-  for t <- List(Target.riscv32Freestanding, Target.thumbFreestanding) do
+  for t <- List(Target.riscv32Freestanding, Target.thumbFreestanding, Target.thumbv7emFreestanding) do
     s"a suite on ${t.name}" - {
 
       // The claim everything else here rests on: the framework links for a bare board at all. It

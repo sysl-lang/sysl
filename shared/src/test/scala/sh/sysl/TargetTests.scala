@@ -141,6 +141,7 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
           "thumb-freestanding",
           "thumb-freestanding-softfp",
           "thumbv6m-freestanding",
+          "thumbv7em-freestanding",
           "riscv32-freestanding"
         )
     }

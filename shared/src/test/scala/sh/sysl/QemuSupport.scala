@@ -76,7 +76,22 @@ trait QemuSupport extends Matchers {
       Board("qemu-system-arm",
         List("-M", "microbit", "-nographic", "-semihosting-config", "enable=on,target=native",
           "-kernel"),
-        "start_thumbv6m.s", "bsp_thumbv6m.c", "thumbv6m.ld")
+        "start_thumbv6m.s", "bsp_thumbv6m.c", "thumbv6m.ld"),
+
+    // Armv7E-M, the STM32 Nucleo boards' architecture. `mps2-an500` is a **Cortex-M7**, which is the
+    // NUCLEO-H753ZI's core; the M4F end of the same target has a machine of its own
+    // (`netduinoplus2`, an STM32F405) and is not wired here, because a board is keyed by target and
+    // one target admits one recipe.
+    //
+    // Reaching a *second* machine for this target is the thing this map cannot express, and it is
+    // worth more here than it was for the others: `thumbv7em-freestanding` is the first row that
+    // deliberately serves two chips, on the argument that both pass a `double` in `d0`/`d1` under
+    // `eabihf`. Nothing yet runs the M4F end and so nothing yet tests that argument.
+    Target.thumbv7emFreestanding.name ->
+      Board("qemu-system-arm",
+        List("-M", "mps2-an500", "-nographic", "-semihosting-config", "enable=on,target=native",
+          "-kernel"),
+        "start_thumbv7em.s", "bsp_thumbv7em.c", "thumbv7em.ld")
   )
 
 
@@ -121,6 +136,29 @@ trait QemuSupport extends Matchers {
           |    bauddiv: volatile u32
           |
           |val UART: usize = 0x40200000
+          |val regs: *Uart = ptr_cast(UART)
+          |
+          |putc(c: u8)
+          |    regs.data = u32(c)
+          |
+          |console() -> *Writer
+          |    regs.bauddiv = 16
+          |    regs.ctrl = 1
+          |    uart
+          |""".stripMargin
+
+      // The AN500's CMSDK UART is the AN505's device at a different address -- five of them in the
+      // APB region from 0x40004000, of which `-nographic` wires the first to QEMU's stdout. Same
+      // word-wide registers, and the same refusal to transmit until `bauddiv` and `ctrl` are set.
+      case n if n == Target.thumbv7emFreestanding.name =>
+        """struct Uart
+          |    data: volatile u32
+          |    state: volatile u32
+          |    ctrl: volatile u32
+          |    intstatus: volatile u32
+          |    bauddiv: volatile u32
+          |
+          |val UART: usize = 0x40004000
           |val regs: *Uart = ptr_cast(UART)
           |
           |putc(c: u8)

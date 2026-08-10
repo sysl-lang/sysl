@@ -96,6 +96,26 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
         |enable.v = 4
         |starttx.v = 1
         |""".stripMargin,
+
+    // The AN500's is the AN505's device moved: five CMSDK UARTs from 0x40004000, the first of them
+    // wired to QEMU's stdout by `-nographic`.
+    Target.thumbv7emFreestanding.name ->
+      """struct Uart
+        |    data: volatile u32
+        |    state: volatile u32
+        |    ctrl: volatile u32
+        |    intstatus: volatile u32
+        |    bauddiv: volatile u32
+        |
+        |val UART: usize = 0x40004000
+        |val regs: *Uart = ptr_cast(UART)
+        |
+        |putc(c: u8)
+        |    regs.data = u32(c)
+        |
+        |regs.bauddiv = 16
+        |regs.ctrl = 1
+        |""".stripMargin,
   )
 
   /** The prelude a program on `t` needs before it can print, plus the one helper every test here
@@ -104,7 +124,8 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
   private def prelude(t: Target): String =
     uarts(t.name) + "\ndigit(n: usize)\n    putc(u8('0') + u8(n))\n"
 
-  for t <- List(Target.riscv32Freestanding, Target.thumbFreestanding, Target.thumbv6mFreestanding) do
+  for t <- List(Target.riscv32Freestanding, Target.thumbFreestanding, Target.thumbv6mFreestanding,
+                Target.thumbv7emFreestanding) do
     s"a program on ${t.name}" - {
       val uart = prelude(t)
 
@@ -318,5 +339,50 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
         withClue(s"the board said: '$out'")(status shouldBe 0)
         out should include("zero")
       }
+
+      // **The one test here that expects a status other than zero, and the tier needs exactly one.**
+      //
+      // Every other assertion in this file and in `QemuHarnessTests` reads `status shouldBe 0`, so
+      // between them they cannot tell a working exit channel from one that reports zero whatever
+      // happened — and reporting zero whatever happened is a real failure mode with a name: on
+      // AArch32 the plain semihosting `SYS_EXIT` (0x18) takes its reason in `r1` and **always**
+      // reports success, which is why every Thumb startup here uses `SYS_EXIT_EXTENDED` (0x20)
+      // instead. A board wired to the wrong one passes all fifty-four of the others.
+      //
+      // Faulting on purpose is what exercises it, because a fault is the only route by which a
+      // program on this tier can produce a non-zero status at all — `main` may not be declared to
+      // return one. So this asserts two things at once: that the vector table is read (the handler
+      // was reached) and that the channel carries a value (99 rather than 0 came out).
+      //
+      // 0x80000000 is chosen rather than null because **null is not a fault on every board here** —
+      // the AN500 has RAM at address zero, so a store through a null pointer succeeds there and
+      // computes nothing.
+      //
+      // **Two boards are excluded, and neither exclusion is a defect.** `riscv32-freestanding`
+      // reports through `virt`'s `sifive_test` device rather than through a fault vector, so it has
+      // no handler for this to reach. And `mps2-an505` has no unmapped address to store to at all:
+      // its TrustZone master security controller claims the whole space —
+      //
+      //   0000000000000000-ffffffffffffffff  tz-msc-downstream
+      //
+      // — so the write is swallowed, the program runs to completion, and the board exits zero
+      // honestly. That was measured with `info mtree -f` after this test failed there, and the
+      // conclusion is about the machine rather than about the startup: `start_thumb.s` asks for
+      // `SYS_EXIT_EXTENDED` exactly as the other two do.
+      if t != Target.riscv32Freestanding && t != Target.thumbFreestanding then
+        "reports a fault as a status of its own rather than as success" in {
+          val (status, _) = bootUnderQemu(t,
+            s"""$uart
+               |struct Bad
+               |    v: volatile u32
+               |
+               |val BAD: usize = 0x80000000
+               |val bad: *Bad = ptr_cast(BAD)
+               |
+               |bad.v = 1
+               |""".stripMargin)
+
+          status shouldBe 99
+        }
     }
 }
