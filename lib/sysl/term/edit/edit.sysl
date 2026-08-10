@@ -19,9 +19,10 @@ import sysl.text.{char_columns, str_builder}
 //
 // ## What it is not
 //
-// **It is deliberately the simple thing.** There is no history, no completion, no multi-line editing,
-// and no absolute cursor addressing. A program wanting those wants linenoise, which does them
-// properly and is a package. What is here is the set a REPL is unusable without.
+// **It is deliberately the simple thing.** There is no completion, no multi-line editing, and no
+// absolute cursor addressing. A program wanting those wants linenoise, which does them properly and
+// is a package. What is here is the set a REPL is unusable without — and history is in that set,
+// because the second thing anybody does at a prompt is run the last line again.
 //
 // **A line that wraps past the terminal's width redraws wrong**, and that is the honest cost of
 // having no absolute addressing: the cursor is moved by writing `\b`, which stops at column zero
@@ -41,6 +42,14 @@ import sysl.text.{char_columns, str_builder}
 
 // U+FFFD, what a decoder answers for input it cannot make sense of.
 private const replacement: char = '\u{FFFD}'
+
+// How many lines the arrows can reach back through.
+//
+// **A cap rather than none, because a console outlives its session.** A board's REPL runs for as long
+// as the board is powered, and each entry is a `string` of its own — so an uncapped history is a leak
+// whose fuse is measured in days. Sixty-four is past where anybody scrolls and small enough not to
+// matter on a microcontroller.
+private const history_limit: usize = 64
 
 // A line editor over a byte source and a place to echo to.
 //
@@ -72,6 +81,26 @@ struct Editor
     // to survive the line boundary, because the two bytes of a CRLF are what straddle it.
     owed_lf: bool
     done: bool
+
+    // ## History
+    //
+    // The lines already entered, oldest first, and where in them the arrow keys are looking.
+
+    // **Capped, and that is not tidiness.** A console on a board runs for as long as the board is
+    // powered, so a list that only grows is a leak with a slow fuse — and the entries are `string`s,
+    // each its own allocation. What the cap costs is the oldest line, which is the one nobody was
+    // going to reach for.
+    hist: Buf[string]
+
+    // Which entry the arrows are showing. `hist.len()` means *none of them* — the line being typed,
+    // which is where every `getline` starts and where Down eventually returns.
+    browse: usize
+
+    // **What was typed before the first Up**, kept so that browsing away from it and back again does
+    // not throw it away. It is the one piece of state a history that felt right had to have: reaching
+    // for an old line and changing your mind is common, and losing half a typed line to it is the
+    // thing people remember.
+    draft: string
 
     // The next byte of input, refilling from the reader when what was read is spent.
     //
@@ -150,6 +179,11 @@ struct Editor
         self.line.clear()
         self.at = 0
 
+        // Every line starts at the newest end of the history, with no draft yet — so the first Up
+        // reaches the previous line however far the last one browsed.
+        self.browse = self.hist.len()
+        self.draft = ""
+
         // **A zero-length write, whose whole purpose is to get the caller's prompt onto the screen.**
         // A hosted sink buffers, and a prompt has no newline after it, so `prints("ogol> ")` sits in
         // C's buffer until something writes one -- which is the next thing this function echoes, one
@@ -215,13 +249,14 @@ struct Editor
                         self.edit(b)
     end getline
 
-    // The characters gathered back into a `string`, which is one `StrBuilder` and no validation.
+    // The characters gathered back into a `string`, which is one `StrBuilder` and no validation —
+    // **and the one place a finished line enters the history**, so that every way of ending a line
+    // records it and no future way can forget to.
     finish(*self) -> string
-        var out = str_builder()
+        val line = self.text_of()
 
-        for c in self.line.view() do out.push_char(c)
-
-        out.finish()
+        self.remember(line)
+        line
     end finish
 
     // One keystroke's worth of editing.
@@ -238,6 +273,8 @@ struct Editor
         elif b == 6 then self.right()                    // Ctrl-F
         elif b == 21 then self.kill_line()               // Ctrl-U
         elif b == 11 then self.kill_to_end()             // Ctrl-K
+        elif b == 16 then self.earlier()                 // Ctrl-P
+        elif b == 14 then self.later()                   // Ctrl-N
         elif b >= 32
             val c = self.char_from(b)
 
@@ -304,12 +341,11 @@ struct Editor
     end numbered
 
     // The last byte of a sequence, where the key is when it is not a number.
-    //
-    // Up and down are deliberately absent rather than forgotten: with no history to move through
-    // there is nothing for them to do, and echoing them would walk the terminal's cursor off the line.
     final_key(*self, c: u8)
         if c == u8('D') then self.left()
         elif c == u8('C') then self.right()
+        elif c == u8('A') then self.earlier()
+        elif c == u8('B') then self.later()
         elif c == u8('H') then self.to_start()
         elif c == u8('F') then self.to_end()
     end final_key
@@ -471,6 +507,86 @@ struct Editor
         self.line.truncate(self.at)
         self.redraw(w)
     end kill_to_end
+
+    // ## History
+    //
+    // **Up and down were swallowed until there was something to move through.** They still are when
+    // there is nothing: an editor whose history is empty answers an Up by doing nothing at all, which
+    // is better than a beep and much better than the sequence's last byte landing in the line.
+
+    // The whole line replaced by `text`, redrawn where it stands.
+    //
+    // **The old line's width is what decides how much to paint over**, not the new one's: replacing
+    // `print something long` with `print 1` leaves twelve columns of the old line on the screen, and
+    // nothing else in this file has to think about that because nothing else shortens a line from the
+    // left. `backspace` and `delete_at` each drop one character and hand `redraw` its width.
+    replace(*self, text: string)
+        self.to_start()
+
+        val was = self.columns_from(0)
+
+        self.line.clear()
+
+        for c in text.chars do self.line.push(c)
+
+        self.at = self.line.len()
+        self.put_from(0)
+
+        val now = self.columns_from(0)
+        val over: usize = if was > now then was - now else 0
+
+        self.blank(over)
+        self.back(over)
+    end replace
+
+    // The line as text, for putting into the history or keeping as the draft.
+    text_of(self) -> string
+        var out = str_builder()
+
+        for c in self.line.view() do out.push_char(c)
+
+        out.finish()
+    end text_of
+
+    // Up: one step towards the oldest.
+    //
+    // **Leaving the draft is where it gets saved**, which is the only moment it can be: once the line
+    // holds a recalled entry the typed one is gone. Coming back to `hist.len()` is what restores it.
+    earlier(*self)
+        if self.browse == 0 then return
+
+        if self.browse == self.hist.len() then self.draft = self.text_of()
+
+        self.browse -= 1
+        self.replace(self.hist.view()[self.browse])
+    end earlier
+
+    // Down: one step towards the line being typed, and then to the draft itself.
+    later(*self)
+        if self.browse >= self.hist.len() then return
+
+        self.browse += 1
+
+        if self.browse == self.hist.len() then
+            self.replace(self.draft)
+        else
+            self.replace(self.hist.view()[self.browse])
+    end later
+
+    // What a finished line leaves behind.
+    //
+    // **A blank line and an immediate repeat are not worth remembering**, which is every shell's rule
+    // and for the same reason: history is for reaching a line that took effort to type, and neither of
+    // those did. A repeat further back is kept — `ls` twice with something in between is two different
+    // moments, and dropping the second would put the arrows somewhere surprising.
+    remember(*self, line: string)
+        if line == "" then return
+        if !self.hist.is_empty() && self.hist.view()[self.hist.len() - 1] == line then return
+
+        if self.hist.len() >= history_limit then self.hist.remove(0)
+
+        self.hist.push(line)
+    end remember
 end Editor
 
 impl Iterate[string] for Editor
@@ -486,4 +602,8 @@ impl Iterate[string] for Editor
 // needs to know how far along the row the line starts, and a caller goes on printing its own prompt
 // exactly as it would before `console_lines`. That is what makes a continuation prompt -- a REPL
 // holding an unfinished expression -- a property of the caller rather than a field here.
-editor(r: *Reader, w: *Writer) -> Editor = Editor(r, w, buf(), 0, [0; 64], [], 0, false, false)
+// **The history belongs to the editor and so outlives a line but not a session**, which is the right
+// lifetime for it: one console, one history, and nothing to save or load. A program wanting it to
+// survive a restart would have to write it somewhere, and where is a question about that program.
+editor(r: *Reader, w: *Writer) -> Editor =
+    Editor(r, w, buf(), 0, [0; 64], [], 0, false, false, buf(), 0, "")

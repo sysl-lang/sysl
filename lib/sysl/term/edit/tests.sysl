@@ -237,6 +237,83 @@ unhandled_escape_swallowed()
     assert_slice_eq(lines_of("ab\u{1b}[A\r").view(), ["ab"])
 end unhandled_escape_swallowed
 
+// -- history --------------------------------------------------------------------------------------
+//
+// Up is `ESC [ A` and Down is `ESC [ B`; both were swallowed until there was something to move
+// through. Ctrl-P and Ctrl-N are the same two keys for readline hands.
+
+@test("the up arrow recalls the line before")
+up_recalls()
+    assert_slice_eq(lines_of("one\rtwo\r\u{1b}[A\r").view(), ["one", "two", "two"])
+end up_recalls
+
+@test("and again reaches the one before that")
+up_twice()
+    assert_slice_eq(lines_of("one\rtwo\r\u{1b}[A\u{1b}[A\r").view(), ["one", "two", "one"])
+end up_twice
+
+@test("up at the oldest entry stays there rather than wrapping")
+up_stops_at_the_oldest()
+    assert_slice_eq(lines_of("one\rtwo\r\u{1b}[A\u{1b}[A\u{1b}[A\u{1b}[A\r").view(),
+                    ["one", "two", "one"])
+end up_stops_at_the_oldest
+
+@test("down comes back towards the newest")
+down_returns()
+    assert_slice_eq(lines_of("one\rtwo\r\u{1b}[A\u{1b}[A\u{1b}[B\r").view(), ["one", "two", "two"])
+end down_returns
+
+// **The case the whole design is arranged around.** Half a line typed, a change of mind, and it is
+// still there — losing it is what makes a history feel worse than none.
+@test("down past the newest restores what was being typed")
+down_restores_the_draft()
+    assert_slice_eq(lines_of("one\rhalf\u{1b}[A\u{1b}[B\r").view(), ["one", "half"])
+end down_restores_the_draft
+
+@test("a recalled line can be edited before it is entered")
+a_recalled_line_is_editable()
+    assert_slice_eq(lines_of("ab\r\u{1b}[Ac\r").view(), ["ab", "abc"])
+end a_recalled_line_is_editable
+
+@test("up with nothing behind it does nothing at all")
+up_with_no_history()
+    assert_slice_eq(lines_of("\u{1b}[Aab\r").view(), ["ab"])
+end up_with_no_history
+
+@test("down with nothing to come back to does nothing either")
+down_with_no_history()
+    assert_slice_eq(lines_of("\u{1b}[Bab\r").view(), ["ab"])
+end down_with_no_history
+
+// Neither is worth reaching back for, and both would push the lines that are further away.
+@test("a blank line is not remembered")
+blank_not_remembered()
+    assert_slice_eq(lines_of("one\r\r\u{1b}[A\r").view(), ["one", "", "one"])
+end blank_not_remembered
+
+@test("nor is an immediate repeat")
+repeat_not_remembered()
+    assert_slice_eq(lines_of("one\rone\r\u{1b}[A\u{1b}[A\r").view(), ["one", "one", "one"])
+end repeat_not_remembered
+
+@test("Ctrl-P and Ctrl-N are the arrows")
+ctrl_p_and_ctrl_n()
+    assert_slice_eq(lines_of("one\rtwo\r\u{10}\u{10}\u{e}\r").view(), ["one", "two", "two"])
+end ctrl_p_and_ctrl_n
+
+@test("SS3 up and down work too")
+ss3_up_and_down()
+    assert_slice_eq(lines_of("one\rtwo\r\u{1b}OA\u{1b}OA\r").view(), ["one", "two", "one"])
+end ss3_up_and_down
+
+// **Recalling a shorter line has to paint over the longer one it replaced**, which is the one piece
+// of arithmetic here that a test looking only at the answer would never see.
+@test("a recalled short line paints over the long one it replaced")
+recall_paints_over()
+    assert_eq(echo_of("ab\rwxyz\u{1b}[A\r"),
+              "ab\r\n" + "wxyz" + "\b\b\b\b" + "ab" + "  " + "\b\b" + "\r\n")
+end recall_paints_over
+
 // -- text -----------------------------------------------------------------------------------------
 
 @test("a multi-byte character is one character in the line")
