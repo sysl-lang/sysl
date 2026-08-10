@@ -86,3 +86,126 @@ jobs:
 
       - name: Test
         run: sbt -batch syslJVM/test
+
+  # An **interim** compiler for `sysl.sh`'s `dev` to document against.
+  #
+  # **This is what lets documentation be written as a feature lands rather than at a release.** The
+  # site compiles every fenced block with the compiler `syslVersion` names, so before this job existed
+  # a page for anything still on dev was not merely premature — it was unverifiable, because no
+  # published compiler had the feature and `publishLocal` is banned. Pages were drafted blind and held,
+  # and a release was the price of writing a paragraph.
+  #
+  # **It goes to GitHub Packages and nowhere else.** Central and the brew formula are release-only.
+  #
+  # `needs: test` is the whole of the quality bar, and it is the right one: what this publishes is
+  # what a downstream repository will compile against, so publishing a tree whose own suite is red
+  # would put the failure somewhere it reads as somebody else's bug.
+  publish-interim:
+    # Pushes to dev only. A pull request must not publish: it would burn a version number on a commit
+    # that may never land, and the token on a fork's PR cannot write packages anyway.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up sbt
+        uses: sbt/setup-sbt@v1
+
+      - name: Cache sbt
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.sbt
+            ~/.cache/coursier
+          key: ${{ runner.os }}-sbt-${{ hashFiles('build.sbt', 'project/**') }}
+          restore-keys: ${{ runner.os }}-sbt-
+
+      # **Stamped with the commit, and the patch bumped past the release.**
+      #
+      # GitHub Packages will not republish a version that exists — `409 Conflict`, and `-SNAPSHOT` is
+      # not special to it — so a fixed development version fails on the second push. The commit is what
+      # makes each one unique, and it is worth more than a counter would be: `syslVersion` in
+      # `sysl.sh` then *names a sysl commit*, so "do the two dev branches correspond?" is answered by
+      # reading one line rather than by remembering when the last interim was cut.
+      #
+      # The patch is bumped because `build.sbt` holds the version last **released**, and an interim is
+      # newer than that. `0.0.37-abc1234` would sort *before* `0.0.37` under semver, which is the
+      # opposite of the truth; `0.0.38-abc1234` is a prerelease of what comes next, which is what this
+      # is. If the next release turns out to be a minor bump instead, nothing breaks — every consumer
+      # pins an exact version and none resolves a range.
+      - name: Work out the interim version
+        id: interim
+        run: |
+          set -euo pipefail
+          released=$(grep -oE '^ThisBuild / version[[:space:]]*:=[[:space:]]*"[^"]+"' build.sbt \
+                     | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          next=$(echo "$released" | awk -F. '{ print $1 "." $2 "." $3 + 1 }')
+          echo "version=$next-$(git rev-parse --short=8 HEAD)" >> "$GITHUB_OUTPUT"
+
+      # **Re-running a workflow on the same commit must not fail**, and without this it would: the
+      # version is derived from the commit, GitHub Packages will not take it twice, and the second
+      # attempt dies on `409 Conflict` — which reads as a broken publish rather than as "already done".
+      # Re-runs are routine (a flake, a cancelled run, a retried queue), so the honest behaviour is to
+      # notice and skip.
+      #
+      # A missing version answers **404** and a present one **302**, redirecting to the artifact —
+      # checked rather than assumed, so this does not treat some other failure as absence and try to
+      # publish over it.
+      - name: Has it been published already?
+        id: exists
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          v="${{ steps.interim.outputs.version }}"
+          url="https://maven.pkg.github.com/sysl-lang/sysl/sh/sysl/sysl_3/$v/sysl_3-$v.pom"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -u "${{ github.actor }}:$GITHUB_TOKEN" "$url")
+
+          echo "$v -> HTTP $code"
+
+          if [ "$code" = "404" ]; then
+            echo "published=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=yes" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report the interim version
+        run: |
+          if [ "${{ steps.exists.outputs.published }}" = "yes" ]; then
+            echo "${{ steps.interim.outputs.version }} is already published — skipping"
+          else
+            echo "publishing ${{ steps.interim.outputs.version }}"
+          fi
+
+      # `publish` builds the javadoc jar, so this carries the scaladoc workaround the release steps
+      # carry. It is a JDK bug rather than anything of sysl's — harmless where it is not needed, and
+      # the run dies on exit 134 *before uploading anything* where it is.
+      - name: Publish to GitHub Packages
+        if: steps.exists.outputs.published == 'no'
+        env:
+          SYSL_PUBLISH_GITHUB: "1"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: |
+          sbt -J-XX:-DoEscapeAnalysis -batch \
+            'set ThisBuild / version := "${{ steps.interim.outputs.version }}"' \
+            syslJVM/publish
+
+      # So that a person bumping `sysl.sh` does not have to open the log to find the line to paste.
+      - name: Say how to use it
+        run: |
+          echo "### Interim published" >> "$GITHUB_STEP_SUMMARY"
+          echo '```scala' >> "$GITHUB_STEP_SUMMARY"
+          echo 'val syslVersion = "${{ steps.interim.outputs.version }}"' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "in \`sysl.sh/build.sbt\`, on its \`dev\` branch." >> "$GITHUB_STEP_SUMMARY"
