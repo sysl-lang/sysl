@@ -159,6 +159,130 @@ class TestFileTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
   }
 
+  /** A closure is lowered to a function of its own under a name no reader wrote, so the rule has to
+   * follow the body it was written in rather than the name it was filed under. Both directions are
+   * pinned here, because a fix that only widened the exemption would pass the first three and lose
+   * the fourth.
+   */
+  "a closure is judged by the body it was written in" - {
+
+    val consumer =
+      "module m\n\ndouble(n: int) -> int = n * 2\n\n" +
+        "apply(f: &Fn(int) -> int, n: int) -> int = f(n)"
+
+    val scaffolding = "module m\n@tests\n\nquadruple(n: int) -> int = double(double(n))"
+
+    "a lambda in a test may call what the test file declared" in {
+      val ran = ranIn(
+        ("", "main.sysl", "import m.*\nprint(double(21))"),
+        ("m", "m.sysl", consumer),
+        ("m", "tests.sysl",
+         scaffolding + "\n\n@test\na_lambda_names_its_own_file() =\n" +
+           "    assert(apply(v -> quadruple(v), 3) == 12)\n"),
+      )
+
+      ran.map(o => o.test.display -> o.passed) shouldBe List("a_lambda_names_its_own_file" -> true)
+    }
+
+    "and a bare name, which is the capture-free closure and so the same question" in {
+      val ran = ranIn(
+        ("", "main.sysl", "import m.*\nprint(double(21))"),
+        ("m", "m.sysl", consumer),
+        ("m", "tests.sysl",
+         scaffolding + "\n\n@test\na_bare_name_from_a_test_file() =\n" +
+           "    assert(apply(quadruple, 3) == 12)\n"),
+      )
+
+      ran.map(o => o.test.display -> o.passed) shouldBe List("a_bare_name_from_a_test_file" -> true)
+    }
+
+    "and storage it declared, which is the third way a name is reached at all" in {
+      val ran = ranIn(
+        ("", "main.sysl", "import m.*\nprint(double(21))"),
+        ("m", "m.sysl", consumer),
+        ("m", "tests.sysl",
+         "module m\n@tests\n\nval fixture: int = 7\n\n" +
+           "@test\na_lambda_reads_test_storage() =\n    assert(apply(v -> v + fixture, 3) == 10)\n"),
+      )
+
+      ran.map(o => o.test.display -> o.passed) shouldBe List("a_lambda_reads_test_storage" -> true)
+    }
+
+    /** A generic taking a callable is instantiated at the closure's own type, and the call inside
+     * that instantiation is a direct call on the closure's body — so an ordinary library function
+     * ends up naming it. Reporting that would name `$closure0.call` at a line in the library, which
+     * is neither a name the program contains nor a place the reader can act on.
+     */
+    "and a generic instantiated at a test's closure is not a mistake to report" in {
+      val ran = ranIn(
+        ("", "main.sysl", "import m.*\nprint(double(21))"),
+        ("m", "m.sysl",
+         "module m\n\ndouble(n: int) -> int = n * 2\n\n" +
+           "both[T](f: (T, T) -> T, a: T, b: T) -> T = f(a, b)"),
+        ("m", "tests.sysl",
+         scaffolding + "\n\n@test\na_generic_at_a_test_closure() =\n" +
+           "    assert(both((x, y) -> quadruple(x) + y, 2, 3) == 11)\n"),
+      )
+
+      ran.map(o => o.test.display -> o.passed) shouldBe List("a_generic_at_a_test_closure" -> true)
+    }
+
+    "and a nested function, which is a closure with a name" in {
+      val ran = ranIn(
+        ("", "main.sysl", "import m.*\nprint(double(21))"),
+        ("m", "m.sysl", consumer),
+        ("m", "tests.sysl",
+         scaffolding + "\n\n@test\na_nested_function_in_a_test() =\n" +
+           "    eight_times(n: int) -> int = quadruple(n) * 2\n\n" +
+           "    assert(eight_times(2) == 16)\n"),
+      )
+
+      ran.map(o => o.test.display -> o.passed) shouldBe List("a_nested_function_in_a_test" -> true)
+    }
+
+    "and a closure inside a closure, which is still inside the test that wrote it" in {
+      val ran = ranIn(
+        ("", "main.sysl", "import m.*\nprint(double(21))"),
+        ("m", "m.sysl", consumer),
+        ("m", "tests.sysl",
+         scaffolding + "\n\n@test\na_closure_inside_a_closure() =\n" +
+           "    assert(apply(v -> apply(w -> quadruple(w), v), 3) == 12)\n"),
+      )
+
+      ran.map(o => o.test.display -> o.passed) shouldBe List("a_closure_inside_a_closure" -> true)
+    }
+
+    "an ordinary function's closure may NOT, exactly as the function itself may not" in {
+      val e = errIn(
+        ("", "main.sysl", "import m.*\nprint(twice_over(21))"),
+        ("m", "m.sysl", consumer + "\n\ntwice_over(n: int) -> int = apply(v -> quadruple(v), n)"),
+        ("m", "tests.sysl", scaffolding),
+      )
+
+      e should include("'m.quadruple' is declared in a file that said '@tests'")
+    }
+
+    /** The exemption is sound only because the drop reaches the lowered body too. Left behind, it
+     * would call a helper that is no longer there — and the method table registering it as an `Fn`
+     * is one of pruning's *roots*, so nothing downstream would remove it either.
+     *
+     * The closure's **type** is still defined, exactly as the types a test file declares are: a
+     * definition nothing reads costs the output no code. What must not be there is a body.
+     */
+    "and what a test's closure lowered to is dropped with the test" in {
+      val out = irIn(
+        ("", "main.sysl", "import m.*\nprint(double(21))"),
+        ("m", "m.sysl", consumer),
+        ("m", "tests.sysl",
+         scaffolding + "\n\n@test\na_lambda_names_its_own_file() =\n" +
+           "    assert(apply(v -> quadruple(v), 3) == 12)\n"),
+      )
+
+      out should not include "quadruple"
+      out.linesIterator.filter(_.startsWith("define")).mkString("\n") should not include "closure"
+    }
+  }
+
   "anything else that names one is told so where it wrote the name" - {
 
     "a function of an ordinary file" in {

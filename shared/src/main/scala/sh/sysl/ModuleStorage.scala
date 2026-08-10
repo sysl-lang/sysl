@@ -28,6 +28,11 @@ trait ModuleStorage extends ModuleFiles {
   protected def analyzeVal(key: String): TVal = inDecl(key)(at(valDecls(key).pos) {
     val decl = valDecls(key)
     val ty   = globalType(key)
+
+    // Storage a test file declared is scaffolding, and so is anything its initializer lowers to —
+    // the same rule a body gets, asked here because an initializer is analyzed outside every body.
+    inTestBody = testOnlyDecls(key)
+
     val init = analyzeExpr(decl.value, Some(ty))
 
     if disagree(init.ty, ty) then
@@ -68,6 +73,9 @@ trait ModuleStorage extends ModuleFiles {
   protected def analyzeStaticVar(key: String): TVal = inDecl(key)(at(staticVarDecls(key).pos) {
     val decl = staticVarDecls(key)
     val ty   = globalType(key)
+
+    inTestBody = testOnlyDecls(key)
+
     val init = decl.init.map { e =>
       val t = analyzeExpr(e, Some(ty))
 

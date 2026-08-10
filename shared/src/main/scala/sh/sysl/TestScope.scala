@@ -16,6 +16,14 @@ import scala.collection.mutable
  *     beside what it tests and `Tests.strip` drops it in the same builds;
  *   - anything else may not, and is told so where it wrote the name.
  *
+ * **A closure is judged by the body it was written in, not by the name it was filed under.** It is
+ * lowered to a function of its own under a name no reader wrote, so on its own terms it belongs to
+ * no file and would be held to the third rule while sitting inside something the first two exempt —
+ * a lambda in a test naming that test's own helper, reported as though a shipped function had named
+ * it. `Closures.lowerClosure` answers that where the answer is still known, by putting the lowered
+ * name into `testOnlyDecls` when the enclosing body is one a test build keeps. That makes the
+ * exemption and the drop the same fact rather than two that have to agree.
+ *
  * That the two halves agree is what makes the drop safe rather than lucky: every reference into a
  * test file comes from something dropped in exactly the builds the file is, so a tree that has been
  * stripped can hold no reference to anything that went with it.
@@ -63,10 +71,27 @@ trait TestScope extends AnalyzerBase {
    * is no path to it but the three below.
    */
   private def named(e: TExpr, testOnly: Set[String]): Option[String] = e match
-    case TCall(name, _, _, _) if testOnly(name)    => Some(name)
-    case TFuncAddr(name, _, _) if testOnly(name)   => Some(name)
-    case TGlobal(symbol, _, _) if testOnly(symbol) => Some(symbol)
-    case _                                         => None
+    case TCall(name, _, _, _) if reportable(name, testOnly)    => Some(name)
+    case TFuncAddr(name, _, _) if reportable(name, testOnly)   => Some(name)
+    case TGlobal(symbol, _, _) if reportable(symbol, testOnly) => Some(symbol)
+    case _                                                     => None
+
+  /** Whether naming this is a mistake worth telling somebody about.
+   *
+   * A **lowered** closure is in the set and is not, and the case that says why is a generic taking a
+   * callable: `is_sorted_by(xs, (a, b) -> a < b)` instantiates the library's own function at the
+   * closure's type, and the `lt(…)` inside that instantiation is a direct call on the closure's body.
+   * The instantiation is an ordinary library function by then, so the walk arrives at it — and what it
+   * would say is that `$closure4.call` may not be named here, which is a name the program does not
+   * contain and the reader cannot go and look at.
+   *
+   * **Nothing is given up by staying quiet.** The rule exists so that a stripped tree holds no
+   * reference to what went, and an instantiation keyed on a test's closure type can only have been
+   * demanded by that test — so it goes when the test does, which is `Reachability.prune`'s answer
+   * rather than this pass's. What is left for this pass is exactly the names a reader wrote.
+   */
+  private def reportable(name: String, testOnly: Set[String]): Boolean =
+    testOnly(name) && !Closures.lowered(name)
 
   /** Walks a tree, reporting each reference into a test file and going no deeper into one.
    *

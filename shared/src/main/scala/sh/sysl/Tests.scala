@@ -143,6 +143,15 @@ object Tests {
    * The **types** it declared are left, exactly as `Reachability.prune` leaves them: a type is
    * emitted for its layout rather than for anything that runs, so an unused one costs a definition
    * nothing reads and no code at all.
+   *
+   * **A method table is not**, and it is the one thing here that has to go with a function rather
+   * than outlive it. A closure lowered inside a test body is dropped with the test (`testOnlyDecls`
+   * carries the name the compiler gave it), and the table registering it as an implementation of
+   * `Fn` would otherwise be left pointing at a function no longer in the tree — which `prune` cannot
+   * repair, since a table is one of its *roots*: it would follow the slot and keep the body, and the
+   * body names the helpers that have just gone. Dropping the table is what makes the removal
+   * complete, and it can catch nothing else: an `impl` may not sit in a `@tests` file, so the only
+   * slot a dropped name can fill is a closure's own.
    */
   def strip(program: TProgram): TProgram = {
     val tests = program.tests.map(_.func).toSet
@@ -151,6 +160,7 @@ object Tests {
     if gone.isEmpty then program
     else
       program.copy(
+        vtables = program.vtables.filterNot(_.slots.exists(s => gone(s.target))),
         funcs = program.funcs.filterNot(f => gone(f.name)),
         vals = program.vals.filterNot(v => gone(v.symbol)),
         externs = program.externs.filterNot(e => gone(e.name)),

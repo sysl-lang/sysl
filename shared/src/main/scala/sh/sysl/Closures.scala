@@ -50,8 +50,16 @@ object Closures {
    */
   private val prefix = s"${Modules.sep}closure"
 
+  /** And what the environment shared by one block of nested functions begins with, for the same
+   * reason (`12 §5a`).
+   */
+  private val envPrefix = s"${Modules.sep}env"
+
   /** The base name of the struct one closure literal lowers to. */
   def base(n: Int): String = s"$prefix$n"
+
+  /** The base name of the struct one block of nested functions shares. */
+  def envBase(n: Int): String = s"$envPrefix$n"
 
   /** Whether a type is the struct behind a closure literal — something a program wrote and did not
    * name. What a reader is told about one has to say "closure" and "captures", never the name the
@@ -66,6 +74,15 @@ object Closures {
    * own filing is not something a reader wrote and not something they can go and look at.
    */
   def symbol(name: String): Boolean = name.startsWith(prefix)
+
+  /** Whether a function's name is one the **lowering** made up rather than one a reader wrote — a
+   * closure's body or a nested function's.
+   *
+   * Wider than `symbol` by the nested-function case, and asked where the two are the same thing: a
+   * diagnostic naming one of these names nothing the program contains, and a rule stated over what a
+   * reader wrote has nothing to say about it.
+   */
+  def lowered(name: String): Boolean = name.startsWith(prefix) || name.startsWith(envPrefix)
 }
 
 trait Closures extends CallAnalysis {
@@ -136,6 +153,13 @@ trait Closures extends CallAnalysis {
     structInsts(struct.base) = struct
 
     val name = s"${Type.mangle(struct)}.call"
+
+    // A closure written inside a test is the test's, and is scaffolding on both counts the header
+    // says (`testing.md`): it may name what the test file declared, and every build that drops the
+    // test drops it too. Recorded before the body is analyzed, so that a closure nested inside this
+    // one is judged against a set this one is already in.
+    if inTestBody then testOnlyDecls += name
+
     val (func, ret) = at(pos)(analyzeNested(name, names.zip(ptypes), result, body,
       Some(Environment(struct, captured, byReference = false, fixed(captured)))))
 
@@ -192,13 +216,13 @@ trait Closures extends CallAnalysis {
     // `Environment`. That is what makes a nested function assigning to one of the block's locals
     // assign to the block's local, which is the thing the form exists for.
     val fields = captured.map(n => (n, Type.Ptr(lookupOpt(n).get._2)))
-    val env    = Type.Struct(s"${Modules.sep}env$environmentCount", Nil)
+    val env    = Type.Struct(Closures.envBase(environmentCount), Nil)
 
     environmentCount += 1
     env.fields = fields
     structInsts(env.base) = env
 
-    val local = declare(s"${Modules.sep}env${environmentCount - 1}", env)
+    val local = declare(Closures.envBase(environmentCount - 1), env)
     val here  = TAddrOf(TLoad(local, env), Type.Ptr(env))
     val self  = TLoad("self", Type.Ptr(env))
 
@@ -207,6 +231,9 @@ trait Closures extends CallAnalysis {
     // (`12 §5a`), so there is nothing here to infer and nothing to wait for.
     val lowered = group.map { f =>
       val fname = s"${Type.mangle(env)}.${f.name}"
+
+      // A nested function is a closure by another spelling, so it is the test's on the same terms.
+      if inTestBody then testOnlyDecls += fname
 
       funcInsts(fname) = (
         ("self", Type.Ptr(env)) :: f.params.map(p => (p.name, resolveType(p.typ, tsubst))),

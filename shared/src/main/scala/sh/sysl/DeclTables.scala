@@ -153,6 +153,22 @@ trait DeclTables extends Reporting {
    */
   protected val testOnlyDecls = mutable.Set.empty[String]
 
+  /** Whether the body being analyzed is one a test build keeps and every other build drops — a
+   * declaration written in a `@tests` file, or a `@test` function written anywhere (`testing.md`).
+   *
+   * It is carried rather than looked up because a **closure has no declaration to ask**. Lowering
+   * one produces a function under a name the compiler made up (`Closures.base`), and that name is in
+   * no table saying which file it came from — so a closure written inside a test would be
+   * indistinguishable from one written in the program, which is both halves of the rule wrong at
+   * once: the walk reports the test's own helpers as though a shipped function had named them, and
+   * the drop leaves the lowered body behind.
+   *
+   * Saved and restored across `analyzeNested` beside `currentFunctionName`, for the reason that one
+   * is: a closure interrupts a body that is still going, and a closure inside a closure is still
+   * inside whatever the outermost body was.
+   */
+  protected var inTestBody = false
+
   /** Types whose *declaration* was reported as a mistake, so that using one does not report it
    * again. A declaration is instantiated eagerly and therefore judged once, but a name can be
    * mentioned any number of times afterwards, and each mention would otherwise rebuild the same

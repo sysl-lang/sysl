@@ -180,6 +180,10 @@ trait AnalyzerBase extends Scoping {
     // `val`'s `__FUNCTION__` silently reported some unrelated function that a *previous pass* had
     // walked — the definition-time pass of `14 §4`, which runs before any storage is laid down.
     currentFunctionName = ""
+    // Cleared for the same reason, and it matters for the same one: a body left over from the last
+    // declaration walked would make a closure lowered outside any of them — in `main`, in a module
+    // `val`'s initializer — inherit whether *that* was a test.
+    inTestBody = false
     resetLocals()
     byNameLocals = Set.empty
     loops = Nil

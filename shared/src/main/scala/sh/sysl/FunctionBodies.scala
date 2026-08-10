@@ -77,9 +77,15 @@ trait FunctionBodies extends ModuleStorage {
     // this walk interrupts a function that is still going.
     val savedFuncName = currentFunctionName
 
+    // And whether that function is one a test build keeps, for the same reason: a closure written
+    // inside a test is scaffolding exactly as the test is, and nothing about the lowered body says
+    // so once the reset has cleared where it came from.
+    val savedInTest = inTestBody
+
     try
       resetFunction()
       currentFunctionName = savedFuncName
+      inTestBody = savedInTest
       retTy = declaredResult.getOrElse(Type.Unknown)
       retIsList = false
       // A nested function states its own signature, so a `...` on one is its own tail to walk; a
@@ -152,6 +158,7 @@ trait FunctionBodies extends ModuleStorage {
       (TFunc(name, tparams, result, tbody, variadic, requires, ensures, olds), result)
     finally
       currentFunctionName = savedFuncName
+      inTestBody = savedInTest
       scopes = savedScopes
       used.clear(); used ++= savedUsed
       readOnlyLocals.clear(); readOnlyLocals ++= savedReadOnly
@@ -188,6 +195,10 @@ trait FunctionBodies extends ModuleStorage {
     // `__FUNCTION__` reports what a reader wrote, and one written function is one name however many
     // times a generic was lowered.
     currentFunctionName = Modules.bare(f.name)
+    // Read off the declaration for the same reason, and off the declaration's own name rather than
+    // off `name`: an instantiation of a generic written in a test file is scaffolding exactly as the
+    // generic is, and its mangled key is in no table that remembers which file wrote it.
+    inTestBody = f.test.isDefined || testOnlyDecls(f.name)
     // A member's body sees `Self` alongside whatever type parameters it was instantiated with, so
     // the one substitution answers both questions and nothing downstream has to know the difference.
     tsubst = subst ++ memberSelf.getOrElse(name, Map.empty)
