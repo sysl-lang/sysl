@@ -37,10 +37,10 @@ trait QemuSupport extends Matchers {
    */
   private val boot = "shared/src/test/resources/qemu"
 
-  /** What it takes to boot one board: the emulator, the arguments before the image, the startup, the
-   * support package and the linker script. A target with no entry here has no recipe, and asking for
-   * one cancels rather than guessing — a wrong `-M` produces a program that hangs, not one that
-   * fails.
+  /** What it takes to boot one board: the machine it is, the target whose code it runs, the
+   * emulator, the arguments before the image, the startup, the support package and the linker
+   * script. A target with no board here has no recipe, and asking for one cancels rather than
+   * guessing — a wrong `-M` produces a program that hangs, not one that fails.
    *
    * **`bsp` is what the board owes the library**, and it is not scaffolding for the tests: a
    * freestanding sysl program names `putchar` whenever anything prints, and `malloc` and `free`
@@ -50,49 +50,74 @@ trait QemuSupport extends Matchers {
    *
    * A program that allocates **nothing** owes the board neither, and `linksWithoutSupport` is what
    * holds the compiler to that.
+   *
+   * ==A board carries its target rather than being found by one==
+   *
+   * This was a `Map` from target name to recipe until 2026-08-10, which made a target and a machine
+   * the same thing and put a ceiling of one machine per target on the whole tier. That ceiling is
+   * wrong on its own terms — a target is an *architecture* and an architecture has many machines —
+   * and `thumbv7em-freestanding` is where it started costing something, being the first row that
+   * deliberately serves two different chips.
+   *
+   * So the list is the unit and a target is a field on it. Two boards may name the same target, and
+   * the suites iterate boards; the console, the addresses and the machine arguments are all board
+   * facts and now live where the board does.
    */
-  private case class Board(qemu: String, machine: List[String], startup: String, bsp: String,
-                           script: String)
+  protected case class Board(name: String, target: Target, qemu: String, machine: List[String],
+                             startup: String, bsp: String, script: String)
 
-  private val boards: Map[String, Board] = Map(
-    Target.riscv32Freestanding.name ->
-      Board("qemu-system-riscv32", List("-M", "virt", "-bios", "none", "-nographic", "-kernel"),
-        "start_rv32.s", "bsp_rv32.c", "rv32.ld"),
+  protected val boards: List[Board] = List(
+    Board("virt", Target.riscv32Freestanding, "qemu-system-riscv32",
+      List("-M", "virt", "-bios", "none", "-nographic", "-kernel"),
+      "start_rv32.s", "bsp_rv32.c", "rv32.ld"),
 
     // The Arm half of the same board. It has no `sifive_test`, so the result channel is semihosting
     // — which has to be asked for, and a run without `-semihosting-config` reports nothing and
     // exits as though the program had said zero.
-    Target.thumbFreestanding.name ->
-      Board("qemu-system-arm",
-        List("-M", "mps2-an505", "-nographic", "-semihosting-config", "enable=on,target=native",
-          "-kernel"),
-        "start_thumb.s", "bsp_thumb.c", "thumb.ld"),
+    Board("mps2-an505", Target.thumbFreestanding, "qemu-system-arm",
+      List("-M", "mps2-an505", "-nographic", "-semihosting-config", "enable=on,target=native",
+        "-kernel"),
+      "start_thumb.s", "bsp_thumb.c", "thumb.ld"),
 
     // Armv6-M, which is the RP2040's core and not a smaller setting of the one above. QEMU has no
     // RP2040 machine, and this tier does not need one: what it is here to exercise is the
     // *architecture* — no Thumb-2, no divider, no unaligned access — running instructions the back
     // end actually chose. The micro:bit's nRF51822 is the Cortex-M0 QEMU does have.
-    Target.thumbv6mFreestanding.name ->
-      Board("qemu-system-arm",
-        List("-M", "microbit", "-nographic", "-semihosting-config", "enable=on,target=native",
-          "-kernel"),
-        "start_thumbv6m.s", "bsp_thumbv6m.c", "thumbv6m.ld"),
+    Board("microbit", Target.thumbv6mFreestanding, "qemu-system-arm",
+      List("-M", "microbit", "-nographic", "-semihosting-config", "enable=on,target=native",
+        "-kernel"),
+      "start_thumbv6m.s", "bsp_thumbv6m.c", "thumbv6m.ld"),
 
-    // Armv7E-M, the STM32 Nucleo boards' architecture. `mps2-an500` is a **Cortex-M7**, which is the
-    // NUCLEO-H753ZI's core; the M4F end of the same target has a machine of its own
-    // (`netduinoplus2`, an STM32F405) and is not wired here, because a board is keyed by target and
-    // one target admits one recipe.
+    // Armv7E-M, the STM32 Nucleo boards' architecture, on **both** of the cores its target row
+    // serves. The AN500 is a Cortex-M7 and the AN386 is a Cortex-M4, and the row covers the two on
+    // the argument that both pass a `double` in `d0`/`d1` under `eabihf` — an argument nothing ran
+    // until the second board existed.
     //
-    // Reaching a *second* machine for this target is the thing this map cannot express, and it is
-    // worth more here than it was for the others: `thumbv7em-freestanding` is the first row that
-    // deliberately serves two chips, on the argument that both pass a `double` in `d0`/`d1` under
-    // `eabihf`. Nothing yet runs the M4F end and so nothing yet tests that argument.
-    Target.thumbv7emFreestanding.name ->
-      Board("qemu-system-arm",
-        List("-M", "mps2-an500", "-nographic", "-semihosting-config", "enable=on,target=native",
-          "-kernel"),
-        "start_thumbv7em.s", "bsp_thumbv7em.c", "thumbv7em.ld")
+    // **The two share every file, which is the reason this pair and not another.** The AN386 is the
+    // AN500's map: `mps.ssram1` at address zero and the CMSDK UART at 0x40004000, measured with
+    // `info mtree -f` rather than assumed. So the M4 end costs one line and a different `-M`, and
+    // what differs between the runs is the *processor executing the image* and nothing else — which
+    // is exactly the claim the target row makes.
+    Board("mps2-an500", Target.thumbv7emFreestanding, "qemu-system-arm",
+      List("-M", "mps2-an500", "-nographic", "-semihosting-config", "enable=on,target=native",
+        "-kernel"),
+      "start_thumbv7em.s", "bsp_thumbv7em.c", "thumbv7em.ld"),
+
+    Board("mps2-an386", Target.thumbv7emFreestanding, "qemu-system-arm",
+      List("-M", "mps2-an386", "-nographic", "-semihosting-config", "enable=on,target=native",
+        "-kernel"),
+      "start_thumbv7em.s", "bsp_thumbv7em.c", "thumbv7em.ld")
   )
+
+  /** Every board that runs `t`'s code. A target with none has no recipe here at all. */
+  protected def boardsFor(t: Target): List[Board] = boards.filter(_.target == t)
+
+  /** One board for `t`, for a check that is about the *target* rather than about a machine — a link
+   * that must not name an allocator is the same link on every board of an architecture. Cancels
+   * rather than guessing when the target has no recipe.
+   */
+  protected def someBoard(t: Target): Board =
+    boardsFor(t).headOption.getOrElse(cancel(s"no QEMU recipe for ${t.name}"))
 
 
   /** The board's console, as a sysl module a test program imports.
@@ -112,9 +137,9 @@ trait QemuSupport extends Matchers {
    * reads through it — `sysl.print`'s `Stdout` uses the same trick, and for the same reason: a
    * destination fixed at compile time keeps no state.
    */
-  protected def boardModule(t: Target, extra: String = ""): Source = {
-    val regs = t.name match
-      case n if n == Target.riscv32Freestanding.name =>
+  protected def boardModule(b: Board, extra: String = ""): Source = {
+    val regs = b.name match
+      case "virt" =>
         """struct Uart
           |    data: volatile u8
           |
@@ -127,7 +152,7 @@ trait QemuSupport extends Matchers {
           |console() -> *Writer = uart
           |""".stripMargin
 
-      case n if n == Target.thumbFreestanding.name =>
+      case "mps2-an505" =>
         """struct Uart
           |    data: volatile u32
           |    state: volatile u32
@@ -150,7 +175,8 @@ trait QemuSupport extends Matchers {
       // The AN500's CMSDK UART is the AN505's device at a different address -- five of them in the
       // APB region from 0x40004000, of which `-nographic` wires the first to QEMU's stdout. Same
       // word-wide registers, and the same refusal to transmit until `bauddiv` and `ctrl` are set.
-      case n if n == Target.thumbv7emFreestanding.name =>
+      // The AN386 is the same board a processor generation earlier and puts them in the same place.
+      case "mps2-an500" | "mps2-an386" =>
         """struct Uart
           |    data: volatile u32
           |    state: volatile u32
@@ -174,7 +200,7 @@ trait QemuSupport extends Matchers {
       // and its ready flag is an *event* that has to be cleared before the next byte — a second
       // write without clearing spins forever on a stale ready. `bsp_thumbv6m.c` says what each
       // number is; the pin is the micro:bit's wiring and the rest is the chip's.
-      case n if n == Target.thumbv6mFreestanding.name =>
+      case "microbit" =>
         """struct Reg
           |    v: volatile u32
           |
@@ -252,8 +278,8 @@ trait QemuSupport extends Matchers {
    * `-fuse-ld=lld`, because these are ELF images and the system linker on a Mac is not an ELF
    * linker.
    */
-  protected def bootUnderQemu(t: Target, src: String, seconds: Int = 20): (Int, String) =
-    bootUnderQemu(t, List(Source("p.sysl", src)), seconds)
+  protected def bootUnderQemu(board: Board, src: String, seconds: Int = 20): (Int, String) =
+    bootUnderQemu(board, List(Source("p.sysl", src)), seconds)
 
   /** The same, for a program that is more than one file.
    *
@@ -279,9 +305,9 @@ trait QemuSupport extends Matchers {
    * a claim something can fail. A program that names one gets `undefined symbol: free`, which is the
    * message the board build gave and the reason the card exists.
    */
-  protected def linksWithoutSupport(t: Target, sources: List[Source]): (Int, String) = {
-    val board = boards.getOrElse(t.name, cancel(s"no QEMU recipe for ${t.name}"))
-    val cc    = Toolchain.findClang(t).getOrElse(cancel(s"no clang here has a back end for ${t.name}"))
+  protected def linksWithoutSupport(board: Board, sources: List[Source]): (Int, String) = {
+    val t  = board.target
+    val cc = Toolchain.findClang(t).getOrElse(cancel(s"no clang here has a back end for ${t.name}"))
 
     if !present("ld.lld") then cancel(s"ld.lld is not installed, so a ${t.name} image cannot be linked")
 
@@ -308,11 +334,11 @@ trait QemuSupport extends Matchers {
       for f <- List(prog, start, image) do try deleteFile(f) catch case _: Exception => ()
   }
 
-  protected def bootUnderQemu(t: Target, sources: List[Source], seconds: Int): (Int, String) = {
-    val board = boards.getOrElse(t.name, cancel(s"no QEMU recipe for ${t.name}"))
-    val cc    = Toolchain.findClang(t).getOrElse(cancel(s"no clang here has a back end for ${t.name}"))
+  protected def bootUnderQemu(board: Board, sources: List[Source], seconds: Int): (Int, String) = {
+    val t  = board.target
+    val cc = Toolchain.findClang(t).getOrElse(cancel(s"no clang here has a back end for ${t.name}"))
 
-    if !present(board.qemu) then cancel(s"${board.qemu} is not installed, so ${t.name} cannot be booted")
+    if !present(board.qemu) then cancel(s"${board.qemu} is not installed, so ${board.name} cannot be booted")
     if !present("ld.lld") then cancel(s"ld.lld is not installed, so a ${t.name} image cannot be linked")
 
     // The compiler's own message, not a summary of it: a diagnostic swallowed here is a diagnostic
@@ -358,7 +384,7 @@ trait QemuSupport extends Matchers {
       // so reading the path out of a log is too late. Nothing reads the variable in an ordinary run.
       envVar("SYSL_QEMU_KEEP") match
         case Some(dir) =>
-          val kept = s"$dir/${t.cpu.symbol}-${image.split('/').last}"
+          val kept = s"$dir/${board.name}-${image.split('/').last}"
           exec(Seq("cp", image, kept))
           println(s"[qemu] kept $kept")
         case None =>

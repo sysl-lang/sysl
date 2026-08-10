@@ -108,7 +108,7 @@ class NoAllocEmissionTests extends AnyFreeSpec with Matchers with QemuSupport {
    * cannot: a call that survives to the link, on a board with no allocator to resolve it.
    */
   "and it links against the board's startup alone, with no allocator anywhere" in {
-    val (status, notes) = linksWithoutSupport(bare,
+    val (status, notes) = linksWithoutSupport(someBoard(bare),
       List(Source("p.sysl",
         s"@no_alloc\n$uart\nvar a = [u8('a'), u8('b')]\nval s = a[..]\nputc(u8(s.len))\n")))
 

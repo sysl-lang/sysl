@@ -36,6 +36,25 @@ _start:
     // the report blames the callee.
     ldr  sp, =_stack_top
 
+    // **Enable the FPU before anything can use it.** The triple is `thumbv8m.main-none-eabihf`, so
+    // clang gives the core an `fpv5-d16` and the back end is free to reach for VFP anywhere -- and a
+    // Cortex-M denies coprocessor access out of reset, so the first such instruction raises a
+    // UsageFault with the NOCP bit. CPACR is at 0xE000ED88, bits 23:20 being full access to CP10 and
+    // CP11.
+    //
+    // **This was missing until 2026-08-10, and cost nothing only because nothing had used a float.**
+    // Every program that had ever run on this board was integer, so the omission was invisible. The
+    // first `f32` program written for this tier faulted here and reported a status of 99 -- on this
+    // board alone, while the two Armv7E-M boards, whose startup did enable it, passed. That is the
+    // argument for testing the FPU deliberately rather than waiting for a program that happens to
+    // want one: the gap sat here for as long as the board has existed and no suite could see it.
+    ldr  r0, =0xE000ED88
+    ldr  r1, [r0]
+    orr  r1, r1, #(0xF << 20)
+    str  r1, [r0]
+    dsb
+    isb
+
     // Zero `.bss`, which is the startup's job on a board and nobody else's. The section is NOBITS,
     // so the loader writes nothing for it and a program finds whatever the RAM held -- and this
     // board's SRAM is not zero at reset. What that costs is not a subtly wrong number: sysl puts a

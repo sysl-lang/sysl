@@ -162,12 +162,33 @@ with it because nothing that has run on the AN505 used a float; that is a proper
 programs rather than of the board, and it is not one to inherit on a target whose whole reason for
 existing is its FPU.
 
-**The M4F end of this target is not wired up.** One row serves both Nucleo cores on the argument
-that an M4F and an M7 both pass a `double` in `d0`/`d1` under `eabihf` — and nothing here tests that,
-because `boards` is keyed by target and one target admits one recipe. `netduinoplus2` (an STM32F405)
-is the machine for it, and it needs more than an address: its flash is a **ROM** region at
-`0x08000000` aliased at zero, so `.data` has to be copied to SRAM by the startup, which no board
-here does yet.
+## thumbv7em, again — `qemu-system-arm -M mps2-an386 …`
+
+**The same target on a Cortex-M4, which is the other core its row serves.** That row covers the M4F
+and the M7 together, and until this board existed only the M7 end had ever executed an instruction —
+so "one row serves both" was a claim about *code generation*, measured against clang, with nothing
+running behind it.
+
+**What it does NOT test is the double ABI, and it is worth being exact about that.** LLVM gives the
+bare triple `.cpu cortex-m4` and `.fpu fpv4-sp-d16` — single-precision only — so a `double` lowers to
+`__aeabi_dmul` and friends rather than to VFP arithmetic, on *both* boards.
+`Target.thumbv7emFreestanding`'s docstring records the same thing. Those are compiler-rt symbols a
+`-nostdlib` link does not define, so an `f64` program on this target does not reach a machine at all;
+it stops at the linker. What runs here is `f32`, which is the FPU both cores actually have.
+
+**It shares every file with the AN500 — startup, linker script, support package, console — and that
+is the point rather than a saving.** The AN386 is the same MPS2 motherboard one processor generation
+earlier: `mps.ssram1` at `0x00000000` and the CMSDK UART at `0x40004000`, measured with
+`info mtree -f` rather than assumed. So the only thing that differs between the two runs is **the
+processor executing the image**, which is exactly the claim being tested. A board with its own console
+source could drift into testing two different programs and report that as agreement.
+
+**`netduinoplus2` was the obvious candidate and is the wrong one.** It is an STM32F405, so it is a
+real M4F — but its flash is a **ROM** region at `0x08000000` aliased at zero, so `.data` must be
+copied to SRAM by the startup, and its console is an `stm32f2xx_usart` rather than a CMSDK. Both are
+work, and both introduce differences from the AN500 that would sit between the two runs and muddy what
+a disagreement meant. It is still the right machine for the day something wants an STM32 *peripheral*
+rather than an Armv7E-M *core*.
 
 ## Wired into the suite
 

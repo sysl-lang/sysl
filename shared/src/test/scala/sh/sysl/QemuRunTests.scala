@@ -38,7 +38,7 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
    * cold produces no output at all, and QEMU says so only under `-d guest_errors`.
    */
   private val uarts: Map[String, String] = Map(
-    Target.riscv32Freestanding.name ->
+    "virt" ->
       """struct Uart
         |    data: volatile u8
         |
@@ -49,7 +49,7 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
         |    regs.data = c
         |""".stripMargin,
 
-    Target.thumbFreestanding.name ->
+    "mps2-an505" ->
       """struct Uart
         |    data: volatile u32
         |    state: volatile u32
@@ -71,7 +71,7 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
     // has to be cleared before each byte — a second write without clearing spins on a stale ready.
     // The registers are scattered across the map rather than adjacent, so each is its own pointer
     // instead of one struct with a hundred words of padding in it.
-    Target.thumbv6mFreestanding.name ->
+    "microbit" ->
       """struct Reg
         |    v: volatile u32
         |
@@ -98,8 +98,9 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
         |""".stripMargin,
 
     // The AN500's is the AN505's device moved: five CMSDK UARTs from 0x40004000, the first of them
-    // wired to QEMU's stdout by `-nographic`.
-    Target.thumbv7emFreestanding.name ->
+    // wired to QEMU's stdout by `-nographic`. The AN386 shares the map, so it shares the source —
+    // the two boards differ in the processor executing the image and in nothing else.
+    "mps2-an500" ->
       """struct Uart
         |    data: volatile u32
         |    state: volatile u32
@@ -118,23 +119,29 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
         |""".stripMargin,
   )
 
-  /** The prelude a program on `t` needs before it can print, plus the one helper every test here
+  /** The AN386 takes the AN500's source rather than a copy of it, so that the pair cannot drift into
+   * testing two different programs — which would defeat the point of running both, that being to
+   * vary the *processor* and nothing else.
+   */
+  private val boardUarts: Map[String, String] = uarts + ("mps2-an386" -> uarts("mps2-an500"))
+
+  /** The prelude a program on `b` needs before it can print, plus the one helper every test here
    * wants. `digit` is separate from the board because it is written in terms of `putc`.
    */
-  private def prelude(t: Target): String =
-    uarts(t.name) + "\ndigit(n: usize)\n    putc(u8('0') + u8(n))\n"
+  private def prelude(b: Board): String =
+    boardUarts(b.name) + "\ndigit(n: usize)\n    putc(u8('0') + u8(n))\n"
 
-  for t <- List(Target.riscv32Freestanding, Target.thumbFreestanding, Target.thumbv6mFreestanding,
-                Target.thumbv7emFreestanding) do
-    s"a program on ${t.name}" - {
-      val uart = prelude(t)
+  for b <- boards do
+    s"a program on ${b.name} (${b.target.name})" - {
+      val t    = b.target
+      val uart = prelude(b)
 
       // The smallest claim this tier can make, and it is not a small one: the toolchain assembles a
       // startup, the linker places the image where the script says, the board boots it, `main` runs,
       // and what it returned reaches the emulator's exit status. Everything below rests on it, so it
       // is asserted on its own rather than assumed by the tests that follow.
       "boots, runs, and reports what it returned" in {
-        val (status, out) = bootUnderQemu(t, s"$uart\nputc(u8('o'))\nputc(u8('k'))\n")
+        val (status, out) = bootUnderQemu(b, s"$uart\nputc(u8('o'))\nputc(u8('k'))\n")
 
         withClue(s"the board said: '$out'")(status shouldBe 0)
         out should include("ok")
@@ -154,7 +161,7 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
              |digit(s.len)
              |""".stripMargin
 
-        val (status, out) = bootUnderQemu(t, src)
+        val (status, out) = bootUnderQemu(b, src)
 
         withClue(s"the board said: '$out'")(status shouldBe 0)
         out should include("53")
@@ -183,7 +190,7 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
              |    putc(pick(letters[..], i))
              |""".stripMargin
 
-        val (status, out) = bootUnderQemu(t, src)
+        val (status, out) = bootUnderQemu(b, src)
 
         withClue(s"the board said: '$out'")(status shouldBe 0)
         out should include("abcd")
@@ -210,7 +217,7 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
              |putc(q.b)
              |""".stripMargin
 
-        val (status, out) = bootUnderQemu(t, src)
+        val (status, out) = bootUnderQemu(b, src)
 
         withClue(s"the board said: '$out'")(status shouldBe 0)
         out should include("yx")
@@ -229,7 +236,7 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
              |if top == 4294967295 then putc(u8('y')) else putc(u8('n'))
              |""".stripMargin
 
-        val (status, out) = bootUnderQemu(t, src)
+        val (status, out) = bootUnderQemu(b, src)
 
         withClue(s"the board said: '$out'")(status shouldBe 0)
         out should include("y")
@@ -255,9 +262,9 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
               |val n: usize = 1000
               |n.display(w, FormatSpec(0, -1, false))
               |""".stripMargin),
-          boardModule(t))
+          boardModule(b))
 
-        val (status, out) = bootUnderQemu(t, src, 20)
+        val (status, out) = bootUnderQemu(b, src, 20)
 
         withClue(s"the board said: '$out'")(status shouldBe 0)
         out should include("n=1000")
@@ -288,9 +295,9 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
               |w.write(counted.bytes)
               |if counted == "hello=5" then w.write(" same".bytes) else w.write(" differs".bytes)
               |""".stripMargin),
-          boardModule(t))
+          boardModule(b))
 
-        val (status, out) = bootUnderQemu(t, src, 20)
+        val (status, out) = bootUnderQemu(b, src, 20)
 
         withClue(s"the board said: '$out'")(status shouldBe 0)
         out should include("hello=5 same")
@@ -311,9 +318,9 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
               |
               |n.display(w, FormatSpec(0, -1, false))
               |""".stripMargin),
-          boardModule(t))
+          boardModule(b))
 
-        val (status, out) = bootUnderQemu(t, src, 20)
+        val (status, out) = bootUnderQemu(b, src, 20)
 
         withClue(s"the board said: '$out'")(status shouldBe 0)
         out should include("9007199254740993")
@@ -332,13 +339,62 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
               |
               |if zeroed() then w.write("zero".bytes) else w.write("junk".bytes)
               |""".stripMargin),
-          boardModule(t, "\nvar counter: int = 0\n\nzeroed() -> bool = counter == 0\n"))
+          boardModule(b, "\nvar counter: int = 0\n\nzeroed() -> bool = counter == 0\n"))
 
-        val (status, out) = bootUnderQemu(t, src, 20)
+        val (status, out) = bootUnderQemu(b, src, 20)
 
         withClue(s"the board said: '$out'")(status shouldBe 0)
         out should include("zero")
       }
+
+      // **The FPU, which is the one piece of hardware on this tier a startup has to switch on.**
+      //
+      // A Cortex-M denies coprocessor access out of reset, so the first VFP instruction a program
+      // executes raises a UsageFault with the NOCP bit unless `CPACR` has been written — and it dies
+      // *inside whatever arithmetic reached for VFP*, which is why this is worth a test of its own
+      // rather than being left to whichever program happens to use a float first. That program
+      // reports a fault in an unrelated computation.
+      //
+      // **Until this existed, nothing on this tier used a float at all**, so a startup that enables
+      // the FPU and a startup that forgets to were indistinguishable — on every board here, for as
+      // long as the tier has existed.
+      //
+      // `f32` rather than `f64` deliberately. `thumbv7em-none-eabihf` selects `fpv4-sp-d16`, whose
+      // unit is single-precision only, so `double` arithmetic lowers to `__aeabi_dmul` and friends —
+      // compiler-rt symbols a `-nostdlib` link does not define. `Target.thumbv7emFreestanding`'s
+      // docstring records the same measurement from the other direction. So a `f64` program here
+      // would fail at the linker and never reach the machine, testing nothing about the FPU.
+      //
+      // **The operand is a volatile read, and the first attempt at this test shows why it has to
+      // be.** Written with module `var`s holding 2.5 and 4.0, the whole computation folded: the
+      // AN500's `board$scaled` came out as `vmov.f32 s0, #1.1e+01 ; bx lr`, and the AN505's image
+      // contained **no VFP instruction at all**. So the test passed on all three boards while
+      // exercising the FPU on two of them and nothing on the third — decided by inlining, which is
+      // not something a test should rest on. `SYSL_QEMU_KEEP` plus `llvm-objdump` is what showed it,
+      // and is the check to repeat on any test whose subject is an instruction.
+      //
+      // `regs.bauddiv` is the CMSDK UART's divisor, which `console()` has just set to 16. It is a
+      // `volatile` field, so the load must happen; 16 is exact, and `* 0.5 + 3` is exact in
+      // binary32, so `==` is a fair comparison here rather than the usual trap.
+      //
+      // All three hard-float boards are CMSDK boards, so one source serves them.
+      if t.hardFloat then
+        "computes with the FPU, which the startup had to enable first" in {
+          val src = List(
+            Source("p.sysl",
+              """import board.*
+                |
+                |val w = console()
+                |
+                |if scaled() == 11.0 then w.write("fpu".bytes) else w.write("bad".bytes)
+                |""".stripMargin),
+            boardModule(b, "\nscaled() -> f32 = f32(regs.bauddiv) * 0.5 + 3.0\n"))
+
+          val (status, out) = bootUnderQemu(b, src, 20)
+
+          withClue(s"the board said: '$out'")(status shouldBe 0)
+          out should include("fpu")
+        }
 
       // **The one test here that expects a status other than zero, and the tier needs exactly one.**
       //
@@ -358,20 +414,21 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
       // the AN500 has RAM at address zero, so a store through a null pointer succeeds there and
       // computes nothing.
       //
-      // **Two boards are excluded, and neither exclusion is a defect.** `riscv32-freestanding`
-      // reports through `virt`'s `sifive_test` device rather than through a fault vector, so it has
-      // no handler for this to reach. And `mps2-an505` has no unmapped address to store to at all:
-      // its TrustZone master security controller claims the whole space —
+      // **Two boards are excluded, and both exclusions are facts about the machine.** `virt` reports
+      // through its `sifive_test` device rather than through a fault vector, so it has no handler
+      // for this to reach. And `mps2-an505` has no unmapped address to store to at all: its
+      // TrustZone master security controller claims the whole space —
       //
       //   0000000000000000-ffffffffffffffff  tz-msc-downstream
       //
       // — so the write is swallowed, the program runs to completion, and the board exits zero
       // honestly. That was measured with `info mtree -f` after this test failed there, and the
       // conclusion is about the machine rather than about the startup: `start_thumb.s` asks for
-      // `SYS_EXIT_EXTENDED` exactly as the other two do.
-      if t != Target.riscv32Freestanding && t != Target.thumbFreestanding then
+      // `SYS_EXIT_EXTENDED` exactly as the others do. The AN386 was measured the same way and has
+      // no such region, which is why it is not a third exclusion.
+      if b.name != "virt" && b.name != "mps2-an505" then
         "reports a fault as a status of its own rather than as success" in {
-          val (status, _) = bootUnderQemu(t,
+          val (status, _) = bootUnderQemu(b,
             s"""$uart
                |struct Bad
                |    v: volatile u32

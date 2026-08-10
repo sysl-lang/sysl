@@ -45,10 +45,9 @@ _start:
     // UsageFault with the NOCP bit and the program dies somewhere arithmetic, blaming the arithmetic.
     // CPACR is at 0xE000ED88 and bits 23:20 are full access to CP10 and CP11.
     //
-    // `start_thumb.s` does not do this and has not needed to, because nothing that has run on that
-    // board used a float. That is a property of the test programs rather than of the board, and it
-    // is not one worth relying on here: this target exists *because* of its FPU, so a program that
-    // exercises it is the expected case rather than the surprising one.
+    // `start_thumb.s` omitted this until 2026-08-10, and got away with it only because nothing that
+    // had run on that board used a float. The first `f32` program on this tier faulted there and
+    // passed here, which is how the gap was found; both startups now do it.
     ldr  r0, =0xE000ED88
     ldr  r1, [r0]
     orr  r1, r1, #(0xF << 20)

@@ -28,7 +28,7 @@ class QemuHarnessTests extends AnyFreeSpec with QemuSupport {
    * linker script pointing at the wrong alias rather than anything about where a statement sits.
    * `thumb.ld` has the account, and the last test below is the one that used to fail.
    */
-  private def program(t: Target, decls: String, stmts: String): List[Source] =
+  private def program(b: Board, decls: String, stmts: String): List[Source] =
     List(
       Source("p.sysl",
         s"""import sysl.harness.*
@@ -38,16 +38,19 @@ class QemuHarnessTests extends AnyFreeSpec with QemuSupport {
            |attach(console())
            |$stmts
            |""".stripMargin),
-      boardModule(t))
+      boardModule(b))
 
-  for t <- List(Target.riscv32Freestanding, Target.thumbFreestanding, Target.thumbv7emFreestanding) do
-    s"a suite on ${t.name}" - {
+  // Every board but the micro:bit's. The Armv6-M target was left out when it was added and nothing
+  // recorded why, so the exclusion is carried rather than justified — it may well run there, and
+  // finding out is a job on its own rather than a line to change while passing.
+  for b <- boards if b.target != Target.thumbv6mFreestanding do
+    s"a suite on ${b.name} (${b.target.name})" - {
 
       // The claim everything else here rests on: the framework links for a bare board at all. It
       // holds module storage, renders through a trait object, and takes the address of a function —
       // and none of that may reach an allocator, a C library, or the host.
       "names each test, reports its verdict, and tallies what it ran" in {
-        val (status, out) = bootUnderQemu(t, program(t,
+        val (status, out) = bootUnderQemu(b, program(b,
           """passes()
             |    check(true)
             |""".stripMargin,
@@ -63,7 +66,7 @@ class QemuHarnessTests extends AnyFreeSpec with QemuSupport {
       // A failure has to say *which* check, *where*, and *what the values were*. That is the whole
       // difference between this tier and the one below it, where a wrong answer is a wrong character.
       "reports a failed equality with both values and the line it was written on" in {
-        val (status, out) = bootUnderQemu(t, program(t,
+        val (status, out) = bootUnderQemu(b, program(b,
           """adds()
             |    check_eq(2 + 2, 5)
             |""".stripMargin,
@@ -81,7 +84,7 @@ class QemuHarnessTests extends AnyFreeSpec with QemuSupport {
       // down to the sink, so these digits were computed by the code under test on a 32-bit machine —
       // `printi` would have reached `snprintf`, which is a C library this board does not have.
       "renders a value wider than one digit, on the machine that computed it" in {
-        val (status, out) = bootUnderQemu(t, program(t,
+        val (status, out) = bootUnderQemu(b, program(b,
           """counts()
             |    var n: usize = 0
             |    for i in 0..<1000 do n += 1
@@ -100,7 +103,7 @@ class QemuHarnessTests extends AnyFreeSpec with QemuSupport {
       // this board has no allocator to reach. That it links at all is a claim worth pinning: the
       // framework's whole report path passes `[]const u8` to `out.write`.
       "compares two slices and says which index differs" in {
-        val (status, out) = bootUnderQemu(t, program(t,
+        val (status, out) = bootUnderQemu(b, program(b,
           """bytes()
             |    check_slice_eq([u8(1), u8(2), u8(3)][..], [u8(1), u8(9), u8(3)][..])
             |""".stripMargin,
@@ -116,7 +119,7 @@ class QemuHarnessTests extends AnyFreeSpec with QemuSupport {
       // on a board is a fixed area of the image rather than anything an allocator handed out. Three
       // verdicts in one run, which is also the largest image this suite builds.
       "runs several tests and counts passes, failures and skips apart" in {
-        val (status, out) = bootUnderQemu(t, program(t,
+        val (status, out) = bootUnderQemu(b, program(b,
           """good()
             |    check(true)
             |
@@ -147,7 +150,7 @@ class QemuHarnessTests extends AnyFreeSpec with QemuSupport {
        * on, and a tier that once said otherwise should go on saying it does not.
        */
       "reports the same failure when a statement is written above the declarations" in {
-        val (status, out) = bootUnderQemu(t, program(t,
+        val (status, out) = bootUnderQemu(b, program(b,
           """""".stripMargin,
           """adds()
             |    check_eq(2 + 2, 5)
