@@ -6,7 +6,7 @@ import io.github.edadma.cross_platform.*
  * its trees came from.
  *
  * Every program is compiled against the library (`13 §8`), and there has been one way to be handed
- * it: `Std.parsed` — the files under `lib/sysl`, read off disk and parsed. That is what a
+ * it: `Std.parsed` — the files under `library/sysl`, read off disk and parsed. That is what a
  * *source* dependence on the standard module is, and it is what the artifact exists to end: every program
  * re-derives every signature in the standard module from text before it can check its own first
  * line.
@@ -30,7 +30,7 @@ import io.github.edadma.cross_platform.*
 final class Stdlib(val units: List[Program]) {
 
   /** The files these trees came from. A `Source` compares by identity (`Diagnostics`), so this is
-   * an identity set: a user file that happened to be called `lib/sysl/display.sysl` is not one of
+   * an identity set: a user file that happened to be called `library/sysl/display.sysl` is not one of
    * these, and neither is the decoded copy of a file an artifact carries under the same name.
    */
   private val own: Set[Source] = units.map(_.source).toSet
@@ -66,7 +66,7 @@ final class Stdlib(val units: List[Program]) {
   /** Whether a declaration is the library's rather than the program's.
    *
    * Asked of the **position** rather than of the module, though the two now agree: a `Source` is a
-   * stronger answer than a name, since a user file that happened to sit at `lib/sysl/display.sysl`
+   * stronger answer than a name, since a user file that happened to sit at `library/sysl/display.sysl`
    * is not one of these.
    */
   def owns(decl: Positioned): Boolean = decl.pos.exists(p => own(p.source))
@@ -201,7 +201,7 @@ object Stdlib {
           case Right(_) => load(path, target)
           case Left(err) =>
             Left(s"cannot find or build the standard module — build it with " +
-              s"'sysl build-lib lib --std', or pass --no-std-lib to compile against the copy built " +
+              s"'sysl build-lib library --std', or pass --no-std-lib to compile against the copy built " +
               s"into the compiler ($err)")
   }
 
@@ -242,7 +242,7 @@ object Stdlib {
    *
    * **The library's own tests are stripped before anybody compiles against it**, which is what
    * `@tests` promises and what this path was quietly not doing. `Std.parsed` reads every file in
-   * `lib/`, `tests.sysl` included; handed to a compilation as the standard module, those files are
+   * `library/`, `tests.sysl` included; handed to a compilation as the standard module, those files are
    * ordinary declarations — nameable, and worse, *instantiable*. A generic named only by a test
    * helper was being monomorphized into every program that compiled against the source std, so the
    * library shipped instantiations no caller had asked for.
@@ -286,7 +286,7 @@ object Stdlib {
    * program **declares** rather than defines a second time, and they belong to the caller that has
    * a linker to hand them to.
    *
-   * **An artifact built from a different `lib/sysl` is refused here**, which is the one check a
+   * **An artifact built from a different `library/sysl` is refused here**, which is the one check a
    * consumer of the *standard* module can make and a consumer of any other library cannot: the
    * compiler has the source this was supposed to be built from, so it can say whether it was
    * (`Std.fingerprint`). Without it the artifact is built separately and can drift — and a stale one
@@ -304,14 +304,14 @@ object Stdlib {
   /** The standard module compiled to an artifact at `out`, from **this** compiler's library source —
    * the other end of `read`, and what an unusable artifact at the default path is rebuilt by.
    *
-   * The sources are `Std.sources` and not the `lib/` in whatever tree the command was run from,
+   * The sources are `Std.sources` and not the `library/` in whatever tree the command was run from,
    * which is what makes this dependable: `read` checks a decoded artifact against `Std.fingerprint`,
    * the fingerprint of exactly these files, so building from them is the one thing guaranteed to
    * produce an artifact this compiler will accept. Point it at another library and you get an
    * artifact it refuses, which is `build-lib --std`'s business rather than this routine's.
    *
    * No C files are gathered, and none can be missed: `15 §7` lets a library carry `.c` beside its
-   * modules, and the standard module carries none. It could not — a `.c` under `lib/sysl` would be
+   * modules, and the standard module carries none. It could not — a `.c` under `library/sysl` would be
    * hashed into the fingerprint of an artifact built by `build-lib`, while `Std.sources` collects
    * only sysl files, so every artifact built from the tree would fail the check it is read back
    * through.

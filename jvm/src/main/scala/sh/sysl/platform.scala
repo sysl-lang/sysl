@@ -20,7 +20,7 @@ def hostMachine: (String, String) =
  *
  * Nothing is lost by it. The JVM build is the development one — `sbt syslJVM/test`, and the driver
  * run from a checkout — where the working directory is inside the repository and the search finds
- * `lib/` there. It is the *native* build that gets installed, and that one answers exactly.
+ * `library/` there. It is the *native* build that gets installed, and that one answers exactly.
  */
 def executablePath: Option[String] = None
 

@@ -307,7 +307,7 @@ would notice was stale.
 **Cross-compiling a library that includes headers needs that target's headers.** This is not a cost
 the design imposes — it is the requirement being honest. A binding to POSIX regex cannot be built for
 a platform whose `regex_t` nobody can see. C that includes nothing cross-compiles like any other
-object. The standard module under `lib/sysl` includes no headers and reaches libc by symbol alone, so
+object. The standard module under `library/sysl` includes no headers and reaches libc by symbol alone, so
 it goes on building for any target the toolchain can lower for; that is worth keeping, and it is a
 property of what that library happens to need rather than a rule about where C may live.
 
@@ -422,7 +422,7 @@ and requires the error to name it back.
 the program computed anything, because `sysl.math` had no way to say so and the compiler had no way
 to be told. That stopgap was bounded to the standard module because the standard module is the one
 the compiler ships; every other module needed this built. It says so itself now, in
-`lib/sysl/sys/math.sysl`.
+`library/sysl/sys/math.sysl`.
 
 ## 9. `opaque` withholds a layout
 
@@ -456,7 +456,7 @@ private[sysl] extern "opendir" c_opendir(path: *u8) -> *Dir
 private[sysl] extern "closedir" c_closedir(d: *Dir) -> int
 ```
 
-That is the C-handle case, and `lib/sysl/fs` is its first user — it previously bound `DIR *` as
+That is the C-handle case, and `library/sysl/fs` is its first user — it previously bound `DIR *` as
 `*u8`, which the linker accepts and which is interchangeable with the `*u8` *paths* declared on the
 lines above it. Nothing in sysl lays a `Dir` out; the storage is libc's. An ordinary struct with no
 body stays an error, and says which word to add.

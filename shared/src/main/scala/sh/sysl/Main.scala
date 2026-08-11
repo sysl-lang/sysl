@@ -32,7 +32,7 @@ import scopt.OParser
  * as well as a `clang`; `--ar` names it where it is somewhere a search would not look.
  *
  * **The standard module's own source is read off disk**, from the library installed with this
- * compiler — `<prefix>/share/sysl/lib` beside the binary, or `lib/` in a checkout (`Std.root`).
+ * compiler — `<prefix>/share/sysl/library` beside the binary, or `library/` in a checkout (`Std.root`).
  * There is no copy inside the executable: a library nobody can open is not one anybody can learn
  * from or edit, which is what every other toolchain concluded too.
  *
@@ -177,6 +177,15 @@ private[sysl] val parser = {
         .action((_, c) => c.copy(command = "emit-header"))
         .text("print the C header for what a module exports")
         .children(arg[String]("<path>").required().action((f, c) => c.copy(file = f))),
+      cmd("doc")
+        .action((_, c) => c.copy(command = "doc"))
+        .text("render the literate sources of a module as Markdown, with their program fenced " +
+          "rather than indented so a highlighter can read it")
+        .children(
+          arg[String]("<path>").required().action((f, c) => c.copy(file = f)),
+          opt[String]('o', "output").action((o, c) => c.copy(output = Some(o)))
+            .text("where to write the document; defaults to standard output"),
+        ),
       cmd("test")
         .action((_, c) => c.copy(command = "test"))
         .text("run the '@test' functions of a sysl module")
@@ -331,6 +340,13 @@ private[sysl] def execute(cfg: Config): Int = {
   if cfg.verbose then
     trace(s"${sources.length} source file(s) under ${cfg.file}")
     sources.foreach(src => trace(s"  read ${src.name}"))
+
+  // Rendering is a **source-level** job and stops here, above everything a compilation needs. It
+  // asks for no target, no standard module and no library, which is not a shortcut but the whole
+  // reason the command is usable: a package's prose is worth reading on a machine that could not
+  // build it, and a document that could only be produced by a successful build would be missing
+  // exactly when somebody wanted it.
+  if cfg.command == "doc" then return renderDoc(cfg, sources)
 
   val project = readPackageConfig(cfg.file) match
     case Left(err) => return fail(err)
@@ -605,6 +621,37 @@ private def cLibrary(command: String): Boolean = command == "build-c" || command
  * left out is one the C author has no way to supply and no way to hear about, since the sysl half
  * compiled cleanly and only the C project's linker ever notices.
  */
+/** `doc`: the literate sources of a tree, rendered as one Markdown document (`Doc`).
+ *
+ * **The ordinary `.sysl` files are passed over rather than refused**, because a directory holding
+ * both is the normal shape of a literate module — `library/sysl/regex` is five `.lsysl` files and its
+ * tests are not — and a command that refused the tree would be unusable on the very trees it is for.
+ * What *is* refused is a tree with no literate source at all: there the request cannot be granted
+ * however it is read, and saying so beats writing an empty document.
+ */
+private def renderDoc(cfg: Config, sources: List[Source]): Int = {
+  val literate = sources.filter(src => Literate.named(src.name))
+
+  if literate.isEmpty then
+    return fail(s"${cfg.file} holds no '${Literate.Extension}' files — 'doc' renders the prose a " +
+      "literate source is written around, and an ordinary sysl program has none")
+
+  Doc.renderAll(literate) match
+    case Left(err) => fail(err)
+    case Right(text) =>
+      cfg.output match
+        case Some(path) =>
+          Project.parentOf(path).foreach(createDirectories)
+
+          try
+            writeFile(path, text + "\n")
+            Console.err.println(s"wrote $path")
+            0
+          catch case e: Exception => fail(s"cannot write $path: ${e.getMessage}")
+
+        case None => stdout(text + "\n"); 0
+}
+
 private def buildForC(cfg: Config, compiled: Compiled, target: Target, named: Option[String],
                       roots: List[String]): Int = {
   // Before the compile rather than after, exactly as `build-lib` does it: the archiver is not needed

@@ -3,7 +3,7 @@
  * A `long` is sixty-four bits on every sysl target, so dividing one on the RP2350 is a **call**
  * rather than an instruction: neither of its cores has the divider, and the back end emits a
  * reference to a compiler-rt builtin instead. Rendering a `long` divides by ten, so
- * `lib/sysl/display.sysl` reaches this the moment a program prints one.
+ * `library/sysl/display.sysl` reaches this the moment a program prints one.
  *
  * The names differ by architecture and nothing else. RISC-V asks for `__divdi3` and its three
  * relatives; the ARM EABI asks for `__aeabi_ldivmod`, which answers the quotient *and* the remainder

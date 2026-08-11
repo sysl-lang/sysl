@@ -23,7 +23,7 @@ trait DeclTables extends Reporting {
    *
    * Empty for every ordinary compilation, which is what makes the library something a program never
    * has to think about. It is non-empty only where the library's own source is what is being
-   * compiled — `sysl build-lib lib --std` — and there it does two things: it stops the compiler
+   * compiled — `sysl build-lib library --std` — and there it does two things: it stops the compiler
    * from handing those files a second copy of themselves, and it makes what they declare count as
    * the library's, which is `libraryOwns` below.
    */
@@ -76,12 +76,12 @@ trait DeclTables extends Reporting {
    *
    * Normally that is a question about which file it came from and nothing else (`Stdlib.owns`), and
    * it is asked of the `Source` rather than of the module because a `Source` is the stronger answer:
-   * a user file that happened to sit at `lib/sysl/render.sysl` is not one of the library's. The
+   * a user file that happened to sit at `library/sysl/render.sysl` is not one of the library's. The
    * compilation that *builds* a library module is the one
    * case where the source is the library's without being what this compilation was handed, and it has
    * to be, or the rest of the library could not name what it declares: the library's
    * `impl Display for (A, B)` calls `display_pad` and resolves it among the library's own, and while
-   * `lib/sysl/render.sysl` is being compiled that is the file in front of it.
+   * `library/sysl/render.sysl` is being compiled that is the file in front of it.
    */
   protected def libraryOwns(d: Positioned, module: String): Boolean =
     std.owns(d) || building(module)

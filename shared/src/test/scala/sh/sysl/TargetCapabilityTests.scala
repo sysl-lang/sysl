@@ -75,7 +75,7 @@ class TargetCapabilityTests extends AnyFreeSpec with Matchers {
     "so a no-alloc target does not turn the library into a wall of errors" in {
       val e = refused(everything - Capability.Alloc)("main.sysl" -> "f() -> &int = 1\n\nprint(*f())\n")
 
-      e shouldNot include("lib/sysl")
+      e shouldNot include("library/sysl")
       e.linesIterator.count(_.contains("needs an allocator")) shouldBe 1
     }
   }

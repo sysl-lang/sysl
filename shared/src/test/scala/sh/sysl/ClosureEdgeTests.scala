@@ -515,7 +515,7 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
      * struct with an environment, so there is nothing to convert.
      *
      * **What the reader is told it gave has to be "a closure".** The struct is filed under a serial
-     * number that runs over the whole compilation with `lib/` lowered first, so the message used to
+     * number that runs over the whole compilation with `library/` lowered first, so the message used to
      * read *"but .closure4 was given"* — a name nothing in the program is called, nothing can be
      * grepped for, and whose digit moves whenever the standard library gains a closure literal of its
      * own. That is not hypothetical: `sysl.slices` arriving with four of them broke five assertions

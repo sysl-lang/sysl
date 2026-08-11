@@ -5,7 +5,7 @@ import org.scalatest.matchers.should.Matchers
 
 /** The library as a **tree of modules** rather than one flat module (`13 §1`, `13 §3`).
  *
- * A module is a directory, so a submodule of the standard one is a directory under `lib/sysl` and
+ * A module is a directory, so a submodule of the standard one is a directory under `library/sysl` and
  * needs nothing new from the compiler to exist. What it does need is for the standard module's
  * privileges to stop at the standard module: the names in scope everywhere with no import are the
  * ones the language desugars onto, and a submodule is an offer like any other library's, reached by

@@ -10,7 +10,7 @@ spending.
 is worth stating in those terms rather than as "sysl has no `__LINE__`", because the second sounds
 like a missing constant and the first is a missing capability.
 
-The cost was visible in the standard module. `lib/sysl/check.sysl` declared
+The cost was visible in the standard module. `library/sysl/check.sysl` declared
 
 ```
 assert(cond: bool, msg: string)

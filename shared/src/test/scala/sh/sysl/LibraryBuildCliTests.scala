@@ -472,7 +472,7 @@ class LibraryBuildCliTests extends LibraryCliSupport {
   "build-lib --std" - {
 
     "builds the standard module, which nothing else may declare" in {
-      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
 
       val out = createTempFile("sysl-cli-std-", LibraryArtifact.extension)
 
@@ -501,7 +501,7 @@ class LibraryBuildCliTests extends LibraryCliSupport {
     }
 
     "refuses to build the standard module against a prebuilt copy of itself" in {
-      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
 
       // The one combination that cannot mean anything: the declarations being compiled are the ones
       // the artifact holds. Refused before the artifact is even read — ignoring it would leave a
@@ -514,7 +514,7 @@ class LibraryBuildCliTests extends LibraryCliSupport {
       // The refusal is the ordinary one every program gets, and keeping it is the point: inferring
       // the mode from the module names in the tree would turn a clear diagnostic into an artifact
       // that builds and then collides with the built-in copy at whatever link tried to use it.
-      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
 
       val out = createTempFile("sysl-cli-std-", LibraryArtifact.extension)
 

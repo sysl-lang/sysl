@@ -7,13 +7,17 @@ import org.scalatest.matchers.should.Matchers
 
 /** Where the standard module library sits, as seen from wherever the suite was started.
  *
- * `lib/` is a **library project root** holding the single module `sysl`, so a module's name is the
+ * `library/` is a **library project root** holding the single module `sysl`, so a module's name is the
  * path below it exactly as it is for a program (`13 §1`) — which is why the root is what is found
- * here and `lib/sysl` is not.
+ * here and `library/sysl` is not.
  */
 object StdRoot {
 
-  def root: Option[String] = List("lib", "../lib", "../../lib").find(isDirectory)
+  /** Asked of `Std.candidates` rather than of a list written out again here. The suite used to
+   * carry its own copy of the search paths, which meant the one thing it could not notice was the
+   * compiler looking somewhere else — and that is precisely what a rename of the directory does.
+   */
+  def root: Option[String] = Std.candidates(None).map(_._1).find(isDirectory)
 }
 
 /** How a compilation gets to the standard module's source, now that the compiler reads it off disk
@@ -48,15 +52,15 @@ class StdLibraryTests extends AnyFreeSpec with Matchers {
       // resolves it to the Cellar, and the library is under that prefix in the ordinary Unix place.
       // Nothing is configured and nothing is carried.
       resolve(None, Some("/opt/homebrew/Cellar/sysl/0.0.2/bin/sysl"),
-        "/opt/homebrew/Cellar/sysl/0.0.2/share/sysl/lib") shouldBe
-        Right("/opt/homebrew/Cellar/sysl/0.0.2/share/sysl/lib")
+        "/opt/homebrew/Cellar/sysl/0.0.2/share/sysl/library") shouldBe
+        Right("/opt/homebrew/Cellar/sysl/0.0.2/share/sysl/library")
     }
 
     "and two installs of different versions each find their own" in {
       // Which is what keying on the compiler's own location buys over a fixed path: the answer moves
       // with the binary, so an old sysl left in the Cellar compiles against the library it shipped
       // with rather than against the newest one on the machine.
-      val both = Seq("/opt/sysl/0.0.1/share/sysl/lib", "/opt/sysl/0.0.2/share/sysl/lib")
+      val both = Seq("/opt/sysl/0.0.1/share/sysl/library", "/opt/sysl/0.0.2/share/sysl/library")
 
       resolve(None, Some("/opt/sysl/0.0.1/bin/sysl"), both*) shouldBe Right(both.head)
       resolve(None, Some("/opt/sysl/0.0.2/bin/sysl"), both*) shouldBe Right(both.last)
@@ -66,28 +70,46 @@ class StdLibraryTests extends AnyFreeSpec with Matchers {
       // The development case, and the one every run of this suite is actually in. The JVM build has
       // no executable path to speak of — its executable is `java` — so this is the only answer it
       // ever gets, which is why it has to work with nothing else present.
-      resolve(None, None, "lib") shouldBe Right("lib")
+      resolve(None, None, "library") shouldBe Right("library")
     }
 
     "from a directory or two below it, since a suite need not run at the root" in {
+      resolve(None, None, "../library") shouldBe Right("../library")
+      resolve(None, None, "../../library") shouldBe Right("../../library")
+    }
+
+    "and still finds a tree that has not been renamed yet, at either kind of path" in {
+      // The directory was `lib` until it was renamed, and copies of it are on disk in eleven other
+      // repositories and inside every compiler already installed. Both spellings are searched for
+      // that reason, so this asserts the compatibility rather than leaving it to be discovered by
+      // whoever's checkout stops building.
+      resolve(None, None, "lib") shouldBe Right("lib")
       resolve(None, None, "../lib") shouldBe Right("../lib")
-      resolve(None, None, "../../lib") shouldBe Right("../../lib")
+
+      resolve(None, Some("/opt/sysl/0.0.40/bin/sysl"), "/opt/sysl/0.0.40/share/sysl/lib") shouldBe
+        Right("/opt/sysl/0.0.40/share/sysl/lib")
     }
 
-    "and prefers the installed tree to whatever `lib` the working directory happens to hold" in {
+    "and prefers the new spelling where a tree carries both" in {
+      // Which is the case a checkout is in for exactly as long as it takes to delete the old one:
+      // `git mv` leaves nothing behind, but an artifact directory or a stray copy does.
+      resolve(None, None, "lib", "library") shouldBe Right("library")
+    }
+
+    "and prefers the installed tree to whatever the working directory happens to hold" in {
       // Ordering is a guard, so it is asserted with both present rather than read off the list.
-      resolve(None, Some("/usr/local/bin/sysl"), "/usr/local/share/sysl/lib", "lib") shouldBe
-        Right("/usr/local/share/sysl/lib")
+      resolve(None, Some("/usr/local/bin/sysl"), "/usr/local/share/sysl/library", "library") shouldBe
+        Right("/usr/local/share/sysl/library")
     }
 
-    "and a `lib` that is not a sysl library is not a candidate at all" in {
-      // The other half of that guard, and the one ordering cannot supply: `lib` is an ordinary
-      // directory name — a C project has one, and so does half of everything else — so a compiler
-      // standing in someone's source tree would take theirs and fail somewhere far from the cause.
-      // What is asked for is `<root>/sysl`, so a `lib` holding anything else is simply skipped.
-      Std.rootOf(None, None, Set("lib")) match
-        case Right(found) => fail(s"a lib/ with no '${Std.module}' in it resolved to $found")
-        case Left(err)    => err should include("lib")
+    "and a directory of that name that is not a sysl library is not a candidate at all" in {
+      // The other half of that guard, and the one ordering cannot supply: both spellings are
+      // ordinary directory names — a C project has a `lib`, and so does half of everything else — so
+      // a compiler standing in someone's source tree would take theirs and fail somewhere far from
+      // the cause. What is asked for is `<root>/sysl`, so one holding anything else is skipped.
+      Std.rootOf(None, None, Set("library", "lib")) match
+        case Right(found) => fail(s"a root with no '${Std.module}' in it resolved to $found")
+        case Left(err)    => err should include("library")
     }
   }
 
@@ -95,17 +117,17 @@ class StdLibraryTests extends AnyFreeSpec with Matchers {
 
     "names the library outright, beating everything else" in {
       resolve(Some("/tmp/mine"), Some("/usr/local/bin/sysl"),
-        "/tmp/mine", "/usr/local/share/sysl/lib", "lib") shouldBe Right("/tmp/mine")
+        "/tmp/mine", "/usr/local/share/sysl/library", "lib") shouldBe Right("/tmp/mine")
     }
 
     "aimed at the module rather than at the root, says which of the two is wanted" in {
-      // The mistake anybody would make once: `lib/sysl` is the module, `lib` is the root, and they
+      // The mistake anybody would make once: `library/sysl` is the module, `lib` is the root, and they
       // differ by one segment. Told the wrong one, the message says which — rather than reporting
       // that a directory plainly sitting there is not a library.
-      Std.rootOf(Some("/tmp/lib/sysl"), None, Set("/tmp/lib/sysl")) match
+      Std.rootOf(Some("/tmp/library/sysl"), None, Set("/tmp/library/sysl")) match
         case Right(found) => fail(s"the module directory should not have resolved as a root: $found")
         case Left(err) =>
-          err should include("/tmp/lib/sysl")
+          err should include("/tmp/library/sysl")
           err should include("above")
     }
 
@@ -129,26 +151,30 @@ class StdLibraryTests extends AnyFreeSpec with Matchers {
       // rather than the message merely being non-empty.
       val err = resolve(None, Some("/opt/sysl/0.0.2/bin/sysl")).left.getOrElse(fail("should not have resolved"))
 
-      err should include("/opt/sysl/0.0.2/share/sysl/lib")
-      err should include("  lib (")
-      err should include("  ../lib (")
-      err should include("  ../../lib (")
+      err should include("/opt/sysl/0.0.2/share/sysl/library")
+      err should include("  library (")
+      err should include("  ../library (")
+      err should include("  ../../library (")
       err should include("SYSL_LIB")
     }
 
     "and lists them in the order it tried them" in {
       val err = resolve(None, Some("/opt/sysl/0.0.2/bin/sysl")).left.getOrElse(fail("should not have resolved"))
 
-      err.indexOf("/opt/sysl/0.0.2/share/sysl/lib") should be < err.indexOf("  lib (")
-      err.indexOf("  lib (") should be < err.indexOf("  ../lib (")
-      err.indexOf("  ../lib (") should be < err.indexOf("  ../../lib (")
+      err.indexOf("/opt/sysl/0.0.2/share/sysl/library") should be < err.indexOf("  library (")
+      err.indexOf("  library (") should be < err.indexOf("  ../library (")
+      err.indexOf("  ../library (") should be < err.indexOf("  ../../library (")
+
+      // And the spelling kept for compatibility is listed after the one a reader should be using,
+      // so the list reads as an order of preference rather than as two equal answers.
+      err.indexOf("  ../../library (") should be < err.indexOf("  lib (")
     }
   }
 
   "the library this compiler resolved" - {
 
     "is the one in this checkout" in {
-      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
 
       // The development-loop claim, and the one the whole suite rests on: what every test compiles
       // against is the tree a reader can open and edit. Compared by place and by text, so a file
@@ -162,20 +188,29 @@ class StdLibraryTests extends AnyFreeSpec with Matchers {
       // So that a diagnostic naming a library file reads the same on every machine. See `Std.named`
       // — this is the claim the full suite caught being broken, in two library pages that quote a
       // refusal about a private field of `sysl.thread.Mutex`.
-      Std.sources.map(_.name) shouldBe Std.sources.map(s => s"lib/${place(s)}")
+      Std.sources.map(_.name) shouldBe Std.sources.map(s => s"${Std.Prefix}/${place(s)}")
     }
 
     "the same name whether it was read from a checkout or from an install" in {
       // The discriminating case, which the checkout alone cannot show: the two roots differ in every
       // segment but the last, and the names have to come out identical.
-      val checkout = Std.named("lib", Source("lib/sysl/print.sysl", "x", List("sysl")))
+      val checkout = Std.named(Source("library/sysl/print.sysl", "x", List("sysl")))
 
       val installed =
-        Std.named("/opt/homebrew/Cellar/sysl/0.0.3/share/sysl/lib",
-          Source("/opt/homebrew/Cellar/sysl/0.0.3/share/sysl/lib/sysl/print.sysl", "x", List("sysl")))
+        Std.named(Source("/opt/homebrew/Cellar/sysl/0.0.3/share/sysl/library/sysl/print.sysl", "x",
+          List("sysl")))
 
-      checkout.name shouldBe "lib/sysl/print.sysl"
+      checkout.name shouldBe "library/sysl/print.sysl"
       installed.name shouldBe checkout.name
+    }
+
+    "and the same name out of a tree that still has the old directory name" in {
+      // The case the constant prefix exists for. Read off the root's own basename, this file would
+      // be `lib/sysl/print.sysl` out of a compiler installed last week and `library/sysl/print.sysl`
+      // out of a moved checkout — and a documentation page quoting the diagnostic could only be
+      // right for one of them.
+      Std.named(Source("lib/sysl/print.sysl", "x", List("sysl"))).name shouldBe
+        "library/sysl/print.sysl"
     }
 
     "in a fixed order, decided by the library rather than by a directory listing" in {
@@ -198,11 +233,11 @@ class StdLibraryTests extends AnyFreeSpec with Matchers {
   "where the library was found does not change what it is" - {
 
     "so the same tree read from somewhere else fingerprints the same" in {
-      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
 
       // **This is the claim the whole change rests on.** The artifact is keyed by this fingerprint,
       // and an installed compiler reads the library from its own prefix while a checkout reads it
-      // from `lib/`. If the paths reached the hash, every install would key an artifact of its own
+      // from `library/`. If the paths reached the hash, every install would key an artifact of its own
       // and an artifact built anywhere would be refused everywhere else.
       val copy = createTempDirectory("sysl-lib-copy-")
 
@@ -231,7 +266,7 @@ class StdLibraryTests extends AnyFreeSpec with Matchers {
 
     "puts every file in the module its own header names" in {
       // The header and the directory both say it, and the driver is what checks they agree — so
-      // this is the same question `build-lib lib` would ask, asked without building anything.
+      // this is the same question `build-lib library` would ask, asked without building anything.
       for source <- Std.sources do
         SyslParser.parse(source) match
           case Right(p)  => p.module.map(_.show) shouldBe Some(source.dir.get.mkString("."))

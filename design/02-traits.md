@@ -154,7 +154,7 @@ impl Greet for Dog
 The keyword is required there and refused on `name`, which answers a requirement rather than
 replacing anything. What it buys is that an `impl` block says which of its members are doing which,
 a question that otherwise means opening the trait to find out. It costs almost nothing, because an
-implementation happy with a default writes no member at all — across `lib/`, `guide/` and
+implementation happy with a default writes no member at all — across `library/`, `guide/` and
 `examples/` exactly two members replace one.
 
 A trait whose every method has a default leaves nothing to write at all, so the block is optional —
@@ -433,7 +433,7 @@ replace it — and the earlier draft of this section used that to exempt it. The
 worth its inconsistency: the reader of an `impl` wants to know which members are replacing something
 and which are supplying what the trait required, and that is the same question in both places. It
 costs almost nothing to say so, because an implementation that is happy with a default writes no
-member at all; across `lib/`, `guide/` and `examples/` exactly two members replace one.
+member at all; across `library/`, `guide/` and `examples/` exactly two members replace one.
 
 **And there is nowhere else the word may be written.** A trait's own member is where a default is
 *written* rather than replaced, so it may not say `override`. Neither may a member of a type's own

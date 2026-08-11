@@ -162,7 +162,7 @@ class LinkDirectiveTests extends AnyFreeSpec with Matchers with RunSupport with 
 
   "what reaches the command line" - {
 
-    // The standard module says this for itself now, in `lib/sysl/sys/math.sysl`, where the driver
+    // The standard module says this for itself now, in `library/sysl/sys/math.sysl`, where the driver
     // used to carry it — which is what makes the mechanism load-bearing rather than decorative.
     "the standard module's own directive is in every compilation" in {
       fromTheLibrary should contain("m")

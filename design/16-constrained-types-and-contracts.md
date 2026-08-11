@@ -549,7 +549,7 @@ turn is sound only if a **`*self` method finishes with its receiver when it retu
 about method bodies that no rule about `&` at a call site could have implied.
 
 The corpus was measured before any of it was written, and the answer was zero: no `&` and no writable
-view anywhere below a clause, so nothing in `guide/` or `lib/` had to change. Two library functions
+view anywhere below a clause, so nothing in `guide/` or `library/` had to change. Two library functions
 did shape the rule — a reader stored in a returned cursor is why the no-escape rule is about `*self`
 alone and not about every pointer parameter, and a `&self.bytes[0]` over a `[]u8` field is why a
 reference or a view hop ends it.

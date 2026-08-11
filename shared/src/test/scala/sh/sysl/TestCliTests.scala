@@ -179,7 +179,7 @@ class TestCliTests extends AnyFreeSpec with Matchers {
     "without it, the library's own tree collides with the copy the compiler supplies" in {
       val root = StdRoot.root
 
-      assume(root.isDefined, "lib/ is not reachable from the working directory")
+      assume(root.isDefined, "the library is not reachable from the working directory")
 
       val (status, _, errs) = ran(Config(command = "test", file = root.get))
 
@@ -204,7 +204,7 @@ class TestCliTests extends AnyFreeSpec with Matchers {
 
       val root = StdRoot.root
 
-      assume(root.isDefined, "lib/ is not reachable from the working directory")
+      assume(root.isDefined, "the library is not reachable from the working directory")
 
       val (status, out, errs) = ran(Config(command = "test", file = root.get, std = true))
 

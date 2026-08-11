@@ -103,7 +103,7 @@ class BufTests extends AnyFreeSpec with RunSupport {
   // number. `remove` is written in terms of `truncate`, which is what `07 § Not yet` said it should
   // be, and `clear` is `truncate(0)` — so all three shorten a buffer the one way.
   // What `truncate` does to the *length* — cutting to a number, and a number past the end being a
-  // no-op rather than a panic — is asserted in `lib/sysl/buf/tests.sysl`, where the buffer is. What
+  // no-op rather than a panic — is asserted in `library/sysl/buf/tests.sysl`, where the buffer is. What
   // stays here is what the length cannot show: the storage that survives a truncation, and the
   // counted elements it lets go of.
   "shortening one" - {
@@ -389,7 +389,7 @@ class BufTests extends AnyFreeSpec with RunSupport {
     }
 
     // The empty run — the one case `extend` has to leave early for, since it has no first element to
-    // repeat into new storage — is asserted in `lib/sysl/buf/tests.sysl`.
+    // repeat into new storage — is asserted in `library/sysl/buf/tests.sysl`.
     "extending an empty buffer works the same as filling one" in {
       run("""var b: &Buf[int] = buf()
             |b.extend([9, 8])

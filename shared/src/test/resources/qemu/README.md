@@ -237,7 +237,7 @@ own hook", and calls such a module allocator-free and portable to every target.
 `ignore`d with the assertion it should make.
 
 **Rendering a `long` needs the board to supply 64-bit division.** A `long` is sixty-four bits on
-every target and neither of the RP2350's cores has the instruction, so `lib/sysl/display.sysl`
+every target and neither of the RP2350's cores has the instruction, so `library/sysl/display.sysl`
 dividing by ten becomes a call to `__divdi3` or `__aeabi_ldivmod`. That is not a defect in anything —
 C does the same here — but it is a link error with no other warning, and a real project only never
 sees it because pico-sdk has already linked `libgcc`.

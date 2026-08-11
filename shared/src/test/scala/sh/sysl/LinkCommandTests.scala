@@ -12,7 +12,7 @@ import org.scalatest.matchers.should.Matchers
  * on, and the only honest test is one that reads the arguments a cross target would be given.
  *
  * The library named throughout is `m`, because it is the one the standard module itself asks for
- * (`lib/sysl/sys/math.sysl`) and the one whose placement differs across all four platforms.
+ * (`library/sysl/sys/math.sysl`) and the one whose placement differs across all four platforms.
  */
 class LinkCommandTests extends AnyFreeSpec with Matchers {
 

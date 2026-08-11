@@ -7,7 +7,7 @@ import org.scalatest.matchers.should.Matchers
 
 /** The standard library's **own** `@test` functions, run as part of this suite (`testing.md` Tier 3).
  *
- * `lib/` is packed with tests written in sysl, and they are the right place for what is true of the
+ * `library/` is packed with tests written in sysl, and they are the right place for what is true of the
  * *library* — that a `Buf` grows geometrically, that `truncate` keeps its storage. This is the one
  * test that makes them part of the gate: without it they would be a thing somebody could run rather
  * than a thing that runs, and a library test that broke would break nothing.
@@ -29,7 +29,7 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
   /** Below this, assume something has gone wrong rather than that the library got quieter.
    *
    * `TestRunner` treats a tree with no tests as a success and says so on stderr — correctly, since a
-   * program is allowed to have none. That makes "the library's tests all passed" true of a `lib/`
+   * program is allowed to have none. That makes "the library's tests all passed" true of a `library/`
    * whose test files had been deleted, which is exactly the silent-green this test exists to
    * prevent. A floor is the cheap guard: it needs no maintenance as tests are added, and it fails
    * loudly if a whole file stops being collected.
@@ -48,15 +48,15 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    *
    * `building` is what says the tree in front of the compiler *is* the standard module rather than a
    * program compiled against one — the same word `build-lib --std` uses, and the same set. Without
-   * it every declaration in `lib/` collides with the copy the compiler supplies, which is what
-   * `sysl test lib` did before `--std` existed.
+   * it every declaration in `library/` collides with the copy the compiler supplies, which is what
+   * `sysl test library` did before `--std` existed.
    */
   private def libraryTests(): List[TestRunner.Outcome] = {
     assume(Toolchain.clangAvailable, "clang not available")
 
     val root = StdRoot.root
 
-    assume(root.isDefined, "lib/ is not reachable from the working directory")
+    assume(root.isDefined, "the library is not reachable from the working directory")
 
     val target = Target.default
 

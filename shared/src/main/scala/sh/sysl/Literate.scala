@@ -63,6 +63,96 @@ object Literate {
    */
   def named(name: String): Boolean = name.endsWith(Extension)
 
+  /** What one line of a literate file turned out to be. Every line is one or the other, and the
+   * whole of what reading such a file amounts to is deciding which.
+   *
+   * The two answers carry different text on purpose. `Code` holds the line with the four columns
+   * that made it program text already gone, because that is what a compiler is owed; `Prose` holds
+   * the line exactly as it was written, because that is what a reader is owed.
+   */
+  private[sysl] enum Line {
+    case Code(text: String)
+    case Prose(text: String)
+  }
+
+  /** Each line of the file, said to be one or the other — or the first thing wrong with the file.
+   *
+   * **Two things read a literate file and they want opposite halves of it**, so the rules that
+   * decide which half a line belongs to live here and neither of them carries a copy. What a fence
+   * does, what an indent means, and what a list item swallows are subtle enough that a second
+   * implementation would drift, and the drift would be a program that compiles as one thing and
+   * renders as another.
+   */
+  private[sysl] def classify(source: Source): Either[String, IndexedSeq[Line]] = {
+    val lines = source.lines
+    val out   = Array.fill[Line](lines.length)(Line.Prose(""))
+    var fence = Option.empty[(String, Int)]
+    var list  = -1
+    var i     = 0
+
+    while (i < lines.length) {
+      val text = lines(i)
+
+      fence match {
+        // Inside an illustration. It ends at a line whose own fence is at least as long as the one
+        // that opened it and made of the same character, which is Markdown's rule and matters
+        // here for one reason: a fenced block may quote a fence, and the longer opener is how.
+        case Some((open, _)) =>
+          out(i) = Line.Prose(text)
+          if closes(text, open) then fence = None
+
+        case None =>
+          val margin = text.takeWhile(c => c == ' ' || c == '\t')
+          val bare   = text.drop(margin.length)
+
+          // A tab is refused wherever it could have been meant as indentation, which is **before**
+          // asking whether the line is deep enough to be code. Asked after, a tab-indented line
+          // would answer "not four spaces", become prose, and be dropped from the program in
+          // silence — the author's function quietly missing a statement. That is the failure the
+          // rule exists to prevent, so the rule has to run before the decision it protects.
+          if bare.nonEmpty && margin.contains('\t') then
+            return Left(Pos(source, i + 1, margin.indexOf('\t') + 1).render(
+              "a tab in the indentation of a literate file — what makes a line program text is " +
+                "four columns of indent, and a tab is as wide as whatever happens to be " +
+                "displaying it, so this line is code in one editor and prose in another"))
+          else {
+            // An open list item ends at the first line with content that is no further in than the
+            // marker was. A blank line does not end one — a list may be written with air between
+            // its items — so what closes a list is prose returning to the margin, which is what a
+            // paragraph or a heading after a list already is.
+            if list >= 0 && bare.nonEmpty && margin.length <= list then list = -1
+
+            if list >= 0 then out(i) = Line.Prose(text)
+            else if opensFence(bare) && margin.length < Indent then
+              out(i) = Line.Prose(text)
+              fence = Some((bare.takeWhile(_ == bare.head), i + 1))
+            else if margin.length >= Indent then out(i) = Line.Code(text.drop(Indent))
+            else {
+              // Only asked where the line is too shallow to be program text, which is why a `-` or
+              // a `*` opening a sysl line can never be read as a bullet: at four columns in, the
+              // line was code before this was consulted.
+              if marker(bare) then list = margin.length
+              out(i) = Line.Prose(text)
+            }
+          }
+      }
+
+      i += 1
+    }
+
+    // Markdown lets an unclosed fence run to the end of the document, and for a document that is
+    // the harmless reading. For a *program* it means every declaration below the opening fence is
+    // quietly not compiled, and what the reader is told is that something further up is
+    // incomplete — the missing half of their file never enters the story. Refused at the fence
+    // that opened, since that is the line to go and look at.
+    fence match
+      case Some((_, line)) =>
+        Left(Pos(source, line, 1).render(
+          "this fence is never closed, so everything below it is an illustration and none of it " +
+            "is compiled — close it, or indent the lines that are meant to run"))
+      case None => Right(out.toIndexedSeq)
+  }
+
   /** The program a literate file holds, as a `Source` the rest of the compiler cannot tell from an
    * ordinary one — or the first thing wrong with the file.
    *
@@ -82,75 +172,15 @@ object Literate {
    */
   def tangle(source: Source): Either[String, Source] =
     if !named(source.name) then Right(source)
-    else {
-      val lines = source.lines
-      val out   = lines.toArray
-      var fence = Option.empty[(String, Int)]
-      var list  = -1
-      var i     = 0
-
-      while (i < lines.length) {
-        val text = lines(i)
-
-        fence match {
-          // Inside an illustration. It ends at a line whose own fence is at least as long as the one
-          // that opened it and made of the same character, which is Markdown's rule and matters
-          // here for one reason: a fenced block may quote a fence, and the longer opener is how.
-          case Some((open, _)) =>
-            out(i) = ""
-            if closes(text, open) then fence = None
-
-          case None =>
-            val margin = text.takeWhile(c => c == ' ' || c == '\t')
-            val bare   = text.drop(margin.length)
-
-            // A tab is refused wherever it could have been meant as indentation, which is **before**
-            // asking whether the line is deep enough to be code. Asked after, a tab-indented line
-            // would answer "not four spaces", become prose, and be dropped from the program in
-            // silence — the author's function quietly missing a statement. That is the failure the
-            // rule exists to prevent, so the rule has to run before the decision it protects.
-            if bare.nonEmpty && margin.contains('\t') then
-              return Left(Pos(source, i + 1, margin.indexOf('\t') + 1).render(
-                "a tab in the indentation of a literate file — what makes a line program text is " +
-                  "four columns of indent, and a tab is as wide as whatever happens to be " +
-                  "displaying it, so this line is code in one editor and prose in another"))
-            else {
-              // An open list item ends at the first line with content that is no further in than the
-              // marker was. A blank line does not end one — a list may be written with air between
-              // its items — so what closes a list is prose returning to the margin, which is what a
-              // paragraph or a heading after a list already is.
-              if list >= 0 && bare.nonEmpty && margin.length <= list then list = -1
-
-              if list >= 0 then out(i) = ""
-              else if opensFence(bare) && margin.length < Indent then
-                out(i) = ""
-                fence = Some((bare.takeWhile(_ == bare.head), i + 1))
-              else if margin.length >= Indent then out(i) = text.drop(Indent)
-              else {
-                // Only asked where the line is too shallow to be program text, which is why a `-` or
-                // a `*` opening a sysl line can never be read as a bullet: at four columns in, the
-                // line was code before this was consulted.
-                if marker(bare) then list = margin.length
-                out(i) = ""
-              }
-            }
+    else
+      classify(source).map { lines =>
+        val body = lines.map {
+          case Line.Code(text) => text
+          case Line.Prose(_)   => ""
         }
 
-        i += 1
+        new Source(source.name, body.mkString("\n"), source.dir, Indent)
       }
-
-      // Markdown lets an unclosed fence run to the end of the document, and for a document that is
-      // the harmless reading. For a *program* it means every declaration below the opening fence is
-      // quietly not compiled, and what the reader is told is that something further up is
-      // incomplete — the missing half of their file never enters the story. Refused at the fence
-      // that opened, since that is the line to go and look at.
-      fence match
-        case Some((_, line)) =>
-          Left(Pos(source, line, 1).render(
-            "this fence is never closed, so everything below it is an illustration and none of it " +
-              "is compiled — close it, or indent the lines that are meant to run"))
-        case None => Right(new Source(source.name, out.mkString("\n"), source.dir, Indent))
-    }
 
   private def opensFence(bare: String): Boolean =
     bare.startsWith("```") || bare.startsWith("~~~")

@@ -29,7 +29,7 @@ be unwound deliberately rather than discovered later.
 The CLI (`sysl run` / `sysl build` / `sysl emit-llvm`) links the emitted IR with `clang`.
 
 The library every compilation carries is the **standard module** `sysl` (`13 §8`) — ordinary sysl
-source in real files under `lib/sysl`, parsed once and hoisted ahead of the user's own declarations,
+source in real files under `library/sysl`, parsed once and hoisted ahead of the user's own declarations,
 and auto-imported into every file so its names arrive unqualified. `Library` is the one place that
 answers which key a library declaration is filed under, since the compiler names some of them for
 itself rather than reading them out of source.
@@ -304,7 +304,7 @@ before they appear and may be mutually recursive).
   growable buffer is ordinary sysl (`sysl.buf.Buf[T]`) and so is a sink over one
   (`sysl.buf.ByteSink`, a struct with an `impl Writer`). The reason is narrower: `str(x)` renders
   without a program naming a sink, so it cannot reach a module the program never imported, and it
-  goes through storage the compiler lays out instead. `lib/sysl/buf/buf.sysl` says the same thing
+  goes through storage the compiler lays out instead. `library/sysl/buf/buf.sysl` says the same thing
   from the other side, and it is why the sink sits beside the buffer it wraps rather than in the
   prelude. A **scalar** keeps its direct path in `print` and its own `str`, so a
   program that prints only numbers builds no sink at all. A `Writer` **borrows** the bytes it is

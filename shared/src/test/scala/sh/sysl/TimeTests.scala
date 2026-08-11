@@ -51,7 +51,7 @@ class TimeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     // The two rules that are not "every fourth year" are asserted in the library itself, where the
-    // calendar is — `lib/sysl/time/tests.sysl`, "the leap-year rules, as a predicate and as a month
+    // calendar is — `library/sysl/time/tests.sysl`, "the leap-year rules, as a predicate and as a month
     // length". What stays here is the same fact reached through the *calendar* rather than through
     // the predicate, because it is a claim about arithmetic on serials rather than about a rule.
     "which the day numbers agree with" in {
@@ -300,7 +300,7 @@ class TimeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   /** What a parse refuses.
     *
     * **The out-of-range family moved into the library**, where the calendar it is about lives:
-    * `lib/sysl/time/tests.sysl` asserts a day the month does not have, the leap day accepted only in
+    * `library/sysl/time/tests.sysl` asserts a day the month does not have, the leap day accepted only in
     * a leap year, and each of month, hour, minute and second — with the same messages, since a
     * parser that answered "day is out of range" to a bad month refuses the right inputs for the
     * wrong reason.

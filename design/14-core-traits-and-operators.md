@@ -621,7 +621,7 @@ most useful erasure in the language, and there is no workaround: coherence puts 
 bool` in the library or nowhere.
 
 So the closed families are **written out**. `bool`, `char`, `string`, `real` and `f32` are five
-types, and `lib/sysl/display.sysl` gives each an ordinary one-line `impl` forwarding to the same
+types, and `library/sysl/display.sysl` gives each an ordinary one-line `impl` forwarding to the same
 `display_*` function the rule used to name. They are now `Display` the way any program's struct is,
 and a `*Display` carries one.
 

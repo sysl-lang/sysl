@@ -41,7 +41,7 @@ trait CodegenSupport extends Matchers { this: Assertions =>
   /** The environment structs of the closures **this program** declared, in index order, with the
    * library's own filtered out.
    *
-   * **Never assert `%struct.$closure0`.** The counter runs over the whole compilation and `lib/` is
+   * **Never assert `%struct.$closure0`.** The counter runs over the whole compilation and `library/` is
    * lowered first, so a program's own closures begin at whatever index the library leaves free. That
    * index moved by four the day `sysl.slices` arrived, four of its functions passing
    * `(a, b) -> a < b` to a bare-arrow parameter — and five assertions broke for a reason that had
@@ -54,7 +54,7 @@ trait CodegenSupport extends Matchers { this: Assertions =>
    * "quietly stops testing anything at all".
    *
    * Asking which environments are *this program's* is what all of these tests always meant, and it
-   * cannot drift again: a closure added to `lib/` changes the baseline and the difference, equally.
+   * cannot drift again: a closure added to `library/` changes the baseline and the difference, equally.
    */
   protected def envs(out: String): List[String] = {
     val defs = envDefs(out)
@@ -131,13 +131,13 @@ trait CodegenSupport extends Matchers { this: Assertions =>
   /** The error message for a project laid out across directories that must be rejected. */
   protected def errIn(fs: (String, String, String)*): String = rejected(project(fs*))
 
-  /** A **stand-in standard module**, written by the test rather than read from `lib/sysl`.
+  /** A **stand-in standard module**, written by the test rather than read from `library/sysl`.
    *
    * Some questions are about the library's *position* rather than about what it happens to declare —
    * that a program reaches its members without importing them, that it is searched after a file's
    * imports, that what it keeps to itself is out of reach. Asking those of the real library means
    * the answer changes whenever the library does, and a question it has no case for cannot be asked
-   * at all: nothing in `lib/sysl` is private, so nothing there can show what a private member of the
+   * at all: nothing in `library/sysl` is private, so nothing there can show what a private member of the
    * library does.
    *
    * The trees go in as the `Stdlib` and **not** as units of the compilation, which is the same way the

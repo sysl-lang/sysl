@@ -37,7 +37,7 @@ object Library {
    * producing, and the only compilation allowed to declare any of them.
    *
    * Read off the library's own headers rather than written down, because a module is a directory
-   * and the library is a tree: adding a directory under `lib/sysl` is how a submodule comes into
+   * and the library is a tree: adding a directory under `library/sysl` is how a submodule comes into
    * being, and a list kept beside that would have to be edited in step with it or would quietly
    * leave the new module out of the build that is supposed to be producing it.
    *
@@ -60,7 +60,7 @@ object Library {
    *
    * From the source specifically, and that is the right one for the questions asked of this: what
    * the library declares, which the compiler-known names are held to, is a claim about the files
-   * under `lib/sysl` rather than about whatever a given compilation was handed. A compilation's own
+   * under `library/sysl` rather than about whatever a given compilation was handed. A compilation's own
    * std is `Stdlib`, which it is given rather than looks up.
    */
   def decls: List[Stmt] = carried.decls

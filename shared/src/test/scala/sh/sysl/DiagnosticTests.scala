@@ -290,7 +290,7 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
       val out = diag(src)
 
       out should include("--> t.sysl:2:")
-      out should not include "lib/sysl"
+      out should not include "library/sysl"
     }
   }
 

@@ -22,7 +22,7 @@ package sh.sysl
  * or to the highlighting grammar `GrammarTests` reconciles against that set.
  *
  * **The restriction is on sysl identifiers and not on the C names an `extern` links to.** C's own
- * reserved space is exactly where a libc lives — `lib/sysl/fs/error.sysl` links `"__errno_location"`
+ * reserved space is exactly where a libc lives — `library/sysl/fs/error.sysl` links `"__errno_location"`
  * and `"__error"` — so the *string* in an `extern` is untouched by any of this. What is checked is
  * the name the declaration binds in sysl, which in that file is `errno_location`.
  */

@@ -9,7 +9,7 @@ import org.scalatest.matchers.should.Matchers
  * claim that has to hold before anything is moved onto that path: that the two mean the same thing.
  *
  * A program is compiled against the library (`13 §8`), and every compilation so far has been handed
- * it the same way — `lib/sysl` as the compiler embeds it, parsed. The artifact exists to end that
+ * it the same way — `library/sysl` as the compiler embeds it, parsed. The artifact exists to end that
  * source dependence: the same trees arrive already decoded, and the half with nothing left to
  * monomorphize arrives as object code to link against rather than emit again.
  *
@@ -27,7 +27,7 @@ import org.scalatest.matchers.should.Matchers
  */
 class StdArtifactTests extends AnyFreeSpec with Matchers {
 
-  /** The std built exactly as `sysl build-lib lib --std` builds it. This is the production path
+  /** The std built exactly as `sysl build-lib library --std` builds it. This is the production path
    * rather than a hand-rolled `AstCodec.encode`, so what is compared below is what a program would
    * actually be handed.
    *
@@ -64,7 +64,7 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
   /** The same program with the standard module's object half linked rather than emitted. */
   private def linked(program: String): String = against(decoded, program, precompiled)
 
-  /** The std's metadata with one of its files changed, which is what an edit to `lib/sysl` after an
+  /** The std's metadata with one of its files changed, which is what an edit to `library/sysl` after an
    * artifact was built amounts to.
    */
   private lazy val drifted: String = {
@@ -137,7 +137,7 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
     }
 
     "and its declarations belong to it rather than to the embedded copy" in {
-      // A `Source` compares by identity, so a decoded file named `lib/sysl/print.sysl` is a
+      // A `Source` compares by identity, so a decoded file named `library/sysl/print.sysl` is a
       // different source from the embedded file of the same name — which is exactly what makes the
       // IR match below a result rather than a tautology.
       val one = decoded.decls.find(_.pos.isDefined).getOrElse(fail("the decoded std carries no positions"))
@@ -199,7 +199,7 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
   "an artifact built from a different standard module than the compiler carries" - {
 
     // The failure this exists for is the quiet one. The artifact is built separately from the
-    // compiler that consumes it, so the two drift: build one, edit `lib/sysl`, and every compilation
+    // compiler that consumes it, so the two drift: build one, edit `library/sysl`, and every compilation
     // afterwards is against a standard module that is not the one in the tree. A stale artifact
     // decodes and links perfectly — it is simply the wrong library, and nothing else would notice.
 
@@ -225,7 +225,7 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
     }
 
     "and it is exactly the hash it says it is" in {
-      // A known-answer test, over a fixed input rather than the library, so that editing `lib/sysl`
+      // A known-answer test, over a fixed input rather than the library, so that editing `library/sysl`
       // does not come here. It is the only kind that pins a hash: every behavioural property worth
       // asserting — that a change moves it, that order and path do not — holds just as well of the
       // FNV-1a underneath without the `fmix64` finalizer on top, so nothing short of the value
@@ -434,7 +434,7 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
       // point of precompiling was gone with nothing failing to say so. Read off disk the same files
       // answered the other way. The fix is that a compilation **building** a module does not treat
       // that module as supplied to it (`AnalyzerBase.suppliedByLibrary`).
-      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
 
       val fromDisk = LibraryArtifact.build(Project.collect(StdRoot.root.get), Target.default, LibraryArtifact.std)
 
@@ -502,7 +502,7 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
       // pair is the discriminating part: the same declaration is linked at one argument and compiled
       // at another, in one program.
       //
-      // **`int` is also the argument `lib/sysl/buf/tests.sysl` uses throughout**, which makes this
+      // **`int` is also the argument `library/sysl/buf/tests.sysl` uses throughout**, which makes this
       // the regression test for `Tests.stripSource`. Analyzing a test body monomorphizes whatever it
       // names, and an instantiation is an ordinary library function afterwards — so a library that
       // stripped its tests from the *typed* tree would ship the whole of `Buf[int]` here and fail on

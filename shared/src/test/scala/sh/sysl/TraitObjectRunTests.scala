@@ -478,7 +478,7 @@ class TraitObjectRunTests extends AnyFreeSpec with RunSupport with CodegenSuppor
     * a compiler-provided membership does not.
     *
     * **Every built-in now clears that bar for `Display`, and the open families were the last to.**
-    * `bool`, `char`, `string` and the two floats are finite, so `lib/sysl/display.sysl` writes them
+    * `bool`, `char`, `string` and the two floats are finite, so `library/sysl/display.sysl` writes them
     * ordinary blocks. The `iN`/`uN` families admit `i5` and `u24`, so no finite list of blocks covers
     * them — what covers them is the single blanket block over `Integer`, whose buffer is measured
     * from the type it is instantiated at. An integer's `display` is therefore an ordinary lowered

@@ -1223,15 +1223,15 @@ Five consequences worth stating, because each is a thing a reader would otherwis
   supplied is keyed outside the library's own modules.
 
 **The standard module is built the same way.** `sysl`'s own source is ordinary sysl files under
-`lib/sysl`, and `sysl build-lib lib --std` compiles them — `--std` being the one thing that lets a
+`library/sysl`, and `sysl build-lib library --std` compiles them — `--std` being the one thing that lets a
 compilation declare a module the compiler otherwise supplies. It is written down rather than inferred
 from the module names in the tree, because a build that guessed would turn a clear refusal — *you
 cannot add to the module every program is compiled against* — into an artifact that builds and then
 collides with the library at whatever link tried to use it.
 
 **Those files are what a compiler is installed with, and it reads them off disk.** An installed sysl
-finds them at `<prefix>/share/sysl/lib`, reached from its own resolved path — the ordinary Unix
-prefix layout, and exactly what Homebrew's `pkgshare` is. A sysl run out of a checkout finds `lib/`
+finds them at `<prefix>/share/sysl/library`, reached from its own resolved path — the ordinary Unix
+prefix layout, and exactly what Homebrew's `pkgshare` is. A sysl run out of a checkout finds `library/`
 in the tree. `SYSL_LIB` names a root outright and is an escape hatch rather than the mechanism: a
 toolchain that had to be told where its own library was is one nobody could install.
 
@@ -1244,7 +1244,7 @@ cannot be pointed at an edited copy is one whose library cannot be worked on at 
 rebuilding the compiler.
 
 `rustc` computes a sysroot from its own location, `clang` finds its resource directory the same way,
-`zig` its `lib/`. None of them carries a standard library inside the executable and none of them asks
+`zig` its `library/`. None of them carries a standard library inside the executable and none of them asks
 for a variable to be set. What replaces the guarantee is the **diagnostic**: a compiler that cannot
 find its library names every path it tried, in the order it tried them, and says how to name one.
 That is the whole of the trade, and it is why the message is specified rather than left to whatever
@@ -1297,7 +1297,7 @@ is found rather than named:
 
 ```
 sysl run prog.sysl                 # builds the artifact if it is not there, then finds it
-sysl build-lib lib --std          # the same artifact, written on demand
+sysl build-lib library --std          # the same artifact, written on demand
 ```
 
 One path at both ends. `build-lib --std` with no `-o` writes to it and a compilation with no
@@ -1308,11 +1308,11 @@ checking its own first line.
 
 **That path is in the user's cache, keyed by the library's fingerprint** — on this author's macOS,
 `~/Library/Caches/sysl/<fingerprint>/std.syslib`. It was once `./.sysl/std.syslib`, and the change is
-what an *installed* compiler forces: a clone has its own `lib/sysl`, so a per-tree artifact was right,
+what an *installed* compiler forces: a clone has its own `library/sysl`, so a per-tree artifact was right,
 but a compiler carrying the library inside itself would otherwise rebuild the same 900KB once per
 directory anyone ran it in, and leave a `.sysl/` wherever `sysl run` was typed. Keying on the
 fingerprint rather than a release number is what makes an upgrade need no invalidation: an edited
-`lib/sysl` hashes differently and therefore *is* a different path, so a stale hit cannot occur rather
+`library/sysl` hashes differently and therefore *is* a different path, so a stale hit cannot occur rather
 than being caught. Where a machine has no cache directory at all — a container with no home — the
 project-local path is still the answer.
 
@@ -1321,7 +1321,7 @@ second, so a clone or a fresh worktree builds its own. That makes drift the thin
 rather than staleness in the repository: the artifact carries a **fingerprint of the standard module sources it
 was built from** — a 64-bit FNV-1a over each file's basename and contents in sorted order, run
 through `fmix64` — and a compilation refuses one whose fingerprint is not the one the compiler
-carries. Sorting by basename rather than by path is what lets the artifact built from `lib/sysl` on
+carries. Sorting by basename rather than by path is what lets the artifact built from `library/sysl` on
 disk match the copy the compiler generated from the same files, which are named by where each was
 read.
 
@@ -1377,7 +1377,7 @@ standard library: clang ships no libc, and rustc ships precompiled `libstd.rlib`
 a sysroot whose absence is a hard error rather than a fallback. Both put the library *alongside* the
 compiler in a known place. sysl carries one instead, deliberately: it has no released compiler to
 bootstrap from, and its own tests have to run in a tree where nothing has been built yet. What that
-costs is the standing obligation to keep the carried copy in step with `lib/sysl` — met by
+costs is the standing obligation to keep the carried copy in step with `library/sysl` — met by
 generating it from those files on every build and asserting file-for-file that the two agree, so the
 files are the fact and the carrier cannot disagree with them.
 
@@ -1471,7 +1471,7 @@ would diagnose it unable to run — so the source path stays, and stays reachabl
 
 - **h. What is in the standard library — the *where* is settled, the *what* is not.** A library now
   has somewhere to live and a way to be reached: §8 is the mechanism, `sysl` is the module name every
-  program is compiled against, and its source is real sysl files under `lib/sysl` that the compiler's
+  program is compiled against, and its source is real sysl files under `library/sysl` that the compiler's
   own `build-lib --std` compiles. What that module should *contain* is the open half, and it is the
   question the whole exercise was for.
 
@@ -1517,7 +1517,7 @@ would diagnose it unable to run — so the source path stays, and stays reachabl
   It is the same question as `14 §8 a`'s — which module the trait catalog lives in once there is more
   than one — asked about a second body of code.
 
-  **The *where* now admits a shape, which narrows the *what*.** `lib/sysl` is a tree: a directory
+  **The *where* now admits a shape, which narrows the *what*.** `library/sysl` is a tree: a directory
   under it is a submodule of `sysl` by §1's ordinary rule, and only `sysl` itself is auto-imported, so
   a name put in a submodule is a name a program has to ask for. That turns "what belongs in the
   standard library" into two questions that can be answered separately — what a program cannot avoid

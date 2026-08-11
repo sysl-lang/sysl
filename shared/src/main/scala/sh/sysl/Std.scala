@@ -5,7 +5,7 @@ import io.github.edadma.cross_platform.*
 /** The library the compiler is installed with: the standard module `sysl` that every program is
  * compiled against, and the submodules beneath it (`13 § Open h`).
  *
- * **`sysl` is the auto-imported part and not the whole of it.** `lib/sysl` is a tree, so a directory
+ * **`sysl` is the auto-imported part and not the whole of it.** `library/sysl` is a tree, so a directory
  * under it is a submodule by `13 §1`'s ordinary rule, and only the standard module's names are the
  * ones every file gets for free. That is what a submodule is for: what a program cannot avoid
  * needing goes in `sysl`, and what it should have to ask for goes below.
@@ -18,7 +18,7 @@ import io.github.edadma.cross_platform.*
  * single hole fails every test at once with nothing to bisect; a move put **one** declaration onto
  * that path, so what broke named what was wrong.
  *
- * **The source is real files, under `lib/sysl`, and the compiler reads them off disk.** That is what
+ * **The source is real files, under `library/sysl`, and the compiler reads them off disk.** That is what
  * the string inside the compiler could never be: a literal has no other form, while these are files
  * a driver reads exactly as it reads a user's library — which is what `sysl build-lib` is pointed
  * at, and what makes the library's own source something a reader can open, edit, and rebuild
@@ -32,7 +32,7 @@ import io.github.edadma.cross_platform.*
  * names every place it looked.
  *
  * **Every real toolchain resolves this way.** `rustc` computes a sysroot from its own location,
- * `clang` finds its resource directory from its own, `zig` its `lib/`. None of them carries its
+ * `clang` finds its resource directory from its own, `zig` its `library/`. None of them carries its
  * standard library in the executable, and none of them asks the user to set a variable.
  *
  * **What a given compilation was handed is a different question**, and it is `Stdlib` that answers it:
@@ -79,11 +79,11 @@ object Std {
    */
   private[sysl] def rootOf(named: Option[String], exe: Option[String],
                            isDir: String => Boolean): Either[String, String] = {
-    // A root is one that **holds the standard module**, not merely one that exists. `lib` is an
-    // ordinary directory name — a C project has one, and so does half of everything else — so an
-    // installed compiler standing in someone's source tree would otherwise take theirs for its own
-    // and fail somewhere far from the cause. Asking for `<root>/sysl` is one `isDirectory` and it
-    // makes the search skip what it should skip.
+    // A root is one that **holds the standard module**, not merely one that exists. Both spellings
+    // are ordinary directory names — a C project has a `lib`, and so does half of everything else —
+    // so an installed compiler standing in someone's source tree would otherwise take theirs for its
+    // own and fail somewhere far from the cause. Asking for `<root>/sysl` is one `isDirectory` and
+    // it makes the search skip what it should skip.
     def holdsLibrary(root: String): Boolean = isDir(s"$root/$module")
 
     named match
@@ -97,19 +97,33 @@ object Std {
   /** The places a library root is looked for, in order, each with the reason it is a candidate — the
    * reasons being what the diagnostic below is made of.
    *
-   * The installed answer is `<prefix>/share/sysl/lib`, reached from the binary's own resolved path
-   * by going up out of `bin`. That is a plain Unix prefix layout and is exactly what Homebrew's
+   * The installed answer is `<prefix>/share/sysl/library`, reached from the binary's own resolved
+   * path by going up out of `bin`. That is a plain Unix prefix layout and is exactly what Homebrew's
    * `pkgshare` is, so an installed sysl finds its library with nothing configured and two installs
    * of different versions each find their own.
    *
    * The relative ones are the development tree. `../` and `../../` are there because the compiler's
    * own tests do not all run from the repository root, and because a developer running the driver
    * from a subdirectory of a checkout is the same case.
+   *
+   * **`lib` is tried after `library` everywhere, and it is not deprecation politeness.** The
+   * directory was called `lib` until the name was changed for being one a reader takes for a build
+   * output; what did not change is that copies of it are on disk in other repositories and inside
+   * every compiler already installed. `sysl.sh` unpacks one from a release tarball and points
+   * `SYSL_LIB` at it; a checkout of any age has one in the tree. Dropping the old spelling would
+   * have made a rename in one repository an outage in eleven, so both are searched and the new one
+   * wins wherever a tree has been moved over.
    */
-  private[sysl] def candidates(exe: Option[String]): List[(String, String)] =
-    exe.flatMap(path => Project.parentOf(path).flatMap(Project.parentOf)).toList
-      .map(prefix => s"$prefix/share/sysl/lib" -> "beside this compiler") :::
-      List("lib", "../lib", "../../lib").map(_ -> "from the working directory")
+  private[sysl] def candidates(exe: Option[String]): List[(String, String)] = {
+    val prefixes = exe.flatMap(path => Project.parentOf(path).flatMap(Project.parentOf)).toList
+
+    Names.flatMap(name => prefixes.map(prefix => s"$prefix/share/sysl/$name" -> "beside this compiler")) :::
+      Names.flatMap(name => List(name, s"../$name", s"../../$name"))
+        .map(_ -> "from the working directory")
+  }
+
+  /** What the directory holding the library is called, in the order a search trusts them. */
+  private val Names: List[String] = List("library", "lib")
 
   /** What a compilation with no library to compile against says.
    *
@@ -131,7 +145,7 @@ object Std {
    *
    * Each carries the directory it sits in below the root, which is the module its header has to
    * agree with (`13 §1`). They are read by the same walk that reads a user's library, because they
-   * *are* a library: `sysl build-lib lib --std` is pointed at this same tree and gets these same
+   * *are* a library: `sysl build-lib library --std` is pointed at this same tree and gets these same
    * values.
    */
   lazy val sources: List[Source] = root match
@@ -145,25 +159,36 @@ object Std {
       // level too high.
       if found.isEmpty then sys.error(s"the library at $dir holds no sysl source files")
 
-      found.map(named(dir, _))
+      found.map(named)
     case Left(err) => sys.error(err)
 
   /** A library file under the name a **diagnostic** should call it: the library root's own name and
    * the file's place below it, never the path it was read from.
    *
    * **A message naming a library file has to read the same on every machine.** The library moves
-   * with the installation — `/opt/homebrew/Cellar/sysl/0.0.3/share/sysl/lib` on one machine, `lib`
-   * in a checkout, wherever `SYSL_LIB` says on a third — and a diagnostic that quoted that path
-   * would be noise on the first, different on the second, and unquotable by the documentation on
-   * all of them. Which is how this was found: two library pages quote
-   * `lib/sysl/thread/mutex.sysl` in a refusal about a private field, and the executable-docs suite
-   * failed the moment the name became absolute.
+   * with the installation — `/opt/homebrew/Cellar/sysl/0.0.3/share/sysl/library` on one machine,
+   * `library` in a checkout, wherever `SYSL_LIB` says on a third — and a diagnostic that quoted that
+   * path would be noise on the first, different on the second, and unquotable by the documentation
+   * on all of them. Which is how this was found: two library pages quote
+   * `library/sysl/thread/mutex.sysl` in a refusal about a private field, and the executable-docs
+   * suite failed the moment the name became absolute.
+   *
+   * **The prefix is a constant and not the root's own basename**, which is the second half of the
+   * same rule and was learned the harder way. Read off the directory, the name said `lib` in a
+   * checkout, `lib` under an install — and `mine` for anyone who pointed `SYSL_LIB` at
+   * `/tmp/mine`. That last one was always wrong and went unnoticed because nobody does it; what made
+   * it matter is the directory being renamed, after which the *same* file was `library/sysl/print.sysl`
+   * out of a moved tree and `library/sysl/print.sysl` out of a compiler installed the week before. A
+   * diagnostic that a page quotes cannot depend on which of those the reader has.
    *
    * A program's own files keep the path they were given, and should: those a reader can open, and
    * the whole point of a diagnostic pointing at one is that they go and look.
    */
-  private[sysl] def named(root: String, s: Source): Source =
-    Source(s"${Project.basename(root)}/${place(s)}", s.text, s.dir.getOrElse(Nil))
+  private[sysl] def named(s: Source): Source =
+    Source(s"$Prefix/${place(s)}", s.text, s.dir.getOrElse(Nil))
+
+  /** What a library file is called in a diagnostic, whatever directory it was read out of. */
+  private[sysl] val Prefix: String = "library"
 
   /** A file's place in the library: the module directories it sits under, then its own name. The
    * same key the fingerprint sorts and hashes by, and for the same reason — it is what is true of a
@@ -176,7 +201,7 @@ object Std {
    * from one built from a different version of it.
    *
    * The artifact is built separately from the compiler that consumes it, and the two can therefore
-   * fall out of step: build one, edit `lib/sysl`, and every compilation after that would be against
+   * fall out of step: build one, edit `library/sysl`, and every compilation after that would be against
    * a standard module that is not the one in the tree. Nothing else would notice — a stale artifact
    * decodes perfectly and links perfectly, it is just the wrong library. This is what an artifact is
    * held to on the way in ([[Stdlib.read]]).
@@ -184,7 +209,7 @@ object Std {
    * **Rebuilding the compiler has nothing to do with it, and that is what reading the library off
    * disk bought.** While the source was generated into the binary there were two copies and two
    * ways to be stale — an artifact behind the carried source, and carried source behind the tree —
-   * and the second needed a test of its own to catch. Now an edit to `lib/sysl` moves this the next
+   * and the second needed a test of its own to catch. Now an edit to `library/sysl` moves this the next
    * time the compiler runs, the artifact keyed by it is a different file, and the drift the second
    * copy made possible cannot occur.
    */
@@ -256,7 +281,7 @@ object Std {
   private[sysl] def memoAnswersTwice(target: Target): Boolean =
     cache.synchronized { parsed(target) eq parsed(target) }
 
-  /** What the standard module **declares**, which is not everything under `lib/`.
+  /** What the standard module **declares**, which is not everything under `library/`.
    *
    * The library's own `@tests` files are scaffolding for `sysl test --std` and are dropped by every
    * other build, so a name only a test writes is not a name the standard module declares — and

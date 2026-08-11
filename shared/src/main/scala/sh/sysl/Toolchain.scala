@@ -388,7 +388,7 @@ object Toolchain {
    *
    * **This replaced a list the driver carried.** Until `15 §8` existed, `-lm` was appended to every
    * ELF link whether or not the program touched mathematics, because the compiler had no way to be
-   * told and `sysl.math` had no way to say. It says so itself now, in `lib/sysl/sys/math.sysl`, and
+   * told and `sysl.math` had no way to say. It says so itself now, in `library/sysl/sys/math.sysl`, and
    * the decision left here is the only part that was ever the driver's: where a named library lives
    * on the machine being built for.
    */

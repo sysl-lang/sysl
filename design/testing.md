@@ -223,7 +223,7 @@ none of the tests there are, both exit 0 and say which happened.
 
 ### `--std` — testing the standard library itself
 
-The compiler supplies `sysl` to every compilation, so pointing the runner at `lib/` means the
+The compiler supplies `sysl` to every compilation, so pointing the runner at `library/` means the
 library arriving twice: once as the tree in front of the compiler and once as the copy it hands
 over. Every declaration is already declared, and the whole library is refused.
 
@@ -236,8 +236,8 @@ a program with a `sysl` directory of its own, which is nearly always a mistake �
 collision.
 
 ```
-sysl test lib --std
-sysl test lib --std --filter sysl.time
+sysl test library --std
+sysl test library --std --filter sysl.time
 ```
 
 This is what makes the first half of Tier 3's claim true. Testing "the standard library and
@@ -255,7 +255,7 @@ assertion into the same widening and pass it.
 
 ### `assert` and `panic`
 
-Both are in the standard module (`lib/sysl/check.sysl`), and the tests needed them: `require`
+Both are in the standard module (`library/sysl/check.sysl`), and the tests needed them: `require`
 is a promise about a *call*, checked on entry, and a test's fifth statement has no contract to
 hang a claim on. They stop the program the way `unwrap` does — a line naming what happened,
 then the hosted exit — rather than with `llvm.trap`, because a check a *program* makes is one

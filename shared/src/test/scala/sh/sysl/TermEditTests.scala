@@ -7,7 +7,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * **What the module's own `@test` functions cannot say is that a *program* can use it.** Those run
  * inside a test build of the library, where every module is already in scope and nothing has been
  * imported across a boundary; a defect in what the module exports, or in what a user program is
- * allowed to name, is invisible from in there. `lib/sysl/term/edit/tests.sysl` therefore carries the
+ * allowed to name, is invisible from in there. `library/sysl/term/edit/tests.sysl` therefore carries the
  * behaviour — every key, every redraw — and this carries the two claims it structurally cannot make:
  * that the module is importable, and that a program written against it links.
  *

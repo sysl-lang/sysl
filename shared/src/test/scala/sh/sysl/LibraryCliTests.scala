@@ -163,7 +163,7 @@ class LibraryCliTests extends LibraryCliSupport {
   "--std-lib" - {
 
     "runs a program whose share of the standard module came from the artifact" in {
-      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
       assume(Toolchain.clangAvailable, "clang not available")
 
       // Exiting 0 is the whole assertion, and it is a strong one. Every std symbol the artifact
@@ -177,7 +177,7 @@ class LibraryCliTests extends LibraryCliSupport {
     }
 
     "builds a library against one too, which is the other thing that gets compiled" in {
-      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
       assume(Toolchain.clangAvailable, "clang not available")
 
       val out = createTempFile("sysl-cli-against-std-", LibraryArtifact.extension)
@@ -222,10 +222,10 @@ class LibraryCliTests extends LibraryCliSupport {
 
       refuses("when its metadata will not decode", corrupt(artifactOfMeta("0000000000000000\n0\nrubbish")))
 
-      // The one a developer actually meets: build the artifact, then edit `lib/sysl`. It decodes and
+      // The one a developer actually meets: build the artifact, then edit `library/sysl`. It decodes and
       // would link perfectly — it is simply no longer the standard module in the tree — so nothing
       // but the fingerprint would catch it, and a silently wrong library is the worst of the five.
-      refuses("when it was built from a different lib/sysl", corrupt(artifactOfMeta(stale)))
+      refuses("when it was built from a different library/sysl", corrupt(artifactOfMeta(stale)))
     }
 
     "is not needed by name, the artifact being looked for where build-lib --std puts it" - {
@@ -236,7 +236,7 @@ class LibraryCliTests extends LibraryCliSupport {
       // introduces, arriving first in our own suite. The real default is pinned separately, below.
 
       "so building it with no -o and compiling with no --std-lib is the whole workflow" in {
-        assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
+        assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
         assume(Toolchain.clangAvailable, "clang not available")
 
         val where = s"${createTempDirectory("sysl-cli-found-")}/std${LibraryArtifact.extension}"
@@ -359,7 +359,7 @@ class LibraryCliTests extends LibraryCliSupport {
        * its shape and the one property a caller depends on, never a path from this author's laptop. */
 
       "and it is keyed by the library, so a compiler carrying another one cannot collide with it" in {
-        // The key is a fingerprint of the library's contents, so a changed `lib/sysl` *is* a
+        // The key is a fingerprint of the library's contents, so a changed `library/sysl` *is* a
         // different path rather than a stale hit at the same one.
         assume(cacheDirectory.isDefined, "this machine has no cache directory")
 
@@ -372,7 +372,7 @@ class LibraryCliTests extends LibraryCliSupport {
         // bytes at an identical fingerprint -- and the upgrade silently keeps the old ones.
         //
         // The regression is 0.0.5 -> 0.0.6: the fix stopped the object half defining `sysl$stdout`
-        // and touched no `lib/sysl` file, so every machine that had run 0.0.5 would have gone on
+        // and touched no `library/sysl` file, so every machine that had run 0.0.5 would have gone on
         // linking against an artifact that still defined it. Keyed on the library alone, that is a
         // release which changes nothing for the people it is for.
         assume(cacheDirectory.isDefined, "this machine has no cache directory")
@@ -456,7 +456,7 @@ class LibraryCliTests extends LibraryCliSupport {
     }
 
     "and takes the built-in copy with a good artifact sitting right there" in {
-      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
 
       // Which module was used, not merely that one was: the same program at the same path, told to
       // use the artifact and told not to. Exiting 0 both ways would hold for a flag that did
@@ -477,7 +477,7 @@ class LibraryCliTests extends LibraryCliSupport {
     // own symbols — declared when linked, defined when carried — so what must agree is the code the
     // **program** lowers to, which the way its library arrived has no business changing.
     "and one program compiled both ways lowers to the same program" in {
-      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
 
       val src = program("f(n: int) -> int = n * 2\nprint(f(21))\n")
       val linked  = emitted(Config(command = "emit-llvm", file = src, stdSearch = Some(std)))
@@ -493,7 +493,7 @@ class LibraryCliTests extends LibraryCliSupport {
     }
 
     "and what it compiles is whole, not a program relying on the artifact anyway" in {
-      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
       assume(Toolchain.clangAvailable, "clang not available")
 
       // Linking is the assertion. The artifact's object half is not handed to the linker here, so
