@@ -311,9 +311,11 @@ crossing a boundary, which is what a channel is for.
 **`Mutex[T]` owns what it protects**, which is the difference against `SpinLock`. Both of its fields
 are private, so there is no way to reach the value that does not go through `lock` or `try_lock` and
 no way to build one already held — `Mutex.new(v)` is the only way in, because a private field puts
-the positional constructor out of reach (`08 §`). Releasing is still written, since the language has
-no destructor and there is nothing for a guard's destruction to hang on: `defer m.unlock()` is the
-idiom, the same one `sysl.fs` uses for `close`.
+the positional constructor out of reach (`08 §`). **Releasing is still written**, and the reason has
+changed without the conclusion changing: it used to be that the language had no destructor, and now
+it is that a guard would have to be a `&T` to get one (`03 § A destructor`) — which means allocating
+a box per `lock`, on the path where the whole point is to hold a lock for as few instructions as
+possible. `defer m.unlock()` is the idiom, the same one `sysl.fs` uses for `close`.
 
 **It is not built on `pthread_mutex_t`, and the reason is a build property rather than a preference.**
 A caller-allocated opaque C type is one of the three things `15 §7` names as reachable from C and from

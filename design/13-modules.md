@@ -1019,7 +1019,7 @@ is never given back at all.
 static *is*.** Every assignment during the run has a perfectly good line to write a release on — its
 own store, which lets go of what was there before it writes what arrives, exactly as an assignment to
 a struct field does. What has nowhere to go is the release at exit, and there is no exit pass: a
-process ending is what returns its memory, and `0021`'s destructor takes the same ruling for the same
+process ending is what returns its memory, and a destructor takes the same ruling for the same
 reason. Rust says this outright about a `static` and it is the right answer; C++ runs static
 destructors at exit and spent twenty years on the order they run in.
 

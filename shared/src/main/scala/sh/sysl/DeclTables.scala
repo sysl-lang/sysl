@@ -157,6 +157,15 @@ trait DeclTables extends Reporting {
    */
   protected def overloadKeys(key: String): List[String] = overloadSets.getOrElse(key, List(key))
 
+  /** The **type keys** that were given a destructor by an `impl Drop` (`03 § A destructor`).
+   *
+   * Kept as the keys an `impl` names rather than as instantiated types, because that is what is
+   * known when the block is lowered — a generic type's `impl` is one block covering every
+   * instantiation, and which of those a program actually makes is not settled until the walk ends.
+   * `ProgramWalk` asks this of each type it did instantiate.
+   */
+  protected val dropsDeclared = mutable.Set.empty[String]
+
   /** The `@test` functions the sources declared, in the order hoisting met them (`testing.md`). A
    * report lists tests in the order they were written, and this is where that order comes from —
    * the typed functions are grouped by what reaches them and say nothing about where they sat.

@@ -953,4 +953,13 @@ case class TProgram(
      * test names one — so by the time a tree reaches here, dropping them can leave nothing dangling.
      */
     testOnly: Set[String] = Set.empty,
+    /** The **destructor** each type that has one is reached by, keyed by the type as `Type.mangle`
+     * spells it — which is exactly how the release hook names itself (`03 § A destructor`).
+     *
+     * It is carried rather than looked up because the two ends are in different phases and neither
+     * can ask the other. The analyzer knows which types an `impl Drop` covered and what the lowered
+     * member is called; the emitter knows only a payload type, at a release site with no name in it.
+     * A map from one to the other is the whole of what has to cross.
+     */
+    destructors: Map[String, String] = Map.empty,
 )

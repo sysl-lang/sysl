@@ -167,10 +167,11 @@ reads the shifted elements at the length it was copied at.
 
 **Correcting what this document said.** The claim here was that a library could not reach a growable
 array — that it would need `sizeof` over a type parameter, a cast to reach the elements through it,
-and above all a **destructor**, since the language has exactly one and no way to write another. That
-was wrong. (The first two are no longer absences either: `sizeof(T)` may be asked of a type parameter
-and `ptr_cast` reaches the elements, both in `03 § Reinterpreting storage`. They were never what was
-missing here, which is the point of the correction.) A container does not need a destructor if its storage is a value that already has one,
+and above all a **destructor**, since the language had exactly one and no way to write another. That
+was wrong. (None of the three is an absence now: `sizeof(T)` may be asked of a type parameter and
+`ptr_cast` reaches the elements, both in `03 § Reinterpreting storage`, and `03 § A destructor` is
+writable. They were never what was missing here, which is the point of the
+correction.) A container does not need a destructor if its storage is a value that already has one,
 and `§Storage sized while running` is precisely what makes a `[]T` field into storage a container
 sizes for itself and ARC destroys on its behalf. The missing piece was never `Drop`; it was the
 ability to ask for storage at a length worked out while running.

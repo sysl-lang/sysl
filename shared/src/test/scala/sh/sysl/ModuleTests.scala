@@ -337,7 +337,7 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
     }
 
     // It may hold a counted value. The last one it holds is never released, which is what a static
-    // is — and this pair was refused outright until the rule was read again (`0073`).
+    // is — and this pair was refused outright until the rule was read again (`13 §7`).
     "and it may hold a value that owes a release" in {
       runIn(
         ("", "main.sysl", "print(m.greeting)"),

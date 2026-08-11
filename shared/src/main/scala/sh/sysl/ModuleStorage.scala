@@ -63,7 +63,8 @@ trait ModuleStorage extends ModuleFiles {
    * **It may hold a counted value, and the last one it holds is never released.** Every assignment
    * *during* the run has a perfectly good line to write a release on — its own store, which
    * `PlaceEmitter.storeInto` already emits — so the only release with nowhere to go is the one at
-   * exit, and never taking it is what a static *is*. `0021` takes the same ruling for a destructor.
+   * exit, and never taking it is what a static *is*. A destructor takes the same ruling, and for the
+   * same reason (`03 § A destructor`).
    *
    * **What is refused instead is a type with no zero and no initializer**, which is a narrower rule
    * about a different thing, and is `hasZero` — the same question a **local** with no initializer is

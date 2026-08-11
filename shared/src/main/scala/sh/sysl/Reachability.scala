@@ -57,10 +57,16 @@ object Reachability {
     // this compilation cannot see that caller any more than it can see the processor. A build with
     // no entry point at all is the case that makes this load bearing: every root above is absent
     // there, so an export that were not one would prune the artifact down to nothing.
-    val handlers = program.funcs.filter(_.conv.isDefined)
-    val exported = program.funcs.filter(_.exported.isDefined)
-    val entries  = handlers ::: exported
-    val roots    = List(program.main, program.vals, program.vtables, program.entry, entries)
+    // **A destructor is a root for the third version of the same reason** (`03 § A destructor`).
+    // What calls it is the release hook the emitter builds, and that is not a tree this walk can
+    // see — it is generated from a payload type at the moment a box of that type is let go of. No
+    // reachable body names one, so pruning it would leave the hook calling a symbol nothing defined,
+    // and the failure would be at the link, against a name no line of the program contains.
+    val handlers    = program.funcs.filter(_.conv.isDefined)
+    val exported    = program.funcs.filter(_.exported.isDefined)
+    val destructors = program.funcs.filter(f => program.destructors.values.toSet.contains(f.name))
+    val entries     = handlers ::: exported ::: destructors
+    val roots       = List(program.main, program.vals, program.vtables, program.entry, entries)
     val live     = reachedFrom(roots, program.funcs, program.vtables).calls ++ entries.map(_.name)
 
     program.copy(

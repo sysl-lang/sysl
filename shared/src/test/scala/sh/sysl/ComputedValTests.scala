@@ -137,7 +137,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
 
     // A **computed** `val` may hold a count, and the count it takes is never given back. That is what
-    // storage lasting the whole run means, and it is the whole of `0073`: the release the old rule
+    // storage lasting the whole run means, and it is the whole of the relaxation: the release the old rule
     // refused this for is the one at exit, which is the release a static is defined by not taking.
     "a reference may be held in one" in {
       run("struct P\n    x: int\nend P\nmk() -> &P = P(1)\nstatic val p: &P = mk()\nprint(p.x)") shouldBe "1\n"

@@ -82,30 +82,31 @@ class WeakReferenceTests extends AnyFreeSpec with CodegenSupport with RunSupport
                    |""".stripMargin) shouldBe "7\n"
     }
 
-    // The one position a 'weak T' does NOT reach, and it is worth two tests because the reason is
-    // not a rule about weak references at all. A default is produced afresh at each call that omits
-    // it, in a scope holding no locals, so what it names has to outlive every frame — and the only
-    // two things that could hand it a 'weak Node' are both closed. A construction is refused for
-    // having nowhere to live (asserted below, under "and only a reference does"), which leaves a
-    // name, and neither kind of name works.
-    "but not a default parameter value, because nothing a default may name can produce one" - {
+    // **A default parameter reaches a `weak T` now, and it did not.** A default is produced afresh
+    // at each call that omits it, in a scope holding no locals, so what it names has to outlive every
+    // frame — and the one declaration that does could not hold a reference at all until `13 §7` was
+    // relaxed. The pair below is what is left of a group that used to be two refusals, and the two
+    // halves fail for quite different reasons, which is why both are kept.
+    "and a default parameter value reaches one, through storage that outlives every frame" - {
 
       // A top-level 'var' is a local of the entry point, so a default reading one is reading the
-      // caller's locals — which is what the scope emptied for defaults is there to prevent.
-      "not a top-level 'var', which is a local of the caller however far above it is written" in {
+      // caller's locals — which is what the scope emptied for defaults is there to prevent. This
+      // half is unchanged and is about scope rather than about counting.
+      "though not a top-level 'var', which is a local of the caller however far above it is written" in {
         err(node + """var fallback: &Node = Node(4)
                      |peek(w: weak Node = fallback) -> int = w.get().unwrap().value
                      |print(peek())
                      |""".stripMargin) should include("undefined name 'fallback'")
       }
 
-      // And the declaration that does outlive every frame cannot hold a reference in the first
-      // place, which closes the other half.
-      "and not a module-level 'val', which outlives every frame and so counts nothing" in {
-        err(node + """static val fallback: &Node = Node(4)
+      // The half that changed. The storage holds a count it never gives back, so the referent is
+      // alive for the whole run — which is exactly what a default naming it needs, and is why this
+      // answers `4` rather than the empty weak reference `get()` would otherwise hand back.
+      "while a module-level 'val' does, and its referent is alive for the whole run" in {
+        run(node + """static val fallback: &Node = Node(4)
                      |peek(w: weak Node = fallback) -> int = w.get().unwrap().value
                      |print(peek())
-                     |""".stripMargin) should include("a count with nowhere to write the release")
+                     |""".stripMargin) shouldBe "4\n"
       }
     }
   }
@@ -149,24 +150,39 @@ class WeakReferenceTests extends AnyFreeSpec with CodegenSupport with RunSupport
     }
   }
 
-  // A weak edge takes a word in the referent's header and gives it back when the edge goes, so it
-  // is counted in the sense `13 §7` means: storage that lasts the whole run has nowhere to write
-  // that release. It reads as the outlier of the four refused types, because it is the one that
-  // keeps nothing alive — but what it owes is a decrement, not a lifetime.
-  "a weak reference is counted too, so a module-level 'val' refuses one" - {
-    "directly" in {
-      err(node + """weaken(r: &Node) -> weak Node = r
-                   |static val w: weak Node = weaken(Node(1))
-                   |""".stripMargin) should include("a count with nowhere to write the release")
+  // A weak edge takes a word in the referent's header and gives it back when the edge goes, so it is
+  // counted in the sense `13 §7` means — and module storage now holds a counted value and simply
+  // never releases the last one, which is what a static is. What makes a **weak** one worth its own
+  // pair of tests is the half that is still true: it keeps nothing alive, so the storage outlives
+  // the run and the object it names does not have to.
+  "a weak reference may be module storage, as any counted value may" - {
+    "directly, and it is empty once its referent has gone" in {
+      run(node + """weaken(r: &Node) -> weak Node = r
+                   |hold() -> weak Node
+                   |    var r: &Node = Node(1)
+                   |    weaken(r)
+                   |static val w: weak Node = hold()
+                   |val state = w.get() match
+                   |    Some(_) -> "live"
+                   |    None -> "gone"
+                   |print(state)
+                   |""".stripMargin) shouldBe "gone\n"
     }
 
     "and inside a struct, which is the recursive half of the same rule" in {
-      err(node + """struct Slot
+      run(node + """struct Slot
                    |    back: weak Node
                    |end Slot
                    |mk(r: &Node) -> Slot = Slot(r)
-                   |static val s: Slot = mk(Node(1))
-                   |""".stripMargin) should include("a count with nowhere to write the release")
+                   |keep() -> Slot
+                   |    var r: &Node = Node(1)
+                   |    mk(r)
+                   |static val s: Slot = keep()
+                   |val state = s.back.get() match
+                   |    Some(_) -> "live"
+                   |    None -> "gone"
+                   |print(state)
+                   |""".stripMargin) shouldBe "gone\n"
     }
   }
 

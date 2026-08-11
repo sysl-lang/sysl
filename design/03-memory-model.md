@@ -175,6 +175,68 @@ The cost lands only where the feature is used. Value types, fixed arrays, and `*
 have no header at all, so kernel code written in the allocator-free subset pays nothing for a
 mechanism it never touches.
 
+### A destructor
+
+**`impl Drop for T` says what a type does when the last reference to one of its values goes.** It
+declares one member, it answers nothing, and nothing in a program calls it:
+
+```
+struct File
+    fd: int
+
+impl Drop for File
+    drop(self) = close(self.fd)
+```
+
+**It exists for the resource the language does not manage.** ARC returns the storage and releases
+whatever the value holds; what it cannot do is close a descriptor, unmap a region, or hand a handle
+back to the C library that made it. Those live at the far end of a `*T` or behind an integer, and
+nothing about either says it is owned. The destructor is where that is said, once, beside the type.
+
+**`defer` is the other way to say it, and neither replaces the other.** `defer close(f)` covers every
+site a program can *name*. Under ARC a value can die where there is no site: a `File` inside a
+`[]File` that goes out of scope, a resource inside a struct inside a container. Nothing in such a
+program names the moment, so no `defer` reaches it and a leak there is not something the author could
+have prevented. **That case is why this is a capability rather than a shorthand** — and where both
+would work, the destructor is the better one, because it is written once and a caller cannot forget
+it.
+
+**It is placed into the hook the section above describes**, which is what makes it cost nothing to
+have and nothing to reach: release already calls through a per-payload function, and a destructor is
+a call at the top of that function's payload half. A type without one produces the hook it always
+did.
+
+Four rules, and each is a consequence of where it runs rather than a policy laid over it.
+
+**It runs before the value's own references are released.** The destructor is handed `self` intact,
+so a field may be read to close what it names. It borrows rather than taking a count — the count is
+already zero, and taking one would resurrect the object into a second teardown.
+
+**It is not called for a value that never reached the heap.** A value type is copied, and a copy is
+not a second resource: there is no single point of death to hook, and running it per copy would close
+one descriptor several times. So a destructor is for a type held behind `&T`, and a program that puts
+one on a type it then passes by value gets no destructor rather than a wrong one. Widening this needs
+a move rule the language does not have, and starting narrow is the direction that can widen later
+without breaking anything written under it.
+
+**It is not called for a value in a reference cycle.** A cycle's count never reaches zero, so nothing
+is released and nothing is destroyed — which is not a new consequence of this feature but the
+existing cost of counting rather than collecting: the *storage* already leaks there. `weak T`
+(below) is what breaks a cycle, and `guide/lisp` exists to show the shape. No detection is attempted;
+that would need an analysis the compiler does not have and would be wrong in both directions.
+
+**It is not called for module storage when the program ends.** Storage that lasts the whole run is
+never let go of (`13 §7`), so its count never reaches zero. There is no exit pass and there will not
+be one: a process exiting is what returns what it held, and running destructors at exit is the
+feature C++ has spent decades regretting, because the order two statics come apart in has no good
+answer. Rust makes the same call and says so plainly. What it costs is that a buffered writer held in
+a static is not flushed at exit; the program flushes it.
+
+**No order is promised among siblings.** Two values that die together — the elements of a slice, the
+fields of a struct — are destroyed in an order that follows the teardown worklist, and today that is
+last-to-first because the worklist is threaded through the dead refcount slots and drains as a stack.
+A program that needs one to happen before another has to say so.
+
 ### `*T` — raw pointer
 
 `*T` is a bare machine pointer, exactly like C: no length, no refcount, no checks, manual
@@ -1097,14 +1159,4 @@ greppable as everything else here.
   table was refused for putting the cost per-operation and out of sight.
 - **`weak sync T`** — an atomic weak reference, which wants the compare-and-swap upgrade and
   something to race with. Waits on `06`.
-- **A type-bound destructor**, so a `File` closes its descriptor wherever a value of it dies
-  rather than at each place one is taken. `defer` (above) covers the per-site half and is the
-  cheaper one; this is the half that would let a resource be wrapped once and used everywhere.
-  What has to be decided first is not the syntax but where it may run: ARC destroys through a
-  type-erased hook (`§ Who frees it`), so a user destructor is a call the compiler places into
-  that hook, and the questions are whether it may fail, whether it may be reached during
-  teardown of a cycle, and whether a value type gets one at all or only a `&T`. `07 § Length`'s
-  claim that a container would need one to be written **was already withdrawn** — a container
-  whose storage is a `[]T` is destroyed by ARC on its behalf — so the customer for this is the
-  C-boundary resource, the same one `defer` serves, and it should be weighed against just
-  having `defer`.
+- ~~**A type-bound destructor.**~~ **Built** — see *A destructor* below.

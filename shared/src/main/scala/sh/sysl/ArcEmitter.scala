@@ -12,6 +12,12 @@ import scala.collection.mutable
  */
 trait ArcEmitter extends Emitter {
 
+  /** The typed program being lowered. Declared here as well as in `CallEmitter` because the release
+   * hook has to ask it which payload types carry a destructor (`03 § A destructor`), and a hook is
+   * built from a type with no call site anywhere near it.
+   */
+  protected val program: TProgram
+
   /** Whether copying a value of this type has to touch a refcount. A raw pointer never does —
    * it is the mode that opts out of management — and a `&T` is a leaf, so a recursive type
    * cannot make this recur forever.
@@ -183,8 +189,13 @@ trait ArcEmitter extends Emitter {
    * holds and then returns the storage. Installed in the box at construction, which is what
    * makes releasing a reference type-erased — a slice's owner has no static type to consult.
    */
-  protected def dropFn(payload: Type): String =
-    if !containsRef(payload) then plainDropFn
+  protected def dropFn(payload: Type): String = {
+    // A type with a destructor needs a hook of its own even when nothing in it is counted
+    // (`03 § A destructor`): the walk has nothing to do and the `drop` still has to be called, so
+    // the plain hook — which is shared by every payload that holds nothing — cannot serve.
+    val destructor = program.destructors.get(Type.mangle(payload))
+
+    if !containsRef(payload) && destructor.isEmpty then plainDropFn
     else
       val m  = Type.mangle(payload)
       val bn = boxName(payload)
@@ -198,6 +209,16 @@ trait ArcEmitter extends Emitter {
           emitLabel(over)
           val pa = freshTemp(); emit(s"$pa = getelementptr $bn, ptr %p, i32 0, i32 $headerFields")
           val v  = freshTemp(); emit(s"$v = load ${payload.llvm}, ptr $pa")
+
+          // **Before the walk, not after.** The destructor is handed the value as it stands, so it
+          // may read a field to close what that field names; releasing first would hand it a value
+          // whose references had already been let go of. It takes `self` **borrowed** — no count is
+          // taken for the call — because the count is already zero and taking one would resurrect
+          // the object into a second teardown.
+          for d <- destructor do
+            if layout.indirect(payload) then emit(s"call void @$d(ptr $pa)")
+            else emit(s"call void @$d(${payload.llvm} $v)")
+
           releaseValue(payload, v)
           emitTerm("ret void")
           emitLabel(give)
@@ -205,6 +226,7 @@ trait ArcEmitter extends Emitter {
           emitTerm("ret void")
         }
       }
+  }
 
   /** The hook for a box whose payload holds nothing: there is no walk to make, so the only phase
    * that does anything is the one that gives the storage back.

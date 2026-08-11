@@ -464,7 +464,24 @@ trait ProgramWalk extends AbstractBodies {
       // typed declaration costs a set entry nothing will match rather than a dispatcher arm nothing
       // answers.
       testOnly = testOnlyDecls.toSet,
+      destructors = destructorsOf,
     )
+  }
+
+  /** Every type this compilation instantiated that has a destructor, paired with the symbol of it
+   * (`03 § A destructor`).
+   *
+   * Asked of the **instantiated** types rather than of the `impl` blocks, because an `impl` for a
+   * generic type is one block covering a family and the hook is emitted per concrete payload. A
+   * type the program never made needs no entry: nothing can release a box of it.
+   */
+  private def destructorsOf: Map[String, String] = {
+    val made = structInsts.values.toList ::: enumInsts.values.toList
+
+    made.collect {
+      case t: Type if dropsDeclared(memberOwner(t)._1) =>
+        Type.mangle(t) -> recover(s"${Type.memberSymbol(t)}.drop")(memberFuncName(t, "drop"))
+    }.toMap
   }
 
   /** The `main` the program declared, and how its arguments are made.

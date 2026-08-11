@@ -276,6 +276,14 @@ trait MemberLowering extends TypeResolution {
       // records nothing, and that absence is what makes its members reachable wherever the type is.
       for tr <- home.fromTrait do memberTrait((home.key, filed)) = tr
 
+      // **A destructor has no caller in the source**, which is the one thing that makes it different
+      // from every other member here: what calls it is the release hook the emitter builds, and that
+      // is decided by a payload type at a site with no name in it. So nothing would mark it reached,
+      // and pruning would drop the body while the hook still named it — a link error against a
+      // symbol no line of the program mentions. Marked at the declaration instead
+      // (`03 § A destructor`).
+      if filed == "drop" && home.fromTrait.contains(Library.key("Drop")) then dropsDeclared += home.key
+
       // A name a program spells that now reaches more than one member is recorded as reaching all of
       // them, so a call has the whole set to answer from. Both reasons a member is filed under
       // something other than its written name come through here — a second implementation of one
@@ -323,6 +331,10 @@ trait MemberLowering extends TypeResolution {
         out += fd
         if home.fixed.nonEmpty then memberSelf(fd.name) = home.fixed
         funcInsts(fd.name) = signature
+
+        // The destructor is the one member nothing in the source reaches, so nothing else would
+        // mark it (`03 § A destructor`). Marked here, where the lowered name exists.
+        if filed == "drop" && home.fromTrait.contains(Library.key("Drop")) then funcsUsed += fd.name
 
       // A member is a function with a receiver in front, so the rules a signature is held to are
       // the same ones — asked of the *lowered* form, where the receiver is a parameter like any

@@ -288,7 +288,7 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
       ir("static val n: int = 5\nprint(str(n))") should include("private constant")
     }
 
-    // It holds a counted value like any other module storage (`0073`), and the `var` half is where
+    // It holds a counted value like any other module storage (`13 §7`), and the `var` half is where
     // that has to be shown rather than merely allowed: the storage is given a literal and then a
     // built string, so the second store is the one that has a release to write and a line to write it
     // on. Reading it back afterwards is what says the first was let go of without taking the second.

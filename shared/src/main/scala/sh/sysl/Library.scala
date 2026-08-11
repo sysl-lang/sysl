@@ -180,6 +180,10 @@ object Library {
       "FormatSpec",
       // The traits whose members a built-in has by rule rather than by an `impl` (`14 §5`).
       "Display", "Hash",
+      // What a type does when the last reference to one of its values goes (`03 § A destructor`).
+      // The compiler spells it because the *hook* is what calls it: a release site has a payload
+      // type and no source anywhere near it, so the member is found by name rather than by a call.
+      "Drop",
       // The family every integer belongs to, which the blanket `impl` of `Display` is written over.
       "Integer",
       // The same, for the members that are not operators and whose trait is in a submodule.
