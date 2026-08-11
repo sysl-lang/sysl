@@ -308,6 +308,24 @@ and that is what tells two overloads apart. With no expected type there is nothi
 address is refused rather than guessed at. A bare name used as a callable (`§5`) chooses the same
 way, off the call trait its parameter is bound by.
 
+**`main` is the one name this does not reach.** A program starts in one place, and the entry point is
+found by asking which declarations are *called* `main` — so a second one would be a declaration that
+question cannot see, and the program would start at whichever was written first with the other
+silently unreachable. It is refused rather than resolved, because nothing calls `main` and so there
+is no call site for arguments to choose at.
+
+**How a candidate is chosen is worth stating, because it has a cost.** The call is tried against each
+candidate and the one it fits is the answer — rather than a rule comparing argument types to
+parameter types, which would have to know about named arguments, defaulted parameters, variadic
+tails, literal inference, generic solving and every coercion a parameter admits. All of that is the
+ordinary call analysis, so asking it is the only way to get the same answer twice.
+
+The arguments are therefore analyzed once per candidate, and **the cost compounds where overloaded
+calls nest**: a call whose arguments are themselves calls to overloaded names analyzes the inner ones
+once per outer candidate. Nothing caches a trial today. That is affordable because an overload set is
+small and nesting one inside another is uncommon, but it grows multiplicatively rather than
+additively, which is worth knowing before writing a set of ten.
+
 ### An `extern` overloads, and the symbol is what keeps them apart
 
 ```
