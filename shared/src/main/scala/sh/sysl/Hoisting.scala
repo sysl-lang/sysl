@@ -319,7 +319,18 @@ trait Hoisting extends HoistMembers {
            f.retType.map(t => recover(Type.Unknown)(resolveReturn(t, Map.empty))).getOrElse(Type.Unit))
       // After every table this declaration fills, because it reports and reporting unwinds: a
       // declaration whose overload is refused is still a declaration the body pass will look up.
-      if key != plain then recover(())(checkOverloadDistinct(plain, key, f.params, f.retType, f.variadic))
+      //
+      // **`main` is the one name overloading must not reach.** A program starts in one place, and
+      // the entry point is found by asking which declarations are *called* `main` — so a second one,
+      // filed under a key of its own, would be invisible to that question and the program would
+      // start at whichever was written first with the other silently unreachable. It is refused
+      // rather than resolved because there is nothing for a call site to choose between: nothing
+      // calls `main`.
+      if key != plain && Modules.bare(plain) == "main" then
+        recover(())(err("'main' is where a program starts, so there is one — a second declaration " +
+          "of it would overload the name, and a program has one beginning rather than a set of them"))
+      else if key != plain then
+        recover(())(checkOverloadDistinct(plain, key, f.params, f.retType, f.variadic))
       checkSignatureRules(f.name, f.params, f.retType, f.variadic)
       checkValueParamArithmetic(f.tvalues.keySet, f.params.map(_.typ) ::: f.retType.toList,
         f.tparams.toSet, f.tpacks)

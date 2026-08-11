@@ -248,6 +248,37 @@ class OverloadTests extends LibraryCliSupport with RunSupport with CodegenSuppor
     out should include("@pick_two")
   }
 
+  // **An overload set has to survive being shipped**, which is a different path from every test
+  // above: a library is compiled once, archived, and hoisted again out of the artifact by whoever
+  // links it. Nothing serializes the set — it is rebuilt by hoisting, exactly as it is from source —
+  // so this is what says that rebuilding really happens. The two declarations answer differently, so
+  // a consumer reaching the wrong one prints the wrong thing.
+  "an overload set survives being built into a library and linked against" in {
+    val lib = rootOf(
+      "demo",
+      """module demo
+        |
+        |scale(n: int) -> string = s"one $n"
+        |scale(n: int, by: int) -> string = s"two ${n * by}"
+        |""".stripMargin,
+    )
+
+    val prog = program("print(demo.scale(3))\nprint(demo.scale(3, 4))")
+
+    ran(Config(command = "run", file = prog, libs = List(artifactOf(lib)))) shouldBe "one 3\ntwo 12\n"
+  }
+
+  // `main` is the one name it must not reach: nothing calls `main`, so there is no call site to
+  // choose between two of them, and the entry point is found by asking which declarations are called
+  // that. A second would be filed under a key of its own and silently never run.
+  "'main' does not overload, since a program has one beginning" in {
+    err("""main()
+          |    print("one")
+          |
+          |main(args: []string)
+          |    print("two")""".stripMargin) should include("a program has one beginning")
+  }
+
   "and the compiler's spelling of an overload never reaches a reader" in {
     // The second declaration is keyed `paint.2` so that the tables stay one-declaration-per-key. A
     // diagnostic naming it that would be naming something the source does not contain.
