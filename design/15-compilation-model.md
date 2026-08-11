@@ -288,6 +288,73 @@ Nothing checks it — sysl's own `sizeof` would report what sysl laid out, not w
 comparison is a tautology. Getting it wrong writes past the end of the caller's storage. The number
 has to come from the headers, and C is what reads headers.
 
+### A shim answers for a function, and `c const` answers for a value
+
+**Wrapping it in a function is the whole answer only where a call will do**, and for a *value* it is
+not an answer at all. A constant reached through a call is not a constant: it has no value until the
+program runs, so it cannot size an array, cannot stand in a `match` arm, cannot be folded into a
+bound and cannot be checked by `@assert`. The macro bullet above still holds for `REG_EXTENDED` as an
+*argument*; it stops holding the moment the number has to be known while compiling.
+
+FreeRTOS is where that stopped being theoretical. A statically allocated task is a
+`[sizeof(StaticTask_t)]u8` the caller supplies, and there is no such thing as an array whose length is
+decided by a function — so the shim route does not reach it, and the only route left was to write the
+number down, which is the practice the paragraph above exists to condemn.
+
+**A `c const` block is a constant whose value the C compiler works out**, for the target being built
+for:
+
+```
+@include("FreeRTOS.h")
+
+c const
+    STATIC_TASK_SIZE: usize = "sizeof(StaticTask_t)"
+    MAX_DELAY: u32          = "portMAX_DELAY"
+
+var tcb: [STATIC_TASK_SIZE]u8 = [0; STATIC_TASK_SIZE]
+```
+
+`@include` is a header clause like `@link`, written the way C writes it and looked for where a shim's
+headers are looked for. What it buys is that the expressions compile: **no name from the header
+becomes visible in sysl**, and a type still arrives by `opaque struct` and a function by `extern`
+(§9). Where the C compiler is not told about the header, this fails at the `#include` exactly as a
+shim does — see §8's paragraph on search paths.
+
+**The value is measured from a probe translation unit, which is compiled and never linked or run**:
+the file's headers, one global per constant, lowered to IR for the target, and the number read out of
+the IR. That is what makes the answer *the target's* — a pointer is four bytes for a Cortex-M and
+eight for this machine, and neither requires anything to execute. It is the same method
+`targets.md § Adding one` already binds an ABI answer to, applied to the numbers a compiler has no
+way to know it should have asked about.
+
+**The C is quoted with a plain string.** Inside such a block a string can mean nothing else, so the
+`c` on the header marks the language once and no literal prefix is introduced. That `c` is
+contextual, which the `const` after it is what makes safe: nothing else in the language follows a
+name with a keyword, so a program is free to call a variable `c`.
+
+**Any C constant expression, and the C compiler is the judge of which those are.** That is what makes
+the claim honest rather than a subset somebody maintains — an expression C will not settle is refused
+in clang's own words, quoted rather than paraphrased. Four more refusals go with it: a header that is
+not there, a value the declared type cannot hold (naming the value and both ends of the range), a
+type that is not an integer, and a block written inside a body, which has no file's headers to be
+compiled against.
+
+**A `string` from C is not written this way, deliberately.** An integer is a number in the IR and
+reads straight off; a string constant is a block of storage and a different job, and it would have to
+be written `"\"foo\""` — two quotings for one value, which is a form nobody would guess. The refusal
+says so rather than leaving it to be discovered.
+
+**It is lowered to an ordinary `const` before anything else looks at the tree**, which is why nothing
+else in this chapter has to change: by the time a name is resolved or a bound is folded, what is there
+is `13 §7`'s constant holding a literal. A **library** is lowered before it is encoded, so an
+artifact ships the measured number rather than the expression — a program linking a package needs
+neither the package's headers nor a C compiler, and could not honestly be handed the expression
+anyway, since an artifact is built for one target and re-measuring it elsewhere would be answering a
+different question under the same name.
+
+**A file that writes no block costs nothing**, and never causes a C compiler to be looked for. Every
+file in this repository is that case.
+
 **An object is named after the path it was found at**, directories included — `demo/util.c` becomes
 `demo.util.o`. A basename alone would not do: `ar r` replaces by name, so two modules each holding a
 `util.c` would have the second evict the first, and the library would ship missing whatever only the
@@ -303,6 +370,13 @@ authors could have known about the other.
 **The C files are fingerprinted with the sysl ones.** A library's shims are as much its source as its
 modules are, and an artifact that did not change when one was edited is a stale artifact nothing
 would notice was stale.
+
+**What the fingerprint does not cover is the headers a tree includes, or the macros it is configured
+with**, and that gap is older than `c const` — a shim compiled against a system header has always had
+it. Editing a header outside the tree, or building with a different `-D`, changes what the C means
+and leaves the fingerprint where it was. A `c const` makes it easier to *notice*, because the stale
+answer is now a number a program reads rather than a shim's behaviour, but it is the same hole and
+closing it belongs to whatever closes it for both.
 
 **Cross-compiling a library that includes headers needs that target's headers.** This is not a cost
 the design imposes — it is the requirement being honest. A binding to POSIX regex cannot be built for

@@ -109,9 +109,9 @@ case class Config(
     stdSearch: Option[String] = None,
     ar: Option[String] = None,
     /** `--link-path` and `--include-path` — where on this machine to look for a library a `@link`
-      * named, and for a header a carried `.c` includes (`SearchPaths`). Lists rather than single
-      * values because a build that needs one prefix usually needs the two it came with, and the
-      * order given is the order searched.
+      * named, and for a header a carried `.c` includes or an `@include` names (`SearchPaths`). Lists
+      * rather than single values because a build that needs one prefix usually needs the two it came
+      * with, and the order given is the order searched.
       */
     linkPaths: List[String] = Nil,
     includePaths: List[String] = Nil,
@@ -274,14 +274,15 @@ private[sysl] val parser = {
       opt[String]("include-path")
         .unbounded()
         .action((d, c) => c.copy(includePaths = c.includePaths :+ d))
-        .text("a directory to look in for a header the C beside a module includes; the other half " +
-          "of --link-path, and needed by the same bindings; may be given more than once"),
+        .text("a directory to look in for a header the C beside a module includes, or one an " +
+          "'@include' names for a 'c const' block; the other half of --link-path, and needed by the " +
+          "same bindings; may be given more than once"),
       opt[String]('D', "define")
         .unbounded()
         .action((d, c) => c.copy(defines = c.defines :+ d))
-        .text("a macro the C beside a module is compiled with, as 'NAME' or 'NAME=value' — what a " +
-          "host C project configures its own headers with, and which finding the header does not " +
-          "supply; may be given more than once"),
+        .text("a macro the C beside a module is compiled with, and a 'c const' block's headers are " +
+          "read under, as 'NAME' or 'NAME=value' — what a host C project configures its own headers " +
+          "with, and which finding the header does not supply; may be given more than once"),
       opt[String]('O', "optimize")
         .action((o, c) => c.copy(optimize = o))
         .text(s"the optimization level to hand clang, as it spells one after the '-O': " +
