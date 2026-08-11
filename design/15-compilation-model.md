@@ -320,6 +320,14 @@ becomes visible in sysl**, and a type still arrives by `opaque struct` and a fun
 (§9). Where the C compiler is not told about the header, this fails at the `#include` exactly as a
 shim does — see §8's paragraph on search paths.
 
+**The module's own directory is searched first, so a vendored header needs no flag.** That is not a
+convenience: C resolves `#include "foo.h"` relative to the file doing the including, and the probe is
+a temporary file somewhere else — so a package carrying `qcbor.h` beside `qcbor.sysl` would have been
+unable to use the feature at all, which is the case it was built for. The shim in that same directory
+reaches the header with no flag, and a `c const` that needed one would have been the odd member of
+the pair. It is searched before the paths given on the command line, which is C's own precedence for
+a quoted include.
+
 **The value is measured from a probe translation unit, which is compiled and never linked or run**:
 the file's headers, one global per constant, lowered to IR for the target, and the number read out of
 the IR. That is what makes the answer *the target's* — a pointer is four bytes for a Cortex-M and

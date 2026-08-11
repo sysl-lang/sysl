@@ -307,6 +307,32 @@ class CConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
       finally try deleteFile(s"$dir/measured.h") catch case _: Exception => ()
     }
 
+    /** **The case the whole feature was surveyed for.** A package vendors its headers beside its
+      * modules and its shim reaches them with a bare `#include "qcbor.h"`, because C resolves a
+      * quoted include relative to the file doing the including. The probe is a temporary file
+      * somewhere else, so without a `-I` for the module's own directory the header is unreachable —
+      * and the packages this exists to serve could not use it.
+      */
+    "a header vendored beside the module is found with no flag at all" in {
+      val dir = createTempDirectory("sysl-cconst-pkg-")
+      val src =
+        """@include("vendored.h")
+          |
+          |c const
+          |    W: u32 = "VENDORED_WIDTH"
+          |
+          |print(str(W))
+          |""".stripMargin
+
+      try
+        writeFile(s"$dir/vendored.h", "#define VENDORED_WIDTH 41\n")
+
+        Compiler.compiledWith(List(Source(s"$dir/lib.sysl", src)), Nil) match
+          case Left(e)  => fail(s"a header beside the module was not found: $e")
+          case Right(c) => c.ir should include("main")
+      finally Project.discard(s"$dir/vendored.h")
+    }
+
     /** Two constants of one name are a duplicate declaration and are reported as one. The lowering
       * used to hand both lines the *same* value, so what got reported was a duplicate of a constant
       * neither line had written.

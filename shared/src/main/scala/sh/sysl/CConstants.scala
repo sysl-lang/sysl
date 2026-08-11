@@ -117,7 +117,7 @@ object CConstants {
       Toolchain.findClang(target).flatMap { cc =>
         val command = Seq(cc, s"--target=${target.triple}", "-S", "-emit-llvm", "-O0") ++
           Option.when(target.shortEnums)("-fshort-enums") ++ paths.defineFlags ++
-          paths.includeFlags ++ Seq("-o", "-", src)
+          beside(unit) ++ paths.includeFlags ++ Seq("-o", "-", src)
 
         val result = exec(command)
 
@@ -162,6 +162,22 @@ object CConstants {
 
     s"$headers\n${globals.mkString("\n")}\n"
   }
+
+  /** `-I` for the directory the sysl file itself sits in, which is **what makes a vendored header
+   * reachable at all**.
+   *
+   * C resolves `#include "foo.h"` relative to the file doing the including, and the probe is a
+   * temporary file somewhere else entirely — so without this, `@include("qcbor.h")` beside
+   * `qcbor.sysl` cannot be found, and the package that motivated the whole feature could not use it.
+   * The shim sitting in the same directory resolves that spelling with no flag, so a `c const` that
+   * needed one would have been the odd member of the pair.
+   *
+   * It goes **before** the search paths given on the command line, so a header carried by the module
+   * wins over one of the same name elsewhere on the machine — which is the C convention for a quoted
+   * include, and the answer a reader of the module would expect.
+   */
+  private def beside(unit: Program): List[String] =
+    Project.parentOf(unit.source.name).map(d => s"-I$d").toList
 
   /** A header as C spells it. A name already carrying its own `<…>` or `"…"` is passed through, so
    * `@include("<stdint.h>")` reaches a system header and `@include("qcbor.h")` reaches one beside
