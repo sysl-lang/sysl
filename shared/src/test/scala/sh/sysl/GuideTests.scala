@@ -401,4 +401,21 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
   "table — a row that does not fit its columns" in {
     guideTests("table") should have length 5
   }
+
+  // The one guide program whose subject is the C boundary. Its checks nearly all read the same way
+  // — the library's sort and the C library's sort agree on this data — because a binding that is
+  // wrong produces a plausible order rather than a crash, and only the comparison catches that.
+  "qsort — a C routine that calls back into sysl" in {
+    val out = guide("qsort")
+
+    out should not include "FAIL"
+    checks(out) shouldBe 15
+    sections(out) shouldBe List(
+      "-- the binding, on the smallest cases there are",
+      "-- and on the shapes a sort is usually wrong about",
+      "-- one body per element type, which is what the callback is",
+      "-- the same data, sorted both ways",
+      "-- what the C library does not promise",
+    )
+  }
 }

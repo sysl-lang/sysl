@@ -756,6 +756,24 @@ missing is a way to name a field list. That is the deriving question, and `14 §
   has nothing to read from and costs a whole statement to write. That is one position rather than a
   class of them, which is why the deferral stands — but it is the first place the missing syntax
   costs more than a word, and a second one would be the case this item is waiting for.
+
+  **The second one has arrived, and unlike the first it is a class.** A C routine that calls back
+  takes a comparison of one fixed shape — `int (*)(const void *, const void *)` — so the natural
+  trampoline is `compare[T](a: *u8, b: *u8) -> int`, with the cast inside it where a C programmer
+  would write one. That function **has no address**: `&compare` reads its instantiation off the
+  expected type (`12 §6a`), the expected type is `*extern(*u8, *u8) -> int`, and `T` is nowhere in
+  it. What gets written instead is a trampoline over `*T`, a second `ptr_cast` on the function
+  pointer itself, and a `val` whose only job is to be somewhere to write the type — which
+  `guide/qsort` does, and explains, because there is nowhere else to explain it.
+
+  It is a class rather than a position because **every** C callback has this shape: the interface
+  fixes the signature and the payload type is the caller's, which is the sentence `12 §6a` opens
+  with. `qsort` is merely the smallest instance of it. The rule itself is written down — `12 §6a`
+  states the limit and gives the honest reason for it — so what the deferral costs is not ignorance
+  but the shape it forces: a trampoline written over `*T` because it may not be written over `*u8`,
+  and a `val` that exists only to be somewhere to put the type. Worth noting that `&` is the one position
+  where the ambiguity this deferral rests on does not arise: `&xs[i]` is the address of an
+  *element*, so `&f[T]` naming a function is not a second reading of anything.
 - **b. Members on generic types** — settled and implemented, and no longer open. A method or
   property is instantiated from the receiver's own type arguments, so `Box[int].get` and
   `Box[real].get` are two monomorphized functions exactly as two instantiations of a free generic

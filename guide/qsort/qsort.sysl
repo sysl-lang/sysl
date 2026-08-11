@@ -1,0 +1,56 @@
+// Handing a sysl comparison to a C function that calls it back — the binding.
+//
+// The axis this owns is **a callback across the C boundary**: a C routine that does not merely take
+// data and return an answer, but reaches back into the caller's code once per step. `qsort` is the
+// smallest honest example of it in any C library, and it needs three things at once — the address of
+// a function that is generic in the element type, the address of a slice's storage, and the size of
+// an element. Nothing else in the set asks for any of them.
+//
+// **Why it is here and not in `sysl.slices`.** The library's sorts are written in sysl, and the
+// reason is not that they are faster. `sysl.slices` asks for **no capability**, which is a promise
+// made to every target sysl builds for — including the freestanding ones, where there is no libc to
+// call and `qsort` is an undefined symbol. On a hosted machine it is worse rather than better: glibc
+// sorts by merging into a temporary buffer and calls `malloc` to get one, while Darwin sorts in
+// place, so the same source allocates on one platform and not on the other. The compiler cannot see
+// either fact — what is behind an `extern` is behind it — so a module that offered this would be
+// making a promise it has no way to keep. What that leaves is exactly this: a program that binds it
+// itself, where the caller can see the whole cost on one screen.
+
+import sysl.slices.as_mut_ptr
+
+// The one C declaration. `size` is why an element type must have a known size and `cmp` is why it
+// must have a comparison; between them they are the whole of the interface.
+private extern "qsort" c_qsort(base: *u8, n: usize, size: usize, cmp: *u8)
+
+// What C calls back, once per comparison. It has to answer C's convention — negative, zero,
+// positive — out of a relation that answers `bool`, so the two-comparison form is not clumsiness:
+// there is no third answer to read off a single `<`.
+//
+// **This is one function per element type, and that is the whole trick.** `qsort` is told the width
+// of an element and otherwise moves anonymous bytes; the only thing that knows what those bytes
+// *are* is this body, and it knows because the compiler made a copy of it for each `T` a program
+// sorted. A C program does the same thing by hand and writes the cast itself.
+private compare[T: Ord](a: *T, b: *T) -> int
+    if *a < *b then -1
+    else if *b < *a then 1
+    else 0
+end compare
+
+// The slice in order, sorted by the C library.
+//
+// **There is no written form for the instantiation** (`12 §6a`), so nothing here says `compare[T]`:
+// the type of the `val` is what settles which body `&compare` is the address of, and it settles it
+// out of the `T` this function was itself instantiated at. That is why the pointer is named on a line
+// of its own rather than written into the call — the call's own parameter is a `*u8`, which says
+// nothing about an element type and could not choose a body.
+//
+// Both casts are unchecked and both are the price of the boundary. C takes a comparison as a
+// function pointer of one fixed shape and the data as `void *`, so the types stop at the call and
+// the two `sizeof`-shaped arguments are what carry the meaning across.
+sort_libc[T: Ord](xs: []T)
+    if xs.len < 2 then return
+
+    val cmp: *extern(*T, *T) -> int = &compare
+
+    c_qsort(ptr_cast(as_mut_ptr(xs)), xs.len, sizeof(T), ptr_cast(cmp))
+end sort_libc

@@ -1,0 +1,189 @@
+// Handing a sysl comparison to a C function that calls it back — the checks.
+//
+// Every check here compares the C library's answer with the library's own `sort`, on the same data,
+// because that is the only assertion worth making: two sorts of the same slice by the same order
+// have to agree element for element, and where they do not it is the binding that is wrong rather
+// than either sort.
+//
+// What writing it turned up:
+//
+//   * **The instantiation of a generic function's address is read off the expected type, and the
+//     obvious shape has nowhere to read it from.** The natural trampoline is
+//     `compare[T](a: *u8, b: *u8) -> int` — C's own signature, with the cast inside — and it cannot
+//     be written: `T` appears in neither parameter nor result, so `&compare` has no way to say which
+//     body it means, and `&compare[T]` is not a form the grammar has (`12 §6a` gives the reason: it
+//     cannot be told from `&xs[i]`). What works is to let the pointers carry the type — `*T` rather
+//     than `*u8` — and cast the *pointer to the function* at the call instead of casting inside it.
+//
+//     `12 §6a` states the limit and is honest about it, so this is not a discovery. What it also
+//     said, and what this program corrects, is that the pattern therefore "takes a concrete
+//     trampoline per state type": it does not. One generic body serves every element type, at the
+//     cost of one more `ptr_cast` and a `val` that exists only to be somewhere to write the type.
+//     That cost is now recorded in `10 § Open a` as the second case for explicit type arguments —
+//     the case that item said it was waiting for.
+//
+//   * **There is no clock.** `sysl.time` has `Instant`, `Duration` and the arithmetic between them,
+//     and nothing anywhere in the library reads one — no monotonic counter and no wall clock. So the
+//     comparison this program was written to make can be made for *correctness* and not for *cost*:
+//     the numbers that would answer "is the sysl sort competitive" cannot be taken by a sysl program
+//     at all. Reported rather than worked around — binding `clock_gettime` here would have put a
+//     hand-rolled clock into the reading material, which is the thing a guide program is least
+//     allowed to teach.
+
+import sysl.slices.{sort, sort_stable, is_sorted}
+import sysl.rand.rng
+
+check(name: string, got: string, want: string)
+    if got == want then print(s"ok    $name = $got")
+    else print(s"FAIL  $name = $got, wanted $want")
+end check
+
+// A copy of a **non-empty** slice. The fill value has to come from somewhere, and a generic body has
+// nothing to make a `T` out of except an element the caller already has — which is a bound this
+// program can meet by never asking it of an empty one.
+copy_of[T](xs: []const T) -> []T
+    var out: []T = [xs[0]; xs.len]
+
+    for i in 0..<xs.len do out[i] = xs[i]
+
+    out
+end copy_of
+
+// The two sorts run on the same data, compared element for element. The answer is a string so that a
+// disagreement says where, rather than saying `false`.
+agree[T: Ord + Eq + Display](xs: []const T) -> string
+    var mine = copy_of(xs)
+    var theirs = copy_of(xs)
+
+    sort(mine)
+    sort_libc(theirs)
+
+    for i in 0..<mine.len
+        if mine[i] != theirs[i] then
+            return "differ at " + str(i) + ": " + str(mine[i]) + " vs " + str(theirs[i])
+
+    if is_sorted(mine) then "agree, in order" else "agree, out of order"
+end agree
+
+shown[T: Display](xs: []const T) -> string
+    var s = ""
+
+    for i in 0..<xs.len
+        if i > 0 then s += " "
+
+        s += str(xs[i])
+
+    s
+end shown
+
+print("-- the binding, on the smallest cases there are")
+
+var empty: []int = [0; 0]
+var one: []int = [7; 1]
+
+sort_libc(empty)
+sort_libc(one)
+check("nothing to sort", shown(empty), "")
+check("one element", shown(one), "7")
+
+var two: []int = [0; 2]
+
+two[0] = 2
+two[1] = 1
+sort_libc(two)
+check("two out of order", shown(two), "1 2")
+
+print("-- and on the shapes a sort is usually wrong about")
+
+var reversed: []int = [0; 10]
+
+for i in 0..<reversed.len
+    reversed[i] = int(reversed.len - i - 1)
+
+var equal: []int = [4; 5]
+var already: []int = [0; 5]
+
+for i in 0..<already.len
+    already[i] = int(i) + 1
+
+sort_libc(reversed)
+sort_libc(equal)
+sort_libc(already)
+check("reversed", shown(reversed), "0 1 2 3 4 5 6 7 8 9")
+check("all equal", shown(equal), "4 4 4 4 4")
+check("already in order", shown(already), "1 2 3 4 5")
+
+print("-- one body per element type, which is what the callback is")
+
+// The widths matter here rather than the values: a trampoline shared between them would read a `u8`
+// eight bytes wide, or an `i64` one byte wide, and the answers would be nonsense in a way a single
+// element type cannot show.
+var bytes: []u8 = [0; 5]
+var wide: []i64 = [0; 4]
+
+bytes[0] = 200
+bytes[1] = 3
+bytes[2] = 97
+bytes[3] = 1
+bytes[4] = 255
+
+wide[0] = -9000000000
+wide[1] = 4
+wide[2] = -1
+wide[3] = 9000000000
+
+sort_libc(bytes)
+sort_libc(wide)
+check("unsigned bytes", shown(bytes), "1 3 97 200 255")
+check("signed 64-bit, both signs", shown(wide), "-9000000000 -1 4 9000000000")
+
+var text: []string = [""; 3]
+
+text[0] = "pear"
+text[1] = "apple"
+text[2] = "fig"
+sort_libc(text)
+check("strings, which are more than one word wide", shown(text), "apple fig pear")
+
+print("-- the same data, sorted both ways")
+
+var run: []int = [0; 5]
+
+for i in 0..<run.len
+    run[i] = int(run.len - i)
+
+var repeats: []int = [0; 6]
+
+repeats[0] = 3
+repeats[1] = 1
+repeats[2] = 3
+repeats[3] = 1
+repeats[4] = 2
+repeats[5] = 2
+
+check("a reversed run", agree(run), "agree, in order")
+check("one with repeats", agree(repeats), "agree, in order")
+check("a single element", agree(one), "agree, in order")
+
+var g = rng(0x853c49e6748fea9b, 0xda3e39cb94b95bdb)
+var noise: []int = [0; 64]
+
+for i in 0..<noise.len
+    noise[i] = int(g.next_u64() % 1000)
+
+check("sixty-four pseudo-random values", agree(noise), "agree, in order")
+
+print("-- what the C library does not promise")
+
+// `qsort` is not stable and ISO C has no sort that is: `mergesort` and `heapsort` are BSD
+// extensions, present on Darwin and absent from glibc. So this could never have replaced
+// `sort_stable`, which is half of why the library keeps its own pair.
+var keys: []int = [0; 8]
+
+for i in 0..<keys.len
+    keys[i] = int(keys.len - i)
+
+var scratch = copy_of(keys)
+
+check("the stable sort this one could never replace", str(sort_stable(keys, scratch)), "true")
+check("and its answer", shown(keys), "1 2 3 4 5 6 7 8")

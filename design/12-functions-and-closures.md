@@ -1039,7 +1039,27 @@ pointer with an untyped `void *`, and a trampoline for one has the signature C f
 -> bool`. The state type appears nowhere in it, so there is nothing for the expected type to solve,
 and such a trampoline is refused by the very rule below about a parameter the signature does not
 mention. Recovering the state means a `ptr_cast` from `*u8`, which is a promise rather than a
-deduction. A concrete trampoline per state type is still what that pattern takes.
+deduction.
+
+**"A concrete trampoline per state type is still what that pattern takes" stood here, and it is too
+strong.** What the rule forbids is a trampoline whose *signature* hides the type — and the signature
+is the author's to choose. Write it over `*T` rather than `*u8`, name its address in a `val` whose
+type mentions `T`, and cast the **function pointer** at the call instead of casting inside the body:
+
+```
+private compare[T: Ord](a: *T, b: *T) -> int = ...
+
+sort_libc[T: Ord](xs: []T)
+    val cmp: *extern(*T, *T) -> int = &compare
+
+    c_qsort(ptr_cast(as_mut_ptr(xs)), xs.len, sizeof(T), ptr_cast(cmp))
+```
+
+`guide/qsort` is written that way and is green, so one generic body does serve every element type.
+What the limit costs is therefore smaller and more specific than a copy per type: one extra
+`ptr_cast`, and a `val` that exists only because there is nowhere else to write the type.
+`10 § Open a` records that cost as the second case for explicit call-site type arguments — the case
+that item said it was waiting for.
 
 **There is no written form, `&f[T]`, and that is a grammar fact rather than a preference.** `&f[T]`
 and `&xs[i]` are the same shape — a name, a bracket, something inside — and only knowing whether the
