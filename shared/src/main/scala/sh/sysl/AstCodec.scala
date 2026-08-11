@@ -324,6 +324,14 @@ object AstCodec {
         case StaticDecl(_) =>
           sys.error("a 'static' declaration reached a library artifact, which is a file a program " +
             "starts in reaching one — the analyzer refuses 'static' everywhere else")
+        // No token either, and for a stronger reason than `static`'s: a `c const` is *lowered* to an
+        // ordinary constant before a library is analyzed or encoded (`CConstants`), so what an
+        // artifact carries is the measured value. Reaching here means a tree skipped that lowering,
+        // and the loud failure is the point — the quiet alternative is a library shipping without
+        // constants a program is about to name.
+        case _: CConstBlock =>
+          sys.error("a 'c const' block reached a library artifact — it is lowered to an ordinary " +
+            "constant before anything is encoded, so this is a path that skipped 'CConstants.lower'")
         case RefDecl(n, p)                => tok("ref"); sref(n); expr(p)
         case MultiAssign(op, ts, vs)      => tok("masg"); sref(op); list(ts)(expr); list(vs)(expr)
         case MultiDecl(ns, mut, vs)       => tok("mdcl"); list(ns)(sref); bool(mut); list(vs)(expr)

@@ -48,6 +48,21 @@ case class CapabilityClause(direction: CapabilityDirection, name: String) extend
  */
 case class LinkClause(name: String) extends Positioned
 
+/** `@include("FreeRTOS.h")` — a C header the file's `c const` block is evaluated against (`15 §7`).
+ *
+ * It is written the way C writes it, quotes and extension and all, because it is handed to the C
+ * compiler unchanged: what a header is called, and whether it is found by `"…"` or by `<…>`, are
+ * facts about the C project rather than about sysl, and a directive that respelled them would be
+ * inventing a second name for something that already has one. Where it is looked for is
+ * `SearchPaths.include`'s answer, exactly as it is for a shim beside the module.
+ *
+ * **It says nothing to the rest of the compilation.** No name from the header becomes visible in
+ * sysl, and no declaration is read out of it: what it buys is that a `c const`'s expression
+ * compiles. A type a program wants from the header is still declared with `opaque struct` and a
+ * function with `extern`, which is `15 §9`'s arrangement and is unchanged.
+ */
+case class IncludeClause(header: String) extends Positioned
+
 /** `@tests` — the file holds a module's tests and the scaffolding they need, and no build but
  * `sysl test` keeps any of it (`testing.md`).
  *
@@ -67,7 +82,7 @@ case class TestsClause() extends Positioned
  * each means once the file is parsed rather than by which rule matched — `@requires` alone yields
  * several, so the list is not one clause per line either way.
  */
-type HeaderClause = CapabilityClause | LinkClause | TestsClause
+type HeaderClause = CapabilityClause | LinkClause | IncludeClause | TestsClause
 
 /** One file's parse: the module it contributes to, the capabilities and link requirements its header
  * declares, its statements, and the source it came from.
@@ -85,6 +100,10 @@ type HeaderClause = CapabilityClause | LinkClause | TestsClause
  * all sit in one file has nothing to say in the other four. The module's requirement is the union of
  * its files' (`15 §8`).
  *
+ * `includes` is per file for the same reason `links` is, and more sharply: two files of one module
+ * may include headers that contradict each other, and each is compiled on its own, so a header
+ * gathered across the module would be one file's context leaking into another's.
+ *
  * `source` is carried because a file is the unit several module rules are stated over, and a
  * diagnostic about one has to name it even where the file holds nothing to point at.
  *
@@ -100,4 +119,5 @@ case class Program(
     links: List[LinkClause],
     source: Source,
     testOnly: Boolean = false,
+    includes: List[IncludeClause] = Nil,
 )

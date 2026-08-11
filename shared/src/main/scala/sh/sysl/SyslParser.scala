@@ -145,8 +145,8 @@ class SyslParser(val source: Source)
       implVisibility |
       misplacedOverride |
       staticDecl |
-      visibility ~ (structDecl | enumDecl | typeDecl | traitDecl | externDecl | constDecl | valDecl |
-        varDecl | funcDecl) ^^ {
+      visibility ~ (structDecl | enumDecl | typeDecl | traitDecl | externDecl | cConstDecl |
+        constDecl | valDecl | varDecl | funcDecl) ^^ {
         case Visibility.Public ~ d => d
         case v ~ d                 => restrict(v, d)
       }
@@ -324,6 +324,8 @@ class SyslParser(val source: Source)
     case e: ExternDecl    => e.copy(vis = v).setPos(e.pos)
     case e: ExternVarDecl => e.copy(vis = v).setPos(e.pos)
     case c: ConstDecl     => c.copy(vis = v).setPos(c.pos)
+    case b: CConstBlock   =>
+      CConstBlock(b.consts.map(c => c.copy(vis = v).setPos(c.pos))).setPos(b.pos)
     case l: ValDecl       => l.copy(vis = v).setPos(l.pos)
     case r: VarDecl       => r.copy(vis = v).setPos(r.pos)
     case f: FuncDecl      => f.copy(vis = v).setPos(f.pos)
@@ -412,6 +414,44 @@ class SyslParser(val source: Source)
     op("const") ~> ident ~ (op(":") ~> typeRef) ~ (op("=") ~> expression) ^^ {
       case n ~ t ~ v => ConstDecl(n, t, v)
     }
+
+  /** `c const` and its constants, each of whose values is a C expression in quotes (`15 §7`).
+   *
+   * ```
+   * c const
+   *     STATIC_TASK_SIZE: usize = "sizeof(StaticTask_t)"
+   *     MAX_DELAY: u32          = "portMAX_DELAY"
+   * ```
+   *
+   * **`c` is contextual and stays an ordinary identifier**, which the `const` after it is what makes
+   * safe: nothing else in the language may follow a name with a keyword, so the two words together
+   * cannot be anything but this, and a program is free to call a variable `c` — which one counting
+   * characters certainly will. It is a cheaper disambiguation than `interrupt`'s (`15 §10`), which
+   * needs a lookahead past an optional parenthesized argument to find the name it qualifies.
+   *
+   * **The C is quoted with a plain string and carries no prefix.** A `c"…"` form would be a second
+   * literal kind bought to say what the header already said: inside this block a string can mean
+   * nothing else, since there is no other thing a value here could be. The quotes themselves are not
+   * optional, and that is the point of them — what is inside is a different language, and a reader
+   * should be able to see where it starts without knowing which words are C's.
+   *
+   * The block is required rather than a `c const NAME: T = "…"` one-liner being offered beside it.
+   * One form is what keeps the cost legible: the constants of a file are measured by a single probe,
+   * so a run of them under one header reads the way the work is actually done.
+   */
+  protected lazy val cConstDecl: PackratParser[Stmt] =
+    softWord("c") ~> op("const") ~> (
+      newline ~> indent ~> skipNewlines ~> rep1sep(cConstItem, newlines) <~ skipNewlines <~ dedent ^^
+        CConstBlock.apply |
+        err("'c const' is followed by its constants, indented under it, each a name and a type and a " +
+          "C expression in quotes: 'SIZE: usize = \"sizeof(struct s)\"'")
+    )
+
+  /** One line of a `c const` block. The type is mandatory for `const`'s reason and one more: it is
+   * what decides whether the C is read back as signed, and therefore what the probe declares.
+   */
+  protected lazy val cConstItem: Parser[CConstDecl] =
+    at(ident ~ (op(":") ~> typeRef) ~ (op("=") ~> linkName) ^^ { case n ~ t ~ c => CConstDecl(n, t, c) })
 
   /** `@assert(cond)`, `@assert(cond, "why")` — a condition checked while compiling.
    *
@@ -753,7 +793,8 @@ class SyslParser(val source: Source)
                   clauses.collect { case c: CapabilityClause => c },
                   clauses.collect { case l: LinkClause => l },
                   source,
-                  clauses.exists(_.isInstanceOf[TestsClause]))
+                  clauses.exists(_.isInstanceOf[TestsClause]),
+                  clauses.collect { case i: IncludeClause => i })
       }
     }
 

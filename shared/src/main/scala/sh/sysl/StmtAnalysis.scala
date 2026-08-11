@@ -702,6 +702,14 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
         "uses before the program runs, so there is no block for one written here to belong to. A " +
         "name bound to a value inside a body is a 'val'")
 
+    // A `c const` block is measured **per file**, by one probe carrying that file's `@include`s, so
+    // the top level of a file is the only place one can be asked from. It is also a module member
+    // for the reason above, which the C in it does not change.
+    case _: CConstBlock =>
+      err("a 'c const' block is declared at the top level of a file — the C in it is compiled " +
+        "against that file's '@include' headers, and a block inside a body would be asking the " +
+        "same question from a place that cannot answer it")
+
     // A function declared inside a body is a **nested function** (`12 §5a`), and the block's are
     // lowered together the first time one is reached — so the ones after it in the same block have
     // already been dealt with and contribute nothing further here.

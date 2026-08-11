@@ -76,7 +76,7 @@ trait HeaderParser extends AttrParser {
    */
   protected lazy val headerAttr: Parser[List[HeaderClause]] =
     op("@") ~> describe("an attribute")(
-      guard(headerAttrWord) ~> commit(noAttr | requiresAttr | linkAttr | testsAttr))
+      guard(headerAttrWord) ~> commit(noAttr | requiresAttr | linkAttr | includeAttr | testsAttr))
 
   /** The words that make an `@` a **header** attribute rather than a declaration's.
    *
@@ -90,7 +90,8 @@ trait HeaderParser extends AttrParser {
    * admitted a bare `@` would turn every one of those into a header-attribute parse error.
    */
   protected lazy val headerAttrWord: Parser[Any] =
-    attrWordPrefixed("no_") | attrWord("requires") | attrWord("link") | attrWord("tests")
+    attrWordPrefixed("no_") | attrWord("requires") | attrWord("link") | attrWord("include") |
+      attrWord("tests")
 
   /** `@tests` — the file is the module's test scaffolding (`testing.md`).
    *
@@ -136,6 +137,19 @@ trait HeaderParser extends AttrParser {
    */
   private lazy val linkAttr: Parser[List[HeaderClause]] =
     at(attrWord("link") ~> op("(") ~> linkName <~ op(")") ^^ LinkClause.apply) ^^ (List(_))
+
+  /** `@include("FreeRTOS.h")` — a header this file's `c const` block is evaluated against.
+   *
+   * A **string**, for `@link`'s reason turned around: a header's name is C's rather than sysl's, and
+   * plenty of real ones are not identifiers — `sys/types.h` is the everyday example, and the
+   * extension alone would already rule an identifier out. It is written as C writes it, so that the
+   * line the compiler builds and the line a reader would have written by hand are the same line.
+   *
+   * Several are allowed and are included in the order written, because a header that needs another
+   * above it is ordinary in C and the file is the only place that order can be stated.
+   */
+  private lazy val includeAttr: Parser[List[HeaderClause]] =
+    at(attrWord("include") ~> op("(") ~> linkName <~ op(")") ^^ IncludeClause.apply) ^^ (List(_))
 
   /** A header attribute written where a statement goes, which is refused for the reason
    * `noVisibility` is: it has a place, and a reader who writes it in the wrong one should be told

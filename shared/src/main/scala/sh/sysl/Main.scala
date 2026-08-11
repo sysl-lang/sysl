@@ -525,7 +525,7 @@ private[sysl] def execute(cfg: Config): Int = {
   // rather than being printed from inside the compiler, which has no business writing to a console.
   val compiled =
     Compiler.compiledWith(librarySources ::: sources, libraryTrees, target, precompiled, Some(std),
-      provides, packages, entryPoint = !cLibrary(cfg.command)) match
+      provides, packages, entryPoint = !cLibrary(cfg.command), paths) match
     case Left(err) => return report(err)
     case Right(result) =>
       if cfg.explainEscapes then
@@ -792,7 +792,7 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
     case None      => ()
 
   LibraryArtifact.build(sources, target, if cfg.std then LibraryArtifact.std else Set.empty, Some(std),
-                        native) match
+                        native, SearchPaths(cfg.linkPaths, cfg.includePaths, cfg.defines)) match
     case Left(err) => report(err)
     case Right((ir, meta)) =>
       // The standard module's default output is the place a compilation looks for it, so that

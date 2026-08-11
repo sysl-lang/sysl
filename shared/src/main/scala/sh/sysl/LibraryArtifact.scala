@@ -237,16 +237,22 @@ object LibraryArtifact {
    * against it is handed a diagnostic pointing into somebody else's source. `main` is optional
    * (`13 §7`), so a library having none is not a complaint.
    */
+  /** **A `c const` is lowered here, before anything else touches the trees**, which is what puts the
+   * measured value into the artifact rather than the C expression that produced it. A consumer then
+   * needs neither a clang nor the library's headers to read the constant — and could not honestly be
+   * given the expression anyway, since an artifact is built for one target and re-evaluating it
+   * somewhere else would be answering a different question under the same name.
+   */
   def build(sources: List[Source], target: Target = Target.default, building: Set[String] = Set.empty,
-            std: Option[Stdlib] = None, native: List[Source] = Nil)
+            std: Option[Stdlib] = None, native: List[Source] = Nil,
+            paths: SearchPaths = SearchPaths.none)
       : Either[String, (String, String)] = {
     val parsed = sources.map(SyslParser.parse(_, target))
 
     parsed.collect { case Left(e) => e } match
       case errs if errs.nonEmpty => Left(errs.mkString("\n"))
       case _ =>
-        val units = parsed.collect { case Right(p) => p }
-
+        CConstants.lower(parsed.collect { case Right(p) => p }, target, paths).flatMap(units =>
         rootless(units) match
           case Some(err) => Left(err)
           case None =>
@@ -280,7 +286,7 @@ object LibraryArtifact {
                 // the two ways a standard module reaches a compilation, which is the one thing
                 // `StdArtifactTests` exists to refuse.
                 (ir, metadata(Tests.stripSource(units), compiled,
-                              fingerprint(sources ::: native), target)))
+                              fingerprint(sources ::: native), target))))
   }
 
   /** What one of a library's C files is called inside the archive.

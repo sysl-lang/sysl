@@ -71,10 +71,27 @@ object Analyzer {
    * diagnostics are raised. `15 §10`'s calling conventions are the case — whether `interrupt` exists
    * at all, and what signature it demands, differ per processor.
    */
+  /** `paths` is here for `target`'s reason one step further out: a `c const` is evaluated by the C
+   * compiler, and a C compiler that has not been told where the headers are cannot evaluate one
+   * (`SearchPaths`). It reaches nothing else in the analyzer.
+   */
   def analyze(units: List[Program], building: Set[String] = Set.empty,
               std: Stdlib = Stdlib.fromSource(Target.default), target: Target = Target.default,
-              provides: Set[String] = Capability.core.toSet, packages: Packages = Packages.none)
-      : Either[String, TProgram] = {
+              provides: Set[String] = Capability.core.toSet, packages: Packages = Packages.none,
+              paths: SearchPaths = SearchPaths.none)
+      : Either[String, TProgram] = CConstants.lower(units, target, paths).flatMap(analyzing(_,
+    building, std, target, provides, packages))
+
+  /** The walk itself, over units whose `c const` blocks are already ordinary constants.
+   *
+   * **The lowering is a separate step in front of this rather than a pass inside it**, and that is
+   * what keeps the rest of the compiler from knowing the feature exists: by the time a name is
+   * resolved or a bound is folded, a `c const` is the `const` of `13 §7` and nothing else. It is
+   * here — at the analyzer's door — rather than in the parser, because `SyslParser.parse` has seven
+   * callers and this has one.
+   */
+  private def analyzing(units: List[Program], building: Set[String], std: Stdlib, target: Target,
+                        provides: Set[String], packages: Packages): Either[String, TProgram] = {
     val analyzer = new Analyzer(units, building, std, target, provides, packages)
 
     val outcome =

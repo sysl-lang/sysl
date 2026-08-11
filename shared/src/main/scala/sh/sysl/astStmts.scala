@@ -95,6 +95,53 @@ case class VarDecl(name: String, typ: Option[TypeRef], init: Option[Expr],
  */
 case class ConstDecl(name: String, typ: TypeRef, value: Expr, vis: Visibility = Visibility.Public) extends Stmt
 
+/** One line of a `c const` block: a constant whose value is a **C constant expression**, evaluated
+ * by the C compiler for the target this build is for (`15 §7`).
+ *
+ * It exists because a number a binding needs is sometimes one only C can work out.
+ * `sizeof(StaticTask_t)` and `portMAX_DELAY` are not symbols to link against and not text to
+ * transcribe: the first is a layout the headers compute and the second a macro that expands to an
+ * arithmetic expression, and both change with the target, the header version and the macros the
+ * project configures its headers with. Transcribing either produces a program that is right on the
+ * machine it was written on.
+ *
+ * `15 §7`'s answer for a macro — wrap it in three lines of C and declare the wrapper `extern` — is
+ * still the answer for a *function*, and it is not one here. A constant reached through a call is
+ * not a constant: it has no value until the program runs, so it cannot size an array, cannot be a
+ * `match` arm and cannot be folded into anything. What this adds is the value itself, at the time
+ * the rest of the language expects to have it.
+ *
+ * The C is held as written and never inspected by sysl. There is nothing to inspect: what is legal
+ * in the expression is C's question, and the C compiler is what answers it — a refusal from clang is
+ * the diagnostic, quoted, which is what makes "any constant expression" a claim this can honour
+ * rather than a subset somebody has to maintain.
+ *
+ * **It is lowered to an ordinary `ConstDecl` before analysis** (`CConstants`), which is why nothing
+ * downstream knows it exists: by the time a name is resolved, a bound is folded or a tree is
+ * encoded, the value is a literal and the constant is the one `13 §7` already describes.
+ *
+ * **It is not a `Stmt`**, which is the same call `Param` and `AsmArm` are: it cannot be written
+ * anywhere a statement can go, only inside the block below. Making it one would have bought nothing
+ * and cost the two exhaustivity checks that keep a new statement from being quietly ignored — every
+ * walk over `Stmt` would have had to carry a case for a node none of them can ever see.
+ */
+case class CConstDecl(name: String, typ: TypeRef, c: String, vis: Visibility = Visibility.Public)
+    extends Positioned
+
+/** A `c const` block and the constants under it.
+ *
+ * They are one declaration rather than several because they are **one question put to the C
+ * compiler**: every constant in a file is measured by a single probe translation unit, so a block is
+ * what the cost is actually shaped like and writing `c const` once per line would suggest a price
+ * per line that is not being paid. It is also what lets the `c` be spent once — the word marks which
+ * language the right-hand sides are written in, and that is a property of the run of them.
+ *
+ * A visibility written before the block belongs to every constant in it, for the reason it is a
+ * block at all: they are declared together, and a modifier on the header is the one place a reader
+ * would look for what governs the lines under it.
+ */
+case class CConstBlock(consts: List[CConstDecl]) extends Stmt
+
 /** `@assert(cond)`, `@assert(cond, "why")` — a condition checked while compiling.
  *
  * The condition is a constant expression (`13 §Constants`) folded by the same machinery a `const`
