@@ -188,6 +188,102 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     case _: Type.Floating => TFloatLit("0x0p+0", ty)
     case _                => TIntLit(0, ty)
 
+  /** A call to a name, which may stand for one function or for several (`12 §1a`).
+   *
+   * **A name declared once takes the same path it always did**, and that is worth stating as a
+   * property rather than as an optimization: `overloadKeys` answers with the one key, the branch
+   * below is not entered, and nothing about the analysis of the overwhelming majority of calls
+   * changed when overloading arrived.
+   *
+   * **A candidate is chosen by trying the call against it**, rather than by a rule that compares
+   * argument types to parameter types. That is the whole design here, and the reason is that the
+   * comparison is not the small thing it sounds like: it would have to know about named arguments,
+   * defaulted parameters, variadic tails, literal inference, generic solving, and every coercion a
+   * parameter admits. All of that is `callFunction`, so asking `callFunction` is the only way to get
+   * the same answer twice. A candidate the call does not fit is one that reported something, which
+   * `probe` catches and drops.
+   *
+   * The cost is analyzing the arguments once per candidate, and it is paid only where a name is
+   * overloaded at all.
+   */
+  protected def callOverloaded(plain: String, written: List[Expr], expected: Option[Type]): TExpr = {
+    val keys = overloadKeys(plain)
+
+    if keys.length == 1 then callFunction(funcDecls(plain), written, expected)
+    else
+      val candidates = keys.map(funcDecls)
+      val fitting    = candidates.filter(f => probe(callFunction(f, written, expected)).isDefined)
+
+      narrow(fitting, written) match
+        case List(one) => callFunction(one, written, expected)
+
+        // Nothing fits. Where exactly one candidate could have taken this many arguments, its own
+        // complaint is the useful message — the reader wrote a call meaning that one and got a type
+        // wrong — so it is made again outside the sandbox and allowed to report. Otherwise the
+        // mistake is about which function was meant, and the answer is the roster.
+        case Nil =>
+          val plausible = candidates.filter(f => arityFits(f.params.length, f.variadic, written.length))
+
+          if plausible.length == 1 then callFunction(plausible.head, written, expected)
+          else
+            err(s"no '${qn(plain)}' takes these arguments — the declarations of that name are:\n" +
+              candidates.map(f => s"    ${signatureOf(f)}").mkString("\n"))
+
+        // Several fit, and the language does not guess. A literal is the usual cause: `0` is an
+        // `int` and an `i64` and an `f64`, so a name declared at two of those is genuinely ambiguous
+        // at a bare `0` and is not at `0i64`.
+        case many =>
+          err(s"'${qn(plain)}' is ambiguous here — ${many.length} of its declarations take these " +
+            s"arguments:\n" + many.map(f => s"    ${signatureOf(f)}").mkString("\n") +
+            "\nAnnotate an argument, or name the type a literal is meant at")
+  }
+
+  /** The tie-breaks applied to the candidates a call fits, in order, stopping as soon as one leaves
+   * a single answer (`12 §1a`).
+   *
+   * Both are about **exactness**, and both exist because a call that fits two declarations usually
+   * fits one of them the way it was written and the other by something the language did for it.
+   *
+   * 1. **A candidate that needed no default fitted the call as written.** `f(x: int)` and
+   *    `f(x: int, y: int = 0)` both take `f(1)`, and the reader who wrote `f(1)` meant the first.
+   * 2. **A candidate whose parameters are exactly the arguments' own types** beats one reached by a
+   *    conversion. This is what makes a literal's natural type decide between two widths.
+   *
+   * What is deliberately *not* here is a rule ranking one conversion above another. Two candidates
+   * each reached by a different conversion are ambiguous, and saying so is better than a ladder of
+   * precedences nobody can predict from the source.
+   */
+  private def narrow(fits: List[FuncDecl], written: List[Expr]): List[FuncDecl] =
+    if fits.length <= 1 then fits
+    else
+      val exactArity = fits.filter(_.params.length == written.length)
+      val ranked     = if exactArity.length == 1 then exactArity else fits
+      val natural    = written.map(a => probe(analyzeExpr(a).ty))
+
+      if ranked.length <= 1 then ranked
+      else
+        val exactTypes = ranked.filter { f =>
+          f.params.length == natural.length && f.params.zip(natural).forall { (p, t) =>
+            t.exists(actual => probe(resolveType(p.typ, Map.empty)).contains(actual))
+          }
+        }
+
+        if exactTypes.length == 1 then exactTypes else ranked
+
+  /** Whether a callee with this many parameters could take this many arguments at all — the arity
+   * question alone, with nothing said about types. Defaults make the low end, a variadic tail
+   * removes the high one.
+   */
+  private def arityFits(params: Int, variadic: Boolean, args: Int): Boolean =
+    args <= params || (variadic && args >= params)
+
+  /** One declaration as a diagnostic lists it: the name a reader wrote and the parameters that tell
+   * it from its siblings. The result is left off — it is not what distinguishes two overloads, since
+   * `12 §1a` refuses a pair that differ only in it.
+   */
+  private def signatureOf(f: FuncDecl): String =
+    s"${qn(f.name)}(${f.params.map(p => s"${p.name}: ${p.typ.show}").mkString(", ")})"
+
   protected def callFunction(f: FuncDecl, written: List[Expr], expected: Option[Type]): TExpr = {
     // A variadic callee — foreign or sysl's own — fixes only where its declared parameters stop;
     // everything after them is the tail, checked by the rule below rather than against a parameter.

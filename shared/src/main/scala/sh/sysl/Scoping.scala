@@ -651,8 +651,22 @@ trait Scoping extends DeclTables {
   /** A key as a diagnostic spells it — the module separator read back as a dot (`Modules.show`).
    * Every message that names a declaration by the key a table holds it under goes through here, so
    * that a reader is shown the path they would write rather than the compiler's spelling of it.
+   *
+   * **An overload's numbered segment comes off here**, which is the reason the suffix was made
+   * numeric: a reader wrote `paint` and every declaration of it is `paint`, so a message naming the
+   * second one `paint.2` would be naming something the source does not contain. Nothing else a key
+   * can end with is only digits — a mangled type argument is a name, `arr3` or `c5` — so this takes
+   * off overload suffixes and nothing besides. Where a message needs to tell two overloads apart it
+   * shows their **signatures**, which is what a reader would use to tell them apart too.
    */
-  protected def qn(key: String): String = Modules.show(key)
+  protected def qn(key: String): String = {
+    val cut = key.lastIndexOf('.')
+    val bare =
+      if cut > 0 && cut < key.length - 1 && key.drop(cut + 1).forall(_.isDigit) then key.take(cut)
+      else key
+
+    Modules.show(bare)
+  }
 
   // --- scopes and unique naming --------------------------------------------------------
 

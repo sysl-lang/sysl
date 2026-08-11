@@ -137,6 +137,26 @@ trait DeclTables extends Reporting {
   protected val enumDecls   = mutable.LinkedHashMap.empty[String, EnumDecl]
   protected val funcDecls   = mutable.LinkedHashMap.empty[String, FuncDecl]
 
+  /** The keys of an **overload set**, under the key the name resolves to (`12 §1a`).
+   *
+   * Overloading is a fact about a *name*, and every table here is keyed by a name that must stand
+   * for one declaration — so the second function of a name is filed under a key of its own, and this
+   * is what relates the two. The first keeps the plain key, which is what makes overloading cost
+   * nothing anywhere it is not used: a name declared once has no entry here at all, and `funcKey`
+   * answers exactly as it did.
+   *
+   * The distinguishing suffix is a **numeric** segment — `m$paint.2` — which no other producer of a
+   * key can collide with. A generic instantiation appends a mangled type (`f.int`), a member appends
+   * a name (`Point.dist`), and `Type.mangle` never yields a segment that is only digits: an array is
+   * `arr3`, a value argument `c5`. `qn` takes it back off, so no diagnostic ever shows one.
+   */
+  protected val overloadSets = mutable.LinkedHashMap.empty[String, List[String]]
+
+  /** Every declaration of the name this key resolves to, in the order they were written. A name with
+   * no overloads answers with itself, so a caller need not ask which case it is in.
+   */
+  protected def overloadKeys(key: String): List[String] = overloadSets.getOrElse(key, List(key))
+
   /** The `@test` functions the sources declared, in the order hoisting met them (`testing.md`). A
    * report lists tests in the order they were written, and this is where that order comes from —
    * the typed functions are grouped by what reaches them and say nothing about where they sat.

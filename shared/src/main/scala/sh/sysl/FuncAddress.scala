@@ -27,7 +27,8 @@ trait FuncAddress extends CallCore {
    * spelling that meant a sysl callable in one slot and a C address in another would be a silent
    * choice between two representations that share nothing.
    */
-  protected def functionAddress(written: String, key: String, expected: Option[Type] = None): TExpr = {
+  protected def functionAddress(written: String, plain: String, expected: Option[Type] = None): TExpr = {
+    val key  = overloadAddressed(written, plain, expected)
     val decl = funcDecls(key)
 
     // Which copy of it? A generic function is not code until its arguments are settled (`10 §7`), so
@@ -80,6 +81,50 @@ trait FuncAddress extends CallCore {
 
     TFuncAddr(instKey, instKey, Type.CFn(ptypes, ret))
   }
+
+  /** Which declaration of an overloaded name an address is of (`12 §1a`).
+   *
+   * **The expected type decides, and it is the same mechanism a generic function's arguments are
+   * read off** — an address is handed to something whose signature is already fixed, so the
+   * signature is there to be matched. What is compared is the parameter list: a `*extern` states
+   * exactly what a call through it passes, and that is what tells two overloads apart.
+   *
+   * The result is deliberately not compared. `12 §1a` refuses a pair differing only in it, so it
+   * carries no information here — and comparing it would refuse an address whose expected type is
+   * spelled with a result the declaration converts to.
+   *
+   * **With no expected type there is nothing to read**, and this reports rather than guessing. An
+   * address is one word with no context of its own; taking the first declaration would be choosing
+   * silently between functions that share nothing but a name.
+   */
+  private def overloadAddressed(written: String, plain: String, expected: Option[Type]): String = {
+    val keys = overloadKeys(plain)
+
+    if keys.length == 1 then plain
+    else
+      val wanted = expected.flatMap(cfnOf)
+      val fits   = keys.filter(k => wanted.exists(w => probe(funcInsts(k)._1.map(_._2)).contains(w.params)))
+
+      fits match
+        case List(one) => one
+        case _ if wanted.isEmpty =>
+          err(s"'$written' names ${keys.length} functions, and an address is of one of them — " +
+            "which is read off the type the context wants, and there is none here. Annotate what " +
+            "this address is being stored in or passed as")
+        case Nil =>
+          err(s"no '$written' has the parameters '${show(expected.get)}' asks for — the declarations " +
+            s"of that name are:\n" + keys.map(k => s"    ${addressOf(k)}").mkString("\n"))
+        case many =>
+          err(s"'$written' is ambiguous as an address — ${many.length} of its declarations match " +
+            s"'${show(expected.get)}'")
+  }
+
+  /** One declaration of an overloaded name as an address's diagnostic lists it. */
+  private def addressOf(key: String): String =
+    probe(funcInsts(key)) match
+      case Some((params, ret)) =>
+        s"${qn(key)}: *extern(${params.map(p => show(p._2)).mkString(", ")}) -> ${show(ret)}"
+      case None => qn(key)
 
   /** Which copy of a generic function this address names, read off the type the context wants.
    *

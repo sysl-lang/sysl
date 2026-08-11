@@ -290,10 +290,17 @@ trait Hoisting extends HoistMembers {
       val f = callBounds(original.tparams, original.params).fold(original) { (tps, ps, bs) =>
         original.copy(tparams = tps, params = ps, bounds = original.bounds ++ bs).setPos(original.pos)
       }
-      val key = Modules.qualify(currentModule, f.name)
+      val plain = Modules.qualify(currentModule, f.name)
+      val key   = if funcDecls.contains(plain) then overloadSlot(plain) else plain
 
-      if funcDecls.contains(key) then duplicate(key, s"function '${f.name}' is already declared")
-      else if constDecls.contains(key) then duplicate(key, s"'${f.name}' is already declared as a constant")
+      // The other side of the `extern` rule below: overloads of an `extern` are told apart by the
+      // symbol each names, and a sysl function has none to give.
+      if key != plain && overloadKeys(plain).exists(externDecls.contains) then
+        err(s"'${f.name}' is already declared as an 'extern', which this would overload — what tells " +
+          "overloads of an 'extern' apart is the symbol each names, and a sysl function declares no " +
+          "symbol")
+
+      if constDecls.contains(key) then duplicate(key, s"'${f.name}' is already declared as a constant")
       else if valDecls.contains(key) then duplicate(key, s"'${f.name}' is already declared as a 'val'")
       else if staticVarDecls.contains(key) then
         duplicate(key, s"'${f.name}' is already declared as a module 'var'")
@@ -302,11 +309,17 @@ trait Hoisting extends HoistMembers {
       funcDecls(key) = f.copy(name = key).setPos(f.pos)
       declScope(key) = currentScope
       recordAccess(key, f.vis)
-      if libraryOffers(f, currentModule) then libraryNames(f.name) = key
+      // The **plain** key, always: what a library offers under a bare name is the name, and the name
+      // is the whole overload set. An overload registered here under its own key would leave the
+      // library offering whichever declaration happened to be written last.
+      if libraryOffers(f, currentModule) && key == plain then libraryNames(f.name) = key
       if f.tparams.isEmpty then
         funcInsts(key) =
           (f.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty)))),
            f.retType.map(t => recover(Type.Unknown)(resolveReturn(t, Map.empty))).getOrElse(Type.Unit))
+      // After every table this declaration fills, because it reports and reporting unwinds: a
+      // declaration whose overload is refused is still a declaration the body pass will look up.
+      if key != plain then recover(())(checkOverloadDistinct(plain, key, f.params, f.variadic))
       checkSignatureRules(f.name, f.params, f.retType, f.variadic)
       checkValueParamArithmetic(f.tvalues.keySet, f.params.map(_.typ) ::: f.retType.toList,
         f.tparams.toSet, f.tpacks)
@@ -326,15 +339,35 @@ trait Hoisting extends HoistMembers {
     // already has, which knows nothing about sysl's modules. So the key the program calls it by
     // carries the module like any other name, and the symbol is pinned to what was written.
     case e: ExternDecl =>
-      val key = Modules.qualify(currentModule, e.name)
+      val plain = Modules.qualify(currentModule, e.name)
+      val key   = if funcDecls.contains(plain) then overloadSlot(plain) else plain
 
-      if funcDecls.contains(key) then duplicate(key, s"function '${e.name}' is already declared")
-      else if externVarDecls.contains(key) then
+      // **An `extern` overloads, and the C symbol is what keeps the overloads apart** (`12 §1a`).
+      // Two sysl declarations sharing a name are two functions; two sharing a *symbol* are one C
+      // function claimed at two signatures, and nothing downstream could tell which was meant — the
+      // symbol is what is emitted, so both calls would reach the same code with different arguments.
+      // That is what `ptr_cast` over a `*extern` is for, written where a reader can see it.
+      val externClash =
+        Option.when(key != plain) {
+          if overloadKeys(plain).flatMap(externDecls.get).exists(_.symbol == e.symbol) then
+            s"'${e.name}' is already declared as an 'extern' for the symbol '${e.symbol}' — two " +
+              "declarations of one name are two functions, and one C function cannot be two. " +
+              "Overloads of an 'extern' are told apart by the symbol each names, so give this one a " +
+              "symbol of its own or take its address and 'ptr_cast' it where the other signature is " +
+              "wanted"
+          else if !externDecls.contains(plain) then
+            s"'${e.name}' is already declared as a function, so this 'extern' would overload it — " +
+              "what tells overloads of an 'extern' apart is the symbol each names, and a sysl " +
+              "function declares no symbol"
+          else ""
+        }.filter(_.nonEmpty)
+
+      if externVarDecls.contains(key) then
         duplicate(key, s"'${e.name}' is already declared as an 'extern' variable")
       funcDecls(key) = FuncDecl(key, Nil, e.params, e.retType, Nil, variadic = e.variadic).setPos(e.pos)
       declScope(key) = currentScope
       recordAccess(key, e.vis)
-      if libraryOffers(e, currentModule) then libraryNames(e.name) = key
+      if libraryOffers(e, currentModule) && key == plain then libraryNames(e.name) = key
 
       val signature =
         (e.params.map(p => (p.name, foreignParam(recover(Type.Unknown)(resolveType(p.typ, Map.empty))))),
@@ -356,6 +389,10 @@ trait Hoisting extends HoistMembers {
             case Left(why)      => err(why); e.symbol
 
       externDecls(key) = e.copy(name = key, link = Some(symbol)).setPos(e.pos)
+      // Reported after every table is filled, for the reason the same check in the branch above is:
+      // the body pass looks this declaration up whatever was wrong with it.
+      for why <- externClash do recover(())(err(why))
+      if key != plain then recover(())(checkOverloadDistinct(plain, key, e.params, e.variadic))
       checkSignatureRules(e.name, e.params, e.retType, e.variadic, foreign = true)
       for s <- e.link if !s.matches("[A-Za-z0-9_$.]+") do
         err(s"'$s' is not a symbol a linker can resolve")
@@ -649,4 +686,62 @@ trait Hoisting extends HoistMembers {
     structDecls.contains(key) || enumDecls.contains(key) || traitDecls.contains(key) ||
       constrainedDecls.contains(key) || scalarType(written).isDefined ||
       written == neverName || written == selfName
+
+  /** The key the **second and later** declarations of one function name are filed under (`12 §1a`),
+   * recording as it goes that the name now stands for a set.
+   *
+   * Every table in the analyzer is keyed by a name that stands for one declaration, and overloading
+   * is precisely a name that does not — so the first declaration keeps the plain key and each one
+   * after it is given a numbered one. Nothing changes for a name declared once: it gets no entry
+   * here, and every lookup answers exactly as it did.
+   */
+  private def overloadSlot(plain: String): String = {
+    val existing = overloadKeys(plain)
+    val key      = s"$plain.${existing.length + 1}"
+
+    overloadSets(plain) = existing :+ key
+    key
+  }
+
+  /** Refuses a declaration that some call could not be told apart from one already made (`12 §1a`).
+   *
+   * **The question is whether a call exists that both would take**, which is the only thing that
+   * makes two declarations of a name a problem. Each declaration takes a *range* of argument counts
+   * — from its parameters without defaults up to all of them, or up from there with no ceiling if it
+   * is variadic — so two of them collide when their ranges overlap at some count and their first
+   * that-many parameter types agree.
+   *
+   * That one rule covers the two cases worth naming separately:
+   *
+   * - **A pair differing only in the result.** `h(x: int) -> string` and `h(x: int) -> int` collide
+   *   at one argument. Resolution never looks at the result (`12 §1a`), so the pair has no call that
+   *   distinguishes them and every use would report an ambiguity — one mistake, made once, reported
+   *   at every call site instead of at the line that has it.
+   * - **A pair whose difference is behind a default.** `g(x: int)` and `g(x: int, y: int = 0)`
+   *   collide at one argument, and the second's default is unreachable: no call can ever supply one
+   *   argument to it, because the first takes that call. A default nothing can use is worth saying
+   *   out loud rather than resolving quietly.
+   *
+   * **Compared as written rather than as resolved**, deliberately. Hoisting has not resolved a
+   * generic parameter's type and cannot, and the written form is what a reader is looking at. Two
+   * spellings of one type slip through here and are caught at the call, where they read as the
+   * ambiguity they are.
+   */
+  private def checkOverloadDistinct(plain: String, key: String, params: List[Param], variadic: Boolean): Unit = {
+    def low(ps: List[Param]) = ps.count(_.default.isEmpty)
+    def high(ps: List[Param], v: Boolean) = if v then Int.MaxValue else ps.length
+
+    for
+      other <- overloadKeys(plain).filter(_ != key).flatMap(funcDecls.get)
+      lo = low(params) max low(other.params)
+      hi = high(params, variadic) min high(other.params, other.variadic)
+      if lo <= hi
+      n = lo min (params.length min other.params.length)
+      if params.take(n).map(_.typ) == other.params.take(n).map(_.typ)
+    do
+      err(s"'${qn(plain)}' is already declared with parameters this one could not be told from — " +
+        s"a call passing $n argument${if n == 1 then "" else "s"} would fit both, and which " +
+        "declaration a call means is decided by its arguments and never by what it returns. Two " +
+        "declarations of one name have to differ in a way a call site can show")
+  }
 }

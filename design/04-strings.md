@@ -268,9 +268,10 @@ The older sysl called the equivalent module `unicode` and classified nothing abo
 caller read a promise the code did not keep. That is the mistake this name exists to avoid.
 
 **It is a trait rather than two sets of functions**, for exactly the reason `sysl.math.Float` is
-one: sysl has no overloading, so free functions would need `is_digit` for a `u8` and some suffixed
-twin for a `char`, and every caller would have to track which it was holding. `b.is_digit()` is the
-same three words either way. The pair is *closed*, which is what makes an `impl` the right mechanism
+one. When both were written sysl had no overloading, so free functions would have needed `is_digit`
+for a `u8` and some suffixed twin for a `char`; `12 §1a` has since removed that, and the trait stays
+for what it buys beyond a shared name — dispatch on the receiver, so `b.is_digit()` is the same
+three words either way, and a member written over the others written once. The pair is *closed*, which is what makes an `impl` the right mechanism
 here and the wrong one for the integers — `sysl.math.Signed` cannot be written this way because
 `iN` is an open family and a finite set of blocks would leave widths out, while a byte and a
 character are the only two types this question is ever asked of.
@@ -534,7 +535,8 @@ The library declares `printi`, `printu`, `printr`, `printb`, `printc`, and `prin
 of them is sysl a program could have written. What the compiler knows is those six *names* and the
 rule that widens an argument to the width its renderer takes — an integer to `long` or `ulong` by
 its own signedness, a float to `real` — so that the library needs one function per kind rather than
-one per width, which a language without overloading has no other way to arrange. That is the same
+one per width. Overloading (`12 §1a`) would give the six one *name*; it would not give them one
+*body*, which is what the widening buys and is why this arrangement is unchanged by it. That is the same
 kind of knowledge it already has of `Option`'s variant names, and it is the whole of it: the
 compiler implements no printing.
 

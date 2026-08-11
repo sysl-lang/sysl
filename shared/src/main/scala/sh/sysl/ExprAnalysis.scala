@@ -751,7 +751,7 @@ trait ExprAnalysis
         "bodies share")
 
     case Call(Ident(name), args) if funcKey(name).isDefined =>
-      callFunction(funcDecls(funcKey(name).get), args, expected)
+      callOverloaded(funcKey(name).get, args, expected)
 
     // A name that is neither a local nor a function, holding a function pointer — a module-level
     // `val` is the one that reaches here, since it is resolved by neither of the two lookups above.

@@ -1519,11 +1519,17 @@ would diagnose it unable to run — so the source path stays, and stays reachabl
   — `guide/fft` declared `sin`, `cos` and `sqrt` as C externs of its own and wrote its own absolute
   value, and every float program after it would have done the same. **`sysl.math` answers that one,
   and what it settles is bigger than the functions in it.** A module of free functions could not have
-  worked: there is no overloading (`12` §1), so `sqrt` over binary64 and `sqrt` over binary32 would
-  have needed two names and every caller would have had to track which width it was holding. What the
-  module ships instead is a **trait implemented for the built-in float types**, which `02` allows for
-  exactly this reason — so `x.sqrt()` is the same three words at either width, and the widths are told
-  apart by the receiver rather than by the caller.
+  worked **when this was written**: there was no overloading, so `sqrt` over binary64 and `sqrt` over
+  binary32 would have needed two names and every caller would have had to track which width it was
+  holding. What the module ships instead is a **trait implemented for the built-in float types**,
+  which `02` allows for exactly this reason — so `x.sqrt()` is the same three words at either width,
+  and the widths are told apart by the receiver rather than by the caller.
+
+  **`12 §1a` since removed that constraint, and the shape stays anyway** — worth saying, because a
+  reader arriving here now would otherwise take the paragraph for a stale one. Two free `sqrt`s
+  would resolve correctly today. What the trait still buys is the half overloading does not: a member
+  that is *arithmetic over the others* is written **once** as a default and inherited by both widths,
+  so the logarithm in an arbitrary base exists in one place. Free functions would need it twice.
 
   That shape draws a line the rest of the standard library can be built along. A trait member whose
   result C computes is *required* of each width and binds to that width's libm entry point; a member

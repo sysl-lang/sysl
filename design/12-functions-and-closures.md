@@ -244,6 +244,109 @@ a call to the same `sin` an ordinary `extern` names, so the transcendentals stay
 An intrinsic has no address (`§10`): there is no body for one to name, and a wrapper that calls it is
 what has one.
 
+## 1a. A name may be declared more than once — overloading
+
+**Two functions of one name are two functions, and every use of the name still means exactly one of
+them.** Which one is decided by the **arguments** a use passes: how many, and what type each is.
+
+```
+render(font: &Font, text: string, fg: Color)
+render(font: &Font, text: string, fg: Color, bg: Color)
+
+show(x: int) -> string
+show(x: string) -> string
+```
+
+**The result is never part of it.** A pair differing only in what they return is refused where the
+second is written, and that refusal is the shape of the rule rather than an exception to it: sysl
+reads an expected type *inwards*, from the context to the expression, so a call whose meaning
+depended on its own result would need its context typed before it could be resolved and would need
+resolving before its context could be typed. Every language that admits return-type overloading pays
+for it with a bidirectional solver, and sysl's inference is worth more than the feature.
+
+**A pair no call could tell apart is refused where it is written.** Each declaration takes a *range*
+of argument counts — from its parameters that have no default up to all of them, or up with no
+ceiling if it is variadic — and two of them collide when their ranges overlap at some count and their
+first that-many parameters agree in type. That single rule catches both cases worth naming:
+
+```
+h(x: int) -> string          -- refused: the pair has no call that tells them apart
+h(x: int) -> int
+
+g(x: int)                    -- refused: the default is unreachable, since a call of one
+g(x: int, y: int = 0)        --   argument is taken by the declaration above
+```
+
+**Reporting it at the declaration rather than at the call is the whole point.** The mistake is in the
+pair; reporting it where the name is *used* would report one mistake once per call site, in files
+whose authors did not write it.
+
+**A use that fits none of them, or several, is refused where the use is.** Both messages carry the
+roster, because the reader's question at that point is which declarations exist:
+
+```
+no 'k' takes these arguments — the declarations of that name are:
+    k(x: int)
+    k(x: string)
+```
+
+Where exactly one declaration could have taken that *many* arguments, its own complaint is given
+instead: the reader meant that one and got a type wrong, and "the third argument is a `string`" beats
+a roster.
+
+**Two tie-breaks decide a use that fits more than one, and both are about exactness.** A candidate
+that needed no default fitted the call as written, and beats one that did; and a candidate whose
+parameters are exactly the arguments' own types beats one reached by a conversion — which is what
+makes a literal's natural type choose between two widths, so `width(1)` is the `int` and `width(1i64)`
+is the `i64`. What is deliberately absent is any ranking *between* conversions. Two candidates each
+reached by a different one are ambiguous, and saying so is better than a ladder of precedences
+nobody can predict from the source.
+
+**An address chooses by the type the context wants**, which is the mechanism a generic function's
+address already uses (`§6a`): a `*extern(int) -> int` states exactly what a call through it passes,
+and that is what tells two overloads apart. With no expected type there is nothing to read and the
+address is refused rather than guessed at. A bare name used as a callable (`§5`) chooses the same
+way, off the call trait its parameter is bound by.
+
+### An `extern` overloads, and the symbol is what keeps them apart
+
+```
+extern "TTF_RenderText_Solid"  render(f: &Font, t: string, fg: Color) -> &Surface
+extern "TTF_RenderText_Shaded" render(f: &Font, t: string, fg: Color, bg: Color) -> &Surface
+```
+
+**Two `extern`s of one name are two functions exactly when they name two symbols.** A C library's
+naming is not sysl's, and a family that C spells `_Solid`/`_Shaded`/`_Blended` is one operation with
+an option — which a binding may now say, without inventing a sysl name per C symbol.
+
+**Two naming the *same* symbol are refused.** That is one C function claimed at two signatures, and
+the symbol is what is emitted: both calls would reach the same code with different arguments, and
+nothing downstream could tell which had been meant. Where that is genuinely wanted — a `void *`
+interface used at several types — it is written where a reader can see it, by taking the address and
+`ptr_cast`ing it (`§6a`).
+
+**An `extern` and a sysl function do not overload each other**, in either order. What tells overloads
+of an `extern` apart is the symbol each names, and a sysl function declares none.
+
+### What this replaces, and what it repairs
+
+Two paragraphs of this specification were written as consequences of overloading's absence, and both
+become ordinary statements now:
+
+- **`13`** records that `sysl.math` could not be a module of free functions, "since there is no
+  overloading, so `sqrt` over binary64 and `sqrt` over binary32 would have needed two names and every
+  caller would have had to track which width it was holding". The trait it took instead is a good
+  shape for other reasons — a width is told by the receiver, and a default member is written once —
+  so it stays. What changes is that it is now a choice.
+- **`§6`** limits a type implementing the call trait to **one arity**, because each would give it a
+  member named `call` and a type's members are one namespace. That limit stands, and its reason is
+  now the namespace alone rather than the absence of overloading: a *member* is not overloaded, which
+  is `08`'s business and is not settled here.
+
+**Interface extraction stays parse-only** (`13 §2`), which is the property that had to survive. A
+signature is explicit in sysl whether or not a name is overloaded, so an overload set is readable off
+a file's syntax tree with nothing resolved and nothing compiled.
+
 ## 2. Parameters are by-value bindings
 
 Every parameter is an ordinary **value binding**: `a: int` names a copy of the argument, and
@@ -933,8 +1036,10 @@ that points at the `&Fn` it should have been — never a silent box.
 other and is worth saying because it is useful: a struct with an `impl Fn(int) -> int` is callable
 with `d(5)`, may be passed to a bare-arrow parameter, and may be erased into a `&Fn`. It is written
 with the arrow, the same way the type of a callable is written everywhere else. **One arity per
-type**, since each would give it a member named `call` and a type's members are one namespace (`08`)
-— sysl has no overloading, so this falls out rather than being a rule of its own.
+type**, since each would give it a member named `call` and a type's members are one namespace (`08`).
+That reason used to be stated as "sysl has no overloading"; overloading arrived in `§1a` and this
+limit did not move, because what it rests on is the member namespace and `§1a` is about the names a
+*module* declares.
 
 **Anything whose type says it is callable may be called**, wherever it was read from: an element of
 an array of them, a part of a tuple, an item of a container, the result of another call. The head of

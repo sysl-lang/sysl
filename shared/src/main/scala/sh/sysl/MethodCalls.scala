@@ -303,17 +303,6 @@ trait MethodCalls extends FuncAddress {
    */
   private def probeType(e: Expr): Option[Type] = probe(analyzeExpr(e).ty)
 
-  /** A question asked of the tables that is allowed to have no answer, with everything it registers
-   * on the way dropped and everything it complains about left for the walk that follows.
-   */
-  protected def probe[T](body: => T): Option[T] =
-    sandboxed {
-      try Some(body)
-      catch
-        case AnalyzerError(_, _, _) => None
-        case Poisoned()          => None
-    }
-
   /** `value.m(…)` where `m` declares type parameters of its own, at the instantiation this call
    * resolves to.
    *

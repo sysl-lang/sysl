@@ -235,6 +235,23 @@ trait AnalyzerBase extends Scoping {
     table ++= saved
   }
 
+  /** A question asked of the tables that is allowed to have no answer, with everything it registers
+   * on the way dropped and everything it complains about left for the walk that follows.
+   *
+   * It sits here, beside `sandboxed`, because two quite different parts of the analyzer ask
+   * speculative questions and neither is above the other: a method call asks whether a receiver has
+   * a member of some name, and an **overloaded** call asks which of several declarations the
+   * arguments fit (`12 §1a`). It was `MethodCalls`' private helper until the second of those needed
+   * it from `CallCore`, which `MethodCalls` is built on top of.
+   */
+  protected def probe[T](body: => T): Option[T] =
+    sandboxed {
+      try Some(body)
+      catch
+        case AnalyzerError(_, _, _) => None
+        case Poisoned()             => None
+    }
+
   // --- hooks provided by the Analyzer class --------------------------------------------
   //
   // These recursive entry points live in the class (statements, expressions, places) but are
