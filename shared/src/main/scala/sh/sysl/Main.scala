@@ -409,11 +409,6 @@ private[sysl] def execute(cfg: Config): Int = {
       case Some(archive) => trace(s"standard module linked from $archive")
       case None          => trace("standard module compiled from source, not linked from an artifact")
 
-  // Building a library stops here — there is no program to link it into. An artifact is **for a
-  // machine**, exactly as an rlib is, because half of it is compiled object code; the generic half
-  // travels as trees because there is nothing to compile until a caller fixes its type arguments.
-  if cfg.command == "build-lib" then return buildLibrary(cfg, sources, target, std, project.name)
-
   // Running the result is what makes `run` different from `build`, and only this machine can do
   // that — so a cross target is refused here rather than built and then failed to execute.
   //
@@ -454,6 +449,20 @@ private[sysl] def execute(cfg: Config): Int = {
   collected.find(_._2.isEmpty) match
     case Some((root, _)) => return fail(s"$root holds no sysl source files")
     case None            => ()
+
+  // Building a library stops here — there is no program to link it into. An artifact is **for a
+  // machine**, exactly as an rlib is, because half of it is compiled object code; the generic half
+  // travels as trees because there is nothing to compile until a caller fixes its type arguments.
+  //
+  // **Below the `--lib` resolution and above the fetch, which is the whole of what `build-lib` was
+  // missing.** A library built on another library needs that library's declarations to compile at
+  // all, and the two ways of naming one — a source root and a `.syslib` — are resolved just above.
+  // What it does not do is *fetch*: a command that compiles one tree into an artifact for one
+  // machine should not reach the network, so a `dependencies` block is refused here rather than
+  // acted on, and `buildLibrary` says so in as many words.
+  if cfg.command == "build-lib" then
+    return buildLibrary(cfg, sources, target, std, project,
+                        collected.flatMap(_._2), decoded.collect { case Right(r) => r._1 }.flatten)
 
   // What this project depends on, fetched and version-selected (`packages.md § 3`, `§ 5`). A project
   // with no `dependencies` resolves to itself and this costs nothing, which is what keeps
@@ -772,9 +781,31 @@ private def moduleName(path: String): String = {
  * names in the tree: guessing it would turn a clear refusal — *you cannot add to the module every
  * program is compiled against* — into an artifact that builds and then collides with the built-in
  * copy at whatever link tried to use it.
+ *
+ * **`--lib` names what this library is built ON, and it is the only way one reaches here.** A
+ * package built on another — `sdl3-ttf` on `sdl3` — needs that one's declarations to compile at all,
+ * and gets them as a source root or as a `.syslib`, exactly as a program does. What it never does is
+ * *fetch*: `dependencies` is a coordinate to resolve over the network, and a command whose whole job
+ * is to compile one tree into an artifact for one machine should not be the thing that goes looking.
+ * So a package that declares dependencies and is handed no library is refused, with the flag that
+ * would have answered it named — rather than compiled until the analyzer reports a module nobody
+ * mentioned.
  */
 private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std: Stdlib,
-                         named: Option[String]): Int = {
+                         project: PackageConfig, libraries: List[Source],
+                         libraryTrees: List[Program]): Int = {
+  val named = project.name
+
+  // Said before anything is compiled, and said as a *request* the driver cannot meet rather than as
+  // a missing module: the reader wrote a `dependencies` block that every other command honours, and
+  // what they are owed is which command they are running and which flag stands in for it here.
+  if project.dependencies.nonEmpty && cfg.libs.isEmpty then
+    val labels = project.dependencies.map(d => s"'${d.label}'").mkString(", ")
+
+    return fail(s"build-lib compiles the tree it is given and fetches nothing, so this package's " +
+      s"dependencies reach it through --lib rather than through 'dependencies' — supply $labels as " +
+      "a source root or as a '.syslib' built from one")
+
   // Before the library is compiled rather than after. Compiling it is the slow part and the archiver
   // is not needed until the end, so discovering it late would make "there is no llvm-ar" a thing a
   // user waited for the whole build to be told.
@@ -793,7 +824,8 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
     case None      => ()
 
   LibraryArtifact.build(sources, target, if cfg.std then LibraryArtifact.std else Set.empty, Some(std),
-                        native, SearchPaths(cfg.linkPaths, cfg.includePaths, cfg.defines)) match
+                        native, SearchPaths(cfg.linkPaths, cfg.includePaths, cfg.defines),
+                        libraries, libraryTrees) match
     case Left(err) => report(err)
     case Right((ir, meta)) =>
       // The standard module's default output is the place a compilation looks for it, so that

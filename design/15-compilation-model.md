@@ -259,6 +259,12 @@ has no such constraint, so its C goes on the command line as objects — which i
 than archiving would be: an archive member is pulled in only to resolve a symbol already undefined,
 and a shim reached through a table nothing has mentioned yet would not be pulled in at all.
 
+**A `build-lib` archives its own C and nobody else's.** A library named with `--lib` while another
+library is being built reaches that build as declarations, exactly as `13 §8` says — its C belongs to
+its own artifact, or to the link line of whatever program consumes both. Archiving it here would put
+the same objects into two artifacts, which is the C half of the duplicate-definition problem that
+section is about.
+
 **A tree brought in as source and the same tree built into an artifact must behave alike**, which is
 what makes `--lib` able to take either without a second flag. It is also why the packages chapter can
 refuse build scripts (`packages.md § 7`): its argument is that sysl compiles a package's C

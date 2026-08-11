@@ -312,6 +312,94 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  /** A library built **on another library** — what `--lib` means at `build-lib` (`15 §7`). `sdl3-ttf`
+   * is the case in the org: it declares `Font` in terms of `sdl3`'s `Surface`, so without the other
+   * library's declarations it does not compile at all.
+   *
+   * The claim worth pinning is the same one separate compilation rests on everywhere else: **a
+   * library defines its own modules and nobody else's.** Folded in with the dependent's own files the
+   * dependency would be *its* module, and the artifact would carry a second copy of a compiled half
+   * somebody else already shipped — which builds, archives, and is a duplicate symbol at whatever
+   * program later links both. That is invisible on a Mach-O link, so it is checked here, in the IR,
+   * where it is a difference between two words.
+   */
+  "a library built on another library" - {
+
+    val base =
+      """module base
+        |
+        |struct Colour
+        |    red: int
+        |end Colour
+        |
+        |brighten(c: Colour) -> Colour = Colour(c.red + 1)
+        |""".stripMargin
+
+    val skin =
+      """module skin
+        |
+        |import base.{Colour, brighten}
+        |
+        |twice(c: Colour) -> Colour = brighten(brighten(c))
+        |""".stripMargin
+
+    val baseSource = List(Source("base/lib.sysl", base, List("base")))
+    val skinSource = List(Source("skin/lib.sysl", skin, List("skin")))
+
+    /** The dependency as a consumer would receive it: an artifact, read back into trees. */
+    def baseTrees: List[Program] =
+      LibraryArtifact.build(baseSource) match
+        case Left(err) => fail(s"the dependency did not build: $err")
+        case Right((_, meta)) =>
+          LibraryArtifact.read("base.syslib", meta, Target.default) match
+            case Right((trees, _, _)) => trees
+            case Left(err)            => fail(s"the dependency's metadata did not read back: $err")
+
+    def onto(libraries: List[Source] = Nil, trees: List[Program] = Nil): (String, Set[String]) =
+      LibraryArtifact.build(skinSource, Target.default, Set.empty, None, Nil, SearchPaths.none,
+        libraries, trees) match
+        case Left(err) => fail(s"the dependent did not build: $err")
+        case Right((ir, meta)) =>
+          LibraryArtifact.read("skin.syslib", meta, Target.default) match
+            case Right((_, syms, _)) => (ir, syms)
+            case Left(err)           => fail(s"the dependent's metadata did not read back: $err")
+
+    def defines(ir: String, name: String): Boolean =
+      ir.linesIterator.exists(l => l.startsWith("define ") && l.contains(s"@$name("))
+
+    def declares(ir: String, name: String): Boolean =
+      ir.linesIterator.exists(l => l.startsWith("declare ") && l.contains(s"@$name("))
+
+    "compiles against a dependency given as a source root" in {
+      val (ir, _) = onto(libraries = baseSource)
+
+      defines(ir, "skin$twice") shouldBe true
+    }
+
+    "compiles against one given as an artifact, which is the other half of what --lib takes" in {
+      val (ir, _) = onto(trees = baseTrees)
+
+      defines(ir, "skin$twice") shouldBe true
+    }
+
+    "declares the dependency's compiled half rather than emitting a second copy of it" in {
+      val (ir, _) = onto(libraries = baseSource)
+
+      defines(ir, "base$brighten") shouldBe false
+      declares(ir, "base$brighten") shouldBe true
+    }
+
+    "advertises only its own, so a program is never told this artifact holds the other's" in {
+      // What the metadata says is what a consuming compilation stops emitting for itself. A name
+      // advertised here that this artifact does not define is a link that fails in somebody else's
+      // program, with nothing in either library to point at.
+      val (_, syms) = onto(libraries = baseSource)
+
+      syms should contain("skin$twice")
+      syms.filter(_.startsWith("base$")) shouldBe empty
+    }
+  }
+
   "a library may not sit in the module a program's own headerless files are in" in {
     // The root module has no name, so nothing that depended on this library could write a path to
     // what it declares — and its keys would be the consuming program's own.

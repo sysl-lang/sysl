@@ -96,6 +96,77 @@ class LibraryBuildCliTests extends LibraryCliSupport {
     }
   }
 
+  /** A library built **on** another one, which is `--lib` at `build-lib` (`15 §7`). The org's case is
+   * `sdl3-ttf`, whose `Font` renders to an `sdl3` `Surface`: without that library's declarations it
+   * does not compile, and until this worked the flag was read off the command line and dropped.
+   *
+   * What `build-lib` still does not do is *fetch*. A `dependencies` block is a coordinate to resolve
+   * over the network, and a command whose whole job is to compile one tree into an artifact for one
+   * machine should not be the thing that goes looking — so the block is refused rather than acted on,
+   * and the flag that answers it is named.
+   */
+  "a library built on another library" - {
+
+    val dependent =
+      """module skin
+        |
+        |import extra.triple
+        |
+        |sixfold(n: int) -> int = triple(triple(n))
+        |""".stripMargin
+
+    "takes one named as a source root" in {
+      succeeds(Config(command = "build-lib", file = rootOf("skin", dependent),
+        output = Some(createTempFile("sysl-cli-skin-", LibraryArtifact.extension)),
+        libs = List(rootOf("extra", other))))
+    }
+
+    "takes one named as an artifact, which is the other thing --lib accepts" in {
+      succeeds(Config(command = "build-lib", file = rootOf("skin", dependent),
+        output = Some(createTempFile("sysl-cli-skin-", LibraryArtifact.extension)),
+        libs = List(artifactOf(rootOf("extra", other)))))
+    }
+
+    "and cannot be built without it" in {
+      // The pair is what says the flag was *used*. A `--lib` accepted and dropped refuses a bad path
+      // exactly as loudly while compiling every library against nothing, which is what it did.
+      val (status, notes) =
+        diagnostics(Config(command = "build-lib", file = rootOf("skin", dependent),
+          output = Some(createTempFile("sysl-cli-skin-", LibraryArtifact.extension))))
+
+      status should not be 0
+      notes should include("no module is called 'extra.triple'")
+    }
+
+    "and a program links the pair and runs" in {
+      // The end of the chain, and the only place the split between the two artifacts is observable:
+      // each half is compiled once, by whoever built it, and the program calls across the seam.
+      val base = artifactOf(rootOf("extra", other))
+      val out  = createTempFile("sysl-cli-skin-", LibraryArtifact.extension)
+
+      succeeds(Config(command = "build-lib", file = rootOf("skin", dependent), output = Some(out),
+        libs = List(base)))
+
+      ran(Config(command = "run", file = program("print(skin.sixfold(2))"),
+        libs = List(out, base))) shouldBe "18\n"
+    }
+
+    "refuses a package whose dependencies it would have to fetch, and says what to write instead" in {
+      val root = rootOf("skin", dependent)
+
+      writeFile(s"$root/${PackageConfig.FileName}",
+        "package { name = \"skin\" }\n\ndependencies {\n  extra { git = \"example.com/extra\", version = \"1.0.0\" }\n}\n")
+
+      val (status, notes) =
+        diagnostics(Config(command = "build-lib", file = root,
+          output = Some(createTempFile("sysl-cli-skin-", LibraryArtifact.extension))))
+
+      status should not be 0
+      notes should include("'extra'")
+      notes should include("--lib")
+    }
+  }
+
   "a library carrying C" - {
 
     /* A C file beside a library's sysl, compiled with it and archived into the same artifact

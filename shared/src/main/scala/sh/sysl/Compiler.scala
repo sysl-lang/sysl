@@ -225,9 +225,15 @@ object Compiler {
    *
    * `building` names the shipped library's own modules where *this* is the compilation producing
    * them, so that the compiler does not supply the files it is being asked to compile.
+   *
+   * `libraries` is every **other** library this one is built on — the `--lib` roots and `.syslib`s
+   * of `15 §7`, already parsed. They join the compilation the way the shipped library does and are
+   * governed by the paragraph above with nothing added: their modules are not this tree's, so what
+   * they declare is declared here and defined in whatever program links them both.
    */
   def compileLibrary(units: List[Program], target: Target = Target.default, building: Set[String] = Set.empty,
-                     std: Option[Stdlib] = None): Either[String, (String, Set[String])] =
+                     std: Option[Stdlib] = None, libraries: List[Program] = Nil)
+      : Either[String, (String, Set[String])] =
     for
       // A library ships no tests. They are the library author's, they run against the sources rather
       // than against the artifact, and emitting them would put a function nothing can call into every
@@ -243,7 +249,8 @@ object Compiler {
       // line and is over before the lexer, so a declaration is either at a file's top level or is
       // not a declaration. There is no branch a `@test` could be hiding inside for the typed pass to
       // catch, and a second removal that can never find anything reads as though there were.
-      typed    <- Analyzer.analyze(Tests.stripSource(units), building, carried(std, target), target)
+      typed    <- Analyzer.analyze(Tests.stripSource(libraries ::: units), building,
+                                   carried(std, target), target)
       promoted <- Escape.check(typed)
       _        <- TailCalls.check(typed)
     yield

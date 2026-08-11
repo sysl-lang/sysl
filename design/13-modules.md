@@ -1255,6 +1255,31 @@ Five consequences worth stating, because each is a thing a reader would otherwis
   root it is built from. This is also what makes the rule above exact: everything the compiler
   supplied is keyed outside the library's own modules.
 
+### A library may be built on another library, and `--lib` is the only way one gets there
+
+```
+sysl build-lib sdl3 -o sdl3.syslib                              # the library it is built on
+sysl build-lib sdl3-ttf --lib sdl3.syslib -o sdl3-ttf.syslib    # and the one built on it
+```
+
+**`build-lib` takes `--lib` exactly as a compilation does**, and for the same reason: a library whose
+declarations are written in another library's types does not compile without them. `sdl3-ttf` is the
+worked case — its `Font` renders to an `sdl3` `Surface` — and a package that could not say so would
+have to be a module inside its dependency rather than a package of its own.
+
+**Nothing about the artifact changes, because the rule that governs it is already stated above.** A
+library defines its own modules and nobody else's, so the dependency's compiled half is *declared*
+here and defined by whatever program links both. Folding it in instead would put a second copy of a
+compiled half into the artifact, which archives cleanly and is a duplicate definition at somebody
+else's link.
+
+**What `build-lib` does not do is fetch.** A `dependencies` block is a coordinate to resolve over the
+network (`packages.md § 3`), and a command whose whole job is to compile one tree into an artifact
+for one machine should not be the thing that goes looking — so a package that declares dependencies
+and is handed no library is refused, naming the dependency and the flag that answers it. The cost is
+that such a package names its dependency twice, once in `package.hocon` and once on the command line,
+and that is the price of a compile step that is offline by construction.
+
 **The standard module is built the same way.** `sysl`'s own source is ordinary sysl files under
 `library/sysl`, and `sysl build-lib library --std` compiles them — `--std` being the one thing that lets a
 compilation declare a module the compiler otherwise supplies. It is written down rather than inferred

@@ -243,16 +243,33 @@ object LibraryArtifact {
    * given the expression anyway, since an artifact is built for one target and re-evaluating it
    * somewhere else would be answering a different question under the same name.
    */
+  /** **`libraries` and `libraryTrees` are what this library is built ON** — the `--lib` source roots
+   * and `.syslib`s of `15 §7`, which reach a library exactly as they reach a program. They are kept
+   * apart from `sources` for one reason and it decides the artifact's correctness: what the object
+   * half **defines** is the modules this tree declares, and everything else is declared. Folded in
+   * with the library's own files they would be *its* modules, so the artifact would carry a second
+   * copy of its dependency's compiled half — which builds, archives, and fails as a duplicate symbol
+   * at whatever program later links both.
+   */
   def build(sources: List[Source], target: Target = Target.default, building: Set[String] = Set.empty,
             std: Option[Stdlib] = None, native: List[Source] = Nil,
-            paths: SearchPaths = SearchPaths.none)
+            paths: SearchPaths = SearchPaths.none, libraries: List[Source] = Nil,
+            libraryTrees: List[Program] = Nil)
       : Either[String, (String, String)] = {
-    val parsed = sources.map(SyslParser.parse(_, target))
+    val parsed = (sources ::: libraries).map(SyslParser.parse(_, target))
 
     parsed.collect { case Left(e) => e } match
       case errs if errs.nonEmpty => Left(errs.mkString("\n"))
       case _ =>
-        CConstants.lower(parsed.collect { case Right(p) => p }, target, paths).flatMap(units =>
+        val (own, supplied) = parsed.collect { case Right(p) => p }.splitAt(sources.length)
+
+        // Both halves are lowered, and with the same search paths. A `--lib` source root is a
+        // library like any other and may hold a `c const` of its own; lowering it here rather than
+        // inside the analyzer is what gets `--include-path` to the C compiler that has to answer it.
+        // Only the library's own units go on to the metadata below — a dependency's constants are
+        // its own artifact's to ship.
+        CConstants.lower(supplied, target, paths).flatMap(carriedSource =>
+        CConstants.lower(own, target, paths).flatMap(units =>
         rootless(units) match
           case Some(err) => Left(err)
           case None =>
@@ -277,7 +294,7 @@ object LibraryArtifact {
             // *before* the analysis, and the reason is that analyzing a test body creates generic
             // instantiations, which are ordinary library functions afterwards — so a filter applied
             // here, however thorough, would be too late to keep them out.
-            Compiler.compileLibrary(units, target, building, std)
+            Compiler.compileLibrary(units, target, building, std, libraryTrees ::: carriedSource)
               .map((ir, compiled) =>
                 // **`stripSource` rather than `filterNot(_.testOnly)`**, so that what an artifact
                 // carries is exactly what `Stdlib.fromSource` carries. The two differ on one shape: a
@@ -286,7 +303,7 @@ object LibraryArtifact {
                 // the two ways a standard module reaches a compilation, which is the one thing
                 // `StdArtifactTests` exists to refuse.
                 (ir, metadata(Tests.stripSource(units), compiled,
-                              fingerprint(sources ::: native), target))))
+                              fingerprint(sources ::: native), target)))))
   }
 
   /** What one of a library's C files is called inside the archive.
