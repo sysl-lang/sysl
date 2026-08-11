@@ -11,7 +11,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * that the mangling is gone, that a build with no entry point keeps the exports alive, and every
  * refusal.
  */
-class ExportTests extends AnyFreeSpec with CodegenSupport {
+class ExportTests extends AnyFreeSpec with CodegenSupport with TestFrameworkSupport {
 
   /** The exports of a compilation, which is the list a header is written from. */
   private def exportsOf(src: String): List[TFunc] =
@@ -68,6 +68,16 @@ class ExportTests extends AnyFreeSpec with CodegenSupport {
 
       out should include("define i32 @doubled(")
       out should include("@demo$helper(")
+    }
+
+    // A test build replaces the roots with the tests, so an export — which nothing in the program
+    // names, that being the point of one — was reachable from nothing and went. It goes *quietly*,
+    // unlike a destructor: there is no generated call site to be left dangling, so the suite links
+    // and the package's own C is what finds out, which is the whole surface a `build-c` package has.
+    "and a test build keeps it, though no test names it" in {
+      testIr("module demo\n\n@export\nunused(a: i32) -> i32 = a + 1\n\n" +
+        "@test(\"something else\")\nother() = assert_eq(1 + 1, 2)\n") should
+        include("define i32 @unused(")
     }
   }
 

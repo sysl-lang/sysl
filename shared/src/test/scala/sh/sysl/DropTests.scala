@@ -14,7 +14,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * destructor that ran twice, ran early, or did not run shows up as different output rather than as a
  * failure to compile — none of which an accident produces.
  */
-class DropTests extends AnyFreeSpec with RunSupport with CodegenSupport {
+class DropTests extends AnyFreeSpec with RunSupport with CodegenSupport with TestFrameworkSupport {
 
   /** A type whose destructor announces itself. `id` is read *in* the destructor, which is what says
    * the value is still intact when it runs.
@@ -162,5 +162,19 @@ class DropTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     run(s"""$handle
            |static var kept: &Handle = Handle(5)
            |print("live", kept.id)""".stripMargin) shouldBe "live 5\n"
+  }
+
+  "and a test build keeps it, which is the build with no other way to reach it" in {
+    // A test build replaces the roots — the tests stand in for the `main` that is no longer there —
+    // so a destructor, which no reachable body names, was reachable from nothing at all and went
+    // with everything else unreached. The release hook still called it, and the failure was `use of
+    // undefined value '@Handle.drop'` at the *link*: a package with a destructor could not compile
+    // its own suite, whatever the suite said.
+    testIr(s"""$handle
+              |@test("a counted handle drops")
+              |counted()
+              |    var a: &Handle = Handle(1)
+              |    assert_eq(a.id, 1)
+              |""".stripMargin) should include("define void @Handle.drop(")
   }
 }

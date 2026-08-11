@@ -43,36 +43,52 @@ object Reachability {
    * what this pass is about; both are their own question.
    */
   def prune(program: TProgram): TProgram = {
-    // **An interrupt handler is a root**, and it is the one kind of function that can never be
-    // anything else: no program calls it — `15 §10` refuses that outright — so a walk starting from
-    // what the program *runs* cannot reach it. Dropping one would leave the vector table pointing at
-    // nothing, which is a fault at the worst available moment. It is entered by the processor, and
-    // that is exactly what an entry point is.
-    //
-    // Its **body** is walked with the others, so whatever a handler calls survives because the
-    // handler does. Only its own name has to be added by hand, since nothing names it.
-    //
-    // **An `@export`ed function is a root for the same reason** (`15 §12`). Nothing inside the
-    // program need ever call it — the whole point is that something outside the program will, and
-    // this compilation cannot see that caller any more than it can see the processor. A build with
-    // no entry point at all is the case that makes this load bearing: every root above is absent
-    // there, so an export that were not one would prune the artifact down to nothing.
-    // **A destructor is a root for the third version of the same reason** (`03 § A destructor`).
-    // What calls it is the release hook the emitter builds, and that is not a tree this walk can
-    // see — it is generated from a payload type at the moment a box of that type is let go of. No
-    // reachable body names one, so pruning it would leave the hook calling a symbol nothing defined,
-    // and the failure would be at the link, against a name no line of the program contains.
-    val handlers    = program.funcs.filter(_.conv.isDefined)
-    val exported    = program.funcs.filter(_.exported.isDefined)
-    val destructors = program.funcs.filter(f => program.destructors.values.toSet.contains(f.name))
-    val entries     = handlers ::: exported ::: destructors
-    val roots       = List(program.main, program.vals, program.vtables, program.entry, entries)
-    val live     = reachedFrom(roots, program.funcs, program.vtables).calls ++ entries.map(_.name)
+    val entries = entryPoints(program)
+    val roots   = List(program.main, program.vals, program.vtables, program.entry, entries)
+    val live    = reachedFrom(roots, program.funcs, program.vtables).calls ++ entries.map(_.name)
 
     program.copy(
       externs = program.externs.filter(e => live(e.name)),
       funcs = program.funcs.filter(f => live(f.name)),
     )
+  }
+
+  /** The functions that are roots because **nothing in the program names them**, whatever the walk
+   * starts from.
+   *
+   * The three below are one idea told three times, and they are gathered here rather than written
+   * where a walk begins because there is more than one such place: a program's walk starts at what it
+   * runs, and a test build's starts at its tests (`Tests.only`). A list of entry kinds that lived
+   * beside one of those would be a list the other did not have — which is exactly what happened, and
+   * cost a test build the ability to link a package that had a destructor or an export.
+   *
+   * **An interrupt handler is a root**, and it is the one kind of function that can never be anything
+   * else: no program calls it — `15 §10` refuses that outright — so a walk starting from what the
+   * program *runs* cannot reach it. Dropping one would leave the vector table pointing at nothing,
+   * which is a fault at the worst available moment. It is entered by the processor, and that is
+   * exactly what an entry point is.
+   *
+   * Its **body** is walked with the others, so whatever a handler calls survives because the handler
+   * does. Only its own name has to be added by hand, since nothing names it.
+   *
+   * **An `@export`ed function is a root for the same reason** (`15 §12`). Nothing inside the program
+   * need ever call it — the whole point is that something outside the program will, and this
+   * compilation cannot see that caller any more than it can see the processor. A build with no entry
+   * point at all is the case that makes this load bearing: every root above is absent there, so an
+   * export that were not one would prune the artifact down to nothing.
+   *
+   * **A destructor is a root for the third version of the same reason** (`03 § A destructor`). What
+   * calls it is the release hook the emitter builds, and that is not a tree this walk can see — it is
+   * generated from a payload type at the moment a box of that type is let go of. No reachable body
+   * names one, so pruning it would leave the hook calling a symbol nothing defined, and the failure
+   * would be at the link, against a name no line of the program contains.
+   */
+  def entryPoints(program: TProgram): List[TFunc] = {
+    val handlers    = program.funcs.filter(_.conv.isDefined)
+    val exported    = program.funcs.filter(_.exported.isDefined)
+    val destructors = program.funcs.filter(f => program.destructors.values.toSet.contains(f.name))
+
+    handlers ::: exported ::: destructors
   }
 
   /** What a set of trees reaches: every `val` read and every function called, following each call

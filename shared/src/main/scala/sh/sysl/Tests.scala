@@ -206,11 +206,19 @@ object Tests {
    * The tests are the **roots**, in place of the `main` that is no longer there, so that everything
    * one of them calls survives the pruning and nothing else does. A program whose tests reach half
    * of it compiles half of it, which is the same bargain every other build gets.
+   *
+   * **`Reachability.entryPoints` is a root here for the same reason it is one there**, and leaving it
+   * out is a bug this build had: a handler, an export and a destructor are each reached from
+   * somewhere this walk cannot see, so replacing the roots does not make them reachable from the
+   * tests instead — it makes them reachable from nothing. A destructor pruned that way still has the
+   * release hook calling it, so a package with one could not link its own suite; an export pruned
+   * that way goes quietly, and the package's C is what discovers it.
    */
   def only(program: TProgram): TProgram = {
-    val kept  = program.copy(main = Nil, entry = None)
-    val roots = List(kept.vals, kept.vtables, kept.tests.map(t => TEntry(t.func, None)))
-    val live  = Reachability.reachedFrom(roots, kept.funcs, kept.vtables).calls
+    val kept    = program.copy(main = Nil, entry = None)
+    val entries = Reachability.entryPoints(kept)
+    val roots   = List(kept.vals, kept.vtables, kept.tests.map(t => TEntry(t.func, None)), entries)
+    val live    = Reachability.reachedFrom(roots, kept.funcs, kept.vtables).calls ++ entries.map(_.name)
 
     kept.copy(
       externs = kept.externs.filter(e => live(e.name)),

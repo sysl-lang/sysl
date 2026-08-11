@@ -102,6 +102,20 @@ not stop being checked.
 A helper only a test calls leaves with it, because it becomes unreachable and pruning notices;
 a helper the program also calls stays, because the program still calls it.
 
+**What a test build must not prune is the three definitions nothing in the program names**: an
+interrupt handler (`15 §10`), an `@export` (`15 §12`), and a destructor (`03 § A destructor`). Each
+is reached from somewhere no walk over the program can see — the processor, a caller outside this
+compilation, and the release hook the emitter generates from a payload type. A test build swaps the
+roots, putting the tests where the entry point was, so leaving these out does not make them reachable
+from the tests instead: it makes them reachable from nothing, and a build meaning to compile "what
+the tests reach" compiles less than the program does.
+
+The two halves fail differently, and only one of them announces itself. A pruned **destructor** still
+has the hook calling it, so the link fails on a symbol no line of the source contains and the suite
+cannot be compiled at all. A pruned **export** has no generated call site to dangle, so the suite
+compiles, passes, and says nothing — and the package's own C is what discovers the surface is
+missing, which for a `build-c` package is the whole of what it ships.
+
 **`sysl build-lib` is the exception and drops them *before* analysis.** An artifact is the one
 output that outlives the compilation that made it, and analysis is not a passive reading: a test
 naming `Buf[int]` **creates** the whole of `Buf` at `int`, and a monomorphization is an ordinary
