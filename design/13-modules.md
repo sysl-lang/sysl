@@ -719,18 +719,19 @@ was written against exactly this spelling and did not compile, because a `var` o
 was read as a statement and refused as a second beginning. The rule stated here is what the chapter
 had assumed all along.
 
-It is stricter in exactly one place, and it is the subtle one. **It may not hold a value that owes a
-release, and the question is asked of the TYPE where a `val`'s is asked of the VALUE.** A `val` is
-forever the value it was given, so `static val greeting: string = "hello"` is admissible — a
-literal's owner word is null and nothing was ever built. A `static var` could be given that literal
-and `str(n)` on the next line, and whatever it holds when the program ends has nowhere to write its
-release, so the question is about what the storage may *ever* hold.
+It **holds a counted value like any other module storage**, which is the section below and not a rule
+of its own. This paragraph said the opposite for a year — that a `var` may not hold a value owing a
+release, asked of the type where a `val`'s was asked of the value — and the argument behind it did not
+survive being read again: what it refused was storage taking a count nobody ever gives back, which is
+what a static is.
 
 Its **initializer may be absent**, which a `val`'s may not: a variable with no value is still a
 complete declaration of storage, and the type's zero is what it starts at. That is the cheapest form
-— `zeroinitializer` and no store at all — and the one an arena wants. Its **type is mandatory** for
-the same reason a `val`'s is (`§2`), and it bites harder here, since there may be no initializer for
-one to be inferred from.
+— `zeroinitializer` and no store at all — and the one an arena wants. **It is therefore the one
+declaration the zero rule below can bite**, since a `val` always has a value: a `var` at a type with
+no zero — a `&T`, an enum — is refused unless it is given one. Its **type is mandatory** for the same
+reason a `val`'s is (`§2`), and it bites harder here, since there may be no initializer for one to be
+inferred from.
 
 It takes a **visibility** like any other module member (`§2`), in both spellings: `private var count:
 int = 0` keeps a module's state inside the file that carries the functions maintaining it, which is
@@ -1008,40 +1009,71 @@ refused, because that is where the promise was made and where it can still be ke
 view of it is a `*T`, the tier `03` excludes on purpose, and is how the view reaches C. Slicing is
 the step between the two, and it is written down.
 
-**A module-level `val` may not hold a value that owes a release.** The reason is the one thing that
-is true of module storage and of no other storage: it exists for the whole run and is therefore never
-let go of, so a count taken in one is a count with no line to write the release on. A `&T`, a
-`weak T`, a slice and a built `string` are each refused for it.
+### Module storage may hold a counted value, and never releases the last one
 
-**The question is asked of the value, not of the type**, and the difference is the whole of what the
-rule is worth. A value the object file carries as it stands was never built and takes no count, so a
-counted *type* is admissible exactly when its initializer is a constant tree by the rule below. A
-string literal is the case this exists for: `04` decided that a literal's owner word is null and that
-both retain and release test for it, so `val greeting: string = "hello"` is three words in read-only
-data with no count anywhere in them, while `val greeting: string = str(n)` is a count with nowhere to
-write the release. The two are told apart by the same test that decides whether any `val` is laid
-into the object file, which is why this is one rule and not two.
+**A `&T`, a `weak T`, a slice, a `string`, and anything built out of them may be module storage.** The
+count the storage takes is given back on every assignment that replaces it, and the last one it holds
+is never given back at all.
+
+**That last release is the only one there was ever a question about, and not taking it is what a
+static *is*.** Every assignment during the run has a perfectly good line to write a release on — its
+own store, which lets go of what was there before it writes what arrives, exactly as an assignment to
+a struct field does. What has nowhere to go is the release at exit, and there is no exit pass: a
+process ending is what returns its memory, and `0021`'s destructor takes the same ruling for the same
+reason. Rust says this outright about a `static` and it is the right answer; C++ runs static
+destructors at exit and spent twenty years on the order they run in.
+
+**This is a relaxation, and the rule it replaces was stated in this chapter for a year.** That rule
+refused a counted type unless its initializer was a *constant tree*, so `val greeting: string =
+"hello"` was admissible and `val greeting: string = str(n)` was not, and a module `var` could hold
+neither because a variable may be given something else tomorrow. The reason given was that storage
+lasting the whole run has no line to write a release on — which is true, and is a description of a
+static rather than an argument against one.
+
+**What it cost was the shape every callback interface needs.** A C function that calls back takes an
+address and an opaque word (`12 §6a`), so a binding wanting to offer a sysl *closure* has to keep it
+where the trampoline can find it again — and module storage is the only storage that outlives the
+call. Nothing could hold one. The available substitute was a raw pointer, which module storage always
+permitted, and which owns nothing and keeps nothing alive: the refusal's effect was to route programs
+towards the one form that actually dangles.
+
+**Whether the initializer is a constant tree still decides where the storage is filled**, and that
+question is untouched — it is the difference between bytes in the object file and a store the prologue
+makes (§ below). It is simply no longer also the question of whether a count may be held.
 
 ```
 val messages: [3]string = ["out of range", "not permitted", "no such device"]
+val banner:   string    = "sysl " + version()
+var current:  string    = ""
+var pending:  Option[&Fn(int) -> unit] = None
 ```
 
-That shape is what asked for the relaxation. A module with `no alloc` (§4) can hold, index, slice and
-compare literals but cannot make bytes, so a table of messages was the one thing it could name only
-by reaching for a `const` — which is folded into its uses and has no address, so it cannot be indexed
-at a position computed while running. That is the whole difference between the two declarations, and
-a message table needs the half a `const` does not have.
+The first still costs nothing at run time and is still what a module with `no alloc` (§4) may hold: a
+literal's owner word is null, so a table of them is read-only data with no count anywhere in it, and
+`04`'s retain and release both test for that and do nothing. The others allocate, and a module that
+declares `no alloc` is refused for that reason rather than this one — which is the honest place for
+the refusal, since what is wrong with them there is the allocating.
 
-**A struct is admitted by the same recursion**, so a table of `{name, code}` pairs is one declaration
-rather than two parallel arrays. It follows that a struct carrying an `invariant` may **not** hold a
-literal string: a value that has to be checked is code by the rule below, and code takes a count. That
-is the specification reading consistently rather than a hole in it, but it is the corner worth knowing
-about before writing a device table with a constraint on it.
+**A struct, an array and an enum are admitted by the same recursion**, so a `{name, handler}` pair is
+one declaration. A struct carrying an `invariant` is admitted too, which the old rule's wording
+excluded by accident: a value that has to be checked is code, code took a count, and a count was
+refused.
 
-**A joined string is refused, however constant its parts look.** `"a" + "b"` allocates, and folding it
-into one literal is separate work; admitting it on the strength of how it reads would be admitting a
-leak. The same holds for `str(x)` and, for now, for a slice of a literal — `"hello"[1..]` genuinely is
-immortal, but seeing that requires folding the slice arithmetic.
+**The storage takes a count of its own for what a computed initializer gives it.** That is not the
+same store an assignment makes and the difference is worth saying, because getting it wrong is silent:
+the initializer's value is a temporary of the region around it, so without a retain it would be
+released when that region ends and the storage left addressing freed bytes. And nothing is released on
+the way in — the storage has never held anything, and a zero is not a value that owes.
+
+**Storage with no initializer must have a type with a zero**, which is the one thing that *is* refused
+and is a different question. A `var` may be declared with no value, and what it starts at is its
+type's zero; a `&T` has none, because there is no such thing as a reference to nothing, so zeroed
+storage of one is not a reference and the first assignment through it would let go of whatever address
+zero is. An enum has none either — a zeroed tag names no variant in particular — which is why
+`Option[&Fn(int) -> unit]` above is written `= None` rather than left empty. A `string` and a slice
+both zero to the empty one and need nothing written. **This is `hasZero`, the same question a local
+declared with no initializer is already held to**, and asking it in both places is the point: a module
+`var` and a block `var` now answer alike about the same types.
 
 **A raw pointer may be held, and so may the address of a function.**
 
@@ -1050,7 +1082,8 @@ const UART: usize = 0x1000_0000
 val regs: *Uart = ptr_cast(UART)
 ```
 
-A `*T` counts nothing, so the reason above does not reach it: there is no release to write. What a
+A `*T` counts nothing, so the section above never reached it either way: there is no release to
+write, so there was nothing for the old rule to refuse and nothing for the new one to permit. What a
 `val` promises is that **its own storage** is written once and never again — the ordinary meaning the
 word carries — and holding an address keeps that promise exactly as holding a number does.
 

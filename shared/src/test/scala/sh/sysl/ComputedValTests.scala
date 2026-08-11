@@ -136,24 +136,25 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       ) should include("cannot be initialized")
     }
 
-    // A **computed** `val` counts nothing, which is where the rule bites now that a constant one may
-    // hold a literal string: the two forms are told apart by the initializer, and the release a
-    // computed value owes is exactly the one there is no line to write.
-    "a reference cannot be held in one" in {
-      val e = err("struct P\n    x: int\nend P\nmk() -> &P = P(1)\nstatic val p: &P = mk()")
-
-      e should include("cannot be a 'val'")
-      e should include("a count with nowhere to write the release")
+    // A **computed** `val` may hold a count, and the count it takes is never given back. That is what
+    // storage lasting the whole run means, and it is the whole of `0073`: the release the old rule
+    // refused this for is the one at exit, which is the release a static is defined by not taking.
+    "a reference may be held in one" in {
+      run("struct P\n    x: int\nend P\nmk() -> &P = P(1)\nstatic val p: &P = mk()\nprint(p.x)") shouldBe "1\n"
     }
 
-    "nor a string a function returned, where the constant form may hold a literal" in {
-      err("static val s: string = str(1)") should include("a count with nowhere to write the release")
+    "as may a string a function returned, where the constant form holds a literal" in {
+      run("static val s: string = str(12)\nprint(s)") shouldBe "12\n"
 
       run("static val s: string = \"hi\"\nprint(s)") shouldBe "hi\n"
     }
 
-    "nor a slice" in {
-      err("static val xs: []int = [1, 2, 3]") should include("a count with nowhere to write the release")
+    // The storage takes a count of its own for what the prologue gives it. Without that retain the
+    // slice would be released at the end of its own initializer's region — so this reads freed bytes
+    // rather than failing to compile, which is why it asks for the elements back rather than the
+    // length alone.
+    "and a slice, whose elements are still there after the initializer's region ends" in {
+      run("static val xs: []int = [1, 2, 3]\nprint(xs[0], xs[2], xs.len)") shouldBe "1 3 3\n"
     }
 
     // The read-only rule is about the storage, not about how it was filled — a computed table is no
@@ -196,17 +197,22 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       run(src) shouldBe "5\n"
     }
 
-    // An enum whose payload is a reference is not, which is the recursive half of the type rule.
-    "but not an enum whose payload is a reference" in {
+    // An enum whose payload is a reference is the recursive case, and it is now admitted like the
+    // rest. Asked through a `Node` rather than the `Leaf` the old test used, so the count actually
+    // has something to be taken of.
+    "including an enum whose payload is a reference" in {
       val src =
         """enum Tree
           |    Leaf
           |    Node(next: &Tree)
           |end Tree
-          |mk() -> Tree = Leaf
-          |static val t: Tree = mk()""".stripMargin
+          |mk() -> Tree = Node(Leaf)
+          |static val t: Tree = mk()
+          |t match
+          |    Node(_) -> print(1)
+          |    Leaf -> print(0)""".stripMargin
 
-      err(src) should include("a count with nowhere to write the release")
+      run(src) shouldBe "1\n"
     }
 
     "an array of structs is computed element by element" in {
@@ -447,17 +453,20 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       )
     }
 
-    // The whole point of the rule seen from the far side: a struct whose field is a reference is
-    // refused even though the struct itself is a value, because the count is still in the storage.
-    "a struct with a reference field cannot be a 'val'" in {
+    // The recursion seen from the far side: a struct whose field is a reference carries the count in
+    // the storage even though the struct itself is a value, and the retain the prologue takes has to
+    // reach into it. Reading the field back is what says it did — the reference is otherwise released
+    // with the initializer's temporaries and the read is of freed bytes.
+    "a struct with a reference field is held, and its field is still there" in {
       val src =
         """struct Holder
           |    it: &int
           |end Holder
           |mk() -> Holder = Holder(3)
-          |static val h: Holder = mk()""".stripMargin
+          |static val h: Holder = mk()
+          |print(*h.it)""".stripMargin
 
-      err(src) should include("a count with nowhere to write the release")
+      run(src) shouldBe "3\n"
     }
 
     // A computed `val` slices exactly as a written-down one does, and the view it gives carries the

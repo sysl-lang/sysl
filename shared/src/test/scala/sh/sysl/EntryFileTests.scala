@@ -288,16 +288,23 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
       ir("static val n: int = 5\nprint(str(n))") should include("private constant")
     }
 
-    // Asked of the TYPE, where a `val`'s is asked of the value — a `static val` may hold a string
-    // *literal*, because a literal's owner word is null and nothing was built. A variable could be
-    // given `str(n)` on the next line, so the question is what the storage may ever hold.
-    "but it may not hold a type that owes a release, even given a literal" in {
-      err("static var greeting: string = \"hello\"\nprint(greeting)") should
-        include("question is asked of the type here")
+    // It holds a counted value like any other module storage (`0073`), and the `var` half is where
+    // that has to be shown rather than merely allowed: the storage is given a literal and then a
+    // built string, so the second store is the one that has a release to write and a line to write it
+    // on. Reading it back afterwards is what says the first was let go of without taking the second.
+    "and it holds a type that owes a release, both given and then reassigned" in {
+      run("static var greeting: string = \"hello\"\ngreeting = greeting + \" \" + str(42)\nprint(greeting)") shouldBe
+        "hello 42\n"
     }
 
     "where a 'static val' given that same literal is admitted" in {
       run("static val greeting: string = \"hello\"\nprint(greeting)") shouldBe "hello\n"
+    }
+
+    // The one refusal that replaces the broad one, in the entry file's spelling: storage with no
+    // initializer starts at its type's zero, and a reference has none.
+    "though one with no zero must be given a value" in {
+      err("struct P\n    x: int\nend P\nstatic var p: &P\nprint(str(p.x))") should include("needs a value")
     }
 
     "it states its type, having no value to infer one from" in {

@@ -336,25 +336,100 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
       ) should not include "static"
     }
 
-    // Asked of the TYPE, not of the value: storage that lives for the whole run has nowhere to
-    // write a release, and a variable may be given a different value tomorrow.
-    "and it may not hold a value that owes a release" in {
-      errIn(
+    // It may hold a counted value. The last one it holds is never released, which is what a static
+    // is — and this pair was refused outright until the rule was read again (`0073`).
+    "and it may hold a value that owes a release" in {
+      runIn(
         ("", "main.sysl", "print(m.greeting)"),
         ("m", "a.sysl", "module m\n\nvar greeting: string = \"hello\""),
-      ) should include("cannot be module storage")
+      ) shouldBe "hello\n"
     }
 
-    // A **slice** owes one too, and it is worth asking separately because it is the plausible hole:
-    // a `[]const u8` reads as a borrowed view of somebody else's bytes, and a rule tested only
-    // through `string` would not say whether the count travels with the view. It does. Found while
-    // writing a library that wanted to remember a name, which is why its name is a fixed array of
-    // bytes and not a slice of one.
-    "which a slice does as much as a string, however much it reads like a view" in {
-      errIn(
+    // A **slice** is the same answer, and it is worth asking separately because it is where the
+    // question is least obvious: a `[]const u8` reads as a borrowed view of somebody else's bytes,
+    // and a rule tested only through `string` would not say whether the count travels with the view.
+    "which a slice may as much as a string, however much it reads like a view" in {
+      runIn(
         ("", "main.sysl", "print(str(m.name.len))"),
-        ("m", "a.sysl", "module m\n\nvar name: []const u8 = \"\".bytes"),
-      ) should include("cannot be module storage")
+        ("m", "a.sysl", "module m\n\nvar name: []const u8 = \"abc\".bytes"),
+      ) shouldBe "3\n"
+    }
+
+    // The half that has to work for the rest to be worth anything: a value **built while the program
+    // runs**, which is what the old rule refused by name. Its initializer is code, so it runs in the
+    // prologue, and the storage takes a count of its own for it — without which the temporary would
+    // be released at the end of the initializer's own region and the global left holding freed bytes.
+    "including one built while the program runs" in {
+      runIn(
+        ("", "main.sysl", "print(m.label)"),
+        ("m", "a.sysl", "module m\n\nvar label: string = \"n=\" + str(6 * 7)"),
+      ) shouldBe "n=42\n"
+    }
+
+    // Reassignment is where the release *does* have a line to write itself on, and it is the whole
+    // reason the old rule was too broad. Three stores, and what each replaces is let go of.
+    "and reassigning one lets go of what was there" in {
+      runIn(
+        ("", "main.sysl", "m.set(str(1))\nm.set(str(2))\nprint(m.get())"),
+        ("m", "a.sysl", "module m\n\nvar cur: string = \"\"\n\nset(s: string) = cur = s\n\nget() -> string = cur"),
+      ) shouldBe "2\n"
+    }
+
+    // A module `val` answers the same, and it is the declaration the old rule bit hardest: a `val`
+    // was admitted only when its initializer was a constant tree, so a table of strings was fine and
+    // one string made out of two was not.
+    "as may a 'val', whose value is built the same way" in {
+      runIn(
+        ("", "main.sysl", "print(m.banner)"),
+        ("m", "a.sysl", "module m\n\nval banner: string = \"v\" + str(1) + \".\" + str(0)"),
+      ) shouldBe "v1.0\n"
+    }
+
+    // The narrow refusal that replaces the broad one, and it is about a different thing: storage with
+    // no initializer starts at its type's zero, and a `&T` has none. Note it is `hasZero` — the same
+    // question a **local** with no initializer is already held to — rather than a rule of its own.
+    "though one with no zero must be given a value" in {
+      errIn(
+        ("", "main.sysl", "print(str(m.cell.v))"),
+        ("m", "a.sysl", "module m\n\nstruct Cell\n    v: int\n\nvar cell: &Cell"),
+      ) should include("needs a value")
+    }
+
+    // The other side of it: given a value, the same declaration is fine. Without this the test above
+    // would pass just as well against a compiler that refused every reference.
+    "and is fine once it has one" in {
+      runIn(
+        ("", "main.sysl", "print(str(m.cell.v))"),
+        ("m", "a.sysl", "module m\n\nstruct Cell\n    v: int\n\nvar cell: &Cell = Cell(7)"),
+      ) shouldBe "7\n"
+    }
+
+    // The shape this was relaxed **for**: a boxed callable kept where something else can find it
+    // again. Every C interface that calls back takes a function pointer and an opaque word, so a
+    // binding that wants to offer a sysl closure has to put it somewhere that outlives the call — and
+    // module storage is the only storage that does. Written as `Option` because the slot is empty
+    // before anything registers and empty again after it has run, which is also what makes the enum
+    // need its `= None`: an enum has no zero.
+    "which is what lets a callable be kept where something else finds it again" in {
+      runIn(
+        ("", "main.sysl", "m.on_done(n -> print(str(n * 2)))\nm.fire(21)\nm.fire(1)"),
+        (
+          "m",
+          "a.sysl",
+          """module m
+            |
+            |private var pending: Option[&Fn(int) -> unit] = None
+            |
+            |on_done(f: &Fn(int) -> unit) = pending = Some(f)
+            |
+            |fire(n: int)
+            |    pending match
+            |        Some(f) ->
+            |            f(n)
+            |            pending = None
+            |        None -> print("nothing registered")""".stripMargin,
+        ),
+      ) shouldBe "42\nnothing registered\n"
     }
 
     // Asserted against the visibility diagnostic rather than against there being *a* diagnostic,

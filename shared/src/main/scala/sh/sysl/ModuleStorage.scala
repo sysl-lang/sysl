@@ -40,7 +40,7 @@ trait ModuleStorage extends ModuleFiles {
 
     val static = isStatic(init)
 
-    checkVal(ty, static, key)
+    checkVal(ty, key)
     TVal(key, ty, Some(init), !static, align = boundaryOf(key, decl.align))
   })
 
@@ -60,12 +60,16 @@ trait ModuleStorage extends ModuleFiles {
    * complete declaration of storage, and the type's zero is what it starts at. That is the cheapest
    * form and the one an arena wants — `zeroinitializer` and no store at all.
    *
-   * **The release rule is asked of the TYPE, where a `val`'s is asked of the value**, and the
-   * difference is the whole of why this is a separate check. A `val` is forever the value it was
-   * given, so `val greeting: string = "hello"` is admissible: a literal's owner word is null and
-   * nothing was ever built. A `var` could be given that literal and `str(n)` on the next
-   * line, so whatever it holds when the program ends has nowhere to write its release — which makes
-   * the question one about what the storage may ever hold, not about what it was first given.
+   * **It may hold a counted value, and the last one it holds is never released.** Every assignment
+   * *during* the run has a perfectly good line to write a release on — its own store, which
+   * `PlaceEmitter.storeInto` already emits — so the only release with nowhere to go is the one at
+   * exit, and never taking it is what a static *is*. `0021` takes the same ruling for a destructor.
+   *
+   * **What is refused instead is a type with no zero and no initializer**, which is a narrower rule
+   * about a different thing, and is `hasZero` — the same question a **local** with no initializer is
+   * already held to. A `&T` has no zero because there is no such thing as a reference to nothing, so
+   * zeroed storage of one is not a reference and the first assignment through it would release
+   * whatever address zero is. A `string` and a slice zero to the empty one, whose owner word is null.
    *
    * **It is `writable`**, which is what `TGlobal` carries to every read of the name so that an
    * assignment through it is allowed and a `@pure` function reading it is not (`17 §6`).
@@ -87,32 +91,30 @@ trait ModuleStorage extends ModuleFiles {
     if Type.zeroSized(ty) then
       err(s"'${qn(key)}' cannot be module storage: ${show(ty)} has no representation, so there is " +
         "nothing for the storage to be")
-    else if !uncounted(ty) then
-      err(s"'${qn(key)}' cannot be module storage: storage that exists for the whole run is never " +
-        s"let go of, so a count taken in one is a count with nowhere to write the release — and " +
-        s"${show(ty)} is a type that takes one. The question is asked of the type here rather than " +
-        "of the value, because a variable may be given a different value tomorrow")
+    else if init.isEmpty && !hasZero(ty) then
+      err(s"'${qn(key)}' needs a value: storage with no initializer starts at its type's zero, and " +
+        s"${show(ty)} has none — the same rule a local with no initializer is held to. A 'string' " +
+        "and a slice both start empty and need no value written; a reference and an enum need one")
 
     TVal(key, ty, init, computed = init.exists(!isStatic(_)), writable = true,
       align = boundaryOf(key, decl.align))
   })
 
-  /** Holds a module-level `val` to a value that **owes no release** (`13 §7`).
+  /** Holds a module-level `val` to something a name can stand for (`13 §7`).
    *
-   * There is one reason and it is about lifetime, not about depth. A module `val` exists for the
-   * whole run and is therefore never let go of, so a value that owes a release in one is a leak with
-   * no line to write the release on.
+   * **A counted value is admissible, and is never released.** The rule this replaced refused one
+   * unless its initializer was a constant tree, on the ground that a module `val` exists for the
+   * whole run and so has no line to write a release on. That is true and is not a reason: the
+   * release it names is the one at exit, which is the release a static is *defined* by not taking.
+   * `val greeting: string = str(n)` and `val log: &File = open(path)` are both storage the program
+   * holds until it ends, which is what the declaration said.
    *
-   * The question is asked of the **value**, not of the type, and the difference is the whole point.
-   * A `&T`, a `weak T`, a slice, and a `string` each owe a box or an owner a release *when one is
-   * built* — but a value the object file carries as it stands was never built, and a literal string
-   * in particular has a null owner word, which both retain and release test for and do nothing
-   * about (`04`). So a counted type is admissible exactly when its initializer is a constant tree:
-   * `val greeting: string = "hello"` is storage in read-only data with no count anywhere in it,
-   * while `val greeting: string = str(n)` is a count with nowhere to write the release.
+   * What the value being a constant tree still decides is where the storage is *filled* — in the
+   * object file, or by the prologue — and `isStatic` remains the test for that. It is no longer also
+   * the test for whether a count may be held.
    *
-   * A raw pointer and the address of a function are outside the question entirely: they own nothing
-   * at the far end, so they owe nothing however they were arrived at.
+   * A raw pointer and the address of a function own nothing at the far end, so they were never part
+   * of this question either way.
    *
    * Read-only *at every depth* is deliberately **not** what this checks, though it once was. That
    * promise is about the storage the declaration lays down, and it is kept where it is made: `k[0] =
@@ -122,7 +124,7 @@ trait ModuleStorage extends ModuleFiles {
    * not be written`). Refusing a `val` at pointer type declined one route to what another route
    * grants.
    */
-  private def checkVal(ty: Type, static: Boolean, key: String): Unit =
+  private def checkVal(ty: Type, key: String): Unit =
     // The whole difference between a `val` and a `const` is that a `val` has an address (`13 §7`),
     // and a value with no representation has nothing to put one on. The initializer would still run,
     // which is the only thing such a declaration could have been for — and a statement says that
@@ -130,11 +132,6 @@ trait ModuleStorage extends ModuleFiles {
     if Type.zeroSized(ty) then
       err(s"'${qn(key)}' cannot be a 'val': a ${show(ty)} value occupies nothing, so there is no " +
         "storage for the name to stand for — write the call as a statement instead")
-    else if !uncounted(ty) && !static then
-      err(s"'${qn(key)}' cannot be a 'val': storage that exists for the whole run is never let go " +
-        s"of, so a count taken in one is a count with nowhere to write the release — and this " +
-        s"${show(ty)} is built while the program runs. One the object file can carry as it stands " +
-        "may be held: a string literal owns nothing, and neither does a table of them")
 
   // --- `extern` variables ----------------------------------------------------------------
 
@@ -153,24 +150,10 @@ trait ModuleStorage extends ModuleFiles {
       err(s"'${qn(key)}' cannot be an 'extern' variable: a ${show(ty)} value occupies nothing, so " +
         "there is no storage for the linker to resolve the name to")
 
-  /** Whether a type carries no refcount anywhere in it, so storage holding one owes no release.
-   *
-   * A `*T` and a `*extern(…) -> R` answer yes and are **not** looked through: a pointer owns nothing
-   * at the far end, so what the far end counts is not this storage's business. A bare trait type
-   * answers no because a value of one is a box the count lives in. Everything built out of parts is
-   * as good as its parts.
-   */
-  private def uncounted(t: Type): Boolean = t match
-    case _: Type.Ptr | _: Type.CFn                                 => true
-    case _: Type.Ref | _: Type.Weak | _: Type.View | _: Type.Trait => false
-    case Type.Array(_, elem)                                       => uncounted(elem)
-    case s: Type.Struct                                            => s.fields.forall(f => uncounted(f._2))
-    case e: Type.Enum        => e.variants.forall(_.fields.forall(f => uncounted(f._2)))
-    case c: Type.Constrained => uncounted(c.base)
-    // A qualifier says how storage is reached, never what is in it, so the answer is the answer for
-    // what it qualifies — which is always yes, since only a scalar or a raw pointer may carry one.
-    case Type.Volatile(inner) => uncounted(inner)
-    case _                    => true
+  // `hasZero` is `GenericInstantiation`'s, and asking it here is the point rather than a saving: it
+  // is what a **local** declared with no initializer is already held to, so a module `var` and a
+  // local `var` now answer the same question about the same types. A second predicate would have
+  // been a second answer to drift from the first.
 
   /** Whether an initializer is a value the object file can carry as it stands: numbers, string
    * literals, and the arrays and structs built from them. Everything else is code, which is what

@@ -217,6 +217,25 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     out.toString
   }
 
+  /** Filling one piece of computed module storage, at the point in a prologue where it is filled.
+   *
+   * **The storage takes a count of its own for what it is given, and releases nothing.** Both halves
+   * matter and neither is what an ordinary assignment does. The retain is needed because the value
+   * is a temporary of the region around this store, so without one it would be released at the end of
+   * the region and the storage left addressing freed bytes. The release is *absent* because there is
+   * nothing to release: the storage has never held anything, and a `&T`'s zero is not a reference —
+   * loading it and letting go of it, which `storeInto` would do, is a decrement through null.
+   *
+   * That the count taken here is never given back is `13 §7`'s ruling and the whole of what module
+   * storage holding a counted value means.
+   */
+  private def genInitStore(v: TVal, init: TExpr): Unit = {
+    val value = genExpr(init)
+
+    if containsRef(v.ty) then retainValue(v.ty, value)
+    emit(s"store ${v.ty.llvm} $value, ptr @${v.symbol}")
+  }
+
   /** `@main`, which is three things in the order the language puts them: the computed `val`s, the
    * program's own top-level statements, and the `main` it declared if it declared one.
    *
@@ -241,7 +260,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
     for v <- vals if v.computed; init <- v.init do
       pushTemps()
-      emit(s"store ${v.ty.llvm} ${genExpr(init)}, ptr @${v.symbol}")
+      genInitStore(v, init)
       popTemps()
 
     stmts.foreach(genStmt)
@@ -305,7 +324,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
     for v <- vals if v.computed; init <- v.init do
       pushTemps()
-      emit(s"store ${v.ty.llvm} ${genExpr(init)}, ptr @${v.symbol}")
+      genInitStore(v, init)
       popTemps()
 
     val named   = freshLabel("test.named")
