@@ -53,11 +53,22 @@ trait ExportCheck extends TypeResolution {
       err(s"'$s' is not a name C can call — an exported symbol is a C identifier, so it is a " +
         "letter or '_' followed by letters, digits and '_'")
 
+    // **An overload exported under its own name is refused here**, and it is worth catching by name
+    // rather than leaving to the rule below. An overload's key carries a numbered segment, which is
+    // not a C identifier — so the check below already refuses it, with a message quoting a spelling
+    // the source does not contain (`12 §1a`). C has no overloading at all: two exports of one name
+    // are two definitions of one symbol, which is a link error rather than anything a reader of
+    // either line could act on.
+    if e.symbol.isEmpty && overloadKeys(overloadPlain(f.name)).length > 1 then
+      err(s"'${qn(f.name)}' is declared more than once, and C has no overloading — two exports of " +
+        "one name would be two definitions of one symbol. Give each export a symbol of its own, " +
+        "'@export(\"...\")'")
+
     // Checked against the *declared* name, since that is what an unwritten symbol becomes. A
     // backtick-quoted name (`09`) is the case: it may hold anything the reader wanted, and the
     // escape that makes it an LLVM label is not something a C header could declare.
-    if e.symbol.isEmpty && !ExportCheck.cIdentifier(Modules.bare(f.name)) then
-      err(s"'${Modules.show(f.name)}' is not a name C can call, so exporting it under its own name " +
+    if e.symbol.isEmpty && !ExportCheck.cIdentifier(Modules.bare(overloadPlain(f.name))) then
+      err(s"'${qn(f.name)}' is not a name C can call, so exporting it under its own name " +
         "would publish a symbol no C declaration could spell — name the symbol instead, " +
         "'@export(\"...\")'")
 

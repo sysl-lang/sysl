@@ -585,9 +585,14 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "60000\n"
     }
 
-    "a module-level 'val' may not hold one, for the reason it holds no reference" in {
-      err("""val greeter: &Fn(int) -> string = k -> "x"
-            |""".stripMargin) should include("a count with nowhere to write the release")
+    // Module storage holds a boxed callable, and this is the shape the rule was relaxed **for**:
+    // every C interface that calls back takes an address and an opaque word, so a binding offering a
+    // sysl closure has to keep it somewhere that outlives the call, and module storage is the only
+    // storage that does. The count it takes is never given back, which is what a static is.
+    "a module-level 'val' holds one, which is what lets a callback be kept" in {
+      run("""static val greeter: &Fn(int) -> string = k -> s"hello $k"
+            |print(greeter(1))
+            |""".stripMargin) shouldBe "hello 1\n"
     }
 
     "two of them are not compared" in {

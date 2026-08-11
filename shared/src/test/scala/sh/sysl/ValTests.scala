@@ -657,9 +657,11 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
       ) shouldBe "6\n"
     }
 
-    // A tuple is a struct with its fields named for their positions, so the recursive half of the
-    // rule reaches it — and reaches it in both directions, which is the discriminating pair.
-    "a tuple with one in it, where a tuple with a reference is still refused" in {
+    // A tuple is a struct with its fields named for their positions, so whatever a struct field may
+    // be, a part may be — a raw pointer, which owns nothing, and a reference, which is a count the
+    // storage takes and never gives back. Both are asked, because the pair used to be the
+    // discriminating one and is now the recursive half of one rule reaching two ways.
+    "a tuple with a pointer in it, and one with a reference" in {
       run(
         """extern malloc(n: usize) -> *u8
           |mk() -> (int, *u8) = (1, malloc(8))
@@ -667,14 +669,14 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |print(str(t.0))""".stripMargin,
       ) shouldBe "1\n"
 
-      err(
+      run(
         """struct Node
           |    v: int
           |end Node
           |mk() -> (int, &Node) = (1, Node(2))
           |static val t: (int, &Node) = mk()
-          |print("ok")""".stripMargin,
-      ) should include("a count with nowhere to write the release")
+          |print(t.0, t.1.v)""".stripMargin,
+      ) shouldBe "1 2\n"
     }
 
     "and one 'val' is filled from another" in {
@@ -867,6 +869,58 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     }
   }
 
+  // Every shape here was **refused** until the rule behind the refusal was read again: storage that
+  // lasts the whole run has no line to write a release on, which is true and is a description of a
+  // static rather than an argument against one. The group is kept — the same five shapes, asked the
+  // other way round — because what it guards now is that each really is *held* rather than merely
+  // accepted: storage that failed to take a count of its own reads as freed bytes, not as an error.
+  "what a counted value in one does, now that it may be held" - {
+    "a string built while the program runs" in {
+      run("static val s: string = str(1)\nprint(s)") shouldBe "1\n"
+    }
+
+    // Two literals joined looks constant and is not, because joining them allocates. It is the
+    // discriminating case against a literal, which the object file carries as it stands.
+    "a string joined from two literals, which allocates however constant it looks" in {
+      run("static val s: string = \"a\" + \"b\"\nprint(s)") shouldBe "ab\n"
+    }
+
+    "a reference, which is the count itself" in {
+      run("struct P\n    x: int\nend P\nmk() -> &P = P(1)\nstatic val r: &P = mk()\nprint(r.x)") shouldBe "1\n"
+    }
+
+    "a view, whose owner word is a count like any other" in {
+      run("static val k: [4]int = [1, 2, 3, 4]\nstatic val s: []const int = k[1..<3]\nprint(s[0], s.len)") shouldBe
+        "2 2\n"
+    }
+
+    // A struct carrying an `invariant` has to be *checked*, and a check is code — so this is a
+    // computed initializer whatever it looks like, and the check runs before the first statement.
+    "a struct whose invariant has to run, even with a literal in it" in {
+      run(
+        """struct Tag
+          |    name: string
+          |    invariant name.len > 0
+          |end Tag
+          |static val t: Tag = Tag("uart")
+          |print(t.name)""".stripMargin,
+      ) shouldBe "uart\n"
+    }
+
+    // And that invariant is a real check rather than a formality, which is also what says the
+    // initializer ran at all: the same declaration with a value that breaks it stops the program.
+    "and that invariant still runs, before the program's own statements" in {
+      exits(
+        """struct Tag
+          |    name: string
+          |    invariant name.len > 0
+          |end Tag
+          |static val t: Tag = Tag("")
+          |print("never")""".stripMargin,
+      )
+    }
+  }
+
   "what it refuses" - {
     "assigning to a module-level 'val'" in {
       err("static val n: int = 1\nn = 2") should include("written once")
@@ -931,51 +985,6 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
 
     "an initializer of the wrong shape" in {
       err("static val k: [3]int = [1, 2]") should include("[3]int")
-    }
-
-    // Storage that outlives every frame is never let go of, so a count taken in one has nowhere to
-    // write the release. What decides is the **value**: a string the program builds takes a count,
-    // and the literal above does not.
-    "a string built while the program runs" in {
-      err("static val s: string = str(1)") should include("a count with nowhere to write the release")
-    }
-
-    // Two literals joined is the discriminating pair against the section above: it looks constant
-    // and is not, because joining them allocates. Folding it is separate work, deliberately not done
-    // here — admitting it on the strength of how it reads would be admitting a leak.
-    "a string joined from two literals, which allocates however constant it looks" in {
-      err("static val s: string = \"a\" + \"b\"") should include("built while the program runs")
-    }
-
-    "a reference, which is the count itself" in {
-      err("struct P\n    x: int\nend P\nmk() -> &P = P(1)\nstatic val r: &P = mk()") should
-        include("a count with nowhere to write the release")
-    }
-
-    "a view, whose owner word is a count like any other" in {
-      err("static val k: [4]int = [1, 2, 3, 4]\nstatic val s: []const int = k[1..<3]") should
-        include("a count with nowhere to write the release")
-    }
-
-    // A struct that carries an `invariant` has to be *checked*, and a check is code (`13 §7`), so
-    // there is nowhere for the object file to carry it — which means a counted field in one is
-    // refused even though every part of it was written as a literal. That is the specification's own
-    // rule rather than a gap, and it is pinned because it is the surprising corner of the relaxation.
-    "a struct whose invariant has to run, even with a literal in it" in {
-      err(
-        """struct Tag
-          |    name: string
-          |    invariant name.len > 0
-          |end Tag
-          |static val t: Tag = Tag("uart")""".stripMargin,
-      ) should include("a count with nowhere to write the release")
-    }
-
-    // The diagnostic names the value rather than the type, because once a literal is legal "its type
-    // is string" sends a reader looking for a spelling instead of at what they wrote.
-    "and the message says what may be held instead" in {
-      err("static val s: string = str(1)") should
-        include("a string literal owns nothing, and neither does a table of them")
     }
 
     // The line between the two declarations, from the other side: a `const` sizes an array because

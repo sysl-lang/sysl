@@ -165,8 +165,23 @@ class OverloadTests extends LibraryCliSupport with RunSupport with CodegenSuppor
     // at the declaration: the mistake is in the pair, and every use of the name would otherwise
     // report the same ambiguity.
     "so two differing only in what they return are refused" in {
-      err("""h(x: int) -> string = "s"
-            |h(x: int) -> int = 1""".stripMargin) should include("never by what it returns")
+      val e = err("""h(x: int) -> string = "s"
+                    |h(x: int) -> int = 1""".stripMargin)
+
+      // Told as the duplicate it is — the parameters are the same, so it is one declaration written
+      // twice — with the sentence finished, because this is the pair a reader wrote on purpose.
+      e should include("function 'h' is already declared")
+      e should include("never by what it returns")
+    }
+
+    // And the same parameters with the same result is the plain duplicate, which gets the plain
+    // message: somebody who wrote one function twice is not owed a paragraph about overloading.
+    "while an outright duplicate is told it is one, with nothing about overloads" in {
+      val e = err("""h(x: int) -> string = "a"
+                    |h(x: int) -> string = "b"""".stripMargin)
+
+      e should include("function 'h' is already declared")
+      e should not include "what it returns"
     }
 
     // The second's default is unreachable — no call can supply one argument to it, because the first
@@ -205,6 +220,32 @@ class OverloadTests extends LibraryCliSupport with RunSupport with CodegenSuppor
             |k(x: string, y: string) -> string = "b"
             |print(k(1.5))""".stripMargin) should include("k(x: int)")
     }
+  }
+
+  // C has no overloading, so an overload set has at most one member that may take its own name as a
+  // symbol. Caught by name rather than left to the rule that an export's symbol must be a C
+  // identifier — which does refuse it, and does so quoting `pick.2`, a spelling the source does not
+  // contain.
+  "an overload exported under its own name is refused, and not by accident" in {
+    val e = err("""@export
+                  |pick(a: int) -> int = a + 1
+                  |
+                  |@export
+                  |pick(a: int, b: int) -> int = a + b""".stripMargin)
+
+    e should include("C has no overloading")
+    e should not include "pick.2"
+  }
+
+  "though each may be exported under a symbol of its own" in {
+    val out = ir("""@export("pick_one")
+                   |pick(a: int) -> int = a + 1
+                   |
+                   |@export("pick_two")
+                   |pick(a: int, b: int) -> int = a + b""".stripMargin)
+
+    out should include("@pick_one")
+    out should include("@pick_two")
   }
 
   "and the compiler's spelling of an overload never reaches a reader" in {

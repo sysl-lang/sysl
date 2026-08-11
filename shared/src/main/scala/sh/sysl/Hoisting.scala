@@ -319,7 +319,7 @@ trait Hoisting extends HoistMembers {
            f.retType.map(t => recover(Type.Unknown)(resolveReturn(t, Map.empty))).getOrElse(Type.Unit))
       // After every table this declaration fills, because it reports and reporting unwinds: a
       // declaration whose overload is refused is still a declaration the body pass will look up.
-      if key != plain then recover(())(checkOverloadDistinct(plain, key, f.params, f.variadic))
+      if key != plain then recover(())(checkOverloadDistinct(plain, key, f.params, f.retType, f.variadic))
       checkSignatureRules(f.name, f.params, f.retType, f.variadic)
       checkValueParamArithmetic(f.tvalues.keySet, f.params.map(_.typ) ::: f.retType.toList,
         f.tparams.toSet, f.tpacks)
@@ -392,7 +392,7 @@ trait Hoisting extends HoistMembers {
       // Reported after every table is filled, for the reason the same check in the branch above is:
       // the body pass looks this declaration up whatever was wrong with it.
       for why <- externClash do recover(())(err(why))
-      if key != plain then recover(())(checkOverloadDistinct(plain, key, e.params, e.variadic))
+      if key != plain then recover(())(checkOverloadDistinct(plain, key, e.params, e.retType, e.variadic))
       checkSignatureRules(e.name, e.params, e.retType, e.variadic, foreign = true)
       for s <- e.link if !s.matches("[A-Za-z0-9_$.]+") do
         err(s"'$s' is not a symbol a linker can resolve")
@@ -727,7 +727,13 @@ trait Hoisting extends HoistMembers {
    * spellings of one type slip through here and are caught at the call, where they read as the
    * ambiguity they are.
    */
-  private def checkOverloadDistinct(plain: String, key: String, params: List[Param], variadic: Boolean): Unit = {
+  private def checkOverloadDistinct(
+      plain: String,
+      key: String,
+      params: List[Param],
+      retType: Option[TypeRef],
+      variadic: Boolean,
+  ): Unit = {
     def low(ps: List[Param]) = ps.count(_.default.isEmpty)
     def high(ps: List[Param], v: Boolean) = if v then Int.MaxValue else ps.length
 
@@ -739,9 +745,33 @@ trait Hoisting extends HoistMembers {
       n = lo min (params.length min other.params.length)
       if params.take(n).map(_.typ) == other.params.take(n).map(_.typ)
     do
-      err(s"'${qn(plain)}' is already declared with parameters this one could not be told from — " +
-        s"a call passing $n argument${if n == 1 then "" else "s"} would fit both, and which " +
-        "declaration a call means is decided by its arguments and never by what it returns. Two " +
-        "declarations of one name have to differ in a way a call site can show")
+      // **A pair whose parameter lists are the same is a DUPLICATE, and is told so.** It is the same
+      // rule — a call fits both — but not the same mistake: somebody who declared one function twice
+      // has not written an overload set that needs distinguishing, they have written the declaration
+      // twice, and a message about how overloads are told apart would send them looking for a
+      // difference to add. This is also the message that stood before overloading existed, which is
+      // what a reader of an older program is owed.
+      if params.map(_.typ) == other.params.map(_.typ) then
+        // **The same parameters is a DUPLICATE, and is told so** — the same rule, and not the same
+        // mistake. Somebody who declared one function twice has not written an overload set that
+        // needs distinguishing; a message about how overloads are told apart would send them looking
+        // for a difference to add. This is also the message that stood before overloading existed.
+        //
+        // Where the two **results** differ the sentence is worth finishing, because that is the pair
+        // a reader wrote on purpose and expected to work.
+        val because =
+          if retType.map(_.show) == other.retType.map(_.show) then ""
+          else " — which declaration a call means is decided by its arguments and never by what it " +
+            "returns, so two that differ only in the result have no call that tells them apart"
+
+        // Through `duplicate`, so the name is marked contested: the key goes on standing for
+        // whichever declaration reached it first, and without this the *losing* file is then told
+        // the name is private to its sibling — a name it declares itself, three lines up.
+        duplicate(plain, s"function '${Modules.bare(plain)}' is already declared$because")
+      else
+        err(s"'${qn(plain)}' is already declared with parameters this one could not be told from — " +
+          s"a call passing $n argument${if n == 1 then "" else "s"} would fit both, and which " +
+          "declaration a call means is decided by its arguments and never by what it returns. Two " +
+          "declarations of one name have to differ in a way a call site can show")
   }
 }

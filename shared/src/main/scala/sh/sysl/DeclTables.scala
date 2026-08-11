@@ -157,6 +157,17 @@ trait DeclTables extends Reporting {
    */
   protected def overloadKeys(key: String): List[String] = overloadSets.getOrElse(key, List(key))
 
+  /** The key a name resolves to, given the key of any one of its overloads — the numbered segment
+   * taken back off. A key with no such segment is its own answer, so this is safe to ask of any
+   * function key.
+   */
+  protected def overloadPlain(key: String): String = {
+    val cut = key.lastIndexOf('.')
+
+    if cut > 0 && cut < key.length - 1 && key.drop(cut + 1).forall(_.isDigit) then key.take(cut)
+    else key
+  }
+
   /** The **type keys** that were given a destructor by an `impl Drop` (`03 § A destructor`).
    *
    * Kept as the keys an `impl` names rather than as instantiated types, because that is what is

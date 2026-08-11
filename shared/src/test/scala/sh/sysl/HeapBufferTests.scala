@@ -371,10 +371,6 @@ class HeapBufferTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       message should include("written where a '[]T' is expected")
     }
 
-    "a buffer as a 'val', since a view in storage that outlives every frame is never let go of" in {
-      err("val xs: []int = [1, 2, 3]") should include("a count with nowhere to write the release")
-    }
-
     "elements of a type that has no values" in {
       err("f(n: usize) -> []unit = [(); n]") should include("an array cannot hold unit values")
     }

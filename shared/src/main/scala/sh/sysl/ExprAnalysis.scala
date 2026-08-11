@@ -762,6 +762,15 @@ trait ExprAnalysis
           .exists(t => cfnOf(t.ty).isDefined) =>
       callThroughAddress(analyzeExpr(Ident(name).setPos(expr.pos)), args)
 
+    // The same, for a name holding a **callable** rather than an address. Module storage may hold one
+    // (`13 §7`), which is what a binding keeping a callback does — so `pending(n)` has to mean what
+    // it would mean if `pending` were a local, and the general case below is unreachable from here
+    // because the complaint about an undefined function comes first.
+    case Call(Ident(name), args)
+        if lookupOpt(name).isEmpty && probe(analyzeExpr(Ident(name).setPos(expr.pos)))
+          .exists(t => callableOf(t.ty).isDefined) =>
+      callCallable(analyzeExpr(Ident(name).setPos(expr.pos)), args, expected)
+
     // A local that is not callable, called anyway, is a different mistake from a name that stands
     // for nothing — the name was found, and what it holds is not a thing a call reaches.
     case Call(Ident(name), _) if lookupOpt(name).isDefined =>
