@@ -19,6 +19,7 @@ import scopt.OParser
  *   - `sysl build <path> -o x`     compile to a native executable
  *   - `sysl build-lib <path> -o x` compile a library to a linkable artifact
  *   - `sysl emit-llvm <path>`      print the generated LLVM IR
+ *   - `sysl doc <path>`            render a literate source as Markdown
  *   - `sysl targets`               list the machines sysl can build for
  *
  * **`--lib` takes either a source tree or an artifact**, and which one is read off the name: a
