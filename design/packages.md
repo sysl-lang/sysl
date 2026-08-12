@@ -289,6 +289,62 @@ machinery exists — `Capabilities.scala`, `GatedModules.scala`, and the propaga
 `capabilities.md § Two levels`. What is new is only that a *package* is now a thing that can carry a
 requirement, alongside a module.
 
+### And so do the headers its C includes and does not carry
+
+A capability is answered by the target and there is nothing for anybody to go and do. **A header is
+answered by a path on a machine the package has never seen**, and that is the second kind of thing a
+package may need of its environment:
+
+```hocon
+requires {
+  headers { lwip = "lwIP's headers — the pico-sdk carries them at lib/lwip/src/include" }
+}
+```
+
+```
+sysl build . --include-path lwip=$PICO_SDK_PATH/lib/lwip/src/include
+```
+
+**The package names the requirement and the driver supplies the path**, which is exactly the split
+`15 §8` draws between `@link("png")` and `--link-path`. That section refuses a path in this file in as
+many words — the file is committed and describes the *package*, and where a prefix lives on somebody's
+laptop is not a property of the package — and an environment variable in it would be the build-script
+problem of `§ 7` wearing a different hat.
+
+**The value is the reason, not a path.** It is prose for a person: what the headers are and where
+they come from, quoted back at whoever has to find them. A name alone would say that something called
+`lwip` is missing and leave the reader to work out what that is.
+
+**What it buys is the refusal.** `--include-path` always worked and a consumer who passed it always
+built; what did not exist was any way for the *package* to say it needed one, so a build without the
+flag failed inside a C compiler that names the header and knows nothing about sysl, the package, or
+the flag:
+
+```
+fatal error: 'lwip/tcp.h' file not found
+```
+
+Now the build stops before clang runs, naming all three:
+
+```
+github.com/sysl-lang/pico2 needs the 'lwip' headers and nothing supplied them — lwIP's headers …
+Say where they are with '--include-path lwip=<dir>'
+```
+
+**A bare `--include-path` is not an answer**, deliberately. The check is about what a build says it
+has rather than what it might happen to find, and reading a bare path as an answer would make the
+declaration unenforceable — a consumer would satisfy it by accident and never learn they had.
+
+**It is asked only where C is compiled.** The requirement exists so that a tree's C compiles, so a
+command that compiles none — `emit-llvm`, `prove` — has nothing unmet, and charging it for a path it
+would never open would turn a requirement about the C into a requirement about the package.
+
+Two things are deliberately absent. **A named path is not scoped to the package that asked for it**
+and reaches every C compilation exactly as a bare one does; scoping is arguably more correct and buys
+nothing the refusal above does not. And **defines are the same shape and are not built** — a header
+path alone is not always enough, since a project of any size configures its headers with macros, and
+`--define` supplies them today with no way for a package to say which it needs.
+
 ## 9. Namespacing — local names, an optional mount, and no silent winners
 
 **This is the one part of Go's model that does not port, and the part most worth getting right.**

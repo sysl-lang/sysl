@@ -464,6 +464,13 @@ one level up. For the same reason it is not a field in `package.hocon`: that fil
 describes the *package*, and where a prefix lives on somebody's laptop is not a property of the
 package.
 
+**What a package may put in that file is the requirement rather than the path**, and
+`packages.md § 8` builds the include half on this section's split: `requires { headers { lwip = "…" } }`
+says what its C must be able to find, and `--include-path lwip=<dir>` answers it. That is
+`@link`/`--link-path` one level up — and it is why the include side needs nothing in the source at
+all, since a `.c` is found by a walk and declares nothing (`§ 7`), so there is no file for an
+`@include`-shaped attribute to sit in and no `extern` for it to sit beside.
+
 **The environment already worked, and that is why the flags exist rather than why they don't.**
 `LIBRARY_PATH` and `CPATH` are read by clang, which sysl execs, so a developer who exports them has
 always had a build that links. But a build that works only because of one person's shell is one
