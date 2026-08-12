@@ -225,22 +225,29 @@ trait ConstFolding extends ImportResolution {
           "expression — a literal, a 'const', 'sizeof', 'alignof', 'offsetof', or the arithmetic " +
           "and comparisons over them, and never a call")
 
-  /** What a failed assertion inside a generic adds, and nothing at all outside one.
+  /** What a failed assertion adds when the body it is in was compiled against a substitution, and
+   * nothing at all when it was not.
    *
    * The mistake is at the call that asked for `Slab[u8]` while the sentence explaining why is at the
    * declaration, so a report carrying only one of the two sends the reader to the wrong file. The
-   * position is the condition's, which is the half that says *what* is wrong; this is the half that
-   * says which instantiation asked.
+   * position is the condition's, which is the half that says *what* is wrong; naming the bindings is
+   * the half that says which choice of types asked.
    *
-   * `Self` is named alongside the type parameters where a member of a generic type is what failed,
-   * rather than filtered out as the compiler's own word: which `Box` this is is exactly as much of
-   * the answer as which `T` it holds, and a member's body may measure either.
+   * `Self` is named alongside the type parameters rather than filtered out as the compiler's own
+   * word. Which `Box` this is is exactly as much of the answer as which `T` it holds, and in an
+   * inherited default body — one text shared by every implementing type — it is the *whole* answer.
+   *
+   * **It does not say "at this instantiation", though every early draft did.** A concrete type's
+   * members carry a `Self` binding too, resolved once at hoist rather than per call, so that wording
+   * announced an instantiation to a reader looking at a plain `struct Point` that nothing had
+   * instantiated. Naming the bindings is true whichever way they were bound, and it is the part that
+   * was carrying the information.
    */
   private def instantiationNote(subst: Map[String, Type]): String =
     val bound = subst.toList.sortBy(_._1)
 
     if bound.isEmpty then ""
-    else s" — at this instantiation, where ${bound.map((n, t) => s"$n = ${show(t)}").mkString(", ")}"
+    else s" — where ${bound.map((n, t) => s"$n = ${show(t)}").mkString(", ")}"
 
   /** Folds a constant expression to the literal it denotes, or `None` where it is not one.
    *

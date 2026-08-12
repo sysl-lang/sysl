@@ -278,6 +278,31 @@ class AssertTests extends AnyFreeSpec with Matchers with CodegenSupport with Run
       msg should not include "where T = ulong"
     }
 
+
+    // A concrete type's members carry a `Self` binding too, resolved once at hoist rather than per
+    // call — so the note must not announce an *instantiation* to somebody looking at a plain struct
+    // that nothing instantiated. Naming the binding is true either way, and in an inherited default
+    // body — one text shared by every implementing type — it is the whole of what the reader needs.
+    "a concrete type's member names its Self without claiming to have been instantiated" in {
+      val msg = err(
+        """struct Point
+          |    x: int
+          |    y: int
+          |
+          |    check(self) -> int
+          |        @assert(sizeof(Point) == 4, "Point must be four bytes")
+          |        1
+          |end Point
+          |
+          |var p = Point(1, 2)
+          |print(p.check())""".stripMargin
+      )
+
+      msg should include("assertion failed: Point must be four bytes")
+      msg should include("where Self = Point")
+      msg should not include "instantiation"
+    }
+
     // A value parameter is bound the same way, so a claim about one is settled the same way — and
     // this is the shape that catches a table too large for the storage it is going into, which is
     // the other half of what a bounded generic wants to say.
