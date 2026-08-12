@@ -222,6 +222,14 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
         // wrong — so it is made again outside the sandbox and allowed to report. Otherwise the
         // mistake is about which function was meant, and the answer is the roster.
         case Nil =>
+          // An argument carrying `Type.Unknown` was already refused where it was made, and it makes
+          // *every* candidate fail — so the roster below would be printed with nothing eliminated,
+          // listing declarations that plainly do take the call as written. That is the worst message
+          // this could give: it says overload resolution rejected a call the reader can see matches,
+          // and sends them to the wrong line. The first error is the one to fix, and it is already on
+          // screen above this one.
+          if written.exists(a => alreadyReported(analyzeExpr(a))) then poisoned()
+
           val plausible = candidates.filter(f => arityFits(f.params.length, f.variadic, written.length))
 
           if plausible.length == 1 then callFunction(plausible.head, written, expected)

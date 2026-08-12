@@ -252,6 +252,23 @@ trait AnalyzerBase extends Scoping {
         case Poisoned()             => None
     }
 
+  /** Whether asking that question failed on a mistake **somebody has already been told about**,
+   * rather than on its own account.
+   *
+   * `probe` folds the two together, because a speculative question only wants to know whether it has
+   * an answer. Deciding what to *say* when it has none needs them apart: an `AnalyzerError` is this
+   * question's own finding and is worth a message, while a `Poisoned` came from a value whose
+   * deciding mistake was reported further up the file, and a second message about it points the
+   * reader at the wrong line.
+   */
+  protected def alreadyReported(body: => Any): Boolean =
+    sandboxed {
+      try { body; false }
+      catch
+        case AnalyzerError(_, _, _) => false
+        case Poisoned()             => true
+    }
+
   // --- hooks provided by the Analyzer class --------------------------------------------
   //
   // These recursive entry points live in the class (statements, expressions, places) but are

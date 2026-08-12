@@ -78,6 +78,31 @@ class ExpressionParserTests extends AnyFreeSpec with ParseSupport {
     "and does not associate, so a chain of two has no reading" in {
       progError("var r = a..b..c") should not be empty
     }
+
+    // Rust spells an inclusive range `a..=b`, so a reader arriving from it writes one here once.
+    // Left to the ordinary grammar it reads as the open-ended `a..` followed by a token nothing
+    // wants, and the refusal is then about the range that was *parsed* rather than the one that was
+    // written — in a `for` header, a sentence saying a range is only allowed in a `for` loop, to
+    // somebody looking at one. All three of these are positions where a range is legal.
+    "'..=' is refused by name, wherever a range may be written" in {
+      val where = List(
+        "main()\n    val a = 1\n    for i in a..=3\n        print(i)\n",
+        "main()\n    val xs = [1, 2, 3]\n    print(xs[0..=1])\n",
+        "main()\n    val a = 1\n    val b = a..=3\n",
+      )
+
+      for src <- where do
+        progError(src) should include(
+          "'..=' is not a range — inclusive is 'a..b' and exclusive is 'a..<b'",
+        )
+    }
+
+    // The token that caused it is what the caret has to be under. Pointing past the `=` would put it
+    // on the bound, which is the one part of the line that is right.
+    "and it points at the '..', not past the '='" in {
+      progError("main()\n    val a = 1\n    for i in a..=3\n        print(i)\n") should
+        include(":3:15")
+    }
   }
 
   "unary and postfix" - {

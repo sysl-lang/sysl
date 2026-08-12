@@ -149,7 +149,23 @@ trait ExprParser extends SyslParserBase {
   protected def compareOp: Parser[String] =
     op("==") | op("!=") | op("<=") | op(">=") | op("<") | op(">")
 
-  protected def rangeOp: Parser[Boolean] = op("..<") ^^^ false | op("..") ^^^ true
+  /** `..=` is refused **by name**, wherever a range may be written.
+   *
+   * Rust spells an inclusive range `a..=b`, so a reader arriving from it writes one here once. Left
+   * to the ordinary grammar what they get is a message about the open-ended range `a..` that was
+   * parsed — in a `for` header, *"a range is only allowed in a 'for' loop or a 'match' pattern"*,
+   * which is a true sentence about something else and asserts the very thing the reader can see is
+   * already so. The `=` that caused it appears nowhere in it.
+   *
+   * The refusal is an `Error` rather than a `Failure` so it survives the alternations above it: a
+   * `Failure` here would be outranked by whichever candidate got furthest, which is how the message
+   * about the open-ended range won in the first place. `guard` is what points it at the `..` rather
+   * than past the `=`.
+   */
+  protected def noInclusiveEq: Parser[Nothing] =
+    guard(op("..") ~ op("=")) ~> err("'..=' is not a range — inclusive is 'a..b' and exclusive is 'a..<b'")
+
+  protected def rangeOp: Parser[Boolean] = op("..<") ^^^ false | noInclusiveEq | op("..") ^^^ true
 
   /** Ranges are non-associative and sit below arithmetic, so each end is a `bitOr`. Either
    * end may be omitted (`a..`, `..b`).
