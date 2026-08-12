@@ -12,6 +12,63 @@ import io.github.edadma.hocon.{ConfigBoolean, ConfigObject, ConfigString, Hocon,
  */
 case class TargetConfig(triple: Option[String], capabilities: Map[String, Boolean])
 
+/** The pair of C symbols a program's storage comes from and goes back to (`packages.md § 10`).
+ *
+ * A program has **one** of these, and `03` is why: whoever holds the last reference is what frees,
+ * so two heaps in one program would mean a box whose payload cannot be given back by the code that
+ * outlived it. What varies is not how many there are but which pair they are — libc's on a hosted
+ * machine, `pvPortMalloc` / `vPortFree` under FreeRTOS, an arena's on a target that has one.
+ *
+ * The two symbols must have `malloc`'s and `free`'s signatures. **Nothing here can check that**, for
+ * the same reason nothing checks an `extern` against the header it names: the declaration is a claim
+ * about code the compiler does not have. It is the same trade `@link` already makes.
+ */
+case class Allocator(alloc: String, free: String)
+
+object Allocator {
+
+  /** What a program gets when no package says otherwise — and every program before this existed. */
+  val c: Allocator = Allocator("malloc", "free")
+
+  /** Whether a name is one a C symbol could have.
+   *
+   * Checked because the string reaches LLVM IR as `@$name`, where a space or a sigil would produce a
+   * module that will not parse — and the failure would arrive as a syntax error inside generated text
+   * rather than as a complaint about the line somebody wrote.
+   */
+  def isSymbol(name: String): Boolean =
+    name.nonEmpty && (name.head.isLetter || name.head == '_') &&
+      name.forall(c => c.isLetterOrDigit || c == '_')
+
+  /** Which allocator a program built from these packages uses, or what is wrong with the answer.
+   *
+   * Each entry is a package's name and what it declared; the root project's name is whatever the
+   * caller calls it, because a conflict has to be reported in words a reader can act on.
+   *
+   * **Two packages declaring the same pair is not a conflict** — it is one fact stated twice, which is
+   * what happens as soon as a package and a driver built on it both know which kernel they are for.
+   * Two packages declaring *different* pairs is refused, naming both, because there is no answer: the
+   * program cannot have two heaps and nothing here can rank one claim above the other.
+   *
+   * **No declaration is not an error and never becomes one.** It is libc's pair, which is what every
+   * program compiled before this feature got, so nothing that exists today changes.
+   */
+  def choose(declared: List[(String, Allocator)]): Either[String, Allocator] =
+    declared.map(_._2).distinct match
+      case Nil          => Right(c)
+      case List(single) => Right(single)
+      case several =>
+        val who = declared
+          .groupBy(_._2)
+          .toList
+          .sortBy(p => several.indexOf(p._1))
+          .map((a, packages) =>
+            s"'${packages.map(_._1).sorted.mkString("' and '")}' name ${a.alloc} / ${a.free}")
+
+        Left("two packages name different allocators, and a program has one heap — " +
+          who.mkString("; ") + ". Drop one of the declarations, or depend on only one of them")
+}
+
 /** The project config — `package.hocon` at the project root (`packages.md § 1`).
  *
  * The file is **optional**, and a project without one is not a lesser project: the defaults are the
@@ -32,6 +89,7 @@ case class PackageConfig(
     requires: Set[String] = Set.empty,
     headers: Map[String, String] = Map.empty,
     dependencies: List[Dependency] = Nil,
+    allocator: Option[Allocator] = None,
 ) {
 
   /** The capabilities `target` provides.
@@ -105,6 +163,7 @@ object PackageConfig {
         _       <- checkNotNarrowing(needed)
         headers <- readHeaders(block2(root, "requires"))
         deps    <- readDependencies(root)
+        alloc   <- readAllocator(root)
       yield PackageConfig(
         name = pkg.flatMap(string(_, "name")),
         version = pkg.flatMap(string(_, "version")),
@@ -114,6 +173,7 @@ object PackageConfig {
         requires = needed.collect { case (name, true) => name }.toSet.flatMap(Capability.closure),
         headers = headers,
         dependencies = deps,
+        allocator = alloc,
       )
     catch
       // Every way HOCON can be wrong arrives as one of these, and the driver wants a line rather
@@ -265,6 +325,54 @@ object PackageConfig {
               Left(s"$FileName: 'requires.$HeadersKey.$name' must be a string saying what these " +
                 "headers are and where they come from")
         }.map(_.toMap)
+
+  /** The keys an `allocator` block has, both required. */
+  private val AllocatorKeys = Set("alloc", "free")
+
+  /** The `allocator` block — the pair of C symbols this package's storage comes from
+   * (`packages.md § 10`).
+   *
+   * ==Why a package and not a target==
+   *
+   * The allocator is a fact about the software a program is built *on*, not about the machine:
+   * `thumbv7em` does not imply FreeRTOS, two RTOSes on one chip want different pairs, and a bare-metal
+   * program on that same chip wants libc's. A target-level answer would need a target per RTOS, which
+   * `targets.md` already declined to do for a float variant.
+   *
+   * ==Both keys, or neither==
+   *
+   * Half a pair is refused rather than filled in from libc. A file naming `alloc` and not `free` would
+   * otherwise get storage from one heap and give it back to another, which is the single worst outcome
+   * available here and would present as corruption a long way from this line.
+   *
+   * An unknown key is refused for the reason `readDependency` refuses one: somebody who wrote
+   * `malloc = "pvPortMalloc"` believes they have said something, and ignoring the key would leave them
+   * believing it while the program went on calling libc.
+   */
+  private def readAllocator(root: ConfigObject): Either[String, Option[Allocator]] =
+    block(root, "allocator").flatMap {
+      case None => Right(None)
+      case Some(sub) =>
+        def unknown: Option[String] = sub.fields.keys.toList.sorted.find(!AllocatorKeys.contains(_))
+
+        def symbol(key: String): Either[String, String] =
+          sub.fields.get(key) match
+            case Some(ConfigString(v)) if Allocator.isSymbol(v) => Right(v)
+            case Some(ConfigString(v)) =>
+              Left(s"$FileName: 'allocator.$key' is '$v', which is not a name a C function can have")
+            case Some(_) => Left(s"$FileName: 'allocator.$key' must be the name of a C function")
+            case None =>
+              Left(s"$FileName: 'allocator' names no '$key' — a program takes its storage from one " +
+                "pair and gives it back to the same one, so both halves are said or neither is")
+
+        for
+          _ <- unknown.toLeft(()).left.map(k => s"$FileName: 'allocator.$k' is not something an " +
+                 s"allocator says — the keys are 'alloc' and 'free'")
+          a <- symbol("alloc")
+          f <- symbol("free")
+          _ <- if a == f then Left(s"$FileName: 'allocator' names '$a' for both halves") else Right(())
+        yield Some(Allocator(a, f))
+    }
 
   private def checkHeaderName(name: String): Either[String, Unit] =
     if isHeaderName(name) then Right(())

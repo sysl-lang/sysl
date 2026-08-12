@@ -471,6 +471,102 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  /** `packages.md § 10` — a package may name the pair a program's storage comes from, and a program
+   * has one of them.
+   */
+  "the allocator" - {
+
+    "a package names a pair" in {
+      val c = read(
+        """allocator {
+          |  alloc = "pvPortMalloc"
+          |  free  = "vPortFree"
+          |}
+          |""".stripMargin)
+
+      c.allocator shouldBe Some(Allocator("pvPortMalloc", "vPortFree"))
+    }
+
+    // The direction that cannot silently change an existing program.
+    "a file that says nothing gets libc's, which is what every program had before" in {
+      read("").allocator shouldBe None
+      Allocator.choose(Nil) shouldBe Right(Allocator("malloc", "free"))
+    }
+
+    "half a pair is refused rather than completed from libc" in {
+      val e = refused("""allocator { alloc = "pvPortMalloc" }""")
+
+      e should include("names no 'free'")
+      e should include("both halves")
+    }
+
+    "a name a C function could not have" in {
+      refused("""allocator { alloc = "pv Port", free = "vPortFree" }""") should
+        include("not a name a C function can have")
+    }
+
+    // The same judgement `dependencies` makes about a misspelled key: somebody wrote `malloc` and
+    // believes they have redirected the allocator.
+    "a key an allocator does not have" in {
+      val e = refused("""allocator { malloc = "pvPortMalloc", free = "vPortFree" }""")
+
+      e should include("'allocator.malloc' is not something an allocator says")
+      e should include("'alloc' and 'free'")
+    }
+
+    "one symbol for both halves" in {
+      refused("""allocator { alloc = "xmalloc", free = "xmalloc" }""") should
+        include("names 'xmalloc' for both halves")
+    }
+
+    "one package's declaration is the program's" in {
+      Allocator.choose(List("freertos" -> Allocator("pvPortMalloc", "vPortFree"))) shouldBe
+        Right(Allocator("pvPortMalloc", "vPortFree"))
+    }
+
+    // Two packages knowing the same kernel is one fact stated twice, which is the ordinary case as
+    // soon as a driver package is built on the binding that names the allocator.
+    "two packages naming the same pair agree rather than conflict" in {
+      val freertos = Allocator("pvPortMalloc", "vPortFree")
+
+      Allocator.choose(List("freertos" -> freertos, "st7796" -> freertos)) shouldBe Right(freertos)
+    }
+
+    "two packages naming different pairs is refused, and both are named" in {
+      val e = Allocator.choose(List(
+        "freertos" -> Allocator("pvPortMalloc", "vPortFree"),
+        "arena"    -> Allocator("arena_alloc", "arena_free"),
+      )).swap.getOrElse(fail("expected a refusal"))
+
+      e should include("a program has one heap")
+      e should include("'freertos' name pvPortMalloc / vPortFree")
+      e should include("'arena' name arena_alloc / arena_free")
+    }
+
+    // The message groups by pair rather than listing packages, so three packages against two
+    // allocators reads as two claims and not as three.
+    "three packages against two pairs reads as two claims" in {
+      val freertos = Allocator("pvPortMalloc", "vPortFree")
+      val e = Allocator.choose(List(
+        "freertos" -> freertos,
+        "st7796"   -> freertos,
+        "arena"    -> Allocator("arena_alloc", "arena_free"),
+      )).swap.getOrElse(fail("expected a refusal"))
+
+      e should include("'freertos' and 'st7796' name pvPortMalloc / vPortFree")
+      e should include("'arena' name arena_alloc / arena_free")
+    }
+
+    "a symbol is what LLVM will accept after an '@'" in {
+      Allocator.isSymbol("pvPortMalloc") shouldBe true
+      Allocator.isSymbol("_malloc_r") shouldBe true
+      Allocator.isSymbol("") shouldBe false
+      Allocator.isSymbol("2malloc") shouldBe false
+      Allocator.isSymbol("my malloc") shouldBe false
+      Allocator.isSymbol("my.malloc") shouldBe false
+    }
+  }
+
   "a file that is not HOCON at all is one line rather than a stack trace" in {
     val e = refused("package { name = ")
 
