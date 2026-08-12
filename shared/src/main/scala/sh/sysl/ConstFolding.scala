@@ -215,7 +215,7 @@ trait ConstFolding extends ImportResolution {
       case Some(BoolLit(false)) =>
         err((a.message match
           case Some(m) => s"assertion failed: $m"
-          case None    => "assertion failed") + instantiationNote(subst))
+          case None    => "assertion failed") + comparedNote(a.cond, subst) + instantiationNote(subst))
       case Some(other) =>
         err(s"'@assert' takes a condition, and this is ${literalKind(other)} — an assertion is " +
           "something that can be true or false")
@@ -243,6 +243,64 @@ trait ConstFolding extends ImportResolution {
    * instantiated. Naming the bindings is true whichever way they were bound, and it is the part that
    * was carrying the information.
    */
+  /** What a failed **comparison** adds: the value each side folded to.
+   *
+   * The compiler folded both sides to constants in order to decide the comparison, so it is holding
+   * the number the reader needs at the moment it reports that the number is wrong. Throwing it away
+   * left them to recover it the only way left — edit the literal, rebuild, repeat — which is a
+   * bisection over builds for a fact that was in hand. That is worst in exactly the case the form
+   * exists for: a mirrored C struct whose size moved reports that it is not 16 without saying it is
+   * now 24, so *"did a field change width, or was one added"* cannot even be started from the
+   * message.
+   *
+   * **A side the reader wrote as a literal is not named.** `sizeof(X) == 12` has the 12 on screen
+   * already, and *"the right side is 12"* is a sentence that teaches nothing; where both sides are
+   * computed — `sizeof(A) == sizeof(B)` — both are worth saying.
+   *
+   * **The expression is not re-rendered, deliberately.** The offending line is quoted with a caret
+   * directly above this message, so the reader has the source text; what they lack is the number.
+   * Printing the operand back would mean an `Expr` printer the tree does not have, and a partial one
+   * lies about the shapes nobody thought of.
+   *
+   * Only a two-operand comparison reaches here. `fold` settles `Compare(List(l, r), List(op))` and
+   * nothing longer, so a chained comparison is refused earlier as not a constant expression, and a
+   * condition that is not a comparison at all has no operand worth naming — the thing that folded to
+   * `false` *is* its only operand.
+   */
+  private def comparedNote(cond: Expr, subst: Map[String, Type]): String = cond match
+    case Compare(List(l, r), List(_)) =>
+      val left  = Option.when(!isWrittenLiteral(l))(fold(l, subst)).flatten.map(literalText)
+      val right = Option.when(!isWrittenLiteral(r))(fold(r, subst)).flatten.map(literalText)
+
+      (left, right) match
+        case (Some(a), Some(b)) => s" — the left side is $a and the right side is $b"
+        case (Some(a), None)    => s" — the left side is $a"
+        case (None, Some(b))    => s" — the right side is $b"
+        case (None, None)       => ""
+    case _ => ""
+
+  /** Whether an operand is a literal the reader **wrote**, rather than one folding produced.
+   *
+   * A negative number is written `-1` and parses as a unary minus over a literal, so it counts too —
+   * otherwise the one shape a bound is most often compared against would be the one reported back.
+   */
+  private def isWrittenLiteral(e: Expr): Boolean = e match
+    case _: IntLit | _: FloatLit | _: BoolLit | _: CharLit | _: StrLit => true
+    case Unary("-", operand)                                          => isWrittenLiteral(operand)
+    case _                                                            => false
+
+  /** A folded literal as it should appear inside a sentence, spelled the way it would be written in
+   * source — a `char` in single quotes and a `string` in double, so that a reader comparing the
+   * sentence against their own line is looking at the same thing twice.
+   */
+  private def literalText(e: Expr): String = e match
+    case IntLit(v, _)   => v.toString
+    case FloatLit(t, _) => t
+    case BoolLit(b)     => b.toString
+    case CharLit(c)     => s"'${String(Character.toChars(c))}'"
+    case StrLit(s)      => s"\"$s\""
+    case other          => literalKind(other)
+
   private def instantiationNote(subst: Map[String, Type]): String =
     val bound = subst.toList.sortBy(_._1)
 

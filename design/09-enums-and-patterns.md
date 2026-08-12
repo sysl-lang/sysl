@@ -626,9 +626,39 @@ Recorded so they are not lost; each needs a decision before the relevant feature
 - **a. Data-enum tag width.** §2 settles the underlying type of a *simple* enum (selectable,
   `int` default, any `iN`/`uN`, checked int→enum conversion). A data enum's tag is an `i32` and
   is not selectable. Now that the payload is a union (§3) the two halves of the layout no longer
-  interact, so `enum E: u8` beside a payload region is a decision that can be taken on its own —
-  and it is worth taking, since a tag narrower than its payload's alignment is free: an
-  `Option[&T]` would be eight bytes rather than sixteen. ~~Also open within simple enums: whether
+  interact, so `enum E: u8` beside a payload region is a decision that can be taken on its own.
+
+  **What it buys, stated as the condition that governs it.** The tag sits at offset 0 and the
+  payload begins at the next offset meeting its *own* alignment, so **narrowing the tag pays
+  exactly when the payload's alignment is strictly less than the tag's width, and not at all when
+  it is greater or equal** — at or above the tag, the bytes a narrower tag would vacate are bytes
+  the payload's own alignment demands anyway. Measured at 0.0.45; the last column is arithmetic,
+  since the narrower tag does not exist to be measured:
+
+  | payload | alignment | today | with a `u8` tag |
+  |---|---|---|---|
+  | `*u8` | 8 | 16 | **16** — unchanged |
+  | `i32` | 4 | 8 | **8** — unchanged |
+  | `u16` | 2 | 8 | **4** |
+  | `u8` | 1 | 8 | **2** |
+  | `[3]u8` | 1 | 8 | **4** |
+
+  **The byte-payload row is the argument for taking it.** Such an enum today carries a four-byte
+  tag *and* is aligned to four on the tag's account, so it costs eight bytes to hold one — and a
+  table of a thousand costs 8 KB where 2 KB would do, which on a microcontroller is the difference
+  between a table that fits in SRAM and one that does not. A small enum of small payloads is also
+  the commonest shape this would touch: a token kind, a pin state, a one-byte opcode with an
+  operand.
+
+  ~~an `Option[&T]` would be eight bytes rather than sixteen~~ — **that example was wrong and is
+  withdrawn.** A pointer payload aligns to 8, which is *above* the tag, so it is precisely the row
+  narrowing cannot help: `Option[*u8]` measures sixteen bytes today and would measure sixteen with
+  a `u8` tag, because the payload still may not begin before offset 8. Getting it to eight is a
+  **niche** (item **g**) and not a narrower tag; conflating the two is what produced the figure,
+  and it is recorded rather than quietly deleted because the wrong number is the memorable part and
+  would otherwise be re-derived.
+
+  ~~Also open within simple enums: whether
   explicit discriminants must be distinct~~ — **that half is closed: they must**, and §2 says why.
   It was never a question about what the language should be. The code had already answered it, and
   answered it wrongly: a duplicate was accepted, the losing variant's `match` arm quietly became
@@ -660,6 +690,22 @@ Recorded so they are not lost; each needs a decision before the relevant feature
   is recorded here rather than left to be discovered so that relaxing it stays a decision somebody
   takes. `for x in seq` is a different question and not this one: its header names an iterator, not
   a condition.
+- **g. A niche discriminant — no tag at all.** Where a payload has a representation no valid value
+  of it can take, the tag can *be* that representation instead of occupying storage beside it: a
+  `&T` is never null, so `Option[&T]` can spend the null pointer on `None` and become exactly a
+  pointer — eight bytes rather than sixteen, which is the figure item **a** was wrongly promising.
+  The same applies wherever a payload leaves room to spare: a `bool` uses one of 256 byte values, a
+  `char` is not every `u32`, and a constrained type (`16`) knows the bounds it excludes, which is
+  the case sysl can see and most languages cannot.
+
+  It is worth wanting, and it is a **separate decision from item a** — that one chooses the tag's
+  width, this one removes the tag. Two things it needs before it could be taken: a rule for *which*
+  representations a type promises never to use (`03`'s reference modes give the pointer case
+  outright and `16 §5`'s bounds give the constrained case, but a plain struct promises nothing),
+  and a statement of what a niche does to `sizeof`, which `03 § Reinterpreting storage` makes an
+  askable part of every type's interface. It is not free either: a match becomes a comparison
+  against the spent representation rather than a tag load, which is cheaper here and not
+  everywhere.
 
 **`sizeof` is settled and has moved.** It was open here because `Layout` is this chapter's, and the
 question was whether the *language* could ask what the compiler already measures. It can, over any
