@@ -71,8 +71,12 @@ object LibraryArtifact {
    * before that installs a one-argument function where the runtime around it calls a two-argument
    * one. Nothing about that is a type error to a linker, and what it produces is a wrong call at the
    * moment an object is destroyed — the least observable place a mismatch could land.
+   *
+   * **5 adds the allocator the object half was built for.** An artifact from 4 records no pair, and a
+   * reader that assumed libc's would be assuming the very thing it has to check — so the whole
+   * container is refused instead, which is what a version is for.
    */
-  val Version: Int = 4
+  val Version: Int = 5
 
   /** The separator both byte formats here lean on: between the fields of a fingerprint, and around
    * the metadata marker.
@@ -205,10 +209,17 @@ object LibraryArtifact {
    * host's artifact and overwrote it, the next host build refused that one and overwrote it back, and
    * each announced itself on stderr in the words of a fault. Keying by target makes them separate
    * entries that both stay warm, which is the whole point of a cache keyed by anything.
+   *
+   * **And the ALLOCATOR, for exactly that reason.** The object half calls the pair by name, so a
+   * program that allocates through `pvPortMalloc` and one that allocates through `malloc` need
+   * different artifacts — and `read` refuses the wrong one, which without a key of its own is the
+   * rebuild-and-overwrite loop above rather than a diagnostic. It costs nothing to add: the key
+   * already names the compiler version, so every entry is new in the release this ships in.
    */
-  def stdDefault(target: Target): String =
+  def stdDefault(target: Target, allocator: Allocator = Allocator.c): String =
     cacheDirectory
-      .map(c => s"$c/sysl/${BuildInfo.version}-${Std.fingerprint}-${target.name}/std$extension")
+      .map(c => s"$c/sysl/${BuildInfo.version}-${Std.fingerprint}-${target.name}" +
+        s"-${allocator.alloc}-${allocator.free}/std$extension")
       .getOrElse(stdLocal)
 
   /** The project-local artifact path, which is what `stdDefault` was before it moved to the cache and
@@ -254,7 +265,7 @@ object LibraryArtifact {
   def build(sources: List[Source], target: Target = Target.default, building: Set[String] = Set.empty,
             std: Option[Stdlib] = None, native: List[Source] = Nil,
             paths: SearchPaths = SearchPaths.none, libraries: List[Source] = Nil,
-            libraryTrees: List[Program] = Nil)
+            libraryTrees: List[Program] = Nil, allocator: Allocator = Allocator.c)
       : Either[String, (String, String)] = {
     val parsed = (sources ::: libraries).map(SyslParser.parse(_, target))
 
@@ -294,7 +305,8 @@ object LibraryArtifact {
             // *before* the analysis, and the reason is that analyzing a test body creates generic
             // instantiations, which are ordinary library functions afterwards — so a filter applied
             // here, however thorough, would be too late to keep them out.
-            Compiler.compileLibrary(units, target, building, std, libraryTrees ::: carriedSource)
+            Compiler.compileLibrary(units, target, building, std, libraryTrees ::: carriedSource,
+                                    allocator)
               .map((ir, compiled) =>
                 // **`stripSource` rather than `filterNot(_.testOnly)`**, so that what an artifact
                 // carries is exactly what `Stdlib.fromSource` carries. The two differ on one shape: a
@@ -303,7 +315,7 @@ object LibraryArtifact {
                 // the two ways a standard module reaches a compilation, which is the one thing
                 // `StdArtifactTests` exists to refuse.
                 (ir, metadata(Tests.stripSource(units), compiled,
-                              fingerprint(sources ::: native), target)))))
+                              fingerprint(sources ::: native), target, allocator)))))
   }
 
   /** What one of a library's C files is called inside the archive.
@@ -376,11 +388,11 @@ object LibraryArtifact {
    * somebody else's library.
    */
   private def metadata(units: List[Program], compiled: Set[String], source: String,
-                       target: Target): String = {
+                       target: Target, allocator: Allocator): String = {
     val names = compiled.toList.sorted
 
-    (target.name :: source :: names.length.toString :: names).mkString("", "\n", "\n") +
-      AstCodec.encode(units)
+    (target.name :: s"${allocator.alloc} ${allocator.free}" :: source ::
+      names.length.toString :: names).mkString("", "\n", "\n") + AstCodec.encode(units)
   }
 
   /** The byte string the metadata is found by, inside an object file nothing else can read.
@@ -518,31 +530,52 @@ object LibraryArtifact {
    * The fingerprint is handed back rather than checked, because only the caller knows what it should
    * be: a library's own source is not something the compiler has, while the standard module's is
    * exactly what it carries. `Stdlib.read` is where that comparison belongs.
+   *
+   * **An artifact built for another allocator is refused here too**, and for a sharper reason than the
+   * target: a mismatched target is refused by the linker eventually, and a mismatched allocator is
+   * refused by nothing at all. Both pairs resolve, the link succeeds, and the program hands one
+   * heap's storage back to another every time an object this artifact allocated is released. Checked
+   * against a *name* rather than by inspecting the object half, because that is what a program can be
+   * told to do about it — rebuild the library.
    */
-  def read(name: String, meta: String, target: Target)
+  def read(name: String, meta: String, target: Target, allocator: Allocator = Allocator.c)
       : Either[String, (List[Program], Set[String], String)] = {
-    val lines = meta.linesWithSeparators
-    val built = if lines.hasNext then lines.next().stripLineEnd else ""
-    val rest0 = meta.drop(built.length).dropWhile(_ == '\n')
+    val firstEnd = meta.indexOf('\n')
+    val built    = if firstEnd >= 0 then meta.take(firstEnd) else ""
+    val afterTgt = meta.drop(firstEnd + 1)
+
+    val pairEnd = afterTgt.indexOf('\n')
+    val pair    = if pairEnd >= 0 then afterTgt.take(pairEnd) else ""
+    val rest0   = afterTgt.drop(pairEnd + 1)
+
+    val declared = pair.split(' ') match
+      case Array(a, f) if Allocator.isSymbol(a) && Allocator.isSymbol(f) => Some(Allocator(a, f))
+      case _                                                            => None
 
     val header  = rest0.indexOf('\n')
     val source  = Option.when(header > 0)(rest0.take(header))
     val rest    = rest0.drop(header + 1)
     val newline = rest.indexOf('\n')
+    val count   = Option.when(newline >= 0)(rest.take(newline)).flatMap(_.trim.toIntOption).filter(_ >= 0)
 
-    (source, Option.when(newline >= 0)(rest.take(newline)).flatMap(_.trim.toIntOption).filter(_ >= 0)) match
-      case (Some(fingerprint), Some(count)) if built == target.name =>
+    (source, count, declared) match
+      case (Some(fingerprint), Some(n), Some(pair)) if built == target.name && pair == allocator =>
         val body  = rest.drop(newline + 1)
-        val lines = body.linesWithSeparators.take(count).toList
+        val lines = body.linesWithSeparators.take(n).toList
         val tree  = body.drop(lines.map(_.length).sum)
 
         AstCodec.decode(tree).left
           .map(e => s"$name is not a readable sysl library: $e")
           .map((_, lines.map(_.stripLineEnd).toSet, fingerprint))
 
-      case (Some(_), Some(_)) =>
+      case (Some(_), Some(_), Some(_)) if built != target.name =>
         Left(s"$name was built for $built and this is a build for ${target.name} — " +
           s"rebuild it with --target ${target.name}")
+
+      case (Some(_), Some(_), Some(pair)) =>
+        Left(s"$name allocates through ${pair.alloc} / ${pair.free} and this program allocates " +
+          s"through ${allocator.alloc} / ${allocator.free} — a program has one heap, so a library " +
+          "compiled against another cannot be linked into it. Rebuild the library against this one")
 
       case _ => Left(s"$name is not a readable sysl library: its metadata header is missing")
   }

@@ -124,22 +124,23 @@ object Stdlib {
    * once, with the diagnostic naming where it looked, rather than at whichever branch happened to
    * touch `Std.sources` first, where it would arrive as an exception.
    */
-  def resolve(choice: Choice, target: Target): Either[String, Resolved] =
+  def resolve(choice: Choice, target: Target, allocator: Allocator = Allocator.c)
+      : Either[String, Resolved] =
     Std.root.flatMap: _ =>
       choice match
         case Choice.FromSource      => Right(Resolved(fromSource(target), Set.empty, None))
-        case Choice.Artifact(named) => load(named, target)
+        case Choice.Artifact(named) => load(named, target, allocator)
         case Choice.Default(search) =>
-          val path = search.getOrElse(LibraryArtifact.stdDefault(target))
+          val path = search.getOrElse(LibraryArtifact.stdDefault(target, allocator))
 
           resolved.synchronized {
-            resolved.get((path, target)) match
+            resolved.get((path, target, allocator)) match
               case Some(answer) => answer
               case None         =>
-                val answer = found(path, target)
+                val answer = found(path, target, allocator)
 
                 resolved.clear()
-                resolved((path, target)) = answer
+                resolved((path, target, allocator)) = answer
                 answer
           }
 
@@ -158,7 +159,8 @@ object Stdlib {
    * has the target in it too, so a test walking `Target.all` produced an entry per target and held
    * every one of them.
    */
-  private val resolved = collection.mutable.Map.empty[(String, Target), Either[String, Resolved]]
+  private val resolved =
+    collection.mutable.Map.empty[(String, Target, Allocator), Either[String, Resolved]]
 
   /** How many answers are held, so a test can pin the bound. See `Std.cachedTargets`. */
   private[sysl] def cachedResolutions: Int = resolved.synchronized(resolved.size)
@@ -189,16 +191,16 @@ object Stdlib {
    * and the flag — the same one they would have got before — with the reason the compiler could not
    * do it for them appended.
    */
-  private def found(path: String, target: Target): Either[String, Resolved] = {
-    val already = if isFile(path) then load(path, target) else Left(s"$path does not exist")
+  private def found(path: String, target: Target, allocator: Allocator): Either[String, Resolved] = {
+    val already = if isFile(path) then load(path, target, allocator) else Left(s"$path does not exist")
 
     already match
       case Right(got) => Right(got)
       case Left(why) =>
         Console.err.println(s"building the standard module at $path ($why)")
 
-        writeArtifact(path, target) match
-          case Right(_) => load(path, target)
+        writeArtifact(path, target, allocator = allocator) match
+          case Right(_) => load(path, target, allocator)
           case Left(err) =>
             Left(s"cannot find or build the standard module — build it with " +
               s"'sysl build-lib library --std', or pass --no-std-lib to compile against the copy built " +
@@ -214,13 +216,13 @@ object Stdlib {
    * kind as not finding it at all, and is reported rather than worked around. A standard module that
    * cannot be read is not a standard module.
    */
-  private def load(path: String, target: Target): Either[String, Resolved] = {
+  private def load(path: String, target: Target, allocator: Allocator): Either[String, Resolved] = {
     val bytes =
       try readBytes(path)
       catch case e: Exception => return Left(s"cannot read $path: ${e.getMessage}")
 
     LibraryArtifact.metadataOf(path, bytes).flatMap(meta =>
-      read(path, meta, target).map((std, symbols) => Resolved(std, symbols, Some(path))))
+      read(path, meta, target, allocator).map((std, symbols) => Resolved(std, symbols, Some(path))))
   }
 
   /** The library **parsed from its source**, as a given target sees it — the standard module the
@@ -294,8 +296,9 @@ object Stdlib {
    * this to fail. Refusing puts it on the path a corrupt one already takes: at the default path it is
    * rebuilt from the library's own source, and where `--std-lib` named it the refusal stands.
    */
-  def read(name: String, metadata: String, target: Target): Either[String, (Stdlib, Set[String])] =
-    LibraryArtifact.read(name, metadata, target).flatMap((units, precompiled, source) =>
+  def read(name: String, metadata: String, target: Target, allocator: Allocator = Allocator.c)
+      : Either[String, (Stdlib, Set[String])] =
+    LibraryArtifact.read(name, metadata, target, allocator).flatMap((units, precompiled, source) =>
       if source == Std.fingerprint then Right((new Stdlib(units), precompiled))
       else
         Left(s"$name was built from a different standard module than this compiler's — " +
@@ -328,10 +331,12 @@ object Stdlib {
    * artifact or the whole of the new one — and a build that fails leaves the one that was already
    * there, rather than deleting a working artifact on its way to not producing one.
    */
-  def writeArtifact(out: String, target: Target, ar: Option[String] = None): Either[String, Unit] =
+  def writeArtifact(out: String, target: Target, ar: Option[String] = None,
+                    allocator: Allocator = Allocator.c): Either[String, Unit] =
     for
       archiver <- Toolchain.findAr(ar)
-      built    <- LibraryArtifact.build(Std.sources, target, LibraryArtifact.std, Some(fromSource(target)))
+      built    <- LibraryArtifact.build(Std.sources, target, LibraryArtifact.std,
+                                        Some(fromSource(target)), allocator = allocator)
       _        <- {
                     val staging  = createTempDirectory("sysl-std-")
                     val code     = s"$staging/${LibraryArtifact.codeMember}"

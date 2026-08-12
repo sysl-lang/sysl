@@ -408,9 +408,44 @@ private[sysl] def execute(cfg: Config): Int = {
     return fail(s"${cfg.command} compiles the standard module into what it writes, since a C link " +
       "line cannot carry a '.syslib' — so --std-lib has nothing to name here")
 
+  // What this project depends on, fetched and version-selected (`packages.md § 3`, `§ 5`). A project
+  // with no `dependencies` resolves to itself and this costs nothing, which is what keeps
+  // `sysl run hello.sysl` free of ceremony.
+  //
+  // **Above the standard module rather than below it, because the allocator is settled here** and
+  // every artifact this compilation reads is built for one allocator — the standard module's included.
+  // It is still below every flag check, so a command line that cannot mean anything is refused without
+  // reaching the network.
+  //
+  // `build-lib` fetches nothing, which is the invariant the early return below preserves: a command
+  // that compiles one tree into an artifact for one machine should not reach the network, so a
+  // `dependencies` block is refused by `buildLibrary` rather than acted on here.
+  val fetched =
+    if cfg.command == "build-lib" then PackageSources.none
+    else
+      dependencies(cfg, project) match
+        case Left(err) => return fail(err)
+        case Right(d)  => d
+
+  // The pair of C functions this whole program allocates through (`packages.md § 10`). A package that
+  // brings its own heap says so, and saying so settles it for the program — which is the only shape
+  // that can work, because there is one heap and whoever holds the last reference to something is who
+  // frees it (`03`). Two packages naming different pairs is refused here rather than at the link,
+  // where it would not be refused at all: both symbols resolve, and the program simply gives one
+  // allocator's storage back to another.
+  //
+  // The project's own declaration is folded in beside the fetched ones, so an application with its own
+  // heap and no dependency that has one is answered by the same rule — and so is a **library** being
+  // built into an artifact, whose own is the whole answer because it has no dependencies to consult.
+  val allocator = Allocator.choose(
+    project.allocator.map("this project" -> _).toList ::: fetched.allocators) match
+    case Left(err) => return fail(err)
+    case Right(a)  => a
+
   // Which standard module this compilation is compiled against — an error if there is none, the same
   // as any other missing library.
-  val Stdlib.Resolved(std, coreSymbols, coreArchive) = Stdlib.resolve(stdChoice(cfg), target) match
+  val Stdlib.Resolved(std, coreSymbols, coreArchive) =
+    Stdlib.resolve(stdChoice(cfg), target, allocator) match
     case Left(err) => return fail(err)
     case Right(c)  => c
 
@@ -450,7 +485,8 @@ private[sysl] def execute(cfg: Config): Int = {
     case None    => ()
 
   val decoded =
-    artifacts.zip(unpacked).collect { case (p, Right(meta)) => LibraryArtifact.read(p, meta, target) }
+    artifacts.zip(unpacked).collect { case (p, Right(meta)) =>
+      LibraryArtifact.read(p, meta, target, allocator) }
 
   decoded.collectFirst { case Left(e) => e } match
     case Some(e) => return fail(e)
@@ -476,28 +512,8 @@ private[sysl] def execute(cfg: Config): Int = {
   // acted on, and `buildLibrary` says so in as many words.
   if cfg.command == "build-lib" then
     return buildLibrary(cfg, sources, target, std, project,
-                        collected.flatMap(_._2), decoded.collect { case Right(r) => r._1 }.flatten)
-
-  // What this project depends on, fetched and version-selected (`packages.md § 3`, `§ 5`). A project
-  // with no `dependencies` resolves to itself and this costs nothing, which is what keeps
-  // `sysl run hello.sysl` free of ceremony.
-  val fetched = dependencies(cfg, project) match
-    case Left(err) => return fail(err)
-    case Right(d)  => d
-
-  // The pair of C functions this whole program allocates through (`packages.md § 10`). A package that
-  // brings its own heap says so, and saying so settles it for the program — which is the only shape
-  // that can work, because there is one heap and whoever holds the last reference to something is who
-  // frees it (`03`). Two packages naming different pairs is refused here rather than at the link,
-  // where it would not be refused at all: both symbols resolve, and the program simply gives one
-  // allocator's storage back to another.
-  //
-  // The project's own declaration is folded in beside the fetched ones, so an application with its own
-  // heap and no dependency that has one is answered by the same rule.
-  val allocator = Allocator.choose(
-    project.allocator.map("this project" -> _).toList ::: fetched.allocators) match
-    case Left(err) => return fail(err)
-    case Right(a)  => a
+                        collected.flatMap(_._2), decoded.collect { case Right(r) => r._1 }.flatten,
+                        allocator)
 
   val librarySources = collected.flatMap(_._2) ::: fetched.sources
   val packages       = fetched.packages
@@ -875,7 +891,7 @@ private def moduleName(path: String): String = {
  */
 private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std: Stdlib,
                          project: PackageConfig, libraries: List[Source],
-                         libraryTrees: List[Program]): Int = {
+                         libraryTrees: List[Program], allocator: Allocator): Int = {
   val named = project.name
 
   // Said before anything is compiled, and said as a *request* the driver cannot meet rather than as
@@ -907,7 +923,7 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
 
   LibraryArtifact.build(sources, target, if cfg.std then LibraryArtifact.std else Set.empty, Some(std),
                         native, SearchPaths(cfg.linkPaths, cfg.includePaths, cfg.defines),
-                        libraries, libraryTrees) match
+                        libraries, libraryTrees, allocator) match
     case Left(err) => report(err)
     case Right((ir, meta)) =>
       // The standard module's default output is the place a compilation looks for it, so that
@@ -917,7 +933,7 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
       // the library without depending on where the caller happened to be standing.
       val out =
         cfg.output.getOrElse(
-          if cfg.std then cfg.stdSearch.getOrElse(LibraryArtifact.stdDefault(target))
+          if cfg.std then cfg.stdSearch.getOrElse(LibraryArtifact.stdDefault(target, allocator))
           else defaultOutput(cfg.file, named, LibraryArtifact.extension))
 
       Project.parentOf(out).foreach(createDirectories)
