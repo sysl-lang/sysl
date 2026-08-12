@@ -24,7 +24,8 @@ import scala.collection.mutable
  * the only level at which a temporary's lifetime is decided.
  */
 class Codegen private (protected val program: TProgram, promotions: Escape.Promotions,
-                       protected val target: Target)
+                       protected val target: Target,
+                       override protected val allocator: Allocator)
     extends ExprEmitter {
 
   /** The ghost functions of this program, which nothing emitted may name (`17 §8`). */
@@ -69,7 +70,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     while runtimeQueue.nonEmpty do
       val text = runtimeQueue.dequeue()()
 
-      if text.contains("call ptr @malloc(") then plainDropFn
+      if text.contains(s"call ptr @$mallocSym(") then plainDropFn
       runtimeTexts += text
 
     val out = new mutable.StringBuilder
@@ -84,8 +85,8 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // the **name** as well as the signature — so all of these are the machine's word rather than
     // eight bytes, and naming the wrong overload is a call to a function that does not exist.
     if heap then
-      out ++= s"declare ptr @malloc($word)\n"
-      out ++= "declare void @free(ptr)\n"
+      out ++= s"declare ptr @$mallocSym($word)\n"
+      out ++= s"declare void @$freeSym(ptr)\n"
     if checked then
       out ++= s"declare { $word, i1 } @llvm.umul.with.overflow.$word($word, $word)\n"
       out ++= s"declare { $word, i1 } @llvm.uadd.with.overflow.$word($word, $word)\n"
@@ -105,7 +106,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // since two declarations may name one symbol under different sysl names. A module may not
     // declare one symbol twice.
     val declared = mutable.Set("llvm.trap") ++
-      (if heap then Set("malloc", "free") else Set.empty) ++
+      (if heap then Set(mallocSym, freeSym) else Set.empty) ++
       (if usesSnprintf then Set("snprintf") else Set.empty) ++
       (if program.entryPoint && program.tests.nonEmpty then Set("strcmp") else Set.empty)
 
@@ -692,11 +693,18 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
 object Codegen {
 
-  /** Lowers a typed program to an LLVM IR module, for a given machine (`targets.md`). */
+  /** Lowers a typed program to an LLVM IR module, for a given machine (`targets.md`) and from a given
+   * heap (`packages.md § 10`).
+   *
+   * `allocator` defaults to libc's pair, so a caller with no opinion — every test that is not about
+   * this, and every program whose packages say nothing — gets exactly the module it got before a
+   * package could name one.
+   */
   def generate(
       program: TProgram,
       promotions: Escape.Promotions = Escape.Promotions.none,
       target: Target = Target.default,
+      allocator: Allocator = Allocator.c,
   ): String =
-    new Codegen(program, promotions, target).gen()
+    new Codegen(program, promotions, target, allocator).gen()
 }

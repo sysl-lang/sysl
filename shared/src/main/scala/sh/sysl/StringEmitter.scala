@@ -97,7 +97,7 @@ object StringEmitter {
    * `sext i32 %n to i32` is not an instruction at all. So this answers with the line to emit,
    * which may be empty, and the name to read afterwards, which may be the original.
    */
-  private def counted(using w: Word): (String, String) =
+  private def counted(using w: Word, a: Allocator): (String, String) =
     if w.bits > 32 then (s"  %n64 = sext i32 %n to ${w.llvm}", "%n64") else ("", "%n")
 
   /** The three header words every `StrBuf` starts with — a strong count of one, no deallocation
@@ -113,10 +113,10 @@ object StringEmitter {
    * runtime helpers reach the allocator — which every helper embedding this one does, one line
    * above.
    */
-  private def strBufHeader(using w: Word): String = {
+  private def strBufHeader(using w: Word, a: Allocator): String = {
     val word = w.llvm
 
-    s"""  %p = call ptr @malloc($word %size)
+    s"""  %p = call ptr @${a.alloc}($word %size)
        |  store $word 1, ptr %p
        |  %hook = getelementptr %arc.header, ptr %p, i32 0, i32 1
        |  store ptr @arc.drop.plain, ptr %hook
@@ -128,7 +128,7 @@ object StringEmitter {
   /** Writing bytes out. `putchar` is declared here rather than beside `printf` because a module
    * that never prints a string never needs it.
    */
-  def write(using w: Word): String = {
+  def write(using w: Word, a: Allocator): String = {
     val word = w.llvm
 
     s"""declare i32 @putchar(i32)
@@ -156,7 +156,7 @@ object StringEmitter {
   /** Byte comparison: the common prefix decides it, and if there is no difference there the
    * shorter string comes first.
    */
-  def cmp(using w: Word): String = {
+  def cmp(using w: Word, a: Allocator): String = {
     val word = w.llvm
 
     s"""define private i32 @sysl.str.cmp(ptr %a, $word %an, ptr %b, $word %bn) {
@@ -198,7 +198,7 @@ object StringEmitter {
    * view names the buffer as its owner, the first payload byte as its start, and the summed
    * length.
    */
-  def concat(using w: Word): String = {
+  def concat(using w: Word, a: Allocator): String = {
     val word = w.llvm
     val str  = Type.Str.llvm
 
@@ -247,7 +247,7 @@ object StringEmitter {
    * payload — with the header size taken portably from `%arc.header`. Every `str(x)` that renders
    * into a scratch buffer finishes through here, so the allocation and copy live in one place.
    */
-  def fromBytes(using w: Word): String = {
+  def fromBytes(using w: Word, a: Allocator): String = {
     val word = w.llvm
     val str  = Type.Str.llvm
 
@@ -283,7 +283,7 @@ object StringEmitter {
    * buffer, then copied out — the length is computed from the range rather than read as a
    * NUL-terminated run, so `char(0)` becomes a one-byte string rather than an empty one.
    */
-  def char(using w: Word): String = {
+  def char(using w: Word, a: Allocator): String = {
     val word = w.llvm
     val str  = Type.Str.llvm
 
@@ -330,7 +330,7 @@ object StringEmitter {
    * problems than this one, so the size is left as the honest consequence of the width rather than
    * being capped into a wrong answer.
    */
-  def int(bits: Int)(using w: Word): String = {
+  def int(bits: Int)(using w: Word, a: Allocator): String = {
     val ty   = s"i$bits"
     val buf  = digitCapacity(bits)
     val word = w.llvm
@@ -387,7 +387,7 @@ object StringEmitter {
    * uncounted exactly as the NUL after a literal does. This is the one case that needs libc, and
    * `print` already does, so it adds no dependency in practice.
    */
-  def float(using w: Word): String = {
+  def float(using w: Word, a: Allocator): String = {
     val word         = w.llvm
     val str          = Type.Str.llvm
     val (widen, len) = counted
@@ -420,7 +420,7 @@ object StringEmitter {
    * **The value stays an `i64` on every machine**, which is the one place in this file where a
    * hardwired sixty-four is right: it is the width `%lld` names, not the width of an address.
    */
-  def fmtInt(using w: Word): String = {
+  def fmtInt(using w: Word, a: Allocator): String = {
     val word         = w.llvm
     val str          = Type.Str.llvm
     val (widen, len) = counted
@@ -446,7 +446,7 @@ object StringEmitter {
   /** A float rendered through a printf specifier, the same shape as the integer case with a
    * `double` argument the specifier expects directly.
    */
-  def fmtFloat(using w: Word): String = {
+  def fmtFloat(using w: Word, a: Allocator): String = {
     val word         = w.llvm
     val str          = Type.Str.llvm
     val (widen, len) = counted
@@ -474,7 +474,7 @@ object StringEmitter {
    * terminator, so a NUL-terminated copy is made for `snprintf` and freed after; an interior NUL
    * therefore ends the field, which is exactly `%s`'s own rule.
    */
-  def fmtStr(using w: Word): String = {
+  def fmtStr(using w: Word, a: Allocator): String = {
     val word         = w.llvm
     val str          = Type.Str.llvm
     val (widen, len) = counted
@@ -482,7 +482,7 @@ object StringEmitter {
     s"""define private $str @sysl.str.fmt_s(ptr %fmt, ptr %src, $word %len) {
        |entry:
        |  %ccap = add $word %len, 1
-       |  %cstr = call ptr @malloc($word %ccap)
+       |  %cstr = call ptr @${a.alloc}($word %ccap)
        |  br label %ccond
        |ccond:
        |  %i = phi $word [ 0, %entry ], [ %inext, %cbody ]
@@ -506,7 +506,7 @@ object StringEmitter {
        |  %size = add $word %hsize, %cap
        |${strBufHeader}
        |  %w = call i32 (ptr, $word, ptr, ...) @snprintf(ptr %bytes, $word %cap, ptr %fmt, ptr %cstr)
-       |  call void @free(ptr %cstr)
+       |  call void @${a.free}(ptr %cstr)
        |  %v0 = insertvalue $str undef, ptr %p, 0
        |  %v1 = insertvalue $str %v0, ptr %bytes, 1
        |  %v2 = insertvalue $str %v1, $word $len, 2
@@ -516,7 +516,7 @@ object StringEmitter {
   }
 
   /** A continuation byte is `10xxxxxx`; every other byte starts a character. */
-  def boundary(using w: Word): String = {
+  def boundary(using w: Word, a: Allocator): String = {
     val word = w.llvm
 
     s"""define private i1 @sysl.str.boundary(ptr %p, $word %n, $word %i) {

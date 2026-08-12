@@ -60,7 +60,7 @@ object WriterEmitter {
    * program's end rather than this writer's business, so `failed` is the constant a latch with
    * nothing to latch reports.
    */
-  def buffer(using w: Word): String = {
+  def buffer(using w: Word, a: Allocator): String = {
     val word = w.llvm
     val str  = Type.Str.llvm
     val slot = s"{ ptr, $word, $word }"
@@ -83,7 +83,7 @@ object WriterEmitter {
        |  %want = select i1 %bigger, $word %need, $word %twice
        |  %tiny = icmp ult $word %want, 32
        |  %newcap = select i1 %tiny, $word 32, $word %want
-       |  %new = call ptr @malloc($word %newcap)
+       |  %new = call ptr @${a.alloc}($word %newcap)
        |  %old = load ptr, ptr %bufp
        |  br label %move
        |move:
@@ -101,7 +101,7 @@ object WriterEmitter {
        |  %had = icmp ne ptr %old, null
        |  br i1 %had, label %drop, label %install
        |drop:
-       |  call void @free(ptr %old)
+       |  call void @${a.free}(ptr %old)
        |  br label %install
        |install:
        |  store ptr %new, ptr %bufp
@@ -142,7 +142,7 @@ object WriterEmitter {
        |  %had = icmp ne ptr %buf, null
        |  br i1 %had, label %drop, label %done
        |drop:
-       |  call void @free(ptr %buf)
+       |  call void @${a.free}(ptr %buf)
        |  br label %done
        |done:
        |  ret $str %s

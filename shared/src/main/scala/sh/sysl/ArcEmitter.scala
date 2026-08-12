@@ -257,7 +257,7 @@ trait ArcEmitter extends Emitter {
    * declaration nothing calls names no symbol in the object file. What the linker was complaining
    * about was the call, which is why the card counted calls rather than declarations.
    */
-  private def emitFree(): Unit = emit("call void @free(ptr %p)")
+  private def emitFree(): Unit = emit(s"call void @$freeSym(ptr %p)")
 
   /** The retain / release helper for an aggregate type, which walks the fields that carry
    * references. Emitted once per type rather than inlined, since a data enum needs a tag test
@@ -346,7 +346,7 @@ trait ArcEmitter extends Emitter {
 
     val end  = freshTemp(); emit(s"$end = getelementptr $bn, ptr null, i32 1")
     val size = freshTemp(); emit(s"$size = ptrtoint ptr $end to $word")
-    val p    = freshTemp(); emit(s"$p = call ptr @malloc($word $size)")
+    val p    = freshTemp(); emit(s"$p = call ptr @$mallocSym($word $size)")
 
     emit(s"store $word 1, ptr $p")
     val hook = freshTemp(); emit(s"$hook = getelementptr $bn, ptr $p, i32 0, i32 1")

@@ -380,7 +380,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val fits  = freshTemp(); emit(s"$fits = xor i1 $over, true")
     trapUnless(fits, "size")
 
-    val p   = freshTemp(); emit(s"$p = call ptr @malloc($word $total)")
+    val p   = freshTemp(); emit(s"$p = call ptr @$mallocSym($word $total)")
     val got = freshTemp(); emit(s"$got = icmp ne ptr $p, null")
     trapUnless(got, "alloc")
 

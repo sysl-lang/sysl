@@ -18,6 +18,26 @@ trait Emitter {
    */
   protected def target: Target
 
+  /** The two C symbols this module's storage comes from and goes back to (`packages.md § 10`).
+   *
+   * A program has one pair, settled from the packages it is built from before any of this runs, so
+   * nothing below decides it — every emitter that allocates or releases reads it here rather than
+   * spelling `malloc`. Defaulted to libc's, which is what every program got before a package could say
+   * otherwise and what a `Codegen` constructed without one still gets.
+   */
+  protected def allocator: Allocator = Allocator.c
+
+  /** The allocating half, as it is written in IR — `@malloc`, or whatever the packages named. */
+  protected def mallocSym: String = allocator.alloc
+
+  /** The releasing half, the same way. */
+  protected def freeSym: String = allocator.free
+
+  /** Given for the same reason `Word` is: the runtime helpers are text templates on the companion
+   * objects, so a helper that allocates needs the pair in scope without every caller threading it.
+   */
+  protected given Allocator = allocator
+
   /** How wide an address is, given to every `Type.llvm` in scope. A view's length is a `usize`, so
    * an emitter cannot write the LLVM form of a slice without it — and because there is no default
    * anywhere, an emitter that somehow had no target would not compile rather than quietly writing
