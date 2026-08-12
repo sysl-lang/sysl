@@ -605,6 +605,22 @@ trait ArcEmitter extends Emitter {
 
 object ArcEmitter {
 
+  /** The one symbol a freestanding **port** may define to say what the running task's reaper scratch
+   * is (`06 § Letting go of the last one`).
+   *
+   * It is a C name rather than a sysl one because whoever knows the answer is a scheduler written in
+   * C: under FreeRTOS it is `pvTaskGetThreadLocalStoragePointer`, under something else it is
+   * whatever that runtime keeps per task. It answers with a pointer to storage of two words —
+   * `struct { void *head; unsigned char draining; }` — which must live as long as the task and must
+   * not be shared with another one.
+   *
+   * Emitted `weak` alongside a definition returning the module's own single slot, so a program with
+   * no scheduler links with nothing supplied and behaves as it always has. Nothing checks that a
+   * port's definition is honest; a slot two tasks share is the very defect this exists to let a port
+   * avoid, and the compiler cannot see it.
+   */
+  val reaperSlot = "__sysl_arc_reaper"
+
   /** All of ARC that is the same for every type — which, because the destructor lives behind the
    * box's hook, is all of it but the hooks themselves.
    *
@@ -626,12 +642,27 @@ object ArcEmitter {
    * releasing the last reference to two unrelated `&sync` structures at the same moment both reach
    * `arc.reap`, and one list between them would have each overwrite the other's head — a queued
    * object dropped on the floor, or drained twice. Neither is a race the counts could prevent: the
-   * counts are what got both threads here correctly. So the list is `thread_local` and each thread
-   * drains its own, which is also what makes the `arc.draining` flag mean what it says, since it
-   * asks whether *this* thread is already inside a drain further up its own stack.
+   * counts are what got both threads here correctly. So the head and the flag travel together as one
+   * **slot**, each thread drains its own, and that is what makes the flag mean what it says: it asks
+   * whether *this* thread is already inside a drain further up its own stack.
    *
-   * A target with no thread-local storage keeps the plain global (`Target.hasThreadLocalStorage`),
-   * which is exactly as correct there as it was everywhere before: nothing on a bare target spawns.
+   * **Where there is no notion of a current thread, the slot is asked for rather than assumed.** A
+   * target with thread-local storage reaches its own directly and this costs nothing. A freestanding
+   * target has no thread pointer — asked for a `thread_local`, LLVM gives it the local-exec model,
+   * whose offset is read from a register nothing on a bare machine has written — so it calls
+   * `__sysl_arc_reaper`, defined `weak` here to return the one plain slot. A program with no
+   * scheduler defines nothing and gets exactly the single-list behaviour it has always had; a port
+   * that *does* schedule defines the symbol over this one and answers with storage belonging to the
+   * running task.
+   *
+   * **That is delegation rather than a new dependency, because `&sync` on a bare target is already
+   * the environment's.** Its counts are `atomicrmw`, which LLVM cannot lower without `ldrex`/`strex`
+   * and turns into a call to `__atomic_fetch_add_4` the board must define — and on a two-core part
+   * that definition needs a hardware spinlock, since masking interrupts covers one core. A runtime
+   * that already asks the board how to add atomically may ask it what the current task is.
+   *
+   * The call is on the path taken when a strong count reaches zero, so it is once per object rather
+   * than once per release, and a target with real thread-local storage does not make it at all.
    *
    * **The storage outlives the object when something weak still asks about it.** The strong count
    * reaching zero destroys the object — the payload's references are given back — but the bytes
@@ -647,6 +678,27 @@ object ArcEmitter {
    */
   def core(target: Target): String = {
     val tls = if target.hasThreadLocalStorage then "thread_local " else ""
+
+    // How `arc.reap` comes by the slot. With thread-local storage the answer is the symbol itself
+    // and nothing is asked — a machine that knows what the current thread is has no reason to
+    // delegate. Without it the slot is fetched, and the `weak` definition below is what makes a
+    // program that supplies nothing behave exactly as it did before there was anything to supply.
+    //
+    // `weak` rather than a declaration, because the overwhelming case is the program that has no
+    // scheduler: a declaration would leave every bare-metal link needing a definition of a symbol
+    // its author has no use for. A port that schedules defines it and wins the link.
+    val supplied = !target.hasThreadLocalStorage
+
+    val supplier = if !supplied then "" else
+      s"""
+        |define weak ptr @$reaperSlot() {
+        |entry:
+        |  ret ptr @arc.reaper.self
+        |}""".stripMargin
+
+    val fetchSlot = if !supplied then "" else s"  %s = call ptr @$reaperSlot()\n"
+
+    val slot = if supplied then "%s" else "@arc.reaper.self"
 
     // The two counts are pointer-width. Nothing forces that — a reference count is not an address —
     // but the alternative is a fixed `i64`, which costs sixteen bytes of header on a machine whose
@@ -668,8 +720,10 @@ object ArcEmitter {
     // allocator that made it.
     s"""%arc.header = type { $word, ptr, $word }
       |
-      |@arc.worklist = internal ${tls}global ptr null
-      |@arc.draining = internal ${tls}global i1 false
+      |%arc.reaper = type { ptr, i8 }
+      |
+      |@arc.reaper.self = internal ${tls}global %arc.reaper zeroinitializer
+      |$supplier
       |
       |define private void @arc.retain(ptr %p) {
       |entry:
@@ -715,26 +769,29 @@ object ArcEmitter {
       |
       |define private void @arc.reap(ptr %p) {
       |entry:
-      |  %w = load ptr, ptr @arc.worklist
+      |$fetchSlot  %head = getelementptr %arc.reaper, ptr $slot, i32 0, i32 0
+      |  %flag = getelementptr %arc.reaper, ptr $slot, i32 0, i32 1
+      |  %w = load ptr, ptr %head
       |  store ptr %w, ptr %p
-      |  store ptr %p, ptr @arc.worklist
-      |  %d = load i1, ptr @arc.draining
-      |  br i1 %d, label %done, label %drain
+      |  store ptr %p, ptr %head
+      |  %d = load i8, ptr %flag
+      |  %in = icmp ne i8 %d, 0
+      |  br i1 %in, label %done, label %drain
       |drain:
-      |  store i1 true, ptr @arc.draining
+      |  store i8 1, ptr %flag
       |  br label %loop
       |loop:
-      |  %q = load ptr, ptr @arc.worklist
+      |  %q = load ptr, ptr %head
       |  %e = icmp eq ptr %q, null
       |  br i1 %e, label %finish, label %step
       |step:
       |  %next = load ptr, ptr %q
-      |  store ptr %next, ptr @arc.worklist
+      |  store ptr %next, ptr %head
       |  store $word 0, ptr %q
       |  call void @arc.destroy(ptr %q)
       |  br label %loop
       |finish:
-      |  store i1 false, ptr @arc.draining
+      |  store i8 0, ptr %flag
       |  ret void
       |done:
       |  ret void

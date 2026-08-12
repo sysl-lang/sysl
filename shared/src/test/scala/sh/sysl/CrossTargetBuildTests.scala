@@ -91,4 +91,46 @@ class CrossTargetBuildTests extends AnyFreeSpec with Matchers {
           withClue(s"$cc, ${t.triple}: ")(Toolchain.compileObject(ir, obj, t) shouldBe Right(()))
         }
     }
+
+  /** That the reaper slot a freestanding port may define really is **weak in the object**, which is
+   * the claim `06 § Letting go of the last one` rests on and the one thing the emitted text cannot
+   * settle by itself.
+   *
+   * `define weak` is what lets a scheduler's port define `__sysl_arc_reaper` and win the link while
+   * a program with no scheduler links against the module's own single slot and defines nothing. Read
+   * in the IR that is an adjective; read out of the symbol table it is the linkage the linker will
+   * act on, and `nm` marks it `W`. A strong definition here would make every bare-metal link that
+   * also carried a port fail on a duplicate symbol — a failure at somebody else's link, months from
+   * the change that caused it.
+   */
+  "the reaper slot a port may define is weak in the object, not merely in the text" in {
+    val t  = Target.aarch64Freestanding
+    val cc = Toolchain.findClang(t).getOrElse(cancel(s"no clang for ${t.name}"))
+
+    val src = """struct Node
+                |    v: int
+                |var p: &sync Node = Node(1)
+                |""".stripMargin
+
+    val obj = createTempFile("sysl-reaper-", ".o")
+    val ir = Compiler.compile(List(Source("p.sysl", src)), t) match
+      case Right(ir) => ir
+      case Left(why) => fail(s"did not compile for ${t.name}: $why")
+
+    withClue(s"$cc, ${t.triple}: ")(Toolchain.compileObject(ir, obj, t) shouldBe Right(()))
+
+    val listed = exec(List("nm", obj))
+    deleteFile(obj)
+
+    // Skipped rather than failed where there is no `nm`: this asserts something about the object
+    // format, and a machine that cannot list symbols cannot be asked about it.
+    assume(listed.exitCode == 0, "nm not available")
+
+    val line = listed.stdout.linesIterator.find(_.contains(ArcEmitter.reaperSlot))
+
+    withClue(listed.stdout)(line.isDefined shouldBe true)
+    // `W` is a weak *definition*; `w` would be a weak reference, which is a different promise and
+    // would leave the single-slot default undefined.
+    withClue(line.get)(line.get should include(" W "))
+  }
 }

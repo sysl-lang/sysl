@@ -160,6 +160,26 @@ same moment would each overwrite the other's list. The counts cannot help with t
 got both threads to the reaper correctly, each having genuinely released the last reference to a
 different object.
 
+**Where there is no notion of a current thread, "per thread" is delegated rather than dropped.** A
+freestanding target has no thread pointer — asked for a thread-local, LLVM gives it a model whose
+offset is read from a register nothing on a bare machine has written — so the reaper asks for its
+slot instead, through one weak symbol: `__sysl_arc_reaper`, answering with a `head` pointer and a
+`draining` flag that must live as long as the running task and must not be shared with another. A
+program with no scheduler defines nothing, gets the single slot the module supplies, and behaves
+exactly as a machine that never spawns should. **An RTOS port defines it** — under FreeRTOS from
+`pvTaskGetThreadLocalStoragePointer` — and `&sync T` then means on that target what this section
+says it means.
+
+That is delegation and not a new dependency, because on such a target the counts are already the
+environment's: an `atomicrmw` with no `ldrex`/`strex` beneath it becomes a call to an `__atomic_*`
+the board defines, and on a two-core part the honest definition takes a hardware spinlock, since
+masking interrupts covers one core. A runtime already asking the board how to add atomically may ask
+it what the running task is.
+
+**Nothing checks that a port's answer is honest**, and nothing can: a slot two tasks share is
+precisely the defect this exists to let a port avoid, and it is invisible from here. What the
+language owes is that the question is asked at all, rather than answered wrongly by assumption.
+
 ## Channels
 
 Domains talk by **channel**, one type with two implementations underneath:

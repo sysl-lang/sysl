@@ -193,49 +193,77 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
    * storage class is asserted in the text.
    */
   "the reaper's worklist" - {
-    "is thread-local, and so is the flag saying a drain is already running" in {
+    "is thread-local, along with the flag saying a drain is already running" in {
       val out = ir(chain + "var p: &sync Node = Node(1)")
 
-      out should include("@arc.worklist = internal thread_local global ptr null")
-      out should include("@arc.draining = internal thread_local global i1 false")
+      out should include("%arc.reaper = type { ptr, i8 }")
+      out should include("@arc.reaper.self = internal thread_local global %arc.reaper zeroinitializer")
     }
 
-    // The reaper is unchanged by the storage class: it still threads the list through the dead count
-    // slot and still drains in a loop rather than recursing.
+    // A machine that knows what the current thread is has no reason to ask anybody: the slot is
+    // reached by name, and the symbol a port would define is not emitted at all.
+    "and a target with it asks nobody for the slot" in {
+      val out = ir(chain + "var p: &sync Node = Node(1)")
+
+      out should include("%head = getelementptr %arc.reaper, ptr @arc.reaper.self, i32 0, i32 0")
+      out should not include ArcEmitter.reaperSlot
+    }
+
+    // The reaper is unchanged by where the slot came from: it still threads the list through the
+    // dead count slot and still drains in a loop rather than recursing.
     "and the reaper reads and writes it exactly as it did" in {
       val out = ir(chain + "var p: &sync Node = Node(1)")
 
-      out should include regex raw"%w = load ptr, ptr @arc\.worklist\n  store ptr %w, ptr %p"
-      out should include("store ptr %p, ptr @arc.worklist")
-      out should include regex raw"drain:\n  store i1 true, ptr @arc\.draining"
+      out should include regex raw"%w = load ptr, ptr %head\n  store ptr %w, ptr %p"
+      out should include("store ptr %p, ptr %head")
+      out should include regex raw"drain:\n  store i8 1, ptr %flag"
     }
 
-    /** A bare target keeps the plain global, and the reason is not that threads are unlikely there:
-     * asked for a thread-local, LLVM gives a freestanding ELF target the **local-exec** model, whose
-     * `:tprel_hi12:` offset is read from a thread pointer register nothing on a bare machine has
-     * written. That links clean and reads a wild address, which is the one outcome worse than the
-     * single-threaded list — and nothing the compiler provides can spawn there anyway, since the
-     * threads a program gets come from a module that is `requires posix`.
+    /** A bare target cannot have the slot as a thread-local, and the reason is not that threads are
+     * unlikely there: asked for one, LLVM gives a freestanding ELF target the **local-exec** model,
+     * whose `:tprel_hi12:` offset is read from a thread pointer register nothing on a bare machine
+     * has written. That links clean and reads a wild address.
+     *
+     * So it asks instead, and the answer is the environment's — which is the same arrangement
+     * `&sync`'s counts are already under, since an `atomicrmw` with no `ldrex`/`strex` under it
+     * becomes a call to an `__atomic_*` the board defines.
      */
-    "is a plain global where nothing has set thread-local storage up" in {
+    "is fetched where nothing has set thread-local storage up" in {
       val out = irFor(Target.aarch64Freestanding, chain + "var p: &sync Node = Node(1)")
 
-      out should include("@arc.worklist = internal global ptr null")
-      out should include("@arc.draining = internal global i1 false")
+      out should include(s"%s = call ptr @${ArcEmitter.reaperSlot}()")
+      out should include("%head = getelementptr %arc.reaper, ptr %s, i32 0, i32 0")
       out should not include "thread_local"
     }
 
+    // `weak`, so the overwhelming case — a bare-metal program with no scheduler at all — links with
+    // nothing supplied and drains through the one slot exactly as it always has. A port that
+    // schedules defines the symbol over this and wins the link.
+    "and the program supplies its own answer weakly, so a port can win the link" in {
+      val out = irFor(Target.aarch64Freestanding, chain + "var p: &sync Node = Node(1)")
+
+      out should include(s"define weak ptr @${ArcEmitter.reaperSlot}()")
+      out should include("@arc.reaper.self = internal global %arc.reaper zeroinitializer")
+      out should include regex raw"entry:\n  ret ptr @arc\.reaper\.self"
+    }
+
     // Stated over the whole registry rather than for the two targets above, so that a target added
-    // later cannot get one storage class while `Target` says the other.
-    "and every target gets whichever one it says it has" in {
+    // later cannot be reaching for a thread pointer it has not got, or paying for a call it need
+    // not make.
+    "and every target either has the slot or asks for it, never both and never neither" in {
       for t <- Target.all if t.supported do
         withClue(t.name) {
           val out = irFor(t, chain + "var p: &sync Node = Node(1)")
           val tls = if t.hasThreadLocalStorage then "thread_local " else ""
 
-          out should include(s"@arc.worklist = internal ${tls}global ptr null")
-          out should include(s"@arc.draining = internal ${tls}global i1 false")
+          out should include(s"@arc.reaper.self = internal ${tls}global %arc.reaper zeroinitializer")
+          out.contains(s"define weak ptr @${ArcEmitter.reaperSlot}()") shouldBe !t.hasThreadLocalStorage
         }
     }
+
+    // That the loop still *works* once it threads its work through a `getelementptr` is
+    // `RecursiveTeardownRunTests`, which drops a chain long enough that one C frame per node would
+    // be the difference between working and not — including through the atomic release path, which
+    // is the one this slot exists for. Read there rather than duplicated here.
   }
 }

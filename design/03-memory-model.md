@@ -153,9 +153,11 @@ work rather than recursing, so a structure of any depth comes apart in O(1) stac
 shares. Two threads letting go of the last reference to two unrelated `&sync` structures at the
 same moment both reach it, and one list between them would have each overwrite the other's head —
 an object dropped on the floor, or drained twice. Neither is a race the counts could have caught:
-the counts are what got both threads there correctly. On a target with no thread-local storage it
-stays a single list, which is exactly as correct there as it was everywhere before — nothing on a
-bare machine can spawn (`06 § Threads are a capability`).
+the counts are what got both threads there correctly. On a target with no thread-local storage the
+list and its flag are **asked for** rather than assumed — one weak symbol a scheduler's port may
+define, answering with the running task's own, and answering with the module's single slot when
+nobody defines it (`06 § Letting go of the last one`). Nothing sysl provides can spawn on a bare
+machine (`06 § Threads are a capability`); something linked beside it can.
 
 Putting the destructor *behind* the hook rather than inline at each release site is what makes
 letting go of a reference **type-erased**: one instruction sequence, no static type. Slices
