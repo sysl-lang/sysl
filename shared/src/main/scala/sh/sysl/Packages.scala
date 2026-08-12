@@ -61,19 +61,29 @@ case class Packages(of: Map[Source, String] = Map.empty, imports: Map[String, Ma
   def isEmpty: Boolean = of.isEmpty && imports.isEmpty
 }
 
+/** One package's declared need of a header it includes and does not carry (`packages.md § 8`).
+ *
+ * `who` is the package's coordinate rather than its module name, because that is what a consumer
+ * wrote in their `dependencies` block and therefore what they can go and look at. `why` is the
+ * package's own prose and is quoted rather than summarised.
+ */
+case class HeaderNeed(who: String, name: String, why: String)
+
 /** What a project's `dependencies` block brings to one compilation.
  *
- * Three things and not one, because a package reaches a build by more than one road. Its `.sysl` is
+ * Four things and not one, because a package reaches a build by more than one road. Its `.sysl` is
  * **more modules** and joins the compilation's own; the table keeps its module names apart from
- * every other package's; and its directory is a tree whose C is compiled and linked beside the
- * program's (`15 §7`, `NativeSources`).
+ * every other package's; its directory is a tree whose C is compiled and linked beside the
+ * program's (`15 §7`, `NativeSources`); and what that C needs to *find* is something only the
+ * consumer can supply, so the package states it and the driver checks it.
  *
  * The third is here because it was once missing. A package's sysl compiled and its C was dropped
  * with no warning, so a build against any package carrying a shim ended at the linker naming symbols
  * that package's own C defines — which `packages.md § 7` had already promised would not happen, on
  * the grounds that sysl compiles a package's C declaratively and needs no build script to do it.
  */
-case class PackageSources(sources: List[Source], packages: Packages, roots: List[String])
+case class PackageSources(sources: List[Source], packages: Packages, roots: List[String],
+                          needs: List[HeaderNeed] = Nil)
 
 object PackageSources {
 

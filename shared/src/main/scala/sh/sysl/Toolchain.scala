@@ -86,6 +86,32 @@ object SearchPaths {
    * which is every one in this repository.
    */
   val none: SearchPaths = SearchPaths()
+
+  /** `--include-path` written as `<name>=<dir>`, which satisfies a package's declared header
+   * requirement (`packages.md § 8`), or nothing where it is the ordinary bare directory.
+   *
+   * ==Why a bare path cannot be mistaken for a named one==
+   *
+   * The two forms share a flag, so the split has to be decidable by looking rather than by guessing.
+   * A name is what `PackageConfig.isHeaderName` allows — letters, digits, `_` and `-`, starting with
+   * a letter — so a directory read as one would have to hold an `=`, be a single segment with no
+   * separator before it, and have a non-empty remainder. Where the text before the first `=` is not a
+   * name the whole string is a directory, which is what an absolute path, a relative one and `.` all
+   * are.
+   *
+   * **The name is not checked against any requirement here**, and a consumer satisfying one no
+   * package declared is not an error: the directory reaches the C compiler exactly as the bare form
+   * does. Refusing it would fail a build over a package's omission, and the flag would be the only
+   * way to work around that omission.
+   */
+  def namedInclude(text: String): Option[(String, String)] =
+    text.indexOf('=') match
+      case -1 => None
+      case at =>
+        val name = text.take(at)
+        val dir  = text.drop(at + 1)
+
+        if dir.nonEmpty && PackageConfig.isHeaderName(name) then Some(name -> dir) else None
 }
 
 object Toolchain {

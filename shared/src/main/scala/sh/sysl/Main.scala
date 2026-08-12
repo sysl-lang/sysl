@@ -115,6 +115,14 @@ case class Config(
       */
     linkPaths: List[String] = Nil,
     includePaths: List[String] = Nil,
+    /** `--include-path <name>=<dir>` — the same flag naming which of a package's declared header
+      * requirements the directory answers (`packages.md § 8`).
+      *
+      * Kept beside `includePaths` rather than instead of it: the directory goes to the C compiler
+      * either way, and what the name adds is that a package which asked for it and got nothing is
+      * refused by name instead of by clang.
+      */
+    namedIncludes: Map[String, String] = Map.empty,
     defines: List[String] = Nil,
     programArgs: List[String] = Nil,
     filter: Option[String] = None,
@@ -273,10 +281,16 @@ private[sysl] val parser = {
           "manager installed outside the toolchain's own prefix; may be given more than once"),
       opt[String]("include-path")
         .unbounded()
-        .action((d, c) => c.copy(includePaths = c.includePaths :+ d))
+        .action { (d, c) =>
+          SearchPaths.namedInclude(d) match
+            case None => c.copy(includePaths = c.includePaths :+ d)
+            case Some((name, dir)) =>
+              c.copy(includePaths = c.includePaths :+ dir, namedIncludes = c.namedIncludes + (name -> dir))
+        }
         .text("a directory to look in for a header the C beside a module includes, or one an " +
           "'@include' names for a 'c const' block; the other half of --link-path, and needed by the " +
-          "same bindings; may be given more than once"),
+          "same bindings; may be given more than once. Written '<name>=<dir>' it also answers the " +
+          "header requirement a package declared under that name"),
       opt[String]('D', "define")
         .unbounded()
         .action((d, c) => c.copy(defines = c.defines :+ d))
@@ -505,6 +519,19 @@ private[sysl] def execute(cfg: Config): Int = {
     for dir <- cfg.includePaths do trace(s"include path: $dir")
     for d <- cfg.defines do trace(s"define: $d")
 
+  // What the packages said their C has to be able to find, asked of what this command line supplied
+  // (`packages.md § 8`). Answered here rather than left to clang because a header that is not there
+  // fails inside a compiler that has never heard of sysl: what comes back is `'lwip/tcp.h' file not
+  // found`, which names neither the package that wanted it nor the flag that would have supplied it.
+  //
+  // Asked only where C is going to be compiled. The requirement exists so that a tree's C compiles,
+  // so a command that compiles none has nothing unmet — and refusing `emit-llvm` or `prove` over a
+  // path they would never open would be charging for something they do not do.
+  if links(cfg.command) || cLibrary(cfg.command) then
+    unmetHeaders(project, fetched.needs, cfg.namedIncludes.keySet) match
+      case Some(err) => return fail(err)
+      case None      => ()
+
   val native =
     if links(cfg.command) then
       NativeSources.build(NativeSources.of(cfg.file :: roots ::: fetched.roots), target, cfg.optimize,
@@ -594,6 +621,38 @@ private[sysl] def execute(cfg: Config): Int = {
  * own C rather than linking it.
  */
 private def links(command: String): Boolean = command == "build" || command == "run" || command == "test"
+
+/** The header requirements nothing on this command line answered, as the one line a build stops on
+ * (`packages.md § 8`).
+ *
+ * ==Why the message is this long==
+ *
+ * Every other requirement in the file is answered by something the reader already has: a capability
+ * is provided by the target or it is not, and there is nothing to go and do. This one is answered by
+ * a path on a machine the package has never seen, so the reader is being asked to find something —
+ * and a refusal that only names what is missing leaves them to work out *what* it is, *where* it
+ * lives and *how* to say so. All three are known here: the package wrote the first two down, and the
+ * third is the flag this very check reads.
+ *
+ * The package's own prose is quoted rather than paraphrased. It is the only part of this nothing in
+ * the compiler could have written, and it is the part that says which library is meant.
+ *
+ * ==One at a time, in the order they were declared==
+ *
+ * The first unmet requirement stops the build, as `requires` already does for a capability. A
+ * consumer satisfying them one flag at a time is the same walk either way, and a list of four would
+ * be four things to look up before anything can be tried.
+ */
+private def unmetHeaders(project: PackageConfig, fromPackages: List[HeaderNeed],
+                         supplied: Set[String]): Option[String] = {
+  val own  = project.headers.toList.sortBy(_._1).map((name, why) => HeaderNeed("this project", name, why))
+  val need = own ::: fromPackages
+
+  need.find(n => !supplied.contains(n.name)).map { n =>
+    s"${n.who} needs the '${n.name}' headers and nothing supplied them — ${n.why}. Say where they " +
+      s"are with '--include-path ${n.name}=<dir>'"
+  }
+}
 
 /** Whether a subcommand is producing something a **C project** links, which is what decides that the
  * module is emitted with no entry point (`15 §12`).
@@ -983,6 +1042,8 @@ private def collectPackages(graph: Resolve.Graph): Either[String, PackageSources
           each.flatMap(_._2),
           Packages(owned, graph.packages.map(p => p.canonical -> p.imports).toMap),
           fetched.map(_.root),
+          fetched.flatMap(p =>
+            p.config.headers.toList.sortBy(_._1).map((name, why) => HeaderNeed(p.canonical, name, why))),
         ))
   catch case e: Exception => Left(s"cannot read a package: ${e.getMessage}")
 }

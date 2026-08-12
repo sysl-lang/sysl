@@ -29,6 +29,7 @@ case class PackageConfig(
     defaultTarget: Option[String] = None,
     targets: Map[String, TargetConfig] = Map.empty,
     requires: Set[String] = Set.empty,
+    headers: Map[String, String] = Map.empty,
     dependencies: List[Dependency] = Nil,
 ) {
 
@@ -51,6 +52,20 @@ object PackageConfig {
   /** The one name the driver looks for. */
   val FileName = "package.hocon"
 
+  /** The sub-block of `requires` that names headers rather than capabilities. */
+  val HeadersKey = "headers"
+
+  /** Whether a header requirement may be called this.
+   *
+   * A name reaches a command line as `--include-path <name>=<dir>`, so it must be tellable from a
+   * directory by looking — which is what `SearchPaths.namedInclude` does with it, and why the rule
+   * lives here rather than being written twice. Refused rather than escaped: a name holding a
+   * separator or an `=` would be one the flag could not carry, and the failure would land on the
+   * consumer typing a command they were given rather than on the package that chose the name.
+   */
+  def isHeaderName(name: String): Boolean =
+    name.nonEmpty && name.head.isLetter && name.forall(c => c.isLetterOrDigit || c == '_' || c == '-')
+
   /** A project that said nothing, which is what a missing file means. */
   val empty: PackageConfig = PackageConfig()
 
@@ -72,7 +87,8 @@ object PackageConfig {
         pkg     <- block(root, "package")
         _       <- checkName(pkg.flatMap(string(_, "name")))
         targets <- readTargets(root)
-        needed  <- readCapabilityFlags(block2(root, "requires"), "requires")
+        needed  <- readCapabilityFlags(capabilitiesOf(block2(root, "requires")), "requires")
+        headers <- readHeaders(block2(root, "requires"))
         deps    <- readDependencies(root)
       yield PackageConfig(
         name = pkg.flatMap(string(_, "name")),
@@ -80,6 +96,7 @@ object PackageConfig {
         defaultTarget = block2(root, "targets").flatMap(string(_, "default")),
         targets = targets,
         requires = needed.collect { case (name, true) => name }.toSet.flatMap(Capability.closure),
+        headers = headers,
         dependencies = deps,
       )
     catch
@@ -160,6 +177,53 @@ object PackageConfig {
               case ConfigBoolean(on) => Right(name -> on)
               case _                 => Left(s"$FileName: '$where.$name' must be true or false")
         }.map(_.toMap)
+
+  /** `requires` less its `headers` sub-block, which is a requirement of a different kind and is read
+   * by `readHeaders`.
+   */
+  private def capabilitiesOf(section: Option[ConfigObject]): Option[ConfigObject] =
+    section.map(caps => ConfigObject(caps.fields - HeadersKey))
+
+  /** The `headers` sub-block of `requires` — the C headers this package's own C includes and does not
+   * carry, each under a name the consumer satisfies with `--include-path <name>=<dir>`
+   * (`packages.md § 8`).
+   *
+   * ==A name, never a path==
+   *
+   * `15 §8` refuses a path here in as many words: the file is committed and describes the *package*,
+   * and where a prefix lives on somebody's laptop is not a property of the package. It refuses an
+   * environment variable for the same reason `packages.md § 7` refuses build scripts — a build that
+   * reads the consumer's shell is one that works for whoever wrote it. So what a package may say is
+   * *which* headers it needs; **where** they are stays the driver's question, exactly as it is for
+   * `@link` and `--link-path`.
+   *
+   * ==The value is the reason, and it is what makes the refusal worth having==
+   *
+   * A name alone would tell a consumer that something called `lwip` is unsatisfied and leave them to
+   * guess what that is and where it lives. The string is quoted back at them instead, so the build
+   * that stops says what to go and find. It is prose for a person and nothing reads it as data.
+   */
+  private def readHeaders(section: Option[ConfigObject]): Either[String, Map[String, String]] =
+    section.flatMap(s => block2(s, HeadersKey)) match
+      case None => Right(Map.empty)
+      case Some(headers) =>
+        collect(headers.fields.toList.sortBy(_._1)) { (name, value) =>
+          value match
+            case ConfigString(why) if why.trim.nonEmpty => checkHeaderName(name).map(_ => name -> why)
+            case ConfigString(_) =>
+              Left(s"$FileName: 'requires.$HeadersKey.$name' says nothing about what it needs — the " +
+                "text is quoted back at whoever has to supply the path, so an empty one helps nobody")
+            case _ =>
+              Left(s"$FileName: 'requires.$HeadersKey.$name' must be a string saying what these " +
+                "headers are and where they come from")
+        }.map(_.toMap)
+
+  private def checkHeaderName(name: String): Either[String, Unit] =
+    if isHeaderName(name) then Right(())
+    else
+      Left(s"$FileName: '$name' is not usable as a header requirement's name — it is written on a " +
+        "command line as '--include-path <name>=<dir>', so it must be letters, digits, '_' and '-', " +
+        "starting with a letter")
 
   /** The `dependencies` block: what to fetch, at what version, and what a consumer may rename it to
    * (`packages.md § 2–4`, `§ 9`).
