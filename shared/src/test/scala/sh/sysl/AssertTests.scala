@@ -52,6 +52,59 @@ class AssertTests extends AnyFreeSpec with Matchers with CodegenSupport with Run
       ) shouldBe "1\n"
     }
 
+    // `sizeof` alone pins the total, which catches a field that changed width and one that was
+    // added. It says nothing about *order*, so this is the half that catches a transposition — the
+    // failure that leaves the size right and every read wrong.
+    "over offsetof, which is what tells a transposition from a match" in {
+      run(
+        """struct Header
+          |    tag: u8
+          |    length: u32
+          |    flags: u16
+          |end Header
+          |@assert(offsetof(Header, tag) == 0)
+          |@assert(offsetof(Header, length) == 4, "the padding after 'tag' is what puts it at 4")
+          |@assert(offsetof(Header, flags) == 8)
+          |@assert(sizeof(Header) == 12)
+          |print(1)""".stripMargin
+      ) shouldBe "1\n"
+    }
+
+    // The same fields packed: no interior padding, so every offset is the sum of the widths before
+    // it. That is the shape a register block and a wire header have, and the one where a mirror is
+    // most worth checking.
+    "over offsetof on a packed struct, where the offsets are the widths before" in {
+      run(
+        """@packed
+          |struct Wire
+          |    tag: u8
+          |    length: u32
+          |    flags: u16
+          |end Wire
+          |@assert(offsetof(Wire, tag) == 0)
+          |@assert(offsetof(Wire, length) == 1)
+          |@assert(offsetof(Wire, flags) == 5)
+          |print(1)""".stripMargin
+      ) shouldBe "1\n"
+    }
+
+    // The transposition itself: two same-width fields swapped in the mirror leave `sizeof` at 12 and
+    // every read wrong. This is the assertion that fires where the size assertion does not.
+    "and a transposition of two same-width fields is what it catches" in {
+      val e = err(
+        """struct Status
+          |    state: u32
+          |    priority: u8
+          |    runtime: u32
+          |end Status
+          |@assert(sizeof(Status) == 12)
+          |@assert(offsetof(Status, state) == 8, "Status.state moved")
+          |print(1)""".stripMargin
+      )
+
+      e should include("assertion failed: Status.state moved")
+    }
+
     "several, each settled on its own" in {
       run(
         """@assert(sizeof(u8) == 1)
@@ -109,6 +162,31 @@ class AssertTests extends AnyFreeSpec with Matchers with CodegenSupport with Run
           |@assert(limit == 10)
           |print(1)""".stripMargin
       ) should include("has to be a constant expression")
+    }
+
+    // A misspelled field is the mistake this form exists to catch, in miniature: being told nothing
+    // about a name that is not there — or being told only that the condition did not fold — would be
+    // the same silent pass the whole feature is against. It names what the struct does store.
+    "a field the struct does not have, by name" in {
+      val e = err(
+        """struct Header
+          |    tag: u8
+          |    length: u32
+          |end Header
+          |@assert(offsetof(Header, len) == 4)
+          |print(1)""".stripMargin
+      )
+
+      e should include("has no field 'len'")
+      e should include("'tag'")
+      e should include("'length'")
+    }
+
+    "an operand that is not a struct at all" in {
+      err(
+        """@assert(offsetof(u32, x) == 0)
+          |print(1)""".stripMargin
+      ) should include("'offsetof' measures a field of a struct")
     }
   }
 

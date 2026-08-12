@@ -764,17 +764,33 @@ unsafe tier's bargain, unchanged: `p[i]` past the end is already the programmer'
 `*T` aimed at storage some invariant covers is the same assertion about a different thing. The
 boundary the compiler *can* police is the one above — that no `&T` comes out — and it polices it.
 
-### `sizeof` and `alignof`
+### `sizeof`, `alignof` and `offsetof`
 
 ```
 var bytes = sizeof(Node)               // usize, a compile-time constant
 var a     = alignof(Node)
+var at    = offsetof(Header, length)   // where a field starts, in bytes
 ```
 
-Both take a **type** and yield a `usize` (`00 §7`). Both are written over the whole type grammar —
-`sizeof(*Node)`, `sizeof([16]u8)`, `sizeof(int)` — which is why they are forms the parser reads
-rather than functions a name lookup finds; a library function's argument list holds values, and these
-hold neither a value nor a name.
+All three yield a `usize` (`00 §7`) and all three are settled while compiling. The first two take a
+**type** and nothing else; `offsetof` takes a type and then a **field name**, which is a name rather
+than an expression because there is no value here for a `p.x` to select from. All are written over
+the whole type grammar — `sizeof(*Node)`, `sizeof([16]u8)`, `offsetof(Option[int], value)` — which is
+why they are forms the parser reads rather than functions a name lookup finds; a library function's
+argument list holds values, and these hold neither a value nor a name.
+
+**`offsetof` is the half of a layout check `sizeof` structurally cannot make.** `13 §@assert` pairs a
+sysl assertion with a `_Static_assert` in the C beside it so that a mirrored struct is *checked*
+rather than transcribed. A size pins the total, which catches a field that changed width and one that
+was added — and says nothing about **order**, so two same-width fields transposed in the mirror leave
+the size right, the alignment right, both size assertions passing, and every read wrong. `offsetof`
+is what turns that into a refusal.
+
+A field that occupies no storage has no offset, and is refused rather than answered with the position
+it would have had: nothing can be read there, and a number would invite a comparison against a C
+struct that has no such member at all. `@packed` is honoured, since it is what the struct was laid
+out under; `@align(n)` is not consulted, because it moves where the whole struct may start and never
+shifts a field inside it (`15 §1`).
 
 There is **no value form**. C accepts `sizeof x` as well as `sizeof(T)`, and the two disagree in the
 one case that matters — `sizeof arr` against `sizeof ptr` after an array has decayed. sysl has no

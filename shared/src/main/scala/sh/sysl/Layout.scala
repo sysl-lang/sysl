@@ -156,6 +156,34 @@ case class Layout(word: Word) {
       case _                        => (bytes, alignment)
   }
 
+  /** Where a field starts, in bytes from the front of the struct it is written in (`03 § Reinterpreting
+   * storage`), or `None` where the struct stores no field of that name.
+   *
+   * It walks the same members `structLayout` walks, in the same order, under the same `@packed` rule
+   * — deliberately, and for the reason the class doc gives about `sizeof` and the union width: the
+   * whole worth of an `offsetof` is that it is measured by the thing that did the laying out, so a
+   * second walk that agreed by inspection rather than by construction would be the tautology `15 §7`
+   * refuses.
+   *
+   * `@align(n)` is not consulted, because it moves where the *struct* may start and never shifts a
+   * field inside it.
+   *
+   * A **zero-sized** field is not stored and so has no offset. It is dropped by `stored` rather than
+   * answered as the position it would have had: it occupies nothing, nothing can be read there, and
+   * a number would invite a comparison against a C struct that has no such member at all.
+   */
+  def fieldOffset(s: Type.Struct, field: String): Option[Int] = {
+    var offset = 0
+    var found  = Option.empty[Int]
+
+    for (name, ty) <- s.stored if found.isEmpty do
+      if !s.packed then offset = roundUp(offset, align(ty))
+
+      if name == field then found = Some(offset) else offset += size(ty)
+
+    found
+  }
+
   private def roundUp(n: Int, to: Int): Int = (n + to - 1) / to * to
 
   /** The payload region of a data enum: the element type its slots are counted in, and how many.

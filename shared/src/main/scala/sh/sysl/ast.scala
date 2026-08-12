@@ -114,6 +114,19 @@ case class TypeAttr(receiver: Expr, attr: String) extends Expr
  */
 case class LayoutOf(op: String, typ: TypeRef) extends Expr
 
+/** `offsetof(T, field)` — where a field starts inside the struct it is written in, in bytes
+ * (`03 § Reinterpreting storage`).
+ *
+ * The other half of what `@assert` needs to hold a mirrored C struct to its original (`13 §@assert`).
+ * `sizeof` pins the total, which catches a field that changed width or one that was added; it says
+ * nothing about **order**, so two same-width fields transposed in the mirror leave the size right and
+ * every read wrong. This is what turns that into a refusal.
+ *
+ * It is not a `LayoutOf` with a third field because its operands are of two kinds — a type and then a
+ * name — and folding it asks a different question of `Layout`.
+ */
+case class OffsetOf(typ: TypeRef, field: String) extends Expr
+
 /** The postfix `?` error-propagation operator. */
 case class TryExpr(expr: Expr) extends Expr
 

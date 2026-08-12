@@ -149,7 +149,23 @@ trait ExprParser extends SyslParserBase {
   protected def compareOp: Parser[String] =
     op("==") | op("!=") | op("<=") | op(">=") | op("<") | op(">")
 
-  protected def rangeOp: Parser[Boolean] = op("..<") ^^^ false | op("..") ^^^ true
+  /** `..=` is refused **by name**, wherever a range may be written.
+   *
+   * Rust spells an inclusive range `a..=b`, so a reader arriving from it writes one here once. Left
+   * to the ordinary grammar what they get is a message about the open-ended range `a..` that was
+   * parsed — in a `for` header, *"a range is only allowed in a 'for' loop or a 'match' pattern"*,
+   * which is a true sentence about something else and asserts the very thing the reader can see is
+   * already so. The `=` that caused it appears nowhere in it.
+   *
+   * The refusal is an `Error` rather than a `Failure` so it survives the alternations above it: a
+   * `Failure` here would be outranked by whichever candidate got furthest, which is how the message
+   * about the open-ended range won in the first place. `guard` is what points it at the `..` rather
+   * than past the `=`.
+   */
+  protected def noInclusiveEq: Parser[Nothing] =
+    guard(op("..") ~ op("=")) ~> err("'..=' is not a range — inclusive is 'a..b' and exclusive is 'a..<b'")
+
+  protected def rangeOp: Parser[Boolean] = op("..<") ^^^ false | noInclusiveEq | op("..") ^^^ true
 
   /** Ranges are non-associative and sit below arithmetic, so each end is a `bitOr`. Either
    * end may be omitted (`a..`, `..b`).
@@ -243,7 +259,8 @@ trait ExprParser extends SyslParserBase {
 
   lazy val primary: PackratParser[Expr] =
     at(
-      floatLit | intLit | charLit | interpLit | cStrLit | strLit | boolLit | nullLit | layoutOf | selfExpr |
+      floatLit | intLit | charLit | interpLit | cStrLit | strLit | boolLit | nullLit | layoutOf | offsetOf |
+        selfExpr |
         placeholderExpr |
         identExpr |
         arrayLit |
@@ -263,6 +280,28 @@ trait ExprParser extends SyslParserBase {
         err(s"'$what' takes a type in parentheses, as '$what(int)' — there is no form that takes a " +
           "value, since a value's type is what would be measured anyway")
     }
+
+  /** `offsetof(T, field)` — the third form whose first operand is a type.
+   *
+   * The field is a **name** rather than an expression for the same reason the type is not one: there
+   * is no value here to select from, so `p.x` would have nothing to be the `p` of. That also makes
+   * the comma unambiguous, since a type is read by `typeRef` and stops at it.
+   *
+   * The refusal is written **twice**, once at each place a token may be missing, rather than once
+   * after the whole form. A message raised after a form that got further along the line is never
+   * reported — the failure the form left behind outranks it by position — so a single one at the end
+   * would have covered only `offsetof` followed by nothing at all, and `offsetof(Header)` would have
+   * been answered with `',' expected`.
+   */
+  protected lazy val offsetOf: PackratParser[Expr] =
+    op("offsetof") ~> {
+      (op("(") ~> typeRef ~ (op(",") ~> ident | offsetOfForm) <~ op(")")) ^^ {
+        case t ~ f => OffsetOf(t, f)
+      } | offsetOfForm
+    }
+
+  private def offsetOfForm: Parser[Nothing] =
+    err("'offsetof' takes a struct type and a field name in parentheses, as 'offsetof(Header, length)'")
 
   /** A comma-separated list that may end in a comma.
    *

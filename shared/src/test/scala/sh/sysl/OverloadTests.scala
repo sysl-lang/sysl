@@ -220,6 +220,32 @@ class OverloadTests extends LibraryCliSupport with RunSupport with CodegenSuppor
             |k(x: string, y: string) -> string = "b"
             |print(k(1.5))""".stripMargin) should include("k(x: int)")
     }
+
+    // An argument that was already refused where it was made carries `Type.Unknown`, which fits no
+    // parameter — so *every* candidate fails and the roster is printed with nothing eliminated,
+    // listing declarations that plainly do take the call as written. That is the worst message
+    // available: it says resolution rejected a call the reader can see matches, and sends them off
+    // to look at the overload set instead of at the first error. Say nothing.
+    "and not at all, when an argument was already refused upstream" in {
+      val e = err("""k(x: int) -> string = "a"
+                    |k(x: int, y: int) -> string = "b"
+                    |val bad = nope
+                    |print(k(bad))""".stripMargin)
+
+      e should include("undefined name 'nope'")
+      e should not include "takes these arguments"
+    }
+
+    // The same value at a name declared *once* has always been silent, which is what makes the
+    // roster the odd one out rather than the cascade a thing sysl reports everywhere.
+    "as a call to a name declared once has always been" in {
+      val e = err("""k(x: int) -> string = "a"
+                    |val bad = nope
+                    |print(k(bad))""".stripMargin)
+
+      e should include("undefined name 'nope'")
+      e.linesIterator.count(_.startsWith("error: ")) shouldBe 1
+    }
   }
 
   // C has no overloading, so an overload set has at most one member that may take its own name as a

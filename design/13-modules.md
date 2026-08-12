@@ -913,12 +913,13 @@ in `16`, where the rest of the constrained-subtype design lives.
 
 ```
 @assert(sizeof(FRect) == 16, "FRect must match SDL_FRect")
+@assert(offsetof(FRect, w) == 8, "FRect.w moved")
 @assert(max_tasks <= 64)
 ```
 
 **The condition is a constant expression**, exactly the set above, folded by the same machinery a
-`const` initializer goes through — so it may name constants, `sizeof`, `alignof`, and the arithmetic
-and comparisons over them, and it may name a constant declared below it. A false one is a compile
+`const` initializer goes through — so it may name constants, `sizeof`, `alignof`, `offsetof`, and the
+arithmetic and comparisons over them, and it may name a constant declared below it. A false one is a compile
 error quoting the message; a true one emits nothing at all. The message is optional and is the
 *reader's* sentence, because they know what the number means and the expression alone says only that
 two of them differ.
@@ -943,6 +944,14 @@ _Static_assert(offsetof(SDL_FRect, w) == 8, "SDL_FRect.w moved");
 
 That pins what the *header* says. `@assert(sizeof(FRect) == 16)` pins what *sysl* laid out. Neither
 can drift without the build stopping, and the number is in the source where a reader can see it.
+
+**Both lines of that pair are writable on the sysl side, and the second is the one that matters
+most.** A size catches a field that changed width and one that was added; it says nothing about
+**order**. Two same-width fields transposed in the mirror leave the total unchanged, so every size
+assertion on both sides passes and every read is off by the distance between them — which is the
+failure mode this whole pairing exists to prevent, arriving through the half that was not checked.
+`offsetof` (`03 § Reinterpreting storage`) closes it, and a binding that mirrors a struct should pin
+every field it reads rather than only the total.
 
 **An attribute rather than a word**, for the reason the capability clauses are (`§4`): it says
 something *about* the module rather than being a construct the language executes. A reserved word

@@ -45,6 +45,7 @@ class LayoutCheckTests extends LibraryCliSupport {
       |end Pair
       |
       |@assert(sizeof(Pair) == 8, "Pair must match struct pair")
+      |@assert(offsetof(Pair, b) == 4, "struct pair.b moved")
       |
       |extern "pair_size" c_pair_size() -> usize
       |
@@ -115,6 +116,34 @@ class LayoutCheckTests extends LibraryCliSupport {
     )
 
     refusedWith(Config(command = "run", file = root)) should include("Pair must match struct pair")
+  }
+
+  // The failure `sizeof` structurally cannot see. The mirror has the same two fields in the other
+  // order, so it is the same eight bytes with the same alignment and every size assertion on both
+  // sides passes — while every read of `a` returns `b`. `offsetof` is the only thing in the pair that
+  // objects, which is the whole argument for it existing.
+  "the sysl half stops two same-width fields transposed, which sizeof cannot see" in {
+    assume(Toolchain.clangAvailable, "clang not available")
+
+    val root = projectOf(
+      "main.sysl" ->
+        """struct Pair
+          |    b: i32
+          |    a: i32
+          |end Pair
+          |
+          |@assert(sizeof(Pair) == 8, "Pair must match struct pair")
+          |@assert(offsetof(Pair, b) == 4, "struct pair.b moved")
+          |
+          |print(1)
+          |""".stripMargin,
+      "pair.c" -> pairC,
+    )
+
+    val notes = refusedWith(Config(command = "run", file = root))
+
+    notes should include("struct pair.b moved")
+    notes should not include "Pair must match struct pair"
   }
 
   // And the C half catching the other direction: the header moved, so `_Static_assert` fails while

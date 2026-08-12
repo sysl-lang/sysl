@@ -49,6 +49,7 @@ trait WrittenTypes extends GenericInstantiation {
   protected def lengthMentions(e: Expr, tps: Set[String]): Boolean = e match
     case Ident(n)               => tps(n)
     case LayoutOf(_, tr)        => mentions(tr, tps)
+    case OffsetOf(tr, _)        => mentions(tr, tps)
     case Unary(_, operand)      => lengthMentions(operand, tps)
     case Binary(_, l, r)        => lengthMentions(l, tps) || lengthMentions(r, tps)
     case Compare(List(l, r), _) => lengthMentions(l, tps) || lengthMentions(r, tps)

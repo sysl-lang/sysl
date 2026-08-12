@@ -222,8 +222,8 @@ trait ConstFolding extends ImportResolution {
       case None if awaitsInstantiation(a.cond, subst) => ()
       case None =>
         err("'@assert' is settled while compiling, so its condition has to be a constant " +
-          "expression — a literal, a 'const', 'sizeof', 'alignof', or the arithmetic and " +
-          "comparisons over them, and never a call")
+          "expression — a literal, a 'const', 'sizeof', 'alignof', 'offsetof', or the arithmetic " +
+          "and comparisons over them, and never a call")
 
   /** What a failed assertion inside a generic adds, and nothing at all outside one.
    *
@@ -308,6 +308,10 @@ trait ConstFolding extends ImportResolution {
     // which is a name the reader can see is declared right there.
     case LayoutOf(what, tr) => layoutBytes(what, resolveType(tr, subst)).map(n => IntLit(n, None))
 
+    // `offsetof(T, field)` folds for the same reason and under the same deferral: a layout is fixed
+    // while compiling, and a type parameter's is fixed at each instantiation rather than here.
+    case OffsetOf(tr, field) => offsetBytes(resolveType(tr, subst), field).map(n => IntLit(n, None))
+
     // `T::Min` and `T::Max` on a built-in integer are constants for the same reason `sizeof` is:
     // the answer is a property of the type and is known once the type is. Folding them here is what
     // puts them in a `const` initializer, an `@assert` and an array bound — the positions this
@@ -345,6 +349,29 @@ trait ConstFolding extends ImportResolution {
     case _: Type.Abstract | Type.Unknown => None
     case t                               => Some(if what == "sizeof" then layout.size(t) else layout.align(t))
 
+  /** The bytes `offsetof(T, field)` answers with.
+   *
+   * The two silent `None`s are exactly `layoutBytes`' — a parameter awaiting its instantiation, and a
+   * type already complained about — and every other way to have no answer is a mistake worth its own
+   * sentence rather than a fall through to "not a constant expression". A misspelled field is the one
+   * that matters: the whole point of the form is to be told when a mirror and its original disagree,
+   * so being told *nothing* about a name that is not there would be the failure in miniature.
+   */
+  protected def offsetBytes(ty: Type, field: String): Option[Int] = Type.underlying(ty) match
+    case _: Type.Abstract | Type.Unknown => None
+    case s: Type.Struct =>
+      layout.fieldOffset(s, field) match
+        case some @ Some(_) => some
+        case None if s.fieldIndex(field) >= 0 =>
+          err(s"'${show(s)}.$field' occupies no storage, so it has no offset — a zero-sized field " +
+            "lands nowhere, and a C struct that is being mirrored has no member matching it either")
+        case None =>
+          err(s"'${show(s)}' has no field '$field'" + (
+            if s.fields.isEmpty then "" else s" — it stores ${s.fields.map(f => s"'${f._1}'").mkString(", ")}"
+          ))
+    case other =>
+      err(s"'offsetof' measures a field of a struct, and ${show(other)} is not one")
+
   /** Whether a constant expression does not fold **yet** rather than not folding at all: it measures
    * a type that is still a parameter, and every instantiation will supply one that is not.
    *
@@ -359,6 +386,10 @@ trait ConstFolding extends ImportResolution {
    */
   protected def awaitsInstantiation(e: Expr, subst: Map[String, Type]): Boolean = e match
     case LayoutOf(_, tr) =>
+      Type.underlying(resolveType(tr, subst)) match
+        case _: Type.Abstract => true
+        case _                => false
+    case OffsetOf(tr, _) =>
       Type.underlying(resolveType(tr, subst)) match
         case _: Type.Abstract => true
         case _                => false
