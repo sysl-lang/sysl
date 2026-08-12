@@ -139,4 +139,112 @@ class AssertTests extends AnyFreeSpec with Matchers with CodegenSupport with Run
     }
   }
 
+  /** Inside a generic, where the interesting facts are per instantiation rather than per declaration.
+   *
+   * A body is analyzed once for each set of arguments, so the condition is settled against the types
+   * that were actually chosen — which is the only moment `sizeof(T)` is a number. This is what
+   * `guide/slab` wanted and had to write as a `require`: a runtime branch for a fact that was known
+   * at the call.
+   */
+  "inside a generic body, settled once per instantiation" - {
+    "a claim the argument satisfies is silent" in {
+      run(
+        """slab[T](x: T) -> int
+          |    @assert(sizeof(T) >= sizeof(*u8), "a free block has to hold the link through it")
+          |    3
+          |
+          |print(slab(1u64))""".stripMargin
+      ) shouldBe "3\n"
+    }
+
+    // The whole point: the same generic, an argument too narrow, and a build that stops. Before this
+    // the condition reported `unknown type 'T'` — about a parameter declared one line above.
+    "and one it does not stops the compilation" in {
+      val msg = err(
+        """slab[T](x: T) -> int
+          |    @assert(sizeof(T) >= sizeof(*u8), "a free block has to hold the link through it")
+          |    3
+          |
+          |print(slab(1u8))""".stripMargin
+      )
+
+      msg should include("assertion failed: a free block has to hold the link through it")
+      msg should not include "unknown type"
+    }
+
+    // The mistake is at the call that chose `u8` while the sentence explaining why is at the
+    // declaration, so a report carrying only one of the two sends the reader to the wrong file.
+    "naming which instantiation asked" in {
+      err(
+        """slab[T](x: T) -> int
+          |    @assert(sizeof(T) >= 8, "too narrow")
+          |    3
+          |
+          |print(slab(1u8))""".stripMargin
+      ) should include("where T = byte")
+    }
+
+    // One generic, two arguments, one of them bad: the good instantiation says nothing and the bad
+    // one is named, which is what makes the note worth printing at all.
+    "one instantiation may fail while another passes" in {
+      val msg = err(
+        """slab[T](x: T) -> int
+          |    @assert(sizeof(T) >= 8, "too narrow")
+          |    3
+          |
+          |print(slab(1u64))
+          |print(slab(1u16))""".stripMargin
+      )
+
+      msg should include("where T = ushort")
+      msg should not include "where T = ulong"
+    }
+
+    // A value parameter is bound the same way, so a claim about one is settled the same way — and
+    // this is the shape that catches a table too large for the storage it is going into, which is
+    // the other half of what a bounded generic wants to say.
+    "over a value parameter, which is inferred from the argument's length" in {
+      val msg = err(
+        """buffer[const N: usize](xs: [N]int) -> usize
+          |    @assert(N <= 4, "the scratch buffer is a stack array")
+          |    N
+          |
+          |var small: [2]int = [1, 2]
+          |var big: [8]int = [1, 2, 3, 4, 5, 6, 7, 8]
+          |print(buffer(small))
+          |print(buffer(big))""".stripMargin
+      )
+
+      msg should include("assertion failed: the scratch buffer is a stack array")
+      msg should include("where N = 8")
+    }
+
+    // A generic nothing calls carries an unchecked claim, and that is the same deferral
+    // `[sizeof(T)]u8` already lives under: the width is not wrong, it is not being measured yet.
+    // What must NOT happen is the walk over the declaration reporting "not a constant expression".
+    "a generic nothing instantiates is not complained about" in {
+      run(
+        """slab[T](x: T) -> int
+          |    @assert(sizeof(T) >= 8, "too narrow")
+          |    3
+          |
+          |print(1)""".stripMargin
+      ) shouldBe "1\n"
+    }
+
+    // The deferral is about a type that will become concrete, and nothing else: a condition that
+    // could never fold is still refused inside a generic, exactly as it is outside one.
+    "and a condition that will never be constant is still refused there" in {
+      err(
+        """f() -> int = 3
+          |
+          |slab[T](x: T) -> int
+          |    @assert(f() == 3)
+          |    3
+          |
+          |print(slab(1u64))""".stripMargin
+      ) should include("has to be a constant expression")
+    }
+  }
+
 }

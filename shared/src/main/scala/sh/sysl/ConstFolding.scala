@@ -197,21 +197,50 @@ trait ConstFolding extends ImportResolution {
    * The message is the reader's own where they wrote one, because they know what the number *means*
    * — that a struct matches its C counterpart, that a table is the size the protocol fixes — and the
    * expression alone says only that two numbers differ.
+   *
+   * **The substitution is what lets one be written inside a generic**, where the interesting facts
+   * are per instantiation rather than per declaration: a body is analyzed once for each set of
+   * arguments, so `sizeof(T)` in a condition has a width at every point the check runs. A module
+   * file's asserts are declarations and pass nothing, having no parameters to substitute.
+   *
+   * The **fourth** outcome exists only inside a generic: a condition measuring a type that is still a
+   * parameter does not fold *yet*, and the walk that checks the body before anything has instantiated
+   * it is not the moment to complain. That is the same deferral `[sizeof(T)]u8` already gets, and it
+   * is why a generic nothing calls carries an unchecked claim — there is nothing to check until
+   * somebody chooses a `T`.
    */
-  protected def checkAssert(a: AssertDecl): Unit =
-    fold(a.cond) match
+  protected def checkAssert(a: AssertDecl, subst: Map[String, Type] = Map.empty): Unit =
+    fold(a.cond, subst) match
       case Some(BoolLit(true))  => ()
       case Some(BoolLit(false)) =>
-        err(a.message match
+        err((a.message match
           case Some(m) => s"assertion failed: $m"
-          case None    => "assertion failed")
+          case None    => "assertion failed") + instantiationNote(subst))
       case Some(other) =>
         err(s"'@assert' takes a condition, and this is ${literalKind(other)} — an assertion is " +
           "something that can be true or false")
+      case None if awaitsInstantiation(a.cond, subst) => ()
       case None =>
         err("'@assert' is settled while compiling, so its condition has to be a constant " +
           "expression — a literal, a 'const', 'sizeof', 'alignof', or the arithmetic and " +
           "comparisons over them, and never a call")
+
+  /** What a failed assertion inside a generic adds, and nothing at all outside one.
+   *
+   * The mistake is at the call that asked for `Slab[u8]` while the sentence explaining why is at the
+   * declaration, so a report carrying only one of the two sends the reader to the wrong file. The
+   * position is the condition's, which is the half that says *what* is wrong; this is the half that
+   * says which instantiation asked.
+   *
+   * `Self` is named alongside the type parameters where a member of a generic type is what failed,
+   * rather than filtered out as the compiler's own word: which `Box` this is is exactly as much of
+   * the answer as which `T` it holds, and a member's body may measure either.
+   */
+  private def instantiationNote(subst: Map[String, Type]): String =
+    val bound = subst.toList.sortBy(_._1)
+
+    if bound.isEmpty then ""
+    else s" — at this instantiation, where ${bound.map((n, t) => s"$n = ${show(t)}").mkString(", ")}"
 
   /** Folds a constant expression to the literal it denotes, or `None` where it is not one.
    *

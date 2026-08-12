@@ -762,9 +762,15 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
      *
      * It emits nothing either way: a true assertion is not code, and a false one has already
      * stopped the compilation.
+     *
+     * **`tsubst` is what makes one inside a generic mean anything** (`10 §7`). A body is analyzed
+     * once per instantiation with its parameters bound to the arguments, so the condition is settled
+     * against the types that were actually chosen — which is the only moment `sizeof(T)` is a number.
+     * Folding against an empty map instead reported `T` as an unknown type, about a parameter
+     * declared a line above.
      */
     case a: AssertDecl =>
-      checkAssert(a)
+      checkAssert(a, tsubst)
       Nil
 
 }
