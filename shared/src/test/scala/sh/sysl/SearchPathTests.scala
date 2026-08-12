@@ -32,7 +32,10 @@ class SearchPathTests extends LibraryCliSupport {
 
     createDirectories(include)
     createDirectories(lib)
-    writeFile(s"$include/probe.h", "int probe_answer(void);\n")
+    // The macro is here so a case can reach this header through a `c const` block as well as through
+    // a `.c` file. Those are two different ways of needing an include path, answered from two
+    // different places in the compiler, so a fixture offering only one cannot tell them apart.
+    writeFile(s"$include/probe.h", "#define PROBE_WIDTH 41\nint probe_answer(void);\n")
     writeFile(s"$lib/probe.c", "#include <probe.h>\nint probe_answer(void) { return 42; }\n")
 
     val obj = s"$lib/probe.o"
@@ -325,6 +328,50 @@ class SearchPathTests extends LibraryCliSupport {
       root
     }
 
+    /** The same declaring package, plus the two things `sysl test` needs to be a real exercise of
+     * it: a `@test` to collect, and a `c const` block so the header is wanted by the *analysis* and
+     * not only by the C compilation. A tree with a shim alone would pass on a compiler that handed
+     * its paths to the toolchain and withheld them from the probe, which is exactly the shape of the
+     * defect this is here for.
+     */
+    def declaringWithTests(): String = {
+      val root = createTempDirectory("sysl-declared-tests-")
+
+      createDirectories(s"$root/m")
+      writeFile(s"$root/main.sysl", "print(m.doubled())\n")
+      writeFile(s"$root/package.hocon",
+        """package { name = "declared" }
+          |requires {
+          |  headers { probe = "the probe library's headers, wherever this machine keeps them" }
+          |}
+          |""".stripMargin)
+      writeFile(s"$root/m/m.sysl",
+        """module m
+          |@link("probe")
+          |@include("probe.h")
+          |
+          |c const
+          |    WIDTH: int = "PROBE_WIDTH"
+          |
+          |extern "shim_doubled" c_doubled() -> int
+          |
+          |doubled() -> int = c_doubled()
+          |width() -> int = WIDTH
+          |""".stripMargin)
+      writeFile(s"$root/m/shim.c",
+        "#include <probe.h>\nint shim_doubled(void) { return probe_answer() * 2; }\n")
+      writeFile(s"$root/m/tests.sysl",
+        """module m
+          |@tests
+          |
+          |@test
+          |the_header_reached_both_halves()
+          |    assert_eq(width(), 41, "the c const block was compiled against the header")
+          |    assert_eq(doubled(), 84, "and the shim was too, and linked")
+          |""".stripMargin)
+      root
+    }
+
     // The whole point, in one case: the build stops naming the requirement, the reason and the flag,
     // and it stops before clang has run at all — so `probe.h` is not in the message, because nothing
     // got far enough to look for it.
@@ -361,6 +408,31 @@ class SearchPathTests extends LibraryCliSupport {
 
       ran(Config(command = "run", file = declaring(), linkPaths = List(lib),
         includePaths = List(include), namedIncludes = Map("probe" -> include))) shouldBe "84\n"
+    }
+
+    // **The combination a real package is actually in**, and the one the cases above miss: its
+    // constants come from a `c const` block over the header it declared, and `sysl test` is how its
+    // own suite runs. Those are two separate reasons to want the include path — the block is
+    // compiled by `CConstants` and the shim by the toolchain — and `test` reaches them through
+    // `Compiler.compileTests`, which is a different call from the one `run` and `build` take.
+    //
+    // That call analyzed without its paths, so a tree could be run, built and turned into a library
+    // and could not have its tests run. `CConstTests` pins the same claim one layer down, against
+    // `compileTests` directly; this one goes through the driver, so it also says the *named* form of
+    // the flag — the only form a package that declares its headers may be given — arrives intact.
+    "and the named form carries a 'c const' block through 'sysl test' as well" in {
+      val (dir, lib) = guard()
+
+      succeeds(Config(command = "test", file = declaringWithTests(),
+        linkPaths = List(lib), includePaths = List(dir), namedIncludes = Map("probe" -> dir)))
+    }
+
+    // The other half of the pair, which is the half that matters: without the flag it must fail, or
+    // the case above would pass against a compiler that had stopped reading headers altogether.
+    "and that same tree is refused when nothing supplies the headers" in {
+      guard()
+
+      refused(Config(command = "test", file = declaringWithTests()))
     }
 
     // A command that compiles no C has nothing unmet. Charging `emit-llvm` for a path it would never
