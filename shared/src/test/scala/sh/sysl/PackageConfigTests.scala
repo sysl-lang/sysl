@@ -539,8 +539,8 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
       )).swap.getOrElse(fail("expected a refusal"))
 
       e should include("a program has one heap")
-      e should include("'freertos' name pvPortMalloc / vPortFree")
-      e should include("'arena' name arena_alloc / arena_free")
+      e should include("'freertos' names pvPortMalloc / vPortFree")
+      e should include("'arena' names arena_alloc / arena_free")
     }
 
     // The message groups by pair rather than listing packages, so three packages against two
@@ -553,8 +553,10 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
         "arena"    -> Allocator("arena_alloc", "arena_free"),
       )).swap.getOrElse(fail("expected a refusal"))
 
+      // And the verb agrees with the count on each claim independently — two packages `name` a pair
+      // where one `names` it, which is the whole reason the grouping is worth reading.
       e should include("'freertos' and 'st7796' name pvPortMalloc / vPortFree")
-      e should include("'arena' name arena_alloc / arena_free")
+      e should include("'arena' names arena_alloc / arena_free")
     }
 
     "a symbol is what LLVM will accept after an '@'" in {

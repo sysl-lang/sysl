@@ -397,15 +397,30 @@ class LibraryCliTests extends LibraryCliSupport {
         host should not be board
       }
 
-      "and names all three in one path, in that order" in {
-        // Pinned whole rather than by three `include`s, because what matters is that they are one
+      "and by the allocator, for the reason the target is in there" in {
+        // The object half calls the allocator's two functions by name, so an artifact is built for one
+        // allocator exactly as it is built for one machine (`packages.md § 13`). Without a key of its
+        // own, `read` refusing the wrong one is not a diagnostic but the same rebuild-and-overwrite
+        // loop the paragraph above describes.
+        assume(cacheDirectory.isDefined, "this machine has no cache directory")
+
+        val libc = LibraryArtifact.stdDefault(Target.default, Allocator.c)
+        val rtos = LibraryArtifact.stdDefault(Target.default, Allocator("pvPortMalloc", "vPortFree"))
+
+        libc should include("malloc-free")
+        rtos should include("pvPortMalloc-vPortFree")
+        libc should not be rtos
+      }
+
+      "and names all four in one path, in that order" in {
+        // Pinned whole rather than by four `include`s, because what matters is that they are one
         // directory: a layout putting them in separate segments would satisfy every assertion above
         // and give each release its own tree of every library it ever saw.
         assume(cacheDirectory.isDefined, "this machine has no cache directory")
 
         LibraryArtifact.stdDefault(Target.default) shouldBe
           s"${cacheDirectory.get}/sysl/${BuildInfo.version}-${Std.fingerprint}-${Target.default.name}" +
-            s"/std${LibraryArtifact.extension}"
+            s"-${Allocator.c.alloc}-${Allocator.c.free}/std${LibraryArtifact.extension}"
       }
 
       "and it sits under the cache directory rather than in the project" in {

@@ -62,8 +62,14 @@ object Allocator {
           .groupBy(_._2)
           .toList
           .sortBy(p => several.indexOf(p._1))
-          .map((a, packages) =>
-            s"'${packages.map(_._1).sorted.mkString("' and '")}' name ${a.alloc} / ${a.free}")
+          .map { (a, packages) =>
+            // The verb agrees, because one package claiming a pair is the ordinary case and 'freertos'
+            // name pvPortMalloc reads as a mistake in the compiler rather than one in the project.
+            val names = packages.map(_._1).sorted
+            val verb  = if names.length == 1 then "names" else "name"
+
+            s"'${names.mkString("' and '")}' $verb ${a.alloc} / ${a.free}"
+          }
 
         Left("two packages name different allocators, and a program has one heap — " +
           who.mkString("; ") + ". Drop one of the declarations, or depend on only one of them")
