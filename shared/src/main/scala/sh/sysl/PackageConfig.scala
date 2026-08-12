@@ -28,6 +28,7 @@ case class PackageConfig(
     version: Option[String] = None,
     defaultTarget: Option[String] = None,
     targets: Map[String, TargetConfig] = Map.empty,
+    capabilities: Map[String, Boolean] = Map.empty,
     requires: Set[String] = Set.empty,
     dependencies: List[Dependency] = Nil,
 ) {
@@ -37,13 +38,25 @@ case class PackageConfig(
    * **A capability the file does not mention is provided**, which is the direction that cannot
    * silently take something away. The compiler's prior is that a machine can do everything — that is
    * what every target did before there was a file to say otherwise — so what a config records is
-   * what a machine *cannot* do. It also composes the way the source clause does: `no alloc` narrows,
-   * and so does `alloc = false`.
+   * what a machine *cannot* do. It also composes the way the source clause does: `@no_alloc` narrows,
+   * and so does `heap = false`.
+   *
+   * **The top-level block is the project's own policy and a target block layers over it**, which is
+   * the order the two are written in and the only one that reads sensibly: a project says what it is
+   * building — *this thing has no heap* — and then names the one machine where that is not so. Keyed
+   * only by target, the statement could not be made at all for a target the registry already has,
+   * since a block would then be a machine the project was redefining rather than a policy it was
+   * declaring.
+   *
+   * Whether a heap exists is a **project engineering decision**, which is the whole reason this is
+   * here rather than derived: `targets.md` deliberately carries no capabilities, because a target's
+   * capabilities are exactly the part a project has an opinion about (`packages.md § 2`).
    */
-  def provides(target: String): Set[String] =
-    targets.get(target) match
-      case None      => Capability.core.toSet
-      case Some(cfg) => Capability.core.toSet.filter(c => cfg.capabilities.getOrElse(c, true))
+  def provides(target: String): Set[String] = {
+    val perTarget = targets.get(target).map(_.capabilities).getOrElse(Map.empty)
+
+    Capability.core.toSet.filter(c => perTarget.getOrElse(c, capabilities.getOrElse(c, true)))
+  }
 }
 
 object PackageConfig {
@@ -72,13 +85,16 @@ object PackageConfig {
         pkg     <- block(root, "package")
         _       <- checkName(pkg.flatMap(string(_, "name")))
         targets <- readTargets(root)
+        project <- readCapabilityFlags(block2(root, "capabilities"), "capabilities")
         needed  <- readCapabilityFlags(block2(root, "requires"), "requires")
+        _       <- checkNotNarrowing(needed)
         deps    <- readDependencies(root)
       yield PackageConfig(
         name = pkg.flatMap(string(_, "name")),
         version = pkg.flatMap(string(_, "version")),
         defaultTarget = block2(root, "targets").flatMap(string(_, "default")),
         targets = targets,
+        capabilities = project.toMap,
         requires = needed.collect { case (name, true) => name }.toSet.flatMap(Capability.closure),
         dependencies = deps,
       )
@@ -86,6 +102,26 @@ object PackageConfig {
       // Every way HOCON can be wrong arrives as one of these, and the driver wants a line rather
       // than a stack trace. The message is the library's own, which already says where it was.
       case e: HoconException => Left(s"$FileName: ${e.getMessage}")
+
+  /** Refuses `requires { … = false }`, which parsed cleanly and was then thrown away.
+   *
+   * `requires` is what a package **needs of its host** (`packages.md § 8`), so a `false` there says
+   * nothing: a package does not need a facility *not* to exist. It was collected with
+   * `collect { case (name, true) => name }` and silently dropped, which is worse than a refusal —
+   * the file then reads as though the project had said something, and it is the spelling somebody
+   * reaches for first when what they mean is *this project has no heap*.
+   *
+   * The two blocks are named in the message because they are the two directions, and somebody who
+   * wrote one of them wanted the other.
+   */
+  private def checkNotNarrowing(needed: Map[String, Boolean]): Either[String, Unit] =
+    needed.collectFirst { case (name, false) => name } match
+      case None => Right(())
+      case Some(name) =>
+        Left(s"$FileName: 'requires { $name = false }' says nothing — 'requires' is what this package " +
+          s"needs its host to have. To say the machine has no $name, write it in the project's own " +
+          s"'capabilities { $name = false }'; to say a module does not use it, write " +
+          s"'@no_${Capability.narrowWord(name)}' in that module's files")
 
   /** A package's name is what a directory project's output is called, so it reaches the filesystem
    * and has to be a single path segment.
@@ -151,9 +187,21 @@ object PackageConfig {
     section match
       case None => Right(Map.empty)
       case Some(caps) =>
-        collect(caps.fields.toList.sortBy(_._1)) { (name, value) =>
+        collect(caps.fields.toList.sortBy(_._1)) { (rawName, value) =>
+          // **A module's word is accepted here and mapped**, which is a transitional allowance rather
+          // than a second spelling: `alloc` names what a module does and `heap` names the facility, and
+          // the config wants the facility. What makes it worth carrying is that a **tag is immutable**
+          // — every package in the org is fetched at a pinned version whose `package.hocon` says
+          // `requires { alloc = true }` and always will, and `Resolve.configOf` validates a fetched
+          // dependency's file exactly as it validates the project's own. Refusing the old word outright
+          // would stop every pinned dependency resolving on the day this shipped, and re-tagging cannot
+          // fix a consumer that has not also bumped its pin.
+          //
+          // `heap` is the documented name and the one to write. This goes when the org has been swept.
+          val name = Capability.narrowedBy.getOrElse(rawName, rawName)
+
           if !Capability.implies.contains(name) then
-            Left(s"$FileName: '$name' in '$where' is not a capability — " +
+            Left(s"$FileName: '$rawName' in '$where' is not a capability — " +
               s"the set is ${Capability.core.map(n => s"'$n'").mkString(", ")}")
           else
             value match

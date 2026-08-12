@@ -452,7 +452,7 @@ trait ProgramWalk extends AbstractBodies {
       emitted,
       tmain,
       tentry,
-      noAllocModules = moduleNarrows.collect { case (m, caps) if caps.contains(Capability.Alloc) => m }.toSet,
+      noAllocModules = moduleNarrows.collect { case (m, caps) if caps.contains(Capability.Heap) => m }.toSet,
       mainModule = mainScope.module,
       // Only the tests whose bodies survived analysis. A test whose body was reported is not a test
       // the runner could run, and listing it would put a name in the report that no dispatcher arm

@@ -37,8 +37,8 @@ trait NoAlloc extends AnalyzerBase {
    * call into it is in the program's own body, and `Allocators.blame` lands the diagnostic there.
    */
   protected def noAlloc(module: String): Boolean =
-    (!targetProvides(Capability.Alloc) && !std.carries(module)) ||
-      moduleNarrows.get(module).exists(_.contains(Capability.Alloc))
+    (!targetProvides(Capability.Heap) && !std.carries(module)) ||
+      moduleNarrows.get(module).exists(_.contains(Capability.Heap))
 
   /** Reports every construction that makes heap storage in a module that declared `no alloc`, and
    * every call out of one that arrives somewhere that does.
@@ -80,7 +80,7 @@ trait NoAlloc extends AnalyzerBase {
    * config or the target, and the message has to point at that instead.
    */
   private def because(module: String): String =
-    if moduleNarrows.get(module).exists(_.contains(Capability.Alloc)) then "this module declared '@no_alloc'"
+    if moduleNarrows.get(module).exists(_.contains(Capability.Heap)) then "this module declared '@no_alloc'"
     else s"'${target.name}' provides no allocator"
 
   /** Which functions make heap storage, and which trees reach one (`13 §4` — *propagation is over

@@ -12,24 +12,44 @@ package sh.sysl
  */
 object Capability {
 
-  val Alloc   = "alloc"
+  val Heap    = "heap"
   val Os      = "os"
   val Posix   = "posix"
   val Threads = "threads"
+
+  /** The word a **module** writes to give a capability up, and the capability it gives up.
+   *
+   * Three of the four are the same word and the heap is not, deliberately. `package.hocon` states
+   * whether a facility **exists** — `heap`, which is a noun beside `os`, `posix` and `threads` — while
+   * a narrowing clause is a module's promise about its own **conduct**, and a promise is about an
+   * action. So a module writes `@no_alloc`: *I do not allocate, so I do not need a heap to exist.*
+   * For the other three, giving the facility up and not using it are the same act, so one word does.
+   *
+   * A mapping rather than one shared string is what keeps each statement to exactly one spelling.
+   * `@no_heap` is not a clause and `requires { alloc = true }` is not a capability, and each is
+   * refused naming the other — somebody who wrote one of them meant the other.
+   */
+  val narrowedBy: Map[String, String] =
+    Map("alloc" -> Heap, Os -> Os, Posix -> Posix, Threads -> Threads)
+
+  /** The word a narrowing is written with, given the capability — `narrowedBy` read backwards, for a
+   * diagnostic that has a capability in hand and has to tell a reader what to type.
+   */
+  def narrowWord(cap: String): String = narrowedBy.collectFirst { case (w, c) if c == cap => w }.getOrElse(cap)
 
   /** Each capability, and what having it implies having. POSIX needs an operating system under it,
    * so a module that requires `posix` requires `os` whether or not it said so.
    */
   val implies: Map[String, Set[String]] =
-    Map(Alloc -> Set.empty, Os -> Set.empty, Posix -> Set(Os), Threads -> Set.empty)
+    Map(Heap -> Set.empty, Os -> Set.empty, Posix -> Set(Os), Threads -> Set.empty)
 
   /** The core set, in the order a diagnostic lists them. */
-  val core: List[String] = List(Alloc, Os, Posix, Threads)
+  val core: List[String] = List(Heap, Os, Posix, Threads)
 
-  /** The capabilities that gate **which standard-library modules exist**, as against `alloc`, which
+  /** The capabilities that gate **which standard-library modules exist**, as against `heap`, which
    * changes what the language allows (`capabilities.md § Two kinds of capability`).
    *
-   * The distinction is what decides where each is enforced. `alloc` is asked of every construction
+   * The distinction is what decides where each is enforced. `heap` is asked of every construction
    * that makes heap storage and of every call that reaches one, because the standard module is one
    * module and half of it allocates. These are asked of the module **graph**, because what they gate
    * is a whole module: a program either may name `sysl.fs` or may not.
@@ -44,7 +64,7 @@ object Capability {
    * `threads` earned its the same way, when `sysl.thread` was. The set stays because that is the
    * order the next capability will arrive in — declared, then gated, then narrowable.
    */
-  val narrowable: Set[String] = Set(Alloc, Os, Posix, Threads)
+  val narrowable: Set[String] = Set(Heap, Os, Posix, Threads)
 
   /** `cap` together with everything it implies. */
   def closure(cap: String): Set[String] = implies.getOrElse(cap, Set.empty) + cap
@@ -138,10 +158,15 @@ trait Capabilities extends AnalyzerBase {
   private def moduleLabel(module: String): String =
     if module.isEmpty then "this module" else s"'$module'"
 
-  /** Whether a clause is one `checkClause` let through. */
-  private def enforceable(c: CapabilityClause): Boolean =
-    Capability.implies.contains(c.name) &&
-      (c.direction == CapabilityDirection.Requires || Capability.narrowable(c.name))
+  /** Whether a clause is one `checkClause` let through.
+   *
+   * The two directions are asked of different vocabularies, which is what `Capability.narrowedBy`
+   * exists for: a `requires` names a **facility** and a narrowing names the **conduct** a module gives
+   * up, and `alloc` and `heap` are the one pair where those are different words.
+   */
+  private def enforceable(c: CapabilityClause): Boolean = c.direction match
+    case CapabilityDirection.Requires => Capability.implies.contains(c.name)
+    case CapabilityDirection.Narrows  => Capability.narrowedBy.get(c.name).exists(Capability.narrowable)
 
   /** Refuses a file that says the same thing about one capability twice, and one that says both
    * things about it.
@@ -152,12 +177,19 @@ trait Capabilities extends AnalyzerBase {
    * meaning whichever the code happened to fold last.
    */
   private def checkRepeats(u: Program): Unit =
-    for (name, cs) <- u.capabilities.filter(enforceable).groupBy(_.name) if cs.length > 1 do
+    for (cap, cs) <- u.capabilities.filter(enforceable).groupBy(capabilityOf) if cs.length > 1 do
       recover(())(at(cs(1).pos) {
         if cs.map(_.direction).distinct.length > 1 then
-          err(s"'$name' is both given up and required here, and a module cannot do without something " +
-            "it cannot be built without")
-        else err(s"'$name' is declared twice, and the second says nothing the first did not")
+          // Grouped by the **capability** and not by the word, which is the whole reason this reads
+          // the way it does: `@no_alloc` beside `requires heap` is one contradiction written in the
+          // two vocabularies, and grouping by what was typed would have let it through.
+          err(s"'$cap' is both given up and required here, and a module cannot do without something " +
+            "it cannot be built without" +
+            (if cs.map(_.name).distinct.length > 1 then
+               s" — '@no_${Capability.narrowWord(cap)}' and 'requires $cap' are the two directions of " +
+                 "one capability"
+             else ""))
+        else err(s"'${cs.head.name}' is declared twice, and the second says nothing the first did not")
       })
 
   /** The module a file contributes to — its header, or the anonymous root module (`13 §1`). */
@@ -181,7 +213,19 @@ trait Capabilities extends AnalyzerBase {
   private def implied(c: CapabilityClause): Set[String] = c.direction match
     case CapabilityDirection.Requires => Capability.closure(c.name)
     case CapabilityDirection.Narrows =>
-      Capability.implies.collect { case (k, ims) if ims(c.name) => k }.toSet + c.name
+      val cap = capabilityOf(c)
+
+      Capability.implies.collect { case (k, ims) if ims(cap) => k }.toSet + cap
+
+  /** The capability a clause is about, whichever vocabulary it was written in.
+   *
+   * Everything that reasons about *what a module said* has to go through this rather than through
+   * `c.name`, because the two directions spell the heap differently — `@no_alloc` against
+   * `requires heap`. Only a diagnostic quoting the reader's own text uses `c.name` directly.
+   */
+  private def capabilityOf(c: CapabilityClause): String = c.direction match
+    case CapabilityDirection.Requires => c.name
+    case CapabilityDirection.Narrows  => Capability.narrowedBy.getOrElse(c.name, c.name)
 
   /** Refuses a clause that names nothing, or that narrows away a capability nothing yet gates.
    *
@@ -193,15 +237,35 @@ trait Capabilities extends AnalyzerBase {
    * window a clause that compiled and enforced nothing would read in a source file as a guarantee
    * the compiler never made.
    */
-  private def checkClause(c: CapabilityClause): Unit = {
-    if !Capability.implies.contains(c.name) then
-      err(s"no capability is called '${c.name}' — the set is ${Capability.core.map(n => s"'$n'").mkString(", ")}")
+  private def checkClause(c: CapabilityClause): Unit = c.direction match {
+    case CapabilityDirection.Requires =>
+      if !Capability.implies.contains(c.name) then
+        // Naming what a module *does* where a facility belongs. `@requires(alloc)` is the one that
+        // happens, since the narrowing beside it is spelled that way and the pair look like a pair.
+        if Capability.narrowedBy.contains(c.name) then
+          err(s"'${c.name}' is what a module does, not something a machine has — a 'requires' names " +
+            s"the facility, so this is '@requires(${Capability.narrowedBy(c.name)})'")
+        else unknown(c)
 
-    if c.direction == CapabilityDirection.Narrows && !Capability.narrowable(c.name) then
-      err(s"'no ${c.name}' is not enforced yet, and would say something the compiler does not check " +
-        s"— nothing gates '${c.name}'. The narrowings that mean something today are " +
-        Capability.core.filter(Capability.narrowable).map(n => s"'no $n'").mkString(", "))
+    case CapabilityDirection.Narrows =>
+      if !Capability.narrowedBy.contains(c.name) then
+        // The mirror image: naming the facility where the conduct belongs. `@no_heap` is what a reader
+        // writes once, having seen `heap` in the config.
+        if Capability.implies.contains(c.name) then
+          err(s"'@no_${c.name}' says a machine has no ${c.name}, which is the project's to say and " +
+            s"not this module's — what a module promises is what it does, so this is " +
+            s"'@no_${Capability.narrowWord(c.name)}'")
+        else unknown(c)
+      else if !Capability.narrowable(Capability.narrowedBy(c.name)) then
+        err(s"'@no_${c.name}' is not enforced yet, and would say something the compiler does not " +
+          s"check. The narrowings that mean something today are " +
+          Capability.core.filter(Capability.narrowable).map(n => s"'@no_${Capability.narrowWord(n)}'").mkString(", "))
   }
+
+  /** A clause naming nothing at all, said the same way in either direction. */
+  private def unknown(c: CapabilityClause): Unit =
+    err(s"no capability is called '${c.name}' — the set is " +
+      Capability.core.map(n => s"'$n'").mkString(", "))
 
   /** Holds the files of one module to declaring the same clauses (`13 §4`).
    *

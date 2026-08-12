@@ -42,14 +42,14 @@ class TargetCapabilityTests extends AnyFreeSpec with Matchers {
   "a target with no allocator makes every module of the program allocator-free" - {
 
     "without a clause being written anywhere" in {
-      val e = refused(everything - Capability.Alloc)("main.sysl" -> "f() -> &int = 1\n\nprint(*f())\n")
+      val e = refused(everything - Capability.Heap)("main.sysl" -> "f() -> &int = 1\n\nprint(*f())\n")
 
       e should include("a reference needs an allocator")
       e should include(s"'${Target.default.name}' provides no allocator")
     }
 
     "and the message does NOT claim a clause the file never wrote" in {
-      refused(everything - Capability.Alloc)(
+      refused(everything - Capability.Heap)(
         "main.sysl" -> "f() -> &int = 1\n\nprint(*f())\n") shouldNot include("declared '@no_alloc'")
     }
 
@@ -63,7 +63,7 @@ class TargetCapabilityTests extends AnyFreeSpec with Matchers {
     }
 
     "a program using only value types is untouched" in {
-      accepted(everything - Capability.Alloc)(
+      accepted(everything - Capability.Heap)(
         "main.sysl" -> "f(p: *int) -> int = *p\n\nvar n = 4\nprint(f(&n))\n") should include("define")
     }
   }
@@ -73,7 +73,7 @@ class TargetCapabilityTests extends AnyFreeSpec with Matchers {
     // Its files are compiled into every program, so holding them to the target's set would report
     // the allocating half of the library as a mistake in source the program's author cannot change.
     "so a no-alloc target does not turn the library into a wall of errors" in {
-      val e = refused(everything - Capability.Alloc)("main.sysl" -> "f() -> &int = 1\n\nprint(*f())\n")
+      val e = refused(everything - Capability.Heap)("main.sysl" -> "f() -> &int = 1\n\nprint(*f())\n")
 
       e shouldNot include("library/sysl")
       e.linesIterator.count(_.contains("needs an allocator")) shouldBe 1
@@ -83,11 +83,11 @@ class TargetCapabilityTests extends AnyFreeSpec with Matchers {
   "'requires' is answered against the target, which is what writing it buys" - {
 
     "one clean error naming the module, the capability and the machine" in {
-      val e = refused(everything - Capability.Alloc)(
-        "thing/a.sysl" -> "module thing\n@requires(alloc)\n\nf() -> int = 1\n",
+      val e = refused(everything - Capability.Heap)(
+        "thing/a.sysl" -> "module thing\n@requires(heap)\n\nf() -> int = 1\n",
         "main.sysl"    -> "print(thing.f())\n")
 
-      e should include("'thing' requires 'alloc'")
+      e should include("'thing' requires 'heap'")
       e should include(s"'${Target.default.name}' does not provide it")
       e should include(PackageConfig.FileName)
     }
@@ -105,8 +105,8 @@ class TargetCapabilityTests extends AnyFreeSpec with Matchers {
     }
 
     "the root module has no name to print, and says so as a sentence" in {
-      refused(everything - Capability.Alloc)(
-        "main.sysl" -> "@requires(alloc)\n\nprint(1)\n") should include("this module requires 'alloc'")
+      refused(everything - Capability.Heap)(
+        "main.sysl" -> "@requires(heap)\n\nprint(1)\n") should include("this module requires 'heap'")
     }
   }
 }

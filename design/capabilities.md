@@ -25,7 +25,7 @@ refused for as long as that is what it would be.
 Capabilities govern the allocator / OS / POSIX boundary
 that lets one language span safe application code and allocator-free kernel/driver code. The
 mechanism spans three layers — project config (targets declare capabilities), the module
-system (propagation, per-module restriction), and the type system (`alloc` gates the memory
+system (propagation, per-module restriction), and the type system (`heap` gates the memory
 modes). **The target registry is now its own doc and is built — `targets.md`** — so what a
 target *is* and how one is named are settled, and the project-config half around it is now
 `packages.md`: the `package.hocon` schema, per-target capability sets, and the dependency model
@@ -41,7 +41,7 @@ This one is the capability model.
 Capabilities are named environment facts, and they come in two kinds, enforced by different
 parts of the compiler:
 
-- **`alloc` — a *language* capability.** It changes what the type system allows. With `alloc`,
+- **`heap` — a *language* capability.** It changes what the type system allows. With `heap`,
   the heap-backed features are legal: `&T`, `weak T`, growable arrays, boxed trait objects
   (`&Trait`), escaping closures, and allocating string operations. Without it, only the
   **no-alloc subset** compiles: value types `T`, raw pointers `*T`, fixed arrays `[N]T`,
@@ -57,14 +57,14 @@ parts of the compiler:
   diagnostic lands at the reference rather than at the clause, because that is the line a reader has
   to change.
 
-`alloc` is the load-bearing one for the memory model. The other three layer on the same two-level
+`heap` is the load-bearing one for the memory model. The other three layer on the same two-level
 machinery but act at the import boundary.
 
 ## The core set
 
 | Capability | Kind | Gates | Implies |
 |---|---|---|---|
-| `alloc` | language | `&T`, `weak T`, growable arrays, `&Trait`, escaping closures, allocating string ops | — |
+| `heap` | language | `&T`, `weak T`, growable arrays, `&Trait`, escaping closures, allocating string ops | — |
 | `os` | environment | OS / syscall standard-library surface | — |
 | `posix` | environment | POSIX compatibility layer | `os` |
 | `threads` | environment | `sysl.thread` — spawning, joining, and the growable channel | — |
@@ -72,19 +72,45 @@ machinery but act at the import boundary.
 `posix` implies `os` (POSIX needs an OS); config validation enforces the implication. The set
 is extensible, but these four are the core.
 
+**The capability is `heap` and the clause that gives it up is `@no_alloc`, and the two names differ
+on purpose.** The config states whether a facility **exists** — a noun, beside `os`, `posix` and
+`threads` — because whether a heap exists is a project engineering decision about the machine being
+built for. A narrowing clause is a module's promise about its own **conduct**, and a promise is about
+an action: *I do not allocate, so I do not need a heap to exist.* The other three need no second word,
+since for them giving the facility up and not using it are the same act.
+
+`@no_heap` is refused, naming `@no_alloc`: it says a machine has no heap, which is the project's to
+say and not a module's.
+
+**The config accepts `alloc` and maps it, transitionally**, and that is compatibility rather than a
+second spelling. A **tag is immutable**: every package is fetched at a pinned version whose
+`package.hocon` says `requires { alloc = true }` and always will, and a fetched dependency's file is
+validated exactly as the project's own is — so refusing the old word would stop every pinned
+dependency resolving on the day it shipped, and re-tagging cannot help a consumer that has not also
+bumped its pin. `heap` is the name to write; the allowance goes once the packages have been swept.
+
 `threads` gates *spawning*, not soundness: what may cross a domain boundary is a structural
 rule (`06`), and one that has no check behind it until the channel is written. A target with no
 scheduler simply does not offer it, and a module may narrow it away to declare itself
-single-threaded. Note that a **fixed-capacity** channel needs neither `alloc` nor `threads` to
+single-threaded. Note that a **fixed-capacity** channel needs neither `heap` nor `threads` to
 exist — allocator-free code can still receive on one, which is the same reason `sysl.sync` requires
 nothing at all while `sysl.thread` requires two.
 
 ## Two levels: target provides, module narrows
 
-1. **The target declares what is available**, in the project config:
+1. **The project declares what is available**, in the project config — for every target it builds
+   for, with a target block layering over it per capability where one machine differs:
    ```hocon
-   aarch64-kernel { triple = "aarch64-none-elf", capabilities { alloc=true, os=false, posix=false } }
+   capabilities { heap = false }        // this project's own policy, everywhere
+
+   targets {
+     aarch64-macos { capabilities { heap = true } }   // except on the workstation
+     aarch64-kernel { triple = "aarch64-none-elf", capabilities { os = false, posix = false } }
+   }
    ```
+   The top-level block is the one that says what the project *is*. Keyed only by target the
+   statement could not be made at all for a machine the registry already has, since a block would
+   then read as a target being redefined rather than as a policy being declared.
 2. **A module inherits the target's capabilities by default.** Ordinary application code writes
    *no* capability clause and simply uses whatever the target provides — zero ceremony for the
    common case.
@@ -97,12 +123,12 @@ nothing at all while `sysl.thread` requires two.
    that has an allocator**. The boundary is compiler-checked, not a naming convention.
 4. **Using a gated feature requires the capability in the module's *effective* set**
    (`target ∩ narrowing`). Otherwise it is a compile error at the use site — e.g. `&T` in a
-   `no alloc` module: *"references need an allocator; not available here."*
+   `@no_alloc` module: *"references need an allocator; not available here."*
 
 The optional other direction — a module that fundamentally needs a capability — is `requires`:
 ```
 module std.heap
-@requires(alloc)    // one clean error if built for a no-alloc target,
+@requires(heap)     // one clean error if built for a target with no heap,
                     // instead of one error at every &T
 ```
 `requires` is documentation plus an early, precise diagnostic; it is not needed for
@@ -114,8 +140,8 @@ A capability requirement flows through the module graph. A module's real require
 uses **plus the requirements of everything it imports**, and the whole transitive graph must
 fit within the target's capabilities.
 
-- A `no alloc` module can only import and call things that are themselves no-alloc-compatible.
-  Importing `std.heap` (which `requires alloc`) from a `no alloc` module is an error — cleanly,
+- A `@no_alloc` module can only import and call things that are themselves allocator-free.
+  Importing `std.heap` (which `requires heap`) from a `@no_alloc` module is an error — cleanly,
   at the import, not deep in codegen.
 - A `no os` module may not reach any module that requires `os`. **This is built**, and the graph it
   is asked of is the **reference** graph rather than the import graph: a qualified path reaches
@@ -123,13 +149,13 @@ fit within the target's capabilities.
   have missed the case a program is most likely to write. The requirement is transitive — reaching
   `sysl.fs` through a module that says nothing itself is still reaching it.
 
-**Where the `alloc` diagnostic actually lands, and why it is the call rather than the import.** The
+**Where the `heap` diagnostic actually lands, and why it is the call rather than the import.** The
 rule above is stated over modules, and the standard library is why the check cannot be: `sysl` is
 one module and is **half allocator-free**. `print` and `from_utf8` are declarations of the same
-module and only one of them allocates, so a module-grained rule would refuse every `no alloc` module
+module and only one of them allocates, so a module-grained rule would refuse every `@no_alloc` module
 that named anything at all — including the printing that allocator-free code does constantly. So the
 question asked is the one this section's first bullet also asks: what does this module *call*. A
-`no alloc` module is refused where it reaches a function that makes heap storage, and the message
+`@no_alloc` module is refused where it reaches a function that makes heap storage, and the message
 points at the smallest part of the body that still reaches it.
 
 The reachable set **over-approximates** where a call's target is decided at run time — a method-table
@@ -138,7 +164,7 @@ in, since a refusal then names a function the program might really arrive at. An
 followed at all: what a C function does is not this compiler's to know, and `capabilities.md` already
 allows an allocator-free module the `malloc` and `free` it provides itself through `*T`.
 
-## What `alloc` gates, precisely
+## What `heap` gates, precisely
 
 **Requires `alloc`** (heap-backed):
 
@@ -171,15 +197,40 @@ promote the array to the heap, and there is nothing to promote into (`05`).
 
 ## The payoff
 
-| | Hosted app | Kernel (alloc, no os) | Cortex-M (no alloc) |
+| | Hosted app | Kernel (heap, no os) | Cortex-M (no heap) |
 |---|---|---|---|
 | ordinary module | everything | `&T` ok; no `sysl.fs` | no-alloc subset only |
-| `no alloc` module | no-alloc subset, enforced | no-alloc subset, enforced | compiles unchanged |
+| `@no_alloc` module | no-alloc subset, enforced | no-alloc subset, enforced | compiles unchanged |
 
-A `no alloc` module is portable across every target — write the arch layer once, guaranteed
+A `@no_alloc` module is portable across every target — write the arch layer once, guaranteed
 allocator-free everywhere.
 
 ## Open sub-questions
+
+- **A GENERIC HAS NO EXECUTION UNTIL A TYPE IS CHOSEN, AND THE CHAPTER NEVER SAID WHOSE CONDUCT IT
+  IS.** Nothing above mentions generics, type parameters, bounds or monomorphization, and the
+  compiler's answer — a monomorphized instance is charged to the module that **declared** the generic
+  — is therefore neither stated nor decided here. It bites a real case: a `@no_alloc` library whose
+  generic calls through a bound is refused when a **hosted** program instantiates it at a type whose
+  `impl` allocates, although the library promised nothing about a type it never saw and the program's
+  own project config says a heap exists.
+
+  **The clause is a promise a module makes about its own conduct** — *no execution that begins in this
+  module's code makes heap storage* — so on that reading the module that chose the type is the one
+  that answers for it. What makes the fix less than a redirection of blame is that the two kinds of
+  call inside a generic body are different: a call to a **concrete** function is the declaring
+  module's conduct at every instantiation, and only a call **through a bound** is the caller's choice.
+
+  Excusing the whole instance was tried and is **too blunt**, measured rather than reasoned: it lets
+
+  ```
+  thru[T](x: T, s: string) -> usize = cstring(s).len
+  ```
+
+  compile on a target with no heap at all, because that call appears nowhere but inside the instance
+  body. After substitution a bound's call is indistinguishable from a direct one, so drawing the line
+  needs the instantiation to mark which calls came from a bound.
+
 
 - ~~**Per-module `os` / `posix` restriction**~~ — **done.** A module may assert `no os` or
   `no posix`, and the assertion is enforced against the module graph. What settled it was not a
