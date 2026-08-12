@@ -566,8 +566,18 @@ private[sysl] def execute(cfg: Config): Int = {
   // Asked only where C is going to be compiled. The requirement exists so that a tree's C compiles,
   // so a command that compiles none has nothing unmet — and refusing `emit-llvm` or `prove` over a
   // path they would never open would be charging for something they do not do.
+  //
+  // A `--lib` **source root** is asked too, and is the one road that used to fall through. A package
+  // reached through `dependencies` is checked because its manifest came back with the graph, and one
+  // reached as a `.syslib` needs no header at all — its `c const` was lowered when the artifact was
+  // built. Handed the same package as a directory, the driver read its `.sysl` and nothing else, so
+  // the requirement it had written down went unasked and clang answered instead.
   if links(cfg.command) || cLibrary(cfg.command) then
-    unmetHeaders(project, fetched.needs, cfg.namedIncludes.keySet) match
+    val fromLibs = libHeaderNeeds(roots) match
+      case Left(err)    => return fail(err)
+      case Right(needs) => needs
+
+    unmetHeaders(project, fetched.needs ::: fromLibs, cfg.namedIncludes.keySet) match
       case Some(err) => return fail(err)
       case None      => ()
 
@@ -682,6 +692,38 @@ private def links(command: String): Boolean = command == "build" || command == "
  * consumer satisfying them one flag at a time is the same walk either way, and a list of four would
  * be four things to look up before anything can be tried.
  */
+/** What the `--lib` **source roots** declare they need headers for (`packages.md § 8`).
+ *
+ * **This is the one road a declared requirement used to fall through.** The other two are already
+ * answered and neither needed anything: a package reached through `dependencies` arrives with its
+ * manifest as part of the graph, and one reached as a `.syslib` never needs a header at all, because
+ * `LibraryArtifact` lowers a `c const` to its measured value before writing. Given the very same
+ * package as a **directory**, though, the driver collected its `.sysl` files and opened nothing else
+ * — so the sentence its author wrote for exactly this moment was never read, and clang's
+ * `'cairo.h' file not found` answered in its place, naming neither the package nor the flag.
+ *
+ * **Only `requires { headers }` is taken from the manifest, and that is deliberate.** `--lib` names
+ * a *source root*, which need not be a package at all, and a root that is not one has nothing to say
+ * here. Reading the rest of what a manifest can declare is a different question with a real cost —
+ * an allocator taken silently from a `--lib` root is the mixed heap `packages.md § 13` exists to
+ * prevent — so it is left alone rather than guessed at.
+ *
+ * **The root is named as the reader wrote it**, which is a path here where it is a coordinate for a
+ * dependency. Both are the thing the person reading the message typed and can go and look at; the
+ * package's own declared name is neither.
+ *
+ * A manifest that will not parse stops the build rather than being skipped. That matches what a
+ * dependency's does, and the alternative is silently dropping a requirement on the one path this
+ * whole check exists to close.
+ */
+private def libHeaderNeeds(roots: List[String]): Either[String, List[HeaderNeed]] =
+  roots.foldLeft[Either[String, List[HeaderNeed]]](Right(Nil)) { (acc, root) =>
+    for
+      seen   <- acc
+      config <- readPackageConfig(root)
+    yield seen ::: config.headers.toList.sortBy(_._1).map((name, why) => HeaderNeed(root, name, why))
+  }
+
 private def unmetHeaders(project: PackageConfig, fromPackages: List[HeaderNeed],
                          supplied: Set[String]): Option[String] = {
   val own  = project.headers.toList.sortBy(_._1).map((name, why) => HeaderNeed("this project", name, why))

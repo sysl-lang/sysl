@@ -444,6 +444,92 @@ class SearchPathTests extends LibraryCliSupport {
     }
   }
 
+  /** The same declaration, reached the third way: as a `--lib` **source root**.
+   *
+   * A package arrives at a build by three roads and only this one skipped the check. Through
+   * `dependencies` its manifest comes back with the graph and is asked; as a `.syslib` it needs no
+   * header at all, since the artifact carries the *measured value* of a `c const` rather than the C
+   * expression that produced it. Handed the same directory, the driver read its `.sysl` files and
+   * opened nothing else — so the sentence the package wrote for this moment went unread, and clang
+   * answered in its place.
+   */
+  "a declaring package reached as a --lib source root" - {
+
+    /** The declaring package with no `main` — a library rather than a project — and a consumer of it
+     * in a directory of its own, which is what makes `--lib` the only road between them.
+     */
+    def libraryAndConsumer(): (String, String) = {
+      val lib = createTempDirectory("sysl-declared-lib-")
+
+      createDirectories(s"$lib/m")
+      writeFile(s"$lib/package.hocon",
+        """package { name = "declared" }
+          |requires {
+          |  headers { probe = "the probe library's headers, wherever this machine keeps them" }
+          |}
+          |""".stripMargin)
+      writeFile(s"$lib/m/m.sysl",
+        """module m
+          |@link("probe")
+          |
+          |extern "shim_doubled" c_doubled() -> int
+          |
+          |doubled() -> int = c_doubled()
+          |""".stripMargin)
+      writeFile(s"$lib/m/shim.c",
+        "#include <probe.h>\nint shim_doubled(void) { return probe_answer() * 2; }\n")
+
+      val consumer = createTempDirectory("sysl-lib-consumer-")
+
+      writeFile(s"$consumer/main.sysl", "print(m.doubled())\n")
+      (lib, s"$consumer/main.sysl")
+    }
+
+    // The case that used to fall through: the consumer was handed clang's `'probe.h' file not
+    // found`, which names neither the package that wanted it nor the flag that answers it.
+    "is refused by name rather than by a header the reader has never heard of" in {
+      val (lib, main)     = libraryAndConsumer()
+      val (status, notes) = diagnostics(Config(command = "build", file = main, libs = List(lib)))
+
+      status should not be 0
+      notes should include("'probe'")
+      notes should include("wherever this machine keeps them")
+      notes should include("--include-path probe=")
+      notes should not include "probe.h"
+    }
+
+    // The root is named as the reader wrote it — a path here, where it is a coordinate for a
+    // dependency. Both are the thing the person reading the message typed and can go and look at.
+    "naming the root the way it was given" in {
+      val (lib, main) = libraryAndConsumer()
+      val (_, notes)  = diagnostics(Config(command = "build", file = main, libs = List(lib)))
+
+      notes should include(lib)
+    }
+
+    "and builds once the named form answers it" in {
+      val (include, libDir) = guard()
+      val (lib, main)       = libraryAndConsumer()
+
+      ran(Config(command = "run", file = main, libs = List(lib), linkPaths = List(libDir),
+        includePaths = List(include), namedIncludes = Map("probe" -> include))) shouldBe "84\n"
+    }
+
+    // A source root need not be a package at all, which is most of what `--lib` is for. One with no
+    // manifest has nothing to declare and must go on building exactly as it did.
+    "while a source root with no manifest is unaffected" in {
+      val root = createTempDirectory("sysl-plain-lib-")
+
+      createDirectories(s"$root/m")
+      writeFile(s"$root/m/m.sysl", "module m\n\ndoubled() -> int = 21 * 4\n")
+
+      val consumer = createTempDirectory("sysl-plain-consumer-")
+
+      writeFile(s"$consumer/main.sysl", "print(m.doubled())\n")
+      ran(Config(command = "run", file = s"$consumer/main.sysl", libs = List(root))) shouldBe "84\n"
+    }
+  }
+
   private def parsed(args: String*): Config =
     parseArgs(args).getOrElse(fail(s"these arguments did not parse: ${args.mkString(" ")}"))
 }
