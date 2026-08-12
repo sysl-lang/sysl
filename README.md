@@ -114,6 +114,11 @@ for you, and neither belongs in a source file — where a prefix lives is a fact
 not about the code (`design/15 §8`). `LIBRARY_PATH` and `CPATH` work too, since clang reads them, and
 are the better answer for a machine where the setting is always the same.
 
+A **package** whose C includes headers it does not carry can name them, and then a build that forgot
+the flag is refused by name rather than by a header you have never heard of — `requires { headers
+{ lwip = "…" } }` in its `package.hocon`, answered with `--include-path lwip=<dir>`
+(`design/packages.md § 8`).
+
 **Both bindings that used to live here have repositories of their own now, and `bindings/` is gone.**
 SQLite went first — [sysl-lang/sqlite3](https://github.com/sysl-lang/sqlite3), the first sysl package
 outside this tree (`design/packages.md`) — because a binding to a library nobody is obliged to have
