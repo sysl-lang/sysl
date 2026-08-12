@@ -113,8 +113,101 @@ class NoAllocGenericTests extends AnyFreeSpec with Matchers with RunSupport with
     }
 
     // Ignored with the two above and for the same reason: it is the accepting half of the same pair.
+    // **The counter-example that killed the first attempt at this**, kept as a test because it is the
+    // exact shape a blunter fix gets wrong. `cstring` here has nothing to do with `T` — it is the
+    // module's own conduct at every instantiation — and it appears nowhere but inside an instance
+    // body, so excusing the whole instance hides it and this compiles with no heap anywhere.
+    "a generic that allocates outright is still its own module's, since no type argument chose it" in {
+      val e = compiledFor(Capability.core.toSet - Capability.Heap)(
+        "main.sysl" ->
+          """import sysl.text.cstring
+            |
+            |thru[T](x: T, s: string) -> usize = cstring(s).len
+            |
+            |main()
+            |    print(thru(1, "hi"))
+            |""".stripMargin,
+      )
+
+      e.isLeft shouldBe true
+      e.swap.getOrElse("") should include("makes heap storage")
+    }
+
     "while the same pair compiles for a target that has one" ignore {
       compiledFor(Capability.core.toSet)("lib/lib.sysl" -> lib, "main.sysl" -> hosted).isRight shouldBe true
+    }
+  }
+
+  "the line is drawn at the type argument, and these are the cases that test where it falls" - {
+
+    // A trait's **default** body is written in the trait's own module and is the same at every
+    // instantiation, so a default that allocates is the library's conduct however the caller's type
+    // is chosen. It is excluded by name without a rule of its own: a default is emitted under the
+    // trait's symbol, not the argument's.
+    "a trait default that allocates is the library's, not the caller's" in {
+      val e = errOf(
+        "lib/lib.sysl" ->
+          """module lib
+            |@no_alloc
+            |
+            |import sysl.text.cstring
+            |
+            |trait Chatty
+            |    say(*self) -> usize = cstring("spoken").len
+            |
+            |use[C: Chatty](c: *C) -> usize = c.say()
+            |""".stripMargin,
+        "main.sysl" ->
+          """import lib.*
+            |
+            |struct Quiet
+            |    n: int
+            |
+            |impl Chatty for Quiet
+            |
+            |main()
+            |    var q = Quiet(0)
+            |    print(use(&q))
+            |""".stripMargin,
+      )
+
+      e should include("lib/lib.sysl")
+    }
+
+    // The type argument is itself an instantiation, so its members are emitted under the mangled
+    // name — `Box.int.put` and not `Box.put`. The ownership test is over that mangling, so a nested
+    // argument is recognised exactly as a plain one is.
+    "a type argument that is itself generic is still the caller's choice" ignore {
+      runOf(
+        "lib/lib.sysl" ->
+          """module lib
+            |@no_alloc
+            |
+            |trait Sink
+            |    put(*self, s: string)
+            |
+            |once[S: Sink](s: *S, msg: string)
+            |    s.put(msg)
+            |""".stripMargin,
+        "main.sysl" ->
+          """import lib.*
+            |import sysl.text.cstring
+            |
+            |struct Box[T]
+            |    v: T
+            |    n: int
+            |
+            |impl[T] Sink for Box[T]
+            |    put(*self, s: string)
+            |        val c = cstring(s)
+            |        self.n += 1
+            |
+            |main()
+            |    var b = Box(1, 0)
+            |    once(&b, "hi")
+            |    print(b.n)
+            |""".stripMargin,
+      ) shouldBe "1\n"
     }
   }
 
