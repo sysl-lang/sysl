@@ -97,7 +97,7 @@ object StringEmitter {
    * `sext i32 %n to i32` is not an instruction at all. So this answers with the line to emit,
    * which may be empty, and the name to read afterwards, which may be the original.
    */
-  private def counted(using w: Word, a: Allocator): (String, String) =
+  private def counted(using w: Word): (String, String) =
     if w.bits > 32 then (s"  %n64 = sext i32 %n to ${w.llvm}", "%n64") else ("", "%n")
 
   /** The three header words every `StrBuf` starts with — a strong count of one, no deallocation
@@ -128,7 +128,7 @@ object StringEmitter {
   /** Writing bytes out. `putchar` is declared here rather than beside `printf` because a module
    * that never prints a string never needs it.
    */
-  def write(using w: Word, a: Allocator): String = {
+  def write(using w: Word): String = {
     val word = w.llvm
 
     s"""declare i32 @putchar(i32)
@@ -156,7 +156,7 @@ object StringEmitter {
   /** Byte comparison: the common prefix decides it, and if there is no difference there the
    * shorter string comes first.
    */
-  def cmp(using w: Word, a: Allocator): String = {
+  def cmp(using w: Word): String = {
     val word = w.llvm
 
     s"""define private i32 @sysl.str.cmp(ptr %a, $word %an, ptr %b, $word %bn) {
@@ -283,7 +283,7 @@ object StringEmitter {
    * buffer, then copied out — the length is computed from the range rather than read as a
    * NUL-terminated run, so `char(0)` becomes a one-byte string rather than an empty one.
    */
-  def char(using w: Word, a: Allocator): String = {
+  def char(using w: Word): String = {
     val word = w.llvm
     val str  = Type.Str.llvm
 
@@ -330,7 +330,7 @@ object StringEmitter {
    * problems than this one, so the size is left as the honest consequence of the width rather than
    * being capped into a wrong answer.
    */
-  def int(bits: Int)(using w: Word, a: Allocator): String = {
+  def int(bits: Int)(using w: Word): String = {
     val ty   = s"i$bits"
     val buf  = digitCapacity(bits)
     val word = w.llvm
@@ -516,7 +516,7 @@ object StringEmitter {
   }
 
   /** A continuation byte is `10xxxxxx`; every other byte starts a character. */
-  def boundary(using w: Word, a: Allocator): String = {
+  def boundary(using w: Word): String = {
     val word = w.llvm
 
     s"""define private i1 @sysl.str.boundary(ptr %p, $word %n, $word %i) {
