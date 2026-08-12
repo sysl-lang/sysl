@@ -598,7 +598,8 @@ document.** This is the fact the whole design turns on:
 |---|---|---|
 | **x86-64** | an LLVM calling convention, `x86_intrcc` | a pointer to the frame the hardware pushed, optionally then an integer error code |
 | **RISC-V** | a function *attribute*, `"interrupt"="machine"` | nothing at all |
-| **AArch64** | it does not exist | — |
+| **AArch64** | it does not exist — a handler is assembly | — |
+| **Arm M-profile** (`thumb`) | it does not exist — a handler is an ordinary function | — |
 
 So the annotation names the **concept** and the back end decides what that becomes. A directive that
 spelled `x86_intrcc` would put one machine's answer in a source file and be wrong on the other two —
@@ -622,6 +623,23 @@ for and that building it for another fails loudly, which is exactly what the tab
 table the processor indexes by cause, where each entry is a fixed-size slot of instructions — so the
 entry point is assembly by construction, and there is nothing for a convention on a sysl function to
 describe.
+
+**M-profile's absence is a different absence, and the refusal has to say which one it is.** Armv6-M,
+Armv7-M and Armv8-M — every `thumb` target — enter an exception with `xPSR`, `PC`, `LR`, `R12` and
+`R3`–`R0` already stacked by the hardware and `EXC_RETURN` in the link register, so a plain AAPCS
+function returning normally *is* a correct handler, and the vector table holds its address rather
+than its code. That is the profile's defining convenience and the reason no Cortex-M project writes
+assembly wrappers. So the annotation is refused there too, and for the opposite reason: not that a
+convention could not describe the entry, but that the entry needs nothing described. **A handler is
+written as an ordinary function and named for the vector table with `@export`** (§12), which is
+already a reachability root, so the two rules that matter — the symbol survives pruning and it
+carries the name the table was built against — are the ones already in force.
+
+Two absences with one sentence between them would be worse than no sentence: an author on a
+Cortex-M told their exception entry is assembly has been given a fact about somebody else's machine,
+and would go looking for the assembly they are supposed to write. The reason therefore belongs with
+the processor rather than with the refusal, and a processor registered with no interrupt form owes
+an account of why alongside it.
 
 **A handler is an entry point, so it is a root of the reachability walk** (§5 step 7's pruning). No
 program calls one, and calling one is refused outright: it leaves through a return-from-interrupt

@@ -42,12 +42,13 @@ trait ConventionCheck extends TypeResolution {
         s"${Conventions.known.map(n => s"'$n'").mkString(", ")} is what there is")
 
     Conventions.interruptForm(target.cpu) match
-      case None =>
-        err(s"'${c.name}' is not something ${target.cpu.toString.toLowerCase} has: its exception " +
-          "entry goes through a vector table of fixed-size instruction slots, so a handler is " +
-          "assembly and there is nothing here for a convention to describe")
+      // The reason comes from the table rather than from here, because the processors without an
+      // interrupt form are without one for unrelated reasons and a shared sentence can be true of
+      // only one of them.
+      case Left(why) =>
+        err(s"'${c.name}' is not something ${target.cpu.toString.toLowerCase} has: $why")
 
-      case Some(form) =>
+      case Right(form) =>
         checkMode(c)
 
         // Generic is refused before anything is resolved, because a type parameter has nothing to

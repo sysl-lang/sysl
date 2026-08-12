@@ -40,31 +40,46 @@ object Conventions {
     /** An LLVM function attribute, written after the signature — RISC-V's `"interrupt"="mode"`. */
     case Attribute(key: String)
 
-  /** What `interrupt` is on this processor.
+  /** What `interrupt` is on this processor, or **why that processor has none** (`15 §10`).
    *
    * Written out per `Cpu` with no default arm, for the reason `Toolchain.libraryFlags` is: a
    * processor added to the registry has to answer this rather than inherit whichever answer sat at
    * the bottom of the match. The wrong answer here is not a build error, it is a handler that looks
    * right and corrupts memory.
+   *
+   * **The absent case carries its own sentence rather than sharing one**, which is the same rule one
+   * level down. Three processors answer `Left` and they answer it for three unrelated reasons: an
+   * A-profile handler is assembly, an M-profile one is an ordinary function, and i386 is simply not
+   * lowerable. A shared sentence can only be true of one of them, and the two it is false of are
+   * told something about their own machine that is not so. Keeping the reason *in this match* is
+   * what makes it impossible to add a processor that has no interrupt form and no account of why.
    */
-  def interruptForm(cpu: Cpu): Option[Form] = cpu match
-    case Cpu.X86_64  => Some(Form.Convention("x86_intrcc"))
+  def interruptForm(cpu: Cpu): Either[String, Form] = cpu match
+    case Cpu.X86_64  => Right(Form.Convention("x86_intrcc"))
     // Both RISC-V widths spell it the same way, because it is the same attribute: the privilege
     // modes below are the architecture's rather than the register width's.
-    case Cpu.Riscv64 | Cpu.Riscv32 => Some(Form.Attribute("interrupt"))
-    // Exception entry on AArch64 goes through a vector table the processor indexes by cause, and
-    // each entry is a fixed-size slot of instructions — so the entry point is assembly by
-    // construction and there is nothing for a convention on a sysl function to describe.
-    case Cpu.Aarch64 => None
+    case Cpu.Riscv64 | Cpu.Riscv32 => Right(Form.Attribute("interrupt"))
+
+    case Cpu.Aarch64 =>
+      Left("its exception entry goes through a vector table of fixed-size instruction slots, so a " +
+        "handler is assembly and there is nothing here for a convention to describe")
+
     // **A Cortex-M handler is an ordinary function, and that is the whole answer rather than a gap.**
-    // Armv8-M enters an exception with the caller-saved registers already stacked by the hardware
+    // M-profile enters an exception with the caller-saved registers already stacked by the hardware
     // and `EXC_RETURN` in the link register, so a plain AAPCS function returning normally is a
     // correct handler — which is why the vector table can just hold its address. A convention or an
     // attribute here would describe a prologue the processor has already written.
-    case Cpu.Thumb => None
+    case Cpu.Thumb =>
+      Left("a Cortex-M exception is entered with the caller-saved registers already stacked by the " +
+        "processor and 'EXC_RETURN' in the link register, so an ordinary function is already a " +
+        "correct handler and there is no prologue for a convention to arrange — write one, and give " +
+        "it the name the vector table holds with '@export(\"SysTick_Handler\")'")
+
     // 32-bit x86 has the convention, but i386 is not lowerable for want of a measured C ABI
     // (`Target.supported`), so nothing can reach this and saying so is better than implying support.
-    case Cpu.X86 => None
+    case Cpu.X86 =>
+      Left("sysl cannot lower for i386 at all, for want of a measured C ABI, so its interrupt " +
+        "convention is not something this compiler implements")
 
   /** The privilege modes RISC-V distinguishes, in the spelling the attribute takes. `machine` is the
    * default because a handler with no mode written is the one a bare-metal program means: M-mode is

@@ -112,6 +112,56 @@ class CallingConventionTests extends AnyFreeSpec with Matchers with RunSupport w
     e should include("vector table")
   }
 
+  /** Refused too, and for a reason that is nothing like AArch64's.
+   *
+   * M-profile — Armv6-M, Armv7-M, Armv8-M, which is every thumb target here — stacks the
+   * caller-saved registers in hardware and leaves `EXC_RETURN` in the link register, so an ordinary
+   * function *is* a correct handler and the vector table holds its address rather than its code.
+   * There is nothing for a convention to arrange, which is why the annotation is refused; but the
+   * refusal has to say that rather than tell a Cortex-M reader their exception entry is assembly.
+   */
+  "on thumb it is refused because nothing is needed, and the reason is M-profile's" - {
+
+    // All four are `Cpu.Thumb` and all four are M-profile, so one answer serves them — but a target
+    // added with the wrong profile in mind would show up here rather than in a handler that faults.
+    for t <- List(Target.thumbFreestanding, Target.thumbFreestandingSoftfp,
+                  Target.thumbv6mFreestanding, Target.thumbv7emFreestanding)
+    do
+      s"on ${t.name}" in {
+        val e = errFor(t, bare)
+
+        e should include("is not something thumb has")
+        e should include("already stacked by the processor")
+        e should include("ordinary function is already a correct handler")
+      }
+
+    // The claim this card was filed for: A-profile's sentence reaches M-profile and is false there.
+    "and it does not borrow AArch64's account of the machine" in {
+      val e = errFor(Target.thumbv7emFreestanding, bare)
+
+      e should not include "handler is assembly"
+      e should not include "fixed-size instruction slots"
+    }
+
+    // Option 2 rather than option 1: a reader arriving from an Arm C project is told what to write,
+    // not merely that what they wrote is wrong. `@export` is already a pruning root, so the name
+    // survives to fill the vector table with nothing else asked of them.
+    "and it names the spelling that does work" in {
+      errFor(Target.thumbv7emFreestanding, bare) should include("""@export("SysTick_Handler")""")
+    }
+  }
+
+  // What the diagnostic tells them to write, actually written — otherwise the advice is prose.
+  "the handler the thumb diagnostic asks for reaches the IR under the name it was given" in {
+    val ir = irFor(Target.thumbv7emFreestanding, ack +
+      """@export("SysTick_Handler")
+        |systick()
+        |    ack()
+        |""".stripMargin)
+
+    ir should include("define void @SysTick_Handler()")
+  }
+
   "the signature each processor demands is enforced" - {
 
     "x86-64 refuses a handler with no frame, and says what the frame is for" in {
