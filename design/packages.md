@@ -339,6 +339,20 @@ declaration unenforceable — a consumer would satisfy it by accident and never 
 command that compiles none — `emit-llvm`, `prove` — has nothing unmet, and charging it for a path it
 would never open would turn a requirement about the C into a requirement about the package.
 
+**It is asked on every road a package reaches a build by, and the three do not each need the same
+thing from it.** A package named in `dependencies` arrives with its manifest as part of the graph and
+is asked. One handed over as a **`.syslib`** is asked nothing and needs nothing: an artifact carries
+the *measured value* of a `c const` rather than the C expression that produced it, so a consumer of
+one needs neither a clang nor the library's headers. One given as a **`--lib` source root** has its
+manifest read for this and is asked exactly as a dependency is — the same package, the same
+declaration and the same sentence, whichever way it arrived.
+
+**Only the header requirements are read from a `--lib` root**, and that is a deliberate stopping
+point rather than as far as somebody got. `--lib` names a *source root*, which need not be a package
+at all; one that is not has nothing to declare here. Reading the rest of what a manifest can say is a
+larger question with a real cost — an allocator taken silently from a `--lib` root is the mixed heap
+`§ 13` exists to prevent — so it is left for a decision rather than arrived at by extension.
+
 Two things are deliberately absent. **A named path is not scoped to the package that asked for it**
 and reaches every C compilation exactly as a bare one does; scoping is arguably more correct and buys
 nothing the refusal above does not. And **defines are the same shape and are not built** — a header
