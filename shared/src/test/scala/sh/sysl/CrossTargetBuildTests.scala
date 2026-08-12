@@ -133,4 +133,65 @@ class CrossTargetBuildTests extends AnyFreeSpec with Matchers {
     // would leave the single-slot default undefined.
     withClue(line.get)(line.get should include(" W "))
   }
+
+  /** And that a port's definition **wins**, which is the other half of the same claim and the half
+   * an adjective in the IR cannot establish.
+   *
+   * `weak` is only worth anything if a strong definition beside it takes over, so the check is the
+   * link itself: the module's object and a C object defining `__sysl_arc_reaper` outright, merged,
+   * leaving one definition and that one strong. A relocatable link (`-r`) rather than a whole
+   * program, because a bare-metal image would want an entry point and a script that are nothing to
+   * do with what is being asked.
+   */
+  "and a port's own definition takes over from it at the link" in {
+    val t  = Target.aarch64Freestanding
+    val cc = Toolchain.findClang(t).getOrElse(cancel(s"no clang for ${t.name}"))
+
+    val src = """struct Node
+                |    v: int
+                |var p: &sync Node = Node(1)
+                |""".stripMargin
+
+    val obj    = createTempFile("sysl-reaper-", ".o")
+    val portC  = createTempFile("sysl-port-", ".c")
+    val portO  = createTempFile("sysl-port-", ".o")
+    val merged = createTempFile("sysl-merged-", ".o")
+
+    val ir = Compiler.compile(List(Source("p.sysl", src)), t) match
+      case Right(ir) => ir
+      case Left(why) => fail(s"did not compile for ${t.name}: $why")
+
+    withClue(s"$cc, ${t.triple}: ")(Toolchain.compileObject(ir, obj, t) shouldBe Right(()))
+
+    // What an RTOS port writes: storage per task, handed back by the symbol the reaper asks. The
+    // layout is the slot's — a head pointer and a flag — and this is the one place it is written in
+    // the language a port is written in.
+    writeFile(portC,
+      s"""struct sysl_arc_reaper { void *head; unsigned char draining; };
+         |static struct sysl_arc_reaper task;
+         |struct sysl_arc_reaper *${ArcEmitter.reaperSlot}(void) { return &task; }
+         |""".stripMargin)
+
+    val compiled = exec(List(cc, s"--target=${t.triple}", "-c", portC, "-o", portO))
+    withClue(compiled.stderr)(compiled.exitCode shouldBe 0)
+
+    val linked = exec(List("ld.lld", "-r", obj, portO, "-o", merged))
+
+    val listed = if linked.exitCode == 0 then exec(List("nm", merged)) else linked
+
+    for f <- List(obj, portC, portO, merged) do deleteFile(f)
+
+    // Skipped rather than failed without lld: this asserts something about a linker, and a machine
+    // with no linker for the target cannot be asked.
+    assume(linked.exitCode == 0, s"ld.lld not available: ${linked.stderr.trim}")
+    assume(listed.exitCode == 0, "nm not available")
+
+    val defs = listed.stdout.linesIterator.filter(_.contains(ArcEmitter.reaperSlot)).toList
+
+    // One definition, and it is the port's: a `W` surviving here would mean the weak default had
+    // been kept and the port's storage never used, which is the defect this whole arrangement is
+    // for — and it would show up as two tasks sharing a worklist rather than as a link error.
+    withClue(listed.stdout)(defs.length shouldBe 1)
+    withClue(defs.head)(defs.head should include(" T "))
+  }
 }
