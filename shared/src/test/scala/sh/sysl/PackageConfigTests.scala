@@ -23,7 +23,7 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
       case Right(c) => fail(s"expected a refusal, got: $c")
 
   "a project may have no file at all, and every capability is then provided" in {
-    PackageConfig.empty.provides("aarch64-macos") shouldBe Set("alloc", "os", "posix", "threads")
+    PackageConfig.empty.provides("aarch64-macos") shouldBe Set("heap", "os", "posix", "threads")
   }
 
   "an empty file is a project that said nothing" in {
@@ -112,18 +112,72 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
           |}
           |""".stripMargin)
 
-      c.provides("aarch64-kernel") shouldBe Set("alloc", "threads")
+      c.provides("aarch64-kernel") shouldBe Set("heap", "threads")
     }
 
     "a target the file says nothing about provides everything" in {
       val c = read(
         """targets {
-          |  aarch64-kernel { capabilities { alloc = false } }
+          |  aarch64-kernel { capabilities { heap = false } }
           |}
           |""".stripMargin)
 
-      c.provides("x86_64-linux") shouldBe Set("alloc", "os", "posix", "threads")
+      c.provides("x86_64-linux") shouldBe Set("heap", "os", "posix", "threads")
       c.provides("aarch64-kernel") shouldBe Set("os", "posix", "threads")
+    }
+
+    // Whether a heap exists is a project engineering decision, so it is stated once for the project
+    // rather than once per machine it is built for. Keyed only by target it could not be said at all
+    // for a target the registry already has, since a block would then be a machine being redefined.
+    "a project states its own policy, for every target it builds for" in {
+      val c = read("capabilities { heap = false }\n")
+
+      c.provides("aarch64-macos") shouldBe Set("os", "posix", "threads")
+      c.provides("thumbv7em-freestanding") shouldBe Set("os", "posix", "threads")
+    }
+
+    "and a target block layers over it, for the one machine where it is not so" in {
+      val c = read(
+        """capabilities { heap = false }
+          |targets {
+          |  aarch64-macos { capabilities { heap = true } }
+          |}
+          |""".stripMargin)
+
+      c.provides("aarch64-macos") should contain("heap")
+      c.provides("thumbv7em-freestanding") shouldNot contain("heap")
+    }
+
+    // The layering is per capability rather than per block: a target block saying one thing does not
+    // discard what the project said about the others.
+    "the layering is per capability, not per block" in {
+      val c = read(
+        """capabilities { heap = false, threads = false }
+          |targets {
+          |  kernel { capabilities { threads = true } }
+          |}
+          |""".stripMargin)
+
+      c.provides("kernel") shouldBe Set("os", "posix", "threads")
+    }
+
+    // `alloc` is what a *module* promises about its conduct; the config names the facility. Somebody
+    // who writes one meant the other, so it is refused naming it rather than as an unknown word.
+    "the module's own vocabulary is refused in the config, naming the right word" in {
+      val e = refused("capabilities { alloc = false }\n")
+
+      e should include("is what a module does, not something a machine has")
+      e should include("'heap'")
+    }
+
+    // It parsed cleanly and was then dropped by `collect { case (name, true) => name }`, so the file
+    // read as though the project had said something. It is the spelling reached for first.
+    "'requires' with a false says nothing, and is refused rather than discarded" in {
+      val e = refused("requires { heap = false }\n")
+
+      e should include("says nothing")
+      e should include("capabilities { heap = false }")
+      e should include("@no_alloc")
     }
 
     "a capability that is not one is refused, rather than quietly doing nothing" in {
@@ -135,13 +189,13 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
 
       e should include("'treads'")
       e should include("is not a capability")
-      e should include("'alloc', 'os', 'posix', 'threads'")
+      e should include("'heap', 'os', 'posix', 'threads'")
     }
 
     "a capability that is not true or false" in {
       refused(
         """targets {
-          |  kernel { capabilities { alloc = "no" } }
+          |  kernel { capabilities { heap = "no" } }
           |}
           |""".stripMargin) should include("must be true or false")
     }
@@ -165,8 +219,11 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
       read("requires { posix = true }").requires shouldBe Set("os", "posix")
     }
 
-    "a false entry asks for nothing rather than forbidding it" in {
-      read("requires { os = false }").requires shouldBe empty
+    // This used to assert that a `false` here asks for nothing, which was true and was the defect:
+    // it parsed, it was dropped, and the file then read as though the project had said something. A
+    // package cannot need a facility *not* to exist, so there is nothing for the entry to mean.
+    "a false entry is refused, since 'requires' cannot ask for an absence" in {
+      refused("requires { os = false }") should include("says nothing")
     }
 
     "a name that is not a capability" in {
