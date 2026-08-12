@@ -230,6 +230,146 @@ class SearchPathTests extends LibraryCliSupport {
       c.includePaths shouldBe empty
       c.defines shouldBe empty
     }
+
+    // The named form is the same flag, so the directory has to reach the C compiler exactly as a
+    // bare one does. A name that recorded the requirement and dropped the path would satisfy the
+    // check and then fail in clang, which is the failure this whole feature exists to remove.
+    "a named --include-path is both a path and an answer" in {
+      val c = parsed("run", "p.sysl", "--include-path", "lwip=/sdk/lwip/include")
+
+      c.includePaths shouldBe List("/sdk/lwip/include")
+      c.namedIncludes shouldBe Map("lwip" -> "/sdk/lwip/include")
+    }
+
+    "and a bare one is only a path" in {
+      val c = parsed("run", "p.sysl", "--include-path", "/opt/homebrew/include")
+
+      c.includePaths shouldBe List("/opt/homebrew/include")
+      c.namedIncludes shouldBe empty
+    }
+  }
+
+  /** Which spellings of the flag are a name and which are a directory (`SearchPaths.namedInclude`).
+   *
+   * The two forms share a flag, so this is the whole of what keeps them apart — and it has to be
+   * decidable by looking, since a path read as a name would silently stop reaching the C compiler.
+   */
+  "the named --include-path form" - {
+
+    "takes a name and a directory" in {
+      SearchPaths.namedInclude("lwip=/sdk/include") shouldBe Some("lwip" -> "/sdk/include")
+    }
+
+    "allows the punctuation a package name uses" in {
+      SearchPaths.namedInclude("pico-sdk_2=/x") shouldBe Some("pico-sdk_2" -> "/x")
+    }
+
+    // The path is the rest of the string rather than the next segment, so a directory holding an
+    // `=` still arrives whole.
+    "splits at the first '=' and keeps the rest" in {
+      SearchPaths.namedInclude("lwip=/sdk/a=b/include") shouldBe Some("lwip" -> "/sdk/a=b/include")
+    }
+
+    "is not a name where there is no '='" in {
+      SearchPaths.namedInclude("/opt/homebrew/include") shouldBe None
+    }
+
+    // Every shape of ordinary directory, none of which may be read as a name. The first two are the
+    // cases that decide the rule: something before an `=` that holds a separator is a path.
+    "is not a name where what precedes the '=' could not be one" in {
+      SearchPaths.namedInclude("/opt/x=y") shouldBe None
+      SearchPaths.namedInclude("../x=y") shouldBe None
+      SearchPaths.namedInclude("2fast=y") shouldBe None
+      SearchPaths.namedInclude("=y") shouldBe None
+    }
+
+    // A name with nothing after it is a mistake either way, and taking it as a directory is the
+    // reading that fails where the reader can see it: clang says the path does not exist.
+    "is not a name where nothing follows the '='" in {
+      SearchPaths.namedInclude("lwip=") shouldBe None
+    }
+  }
+
+  /** A package saying which headers its own C needs, and the driver checking somebody supplied them
+   * (`packages.md § 8`).
+   *
+   * **The refusal is the feature.** `--include-path` already worked, and a project that passes it
+   * built before this existed and builds now — what did not exist was any way for the *package* to
+   * say it needed one, so the build failed inside a C compiler that names the header and knows
+   * nothing about sysl, the package, or the flag.
+   */
+  "a package that declares the headers it needs" - {
+
+    /** The doubling shim again, with a `package.hocon` saying out loud what its C includes. */
+    def declaring(): String = {
+      val root = createTempDirectory("sysl-declared-")
+
+      createDirectories(s"$root/m")
+      writeFile(s"$root/main.sysl", "print(m.doubled())\n")
+      writeFile(s"$root/package.hocon",
+        """package { name = "declared" }
+          |requires {
+          |  headers { probe = "the probe library's headers, wherever this machine keeps them" }
+          |}
+          |""".stripMargin)
+      writeFile(s"$root/m/m.sysl",
+        """module m
+          |@link("probe")
+          |
+          |extern "shim_doubled" c_doubled() -> int
+          |
+          |doubled() -> int = c_doubled()
+          |""".stripMargin)
+      writeFile(s"$root/m/shim.c",
+        "#include <probe.h>\nint shim_doubled(void) { return probe_answer() * 2; }\n")
+      root
+    }
+
+    // The whole point, in one case: the build stops naming the requirement, the reason and the flag,
+    // and it stops before clang has run at all — so `probe.h` is not in the message, because nothing
+    // got far enough to look for it.
+    "is refused by name rather than by a header the reader has never heard of" in {
+      val (status, notes) = diagnostics(Config(command = "build", file = declaring()))
+
+      status should not be 0
+      notes should include("'probe'")
+      notes should include("wherever this machine keeps them")
+      notes should include("--include-path probe=")
+      notes should not include "probe.h"
+    }
+
+    // A bare path compiles the C perfectly well and is deliberately *not* an answer: the check is
+    // about what the build says it has rather than about what it might happen to find. Reading a
+    // bare path as an answer would make the declaration unenforceable.
+    // Bound as `dir` rather than `include`, which would shadow the matcher of that name two lines
+    // down and turn the assertion into a `charAt`.
+    "is not answered by a bare --include-path" in {
+      val (dir, _) = guard()
+
+      val (status, notes) =
+        diagnostics(Config(command = "build", file = declaring(), includePaths = List(dir)))
+
+      status should not be 0
+      notes should include("'probe'")
+    }
+
+    // Both fields, because a `Config` is what the parser *produced*: the name answers the
+    // requirement and the directory is what reaches clang, and the pair of cases above is what
+    // asserts one flag writes both.
+    "and builds once the named form answers it" in {
+      val (include, lib) = guard()
+
+      ran(Config(command = "run", file = declaring(), linkPaths = List(lib),
+        includePaths = List(include), namedIncludes = Map("probe" -> include))) shouldBe "84\n"
+    }
+
+    // A command that compiles no C has nothing unmet. Charging `emit-llvm` for a path it would never
+    // open would turn a requirement about the C into a requirement about the package.
+    "and does not hold up a command that compiles no C" in {
+      val (status, _) = diagnostics(Config(command = "emit-llvm", file = declaring()))
+
+      status shouldBe 0
+    }
   }
 
   private def parsed(args: String*): Config =

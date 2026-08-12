@@ -236,6 +236,60 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  /** The `headers` sub-block: which C headers this package includes and does not carry, each under a
+   * name a consumer answers with `--include-path <name>=<dir>` (`packages.md § 8`).
+   *
+   * It sits under `requires` because that is already *what this package needs of its environment*,
+   * and the only thing separating it from the capabilities beside it is that satisfying it is a path
+   * — which `15 §8` settles is the driver's and may never be written in this file.
+   */
+  "the headers a package requires" - {
+
+    "are read as a name and the reason the consumer is given" in {
+      read(
+        """requires {
+          |  headers { lwip = "lwIP's headers, from the pico-sdk" }
+          |}
+          |""".stripMargin).headers shouldBe Map("lwip" -> "lwIP's headers, from the pico-sdk")
+    }
+
+    // The two kinds of requirement share the block, so each has to survive the other being there.
+    // Read as a capability, `headers` would be refused as a name that is not one.
+    "sit beside the capabilities without disturbing them" in {
+      val c = read(
+        """requires {
+          |  os = true
+          |  headers { lwip = "lwIP's headers" }
+          |}
+          |""".stripMargin)
+
+      c.requires shouldBe Set("os")
+      c.headers.keySet shouldBe Set("lwip")
+    }
+
+    "and a file that declares none needs none" in {
+      read("requires { os = true }").headers shouldBe empty
+    }
+
+    // The name is written on a command line as `--include-path <name>=<dir>`, so one the flag could
+    // not carry is refused where the package chose it rather than where a consumer types it.
+    "a name a command line could not carry is refused" in {
+      val e = refused("""requires { headers { "lw/ip" = "why" } }""")
+
+      e should include("--include-path <name>=<dir>")
+    }
+
+    // The string is quoted back at whoever has to go and find the headers, and is the only part of
+    // the refusal nothing in the compiler could have written.
+    "a reason that says nothing is refused, because the reason is the point" in {
+      refused("""requires { headers { lwip = "" } }""") should include("says nothing about what it needs")
+    }
+
+    "and a path where the reason belongs is refused as the wrong kind of thing" in {
+      refused("""requires { headers { lwip = true } }""") should include("must be a string")
+    }
+  }
+
   "the dependencies block" - {
 
     "a coordinate and a version" in {
