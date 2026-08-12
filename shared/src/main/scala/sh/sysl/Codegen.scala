@@ -491,12 +491,12 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
    * exist, so what is left here is the spelling.
    */
   private def convention(f: TFunc): String =
-    f.conv.flatMap(_ => Conventions.interruptForm(target.cpu)) match
+    f.conv.flatMap(_ => Conventions.interruptForm(target.cpu).toOption) match
       case Some(Conventions.Form.Convention(llvm)) => s"$llvm "
       case _                                       => ""
 
   private def attribute(f: TFunc): String =
-    f.conv.zip(Conventions.interruptForm(target.cpu)) match
+    f.conv.zip(Conventions.interruptForm(target.cpu).toOption) match
       case Some((c, Conventions.Form.Attribute(key))) =>
         s""" "$key"="${c.arg.getOrElse(Conventions.defaultRiscvMode)}""""
       case _ => ""
@@ -510,7 +510,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
    * integer passed as itself.
    */
   private def frameOf(f: TFunc, ty: Type, name: String): String =
-    f.conv.flatMap(_ => Conventions.interruptForm(target.cpu)) match
+    f.conv.flatMap(_ => Conventions.interruptForm(target.cpu).toOption) match
       case Some(Conventions.Form.Convention(_)) if f.params.headOption.exists(_._1 == name) =>
         ty match
           case Type.Ptr(inner) => s" byval(${inner.llvm})"
