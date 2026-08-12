@@ -79,9 +79,15 @@ built for. A narrowing clause is a module's promise about its own **conduct**, a
 an action: *I do not allocate, so I do not need a heap to exist.* The other three need no second word,
 since for them giving the facility up and not using it are the same act.
 
-Each spelling is refused where the other belongs, naming it, because somebody who wrote one meant the
-other: `@no_heap` says a machine has no heap, which is the project's to say and not a module's, and
-`capabilities { alloc = false }` names what a module does where a facility belongs.
+`@no_heap` is refused, naming `@no_alloc`: it says a machine has no heap, which is the project's to
+say and not a module's.
+
+**The config accepts `alloc` and maps it, transitionally**, and that is compatibility rather than a
+second spelling. A **tag is immutable**: every package is fetched at a pinned version whose
+`package.hocon` says `requires { alloc = true }` and always will, and a fetched dependency's file is
+validated exactly as the project's own is — so refusing the old word would stop every pinned
+dependency resolving on the day it shipped, and re-tagging cannot help a consumer that has not also
+bumped its pin. `heap` is the name to write; the allowance goes once the packages have been swept.
 
 `threads` gates *spawning*, not soundness: what may cross a domain boundary is a structural
 rule (`06`), and one that has no check behind it until the channel is written. A target with no

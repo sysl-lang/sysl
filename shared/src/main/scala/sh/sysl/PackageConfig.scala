@@ -187,18 +187,22 @@ object PackageConfig {
     section match
       case None => Right(Map.empty)
       case Some(caps) =>
-        collect(caps.fields.toList.sortBy(_._1)) { (name, value) =>
+        collect(caps.fields.toList.sortBy(_._1)) { (rawName, value) =>
+          // **A module's word is accepted here and mapped**, which is a transitional allowance rather
+          // than a second spelling: `alloc` names what a module does and `heap` names the facility, and
+          // the config wants the facility. What makes it worth carrying is that a **tag is immutable**
+          // — every package in the org is fetched at a pinned version whose `package.hocon` says
+          // `requires { alloc = true }` and always will, and `Resolve.configOf` validates a fetched
+          // dependency's file exactly as it validates the project's own. Refusing the old word outright
+          // would stop every pinned dependency resolving on the day this shipped, and re-tagging cannot
+          // fix a consumer that has not also bumped its pin.
+          //
+          // `heap` is the documented name and the one to write. This goes when the org has been swept.
+          val name = Capability.narrowedBy.getOrElse(rawName, rawName)
+
           if !Capability.implies.contains(name) then
-            // A module's word where a facility belongs. `alloc = true` is what somebody writes having
-            // read `@no_alloc` in the source beside it, and the two are deliberately different words:
-            // the config says whether a heap **exists**, and the clause promises what a module
-            // **does**.
-            if Capability.narrowedBy.contains(name) then
-              Left(s"$FileName: '$name' in '$where' is what a module does, not something a machine " +
-                s"has — the config names the facility, so this is '${Capability.narrowedBy(name)}'")
-            else
-              Left(s"$FileName: '$name' in '$where' is not a capability — " +
-                s"the set is ${Capability.core.map(n => s"'$n'").mkString(", ")}")
+            Left(s"$FileName: '$rawName' in '$where' is not a capability — " +
+              s"the set is ${Capability.core.map(n => s"'$n'").mkString(", ")}")
           else
             value match
               case ConfigBoolean(on) => Right(name -> on)

@@ -161,13 +161,18 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
       c.provides("kernel") shouldBe Set("os", "posix", "threads")
     }
 
-    // `alloc` is what a *module* promises about its conduct; the config names the facility. Somebody
-    // who writes one meant the other, so it is refused naming it rather than as an unknown word.
-    "the module's own vocabulary is refused in the config, naming the right word" in {
-      val e = refused("capabilities { alloc = false }\n")
+    // `alloc` is what a *module* promises about its conduct and `heap` is the facility, so the config
+    // wants `heap`. The old word is accepted and mapped, transitionally, because **a tag is
+    // immutable**: every package in the org is fetched at a pinned version whose `package.hocon` says
+    // `requires { alloc = true }` and always will, and a fetched dependency's file is validated
+    // exactly as the project's own is. Refusing it would stop every pinned dependency resolving.
+    "the module's own word is accepted in the config and mapped, so a pinned dependency still reads" in {
+      read("capabilities { alloc = false }\n").provides("aarch64-macos") shouldNot contain("heap")
+      read("requires { alloc = true }\n").requires should contain("heap")
+    }
 
-      e should include("is what a module does, not something a machine has")
-      e should include("'heap'")
+    "while a word that is neither is still refused" in {
+      refused("capabilities { treads = false }\n") should include("is not a capability")
     }
 
     // It parsed cleanly and was then dropped by `collect { case (name, true) => name }`, so the file
