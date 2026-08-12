@@ -145,8 +145,8 @@ case class CConstBlock(consts: List[CConstDecl]) extends Stmt
 /** `@assert(cond)`, `@assert(cond, "why")` — a condition checked while compiling.
  *
  * The condition is a constant expression (`13 §Constants`) folded by the same machinery a `const`
- * initializer goes through, so it may name constants, `sizeof`, `alignof` and the arithmetic over
- * them. A false one is a compile error quoting the message; a true one emits nothing at all.
+ * initializer goes through, so it may name constants, `sizeof`, `alignof`, `offsetof` and the
+ * arithmetic over them. A false one is a compile error quoting the message; a true one emits nothing at all.
  *
  * **It exists because `require` is the wrong tool and there was no right one.** A `require` is a
  * *runtime* precondition — `17` is explicit that it is still compiled, still branches and still

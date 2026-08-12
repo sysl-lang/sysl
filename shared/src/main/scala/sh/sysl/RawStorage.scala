@@ -29,6 +29,12 @@ trait RawStorage extends ExprSupport {
   protected def layoutOf(what: String, tr: TypeRef): TExpr =
     TIntLit(layoutBytes(what, resolveType(tr, tsubst)).getOrElse(0), Type.usize)
 
+  /** `offsetof(T, field)` — the same, for where a field starts rather than how wide a type is. The
+   * placeholder stands in for the same two answerless cases, and is emitted in neither.
+   */
+  protected def offsetOf(tr: TypeRef, field: String): TExpr =
+    TIntLit(offsetBytes(resolveType(tr, tsubst), field).getOrElse(0), Type.usize)
+
   /** `ptr_cast(x)` — an address read as a pointer to something else.
    *
    * The target is the type the context asks for, the way `va_arg`, a bare `None` and a bare `null`

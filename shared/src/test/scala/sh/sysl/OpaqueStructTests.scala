@@ -127,6 +127,13 @@ class OpaqueStructTests extends AnyFreeSpec with Matchers with RunSupport with C
       rejecting("print(alignof(net.Conn))\n") should include("opaque outside 'net'")
     }
 
+    // An offset is the one fact the modifier exists to withhold, so this is the question asked most
+    // directly of all. It is refused by the same path the other two are — resolving the written type
+    // — rather than by a rule of its own.
+    "and 'offsetof', which asks for the withheld fact by name" in {
+      rejecting("print(offsetof(net.Conn, fd))\n") should include("opaque outside 'net'")
+    }
+
     "reading a field through the pointer is refused, since that needs an offset" in {
       rejecting("f(c: *net.Conn) -> int = c.fd\nprint(1)\n") should include("opaque")
     }

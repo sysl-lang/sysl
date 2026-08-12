@@ -136,6 +136,7 @@ class SyslLexical
     "weak",
     "sizeof",
     "alignof",
+    "offsetof",
     "require",
     "ensure",
     "type",

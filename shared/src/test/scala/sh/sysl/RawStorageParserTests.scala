@@ -43,6 +43,33 @@ class RawStorageParserTests extends AnyFreeSpec with ParseSupport {
     lastExpr("alignof(*Node)") shouldBe LayoutOf("alignof", PtrType(NamedType("Node")))
   }
 
+  /** `offsetof(T, field)` is a node of its own rather than a third spelling of `LayoutOf`, because its
+   * operands are of two kinds: the type grammar reads the first and stops at the comma, and the
+   * second is a **name** — there is no value here for a `p.x` to select from.
+   */
+  "'offsetof' takes a type and then a field name" - {
+    "over a plain struct name" in {
+      lastExpr("offsetof(Header, length)") shouldBe OffsetOf(NamedType("Header"), "length")
+    }
+    "over the type grammar, exactly as sizeof does" in {
+      lastExpr("offsetof(Option[int], value)") shouldBe
+        OffsetOf(NamedType("Option", List(NamedType("int"))), "value")
+    }
+    "and the field may be a quoted name, since every naming position takes one" in {
+      lastExpr("offsetof(Header, `type`)") shouldBe OffsetOf(NamedType("Header"), "type")
+    }
+    // Both places a token may be missing, because a message written after the whole form would be
+    // outranked by the failure the form left further along the line and never reported.
+    "a missing field name is refused by name" in {
+      progError("print(offsetof(Header))") should
+        include("'offsetof' takes a struct type and a field name in parentheses")
+    }
+    "and so is a missing operand list" in {
+      progError("var n = 3\nprint(offsetof n)") should
+        include("'offsetof' takes a struct type and a field name in parentheses")
+    }
+  }
+
   "it is a primary, so an operator around it binds outside it" - {
     "a following operator" in {
       lastExpr("sizeof(int) * 4") shouldBe Binary("*", LayoutOf("sizeof", NamedType("int")), i(4))
@@ -76,6 +103,9 @@ class RawStorageParserTests extends AnyFreeSpec with ParseSupport {
     }
     "'alignof'" in {
       progError("var alignof = 1") should not be empty
+    }
+    "'offsetof'" in {
+      progError("var offsetof = 1") should not be empty
     }
   }
 }

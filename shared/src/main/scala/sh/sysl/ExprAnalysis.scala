@@ -667,9 +667,11 @@ trait ExprAnalysis
     case Call(Ident("atomic_fence"), args) if atomicFenceForm => atomicFence(args)
     case Call(Ident(name), args) if atomicForm(name)          => atomicCall(name, args)
 
-    // `sizeof(T)` / `alignof(T)` — the parser has already read the operand as a type, which is what
-    // separates these from every form above: they are syntax rather than a name the analyzer knows.
+    // `sizeof(T)` / `alignof(T)` / `offsetof(T, f)` — the parser has already read the operand as a
+    // type, which is what separates these from every form above: they are syntax rather than a name
+    // the analyzer knows.
     case LayoutOf(what, tr)                                 => layoutOf(what, tr)
+    case OffsetOf(tr, field)                                => offsetOf(tr, field)
 
     // `old(e)` is a contextual keyword read only while an `ensure` is being analyzed; the guard is
     // what lets `old` stay an ordinary name outside a postcondition.
