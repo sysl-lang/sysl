@@ -45,8 +45,8 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
         "main.sysl" -> "var n = 7\nprint(thing.f(&n))") should include("define")
     }
 
-    "'requires alloc', the other direction" in {
-      runOf("thing/a.sysl" -> "module thing\n@requires(alloc)\n\nf() -> &int = 1\n",
+    "'requires heap', the other direction" in {
+      runOf("thing/a.sysl" -> "module thing\n@requires(heap)\n\nf() -> &int = 1\n",
         "main.sysl" -> "print(*thing.f())") shouldBe "1\n"
     }
 
@@ -109,7 +109,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
       val e = err("@requires(sockets)\n\nf() -> int = 1\n")
 
       e should include("no capability is called 'sockets'")
-      e should include("'alloc', 'os', 'posix', 'threads'")
+      e should include("'heap', 'os', 'posix', 'threads'")
     }
 
     // The narrowing form carries the name in the attribute's own word, so an unknown one is a
@@ -123,9 +123,14 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
       err("@no_alloc\n@no_alloc\n\nf() -> int = 1\n") should include("'alloc' is declared twice")
     }
 
+    // Written in the two vocabularies, because that is what the pair looks like: the module promises
+    // it does not allocate and then says it cannot be built without a heap. Grouping the clauses by
+    // what was *typed* would have let this through, since the words differ.
     "and a capability both given up and required" in {
-      err("@no_alloc\n@requires(alloc)\n\nf() -> int = 1\n") should
-        include("'alloc' is both given up and required here")
+      val e = err("@no_alloc\n@requires(heap)\n\nf() -> int = 1\n")
+
+      e should include("'heap' is both given up and required here")
+      e should include("'@no_alloc' and 'requires heap' are the two directions of one capability")
     }
 
     /* The refusal that used to sit here refuses nothing now, and that is the state it was built to

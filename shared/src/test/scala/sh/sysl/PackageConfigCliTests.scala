@@ -160,7 +160,10 @@ class PackageConfigCliTests extends AnyFreeSpec with Matchers {
       val (code, said) = stderrOf(cli(Config(command = "build", file = dir, output = Some(s"$dir/out"))))
 
       code should not be 0
-      said should include("this package requires 'alloc'")
+      // The config wrote `alloc`, which is the module's word and is accepted transitionally; the
+      // diagnostic names the capability it was mapped to, since that is the one the reader has to
+      // write from now on.
+      said should include("this package requires 'heap'")
     }
   }
 
