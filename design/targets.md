@@ -122,6 +122,14 @@ mistake. What the chip has instead is a hardware spinlock, which is a fact about
 not be something the compiler knows. The package carries it, exactly as a package carries any other
 thing only the board can answer.
 
+**A program that shares across *tasks* rather than cores owes the same kind of answer for the
+reaper's scratch**, and for the same reason: the compiler has no notion of a current thread on a
+freestanding target, so a `&sync` release that reaches zero fetches its worklist through the weak
+`__sysl_arc_reaper` (`03 § Teardown is iterative`). Nothing to define where nothing schedules; the
+scheduler's port defines it where something does. Both of these are the board's answers to questions
+the language deliberately declines to guess at, which is what makes them one paragraph rather than
+two mechanisms.
+
 **`Freestanding` is a real answer, not a missing one.** A kernel or a bare-metal program has no
 operating system, and the ABI of a freestanding ELF target is fully specified; it differs from a
 hosted target on the same processor only where the OS is what fixed the convention. That is the
