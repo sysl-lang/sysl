@@ -71,7 +71,7 @@ targets {
 
   aarch64-kernel {
     triple       = "aarch64-none-elf"
-    capabilities { alloc = true, os = false, posix = false, threads = false }
+    capabilities { os = false, posix = false, threads = false }
   }
 }
 
