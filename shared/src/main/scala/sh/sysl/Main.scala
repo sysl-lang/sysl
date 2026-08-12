@@ -485,6 +485,20 @@ private[sysl] def execute(cfg: Config): Int = {
     case Left(err) => return fail(err)
     case Right(d)  => d
 
+  // The pair of C functions this whole program allocates through (`packages.md § 10`). A package that
+  // brings its own heap says so, and saying so settles it for the program — which is the only shape
+  // that can work, because there is one heap and whoever holds the last reference to something is who
+  // frees it (`03`). Two packages naming different pairs is refused here rather than at the link,
+  // where it would not be refused at all: both symbols resolve, and the program simply gives one
+  // allocator's storage back to another.
+  //
+  // The project's own declaration is folded in beside the fetched ones, so an application with its own
+  // heap and no dependency that has one is answered by the same rule.
+  val allocator = Allocator.choose(
+    project.allocator.map("this project" -> _).toList ::: fetched.allocators) match
+    case Left(err) => return fail(err)
+    case Right(a)  => a
+
   val librarySources = collected.flatMap(_._2) ::: fetched.sources
   val packages       = fetched.packages
   val read           = decoded.collect { case Right(r) => r }
@@ -519,6 +533,15 @@ private[sysl] def execute(cfg: Config): Int = {
     for dir <- cfg.includePaths do trace(s"include path: $dir")
     for d <- cfg.defines do trace(s"define: $d")
 
+    // Said even when it is libc's, because "which allocator is this program using" is a question with
+    // an answer whatever the answer is, and one that is silent until a package changes it reads as a
+    // setting that does not exist.
+    val who = (project.allocator.map("this project" -> _).toList ::: fetched.allocators)
+      .collectFirst { case (name, a) if a == allocator => name }
+
+    trace(s"allocator: ${allocator.alloc} / ${allocator.free}" +
+      who.fold(" (the C default)")(n => s" (named by $n)"))
+
   // What the packages said their C has to be able to find, asked of what this command line supplied
   // (`packages.md § 8`). Answered here rather than left to clang because a header that is not there
   // fails inside a compiler that has never heard of sysl: what comes back is `'lwip/tcp.h' file not
@@ -547,7 +570,7 @@ private[sysl] def execute(cfg: Config): Int = {
   if cfg.command == "test" then
     val status =
       TestRunner.run(cfg, librarySources ::: sources, libraryTrees, target, precompiled, std, archives,
-        native.objects, paths)
+        native.objects, paths, allocator)
 
     native.scratch.foreach(Project.discard)
     return status
@@ -562,7 +585,7 @@ private[sysl] def execute(cfg: Config): Int = {
   // rather than being printed from inside the compiler, which has no business writing to a console.
   val compiled =
     Compiler.compiledWith(librarySources ::: sources, libraryTrees, target, precompiled, Some(std),
-      provides, packages, entryPoint = !cLibrary(cfg.command), paths) match
+      provides, packages, entryPoint = !cLibrary(cfg.command), paths, allocator) match
     case Left(err) => return report(err)
     case Right(result) =>
       if cfg.explainEscapes then
@@ -1044,6 +1067,7 @@ private def collectPackages(graph: Resolve.Graph): Either[String, PackageSources
           fetched.map(_.root),
           fetched.flatMap(p =>
             p.config.headers.toList.sortBy(_._1).map((name, why) => HeaderNeed(p.canonical, name, why))),
+          fetched.flatMap(p => p.config.allocator.map(p.canonical -> _)),
         ))
   catch case e: Exception => Left(s"cannot read a package: ${e.getMessage}")
 }

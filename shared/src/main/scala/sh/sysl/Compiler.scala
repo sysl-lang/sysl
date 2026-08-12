@@ -8,6 +8,11 @@ package sh.sysl
  * A compilation is **for** a target (`targets.md`), which is a parameter and not an ambient fact:
  * the machine the compiler is running on reaches this only as the default `Target.default` picks,
  * and a caller that names one is building for it whether or not it could run the result.
+ *
+ * A compilation also allocates from **one** pair of C functions (`15 §10`), and that pair is a
+ * parameter for the same reason: it is settled by the packages a program depends on, which is a fact
+ * the driver holds and no pass here could work out. `Allocator.c` is libc's, which is what a program
+ * depending on nothing that says otherwise gets.
  */
 /** What one compilation produced: the module, whatever the driver may want to tell the user about
  * it, and what the result has to be linked against.
@@ -32,17 +37,19 @@ object Compiler {
    * `name` is what a diagnostic calls the source — a path from the driver, a placeholder from a
    * test — and it is carried by every position the front end records.
    */
-  def compileToLlvm(source: String, name: String = "<input>", target: Target = Target.default)
+  def compileToLlvm(source: String, name: String = "<input>", target: Target = Target.default,
+                    allocator: Allocator = Allocator.c)
       : Either[String, String] =
-    compile(List(Source(name, source)), target)
+    compile(List(Source(name, source)), target, allocator)
 
   /** Compiles the files of one program, however many modules they make up. Each file says which
    * module it contributes to, the files of one module share a single scope (`13 §1`), and a module
    * reaches another's members by naming them in full (`13 §3`) — so the order the files are handed
    * over in decides nothing but which one a diagnostic is reported against first.
    */
-  def compile(sources: List[Source], target: Target = Target.default): Either[String, String] =
-    compiled(sources, target).map(_.ir)
+  def compile(sources: List[Source], target: Target = Target.default,
+              allocator: Allocator = Allocator.c): Either[String, String] =
+    compiled(sources, target, allocator).map(_.ir)
 
   /** The same compilation, starting from trees that are **already parsed**.
    *
@@ -50,8 +57,9 @@ object Compiler {
    * parser would have produced, so everything from here on is unchanged and no pass has to know
    * whether a declaration was read from source or from an artifact.
    */
-  def compileTrees(units: List[Program], target: Target = Target.default): Either[String, String] =
-    analyzed(units, target, Set.empty, Stdlib.fromSource(target)).map(_._1)
+  def compileTrees(units: List[Program], target: Target = Target.default,
+                   allocator: Allocator = Allocator.c): Either[String, String] =
+    analyzed(units, target, Set.empty, Stdlib.fromSource(target), allocator = allocator).map(_._1)
 
   /** Compiles a program **against a library**: the library's modules are compiled alongside it, and
    * the program reaches them by the ordinary module rules (`13 §3`) — a full path, or an `import`.
@@ -65,8 +73,9 @@ object Compiler {
    * rule that reports two of them.
    */
   def compileWith(sources: List[Source], libraries: List[Program],
-                  target: Target = Target.default): Either[String, String] =
-    compiledWith(sources, libraries, target).map(_.ir)
+                  target: Target = Target.default,
+                  allocator: Allocator = Allocator.c): Either[String, String] =
+    compiledWith(sources, libraries, target, allocator = allocator).map(_.ir)
 
   /** The same compilation against a library, keeping the notes the driver may want to show. This is
    * the one the CLI takes, so that a program linked against a library reports its heap promotions
@@ -76,14 +85,14 @@ object Compiler {
                    precompiled: Set[String] = Set.empty, std: Option[Stdlib] = None,
                    provides: Set[String] = Capability.core.toSet,
                    packages: Packages = Packages.none, entryPoint: Boolean = true,
-                   paths: SearchPaths = SearchPaths.none)
+                   paths: SearchPaths = SearchPaths.none, allocator: Allocator = Allocator.c)
       : Either[String, Compiled] = {
     val parsed = sources.map(SyslParser.parse(_, target))
 
     parsed.collect { case Left(e) => e } match
       case Nil =>
         compiledTrees(parsed.collect { case Right(p) => p }, libraries, target, precompiled, std,
-          provides, packages, entryPoint, paths)
+          provides, packages, entryPoint, paths, allocator)
       case errs => Left(errs.mkString("\n"))
   }
 
@@ -97,10 +106,10 @@ object Compiler {
                     target: Target = Target.default, precompiled: Set[String] = Set.empty,
                     std: Option[Stdlib] = None, provides: Set[String] = Capability.core.toSet,
                     packages: Packages = Packages.none, entryPoint: Boolean = true,
-                    paths: SearchPaths = SearchPaths.none)
+                    paths: SearchPaths = SearchPaths.none, allocator: Allocator = Allocator.c)
       : Either[String, Compiled] =
     analyzed(libraries ::: units, target, precompiled, carried(std, target), provides, packages,
-      entryPoint, paths)
+      entryPoint, paths, allocator)
 
   /** The same compilation stopped at the **typed tree**, which is what `sysl prove` reads (`17 §9`).
    *
@@ -142,14 +151,16 @@ object Compiler {
    * promotions, for `--explain-escapes` (`05`). Separate from `compile` so that the ordinary path
    * has nothing extra to ignore.
    */
-  def compiled(sources: List[Source], target: Target = Target.default)
+  def compiled(sources: List[Source], target: Target = Target.default,
+               allocator: Allocator = Allocator.c)
       : Either[String, Compiled] = {
     val parsed = sources.map(SyslParser.parse(_, target))
 
     // Every file is parsed before any is rejected, so a syntax error in one does not hide the
     // syntax errors in the rest — the same reason the analyzer reports every mistake it finds.
     parsed.collect { case Left(e) => e } match
-      case Nil  => analyzed(parsed.collect { case Right(p) => p }, target, Set.empty, Stdlib.fromSource(target))
+      case Nil  => analyzed(parsed.collect { case Right(p) => p }, target, Set.empty,
+                     Stdlib.fromSource(target), allocator = allocator)
       case errs => Left(errs.mkString("\n"))
   }
 
@@ -170,7 +181,7 @@ object Compiler {
    */
   def compileTests(sources: List[Source], libraries: List[Program], target: Target = Target.default,
                    precompiled: Set[String] = Set.empty, std: Option[Stdlib] = None,
-                   building: Set[String] = Set.empty)
+                   building: Set[String] = Set.empty, allocator: Allocator = Allocator.c)
       : Either[String, (Compiled, List[TTest])] = {
     val parsed = sources.map(SyslParser.parse(_, target))
 
@@ -191,7 +202,7 @@ object Compiler {
           // different compilation from the one above rather than a variant of it, which is why the
           // collection is repeated here instead of shared: what the two keep differs, and only what
           // they link is the same.
-          (Compiled(Codegen.generate(kept.copy(precompiled = precompiled), promoted, target),
+          (Compiled(Codegen.generate(kept.copy(precompiled = precompiled), promoted, target, allocator),
                     promoted.explanations,
                     LinkDirectives.required(units ::: whole.units)),
            kept.tests)
@@ -231,8 +242,15 @@ object Compiler {
    * governed by the paragraph above with nothing added: their modules are not this tree's, so what
    * they declare is declared here and defined in whatever program links them both.
    */
+  /** **The object half is built for one allocator**, exactly as it is built for one target: an
+   * allocating function compiled here calls the pair by name, and a program that frees through a
+   * different pair would be giving one heap's storage back to another. That is why an artifact
+   * records the pair it was built with and `LibraryArtifact.read` refuses a mismatch — the alternative
+   * is a link that succeeds and a heap that is quietly wrong.
+   */
   def compileLibrary(units: List[Program], target: Target = Target.default, building: Set[String] = Set.empty,
-                     std: Option[Stdlib] = None, libraries: List[Program] = Nil)
+                     std: Option[Stdlib] = None, libraries: List[Program] = Nil,
+                     allocator: Allocator = Allocator.c)
       : Either[String, (String, Set[String])] =
     for
       // A library ships no tests. They are the library author's, they run against the sources rather
@@ -280,7 +298,7 @@ object Compiler {
       val ir =
         Codegen.generate(
           typed.copy(entryPoint = false, precompiled = (supplied ::: deferred).map(_.name).toSet),
-          promoted, target)
+          promoted, target, allocator)
 
       // **What is advertised is what the linker can reach**, so a file-private declaration is left
       // out however ordinary it looks here. Its symbol is emitted `internal` (`13 §2`), which is a
@@ -308,7 +326,7 @@ object Compiler {
   private def analyzed(units: List[Program], target: Target, precompiled: Set[String],
                        std: Stdlib, provides: Set[String] = Capability.core.toSet,
                        packages: Packages = Packages.none, entryPoint: Boolean = true,
-                       paths: SearchPaths = SearchPaths.none)
+                       paths: SearchPaths = SearchPaths.none, allocator: Allocator)
       : Either[String, Compiled] =
     for
       typed    <- Analyzer.analyze(units, std = std, target = target, provides = provides,
@@ -335,7 +353,7 @@ object Compiler {
       // something its linker takes rather than something that wanted to be a program. It is the same
       // switch a library build has always used, reached from a second command.
       Compiled(Codegen.generate(pruned.copy(precompiled = precompiled, entryPoint = entryPoint),
-                                promoted, target),
+                                promoted, target, allocator),
                promoted.explanations,
                LinkDirectives.required(units ::: std.units),
                pruned.funcs.filter(_.exported.isDefined))

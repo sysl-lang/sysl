@@ -71,19 +71,26 @@ case class HeaderNeed(who: String, name: String, why: String)
 
 /** What a project's `dependencies` block brings to one compilation.
  *
- * Four things and not one, because a package reaches a build by more than one road. Its `.sysl` is
+ * Five things and not one, because a package reaches a build by more than one road. Its `.sysl` is
  * **more modules** and joins the compilation's own; the table keeps its module names apart from
  * every other package's; its directory is a tree whose C is compiled and linked beside the
- * program's (`15 §7`, `NativeSources`); and what that C needs to *find* is something only the
- * consumer can supply, so the package states it and the driver checks it.
+ * program's (`15 §7`, `NativeSources`); what that C needs to *find* is something only the
+ * consumer can supply, so the package states it and the driver checks it; and it may name the pair of
+ * C functions the whole program allocates through.
  *
  * The third is here because it was once missing. A package's sysl compiled and its C was dropped
  * with no warning, so a build against any package carrying a shim ended at the linker naming symbols
  * that package's own C defines — which `packages.md § 7` had already promised would not happen, on
  * the grounds that sysl compiles a package's C declaratively and needs no build script to do it.
+ *
+ * `allocators` is carried as the **declarations** rather than as the answer, because the project's
+ * own is not here: the root is not a fetched package, and `Allocator.choose` has to see every claim
+ * at once to say which wins or that two disagree. That is the same shape as `needs`, which is folded
+ * together with the project's own headers at the one place holding both.
  */
 case class PackageSources(sources: List[Source], packages: Packages, roots: List[String],
-                          needs: List[HeaderNeed] = Nil)
+                          needs: List[HeaderNeed] = Nil,
+                          allocators: List[(String, Allocator)] = Nil)
 
 object PackageSources {
 

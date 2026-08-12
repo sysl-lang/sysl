@@ -54,14 +54,16 @@ object TestRunner {
    */
   def run(cfg: Config, sources: List[Source], libraries: List[Program], target: Target,
           precompiled: Set[String], std: Stdlib, archives: List[String],
-          objects: List[String] = Nil, paths: SearchPaths = SearchPaths.none): Int = {
+          objects: List[String] = Nil, paths: SearchPaths = SearchPaths.none,
+          allocator: Allocator = Allocator.c): Int = {
     if !Target.host.contains(target) then
       return fail(s"'test' runs what it builds, and '${target.name}' is not this machine")
 
     val building = if cfg.std then LibraryArtifact.std else Set.empty[String]
 
     val (built, tests) =
-      Compiler.compileTests(sources, libraries, target, precompiled, Some(std), building) match
+      Compiler.compileTests(sources, libraries, target, precompiled, Some(std), building,
+                            allocator) match
       case Left(err)     => return report(err)
       case Right(result) => result
 
