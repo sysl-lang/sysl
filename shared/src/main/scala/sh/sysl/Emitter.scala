@@ -18,7 +18,7 @@ trait Emitter {
    */
   protected def target: Target
 
-  /** The two C symbols this module's storage comes from and goes back to (`packages.md § 10`).
+  /** The two C symbols this module's storage comes from and goes back to (`packages.md § 13`).
    *
    * A program has one pair, settled from the packages it is built from before any of this runs, so
    * nothing below decides it — every emitter that allocates or releases reads it here rather than

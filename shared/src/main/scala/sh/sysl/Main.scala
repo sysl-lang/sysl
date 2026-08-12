@@ -427,7 +427,7 @@ private[sysl] def execute(cfg: Config): Int = {
         case Left(err) => return fail(err)
         case Right(d)  => d
 
-  // The pair of C functions this whole program allocates through (`packages.md § 10`). A package that
+  // The pair of C functions this whole program allocates through (`packages.md § 13`). A package that
   // brings its own heap says so, and saying so settles it for the program — which is the only shape
   // that can work, because there is one heap and whoever holds the last reference to something is who
   // frees it (`03`). Two packages naming different pairs is refused here rather than at the link,

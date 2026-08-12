@@ -522,6 +522,70 @@ code reaches.
   together, which is the part that has actually been wanted.
 - **Publishing.** There is nothing to publish *to* — a tagged git repository is the published form.
 
+## 13. One heap, and the package that names it
+
+A program allocates through **one** pair of C functions, and a package that brings its own heap says
+which:
+
+```hocon
+allocator {
+  alloc = "pvPortMalloc"
+  free  = "vPortFree"
+}
+```
+
+Saying it settles the pair for the **whole program**, not for the package that said it. Every
+allocation the compilation emits — a string concatenation, a `Buf` growing, a box the ARC machinery
+builds — calls that pair, and every release gives the storage back to it. Given no declaration
+anywhere, the pair is libc's `malloc` and `free`, which is what every program built so far has used
+and what a program depending on nothing that says otherwise goes on using.
+
+**It has to be the program's rather than the package's, because there is one heap.** `03` settles
+ownership by reference count: whoever holds the last reference to something frees it, and which code
+that turns out to be is not knowable when a package is written. A `Buf` filled inside a FreeRTOS
+package and handed back to application code is freed by the application; one built by the application
+and passed in is freed by the package. Two allocators would make each of those crossings a heap
+boundary, and a heap boundary no signature marks is one nothing can check.
+
+**A package declares it rather than a target, and that is deliberate.** The obvious alternative is a
+target fact — the machine knows it is a Cortex-M — and it does not survive contact: `thumbv7em` does
+not imply FreeRTOS, two RTOSes on one chip want different pairs, and a bare-metal program on that
+chip wants libc's. Answering it per target would need a target per RTOS, which `targets.md` already
+declined to do for a float variant. What actually knows the answer is the package carrying the heap.
+
+**Two packages naming different pairs is refused**, and refused when the graph is resolved rather
+than at the link, because the link will not refuse it: both symbols resolve, the program builds, and
+it hands one allocator's storage to the other's `free` at run time. The diagnostic names both claims
+and the packages making them, since the fix is a choice between them — drop one declaration, or
+depend on only one of the two.
+
+Two packages naming the **same** pair is ordinary and unifies to it. That is the common case rather
+than a coincidence: a kernel package and a driver package built on it both name the kernel's
+allocator, and neither has to know whether the other did.
+
+Both halves are said or neither is. Half a pair is refused, because storage taken from one heap and
+given back to another is the one outcome worse than not building.
+
+The project's own manifest may declare one, which covers an application with its own heap and no
+dependency that has one — a bare-metal program with an arena in its own C. It is folded in with the
+fetched packages and settled by the same rule, so a project and a dependency that disagree is the
+refusal above rather than a special case.
+
+**A library artifact records the pair it was built with, and a program that allocates another way
+refuses it.** A `.syslib`'s object half is compiled code: it calls the pair *by name*, so it is built
+for one allocator exactly as it is built for one machine. The refusal is sharper than the target's,
+because a mismatched target is eventually refused by a linker that cannot read the object at all,
+while a mismatched allocator is refused by nothing — which makes recording the name the only place
+this can be caught. The standard module is under the same rule and needs no user action: it is keyed
+by the pair among the other things it is keyed by, so a program that names one gets an artifact built
+for it, built on demand.
+
+**What a declaration does not do is make the allocator safe to call from anywhere.** An RTOS
+allocator typically suspends the scheduler and is not usable from an interrupt handler, while sysl
+allocates *implicitly* — a string operation, a growing buffer, a box. Naming the pair says which
+functions the program uses; it says nothing about where the program may use them, and code reachable
+from an interrupt handler is the caller's to bound.
+
 ## Open (not yet decided)
 
 - **~~a. Where a preferred name comes from when there is no manifest.~~ CLOSED by §9's own rule.**

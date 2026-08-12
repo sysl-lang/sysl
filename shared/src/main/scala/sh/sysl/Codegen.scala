@@ -694,7 +694,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 object Codegen {
 
   /** Lowers a typed program to an LLVM IR module, for a given machine (`targets.md`) and from a given
-   * heap (`packages.md § 10`).
+   * heap (`packages.md § 13`).
    *
    * `allocator` defaults to libc's pair, so a caller with no opinion — every test that is not about
    * this, and every program whose packages say nothing — gets exactly the module it got before a

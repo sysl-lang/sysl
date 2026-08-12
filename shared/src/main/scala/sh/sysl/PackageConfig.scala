@@ -12,7 +12,7 @@ import io.github.edadma.hocon.{ConfigBoolean, ConfigObject, ConfigString, Hocon,
  */
 case class TargetConfig(triple: Option[String], capabilities: Map[String, Boolean])
 
-/** The pair of C symbols a program's storage comes from and goes back to (`packages.md § 10`).
+/** The pair of C symbols a program's storage comes from and goes back to (`packages.md § 13`).
  *
  * A program has **one** of these, and `03` is why: whoever holds the last reference is what frees,
  * so two heaps in one program would mean a box whose payload cannot be given back by the code that
@@ -330,7 +330,7 @@ object PackageConfig {
   private val AllocatorKeys = Set("alloc", "free")
 
   /** The `allocator` block — the pair of C symbols this package's storage comes from
-   * (`packages.md § 10`).
+   * (`packages.md § 13`).
    *
    * ==Why a package and not a target==
    *

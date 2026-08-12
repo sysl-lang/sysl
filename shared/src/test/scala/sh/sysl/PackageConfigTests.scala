@@ -471,7 +471,7 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
     }
   }
 
-  /** `packages.md § 10` — a package may name the pair a program's storage comes from, and a program
+  /** `packages.md § 13` — a package may name the pair a program's storage comes from, and a program
    * has one of them.
    */
   "the allocator" - {
