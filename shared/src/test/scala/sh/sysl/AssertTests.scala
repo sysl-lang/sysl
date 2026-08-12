@@ -137,6 +137,93 @@ class AssertTests extends AnyFreeSpec with Matchers with CodegenSupport with Run
     }
   }
 
+  /** The number the compiler was holding at the moment it said the number was wrong.
+   *
+   * It folds both sides in order to decide the comparison, and used to throw the result away — so
+   * recovering it meant editing the literal and rebuilding until the message stopped, which is a
+   * bisection over builds for a fact that was already in hand.
+   */
+  "a failed comparison says what the sides actually were" - {
+    "naming the computed side" in {
+      val msg = err(
+        """struct FRect
+          |    x: f32
+          |    y: f32
+          |end FRect
+          |@assert(sizeof(FRect) == 16, "FRect must match SDL_FRect")
+          |print(1)""".stripMargin
+      )
+
+      msg should include("assertion failed: FRect must match SDL_FRect")
+      msg should include("the left side is 8")
+    }
+
+    // The literal is on screen directly above the message, so repeating it back teaches nothing.
+    "and not the side the reader wrote as a literal" in {
+      err(
+        """struct FRect
+          |    x: f32
+          |    y: f32
+          |end FRect
+          |@assert(sizeof(FRect) == 16)
+          |print(1)""".stripMargin
+      ) should not include "the right side"
+    }
+
+    "both, where both were computed" in {
+      val msg = err(
+        """struct Wide
+          |    a: u64
+          |end Wide
+          |struct Narrow
+          |    a: u8
+          |end Narrow
+          |@assert(sizeof(Wide) == sizeof(Narrow))
+          |print(1)""".stripMargin
+      )
+
+      msg should include("the left side is 8")
+      msg should include("the right side is 1")
+    }
+
+    // A negative bound parses as a unary minus over a literal, and is still something the reader
+    // wrote rather than something folding produced.
+    "treating a written negative as the literal it is" in {
+      err(
+        """const limit: int = 3
+          |@assert(limit == -1)
+          |print(1)""".stripMargin
+      ) should not include "the right side"
+    }
+
+    // The order the two notes compose in: what the sides were, then which instantiation asked.
+    "alongside the instantiation note, not instead of it" in {
+      val msg = err(
+        """slab[T](x: T) -> int
+          |    @assert(sizeof(T) >= 8, "too narrow")
+          |    3
+          |
+          |print(slab(1u8))""".stripMargin
+      )
+
+      msg should include("the left side is 1")
+      msg should include("where T = byte")
+    }
+
+    // A condition that is not a comparison has no operand worth naming: the thing that folded to
+    // `false` is its only one, and the message has already said it is false.
+    "and adds nothing to a condition that is not a comparison" in {
+      val msg = err(
+        """const enabled: bool = false
+          |@assert(enabled, "the feature has to be on")
+          |print(1)""".stripMargin
+      )
+
+      msg should include("assertion failed: the feature has to be on")
+      msg should not include "side is"
+    }
+  }
+
   "what it refuses" - {
     // A call is the line `13 §Constants` draws around a constant expression, and it is the line that
     // makes this feature necessary rather than redundant: a shim accessor is a call, so a C
