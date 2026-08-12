@@ -307,6 +307,58 @@ class CConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
       finally try deleteFile(s"$dir/measured.h") catch case _: Exception => ()
     }
 
+    /** **A test build is a compilation and needs the same headers.** `sysl test` was the one
+      * subcommand that did not pass its `--include-path` directories on to the probe, so a tree whose
+      * `@include` names a header outside the toolchain's own path could be run, built and turned into
+      * a library, and could not have its tests run — which is exactly the tree the feature exists for,
+      * since a package binding a C library is nothing but `c const` over somebody else's headers. It
+      * was found in `sysl-lang/freertos`, whose whole surface is measured out of the consumer's kernel
+      * headers.
+      *
+      * The assertion is written per **tier** rather than for the one call that was broken. `test`
+      * reaches the probe through `Compiler.compileTests` and an ordinary build through `compiledWith`;
+      * a suite pinning only the second is what let this through, and one pinning only the first would
+      * let the next through in the other direction.
+      */
+    "every tier of build finds a header through the search paths, the test build included" in {
+      val dir = createTempDirectory("sysl-cconst-tiers-")
+
+      try
+        writeFile(s"$dir/tiered.h", "#define TIERED_WIDTH 41\n")
+
+        val text =
+          """@include("tiered.h")
+            |
+            |c const
+            |    W: u32 = "TIERED_WIDTH"
+            |
+            |@test
+            |it_measured() = assert(W == 41, "the header said 41")
+            |""".stripMargin
+
+        val src   = Source("<input>", text)
+        val paths = SearchPaths(include = List(dir))
+
+        Compiler.compileTests(List(src), Nil, paths = paths) match
+          case Left(e)           => fail(s"the include path did not reach the test build's probe: $e")
+          case Right((c, tests)) =>
+            tests.map(_.display) shouldBe List("it_measured")
+            c.ir should include("main")
+
+        // The same tree through the ordinary path, so this case says the two *agree* rather than
+        // saying only that one of them works.
+        Compiler.compiledWith(List(src), Nil, paths = paths) match
+          case Left(e)  => fail(s"the include path did not reach an ordinary build's probe: $e")
+          case Right(c) => c.ir should include("main")
+
+        // And a test build with no paths is still refused, naming the header — so the case above is
+        // about the flag arriving rather than about a header findable without it.
+        Compiler.compileTests(List(src), Nil) match
+          case Left(e)  => e should include("tiered.h")
+          case Right(_) => fail("a header outside the toolchain's path was found with no flag")
+      finally try deleteFile(s"$dir/tiered.h") catch case _: Exception => ()
+    }
+
     /** **The case the whole feature was surveyed for.** A package vendors its headers beside its
       * modules and its shim reaches them with a bare `#include "qcbor.h"`, because C resolves a
       * quoted include relative to the file doing the including. The probe is a temporary file

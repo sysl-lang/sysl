@@ -61,8 +61,12 @@ object TestRunner {
 
     val building = if cfg.std then LibraryArtifact.std else Set.empty[String]
 
+    // `paths` reaches the compilation as well as the link below. A `c const` is evaluated by the C
+    // compiler while the tree is analyzed, so a test build of a tree that has one needs the include
+    // directories exactly as an ordinary build does — and not passing them here is what once made
+    // `test` the one subcommand a package built on `c const` could not run.
     val (built, tests) =
-      Compiler.compileTests(sources, libraries, target, precompiled, Some(std), building,
+      Compiler.compileTests(sources, libraries, target, precompiled, Some(std), building, paths,
                             allocator) match
       case Left(err)     => return report(err)
       case Right(result) => result

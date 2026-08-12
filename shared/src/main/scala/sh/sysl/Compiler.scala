@@ -178,10 +178,19 @@ object Compiler {
    * what testing the standard library from its own source amounts to. It is the caller that says so
    * and never inferred, for the reason `ModuleFiles.checkLibraryModules` gives: a build that guessed
    * would turn a crisp refusal into a link-time collision.
+   *
+   * **`paths` is not optional in practice, whatever its default says.** A `c const` block is
+   * evaluated by the C compiler, so a tree whose `@include` names a header outside the toolchain's own
+   * search path cannot be analyzed without it — and a test build is a compilation like any other. It
+   * was missing here until 0.0.46, which made `test` the one subcommand that could not compile a
+   * package built on `c const`: the driver printed every `--include-path` it had been given and then
+   * analyzed without them. The default stays because a dozen in-tree callers legitimately have no
+   * paths to give.
    */
   def compileTests(sources: List[Source], libraries: List[Program], target: Target = Target.default,
                    precompiled: Set[String] = Set.empty, std: Option[Stdlib] = None,
-                   building: Set[String] = Set.empty, allocator: Allocator = Allocator.c)
+                   building: Set[String] = Set.empty, paths: SearchPaths = SearchPaths.none,
+                   allocator: Allocator = Allocator.c)
       : Either[String, (Compiled, List[TTest])] = {
     val parsed = sources.map(SyslParser.parse(_, target))
 
@@ -192,7 +201,7 @@ object Compiler {
         val whole = carried(std, target)
 
         for
-          typed    <- Analyzer.analyze(units, building, whole, target)
+          typed    <- Analyzer.analyze(units, building, whole, target, paths = paths)
           promoted <- Escape.check(typed)
           _        <- TailCalls.check(typed)
         yield
@@ -333,7 +342,20 @@ object Compiler {
                     packages = packages, paths = paths)
       promoted <- Escape.check(typed)
       _        <- TailCalls.check(typed)
-      _        <- Exports.check(typed)
+
+      // **`Exports.check` reads the tree this build is going to emit, which is the stripped one.**
+      // Reading `typed` instead made an `@export` in a `@tests` file a definition in every build,
+      // and its most visible effect was that a *package* could not carry a test-only export at all:
+      // any consumer defining that symbol — as it must, when the symbol is one the package's C
+      // demands of its application — was refused, and the diagnostic named the package's own test
+      // file as the other definition. Only one of the two was ever emitted.
+      //
+      // `Escape` and `TailCalls` above are deliberately not moved with it. Both are about whether a
+      // body is *correct*, and a `@test` that does not compile is an error in a build that would
+      // never have run it — which is the whole of what makes it safe to leave a test beside the code
+      // it tests. `Exports` is the odd one out because it asks a question about the emitted
+      // program's symbol table rather than about a body.
+      _        <- Exports.check(Tests.strip(typed))
     yield
       // Pruning still runs, and still from `main`: a library function this program never calls is
       // dropped from the tree exactly as before. What `precompiled` changes is only what happens to

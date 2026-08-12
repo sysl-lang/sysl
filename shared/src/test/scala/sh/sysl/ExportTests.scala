@@ -161,6 +161,45 @@ class ExportTests extends AnyFreeSpec with CodegenSupport with TestFrameworkSupp
 
       err(src) should include("one symbol is one definition")
     }
+
+    /** **But not one this build is about to discard.** The check reads the tree that is going to be
+      * emitted, which is the one `Tests.strip` has been over — so an `@export` in a `@tests` file is
+      * not a definition in an ordinary build, because it is not in an ordinary build at all.
+      *
+      * The case this was found in is a *package* rather than a program. A binding whose C calls back
+      * into the application — a FreeRTOS kernel wants `vAssertCalled` and the idle task's storage from
+      * whoever links it — has to define those symbols in order to test itself, and its `tests.sysl` is
+      * the only place they belong. Counting them made every *consumer* of the package refuse, naming
+      * the package's own test file as the other definition, and only one of the two was ever emitted.
+      *
+      * Both halves are asserted together on purpose. A case pinning only the first would go on passing
+      * against a check that had been deleted outright.
+      */
+    "but a @tests file's export is not a second definition, while two real ones still are" in {
+      val test =
+        """module demo
+          |
+          |@tests
+          |
+          |@export("f")
+          |theirs(x: i32) -> i32 = x
+          |
+          |@test
+          |it_runs() = assert(1 == 1, "one")
+          |""".stripMargin
+
+      val program = "module demo\n\n@export(\"f\")\nmine(x: i32) -> i32 = x\n"
+
+      Compiler.compiled(List(Source("tests.sysl", test), Source("demo.sysl", program))) match
+        case Left(e)  => fail(s"a discarded export was counted as a definition: $e")
+        case Right(c) => c.ir should include("define i32 @f(")
+
+      // The same two exports with the `@tests` header gone are two definitions, and are refused.
+      Compiler.compiled(List(Source("tests.sysl", test.replace("@tests\n\n", "")),
+                             Source("demo.sysl", program))) match
+        case Left(e)  => e should include("one symbol is one definition")
+        case Right(_) => fail("two real exports of one symbol were accepted")
+    }
   }
 
   "module storage" - {
