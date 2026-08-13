@@ -116,6 +116,47 @@ lazy val embedVersion = Def.task {
   Seq(out)
 }
 
+// The TextMate grammar `weave` highlights sysl with, compiled into the binary rather than read off
+// disk beside `library/`.
+//
+// **It lives here because `GrammarTests` does**, and that test is the only thing standing between the
+// grammar and the language drifting apart -- it reconciles the grammar against `SyslLexical`, which
+// is in this tree. The grammar was in `sysl.sh` until 0082, where the test could see it but not the
+// lexer it is a claim about; the site now fetches it the same way its CI already fetches `library/`.
+//
+// Compiled in rather than staged because it is 9 KB and because a `weave` that cannot find its
+// grammar is a failure mode worth not having. The library is read off disk for the opposite reason:
+// it is large, and people edit it.
+lazy val embedGrammar = Def.task {
+  val utf8    = java.nio.charset.StandardCharsets.UTF_8
+  val out     = (Compile / sourceManaged).value / "sh" / "sysl" / "Grammar.scala"
+  val grammar = IO.read((ThisBuild / baseDirectory).value / "grammars" / "sysl.tmLanguage.json", utf8)
+
+  // Escaped into an ordinary string literal rather than set in triple quotes: the grammar is full of
+  // regex backslashes, and a `"""` block would hand them to the reader intact only until the day one
+  // of its patterns ends in a quote.
+  val escaped = grammar.flatMap {
+    case '\\' => "\\\\"
+    case '"'  => "\\\""
+    case '\n' => "\\n"
+    case '\r' => "\\r"
+    case '\t' => "\\t"
+    case c    => c.toString
+  }
+
+  val text =
+    s"""package sh.sysl
+       |
+       |/** Generated from `grammars/sysl.tmLanguage.json` by `build.sbt` -- do not edit. */
+       |private[sysl] object Grammar {
+       |  val sysl: String = "$escaped"
+       |}
+       |""".stripMargin
+
+  if (!out.exists || IO.read(out, utf8) != text) IO.write(out, text, utf8)
+  Seq(out)
+}
+
 lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
   .in(file("."))
   .settings(
@@ -137,6 +178,7 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
         "-language:dynamics",
       ),
     Compile / sourceGenerators += embedVersion.taskValue,
+    Compile / sourceGenerators += embedGrammar.taskValue,
     libraryDependencies += "org.scalatest" %%% "scalatest" % "3.2.20" % "test",
     libraryDependencies ++= Seq(
       "com.github.scopt"         %%% "scopt"                    % "4.1.0",
@@ -148,6 +190,13 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
       "io.github.edadma"         %%% "cross_platform"           % "0.1.9",
       // The project config's format (see design/packages.md §1).
       "io.github.edadma"         %%% "hocon"                    % "0.1.2",
+      // What `weave` renders a literate source with. The prose of a '.lsysl' file is Markdown
+      // already, and `indentedCodeLanguage` is what carries the one thing the format gives up: a
+      // program marked by an indent and nothing else reaches the highlighter knowing its language.
+      "io.github.edadma"         %%% "markdown"                 % "0.4.6",
+      // Turns the TextMate grammar into the spans the woven document's stylesheet colours, so a
+      // reader needs no JavaScript for the code.
+      "io.github.edadma"         %%% "highlighter"              % "0.0.10",
 //      "com.lihaoyi" %%% "pprint" % "0.9.6" % "test",
     ),
     publishMavenStyle      := true,

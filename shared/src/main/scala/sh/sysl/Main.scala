@@ -19,7 +19,8 @@ import scopt.OParser
  *   - `sysl build <path> -o x`     compile to a native executable
  *   - `sysl build-lib <path> -o x` compile a library to a linkable artifact
  *   - `sysl emit-llvm <path>`      print the generated LLVM IR
- *   - `sysl doc <path>`            render a literate source as Markdown
+ *   - `sysl weave <path>`          render a literate source as an HTML document
+ *   - `sysl tangle <path>`         print the program a literate source holds
  *   - `sysl targets`               list the machines sysl can build for
  *
  * **`--lib` takes either a source tree or an artifact**, and which one is read off the name: a
@@ -186,14 +187,23 @@ private[sysl] val parser = {
         .action((_, c) => c.copy(command = "emit-header"))
         .text("print the C header for what a module exports")
         .children(arg[String]("<path>").required().action((f, c) => c.copy(file = f))),
-      cmd("doc")
-        .action((_, c) => c.copy(command = "doc"))
-        .text("render the literate sources of a module as Markdown, with their program fenced " +
-          "rather than indented so a highlighter can read it")
+      cmd("weave")
+        .action((_, c) => c.copy(command = "weave"))
+        .text("render a literate source as an HTML document, with its prose set, its program " +
+          "highlighted and its mathematics typeset")
         .children(
           arg[String]("<path>").required().action((f, c) => c.copy(file = f)),
           opt[String]('o', "output").action((o, c) => c.copy(output = Some(o)))
-            .text("where to write the document; defaults to standard output"),
+            .text("where to write the document; a directory when the path holds several sources, " +
+              "and standard output by default"),
+        ),
+      cmd("tangle")
+        .action((_, c) => c.copy(command = "tangle"))
+        .text("print the program a literate source holds, with the prose stripped")
+        .children(
+          arg[String]("<path>").required().action((f, c) => c.copy(file = f)),
+          opt[String]('o', "output").action((o, c) => c.copy(output = Some(o)))
+            .text("where to write the program; defaults to standard output"),
         ),
       cmd("test")
         .action((_, c) => c.copy(command = "test"))
@@ -362,7 +372,8 @@ private[sysl] def execute(cfg: Config): Int = {
   // reason the command is usable: a package's prose is worth reading on a machine that could not
   // build it, and a document that could only be produced by a successful build would be missing
   // exactly when somebody wanted it.
-  if cfg.command == "doc" then return renderDoc(cfg, sources)
+  if cfg.command == "weave" then return weave(cfg, sources)
+  if cfg.command == "tangle" then return tangle(cfg, sources)
 
   val project = readPackageConfig(cfg.file) match
     case Left(err) => return fail(err)
@@ -834,7 +845,7 @@ private def cLibrary(command: String): Boolean = command == "build-c" || command
  * left out is one the C author has no way to supply and no way to hear about, since the sysl half
  * compiled cleanly and only the C project's linker ever notices.
  */
-/** `doc`: the literate sources of a tree, rendered as one Markdown document (`Doc`).
+/** The literate sources of a tree, or the reason there is nothing to render.
  *
  * **The ordinary `.sysl` files are passed over rather than refused**, because a directory holding
  * both is the normal shape of a literate module — `library/sysl/regex` is five `.lsysl` files and its
@@ -842,27 +853,90 @@ private def cLibrary(command: String): Boolean = command == "build-c" || command
  * What *is* refused is a tree with no literate source at all: there the request cannot be granted
  * however it is read, and saying so beats writing an empty document.
  */
-private def renderDoc(cfg: Config, sources: List[Source]): Int = {
+private def literateSources(cfg: Config, sources: List[Source], verb: String): Either[String, List[Source]] = {
   val literate = sources.filter(src => Literate.named(src.name))
 
   if literate.isEmpty then
-    return fail(s"${cfg.file} holds no '${Literate.Extension}' files — 'doc' renders the prose a " +
+    Left(s"${cfg.file} holds no '${Literate.Extension}' files — '$verb' reads the prose a " +
       "literate source is written around, and an ordinary sysl program has none")
+  else Right(literate)
+}
 
-  Doc.renderAll(literate) match
+/** `weave`: each literate source of a tree rendered as its own HTML document (`Weave`).
+ *
+ * **One source is one document, rather than a tree being joined into one.** A woven document is a
+ * leaf artifact somebody opens, so the unit that makes sense is the file that was written; a tree
+ * rendered end to end would put five modules under one title and one heading numbering. When the
+ * path holds several sources, `-o` therefore names a **directory**, and each document is written
+ * into it under its own name.
+ */
+private def weave(cfg: Config, sources: List[Source]): Int =
+  literateSources(cfg, sources, "weave") match
     case Left(err) => fail(err)
-    case Right(text) =>
-      cfg.output match
-        case Some(path) =>
-          Project.parentOf(path).foreach(createDirectories)
+    case Right(literate) =>
+      val rendered = literate.map(src => src -> Weave.render(src))
 
-          try
-            writeFile(path, text + "\n")
-            Console.err.println(s"wrote $path")
-            0
-          catch case e: Exception => fail(s"cannot write $path: ${e.getMessage}")
+      rendered.collectFirst { case (_, Left(err)) => err } match
+        case Some(err) => fail(err)
+        case None =>
+          val documents = rendered.collect { case (src, Right(html)) => src -> html }
 
-        case None => stdout(text + "\n"); 0
+          (cfg.output, documents) match
+            case (None, (_, html) :: Nil) => stdout(html); 0
+
+            // Several documents and nowhere to put them: they cannot be told apart on a stream, and
+            // concatenating them would produce one file with several `<html>` elements in it.
+            case (None, _) =>
+              fail(s"${cfg.file} holds ${documents.length} literate sources — 'weave' writes one " +
+                "document each, so give '-o' a directory to write them into")
+
+            case (Some(path), (_, html) :: Nil) => write(path, html)
+
+            case (Some(dir), many) =>
+              try
+                createDirectories(dir)
+
+                many.foldLeft(0) { (code, entry) =>
+                  val (src, html) = entry
+
+                  if code != 0 then code else write(s"$dir/${Weave.documentName(src.name)}", html)
+                }
+              catch case e: Exception => fail(s"cannot write $dir: ${e.getMessage}")
+
+/** `tangle`: the program a literate source holds, with the prose stripped (`Literate.tangle`).
+ *
+ * **This is what the compiler reads**, and that is the whole of why it is worth a command. When a
+ * literate file misbehaves — a block indented that should not have been, a fence that swallowed a
+ * function — the question is always what tangling produced, and until now there was no way to ask.
+ * It also hands the program to anything that does not know the format: a tool, a paste, a bug
+ * report.
+ */
+private def tangle(cfg: Config, sources: List[Source]): Int =
+  literateSources(cfg, sources, "tangle") match
+    case Left(err) => fail(err)
+    case Right(literate) =>
+      val tangled = literate.map(Literate.tangle)
+
+      tangled.collectFirst { case Left(err) => err } match
+        case Some(err) => fail(err)
+        case None =>
+          // A tree's programs are joined rather than written separately, because unlike a document
+          // they are all the same kind of thing and a module's source is read in one piece.
+          val text = tangled.collect { case Right(src) => src.text }.mkString("\n")
+
+          cfg.output match
+            case Some(path) => write(path, text)
+            case None       => stdout(text); 0
+
+/** A rendered thing written where it was asked for, or the reason it could not be. */
+private def write(path: String, text: String): Int = {
+  Project.parentOf(path).foreach(createDirectories)
+
+  try
+    writeFile(path, text)
+    Console.err.println(s"wrote $path")
+    0
+  catch case e: Exception => fail(s"cannot write $path: ${e.getMessage}")
 }
 
 private def buildForC(cfg: Config, compiled: Compiled, target: Target, named: Option[String],
