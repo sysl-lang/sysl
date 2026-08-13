@@ -281,6 +281,33 @@ class ExportCliTests extends LibraryCliSupport {
       |answer(n: i32) -> i32 = used.double(n)
       |""".stripMargin
 
+  /** A handler taking nothing, which is the shape RISC-V requires, and an `extern` for it to call so
+   * that the body reaches something a dropped handler would take with it.
+   */
+  private val handlerModule =
+    """module spare
+      |
+      |extern "ack" ack()
+      |
+      |interrupt timer()
+      |    ack()
+      |""".stripMargin
+
+  /** A module with a type of its own that has a destructor, **and a function that makes one** — the
+   * second half is what puts the type in `structInsts` and so its hook in `program.destructors`.
+   */
+  private val droppingModule =
+    """module spare
+      |
+      |struct Handle
+      |    n: i32
+      |
+      |impl Drop for Handle
+      |    drop(self) = print("gone", self.n)
+      |
+      |make() -> &Handle = Handle(1)
+      |""".stripMargin
+
   /** An `@export` in a dependency is a root only where the program reaches its module (card 0111).
    *
    * **A dependency's source root is compiled whole rather than by what the program imports**, so
@@ -426,6 +453,173 @@ class ExportCliTests extends LibraryCliSupport {
 
       status should not be 0
       notes should include("'mylib_answer' is exported by")
+    }
+  }
+
+  /** The other three unconditional roots, qualified the same way (card 0118).
+   *
+   * `Reachability.entryPoints` has four kinds and 0111 qualified one, which left the rule holding
+   * only while an export carried no second attribute: a function that is *also* placed or *also* a
+   * handler was kept for that reason and landed its C symbol in the consumer anyway. So the
+   * qualification is about **provenance** and applies to all four — a module a dependency supplied
+   * contributes nothing unless the program reaches it, and `import` is how a consumer asks for one.
+   */
+  "the other roots in a '--lib' source tree are qualified the same way" - {
+
+    /** A `@section` definition placed in RAM by a linker script.
+     *
+     * **`@section` implies `@llvm.used` (card 0101), so nothing downstream will remove it either** —
+     * a placed definition kept here is bytes in every consumer's image, on parts where the region it
+     * asks for is the scarce thing the attribute exists to manage.
+     */
+    "a '@section' definition is dropped where nothing reaches its module" in {
+      val lib = twoModuleLib("module spare\n\n@section(\".ramfunc\")\nplaced() -> i32 = 7\n")
+      val ir  = emitted(Config(command = "emit-llvm", file = rootOf("mylib", usingUsed),
+        libs = List(lib)))
+
+      symbols(ir, "define") should not contain "spare$placed"
+      ir should not include ".ramfunc"
+    }
+
+    "and is kept where the program does reach it" in {
+      val program =
+        """module mylib
+          |
+          |@export("mylib_answer")
+          |answer(n: i32) -> i32 = used.double(n) + spare.placed()
+          |""".stripMargin
+
+      val lib = twoModuleLib("module spare\n\n@section(\".ramfunc\")\nplaced() -> i32 = 7\n")
+      val ir  = emitted(Config(command = "emit-llvm", file = rootOf("mylib", program),
+        libs = List(lib)))
+
+      symbols(ir, "define") should contain("spare$placed")
+      ir should include(".ramfunc")
+    }
+
+    /** An interrupt handler, which is the kind with the loudest consequence: a package shipping one
+     * for a peripheral the consumer never uses was putting it in the consumer's vector table, and two
+     * packages shipping a handler for one vector is the `main` collision 0111 was filed for, a layer
+     * down.
+     *
+     * Lowered for RISC-V, where the convention is a function attribute rather than a calling
+     * convention — the host cannot be asked, since AArch64 has no interrupt attribute at all
+     * (`CallingConventionTests`).
+     */
+    "an interrupt handler is dropped where nothing reaches its module" in {
+      val lib = twoModuleLib(handlerModule)
+      val ir  = emitted(Config(command = "emit-llvm", file = rootOf("mylib", usingUsed),
+        libs = List(lib), target = Some("riscv64-linux")))
+
+      symbols(ir, "define") should not contain "spare$timer"
+    }
+
+    // An `import` and nothing else, which is what a consumer wanting a package's handler writes:
+    // no function of that module is ever called, so a rule asking about calls would drop it.
+    "and an 'import' is enough to keep it" in {
+      val program =
+        """module mylib
+          |
+          |import spare
+          |
+          |@export("mylib_answer")
+          |answer(n: i32) -> i32 = used.double(n)
+          |""".stripMargin
+
+      val ir = emitted(Config(command = "emit-llvm", file = rootOf("mylib", program),
+        libs = List(twoModuleLib(handlerModule)), target = Some("riscv64-linux")))
+
+      symbols(ir, "define") should contain("spare$timer")
+    }
+
+    /** A destructor — the kind the card guessed was already safe, on the reasoning that
+     * `program.destructors` is built from the types the compilation laid out.
+     *
+     * **It is not**, and the reason is the same one behind every other kind here: a dependency's tree
+     * is compiled *whole*, so a module that makes a value of its own type has that type instantiated
+     * and its hook in the map, whether or not the program can reach either.
+     */
+    "a destructor is dropped where nothing reaches its module" in {
+      val ir = emitted(Config(command = "emit-llvm", file = rootOf("mylib", usingUsed),
+        libs = List(twoModuleLib(droppingModule))))
+
+      symbols(ir, "define") should not contain "spare$Handle.drop"
+    }
+
+    // The control that says the hook still survives for a type the program does use: a destructor
+    // pruned where something can release a box of that payload is a link error against a name no
+    // line of the program contains.
+    "while one whose module the program reaches survives" in {
+      val program =
+        """module mylib
+          |
+          |@export("mylib_answer")
+          |answer(n: i32) -> i32 = used.double(n) + spare.make().n
+          |""".stripMargin
+
+      val ir = emitted(Config(command = "emit-llvm", file = rootOf("mylib", program),
+        libs = List(twoModuleLib(droppingModule))))
+
+      symbols(ir, "define") should contain("spare$Handle.drop")
+    }
+
+    /** The destructor is the kind whose over-pruning is a **link error** rather than a size cost —
+     * the release hook the emitter builds calls a name no line of the program contains — so it is
+     * the one asserted by building and running a program rather than by reading IR.
+     *
+     * The type is reached the way a package's types usually are: through another of its modules,
+     * never named by the program. `moduleDeps` is the whole graph rather than the program's own
+     * edges, so `used` naming `spare` is what carries it.
+     */
+    "a destructor reached only through another dependency module still runs" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val root = createTempDirectory("sysl-cli-deplib-")
+
+      createDirectory(s"$root/used")
+      createDirectory(s"$root/spare")
+      writeFile(s"$root/used/lib.sysl",
+        "module used\n\nmake() -> &spare.Handle = spare.Handle(1)\n")
+      writeFile(s"$root/spare/lib.sysl", droppingModule)
+
+      val src =
+        """hold()
+          |    var h = used.make()
+          |    print("held", h.n)
+          |
+          |hold()
+          |print("out")
+          |""".stripMargin
+
+      ran(Config(command = "run", file = program(src), libs = List(root))) shouldBe
+        "held 1\ngone 1\nout\n"
+    }
+
+    /** The measurement that decided the rule was about provenance rather than about kinds.
+     *
+     * Before this, an export in an unreached module was dropped *as an export* and kept anyway
+     * because it was also placed — so 0111's fix held only for a function carrying one attribute.
+     * Counted rather than looked for, exactly as 0111's is: the program has a `main` of its own.
+     */
+    "and an export kept alive by a second attribute no longer defeats the export rule" in {
+      val lib = twoModuleLib(
+        "module spare\n\n@section(\".ramfunc\")\n@export(\"main\")\nplaced() -> i32 = 7\n")
+
+      val ir = emitted(Config(command = "emit-llvm", file = rootOf("mylib", usingUsed),
+        libs = List(lib)))
+
+      ir.linesIterator.count(l => l.startsWith("define ") && l.contains("@main(")) shouldBe 1
+    }
+
+    "the same for an export carried by a handler" in {
+      val lib = twoModuleLib(
+        "module spare\n\nextern \"ack\" ack()\n\n@export(\"SysTick_Handler\")\ninterrupt timer()\n" +
+          "    ack()\n")
+
+      val ir = emitted(Config(command = "emit-llvm", file = rootOf("mylib", usingUsed),
+        libs = List(lib), target = Some("riscv64-linux")))
+
+      symbols(ir, "define") should not contain "SysTick_Handler"
     }
   }
 

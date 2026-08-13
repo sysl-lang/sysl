@@ -83,7 +83,7 @@ object Compiler {
    */
   /** `librarySources` is a library given as **source** — a `--lib` root or a fetched package — which
    * is more modules exactly as `libraries` is, and is separate from `sources` for one reason: which
-   * modules are the program's own is only knowable here, and `Reachability.exporting` needs it.
+   * modules are the program's own is only knowable here, and `Reachability.contributing` needs it.
    *
    * Concatenated in front, which is the order the driver used when it did this itself, so which file
    * a diagnostic is reported against first does not move.

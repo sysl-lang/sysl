@@ -60,7 +60,7 @@ object Reachability {
   /** The functions that are roots because **nothing in the program names them**, whatever the walk
    * starts from.
    *
-   * The three below are one idea told three times, and they are gathered here rather than written
+   * The four below are one idea told four times, and they are gathered here rather than written
    * where a walk begins because there is more than one such place: a program's walk starts at what it
    * runs, and a test build's starts at its tests (`Tests.only`). A list of entry kinds that lived
    * beside one of those would be a list the other did not have — which is exactly what happened, and
@@ -94,47 +94,62 @@ object Reachability {
    * names one, so pruning it would leave the hook calling a symbol nothing defined, and the failure
    * would be at the link, against a name no line of the program contains.
    *
-   * **An export supplied by a DEPENDENCY is a root only where the program reaches its module**, and
-   * that is the one qualification on any of the four. `exporting` is the whole of it.
+   * **A root supplied by a DEPENDENCY counts only where the program reaches its module**, and that
+   * is the one qualification on any of the four — the same qualification on each of them, since a
+   * rule told per kind turns into a rule about which attributes a function carries *together*.
+   * `contributing` is the whole of it.
    */
   def entryPoints(program: TProgram, own: Option[Set[String]] = None): List[TFunc] = {
-    val handlers    = program.funcs.filter(_.conv.isDefined)
-    val exported    = exports(program, own)
-    val placed      = program.funcs.filter(_.section.isDefined)
-    val destructors = program.funcs.filter(f => program.destructors.values.toSet.contains(f.name))
+    val contributes = contributing(program, own)
+    val drops       = program.destructors.values.toSet
 
-    handlers ::: exported ::: placed ::: destructors
+    program.funcs.filter { f =>
+      val kind = f.conv.isDefined || f.exported.isDefined || f.section.isDefined || drops(f.name)
+
+      kind && contributes(f.name)
+    }
   }
 
   /** The exports this compilation is answerable for: the ones it will emit, and the ones every pass
    * that reads the emitted program's symbol table should read (`Exports.check`).
    *
-   * **An export in the program's own tree is one unconditionally**, exactly as it always was. An
-   * export in a module a *dependency* supplied is one only where the program reaches that module,
-   * which is what `exporting` computes.
+   * The same rule `entryPoints` applies, narrowed to the one kind, because the check is about symbols
+   * rather than about emission: a symbol two declarations claim is a refusal, and one of them being
+   * in a module this program never reaches means there is only one claimant.
    */
   def exports(program: TProgram, own: Option[Set[String]]): List[TFunc] = {
-    val rooted = exporting(program, own)
+    val contributes = contributing(program, own)
 
-    program.funcs.filter(f => f.exported.isDefined && rooted.forall(_(Modules.moduleOf(f.name))))
+    program.funcs.filter(f => f.exported.isDefined && contributes(f.name))
   }
 
-  /** Which modules an `@export` in is a root, or `None` where every module's is.
+  /** Whether the module a function is in contributes roots to this compilation at all.
    *
    * **A dependency's source root is compiled whole rather than by what the program imports**, so
    * every module of every `--lib` root and every fetched package is in this tree whether or not
    * anything reaches it. For an ordinary declaration that costs nothing — `prune` drops what no body
-   * names — but an export is precisely a declaration no body names, so an unconditional root put an
-   * unimported module's symbol in the consumer's archive. What that cost was a **package carrying its
-   * own program**: a test application's `@export("main")` reached every consumer, and the two `main`s
-   * fought at the link.
+   * names — but every kind above is precisely a declaration no body names, so an unconditional root
+   * put an unimported module's contribution into the consumer's output. What that cost was a
+   * **package carrying its own program**: a test application's `@export("main")` reached every
+   * consumer, and the two `main`s fought at the link.
    *
-   * So a supplied export is a root where the program refers to its module, and the referring is asked
-   * of `TProgram.moduleDeps` — the graph name resolution built, which records an `import` as readily
-   * as a call. That is deliberately coarser than the function-level walk beside it: a module holding
-   * nothing but an ISR handler and an exported C entry has no function anything calls, and a rule
-   * asking whether the program *called* something there would drop exactly the case an export exists
-   * for.
+   * **The rule is about provenance and it is one rule for all four kinds**, which is what makes it
+   * hold. Told per kind it would have to be told about *pairs* as well, since a root left
+   * unconditional keeps whatever else the same function carries: an `@export` that is also
+   * `@section`-placed, or that is also a handler, would be emitted for the second reason and land its
+   * C symbol in the consumer anyway — measured, and it put two `define @main`s in one module.
+   *
+   * **What the qualification costs is that a consumer wanting a package's handler or placed
+   * definition has to name its module**, and `import` is how — that is a reference like any other,
+   * and it says in the consumer's own source what it is asking for. A vector table slot and a
+   * RAM-resident `.ramfunc` region are the scarcest things on the parts those attributes exist for,
+   * so gaining every unimported module's silently is the worse way to be wrong.
+   *
+   * The referring is asked of `TProgram.moduleDeps` — the graph name resolution built, which records
+   * an `import` as readily as a call. That is deliberately coarser than the function-level walk
+   * beside it: a module holding nothing but an ISR handler and an exported C entry has no function
+   * anything calls, and a rule asking whether the program *called* something there would drop exactly
+   * the case these attributes exist for.
    *
    * **The transitive closure and not the direct edges**, because a package reached through another
    * package is reached: `own` is where the walk starts, and it follows the graph out.
@@ -144,7 +159,14 @@ object Reachability {
    * in the root module and is therefore treated as the program's own**, since the root module is the
    * one name two trees can share — the answer that keeps a symbol is the safe one to be wrong with.
    */
-  private def exporting(program: TProgram, own: Option[Set[String]]): Option[Set[String]] =
+  private def contributing(program: TProgram, own: Option[Set[String]]): String => Boolean = {
+    val reached = reachedModules(program, own)
+
+    name => reached.forall(_(Modules.moduleOf(name)))
+  }
+
+  /** Which modules a root in counts, or `None` where every module's does. */
+  private def reachedModules(program: TProgram, own: Option[Set[String]]): Option[Set[String]] =
     own.map { ours =>
       val reached = mutable.HashSet.from(ours + Modules.root)
       val queue   = mutable.Queue.from(reached)

@@ -54,8 +54,9 @@ object TestRunner {
    *
    * `librarySources` is a library handed over as source, kept apart from `sources` rather than
    * concatenated into it because which modules are this tree's own is what decides whether a
-   * dependency's `@export` is a root (`Reachability.exporting`). A test build links a `main` of its
-   * own, so it is one of the builds that collision costs.
+   * dependency's export, handler, placed definition or destructor is a root
+   * (`Reachability.contributing`). A test build links a `main` of its own, so it is one of the builds
+   * that collision costs.
    */
   def run(cfg: Config, sources: List[Source], libraries: List[Program], target: Target,
           precompiled: Set[String], std: Stdlib, archives: List[String],

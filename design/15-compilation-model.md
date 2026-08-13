@@ -751,6 +751,12 @@ that would unwind a frame the call never pushed. A walk starting from what the p
 therefore cannot reach it, and dropping it would leave the vector table pointing at nothing — a fault
 at the worst available moment. Its address is still worth taking, which is what fills that table.
 
+**A handler a DEPENDENCY supplied is a root only where the program reaches its module**, by the rule
+§12 states for every kind of root at once. A package shipping a handler for a peripheral a consumer
+never uses would otherwise put it in that consumer's vector table, and two packages shipping one for
+the same vector is the collision that rule was written for. A consumer that wants a package's handler
+names its module — an `import` is enough, and is what says so.
+
 **The rules are about the signature, so they are checked on the declaration** rather than while a
 body is walked. A generic handler nothing instantiates has no body analyzed at all, and it is exactly
 as wrong as one that does.
@@ -977,25 +983,35 @@ which is suppressed — the same switch a library build has always used, reached
 same reason: nothing inside the program calls it, and the whole point is that something outside will.
 A build with no entry point is what makes this load bearing, since every other root is absent there.
 
-**An export a DEPENDENCY supplied is a root only where the program reaches its module**, and that is
-the one qualification on the rule above. A dependency's source root is compiled whole rather than by
-what the program imports (§7), so every module of every `--lib` root and every fetched package is in
-the compilation whether or not anything names it. For an ordinary declaration that costs nothing —
-pruning drops what no body reaches — but an export is precisely a declaration no body reaches, so an
-unconditional root put an unimported module's symbol in the consumer's artifact. What that cost was a
-**package carrying its own program**: a test application's `@export("main")` reached every consumer,
-and the two `main`s fought at the link, which is why a binding's runnable half has had to live in a
-second repository.
+**A root a DEPENDENCY supplied counts only where the program reaches its module**, and that is the
+one qualification on the rule above. A dependency's source root is compiled whole rather than by what
+the program imports (§7), so every module of every `--lib` root and every fetched package is in the
+compilation whether or not anything names it. For an ordinary declaration that costs nothing —
+pruning drops what no body reaches — but every kind of root is precisely a declaration no body
+reaches, so an unconditional one put an unimported module's contribution into the consumer's
+artifact. What that cost was a **package carrying its own program**: a test application's
+`@export("main")` reached every consumer, and the two `main`s fought at the link, which is why a
+binding's runnable half has had to live in a second repository.
+
+**The qualification is about PROVENANCE and applies to all four kinds** — an export, an interrupt
+handler (§10), a `@section` definition (§13) and a destructor (`03 § A destructor`). Telling it per
+kind does not work, and the reason is worth stating: a root left unconditional keeps whatever else
+the same function carries, so an export that is *also* placed, or that is *also* a handler, would be
+kept for the second reason and land its C symbol in the consumer anyway. A rule about which
+attributes appear *together* is a worse rule than a rule about where the declaration came from.
 
 Reaching is asked of the module graph `13` §6 already builds, so an `import` counts as readily as a
 call, and it is the transitive closure — a package reached through a package is reached. That is
 deliberately coarser than the walk over function bodies beside it: a module holding nothing but an
-exported C entry point has no function anything calls, and a rule asking whether the program *called*
-something there would drop exactly the case an export exists for.
+exported C entry point or an interrupt handler has no function anything calls, and a rule asking
+whether the program *called* something there would drop exactly the case these attributes exist for.
 
-**A package that wants a symbol published regardless puts it in a module the consumer imports.** The
-export is a claim about a symbol the *consumer's* artifact publishes, and a consumer that never
-reaches the module has not asked for it.
+**A package that wants a symbol, a handler or a placed definition published regardless puts it in a
+module the consumer imports.** Each is a claim about what the *consumer's* image contains, and a
+consumer that never reaches the module has not asked for it. That reading is at its strongest where
+the attributes matter most: a vector table slot and a RAM-resident `.ramfunc` region are the scarcest
+things on the parts they exist for, so gaining every unimported module's silently is the worse way to
+be wrong — and `import` says in the consumer's own source what it is asking for.
 
 **The header is a translation and holds no decisions**, which is why it is the cheapest of the three
 pieces: the marking is what does the work. It uses `<stdint.h>`'s fixed-width names because sysl's
@@ -1064,6 +1080,12 @@ optimizer does not delete an object with no reader. Without that second half the
 compile, link, and place nothing — the failure being the absence of a section nobody looked for. C
 answers it the same way, which is why a placement in Zephyr or in a startup file is always written
 beside `__used`.
+
+**A placed definition a DEPENDENCY supplied is a root only where the program reaches its module**,
+which is §12's rule reaching the third of its four kinds. It bites harder here than anywhere else,
+because `used` is exactly what stops the optimizer undoing it: a placed definition kept for want of
+the rule is bytes in every consumer's image that nothing downstream will remove, in the region the
+attribute exists to manage. A consumer that wants a package's placed definition names its module.
 
 **The name is not validated beyond being non-empty.** `.vectors` is ELF's spelling, `__DATA,__mine` is
 Mach-O's, and a character set chosen here would refuse a section some target requires. This is the
