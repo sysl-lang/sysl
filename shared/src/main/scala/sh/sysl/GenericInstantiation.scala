@@ -153,12 +153,51 @@ trait GenericInstantiation extends ConstFolding {
           s.fields = decl.fields.map(f => (f.name, recover(Type.Unknown)(resolveQualified(f.typ, subst))))
           s.packed = decl.packed
           s.minAlign = decl.alignment.flatMap(a => recover(Option.empty[Int])(alignBound(decl.name, a)))
+          recover(())(checkBitfields(s))
         finally
           resolving -= key
           inProgress -= key
 
         structInsts(key) = s
         s
+  }
+
+  /** The two things a **bitfield struct** may not hold, refused where the struct is built rather
+   * than where one of its fields is later read (`15 §1`, `Bitfields`).
+   *
+   * A `@packed` struct with a field narrower than a byte is one integer, and both refusals follow
+   * from that sentence rather than from a policy laid over it.
+   *
+   * A field that does not lower to an integer has no bit range to occupy, and the alternative to
+   * refusing it — packing a pointer into the container — would mean an `inttoptr` round trip that
+   * loses the provenance the back end reasons about. Nesting is the answer, and it costs nothing:
+   * an outer `@packed` struct lays a bitfield struct out as an ordinary field of its size.
+   *
+   * A `volatile` field would be a sub-word volatile access, which is a read-modify-write of the
+   * container where a device expects one bus cycle — and `volatile` is exactly the audience this
+   * feature is for, so allowing it silently is worse than not having bitfields. The struct itself
+   * may still be volatile where it is *held*, which is the shape a read-write register wants.
+   */
+  private def checkBitfields(s: Type.Struct): Unit = {
+    val stored = s.stored
+
+    // Nothing is said about a struct one of whose fields did not resolve: it has been complained
+    // about once already, and `Unknown` is not an integer, so every field after it would be too.
+    if s.packed && !stored.exists((_, t) => Type.underlying(t) == Type.Unknown) &&
+      stored.exists((_, t) => Bitfields.width(t).exists(_ % 8 != 0))
+    then
+      for (name, ty) <- stored do
+        if Bitfields.width(ty).isEmpty then
+          err(s"'${s.name}.$name' is ${show(ty)}, and '${s.name}' is '@packed' with a field narrower " +
+            s"than a byte — so it is one integer, and every field of it has to be one too. Put the " +
+            s"narrow fields in a '@packed' struct of their own and hold that here: it lays out " +
+            s"identically and leaves ${show(ty)} what it is")
+
+        if Type.volatileIn(ty) then
+          err(s"'${s.name}.$name' is 'volatile' and is a bitfield — it occupies part of a byte, so " +
+            s"reading or writing it is a read-modify-write of the whole of '${s.name}' rather than " +
+            s"the single access a device is entitled to. Hold the struct in a volatile field instead " +
+            s"— 'reg: volatile ${s.name}' — which makes it one read and one write of the whole register")
   }
 
   /** `@align(n)` folded to the boundary it names, with the two things that are not alignments

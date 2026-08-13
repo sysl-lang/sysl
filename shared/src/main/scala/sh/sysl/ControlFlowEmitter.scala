@@ -332,12 +332,21 @@ trait ControlFlowEmitter extends PlaceEmitter {
       emit(s"$fv = extractvalue ${en.payloadLlvm(variant)} $payload, ${variant.slot(i)}")
       fv
 
+  /** One field of a struct being destructured — a bit range of the container where the struct is a
+   * bitfield struct, and a slot of the aggregate otherwise (`Bitfields`).
+   */
   private def structField(struct: Type.Struct, value: String, i: Int): String =
     if Type.zeroSized(struct.fields(i)._2) then ""
     else
-      val fv = freshTemp()
-      emit(s"$fv = extractvalue ${struct.llvm} $value, ${struct.slot(i)}")
-      fv
+      Bitfields.of(struct) match
+        case Some(ranges) =>
+          val c = freshTemp()
+          emit(s"$c = extractvalue ${struct.llvm} $value, 0")
+          readBits(ranges, ranges(i), c)
+        case None =>
+          val fv = freshTemp()
+          emit(s"$fv = extractvalue ${struct.llvm} $value, ${struct.slot(i)}")
+          fv
 
   private def bindsAny(p: TPattern): Boolean = p match
     case _: TBindPattern    => true

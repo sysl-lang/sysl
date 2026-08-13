@@ -62,6 +62,14 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     // that walk evaluates — exactly as it is for every other field.
     case TField(receiver, _, ty) if Type.zeroSized(ty) => address(receiver)
 
+    // A **bitfield** has no address at all, and this says so rather than handing back the
+    // container's — which is what a `getelementptr` to slot zero would be, and would be wrong for
+    // every field but the first while looking right for all of them. Nothing reaches here: `15 §1`
+    // refuses `&` on any packed field, and both the read and the write of a bitfield go through its
+    // container by name (`Bitfields`).
+    case TField(receiver, _, _) if bitfieldOf(receiver.ty).isDefined =>
+      sys.error(s"unreachable address of a bitfield in ${receiver.ty.llvm}")
+
     case TField(receiver, index, _) =>
       val base = address(receiver)
       val r    = freshTemp()
@@ -114,7 +122,11 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * refused for the moment `lo` was `6` and `hi` still `5`.
    */
   protected def genMultiAssign(writes: List[TWrite]): Unit = {
-    val addrs = writes.map(w => if Type.zeroSized(w.place.ty) then "" else address(w.place))
+    // A bitfield has no address of its own — `15 §1` refuses one outright — so what `placeAddr`
+    // locates for one is the **container's**, which is where its read-modify-write happens. Locating
+    // it in this phase rather than at the write is what keeps the form's promise for a bitfield too:
+    // every place's own subexpressions are evaluated once, and before anything is read.
+    val addrs = writes.map(w => if Type.zeroSized(w.place.ty) then "" else placeAddr(w.place))
 
     // Every read takes a count for the statement, which is what a form that reads everything before
     // it writes anything needs and a single assignment does not. Writing into the first place lets
@@ -127,35 +139,94 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     }
 
     val curs = writes.zip(addrs).map { (w, p) =>
-      if w.op == "=" || p.isEmpty then ""
-      else
-        val c = freshTemp(); emit(s"$c = load${vol(w.place)} ${w.place.ty.llvm}, ptr $p")
-        held(c, w.place.ty)
+      if w.op == "=" || p.isEmpty then "" else held(loadPlace(w.place, p), w.place.ty)
     }
     val vals = writes.map(w => held(genExpr(w.value), w.value.ty))
 
     for ((w, p), (cur, v)) <- writes.zip(addrs).zip(curs.zip(vals)) do
       if p.nonEmpty then
-        val ty = w.place.ty
-        val q  = vol(w.place)
-
-        if w.op == "=" then storeInto(ty, p, v, q)
+        if w.op == "=" then storePlace(w.place, p, v)
         else
-          val updated = combine(w.op, ty, w.value.ty, w.dispatch, cur, v)
+          val updated = combine(w.op, w.place.ty, w.value.ty, w.dispatch, cur, v)
 
           for c <- w.constraint do emitConstraintChecks(updated, c)
 
-          // A compound arm has already read what was in the slot, so the release is of that value
-          // rather than of a second load — which is `TUpdate`'s arrangement, for its reason.
-          if containsRef(ty) then
-            retainValue(ty, updated)
-            emit(s"store$q ${ty.llvm} $updated, ptr $p")
-            releaseValue(ty, cur)
-          else emit(s"store$q ${ty.llvm} $updated, ptr $p")
+          storePlace(w.place, p, updated, Some(cur))
 
     for (recv, struct, invFn) <- writes.flatMap(_.check).distinct do
       emitInvCheck(genExpr(recv), struct, invFn)
   }
+
+  // --- a place that is a bit range ------------------------------------------------------
+  //
+  // Four forms write through a place — `TStore`, `TUpdate`, `TIncDec` and each arm of a
+  // `TMultiAssign` — and a bitfield changes the same three steps in all of them: what is located,
+  // what a read of it costs, and what a write of it has to preserve. They are here so that a fifth
+  // form cannot be added without meeting them, which is the failure this replaced: three of the four
+  // reached `address` directly and got a `getelementptr` into a struct that has no such field.
+
+  /** A place that is a bit range of a bitfield struct: the receiver holding the container, the
+   * struct's ranges, and this field's one — or `None` for every other place, which is nearly all of
+   * them (`Bitfields`).
+   */
+  protected def bitPlace(place: TExpr): Option[(TExpr, List[BitRange], BitRange)] = place match
+    case TField(receiver, index, _) =>
+      bitfieldOf(receiver.ty).map(ranges => (receiver, ranges, ranges(index)))
+    case _ => None
+
+  /** Where a write to this place goes: a bitfield's **container**, since the field itself has no
+   * address at all, and the place's own otherwise.
+   */
+  protected def placeAddr(place: TExpr): String =
+    address(bitPlace(place).map(_._1).getOrElse(place))
+
+  /** What is in the place now — one load of the container and a shift for a bitfield.
+   *
+   * **One load, whatever the field's width**, which is what makes a bitfield of a `volatile` struct
+   * a single bus read of the whole register rather than a sub-word access of part of it. The
+   * qualifier comes from the receiver, since the field itself may not carry one (`15 §1`).
+   */
+  protected def loadPlace(place: TExpr, p: String): String = bitPlace(place) match
+    case Some((recv, ranges, r)) => readBits(ranges, r, loadContainer(ranges, recv, p))
+    case None =>
+      val t = freshTemp(); emit(s"$t = load${vol(place)} ${place.ty.llvm}, ptr $p"); t
+
+  private def loadContainer(ranges: List[BitRange], receiver: TExpr, addr: String): String = {
+    val t = freshTemp()
+
+    emit(s"$t = load${qualifier(receiver.placeTy)} ${containerLlvm(ranges)}, ptr $addr")
+    t
+  }
+
+  /** Puts `v` in the place. `cur` is what a compound form already found there, so that the release
+   * is of that value rather than of a second load — `TUpdate`'s arrangement, for its reason; `None`
+   * is a plain assignment, which gives the old value up at the address instead.
+   *
+   * A bitfield needs neither: every field of a bitfield struct is an integer, so nothing there
+   * carries a count. **Its container is re-read here** rather than reused from `loadPlace`, because
+   * two arms of one statement may be two fields of one container and the second has to see what the
+   * first left behind.
+   */
+  protected def storePlace(place: TExpr, p: String, v: String, cur: Option[String] = None): Unit =
+    bitPlace(place) match
+      case Some((recv, ranges, r)) =>
+        val q = qualifier(recv.placeTy)
+        val c = loadContainer(ranges, recv, p)
+
+        emit(s"store$q ${containerLlvm(ranges)} ${writeBits(ranges, r, c, v)}, ptr $p")
+
+      case None =>
+        val ty = place.ty
+        val q  = vol(place)
+
+        cur match
+          case None => storeInto(ty, p, v, q)
+          case Some(old) =>
+            if containsRef(ty) then
+              retainValue(ty, v)
+              emit(s"store$q ${ty.llvm} $v, ptr $p")
+              releaseValue(ty, old)
+            else emit(s"store$q ${ty.llvm} $v, ptr $p")
 
   /** Where a written field index lands in the emitted aggregate, once the zero-sized fields before
    * it are dropped.

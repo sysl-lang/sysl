@@ -176,38 +176,35 @@ trait ExprEmitter extends ArithEmitter {
       address(place)
       ""
 
+    // The three forms that write through a place go through `placeAddr`/`loadPlace`/`storePlace`
+    // rather than through `address` and a `load`, because a **bitfield** is a range of a container
+    // and has no address of its own (`Bitfields`). For every other place those three are the address
+    // and the load and the store, unchanged.
     case TStore(place, value, ty) =>
       val v = genExpr(value)
-      val p = address(place)
-      storeInto(ty, p, v, vol(place))
+      val p = placeAddr(place)
+      storePlace(place, p, v)
       v
 
     case TUpdate(place, op, value, ty, dispatch, check) =>
-      val q       = vol(place)
-      val p       = address(place)
-      val cur     = freshTemp(); emit(s"$cur = load$q ${ty.llvm}, ptr $p")
+      val p       = placeAddr(place)
+      val cur     = loadPlace(place, p)
       val v       = genExpr(value)
       val updated = combine(op, ty, value.ty, dispatch, cur, v)
 
       for c <- check do emitConstraintChecks(updated, c)
 
-      if containsRef(ty) then
-        retainValue(ty, updated)
-        emit(s"store$q ${ty.llvm} $updated, ptr $p")
-        releaseValue(ty, cur)
-      else emit(s"store$q ${ty.llvm} $updated, ptr $p")
+      storePlace(place, p, updated, Some(cur))
       updated
 
     case TIncDec(place, op, pre, ty, check) =>
-      val w   = ty.llvm
-      val q   = vol(place)
-      val p   = address(place)
-      val cur = freshTemp(); emit(s"$cur = load$q $w, ptr $p")
-      val nv  = freshTemp(); emit(s"$nv = ${if op == "++" then "add" else "sub"} $w $cur, 1")
+      val p   = placeAddr(place)
+      val cur = loadPlace(place, p)
+      val nv  = freshTemp(); emit(s"$nv = ${if op == "++" then "add" else "sub"} ${ty.llvm} $cur, 1")
 
       for c <- check do emitConstraintChecks(nv, c)
 
-      emit(s"store$q $w $nv, ptr $p")
+      storePlace(place, p, nv, Some(cur))
       if pre then nv else cur
 
     case TStr(arg) =>
@@ -599,6 +596,18 @@ trait ExprEmitter extends ArithEmitter {
 
     case e @ TEnumNew(en, _, _) if !en.simple && layout.indirect(en) => throughSlot(e)
 
+    // A bitfield struct is one integer, so it is built by or-ing every field into place rather than
+    // inserting each into a slot of its own — and the container then goes into the single slot the
+    // emitted aggregate has (`Bitfields`). No field of one is zero-sized, since every field of one
+    // is an integer, so the arguments and the ranges line up one for one.
+    case TStructNew(struct, args) if Bitfields.of(struct).isDefined =>
+      val ranges = Bitfields.of(struct).get
+      val c      = buildBits(ranges, args.map(genExpr))
+      val r      = freshTemp()
+
+      emit(s"$r = insertvalue ${struct.llvm} undef, ${containerLlvm(ranges)} $c, 0")
+      r
+
     case TStructNew(struct, args) =>
       val vals = args.map(genExpr)
       var acc  = "undef"
@@ -631,6 +640,25 @@ trait ExprEmitter extends ArithEmitter {
 
     case TField(receiver, _, ty) if Type.zeroSized(ty) =>
       genExpr(receiver); ""
+
+    // A bitfield is read out of its container, and the container is reached the way the *receiver*
+    // is: at its address where it has one, so that a field of a `volatile` register block is one
+    // volatile load of the whole register — and out of the value otherwise. Which of those it is has
+    // to be settled here rather than by the two cases below, because both of those take the address
+    // of the **field**, and a bitfield has none (`15 §1`).
+    case e @ TField(receiver, index, _) if bitfieldOf(receiver.ty).isDefined =>
+      val ranges = bitfieldOf(receiver.ty).get
+      val ct     = containerLlvm(ranges)
+
+      val c =
+        if hasAddress(receiver) && (Type.volatileIn(e.placeTy) || layout.indirect(receiver.ty)) then
+          val p = address(receiver)
+          val t = freshTemp(); emit(s"$t = load${qualifier(e.placeTy)} $ct, ptr $p"); t
+        else
+          val rv = genExpr(receiver)
+          val t  = freshTemp(); emit(s"$t = extractvalue ${receiver.ty.llvm} $rv, 0"); t
+
+      readBits(ranges, ranges(index), c)
 
     // A register is reached at its own address, because the ordinary lowering below would read the
     // whole block to get at one field of it — and reading a register block is not a way of reading

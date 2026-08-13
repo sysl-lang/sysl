@@ -29,7 +29,7 @@ class AbiAgainstClangTests extends AnyFreeSpec with Matchers with CodegenSupport
    * member widths, same order, same array lengths — because the whole test is that two compilers
    * given the same shape choose the same coercion.
    */
-  private case class Shape(what: String, sysl: String, c: String)
+  private case class Shape(what: String, sysl: String, c: String, packed: Boolean = false)
 
   private val shapes = List(
     Shape("one byte", "    a: u8", "unsigned char a;"),
@@ -48,6 +48,31 @@ class AbiAgainstClangTests extends AnyFreeSpec with Matchers with CodegenSupport
       "double a; double b; double c; double d; double e;"),
     Shape("a double beside an integer", "    a: f64\n    b: i64", "double a; long long b;"),
     Shape("a float beside an integer", "    a: f32\n    b: i32", "float a; int b;"),
+
+    // `@packed`, which is the one thing a layout attribute changes about a *call*: System V
+    // classifies an aggregate with a member off its own alignment as MEMORY whatever its size is.
+    Shape("a packed header", "    a: u8\n    b: u32", "unsigned char a; unsigned int b;", packed = true),
+
+    // And the bitfields inside one. **The C is one unsigned integer of the container's width, not C
+    // bitfields**, and that is the claim being tested rather than a way around a difficulty: a
+    // bitfield struct *is* one integer (`Bitfields`), so a packed struct holding that integer is
+    // what it must agree with, on every target and in both directions.
+    //
+    // Writing C bitfields here would test something else and would not even be well posed. C leaves
+    // their allocation implementation-defined, which is the whole reason sysl pins it — so MSVC puts
+    // `unsigned a:1` in a four-byte unit where the Itanium ABI packs it into one byte, and those two
+    // C structs are different sizes from sysl's and from each other. The difference is not academic
+    // on the register question either: at `wasm32` a packed struct of one `unsigned int` is passed
+    // directly and one of four `unsigned char` indirectly, so even the byte-array spelling of the
+    // same storage answers differently.
+    //
+    // Three bytes is the one width with no C integer to name it, and there the byte array is what
+    // clang itself models a three-byte bitfield struct as.
+    Shape("a byte of bitfields", "    a: u1\n    b: u3\n    c: u4", "unsigned char x;", packed = true),
+    Shape("bitfields straddling a byte", "    a: u3\n    b: u16\n    c: u5",
+      "unsigned char x[3];", packed = true),
+    Shape("a word of bitfields", "    a: u3\n    b: u29", "unsigned int x;", packed = true),
+    Shape("eight bytes of bitfields", "    a: u5\n    b: u59", "unsigned long long x;", packed = true),
   )
 
   /** Everything a `declare` line carries that is not the convention's answer.
@@ -87,12 +112,13 @@ class AbiAgainstClangTests extends AnyFreeSpec with Matchers with CodegenSupport
   /** What clang makes of the shape, as the two `declare`s for it. The `go` body is what forces both
    * to be emitted — a declaration nothing calls is dropped.
    */
-  private def clangSays(cc: String, t: Target, c: String): (Option[String], Option[String]) = {
-    val src = createTempFile("sysl-abi-", ".c")
+  private def clangSays(cc: String, t: Target, c: String, packed: Boolean): (Option[String], Option[String]) = {
+    val src  = createTempFile("sysl-abi-", ".c")
+    val attr = if packed then " __attribute__((packed))" else ""
 
     try {
       writeFile(src,
-        s"""struct S { $c };
+        s"""struct$attr S { $c };
            |extern struct S give(void);
            |extern void take(struct S v);
            |void go(void) { take(give()); }
@@ -111,9 +137,9 @@ class AbiAgainstClangTests extends AnyFreeSpec with Matchers with CodegenSupport
     } finally try deleteFile(src) catch case _: Exception => ()
   }
 
-  private def syslSays(t: Target, fields: String): (Option[String], Option[String]) = {
+  private def syslSays(t: Target, fields: String, packed: Boolean): (Option[String], Option[String]) = {
     val ir = irFor(t,
-      s"""struct S
+      s"""${if packed then "@packed\n" else ""}struct S
          |$fields
          |extern give() -> S
          |extern take(v: S)
@@ -128,8 +154,8 @@ class AbiAgainstClangTests extends AnyFreeSpec with Matchers with CodegenSupport
         s.what in {
           val cc = Toolchain.findClang(t).getOrElse(cancel(s"no clang here has a back end for ${t.name}"))
 
-          val (cGive, cTake) = clangSays(cc, t, s.c)
-          val (mGive, mTake) = syslSays(t, s.sysl)
+          val (cGive, cTake) = clangSays(cc, t, s.c, s.packed)
+          val (mGive, mTake) = syslSays(t, s.sysl, s.packed)
 
           withClue(s"returning it (${t.triple}, ${s.c}): ")(mGive shouldBe cGive)
           withClue(s"passing it (${t.triple}, ${s.c}): ")(mTake shouldBe cTake)

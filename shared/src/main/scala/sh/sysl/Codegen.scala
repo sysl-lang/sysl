@@ -139,8 +139,14 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // `@align` is *not* written here. A type carries no alignment in LLVM's textual form: the
     // boundary is stated where storage is created, which is what `alignAttr` stamps onto an alloca
     // and a global below.
+    // A **bitfield struct** has no members here at all: it is one integer, and its fields are bit
+    // ranges of that integer rather than anything LLVM is told about (`Bitfields`). Writing the
+    // container inside `<{ }>` rather than as a bare `iM` is what keeps every site that reaches into
+    // a struct — an alloca, a by-value parameter, a load of the whole of one — on the one shape.
     for s <- structs do
-      val fields = s.stored.map(_._2.llvm).mkString(", ")
+      val fields = Bitfields.of(s) match
+        case Some(ranges) => s"i${Bitfields.bits(ranges)}"
+        case None         => s.stored.map(_._2.llvm).mkString(", ")
 
       out ++= (if s.packed then s"${s.llvm} = type <{ $fields }>\n" else s"${s.llvm} = type { $fields }\n")
       s.minAlign.filter(_ > 1).foreach(raisedAligns(s.llvm) = _)

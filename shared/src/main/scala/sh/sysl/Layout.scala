@@ -143,13 +143,19 @@ case class Layout(word: Word) {
    * They are applied in that order because they are separate axes, and the other order would let the
    * packing undo an alignment written beside it. A struct may carry both: a wire header that has to
    * live in a DMA-capable buffer is exactly that shape.
+   *
+   * A **bitfield struct** (`Bitfields`) is one integer rather than a sequence of fields, so its size
+   * is that integer's. It is the same attribute reaching a different answer: `{a: u12, b: u12}` is
+   * twenty-four bits here and two allocations of a `u12` — four bytes — under the rule below.
    */
   private def structLayout(s: Type.Struct): (Int, Int) = {
     val members = s.stored.map(_._2)
 
     val (bytes, alignment) =
-      if s.packed then (math.max(members.map(size).sum, 1), 1)
-      else aggregate(members)
+      Bitfields.of(s) match
+        case Some(ranges)     => (Bitfields.bits(ranges) / 8, 1)
+        case None if s.packed => (math.max(members.map(size).sum, 1), 1)
+        case None             => aggregate(members)
 
     s.minAlign match
       case Some(n) if n > alignment => (math.max(roundUp(bytes, n), n), n)
@@ -171,6 +177,10 @@ case class Layout(word: Word) {
    * A **zero-sized** field is not stored and so has no offset. It is dropped by `stored` rather than
    * answered as the position it would have had: it occupies nothing, nothing can be read there, and
    * a number would invite a comparison against a C struct that has no such member at all.
+   *
+   * A **bitfield** has no byte offset either, and its caller says so in those words rather than
+   * reaching here — a field starting at bit 12 is not at byte 1, and rounding it down to the byte it
+   * begins in would answer a question nobody asked.
    */
   def fieldOffset(s: Type.Struct, field: String): Option[Int] = {
     var offset = 0

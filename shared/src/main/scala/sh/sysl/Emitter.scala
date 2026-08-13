@@ -218,6 +218,87 @@ trait Emitter {
     if a == "true" then "false"
     else { val r = freshTemp(); emit(s"$r = xor i1 $a, true"); r }
 
+  // --- bit ranges of a bitfield struct's container ---------------------------------------
+  //
+  // A bitfield struct is one integer and its fields are ranges of it (`Bitfields`), so the two
+  // things every emitter needs are here rather than in each of them: lifting a range out of a
+  // container, and putting one back. Both halves of codegen reach a field — the one that reads a
+  // value and the one that writes through a place — which is the reason the `i1` folding above
+  // lives here too.
+
+  /** The ranges of the bitfield struct this type is one of, through whatever qualifies it, or
+   * `None` — which is every other type.
+   */
+  protected def bitfieldOf(t: Type): Option[List[BitRange]] = Type.underlying(t) match
+    case s: Type.Struct => Bitfields.of(s)
+    case _              => None
+
+  /** The container type a bitfield struct's fields are ranges of. */
+  protected def containerLlvm(ranges: List[BitRange]): String = s"i${Bitfields.bits(ranges)}"
+
+  /** A field's value widened to the container and shifted to where it belongs — the half of a write
+   * that is about the range, before anything is said about what was there already.
+   */
+  protected def placeBits(ranges: List[BitRange], r: BitRange, v: String): String = {
+    val ct = containerLlvm(ranges)
+
+    val wide =
+      if r.width == Bitfields.bits(ranges) then v
+      else { val t = freshTemp(); emit(s"$t = zext i${r.width} $v to $ct"); t }
+
+    if r.offset == 0 then wide
+    else { val t = freshTemp(); emit(s"$t = shl $ct $wide, ${r.offset}"); t }
+  }
+
+  /** A whole container built from one value per field, which is what constructing a bitfield struct
+   * is. It ors the placed ranges together rather than folding `writeBits` over a zero, because there
+   * is nothing to preserve: every bit of the result is being written.
+   */
+  protected def buildBits(ranges: List[BitRange], vals: List[String]): String = {
+    val ct = containerLlvm(ranges)
+
+    ranges.zip(vals).map(placeBits(ranges, _, _)).reduceOption { (a, b) =>
+      val t = freshTemp(); emit(s"$t = or $ct $a, $b"); t
+    }.getOrElse("0")
+  }
+
+  /** One range lifted out of the container `c`.
+   *
+   * **No sign fixup is needed and none is emitted**, which is worth saying because a C bitfield
+   * needs one: an `i5` field *is* an LLVM `i5`, so truncating the shifted container to the field's
+   * own width lands the two's-complement value already in place. The signedness is in the type
+   * rather than in the extraction.
+   */
+  protected def readBits(ranges: List[BitRange], r: BitRange, c: String): String = {
+    val ct     = containerLlvm(ranges)
+    val shifted =
+      if r.offset == 0 then c
+      else { val t = freshTemp(); emit(s"$t = lshr $ct $c, ${r.offset}"); t }
+
+    if r.width == Bitfields.bits(ranges) then shifted
+    else { val t = freshTemp(); emit(s"$t = trunc $ct $shifted to i${r.width}"); t }
+  }
+
+  /** The container `c` with one range replaced by `v` — the read-modify-write a bitfield write is,
+   * with the read already done by the caller so that the whole of a multi-field update is one load
+   * and one store rather than one of each per field.
+   */
+  protected def writeBits(ranges: List[BitRange], r: BitRange, c: String, v: String): String = {
+    val ct         = containerLlvm(ranges)
+    val bits       = Bitfields.bits(ranges)
+    val (_, clear) = Bitfields.mask(r, bits)
+    val shifted    = placeBits(ranges, r, v)
+
+    // A field occupying the whole container has nothing to preserve, so the mask and the or would
+    // be two instructions saying `shifted` — and the constant one of them ands with is zero, which
+    // reads as a bug rather than as an identity.
+    if r.width == bits then shifted
+    else
+      val cleared = freshTemp(); emit(s"$cleared = and $ct $c, $clear")
+      val merged  = freshTemp(); emit(s"$merged = or $ct $cleared, $shifted")
+      merged
+  }
+
   // --- how a sysl signature is spelled --------------------------------------------------
   //
   // Six places write down what a sysl function looks like to LLVM — its definition, a declaration

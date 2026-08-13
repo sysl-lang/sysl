@@ -248,6 +248,14 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    * and is what the code did before any of this.
    */
   protected def genBorrowedInto(dest: String, e: TExpr): Unit = e match
+    // A bitfield struct has one slot however many fields were written, so there is nothing to build
+    // field by field: the container is assembled as a value and stored once (`Bitfields`).
+    case TStructNew(struct, args) if Bitfields.of(struct).isDefined =>
+      val ranges = Bitfields.of(struct).get
+      val c      = buildBits(ranges, args.map(genExpr))
+
+      emit(s"store ${containerLlvm(ranges)} $c, ptr $dest")
+
     case TStructNew(struct, args) =>
       for (a, i) <- args.zipWithIndex if !Type.zeroSized(struct.fields(i)._2) do
         val p = freshTemp()

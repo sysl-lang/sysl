@@ -337,7 +337,7 @@ object CAbi {
    * Past two eightbytes there are no registers left for it and the whole thing goes in memory.
    */
   private def sysv(t: Type, size: Int)(using l: Layout): Shape =
-    if size > 16 then Shape.Memory
+    if size > 16 || misaligned(t, 0) then Shape.Memory
     else
       val ls = leaves(t)
 
@@ -349,6 +349,38 @@ object CAbi {
         if here.nonEmpty && here.forall(m => floating(m._2)) then floatingChunk(here)
         else integerChunk(ls, lo, hi, size)
       })
+
+  /** Whether any member of the aggregate sits off its own alignment, which System V classifies as
+   * **MEMORY whatever the size is** — the one clause of the classification that is about the layout
+   * rather than about the members' kinds, and the only thing `@packed` changes about a call.
+   *
+   * `struct __attribute__((packed)) { unsigned char a; unsigned int b; }` is five bytes and would
+   * otherwise be one eightbyte in a register; clang returns it through `sret` and takes it as
+   * `byval align 8`. Nothing else here needs asking, since a member is on its alignment in every
+   * layout but a packed one.
+   *
+   * **A bitfield struct is never one of these**, and that is clang's answer rather than a choice
+   * made here: its members are ranges of a container rather than objects with addresses, so there is
+   * nothing for the clause to be about. A three-byte one comes back as `i24`.
+   */
+  private def misaligned(t: Type, at: Int)(using l: Layout): Boolean = Type.underlying(t) match
+    case s: Type.Struct if Bitfields.of(s).isDefined => false
+
+    case s: Type.Struct =>
+      var off = at
+      var bad = false
+
+      for (_, f) <- s.stored do
+        if !s.packed then off = roundUp(off, l.align(f))
+        if off % l.align(f) != 0 || misaligned(f, off) then bad = true
+        off += l.size(f)
+
+      bad
+
+    // Every element of an array is the stride from the one before it, so if the first is on its
+    // alignment they all are — and if it is not, none of them is.
+    case Type.Array(n, elem) => n > 0 && misaligned(elem, at)
+    case _                   => false
 
   /** Members that all fit in floating registers are named by what fills the chunk: several of one
    * width as a vector of that many, one on its own — a `double`, or a `float` in a tail chunk with
@@ -372,7 +404,13 @@ object CAbi {
    */
   private def integerChunk(ls: List[(Int, Type)], lo: Int, hi: Int, size: Int)(using l: Layout): String = {
     val starts = ls.find(_._1 == lo).map(_._2)
-    val width  = starts.map(l.size).getOrElse(0)
+
+    // Clamped to what is left of the aggregate, because a member's *allocation* may be wider than
+    // the storage it occupies here: a bitfield struct's three-byte container is an `i24`, whose
+    // stride standing alone is four. Naming the chunk `i32` would claim a byte the struct does not
+    // have, and clang writes `i24`. Nothing else is affected — outside a packed layout no member
+    // reaches past the end of what holds it.
+    val width  = starts.map(m => math.min(l.size(m), size - lo)).getOrElse(0)
     val alone  = !ls.exists((off, _) => off >= lo + width && off < math.min(lo + 8, size))
 
     // An address fills its chunk and is named as one, which changes nothing about the call — an
@@ -484,6 +522,13 @@ object CAbi {
 
   private def walk(t: Type, at: Int, acc: mutable.ListBuffer[(Int, Type)])(using l: Layout): Unit =
     Type.underlying(t) match {
+      // A bitfield struct has one member however many fields were written — the container its
+      // ranges are cut from (`Bitfields`) — so that is the one leaf. Walking the written fields
+      // instead would put each at a byte offset of its own and make a one-byte struct three bytes
+      // of members, which is a classification of a layout nothing has.
+      case s: Type.Struct if Bitfields.of(s).isDefined =>
+        acc += ((at, Type.Integer(Bitfields.bits(Bitfields.of(s).get), signed = false)))
+
       case s: Type.Struct =>
         var off = at
 

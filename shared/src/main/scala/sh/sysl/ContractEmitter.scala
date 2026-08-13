@@ -213,9 +213,20 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
    * an ordinary call's arguments are — the callee borrows, so no count is taken here.
    */
   protected def emitInvCheck(v: String, struct: Type.Struct, invFn: String): Unit =
+    val container = Bitfields.of(struct).map { ranges =>
+      val c = freshTemp(); emit(s"$c = extractvalue ${struct.llvm} $v, 0"); (ranges, c)
+    }
+
     val args = struct.fields.zipWithIndex.collect {
       case ((_, ft), i) if !Type.zeroSized(ft) =>
-        val r = freshTemp(); emit(s"$r = extractvalue ${struct.llvm} $v, ${struct.slot(i)}")
+        // A bitfield struct's fields are ranges of one container rather than slots of an aggregate,
+        // so they are read out of it once it has been lifted out — which is the same one read
+        // whether the invariant relates one field or all of them.
+        val r = container match
+          case Some((ranges, c)) => readBits(ranges, ranges(i), c)
+          case None =>
+            val t = freshTemp(); emit(s"$t = extractvalue ${struct.llvm} $v, ${struct.slot(i)}"); t
+
         s"${ft.llvm} $r"
     }
     val ok = freshTemp(); emit(s"$ok = call i1 @$invFn(${args.mkString(", ")})")

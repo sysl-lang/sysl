@@ -447,17 +447,26 @@ trait ConstFolding extends ImportResolution {
   protected def offsetBytes(ty: Type, field: String): Option[Int] = Type.underlying(ty) match
     case _: Type.Abstract | Type.Unknown => None
     case s: Type.Struct =>
-      layout.fieldOffset(s, field) match
-        case some @ Some(_) => some
-        case None if s.fieldIndex(field) >= 0 =>
-          err(s"'${show(s)}.$field' occupies no storage, so it has no offset — a zero-sized field " +
-            "lands nowhere, and a C struct that is being mirrored has no member matching it either")
-        case None =>
-          err(s"'${show(s)}' has no field '$field'" + (
-            if s.fields.isEmpty then "" else s" — it stores ${s.fields.map(f => s"'${f._1}'").mkString(", ")}"
-          ))
+      Bitfields.of(s).flatMap(_.find(_.name == field)) match
+        case Some(r) =>
+          err(s"'${show(s)}.$field' is a bitfield — it starts at bit ${r.offset} of the struct and is " +
+            s"${r.width} bits wide, so it has no byte offset. 'offsetof' answers in bytes, and the byte " +
+            s"it begins in is not where it is")
+        case None => byteOffset(s, field)
     case other =>
       err(s"'offsetof' measures a field of a struct, and ${show(other)} is not one")
+
+  /** The same measurement for a field that has one: a byte offset into an ordinary layout. */
+  private def byteOffset(s: Type.Struct, field: String): Option[Int] =
+    layout.fieldOffset(s, field) match
+      case some @ Some(_) => some
+      case None if s.fieldIndex(field) >= 0 =>
+        err(s"'${show(s)}.$field' occupies no storage, so it has no offset — a zero-sized field " +
+          "lands nowhere, and a C struct that is being mirrored has no member matching it either")
+      case None =>
+        err(s"'${show(s)}' has no field '$field'" + (
+          if s.fields.isEmpty then "" else s" — it stores ${s.fields.map(f => s"'${f._1}'").mkString(", ")}"
+        ))
 
   /** Whether a constant expression does not fold **yet** rather than not folding at all: it measures
    * a type that is still a parameter, and every instantiation will supply one that is not.
