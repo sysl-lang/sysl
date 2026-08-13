@@ -516,4 +516,39 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
       built._1 should not include "define i32 @main("
     }
   }
+
+  /** `LibraryArtifact.collisions`, on the one member name that would evict the library itself.
+   *
+   * It is pinned here rather than through the CLI because `15 §7` takes a tree's C from a module or
+   * its root and from nowhere else, so a plain `sysl/` directory of C is skipped before this is ever
+   * consulted. **The guard is still live for the one build whose modules really are `sysl/…`** — a
+   * `build-lib --std` over the standard library — and that build is far too expensive to reach for
+   * an assertion about a string.
+   */
+  "the member name a library's own compiled half uses" - {
+
+    "is refused to a C file that would take it" in {
+      val clash = Source("library/sysl/code.c", "int f(void) { return 0; }\n", List("sysl"))
+
+      LibraryArtifact.nativeMember(clash) shouldBe LibraryArtifact.codeMember
+
+      LibraryArtifact.collisions(List(clash)) match
+        case Some(why) => why should include(LibraryArtifact.codeMember)
+        case None      => fail("a C file mapping to the code member was allowed through")
+    }
+
+    "and so is one that would take the metadata member's" in {
+      val clash = Source("library/sysl/smeta.c", "int f(void) { return 0; }\n", List("sysl"))
+
+      LibraryArtifact.collisions(List(clash)) shouldBe defined
+    }
+
+    "while the same file one directory over is ordinary" in {
+      val fine = Source("library/sysl/text/code.c", "int f(void) { return 0; }\n",
+        List("sysl", "text"))
+
+      LibraryArtifact.nativeMember(fine) shouldBe "sysl.text.code.o"
+      LibraryArtifact.collisions(List(fine)) shouldBe None
+    }
+  }
 }
