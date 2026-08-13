@@ -194,7 +194,7 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
         val on = Conditional.defined(t)
 
         on.count(Set("macos", "linux", "windows", "freestanding")) shouldBe 1
-        on.count(Set("aarch64", "x86_64", "riscv64", "riscv32", "thumb", "x86")) shouldBe 1
+        on.count(Set("aarch64", "x86_64", "riscv64", "riscv32", "thumb", "wasm32", "x86")) shouldBe 1
     }
 
     "nothing a target defines is outside the closed set" in {

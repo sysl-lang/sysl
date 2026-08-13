@@ -61,6 +61,42 @@ class LinkCommandTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  /** WebAssembly is the one target that needs the *linker* told something, and both halves of what
+   * it is told exist because of a failure that does not look like one.
+   */
+  "the WebAssembly link" - {
+
+    // Without it the driver opens a wasm link the way it opens a hosted one -- `crt1.o`, `-lc` and a
+    // wasm `libclang_rt.builtins.a`, none of which exists for this triple. The error names `crt1.o`,
+    // so it reads as a broken LLVM installation rather than as a bare target having no libc.
+    "says -nostdlib, so the driver does not reach for a libc that is not there" in {
+      commandFor(Target.wasm32Freestanding) should contain("-nostdlib")
+    }
+
+    // **The one that matters, and the reason it is not `--no-entry`.** A wasm module has no `_start`,
+    // so `--no-entry` is the obvious spelling — and paired with the `--gc-sections` every link here
+    // passes, nothing is reachable from anywhere and the linker drops the whole program and reports
+    // success. Measured: 278 bytes, no `main`, exit 0. Naming `main` as the entry is what keeps it,
+    // and what exports it under that name for an embedder to call.
+    "names main as the entry, because --no-entry would link an empty module green" in {
+      val said = commandFor(Target.wasm32Freestanding)
+
+      said should contain("-Wl,--entry=main")
+      said should not contain "-Wl,--no-entry"
+    }
+
+    // Both are this target's and no other's: every other row here links with a driver whose defaults
+    // are already right for it, and a flag leaking onto one of those would be passed to a linker that
+    // has never heard of it.
+    "and says neither to any other target" in {
+      for t <- Target.all.filterNot(_.cpu == Cpu.Wasm32) do
+        withClue(t.name) {
+          commandFor(t) should not contain "-nostdlib"
+          commandFor(t).filter(_.startsWith("-Wl,--entry")) shouldBe empty
+        }
+    }
+  }
+
   // A directive names a library and the target spells the flag, which is the whole of `15 §8`'s
   // translation. These are the cases that are not `-l` plus the name.
   "resolving a library name for a target" - {

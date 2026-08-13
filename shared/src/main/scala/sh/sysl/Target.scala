@@ -156,6 +156,7 @@ enum Cpu(val bits: Int) {
   case Riscv64 extends Cpu(64)
   case Riscv32 extends Cpu(32)
   case Thumb   extends Cpu(32)
+  case Wasm32  extends Cpu(32)
   case X86     extends Cpu(32)
 
   /** How a source file names this processor — in a `#if` condition and in an assembly arm alike.
@@ -172,6 +173,7 @@ enum Cpu(val bits: Int) {
     case Riscv64 => "riscv64"
     case Riscv32 => "riscv32"
     case Thumb   => "thumb"
+    case Wasm32  => "wasm32"
     case X86     => "x86"
 
   /** The name LLVM registers this processor's back end under, which is what `clang -print-targets`
@@ -180,8 +182,12 @@ enum Cpu(val bits: Int) {
    * **It is not `symbol`, and the difference is not cosmetic.** `symbol` is what a *program* writes
    * in a `#if` or an `asm` arm and is sysl's to choose; this is LLVM's, and LLVM spells the 64-bit
    * x86 back end `x86-64` where a source file says `x86_64`. Deriving one from the other would work
-   * for five processors out of six and fail for that one, silently, in the form of a clang that
+   * for six processors out of seven and fail for that one, silently, in the form of a clang that
    * looks incapable of a target it handles perfectly well.
+   *
+   * **It is also what says a target needs a clang the PATH may not have.** Apple's clang registers
+   * eleven back ends and `wasm32` is not among them, so `Toolchain.findClang` falls through to
+   * Homebrew's LLVM for that one exactly as it already does for RISC-V.
    */
   def backend: String = this match
     case Aarch64 => "aarch64"
@@ -189,6 +195,7 @@ enum Cpu(val bits: Int) {
     case Riscv64 => "riscv64"
     case Riscv32 => "riscv32"
     case Thumb   => "thumb"
+    case Wasm32  => "wasm32"
     case X86     => "x86"
 }
 
@@ -429,6 +436,33 @@ object Target {
     Target("riscv32-freestanding", "riscv32-unknown-elf", Cpu.Riscv32, Os.Freestanding,
       VaListAbi.Loaded, 4, softFloat = true, noFpu = true)
 
+  /** WebAssembly, which is not a processor at all and is the first target here that is a **virtual**
+   * machine — a stack machine with typed values, executed by a browser, by `wasmtime`, or by whatever
+   * else embeds one.
+   *
+   * **`Freestanding` is the literal truth of `wasm32-unknown-unknown` rather than a convenience.**
+   * The middle field of that triple is the vendor and the last is the operating system, and `unknown`
+   * there means there is none: no libc, no loader, nothing that runs before an exported function is
+   * called. Everything the `Os` answer decides is right for it in consequence — no `-l` is implied,
+   * `hosted` and `posix` are both false, and `thread_local` gets `false`, which matters here because
+   * the keyword is **accepted and silently meaningless**: measured, `@slot = internal thread_local
+   * global i32 0` compiles to an ordinary data symbol.
+   *
+   * **`softFloat` is false and it is not the usual claim.** There are no registers on this machine to
+   * pass anything in — but `f32` and `f64` are value types the instruction set has, a call takes and
+   * returns them as themselves, and there is a `f64.add`. It reaches no decision here either way,
+   * because the convention below never asks: an aggregate of floating members is not flattened on
+   * this target any more than an aggregate of anything else is.
+   *
+   * **Atomics need nothing, unlike Armv6-M.** An `atomicrmw` for this triple lowers to a plain
+   * read-modify-write with no undefined symbol, with and without `-matomics`, so a `&sync T` program
+   * links as it stands. A wasm built for threads is a different machine — a shared memory and a real
+   * `thread_local` — and would be a row of its own rather than a flag on this one.
+   */
+  val wasm32Freestanding: Target =
+    Target("wasm32-freestanding", "wasm32-unknown-unknown", Cpu.Wasm32, Os.Freestanding,
+      VaListAbi.Loaded, 4)
+
   /** A target that is listed and cannot be built for. It is here rather than left out because the
    * limit is the compiler's and not the machine's, and a reader who names it deserves to be told
    * what is missing rather than told the name is unknown.
@@ -460,6 +494,7 @@ object Target {
       thumbv7emFreestanding,
       thumbv7emFreestandingSoft,
       riscv32Freestanding,
+      wasm32Freestanding,
       x86Linux,
     )
 

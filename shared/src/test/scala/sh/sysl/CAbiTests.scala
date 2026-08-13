@@ -60,6 +60,7 @@ class CAbiTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   private val rvBare  = Target.riscv64Freestanding
   private val win     = Target.x86_64Windows
   private val rv32    = Target.riscv32Freestanding
+  private val wasm    = Target.wasm32Freestanding
   private val thumb   = Target.thumbFreestanding
 
   "AAPCS64 packs a small aggregate into whole registers" - {
@@ -470,6 +471,84 @@ class CAbiTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       shape(win, "    p: *u8") shouldBe ("declare i64 @give()", "declare void @take(i64)")
       shape(win, "    p: *u8\n    q: *u8") shouldBe
         ("declare void @give(ptr sret(%struct.S) align 8)", "declare void @take(ptr)")
+    }
+  }
+
+  /** WebAssembly asks nothing about size, which makes it the one convention here whose table can be
+   * stated in a sentence — and the one whose cases are all boundaries of the *same* question rather
+   * than of a threshold.
+   */
+  "WebAssembly unwraps a lone scalar and sends everything else to memory" - {
+
+    "one scalar wrapped in a struct is that scalar, whatever it is" in {
+      shape(wasm, "    a: u8") shouldBe ("declare i8 @give()", "declare void @take(i8)")
+      shape(wasm, "    a: i32") shouldBe ("declare i32 @give()", "declare void @take(i32)")
+      shape(wasm, "    a: i64") shouldBe ("declare i64 @give()", "declare void @take(i64)")
+      shape(wasm, "    a: f32") shouldBe ("declare float @give()", "declare void @take(float)")
+      shape(wasm, "    a: f64") shouldBe ("declare double @give()", "declare void @take(double)")
+    }
+
+    // An address is named as one here, where the Microsoft convention calls it the eight bytes it
+    // occupies -- because this convention never asks how many bytes anything is.
+    "and an address stays an address" in {
+      shape(wasm, "    p: *u8") shouldBe ("declare ptr @give()", "declare void @take(ptr)")
+    }
+
+    // The whole of what separates this convention from every other one: eight bytes of two members
+    // is a register or two everywhere else and is memory here. There is no threshold to be off by
+    // one about, because there is no threshold.
+    "two members are memory at any size, which no other convention says" in {
+      shape(wasm, "    a: i32\n    b: i32") shouldBe
+        ("declare void @give(ptr sret(%struct.S) align 4)",
+          "declare void @take(ptr byval(%struct.S) align 4)")
+      shape(wasm, "    a: f32\n    b: f32") shouldBe
+        ("declare void @give(ptr sret(%struct.S) align 4)",
+          "declare void @take(ptr byval(%struct.S) align 4)")
+      shape(wasm, "    a: u8\n    b: u8") shouldBe
+        ("declare void @give(ptr sret(%struct.S) align 1)",
+          "declare void @take(ptr byval(%struct.S) align 1)")
+    }
+
+    // Four doubles are a homogeneous floating aggregate on AAPCS64 and flatten on RISC-V; here they
+    // are four members, so they are memory like any other four.
+    "a floating aggregate gets no floating case, there being none in this convention" in {
+      shape(wasm, "    a: f64\n    b: f64\n    c: f64\n    d: f64") shouldBe
+        ("declare void @give(ptr sret(%struct.S) align 8)",
+          "declare void @take(ptr byval(%struct.S) align 8)")
+    }
+
+    // The argument is a copy the caller makes, as on System V -- but the alignment rule is the other
+    // one. System V floors a stack argument at eight; this states the type's own, so sixty-four bytes
+    // of `u8` is `align 1` where System V says `align 8`.
+    //
+    // Only the *argument* differs. The `sret` alignment is the type's under both conventions, which
+    // is the reminder that the floor is a fact about the stack slot a caller writes and not about the
+    // aggregate.
+    "the caller's copy is aligned to the type and not floored at a word" in {
+      shape(wasm, "    a: [64]u8") shouldBe
+        ("declare void @give(ptr sret(%struct.S) align 1)",
+          "declare void @take(ptr byval(%struct.S) align 1)")
+      shape(x64, "    a: [64]u8") shouldBe
+        ("declare void @give(ptr sret(%struct.S) align 1)",
+          "declare void @take(ptr byval(%struct.S) align 8)")
+    }
+
+    // clang's `isSingleElementStruct` sees through nesting in both directions, so the unwrapping has
+    // to as well: a struct of a struct of a double is a double, and a one-element array is its one
+    // element.
+    "the unwrapping sees through nesting and through a one-element array" in {
+      shape(wasm, "    inner: Inner", "struct Inner\n    a: i32\n") shouldBe
+        ("declare i32 @give()", "declare void @take(i32)")
+      shape(wasm, "    a: [1]f64") shouldBe ("declare double @give()", "declare void @take(double)")
+    }
+
+    // And it stops where the padding starts. A five-byte array is five members, not one -- the
+    // arithmetic that would make it "one thing" is exactly the size question this convention does
+    // not ask.
+    "but a longer array is its members, so it is memory" in {
+      shape(wasm, "    a: [5]u8") shouldBe
+        ("declare void @give(ptr sret(%struct.S) align 1)",
+          "declare void @take(ptr byval(%struct.S) align 1)")
     }
   }
 

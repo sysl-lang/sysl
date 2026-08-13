@@ -86,6 +86,7 @@ class InlineAssemblyTests extends AnyFreeSpec with Matchers with CodegenSupport 
            |        [riscv64] "fence rw, rw"
            |        [riscv32] "fence rw, rw"
            |        [thumb]   "dmb ish"
+           |${others("x86_64", "aarch64", "riscv64", "riscv32", "thumb")}
            |
            |barrier()
            |""".stripMargin

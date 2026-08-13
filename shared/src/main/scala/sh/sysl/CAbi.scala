@@ -103,22 +103,35 @@ object CAbi {
     else
       shape(t, target) match
         case Shape.Memory =>
-          // Only System V wants the copy made on the caller's stack; the rest take an address.
-          val byval = target.cpu == Cpu.X86_64 && target.os != Os.Windows
-
-          // A `byval` alignment is the **stack slot's**, not the type's, and System V aligns an
-          // argument passed in memory to eight whatever the aggregate is made of — so clang says
-          // `align 8` for a `char[64]`, and only says more when the type itself demands more
-          // (`align 16` for a pair of `__int128`s). Measured, like every other answer here.
-          //
-          // Saying the type's alignment instead generated identical code, because the back end
-          // applies the minimum on its own. It was still worth fixing: the attribute is a claim
-          // about the ABI, a claim that disagrees with clang's is wrong whether or not this year's
-          // back end acts on it, and `AbiAgainstClangTests` now asks clang every run rather than
-          // trusting that somebody read it right once.
-          Param.Indirect(t.llvm, if byval then math.max(l.align(t), 8) else l.align(t), byval)
+          stackCopy(t, target) match
+            case Some(align) => Param.Indirect(t.llvm, align, byval = true)
+            case None        => Param.Indirect(t.llvm, l.align(t), byval = false)
         case Shape.Registers(_, passed) => Param.Coerced(passed)
         case Shape.Split(passed)        => Param.Coerced(passed)
+
+  /** Whether an aggregate that goes in memory is a copy the **caller** makes — LLVM's `byval` — and
+   * at what alignment the convention states the slot, or `None` where the callee is handed an address
+   * it may not write.
+   *
+   * **Two conventions ask for the copy and they state its alignment by different rules**, which is
+   * why this is a function rather than a flag:
+   *
+   *   - **System V** aligns an argument passed in memory to eight whatever the aggregate is made of,
+   *     so clang says `align 8` for a `char[64]` and says more only where the type itself demands it
+   *     (`align 16` for a pair of `__int128`s).
+   *   - **WebAssembly** states the type's own alignment and nothing more: `align 1` for that same
+   *     `char[64]`, `align 4` for a pair of `i32`, `align 8` for an `i64` beside an `i32`.
+   *
+   * Both measured. A `byval` alignment is a claim about the ABI rather than a hint — saying the wrong
+   * one generated identical code here, because the back end applies its own minimum, and it was still
+   * worth fixing: a claim that disagrees with clang's is wrong whether or not this year's back end
+   * acts on it, and `AbiAgainstClangTests` asks clang every run rather than trusting that somebody
+   * read it right once.
+   */
+  private def stackCopy(t: Type, target: Target)(using l: Layout): Option[Int] = target.cpu match
+    case Cpu.X86_64 if target.os != Os.Windows => Some(math.max(l.align(t), 8))
+    case Cpu.Wasm32                            => Some(l.align(t))
+    case _                                     => None
 
   /** The registers an aggregate occupies, named twice — because a result and an argument may spell
    * the same registers differently, which is AAPCS64's case throughout and nobody else's.
@@ -155,6 +168,7 @@ object CAbi {
       case Cpu.Riscv64                           => riscv(t, size, target.hardFloat, xlen = 8)
       case Cpu.Riscv32                           => riscv(t, size, target.hardFloat, xlen = 4)
       case Cpu.Thumb                             => aapcs32(t, size, target.hardFloat)
+      case Cpu.Wasm32                            => wasm(t, size)
       // i386 is refused at the registry (`Target.supported`) for want of exactly this, so nothing
       // reaches here — and when its convention is measured, this is the line that gains it.
       case Cpu.X86                               => Shape.Memory
@@ -344,6 +358,44 @@ object CAbi {
   private def windows(size: Int): Shape =
     if size == 1 || size == 2 || size == 4 || size == 8 then alike(List(s"i${size * 8}"))
     else Shape.Memory
+
+  // --- WebAssembly ------------------------------------------------------------------------
+
+  /** WebAssembly's convention, which is the simplest of the seven and the only one that asks nothing
+   * about **size**. An aggregate that is one scalar with structs and one-element arrays wrapped
+   * round it travels as that scalar; everything else goes in memory, at any size at all.
+   *
+   * So a pair of `i32` — eight bytes, which every other convention here puts in a register or two —
+   * is `byval` on this machine, and so is a pair of floats. There is no eightbyte classification, no
+   * homogeneous floating aggregate rule and no threshold to be off by one about: the whole convention
+   * is one predicate and two answers, and this function is what that predicate costs.
+   *
+   * Measured against clang for `wasm32-unknown-unknown`, as `targets.md § Adding one` requires, and
+   * `AbiAgainstClangTests` re-asks it every run.
+   */
+  private def wasm(t: Type, size: Int)(using l: Layout): Shape =
+    onlyScalar(t, size) match
+      case Some(scalar) => alike(List(scalar.llvm))
+      case None         => Shape.Memory
+
+  /** The one scalar an aggregate is made of, where it is made of exactly one and no padding was
+   * added round it — clang's `isSingleElementStruct`, which sees through nesting in both directions:
+   * a struct holding a struct holding a `double` is a `double`, and so is a one-element array of
+   * either.
+   *
+   * **The size check is what stops an over-aligned wrapper from being unwrapped.** A struct of one
+   * `i32` declared to align to eight is eight bytes with one member, and clang passes it in memory
+   * rather than as an `i32` — the padding is part of what the callee is promised, so unwrapping would
+   * hand over four bytes where eight were expected.
+   *
+   * `leaves` does the seeing-through, because it already walks the layout the emitted module has
+   * rather than the shape a program wrote: a zero-sized member contributes nothing here exactly as it
+   * contributes nothing to the homogeneity question.
+   */
+  private def onlyScalar(t: Type, size: Int)(using l: Layout): Option[Type] =
+    leaves(t) match
+      case (0, scalar) :: Nil if l.size(scalar) == size => Some(scalar)
+      case _                                            => None
 
   // --- the members an aggregate is made of -----------------------------------------------
 

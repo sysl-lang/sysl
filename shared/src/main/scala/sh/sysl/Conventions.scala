@@ -75,6 +75,16 @@ object Conventions {
         "correct handler and there is no prologue for a convention to arrange — write one, and give " +
         "it the name the vector table holds with '@export(\"SysTick_Handler\")'")
 
+    // **WebAssembly has no interrupts to have a form for**, which is a different kind of absence
+    // from the two above: those are machines whose exception entry a convention cannot usefully
+    // describe, and this is a machine with no exception entry. Nothing arrives asynchronously in a
+    // wasm module — the embedder calls an exported function and that call returns — so a handler
+    // here is not a thing the compiler declines to lower, it is a thing the execution model has not
+    // got.
+    case Cpu.Wasm32 =>
+      Left("a wasm module is only ever entered by its embedder calling an exported function, so " +
+        "nothing arrives asynchronously and there is no handler for a convention to describe")
+
     // 32-bit x86 has the convention, but i386 is not lowerable for want of a measured C ABI
     // (`Target.supported`), so nothing can reach this and saying so is better than implying support.
     case Cpu.X86 =>

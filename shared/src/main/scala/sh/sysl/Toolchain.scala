@@ -389,9 +389,31 @@ object Toolchain {
                                 paths: SearchPaths = SearchPaths.none,
                                 cc: String = "clang"): List[String] =
     List(cc, s"--target=${target.triple}", "-Wno-override-module", flag(level)) :::
-      machineFlags(target) ::: deadStrip(target) :::
+      machineFlags(target) ::: linkerFlags(target) ::: deadStrip(target) :::
       paths.linkFlags ::: List(ll) ::: objects ::: archives ::: libraryFlags(links, target) :::
       List("-o", exe)
+
+  /** What a target needs said to the **linker** beyond its triple, which today is WebAssembly's and
+   * nobody else's.
+   *
+   * `wasm-ld` is not a variation on `ld` and the driver's defaults for it are a hosted program's:
+   * without `-nostdlib` the link opens with `crt1.o`, `-lc` and a wasm `libclang_rt.builtins.a`, none
+   * of which exists for `wasm32-unknown-unknown` and the first of which is what the error names — so
+   * the failure reads as a broken installation rather than as a freestanding target having no libc.
+   *
+   * **`--entry=main` is the load-bearing half, and the reason is a link that SUCCEEDS.** The obvious
+   * spelling is `--no-entry`, since a wasm module has no `_start`; pair it with `--gc-sections` — as
+   * every link here does — and nothing is reachable from anywhere, so the linker drops the entire
+   * program and reports success. Measured: 278 bytes, no `main`, exit 0. Naming `main` as the entry
+   * keeps it and everything it reaches, and exports it under that name for an embedder to call, which
+   * is the whole of what running a wasm module means.
+   *
+   * The failure that replaces it is the honest one this page describes for every freestanding target:
+   * a program that prints fails at the link naming `putchar`, because nothing on a bare target
+   * defines it.
+   */
+  private def linkerFlags(target: Target): List[String] =
+    if target.cpu == Cpu.Wasm32 then List("-nostdlib", "-Wl,--entry=main") else Nil
 
   /** What the machine needs said to clang **beyond its triple**, on every command line that produces
    * code for it or reads a header as it.

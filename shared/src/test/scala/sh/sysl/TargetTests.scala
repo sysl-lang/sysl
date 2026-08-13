@@ -227,7 +227,11 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
           "thumbv7m-freestanding",
           "thumbv7em-freestanding",
           "thumbv7em-freestanding-soft",
-          "riscv32-freestanding"
+          "riscv32-freestanding",
+          // The one row here where the keyword is accepted and means nothing rather than reaching
+          // storage nobody set up: LLVM compiles a wasm `thread_local` to an ordinary data symbol
+          // unless the module is built for threads, which this one is not.
+          "wasm32-freestanding"
         )
     }
 

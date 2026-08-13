@@ -51,6 +51,7 @@ of what makes it different from `build`.
 | `thumbv7em-freestanding` | `thumbv7em-none-eabihf` | loaded | yes | yes |
 | `thumbv7em-freestanding-soft` | `thumbv7em-none-eabi` | loaded | **no** | **no** |
 | `riscv32-freestanding` | `riscv32-unknown-elf` | loaded | **no** | **no** |
+| `wasm32-freestanding` | `wasm32-unknown-unknown` | loaded | yes | yes |
 | `x86-linux` | `i386-unknown-linux-gnu` | *no measured C ABI* | | |
 
 **The last two columns are different questions, and the `softfp` row is where that shows.** The
@@ -66,12 +67,16 @@ and two machines. What separates them is `-mfpu=none`, which sysl puts on every 
 for a Thumb row answering no in the last column. **A target is the whole of what is said to clang**,
 and the triple stopped being all of that.
 
-**Eight of these are 32-bit, and the Arm half is a family rather than a board.** The RP2350 boots
-either a pair of Cortex-M33s or a pair of RV32IMAC Hazard3 cores; the RP2040 — the original Pico —
-has a pair of Cortex-M0+; the Armv7E-M rows are ST's parts; and Armv7-M is the Cortex-M3, which is
-the board Zephyr's own documentation reaches for first. All are here because a microcontroller is
-what *freestanding* is mostly for: the three 64-bit freestanding rows reach kernels and hypervisors,
-which is a different audience from the one writing embedded C, and nearly all of that is 32-bit.
+**Nine of these are 32-bit, and eight of the nine are a microcontroller.** The RP2350 boots either a
+pair of Cortex-M33s or a pair of RV32IMAC Hazard3 cores; the RP2040 — the original Pico — has a pair
+of Cortex-M0+; the Armv7E-M rows are ST's parts; and Armv7-M is the Cortex-M3, which is the board
+Zephyr's own documentation reaches for first. The Arm half is a family rather than a board, and all
+of it is here because a microcontroller is what *freestanding* is mostly for: the three 64-bit
+freestanding rows reach kernels and hypervisors, which is a different audience from the one writing
+embedded C, and nearly all of that is 32-bit.
+
+The ninth is `wasm32-freestanding`, which is 32-bit for an unrelated reason and is not a
+microcontroller at all — see *WebAssembly, which is not a processor* below.
 
 `thumb` rather than `arm` names the Arm half, and the reason is the assembly arm rather than the
 architecture family — a Cortex-M executes Thumb only, so an arm written for A32 would assemble for a
@@ -225,6 +230,56 @@ is not there. **What is missing is no longer its width** — this page said "it 
 targets arrived — but a C calling convention measured against clang, which *Adding one* says is the
 only way a target's answers may be arrived at. The limit is the compiler's, not the machine's.
 
+### WebAssembly, which is not a processor
+
+`wasm32-freestanding` is the first row here that is a **virtual** machine: a stack machine with typed
+values, executed by a browser, by `wasmtime`, or by whatever else embeds one. Most of what makes it
+unlike the others turns out to change nothing, and the two things that do change are both about the
+link rather than about the code.
+
+**`Freestanding` is the literal truth of `wasm32-unknown-unknown`, not a convenience.** The last field
+of a triple is the operating system and `unknown` there means there is none — no libc, no loader,
+nothing that runs before an exported function is called. Everything that answer decides is right in
+consequence: no `-l` is implied, `hosted` and `posix` are both false, and `thread_local` answers
+false, which matters here because the keyword is **accepted and silently meaningless**. LLVM compiles
+a wasm `thread_local` to an ordinary data symbol unless the module is built for threads, so the
+failure mode is the one that field exists for.
+
+**The float columns read `yes` and neither word is quite literal.** There are no registers on this
+machine to pass anything in; what is true is that `f32` and `f64` are types the instruction set has,
+that a call takes and returns them as themselves, and that there is an `f64.add`. Neither answer
+reaches a decision, because the convention above never asks — an aggregate of floating members is not
+flattened here any more than an aggregate of anything else is.
+
+**Atomics need nothing, unlike Armv6-M.** An `atomicrmw` for this triple lowers to a plain
+read-modify-write with no undefined symbol, with or without `-matomics`, so a `&sync T` program links
+as it stands. A wasm built for threads is a different machine — a shared memory and a real
+`thread_local` — and would be a row of its own rather than a flag on this one.
+
+**What does need saying is said to the linker, and one half of it is a green link that is wrong.**
+`wasm-ld` is not a variation on `ld`, and the driver's defaults for it are a hosted program's, so
+without `-nostdlib` a link opens with `crt1.o`, `-lc` and a wasm `libclang_rt.builtins.a` — none of
+which exists for this triple, and the first of which is what the error names, so the failure reads as
+a broken LLVM installation. That much is ordinary. The other half is not: a wasm module has no
+`_start`, so `--no-entry` is the obvious spelling, and paired with the `--gc-sections` every link here
+passes it leaves nothing reachable from anywhere. The linker drops the entire program and **reports
+success** — 278 bytes, no `main`, exit 0. `--entry=main` is what keeps `main` and everything it
+reaches, and exports it under that name for an embedder to call.
+
+With those two, a program that prints fails at the link naming `putchar`, which is the honest report
+this page describes for every bare target, and a program that does not print produces a 263-byte
+module `wasmtime` runs.
+
+**This is the first freestanding row the test suite could actually execute**, which is worth noting
+because it is not what "no operating system" usually implies: there is no emulator image, no linker
+script and no board, and `wasmtime` is one binary. The suite does not yet use that, and the QEMU
+board list is where it would go.
+
+**WASI is the row this one is not.** `wasm32-wasip1` is a *hosted* wasm — `printf`, files, a program
+that runs rather than a module that is called — and it needs a wasi-libc sysroot. Its ABI is this same
+convention with an operating system above it, and it is a row to be measured when there is a sysroot
+to measure it against, not one to be reasoned into existence from this one.
+
 ### Adding one
 
 A target is not a description of a machine. It is the set of answers codegen asks for, so:
@@ -269,9 +324,9 @@ agree.
 
 A scalar crosses as itself; an `i32` is one register everywhere. An aggregate does not, and **LLVM
 applies no C classification to one of its own accord** — given a struct type in a signature it
-assigns one register per element, which is not what any of the five conventions asks for. So a
+assigns one register per element, which is not what any of the six conventions asks for. So a
 foreign declaration names the *coerced* types the convention specifies and the call converts each
-value into and out of that shape. The five:
+value into and out of that shape. The six:
 
 - **AAPCS64** asks first whether the aggregate is a homogeneous floating aggregate — up to four
   members all of one floating width, however deeply nested — because those go in floating registers
@@ -295,8 +350,13 @@ value into and out of that shape. The five:
   **argument** goes in registers *at any size* — a sixty-four-byte struct is `[16 x i32]`. So an
   aggregate too big to return is still not too big to pass, and a target where an argument is never
   indirect is a target where the indirect case is unreachable.
-- **The Microsoft convention** is the simplest: one, two, four or eight bytes in one integer
-  register, anything else by address. No floating case at all.
+- **The Microsoft convention** is one, two, four or eight bytes in one integer register, anything
+  else by address. No floating case at all.
+- **WebAssembly** is the simplest, and the only one that asks nothing about **size**: an aggregate
+  that is one scalar with structs and one-element arrays wrapped round it travels as that scalar, and
+  everything else goes in memory at any size at all. So a pair of `i32` — eight bytes, which every
+  other convention puts in a register or two — is `byval` here, and so is a pair of floats. There is
+  no threshold to be off by one about, because there is no threshold.
 
 Three details are worth stating because no document states them and only the measurement finds them.
 System V names an integer chunk after **the member that starts it** when that member is all the chunk
@@ -313,6 +373,11 @@ aligns an argument passed in memory to eight whatever the aggregate is made of, 
 `AbiAgainstClangTests` asked clang and found the two disagreeing. The generated code was identical,
 because the back end applies the minimum on its own — which is exactly why it survived every tier
 below this one, and exactly why *measure it against clang* is a rule and not a habit.
+
+**Two conventions ask for that copy and they state its alignment by different rules**, which is why
+the answer is a function of the target rather than a flag. System V floors it at eight as above;
+WebAssembly states the type's own and nothing more, so the same `char[64]` is `align 1` there. A
+single rule would have been right for one of them and quietly wrong for the other.
 
 **That test is the rule made mechanical.** Every convention above is now re-derived from clang on
 every run: the equivalent C is compiled for the same triple and the `declare` it produces has to be
