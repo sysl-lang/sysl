@@ -975,4 +975,16 @@ case class TProgram(
      * A map from one to the other is the whole of what has to cross.
      */
     destructors: Map[String, String] = Map.empty,
+    /** Which module refers to which, as name resolution settled it (`13 §6`) — the same edges
+     * `ModuleGraph` holds to being acyclic, kept for the one question that is asked after the
+     * analyzer has finished.
+     *
+     * That question is `Reachability.prune`'s: whether an `@export` in a module a **dependency**
+     * supplied is a root. Nothing in the typed tree answers it, because the whole point of an export
+     * is that no body names one — so what decides it is whether the program refers to that module at
+     * all, which is exactly an edge here. An empty map means nothing was recorded rather than that
+     * nothing was referenced, which is why the caller says which modules are its own instead of the
+     * walk inferring it from a graph that may simply not have been built.
+     */
+    moduleDeps: Map[String, Set[String]] = Map.empty,
 )

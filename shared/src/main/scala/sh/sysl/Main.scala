@@ -307,8 +307,8 @@ private[sysl] def execute(cfg: Config): Int = {
   // which is why the branch is here and not at the top.
   if cfg.command == "test" then
     val status =
-      TestRunner.run(cfg, librarySources ::: sources, libraryTrees, target, precompiled, std, archives,
-        native.objects, paths, allocator)
+      TestRunner.run(cfg, sources, libraryTrees, target, precompiled, std, archives,
+        native.objects, paths, allocator, librarySources)
 
     native.scratch.foreach(Project.discard)
     return status
@@ -322,8 +322,9 @@ private[sysl] def execute(cfg: Config): Int = {
   // One compilation, whatever the subcommand does with it. The notes come back beside the IR
   // rather than being printed from inside the compiler, which has no business writing to a console.
   val compiled =
-    Compiler.compiledWith(librarySources ::: sources, libraryTrees, target, precompiled, Some(std),
-      provides, packages, entryPoint = !cLibrary(cfg.command), paths, allocator) match
+    Compiler.compiledWith(sources, libraryTrees, target, precompiled, Some(std),
+      provides, packages, entryPoint = !cLibrary(cfg.command), paths, allocator,
+      librarySources) match
     case Left(err) => return report(err)
     case Right(result) =>
       if cfg.explainEscapes then

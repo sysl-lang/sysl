@@ -251,6 +251,184 @@ class ExportCliTests extends LibraryCliSupport {
     }
   }
 
+  /** A `--lib` source root holding two modules: one the program uses, and one nothing names.
+   *
+   * Two are the whole point. A root with one module cannot tell "a dependency's exports are dropped"
+   * from "a dependency's exports are kept", because whichever answer the rule gives, the one module
+   * is reached — so the used module is the control and the spare one is the measurement.
+   */
+  private def twoModuleLib(spare: String): String = {
+    val root = createTempDirectory("sysl-cli-deplib-")
+
+    createDirectory(s"$root/used")
+    createDirectory(s"$root/spare")
+    writeFile(s"$root/used/lib.sysl", "module used\n\ndouble(n: i32) -> i32 = n * 2\n")
+    writeFile(s"$root/spare/lib.sysl", spare)
+    root
+  }
+
+  private val spareExport =
+    """module spare
+      |
+      |@export("spare_thing")
+      |thing() -> i32 = 42
+      |""".stripMargin
+
+  private val usingUsed =
+    """module mylib
+      |
+      |@export("mylib_answer")
+      |answer(n: i32) -> i32 = used.double(n)
+      |""".stripMargin
+
+  /** An `@export` in a dependency is a root only where the program reaches its module (card 0111).
+   *
+   * **A dependency's source root is compiled whole rather than by what the program imports**, so
+   * before this every module of every `--lib` root and every fetched package put its exports in the
+   * consumer's archive. What that cost was a package carrying its own program: a test application's
+   * `@export("main")` reached every consumer, and the two `main`s fought at the link — which is why
+   * `sysl-lang/zephyr` had to put its suite in a second repository.
+   */
+  "an '@export' in a '--lib' source tree" - {
+
+    "is dropped where nothing in the program reaches its module" in {
+      val lib = twoModuleLib(spareExport)
+      val ir  = emitted(Config(command = "emit-llvm", file = rootOf("mylib", usingUsed),
+        libs = List(lib)))
+
+      symbols(ir, "define") should contain("mylib_answer")
+      symbols(ir, "define") should not contain "spare_thing"
+    }
+
+    // The control: the same tree, the same flag, and the one thing that differs is that the program
+    // names the module. Without this the test above passes for a compiler that dropped every export.
+    "and is kept where the program does reach it" in {
+      val program =
+        """module mylib
+          |
+          |@export("mylib_answer")
+          |answer(n: i32) -> i32 = used.double(n) + spare.thing()
+          |""".stripMargin
+
+      val ir = emitted(Config(command = "emit-llvm", file = rootOf("mylib", program),
+        libs = List(twoModuleLib(spareExport))))
+
+      symbols(ir, "define") should contain("spare_thing")
+    }
+
+    // An `import` is a reference like any other — `AnalyzerBase.dependsOn` records one — and it is
+    // what a module holding nothing but an exported C entry has instead of a call. A rule asking
+    // whether the program *called* something there would drop exactly the case an export exists for.
+    "including where the only reference is an 'import'" in {
+      val program =
+        """module mylib
+          |
+          |import spare
+          |
+          |@export("mylib_answer")
+          |answer(n: i32) -> i32 = used.double(n)
+          |""".stripMargin
+
+      val ir = emitted(Config(command = "emit-llvm", file = rootOf("mylib", program),
+        libs = List(twoModuleLib(spareExport))))
+
+      symbols(ir, "define") should contain("spare_thing")
+    }
+
+    // The header is written from the pruned tree, so it says the same thing the archive does — which
+    // is the property `Compiled.exports` exists for: a header naming a function the object does not
+    // define is the one failure a C project cannot diagnose.
+    "and the header does not declare it either" in {
+      val out = new java.io.ByteArrayOutputStream
+
+      val status = Console.withOut(out)(sh.sysl.execute(Config(command = "emit-header",
+        file = rootOf("mylib", usingUsed), libs = List(twoModuleLib(spareExport)), noStdLib = true)))
+
+      status shouldBe 0
+      out.toString should include("mylib_answer")
+      out.toString should not include "spare_thing"
+    }
+
+    /** The case the card was filed for.
+     *
+     * **Counted rather than looked for**, because the program has a `main` of its own — the entry
+     * point codegen lays down — so the symbol is present either way and its presence says nothing.
+     * What the second one makes is a module with two `define`s of it, which is not a module at all.
+     */
+    "so a package carrying its own program no longer hands every consumer a second 'main'" in {
+      val lib = twoModuleLib("module spare\n\n@export(\"main\")\nrun() -> i32 = 0\n")
+
+      val ir = emitted(Config(command = "emit-llvm", file = rootOf("mylib", usingUsed),
+        libs = List(lib)))
+
+      symbols(ir, "define") should contain("mylib_answer")
+      ir.linesIterator.count(l => l.startsWith("define ") && l.contains("@main(")) shouldBe 1
+    }
+
+    /** A root the program reaches only through another of its dependencies.
+     *
+     * The closure and not the direct edges, which is what makes a package built on a package work:
+     * the program names `used`, `used` names `middle`, and an export in `middle` is as reachable as
+     * one the program named itself.
+     */
+    "and a module reached only through another dependency is reached" in {
+      val root = createTempDirectory("sysl-cli-deplib-")
+
+      createDirectory(s"$root/used")
+      createDirectory(s"$root/middle")
+      writeFile(s"$root/used/lib.sysl", "module used\n\ndouble(n: i32) -> i32 = middle.step(n)\n")
+      writeFile(s"$root/middle/lib.sysl",
+        "module middle\n\n@export(\"middle_thing\")\nstep(n: i32) -> i32 = n * 2\n")
+
+      val ir = emitted(Config(command = "emit-llvm", file = rootOf("mylib", usingUsed),
+        libs = List(root)))
+
+      symbols(ir, "define") should contain("middle_thing")
+    }
+
+    /** The edge has a direction, and this is the case that would pass with it read backwards.
+     *
+     * `spare` imports `used`, which the program does reach — so the two modules are joined, and a
+     * rule asking whether they are *connected* rather than which way keeps an export nothing can
+     * arrive at. What makes a module reachable is being pointed **at**.
+     */
+    "while a module that imports a reached one is not itself reached" in {
+      val root = createTempDirectory("sysl-cli-deplib-")
+
+      createDirectory(s"$root/used")
+      createDirectory(s"$root/spare")
+      writeFile(s"$root/used/lib.sysl", "module used\n\ndouble(n: i32) -> i32 = n * 2\n")
+      writeFile(s"$root/spare/lib.sysl",
+        "module spare\n\n@export(\"spare_thing\")\nthing() -> i32 = used.double(1)\n")
+
+      val ir = emitted(Config(command = "emit-llvm", file = rootOf("mylib", usingUsed),
+        libs = List(root)))
+
+      symbols(ir, "define") should not contain "spare_thing"
+    }
+
+    // The rule qualifies a *dependency's* export and nothing else, so two of the program's own
+    // claiming one symbol are refused exactly as before. Without this the fix above reads as
+    // "duplicate exports stopped being checked".
+    "while two of the program's own exports claiming one symbol are still refused" in {
+      val program =
+        """module mylib
+          |
+          |@export("mylib_answer")
+          |answer() -> i32 = 1
+          |
+          |@export("mylib_answer")
+          |other() -> i32 = 2
+          |""".stripMargin
+
+      val (status, notes) = diagnostics(Config(command = "emit-llvm", file = rootOf("mylib", program),
+        libs = List(twoModuleLib(spareExport))))
+
+      status should not be 0
+      notes should include("'mylib_answer' is exported by")
+    }
+  }
+
   // The flag has a reading everywhere else and none here, so it is refused rather than discarded:
   // taking it silently would produce the unlinkable archive this command exists not to write.
   "naming a prebuilt standard module is refused, since a C link line cannot carry one" in {

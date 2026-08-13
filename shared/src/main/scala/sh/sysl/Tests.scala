@@ -213,10 +213,14 @@ object Tests {
    * tests instead — it makes them reachable from nothing. A destructor pruned that way still has the
    * release hook calling it, so a package with one could not link its own suite; an export pruned
    * that way goes quietly, and the package's C is what discovers it.
+   *
+   * `own` carries through to the same place for the same reason: a test build links a `main` of its
+   * own, so a dependency's unreached `@export("main")` would fight it exactly as it fights a
+   * program's.
    */
-  def only(program: TProgram): TProgram = {
+  def only(program: TProgram, own: Option[Set[String]] = None): TProgram = {
     val kept    = program.copy(main = Nil, entry = None)
-    val entries = Reachability.entryPoints(kept)
+    val entries = Reachability.entryPoints(kept, own)
     val roots   = List(kept.vals, kept.vtables, kept.tests.map(t => TEntry(t.func, None)), entries)
     val live    = Reachability.reachedFrom(roots, kept.funcs, kept.vtables).calls ++ entries.map(_.name)
 

@@ -18,8 +18,15 @@ package sh.sysl
  */
 object Exports {
 
-  def check(program: TProgram): Either[String, Unit] = {
-    val exported = program.funcs.filter(_.exported.isDefined)
+  /** `own` names the modules this compilation is building, and it is here because all three
+   * questions below are about the **emitted** symbol table. An export in a dependency module the
+   * program never reaches is not emitted (`Reachability.exporting`), so holding it to a shape C can
+   * spell, or reporting it as the second claimant of a symbol, would be refusing a build over a
+   * definition that build does not contain — which is the `main` collision this card was filed for,
+   * reappearing as a diagnostic instead of as a link error.
+   */
+  def check(program: TProgram, own: Option[Set[String]] = None): Either[String, Unit] = {
+    val exported = Reachability.exports(program, own)
     val refused  = exported.flatMap(signature) ::: duplicates(exported) ::: storage(exported, program)
 
     if refused.nonEmpty then Left(Diagnostic.report(refused)) else Right(())

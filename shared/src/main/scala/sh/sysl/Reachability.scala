@@ -41,9 +41,13 @@ object Reachability {
    * The tables and the types are left alone. A table is reached by erasing a value into a trait
    * object, and a type is emitted for its layout rather than for anything that runs, so neither is
    * what this pass is about; both are their own question.
+   *
+   * `own` names the modules this compilation is **building** rather than being handed, and what it
+   * decides is which exports are roots — `exporting` says why. `None` is what a compilation with no
+   * dependencies means: everything here is the program's own.
    */
-  def prune(program: TProgram): TProgram = {
-    val entries = entryPoints(program)
+  def prune(program: TProgram, own: Option[Set[String]] = None): TProgram = {
+    val entries = entryPoints(program, own)
     val roots   = List(program.main, program.vals, program.vtables, program.entry, entries)
     val live    = reachedFrom(roots, program.funcs, program.vtables).calls ++ entries.map(_.name)
 
@@ -89,15 +93,68 @@ object Reachability {
    * generated from a payload type at the moment a box of that type is let go of. No reachable body
    * names one, so pruning it would leave the hook calling a symbol nothing defined, and the failure
    * would be at the link, against a name no line of the program contains.
+   *
+   * **An export supplied by a DEPENDENCY is a root only where the program reaches its module**, and
+   * that is the one qualification on any of the four. `exporting` is the whole of it.
    */
-  def entryPoints(program: TProgram): List[TFunc] = {
+  def entryPoints(program: TProgram, own: Option[Set[String]] = None): List[TFunc] = {
     val handlers    = program.funcs.filter(_.conv.isDefined)
-    val exported    = program.funcs.filter(_.exported.isDefined)
+    val exported    = exports(program, own)
     val placed      = program.funcs.filter(_.section.isDefined)
     val destructors = program.funcs.filter(f => program.destructors.values.toSet.contains(f.name))
 
     handlers ::: exported ::: placed ::: destructors
   }
+
+  /** The exports this compilation is answerable for: the ones it will emit, and the ones every pass
+   * that reads the emitted program's symbol table should read (`Exports.check`).
+   *
+   * **An export in the program's own tree is one unconditionally**, exactly as it always was. An
+   * export in a module a *dependency* supplied is one only where the program reaches that module,
+   * which is what `exporting` computes.
+   */
+  def exports(program: TProgram, own: Option[Set[String]]): List[TFunc] = {
+    val rooted = exporting(program, own)
+
+    program.funcs.filter(f => f.exported.isDefined && rooted.forall(_(Modules.moduleOf(f.name))))
+  }
+
+  /** Which modules an `@export` in is a root, or `None` where every module's is.
+   *
+   * **A dependency's source root is compiled whole rather than by what the program imports**, so
+   * every module of every `--lib` root and every fetched package is in this tree whether or not
+   * anything reaches it. For an ordinary declaration that costs nothing — `prune` drops what no body
+   * names — but an export is precisely a declaration no body names, so an unconditional root put an
+   * unimported module's symbol in the consumer's archive. What that cost was a **package carrying its
+   * own program**: a test application's `@export("main")` reached every consumer, and the two `main`s
+   * fought at the link.
+   *
+   * So a supplied export is a root where the program refers to its module, and the referring is asked
+   * of `TProgram.moduleDeps` — the graph name resolution built, which records an `import` as readily
+   * as a call. That is deliberately coarser than the function-level walk beside it: a module holding
+   * nothing but an ISR handler and an exported C entry has no function anything calls, and a rule
+   * asking whether the program *called* something there would drop exactly the case an export exists
+   * for.
+   *
+   * **The transitive closure and not the direct edges**, because a package reached through another
+   * package is reached: `own` is where the walk starts, and it follows the graph out.
+   *
+   * `own` is `None` where the compilation has no dependencies at all, which is most of them, and the
+   * answer is then that every module is the program's own. **A supplied file with no module header is
+   * in the root module and is therefore treated as the program's own**, since the root module is the
+   * one name two trees can share — the answer that keeps a symbol is the safe one to be wrong with.
+   */
+  private def exporting(program: TProgram, own: Option[Set[String]]): Option[Set[String]] =
+    own.map { ours =>
+      val reached = mutable.HashSet.from(ours + Modules.root)
+      val queue   = mutable.Queue.from(reached)
+
+      while queue.nonEmpty do
+        for to <- program.moduleDeps.getOrElse(queue.dequeue(), Set.empty) if reached.add(to) do
+          queue += to
+
+      reached.toSet
+    }
 
   /** What a set of trees reaches: every `val` read and every function called, following each call
    * into the body it lands in.

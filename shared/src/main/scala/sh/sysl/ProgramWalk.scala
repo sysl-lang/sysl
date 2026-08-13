@@ -465,6 +465,10 @@ trait ProgramWalk extends AbstractBodies {
       // answers.
       testOnly = testOnlyDecls.toSet,
       destructors = destructorsOf,
+      // The graph `checkModuleGraph` and `checkGatedModules` have just read, carried out of the
+      // analyzer because one question about it is asked after this walk: which of a dependency's
+      // exports this program reaches (`Reachability.prune`).
+      moduleDeps = moduleEdges.keys.toList.groupMap(_._1)(_._2).view.mapValues(_.toSet).toMap,
     )
   }
 

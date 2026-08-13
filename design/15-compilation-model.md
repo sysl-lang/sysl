@@ -956,6 +956,26 @@ which is suppressed — the same switch a library build has always used, reached
 same reason: nothing inside the program calls it, and the whole point is that something outside will.
 A build with no entry point is what makes this load bearing, since every other root is absent there.
 
+**An export a DEPENDENCY supplied is a root only where the program reaches its module**, and that is
+the one qualification on the rule above. A dependency's source root is compiled whole rather than by
+what the program imports (§7), so every module of every `--lib` root and every fetched package is in
+the compilation whether or not anything names it. For an ordinary declaration that costs nothing —
+pruning drops what no body reaches — but an export is precisely a declaration no body reaches, so an
+unconditional root put an unimported module's symbol in the consumer's artifact. What that cost was a
+**package carrying its own program**: a test application's `@export("main")` reached every consumer,
+and the two `main`s fought at the link, which is why a binding's runnable half has had to live in a
+second repository.
+
+Reaching is asked of the module graph `13` §6 already builds, so an `import` counts as readily as a
+call, and it is the transitive closure — a package reached through a package is reached. That is
+deliberately coarser than the walk over function bodies beside it: a module holding nothing but an
+exported C entry point has no function anything calls, and a rule asking whether the program *called*
+something there would drop exactly the case an export exists for.
+
+**A package that wants a symbol published regardless puts it in a module the consumer imports.** The
+export is a claim about a symbol the *consumer's* artifact publishes, and a consumer that never
+reaches the module has not asked for it.
+
 **The header is a translation and holds no decisions**, which is why it is the cheapest of the three
 pieces: the marking is what does the work. It uses `<stdint.h>`'s fixed-width names because sysl's
 integers say what they *are* where C's say what they are *at least* — an `i32` is `int32_t`, and

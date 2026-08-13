@@ -81,17 +81,27 @@ object Compiler {
    * the one the CLI takes, so that a program linked against a library reports its heap promotions
    * exactly as one compiled alone does.
    */
+  /** `librarySources` is a library given as **source** — a `--lib` root or a fetched package — which
+   * is more modules exactly as `libraries` is, and is separate from `sources` for one reason: which
+   * modules are the program's own is only knowable here, and `Reachability.exporting` needs it.
+   *
+   * Concatenated in front, which is the order the driver used when it did this itself, so which file
+   * a diagnostic is reported against first does not move.
+   */
   def compiledWith(sources: List[Source], libraries: List[Program], target: Target = Target.default,
                    precompiled: Set[String] = Set.empty, std: Option[Stdlib] = None,
                    provides: Set[String] = Capability.core.toSet,
                    packages: Packages = Packages.none, entryPoint: Boolean = true,
-                   paths: SearchPaths = SearchPaths.none, allocator: Allocator = Allocator.c)
+                   paths: SearchPaths = SearchPaths.none, allocator: Allocator = Allocator.c,
+                   librarySources: List[Source] = Nil)
       : Either[String, Compiled] = {
-    val parsed = sources.map(SyslParser.parse(_, target))
+    val supplied = librarySources.map(SyslParser.parse(_, target))
+    val parsed   = sources.map(SyslParser.parse(_, target))
 
-    parsed.collect { case Left(e) => e } match
+    (supplied ::: parsed).collect { case Left(e) => e } match
       case Nil =>
-        compiledTrees(parsed.collect { case Right(p) => p }, libraries, target, precompiled, std,
+        compiledTrees(parsed.collect { case Right(p) => p },
+          libraries ::: supplied.collect { case Right(p) => p }, target, precompiled, std,
           provides, packages, entryPoint, paths, allocator)
       case errs => Left(errs.mkString("\n"))
   }
@@ -109,7 +119,21 @@ object Compiler {
                     paths: SearchPaths = SearchPaths.none, allocator: Allocator = Allocator.c)
       : Either[String, Compiled] =
     analyzed(libraries ::: units, target, precompiled, carried(std, target), provides, packages,
-      entryPoint, paths, allocator)
+      entryPoint, paths, allocator, ownModules(units, libraries))
+
+  /** Which modules this compilation is **building** rather than being handed, where anything was
+   * handed to it at all.
+   *
+   * `None` where nothing was, which is most compilations and is what keeps the rule below invisible
+   * to them: with no dependency there is no supplied export to qualify, and computing a set every
+   * module is in would be the same answer written out.
+   *
+   * Read off the module headers, which is what `compileLibrary` and `typedWith` already do — the
+   * directory has to agree and the analyzer is what holds it to that, so a header is the answer
+   * before anything is analyzed.
+   */
+  private def ownModules(units: List[Program], libraries: List[Program]): Option[Set[String]] =
+    Option.when(libraries.nonEmpty)(units.map(moduleOf).toSet)
 
   /** The same compilation stopped at the **typed tree**, which is what `sysl prove` reads (`17 §9`).
    *
@@ -190,22 +214,25 @@ object Compiler {
   def compileTests(sources: List[Source], libraries: List[Program], target: Target = Target.default,
                    precompiled: Set[String] = Set.empty, std: Option[Stdlib] = None,
                    building: Set[String] = Set.empty, paths: SearchPaths = SearchPaths.none,
-                   allocator: Allocator = Allocator.c)
+                   allocator: Allocator = Allocator.c, librarySources: List[Source] = Nil)
       : Either[String, (Compiled, List[TTest])] = {
-    val parsed = sources.map(SyslParser.parse(_, target))
+    val supplied = librarySources.map(SyslParser.parse(_, target))
+    val parsed   = sources.map(SyslParser.parse(_, target))
 
-    parsed.collect { case Left(e) => e } match
+    (supplied ::: parsed).collect { case Left(e) => e } match
       case errs if errs.nonEmpty => Left(errs.mkString("\n"))
       case _ =>
-        val units = libraries ::: parsed.collect { case Right(p) => p }
-        val whole = carried(std, target)
+        val mine   = parsed.collect { case Right(p) => p }
+        val handed = libraries ::: supplied.collect { case Right(p) => p }
+        val units  = handed ::: mine
+        val whole  = carried(std, target)
 
         for
           typed    <- Analyzer.analyze(units, building, whole, target, paths = paths)
           promoted <- Escape.check(typed)
           _        <- TailCalls.check(typed)
         yield
-          val kept = Tests.only(typed)
+          val kept = Tests.only(typed, ownModules(mine, handed))
 
           // A test binary is linked like any other, so it needs the same libraries. It is a
           // different compilation from the one above rather than a variant of it, which is why the
@@ -335,7 +362,8 @@ object Compiler {
   private def analyzed(units: List[Program], target: Target, precompiled: Set[String],
                        std: Stdlib, provides: Set[String] = Capability.core.toSet,
                        packages: Packages = Packages.none, entryPoint: Boolean = true,
-                       paths: SearchPaths = SearchPaths.none, allocator: Allocator)
+                       paths: SearchPaths = SearchPaths.none, allocator: Allocator,
+                       own: Option[Set[String]] = None)
       : Either[String, Compiled] =
     for
       typed    <- Analyzer.analyze(units, std = std, target = target, provides = provides,
@@ -355,7 +383,7 @@ object Compiler {
       // never have run it — which is the whole of what makes it safe to leave a test beside the code
       // it tests. `Exports` is the odd one out because it asks a question about the emitted
       // program's symbol table rather than about a body.
-      _        <- Exports.check(Tests.strip(typed))
+      _        <- Exports.check(Tests.strip(typed), own)
     yield
       // Pruning still runs, and still from `main`: a library function this program never calls is
       // dropped from the tree exactly as before. What `precompiled` changes is only what happens to
@@ -365,7 +393,7 @@ object Compiler {
       // The tests go first, and they go **after** the analysis above rather than instead of it: a
       // `@test` that does not compile is an error in a build that would never have run it, which is
       // what makes it safe to leave one beside the code it tests (`Tests`).
-      val pruned = Reachability.prune(Tests.strip(typed))
+      val pruned = Reachability.prune(Tests.strip(typed), own)
 
       // The std's units are asked as well as the program's, and this is what makes an artifact's
       // directives mean anything: the standard module arrives as `Stdlib` rather than in `units`, so a
