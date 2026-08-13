@@ -250,8 +250,19 @@ trait Emitter {
    * else. Neither end of a sysl-to-sysl call claims it, so neither may rely on it.
    */
   protected def syslResult(retTy: Type): String =
-    if Type.noValue(retTy) || layout.indirect(retTy) then "void"
-    else CAbi.returning(CAbi.extension(retTy, target), retTy.llvm)
+    CAbi.returning(if syslResultType(retTy) == "void" then "" else CAbi.extension(retTy, target),
+                   syslResultType(retTy))
+
+  /** The same **type**, with no attribute on it — for the `ret` instruction, which takes none.
+   *
+   * A return attribute belongs to the signature: `define zeroext i1 @f()` states what the function
+   * guarantees, and the terminator inside it just names the value's type. LLVM refuses `ret zeroext
+   * i1 %x` outright, which is a parse error in the emitted module rather than anything a test of the
+   * compiler's own types would notice — so the two spellings are kept apart here rather than at each
+   * of the places that needs one.
+   */
+  protected def syslResultType(retTy: Type): String =
+    if Type.noValue(retTy) || layout.indirect(retTy) then "void" else retTy.llvm
 
   /** How a parameter is declared. A **large** one arrives as the address of storage the caller
    * holds; the callee makes its own copy at entry, which is the copy it always made — the only

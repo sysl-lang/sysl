@@ -814,6 +814,30 @@ class CAbiTests extends AnyFreeSpec with RunSupport with CodegenSupport {
      * unspecified and makes the callee narrow what it reads. A rule written from the host alone
      * would have put `zeroext` on both.
      */
+    /** The variadic tail, where C's own default argument promotion has already been applied — a
+      * narrow argument past the declared parameters becomes an `int` before it is handed over, so
+      * there is nothing narrow left for a convention to widen. On RISC-V 64 that promoted `int` is
+      * still widened, because that is the one target whose rule reaches 32 bits, and the result of a
+      * variadic declaration is widened with it.
+      *
+      * Asserted because the two rules meet here and could each have been applied to the other's
+      * value: promoting and *then* widening the original width would put `zeroext` on an `i32`.
+      */
+    "a promoted variadic argument takes the width it was promoted to" in {
+      irFor(arm,
+        """extern vf(f: *u8, ...) -> int
+          |val b: u8 = 7
+          |print(vf(null, b))""".stripMargin) should include("call i32 (ptr, ...) @vf(ptr null, i32")
+
+      val out = irFor(rv,
+        """extern vf(f: *u8, ...) -> int
+          |val b: u8 = 7
+          |print(vf(null, b))""".stripMargin)
+
+      out should include("declare signext i32 @vf(ptr, ...)")
+      out should include("i32 signext")
+    }
+
     "and nowhere at all on AArch64 away from Darwin, which widens nothing" in {
       val out = irFor(armLnx,
         """extern take(v: u8)

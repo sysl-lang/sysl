@@ -33,6 +33,10 @@ trait VtableEmitter extends ArcEmitter {
   private def adapter(vt: TVtable, slot: TVSlot): String = {
     val name    = s"vt.adapt.${if vt.boxed then "ref." else ""}${slot.target}"
     val ret     = syslResult(slot.retTy)
+    // The signature's spelling above carries the extension a narrow result owes whoever called
+    // through the table; the `ret` at the bottom names the type alone, a terminator taking no
+    // return attribute.
+    val retType = syslResultType(slot.retTy)
     // A large result is written into the caller's storage, so the adapter neither receives it in a
     // register nor returns one — it forwards the out-pointer it was handed and returns nothing.
     val out     = syslSret(slot.retTy)
@@ -71,13 +75,13 @@ trait VtableEmitter extends ArcEmitter {
         val forward = out.map(o => s"${o.replace("noalias ", "")} $sretParam").toList
         val call    = (forward ::: self :: pass).mkString(", ")
 
-        if ret == "void" then
+        if retType == "void" then
           emit(s"call void @${slot.target}($call)")
           emitTerm("ret void")
         else
           val r = freshTemp()
           emit(s"$r = call $ret @${slot.target}($call)")
-          emitTerm(s"ret $ret $r")
+          emitTerm(s"ret $retType $r")
       }
     }
   }
