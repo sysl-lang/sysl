@@ -135,8 +135,10 @@ trait SpecialForms extends Closures {
       // Either view will do: making a string out of bytes reads them, and a `[]const u8` is the
       // shape `s.bytes` hands over, which is the commonest thing anyone validates.
       case Type.Slice(Type.Byte, _) => TFromBytes(t)
-      case Type.Array(_, Type.Byte) =>
-        err("'from_utf8_unchecked' takes a []u8, and an array is not one — slice it, as 'from_utf8_unchecked(a[..])'")
+      // An array of bytes is a view of itself here, on the same terms every other position takes one
+      // on. This form asks for a `[]u8` and is one of the places that asks, so an array reaching it
+      // need be sliced by hand no more than an argument to a `[]u8` parameter does.
+      case Type.Array(_, Type.Byte) => TFromBytes(coerce(t, Type.Slice(Type.Byte, readOnly = true)))
       case Type.Str =>
         err("'from_utf8_unchecked' makes a string out of bytes, and this value is already a string")
       case other =>

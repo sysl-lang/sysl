@@ -458,6 +458,137 @@ class ArrayClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  /** `§ Slicing` — an array is a view of itself where a view is asked for, without the `[..]`.
+   *
+   * The conversion is `a[..]` and nothing else, which is what most of these are about: the same
+   * node, the same read-only rule, the same invariant gate, the same escape. So the case that can
+   * be written twice is, and the two spellings are asserted to agree rather than each asserted to
+   * work on its own.
+   *
+   * What the conversion cannot supply is the ability to **write**, since that is a property of the
+   * storage rather than of the view taken of it — so a `val` array reaching a `[]T` is refused, and
+   * the message is the one about the two views rather than the bare mismatch unrelated types get.
+   *
+   * A literal has converted here since 0.0.21; a name for the same array had to say `[..]`, and the
+   * cost fell on exactly the APIs written that way — a package whose every constructor takes
+   * caller-supplied storage read as ceremony where it was meant to read as lending.
+   */
+  "an array is a view of itself where a view is asked for" - {
+    "at a parameter that may write it, and the write reaches the array" in {
+      run("""fill(s: []int) =
+            |    for i in 0..<s.len
+            |        s[i] = int(i) * 2
+            |end fill
+            |var a: [4]int = [0; 4]
+            |fill(a)
+            |print(a[0], a[1], a[2], a[3])
+            |""".stripMargin) shouldBe "0 2 4 6\n"
+    }
+
+    "at one that may not, which is what a 'val' array can reach" in {
+      run("""total(xs: []const int) -> int
+            |    var n = 0
+            |    for x in xs do n += x
+            |    n
+            |end total
+            |val a = [1, 2, 3]
+            |print(total(a))
+            |""".stripMargin) shouldBe "6\n"
+    }
+
+    /* The heap array converts on the same terms, and it is the reference the view is built over: for
+     * a heap array the reference is both where the elements are and what keeps them alive, which is
+     * why `a[..]` leaves its receiver undereferenced too. */
+    "including a heap array, whose reference is what the view is taken over" in {
+      run("""len(xs: []const int) -> usize = xs.len
+            |val r: &[3]int = [1, 2, 3]
+            |print(len(r))
+            |""".stripMargin) shouldBe "3\n"
+    }
+
+    "and a binding, a return and a field, which are the other positions that ask" in {
+      run("""struct Box
+            |    xs: [4]int
+            |end Box
+            |len(xs: []const int) -> usize = xs.len
+            |whole() -> []const int
+            |    val local: [3]int = [7, 8, 9]
+            |    local
+            |end whole
+            |val b = Box([1, 2, 3, 4])
+            |val v: []const int = b.xs
+            |val w = whole()
+            |print(v.len, len(b.xs), w[0], w[2])
+            |""".stripMargin) shouldBe "4 4 7 9\n"
+    }
+
+    /* The storage a returned view names outlives the frame it was written in, exactly as it does for
+     * `local[..]` — the escape analysis reads the view's base and promotes what it roots in, and it
+     * reaches a coerced array by the arm it already reached an explicit one by. */
+    "the two spellings agree, including where the storage has to outlive the frame" in {
+      run("""implicitly() -> []const int
+            |    val local: [3]int = [10, 20, 30]
+            |    local
+            |end implicitly
+            |explicitly() -> []const int
+            |    val local: [3]int = [10, 20, 30]
+            |    local[..]
+            |end explicitly
+            |val a = implicitly()
+            |val b = explicitly()
+            |print(a.len == b.len, a[0] == b[0], a[2] == b[2])
+            |""".stripMargin) shouldBe "true true true\n"
+    }
+
+    "and 'from_utf8_unchecked' is one of the positions that asks, so it takes the bytes as they are" in {
+      run("""val bytes: [3]u8 = [104, 105, 33]
+            |print(from_utf8_unchecked(bytes))
+            |""".stripMargin) shouldBe "hi!\n"
+    }
+
+    "a 'val' array is still refused where the view may be written, and told which half is missing" in {
+      val out = err("""fill(s: []int) = s[0] = 1
+                      |val a = [1, 2, 3]
+                      |fill(a)
+                      |""".stripMargin)
+
+      out should include("views elements it may not write")
+      out should not include "[3]int was given"
+    }
+
+    /* The gate a writable view goes through is about the storage it views rather than the spelling
+     * that took it: such a view is an alias like any other, and `16 §6` refuses one over storage a
+     * struct's invariant reads. */
+    "so is one inside a struct whose invariant reads it" in {
+      err("""struct Box
+            |    xs: [4]int
+            |
+            |    invariant xs[0] > 0
+            |end Box
+            |grab(s: []int) -> usize = s.len
+            |var b = Box([1, 2, 3, 4])
+            |print(grab(b.xs))
+            |""".stripMargin) should include("whose invariant reads 'xs'")
+    }
+
+    "and a '&sync' array, whose owner's count a view does not record" in {
+      err("""len(xs: []const int) -> usize = xs.len
+            |val r: &sync [3]int = [1, 2, 3]
+            |print(len(r))
+            |""".stripMargin) should include("&sync [3]int was given")
+    }
+
+    /* The conversion is about the shape and not about the elements, so an array of the wrong ones is
+     * left to the ordinary mismatch — which names the array the reader wrote rather than a view
+     * built out of it, a value that appears nowhere in the source. */
+    "while an array of other elements is reported as the array it is" in {
+      err("""len(xs: []const int) -> usize = xs.len
+            |var a: [2]long = [1, 2]
+            |print(len(a))
+            |""".stripMargin) should include("is []const int, but [2]long was given")
+    }
+  }
+
   /** The three sequence types answer the same questions, so the questions are asked of all three at
     * once. Each of these reaches the array, the slice and the string by a different path in the
     * compiler, and a claim about "a sequence" is satisfied by whichever one a test happens to pick —

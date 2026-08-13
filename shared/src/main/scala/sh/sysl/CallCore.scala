@@ -59,18 +59,18 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
         }
       case None => args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
 
-    // A **written-out array standing where a slice is asked for**, which is a conversion the
-    // *analysis* performs rather than one `coerce` repairs afterwards: `[1, 2, 3]` becomes a slice
-    // because the position it was written in said so, and by the time there is a `[3]int` to coerce
-    // the moment has passed. A non-generic call never meets this — its parameter type is known, so
-    // the argument is analyzed against it in the first place — and a generic one analyzed the
-    // argument before the solution existed, which is exactly what this re-does.
+    // A **written-out array standing where a slice is asked for**, which for a literal is a
+    // conversion the *analysis* performs rather than one `coerce` repairs afterwards: `[1, 2, 3]`
+    // becomes a slice because the position it was written in said so, and by the time there is a
+    // `[3]int` to coerce the storage has already been made as an array. A non-generic call never
+    // meets this — its parameter type is known, so the argument is analyzed against it in the first
+    // place — and a generic one analyzed the argument before the solution existed, which is exactly
+    // what this re-does.
     //
-    // Asked of the two **types** rather than of the argument's shape, so a named array gets the same
-    // answer as a literal: re-analyzing `a` against `[]const int` reports what a non-generic call
-    // reports for `plain(a)`, which is that an array does not convert on its own and `a[..]` is how
-    // it is written. Matching on the syntax would have made a literal work and a variable fail with
-    // a *different* message for the same rule.
+    // Asked of the two **types** rather than of the argument's shape, so a named array takes the
+    // same road as a literal: re-analyzing `a` against `[]const int` reaches the coercion that
+    // views it, which is what a non-generic call already does for `plain(a)`. Matching on the
+    // syntax would have made the two forms differ here for a rule that does not distinguish them.
 
     // The complaint is about one argument, so it is reported where that argument is written
     // rather than at the call as a whole.

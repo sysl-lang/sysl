@@ -208,8 +208,19 @@ class AnalyzerTypeErrorTests extends AnyFreeSpec with CodegenSupport {
       err("var n = 1\nvar s = n[..]") should include("cannot slice int")
     }
 
-    "do not accept an array where a view was asked for" in {
-      err("f(s: []int) -> usize = s.len\nvar a = [1, 2]\nprint(f(a))") should include("is []int, but [2]int was given")
+    // An array *does* become a view where one is asked for, so what is left to refuse here is the
+    // elements: a view of `[2]long` is not a `[]int`, and the message names the array rather than
+    // some view built out of it, which is the value the reader wrote.
+    "do not accept an array whose elements are not the ones asked for" in {
+      err("f(s: []int) -> usize = s.len\nvar a: [2]long = [1, 2]\nprint(f(a))") should
+        include("is []int, but [2]long was given")
+    }
+
+    // The ability to write is the half the conversion cannot supply, and the message says which
+    // half rather than reporting the two types as unrelated.
+    "and do not accept a 'val' array where one that may be written was asked for" in {
+      err("f(s: []int) -> usize = s.len\nval a = [1, 2]\nprint(f(a))") should
+        include("views elements it may not write")
     }
   }
 
