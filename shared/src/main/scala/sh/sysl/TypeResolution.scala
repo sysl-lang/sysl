@@ -332,7 +332,7 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
     // A **data** enum is a tag beside a payload, so touching one is as many accesses as the payload
     // has words however the source writes it — the one promise the qualifier makes, and the one it
     // could not keep here.
-    case e: Type.Enum =>
+    case _: Type.Enum =>
       err(s"'volatile ${show(t)}' is not a type: '${show(t)}' carries a payload beside its tag, so " +
         "touching one is more than the single access the qualifier promises. A register field that " +
         "is a set of named values is a simple enum, which is one integer")
