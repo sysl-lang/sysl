@@ -248,6 +248,77 @@ class OverloadTests extends LibraryCliSupport with RunSupport with CodegenSuppor
     }
   }
 
+  /** A generic declaration beside an ordinary one, which is the pair the exactness tie-break could
+   * not judge until it was asked of the **instantiated** parameter types rather than of the ones the
+   * declaration wrote. A `T` resolves to nothing on its own, so a generic candidate used to be
+   * inexact whatever the call solved it to, and tied with anything a conversion reached.
+   *
+   * Checked by running, like the rest of this file: each declaration answers differently, so a call
+   * reaching the wrong one prints the wrong word.
+   */
+  "a generic declaration takes its place among the candidates" - {
+    // The card's own reduction. `v` is a `[]int`, which `g[T]` takes as written and `g(s: []const
+    // int)` takes only by giving up the ability to write — so the generic is the exact one.
+    "and wins where it fits as written and the ordinary one needs a view" in {
+      run("""g(s: []const int) -> string = "const"
+            |g[T](x: T) -> string = "generic"
+            |
+            |var a = [1, 2, 3]
+            |val v: []int = a[..]
+            |print(g(v))""".stripMargin) shouldBe "generic\n"
+    }
+
+    // A second conversion, so the rule is not read as being about const views. An `int` erases to a
+    // trait object and is exact at `T`.
+    "whatever the conversion is — an erasure decides the same way" in {
+      run("""p(x: &Display) -> string = "erased"
+            |p[T](x: T) -> string = "generic"
+            |
+            |print(p(1))""".stripMargin) shouldBe "generic\n"
+    }
+
+    // The pair 0110 made reach this tie: an array is now a view of itself where a view is asked for,
+    // so both candidates fit `pick(a)` and only the const-generic one fits it as an array.
+    "including a const-generic candidate against a slice parameter" in {
+      run("""pick(s: []const int) -> string = "slice"
+            |pick[const N: usize](a: [N]int) -> string = "array"
+            |
+            |var a = [1, 2, 3]
+            |print(pick(a))""".stripMargin) shouldBe "array\n"
+    }
+
+    // Tie-break three. Both are exact at `int`, and the reader who wrote `f(x: int)` said what it
+    // takes rather than being solved for it. Without this the tie-break above would turn a call that
+    // resolves today into an ambiguity, which is why it is a guard and not a preference.
+    "while an ordinary declaration beats it where both are exact" in {
+      run("""f(x: int) -> string = "plain"
+            |f[T](x: T) -> string = "generic"
+            |
+            |print(f(0))""".stripMargin) shouldBe "plain\n"
+    }
+
+    // The literal-width tie-break with a generic in the set, which is the case that says the third
+    // rule is applied to the *exact* candidates rather than to every one that fits: `i64` is not
+    // exact at a bare `1` and must not be reached by being the only other ordinary declaration.
+    "and the literal's own type still decides among the ordinary ones" in {
+      run("""width(x: int) -> string = "int"
+            |width(x: i64) -> string = "i64"
+            |width[T](x: T) -> string = "generic"
+            |
+            |print(width(1))
+            |print(width(1i64))""".stripMargin) shouldBe "int\ni64\n"
+    }
+
+    // Nothing about this makes a generic candidate win by default: where it is the only one that
+    // fits at all it is chosen, and where an ordinary one fits exactly it is not.
+    "and it is still chosen where it is the only candidate that fits" in {
+      run("""q(x: int) -> string = "int"
+            |q[T](x: T) -> string = "generic"
+            |
+            |print(q("a"))""".stripMargin) shouldBe "generic\n"
+    }
+  }
+
   // C has no overloading, so an overload set has at most one member that may take its own name as a
   // symbol. Caught by name rather than left to the rule that an export's symbol must be a C
   // identifier — which does refuse it, and does so quoting `pick.2`, a spelling the source does not

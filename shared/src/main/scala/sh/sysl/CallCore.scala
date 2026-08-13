@@ -212,10 +212,10 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     if keys.length == 1 then callFunction(funcDecls(plain), written, expected)
     else
       val candidates = keys.map(funcDecls)
-      val fitting    = candidates.filter(f => probe(callFunction(f, written, expected)).isDefined)
+      val fitting    = candidates.flatMap(f => fitSignature(f, written, expected).map(f -> _))
 
       narrow(fitting, written) match
-        case List(one) => callFunction(one, written, expected)
+        case List((one, _)) => callFunction(one, written, expected)
 
         // Nothing fits. Where exactly one candidate could have taken this many arguments, its own
         // complaint is the useful message — the reader wrote a call meaning that one and got a type
@@ -242,41 +242,80 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
         // at a bare `0` and is not at `0i64`.
         case many =>
           err(s"'${qn(plain)}' is ambiguous here — ${many.length} of its declarations take these " +
-            s"arguments:\n" + many.map(f => s"    ${signatureOf(f)}").mkString("\n") +
+            s"arguments:\n" + many.map((f, _) => s"    ${signatureOf(f)}").mkString("\n") +
             "\nAnnotate an argument, or name the type a literal is meant at")
   }
 
-  /** The tie-breaks applied to the candidates a call fits, in order, stopping as soon as one leaves
-   * a single answer (`12 §1a`).
+  /** The parameter types a candidate would take this call at, or `None` where it does not take it.
    *
-   * Both are about **exactness**, and both exist because a call that fits two declarations usually
-   * fits one of them the way it was written and the other by something the language did for it.
+   * It is one `probe` of `callFunction`, which is the same question `12 §1a` says to ask — but the
+   * answer kept is the **signature the fit arrived at** rather than only that there was one. For a
+   * generic candidate that is the signature of the *instantiation*: `callFunction` ends at
+   * `funcInsts(name)` with `name` the instantiated key, so the type arguments the call solved are
+   * already applied. That is what lets `narrow` ask a generic candidate the same exactness question
+   * as an ordinary one, without being handed the substitution or having to read coercion nodes back
+   * out of the tree.
+   *
+   * The instantiation the probe registered is dropped with everything else it did — `probe` is
+   * `sandboxed` — so this reads the table inside the attempt and hands out types, which outlive it.
+   */
+  private def fitSignature(
+      f: FuncDecl,
+      written: List[Expr],
+      expected: Option[Type],
+  ): Option[List[Type]] =
+    probe {
+      val TCall(inst, _, _, _) = callFunction(f, written, expected): @unchecked
+      funcInsts(inst)._1.map(_._2)
+    }
+
+  /** The tie-breaks applied to the candidates a call fits, in order, stopping as soon as one leaves
+   * a single answer (`12 §1a`). Each candidate arrives with the signature its fit arrived at, which
+   * for a generic one is the instantiation's — see `fitSignature`.
+   *
+   * The first two are about **exactness**, and both exist because a call that fits two declarations
+   * usually fits one of them the way it was written and the other by something the language did for
+   * it.
    *
    * 1. **A candidate that needed no default fitted the call as written.** `f(x: int)` and
    *    `f(x: int, y: int = 0)` both take `f(1)`, and the reader who wrote `f(1)` meant the first.
    * 2. **A candidate whose parameters are exactly the arguments' own types** beats one reached by a
-   *    conversion. This is what makes a literal's natural type decide between two widths.
+   *    conversion. This is what makes a literal's natural type decide between two widths, and it is
+   *    asked of the types the fit settled on rather than of the types the declaration wrote — so
+   *    `g[T](x: T)` is exact at a `[]int` argument and beats `g(s: []const int)`, which is reached
+   *    only by giving up the ability to write.
+   * 3. **A candidate that named its parameters beats one that was solved for them**, where both are
+   *    exact. `f(x: int)` beside `f[T](x: T)` at `f(0)` fits both at `int`, and a generic
+   *    declaration is the one that took the call by being told what to be. Without this the second
+   *    tie-break would turn that call — which resolves today — into an ambiguity, so it is a guard
+   *    rather than a preference.
    *
    * What is deliberately *not* here is a rule ranking one conversion above another. Two candidates
    * each reached by a different conversion are ambiguous, and saying so is better than a ladder of
-   * precedences nobody can predict from the source.
+   * precedences nobody can predict from the source. Ranking a declaration against a declaration, as
+   * the third does, is a different question from ranking the routes the arguments took.
    */
-  private def narrow(fits: List[FuncDecl], written: List[Expr]): List[FuncDecl] =
+  private def narrow(
+      fits: List[(FuncDecl, List[Type])],
+      written: List[Expr],
+  ): List[(FuncDecl, List[Type])] =
     if fits.length <= 1 then fits
     else
-      val exactArity = fits.filter(_.params.length == written.length)
+      val exactArity = fits.filter(_._1.params.length == written.length)
       val ranked     = if exactArity.length == 1 then exactArity else fits
       val natural    = written.map(a => probe(analyzeExpr(a).ty))
 
       if ranked.length <= 1 then ranked
       else
-        val exactTypes = ranked.filter { f =>
-          f.params.length == natural.length && f.params.zip(natural).forall { (p, t) =>
-            t.exists(actual => probe(resolveType(p.typ, Map.empty)).contains(actual))
-          }
+        val exactTypes = ranked.filter { (_, ptypes) =>
+          ptypes.length == natural.length && ptypes.zip(natural).forall((p, t) => t.contains(p))
         }
 
-        if exactTypes.length == 1 then exactTypes else ranked
+        if exactTypes.length == 1 then exactTypes
+        else
+          val spelled = exactTypes.filter(_._1.tparams.isEmpty)
+
+          if spelled.length == 1 then spelled else ranked
 
   /** Whether a callee with this many parameters could take this many arguments at all — the arity
    * question alone, with nothing said about types. Defaults make the low end, a variadic tail
