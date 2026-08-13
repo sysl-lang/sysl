@@ -7,11 +7,19 @@ import org.scalatest.matchers.should.Matchers
 
 /** `-v` / `--verbose` — what a build decided, on stderr.
  *
- * **The three things it reports were chosen rather than accumulated**: which standard module the
- * compilation got and by which route, the files it read, and the command lines it handed to clang
- * together with the search paths behind them. Phase timings were offered and declined, which is why
- * there are none — a build that is slow is diagnosed by asking what it *did*, and every one of the
- * three above has been the answer to a real question already.
+ * **The four things it reports were chosen rather than accumulated**: which standard module the
+ * compilation got and by which route, the files it read, the command lines it handed to clang
+ * together with the search paths behind them, and — for `build-lib` alone — the directory it staged
+ * the artifact's members in. Phase timings were offered and declined, which is why there are none —
+ * a build that is slow is diagnosed by asking what it *did*, and every one of the four above has
+ * been the answer to a real question already.
+ *
+ * The fourth is the odd one, because the other three are decisions and it is a **write**. It earns
+ * its place on exactly that: a staging directory is the one thing `build-lib` puts anywhere but the
+ * artifact it was asked for, so a run interrupted before the cleanup leaves something behind that
+ * nothing else in the run would name. `LibraryBuildCliTests` pins the cleanup, and this line is what
+ * lets it ask about **one invocation's** directory rather than count the entries in a temp directory
+ * every other build on the machine is writing into at the same time.
  *
  * It goes to stderr for the reason `wrote <exe>` does: stdout is whatever the build was for, and
  * `emit-llvm` prints a module there.
@@ -87,6 +95,27 @@ class VerboseTests extends AnyFreeSpec with Matchers {
 
         notes should include("link path: /opt/somewhere/lib")
         notes should include("include path: /opt/somewhere/include")
+      }
+    }
+
+    // Only `build-lib` stages anything, so this is the one line here an ordinary build does not
+    // print — and both halves are worth pinning: a flag that reported a step which did not happen
+    // would be worse than one that reported nothing.
+    "and where build-lib staged the members, which no other command has to say" in {
+      val root = createTempDirectory("sysl-verbose-lib-")
+      val dir  = s"$root/demo"
+
+      createDirectory(dir)
+      writeFile(s"$dir/lib.sysl", "module demo\n\ndouble(n: int) -> int = n * 2\n")
+
+      val out = s"$root/demo${LibraryArtifact.extension}"
+
+      said(Config(command = "build-lib", file = root, output = Some(out), verbose = true)) should
+        include("members staged in")
+
+      project { plain =>
+        said(Config(command = "build", file = plain, output = Some(s"$plain/out"), verbose = true)) should
+          not include "members staged in"
       }
     }
   }

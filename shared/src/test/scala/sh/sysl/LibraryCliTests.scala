@@ -48,23 +48,6 @@ class LibraryCliTests extends LibraryCliSupport {
 
       succeeds(Config(command = "emit-llvm", file = prog, libs = List(libraryRoot())))
     }
-
-    "leaves no unpacked object behind" in {
-      assume(Toolchain.clangAvailable, "clang not available")
-
-      // The object half is written to a temporary file for the linker's sake. One per invocation
-      // that is never removed is a leak a long-running build would feel and nothing would report.
-      val probe   = createTempFile("sysl-probe-", "")
-      val tempDir = probe.substring(0, math.max(probe.lastIndexOf('/'), probe.lastIndexOf('\\')))
-
-      deleteFile(probe)
-
-      val before = listFiles(tempDir).count(_.contains("sysl-lib-"))
-
-      succeeds(Config(command = "run", file = program("print(demo.double(1))"), libs = List(artifact())))
-
-      listFiles(tempDir).count(_.contains("sysl-lib-")) shouldBe before
-    }
   }
 
   "several --lib at once" - {

@@ -1046,6 +1046,12 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
       // artifact holds the same names wherever it was built and `ar t` shows a reader something they
       // can make sense of. A directory of our own is what makes naming them possible.
       val staging  = createTempDirectory("sysl-lib-")
+
+      // The one place this command writes outside the artifact it was asked for, so it is the one
+      // place a reader has to be told about: a build interrupted between here and the cleanup below
+      // leaves the directory named here, and nothing else in the run would say where it went.
+      if cfg.verbose then trace(s"members staged in $staging")
+
       val code     = s"$staging/${LibraryArtifact.codeMember}"
       val metadata = s"$staging/${LibraryArtifact.metadataMember}"
       val objects  = native.map(s => s -> s"$staging/${LibraryArtifact.nativeMember(s)}")

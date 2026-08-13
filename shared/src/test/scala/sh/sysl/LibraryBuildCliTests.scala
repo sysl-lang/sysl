@@ -94,6 +94,56 @@ class LibraryBuildCliTests extends LibraryCliSupport {
       refused(Config(command = "build-lib", file = root, output = Some(out)))
       isFile(out) shouldBe false
     }
+
+    /* The members are staged in a directory of their own so they can be named, and that directory is
+     * the one thing this command writes outside the artifact it was asked for. One per invocation
+     * that is never removed is a leak nothing would report: a temporary directory is nobody's to
+     * notice, and a machine that builds libraries all day fills up quietly.
+     *
+     * **Asked of this invocation's directory, by name.** The obvious test — count the `sysl-lib-`
+     * entries in the system temp directory before and after — is a race against every other build on
+     * the machine, three of the suites here included, since they create temporaries under that same
+     * prefix and sbt runs six of them at once. It failed exactly that way during another branch's
+     * gate, reporting `127 was not equal to 128`: two numbers one apart, which is what a single
+     * leaked temporary would look like and is why it cost an afternoon to disbelieve. `--verbose`
+     * names the directory, which leaves no shared namespace to be raced on.
+     */
+    "removes the directory it staged the members in" in {
+      val out = createTempFile("sysl-cli-staged-", LibraryArtifact.extension)
+      val (status, notes) =
+        diagnostics(Config(command = "build-lib", file = libraryRoot(), output = Some(out), verbose = true))
+
+      withClue(notes)(status shouldBe 0)
+      exists(staged(notes)) shouldBe false
+    }
+
+    "and removes it when the build fails, which is where a leak would come from" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      // Cleanup runs before the outcome is examined, and this is the path that makes that worth
+      // doing: a build that succeeded had every reason to tidy up after itself, while one that gave
+      // up partway is where a directory gets left behind. The C is staged and compiled after the
+      // module's own object, so the build reaches the staging directory and then fails.
+      val out = createTempFile("sysl-cli-staged-bad-", LibraryArtifact.extension)
+      val (status, notes) =
+        diagnostics(Config(command = "build-lib", file = rootWithC("demo", library, "shim.c" -> "not C at all\n"),
+          output = Some(out), verbose = true))
+
+      status should not be 0
+      exists(staged(notes)) shouldBe false
+    }
+  }
+
+  /** The staging directory a verbose `build-lib` said it was using. A run that announced none never
+   * got as far as staging, which makes the assertion above vacuous rather than satisfied — so it is
+   * a failure here rather than a path that does not exist.
+   */
+  private def staged(notes: String): String = {
+    val marker = "members staged in "
+
+    notes.linesIterator.collectFirst {
+      case line if line.contains(marker) => line.substring(line.indexOf(marker) + marker.length).trim
+    }.getOrElse(fail(s"the build never said where it staged its members:\n$notes"))
   }
 
   /** A library built **on** another one, which is `--lib` at `build-lib` (`15 §7`). The org's case is
