@@ -294,13 +294,26 @@ Where exactly one declaration could have taken that *many* arguments, its own co
 instead: the reader meant that one and got a type wrong, and "the third argument is a `string`" beats
 a roster.
 
-**Two tie-breaks decide a use that fits more than one, and both are about exactness.** A candidate
-that needed no default fitted the call as written, and beats one that did; and a candidate whose
-parameters are exactly the arguments' own types beats one reached by a conversion — which is what
-makes a literal's natural type choose between two widths, so `width(1)` is the `int` and `width(1i64)`
-is the `i64`. What is deliberately absent is any ranking *between* conversions. Two candidates each
-reached by a different one are ambiguous, and saying so is better than a ladder of precedences
-nobody can predict from the source.
+**Three tie-breaks decide a use that fits more than one.** A candidate that needed no default fitted
+the call as written, and beats one that did; and a candidate whose parameters are exactly the
+arguments' own types beats one reached by a conversion — which is what makes a literal's natural type
+choose between two widths, so `width(1)` is the `int` and `width(1i64)` is the `i64`. What is
+deliberately absent is any ranking *between* conversions. Two candidates each reached by a different
+one are ambiguous, and saying so is better than a ladder of precedences nobody can predict from the
+source.
+
+**Exactness is asked of the types the candidate was fitted at, which for a generic one is what the
+call solved it to.** `g[T](x: T)` beside `g(s: []const int)` takes a `[]int` argument at `T = []int`,
+as written, where the other takes it only by giving up the ability to write — so the generic one is
+the exact candidate and is chosen. Asking it of the parameter types as *written* would make a generic
+candidate inexact always, since a `T` is not a type until the call has solved it, and every such pair
+would be ambiguous.
+
+**The third tie-break is that a candidate that named its parameters beats one that was solved for
+them, where both are exact.** `f(x: int)` beside `f[T](x: T)` fits `f(0)` at `int` either way, and
+the ordinary declaration is the one that said what it takes. This ranks a declaration against a
+declaration, which is a different question from ranking the routes the arguments took — the thing the
+paragraph above refuses.
 
 **An address chooses by the type the context wants**, which is the mechanism a generic function's
 address already uses (`§6a`): a `*extern(int) -> int` states exactly what a call through it passes,
