@@ -716,51 +716,6 @@ private[sysl] def execute(cfg: Config): Int = {
  */
 private def links(command: String): Boolean = command == "build" || command == "run" || command == "test"
 
-/** The header requirements nothing on this command line answered, as the one line a build stops on
- * (`packages.md § 8`).
- *
- * ==Why the message is this long==
- *
- * Every other requirement in the file is answered by something the reader already has: a capability
- * is provided by the target or it is not, and there is nothing to go and do. This one is answered by
- * a path on a machine the package has never seen, so the reader is being asked to find something —
- * and a refusal that only names what is missing leaves them to work out *what* it is, *where* it
- * lives and *how* to say so. All three are known here: the package wrote the first two down, and the
- * third is the flag this very check reads.
- *
- * The package's own prose is quoted rather than paraphrased. It is the only part of this nothing in
- * the compiler could have written, and it is the part that says which library is meant.
- *
- * ==One at a time, in the order they were declared==
- *
- * The first unmet requirement stops the build, as `requires` already does for a capability. A
- * consumer satisfying them one flag at a time is the same walk either way, and a list of four would
- * be four things to look up before anything can be tried.
- */
-/** What the `--lib` **source roots** declare they need headers for (`packages.md § 8`).
- *
- * **This is the one road a declared requirement used to fall through.** The other two are already
- * answered and neither needed anything: a package reached through `dependencies` arrives with its
- * manifest as part of the graph, and one reached as a `.syslib` never needs a header at all, because
- * `LibraryArtifact` lowers a `c const` to its measured value before writing. Given the very same
- * package as a **directory**, though, the driver collected its `.sysl` files and opened nothing else
- * — so the sentence its author wrote for exactly this moment was never read, and clang's
- * `'cairo.h' file not found` answered in its place, naming neither the package nor the flag.
- *
- * **Only `requires { headers }` is taken from the manifest, and that is deliberate.** `--lib` names
- * a *source root*, which need not be a package at all, and a root that is not one has nothing to say
- * here. Reading the rest of what a manifest can declare is a different question with a real cost —
- * an allocator taken silently from a `--lib` root is the mixed heap `packages.md § 13` exists to
- * prevent — so it is left alone rather than guessed at.
- *
- * **The root is named as the reader wrote it**, which is a path here where it is a coordinate for a
- * dependency. Both are the thing the person reading the message typed and can go and look at; the
- * package's own declared name is neither.
- *
- * A manifest that will not parse stops the build rather than being skipped. That matches what a
- * dependency's does, and the alternative is silently dropping a requirement on the one path this
- * whole check exists to close.
- */
 /** The allocator each `--lib` **source root** declares, named by the root as the reader wrote it.
  *
  * `packages.md § 13` makes the allocator a property of the *package*: one that brings its own heap
@@ -789,6 +744,30 @@ private def libAllocators(roots: List[String]): Either[String, List[(String, All
     yield seen ::: config.allocator.map(root -> _).toList
   }
 
+/** What the `--lib` **source roots** declare they need headers for (`packages.md § 8`).
+ *
+ * **This is the one road a declared requirement used to fall through.** The other two are already
+ * answered and neither needed anything: a package reached through `dependencies` arrives with its
+ * manifest as part of the graph, and one reached as a `.syslib` never needs a header at all, because
+ * `LibraryArtifact` lowers a `c const` to its measured value before writing. Given the very same
+ * package as a **directory**, though, the driver collected its `.sysl` files and opened nothing else
+ * — so the sentence its author wrote for exactly this moment was never read, and clang's
+ * `'cairo.h' file not found` answered in its place, naming neither the package nor the flag.
+ *
+ * **Only `requires { headers }` is taken from the manifest, and that is deliberate.** `--lib` names
+ * a *source root*, which need not be a package at all, and a root that is not one has nothing to say
+ * here. Reading the rest of what a manifest can declare is a different question with a real cost —
+ * an allocator taken silently from a `--lib` root is the mixed heap `packages.md § 13` exists to
+ * prevent — so it is left alone rather than guessed at.
+ *
+ * **The root is named as the reader wrote it**, which is a path here where it is a coordinate for a
+ * dependency. Both are the thing the person reading the message typed and can go and look at; the
+ * package's own declared name is neither.
+ *
+ * A manifest that will not parse stops the build rather than being skipped. That matches what a
+ * dependency's does, and the alternative is silently dropping a requirement on the one path this
+ * whole check exists to close.
+ */
 private def libHeaderNeeds(roots: List[String]): Either[String, List[HeaderNeed]] =
   roots.foldLeft[Either[String, List[HeaderNeed]]](Right(Nil)) { (acc, root) =>
     for
@@ -797,6 +776,27 @@ private def libHeaderNeeds(roots: List[String]): Either[String, List[HeaderNeed]
     yield seen ::: config.headers.toList.sortBy(_._1).map((name, why) => HeaderNeed(root, name, why))
   }
 
+/** The header requirements nothing on this command line answered, as the one line a build stops on
+ * (`packages.md § 8`).
+ *
+ * ==Why the message is this long==
+ *
+ * Every other requirement in the file is answered by something the reader already has: a capability
+ * is provided by the target or it is not, and there is nothing to go and do. This one is answered by
+ * a path on a machine the package has never seen, so the reader is being asked to find something —
+ * and a refusal that only names what is missing leaves them to work out *what* it is, *where* it
+ * lives and *how* to say so. All three are known here: the package wrote the first two down, and the
+ * third is the flag this very check reads.
+ *
+ * The package's own prose is quoted rather than paraphrased. It is the only part of this nothing in
+ * the compiler could have written, and it is the part that says which library is meant.
+ *
+ * ==One at a time, in the order they were declared==
+ *
+ * The first unmet requirement stops the build, as `requires` already does for a capability. A
+ * consumer satisfying them one flag at a time is the same walk either way, and a list of four would
+ * be four things to look up before anything can be tried.
+ */
 private def unmetHeaders(project: PackageConfig, fromPackages: List[HeaderNeed],
                          supplied: Set[String]): Option[String] = {
   val own  = project.headers.toList.sortBy(_._1).map((name, why) => HeaderNeed("this project", name, why))
@@ -818,33 +818,6 @@ private def unmetHeaders(project: PackageConfig, fromPackages: List[HeaderNeed],
  */
 private def cLibrary(command: String): Boolean = command == "build-c" || command == "emit-header"
 
-/** `sysl build-c` — the static archive and the C header a C project is handed (`15 §12`).
- *
- * **This is `build-lib`'s shape with a different destination.** The compilation is the ordinary one
- * rather than a library build, because what is wanted is a module lowered for *this* target with its
- * calls resolved, not a tree of declarations somebody else will compile. What differs from `build`
- * is the entry point, which `cLibrary` above suppressed, and the ending: an archive rather than a
- * link.
- *
- * **The standard module is compiled into the archive**, always, and this is the one thing `build-c`
- * decides differently from every other command. A `.syslib` is not something a C project can link:
- * an archive referring to code no reachable file contains fails at the C link naming `sysl$prints`,
- * which is a symbol its author has no way to place. So the archive stands alone or it is not an
- * artifact. See `stdChoice`.
- *
- * **What is NOT in the archive is what this build's own libraries supply** — `libm`, and whatever
- * `@link` named — and the report says so rather than leaving it to be discovered at the C project's
- * link. Those are libraries the author chose and can be given to a linker, which is exactly the
- * distinction the standard module fails.
- *
- * **`roots` is every tree the compilation walked, not the project's own**, and it is a parameter for
- * that reason. `15 §7` gives a source root named with `--lib` and a package a `dependencies` block
- * brought in the same answer as the project itself: their C is compiled and reaches the link. This
- * command reads that table exactly as `NativeSources` does for the commands that link, and the
- * archive is where "the link line" lands when the consumer is a C project — an object the archive
- * left out is one the C author has no way to supply and no way to hear about, since the sysl half
- * compiled cleanly and only the C project's linker ever notices.
- */
 /** The literate sources of a tree, or the reason there is nothing to render.
  *
  * **The ordinary `.sysl` files are passed over rather than refused**, because a directory holding
@@ -939,6 +912,33 @@ private def write(path: String, text: String): Int = {
   catch case e: Exception => fail(s"cannot write $path: ${e.getMessage}")
 }
 
+/** `sysl build-c` — the static archive and the C header a C project is handed (`15 §12`).
+ *
+ * **This is `build-lib`'s shape with a different destination.** The compilation is the ordinary one
+ * rather than a library build, because what is wanted is a module lowered for *this* target with its
+ * calls resolved, not a tree of declarations somebody else will compile. What differs from `build`
+ * is the entry point, which `cLibrary` above suppressed, and the ending: an archive rather than a
+ * link.
+ *
+ * **The standard module is compiled into the archive**, always, and this is the one thing `build-c`
+ * decides differently from every other command. A `.syslib` is not something a C project can link:
+ * an archive referring to code no reachable file contains fails at the C link naming `sysl$prints`,
+ * which is a symbol its author has no way to place. So the archive stands alone or it is not an
+ * artifact. See `stdChoice`.
+ *
+ * **What is NOT in the archive is what this build's own libraries supply** — `libm`, and whatever
+ * `@link` named — and the report says so rather than leaving it to be discovered at the C project's
+ * link. Those are libraries the author chose and can be given to a linker, which is exactly the
+ * distinction the standard module fails.
+ *
+ * **`roots` is every tree the compilation walked, not the project's own**, and it is a parameter for
+ * that reason. `15 §7` gives a source root named with `--lib` and a package a `dependencies` block
+ * brought in the same answer as the project itself: their C is compiled and reaches the link. This
+ * command reads that table exactly as `NativeSources` does for the commands that link, and the
+ * archive is where "the link line" lands when the consumer is a C project — an object the archive
+ * left out is one the C author has no way to supply and no way to hear about, since the sysl half
+ * compiled cleanly and only the C project's linker ever notices.
+ */
 private def buildForC(cfg: Config, compiled: Compiled, target: Target, named: Option[String],
                       roots: List[String]): Int = {
   // Before the compile rather than after, exactly as `build-lib` does it: the archiver is not needed
@@ -1209,17 +1209,6 @@ private def chooseTarget(named: Option[String], configured: Option[String]): Eit
         "this machine is not one sysl knows, so a build has to name its target with --target " +
           "('sysl targets' lists them)")
 
-/** The project config, read from the root this invocation was given (`packages.md § 1`).
- *
- * **A missing file is not an error.** A single-file program has no config and wants none, so what
- * comes back is the empty one — the same shape `13 §1` gives the anonymous root module. A file that
- * is *there* and will not read is a different thing entirely and stops the build: somebody wrote it,
- * and building while ignoring it would be building something other than what they asked for.
- *
- * The file is looked for beside the sources rather than searched for upwards. `13 § Open a` settles
- * that the driver is *given* a root rather than discovering one, and a search that walked upward
- * would make a build depend on directories above the one named.
- */
 /** What this compilation depends on, brought onto this machine and turned into what it needs from
  * them (`packages.md § 3`, `§ 5`, `§ 9`).
  *
@@ -1354,6 +1343,17 @@ private def projectRoot(file: String): String =
 
     if slash >= 0 then file.substring(0, slash) else "."
 
+/** The project config, read from the root this invocation was given (`packages.md § 1`).
+ *
+ * **A missing file is not an error.** A single-file program has no config and wants none, so what
+ * comes back is the empty one — the same shape `13 §1` gives the anonymous root module. A file that
+ * is *there* and will not read is a different thing entirely and stops the build: somebody wrote it,
+ * and building while ignoring it would be building something other than what they asked for.
+ *
+ * The file is looked for beside the sources rather than searched for upwards. `13 § Open a` settles
+ * that the driver is *given* a root rather than discovering one, and a search that walked upward
+ * would make a build depend on directories above the one named.
+ */
 private def readPackageConfig(file: String): Either[String, PackageConfig] = {
   val path = s"${projectRoot(file)}/${PackageConfig.FileName}"
 
