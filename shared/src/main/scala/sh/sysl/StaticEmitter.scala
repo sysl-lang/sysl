@@ -24,16 +24,35 @@ trait StaticEmitter extends StringEmitter {
   protected def genVals(vals: List[TVal]): String =
     vals.map { v =>
       val kind = if v.computed || v.writable then "global" else "constant"
-      // `@align(n)` where the declaration asked for a boundary. Nothing otherwise, which leaves LLVM
-      // its own choice — the natural alignment, and the target's business rather than sysl's.
-      val at = v.align.map(n => s", align $n").getOrElse("")
+      // `@section("…")` where one was named, and `@align(n)` where a boundary was. Nothing otherwise,
+      // which leaves LLVM its own choice — the natural alignment, and the target's business rather
+      // than sysl's. The order is LLVM's: a section is written before an alignment.
+      val sec = v.section.map(s => s""", section "$s"""").getOrElse("")
+      val at  = v.align.map(n => s", align $n").getOrElse("")
 
       v.init match
         case Some(init) if !v.computed =>
-          s"@${v.symbol} = private $kind ${v.ty.llvm} ${constantValue(init)}$at\n"
+          s"@${v.symbol} = private $kind ${v.ty.llvm} ${constantValue(init)}$sec$at\n"
         case _ =>
-          s"@${v.symbol} = private $kind ${v.ty.llvm} zeroinitializer$at\n"
+          s"@${v.symbol} = private $kind ${v.ty.llvm} zeroinitializer$sec$at\n"
     }.mkString
+
+  /** `@llvm.used` — the symbols this module places by hand and nothing in it reads (`15 §13`).
+   *
+   * It is what keeps the feature from compiling, linking and placing nothing. A table gathered by a
+   * linker script has no reader inside the program; the globals are emitted `private` and a program
+   * builds at `-O1` by default, so the pass that deletes an unreferenced private global would delete
+   * exactly the object the attribute was written for. C answers this the same way — every one of
+   * Zephyr's iterable-section items carries `__used` beside its section — and this is that answer.
+   *
+   * `appending` linkage is what makes the list a list: each module contributes its own and the
+   * linker concatenates them.
+   */
+  protected def genUsed(names: List[String]): String =
+    if names.isEmpty then ""
+    else
+      val refs = names.map(n => s"ptr @$n").mkString(", ")
+      s"@llvm.used = appending global [${names.length} x ptr] [$refs], section \"llvm.metadata\"\n"
 
   /** A `val`'s initializer as a **constant expression** — text laid straight into the object file,
    * with no instruction emitted for any of it.

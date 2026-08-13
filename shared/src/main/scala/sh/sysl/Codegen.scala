@@ -215,6 +215,12 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
     for t <- funcTexts do out ++= t; out ++= "\n"
     out ++= mainText
+    // Last, so that every symbol it names has been written above it. A definition a library already
+    // compiled is not in this list: its own module said it was used, and saying so again here would
+    // be this module claiming a symbol it does not define.
+    out ++= genUsed(
+      program.vals.filter(_.section.isDefined).map(v => v.symbol) :::
+        own.filterNot(_.ghost).filter(_.section.isDefined).map(f => symbolOf(f.name)))
     out.toString
   }
 
@@ -460,8 +466,13 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // costs today.
     val linkage = if f.internal then "internal " else ""
 
+    // `@section("…")` is written after the attributes, which is where LLVM's own grammar puts it — a
+    // section before them is a parse error rather than a different meaning.
+    val placement = f.section.map(s => s""" section "$s"""").getOrElse("")
+
     finishFunction(
-      s"define $linkage${convention(f)}${syslResult(f.retTy)} @${symbolOf(f.name)}($params)${attribute(f)}")
+      s"define $linkage${convention(f)}${syslResult(f.retTy)} @${symbolOf(f.name)}($params)" +
+        s"${attribute(f)}$placement")
   }
 
   /** The `return` of a **large** result: it is written into the caller's storage rather than handed

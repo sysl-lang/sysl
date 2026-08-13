@@ -44,8 +44,8 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
     // here made every such use report that it was "declared below" — from above it and from below it
     // alike, since the name was never bound at all.
     blockDeclares = savedDeclares ++ stmts.collect {
-      case VarDecl(n, _, _, _, _)  => List(n)
-      case ValDecl(n, _, _, _, _)  => List(n)
+      case VarDecl(n, _, _, _, _, _)  => List(n)
+      case ValDecl(n, _, _, _, _, _)  => List(n)
       case RefDecl(n, _)        => List(n)
       case MultiDecl(ns, _, _)  => ns
       case PatternDecl(p, _, _) => patternNames(p)
@@ -250,8 +250,8 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
    * the name into an "undefined name" of its own, and the real mistake is lost among them.
    */
   private def bindFailed(stmt: Stmt): Unit = stmt match
-    case VarDecl(name, _, _, _, _) => declare(name, Type.Unknown)
-    case ValDecl(name, _, _, _, _) => declareReadOnly(name, Type.Unknown)
+    case VarDecl(name, _, _, _, _, _) => declare(name, Type.Unknown)
+    case ValDecl(name, _, _, _, _, _) => declareReadOnly(name, Type.Unknown)
     // A ref whose place did not analyze binds the name at `Type.Unknown` like the other two, and
     // records no place: there is nothing to walk outward through, and a guard built from a poisoned
     // node would refuse assignments for a reason the program never gave.
@@ -567,6 +567,22 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
   private def boundary(name: String, align: Option[Expr]): Option[Int] =
     align.flatMap(a => recover(Option.empty[Int])(alignBound(name, a)))
 
+  /** `@section("…")` above a **local**, which is refused here rather than in the grammar.
+   *
+   * The two are the same syntax and differ only in where they stand: a top-level `var` is module
+   * storage in every file but the one the program starts in, where it is a local of the entry point
+   * (`13 §7`). So the parser cannot tell them apart, and this is the first place that can.
+   *
+   * What it refuses is real rather than unimplemented. A local's storage is the frame, laid down by
+   * whichever call is running; a section is a region of the image, decided once at the link. There is
+   * no reading of the attribute that would make both true.
+   */
+  private def noSection(name: String, section: Option[String]): Unit =
+    for s <- section do
+      err(s"'$name' is a local, so it cannot be placed in section \"$s\" — its storage is the frame " +
+        "of whichever call is running, and a section is a region of the image the linker decides " +
+        "once. Declare it as module storage, outside every function, for a section to be about")
+
   /** Most statements are one statement. The two comma forms are the exception, and the only reason
    * this hands back a list: a binding that names several things is several declarations.
    */
@@ -582,7 +598,8 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
       importInBlock(i)
       List(TExprStmt(TUnitLit()))
 
-    case VarDecl(name, typOpt, Some(init), _, align) =>
+    case VarDecl(name, typOpt, Some(init), _, align, section) =>
+      noSection(name, section)
       val declared = typOpt.map(rt)
       val ti       = analyzeExpr(init, declared)
       // A binding needs a value to hold, and an initializer that does not finish never produces
@@ -597,7 +614,8 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
     // A local `val` is a `var` that may not be assigned to again — same frame, same lifetime, same
     // code. Only the binding differs, so the two share everything below this line, and the read-only
     // half of the rule is enforced where an assignment target is checked rather than here.
-    case ValDecl(name, typOpt, init, _, align) =>
+    case ValDecl(name, typOpt, init, _, align, section) =>
+      noSection(name, section)
       val declared = typOpt.map(rt)
       val ti       = analyzeExpr(init, declared)
       if ti.ty == Type.Never then err(s"cannot bind '$name' to an expression that never returns")
@@ -622,7 +640,8 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
 
       List(TRefDecl(declareRef(name, tp, refHazards(tp)), tp.ty, tp))
 
-    case VarDecl(name, typOpt, None, _, align) =>
+    case VarDecl(name, typOpt, None, _, align, section) =>
+      noSection(name, section)
       val ty = typOpt.map(rt).getOrElse(err(s"'$name' needs either a type or an initial value"))
       if !hasZero(ty) then err(s"${show(ty)} has no zero value, so '$name' needs an initial value")
       List(TVarDecl(declare(name, ty), ty, TZero(ty), boundary(name, align)))

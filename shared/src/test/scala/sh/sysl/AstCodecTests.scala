@@ -215,6 +215,18 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
         |@test("both at once", should_trap: "past the end")
         |both() = 0
         |""".stripMargin)
+    // A section that did not survive the trip would leave a library's placed object landing wherever
+    // the linker chose — in a program that read the artifact, and nowhere else, so nothing about
+    // compiling that library from source would show it. The binding carries `@align` beside it
+    // because the two are folded by different lines and one could travel without the other.
+    check("a section on a binding and on a definition",
+      """@align(4096)
+        |@section(".noinit")
+        |var reason: [4]u32
+        |
+        |@section(".ramfunc")
+        |erase() -> int = 7
+        |""".stripMargin)
   }
 
   "an expression round-trips" - {

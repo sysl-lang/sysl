@@ -179,13 +179,29 @@ class SyslParser(val source: Source)
           err("'@pure' already says '@reads()' and '@writes()', so a frame beside it says one thing " +
             "twice — write the frame alone if the function touches module storage, and '@pure' alone " +
             "if it touches none")
+        // `@packed` describes the arrangement of fields *within* a type and `@section` places one
+        // object, so the two cannot be about the same declaration whichever kind it turns out to be:
+        // a struct is not an object, and a binding has no fields.
+        case None if as.exists(_ == Attr.Packed) && as.exists(places) =>
+          err("'@packed' lays out a struct's fields and '@section(\"...\")' places one object, so " +
+            "they cannot stand above one declaration — a type occupies no address of its own, and " +
+            "the storage that holds a packed value is what a section would be about")
         // A layout annotation and a function annotation describe different kinds of thing, so one
         // declaration cannot carry both — and saying which pair collided is more use than the
-        // grammar's complaint about whichever alternative it went on to try.
-        case None if as.exists(layout) && as.exists(!layout(_)) =>
+        // grammar's complaint about whichever alternative it went on to try. `@section` is in
+        // neither camp: it marks whatever occupies an address, which is a binding or a function.
+        case None if as.exists(layout) && as.exists(a => !layout(a) && !places(a)) =>
           err("'@packed' and '@align' describe a layout and the rest mark a function, so they " +
             "cannot stand above one declaration — a struct has no body to be tail-recursive or " +
             "pure in, and a function has no fields to lay out")
+        // `@align` beside `@section` is a binding and only a binding: a struct takes the first and
+        // not the second, and a function takes the second and not the first. It is also the pair a
+        // statically placed stack is written with, so it is the case rather than a corner.
+        case None if as.exists(layout) && as.exists(places) =>
+          storageDecl(as) | err(
+            "'@align(n)' beside '@section(\"...\")' marks one binding's storage — the boundary it " +
+              "begins on and the section it sits in are both about one object, and this declares none",
+          )
         case None if as.forall(layout) =>
           (visibility ~ structDecl) ^^ {
             case Visibility.Public ~ (s: StructDecl) => laidOut(s, as)
@@ -199,6 +215,19 @@ class SyslParser(val source: Source)
               "'@packed' describes how a struct's fields are laid out, so it can only mark a struct " +
                 "— a 'var' or a 'val' has no fields to pack, and '@align(n)' is the one of the two " +
                 "that may stand above one",
+          )
+        // `@section` alone marks either kind, so both are read: a binding is settled by its own
+        // keyword and a function by everything else, which is why the storage form goes first and
+        // declines without consuming anything.
+        case None if as.forall(places) =>
+          storageDecl(as) | (visibility ~ funcDecl) ^^ {
+            case Visibility.Public ~ (f: FuncDecl) => attributed(f, as)
+            case v ~ (f: FuncDecl)                 => restrict(v, attributed(f, as))
+            case _ ~ other                         => other
+          } | err(
+            "'@section(\"...\")' places one object in a linker section, so it marks a 'var', a " +
+              "'val' or a function — a 'const' is folded into every use and has no storage to place, " +
+              "and an 'extern' names something this program does not define",
           )
         case None =>
           (visibility ~ funcDecl) ^^ {
@@ -227,6 +256,14 @@ class SyslParser(val source: Source)
     case _: Attr.Align => true
     case _             => false
 
+  /** Whether an attribute **places** what it marks rather than describing it, which is `@section` and
+   * only `@section`. It is a category of its own because it is the one attribute that marks either a
+   * binding or a function: both occupy an address, and placement is the same request about each.
+   */
+  private def places(a: Attr): Boolean = a match
+    case _: Attr.Section => true
+    case _               => false
+
   /** `@align(n)` above a `var` or a `val` — the boundary one object's storage begins on, which is C's
    * `alignas` rather than Rust's `#[repr(align)]`.
    *
@@ -246,16 +283,23 @@ class SyslParser(val source: Source)
    * against the binding, which is the diagnostic this whole shape exists to avoid.
    */
   private def storageDecl(as: List[Attr]): PackratParser[Stmt] =
-    if !as.forall(aligns) then failure("not an alignment")
+    if !as.forall(a => aligns(a) || places(a)) then failure("not a binding's annotation")
     else
       (staticDecl | visibility ~ (valDecl | varDecl) ^^ {
         case Visibility.Public ~ d => d
         case v ~ d                 => restrict(v, d)
       }) >> { d =>
         if !oneBinding(d) then
-          err("'@align(n)' is the boundary one object's storage begins on, and a binding that names " +
-            "several has no one object for it to be about — declare them on lines of their own")
-        else success(as.foldLeft(d) { case (s, Attr.Align(n)) => aligned(s, n); case (s, _) => s })
+          err(s"'${as.find(!places(_)).fold("@section(\"...\")")(_ => "@align(n)")}' is about one " +
+            "object — the boundary its storage begins on, or the section it sits in — and a binding " +
+            "that names several has no one object for it to be about; declare them on lines of " +
+            "their own")
+        else
+          success(as.foldLeft(d) {
+            case (s, Attr.Align(n))   => aligned(s, n)
+            case (s, Attr.Section(n)) => placed(s, n)
+            case (s, _)               => s
+          })
       }
 
   /** Whether a binding names exactly one thing, reaching through the `static` wrapper. */
@@ -271,6 +315,15 @@ class SyslParser(val source: Source)
     case d: VarDecl    => d.copy(align = Some(bound)).setPos(d.pos)
     case d: ValDecl    => d.copy(align = Some(bound)).setPos(d.pos)
     case StaticDecl(d) => StaticDecl(aligned(d, bound)).setPos(s.pos)
+    case other         => other
+
+  /** `@section("…")` folded onto whichever binding it was written above, reaching through the
+   * `static` wrapper exactly as the boundary above it does.
+   */
+  private def placed(s: Stmt, name: String): Stmt = s match
+    case d: VarDecl    => d.copy(section = Some(name)).setPos(d.pos)
+    case d: ValDecl    => d.copy(section = Some(name)).setPos(d.pos)
+    case StaticDecl(d) => StaticDecl(placed(d, name)).setPos(s.pos)
     case other         => other
 
   /** The struct these layout annotations describe, folded onto its declaration. */

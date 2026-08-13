@@ -905,6 +905,53 @@ where an unresolved symbol reads as a missing definition rather than as a missin
 libraries the author chose and can hand to a linker, which is exactly the distinction the standard
 module fails.
 
+## 13. `@section("…")` says where a symbol lands
+
+`@section(".vectors")` above a binding or a function places that one object in a named linker
+section. It is C's `__attribute__((section(…)))`, and it is what a program says when the *address* of
+a thing is part of what it is: a vector table at the address the processor fetches from, storage in
+`.noinit` that survives a warm reset, a DMA buffer in the RAM bank the engine can reach, a `.ramfunc`
+copied into RAM so it runs while flash is being erased.
+
+**It is the fourth thing reachable only from C, and the only one of the four with no shim that
+removes it.** §7's three — a caller-allocated opaque type, a macro, and a shape with no sysl spelling
+— are each answered by a wrapper. Placement is not: a shim can define the object in C, but then the
+object *is* C's, and sysl can neither name its type nor reach its fields. So a language without this
+leaves a whole family of programs half-written in another one.
+
+**It marks whatever occupies an address**, which is a module `var`, a module `val` — `static` spelling
+included — and a function. It does **not** mark a type. `@align(n)` on a struct says every value of
+that type begins on a boundary, and there is no corresponding reading for a section: one object lands
+in one place, so what carries the attribute is the object rather than its type. It composes with
+`@align(n)` on a binding, which is not a nicety — a statically placed stack is written with both.
+
+**A section makes the symbol a root, and marks it `used`.** Nothing inside the program reads a table
+the linker script gathers, and that is the whole point of writing one. So a placed definition joins
+the entry points of §12 and §10, and every placed symbol is named in `llvm.used` so that the
+optimizer does not delete an object with no reader. Without that second half the attribute would
+compile, link, and place nothing — the failure being the absence of a section nobody looked for. C
+answers it the same way, which is why a placement in Zephyr or in a startup file is always written
+beside `__used`.
+
+**The name is not validated beyond being non-empty.** `.vectors` is ELF's spelling, `__DATA,__mine` is
+Mach-O's, and a character set chosen here would refuse a section some target requires. This is the
+rule §2 already applies to an `@export` symbol and `12 §1` to a link name: the spelling belongs to
+whoever consumes it, and an assembler that will not take one says so far better than sysl could.
+
+**What is refused** is anything with no address for a section to be about: a `const`, which is folded
+into every use; a struct, enum, type or trait, which are not objects; an `extern`, whose definition is
+the other side's; and a **local**, whose storage is the frame of whichever call is running rather than
+a region of the image. The local is refused by the analyzer rather than the grammar, because a
+top-level `var` is module storage in every file but the one the program starts in, where it is a local
+of the entry point (`13 §7`) — so the two are one syntax and only the analyzer can tell them apart.
+
+**A header says nothing about it.** `emit-header` (§12) renders a C declaration of a definition that
+lives elsewhere, and a declaration does not repeat where that definition was placed.
+
+**Nothing is made `noinline` by being placed.** A `.ramfunc` inlined into a caller in flash still has
+its out-of-line copy in RAM, exactly as C's does. Placement decides where a definition lives, not how
+a call reaches it.
+
 ## Open (not yet decided)
 
 - **b. The symbol-length threshold** at which §2 truncates and appends a hash.

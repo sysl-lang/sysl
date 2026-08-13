@@ -77,9 +77,13 @@ case class ImportDecl(
  * expression it was written as because the bound is folded rather than lexed, exactly as a struct's
  * is. It is on the *declaration* and not on the type: `@align` on a struct says every value of that
  * type is aligned, and this says this one object is.
+ *
+ * `section` is `@section("…")` — the linker section this object is placed in (`15 §13`). It carries
+ * the string as written, because a section name is the target's spelling and not sysl's.
  */
 case class VarDecl(name: String, typ: Option[TypeRef], init: Option[Expr],
-                   vis: Visibility = Visibility.Public, align: Option[Expr] = None) extends Stmt
+                   vis: Visibility = Visibility.Public, align: Option[Expr] = None,
+                   section: Option[String] = None) extends Stmt
 
 /** `const name: type = value` — a **module member** (`13 §7`). It is what a top-level `var` is not:
  * hoisted, order-free, and visible beyond its file under the ordinary rules, where a `var` at the
@@ -202,7 +206,7 @@ case class StaticDecl(inner: Stmt) extends Stmt
  * so it infers exactly as a `var` does.
  */
 case class ValDecl(name: String, typ: Option[TypeRef], value: Expr, vis: Visibility = Visibility.Public,
-                   align: Option[Expr] = None) extends Stmt
+                   align: Option[Expr] = None, section: Option[String] = None) extends Stmt
 
 /** `ref name = place` — a name for a place rather than for a value (`03 § ref`).
  *
@@ -482,6 +486,8 @@ case class FuncDecl(
     writes: Option[List[String]] = None,
     /** `@export` — see `ExportAttr`. */
     exported: Option[ExportAttr] = None,
+    /** `@section("…")` — the linker section this definition is placed in (`15 §13`). */
+    section: Option[String] = None,
 ) extends Stmt
 
 /** What `@export` says about the function it is written above (`15 §12`).
@@ -554,6 +560,20 @@ enum Attr(val word: String) {
     * symbol (`15 §12`). See `ExportAttr` for why the rename is the form that matters.
     */
   case Export(attr: ExportAttr) extends Attr("export")
+
+  /** `@section(".vectors")` — where the linker puts this one object or definition (`15 §13`).
+    *
+    * It is the one attribute that marks **either** a binding or a function, because both are things
+    * that occupy an address: a vector table is storage and a `.ramfunc` is code, and placement is
+    * the same request about each. It marks no *type*, since a section holds an object and a type is
+    * not one.
+    *
+    * The name is carried as the string it was written as, not lexed into anything: `.vectors` is
+    * ELF's spelling and `__DATA,__mysection` is Mach-O's, and a set of characters chosen here would
+    * refuse one some target requires. That is `extern`'s link name and `@export`'s symbol read a
+    * third time — a spelling belongs to whoever consumes it.
+    */
+  case Section(name: String) extends Attr("section")
 }
 
 /** `extern name(params) -> ret` — a function this program does not define but may call, resolved

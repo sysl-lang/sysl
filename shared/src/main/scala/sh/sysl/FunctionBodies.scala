@@ -261,7 +261,10 @@ trait FunctionBodies extends ModuleStorage {
       // `@export` becomes a symbol here, where the declared name is still in hand. An unwritten one
       // is the function's **bare** name: the module path is what mangling adds, and suppressing the
       // mangling is the whole of what the attribute does.
-      f.exported.map(_.symbol.getOrElse(Modules.bare(f.name))))
+      f.exported.map(_.symbol.getOrElse(Modules.bare(f.name))),
+      // `@section` travels as written: the name is the target's spelling, so there is nothing here to
+      // resolve it against and nothing downstream that would rather have it in another form.
+      f.section)
   }
 
   /** Typechecks the leading `require`/`ensure` clauses. Both conditions must be `bool`. `result`

@@ -1040,6 +1040,10 @@ work:
   `guide/slab` was the customer, paying up to `alignof(T) - 1` bytes of its region and one block of
   capacity for a fact its declaration could have stated.
 
+  **The other half of the same question — *where* the storage goes, rather than what boundary it
+  begins on — is `@section("…")` (`15 §13`).** It arrived later and composes with this: a statically
+  placed stack is written with both, which is the shape that shows the two are different axes.
+
   The one thing the pair does **not** answer is the sub-byte case above: an `iN` field still occupies
   its allocated width inside a `@packed` struct, so a hardware register's five-bit field is still
   shifts and masks. That is the bitfield question, and it stays open on its own.

@@ -77,7 +77,14 @@ object Reachability {
    * point at all is the case that makes this load bearing: every root above is absent there, so an
    * export that were not one would prune the artifact down to nothing.
    *
-   * **A destructor is a root for the third version of the same reason** (`03 § A destructor`). What
+   * **A `@section` definition is a root for the third version of it** (`15 §13`). What finds it is a
+   * linker script gathering a named section, which is no more visible to this walk than the processor
+   * or the C caller is — a `.ramfunc` copied into RAM by a startup routine, or a boot entry the image
+   * is laid out around. Placing a definition somewhere and then dropping it for want of a caller is
+   * the one outcome the attribute was written to prevent, and keeping it costs a function nobody
+   * calls, which is the trade every other kind here makes.
+   *
+   * **A destructor is a root for the fourth version of the same reason** (`03 § A destructor`). What
    * calls it is the release hook the emitter builds, and that is not a tree this walk can see — it is
    * generated from a payload type at the moment a box of that type is let go of. No reachable body
    * names one, so pruning it would leave the hook calling a symbol nothing defined, and the failure
@@ -86,9 +93,10 @@ object Reachability {
   def entryPoints(program: TProgram): List[TFunc] = {
     val handlers    = program.funcs.filter(_.conv.isDefined)
     val exported    = program.funcs.filter(_.exported.isDefined)
+    val placed      = program.funcs.filter(_.section.isDefined)
     val destructors = program.funcs.filter(f => program.destructors.values.toSet.contains(f.name))
 
-    handlers ::: exported ::: destructors
+    handlers ::: exported ::: placed ::: destructors
   }
 
   /** What a set of trees reaches: every `val` read and every function called, following each call

@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 33
+  val Version: Int = 34
 
   private val Magic = "sysl-ast"
 
@@ -316,9 +316,14 @@ object AstCodec {
       s match
         case ImportDecl(path, sels, wild, alias) =>
           tok("imp"); list(path)(sref); list(sels)(selector); bool(wild); opt(alias)(sref)
-        case VarDecl(n, t, i, vs, al)     => tok("var"); sref(n); opt(t)(typ); opt(i)(expr); vis(vs); opt(al)(expr)
+        // A section travels for the reason a layout does, one line below: it is a property of the
+        // storage this declaration lays down, so a program reading the declaration back has to lay it
+        // down in the same place the library's own build would have.
+        case VarDecl(n, t, i, vs, al, sc) =>
+          tok("var"); sref(n); opt(t)(typ); opt(i)(expr); vis(vs); opt(al)(expr); opt(sc)(sref)
         case ConstDecl(n, t, v, vs)       => tok("cst"); sref(n); typ(t); expr(v); vis(vs)
-        case ValDecl(n, t, v, vs, al)     => tok("val"); sref(n); opt(t)(typ); expr(v); vis(vs); opt(al)(expr)
+        case ValDecl(n, t, v, vs, al, sc) =>
+          tok("val"); sref(n); opt(t)(typ); expr(v); vis(vs); opt(al)(expr); opt(sc)(sref)
         // No token, and no version bump to give it one: `static` is legal only in the file a program
         // starts in, a library has no such file, and the analyzer has already said so by the time
         // anything is encoded. Reaching here would mean that check stopped running.
@@ -353,7 +358,7 @@ object AstCodec {
         case Invariant(c, m)              => tok("inv"); expr(c); opt(m)(sref)
         case Variant(e)                   => tok("vnt"); expr(e)
 
-        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, tvs, tpk, t, cv, tr, pu, gh, rd, wr, ex) =>
+        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, tvs, tpk, t, cv, tr, pu, gh, rd, wr, ex, sc) =>
           tok("fn"); sref(n); list(tps)(sref); list(ps)(param); opt(rt)(typ); list(b)(stmt)
           bounds(bs); bool(va); vis(vs); tdefaults(tds); tdefaults(tvs); list(tpk.toList)(sref)
           opt(t)(testAttr)
@@ -365,6 +370,9 @@ object AstCodec {
           // whether it was compiled from source or read back from an artifact, and one that dropped
           // the mark would quietly mangle the name again.
           opt(ex)(e => { pos(e); opt(e.symbol)(sref) })
+          // And `@section` for the same reason: a definition the library placed somewhere is placed
+          // there in the program that reads it back, or the linker script gathers nothing.
+          opt(sc)(sref)
 
         case ExternDecl(n, ps, rt, va, lk, vs) =>
           tok("ext"); sref(n); list(ps)(param); opt(rt)(typ); bool(va); opt(lk)(sref); vis(vs)
@@ -732,9 +740,9 @@ object AstCodec {
     private def stmt(): Stmt = at {
       tok() match
         case "imp"  => ImportDecl(list(sref()), list(selector()), bool(), opt(sref()))
-        case "var"  => VarDecl(sref(), opt(typ()), opt(expr()), vis(), opt(expr()))
+        case "var"  => VarDecl(sref(), opt(typ()), opt(expr()), vis(), opt(expr()), opt(sref()))
         case "cst"  => ConstDecl(sref(), typ(), expr(), vis())
-        case "val"  => ValDecl(sref(), opt(typ()), expr(), vis(), opt(expr()))
+        case "val"  => ValDecl(sref(), opt(typ()), expr(), vis(), opt(expr()), opt(sref()))
         case "ref"  => RefDecl(sref(), expr())
         case "masg" => MultiAssign(sref(), list(expr()), list(expr()))
         case "mdcl" => MultiDecl(list(sref()), bool(), list(expr()))
@@ -754,7 +762,7 @@ object AstCodec {
           FuncDecl(sref(), list(sref()), list(param()), opt(typ()), list(stmt()),
             bounds(), bool(), vis(), tdefaults(), tdefaults(), list(sref()).toSet, opt(testAttr()),
             opt(at(CallConv(sref(), opt(sref())))), bool(), bool(), bool(),
-            opt(list(sref())), opt(list(sref())), opt(at(ExportAttr(opt(sref())))))
+            opt(list(sref())), opt(list(sref())), opt(at(ExportAttr(opt(sref())))), opt(sref()))
         case "ext" =>
           ExternDecl(sref(), list(param()), opt(typ()), bool(), opt(sref()), vis())
         case "extv" =>

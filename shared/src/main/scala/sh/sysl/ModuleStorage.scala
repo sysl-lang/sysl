@@ -41,7 +41,7 @@ trait ModuleStorage extends ModuleFiles {
     val static = isStatic(init)
 
     checkVal(ty, key)
-    TVal(key, ty, Some(init), !static, align = boundaryOf(key, decl.align))
+    TVal(key, ty, Some(init), !static, align = boundaryOf(key, decl.align), section = decl.section)
   })
 
   /** `@align(n)` above module storage, folded to the boundary it named — the same fold a struct's
@@ -98,7 +98,7 @@ trait ModuleStorage extends ModuleFiles {
         "and a slice both start empty and need no value written; a reference and an enum need one")
 
     TVal(key, ty, init, computed = init.exists(!isStatic(_)), writable = true,
-      align = boundaryOf(key, decl.align))
+      align = boundaryOf(key, decl.align), section = decl.section)
   })
 
   /** Holds a module-level `val` to something a name can stand for (`13 §7`).

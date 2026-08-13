@@ -798,6 +798,14 @@ case class TFunc(
       * the program calls it, and the whole point is that something outside will (`Reachability`).
       */
     exported: Option[String] = None,
+    /** `@section("…")` — the linker section this definition is placed in (`15 §13`).
+      *
+      * It makes the function a **root** for the third version of the export's reason: what finds a
+      * definition by its placement is a linker script, and no call in this program need name it. The
+      * symbol is written into `llvm.used` for the same reason one step further down, where the
+      * optimizer would otherwise drop a definition nothing calls.
+      */
+    section: Option[String] = None,
 )
 
 /** A function the linker supplies, which the module declares rather than defines. Only the ones
@@ -852,6 +860,11 @@ case class TVal(
       * what LLVM gives a global that asked for nothing.
       */
     align: Option[Int] = None,
+    /** `@section("…")` — the linker section this storage is placed in (`15 §13`). Present also means
+      * the symbol is kept: nothing in the program reads a table the linker script gathers, so the
+      * object joins `llvm.used` rather than being dropped by the optimizer that finds no reader.
+      */
+    section: Option[String] = None,
 )
 
 /** The `main` a program declared, which runs after its top-level statements (`13 §7`).
