@@ -9,7 +9,8 @@ code. `targets.md` already settled the other half, what a machine is.
 identity, the active target, per-target capability sets and **dependencies**. A `sysl build` over a
 project with a `dependencies` block fetches what it names, selects versions by MVS, checks what
 arrived against `sysl.sum`, and compiles the result as more modules — which is what a `--lib` source
-tree already was, so nothing downstream of resolution is new.
+tree already was, so nothing downstream of resolution is new. A `--lib` **source root's** own
+`dependencies` are read too, into the same graph (§8).
 
 The capability half was the first thing the file was needed for: `capabilities.md`'s *target
 provides* level had no way to be stated before, so every target offered everything. A target that
@@ -380,9 +381,34 @@ mismatch is refused outright. That refusal is a physical constraint rather than 
 it does not settle what a *source* root should do — source has not been compiled yet, so adopting is
 available there exactly as it is for a coordinate.
 
-What is still not read is the rest of the manifest, and the reason is unchanged: a root's
-`dependencies` are not fetched, its capabilities are the program's own to state, and neither has the
-one-answer-per-program character that makes the allocator settle for everybody.
+**And its `dependencies`, which was the last of the three and went the same way for the same reason.**
+A package reached as a source root is the same package it is by coordinate, so what it depends on is a
+property of *it*; read only by coordinate, the same directory gave a build the package's sysl and
+nothing it was written against. What the caller got was the unresolved-name cascade that follows code
+whose imports point at something nobody brought — 36 errors on the tree that found it, pointing into a
+package the caller had not written, none of them naming the missing dependency or a flag.
+
+`build-lib`'s refusal is right *there* and does not reach here: that command compiles one tree into an
+artifact for one machine and must not go looking over the network, so it has nothing to fetch **with**.
+A compilation is under no such constraint and already fetches a program's own `dependencies` — so the
+consistent answer is the fetch, and copying the refusal would have turned one command's
+offline-by-construction property into a policy for commands that are not offline.
+
+**One graph, not one per road.** The roots' entries are folded into the list the project's own are read
+from, so MVS takes its maximum over every claim at once (§5) and a coordinate two roots share resolves
+to one copy at one version — where a road at a time would put two versions of one module in a program,
+which is what §4 is about. Their bindings land in the **root's** import table, which follows from where
+their source lands rather than being a choice: a `--lib` root's files are filed under the project's own
+prefix. So a name only a root's manifest bound is a name the project's own files can write, which is no
+more true of a dependency's name than it always was of the root's own modules.
+
+A `path` dependency of a root is resolved exactly as the project's own is. Reading it against the root
+it was written in would be a *second* meaning for one field, and whether a relative path should be read
+against a project root rather than the working directory is the same question on both roads.
+
+What is still not read is the rest of the manifest: a root's capabilities are the program's own to
+state, and they have none of the one-answer-per-program character that makes the allocator settle for
+everybody.
 
 Two things are deliberately absent. **A named path is not scoped to the package that asked for it**
 and reaches every C compilation exactly as a bare one does; scoping is arguably more correct and buys
@@ -444,6 +470,13 @@ This is the thing the JVM classpath gets wrong — the same package in two jars 
 order, quietly, and the program that results is one somebody has to bisect to understand.
 **Collisions include the consumer's own modules**, which is in fact the common case: a project with a
 `json/` directory at its root and a dependency offering `json` is not an exotic scenario.
+
+**"The consumer's own modules" is more than one directory, and reading it as the project root alone
+left exactly the silent winner this rule forbids.** A `--lib` source root's modules are filed under the
+project's prefix, so they are names just as taken: a root declaring a dependency that offers a name the
+root itself declares is two modules claiming one path. Checked against the project's directories only,
+the local module answered, the dependency's was unreachable, and the build was green — one refusal
+short of the rule, in the one place where both claims come from the same manifest.
 
 **Nesting collides as well as equality.** A package offering `sh.sysl` and one offering
 `sh.sysl.table` share no name, but an import of `sh.sysl.table` could be read as either — and
