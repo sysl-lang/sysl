@@ -652,10 +652,19 @@ trait ExprEmitter extends ArithEmitter {
       val ranges = bitfieldOf(receiver.ty).get
       val ct     = containerLlvm(ranges)
 
+      // The container is read at the receiver's address where the receiver is large enough to be
+      // handed about through memory, and lifted out of its value otherwise — the same choice the two
+      // cases below make, made here because both of those take the address of the **field** and a
+      // bitfield has none.
+      //
+      // **There is no volatile case, and that is a gap rather than an omission.** `volatile`
+      // qualifies scalar storage only — `volatile Ctrl` is refused wherever it is written, a field
+      // and a `*T` pointee included — so no bitfield struct can be one, and the register block this
+      // feature was asked for cannot yet be written with it.
       val c =
-        if hasAddress(receiver) && (Type.volatileIn(e.placeTy) || layout.indirect(receiver.ty)) then
+        if hasAddress(receiver) && layout.indirect(receiver.ty) then
           val p = address(receiver)
-          val t = freshTemp(); emit(s"$t = load${qualifier(e.placeTy)} $ct, ptr $p"); t
+          val t = freshTemp(); emit(s"$t = load $ct, ptr $p"); t
         else
           val rv = genExpr(receiver)
           val t  = freshTemp(); emit(s"$t = extractvalue ${receiver.ty.llvm} $rv, 0"); t

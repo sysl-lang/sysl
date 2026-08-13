@@ -114,10 +114,17 @@ two widths; a flag is a `u1`. A **simple enum** is one, and is the spelling a mo
 
 **A bitfield may not be `volatile`.** A sub-word volatile access is a read-modify-write of the
 container where a device is entitled to one bus cycle, and a register with clear-on-read or
-write-1-to-clear semantics is corrupted by it. **The struct may still be volatile where it is held**,
-and that is the shape a register block wants: `ctrl: volatile Ctrl` makes `regs.ctrl.enable = true`
-one volatile read and one volatile write of the whole register, which is what C does. The two cycles
-a read-write register costs are not removable and are not what is being refused.
+write-1-to-clear semantics is corrupted by it.
+
+**That leaves a bitfield register unwritable, and it is a gap rather than a deliberate exclusion.**
+The refusal above assumed the qualifier could go on the struct instead — `ctrl: volatile Ctrl` — and
+it cannot: `volatile` qualifies **scalar** storage, so a struct-typed field, and a `*volatile Ctrl`,
+are both refused already and for their own reason. So the hardware register this section's feature
+was asked for is exactly the thing that cannot yet use it, and a driver keeps its `volatile u32` and
+its shifts. Settling it means deciding one of two things — whether `volatile` on a bitfield should
+mean a volatile access of the *container* (two bus cycles, which is what C does with
+`volatile unsigned x : 3`), or whether a struct should be able to carry the qualifier at all — and
+that is a decision this section does not make.
 
 **A bitfield has no address and no byte offset.** The first is the packed rule above, unchanged and a
 fortiori. The second is `offsetof`, which answers in bytes: a field starting at bit twelve is not at

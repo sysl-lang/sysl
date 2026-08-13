@@ -57,6 +57,22 @@ class BitfieldErrorTests extends AnyFreeSpec with CodegenSupport {
       ir("@packed\nstruct Block\n    a: volatile u32\n    b: volatile u32\n" +
         "var p: *Block = ptr_cast(4096usize)\np.a = 1u32\n") should include("store volatile")
     }
+
+    // **And so a bitfield struct cannot be a volatile register at all today**, which is a corner the
+    // feature exposed rather than one it created: `volatile` qualifies *scalar* storage, so the
+    // struct cannot carry the qualifier either — not on a field, and not as a `*T` pointee. Both
+    // halves are pinned here so that whichever way the question is settled, the test says so.
+    "and the struct cannot carry the qualifier instead, by either route" in {
+      val field = err("@packed\nstruct Ctrl\n    a: u3\n    b: u5\n@packed\nstruct Regs\n" +
+        "    ctrl: volatile Ctrl\nvar p: *Regs = ptr_cast(4096usize)\nprint(p.ctrl.a)")
+
+      field should include("'volatile Ctrl' is not a type")
+      field should include("qualified one field at a time")
+
+      err("@packed\nstruct Ctrl\n    a: u3\n    b: u5\n" +
+        "var p: *volatile Ctrl = ptr_cast(4096usize)\nprint(p.a)") should
+        include("'volatile Ctrl' is not a type")
+    }
   }
 
   "a bitfield has no byte offset" - {
