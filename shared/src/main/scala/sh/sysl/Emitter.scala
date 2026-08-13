@@ -235,9 +235,23 @@ trait Emitter {
   protected def syslSret(retTy: Type): Option[String] =
     Option.when(layout.indirect(retTy))(s"ptr noalias sret(${retTy.llvm}) align ${layout.align(retTy)}")
 
-  /** What a sysl `define`, `declare` and `call` name as the result type. */
+  /** What a sysl `define`, `declare` and `call` name as the result type.
+   *
+   * A **narrow** result carries the C convention's extension (`CAbi.extension`), which is the one
+   * thing about a sysl signature that is not sysl's own answer. Widening a result is the *callee's*
+   * obligation, and a definition cannot know who calls it: `@export` and `&f` hand this very symbol
+   * to C, and a `bool` returned without the attribute would reach it as whatever was in the top of
+   * the register. Stating it everywhere costs a sysl caller nothing — it does not ask for the
+   * extension and is not harmed by receiving one — and it means no part of the compiler has to work
+   * out which definitions C can reach.
+   *
+   * A **parameter** gets none, which is the same rule seen from the other side: widening an argument
+   * is the caller's obligation, so it is stated at a foreign call (`ForeignEmitter`) and nowhere
+   * else. Neither end of a sysl-to-sysl call claims it, so neither may rely on it.
+   */
   protected def syslResult(retTy: Type): String =
-    if Type.noValue(retTy) || layout.indirect(retTy) then "void" else retTy.llvm
+    if Type.noValue(retTy) || layout.indirect(retTy) then "void"
+    else CAbi.returning(CAbi.extension(retTy, target), retTy.llvm)
 
   /** How a parameter is declared. A **large** one arrives as the address of storage the caller
    * holds; the callee makes its own copy at entry, which is the copy it always made — the only

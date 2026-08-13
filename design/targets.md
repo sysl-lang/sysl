@@ -198,8 +198,10 @@ agree.
 
 ### How an aggregate crosses to a C function
 
-A scalar crosses as itself; an `i32` is one register everywhere. An aggregate does not, and **LLVM
-applies no C classification to one of its own accord** — given a struct type in a signature it
+A register-width scalar crosses as itself; an `i32` is one register everywhere. A **narrower** one
+crosses as itself too but with a widening owed on it, which is the next section. An aggregate is the
+case with real work in it, and **LLVM applies no C classification to one of its own accord** — given
+a struct type in a signature it
 assigns one register per element, which is not what any of the five conventions asks for. So a
 foreign declaration names the *coerced* types the convention specifies and the call converts each
 value into and out of that shape. The five:
@@ -252,6 +254,46 @@ misreading is pinned by its own test exactly as firmly as a correct one.
 
 Only the boundary is affected. A struct handed over **by address** needs none of this, which is why
 that was the workaround while the boundary was broken, and a sysl-to-sysl call is untouched.
+
+### How a scalar narrower than a register crosses
+
+A `u8` is an `i8` to both compilers, so there is nothing to coerce — and it still does not cross for
+free. It travels in a register a whole word wide, and what the conventions disagree about is **the
+state of the bits above it**. Most of them settle it by making whoever hands the value over widen it
+first, `signext` or `zeroext` by the type's own signedness, and LLVM emits that widening only where
+the signature asks for it. A declaration without the attribute passes a register whose top bits are
+whatever was left in it; a callee compiled by clang, which was promised otherwise, then acts on a
+number nobody wrote.
+
+**Two obligations, falling on opposite sides.** Widening an *argument* is the **caller's**, so sysl
+writes it at a foreign call and on the declaration that call names. Widening a *result* is the
+**callee's**, so sysl writes it on every definition it emits — including ones no C will ever call,
+because a definition cannot know that and a sysl caller is not harmed by a guarantee it never asked
+for. Nothing is written on a sysl *parameter*: neither end of a sysl-to-sysl call claims the
+extension, so neither may rely on it, and they agree the way they agree about everything else.
+
+That second half is why `@export` and `&f` need no rule of their own. Both hand a sysl definition to
+C, and the definition already states what it owes.
+
+Three conventions depart from the ordinary rule, and each was found by measuring rather than by
+reading:
+
+- **AArch64 away from Darwin widens nothing at all**, `_Bool` included: AAPCS64 leaves the top bits
+  unspecified and makes the callee narrow what it reads. Apple's variant of the same convention does
+  widen, so the two aarch64 targets in the registry disagree and both are right.
+- **The Microsoft convention widens `_Bool` and nothing else**, so `char` and `short` cross bare.
+- **RISC-V 64 widens a 32-bit value too**, and `signext` whether or not it is signed — an
+  `unsigned int` is *sign*-extended into a 64-bit register. It is the one place a convention asks for
+  an extension that contradicts the type's own signedness.
+
+A width C cannot spell — `i5`, `u12` — takes the ordinary rule for its width, there being no C
+declaration to measure against.
+
+This is the part of the boundary that was missing longest, because nothing about it is visible in a
+type. It was found when a `u8` computed by a `match` reached a C function as a different number,
+which had gone unnoticed through every tier: the IR verified, the program linked, and only the
+callee's arithmetic was wrong. `AbiAgainstClangTests` now asks clang for every width on every target,
+the same way it asks about every aggregate shape.
 
 ### How a walk over a variadic tail reaches a C function
 

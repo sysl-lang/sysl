@@ -129,5 +129,66 @@ class AbiAgainstClangTests extends AnyFreeSpec with Matchers with CodegenSupport
           withClue(s"returning it (${t.triple}, ${s.c}): ")(mGive shouldBe cGive)
           withClue(s"passing it (${t.triple}, ${s.c}): ")(mTake shouldBe cTake)
         }
+
+      "every scalar width, and which of them the convention widens" in scalarsAgree(t)
     }
+
+  // --- the narrow scalars ------------------------------------------------------------------
+  //
+  // An aggregate's answer is a *type*; a scalar's is an **attribute** — `signext`, `zeroext`, or
+  // nothing — and until a `u8` reached a C function as a different number nothing here asked about
+  // one at all. `CAbi`'s own docstring said a scalar crossed as itself and needed no decision, which
+  // is true of its type and false of its bits.
+  //
+  // All of them go in **one** translation unit and one sysl module, unlike the shapes above, because
+  // the answer is per width rather than per layout: eight widths asked separately would be eight
+  // clang invocations per target for a question one answers.
+
+  /** One scalar, spelled in both languages, and the pair of symbols it is asked about. */
+  private case class Scalar(what: String, sysl: String, c: String) {
+    def give: String = s"g_$what"
+    def take: String = s"t_$what"
+  }
+
+  private val scalars = List(
+    Scalar("bool", "bool", "_Bool"),
+    Scalar("i8", "i8", "signed char"),
+    Scalar("u8", "u8", "unsigned char"),
+    Scalar("i16", "i16", "short"),
+    Scalar("u16", "u16", "unsigned short"),
+    Scalar("i32", "i32", "int"),
+    Scalar("u32", "u32", "unsigned int"),
+    Scalar("i64", "i64", "long long"),
+    // A `char` is a Unicode scalar in 32 bits, so what it must agree with is `unsigned int` — which
+    // is the one width RISC-V 64 widens against its own signedness, and the only reason this row is
+    // worth a line of its own.
+    Scalar("char", "char", "unsigned int"),
+  )
+
+  private def scalarsAgree(t: Target): Unit = {
+    val cc  = Toolchain.findClang(t).getOrElse(cancel(s"no clang here has a back end for ${t.name}"))
+    val src = createTempFile("sysl-abi-scalar-", ".c")
+
+    val fromClang =
+      try {
+        writeFile(src,
+          scalars.map(s => s"extern ${s.c} ${s.give}(void); extern void ${s.take}(${s.c} v);\n").mkString +
+            s"void go(void) {\n${scalars.map(s => s"  ${s.take}(${s.give}());\n").mkString}}\n")
+
+        val r = exec(Seq(cc, s"--target=${t.triple}", "-S", "-emit-llvm", "-O0", "-o", "-", src))
+
+        withClue(s"clang refused the C for ${t.triple}:\n${r.stderr}")(r.exitCode shouldBe 0)
+        r.stdout
+      } finally try deleteFile(src) catch case _: Exception => ()
+
+    val fromSysl = irFor(t,
+      scalars.map(s => s"extern ${s.give}() -> ${s.sysl}\nextern ${s.take}(v: ${s.sysl})\n").mkString +
+        scalars.map(s => s"${s.take}(${s.give}())\n").mkString)
+
+    for s <- scalars do
+      withClue(s"returning a ${s.sysl} (${t.triple}, ${s.c}): ")(
+        declaring(t, fromSysl, s.give) shouldBe declaring(t, fromClang, s.give))
+      withClue(s"passing a ${s.sysl} (${t.triple}, ${s.c}): ")(
+        declaring(t, fromSysl, s.take) shouldBe declaring(t, fromClang, s.take))
+  }
 }

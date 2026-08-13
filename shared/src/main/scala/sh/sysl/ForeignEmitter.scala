@@ -33,12 +33,14 @@ trait ForeignEmitter extends ArcEmitter {
   }
 
   protected def foreignResultType(retTy: Type): String = CAbi.result(retTy, target) match
-    case CAbi.Result.Plain       => retTy.llvm
+    // A narrow scalar is named as itself and carries the convention's extension in front of it, so
+    // that what the callee widened is what this side reads back (`CAbi.extension`).
+    case CAbi.Result.Plain       => CAbi.returning(CAbi.extension(retTy, target), retTy.llvm)
     case CAbi.Result.Coerced(l)  => l
     case CAbi.Result.Sret(_, _)  => "void"
 
   private def foreignParamTypes(p: Type): List[String] = CAbi.param(p, target) match
-    case CAbi.Param.Plain                       => List(p.llvm)
+    case CAbi.Param.Plain                       => List(CAbi.Arg(p.llvm, CAbi.extension(p, target)).declared)
     case CAbi.Param.Coerced(pieces)             => pieces.map(_.declared)
     case CAbi.Param.Indirect(llvm, align, true) => List(s"ptr byval($llvm) align $align")
     case CAbi.Param.Indirect(_, _, false)       => List("ptr")
@@ -76,7 +78,10 @@ trait ForeignEmitter extends ArcEmitter {
       if Type.zeroSized(a.ty) then Nil
       else
         CAbi.param(a.ty, target) match
-          case CAbi.Param.Plain           => List(s"${a.ty.llvm} $v")
+          // The extension is stated at the call as well as on the declaration, because it is the
+          // **caller's** obligation and the call is where the caller is: it is this line that makes
+          // the back end widen the value before it goes into the register.
+          case CAbi.Param.Plain           => List(s"${CAbi.Arg(a.ty.llvm, CAbi.extension(a.ty, target)).declared} $v")
           case CAbi.Param.Coerced(pieces) => spread(v, a.ty, pieces)
           case CAbi.Param.Indirect(llvm, align, byval) =>
             val slot = emitAlloca(freshTemp(), llvm)

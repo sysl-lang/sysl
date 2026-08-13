@@ -27,11 +27,13 @@ object Exports {
 
   /** A parameter or a result C has no way to spell.
    *
-   * A scalar and a pointer are one register on every machine sysl lowers for, and nothing has to be
-   * decided about them. An aggregate is the opposite: each ABI says which registers a struct arrives
-   * in, LLVM applies no rule of its own, and `CAbi` exists precisely because sysl's own lowering and
-   * C's published one differ. Passing one by value would be a **corrupt call rather than a link
-   * error**, which is why it is refused here instead of lowered hopefully.
+   * A scalar and a pointer are one register on every machine sysl lowers for, so the only thing to
+   * decide about one is whether it is widened on the way — which `CAbi.extension` decides, on the
+   * definition itself, and which is therefore not a reason to refuse anything. An aggregate is the
+   * opposite: each ABI says which registers a struct arrives in, LLVM applies no rule of its own, and
+   * `CAbi` exists precisely because sysl's own lowering and C's published one differ. Passing one by
+   * value would be a **corrupt call rather than a link error**, which is why it is refused here
+   * instead of lowered hopefully.
    *
    * Every refusal carries the shape to write instead, because there always is one — a slice becomes
    * the pointer and length C's own buffer functions already take, an aggregate becomes a pointer to

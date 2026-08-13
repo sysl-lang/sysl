@@ -2,20 +2,28 @@ package sh.sysl
 
 import scala.collection.mutable
 
-/** How an **aggregate** is handed to and from a C function.
+/** How an **aggregate** — and a **narrow scalar** — is handed to and from a C function.
  *
- * A scalar crosses the boundary as itself: an `i32` is one register on every machine sysl lowers
- * for, and nothing has to be decided. An aggregate does not. Each ABI says which registers a struct
- * arrives in, and **LLVM applies no such rule of its own** — given a struct type in a signature it
- * assigns one register per element, which is not what any of the four conventions asks for. So the
- * declaration a call names has to be the *coerced* one the ABI specifies, and the value converted
- * into and out of that shape at the call.
+ * A register-width scalar crosses the boundary as itself: an `i32` is one register on every machine
+ * sysl lowers for, and nothing has to be decided. An aggregate does not. Each ABI says which
+ * registers a struct arrives in, and **LLVM applies no such rule of its own** — given a struct type
+ * in a signature it assigns one register per element, which is not what any of the four conventions
+ * asks for. So the declaration a call names has to be the *coerced* one the ABI specifies, and the
+ * value converted into and out of that shape at the call.
  *
- * The one thing this is *not* needed for is a call from sysl to sysl. Both sides are this compiler,
- * so a struct handed over as a struct is a convention like any other and the two agree by
- * construction. It is only at the seam with a foreign function — where the other side was compiled
- * by somebody else against a published document — that the published answer is the only one that
- * works.
+ * A scalar **narrower** than a register is the third case, and it was missing here until a `u8`
+ * arrived at a C function as a different number (`extension` below says how). It needs no coercion —
+ * an `i8` is an `i8` on both sides — but most conventions require whoever hands it over to widen it
+ * to a whole register first, and LLVM does that only when the signature says to.
+ *
+ * The **coercion** is not needed for a call from sysl to sysl. Both sides are this compiler, so a
+ * struct handed over as a struct is a convention like any other and the two agree by construction.
+ * It is only at the seam with a foreign function — where the other side was compiled by somebody
+ * else against a published document — that the published answer is the only one that works.
+ *
+ * The **extension** does not divide that way, and it is the one answer here that a sysl-to-sysl
+ * signature carries too: a definition cannot know that C is not on the other end of it, and widening
+ * a result is what the *callee* owes. `extension` says which side owes what.
  *
  * Every rule below was read off `clang -S -emit-llvm` for the triple, which is the method
  * `targets.md` prescribes, and it is the only method that finds the parts no document states
@@ -119,6 +127,65 @@ object CAbi {
           Param.Indirect(t.llvm, if byval then math.max(l.align(t), 8) else l.align(t), byval)
         case Shape.Registers(_, passed) => Param.Coerced(passed)
         case Shape.Split(passed)        => Param.Coerced(passed)
+
+  /** How a scalar **narrower than a register** is widened to fill one — `signext`, `zeroext`, or
+   * nothing at all.
+   *
+   * This is the half of the boundary that has no coercion in it. An `i8` is an `i8` to both
+   * compilers and travels in the register a whole word would; what the conventions disagree about is
+   * **the state of the bits above it**, and most of them settle it by making the sender widen the
+   * value first. LLVM emits that widening only where the signature asks for it, so a declaration
+   * without the attribute hands over a register whose top bits are whatever was in it — and a callee
+   * compiled by clang, which was promised they were extended, reads a number nobody wrote.
+   *
+   * **Two obligations, and they fall on opposite sides.** A parameter's extension is the *caller's*,
+   * so it is written at a foreign call and on the declaration it calls (`ForeignEmitter`). A result's
+   * is the *callee's*, so it is written on every definition sysl emits (`Emitter.syslResult`) — a
+   * definition cannot know that C is not on the other end, and a sysl caller that does not ask for
+   * the extension is unharmed by getting it. That is why nothing here is written on a sysl
+   * *parameter*: neither side of a sysl-to-sysl call claims it, so both are free to ignore the top
+   * bits, and they agree by construction the way they do about everything else.
+   *
+   * Read off `clang -S -emit-llvm` for all fifteen triples, and the three departures from the
+   * ordinary rule are why this is a measurement and not a line of reasoning:
+   *
+   *   - **AArch64 away from Darwin extends nothing**, not even `_Bool` — AAPCS64 leaves the top bits
+   *     unspecified and makes the callee narrow what it reads. Apple's variant of the same
+   *     convention is the opposite and does extend, so the two aarch64 targets in this registry
+   *     disagree and both are right.
+   *   - **Windows x64 extends `_Bool` and nothing else**, so `char` and `short` cross bare there.
+   *   - **RISC-V 64 extends a 32-bit value too**, and `signext` whether or not it is signed: an
+   *     `unsigned int` is sign-extended into a 64-bit register, which is the one place a convention
+   *     asks for an extension that contradicts the type's own signedness.
+   *
+   * A width C cannot spell — sysl's `i5`, `u12` — takes the ordinary rule for its width. There is no
+   * clang answer to measure against because there is no C declaration to write, and following the
+   * sign is what every convention that extends anything does with the widths there are.
+   */
+  def extension(t: Type, target: Target): String = Type.underlying(t) match {
+    case Type.Bool                     => widen(1, signed = false, target)
+    // A `char` is a Unicode scalar in a `u32` (`Type.Char`), so it is that width's answer.
+    case Type.Char                     => widen(32, signed = false, target)
+    // A **simple** enum is its discriminant, whose width its `: iN` annotation chose — which is the
+    // `-fshort-enums` case, and the reason this is read off the enum rather than assumed to be `int`.
+    case e: Type.Enum if e.simple      => widen(e.underlying.bits, e.underlying.signed, target)
+    case Type.Integer(bits, signed, _) => widen(bits, signed, target)
+    case _                             => ""
+  }
+
+  private def widen(bits: Int, signed: Boolean, target: Target): String =
+    if target.cpu == Cpu.Aarch64 && target.os != Os.MacOS then ""
+    else if bits == 1 then "zeroext"
+    else if target.cpu == Cpu.X86_64 && target.os == Os.Windows then ""
+    else if bits < 32 then (if signed then "signext" else "zeroext")
+    else if bits == 32 && target.cpu == Cpu.Riscv64 then "signext"
+    else ""
+
+  /** `attr` in front of `llvm`, which is where a **result** attribute goes — after the linkage and
+   * the calling convention, before the type, in a `define`, a `declare` and a `call` alike. A
+   * parameter's goes the other way round and is spelled by `Arg.declared`.
+   */
+  def returning(attr: String, llvm: String): String = if attr.isEmpty then llvm else s"$attr $llvm"
 
   /** The registers an aggregate occupies, named twice — because a result and an argument may spell
    * the same registers differently, which is AAPCS64's case throughout and nobody else's.
