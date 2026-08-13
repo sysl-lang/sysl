@@ -13,9 +13,14 @@ import org.scalatest.freespec.AnyFreeSpec
 class ExternCodegenTests extends AnyFreeSpec with CodegenSupport {
 
   "declarations" - {
+    /** The narrow parts carry the widening the convention asks for (`CAbi.extension`) — `zeroext` on
+      * the `bool` argument and on the `u8` result, this being a Darwin target. The `i32` and the
+      * `double` fill a register already and take nothing, which is what makes this one assertion
+      * show both halves of the rule.
+      */
     "a called extern is declared with its lowered signature" in {
       ir("extern f(a: int, b: real, c: bool) -> u8\nprint(f(1, 2.0, true))") should
-        include("declare i8 @f(i32, double, i1)")
+        include("declare zeroext i8 @f(i32, double, i1 zeroext)")
     }
 
     "no result at all is declared void" in {

@@ -235,8 +235,33 @@ trait Emitter {
   protected def syslSret(retTy: Type): Option[String] =
     Option.when(layout.indirect(retTy))(s"ptr noalias sret(${retTy.llvm}) align ${layout.align(retTy)}")
 
-  /** What a sysl `define`, `declare` and `call` name as the result type. */
+  /** What a sysl `define`, `declare` and `call` name as the result type.
+   *
+   * A **narrow** result carries the C convention's extension (`CAbi.extension`), which is the one
+   * thing about a sysl signature that is not sysl's own answer. Widening a result is the *callee's*
+   * obligation, and a definition cannot know who calls it: `@export` and `&f` hand this very symbol
+   * to C, and a `bool` returned without the attribute would reach it as whatever was in the top of
+   * the register. Stating it everywhere costs a sysl caller nothing — it does not ask for the
+   * extension and is not harmed by receiving one — and it means no part of the compiler has to work
+   * out which definitions C can reach.
+   *
+   * A **parameter** gets none, which is the same rule seen from the other side: widening an argument
+   * is the caller's obligation, so it is stated at a foreign call (`ForeignEmitter`) and nowhere
+   * else. Neither end of a sysl-to-sysl call claims it, so neither may rely on it.
+   */
   protected def syslResult(retTy: Type): String =
+    CAbi.returning(if syslResultType(retTy) == "void" then "" else CAbi.extension(retTy, target),
+                   syslResultType(retTy))
+
+  /** The same **type**, with no attribute on it — for the `ret` instruction, which takes none.
+   *
+   * A return attribute belongs to the signature: `define zeroext i1 @f()` states what the function
+   * guarantees, and the terminator inside it just names the value's type. LLVM refuses `ret zeroext
+   * i1 %x` outright, which is a parse error in the emitted module rather than anything a test of the
+   * compiler's own types would notice — so the two spellings are kept apart here rather than at each
+   * of the places that needs one.
+   */
+  protected def syslResultType(retTy: Type): String =
     if Type.noValue(retTy) || layout.indirect(retTy) then "void" else retTy.llvm
 
   /** How a parameter is declared. A **large** one arrives as the address of storage the caller

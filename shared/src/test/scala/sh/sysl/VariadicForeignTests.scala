@@ -144,9 +144,17 @@ class VariadicForeignTests extends AnyFreeSpec with CodegenSupport with RunSuppo
       irFor(Target.x86_64Linux, call) should not include "llvm.memcpy"
     }
 
+    /** The **parameter list** is what is the same everywhere, and it is the whole of the claim: a
+      * `va_list` reaches C as one pointer whatever the target does with the storage behind it.
+      *
+      * The result deliberately is not asserted. RISC-V 64 widens a 32-bit result (`CAbi.extension`)
+      * and so declares `signext i32` where the rest declare `i32`, which is a fact about that
+      * convention rather than about `va_list` — writing the whole line here would make this test
+      * fail for a reason it is not about, which is exactly what it did.
+      */
     "and every target declares the callee the same way, taking one pointer" in {
       for t <- Target.all if t.supported do
-        withClue(t.name)(irFor(t, call) should include("declare i32 @vprintf(ptr, ptr)"))
+        withClue(t.name)(irFor(t, call) should include("@vprintf(ptr, ptr)"))
     }
   }
 
@@ -162,7 +170,10 @@ class VariadicForeignTests extends AnyFreeSpec with CodegenSupport with RunSuppo
         withClue(t.name) {
           val out = defineOf(irFor(t, s"$byPointer\nprint(f(0))"), "f")
 
-          out should include("call i32 @advance(ptr %ap.addr)")
+          // The arguments, not the result: RISC-V 64 widens a 32-bit one and writes `call signext
+          // i32` where the rest write `call i32`, which is the convention's business and not this
+          // test's.
+          out should include("@advance(ptr %ap.addr)")
           out should not include "memcpy"
         }
     }

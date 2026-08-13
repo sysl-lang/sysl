@@ -830,4 +830,102 @@ class CAbiTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       body.linesIterator.count(_.contains("@arc.dispose.Named")) shouldBe 1
     }
   }
+
+  /** The widening a narrow scalar takes (`CAbi.extension`), for the parts `AbiAgainstClangTests`
+   * cannot ask clang about.
+   *
+   * That suite is the oracle for everything with a C spelling — every width, on every target — and
+   * nothing here duplicates it. What is left over is the half of the rule that has no C counterpart
+   * to measure against: **a sysl `define` states the extension of its own result**, because widening
+   * a result is the callee's obligation and `@export` and `&f` hand this very definition to C. There
+   * is no clang output for "what should a sysl function's signature say", so it is written down.
+   */
+  "a narrow scalar is widened by whoever owes it" - {
+
+    /** The callee's half. Nothing here is exported or address-taken — the attribute is on every
+     * definition, because a definition cannot know which of them C will reach and a sysl caller is
+     * unharmed by a guarantee it never asked for.
+     */
+    "a sysl definition states its own result's extension" in {
+      val out = irFor(arm,
+        """yes() -> bool = true
+          |small() -> u8 = 7
+          |wide() -> i64 = 7
+          |print(if yes() then int(small()) else int(wide()))""".stripMargin)
+
+      defineOf(out, "yes") should include("define zeroext i1 @yes()")
+      defineOf(out, "small") should include("define zeroext i8 @small()")
+      // A register-width result has nothing owed on it, so nothing is written — an attribute that
+      // appeared everywhere would say nothing about where the rule applies.
+      defineOf(out, "wide") should include("define i64 @wide()")
+    }
+
+    /** The caller's half, which is the reported bug: the extension is at the **call** as well as on
+     * the declaration, since it is the call that makes the back end widen the value.
+     */
+    "a foreign call states its arguments'" in {
+      val out = irFor(arm,
+        """extern take(v: u8)
+          |take(7)""".stripMargin)
+
+      out should include("declare void @take(i8 zeroext)")
+      out should include("call void @take(i8 zeroext 7)")
+    }
+
+    /** A **simple** enum is its discriminant, so a narrow one is widened by its own annotation's
+     * width and signedness rather than as the `int` an enum is assumed to be. This is the
+     * `-fshort-enums` shape from the other direction, and reading the width off the enum is what
+     * keeps the two agreeing.
+     */
+    "a narrow simple enum by the width its annotation chose" in {
+      val out = irFor(arm,
+        """enum Code : u8
+          |    Ok
+          |    Bad
+          |extern take(c: Code)
+          |take(Code.Ok)""".stripMargin)
+
+      out should include("declare void @take(i8 zeroext)")
+    }
+
+    /** AArch64 away from Darwin is the departure that matters most here, because it is the same
+     * convention as the host's and answers the opposite way: AAPCS64 leaves the top bits
+     * unspecified and makes the callee narrow what it reads. A rule written from the host alone
+     * would have put `zeroext` on both.
+     */
+    /** The variadic tail, where C's own default argument promotion has already been applied — a
+      * narrow argument past the declared parameters becomes an `int` before it is handed over, so
+      * there is nothing narrow left for a convention to widen. On RISC-V 64 that promoted `int` is
+      * still widened, because that is the one target whose rule reaches 32 bits, and the result of a
+      * variadic declaration is widened with it.
+      *
+      * Asserted because the two rules meet here and could each have been applied to the other's
+      * value: promoting and *then* widening the original width would put `zeroext` on an `i32`.
+      */
+    "a promoted variadic argument takes the width it was promoted to" in {
+      irFor(arm,
+        """extern vf(f: *u8, ...) -> int
+          |val b: u8 = 7
+          |print(vf(null, b))""".stripMargin) should include("call i32 (ptr, ...) @vf(ptr null, i32")
+
+      val out = irFor(rv,
+        """extern vf(f: *u8, ...) -> int
+          |val b: u8 = 7
+          |print(vf(null, b))""".stripMargin)
+
+      out should include("declare signext i32 @vf(ptr, ...)")
+      out should include("i32 signext")
+    }
+
+    "and nowhere at all on AArch64 away from Darwin, which widens nothing" in {
+      val out = irFor(armLnx,
+        """extern take(v: u8)
+          |yes() -> bool = true
+          |take(7)
+          |print(yes())""".stripMargin)
+
+      out should include("declare void @take(i8)")
+      defineOf(out, "yes") should include("define i1 @yes()")
+    }
+  }
 }

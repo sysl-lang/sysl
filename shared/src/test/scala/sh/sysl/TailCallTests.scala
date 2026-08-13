@@ -228,7 +228,9 @@ class TailCallTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         "even",
       )
 
-      out should include("call i1 @odd")
+      // Named without the result's type, which on a widening target carries a `zeroext` the
+      // convention asks for: what this is about is that a `call` was emitted at all.
+      out should include("call zeroext i1 @odd")
       out should not include "tailrec"
     }
   }

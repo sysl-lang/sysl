@@ -48,6 +48,19 @@ trait ConstFolding extends ImportResolution {
   /** The key a written **constant** name resolves to (`13 §7`). */
   protected def constKey(written: String): Option[String] = resolveName(written)(constDecls.contains)
 
+  /** A dotted path written as field reads, flattened back into the name it was written as — `c.limit`
+   * from `Field(Ident("c"), "limit")`.
+   *
+   * A qualified name and a field read are the same shape after parsing, and which one is meant is
+   * decided by what the name resolves to rather than by how it was written. So this hands back a
+   * candidate spelling and nothing more; `None` is for a receiver that is an expression rather than a
+   * name, which cannot be a module path however it is read.
+   */
+  protected def dottedName(e: Expr): Option[String] = e match
+    case Ident(n)         => Some(n)
+    case Field(recv, name) => dottedName(recv).map(r => s"$r.$name")
+    case _                 => None
+
   /** The type a constant was declared with.
    *
    * A constant is a scalar and nothing else, which is not an arbitrary restriction but the shape of
@@ -337,6 +350,15 @@ trait ConstFolding extends ImportResolution {
     // one. During the walk that checks a generic body the pack stands at two, so this is 2 there.
     case Field(Ident(n), "len") =>
       subst.get(n).collect { case Type.Pack(elems) => IntLit(BigInt(elems.length), None) }
+
+    // A **module-qualified** constant — `c.limit`. A `const` is registered under its dotted path and
+    // `constKey` has always taken one, which is why the two positions that read a constant *as a
+    // written name* — a match pattern, an ordinary expression — accepted this spelling from the
+    // start. Only the folder did not: it matched a bare `Ident` and nothing else, so the very same
+    // declaration was a constant when imported unqualified and not one when reached through its
+    // module. A `Field` that names no constant answers `None` and is reported as whatever it is,
+    // which is what an ordinary field read of a value has always been here.
+    case f: Field => dottedName(f).flatMap(constKey).map(constLiteral)
 
     case Unary("-", operand) =>
       fold(operand, subst).collect {

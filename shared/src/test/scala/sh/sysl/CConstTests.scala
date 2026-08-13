@@ -278,6 +278,42 @@ class CConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
             |""".stripMargin) should include("main")
     }
 
+    /** The two spellings of one declaration, asserted to agree rather than to be any number.
+      *
+      * A binding puts its measured constants in a `c` sub-module of its own, so a consumer names them
+      * qualified — and the qualified spelling was not folding, so a constant reached through its
+      * module was refused in the two positions a constant exists for while the same declaration
+      * imported unqualified was accepted. What is asserted is the *agreement*, for the reason this
+      * whole file asserts agreement: a literal `8` here would be the transcription the feature
+      * abolishes.
+      *
+      * The defect was the folder's and had nothing to do with `c const` — an ordinary `const` reached
+      * through its module failed identically, which is what `ConstTests` pins. This is here because a
+      * binding is where the qualified spelling is unavoidable, and so where it will next be noticed.
+      */
+    "a module-qualified one is the same constant as the imported one, in every position" in {
+      runIn(
+        ("bits", "bits.sysl",
+          """module bits
+            |@include("<limits.h>")
+            |
+            |c const
+            |    byte_width: int = "CHAR_BIT"
+            |""".stripMargin),
+        ("", "main.sysl",
+          """import bits.byte_width
+            |
+            |const near: int = byte_width
+            |const far: int = bits.byte_width
+            |
+            |var here: [byte_width]int
+            |var there: [bits.byte_width]int
+            |
+            |print(s"${near == far} ${here.len == there.len}")
+            |""".stripMargin),
+      ) shouldBe "true true\n"
+    }
+
     /** A header outside the toolchain's own directories is reached by `--include-path`, exactly as
       * one a shim includes is (`SearchPaths`). This is what makes the feature usable against a real
       * C project, whose headers are never on the default path.

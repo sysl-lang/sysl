@@ -67,6 +67,10 @@ trait FuncAddress extends CallCore {
     // registers. Refusing is the honest half of that — an adapter is what closes it, and until there
     // is one this says which parameter is the problem rather than handing over an address that
     // silently means something else.
+    //
+    // A **narrow** scalar crosses as itself and is not one of those: the widening C expects of the
+    // result is written on the definition rather than being something an address has to arrange
+    // (`CAbi.extension`), so a callback answering a `bool` is reachable through here and correct.
     for (t, i) <- (ptypes :+ ret).zipWithIndex do
       if !crossesAsItself(t) then
         val which = if i < ptypes.length then s"the ${ordinal(i + 1)} parameter" else "the result"
