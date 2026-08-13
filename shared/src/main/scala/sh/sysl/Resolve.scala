@@ -89,14 +89,23 @@ object Resolve {
    * `cache` is passed in rather than found here so that a test can resolve a whole graph without
    * writing into the machine's own package cache — the same reason `PackageConfig.read` takes text
    * rather than a path.
+   *
+   * `sharing` names the directories whose modules are in the root's **own name space** rather than
+   * under a prefix of their own: the `--lib` source roots, whose files are filed under the empty
+   * prefix because that is what the flag means. They are not packages of this graph and contribute no
+   * dependencies of their own here — what they contribute is *names already taken*, which is the only
+   * thing the collision rule below can be asked about them. Left out, a root's module and a
+   * dependency's module could both claim one name and the local one would quietly win, which is the
+   * silent winner `§ 9` exists to refuse.
    */
-  def graph(root: String, config: PackageConfig, sums: Sums, cache: String): Either[String, Graph] =
+  def graph(root: String, config: PackageConfig, sums: Sums, cache: String,
+            sharing: List[String] = Nil): Either[String, Graph] =
     for
       withLocals <- readLocals(config.dependencies, State(sums = sums), cache)
       settled    <- select(withLocals.demanding(config.dependencies), cache)
-      rootTable  <- tableOf(PackageConfig.FileName, root, config.dependencies, settled)
+      rootTable  <- tableOf(PackageConfig.FileName, root :: sharing, config.dependencies, settled)
       packages   <- materialize(settled)
-      tables     <- collect(packages)(p => tableOf(owner(p), p.root, p.config.dependencies, settled)
+      tables     <- collect(packages)(p => tableOf(owner(p), List(p.root), p.config.dependencies, settled)
                       .map(t => p.copy(imports = t)))
     yield Graph(ResolvedPackage("", root, config, rootTable) :: tables, settled.sums, settled.changed)
 
@@ -179,7 +188,7 @@ object Resolve {
    * the manifest of the version that is actually being built — which is where its *name* comes from
    * when no mount overrides it, and is exactly the thing one pass would have got wrong.
    */
-  private def tableOf(owner: String, ownerRoot: String, deps: List[Dependency], state: State)
+  private def tableOf(owner: String, ownerRoots: List[String], deps: List[Dependency], state: State)
       : Either[String, Map[String, String]] = {
     // Which package put each name there, carried beside the name it resolves to and dropped at the
     // end. The collision test is about *packages* — two of them wanting one name — and the target
@@ -192,7 +201,7 @@ object Resolve {
         table <- acc
         dir   <- theirRoot(dep, state)
         added <- bindings(dep, dir).left.map(e => s"$owner: $e")
-        _     <- collect(added.keys.toList.sorted)(local => noCollision(owner, ownerRoot, table, local, dep))
+        _     <- collect(added.keys.toList.sorted)(local => noCollision(owner, ownerRoots, table, local, dep))
       yield table ++ added.map((k, v) => k -> (v, dep.canonical))
     }.map(_.map((k, v) => k -> v._1))
   }
@@ -259,8 +268,14 @@ object Resolve {
    * `sh.sysl` and offer `sh.sysl.sqlite` and `sh.sysl.linenoise` do not collide, because no import
    * line can be read as either. The names they share are `sh` and `sh.sysl`, and neither package
    * declares those — a directory holding no source is not a module (`13 §1`).
+   *
+   * **`ownerRoots` is a list because the consumer's name space can be more than one directory.** Its
+   * head is the consumer itself; the rest are the `--lib` source roots, whose modules are filed under
+   * the consumer's prefix and are therefore names just as taken. One of those colliding used to be the
+   * silent winner this rule refuses everywhere else — the local module answered and the dependency's
+   * was unreachable, with nothing said.
    */
-  private def noCollision(owner: String, ownerRoot: String, table: Map[String, (String, String)],
+  private def noCollision(owner: String, ownerRoots: List[String], table: Map[String, (String, String)],
                           local: String, dep: Dependency): Either[String, Unit] =
     table.find((name, _) => overlap(name, local)) match
       case Some((name, (_, other))) if other != dep.canonical =>
@@ -272,9 +287,16 @@ object Resolve {
         // The consumer's own modules are in the same name space, and a project with a `json`
         // directory at its root taking a dependency that offers `json` is the common case rather
         // than an exotic one. Refused in the same words, because it is the same collision.
-        Either.cond(!Project.modules(ownerRoot).exists(overlap(_, local)), (),
-          s"$owner: '$local' is both a module of this project and one ${dep.canonical} offers — " +
-            "give the dependency a 'mount' to say what it is called here")
+        ownerRoots.find(r => Project.modules(r).exists(overlap(_, local))) match
+          case None => Right(())
+          case Some(r) =>
+            // Named as the reader gave it where it is a source root, and "this project" where it is
+            // the consumer itself — the same choice the header requirements make, and for the same
+            // reason: what is quoted back is the thing they typed and can go and look at.
+            val whose = if r == ownerRoots.head then "this project" else s"the source root '$r'"
+
+            Left(s"$owner: '$local' is both a module of $whose and one ${dep.canonical} offers — " +
+              "give the dependency a 'mount' to say what it is called here")
 
   /** Whether two module paths claim ground the other needs: the same name, or one a path **inside**
    * the other.
