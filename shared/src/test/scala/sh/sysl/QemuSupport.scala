@@ -106,7 +106,20 @@ trait QemuSupport extends Matchers {
     Board("mps2-an386", Target.thumbv7emFreestanding, "qemu-system-arm",
       List("-M", "mps2-an386", "-nographic", "-semihosting-config", "enable=on,target=native",
         "-kernel"),
-      "start_thumbv7em.s", "bsp_thumbv7em.c", "thumbv7em.ld")
+      "start_thumbv7em.s", "bsp_thumbv7em.c", "thumbv7em.ld"),
+
+    // Armv7-M, on the AN385's Cortex-M3 — the third MPS2 in this list and the only one of the three
+    // with **no floating-point unit at all**. It is here for the reason the micro:bit is: what has to
+    // be run is the *architecture*, and nothing else on this tier boots an image whose back end was
+    // told there is nothing to compute a float with.
+    //
+    // Its map is the AN500's to the byte, checked with `info mtree -f` rather than assumed from the
+    // family name — so the three board files are that board's text under names saying Armv7-M, and
+    // `bsp_thumbv7m.c`'s own header explains why they are copies rather than one shared file.
+    Board("mps2-an385", Target.thumbv7mFreestanding, "qemu-system-arm",
+      List("-M", "mps2-an385", "-nographic", "-semihosting-config", "enable=on,target=native",
+        "-kernel"),
+      "start_thumbv7m.s", "bsp_thumbv7m.c", "thumbv7m.ld")
   )
 
   /** Every board that runs `t`'s code. A target with none has no recipe here at all. */
@@ -175,8 +188,10 @@ trait QemuSupport extends Matchers {
       // The AN500's CMSDK UART is the AN505's device at a different address -- five of them in the
       // APB region from 0x40004000, of which `-nographic` wires the first to QEMU's stdout. Same
       // word-wide registers, and the same refusal to transmit until `bauddiv` and `ctrl` are set.
-      // The AN386 is the same board a processor generation earlier and puts them in the same place.
-      case "mps2-an500" | "mps2-an386" =>
+      // The AN386 and the AN385 are the same board one and two processor generations earlier, and
+      // put them in the same place — measured with `info mtree -f` on each rather than inferred from
+      // the three sharing a family name.
+      case "mps2-an500" | "mps2-an386" | "mps2-an385" =>
         """struct Uart
           |    data: volatile u32
           |    state: volatile u32

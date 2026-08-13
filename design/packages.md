@@ -595,8 +595,10 @@ boundary, and a heap boundary no signature marks is one nothing can check.
 **A package declares it rather than a target, and that is deliberate.** The obvious alternative is a
 target fact — the machine knows it is a Cortex-M — and it does not survive contact: `thumbv7em` does
 not imply FreeRTOS, two RTOSes on one chip want different pairs, and a bare-metal program on that
-chip wants libc's. Answering it per target would need a target per RTOS, which `targets.md` already
-declined to do for a float variant. What actually knows the answer is the package carrying the heap.
+chip wants libc's. Answering it per target would need a target per RTOS, and `targets.md` takes a row
+only for a fact about the **machine** — which is why one Cortex-M33 has three of them, for two float
+conventions and for whether the unit is there at all, and none at all for what is running on it. What
+knows this answer is the package carrying the heap.
 
 **Two packages naming different pairs is refused**, and refused when the graph is resolved rather
 than at the link, because the link will not refuse it: both symbols resolve, the program builds, and

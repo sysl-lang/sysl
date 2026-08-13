@@ -23,9 +23,9 @@ real projects use (the intended audio project targets an audio-class STM32, a Co
 
 - **Multi-target and single-backend are not in tension.** There is exactly one code
   generator: sysl emits LLVM IR, and a target is just a different LLVM *triple* + data layout
-  + calling convention + runtime — aarch64, ARM Cortex-M (`thumbv6m`/`thumbv7em`/`thumbv8m`,
-  for STM32 and Pico), `riscv32` (the RP2350's RISC-V cores), `x86_64`, `wasm32`. Adding a
-  target extends a table; it does not add a backend. This is the crucial distinction: the old
+  + calling convention + runtime + whatever the triple leaves unsaid — aarch64, ARM Cortex-M
+  (`thumbv6m`/`thumbv7m`/`thumbv7em`/`thumbv8m`, for STM32 and Pico), `riscv32` (the RP2350's
+  RISC-V cores), `x86_64`, `wasm32`. Adding a target extends a table; it does not add a backend. This is the crucial distinction: the old
   sysl's cost came from multiple *backends* — a tree-walking interpreter, a hand-rolled TRISC
   codegen, an SVM bytecode emitter — that each re-implemented the language's semantics and
   drifted. One LLVM backend over many triples carries none of that tax. Multi-target is the

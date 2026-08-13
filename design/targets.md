@@ -32,28 +32,46 @@ of what makes it different from `build`.
 
 ## The registry
 
-| name | triple | `va_list` | floating registers |
-|---|---|---|---|
-| `aarch64-macos` | `arm64-apple-macosx` | loaded | yes |
-| `x86_64-macos` | `x86_64-apple-macosx` | address | yes |
-| `aarch64-linux` | `aarch64-unknown-linux-gnu` | copied | yes |
-| `x86_64-linux` | `x86_64-unknown-linux-gnu` | address | yes |
-| `riscv64-linux` | `riscv64-unknown-linux-gnu` | loaded | yes |
-| `x86_64-windows` | `x86_64-pc-windows-msvc` | loaded | yes |
-| `aarch64-freestanding` | `aarch64-none-elf` | copied | yes |
-| `x86_64-freestanding` | `x86_64-unknown-none-elf` | address | yes |
-| `riscv64-freestanding` | `riscv64-unknown-elf` | loaded | **no** |
-| `thumb-freestanding` | `thumbv8m.main-none-eabihf` | loaded | yes |
-| `thumb-freestanding-softfp` | `thumbv8m.main-none-eabi` | loaded | **no** |
-| `thumbv6m-freestanding` | `thumbv6m-none-eabi` | loaded | **no** |
-| `riscv32-freestanding` | `riscv32-unknown-elf` | loaded | **no** |
-| `x86-linux` | `i386-unknown-linux-gnu` | *no measured C ABI* | |
+| name | triple | `va_list` | floating registers | an FPU |
+|---|---|---|---|---|
+| `aarch64-macos` | `arm64-apple-macosx` | loaded | yes | yes |
+| `x86_64-macos` | `x86_64-apple-macosx` | address | yes | yes |
+| `aarch64-linux` | `aarch64-unknown-linux-gnu` | copied | yes | yes |
+| `x86_64-linux` | `x86_64-unknown-linux-gnu` | address | yes | yes |
+| `riscv64-linux` | `riscv64-unknown-linux-gnu` | loaded | yes | yes |
+| `x86_64-windows` | `x86_64-pc-windows-msvc` | loaded | yes | yes |
+| `aarch64-freestanding` | `aarch64-none-elf` | copied | yes | yes |
+| `x86_64-freestanding` | `x86_64-unknown-none-elf` | address | yes | yes |
+| `riscv64-freestanding` | `riscv64-unknown-elf` | loaded | **no** | **no** |
+| `thumb-freestanding` | `thumbv8m.main-none-eabihf` | loaded | yes | yes |
+| `thumb-freestanding-softfp` | `thumbv8m.main-none-eabi` | loaded | **no** | yes |
+| `thumb-freestanding-soft` | `thumbv8m.main-none-eabi` | loaded | **no** | **no** |
+| `thumbv6m-freestanding` | `thumbv6m-none-eabi` | loaded | **no** | **no** |
+| `thumbv7m-freestanding` | `thumbv7m-none-eabi` | loaded | **no** | **no** |
+| `thumbv7em-freestanding` | `thumbv7em-none-eabihf` | loaded | yes | yes |
+| `thumbv7em-freestanding-soft` | `thumbv7em-none-eabi` | loaded | **no** | **no** |
+| `riscv32-freestanding` | `riscv32-unknown-elf` | loaded | **no** | **no** |
+| `x86-linux` | `i386-unknown-linux-gnu` | *no measured C ABI* | | |
 
-**Four of those are 32-bit, and they are the two Raspberry Pi microcontrollers.** The RP2350 boots
+**The last two columns are different questions, and the `softfp` row is where that shows.** The
+fourth is where a `double` travels on the way into a call; the fifth is whether the machine has a
+unit at all. A Cortex-M33 under `-mfloat-abi=softfp` passes arguments in core registers over an
+`fpv5-d16` that is present and used for the arithmetic, so it answers **no** and then **yes** — and
+every other row saying no in the fourth column is a machine that never had a choice to record.
+
+**Two rows share a triple, which used to be impossible and is now the point.** A triple names an
+architecture and a calling convention, and on Arm it says nothing whatever about the *presence* of
+the floating-point unit — so `thumb-freestanding-softfp` and `thumb-freestanding-soft` are one triple
+and two machines. What separates them is `-mfpu=none`, which sysl puts on every clang command line
+for a Thumb row answering no in the last column. **A target is the whole of what is said to clang**,
+and the triple stopped being all of that.
+
+**Eight of these are 32-bit, and the Arm half is a family rather than a board.** The RP2350 boots
 either a pair of Cortex-M33s or a pair of RV32IMAC Hazard3 cores; the RP2040 — the original Pico —
-has a pair of Cortex-M0+. All are here because a microcontroller is what *freestanding* is mostly
-for: the three 64-bit freestanding rows reach kernels and hypervisors, which is a different audience
-from the one writing embedded C, and nearly all of that is 32-bit.
+has a pair of Cortex-M0+; the Armv7E-M rows are ST's parts; and Armv7-M is the Cortex-M3, which is
+the board Zephyr's own documentation reaches for first. All are here because a microcontroller is
+what *freestanding* is mostly for: the three 64-bit freestanding rows reach kernels and hypervisors,
+which is a different audience from the one writing embedded C, and nearly all of that is 32-bit.
 
 `thumb` rather than `arm` names the Arm half, and the reason is the assembly arm rather than the
 architecture family — a Cortex-M executes Thumb only, so an arm written for A32 would assemble for a
@@ -72,29 +90,31 @@ cross in VFP registers. `-mcpu=cortex-m33` refines instruction selection to the 
 changes nothing about the ABI — it is the sub-architecture question left open at the bottom of this
 page, and it is not needed for a correct call.
 
-**And it is the one machine here with two rows, because the float ABI is the C project's to pick
-rather than sysl's.** `thumb-freestanding-softfp` is the same Cortex-M33 with arguments crossing in
-core registers, which is what `-mfloat-abi=softfp` means and what pico-sdk builds by default. The two
-cannot be mixed — GNU ld refuses the link outright, saying one object "uses VFP register arguments"
-and the other "does not" — so a sysl object joining a C build has to agree with it, and offering only
-the hard-float row meant the *C* had to be rebuilt to follow sysl. That is backwards for a language
-whose `@export` claim is that it joins somebody else's build.
+**And it is the one machine here with three rows, because neither the float ABI nor the FPU's
+presence is sysl's to pick.** `thumb-freestanding-softfp` is the same Cortex-M33 with arguments
+crossing in core registers, which is what `-mfloat-abi=softfp` means and what pico-sdk builds by
+default. The two cannot be mixed — GNU ld refuses the link outright, saying one object "uses VFP
+register arguments" and the other "does not" — so a sysl object joining a C build has to agree with
+it, and offering only the hard-float row meant the *C* had to be rebuilt to follow sysl. That is
+backwards for a language whose `@export` claim is that it joins somebody else's build.
 
 `softfp` is gcc's and pico-sdk's own spelling, which is the whole argument for the name: somebody
 handed that linker message goes looking for the word in their build system, and it is that one. It is
 **not** `soft`, which means something else — no FPU instructions at all, where `softfp` uses the
-`fpv5-d16` and changes only the convention.
+`fpv5-d16` and changes only the convention. `thumb-freestanding-soft` is that other thing, and the
+section below is about it.
 
 ### Armv6-M, which is the RP2040 and is a different architecture
 
-`thumbv6m-freestanding` is the **third** Thumb row and the only one that is not that Cortex-M33. Its
-name carries the sub-architecture where the other two do not, because what separates it is not a
+`thumbv6m-freestanding` was the **fourth** Thumb row and the first that was not that Cortex-M33. Its
+name carries the sub-architecture where the first three do not, because what separates it is not a
 calling convention: Armv6-M is Armv8-M's predecessor rather than a subset of its options.
 
-**The float column misleads here, and that is the reason to say so.** It reads `no` exactly as the
-`softfp` row does, for an unrelated reason. `softfp` is a *convention* chosen over an FPU that is
-present; the M0+ has no FPU at all, so there was never a choice to record. Two rows agreeing on that
-column agree about nothing.
+**The float column misled here, and saying so is what eventually produced the fifth column.** It read
+`no` exactly as the `softfp` row did, for an unrelated reason — `softfp` is a *convention* chosen over
+an FPU that is present, and the M0+ has no FPU at all, so there was never a choice to record. Two
+rows agreeing on that column agreed about nothing. The registry now asks the second question outright
+rather than leaving it to a paragraph, and this is the paragraph that noticed it was two questions.
 
 **The ABI is the same and needed no work**, which is the happy half: AAPCS32 under soft-float already
 described this core exactly, and the oracle of *Adding one* passed on the first run — the only
@@ -129,6 +149,55 @@ freestanding target, so a `&sync` release that reaches zero fetches its worklist
 scheduler's port defines it where something does. Both of these are the board's answers to questions
 the language deliberately declines to guess at, which is what makes them one paragraph rather than
 two mechanisms.
+
+### A machine with no floating-point unit, which the triple does not say
+
+**Three rows exist because a triple cannot express this, and it took a real board to notice.** Aiming
+sysl at Zephyr's `qemu_cortex_m3` in August 2026 found two things at once: there was no Armv7-M row at
+all, and the row that looked closest — `thumb-freestanding-softfp` — still told the C preprocessor an
+FPU was there.
+
+```
+$ clang --target=thumbv8m.main-none-eabi -dM -E -x c /dev/null | grep __ARM_FP
+#define __ARM_FP 0xe
+#define __ARM_FPV5__ 1
+```
+
+That is not a mistake in the triple. `eabi` versus `eabihf` is a statement about **where arguments
+travel**, and clang gives `thumbv8m.main` an `fpv5-d16` unasked in both cases, so `a * b` on an `f32`
+compiles to `vmla.f32` under either suffix. The soft-float ABI and an absent unit are different
+claims, and only the first has a triple to be written in.
+
+The cost of the two being conflated is paid twice, in two unrelated places:
+
+- **at the `#include`**, where CMSIS refuses outright against a device configured without one —
+  `error: "Compiler generates FPU instructions for a device without an FPU (check __FPU_PRESENT)"`;
+- **at run time**, where an image that got past the headers takes a usage fault on the first VFP
+  instruction it reaches, in whatever arithmetic happened to reach one.
+
+So a target records the unit's presence beside its calling convention, and a Thumb row that answers
+*no* has **`-mfpu=none`** added to every clang command line sysl builds for it — the link, the object,
+a package's C, and a `c const` probe alike. The last two matter as much as the first two: they are
+compiled *as* the target and are where the header refusal happens.
+
+**`soft` is the name because gcc already drew this line.** `-mfloat-abi=soft` means no FPU
+instructions at all where `-mfloat-abi=softfp` means the unit is used and only the convention is in
+core registers, so the three Armv8-M rows are that series end to end: hard, `softfp`, `soft`.
+
+**Armv7-M needed no flag and a row anyway.** `thumbv7m-none-eabi` defines no `__ARM_FP` and calls
+`__aeabi_fmul` unasked, because the architecture has no unit to have an opinion about — so half of
+this is one plain row. What it is *not* is the Armv6-M row pointed at a Cortex-M3: v6-M code links
+into an M3 image, being a subset, but a real project reads its own configuration rather than the
+triple. `CONFIG_CPU_CORTEX_M3` says Armv7-M, so Zephyr's inline assembly uses `BASEPRI`, while CMSIS
+reading `__ARM_ARCH_6M__` out of our triple supplies the intrinsic set that has no `__get_BASEPRI`.
+Neither side is wrong; they were told about two different machines.
+
+**None of the three needed ABI work, which was measured rather than hoped.** All three passed the
+oracle of *Adding one* on the first run: AAPCS32 under soft-float already described them, and the one
+convention question — whether a homogeneous floating aggregate travels in floating registers — has the
+same answer on a core with no such registers as on one whose convention declines to use them. What
+they do owe a board is arithmetic: `__aeabi_fmul` and its family, exactly as `__aeabi_ldivmod` is
+already owed on every 32-bit row.
 
 **`Freestanding` is a real answer, not a missing one.** A kernel or a bare-metal program has no
 operating system, and the ABI of a freestanding ELF target is fully specified; it differs from a
@@ -499,3 +568,10 @@ the trees a library ships are now a per-target answer. `13 §8` has the rest.
   report clearly, not to work around.
 - **Sub-architectures.** `-mcpu` / feature levels — a target today is a processor family and a
   system, and nothing yet needs finer.
+
+  **One feature flag has since been needed, and it did not open this.** A row for an FPU-less core
+  carries `-mfpu=none`, which is a feature level in clang's own terms — but it is recorded as a *fact
+  about the machine* (`Target.noFpu`) with the flag derived from it, rather than as a `-mfpu` a
+  caller may set. That is the shape this item would have to keep if it is ever built: what the H7's
+  double-precision unit wants is not "a way to pass `-mcpu`", it is a row that answers a question
+  codegen asks. The distinction is the whole of *A target is a value, not an ambient fact*.

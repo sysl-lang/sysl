@@ -119,11 +119,12 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
         |""".stripMargin,
   )
 
-  /** The AN386 takes the AN500's source rather than a copy of it, so that the pair cannot drift into
-   * testing two different programs — which would defeat the point of running both, that being to
-   * vary the *processor* and nothing else.
+  /** The AN386 and the AN385 take the AN500's source rather than a copy of it, so that the three
+   * cannot drift into testing different programs — which would defeat the point of running them all,
+   * that being to vary the *processor* and nothing else.
    */
-  private val boardUarts: Map[String, String] = uarts + ("mps2-an386" -> uarts("mps2-an500"))
+  private val boardUarts: Map[String, String] =
+    uarts ++ List("mps2-an386", "mps2-an385").map(_ -> uarts("mps2-an500"))
 
   /** The prelude a program on `b` needs before it can print, plus the one helper every test here
    * wants. `digit` is separate from the board because it is written in terms of `putc`.

@@ -388,9 +388,36 @@ object Toolchain {
                                 links: List[String] = Nil, objects: List[String] = Nil,
                                 paths: SearchPaths = SearchPaths.none,
                                 cc: String = "clang"): List[String] =
-    List(cc, s"--target=${target.triple}", "-Wno-override-module", flag(level)) ::: deadStrip(target) :::
+    List(cc, s"--target=${target.triple}", "-Wno-override-module", flag(level)) :::
+      machineFlags(target) ::: deadStrip(target) :::
       paths.linkFlags ::: List(ll) ::: objects ::: archives ::: libraryFlags(links, target) :::
       List("-o", exe)
+
+  /** What the machine needs said to clang **beyond its triple**, on every command line that produces
+   * code for it or reads a header as it.
+   *
+   * There is one such thing today and it is the floating-point unit. A triple names an architecture
+   * and a calling convention, and on Arm those two leave the *presence* of the unit unstated:
+   * `thumbv7em-none-eabi` and `thumbv8m.main-none-eabi` both select `vmul.f32` for a multiply and both
+   * define `__ARM_FP`, though the `eabi` suffix was only ever a statement about where arguments
+   * travel. `-mfpu=none` is the missing half of the sentence, and it does two things a board without
+   * a unit needs: the back end stops selecting VFP instructions, and `__ARM_FP` goes away, which is
+   * what a header guarding on `__FPU_PRESENT` is reading.
+   *
+   * **It goes on all four command lines, not only the two that emit instructions.** A package's C and
+   * a `c const` probe are compiled *as* the target, and CMSIS's own
+   * `#error "Compiler generates FPU instructions for a device without an FPU"` refuses them at the
+   * `#include`, one step before anything has been lowered.
+   *
+   * **It is Arm's flag because Arm is where the triple is silent.** RISC-V says it in the triple —
+   * `riscv32-unknown-elf` is RV32IMAC and has no F extension to turn off — so `noFpu` is true there
+   * and nothing is passed. Armv6-M and Armv7-M are that same case on the Arm side, their triples
+   * defining no `__ARM_FP` at all; the flag is passed for them anyway rather than being conditioned on
+   * which Thumb it is, because it was checked to be accepted and to change nothing there, and one rule
+   * that is uniformly true beats two that have to be kept in step.
+   */
+  private[sysl] def machineFlags(target: Target): List[String] =
+    if target.noFpu && target.cpu == Cpu.Thumb then List("-mfpu=none") else Nil
 
   /** What a build's link directives (`15 §8`) become on **this** target's command line.
    *
@@ -477,8 +504,9 @@ object Toolchain {
       val ll = createTempFile("sysl-", ".ll")
       writeFile(ll, ir)
 
-      val result = exec(Seq(cc, s"--target=${target.triple}", "-Wno-override-module", flag(level),
-        "-ffunction-sections", "-fdata-sections", "-c", ll, "-o", obj))
+      val result = exec(Seq(cc, s"--target=${target.triple}", "-Wno-override-module", flag(level)) ++
+        machineFlags(target) ++
+        Seq("-ffunction-sections", "-fdata-sections", "-c", ll, "-o", obj))
       deleteFile(ll)
 
       if result.exitCode == 0 then Right(())
@@ -525,7 +553,7 @@ object Toolchain {
                level: String = defaultOptimization,
                paths: SearchPaths = SearchPaths.none, verbose: Boolean = false): Either[String, Unit] = {
     findClang(target).flatMap { cc =>
-      val command = Seq(cc, s"--target=${target.triple}", flag(level)) ++
+      val command = Seq(cc, s"--target=${target.triple}", flag(level)) ++ machineFlags(target) ++
         Option.when(target.shortEnums)("-fshort-enums") ++ paths.defineFlags ++
         paths.includeFlags ++
         Seq("-ffunction-sections", "-fdata-sections", "-c", source, "-o", obj)

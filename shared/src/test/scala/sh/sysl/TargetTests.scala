@@ -13,9 +13,22 @@ import org.scalatest.freespec.AnyFreeSpec
 class TargetTests extends AnyFreeSpec with CodegenSupport {
 
   "the registry" - {
-    "gives each target one name and one triple" in {
+    "gives each target one name" in {
       Target.all.map(_.name).distinct.length shouldBe Target.all.length
-      Target.all.map(_.triple).distinct.length shouldBe Target.all.length
+    }
+
+    // **The triple used to be unique too, and deliberately is not any more.** A triple names an
+    // architecture and a calling convention, and on Arm those two leave the *presence* of a
+    // floating-point unit unstated — so `thumb-freestanding-softfp` and `thumb-freestanding-soft` are
+    // two machines under one triple, told apart by what `machineFlags` adds to it.
+    //
+    // What has to stay unique is therefore the whole of what is said to clang, since two rows that
+    // said the identical thing would be one machine written down twice.
+    "and one distinct thing to say to clang, which the triple alone no longer is" in {
+      val said = Target.all.map(t => (t.triple, Toolchain.machineFlags(t)))
+
+      said.distinct.length shouldBe Target.all.length
+      Target.all.map(_.triple).distinct.length should be < Target.all.length
     }
 
     "names no target it cannot answer the ABI questions for" in {
@@ -77,8 +90,77 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
     // that is here on purpose rather than by the triple's default, and the test below is about it.
     "records which targets have floating registers to pass arguments in" in {
       Target.all.filterNot(_.hardFloat).map(_.name) shouldBe
-        List("riscv64-freestanding", "thumb-freestanding-softfp", "thumbv6m-freestanding",
+        List("riscv64-freestanding", "thumb-freestanding-softfp", "thumb-freestanding-soft",
+          "thumbv6m-freestanding", "thumbv7m-freestanding", "thumbv7em-freestanding-soft",
           "riscv32-freestanding")
+    }
+
+    // A *different* question from the one above, and the list is deliberately not the same list:
+    // `softFloat` is where a `double` travels on the way into a call, and this is whether there is a
+    // unit at all. `thumb-freestanding-softfp` is the row that separates them — soft-float convention
+    // over an `fpv5-d16` that is there and used for arithmetic.
+    "records which targets have no floating-point unit at all, which is not the same question" in {
+      Target.all.filter(_.noFpu).map(_.name) shouldBe
+        List("riscv64-freestanding", "thumb-freestanding-soft", "thumbv6m-freestanding",
+          "thumbv7m-freestanding", "thumbv7em-freestanding-soft", "riscv32-freestanding")
+
+      Target.thumbFreestandingSoftfp.softFloat shouldBe true
+      Target.thumbFreestandingSoftfp.noFpu shouldBe false
+    }
+
+    // The flag is Arm's because Arm is where the triple is silent. RISC-V says it in the triple --
+    // `riscv32-unknown-elf` is RV32IMAC and has no F extension to turn off -- so a row that is
+    // `noFpu` there is told to clang by its name alone and gets nothing extra.
+    "says -mfpu=none to clang for a Thumb machine with no unit, and for nothing else" in {
+      for t <- Target.all do
+        withClue(t.name) {
+          Toolchain.machineFlags(t) shouldBe
+            (if t.noFpu && t.cpu == Cpu.Thumb then List("-mfpu=none") else Nil)
+        }
+
+      Toolchain.machineFlags(Target.riscv32Freestanding) shouldBe empty
+      Toolchain.machineFlags(Target.thumbFreestandingSoftfp) shouldBe empty
+    }
+
+    // The `softfp` row and the `soft` row are one triple and two machines, which is the shape this
+    // registry has no other example of -- and a sibling that differs only in a suffix is exactly what
+    // somebody tidies away. `AbiAgainstClangTests` would then go on measuring whatever was left and
+    // stay green about it, because each row is right *separately*; nothing but this says the pair is
+    // deliberate.
+    "keeps the softfp row and the soft row apart on the unit, sharing everything else" in {
+      val softfp = Target.thumbFreestandingSoftfp
+      val soft   = Target.thumbFreestandingSoft
+
+      soft.triple shouldBe softfp.triple
+
+      softfp.noFpu shouldBe false
+      soft.noFpu shouldBe true
+
+      Toolchain.machineFlags(soft) should contain("-mfpu=none")
+      Toolchain.machineFlags(softfp) shouldBe empty
+
+      (soft.cpu, soft.os, soft.vaList, soft.vaListBytes, soft.softFloat, soft.shortEnums) shouldBe
+        (softfp.cpu, softfp.os, softfp.vaList, softfp.vaListBytes, softfp.softFloat,
+          softfp.shortEnums)
+    }
+
+    // Armv7-M is the half of card 0106 that needed no flag at all: the architecture has no unit, so
+    // `thumbv7m-none-eabi` already describes an FPU-less machine. It is a row rather than a reuse of
+    // the Armv6-M one because a real project reads its own configuration and not the triple --
+    // `CONFIG_CPU_CORTEX_M3` says Armv7-M and its inline assembly uses `BASEPRI`, while CMSIS reading
+    // a v6-M triple supplies an intrinsic set that has no `__get_BASEPRI`.
+    "gives Armv7-M a row of its own rather than aiming Armv6-M at a Cortex-M3" in {
+      val m3 = Target.thumbv7mFreestanding
+      val m0 = Target.thumbv6mFreestanding
+
+      m3.triple shouldBe "thumbv7m-none-eabi"
+      m0.triple shouldBe "thumbv6m-none-eabi"
+
+      m3.noFpu shouldBe true
+      m0.noFpu shouldBe true
+
+      (m3.cpu, m3.os, m3.vaList, m3.vaListBytes, m3.softFloat, m3.shortEnums) shouldBe
+        (m0.cpu, m0.os, m0.vaList, m0.vaListBytes, m0.softFloat, m0.shortEnums)
     }
 
     // The two Thumb targets are one machine under two calling conventions, and the pair exists so
@@ -140,8 +222,11 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
           "riscv64-freestanding",
           "thumb-freestanding",
           "thumb-freestanding-softfp",
+          "thumb-freestanding-soft",
           "thumbv6m-freestanding",
+          "thumbv7m-freestanding",
           "thumbv7em-freestanding",
+          "thumbv7em-freestanding-soft",
           "riscv32-freestanding"
         )
     }
