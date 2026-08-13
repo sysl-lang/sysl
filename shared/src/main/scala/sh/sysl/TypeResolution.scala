@@ -557,7 +557,7 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
    * generic body, exactly as an array length written over one does — there is no argument yet, and
    * the tree that walk builds is discarded.
    */
-  private def valueArg(ref: TypeRef, ty: Type, subst: Map[String, Type]): Type = {
+  protected def valueArg(ref: TypeRef, ty: Type, subst: Map[String, Type]): Type = {
     val written = ref match
       case ValueArgType(e)      => Some(e)
       case NamedType(name, Nil) => Some(Ident(name))

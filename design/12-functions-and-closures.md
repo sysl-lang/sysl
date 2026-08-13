@@ -1156,45 +1156,53 @@ being unusable as a callback, however completely the context described the one w
 written once over `*T` could not be handed to `qsort`, and a program needing it wrote a concrete copy
 per element type.
 
-**What this does NOT reach is the `void *userdata` pattern**, and the boundary is worth stating
-because it is the case a reader will assume is covered. Every C interface that calls back pairs the
-pointer with an untyped `void *`, and a trampoline for one has the signature C fixed — `(*u8, Event)
--> bool`. The state type appears nowhere in it, so there is nothing for the expected type to solve,
-and such a trampoline is refused by the very rule below about a parameter the signature does not
-mention. Recovering the state means a `ptr_cast` from `*u8`, which is a promise rather than a
-deduction.
-
-**"A concrete trampoline per state type is still what that pattern takes" stood here, and it is too
-strong.** What the rule forbids is a trampoline whose *signature* hides the type — and the signature
-is the author's to choose. Write it over `*T` rather than `*u8`, name its address in a `val` whose
-type mentions `T`, and cast the **function pointer** at the call instead of casting inside the body:
+**Where the signature does not mention the parameter, the arguments are written: `&f[T]`.** This is
+the `void *userdata` pattern, and it is the shape every C interface that calls back has — the
+interface fixes the signature to untyped pointers, so a trampoline for one is `(*u8, Event) -> bool`
+and the state type appears nowhere in it. There is nothing for the expected type to solve, and no
+annotation anywhere else would supply it, so the arguments are written where the address is taken:
 
 ```
-private compare[T: Ord](a: *T, b: *T) -> int = ...
+private compare[T: Ord](a: *u8, b: *u8) -> int
+    var x: *T = ptr_cast(a)
+    var y: *T = ptr_cast(b)
+    ...
 
 sort_libc[T: Ord](xs: []T)
-    val cmp: *extern(*T, *T) -> int = &compare
-
-    c_qsort(ptr_cast(as_mut_ptr(xs)), xs.len, sizeof(T), ptr_cast(cmp))
+    c_qsort(ptr_cast(as_mut_ptr(xs)), xs.len, sizeof(T), &compare[T])
 ```
 
-`guide/qsort` is written that way and is green, so one generic body does serve every element type.
-What the limit costs is therefore smaller and more specific than a copy per type: one extra
-`ptr_cast`, and a `val` that exists only because there is nowhere else to write the type.
-`10 § Open a` records that cost as the second case for explicit call-site type arguments — the case
-that item said it was waiting for.
+Recovering the state is still a `ptr_cast` from `*u8`, which is a promise rather than a deduction —
+that is C's shape and nothing here changes it. What is no longer needed is the shape the *language*
+was forcing: a trampoline written over `*T` because it could not be written over `*u8`, a second
+`ptr_cast` of the function pointer, and a `val` whose only job was to be somewhere to put the type.
 
-**There is no written form, `&f[T]`, and that is a grammar fact rather than a preference.** `&f[T]`
-and `&xs[i]` are the same shape — a name, a bracket, something inside — and only knowing whether the
-name is a generic function separates them. The expected type carries the same information with no
-ambiguity, and is information the caller has anyway: a `*extern` is handed to something whose
-signature is already fixed. Written anyway, `&f[T]` is answered by a message saying where the
-arguments come from.
+**This is the one position in the language where type arguments are written**, and the deferral it
+closes is `10 § Open a`'s. The general form `f[T](x)` is still refused, because the annotation that
+stands in for it there is a word — the type on the binding that was going to be written anyway —
+while here it was a whole shape.
 
-**Two things it does not do.** Where nothing says what is wanted — `var f = &ident` — the arguments
-cannot be settled and the message asks for the type. And a type parameter the *signature* never
-mentions cannot be settled by anything in the expected type, which is an honest limit of reading an
-instantiation off a type rather than an omission.
+**The grammar gives `&f[T]` and `&xs[i]` one shape, and the *analyzer* is what separates them.** Both
+are a name, a bracket and something inside, so nothing at the parse decides it; the name resolving to
+a function declaration with no local shadowing it is what does, which is the same test every call
+form makes. A local shadowing the name keeps the ordinary indexed reading, so an author who wrote a
+subscript is never told about a feature they did not reach for. More than one thing in the brackets —
+`&f[A, B]` — was never an index at all, and needs no such test.
+
+**What the brackets can hold is the *expression* grammar's reading of a type**, which is what a
+subscript's contents are parsed as: a name, a qualified name, a name applied to arguments, `*T`,
+`&T`, a tuple, and an integer for a value parameter (`10 §9`). A slice, a `weak`, a `volatile` and a
+callable have spellings that grammar has no production for, so they cannot be written here. That is a
+hole in this form and not in the language — the annotated `val` reaches every one of them, and the
+diagnostic says so.
+
+**Written arguments are held to the declaration's bounds** exactly as inferred ones are. A bound is
+what the body was compiled against, and writing the argument out is not a way around it.
+
+**Two things it does not do.** Where nothing says what is wanted and nothing is written —
+`var f = &ident` — the arguments cannot be settled, and the message asks for either. And the written
+form is all-or-nothing: a declaration's arguments are written out in full or left entirely to the
+expected type, since a partial list would have to be positional and a reader would have to count.
 
 ### What has no address, and why
 
@@ -1357,11 +1365,12 @@ the refusal names the walk as the reason.
 
   *(An earlier draft of this section spelled it `va_arg[T](ap)` and called the type argument "the
   same position every other generic puts one in". There is no such position: `10` §2 gives square
-  brackets in an expression to indexing, and call-site type arguments are refused language-wide,
+  brackets in an expression to indexing, and type arguments are not written at a call,
   `10 § Open a`. What that leaves is context and an annotation, which is what the implementation
-  does. `va_arg` is the strongest customer that open item has — the annotation costs a whole
+  does. `va_arg` is the strongest customer that open item still has — the annotation costs a whole
   statement in the one position, a bare `print(va_arg(ap))`, where the surrounding expression says
-  nothing.)*
+  nothing. The item's other customer, a callback trampoline, was answered at an **address** rather
+  than at a call (`§6a`), which is a position `va_arg` does not have.)*
 - **`va_end(ap)`** finishes with it.
 - **`va_copy(dst, src)`** starts `dst` where `src` has reached, so a tail can be walked twice.
 

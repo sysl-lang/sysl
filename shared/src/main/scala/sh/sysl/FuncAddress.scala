@@ -165,7 +165,22 @@ trait FuncAddress extends CallCore {
         s"(${decl.tparams.map(t => s"'$t'").mkString(", ")}), and ${targs.length} " +
         s"${if targs.length == 1 then "was" else "were"} written")
 
-    val types = targs.map(t => rt(typeArgWritten(t)))
+    // A type **pack** stands for a list of types rather than one, so it has no written argument to
+    // stand against: `..A` is not an expression in any reading, and writing out one argument per
+    // element would be a different arity from the declaration's.
+    for tp <- decl.tparams if decl.tpacks(tp) do
+      err(s"'$tp' is a type pack, which stands for a list of types rather than one, so it has no " +
+        "written form here — a function taking one has its instantiation read off the type its " +
+        "address is wanted at")
+
+    // A declaration's parameters are one list and one argument position whichever kind each of them
+    // is (`10 §9`), so this walks the two lists together: a `const` parameter folds its argument to
+    // a value of the type the declaration wrote, and every other one resolves as a type.
+    val types = decl.tparams.zip(targs).map { (tp, e) =>
+      decl.tvalues.get(tp) match
+        case Some(vt) => at(e.pos)(valueArg(ValueArgType(e), recover(Type.Unknown)(rt(vt)), tsubst))
+        case None     => rt(typeArgWritten(e))
+    }
 
     // The same check a call makes on the arguments it solved (`checkBounds`). Writing them out does
     // not exempt them: a bound is what the body was compiled against, and an unsatisfied one would

@@ -154,6 +154,18 @@ class GenericFuncAddressTests extends AnyFreeSpec with Matchers with CodegenSupp
       ) shouldBe "1\n"
     }
 
+    // A declaration's parameters are one list and one argument position, whichever kind each is
+    // (`10 §9`), so a value parameter is written here like any other — and a value generic is the
+    // other declaration whose parameter can be absent from the signature entirely.
+    "a value argument" in {
+      run(
+        """scaled[const N: usize](x: i32) -> i32 = x * i32(N)
+          |
+          |var f = &scaled[3]
+          |print(f(4))""".stripMargin
+      ) shouldBe "12\n"
+    }
+
     // Writing them wins outright: the expected type is not consulted, which is what makes the form
     // usable at a parameter whose signature says nothing about `T`.
     "the written arguments beat an expected type that would have solved differently" in {
@@ -197,6 +209,17 @@ class GenericFuncAddressTests extends AnyFreeSpec with Matchers with CodegenSupp
           |var f = &pair[i32]
           |print(1)""".stripMargin
       ) should include("takes 2 type arguments")
+    }
+
+    // A pack stands for a list of types rather than one, so there is no written argument that could
+    // stand against it — writing the elements out would be a different arity from the declaration's.
+    "a type pack, which no written argument can stand against" in {
+      err(
+        """joined[..A: Display](p: *u8) -> i32 = 0
+          |
+          |var f = &joined[i32]
+          |print(1)""".stripMargin
+      ) should include("is a type pack")
     }
 
     "a name that is not generic" in {

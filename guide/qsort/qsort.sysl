@@ -19,38 +19,40 @@
 import sysl.slices.as_mut_ptr
 
 // The one C declaration. `size` is why an element type must have a known size and `cmp` is why it
-// must have a comparison; between them they are the whole of the interface.
-private extern "qsort" c_qsort(base: *u8, n: usize, size: usize, cmp: *u8)
+// must have a comparison; between them they are the whole of the interface. The comparison is
+// declared at the shape C fixed for it — two anonymous addresses and an `int` — so the declaration
+// says what a call through it passes, and nothing has to be cast into place at the call.
+private extern "qsort" c_qsort(base: *u8, n: usize, size: usize, cmp: *extern(*u8, *u8) -> int)
 
 // What C calls back, once per comparison. It has to answer C's convention — negative, zero,
 // positive — out of a relation that answers `bool`, so the two-comparison form is not clumsiness:
 // there is no third answer to read off a single `<`.
 //
-// **This is one function per element type, and that is the whole trick.** `qsort` is told the width
-// of an element and otherwise moves anonymous bytes; the only thing that knows what those bytes
-// *are* is this body, and it knows because the compiler made a copy of it for each `T` a program
-// sorted. A C program does the same thing by hand and writes the cast itself.
-private compare[T: Ord](a: *T, b: *T) -> int
-    if *a < *b then -1
-    else if *b < *a then 1
+// **The signature is C's and the casts are inside**, which is where a C programmer writes them: the
+// interface moves anonymous bytes and the only thing that knows what those bytes *are* is this
+// body. It knows because the compiler made a copy of it for each `T` a program sorted — one
+// function per element type, which is the whole trick.
+private compare[T: Ord](a: *u8, b: *u8) -> int
+    var x: *T = ptr_cast(a)
+    var y: *T = ptr_cast(b)
+
+    if *x < *y then -1
+    else if *y < *x then 1
     else 0
 end compare
 
 // The slice in order, sorted by the C library.
 //
-// **There is no written form for the instantiation** (`12 §6a`), so nothing here says `compare[T]`:
-// the type of the `val` is what settles which body `&compare` is the address of, and it settles it
-// out of the `T` this function was itself instantiated at. That is why the pointer is named on a line
-// of its own rather than written into the call — the call's own parameter is a `*u8`, which says
-// nothing about an element type and could not choose a body.
+// **`&compare[T]` is the address of one instantiation, with the argument written out** (`12 §6a`).
+// It has to be written here and cannot be inferred: `compare`'s signature is two `*u8` and an
+// `int`, so `T` appears nowhere in it, and neither the parameter it is passed to nor any annotation
+// that could be written elsewhere says which body is wanted. The `T` written is this function's
+// own, so one generic body serves every element type a program sorts.
 //
-// Both casts are unchecked and both are the price of the boundary. C takes a comparison as a
-// function pointer of one fixed shape and the data as `void *`, so the types stop at the call and
-// the two `sizeof`-shaped arguments are what carry the meaning across.
+// The remaining cast is unchecked and is the price of the boundary: C takes the data as `void *`,
+// so the element type stops at the call and `sizeof(T)` is what carries the width across.
 sort_libc[T: Ord](xs: []T)
     if xs.len < 2 then return
 
-    val cmp: *extern(*T, *T) -> int = &compare
-
-    c_qsort(ptr_cast(as_mut_ptr(xs)), xs.len, sizeof(T), ptr_cast(cmp))
+    c_qsort(ptr_cast(as_mut_ptr(xs)), xs.len, sizeof(T), &compare[T])
 end sort_libc

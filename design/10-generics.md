@@ -113,6 +113,8 @@ grammatical slot. The cost is that **explicit type arguments at a call site coll
 indexing** — `id[int](7)` in expression position reads as "index `id` by `int`, then call" — so
 call-site type arguments are not offered; inference (§4) supplies them instead, and the one
 case inference cannot reach is answered by annotating the result, not by a turbofish (`§ Open a`).
+The single exception is an **address**, `&f[T]`, where there is no indexing to collide with and no
+annotation that could stand in — `12 §6a` has the case that earned it.
 
 ## 3. Type arguments and construction
 
@@ -740,11 +742,24 @@ missing is a way to name a field list. That is the deriving question, and `14 §
 
 ## Open (not yet decided)
 
-- **a. Explicit call-site type arguments.** Inference (§4) plus result annotation covers every
-  case the implementation exercises, and the naive `id[int](7)` spelling collides with indexing
-  (§2). If explicit arguments prove necessary, they need a disambiguating syntax (a Rust-style
-  turbofish marker, or a rule that a type-argument list is only read in a call head). Deferred
-  until a real case cannot be served by inference.
+- **a. Explicit type arguments at a *call*.** Still open — but the case this item was waiting for
+  arrived and was answered somewhere narrower than a call, so read this alongside the settled half
+  below.
+
+  **Settled: at an address, the arguments are written — `&f[T]`, `&f[A, B]` (`12 §6a`).** That is
+  the one position in the language that takes them, and what earned it is the class of cases in the
+  paragraphs further down: a C callback's signature is fixed by the interface, so a trampoline
+  mentions its own type parameter nowhere and *no* annotation anywhere else can supply it. The
+  discrimination against indexing turned out not to need new syntax at all — the analyzer already
+  told `&f[T]` from `&xs[i]` by name resolution, in order to refuse the first by name, so what
+  changed was the action and not the decision.
+
+  **Still deferred: `f[T](x)` at a call head**, along with `buf[u8]()` and `va_arg[int](ap)`.
+  Inference (§4) plus result annotation covers those, and what stands in for the syntax there is a
+  word — the type on the binding that was going to be written anyway — rather than the whole shape
+  it was costing at an address. The naive spelling still collides with indexing (§2), and if it
+  proves necessary it needs the same decision as before: a turbofish marker, or a rule that a
+  type-argument list is only read in a call head.
 
   The reach for it is common enough to be worth a sentence of its own, because a **nullary**
   generic has no argument to be inferred from: `buf()` and `map()` are solved by what receives the
@@ -764,23 +779,25 @@ missing is a way to name a field list. That is the deriving question, and `14 §
   class of them, which is why the deferral stands — but it is the first place the missing syntax
   costs more than a word, and a second one would be the case this item is waiting for.
 
-  **The second one has arrived, and unlike the first it is a class.** A C routine that calls back
-  takes a comparison of one fixed shape — `int (*)(const void *, const void *)` — so the natural
-  trampoline is `compare[T](a: *u8, b: *u8) -> int`, with the cast inside it where a C programmer
-  would write one. That function **has no address**: `&compare` reads its instantiation off the
-  expected type (`12 §6a`), the expected type is `*extern(*u8, *u8) -> int`, and `T` is nowhere in
-  it. What gets written instead is a trampoline over `*T`, a second `ptr_cast` on the function
-  pointer itself, and a `val` whose only job is to be somewhere to write the type — which
-  `guide/qsort` does, and explains, because there is nowhere else to explain it.
+  **The second one arrived, and unlike the first it was a class — which is why it was built.** A C
+  routine that calls back takes a comparison of one fixed shape — `int (*)(const void *, const void
+  *)` — so the natural trampoline is `compare[T](a: *u8, b: *u8) -> int`, with the cast inside it
+  where a C programmer would write one. That function had **no address**: `&compare` reads its
+  instantiation off the expected type (`12 §6a`), the expected type is `*extern(*u8, *u8) -> int`,
+  and `T` is nowhere in it. What got written instead was a trampoline over `*T`, a second `ptr_cast`
+  on the function pointer itself, and a `val` whose only job was to be somewhere to write the type.
 
   It is a class rather than a position because **every** C callback has this shape: the interface
   fixes the signature and the payload type is the caller's, which is the sentence `12 §6a` opens
-  with. `qsort` is merely the smallest instance of it. The rule itself is written down — `12 §6a`
-  states the limit and gives the honest reason for it — so what the deferral costs is not ignorance
-  but the shape it forces: a trampoline written over `*T` because it may not be written over `*u8`,
-  and a `val` that exists only to be somewhere to put the type. Worth noting that `&` is the one position
-  where the ambiguity this deferral rests on does not arise: `&xs[i]` is the address of an
-  *element*, so `&f[T]` naming a function is not a second reading of anything.
+  with. `qsort` is merely the smallest instance of it — `bsearch`, `atexit`-style registries,
+  `sqlite3_exec`, and every `userdata` parameter in the org's own bindings are the same. So the cost
+  was not one awkward line but a shape imposed on every binding that would ever be written.
+
+  **`&` is also where the ambiguity this item rests on is cheapest to settle**, and that decided the
+  scope: `&xs[i]` is the address of an *element*, so `&f[T]` naming a function is not a second
+  reading of anything. The compiler was already making exactly that distinction, by name resolution,
+  to produce a bespoke refusal — so accepting the form cost no new syntax and no new decision, while
+  opening the call head would have settled a question this item deliberately keeps open.
 - **b. Members on generic types** — settled and implemented, and no longer open. A method or
   property is instantiated from the receiver's own type arguments, so `Box[int].get` and
   `Box[real].get` are two monomorphized functions exactly as two instantiations of a free generic
