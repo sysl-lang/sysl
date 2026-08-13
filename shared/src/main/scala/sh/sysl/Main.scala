@@ -511,6 +511,19 @@ private[sysl] def execute(cfg: Config): Int = {
   // machine should not reach the network, so a `dependencies` block is refused here rather than
   // acted on, and `buildLibrary` says so in as many words.
   if cfg.command == "build-lib" then
+    // Asked here rather than with the others below, because this return is above them and the reason
+    // they are asked applies squarely: `buildLibrary` compiles this package's C into the artifact,
+    // so a header it cannot find fails inside clang exactly as it would for a `build`.
+    //
+    // **Its own manifest and nothing else, which is narrower than every other command and is what
+    // this command actually does.** `Project.cSources(cfg.file)` is the whole of the C compiled here
+    // — a `--lib` source root's C is not, because that root's C belongs in that root's own artifact,
+    // and a `dependencies` block is refused outright a few lines into `buildLibrary` rather than
+    // fetched. Charging for either would be charging for a header this command will never open.
+    unmetHeaders(project, Nil, cfg.namedIncludes.keySet) match
+      case Some(err) => return fail(err)
+      case None      => ()
+
     return buildLibrary(cfg, sources, target, std, project,
                         collected.flatMap(_._2), decoded.collect { case Right(r) => r._1 }.flatten,
                         allocator)
@@ -565,7 +578,8 @@ private[sysl] def execute(cfg: Config): Int = {
   //
   // Asked only where C is going to be compiled. The requirement exists so that a tree's C compiles,
   // so a command that compiles none has nothing unmet — and refusing `emit-llvm` or `prove` over a
-  // path they would never open would be charging for something they do not do.
+  // path they would never open would be charging for something they do not do. `build-lib` compiles
+  // C too and is asked at its own return above, for its own manifest only.
   //
   // A `--lib` **source root** is asked too, and is the one road that used to fall through. A package
   // reached through `dependencies` is checked because its manifest came back with the graph, and one

@@ -530,6 +530,101 @@ class SearchPathTests extends LibraryCliSupport {
     }
   }
 
+  /** The same declaration on the fourth road: `build-lib`, which compiles the package's C into the
+   * artifact and so is asked the same question.
+   *
+   * **This is the road a package is packaged by**, which is what makes it worth its own block: the
+   * command whose whole job is turning a declaring package into something distributable was the one
+   * that never read the declaration. What answered instead was clang's `'probe.h' file not found`,
+   * out of the package's own shim.
+   *
+   * The bare-path case is the half that matters more. Everywhere else a bare `--include-path`
+   * reaches the toolchain and is deliberately not an answer; here it was one in effect, because
+   * nothing asked — so a requirement could be met by accident on the machine that built the artifact
+   * and go unenforced everywhere else, which is the state a declaration exists to make impossible.
+   */
+  "a declaring package built into an artifact" - {
+
+    /** The declaring package with no `main`, which is the shape `build-lib` takes: a library rather
+     * than a program, with a shim that reaches the probe's header.
+     */
+    def declaringLibrary(prefix: String): String = {
+      val root = createTempDirectory(prefix)
+
+      createDirectories(s"$root/m")
+      writeFile(s"$root/package.hocon",
+        """package { name = "declared" }
+          |requires {
+          |  headers { probe = "the probe library's headers, wherever this machine keeps them" }
+          |}
+          |""".stripMargin)
+      writeFile(s"$root/m/m.sysl",
+        """module m
+          |@link("probe")
+          |
+          |extern "shim_doubled" c_doubled() -> int
+          |
+          |doubled() -> int = c_doubled()
+          |""".stripMargin)
+      writeFile(s"$root/m/shim.c",
+        "#include <probe.h>\nint shim_doubled(void) { return probe_answer() * 2; }\n")
+      root
+    }
+
+    def artifact(name: String): String =
+      s"${createTempDirectory(name)}/declared.syslib"
+
+    "is refused by name rather than by a header the reader has never heard of" in {
+      guard()
+
+      val (status, notes) =
+        diagnostics(Config(command = "build-lib", file = declaringLibrary("sysl-artifact-"),
+          output = Some(artifact("sysl-artifact-out-"))))
+
+      status should not be 0
+      notes should include("'probe'")
+      notes should include("wherever this machine keeps them")
+      notes should include("--include-path probe=")
+      notes should not include "probe.h"
+    }
+
+    // The half this command was actually failing at: a bare path compiles the shim perfectly well,
+    // so before the check was asked here the artifact was written and nobody learned anything.
+    "is not answered by a bare --include-path, as on every other command" in {
+      val (dir, _) = guard()
+
+      val (status, notes) =
+        diagnostics(Config(command = "build-lib", file = declaringLibrary("sysl-artifact-bare-"),
+          includePaths = List(dir), output = Some(artifact("sysl-artifact-bare-out-"))))
+
+      status should not be 0
+      notes should include("'probe'")
+    }
+
+    "and writes the artifact once the named form answers it" in {
+      val (dir, _) = guard()
+
+      succeeds(Config(command = "build-lib", file = declaringLibrary("sysl-artifact-named-"),
+        includePaths = List(dir), namedIncludes = Map("probe" -> dir),
+        output = Some(artifact("sysl-artifact-named-out-"))))
+    }
+
+    // **Its own manifest and nothing else, which is narrower than every other command and is
+    // deliberate.** `build-lib` compiles the C of the tree it was handed; a `--lib` source root's C
+    // is not compiled here at all, because it belongs in that root's own artifact. Charging this
+    // command for that root's declaration would refuse a build over a header it never opens.
+    "while a declaring --lib source root is not charged to it, whose C this never compiles" in {
+      val lib  = declaringLibrary("sysl-artifact-dep-")
+      val root = createTempDirectory("sysl-artifact-consumer-")
+
+      createDirectories(s"$root/c")
+      writeFile(s"$root/c/c.sysl", "module c\n\nask() -> int = m.doubled()\n")
+
+      succeeds(Config(command = "build-lib", file = root, libs = List(lib),
+        output = Some(artifact("sysl-artifact-consumer-out-"))))
+    }
+  }
+
   private def parsed(args: String*): Config =
     parseArgs(args).getOrElse(fail(s"these arguments did not parse: ${args.mkString(" ")}"))
 }

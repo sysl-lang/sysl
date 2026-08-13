@@ -339,6 +339,20 @@ declaration unenforceable — a consumer would satisfy it by accident and never 
 command that compiles none — `emit-llvm`, `prove` — has nothing unmet, and charging it for a path it
 would never open would turn a requirement about the C into a requirement about the package.
 
+**`build-lib` compiles C, so it is asked — and it is asked for its own manifest and nothing else.**
+That is the narrowest scope of any command here, and it follows from the same rule rather than being
+an exception to it: `build-lib` compiles the C of the tree it was handed and no other, because a
+`--lib` source root's C belongs in *that* root's own artifact and a `dependencies` block is refused
+here rather than fetched. So a root's declaration is not charged to a library built against it —
+that build never opens the header, and the root will be asked for it when it is built itself.
+
+This is the road a package is *packaged* by, which is why leaving it out mattered more than the
+count of commands suggests. Until it was asked, the one command whose whole job is turning a
+declaring package into something distributable answered with `'lwip/tcp.h' file not found` out of the
+package's own shim — and worse, a **bare** `--include-path` satisfied it in effect, because nothing
+was asking. A requirement that can be met by accident on the machine that built the artifact and
+nowhere else is the exact state the paragraph above exists to make impossible.
+
 **It is asked on every road a package reaches a build by, and the three do not each need the same
 thing from it.** A package named in `dependencies` arrives with its manifest as part of the graph and
 is asked. One handed over as a **`.syslib`** is asked nothing and needs nothing: an artifact carries
