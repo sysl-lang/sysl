@@ -804,27 +804,42 @@ for a document is harmless. Here it turns every declaration below it into an ill
 diagnostic the author would get is about something incomplete further up — their missing half never
 enters the story. Refused at the line that opened it, which is the line to go and look at.
 
-### `sysl doc` renders one, and what it puts back is smaller than it sounds
+### `weave` and `tangle` are the two halves, and sysl was already doing one of them
 
-A `.lsysl` file is already Markdown, so the obvious objection to a renderer is that it has nothing to
-do. What it has to do is restore the one thing the format gives up: **the program is marked by an
-indent**, which is Markdown's own spelling of a code block and is exactly what makes the file
-readable unrendered — and an indented block carries no *language*. Nothing can highlight it, and
-nothing scanning for the code can find it. `sysl doc` re-fences each block as ` ```sysl ` and passes
-prose, illustrations and heading levels through as written. It is not a formatter and has no opinion
-about anybody's Markdown.
+**A literate system has two operations, and they are named after what they do to the source.**
+`tangle` extracts the program; `weave` renders the document. A sysl build has been tangling since the
+format existed — that is what `Literate.tangle` is — so what the commands add is a way to *ask* for
+each half by name.
 
-It is a **source-level** command and asks for no target, no standard module and no library, which is
+`sysl tangle` prints the program with the prose stripped. It is worth a command because it answers
+the question a misbehaving literate file always raises — a block indented that should not have been,
+a fence that swallowed a function — which is **what did the compiler actually read**, and which had
+no way to be asked. It also hands the program to anything that does not know the format.
+
+`sysl weave` writes an HTML document. A `.lsysl` file is already Markdown, so the obvious objection
+is that a renderer has nothing to do — and the answer is the one thing the format gives up: **the
+program is marked by an indent**, which is Markdown's own spelling of a code block and exactly what
+makes the file readable unrendered, but an indented block carries no *language*. Nothing can
+highlight it and nothing scanning for the code can find it.
+
+**What restores it is a setting rather than a rewrite.** The renderer is told that an indented block
+is sysl, so the block arrives at the highlighter already knowing what it is, and the source reaches
+the renderer **verbatim** — nothing re-fences a block or edits a line on the way past. The document
+that comes out carries its own styling, its code coloured by the same grammar the site uses, and its
+mathematics set by KaTeX from a linked script.
+
+Weaving is a **source-level** job and asks for no target, no standard module and no library, which is
 the whole of why it is usable: a package's prose is worth reading on a machine that could not build
-it. What it does share with a compilation is the *reading* — the same pass decides which lines are
-program — because a document that rendered happily out of a file the compiler refuses would be
+it. What it does share with a compilation is the *reading* — the file is tangled and the result
+discarded — because a document that wove cleanly out of a file the compiler refuses would be
 documentation of a program that does not exist.
 
-**The other product a `doc` command usually means — a page per module, generated from declarations
-and the comments above them — is not this, and is not built.** It cannot be yet, for a reason that
-has nothing to do with rendering: a comment here is lexical trivia, dropped by the lexer, reaching no
-tree. What that product needs first is a decision about whether a documentation comment is a
-*construct*, which is a question about the language.
+**The other product a documentation command usually means — a page per module, generated from
+declarations and the comments above them — is not this, and is not built.** It cannot be yet, for a
+reason that has nothing to do with rendering: a comment here is lexical trivia, dropped by the lexer,
+reaching no tree. What that product needs first is a decision about whether a documentation comment
+is a *construct*, which is a question about the language. Leaving `doc` unclaimed is deliberate:
+that is the name a reader will eventually expect it under.
 
 ## 12. `@export` makes a definition C-callable
 
