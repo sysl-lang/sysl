@@ -27,7 +27,12 @@ trait FuncAddress extends CallCore {
    * spelling that meant a sysl callable in one slot and a C address in another would be a silent
    * choice between two representations that share nothing.
    */
-  protected def functionAddress(written: String, plain: String, expected: Option[Type] = None): TExpr = {
+  protected def functionAddress(
+      written: String,
+      plain: String,
+      expected: Option[Type] = None,
+      targs: List[Expr] = Nil,
+  ): TExpr = {
     val key  = overloadAddressed(written, plain, expected)
     val decl = funcDecls(key)
 
@@ -37,7 +42,13 @@ trait FuncAddress extends CallCore {
     // other. Refusing outright was too broad: it is what stopped a library offering a callback
     // helper at all, since a trampoline's state type belongs to the application rather than to the
     // binding, so every application had to hand-roll one and cast the userdata itself.
-    val instKey = if decl.tparams.isEmpty then key else instantiationFor(written, decl, expected)
+    //
+    // Where the arguments are *written*, they are what settles it, and the expected type is not
+    // consulted at all: `&f[T]` exists precisely for the signatures the expected type cannot solve.
+    val instKey =
+      if targs.nonEmpty then instantiationWritten(written, decl, targs)
+      else if decl.tparams.isEmpty then key
+      else instantiationFor(written, decl, expected)
 
     // A `...` is read relative to the last named argument, so a caller has to know where the named
     // ones stop. A `*extern` says only what it is called with, which is what makes it callable at
@@ -130,22 +141,91 @@ trait FuncAddress extends CallCore {
         s"${qn(key)}: *extern(${params.map(p => show(p._2)).mkString(", ")}) -> ${show(ret)}"
       case None => qn(key)
 
+  /** Which copy of a generic function this address names, **written out** — `&f[T]` (`12 §6a`).
+   *
+   * This is the one position in the language where type arguments are written rather than inferred,
+   * and it is narrow on purpose. What earns it is the shape every C callback has: the interface
+   * fixes the signature to untyped pointers and the payload type is the caller's, so a trampoline
+   * over `*u8` mentions its own type parameter nowhere and there is nothing for `instantiationFor`
+   * to read. The alternative that stood here was a trampoline written over `*T`, a `ptr_cast` of
+   * the *function pointer*, and a `val` whose only job was to be somewhere to write the type.
+   *
+   * The expected type is not consulted. Where both are present the written arguments win outright
+   * rather than being checked against it, because the resulting `*extern` is checked against the
+   * expected type anyway by whatever it is being passed to — a second check here would report the
+   * same mismatch in worse words.
+   */
+  private def instantiationWritten(written: String, decl: FuncDecl, targs: List[Expr]): String = {
+    if decl.tparams.isEmpty then
+      err(s"'$written' is not generic, so it has no type arguments to write — its address is " +
+        s"'&$written'")
+
+    if targs.length != decl.tparams.length then
+      err(s"'$written' takes ${quantity(decl.tparams.length, "type argument")} " +
+        s"(${decl.tparams.map(t => s"'$t'").mkString(", ")}), and ${targs.length} " +
+        s"${if targs.length == 1 then "was" else "were"} written")
+
+    val types = targs.map(t => rt(typeArgWritten(t)))
+
+    // The same check a call makes on the arguments it solved (`checkBounds`). Writing them out does
+    // not exempt them: a bound is what the body was compiled against, and an unsatisfied one would
+    // otherwise surface as a missing method inside a monomorphized body the reader never wrote.
+    checkBounds(decl, types)
+    instantiateFunc(decl, types)
+  }
+
+  /** A written type argument, as the *expression* grammar delivered it.
+   *
+   * `&f[T]` is parsed as a subscript, because a name followed by a bracket is a subscript
+   * everywhere else in the language and the parser is not the thing that knows what `f` is. So what
+   * arrives is an expression to be read back as the type it was written as, and the shapes that
+   * survive the round trip are the ones a type and an expression spell identically: a name, a
+   * qualified name, a name applied to arguments, `*T`, `&T`, a tuple, and an integer for a value
+   * parameter (`10 §9`).
+   *
+   * **The rest are refused by name rather than misread.** A slice, a `weak`, a `volatile` and a
+   * callable have spellings the expression grammar has no production for, so there is nothing here
+   * to recover them from. That is a hole in this form and not in the language: the annotated `val`
+   * this shortens still reaches every one of them, which is what the message says to write.
+   */
+  private def typeArgWritten(e: Expr): TypeRef = at(e.pos) {
+    e match
+      case Ident(n)                => NamedType(n)
+      case Unary("*", inner)       => PtrType(typeArgWritten(inner))
+      case Unary("&", inner)       => RefType(typeArgWritten(inner), sync = false)
+      case Tuple(parts)            => TupleType(parts.map(typeArgWritten))
+      case n: IntLit               => ValueArgType(n)
+      case Index(r, i)             => NamedType(typeArgName(r), List(typeArgWritten(i)))
+      case TypeArgs(r, as)         => NamedType(typeArgName(r), as.map(typeArgWritten))
+      case f: Field                => NamedType(typeArgName(f))
+      case _                       =>
+        err("this is not a type — what is written after '&f' is a type argument, and the brackets " +
+          "read it out of the expression grammar, so a slice, a 'weak', a 'volatile' and a " +
+          "callable have no spelling here. Write the type on the binding instead: " +
+          "'var f: *extern(…) -> … = &…'")
+  }
+
+  /** The name a written type argument applies its own arguments to — `Box` in `Box[int]`, and the
+   * whole dotted path in `mod.Box[int]`, which is one name to the type grammar (`qualifiedName`).
+   */
+  private def typeArgName(e: Expr): String = e match
+    case Ident(n)    => n
+    case Field(r, n) => s"${typeArgName(r)}.$n"
+    case _           => err("this is not a type name, so it cannot be given type arguments")
+
   /** Which copy of a generic function this address names, read off the type the context wants.
    *
-   * There is no written form for the arguments and deliberately so: `&f[T]` cannot be told from
-   * `&xs[i]` by the grammar — both are a name, a bracket and something inside it — and only knowing
-   * whether the name is a generic function separates them. The expected type carries the same
-   * information without the ambiguity, and it is the information a caller has anyway: a `*extern`
-   * is being handed to something whose signature is already fixed.
-   *
-   * The match is against the **signature as declared**, so it solves exactly what a call site's
-   * arguments would. A parameter the signature does not mention cannot be solved, which is a real
-   * limit rather than an oversight — nothing in the expected type says what it should be.
+   * This is what serves every address whose arguments the signature *does* mention, which is most
+   * of them: the match is against the **signature as declared**, so it solves exactly what a call
+   * site's arguments would, and a `*extern` is handed to something whose signature is already
+   * fixed. A parameter the signature does not mention cannot be solved here — that is what the
+   * written form above is for, and the message below names it.
    */
   private def instantiationFor(written: String, decl: FuncDecl, expected: Option[Type]): String = {
     val want = expected.flatMap(cfnOf).getOrElse(
       err(s"'$written' is generic, so which copy of it this addresses depends on its type " +
-        s"arguments, and nothing here says what they are — write the type: " +
+        s"arguments, and nothing here says what they are — write them, as " +
+        s"'&$written[${decl.tparams.mkString(", ")}]', or write the type this is stored in, as " +
         s"'var f: *extern(…) -> … = &$written'"))
 
     if want.params.length != decl.params.length then
@@ -163,7 +243,8 @@ trait FuncAddress extends CallCore {
     if unsolved.nonEmpty then
       err(s"'$written' is generic, and the ${show(want)} wanted here does not say what " +
         s"${unsolved.map(t => s"'$t'").mkString(" or ")} should be — a type parameter the signature " +
-        "does not mention cannot be settled by the type of the address")
+        s"does not mention cannot be settled by the type of the address. Write it: " +
+        s"'&$written[${decl.tparams.mkString(", ")}]'")
 
     instantiateFunc(decl, decl.tparams.map(sub))
   }

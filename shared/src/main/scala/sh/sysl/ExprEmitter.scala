@@ -648,7 +648,7 @@ trait ExprEmitter extends ArithEmitter {
     // volatile load of the whole register — and out of the value otherwise. Which of those it is has
     // to be settled here rather than by the two cases below, because both of those take the address
     // of the **field**, and a bitfield has none (`15 §1`).
-    case e @ TField(receiver, index, _) if bitfieldOf(receiver.ty).isDefined =>
+    case TField(receiver, index, _) if bitfieldOf(receiver.ty).isDefined =>
       val ranges = bitfieldOf(receiver.ty).get
       val ct     = containerLlvm(ranges)
 

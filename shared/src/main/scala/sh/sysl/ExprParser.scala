@@ -213,7 +213,14 @@ trait ExprParser extends SyslParserBase {
    * caret belongs on the tail, not back at the start of the receiver.
    */
   protected lazy val postfixTail: PackratParser[Expr => Expr] =
-    here ~ (op("[") ~> expression <~ op("]")) ^^ { case p ~ idx => (e: Expr) => Index(e, idx).setPos(p) } |
+      // One thing in the brackets is a subscript; more than one never was — `xs[a, b]` was a parse
+      // error until this read it, so nothing that compiled before changes meaning here. What the
+      // comma buys is the *multi-argument* type list `&f[A, B]` (`12 §6a`), which the analyzer is
+      // the only thing entitled to accept, and it refuses this node everywhere else.
+      here ~ (op("[") ~> expression ~ rep(op(",") ~> expression) <~ op("]")) ^^ {
+        case p ~ (idx ~ Nil)  => (e: Expr) => Index(e, idx).setPos(p)
+        case p ~ (idx ~ more) => (e: Expr) => TypeArgs(e, idx :: more).setPos(p)
+      } |
       // **The position is taken after the dot, so a diagnostic points at the member rather than at
       // the punctuation.** Every message about a member — a missing one, a wrong arity, a receiver
       // that may not be written through — names the member, and a caret under the `.` sends the

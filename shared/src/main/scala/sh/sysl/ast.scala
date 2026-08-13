@@ -97,6 +97,19 @@ case class DefaultArg(owner: Option[String], value: Expr) extends Expr
 case class Index(receiver: Expr, index: Expr)   extends Expr
 case class Field(receiver: Expr, name: String)  extends Expr
 
+/** `f[A, B]` — brackets holding *more than one* thing, which is never an index.
+ *
+ * A subscript takes one index, so a comma inside the brackets is what tells the two readings apart
+ * without asking what the name is. It exists for the one place a list of types is written —
+ * `&f[A, B]`, the address of an instantiation (`12 §6a`) — and every other position refuses it.
+ *
+ * The single-argument form `&f[T]` has no comma to distinguish it and arrives as an `Index`, which
+ * the analyzer re-reads where the name is a generic function. That asymmetry is deliberate: it is
+ * the *analyzer* that decides between an index and a type-argument list, and this node only spares
+ * it the cases the grammar could never have built.
+ */
+case class TypeArgs(receiver: Expr, args: List[Expr]) extends Expr
+
 /** `T::Attr` — a type attribute (`16 §5`, `09 §2`): metadata a type exposes under a name, with `::`
  * rather than `.` because it belongs to the type itself, not to a value of it. `Age::First`,
  * `Day::Succ(d)`. The receiver is a type name; a bare `Attr` reads a value, and `Attr(args)` is a

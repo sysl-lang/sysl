@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 34
+  val Version: Int = 35
 
   private val Magic = "sysl-ast"
 
@@ -285,6 +285,7 @@ object AstCodec {
         case NamedArg(n, v)          => tok("narg"); sref(n); expr(v)
         case DefaultArg(o, v)        => tok("darg"); opt(o)(sref); expr(v)
         case Index(recv, i)          => tok("idx"); expr(recv); expr(i)
+        case TypeArgs(recv, as)      => tok("targs"); expr(recv); list(as)(expr)
         case Field(recv, n)          => tok("fld"); expr(recv); sref(n)
         case TypeAttr(recv, a)       => tok("tat"); expr(recv); sref(a)
         case LayoutOf(what, t)       => tok("lay"); sref(what); typ(t)
@@ -711,7 +712,8 @@ object AstCodec {
         case "call" => Call(expr(), list(expr()))
         case "narg" => NamedArg(sref(), expr())
         case "darg" => DefaultArg(opt(sref()), expr())
-        case "idx"  => Index(expr(), expr())
+        case "idx"   => Index(expr(), expr())
+        case "targs" => TypeArgs(expr(), list(expr()))
         case "fld"  => Field(expr(), sref())
         case "tat"  => TypeAttr(expr(), sref())
         case "lay"  => LayoutOf(sref(), typ())

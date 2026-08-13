@@ -565,18 +565,36 @@ trait ExprAnalysis
     case Unary("&", Ident(name)) if lookupOpt(name).isEmpty && !ownValueName(name) && funcKey(name).isDefined =>
       functionAddress(name, funcKey(name).get, expected)
 
-    // `&f[T]` — the spelling a reader arrives with, from a language that writes the arguments here.
-    // Without this the brackets read as an *index*, and the complaint is about `f` not being a value:
-    // true, unhelpful, and it sends the reader to `&f`, which on its own is a second error.
+    // `&f[T]` and `&f[A, B]` — the address of an *instantiation*, with the arguments written out
+    // (`12 §6a`). This is the one position in the language where type arguments are written rather
+    // than inferred, and what earns it is the shape every C callback has: the interface fixes the
+    // signature to untyped pointers, so a trampoline mentions its own type parameter nowhere and
+    // there is nothing for the expected type to solve.
     //
-    // The form is refused rather than supported because the grammar cannot tell it from `&xs[i]` —
-    // a name, a bracket, and something inside — and only knowing whether the name is a generic
-    // function separates the two (`12 §6a`).
-    case Unary("&", Index(Ident(name), _))
-        if lookupOpt(name).isEmpty && funcKey(name).exists(k => funcDecls.get(k).exists(_.tparams.nonEmpty)) =>
-      err(s"the type arguments of '$name' are not written here — an address reads them from the " +
-        s"type it is wanted at, so write 'var f: *extern(…) -> … = &$name'. The brackets after a " +
-        "name are an index, and there is nothing here to index")
+    // **The grammar gives this the same shape as `&xs[i]`, and the discrimination is here rather
+    // than there.** The name has to be a generic declaration and nothing nearer: a local shadowing
+    // one is an ordinary indexed value, and reading its author's subscript as a type argument would
+    // be worse than any message. That is the same shadowing test every call form above makes.
+    // The test is that the name is a *function*, not that it is a generic one: a function cannot be
+    // indexed, so there is no second reading to protect, and `&plain[i32]` is owed the message that
+    // `plain` has no type arguments rather than a general complaint about callables.
+    case Unary("&", Index(Ident(name), targ)) if lookupOpt(name).isEmpty && funcKey(name).isDefined =>
+      functionAddress(name, funcKey(name).get, expected, List(targ))
+
+    // More than one thing in the brackets was never an index, so this needs no shadowing test to be
+    // sure of the reading — only to say something useful about a name that is not a generic
+    // function, which `functionAddress` does with the declaration in hand.
+    case Unary("&", TypeArgs(Ident(name), targs)) if lookupOpt(name).isEmpty && funcKey(name).isDefined =>
+      functionAddress(name, funcKey(name).get, expected, targs)
+
+    // The same node anywhere else. A subscript takes one index, so what was written is a
+    // type-argument list — and `12 §6a` is the only place one may be written, which is what this
+    // says rather than complaining that a comma was unexpected.
+    case TypeArgs(_, args) =>
+      err(s"a subscript takes one index, and ${args.length} were written — a list of types in " +
+        "brackets is a type-argument list, and the only place one is written is at an address, as " +
+        "'&f[A, B]'. Everywhere else a generic's arguments are inferred, from the arguments at a " +
+        "call or from the type the result is read into")
 
     // A nested function's environment is the frame it was declared in (`12 §5a`), and an address is
     // a way of carrying it out of that frame — the same reason the name is not a value either.
