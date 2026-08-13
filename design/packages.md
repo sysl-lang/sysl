@@ -361,11 +361,28 @@ one needs neither a clang nor the library's headers. One given as a **`--lib` so
 manifest read for this and is asked exactly as a dependency is — the same package, the same
 declaration and the same sentence, whichever way it arrived.
 
-**Only the header requirements are read from a `--lib` root**, and that is a deliberate stopping
-point rather than as far as somebody got. `--lib` names a *source root*, which need not be a package
-at all; one that is not has nothing to declare here. Reading the rest of what a manifest can say is a
-larger question with a real cost — an allocator taken silently from a `--lib` root is the mixed heap
-`§ 13` exists to prevent — so it is left for a decision rather than arrived at by extension.
+**The header requirements and the allocator are read from a `--lib` root, and nothing else is.** That
+is a deliberate stopping point rather than as far as somebody got. `--lib` names a *source root*,
+which need not be a package at all; one that is not has nothing to declare here.
+
+The allocator was the open question this paragraph used to leave, and the argument against reading it
+was that an allocator taken silently from a `--lib` root is the mixed heap `§ 13` exists to prevent.
+**The measurement answered it the other way: not reading it is also silent, and its failure is the
+worse one**, because there is no moment at which anybody is told. Reached by coordinate the pair was
+adopted and reached as the same directory it was ignored, so one program allocated through two heaps
+— the kernel's objects out of its own and every string, `Buf` and box out of libc's — and only the
+`-v` line differed. `§ 13` makes the allocator a property of the *package*, so the road it arrived by
+was never the thing that should have decided it.
+
+**An artifact is checked rather than consulted, and that is not the same choice made twice.** A
+`.syslib`'s object half is already compiled against a pair, so there is nothing left to adopt; a
+mismatch is refused outright. That refusal is a physical constraint rather than a policy, which is why
+it does not settle what a *source* root should do — source has not been compiled yet, so adopting is
+available there exactly as it is for a coordinate.
+
+What is still not read is the rest of the manifest, and the reason is unchanged: a root's
+`dependencies` are not fetched, its capabilities are the program's own to state, and neither has the
+one-answer-per-program character that makes the allocator settle for everybody.
 
 Two things are deliberately absent. **A named path is not scoped to the package that asked for it**
 and reaches every C compilation exactly as a bare one does; scoping is arguably more correct and buys
@@ -598,6 +615,14 @@ The project's own manifest may declare one, which covers an application with its
 dependency that has one — a bare-metal program with an arena in its own C. It is folded in with the
 fetched packages and settled by the same rule, so a project and a dependency that disagree is the
 refusal above rather than a special case.
+
+**A `--lib` source root's declaration is folded in beside those two, so the road a package arrived by
+does not decide its heap.** This paragraph is a claim about the *package* — it brings a heap, and
+that settles the pair for everybody — and a package handed over as a directory is the same package as
+one named by a coordinate. Reading only the coordinate meant a build could adopt the pair or ignore
+it depending on which flag reached the same files, and the ignoring branch was silent: one program,
+two heaps, and nothing said at any point. `§ 8` has the argument that was made against reading it and
+why the measurement went the other way.
 
 **A library artifact records the pair it was built with, and a program that allocates another way
 refuses it.** A `.syslib`'s object half is compiled code: it calls the pair *by name*, so it is built

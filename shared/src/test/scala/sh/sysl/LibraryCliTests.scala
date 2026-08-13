@@ -160,6 +160,87 @@ class LibraryCliTests extends LibraryCliSupport {
     }
   }
 
+  /** The allocator a `--lib` **source root** declares, which is the program's (`packages.md § 13`).
+   *
+   * A package that brings its own heap settles the question for the whole program, and that is a
+   * property of the *package* rather than of the road it arrived by — so the same directory answers
+   * the same whether a build reaches it by coordinate or by this flag.
+   *
+   * **It used to answer only by coordinate**, and the disagreement was silent: the kernel's objects
+   * came out of its own heap and every sysl allocation in the same program out of libc's, with
+   * nothing said at any point. The `-v` line was the only place the two roads differed, and what it
+   * was predicting is a `free` of storage the other allocator owns.
+   *
+   * An **artifact** is checked rather than consulted, which is the case above this one and a
+   * different thing: its object half is already compiled against a pair, so there is nothing left to
+   * adopt and `LibraryArtifact.read` refuses one that disagrees.
+   */
+  "--lib pointed at a source root that names an allocator" - {
+
+    /** A library that declares a heap of its own, and allocates — a concatenation is the shortest
+     * thing that reaches the allocator through the runtime helpers rather than a program's own code.
+     */
+    def declaringRoot(alloc: String = "pvPortMalloc", free: String = "vPortFree",
+                      module: String = "heapy"): String = {
+      val root = rootOf(module, s"module $module\n\njoin(a: string, b: string) -> string = a + b\n")
+
+      writeFile(s"$root/package.hocon",
+        s"""package { name = "$module" }
+           |allocator {
+           |  alloc = "$alloc"
+           |  free  = "$free"
+           |}
+           |""".stripMargin)
+      root
+    }
+
+    "is the pair the whole program allocates through" in {
+      val ir = emitted(Config(command = "emit-llvm", file = program("print(heapy.join(\"a\", \"b\"))"),
+        libs = List(declaringRoot())))
+
+      ir should include("pvPortMalloc")
+      ir should include("vPortFree")
+    }
+
+    // The half that says the adoption really replaced libc's rather than being declared beside it.
+    // A program with two allocators in its IR is the mixed heap this exists to prevent, and it would
+    // satisfy the case above on its own.
+    "and libc's pair is then reached nowhere at all" in {
+      val ir = emitted(Config(command = "emit-llvm", file = program("print(heapy.join(\"a\", \"b\"))"),
+        libs = List(declaringRoot())))
+
+      symbols(ir, "declare") should not contain "malloc"
+      symbols(ir, "declare") should not contain "free"
+    }
+
+    // A source root need not be a package at all, which is most of what `--lib` is for, and one with
+    // no manifest has nothing to declare. The C default has to survive this change untouched.
+    "while a source root with no manifest leaves libc's pair in place" in {
+      val ir = emitted(Config(command = "emit-llvm", file = program("print(demo.double(21))"),
+        libs = List(libraryRoot())))
+
+      ir should include("malloc")
+    }
+
+    // Two heaps cannot be one program's, whichever roads they came by. This is `Allocator.choose`'s
+    // own rule, and the case is here to say that a root reaches it rather than bypassing it.
+    //
+    // **The two roots declare different modules on purpose.** Written with the same one they collide
+    // on `join` already declared, and the refusal this is asserting would be a duplicate declaration
+    // wearing its clothes — which is what the first draft of this case did.
+    "and two roots naming different pairs are refused rather than resolved by order" in {
+      refused(Config(command = "emit-llvm", file = program("print(1)"),
+        libs = List(declaringRoot(), declaringRoot("kmalloc", "kfree", module = "kheap"))))
+    }
+
+    // Agreement is not a conflict — the same pair twice is one pair, and refusing it would make a
+    // package unusable beside anything that shares its heap.
+    "while two roots naming the same pair agree" in {
+      succeeds(Config(command = "emit-llvm", file = program("print(1)"),
+        libs = List(declaringRoot(), declaringRoot(module = "alsoheapy"))))
+    }
+  }
+
   "--std-lib" - {
 
     "runs a program whose share of the standard module came from the artifact" in {

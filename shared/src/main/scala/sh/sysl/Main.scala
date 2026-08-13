@@ -427,6 +427,17 @@ private[sysl] def execute(cfg: Config): Int = {
         case Left(err) => return fail(err)
         case Right(d)  => d
 
+  // A library reaches a compilation two ways, and neither is a second kind of input — both end as
+  // **more modules**. Given as source its files carry the directory segments they were found under,
+  // exactly as the program's do. Given as an artifact it arrives already parsed. Which one a path
+  // names is read off the name, so a program that depends on a library need not know how it shipped.
+  //
+  // **Split here rather than where the two halves are read**, because the allocator below has to
+  // consult the source roots and is itself settled above the standard module. Splitting is a pure
+  // function of what was on the command line — no file is opened by it — so the only thing moving it
+  // costs is that the reader meets it earlier than the code that uses it most.
+  val (artifacts, roots) = cfg.libs.partition(LibraryArtifact.isArtifact)
+
   // The pair of C functions this whole program allocates through (`packages.md § 13`). A package that
   // brings its own heap says so, and saying so settles it for the program — which is the only shape
   // that can work, because there is one heap and whoever holds the last reference to something is who
@@ -437,8 +448,23 @@ private[sysl] def execute(cfg: Config): Int = {
   // The project's own declaration is folded in beside the fetched ones, so an application with its own
   // heap and no dependency that has one is answered by the same rule — and so is a **library** being
   // built into an artifact, whose own is the whole answer because it has no dependencies to consult.
+  //
+  // **And a `--lib` source root's, which is the third road and used to be the silent one.** § 13 makes
+  // this a property of the *package* rather than of how the package was reached, so a package that
+  // brings its own heap brings it whichever way a build names it. Reached by coordinate it was
+  // adopted; handed over as the same directory it was ignored, and what shipped was one program with
+  // two heaps and nothing said about it at any point.
+  //
+  // An **artifact** is not consulted here and is not an omission: its object half is already compiled
+  // against a pair, so there is nothing to adopt, and `LibraryArtifact.read` refuses one that does not
+  // match rather than quietly re-deciding. Source is the only form where adopting is a thing that can
+  // be done at all.
+  val fromRoots = libAllocators(roots) match
+    case Left(err)   => return fail(err)
+    case Right(pair) => pair
+
   val allocator = Allocator.choose(
-    project.allocator.map("this project" -> _).toList ::: fetched.allocators) match
+    project.allocator.map("this project" -> _).toList ::: fetched.allocators ::: fromRoots) match
     case Left(err) => return fail(err)
     case Right(a)  => a
 
@@ -466,12 +492,6 @@ private[sysl] def execute(cfg: Config): Int = {
   if cfg.command == "run" && !Target.host.contains(target) then
     return fail(s"'run' executes what it builds, and '${target.name}' is not this machine — " +
       s"use 'sysl build --target ${target.name}'")
-
-  // A library reaches a compilation two ways, and neither is a second kind of input — both end as
-  // **more modules**. Given as source its files carry the directory segments they were found under,
-  // exactly as the program's do. Given as an artifact it arrives already parsed. Which one a path
-  // names is read off the name, so a program that depends on a library need not know how it shipped.
-  val (artifacts, roots) = cfg.libs.partition(LibraryArtifact.isArtifact)
 
   // Only the metadata is read here. The object half stays in the file and reaches the linker as the
   // archive it already is — there is nothing to unwrap, nothing to write to a temporary, and nothing
@@ -565,7 +585,7 @@ private[sysl] def execute(cfg: Config): Int = {
     // Said even when it is libc's, because "which allocator is this program using" is a question with
     // an answer whatever the answer is, and one that is silent until a package changes it reads as a
     // setting that does not exist.
-    val who = (project.allocator.map("this project" -> _).toList ::: fetched.allocators)
+    val who = (project.allocator.map("this project" -> _).toList ::: fetched.allocators ::: fromRoots)
       .collectFirst { case (name, a) if a == allocator => name }
 
     trace(s"allocator: ${allocator.alloc} / ${allocator.free}" +
@@ -730,6 +750,34 @@ private def links(command: String): Boolean = command == "build" || command == "
  * dependency's does, and the alternative is silently dropping a requirement on the one path this
  * whole check exists to close.
  */
+/** The allocator each `--lib` **source root** declares, named by the root as the reader wrote it.
+ *
+ * `packages.md § 13` makes the allocator a property of the *package*: one that brings its own heap
+ * settles the question for the whole program, because there is one heap and whoever holds the last
+ * reference is who frees it. That is a claim about the package rather than about the road it arrived
+ * by, so a package reached as a directory answers exactly as the same package reached by coordinate.
+ *
+ * **Until this existed the two roads disagreed in silence**, which is the worst way for them to
+ * disagree: a coordinate adopted the pair and a source root ignored it, so one program allocated
+ * through two heaps and nothing said so at any point. Only the `-v` line differed, and the failure it
+ * predicts is a `free` of storage the other allocator owns.
+ *
+ * **An artifact is deliberately not here.** Its object half is already compiled against a pair, so
+ * there is nothing to adopt — `LibraryArtifact.read` refuses one that disagrees with the program
+ * rather than re-deciding, and that refusal is a physical constraint rather than a policy this could
+ * have shared.
+ *
+ * A root with no manifest has nothing to declare, exactly as for the header requirements beside this,
+ * and one whose manifest will not parse stops the build rather than being skipped.
+ */
+private def libAllocators(roots: List[String]): Either[String, List[(String, Allocator)]] =
+  roots.foldLeft[Either[String, List[(String, Allocator)]]](Right(Nil)) { (acc, root) =>
+    for
+      seen   <- acc
+      config <- readPackageConfig(root)
+    yield seen ::: config.allocator.map(root -> _).toList
+  }
+
 private def libHeaderNeeds(roots: List[String]): Either[String, List[HeaderNeed]] =
   roots.foldLeft[Either[String, List[HeaderNeed]]](Right(Nil)) { (acc, root) =>
     for
