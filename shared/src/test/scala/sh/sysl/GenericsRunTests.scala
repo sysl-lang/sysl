@@ -139,8 +139,8 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
    * ordinary call with "cannot infer the type argument 'T'".
    *
    * It needed both halves. `unify` never matched an array against a `[]T` parameter, so `T` stayed
-   * unbound; and once it was bound, the call path still had a `[3]int` in hand where `coerce` cannot
-   * help, because becoming a slice is something the *analysis* does and not a repair afterwards.
+   * unbound; and once it was bound, the call path still had a `[3]int` in hand at a position it had
+   * already been analyzed for, which is what the re-analysis exists to redo.
    */
   "an array where a slice is asked for" - {
     "a literal solves the element type and becomes the slice" in {
@@ -168,17 +168,15 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "0.25\n"
     }
 
-    // The rule the fix must not have widened: an array does not convert on its own, and `a[..]` is
-    // how one is written. A generic callee now reports that in the same terms a non-generic one
-    // does, where before it reported a failure to infer — a different message for the same rule.
-    "while a named array is refused exactly as a non-generic call refuses it" in {
-      val out = err("""gen[T](xs: []const T) -> int = int(xs.len)
-                      |var a = [1, 2, 3]
-                      |print(gen(a))
-                      |""".stripMargin)
-
-      out should include("'xs' of 'gen' is []const int, but [3]int was given")
-      out should not include "cannot infer"
+    // A **named** array goes the same way, which it did not when this group was written: the two
+    // halves get it to a solved `[]const int` parameter, and the coercion there views it. What is
+    // still being asserted is that the generic path arrives where the non-generic one does — the
+    // conversion itself is `ArrayClaimTests`'.
+    "and a named array of the same elements arrives at the same place" in {
+      run("""gen[T](xs: []const T) -> int = int(xs.len)
+            |var a = [1, 2, 3]
+            |print(gen(a))
+            |""".stripMargin) shouldBe "3\n"
     }
 
     "and the array parameter it could have been confused with still binds its length" in {
