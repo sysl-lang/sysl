@@ -416,6 +416,11 @@ read above: it is reached at its own address instead, because loading the aggreg
 out of it would read every register in the block. A whole-aggregate access is marked whenever the
 type holds a qualified field anywhere in it.
 
+A qualified **bitfield** is the same exception reached one level up, since a bitfield has no address
+of its own: the *container* is what is loaded and stored, at the receiver's address, so a read is one
+`load volatile` and a write one `load volatile` and one `store volatile` of it. `15 §1` states the
+rule and what the read-modify-write costs a driver.
+
 **A large aggregate is the other exception, and it is a whole lowering rather than one
 instruction.** Above `Layout.DirectBytes` — 128 bytes — a value is never a first-class LLVM value
 at all: it is built where it is going to live, copied with `llvm.memcpy`, read a field at a time
