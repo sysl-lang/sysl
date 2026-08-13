@@ -1008,10 +1008,13 @@ work:
   is what `bool` lowers to as well, so the two are layout-compatible and distinct types — the
   relationship `char` already has to `u32`. What remains open is **the maximum permitted `N`** (the
   back end stops at `2^23 - 1`, which is a toolchain fact and not a ruling — the language has never
-  said what a *program* should be allowed to want); what, if anything, should connect `u1` to `bool`
-  beyond that shared representation; and whether packed structs lay out an `i5` field in exactly 5
-  bits (the bitfield / hardware register payoff), since it is about a *field* rather than a
-  standalone value.
+  said what a *program* should be allowed to want); and what, if anything, should connect `u1` to
+  `bool` beyond that shared representation. ~~Whether packed structs lay out an `i5` field in exactly
+  5 bits~~ — **settled, and it does** (`15 §1`): a `@packed` struct whose fields all lower to
+  integers, one of them narrower than a byte, *is* one unsigned integer, and its fields are ranges of
+  it filled from the least significant bit upward in declaration order. The open family did the work
+  C needs `int x : 3` for, so this needed no syntax of its own — which was the argument for asking
+  the question here rather than beside the attributes.
 - ~~**Storage declared at a required alignment.**~~ **Settled: `@align(n)` on a struct, and
   `@packed` beside it** (`15 §1`). They arrived together because they were always one question about
   two directions — `@packed` lowers a struct's alignment to one and removes the padding between its
@@ -1044,9 +1047,10 @@ work:
   begins on — is `@section("…")` (`15 §13`).** It arrived later and composes with this: a statically
   placed stack is written with both, which is the shape that shows the two are different axes.
 
-  The one thing the pair does **not** answer is the sub-byte case above: an `iN` field still occupies
-  its allocated width inside a `@packed` struct, so a hardware register's five-bit field is still
-  shifts and masks. That is the bitfield question, and it stays open on its own.
+  The sub-byte case above arrived **after** this pair and on top of it: inside `@packed`, an `iN`
+  field now occupies exactly N bits, so a hardware register's five-bit field is a field rather than
+  the shifts and masks a reader has to check by hand. `@align` composes with that too, since a
+  bitfield struct is still a struct and still begins somewhere.
 - ~~**Statement/block grammar:** which keywords open indented blocks (`then` / `do` / `=`).~~
   **Settled, and settled the same way for all of them:** an introducer is **required for a one-line
   body and optional before an indented block**, since the `Newline`+`Indent` the lexer emits already

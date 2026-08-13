@@ -171,7 +171,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    */
   protected def bitPlace(place: TExpr): Option[(TExpr, List[BitRange], BitRange)] = place match
     case TField(receiver, index, _) =>
-      bitfieldOf(receiver.ty).map(ranges => (receiver, ranges, ranges(index)))
+      bitfieldOf(receiver.ty).map(ranges => (receiver, ranges, bitRange(receiver.ty, index).get))
     case _ => None
 
   /** Where a write to this place goes: a bitfield's **container**, since the field itself has no

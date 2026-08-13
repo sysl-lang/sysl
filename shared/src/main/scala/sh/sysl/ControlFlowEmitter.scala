@@ -342,7 +342,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
         case Some(ranges) =>
           val c = freshTemp()
           emit(s"$c = extractvalue ${struct.llvm} $value, 0")
-          readBits(ranges, ranges(i), c)
+          readBits(ranges, ranges(struct.slot(i)), c)
         case None =>
           val fv = freshTemp()
           emit(s"$fv = extractvalue ${struct.llvm} $value, ${struct.slot(i)}")

@@ -252,7 +252,8 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     // field by field: the container is assembled as a value and stored once (`Bitfields`).
     case TStructNew(struct, args) if Bitfields.of(struct).isDefined =>
       val ranges = Bitfields.of(struct).get
-      val c      = buildBits(ranges, args.map(genExpr))
+      val vals   = args.zipWithIndex.map((a, i) => (genExpr(a), struct.fields(i)._2))
+      val c      = buildBits(ranges, vals.collect { case (v, ft) if !Type.zeroSized(ft) => v })
 
       emit(s"store ${containerLlvm(ranges)} $c, ptr $dest")
 

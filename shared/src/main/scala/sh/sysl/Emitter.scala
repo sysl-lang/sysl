@@ -233,6 +233,17 @@ trait Emitter {
     case s: Type.Struct => Bitfields.of(s)
     case _              => None
 
+  /** The range the field **written** `index`th occupies, or `None` where the receiver is not a
+   * bitfield struct.
+   *
+   * The two indices are not the same number, which is the whole reason this is a method: the ranges
+   * are cut from `stored`, and a zero-sized field is not stored. `struct { a: u3, u: unit, b: u5 }`
+   * writes `b` third and stores it second.
+   */
+  protected def bitRange(t: Type, index: Int): Option[BitRange] = Type.underlying(t) match
+    case s: Type.Struct => Bitfields.of(s).map(_(s.slot(index)))
+    case _              => None
+
   /** The container type a bitfield struct's fields are ranges of. */
   protected def containerLlvm(ranges: List[BitRange]): String = s"i${Bitfields.bits(ranges)}"
 

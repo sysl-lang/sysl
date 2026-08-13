@@ -223,7 +223,7 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
         // so they are read out of it once it has been lifted out — which is the same one read
         // whether the invariant relates one field or all of them.
         val r = container match
-          case Some((ranges, c)) => readBits(ranges, ranges(i), c)
+          case Some((ranges, c)) => readBits(ranges, ranges(struct.slot(i)), c)
           case None =>
             val t = freshTemp(); emit(s"$t = extractvalue ${struct.llvm} $v, ${struct.slot(i)}"); t
 

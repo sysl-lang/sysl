@@ -172,6 +172,24 @@ class BitfieldRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     run(src) shouldBe "1 5 9\n"
   }
 
+  // A `unit` field occupies nothing and is not stored, so the field a program writes third is the
+  // range stored second — the two indices differ, and every site that reaches a range by a written
+  // index has to say which it has.
+  "a zero-sized field is written and occupies no bits" in {
+    val src =
+      """|@packed
+         |struct Odd
+         |    a: u3
+         |    u: unit
+         |    b: u5
+         |var o = Odd(5, (), 20)
+         |o.b = 9
+         |o match
+         |    Odd(x, _, y) -> print(sizeof(Odd), x, y)""".stripMargin
+
+    run(src) shouldBe "1 5 9\n"
+  }
+
   "an invariant sees the fields it relates" in {
     val src =
       """|@packed

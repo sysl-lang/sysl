@@ -598,11 +598,13 @@ trait ExprEmitter extends ArithEmitter {
 
     // A bitfield struct is one integer, so it is built by or-ing every field into place rather than
     // inserting each into a slot of its own — and the container then goes into the single slot the
-    // emitted aggregate has (`Bitfields`). No field of one is zero-sized, since every field of one
-    // is an integer, so the arguments and the ranges line up one for one.
+    // emitted aggregate has (`Bitfields`). The arguments are still evaluated in written order, a
+    // zero-sized one included: it contributes no bits and is not a reason to skip whatever computing
+    // it does.
     case TStructNew(struct, args) if Bitfields.of(struct).isDefined =>
       val ranges = Bitfields.of(struct).get
-      val c      = buildBits(ranges, args.map(genExpr))
+      val vals   = args.zipWithIndex.map((a, i) => (genExpr(a), struct.fields(i)._2))
+      val c      = buildBits(ranges, vals.collect { case (v, ft) if !Type.zeroSized(ft) => v })
       val r      = freshTemp()
 
       emit(s"$r = insertvalue ${struct.llvm} undef, ${containerLlvm(ranges)} $c, 0")
@@ -658,7 +660,7 @@ trait ExprEmitter extends ArithEmitter {
           val rv = genExpr(receiver)
           val t  = freshTemp(); emit(s"$t = extractvalue ${receiver.ty.llvm} $rv, 0"); t
 
-      readBits(ranges, ranges(index), c)
+      readBits(ranges, bitRange(receiver.ty, index).get, c)
 
     // A register is reached at its own address, because the ordinary lowering below would read the
     // whole block to get at one field of it — and reading a register block is not a way of reading

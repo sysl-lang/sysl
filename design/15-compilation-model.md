@@ -74,9 +74,61 @@ of one is entitled to assume the address is aligned. Reading and writing the fie
 those go through the struct, where the offset is known. Only the escaped address loses that, and it
 loses it arbitrarily far from the `&` that made it.
 
-**Sub-byte fields are not part of this.** Whether a `@packed` struct lays an `i5` field out in
-exactly five bits — the bitfield and hardware-register payoff — remains open in `00` §Open. Today an
-`iN` field occupies its allocated width wherever it sits, packed or not.
+### A bitfield struct is one integer
+
+**Inside `@packed`, an `iN` field occupies exactly N bits.** A `@packed` struct whose fields all
+lower to an integer, at least one of them narrower than a byte, **is** one unsigned integer as wide
+as their total rounded up to a whole byte — and its fields are ranges of that integer, filled from
+the **least significant bit upward in declaration order**, **straddling** byte boundaries freely.
+Outside `@packed` nothing changes, and neither does a packed struct whose every field is already a
+whole number of bytes: it occupied exactly those bits before.
+
+```
+@packed
+struct Ctrl
+    enable: u1                          -- bit 0
+    mode: u3                            -- bits 1..3
+    prescale: u4                        -- bits 4..7
+```
+
+**C leaves both of those rules to the implementation, and that is precisely why this is worth
+having.** It is why portable embedded C avoids bitfields and writes the shifts out by hand; pinning
+them makes the declaration a description of the register rather than a hint about it. No syntax was
+needed, because the open integer family (`00` §5) already does the work C needs `int x : 3` for.
+
+**The rule is stated over the integer's value and never over memory bytes.** Phrased the other way —
+"the low bits of byte 0" — it would be endianness-observable, which `00` §49 forbids. Phrased this
+way it costs nothing to honour: the container is emitted as an `iM`, so how it reaches memory is the
+target's ordinary byte order for an integer of that width, and nothing here asks the target anything.
+A wire format's byte order is a property of the protocol rather than of the CPU, so it stays with
+`sysl.encoding.binary`'s `get_u16_le` and the rest, where it is an operation instead of a type.
+
+**Every field of one has to be an integer**, and that is a floor rather than a simplification to be
+lifted later. Keeping the container a single integer is what makes the paragraph above statable, and
+it keeps a pointer out of the integer round trip that packing one would need — which loses the
+provenance the back end reasons about. **The composition path is nesting**, and it costs nothing: a
+bitfield struct is a leaf, and an outer `@packed` struct lays one out as an ordinary field of its
+size, so `{p: *u8, bits: Flags}` is how `{p: *u8, a: u3}` is written. A `bool` is not an integer
+here — its storage is a byte and its representation a bit, so admitting it would make one type mean
+two widths; a flag is a `u1`. A **simple enum** is one, and is the spelling a mode field wants.
+
+**A bitfield may not be `volatile`.** A sub-word volatile access is a read-modify-write of the
+container where a device is entitled to one bus cycle, and a register with clear-on-read or
+write-1-to-clear semantics is corrupted by it. **The struct may still be volatile where it is held**,
+and that is the shape a register block wants: `ctrl: volatile Ctrl` makes `regs.ctrl.enable = true`
+one volatile read and one volatile write of the whole register, which is what C does. The two cycles
+a read-write register costs are not removable and are not what is being refused.
+
+**A bitfield has no address and no byte offset.** The first is the packed rule above, unchanged and a
+fortiori. The second is `offsetof`, which answers in bytes: a field starting at bit twelve is not at
+byte one, so it is refused rather than rounded down to the byte it begins in.
+
+**It crosses a C boundary as what it is — a packed struct of one integer — and not as a C bitfield
+struct.** Those are different things on some machines, and it is C's own doing: MSVC allocates
+`unsigned a:1` into a four-byte unit where the Itanium ABI packs it into a byte, so a C bitfield
+struct of the same fields need not even be the same *size* everywhere, let alone travel the same way.
+A sysl bitfield struct is one integer on every target, which is the guarantee this section is about,
+and that is what its calling convention is measured against.
 
 ## 2. Symbol names carry the module path
 
