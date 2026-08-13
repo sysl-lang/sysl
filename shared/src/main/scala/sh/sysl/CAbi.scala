@@ -7,9 +7,9 @@ import scala.collection.mutable
  * A register-width scalar crosses the boundary as itself: an `i32` is one register on every machine
  * sysl lowers for, and nothing has to be decided. An aggregate does not. Each ABI says which
  * registers a struct arrives in, and **LLVM applies no such rule of its own** — given a struct type
- * in a signature it assigns one register per element, which is not what any of the four conventions
- * asks for. So the declaration a call names has to be the *coerced* one the ABI specifies, and the
- * value converted into and out of that shape at the call.
+ * in a signature it assigns one register per element, which is not what a single one of the
+ * conventions below asks for. So the declaration a call names has to be the *coerced* one the ABI
+ * specifies, and the value converted into and out of that shape at the call.
  *
  * A scalar **narrower** than a register is the third case, and it was missing here until a `u8`
  * arrived at a C function as a different number (`extension` below says how). It needs no coercion —
@@ -72,9 +72,10 @@ object CAbi {
     /** An aggregate spread across registers, each its own parameter. */
     case Coerced(pieces: List[Arg])
 
-    /** An aggregate passed by address. `byval` is System V's: the bytes go on the stack and the
-     * pointer is how LLVM is told to put them there. The other three conventions pass a real
-     * pointer in a register, and marking one `byval` there would be a different call.
+    /** An aggregate passed by address. `byval` says the bytes go on the caller's stack and the
+     * pointer is how LLVM is told to put them there — System V's answer, and WebAssembly's. The rest
+     * pass a real pointer in a register, and marking one `byval` there would be a different call.
+     * `stackCopy` is where the two that ask for it are written down, alignment and all.
      */
     case Indirect(llvm: String, align: Int, byval: Boolean)
   }

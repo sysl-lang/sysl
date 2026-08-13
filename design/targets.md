@@ -631,6 +631,13 @@ the trees a library ships are now a per-target answer. `13 §8` has the rest.
 - **Cross-linking.** Building for another machine emits a correct module and then hands it to a
   `clang` that has no sysroot for it. That is the toolchain's problem to solve and sysl's to
   report clearly, not to work around.
+
+  **`wasm32-freestanding` is the first cross target that does link**, and it is not an exception to
+  that: it links because it needs no sysroot at all, having no libc to find one for. What it did need
+  was for the driver to be told so — `-nostdlib`, and an entry — which is the same "report clearly"
+  half of this item, met by saying the right thing to the linker rather than by supplying anything.
+  The row that would test the item properly is the WASI one, which has a sysroot and has not got it
+  here.
 - **Sub-architectures.** `-mcpu` / feature levels — a target today is a processor family and a
   system, and nothing yet needs finer.
 
