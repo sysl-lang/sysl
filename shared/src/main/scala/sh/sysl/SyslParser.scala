@@ -290,10 +290,15 @@ class SyslParser(val source: Source)
         case v ~ d                 => restrict(v, d)
       }) >> { d =>
         if !oneBinding(d) then
-          err(s"'${as.find(!places(_)).fold("@section(\"...\")")(_ => "@align(n)")}' is about one " +
-            "object — the boundary its storage begins on, or the section it sits in — and a binding " +
-            "that names several has no one object for it to be about; declare them on lines of " +
-            "their own")
+          // Two sentences rather than one about "an annotation", because each names the thing it is
+          // about — and because `@align`'s is quoted verbatim on the site, where a word inserted into
+          // the middle of a diagnostic breaks the page at the next version bump and not before.
+          if as.forall(aligns) then
+            err("'@align(n)' is the boundary one object's storage begins on, and a binding that " +
+              "names several has no one object for it to be about — declare them on lines of their own")
+          else
+            err("'@section(\"...\")' places one object, and a binding that names several has no one " +
+              "object for it to be about — declare them on lines of their own")
         else
           success(as.foldLeft(d) {
             case (s, Attr.Align(n))   => aligned(s, n)

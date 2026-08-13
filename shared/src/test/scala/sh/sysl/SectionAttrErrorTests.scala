@@ -77,8 +77,15 @@ class SectionAttrErrorTests extends AnyFreeSpec with CodegenSupport {
       err("@align(16)\n@section(\".data\")\nstruct S\n    a: int\n") should include("marks one binding")
     }
 
+    // Each attribute says this in its own words, and `@align`'s is left byte-for-byte as it was: it
+    // is quoted verbatim in an `error` block on the site, where a page checks a diagnostic by
+    // substring and a word inserted into the middle of one breaks it.
     "a binding that names several has no one object for either to be about" in {
-      err("@section(\".data\")\nstatic var a, b = 1, 2\nprint(a)") should include("about one object")
+      err("@section(\".data\")\nstatic var a, b = 1, 2\nprint(a)") should
+        include("'@section(\"...\")' places one object, and a binding that names several")
+      err("@align(16)\nstatic var a, b = 1, 2\nprint(a)") should
+        include("'@align(n)' is the boundary one object's storage begins on, and a binding that " +
+          "names several")
     }
   }
 

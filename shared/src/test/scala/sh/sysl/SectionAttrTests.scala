@@ -82,6 +82,14 @@ class SectionAttrTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       out should include("section \".text.boot\"")
     }
 
+    // A function declared inside another is hoisted to a definition of its own, so the placement has
+    // to travel with it — and this is where a driver writes the routine that must not be in flash
+    // while flash is being written.
+    "a nested function carries it too" in {
+      run("outer() -> int\n    @section(\"__TEXT,__mine\")\n    inner() -> int = 7\n    inner()\n\n" +
+        "print(outer())") shouldBe "7\n"
+    }
+
     // A generic is one declaration and many definitions, so the section is a property each of them
     // carries — which is what a placed helper instantiated at two types means.
     "an instantiation of a generic carries it" in {
