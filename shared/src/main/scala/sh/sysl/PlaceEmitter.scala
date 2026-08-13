@@ -182,9 +182,11 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
 
   /** What is in the place now — one load of the container and a shift for a bitfield.
    *
-   * **One load, whatever the field's width**, which is what makes a bitfield of a `volatile` struct
-   * a single bus read of the whole register rather than a sub-word access of part of it. The
-   * qualifier comes from the receiver, since the field itself may not carry one (`15 §1`).
+   * **One load, whatever the field's width**, which is what makes reading a bitfield register a
+   * single bus read of the whole register rather than a sub-word access of part of it. The qualifier
+   * is asked of the **receiver's storage** rather than of the field: every field of a bitfield struct
+   * is bits of one word, so `volatile` on any of them qualifies the container they share, which is
+   * what `Type.volatileIn` already answers by looking through a struct (`15 §1`).
    */
   protected def loadPlace(place: TExpr, p: String): String = bitPlace(place) match
     case Some((recv, ranges, r)) => readBits(ranges, r, loadContainer(ranges, recv, p))

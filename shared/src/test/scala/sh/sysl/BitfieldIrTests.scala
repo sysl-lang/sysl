@@ -84,6 +84,83 @@ class BitfieldIrTests extends AnyFreeSpec with CodegenSupport {
     out should include("or i24")
   }
 
+  // **`volatile` on a bitfield is a volatile access of the container**, which is what makes a
+  // `@packed` struct able to describe the hardware register the feature was asked for. The cost is
+  // stated rather than diagnosed: a write is a read-modify-write, so a register whose reads have side
+  // effects is corrupted by one and nothing here will say so (`15 §1`).
+  "a volatile bitfield is reached through its container" - {
+    val reg =
+      """|@packed
+         |struct Reg
+         |    enable: volatile u1
+         |    mode: volatile u3
+         |    prescale: volatile u4
+         |static val p: *Reg = ptr_cast(usize(4096))
+         |""".stripMargin
+
+    "reading one is a single volatile load of the whole container" in {
+      val out = defineOf(ir(reg + "read() -> u4 = p.prescale\nprint(read())"), "read")
+
+      out should include("load volatile i8")
+      out should include("lshr i8")
+      // The container is the struct's only member, so lifting the field out of a loaded aggregate
+      // would be a second way to reach the same byte — and an unqualified one.
+      out should not include "extractvalue"
+    }
+
+    "writing one is a volatile load and a volatile store, and nothing between them touches memory" in {
+      val out = defineOf(ir(reg + "go() = p.mode = 5\ngo()"), "go")
+
+      out should include("load volatile i8")
+      out should include("store volatile i8")
+      out should include("and i8")
+      out should include("or i8")
+      out.linesIterator.count(_.contains("load volatile")) shouldBe 1
+      out.linesIterator.count(_.contains("store volatile")) shouldBe 1
+    }
+
+    // Every field of a bitfield struct is bits of one word, so the qualifier is a property of the
+    // container rather than of one range of it: there is no such thing here as a shadow field, which
+    // is the thing per-field qualification buys in an ordinary register block.
+    "one qualified field makes every access to the container volatile" in {
+      val out = defineOf(ir("@packed\nstruct Mixed\n    flag: volatile u1\n    rest: u7\n" +
+        "static val p: *Mixed = ptr_cast(usize(4096))\nread() -> u7 = p.rest\nprint(read())"), "read")
+
+      out should include("load volatile i8")
+    }
+
+    // A simple enum is its underlying integer, so it is one load — and `15 §1` names it as the
+    // spelling a mode field wants, which is the whole reason it must be allowed to be volatile.
+    "a simple enum field may be one" in {
+      val src = "enum Mode: u3\n    Off\n    Slow\n    Fast\n" +
+        "@packed\nstruct Ctrl\n    enable: volatile u1\n    mode: volatile Mode\n    rest: volatile u4\n" +
+        "static val p: *Ctrl = ptr_cast(usize(4096))\ngo() = p.mode = Mode.Fast\ngo()"
+      val out = defineOf(ir(src), "go")
+
+      out should include("load volatile i8")
+      out should include("store volatile i8")
+    }
+
+    // The control for all four above, and it is the same program with the qualifier taken off. A
+    // small struct with no volatile field is still lifted out of a loaded value, which is what the
+    // qualifier changes: what the tests above are seeing is the qualifier, and not the shape of a
+    // pointer dereference.
+    "and the same struct with no qualified field is still read out of a loaded value" in {
+      val out = defineOf(ir(ctrl + "static val p: *Ctrl = ptr_cast(usize(4096))\n" +
+        "read() -> u4 = p.prescale\nprint(read())"), "read")
+
+      out should include("extractvalue %struct.Ctrl")
+      out should not include "volatile"
+    }
+
+    // The neighbouring case, and the reason the container rule is narrow: a packed struct of whole
+    // bytes is not a bitfield struct at all, so its registers are reached one field at a time.
+    "a packed struct of whole bytes is still a register block, one field at a time" in {
+      ir("@packed\nstruct Block\n    a: volatile u32\n    b: volatile u32\n" +
+        "var p: *Block = ptr_cast(4096usize)\np.a = 1u32\n") should include("store volatile i32")
+    }
+  }
+
   "construction ors the fields together rather than inserting each" in {
     val out = ir(odd + "print(o.b)")
 

@@ -42,37 +42,35 @@ class BitfieldErrorTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
-  "a bitfield may not be volatile" - {
-    "because reading one is a read-modify-write of the whole struct" in {
-      val e = err("@packed\nstruct Reg\n    a: volatile u3\n    b: u5\nval r = Reg(1, 2)\nprint(r.a)")
-
-      e should include("'Reg.a' is 'volatile' and is a bitfield")
-      e should include("single access a device is entitled to")
-    }
-    "and it says where the qualifier belongs instead" in {
-      err("@packed\nstruct Reg\n    a: volatile u3\n    b: u5\nval r = Reg(1, 2)\nprint(r.a)") should
-        include("'reg: volatile Reg'")
-    }
-    "a struct of whole bytes still takes one, which is what a register block is" in {
-      ir("@packed\nstruct Block\n    a: volatile u32\n    b: volatile u32\n" +
-        "var p: *Block = ptr_cast(4096usize)\np.a = 1u32\n") should include("store volatile")
-    }
-
-    // **And so a bitfield struct cannot be a volatile register at all today**, which is a corner the
-    // feature exposed rather than one it created: `volatile` qualifies *scalar* storage, so the
-    // struct cannot carry the qualifier either — not on a field, and not as a `*T` pointee. Both
-    // halves are pinned here so that whichever way the question is settled, the test says so.
-    "and the struct cannot carry the qualifier instead, by either route" in {
-      val field = err("@packed\nstruct Ctrl\n    a: u3\n    b: u5\n@packed\nstruct Regs\n" +
+  // A bitfield **may** be `volatile`, and `BitfieldIrTests` is where that is asserted. What stays
+  // refused is the qualifier on the struct, which is the answer this feature settled rather than a
+  // corner left over from it: `volatile` qualifies scalar storage, and a bitfield field is scalar
+  // storage, so nothing had to move for the register case to work. Qualifying the aggregate instead
+  // would take away what per-field qualification buys — a shadow field in the middle of a register
+  // block that stays ordinary.
+  "the struct itself still may not carry the qualifier, by either route" - {
+    "not as a field, and the message names the per-field spelling" in {
+      val e = err("@packed\nstruct Ctrl\n    a: u3\n    b: u5\n@packed\nstruct Regs\n" +
         "    ctrl: volatile Ctrl\nvar p: *Regs = ptr_cast(4096usize)\nprint(p.ctrl.a)")
 
-      field should include("'volatile Ctrl' is not a type")
-      field should include("qualified one field at a time")
-
+      e should include("'volatile Ctrl' is not a type")
+      e should include("qualified one field at a time")
+    }
+    "and not as a '*T' pointee" in {
       err("@packed\nstruct Ctrl\n    a: u3\n    b: u5\n" +
         "var p: *volatile Ctrl = ptr_cast(4096usize)\nprint(p.a)") should
         include("'volatile Ctrl' is not a type")
     }
+  }
+
+  // A **simple** enum is one integer and may be a volatile bitfield — `BitfieldIrTests` has it. A
+  // data enum is a tag beside a payload, so no single access reaches one whatever the source says.
+  "a data enum is not a register field" in {
+    val e = err("enum P\n    None\n    Some(x: int)\n@packed\nstruct Bad\n" +
+      "    a: volatile u3\n    b: volatile P\nprint(0)")
+
+    e should include("'volatile P' is not a type")
+    e should include("carries a payload beside its tag")
   }
 
   "a bitfield has no byte offset" - {

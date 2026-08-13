@@ -657,14 +657,16 @@ trait ExprEmitter extends ArithEmitter {
       // cases below make, made here because both of those take the address of the **field** and a
       // bitfield has none.
       //
-      // **There is no volatile case, and that is a gap rather than an omission.** `volatile`
-      // qualifies scalar storage only — `volatile Ctrl` is refused wherever it is written, a field
-      // and a `*T` pointee included — so no bitfield struct can be one, and the register block this
-      // feature was asked for cannot yet be written with it.
+      // **A container holding any `volatile` field is read at its address whatever its size**, so
+      // that reading a bitfield register is one volatile load of the register and not a load of the
+      // struct followed by an `extractvalue` (`15 §1`). `volatile` is a property of the container
+      // rather than of one range of it — every field of a bitfield struct is bits of the same word —
+      // which is why the qualifier is asked of the receiver's storage and not of the field.
+      val q = qualifier(receiver.placeTy)
       val c =
-        if hasAddress(receiver) && layout.indirect(receiver.ty) then
+        if hasAddress(receiver) && (layout.indirect(receiver.ty) || q.nonEmpty) then
           val p = address(receiver)
-          val t = freshTemp(); emit(s"$t = load $ct, ptr $p"); t
+          val t = freshTemp(); emit(s"$t = load$q $ct, ptr $p"); t
         else
           val rv = genExpr(receiver)
           val t  = freshTemp(); emit(s"$t = extractvalue ${receiver.ty.llvm} $rv, 0"); t
