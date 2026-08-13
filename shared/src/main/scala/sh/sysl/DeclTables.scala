@@ -515,6 +515,39 @@ trait DeclTables extends Reporting {
    */
   protected val pending = mutable.Queue.empty[(String, FuncDecl, Map[String, Type])]
 
+  /** Which lowered functions are a **generic's** body at some choice of type, by mangled name.
+   *
+   * An instantiation's name says nothing about where the choice came from: `lib$twice.Loud` is
+   * spelled from the declaration's module and the caller's type, and `Modules.moduleOf` reads only
+   * the first half. So what a module promised about its own conduct cannot be asked of an
+   * instantiation — the answer would hold the library to a type it never saw — and this is what lets
+   * the promise be asked of the generic's **own** body instead (`capabilities.md § A generic`).
+   */
+  protected val genericInsts = mutable.HashSet.empty[String]
+
+  /** Every generic body as the definition-time pass of `14 §4` analyzed it: each type parameter
+   * standing for itself, and each call through a bound naming the **trait's** member rather than
+   * whatever an instantiation would substitute.
+   *
+   * That is the one form in which a generic's own conduct can be read. `s.put(msg)` in it is
+   * `Sink.put`, which is no function the program links, while a call the body makes to something
+   * concrete keeps the name it always had — so what the declaring module wrote and what its caller
+   * chose are told apart by the names alone, before substitution makes them identical.
+   */
+  protected val abstractFuncs = mutable.ListBuffer.empty[TFunc]
+
+  /** What a call **inside** one of those bodies to another generic named, against the declaration it
+   * came from.
+   *
+   * A generic calling a generic instantiates it at whatever the outer one's parameters stand for, so
+   * the call reads `lib$grow.T` — a name no program ever links, since the walk that made it throws
+   * its instantiations away. Without this the call leads nowhere and a module could promise `no
+   * alloc` and then reach an allocator through a one-line generic of its own, which is the promise
+   * being worth nothing. With it the abstract body is what the name leads to, which is the same
+   * answer the rest of this gives one step further out.
+   */
+  protected val abstractInsts = mutable.HashMap.empty[String, String]
+
   /** Every enum variant name maps to the enums declaring one of that name, so a bare `Circle(5)` or
    * `Empty` resolves without qualification.
    *

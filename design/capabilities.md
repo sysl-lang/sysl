@@ -164,6 +164,43 @@ in, since a refusal then names a function the program might really arrive at. An
 followed at all: what a C function does is not this compiler's to know, and `capabilities.md` already
 allows an allocator-free module the `malloc` and `free` it provides itself through `*T`.
 
+### A generic answers for what it wrote, not for what its caller chose
+
+A generic has no execution until a type is chosen, and the module that chose it is not the module
+that declared it. So the promise is asked of **the body as written** — the one the definition-time
+pass of `14 §4` checks, with each type parameter standing for itself — and a monomorphized instance
+answers for nothing at all.
+
+That is not a redirection of blame, because the two kinds of call inside a generic body are
+different things:
+
+- a call to a **concrete** function is the declaring module's conduct at every instantiation, and is
+  charged to it;
+- a call **through a bound** is the caller's choice of type, and is charged to nobody here — the
+  module that made the choice is the one holding whatever `impl` answers it, and its own body is
+  walked exactly as any other.
+
+The distinction needs nothing recorded at a call site. In the body as written, a bound's call names
+the **trait's** member — a name no program links, since every implementation is somewhere else —
+while a concrete call keeps the name it always had. Substitution is what makes the two identical, so
+the answer is read before it happens.
+
+Three consequences follow, and each is the rule rather than an exception to it:
+
+- **A construction in the generic's own body is still the declaring module's.** `boxed[T](x: T) -> &T`
+  makes a reference at every instantiation, whatever `T` is, so an allocator-free module may not
+  write one.
+- **A trait's default body is the trait's module's**, for the same reason: it is written once, in the
+  trait's own file, and is the same at every implementing type.
+- **A generic calling a generic leads to the body that was written**, so a module cannot promise
+  `no alloc` and then reach an allocator through a one-line generic of its own.
+
+**None of this weakens the promise where it is load-bearing.** On a target that provides no heap
+every module is allocator-free with no clause written anywhere, so the module that chose the type is
+itself checked, and the walk from its body goes straight through the instance to whatever the type
+argument dragged in. What the rule gives up is a refusal aimed at the wrong file; it gives up no
+refusal.
+
 ## What `heap` gates, precisely
 
 **Requires `alloc`** (heap-backed):
@@ -207,29 +244,23 @@ allocator-free everywhere.
 
 ## Open sub-questions
 
-- **A GENERIC HAS NO EXECUTION UNTIL A TYPE IS CHOSEN, AND THE CHAPTER NEVER SAID WHOSE CONDUCT IT
-  IS.** Nothing above mentions generics, type parameters, bounds or monomorphization, and the
-  compiler's answer — a monomorphized instance is charged to the module that **declared** the generic
-  — is therefore neither stated nor decided here. It bites a real case: a `@no_alloc` library whose
-  generic calls through a bound is refused when a **hosted** program instantiates it at a type whose
-  `impl` allocates, although the library promised nothing about a type it never saw and the program's
-  own project config says a heap exists.
+- ~~**A generic has no execution until a type is chosen, and the chapter never said whose conduct it
+  is**~~ — **done**, and the rule is § *A generic answers for what it wrote* above. A generic is
+  charged from the body as written and an instance from nobody, which is what lets an allocator-free
+  library be instantiated at a type whose `impl` allocates.
 
-  **The clause is a promise a module makes about its own conduct** — *no execution that begins in this
-  module's code makes heap storage* — so on that reading the module that chose the type is the one
-  that answers for it. What makes the fix less than a redirection of blame is that the two kinds of
-  call inside a generic body are different: a call to a **concrete** function is the declaring
-  module's conduct at every instantiation, and only a call **through a bound** is the caller's choice.
-
-  Excusing the whole instance was tried and is **too blunt**, measured rather than reasoned: it lets
+  **Two attempts at it failed first, and both failed by asking the wrong tree.** Excusing the
+  instance alone lets
 
   ```
   thru[T](x: T, s: string) -> usize = cstring(s).len
   ```
 
-  compile on a target with no heap at all, because that call appears nowhere but inside the instance
-  body. After substitution a bound's call is indistinguishable from a direct one, so drawing the line
-  needs the instantiation to mark which calls came from a bound.
+  compile with no heap anywhere, because that call appears nowhere but inside an instance body;
+  marking which calls came from a bound was then priced as machinery on every call site. What was
+  missing from both is that the body **as written** already draws the line — a bound's call names the
+  trait's member and a concrete call does not — and that the definition-time pass had analyzed it and
+  thrown it away.
 
 
 - ~~**Per-module `os` / `posix` restriction**~~ — **done.** A module may assert `no os` or

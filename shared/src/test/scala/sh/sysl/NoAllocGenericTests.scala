@@ -69,11 +69,11 @@ class NoAllocGenericTests extends AnyFreeSpec with Matchers with RunSupport with
    * outright compile on a target that has no heap — which the section below is what catches.
    */
   "a generic's caller is who chose the type, so the caller is who answers for it" - {
-    "a hosted program may instantiate an allocator-free library's generic at a type that allocates" ignore {
+    "a hosted program may instantiate an allocator-free library's generic at a type that allocates" in {
       runOf("lib/lib.sysl" -> lib, "main.sysl" -> hosted) shouldBe "2\n"
     }
 
-    "and the same program compiles identically with the library's clause removed" ignore {
+    "and the same program compiles identically with the library's clause removed" in {
       runOf("lib/lib.sysl" -> lib.replace("@no_alloc\n", ""), "main.sysl" -> hosted) shouldBe "2\n"
     }
 
@@ -133,8 +133,53 @@ class NoAllocGenericTests extends AnyFreeSpec with Matchers with RunSupport with
       e.swap.getOrElse("") should include("makes heap storage")
     }
 
-    "while the same pair compiles for a target that has one" ignore {
+    "while the same pair compiles for a target that has one" in {
       compiledFor(Capability.core.toSet)("lib/lib.sysl" -> lib, "main.sysl" -> hosted).isRight shouldBe true
+    }
+
+    // The one-line way around the whole thing, if a generic's own calls were not followed: `f` makes
+    // no storage and reaches an allocator only through another generic, whose instantiation belongs
+    // to nobody. What answers it is that a call in a generic body to another generic leads to the
+    // **body that was written**, exactly as a call to a concrete function leads to its.
+    "a generic that reaches an allocator through another generic is still its own module's" in {
+      val e = errOf(
+        "lib/lib.sysl" ->
+          """module lib
+            |
+            |grow[T: Display](x: T) -> string = s"$x!"
+            |""".stripMargin,
+        "a/a.sysl" ->
+          """module a
+            |@no_alloc
+            |
+            |import lib.*
+            |
+            |f[U: Display](u: U) -> usize = grow(u).len
+            |""".stripMargin,
+        "main.sysl" -> "import a.*\n\nprint(f(1))\n",
+      )
+
+      e should include("a/a.sysl")
+    }
+
+    // A member of a generic type is a generic like any other, and what it constructs is the
+    // declaring module's at every instantiation, whoever chose the `T`.
+    "a generic type's own member is charged where it is written" in {
+      val e = errOf(
+        "lib/lib.sysl" ->
+          """module lib
+            |@no_alloc
+            |
+            |struct Cell[T]
+            |    v: T
+            |
+            |    boxed(self) -> &T = self.v
+            |""".stripMargin,
+        "main.sysl" -> "import lib.*\n\nprint(*Cell(3).boxed())\n",
+      )
+
+      e should include("a reference needs an allocator")
+      e should include("lib/lib.sysl")
     }
   }
 
@@ -177,7 +222,7 @@ class NoAllocGenericTests extends AnyFreeSpec with Matchers with RunSupport with
     // The type argument is itself an instantiation, so its members are emitted under the mangled
     // name — `Box.int.put` and not `Box.put`. The ownership test is over that mangling, so a nested
     // argument is recognised exactly as a plain one is.
-    "a type argument that is itself generic is still the caller's choice" ignore {
+    "a type argument that is itself generic is still the caller's choice" in {
       runOf(
         "lib/lib.sysl" ->
           """module lib
