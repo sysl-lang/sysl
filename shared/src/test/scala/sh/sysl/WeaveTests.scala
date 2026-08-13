@@ -160,7 +160,14 @@ class WeaveTests extends AnyFreeSpec with Matchers {
     // happen in a shipped build. It is pinned because the alternative to degrading is refusing to
     // write a document over the styling of its code, and that trade is not close.
     Grammar.sysl should not be empty
-    io.github.edadma.highlighter.Highlighter.fromJson(Grammar.sysl) shouldBe Symbol("right")
+    // Matched rather than asserted with `shouldBe Symbol("right")`, which is what this was. That
+    // matcher reaches `isRight` by runtime reflection, and Scala Native has none -- so on the
+    // platform the compiler actually ships as, it compared an `Either` against a `Symbol` and failed
+    // however well the grammar had parsed. Matching also gets the reason into the failure, which a
+    // boolean assertion throws away.
+    io.github.edadma.highlighter.Highlighter.fromJson(Grammar.sysl) match
+      case Right(_) => succeed
+      case Left(e)  => fail(e.toString)
   }
 
   "the document carries its own styling and stands on its own" in {
