@@ -162,21 +162,23 @@ trait GenericInstantiation extends ConstFolding {
         s
   }
 
-  /** The two things a **bitfield struct** may not hold, refused where the struct is built rather
+  /** The one thing a **bitfield struct** may not hold, refused where the struct is built rather
    * than where one of its fields is later read (`15 §1`, `Bitfields`).
    *
-   * A `@packed` struct with a field narrower than a byte is one integer, and both refusals follow
-   * from that sentence rather than from a policy laid over it.
+   * A `@packed` struct with a field narrower than a byte is one integer, and the refusal follows
+   * from that sentence rather than from a policy laid over it: a field that does not lower to an
+   * integer has no bit range to occupy, and the alternative — packing a pointer into the container —
+   * would mean an `inttoptr` round trip that loses the provenance the back end reasons about.
+   * Nesting is the answer, and it costs nothing: an outer `@packed` struct lays a bitfield struct
+   * out as an ordinary field of its size.
    *
-   * A field that does not lower to an integer has no bit range to occupy, and the alternative to
-   * refusing it — packing a pointer into the container — would mean an `inttoptr` round trip that
-   * loses the provenance the back end reasons about. Nesting is the answer, and it costs nothing:
-   * an outer `@packed` struct lays a bitfield struct out as an ordinary field of its size.
-   *
-   * A `volatile` field would be a sub-word volatile access, which is a read-modify-write of the
-   * container where a device expects one bus cycle — and `volatile` is exactly the audience this
-   * feature is for, so allowing it silently is worse than not having bitfields. The struct itself
-   * may still be volatile where it is *held*, which is the shape a read-write register wants.
+   * **`volatile` on a bitfield used to be refused here and is not any more.** It means a volatile
+   * access of the **container**: one volatile load to read a field, and one volatile load plus one
+   * volatile store to write one, which is what C does with `volatile unsigned x : 3`. The hazard
+   * that refusal was protecting is real and is now the driver author's to carry — a write to a
+   * clear-on-read or write-1-to-clear register reads it first — but refusing it left the hardware
+   * register this whole feature was asked for unable to use it, since `volatile` qualifies scalar
+   * storage and so the struct could not carry the qualifier either.
    */
   private def checkBitfields(s: Type.Struct): Unit = {
     val stored = s.stored
@@ -192,12 +194,6 @@ trait GenericInstantiation extends ConstFolding {
             s"than a byte — so it is one integer, and every field of it has to be one too. Put the " +
             s"narrow fields in a '@packed' struct of their own and hold that here: it lays out " +
             s"identically and leaves ${show(ty)} what it is")
-
-        if Type.volatileIn(ty) then
-          err(s"'${s.name}.$name' is 'volatile' and is a bitfield — it occupies part of a byte, so " +
-            s"reading or writing it is a read-modify-write of the whole of '${s.name}' rather than " +
-            s"the single access a device is entitled to. Hold the struct in a volatile field instead " +
-            s"— 'reg: volatile ${s.name}' — which makes it one read and one write of the whole register")
   }
 
   /** `@align(n)` folded to the boundary it names, with the two things that are not alignments

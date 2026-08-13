@@ -112,19 +112,40 @@ size, so `{p: *u8, bits: Flags}` is how `{p: *u8, a: u3}` is written. A `bool` i
 here — its storage is a byte and its representation a bit, so admitting it would make one type mean
 two widths; a flag is a `u1`. A **simple enum** is one, and is the spelling a mode field wants.
 
-**A bitfield may not be `volatile`.** A sub-word volatile access is a read-modify-write of the
-container where a device is entitled to one bus cycle, and a register with clear-on-read or
-write-1-to-clear semantics is corrupted by it.
+**A bitfield may be `volatile`, and it means a volatile access of the container.** Reading one is a
+single volatile load of the whole container; writing one is a single volatile load and a single
+volatile store of it. That is what C does with `volatile unsigned x : 3`, and it is what lets a
+`@packed` struct describe the hardware register this feature was asked for:
 
-**That leaves a bitfield register unwritable, and it is a gap rather than a deliberate exclusion.**
-The refusal above assumed the qualifier could go on the struct instead — `ctrl: volatile Ctrl` — and
-it cannot: `volatile` qualifies **scalar** storage, so a struct-typed field, and a `*volatile Ctrl`,
-are both refused already and for their own reason. So the hardware register this section's feature
-was asked for is exactly the thing that cannot yet use it, and a driver keeps its `volatile u32` and
-its shifts. Settling it means deciding one of two things — whether `volatile` on a bitfield should
-mean a volatile access of the *container* (two bus cycles, which is what C does with
-`volatile unsigned x : 3`), or whether a struct should be able to carry the qualifier at all — and
-that is a decision this section does not make.
+```
+@packed
+struct Ctrl
+    enable: volatile u1
+    mode: volatile u3
+    prescale: volatile u4
+
+static val ctrl: *Ctrl = ptr_cast(usize(0x4000_1000))
+
+ctrl.mode = 5                       -- one volatile load, one volatile store
+```
+
+**The qualifier is a property of the CONTAINER rather than of one range of it**, so writing it on any
+field qualifies every access to the struct. That is not a concession to the implementation: every
+field of a bitfield struct is bits of one word, so there is no such thing here as a shadow field
+staying ordinary, which is the thing per-field qualification buys in an ordinary register block. The
+struct itself still cannot carry the qualifier — `volatile Ctrl` is refused wherever it is written,
+as a field and as a `*T` pointee both — and it does not need to.
+
+**A write is a read-modify-write, and nothing diagnoses what that costs.** A device is entitled to
+one bus cycle, so writing a field of a register with **clear-on-read** or **write-1-to-clear**
+semantics corrupts the ranges beside it: the read that begins the sequence has already had its
+effect. sysl cannot know a register's read semantics — nothing in the language describes them — so
+this is stated rather than refused, exactly as it is in C. A register of that kind keeps its
+`volatile u32` and its shifts, where the single access is written out.
+
+A field that is a set of named values is a **simple enum**, which is one integer and so may be
+`volatile` like any other. A **data enum** may not: it is a tag beside a payload, so touching one is
+more than the single access the qualifier promises.
 
 **A bitfield has no address and no byte offset.** The first is the packed rule above, unchanged and a
 fortiori. The second is `offsetof`, which answers in bytes: a field starting at bit twelve is not at

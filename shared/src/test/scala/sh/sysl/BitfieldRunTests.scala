@@ -132,6 +132,27 @@ class BitfieldRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     run(src) shouldBe "1 true 6\n"
   }
 
+  // A `volatile` bitfield is a volatile access of the *container*, so a write is a read-modify-write
+  // of the whole of it. `BitfieldIrTests` asserts that the accesses are the ones the source wrote;
+  // what is asserted here is the half that matters to a driver — the read-modify-write puts the
+  // neighbouring ranges back exactly as it found them.
+  "a volatile bitfield keeps its neighbours through the read-modify-write" in {
+    val src =
+      """|@packed
+         |struct Reg
+         |    enable: volatile u1
+         |    mode: volatile u3
+         |    prescale: volatile u4
+         |var arena: [4]u8 = [0u8; 4]
+         |var r: *Reg = ptr_cast(&arena[0])
+         |r.enable = 1
+         |r.prescale = 9
+         |r.mode = 5
+         |print(arena[0], r.enable, r.mode, r.prescale)""".stripMargin
+
+    run(src) shouldBe "155 1 5 9\n"
+  }
+
   "a bitfield struct nests inside an ordinary one" - {
     // The composition path for everything a bitfield struct may not itself hold: it is a leaf, and
     // an outer struct lays it out as an ordinary field of its size.

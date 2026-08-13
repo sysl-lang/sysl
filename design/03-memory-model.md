@@ -897,6 +897,15 @@ object is refused for a plainer reason — it is two words, so touching one is t
 the source says, and the table beside the value is this compiler's rather than a device's. Device
 memory is reached with a raw pointer, which is the tier this belongs to.
 
+A **simple enum** counts as a scalar and is admitted: it *is* its underlying integer, so reading one
+is the single load the qualifier promises — and it is the spelling a register's mode field wants, so
+refusing it would mean declaring that field at the raw `u3` the enum exists to name. A **data enum**
+is refused: a tag beside a payload is more than one access however the source writes it.
+
+A **bitfield** is admitted too, and is the one case where the access reaches more than the field
+named: the qualifier applies to the container the field is bits of, so a write is a read-modify-write
+of the whole of it. `15 §1` states that rule and what it costs a driver.
+
 **A constrained subtype is refused too, and this one is about trust rather than instructions.** A
 `Level = int within 0..7` is the claim that a value *has been checked* (`16 §4`); a register holds
 whatever the device put there. `lvl: volatile Level` would hand that claim back unchecked through a

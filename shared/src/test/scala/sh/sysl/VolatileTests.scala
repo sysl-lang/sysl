@@ -373,6 +373,38 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         include("'volatile' qualifies a scalar or a raw pointer")
     }
 
+    // A data enum is a tag beside a payload, so touching one is as many accesses as the payload has
+    // words — which is the one promise the qualifier makes.
+    "a data enum, which is a tag beside a payload" in {
+      val src =
+        """enum P
+          |    None
+          |    Some(x: int)
+          |struct S
+          |    a: volatile P
+          |print(0)""".stripMargin
+
+      err(src) should include("carries a payload beside its tag")
+    }
+
+    // And the other side of *that* line: a **simple** enum is its underlying integer and nothing
+    // else, so reading one is the single load the qualifier promises. It is what a register's mode
+    // field wants to be declared as, which is why refusing it would have cost something real.
+    "while a simple enum, which is one integer, is admitted" in {
+      val src =
+        """enum Mode: u32
+          |    Off
+          |    Slow
+          |    Fast
+          |struct Ctl
+          |    mode: volatile Mode
+          |static val c: *Ctl = ptr_cast(usize(4096))
+          |get() -> Mode = c.mode
+          |print(get() == Mode.Fast)""".stripMargin
+
+      defineOf(ir(src), "get") should include("load volatile i32")
+    }
+
     // A constrained subtype is the claim that a value has been checked, and a device did not check
     // anything — so reading a register at one would hand back the claim through a field selection
     // that looks like any other.

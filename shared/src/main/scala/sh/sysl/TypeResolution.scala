@@ -324,6 +324,18 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
         s"${show(t)} is the claim that a value has been checked. Declare the register at " +
         s"${show(Type.underlying(t))} and convert what you read")
     case _: Type.Integer | _: Type.Floating | Type.Char | Type.Bool => t
+    // A **simple** enum is its underlying integer and nothing else — `llvm` delegates to it — so
+    // reading one is the single load the qualifier promises. It is also the spelling a mode field
+    // wants (`15 §1`), which is the reason this is here rather than left to the catch-all: refusing
+    // it would mean a register's mode had to be declared as the raw `u3` the enum exists to name.
+    case e: Type.Enum if e.simple => t
+    // A **data** enum is a tag beside a payload, so touching one is as many accesses as the payload
+    // has words however the source writes it — the one promise the qualifier makes, and the one it
+    // could not keep here.
+    case e: Type.Enum =>
+      err(s"'volatile ${show(t)}' is not a type: '${show(t)}' carries a payload beside its tag, so " +
+        "touching one is more than the single access the qualifier promises. A register field that " +
+        "is a set of named values is a simple enum, which is one integer")
     // A trait object is two words, so an access to one is two accesses however it is written — which
     // is the one promise the qualifier makes, and the one it could not keep here. It is also nothing
     // a device could have put there: what the second word points at is a method table this compiler
