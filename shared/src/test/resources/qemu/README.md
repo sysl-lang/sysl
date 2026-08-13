@@ -1,8 +1,10 @@
 # Booting a target under QEMU
 
 What a freestanding module needs before it can *run*, as opposed to merely assemble
-(`CrossTargetBuildTests`). Both boards are the RP2350's, which is why they are the two here: one
-board with two architectures is testable in a way a family is not.
+(`CrossTargetBuildTests`). It began with the RP2350's two architectures, one board being testable in a
+way a family is not, and has grown a machine per Arm sub-architecture since: **a board is the unit
+here and a target is a field on it**, so two boards may name one target and each of the five gets its
+own recipe.
 
 Each board is four files — a startup, a linker script, a support package, and an entry in
 `QemuSupport.boards` naming the emulator.
@@ -189,6 +191,33 @@ copied to SRAM by the startup, and its console is an `stm32f2xx_usart` rather th
 work, and both introduce differences from the AN500 that would sit between the two runs and muddy what
 a disagreement meant. It is still the right machine for the day something wants an STM32 *peripheral*
 rather than an Armv7E-M *core*.
+
+## thumbv7m — `qemu-system-arm -M mps2-an385 …`
+
+**A Cortex-M3, and the only board here with no floating-point unit above Armv6-M.** It is the third
+MPS2 in this directory and its map is the AN500's to the byte, checked with `info mtree -f` rather
+than carried over on the strength of the family name — so the three files are that board's text under
+names that say Armv7-M.
+
+**The one difference is the block that is missing.** `start_thumbv7m.s` does not write `CPACR`,
+because there is no coprocessor to grant access to. `Target.thumbv7mFreestanding` answers `noFpu`, so
+the back end selects `__aeabi_fmul` where it would have selected `vmul.f32` and nothing ever asks for
+the unit; a startup that wrote `CPACR` anyway would assemble and run — those bits are reserved rather
+than faulting — and would stand as a sentence telling the next reader this core has one.
+
+**Nothing here computes with a float, and that is on purpose rather than an omission.** The FPU test
+in `QemuRunTests` is guarded by `hardFloat`, so this board is never asked for a multiply its core
+cannot do — which is why `bsp_thumbv7m.c` owes no `__aeabi_fmul`. A real Armv7-M project that computes
+with floats owes that family exactly as this file already owes `__aeabi_ldivmod`.
+
+**Its 32-bit division helpers are absent for the opposite reason to Armv6-M's being present.** The M3
+has `sdiv` and `udiv`, so `/` on an `int` is an instruction here where it is a call on an M0+.
+
+**What this board is for is the architecture, not the chip.** Armv6-M code links into a Cortex-M3
+image, being a subset, so nothing about the *link* forced this row to exist. What forced it is that a
+real project reads its own configuration and not the triple: `CONFIG_CPU_CORTEX_M3` means Armv7-M and
+brings `BASEPRI` with it, while CMSIS reading an Armv6-M triple hands back an intrinsic set that has
+none. Zephyr's `qemu_cortex_m3` is where that was met.
 
 ## Wired into the suite
 
