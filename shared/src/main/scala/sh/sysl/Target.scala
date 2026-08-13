@@ -39,6 +39,30 @@ case class Target(
       * warning.
       */
     shortEnums: Boolean = false,
+    /** Whether the machine has no floating-point unit at all, so no floating-point **instruction**
+      * may be emitted for it.
+      *
+      * **It is a different claim from `softFloat`, and the two only sometimes give the same answer.**
+      * `softFloat` is about the *convention* — where a `double` travels on the way into a call — and a
+      * core can perfectly well have an FPU and pass arguments in core registers anyway, which is what
+      * `-mfloat-abi=softfp` means and what pico-sdk builds. This is about the *hardware*: a Cortex-M3
+      * has no such unit to have a convention about, and a Cortex-M4 on a board that leaves the FPU off
+      * has one that must not be used.
+      *
+      * **It cannot be left to the triple, because the Arm triples do not say it.** Measured rather
+      * than assumed: `clang --target=thumbv7em-none-eabi` compiles `a * b` to `vmul.f32` and defines
+      * `__ARM_FP 0x6`, and `thumbv8m.main-none-eabi` gives `vmla.f32` and `__ARM_FP 0xe` — the `eabi`
+      * suffix chose a calling convention and said nothing whatever about the presence of the unit. An
+      * image built from either faults on a board that has not got one, and a header that checks —
+      * CMSIS's *"Compiler generates FPU instructions for a device without an FPU"* — refuses to
+      * compile at all.
+      *
+      * It reaches exactly one decision, the flag `Toolchain.machineFlags` puts on every clang command
+      * line for this target, and that flag is Arm's because Arm is where the triple is silent. RISC-V
+      * and Armv6-M answer `true` here honestly and need nothing said on their behalf: their triples
+      * already describe a machine with no unit.
+      */
+    noFpu: Boolean = false,
 ) {
 
   /** How wide an address is, as a value that can be handed to the two places that need it — the
@@ -251,7 +275,7 @@ object Target {
    */
   val riscv64Freestanding: Target =
     Target("riscv64-freestanding", "riscv64-unknown-elf", Cpu.Riscv64, Os.Freestanding, VaListAbi.Loaded, 8,
-      softFloat = true)
+      softFloat = true, noFpu = true)
 
   /** The RP2350's Arm personality: a Cortex-M33, which is Armv8-M Mainline and executes Thumb only.
    *
@@ -282,6 +306,26 @@ object Target {
     Target("thumb-freestanding-softfp", "thumbv8m.main-none-eabi", Cpu.Thumb, Os.Freestanding,
       VaListAbi.Loaded, 4, softFloat = true, shortEnums = true)
 
+  /** The **third** row for that same Cortex-M33, and the one for a board whose FPU is simply not
+   * there — an Armv8-M Mainline part built without one, or a build that gates it off, which is what
+   * every MPS2 defconfig in Zephyr does.
+   *
+   * **`softfp` was not enough, and the difference is measurable rather than a nicety.**
+   * `thumb-freestanding-softfp` carries the soft-float *ABI* and nothing more: its triple still
+   * defines `__ARM_FP 0xe`, and clang still compiles `a * b + 1.0f` to `vmla.f32` for it, because the
+   * `fpv5-d16` is there to be used and only the convention was asked about. So aiming that row at a
+   * board with no unit produces an image that links, boots and takes a usage fault on the first
+   * floating-point instruction — and a header that checks first refuses outright.
+   *
+   * **`soft` is gcc's own spelling for the distinction, which is the whole argument for the name.**
+   * `-mfloat-abi=soft` means no FPU instructions at all where `-mfloat-abi=softfp` means the unit is
+   * used and only the convention is in core registers. The registry's three v8m rows are that series
+   * end to end: hard, `softfp`, `soft`.
+   */
+  val thumbFreestandingSoft: Target =
+    Target("thumb-freestanding-soft", "thumbv8m.main-none-eabi", Cpu.Thumb, Os.Freestanding,
+      VaListAbi.Loaded, 4, softFloat = true, shortEnums = true, noFpu = true)
+
   /** The **RP2040's** core: a Cortex-M0+, which is Armv6-M — Armv8-M's predecessor rather than a
    * variant of it, and a strictly smaller Thumb.
    *
@@ -309,7 +353,29 @@ object Target {
    */
   val thumbv6mFreestanding: Target =
     Target("thumbv6m-freestanding", "thumbv6m-none-eabi", Cpu.Thumb, Os.Freestanding,
-      VaListAbi.Loaded, 4, softFloat = true, shortEnums = true)
+      VaListAbi.Loaded, 4, softFloat = true, shortEnums = true, noFpu = true)
+
+  /** Armv7-M — the Cortex-M3, which is the core Zephyr's own documentation reaches for first
+   * (`qemu_cortex_m3`, `mps2/an385`) and which the registry could not describe at all.
+   *
+   * **Armv6-M code runs on it and the headers do not survive the mismatch**, which is why aiming the
+   * row below at this core is not an answer. A real project reads its own configuration rather than
+   * the triple: `CONFIG_CPU_CORTEX_M3` says Armv7-M, so Zephyr's inline assembly uses `BASEPRI`,
+   * while CMSIS reads `__ARM_ARCH_6M__` out of a v6-M triple and supplies the intrinsic set that has
+   * no `__get_BASEPRI`. Neither side is wrong; they were told about two different machines.
+   *
+   * **It is the one new Thumb row that needs no flag**, because Armv7-M base has no floating-point
+   * unit in the architecture and the triple says so — `thumbv7m-none-eabi` defines no `__ARM_FP` and
+   * compiles `a * b` to `__aeabi_fmul` unasked. `noFpu` is set anyway, and is the fact rather than
+   * the flag: it is true of the machine, and `machineFlags` passing `-mfpu=none` here changes
+   * nothing, which was checked rather than assumed.
+   *
+   * Everything Armv6-M lacks, this core has: Thumb-2, a hardware divider, unaligned access, and
+   * `ldrex`/`strex` — so an `atomicrmw` lowers inline and `&sync T` needs nothing from the board.
+   */
+  val thumbv7mFreestanding: Target =
+    Target("thumbv7m-freestanding", "thumbv7m-none-eabi", Cpu.Thumb, Os.Freestanding,
+      VaListAbi.Loaded, 4, softFloat = true, shortEnums = true, noFpu = true)
 
   /** The STM32s: Armv7E-M, which is where most of ST's parts land and which covers **two** boards
    * with different silicon — a Cortex-M4F (STM32G491RE) and a Cortex-M7 (STM32H753ZI).
@@ -343,12 +409,25 @@ object Target {
     Target("thumbv7em-freestanding", "thumbv7em-none-eabihf", Cpu.Thumb, Os.Freestanding,
       VaListAbi.Loaded, 4, shortEnums = true)
 
+  /** The same Armv7E-M with the unit **absent** rather than merely unused — an STM32 F4 on a board
+   * that leaves the FPU off, and `mps2/an386`, whose Zephyr defconfig sets no `CONFIG_FPU` and
+   * silently drops an application's `CONFIG_FPU=y` because the SoC does not select `CPU_HAS_FPU`.
+   *
+   * The row beside it is hard-float and cannot serve here for two reasons at once — the convention is
+   * wrong *and* the instructions are unavailable. The bare `thumbv7em-none-eabi` triple fixes only
+   * the first: it still defines `__ARM_FP 0x6` and still selects `vmul.f32`, so what makes this row
+   * different from that triple alone is `noFpu`.
+   */
+  val thumbv7emFreestandingSoft: Target =
+    Target("thumbv7em-freestanding-soft", "thumbv7em-none-eabi", Cpu.Thumb, Os.Freestanding,
+      VaListAbi.Loaded, 4, softFloat = true, shortEnums = true, noFpu = true)
+
   /** The RP2350's other personality: a Hazard3, which is RV32IMAC and has no F extension at all —
    * so, like bare-metal RISC-V at 64 bits, there are no floating registers to pass arguments in.
    */
   val riscv32Freestanding: Target =
     Target("riscv32-freestanding", "riscv32-unknown-elf", Cpu.Riscv32, Os.Freestanding,
-      VaListAbi.Loaded, 4, softFloat = true)
+      VaListAbi.Loaded, 4, softFloat = true, noFpu = true)
 
   /** A target that is listed and cannot be built for. It is here rather than left out because the
    * limit is the compiler's and not the machine's, and a reader who names it deserves to be told
@@ -375,8 +454,11 @@ object Target {
       riscv64Freestanding,
       thumbFreestanding,
       thumbFreestandingSoftfp,
+      thumbFreestandingSoft,
       thumbv6mFreestanding,
+      thumbv7mFreestanding,
       thumbv7emFreestanding,
+      thumbv7emFreestandingSoft,
       riscv32Freestanding,
       x86Linux,
     )

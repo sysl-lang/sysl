@@ -98,7 +98,12 @@ class AbiAgainstClangTests extends AnyFreeSpec with Matchers with CodegenSupport
            |void go(void) { take(give()); }
            |""".stripMargin)
 
-      val r = exec(Seq(cc, s"--target=${t.triple}", "-S", "-emit-llvm", "-O0", "-o", "-", src))
+      // `machineFlags` and not the triple alone, because the triple is not the whole of what a
+      // target says. A row for an FPU-less core carries `-mfpu=none`, and an oracle that left it off
+      // would be asking clang about a machine with a floating-point unit and comparing the answer to
+      // sysl's for one without.
+      val r = exec(Seq(cc, s"--target=${t.triple}") ++ Toolchain.machineFlags(t) ++
+        Seq("-S", "-emit-llvm", "-O0", "-o", "-", src))
 
       withClue(s"clang refused the C for ${t.triple}:\n${r.stderr}")(r.exitCode shouldBe 0)
 
