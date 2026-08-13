@@ -318,6 +318,17 @@ trait FunctionBodies extends ModuleStorage {
   protected def instantiateFunc(f: FuncDecl, targs: List[Type]): String = {
     val name = Type.mangled(f.name, targs)
 
+    // Recorded here because this is the one place a generic becomes a function, and the name it
+    // becomes cannot be read back to say so: what tells `lib$twice.Loud` from a member of a type
+    // called `Loud` is that this line made it. What reads it is `NoAlloc`, which holds a module to
+    // the bodies it wrote rather than to the ones a caller's type argument chose for it.
+    if f.tparams.nonEmpty then
+      genericInsts += name
+      // And where the *definition-time* pass made one, what it was made from — the instantiation
+      // itself is about to be thrown away with the rest of that walk, so its name is the only thing
+      // left pointing at the generic that was called.
+      if abstractPass then abstractInsts(name) = f.name
+
     // The signature being made real is the declaration's, so it is resolved in the declaration's
     // module however far from it the call that asked for this instantiation was written.
     if !funcInsts.contains(name) then

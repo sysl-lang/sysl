@@ -87,7 +87,7 @@ trait HoistMembers extends HoistImpl {
     for
       tr <- traitDecls.values.toList
       m  <- tr.methods if m.body.nonEmpty
-    yield FuncDecl(
+    yield defaultAt(tr, FuncDecl(
       s"${tr.name}.${m.name}",
       selfName :: tr.tparams,
       receiverParam(m, NamedType(selfName, Nil)).toList ::: m.params,
@@ -99,7 +99,21 @@ trait HoistMembers extends HoistImpl {
       bounds = tr.bounds +
         (selfName -> List(BoundRef(tr.name, tr.tparams.map(NamedType(_, Nil))))),
       variadic = m.variadic,
-    ).setPos(m.pos)
+    ).setPos(m.pos))
+
+  /** Records that a default is read **in its trait's terms**, and hands it back.
+   *
+   * These declarations are synthesized rather than hoisted, so nothing has filed where they were
+   * written — and `scopeFor` answers for a key it does not know with the module the key names and
+   * **no imports at all**. A default calling anything its file imported was therefore undefined the
+   * moment the definition-time pass looked at it, and the pass drops what it cannot resolve, so the
+   * body was silently not checked. It is the same fact `MemberLowering` records for the copy made
+   * per implementing type, which is why the copies resolved what the original could not.
+   */
+  private def defaultAt(tr: TraitDecl, fd: FuncDecl): FuncDecl = {
+    declScope(fd.name) = scopeFor(tr.name)
+    fd
+  }
   /** Checks that every bound a declaration writes names a trait and applies it to as many arguments
    * as it declares, whichever declaration form wrote it — a function, a struct, an enum, a trait. A
    * bound is a trait and nothing else (`10 §5`), so a name that is a struct, a scalar, or nothing at

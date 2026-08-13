@@ -399,7 +399,7 @@ trait ProgramWalk extends AbstractBodies {
     // Asked of the finished tree, because what allocates is a node rather than a place in the
     // analyzer — and asked here rather than after `analyze` returns, so that a module doing what it
     // declared it would not is one of this walk's diagnostics like any other.
-    checkNoAlloc(allFuncs, tvals.toList, vtables.values.toList, tmain, mainScope.module)
+    checkNoAlloc(allFuncs, abstractFuncs.toList, tvals.toList, vtables.values.toList, tmain, mainScope.module)
 
     // And what a `@pure` function promised, asked of the same tree for the same reason (`17 §6`).
     checkPurity(allFuncs, externs)
