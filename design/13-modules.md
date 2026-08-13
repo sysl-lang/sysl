@@ -885,6 +885,15 @@ different operation wearing the same spelling. There are no calls: a function ca
 expression is a request for compile-time evaluation of arbitrary code, which is a language of its
 own and not one this needs.
 
+**"A `const`" means the declaration and not a spelling of it.** A constant reached by its full path
+is the same constant as one reached by an import — `bits.byte_width` and `byte_width` fold alike, in
+every position below — because what decides is what the name resolves to, and §6 is the whole of how
+a name resolves. It is worth saying only because the two spellings are different enough to be
+implemented separately, and once were: a qualified one was refused in exactly the positions this
+declaration exists for while the same value imported was accepted, which made the spelling look like
+part of the rule. It is not, and a `c const` — whose constants a binding keeps in a sub-module of
+their own, so that every consumer names them qualified — is no different.
+
 **Where a constant may stand:** anywhere an expression may, plus the three places a literal was
 previously the only thing accepted — an **array bound** (`[capacity]u8`), an **enum discriminant**
 (`Halt = base`), and a **pattern** (`n match { limit -> … }`). That last one is the one worth

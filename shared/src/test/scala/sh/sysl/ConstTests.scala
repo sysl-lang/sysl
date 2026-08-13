@@ -108,6 +108,48 @@ class ConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pa
       ) shouldBe "12\n"
     }
 
+    /** The three positions above — an array bound, a discriminant, a pattern — are what a constant
+     * is *for*, and the qualified spelling reached none of them: the folder matched a bare name and
+     * a full path is a field read after parsing, so the very same declaration was a constant when
+     * imported and not one when named through its module.
+     *
+     * It read as a rule about `c const`, since a binding is where the qualified spelling turns up in
+     * bulk. It was never about `c const` at all, which is why these are written with an ordinary one.
+     */
+    "in every position a constant may stand, and not only in an expression" in {
+      runIn(
+        ("limits", "limits.sysl", "module limits\nconst width: int = 3\n"),
+        ("", "main.sysl",
+          """const same: int = limits.width * 2
+            |
+            |enum Step
+            |    Small = limits.width
+            |    Large = 9
+            |
+            |var xs: [limits.width]int
+            |
+            |print(s"$same ${int(Step.Small)} ${xs.len}")
+            |""".stripMargin),
+      ) shouldBe "6 3 3\n"
+    }
+
+    /** A path deeper than one segment is the same question asked twice, and it is worth its own case
+     * because flattening a chain of field reads is where a fix could stop one level short.
+     */
+    "however deep the module path is" in {
+      runIn(
+        ("a.b", "b.sysl", "module a.b\nconst width: int = 4\n"),
+        ("", "main.sysl", "const same: int = a.b.width\nvar xs: [a.b.width]int\nprint(s\"$same ${xs.len}\")\n"),
+      ) shouldBe "4 4\n"
+    }
+
+    /** The other half: a `Field` that names no constant has to go on being reported as what it is,
+     * rather than becoming "not a constant expression" for every field read in the language.
+     */
+    "while a field read of a value is still not a constant" in {
+      err("struct P\n    x: int\nend P\nval p = P(1)\nconst n: int = p.x") should include("not a constant")
+    }
+
     "unless it is private to its file" in {
       errIn(
         ("limits", "a.sysl", "module limits\nprivate const width: int = 12\n"),
