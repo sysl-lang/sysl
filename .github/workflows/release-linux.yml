@@ -1,0 +1,280 @@
+# The Linux halves of a release.
+#
+# **This is the one thing GitHub Actions makes rather than checks, and that is a deliberate exception
+# to an otherwise flat rule.** Every other artifact a release ships is built on the development
+# machine — the macOS tarball, the jars for Central, the tap commit — so a release goes out with the
+# runners down. It cannot hold here: Scala Native does not cross-compile, a Linux binary has to be
+# built on Linux, and there is no Linux machine. So a runner outage now blocks the Linux half of a
+# release and nothing else.
+#
+# **The trigger is a tag push, and a `release: published` trigger could not work.** For a `release`
+# event GitHub takes the workflow file from the *default branch*, which is `stable`, and `stable` is
+# moved at the very end of a release — so such a job would run the *previous* release's copy of this
+# file, and on the first release would find no file at all. A tag push takes the workflow from the
+# tag's own commit, which is exactly the tree being released.
+#
+# The consequence is an ordering one: the tag is pushed before `gh release create`, so this waits for
+# the release to appear before attaching to it.
+
+name: Linux release artifacts
+
+on:
+  push:
+    tags: ["v*"]
+    branches: ["linux-release"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach to, e.g. v0.0.49. Leave empty to build and smoke-test only."
+        required: false
+        type: string
+
+# Attaching an asset to a release is a write to the repository's contents.
+permissions:
+  contents: write
+
+# **Never cancel in progress.** The usual reason to cancel a superseded run is that a newer commit
+# has made it irrelevant; a release build is not superseded by anything, and half an hour of runner
+# time is not reproducible on the development machine.
+concurrency:
+  group: "release-linux-${{ github.event.inputs.tag || github.ref }}"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      # Independent artifacts for independent architectures — one failing says nothing about the
+      # other, and shipping one of the two is better than shipping neither.
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+
+    # **22.04 rather than 24.04, and the reason is the glibc floor.** Whatever the runner links
+    # against becomes the oldest distribution this binary runs on. 24.04 would set that at 2.39,
+    # which excludes Debian 12 — the current Debian stable, on 2.36. 22.04 gives 2.35 and covers it.
+    # The build reports the floor it actually achieved rather than trusting this comment.
+    #
+    # These are the older images and will eventually be retired. When they are, the honest fix is to
+    # build inside a `container:` rather than on the runner image, which decouples the floor from
+    # GitHub's retirement schedule; moving to a newer image instead silently raises the floor.
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      # Before the checkout, because it decides what to check out. A dispatch may name a tag; a tag
+      # push is its own; a dispatch naming nothing builds whatever ref it was dispatched from and
+      # attaches to nothing, which is how this workflow is tested without cutting a release.
+      - name: Work out what is being built
+        id: what
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag }}"
+          if [ -z "$tag" ] && [ "${{ github.ref_type }}" = "tag" ]; then
+            tag="${{ github.ref_name }}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ref=${tag:-${{ github.ref }}}" >> "$GITHUB_OUTPUT"
+          echo "building ${tag:-${{ github.ref }}}, attaching to ${tag:-nothing}"
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.what.outputs.ref }}
+
+      # **The tag and `build.sbt` must agree, and this is where that is caught.** A tag cut before
+      # the version bump would otherwise produce a tarball named for the new version containing a
+      # compiler that answers with the old one — which installs, runs, and lies.
+      - name: Work out the version
+        id: version
+        run: |
+          set -euo pipefail
+          declared=$(grep -oE '^ThisBuild / version[[:space:]]*:=[[:space:]]*"[^"]+"' build.sbt \
+                     | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          tag="${{ steps.what.outputs.tag }}"
+          if [ -n "$tag" ] && [ "${tag#v}" != "$declared" ]; then
+            echo "tag $tag names ${tag#v}, but build.sbt declares $declared" >&2
+            exit 1
+          fi
+          echo "version=$declared" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up sbt
+        uses: sbt/setup-sbt@v1
+
+      - name: Cache sbt
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.sbt
+            ~/.cache/coursier
+          key: ${{ runner.os }}-${{ matrix.arch }}-sbt-${{ hashFiles('build.sbt', 'project/**') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.arch }}-sbt-
+
+      # The same pinned LLVM `ci.yml` installs, and for a second reason on top of its own: the smoke
+      # test below does not merely start the binary, it compiles and runs a program, so this is also
+      # the toolchain the shipped compiler is proved able to drive.
+      #
+      # `libunwind` and `libgc` are Scala Native's, not sysl's.
+      - name: Install the toolchain
+        env:
+          LLVM_VERSION: "20"
+        run: |
+          set -euo pipefail
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh "$LLVM_VERSION"
+          sudo apt-get install -y "llvm-$LLVM_VERSION" "lld-$LLVM_VERSION" libunwind-dev libgc-dev
+          echo "/usr/lib/llvm-$LLVM_VERSION/bin" >> "$GITHUB_PATH"
+
+      - name: Report the toolchain
+        run: |
+          which clang llvm-ar
+          clang --version | head -2
+          llvm-ar --version | head -2
+          ldd --version | head -1
+
+      # `SYSL_RELEASE=1` is not decoration: it turns on `releaseFast` and thin LTO, so the released
+      # binary is not the same lowering as a debug Native build. The macOS tarball is built with it
+      # and these must match.
+      - name: Link the compiler
+        run: SYSL_RELEASE=1 sbt -batch syslNative/nativeLink
+
+      # **`-C stage .` is load bearing.** `prefix.install Dir["*"]` is the whole of the formula's
+      # `install`, so the tarball *is* a prefix. `tar czf … stage` would put everything under a
+      # `stage/` directory and install a compiler whose library sits one level too deep.
+      #
+      # The binary's path is globbed rather than spelled with the Scala version in it, so that a
+      # Scala upgrade does not silently stage nothing.
+      - name: Stage and archive
+        id: archive
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          arch="${{ matrix.arch }}"
+
+          binaries=(native/target/scala-*/sysl)
+          if [ "${#binaries[@]}" -ne 1 ] || [ ! -x "${binaries[0]}" ]; then
+            echo "expected exactly one linked binary, found: ${binaries[*]}" >&2
+            exit 1
+          fi
+
+          mkdir -p stage/bin stage/share/sysl
+          cp "${binaries[0]}" stage/bin/sysl
+          cp -R library stage/share/sysl/library
+
+          tarball="sysl-$version-linux-$arch.tar.gz"
+          tar -czf "$tarball" -C stage .
+
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "$tarball" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      # **The floor is measured, not assumed.** The comment on `runs-on` says which image was chosen
+      # and why; this says what the binary actually ended up requiring, which is the number a release
+      # note should carry and the only one anybody can act on.
+      - name: Report the glibc floor
+        id: glibc
+        run: |
+          set -euo pipefail
+          floor=$(objdump -T stage/bin/sysl | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sort -uV | tail -1)
+          echo "floor=${floor#GLIBC_}" >> "$GITHUB_OUTPUT"
+          echo "highest glibc symbol version required: $floor"
+
+      # **The formula's own `test` block, run against the tarball before anybody installs it.**
+      #
+      # This is the whole of the gate for these artifacts, and it is deliberately not the Native
+      # suite: `run-gate.sh`'s memory bounds are measured for an 18-core machine with 64 GB and a
+      # runner is four cores. What is checked instead is the class of failure an artifact can
+      # actually have — staged one level too deep, a library that did not travel, a binary that
+      # cannot drive clang — which is the class no suite on the development machine can see.
+      #
+      # `sysl run` is a real compile-and-link, and the expected output is pinned whole rather than
+      # matched, with 42 computed by the compiled program rather than echoed. The standard-module
+      # artifact is built into the cache on the way through, which is the notice on stderr.
+      - name: Smoke-test the tarball
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+
+          mkdir -p check/prefix
+          tar -xzf "${{ steps.archive.outputs.tarball }}" -C check/prefix
+
+          test -x check/prefix/bin/sysl
+          test -d check/prefix/share/sysl/library/sysl
+
+          check/prefix/bin/sysl --version | grep -qx "sysl $version"
+
+          cat > check/hello.sysl <<'SYSL'
+          print("Hello, sysl!")
+          print(6 * 7)
+          SYSL
+
+          got=$(check/prefix/bin/sysl run check/hello.sysl)
+          want=$(printf 'Hello, sysl!\n42')
+          if [ "$got" != "$want" ]; then
+            echo "expected:"; printf '%s\n' "$want"
+            echo "got:";      printf '%s\n' "$got"
+            exit 1
+          fi
+
+      # **Unconditional, and it is the safety net rather than the delivery.** Attaching to the
+      # release can fail for reasons that have nothing to do with the build — a release not yet
+      # created, a token, a network — and half an hour of runner time is not something the
+      # development machine can reproduce. With this, a failed attach is a download away from being
+      # fixed by hand.
+      - name: Keep the tarball whatever happens next
+        uses: actions/upload-artifact@v4
+        with:
+          name: sysl-linux-${{ matrix.arch }}
+          path: ${{ steps.archive.outputs.tarball }}
+          if-no-files-found: error
+
+      # The tag is pushed before `gh release create` runs on the workstation, so the release may not
+      # exist yet when this gets here. Waiting is correct; giving up quietly is not, which is why the
+      # step fails rather than skipping when the release never appears.
+      - name: Wait for the release, then attach
+        if: steps.what.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.what.outputs.tag }}"
+
+          for _ in $(seq 1 60); do
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+              found=yes
+              break
+            fi
+            sleep 30
+          done
+
+          if [ "${found:-no}" != "yes" ]; then
+            echo "release $tag still does not exist after 30 minutes" >&2
+            echo "the tarball is attached to this run as an artifact and can be uploaded by hand" >&2
+            exit 1
+          fi
+
+          gh release upload "$tag" "${{ steps.archive.outputs.tarball }}" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+      # So that the release step does not have to open the log. **The digest here is a cross-check,
+      # not the source of the formula's `sha256`** — that one is taken by downloading the asset the
+      # release URL serves, since the local file is only *probably* the bytes anybody will fetch.
+      - name: Say what was built
+        run: |
+          {
+            echo "### ${{ matrix.arch }}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| tarball | \`${{ steps.archive.outputs.tarball }}\` |"
+            echo "| sha256 | \`${{ steps.archive.outputs.sha256 }}\` |"
+            echo "| glibc floor | \`${{ steps.glibc.outputs.floor }}\` |"
+            echo "| attached to | \`${{ steps.what.outputs.tag || 'nothing — build only' }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
