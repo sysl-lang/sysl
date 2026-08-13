@@ -199,6 +199,13 @@ have and others do not, so each requires a bound that guarantees it, and each is
 definition**, naming the bound to write. A subscript is among them because a subscript *is* `Index`'s
 one method (`14 §3`), so it is asked of the bounds exactly as a dot call is.
 
+**A machine capability is asked at the definition too, and of the same body** (`capabilities.md § A
+generic answers for what it wrote`). Whether a generic makes heap storage is a question about the
+body as written — a construction in it is the declaring module's at every instantiation, and a call
+through a bound is whatever the caller's type turned out to supply — so `@no_alloc` is held against
+that body and against no monomorphized instance. It is this section's rule applied to the other kind
+of capability: the definition is where a generic answers for itself.
+
 **A conversion is the exception, and it belongs here as an open question rather than as a rule.**
 `u8(x)` on a parameter is *not* refused at the definition: `§ Open f` calls it ordinary code, and
 `guide/sha2` is written on it — `top_byte[T: Word](x: T) -> u8` converts out of its parameter, once
