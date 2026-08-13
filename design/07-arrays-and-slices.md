@@ -284,6 +284,37 @@ requires that its named high element exist. An empty slice is legal, including a
 `*[N]T` — field selection's one-level auto-deref (`03`) applies to a subscript too, so
 `buf[0..<n]` reads the same whether `buf` is the array or a reference to it.
 
+## An array where a view is asked for
+
+**A `[N]T` standing where a `[]T` is wanted is the whole of it, `a[..]`, written by the position
+instead of by hand.** An array is the one value that already knows both halves a view is made of —
+where the elements are, and how many — so nothing is taken on trust and no bound is guessed:
+
+```
+fill(s: []int)                     // lends its caller's storage, which is how a
+    for i in 0..<s.len             // freestanding API is written
+        s[i] = 0
+
+var a: [4]int = [0; 4]
+fill(a)                            // and this is the whole of the call
+```
+
+It is the same conversion at every position that asks for a view rather than merely requiring one:
+an argument, a `val` or `var` with the view's type written on it, a `return`, a parameter's default.
+A `&[N]T` converts on the same terms, and it is the *reference* the view is taken over — for a heap
+array that reference is both where the elements are and what keeps them alive.
+
+**What the conversion does not do is add anything to the storage's own terms.** A view of a `val`
+array is a `[]const T` exactly as `a[..]` would give, so a `val` array reaching a `[]T` is refused —
+the ability to write is a property of the storage rather than of the handle taken on it. A writable
+view is still an alias like any other and is refused over storage a struct's invariant reads
+(`16 §6`). And a `&sync [N]T` does not convert, for the reason `a[..]` will not slice one: a view
+records nothing about whether its owner's count is atomic.
+
+**A `*[N]T` is left out on purpose.** `a[..]` takes one and this does not — the raw-pointer tier is
+written out where it is used (`03`), and a view of pointed-at storage taken silently is the one case
+where nothing in the type says the elements are really there.
+
 ## A view that may not be written
 
 `[]const T` is a view whose elements may not be written **through it**:

@@ -312,14 +312,14 @@ class Utf8Tests extends AnyFreeSpec with RunSupport with CodegenSupport {
   }
 
   "the error path" - {
-    "an array is not a slice, and the fix is named" in {
-      val e = err(
+    // This form asks for a `[]u8`, and an array standing where a view is asked for is a view of
+    // itself — so the advice that used to be here, to write `a[..]`, was advice to type what the
+    // position already does. The bytes are read exactly as the sliced spelling reads them.
+    "an array of bytes is taken as it is, needing no '[..]'" in {
+      run(
         """var a: [3]u8 = [0x61u8, 0x62u8, 0x63u8]
           |print(from_utf8_unchecked(a))""".stripMargin,
-      )
-
-      e should include("takes a []u8")
-      e should include("a[..]")
+      ) shouldBe "abc\n"
     }
 
     "a string is already a string" in {

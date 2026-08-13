@@ -12,6 +12,35 @@ import org.scalatest.freespec.AnyFreeSpec
 class TraitDefaultErrorTests extends AnyFreeSpec with CodegenSupport {
 
   "a default is checked at the trait" - {
+    // **The default is read in its trait's file**, which is not something the declaration carries:
+    // it is synthesized rather than hoisted, so nothing had filed where it was written and it was
+    // read with no imports at all. The body then stopped at its first imported name, taking the
+    // rest of the walk with it — and what that walk is *for* is the complaints nothing else makes,
+    // so a bound the body needed after that line was asked for by nobody. A copy carried onto an
+    // implementing type is read in the trait's terms and always was, which is why an implemented
+    // trait showed nothing.
+    "what a default needs a bound for is asked in an expression that also calls an import" in {
+      err(
+        """import sysl.text.cstring
+          |
+          |trait Loud
+          |    say(self) -> string = s"${cstring("x").len} $self"
+          |""".stripMargin
+      ) should include("'Self: sysl.Display'")
+    }
+
+    "and one calling an imported function correctly is accepted with no impl in sight" in {
+      ir(
+        """import sysl.text.cstring
+          |
+          |trait Greet
+          |    greet(self) -> usize = cstring("hi").len
+          |
+          |main()
+          |    print(1)""".stripMargin
+      ) should include("define")
+    }
+
     // Nothing implements `Greet`, so there is no instantiation to catch this — the trait is the
     // only place it can be reported, which is the whole point of checking it there.
     "a default calling a method the trait does not declare is refused with no impl in sight" in {

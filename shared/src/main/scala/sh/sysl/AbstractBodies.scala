@@ -50,7 +50,8 @@ trait AbstractBodies extends FunctionBodies {
 
           for f <- generics do
             currentPos = f.pos
-            inDecl(f.name)(recover(())(sandboxed(checkAbstractBody(f))))
+            val before = diagnosticCount
+            inDecl(f.name)(recover(())(sandboxed(keep(before, checkAbstractBody(f)))))
 
           // A member reported here has been reported against the body as written, naming the bound
           // that would license what it does. Every instantiation would fail the same way and say so
@@ -59,7 +60,7 @@ trait AbstractBodies extends FunctionBodies {
           for f <- members do
             currentPos = f.pos
             val before = diagnosticCount
-            inDecl(f.name)(recover(())(sandboxed(checkAbstractBody(f))))
+            inDecl(f.name)(recover(())(sandboxed(keep(before, checkAbstractBody(f)))))
             if diagnosticCount > before then brokenMembers += f.name
 
           // A default that fails here has been reported, at the trait, against the body a
@@ -69,7 +70,7 @@ trait AbstractBodies extends FunctionBodies {
           for f <- defaults do
             currentPos = f.pos
             val before = diagnosticCount
-            inDecl(f.name)(recover(())(sandboxed(checkAbstractBody(f))))
+            inDecl(f.name)(recover(())(sandboxed(keep(before, checkAbstractBody(f)))))
             if diagnosticCount > before then brokenDefaults += f.name
         finally abstractPass = false
       }
@@ -113,8 +114,21 @@ trait AbstractBodies extends FunctionBodies {
       inDecl(n)(recover(())(sandboxed(instantiateEnum(n, abstracts(d.tparams, d.bounds, d.tvalues)))))
   }
 
+  /** Keeps what this walk built, which every other part of it throws away.
+   *
+   * The pass exists to *report*, so `sandboxed` drops everything it registered and the analyzed
+   * bodies go with it. One question is asked of the body a generic wrote rather than of any
+   * instantiation of it — what storage this module makes, which its caller's type argument does not
+   * decide — and it is asked after this pass is over, so the body has to outlive it.
+   *
+   * A body that was reported on is not kept: it is being compiled no further, and holding the
+   * declaring module to a tree that is already wrong would say a second thing about one mistake.
+   */
+  private def keep(before: Int, f: TFunc): Unit =
+    if diagnosticCount == before then abstractFuncs += f
+
   /** One generic body, analyzed with each of its type parameters substituted by itself. */
-  private def checkAbstractBody(f: FuncDecl): Unit = at(f.pos) {
+  private def checkAbstractBody(f: FuncDecl): TFunc = at(f.pos) {
     val subst: Map[String, Type] = withSelf(f.name, abstractSubst(f.tparams, f.bounds, f.tvalues, f.tpacks))
     val params = f.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, subst))))
     val rtype  = f.retType.map(t => recover(Type.Unknown)(resolveReturn(t, subst))).getOrElse(Type.Unit)

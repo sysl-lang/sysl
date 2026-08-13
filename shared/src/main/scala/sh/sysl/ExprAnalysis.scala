@@ -287,7 +287,43 @@ trait ExprAnalysis
         s"'[]${show(want)}' of your own, or take the parameter as '[]const ${show(want)}' if it is " +
         "only read")
 
+    // An array where a view of it was asked for, which is `a[..]` performed by the position rather
+    // than written by hand. The array is the one thing that already knows both halves a view is made
+    // of — where the elements are, and how many — so nothing is taken on trust and no bound is
+    // guessed. Written out, it is the conversion an array *literal* has always had here; a name for
+    // the same array had to say `[..]`, and a page of caller-supplied storage read as ceremony
+    // because of it.
+    case v: Type.Slice => arrayView(t, v).map(coerce(_, v)).getOrElse(t)
+
     case _ => t
+
+  /** The whole-array view an array coerces to, where its elements are the ones the slice wants.
+   *
+   * It is exactly what `a[..]` builds, by the same rules and through the same node: a view of
+   * read-only storage is read-only, a view asked for as `[]const T` is made read-only rather than
+   * made writable and then given up, and one that may be written is refused where storage inside an
+   * invariant-carrying struct is what it would view. Anything else is left alone for the caller to
+   * diagnose — where the elements differ, the message naming the array says more than one naming a
+   * view built from it would.
+   *
+   * A **heap** array converts on the same terms as a frame one, and the reference is what the view
+   * is built over rather than the array behind it: for a heap array the reference is both where the
+   * elements are and what keeps them alive, which is the same reason `a[..]` leaves its receiver
+   * undereferenced. A `&sync` array is not among them, since a view records nothing about whether
+   * its owner's count is atomic; nor is a `*[N]T`, whose whole tier is written out.
+   */
+  private def arrayView(t: TExpr, want: Type.Slice): Option[TExpr] =
+    val elem = t.ty match
+      case Type.Array(_, e)                  => Some(e)
+      case Type.Ref(Type.Array(_, e), false) => Some(e)
+      case _                                 => None
+
+    elem.filter(_ == want.elem).map { e =>
+      val viewTy = Type.Slice(e, readOnly = readOnly(t) || want.readOnly)
+
+      checkSliceable(t, viewTy)
+      TSlice(t, None, None, inclusive = true, viewTy).setPos(t.pos)
+    }
 
   /** What a reserved identifier stands for, folded into the use as the literal it names
    * (`ReservedNames`).

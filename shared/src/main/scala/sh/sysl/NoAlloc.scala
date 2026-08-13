@@ -45,9 +45,21 @@ trait NoAlloc extends AnalyzerBase {
    *
    * The `main` statements are checked under the module of the file that carries them, since they are
    * that file's code however little they look like a declaration.
+   *
+   * **A generic is answered for by the body it was written as, and an instantiation of one by
+   * nobody** (`capabilities.md § A generic`). The clause is a promise about a module's own conduct,
+   * and a generic has no conduct until a type is chosen — by somebody else, in a module of their
+   * own. So `abstracts` carries what the definition-time pass of `14 §4` analyzed, where the
+   * declaring module's own calls still have their names and a call through a bound is the trait's,
+   * and the instantiations are passed over.
+   *
+   * They are passed over rather than dropped: an instance is still part of the program every other
+   * walk goes through, so a module calling a generic that allocates is reported at *its* call, which
+   * is the line its author can change.
    */
   protected def checkNoAlloc(
       funcs: List[TFunc],
+      abstracts: List[TFunc],
       vals: List[TVal],
       vtables: List[TVtable],
       main: List[TStmt],
@@ -57,11 +69,29 @@ trait NoAlloc extends AnalyzerBase {
     // anywhere — which is almost all of them — should pay nothing at all for this pass.
     lazy val allocator = new Allocators(funcs, vtables)
 
-    for f <- funcs if noAlloc(Modules.moduleOf(f.name)) do
+    // A generic's body is walked against a pool of its own: the program's functions, plus every
+    // abstract body under the name a call in *another* abstract body gave it. A generic calling a
+    // generic names an instantiation nothing links, so without those entries the call leads nowhere
+    // and a module could reach an allocator through a one-line generic of its own. The pools are
+    // two rather than one because those names belong to no program — a real body that happened to
+    // call something spelled the same would be answered with a body it never called.
+    lazy val abstractly = new Allocators(aliased(abstracts) ::: funcs, vtables)
+
+    for f <- funcs if !genericInsts(f.name) && noAlloc(Modules.moduleOf(f.name)) do
       val why = because(Modules.moduleOf(f.name))
 
       scan(f.body, why)
       allocator.blame(f.body, why)
+    // Asked of **where the declaration was written** rather than of its key, which is the one place
+    // the two part company. A member of a structural type is hoisted under a bare `tuple.display`,
+    // whose key names no module — so reading the key puts the library's own tuple renderer in the
+    // anonymous module, which is the *program's*, and a freestanding program is then refused for a
+    // string the library builds. Every other kind of declaration answers the same either way.
+    for f <- abstracts; module = scopeFor(f.name).module if noAlloc(module) do
+      val why = because(module)
+
+      scan(f.body, why)
+      abstractly.blame(f.body, why)
     for v <- vals if noAlloc(Modules.moduleOf(v.symbol)); init <- v.init do
       val why = because(Modules.moduleOf(v.symbol))
 
@@ -70,6 +100,21 @@ trait NoAlloc extends AnalyzerBase {
     if noAlloc(mainModule) then
       scan(main, because(mainModule))
       allocator.blame(main, because(mainModule))
+  }
+
+  /** Each abstract body again under every name a call in another one gave it, so that a walk
+   * following such a call arrives somewhere.
+   *
+   * A generic instantiated at a type parameter is spelled from the parameter — `lib$grow.T` — and
+   * one instantiated at a real type during that same walk is spelled like an instantiation the
+   * program might also have made. Both are answered here with the body the declaration wrote, which
+   * is the only body either name has: `sandboxed` dropped everything that walk registered, so
+   * nothing was ever analyzed under them.
+   */
+  private def aliased(abstracts: List[TFunc]): List[TFunc] = {
+    val byName = abstracts.map(f => f.name -> f).toMap
+
+    abstractInsts.toList.flatMap((mangled, decl) => byName.get(decl).map(_.copy(name = mangled)))
   }
 
   /** Which of the two made this module allocator-free, said the way the diagnostic needs it.
