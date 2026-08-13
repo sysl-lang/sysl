@@ -180,7 +180,12 @@ class AbiAgainstClangTests extends AnyFreeSpec with Matchers with CodegenSupport
           scalars.map(s => s"extern ${s.c} ${s.give}(void); extern void ${s.take}(${s.c} v);\n").mkString +
             s"void go(void) {\n${scalars.map(s => s"  ${s.take}(${s.give}());\n").mkString}}\n")
 
-        val r = exec(Seq(cc, s"--target=${t.triple}", "-S", "-emit-llvm", "-O0", "-o", "-", src))
+        // `machineFlags` for the reason `clangSays` passes them: the triple is not the whole of what
+        // a target says, and an oracle asking about a different machine than sysl compiled for is
+        // not an oracle. No scalar here is floating, so nothing in this list can turn on the FPU
+        // rows — which is a reason it has never mattered, not a reason to leave them off.
+        val r = exec(Seq(cc, s"--target=${t.triple}") ++ Toolchain.machineFlags(t) ++
+          Seq("-S", "-emit-llvm", "-O0", "-o", "-", src))
 
         withClue(s"clang refused the C for ${t.triple}:\n${r.stderr}")(r.exitCode shouldBe 0)
         r.stdout
