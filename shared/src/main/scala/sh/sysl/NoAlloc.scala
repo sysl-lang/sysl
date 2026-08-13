@@ -82,8 +82,13 @@ trait NoAlloc extends AnalyzerBase {
 
       scan(f.body, why)
       allocator.blame(f.body, why)
-    for f <- abstracts if noAlloc(Modules.moduleOf(f.name)) do
-      val why = because(Modules.moduleOf(f.name))
+    // Asked of **where the declaration was written** rather than of its key, which is the one place
+    // the two part company. A member of a structural type is hoisted under a bare `tuple.display`,
+    // whose key names no module — so reading the key puts the library's own tuple renderer in the
+    // anonymous module, which is the *program's*, and a freestanding program is then refused for a
+    // string the library builds. Every other kind of declaration answers the same either way.
+    for f <- abstracts; module = scopeFor(f.name).module if noAlloc(module) do
+      val why = because(module)
 
       scan(f.body, why)
       abstractly.blame(f.body, why)
