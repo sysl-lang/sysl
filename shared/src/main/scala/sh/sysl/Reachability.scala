@@ -139,6 +139,14 @@ object Reachability {
    * `@section`-placed, or that is also a handler, would be emitted for the second reason and land its
    * C symbol in the consumer anyway — measured, and it put two `define @main`s in one module.
    *
+   * **The destructor is the kind that could under-prune, and coherence is why it cannot.** Over-
+   * pruning the other three costs a symbol nobody asked for; over-pruning a destructor is a *link*
+   * error, since the release hook the emitter builds calls a name no line of the program contains.
+   * What makes it safe is `02 § Coherence`: an `impl Drop for T` may live only in the module
+   * declaring `Drop` — the library's, so not a package's to add to — or in one declaring a type named
+   * in `T`. So the hook's module is always one that instantiating `T` had to name, and a reachable
+   * instantiation always carries an edge to it.
+   *
    * **What the qualification costs is that a consumer wanting a package's handler or placed
    * definition has to name its module**, and `import` is how — that is a reference like any other,
    * and it says in the consumer's own source what it is asking for. A vector table slot and a
