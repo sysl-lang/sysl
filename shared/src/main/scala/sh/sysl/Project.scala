@@ -40,6 +40,20 @@ object Project {
    * in exactly as a sysl file does, which is what lets its object be named after a path that is
    * unique across the tree.
    *
+   * **C belongs to a module or to the tree's own root, so a directory that is neither contributes
+   * none of its own.** The walk still descends through such a directory, since a module may sit any
+   * depth below one — what it does not do is take the C sitting *in* it. That is `15 §5` step 1 read
+   * for the other half of the walk: a directory containing sources is a module, and `modules` below
+   * already applies the same rule to the sysl. The two disagreeing is how a project came to compile
+   * C nobody wrote for it — `cmake -B build` puts a build directory *inside* the project, and a
+   * Zephyr build fills it with generated C meant for a different compiler.
+   *
+   * The cost, which is accepted rather than fixed: a vendored C library laid out in sub-directories
+   * of its own loses the ones holding no sysl, and the signal is a link error naming the symbols.
+   * Every binding in the org puts its C flat beside the module that declares it, so the rule is the
+   * house pattern rather than a new constraint on it; a package needing the nested form makes the
+   * directory a module by putting the `.sysl` that declares those `extern`s in it.
+   *
    * It is a *separate* call rather than a second list out of one walk because the two answers are
    * wanted at different moments: the sysl decides whether there is anything to compile at all, and
    * the C is not looked at until a compilation that got that far is about to link. Which trees are
@@ -50,7 +64,7 @@ object Project {
    * is not a program.
    */
   def cSources(path: String): List[Source] =
-    if isDirectory(path) then walk(path, Nil, List(".c")) else Nil
+    if isDirectory(path) then walkModules(path, Nil, List(".c")) else Nil
 
   /** The modules a tree offers to something outside it: the shallowest directories under `root` that
    * hold source, as dotted paths (`13 §1`).
@@ -92,6 +106,29 @@ object Project {
     val here    = entries.filter(f => isFile(f) && exts.exists(f.endsWith)).map(f => Source(f, readFile(f), dir))
 
     here ::: entries.filter(isDirectory).flatMap(sub => walk(sub, dir :+ basename(sub), exts))
+  }
+
+  /** `walk`, taking a directory's own files only where that directory is a **module** — where it
+   * holds a sysl file of its own — or is the tree's own root. Sub-directories are still descended
+   * into, because a module may sit any depth below a directory that holds nothing.
+   *
+   * This is what `cSources` wants and `collect` does not: the sysl walk finds the modules, so a
+   * directory it takes nothing from has by definition contributed nothing, while the C walk would
+   * otherwise take files out of a directory the project never claimed.
+   *
+   * **The root is exempt because the root is the tree rather than a directory in it**, which is what
+   * `LibraryBuildCliTests` and `PackageBuildTests` mean by *"as well as beside a module"*: a package
+   * namespaced by reverse DNS has no sysl at its root, and the C belonging to no single module goes
+   * there. `dir` is empty at exactly one place and that is the place.
+   */
+  private def walkModules(path: String, dir: List[String], exts: List[String]): List[Source] = {
+    val entries = listFiles(path).toList.sorted
+    val files   = entries.filter(isFile)
+    val mine    = dir.isEmpty || files.exists(f => sysl.exists(f.endsWith))
+    val here    = if mine then files.filter(f => exts.exists(f.endsWith)).map(f => Source(f, readFile(f), dir))
+                  else Nil
+
+    here ::: entries.filter(isDirectory).flatMap(sub => walkModules(sub, dir :+ basename(sub), exts))
   }
 
   /** The last segment of a path, whichever separator the platform wrote it with. */

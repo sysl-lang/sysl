@@ -323,10 +323,12 @@ class LibraryBuildCliTests extends LibraryCliSupport {
         libs = List(out))) shouldBe "3\n"
     }
 
-    "while a C file that would take the code member's name is refused" in {
-      // The one collision the naming scheme cannot rule out by construction, and the worst: this
-      // member would evict the object the whole library is, leaving an artifact that builds, reads
-      // back perfectly, and fails to link every program that uses it.
+    // The collision this used to reach — a `sysl/code.c` taking the name the library's own compiled
+    // half uses — is no longer reachable from a tree like this one, because `15 §7` takes C only
+    // from a module or the root and a bare `sysl/` is neither. The guard itself is not dead: a
+    // `build-lib --std` walks a tree whose modules genuinely are `sysl/…`, which is the only place
+    // the name can now be produced, and `LibraryArtifactTests` pins it on `collisions` directly.
+    "while a C file in a directory that declares no module is skipped rather than archived" in {
       val root = createTempDirectory("sysl-cli-clash-")
 
       createDirectory(s"$root/demo")
@@ -335,10 +337,17 @@ class LibraryBuildCliTests extends LibraryCliSupport {
       writeFile(s"$root/sysl/code.c", "int f(void) { return 0; }\n")
 
       val out = createTempFile("sysl-cli-clash-", LibraryArtifact.extension)
-      val (status, notes) = diagnostics(Config(command = "build-lib", file = root, output = Some(out)))
 
-      status should not be 0
-      notes should include(LibraryArtifact.codeMember)
+      succeeds(Config(command = "build-lib", file = root, output = Some(out)))
+
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      // The member name is the point rather than the member count: had the stray C been archived it
+      // would have taken `sysl.code.o` and evicted the library's own compiled half, leaving an
+      // artifact that reads back perfectly and links nothing. A program running off it says it did
+      // not, which no assertion about names can — both spellings are the same string.
+      ran(Config(command = "run", file = program("print(demo.double(21))"),
+        libs = List(out))) shouldBe "42\n"
     }
 
     "a C file that does not compile stops the build and names itself" in {

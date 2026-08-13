@@ -23,6 +23,12 @@ class NativeSourceTests extends LibraryCliSupport {
    */
   private val shim = "int demo_seven(void) { return 7; }\n"
 
+  /** C that cannot compile, for the cases whose whole claim is that it is never offered to clang. A
+   * build reaching the toolchain with this in hand fails; a green run says the file was skipped, and
+   * cannot say it by accident.
+   */
+  private val refuses = "#error this file is not part of any module\n"
+
   private val calling =
     """extern "demo_seven" c_seven() -> int
       |
@@ -98,6 +104,84 @@ class NativeSourceTests extends LibraryCliSupport {
 
       status should not be 0
       notes should include("demo_seven")
+    }
+  }
+
+  /** `15 §7`: C belongs to a **module**, so a directory holding no sysl contributes none of its own.
+   *
+   * The case this is for is not hypothetical and not a tidy-up. `cmake -B build -S .` — CMake's
+   * default and what `sysl-lang/zephyr-demo` documents — puts the build directory *inside* the
+   * project, and a Zephyr build fills `build/zephyr/` with generated C written for the toolchain
+   * *it* was configured with. Compiling that with clang against headers Zephyr emitted for gcc
+   * stops the build on `#error processor architecture not supported`, which reads as a
+   * target-support failure in sysl or in Zephyr and is neither.
+   */
+  "C in a directory that holds no sysl" - {
+
+    "is not compiled, however deep it sits" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val root = projectOf(
+        "main.sysl"            -> "print(demo.seven_times(6))\n",
+        "demo/demo.sysl"       -> s"module demo\n\n$calling",
+        "demo/shim.c"          -> shim,
+        "build/generated.c"    -> refuses,
+        "build/deep/nested.c"  -> refuses,
+      )
+
+      ran(Config(command = "run", file = root)) shouldBe "42\n"
+    }
+
+    // The root is the case a looser rule gets wrong: prune only a subtree with no sysl *below* it
+    // and a root holding `main.sysl` makes the whole project one module again, `build/` included.
+    "including where the project root itself holds sysl" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val root = projectOf(
+        "main.sysl"         -> s"$calling\nprint(seven_times(6))\n",
+        "shim.c"            -> shim,
+        "build/generated.c" -> refuses,
+      )
+
+      ran(Config(command = "run", file = root)) shouldBe "42\n"
+    }
+
+    // The root is the tree rather than a directory in it, so it carries C whether or not it holds
+    // sysl — which is what a package namespaced by reverse DNS relies on, having nothing at its top.
+    // `PackageBuildTests` and `LibraryBuildCliTests` pin that on their own trees; here it is the
+    // interaction that matters, since the exemption must not reach the build directory beside it.
+    "though the root itself carries C with no sysl of its own" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val root = projectOf(
+        "demo/demo.sysl"    -> s"""module demo
+                                  |
+                                  |$calling
+                                  |@test
+                                  |seven_is_seven() =
+                                  |    assert(seven_times(6) == 42, "the root's shim was linked")
+                                  |""".stripMargin,
+        "shim.c"            -> shim,
+        "build/generated.c" -> refuses,
+      )
+
+      ran(Config(command = "test", file = root)) should include("1 passed")
+    }
+
+    // The descent is not pruned with the directory: `sh/` and `sh/sysl/` hold nothing at all in
+    // every package namespaced by reverse DNS, and the module three levels down is the whole package.
+    "while a module below such a directory still carries its own" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val root = projectOf(
+        "main.sysl"                 -> "print(sh.sysl.demo.seven_times(6))\n",
+        "sh/sysl/demo/demo.sysl"    -> s"module sh.sysl.demo\n\n$calling",
+        "sh/sysl/demo/shim.c"       -> shim,
+        "sh/stray.c"                -> refuses,
+        "sh/sysl/stray.c"           -> refuses,
+      )
+
+      ran(Config(command = "run", file = root)) shouldBe "42\n"
     }
   }
 

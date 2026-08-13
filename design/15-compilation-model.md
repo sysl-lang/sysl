@@ -290,11 +290,28 @@ appending a field cannot move an existing field's offset.
 
 ## 7. A source tree may carry C
 
-**A `.c` file dropped anywhere in a tree is compiled with it.** Nothing declares it and nothing lists
-it: the walk of §5 step 1 already visits every directory, and a C file found there is compiled for
-the same target as the sysl beside it. The sysl side reaches it through the `extern` that was already
-the way to name a symbol the linker has (`12` §1) — so the language gains nothing, and the whole of
-the feature is in the build.
+**A `.c` file dropped in any module of a tree, or at the tree's own root, is compiled with it.**
+Nothing declares it and nothing lists it: the walk of §5 step 1 already visits every directory, and a
+C file found in one that holds source is compiled for the same target as the sysl beside it. The sysl
+side reaches it through the `extern` that was already the way to name a symbol the linker has
+(`12` §1) — so the language gains nothing, and the whole of the feature is in the build.
+
+**A module and not merely a directory**, which is step 1's own rule and matters because a project is
+not the only thing that writes into a project's tree. `cmake -B build` puts a build directory
+*inside* the project and fills it with generated C meant for a different compiler; a directory
+holding no sysl was never a module, so its C was never the tree's. The walk still descends through
+one, since a module may sit any depth below a directory that holds nothing itself.
+
+**The root is the exception, because the root is the tree rather than a directory in it.** A package
+namespaced by reverse DNS has its modules at `sh/sysl/foo/` and nothing at all at the top, so a C
+file belonging to no single module has nowhere else to go.
+
+The cost is that a vendored C library laid out in sub-directories of its own loses the ones holding
+no sysl, and a link error naming the symbols is the signal. That is the right trade rather than a
+regret: the looser rules either prune a pure-C directory *inside* a module just the same, or let the
+build directory back in whenever the project root happens to hold a `.sysl`. A package needing the
+nested form makes the directory a module, by putting the `.sysl` that declares those `extern`s in it
+— which is where every binding written so far has put it anyway.
 
 **Which tree it is decides nothing about whether the C is compiled, and only where the object goes.**
 Four trees reach a build and all four carry their C:
