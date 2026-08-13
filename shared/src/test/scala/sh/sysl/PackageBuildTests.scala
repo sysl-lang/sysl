@@ -82,9 +82,10 @@ class PackageBuildTests extends PackageCacheSupport {
     out.toString
   }
 
-  private def refused(root: String): String = {
+  private def refused(root: String, libs: List[String] = Nil): String = {
     val notes  = new java.io.ByteArrayOutputStream
-    val status = Console.withOut(Discarded)(Console.withErr(notes)(sh.sysl.execute(Config(command = "run", file = root))))
+    val status = Console.withOut(Discarded)(
+      Console.withErr(notes)(sh.sysl.execute(Config(command = "run", file = root, libs = libs))))
 
     if status == 0 then fail(s"expected a refusal, got a build")
 
@@ -470,6 +471,218 @@ class PackageBuildTests extends PackageCacheSupport {
     writeFile(s"$root/main.sysl", "print(42)")
 
     run(root) shouldBe "42\n"
+  }
+
+  /** A **`--lib` source root** that is itself a package, and the `dependencies` block it declares.
+   *
+   * A package reached this way is the same package it is by coordinate, so what it depends on is a
+   * property of *it* rather than of the road it arrived by — the argument `§ 13` makes about the
+   * allocator and `§ 8` about the headers its C needs. It was the one road that read neither: the
+   * driver took the root's `.sysl` and nothing else, so the block was neither fetched nor mentioned,
+   * and what a caller got was the unresolved-name cascade that follows code whose imports point at a
+   * package nobody brought — none of it naming the package or the flag that would have answered.
+   *
+   * It is the loop for developing a package against an unreleased dependency, which is why it cost
+   * something rather than merely being inconsistent: the companion had to be tagged before anything
+   * could be tried against it.
+   */
+  "a --lib source root's own dependencies" - {
+
+    /** A source root that is a package: a manifest naming what it depends on, and a module whose code
+     * reaches it.
+     */
+    def declaring(deps: String, body: String, module: String = "mid"): String = {
+      val root = createTempDirectory("sysl-lib-deps-")
+
+      writeFile(s"$root/${PackageConfig.FileName}", manifest(module, "1.0.0", deps))
+      createDirectories(s"$root/$module")
+      writeFile(s"$root/$module/$module.sysl", s"module $module\n\n$body\n")
+      root
+    }
+
+    /** A program with **no manifest of its own**, so the only `dependencies` block in the build is the
+     * root's. That is what makes each case below say something about the root rather than about a
+     * project that would have fetched the package anyway.
+     */
+    def program(text: String): String = {
+      val root = createTempDirectory("sysl-lib-deps-app-")
+
+      writeFile(s"$root/main.sysl", text)
+      s"$root/main.sysl"
+    }
+
+    /** A package published at a version, whose one function answers with a number naming that
+     * version — which is how the cases below say *which* copy was selected rather than only that one
+     * was.
+     */
+    def bottom(cache: String, version: Version, stamp: Int): Unit = {
+      val at = published(cache, "github.com/e/bottom", version, manifest("bottom", version.toString))
+
+      createDirectories(s"$at/bottom")
+      writeFile(s"$at/bottom/bottom.sysl", s"module bottom\n\nstamp() -> int = $stamp\n")
+    }
+
+    "are fetched, so its own code reaches what it declared" in {
+      val geom = packageOf("geom-lib", "geom", "double(n: int) -> int = n * 2")
+      val root = declaring(s"""g { path = "$geom" }""",
+        "quadruple(n: int) -> int = geom.double(geom.double(n))")
+
+      run(program("print(mid.quadruple(10))"), List(root)) shouldBe "40\n"
+    }
+
+    "and a coordinate is fetched, not only a directory already on this machine" in {
+      val cache = emptyCache()
+
+      bottom(cache, Version(1, 0, 0), 100)
+
+      val root = declaring("""b { git = "github.com/e/bottom", version = "1.0.0" }""",
+        "answer() -> int = bottom.stamp()")
+
+      withCache(cache)(run(program("print(mid.answer())"), List(root))) shouldBe "100\n"
+    }
+
+    /** One graph rather than one per road, which is what makes selection mean anything: MVS takes its
+     * maximum over every claim at once (`§ 5`), so the project's floor and the root's are read
+     * together and one copy is built at the higher of them.
+     *
+     * Resolved a road at a time, this program would hold two versions of one module — and `§ 4` is
+     * about exactly what that costs, since the two emit *the same symbol names* for different code.
+     * The sum is what says the floor rose for the project's own use too: 240 rather than 220.
+     */
+    "and are version-selected together with the project's own claims" in {
+      val cache = emptyCache()
+
+      bottom(cache, Version(1, 0, 0), 100)
+      bottom(cache, Version(1, 2, 0), 120)
+
+      val root = declaring("""b { git = "github.com/e/bottom", version = "1.2.0" }""",
+        "answer() -> int = bottom.stamp()")
+
+      withCache(cache)(run(app("""print(mid.answer() + bottom.stamp())""",
+        """b { git = "github.com/e/bottom", version = "1.0.0" }"""), List(root))) shouldBe "240\n"
+    }
+
+    "and two roots naming one coordinate get one copy of it, at the higher version" in {
+      val cache = emptyCache()
+
+      bottom(cache, Version(1, 0, 0), 100)
+      bottom(cache, Version(1, 4, 0), 140)
+
+      val low  = declaring("""b { git = "github.com/e/bottom", version = "1.0.0" }""",
+        "value() -> int = bottom.stamp()", module = "low")
+      val high = declaring("""b { git = "github.com/e/bottom", version = "1.4.0" }""",
+        "value() -> int = bottom.stamp()", module = "high")
+
+      withCache(cache)(run(program("print(low.value() + high.value())"), List(low, high))) shouldBe
+        "280\n"
+    }
+
+    /** What a package declares is charged to the build that reached it, whichever road reached it — so
+     * `§ 8`'s header requirement and `§ 13`'s allocator arrive with a package a *root* named, without
+     * either needing an answer of its own for this road. Both are refusals, which is the shape a
+     * declaration has that a suite watching a program's output can see.
+     */
+    "and what one of them declares is charged to the build that reached it" - {
+
+      "its header requirement, named rather than left to clang" in {
+        val cache = emptyCache()
+        val at    = published(cache, "github.com/e/probing", Version(1, 0, 0),
+          """package { name = "probing", version = "1.0.0" }
+            |requires { headers { probe = "the probe library's headers" } }
+            |""".stripMargin)
+
+        createDirectories(s"$at/probing")
+        writeFile(s"$at/probing/probing.sysl", "module probing\n\nvalue() -> int = 42\n")
+
+        val root = declaring("""p { git = "github.com/e/probing", version = "1.0.0" }""",
+          "answer() -> int = probing.value()")
+
+        withCache(cache)(refused(program("print(mid.answer())"), List(root))) should
+          include("--include-path probe=")
+      }
+
+      "and its allocator, which cannot then disagree with one the project names" in {
+        val cache = emptyCache()
+        val at    = published(cache, "github.com/e/heapy", Version(1, 0, 0),
+          """package { name = "heapy", version = "1.0.0" }
+            |allocator { alloc = "pvPortMalloc", free = "vPortFree" }
+            |""".stripMargin)
+
+        createDirectories(s"$at/heapy")
+        writeFile(s"$at/heapy/heapy.sysl", "module heapy\n\nvalue() -> int = 42\n")
+
+        val root     = declaring("""h { git = "github.com/e/heapy", version = "1.0.0" }""",
+          "answer() -> int = heapy.value()")
+        val consumer = createTempDirectory("sysl-lib-deps-heap-")
+
+        writeFile(s"$consumer/${PackageConfig.FileName}",
+          """package { name = "app", version = "0.1.0" }
+            |allocator { alloc = "kmalloc", free = "kfree" }
+            |""".stripMargin)
+        writeFile(s"$consumer/main.sysl", "print(mid.answer())")
+
+        withCache(cache)(refused(consumer, List(root))) should include("pvPortMalloc")
+      }
+    }
+
+    // A source root need not be a package at all, which is most of what `--lib` is for, and one with
+    // no manifest depends on nothing. Nothing may be fetched on its account and nothing may break.
+    "while a root with no manifest depends on nothing" in {
+      run(program("print(41 + 1)"), List(libRoot("sh.sysl.other"))) shouldBe "42\n"
+    }
+
+    /** The collision this made reachable, and the one thing the first draft of the fetch got wrong.
+     *
+     * A root's modules are filed under the project's prefix, so a dependency of that root offering a
+     * name the root itself declares is two modules claiming one name — `§ 9`'s collision, and the
+     * refusal was checked against the *project's* directories only. What happened instead was the
+     * silent winner that rule exists to refuse: the root's own module answered, the dependency's was
+     * unreachable, and the build was green.
+     */
+    "and a dependency claiming a name the root itself declares is refused" in {
+      val cache = emptyCache()
+      val at    = published(cache, "github.com/e/mid", Version(1, 0, 0), manifest("mid", "1.0.0"))
+
+      createDirectories(s"$at/mid")
+      writeFile(s"$at/mid/mid.sysl", "module mid\n\nstamp() -> int = 7\n")
+
+      val root  = declaring("""m { git = "github.com/e/mid", version = "1.0.0" }""",
+        "answer() -> int = 42")
+      val notes = withCache(cache)(refused(program("print(mid.answer())"), List(root)))
+
+      notes should include("is both a module of the source root")
+      notes should include(root)
+      notes should include("'mount'")
+    }
+
+    // And a mount settles it, exactly as it settles every other collision — the escape hatch has to
+    // be reachable from this road too, or the refusal above is a wall rather than a diagnostic.
+    "while a mount settles that, as it does every other collision" in {
+      val cache = emptyCache()
+      val at    = published(cache, "github.com/e/mid", Version(1, 0, 0), manifest("mid", "1.0.0"))
+
+      createDirectories(s"$at/mid")
+      writeFile(s"$at/mid/mid.sysl", "module mid\n\nstamp() -> int = 7\n")
+
+      val root = declaring(
+        """m { git = "github.com/e/mid", version = "1.0.0", mount = "theirs" }""",
+        "answer() -> int = theirs.mid.stamp() * 6")
+
+      withCache(cache)(run(program("print(mid.answer())"), List(root))) shouldBe "42\n"
+    }
+
+    /** The accepted cost, pinned so that it is deliberate rather than discovered. A `--lib` root's
+     * files are filed under the **project's own** prefix — that is what `--lib` means — so the import
+     * table its manifest binds into is the project's, and a name only the root declared is a name the
+     * program can write. It is no more true of a dependency's name than it always was of the root's
+     * own modules.
+     */
+    "and the program may write a name only the root's manifest bound" in {
+      val geom = packageOf("geom-lib", "geom", "double(n: int) -> int = n * 2")
+      val root = declaring(s"""g { path = "$geom" }""", "unused() -> int = 0")
+
+      run(program("print(geom.double(21))"), List(root)) shouldBe "42\n"
+    }
   }
 
   "sysl.sum" - {
