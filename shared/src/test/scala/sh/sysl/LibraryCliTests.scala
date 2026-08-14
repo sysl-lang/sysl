@@ -788,4 +788,66 @@ class LibraryCliTests extends LibraryCliSupport {
       ran(Config(command = "run", file = prog, libs = List(lib))) shouldBe "timer 32\n"
     }
   }
+
+  /** **A library is built for every target, so a probe in one has to be gated or a library cannot
+    * hold a probe at all** (`CProbe.unmeasurable`).
+    *
+    * `CConstTests` pins the gate on the compilation path; this pins it at `build-lib`, which is the
+    * path that matters for a library and which reaches `CProbe.lower` from `LibraryArtifact` rather
+    * than from the analyzer. They are two call sites, and a fix applied to one would have left the
+    * other exactly as it was.
+    */
+  "a library holding a probe the target cannot answer" - {
+    val bare = Target.named("thumbv7em-freestanding").getOrElse(cancel("no such target"))
+
+    val gated =
+      """module demo
+        |@requires(posix)
+        |@include("regex.h")
+        |
+        |c const
+        |    REGEX_SIZE: usize = "sizeof(regex_t)"
+        |
+        |size() -> usize = REGEX_SIZE
+        |""".stripMargin
+
+    "builds for a machine that has no such header, because the module said it needs one" in {
+      val out = createTempFile("sysl-cli-", LibraryArtifact.extension)
+
+      succeeds(Config(command = "build-lib", file = rootOf("demo", gated), output = Some(out),
+        target = Some(bare.name)))
+    }
+
+    /** The guard against fixing this by never probing at all: same tree, a machine that does have
+      * the header, and the measurement still happens.
+      */
+    "and is measured for one that does" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val out = createTempFile("sysl-cli-", LibraryArtifact.extension)
+
+      succeeds(Config(command = "build-lib", file = rootOf("demo", gated), output = Some(out)))
+    }
+
+    /** A module that declared nothing is measured wherever it is built, which keeps this a rule
+      * about files that said what they need rather than one about which machine is being built for.
+      */
+    "while one that declares nothing is still refused there" in {
+      val ungated =
+        """module demo
+          |@include("regex.h")
+          |
+          |c const
+          |    REGEX_SIZE: usize = "sizeof(regex_t)"
+          |""".stripMargin
+
+      val out = createTempFile("sysl-cli-", LibraryArtifact.extension)
+      val (status, notes) =
+        diagnostics(Config(command = "build-lib", file = rootOf("demo", ungated), output = Some(out),
+          target = Some(bare.name)))
+
+      status should not be 0
+      notes should include("regex.h")
+    }
+  }
 }

@@ -528,6 +528,32 @@ measurement does not reopen it.
 **It does not import the typedef.** A `c type` names one and gets an integer back; no name from the
 header becomes visible in sysl, which is §9's arrangement and is deliberately untouched.
 
+### A file that says what it needs is not probed on a machine that cannot have it
+
+**A probe is a C compilation, so a file carrying one asks for headers — and a library is built for
+every target.** Without a rule here a library could hold no probe at all: one module measuring
+`sizeof(regex_t)` would fail every freestanding build of every program, including programs that never
+name it, because there is no `<regex.h>` for a bare Cortex-M and no reason there should be.
+
+So a file's blocks are **skipped** when the file declares `@requires` on an environment capability the
+machine cannot have. Its header stays and its declarations go: the module is still there to be
+answered about, so a program that *does* reach it is told *"this reaches 'x', which requires 'posix'"*
+by the ordinary rule (`capabilities.md § Propagation through imports`) rather than being answered with
+an undefined name and sent looking for a typo.
+
+**What is asked is whether the machine can have the capability, not whether the project provides
+it**, and the difference is the whole of why this works. `package.hocon` defaults every capability to
+provided, so a freestanding target nominally offers `posix` and a gate reading `provides` would gate
+nothing whatever — which is what this was first misdiagnosed as. The question here is physical and has
+one answer per target: an operating system, and POSIX. `heap` has no physical answer and is not asked,
+since whether there is an allocator is an engineering decision about a machine that could have one
+either way. It is the same fact `Conditional` publishes as `hosted` and `posix`, read from one place
+so the two cannot drift.
+
+**A file that requires nothing is measured wherever it is built**, and that is deliberate rather than
+an omission: such a file claims to build anywhere, so a header it cannot find there is the file having
+mis-stated itself. The gate is a rule about files that said what they need.
+
 **An object is named after the path it was found at**, directories included — `demo/util.c` becomes
 `demo.util.o`. A basename alone would not do: `ar r` replaces by name, so two modules each holding a
 `util.c` would have the second evict the first, and the library would ship missing whatever only the

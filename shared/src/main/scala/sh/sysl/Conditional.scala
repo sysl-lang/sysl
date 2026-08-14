@@ -49,11 +49,19 @@ object Conditional {
 
   /** The symbols that are **true** for a target. Everything in [[symbols]] and not in here is false;
    * everything in neither is a mistake.
+   *
+   * `Hosted` and `Posix` are read off `Target.inherentCapabilities` rather than recomputed here.
+   * They are the same two facts a `c const` block is gated on, under a different vocabulary — this
+   * side names a symbol a source line may test, that side names a capability a module may require —
+   * and a machine that is hosted for one and bare for the other is a bug nobody would find by
+   * reading either file alone.
    */
   def defined(target: Target): Set[String] =
+    val machine = target.inherentCapabilities
+
     Set(osSymbol(target.os), cpuSymbol(target.cpu)) ++
-      Option.when(target.os != Os.Freestanding)(Hosted) ++
-      Option.when(target.os == Os.MacOS || target.os == Os.Linux)(Posix)
+      Option.when(machine(Capability.Os))(Hosted) ++
+      Option.when(machine(Capability.Posix))(Posix)
 
   /** The source as this target sees it, or the first thing wrong with its directives.
    *

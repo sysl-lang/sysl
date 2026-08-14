@@ -111,8 +111,52 @@ object CProbe {
     then Right(units)
     else
       units.foldLeft[Either[String, List[Program]]](Right(Nil)) { (soFar, unit) =>
-        soFar.flatMap(done => lowerUnit(unit, target, paths).map(done :+ _))
+        soFar.flatMap(done =>
+          if unmeasurable(unit, target) then Right(done :+ emptied(unit))
+          else lowerUnit(unit, target, paths).map(done :+ _))
       }
+
+  /** Whether this file's blocks must not be measured, because the machine being built for cannot
+   * have what the file says it needs (`capabilities.md`, `15 § c type`).
+   *
+   * **A probe is a C compilation, so a file carrying one asks for headers.** A file that also
+   * declares `@requires(posix)` has said which machines it is for, and a freestanding target is not
+   * one of them — there is no `<regex.h>` for a bare Cortex-M and no reason there should be. Without
+   * this the standard library could hold no probe at all: the artifact is built for every target, so
+   * one POSIX module measuring `sizeof(regex_t)` would fail every freestanding build, including
+   * builds of programs that never name it.
+   *
+   * **The question is `Target.inherentCapabilities` and deliberately not `provides`.** A project's
+   * config defaults every capability to provided, so a freestanding target nominally offers `posix`
+   * and gating on it would gate nothing — which is the shape this was first misdiagnosed as. What is
+   * asked here is physical: is there an operating system on this machine at all.
+   *
+   * A file requiring nothing is measured as before, whatever the target. That is the status quo and
+   * is what keeps this from being a rule about targets rather than about the files that opted in:
+   * a probe with no clause is a file claiming to build anywhere, and one whose header is missing has
+   * mis-stated itself rather than found a bug here.
+   */
+  private def unmeasurable(unit: Program, target: Target): Boolean =
+    val machine = target.inherentCapabilities
+
+    unit.capabilities.exists(c =>
+      c.direction == CapabilityDirection.Requires &&
+        Capability.closure(c.name).exists(cap => Capability.environment(cap) && !machine(cap)))
+
+  /** The file with its declarations dropped and its **header kept**, which is what a skipped probe
+   * leaves behind.
+   *
+   * The body has to go, and not merely the blocks: a `c const` is what the declarations around it are
+   * written in terms of, and an unmeasured one cannot be analyzed or encoded — `AstCodec` says so
+   * outright, since a block reaching it means a path skipped this pass.
+   *
+   * **The header stays so the module goes on being answerable.** `Capabilities.record` reads the
+   * clause and `GatedModules` reports at the reference that reached it, so a program naming this
+   * module on a target that cannot have it still gets *"this reaches 'x', which requires 'posix'"* —
+   * which is the diagnostic a reader can act on. Dropping the file outright would answer them with
+   * an undefined name instead, and send them looking for a typo.
+   */
+  private def emptied(unit: Program): Program = unit.copy(body = Nil)
 
   private def lowerUnit(unit: Program, target: Target, paths: SearchPaths)
       : Either[String, Program] = {

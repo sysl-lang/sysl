@@ -446,4 +446,123 @@ class CConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
 
     CProbe.lower(units, Target.default) shouldBe Right(units)
   }
+
+  /** **A probe is a C compilation, so a file carrying one asks for headers — and a file that also
+    * declares what it needs has said which machines it is for.**
+    *
+    * This is what lets a *library* hold a probe at all. A library is compiled for every target, so
+    * without the gate one POSIX module measuring `sizeof(regex_t)` fails every freestanding build,
+    * including builds of programs that never name it — `<regex.h>` does not exist for a bare
+    * Cortex-M and there is no reason it should.
+    *
+    * The gate asks `Target.inherentCapabilities` and **not** what the project provides, which is the
+    * distinction the whole thing turns on: `package.hocon` defaults every capability to provided, so
+    * a freestanding target nominally offers `posix` and gating on that would gate nothing at all.
+    */
+  "a probe the machine cannot answer" - {
+    val bare = Target.named("thumbv7em-freestanding").getOrElse(cancel("no such target"))
+
+    val tree = project(
+      ("host", "host.sysl",
+        """module host
+          |@requires(posix)
+          |@include("regex.h")
+          |
+          |c const
+          |    REGEX_SIZE: usize = "sizeof(regex_t)"
+          |
+          |size() -> usize = REGEX_SIZE
+          |""".stripMargin),
+      ("", "main.sysl", "print(\"nothing here names host\")\n"),
+    )
+
+    /** The case the gate exists for, and the one that used to fail: clang is never asked, because
+      * the file said it needs an operating system and this machine has none.
+      */
+    "is not asked for, on a machine whose header it could not have" in {
+      Compiler.compile(tree, bare) match {
+        case Right(ir) => ir should include("main")
+        case Left(e)   => fail(s"the probe should have been skipped, but:\n$e")
+      }
+    }
+
+    /** The other half, and the reason this is a gate rather than a suppression: the same tree on a
+      * machine that *does* have POSIX is measured exactly as before. A test asserting only the skip
+      * would pass against a `c const` that had stopped working everywhere.
+      */
+    "and is asked for, on a machine that has it" in {
+      Toolchain.findClang(Target.default).getOrElse(cancel("no clang here"))
+
+      Compiler.compile(tree, Target.default) match {
+        case Right(ir) => ir should include("main")
+        case Left(e)   => fail(s"the probe should have been measured here, but:\n$e")
+      }
+    }
+
+    /** **The header is kept when the body is dropped**, which is what makes the skip invisible to
+      * everybody except the module that opted out of this machine. A program that *does* reach it
+      * gets the capability diagnostic naming what it needs — not an undefined name, which would send
+      * a reader looking for a typo in a module that is exactly where they left it.
+      */
+    "while a program that reaches it is told what it requires" in {
+      val reaching = project(
+        ("host", "host.sysl",
+          """module host
+            |@requires(posix)
+            |@include("regex.h")
+            |
+            |c const
+            |    REGEX_SIZE: usize = "sizeof(regex_t)"
+            |
+            |size() -> usize = REGEX_SIZE
+            |""".stripMargin),
+        ("", "main.sysl", "@no_posix\n\nprint(str(host.size()))\n"),
+      )
+
+      Compiler.compile(reaching, bare) match {
+        case Right(out) => fail(s"expected a refusal, got:\n$out")
+        case Left(e) =>
+          e should include("requires 'posix'")
+          e should not include "regex.h"
+      }
+    }
+
+    /** A file that requires nothing is measured whatever the target, which keeps this a rule about
+      * files that opted in rather than a rule about machines. Such a file claims to build anywhere,
+      * and one whose header is missing has mis-stated itself.
+      */
+    "but a file that requires nothing is still measured, and still refused where it cannot be" in {
+      val unguarded = project(
+        ("host", "host.sysl",
+          """module host
+            |@include("regex.h")
+            |
+            |c const
+            |    REGEX_SIZE: usize = "sizeof(regex_t)"
+            |""".stripMargin),
+        ("", "main.sysl", "print(\"nothing here names host\")\n"),
+      )
+
+      Compiler.compile(unguarded, bare) match {
+        case Right(out) => fail(s"expected a refusal, got:\n$out")
+        case Left(e)    => e should include("regex.h")
+      }
+    }
+  }
+
+  /** The two vocabularies for one fact, held to agreeing. `Conditional` names a symbol a source line
+    * may test and `Capability` names something a module may require, and both are asking whether the
+    * machine is hosted — so a target that answered one way here and the other way there would gate a
+    * `c const` and a `#if` differently, which nobody would find by reading either file alone.
+    */
+  "the machine's own capabilities are the symbols conditional compilation defines" in {
+    for target <- Target.all do
+      val machine = target.inherentCapabilities
+      val symbols = Conditional.defined(target)
+
+      withClue(s"${target.name}: ") {
+        machine(Capability.Os) shouldBe symbols("hosted")
+        machine(Capability.Posix) shouldBe symbols("posix")
+      }
+  }
 }

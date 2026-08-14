@@ -139,6 +139,27 @@ case class Target(
    */
   def hasThreadLocalStorage: Boolean = os != Os.Freestanding
 
+  /** The environment capabilities this machine can have **at all**, which is a different question
+   * from what a project says it provides.
+   *
+   * `package.hocon` is the authority on what a target *offers* and is the one to ask nearly
+   * everywhere — but its prior is that a machine can do everything, so a capability the file does not
+   * mention comes back provided. That prior is right for policy and wrong for physics: a freestanding
+   * target has no operating system whatever a config omits to say, and no `<regex.h>` for a probe to
+   * include. Asking `provides` where the question is physical answers `true` for every target and
+   * gates nothing, which is the trap this exists to close.
+   *
+   * Only the two environment capabilities have a physical half. `heap` is deliberately absent —
+   * whether there is an allocator is an engineering decision about a machine that could have one
+   * either way, which is what `package.hocon` is for.
+   *
+   * **`Conditional` derives its two facts from this**, so the compiler holds one answer to "is this
+   * machine hosted" rather than two that can drift apart.
+   */
+  def inherentCapabilities: Set[String] =
+    Option.when(os != Os.Freestanding)(Capability.Os).toSet ++
+      Option.when(os == Os.MacOS || os == Os.Linux)(Capability.Posix)
+
   /** Whether the compiler can lower for this target at all. A target it knows and cannot lower for
    * is worth naming: the diagnostic then says what is missing instead of leaving the name unknown,
    * which reads as a typo.
