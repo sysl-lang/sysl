@@ -1057,7 +1057,7 @@ tries:
 | refused | because |
 |---|---|
 | a **generic** | an exported symbol is one function at one signature, and there is no way to say which instantiation the linker holds |
-| a **member** | C has no receiver to hand it. The grammar refuses this before any rule does: an attribute is read at statement position only, so `@test` and `@pure` are as unavailable on a method |
+| a **member** | C has no receiver to hand it. The grammar refuses this before any rule here is reached, and says so in as many words: no annotation marks a member (`06 § What it does not reach`), so `@test` and `@pure` are as unavailable on a method |
 | a **`private`** definition | `private` emits the symbol `internal` (§3), which promises every caller is inside the module; an export promises the opposite, and a definition cannot make both claims |
 | a **`@ghost`** | it is erased before codegen (`17` §8), so there is no symbol at all |
 | a **`@test`** | only `sysl test` builds one, and an exported symbol has to be in the artifact a C project links |

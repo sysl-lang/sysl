@@ -55,14 +55,20 @@ a_broken_promise() = …
 an_index_past_the_end() = …
 ```
 
-`@test` was the language's first attribute and is a long way from being its only one. A **function**
-takes `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads(...)`, `@writes(...)` and `@crossing(...)`
-beside it; `@packed` and `@align(n)` mark a struct's layout and `@section("...")` places a binding or
-a function (`15 §1`, `§13`); and `@no_<capability>`, `@requires(...)`, `@link("...")`,
-`@include("...")` and `@tests` belong to the file's header (`13 §4`). A word after `@` that is none
-of them is answered by name rather than as grammar, and the message says which of the lists it was
-looking in. The attribute goes on its own line above an ordinary function declaration, which may
-still be `private`.
+`@test` was the language's first attribute and is a long way from being its only one. A **free
+function** takes `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads(...)`, `@writes(...)` and
+`@crossing(...)` beside it; `@packed` and `@align(n)` mark a struct's layout and `@section("...")`
+places a binding or a function (`15 §1`, `§13`); and `@no_<capability>`, `@requires(...)`,
+`@link("...")`, `@include("...")` and `@tests` belong to the file's header (`13 §4`). A word after
+`@` that is none of them is answered by name rather than as grammar, and the message says which of
+the lists it was looking in. The attribute goes on its own line above an ordinary function
+declaration, which may still be `private`.
+
+**A member takes none of them**, which is `06 § What it does not reach` read from this end: a method,
+a property, an associated function, a field and a variant each carry no annotation at all. That is a
+refusal *with a sentence* rather than a form the grammar happens not to read — one written above a
+member says so, and says that what `sysl test` runs is a free function calling the member. `@assert`
+inside a type's body is told apart and answered separately, since it describes nothing but itself.
 
 **Do not read that growth as a general extension mechanism.** The set is closed and each member was
 added because something needed it: the list is longer than it was, and every entry on it is still one
@@ -74,8 +80,11 @@ compilation`), and the two never meet: a directive sits at the margin and is gon
 runs, while an attribute is indented with the declaration it is on and reaches the grammar as one.
 **`#test` is refused by name**, because `#` is the sigil a reader arriving from Rust or C reaches for
 first, and being told the annotation is written `@test` is more use than being told a directive word
-is unknown. A `@test` inside a gated-out branch is simply not there, so a test build has the tests its
-target has.
+is unknown. **Above a member it is answered by the member rule instead**, with the sigil named at the
+end of it: the pass that takes directives reads only column 1, so an indented `#` reaches the grammar
+like any other token — and being told only that an annotation is written `@` would send that reader
+to write `@test`, which a member is refused just the same. A `@test` inside a gated-out branch is
+simply not there, so a test build has the tests its target has.
 
 **A test is an ordinary function with a caller nothing else has.** No parameters, no result,
 not generic — all three are the same requirement from different sides, since the runner calls
