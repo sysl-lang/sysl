@@ -24,7 +24,14 @@ import io.github.edadma.cross_platform.*
  * register on AArch64 where sysl's own lowering passes a two-field LLVM struct; `Pair` is
  * `{f32,f32}`, a homogeneous floating aggregate, which travels in floating registers on a machine
  * that has them and nowhere near the integer ones; `Big` is twenty-four bytes, which is past every
- * convention's register threshold and goes through memory in both directions.
+ * convention's register threshold and goes through memory in both directions; and `Xf` is a
+ * homogeneous floating aggregate of **four** members, which several conventions bound separately
+ * from one of two.
+ *
+ * **The two axes are crossed as well as covered, which is 0143.** A classification is chosen per
+ * parameter and an address is a separate question from a call, so "a floating aggregate" and "through
+ * an address" being green apart says nothing about them together — and together is what a real
+ * callback registration is, since one that takes a position or a transform takes nothing but floats.
  */
 class CExportAbiTests extends LibraryCliSupport {
 
@@ -64,6 +71,10 @@ class CExportAbiTests extends LibraryCliSupport {
       |    b: i64
       |    c: i64
       |
+      |struct Xf
+      |    p: Pair
+      |    q: Pair
+      |
       |""".stripMargin
 
   private val cTypes =
@@ -72,6 +83,7 @@ class CExportAbiTests extends LibraryCliSupport {
       |typedef struct { int32_t index1; uint16_t world0; uint16_t generation; } Id;
       |typedef struct { float x; float y; } Pair;
       |typedef struct { int64_t a; int64_t b; int64_t c; } Big;
+      |typedef struct { Pair p; Pair q; } Xf;
       |
       |""".stripMargin
 
@@ -363,6 +375,79 @@ class CExportAbiTests extends LibraryCliSupport {
             |	Id b = { 2, 4, 8 };
             |
             |	return f( a, b ) && !f( b, a ) ? 0 : 999;
+            |}
+            |""".stripMargin) shouldBe "0\n"
+    }
+
+    /** The two axes crossed, which is the case neither of the ones above reaches (0143).
+     *
+     * Every address case above passes `Id`, an aggregate that travels in the **integer** registers,
+     * and every floating aggregate above is reached by a **direct call**. A classification is chosen
+     * per parameter, so an address handed over for a function whose parameters go somewhere else
+     * entirely is a separate question from either — and it is the question a real registration asks,
+     * since a callback that takes a position or a transform takes nothing but floats.
+     */
+    "and a homogeneous floating aggregate arrives through it too" in {
+      ranProject(
+        types +
+          """@export("probe_scale")
+            |scale(p: Pair, q: Pair) -> f32 = p.x + p.y * 10.0 + q.x * 100.0 + q.y * 1000.0
+            |
+            |extern "probe_through_pair" through_pair(f: *extern(Pair, Pair) -> f32) -> int
+            |
+            |check() -> int = through_pair(&scale)
+            |""".stripMargin,
+        cTypes +
+          """typedef float ( *PairFn )( Pair, Pair );
+            |
+            |int probe_through_pair( PairFn f )
+            |{
+            |	Pair p = { 1.0f, 2.0f };
+            |	Pair q = { 3.0f, 4.0f };
+            |	float got = f( p, q );
+            |
+            |	return got > 4320.9f && got < 4321.1f ? 0 : 999;
+            |}
+            |""".stripMargin) shouldBe "0\n"
+    }
+
+    /** The shape a debug-draw callback actually is, which reaches three arms at once and is the
+     * densest case in this file.
+     *
+     * `Xf` is a homogeneous floating aggregate of **four** members rather than two, which several
+     * conventions bound separately; the loose `f32` after two aggregates is what puts pressure on the
+     * floating registers, since it has to land in the first one they left; and the result is
+     * **`void`**, the arm added for the direct case and reached here through an address for the first
+     * time. Every field is read and weighted distinctly, so a value in the wrong register moves the
+     * answer rather than being masked by a field nobody looks at.
+     *
+     * The weights are powers of two over values exact in binary32, so the sum is exact.
+     */
+    "and the shape a debug-draw callback actually is" in {
+      ranProject(
+        types +
+          """@export("probe_draw")
+            |draw(xf: Xf, centre: Pair, radius: f32, colour: i32, out: *f32)
+            |    out[0] = xf.p.x + xf.p.y * 2.0 + xf.q.x * 4.0 + xf.q.y * 8.0 +
+            |             centre.x * 16.0 + centre.y * 32.0 + radius * 64.0 + f32(colour) * 128.0
+            |
+            |extern "probe_through_draw" through_draw(
+            |    f: *extern(Xf, Pair, f32, i32, *f32) -> unit) -> int
+            |
+            |check() -> int = through_draw(&draw)
+            |""".stripMargin,
+        cTypes +
+          """typedef void ( *DrawFn )( Xf, Pair, float, int32_t, float * );
+            |
+            |int probe_through_draw( DrawFn f )
+            |{
+            |	Xf xf         = { { 10.0f, 20.0f }, { 0.5f, 0.125f } };
+            |	Pair centre   = { 3.5f, 4.5f };
+            |	float got     = 0.0f;
+            |
+            |	f( xf, centre, 6.25f, 42, &got );
+            |
+            |	return got == 6029.0f ? 0 : 999;
             |}
             |""".stripMargin) shouldBe "0\n"
     }
