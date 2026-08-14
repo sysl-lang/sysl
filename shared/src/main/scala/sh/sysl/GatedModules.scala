@@ -24,27 +24,54 @@ import scala.collection.mutable
  */
 trait GatedModules extends AnalyzerBase {
 
-  /** Reports every reference out of a module that narrowed an environment capability into one that
-   * needs it.
+  /** Reports every reference into a module that needs an environment capability the reaching module
+   * does not have — **either because it gave the capability up, or because the target never had it**.
+   *
+   * The two halves are one check because they are one rule: `capabilities.md § Two levels` says a
+   * module's effective set is `target ∩ narrowing`, so a capability is out of reach whichever of the
+   * two removed it, and the edge that reached it is the line a reader has to change either way. Only
+   * the sentence differs, since only one of them names something the reader wrote.
    *
    * It runs after the module graph is settled and held to being acyclic, for both of the reasons
    * that pass does: an edge is made by a reference and a reference may be anywhere a body is, and
    * the transitive walk below terminates because the graph has no cycles.
    */
   protected def checkGatedModules(): Unit = {
-    val gaveUp = moduleNarrows.view
+    val narrowed = moduleNarrows.view
       .mapValues(_.keySet & Capability.environment)
       .filter(_._2.nonEmpty)
       .toMap
 
-    // Nothing narrowed anything, which is almost every program: the walk below reads every edge, and
-    // a compilation with no clause in it should pay nothing at all for this.
-    if gaveUp.nonEmpty then
+    // The ceiling half of the two-level rule, which is the machine's rather than any module's: what
+    // the target does not provide is out of reach for every module of the program, with no clause
+    // written anywhere. It is the same treatment `NoAlloc` gives a target with no heap, and for the
+    // same reason — `capabilities.md` says the whole transitive graph must fit within the target's
+    // set, and a module that inherits the target's capabilities by default inherits their absence too.
+    //
+    // **Reported here at the reference rather than at the required module's own clause**, which is
+    // the whole of what makes it answerable. That clause is in a file the program's author did not
+    // write: the standard module's `sysl.fs`, or a package's one POSIX module. Refusing there makes a
+    // library unusable on a machine because of a module the program never names; refusing here
+    // refuses exactly the programs that reach one.
+    //
+    // The library's own modules are left out for the reason `NoAlloc` leaves them out: they are
+    // compiled into every program, so an edge inside the library would report a mistake in source
+    // nobody in this compilation can change. What is being asked is whether the *program* reaches a
+    // gated module, and that edge starts in a module of the program's.
+    val absent = Capability.environment.filterNot(targetProvides)
+
+    def reaching(module: String): Set[String] =
+      narrowed.getOrElse(module, Set.empty) ++
+        (if ownModule(module) && !std.carries(module) then absent else Set.empty)
+
+    // Nothing narrowed anything and the target has everything, which is almost every compilation: the
+    // walk below reads every edge, and one with no question to ask should pay nothing at all for it.
+    if narrowed.nonEmpty || absent.nonEmpty then
       val needed = requirements()
 
       for
         ((from, to), pos) <- moduleEdges.toList
-        given_up          <- gaveUp.get(from)
+        given_up = reaching(from) if given_up.nonEmpty
         // The least of them by name where a reference is refused for more than one reason, so the
         // message does not vary between runs with the iteration order of a set.
         cap <- (given_up & needed.getOrElse(to, Set.empty)).toList.sorted.headOption
@@ -53,9 +80,18 @@ trait GatedModules extends AnalyzerBase {
         // finished walk left it when an edge carries no position of its own.
         currentPos = pos
 
-        recover(())(err(s"this reaches '$to', which requires '$cap', and ${here(from)} declared " +
-          s"'no $cap' — an environment capability gates which modules exist, so a module that gave " +
-          "one up may not reach one that needs it"))
+        // A clause the reader wrote is the better half of the answer where there is one, so it is
+        // preferred over the target's: told both, somebody would go and change the config.
+        val why =
+          if narrowed.get(from).exists(_.contains(cap)) then
+            s"${here(from)} declared 'no $cap' — an environment capability gates which modules " +
+              "exist, so a module that gave one up may not reach one that needs it"
+          else
+            s"'${target.name}' does not provide it — a target's capabilities are what " +
+              s"'${PackageConfig.FileName}' declares, so either this reference cannot be made on " +
+              "this machine or the config is understating it"
+
+        recover(())(err(s"this reaches '$to', which requires '$cap', and $why"))
   }
 
   /** How a module refers to itself in a diagnostic. The root module has no name to print, and a

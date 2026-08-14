@@ -43,6 +43,7 @@ class Analyzer private (
     protected val target: Target,
     protected val provides: Set[String],
     protected val packages: Packages,
+    protected val own: Option[Set[String]],
 ) extends ProgramWalk with ExprAnalysis {
 
   /** Every error the walk found, rendered and in source order. */
@@ -75,12 +76,21 @@ object Analyzer {
    * compiler, and a C compiler that has not been told where the headers are cannot evaluate one
    * (`SearchPaths`). It reaches nothing else in the analyzer.
    */
+  /** `own` names the modules this compilation is **producing**, where a library was handed to it as
+   * more modules — a `--lib` source root or a fetched package (`Compiler.compiledWith`). `None` says
+   * there was no such library, and then every module is the program's own.
+   *
+   * It is here for the reason `building` is: `units` is one flat list and nothing in a tree says
+   * which road it arrived by, so a rule that has to tell a program's own file from a library's has to
+   * be told. What reads it is the target half of `Capabilities` — the only rule in the walk whose
+   * answer is the **machine's** and therefore the program author's rather than a library author's.
+   */
   def analyze(units: List[Program], building: Set[String] = Set.empty,
               std: Stdlib = Stdlib.fromSource(Target.default), target: Target = Target.default,
               provides: Set[String] = Capability.core.toSet, packages: Packages = Packages.none,
-              paths: SearchPaths = SearchPaths.none)
+              paths: SearchPaths = SearchPaths.none, own: Option[Set[String]] = None)
       : Either[String, TProgram] = CProbe.lower(units, target, paths).flatMap(analyzing(_,
-    building, std, target, provides, packages))
+    building, std, target, provides, packages, own))
 
   /** The walk itself, over units whose `c const` blocks are already ordinary constants.
    *
@@ -91,8 +101,9 @@ object Analyzer {
    * callers and this has one.
    */
   private def analyzing(units: List[Program], building: Set[String], std: Stdlib, target: Target,
-                        provides: Set[String], packages: Packages): Either[String, TProgram] = {
-    val analyzer = new Analyzer(units, building, std, target, provides, packages)
+                        provides: Set[String], packages: Packages, own: Option[Set[String]])
+      : Either[String, TProgram] = {
+    val analyzer = new Analyzer(units, building, std, target, provides, packages, own)
 
     val outcome =
       try Right(analyzer.analyze())

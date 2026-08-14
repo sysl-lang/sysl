@@ -104,8 +104,15 @@ trait Capabilities extends AnalyzerBase {
       checkRepeats(u)
 
     for (module, files) <- units.groupBy(declaredModule) do
+      // A handed-over library is asked the first of these and not the second, and the split is over
+      // *whose mistake it could be*. Whether a clause names a capability at all, and whether the
+      // files of one module agree, are facts about the **files** — a typo is a typo wherever it is
+      // written, and nobody else has checked these, since a `--lib` source root arrives as text. What
+      // the **machine** provides is the program author's business and not the library author's: a
+      // library holding one POSIX module is not a library that cannot be used on a target without
+      // POSIX, it is a library one module of which that program cannot reach.
       checkAgreement(module, files)
-      checkAgainstTarget(module, files.head)
+      if ownModule(module) then checkAgainstTarget(module, files.head)
       record(module, files.head)
 
     // The library's own headers, read but **not checked**. They were checked when the library was
@@ -142,9 +149,16 @@ trait Capabilities extends AnalyzerBase {
    * `&T`"*, and this is that error. It is reported per **module** rather than per file, since the
    * clause is a property of the module and its files have already been held to agreeing.
    *
-   * Only the modules this compilation contributes are asked. A library module requiring `os` is not
-   * a mistake on a target without one — it is a module that program cannot reach, which is a
-   * different diagnostic in a different pass.
+   * Only the modules this compilation contributes are asked, which is `ownModule` above. A library
+   * module requiring `os` is not a mistake on a target without one — it is a module that program
+   * cannot reach, which is a different diagnostic in a different pass (`GatedModules`, which reports
+   * at the reference that reached it rather than at a clause in a file the reader did not write).
+   *
+   * The standard module has always been exempt, by never reaching this at all: `readCapabilities`
+   * only `record`s what `std.contributed` hands back. A `--lib` source root and a fetched package are
+   * in the same position and took a different road, which is what `ownModule` is here to close: one
+   * POSIX module in a library made the whole library unusable on a target without POSIX, even for a
+   * program that never named it.
    */
   private def checkAgainstTarget(module: String, first: Program): Unit =
     for
