@@ -339,6 +339,50 @@ class FuncAddressTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       result should include("an aggregate")
     }
 
+    /** **But not an `extern`, and that was the whole of 0136.** The refusal above is a statement
+      * about code *this compiler emitted* — sysl put the aggregate where its own convention says, so
+      * the address would be of a function C cannot call correctly. None of that can be true of a C
+      * function: sysl neither compiled it nor chose its convention, and its type is what the
+      * declaration transcribed from the header. Refusing one made every C callback a binding wants
+      * to register unnameable, which is most of what a callback-shaped library is.
+      */
+    "and an extern is past the question, since its convention was never sysl's to choose" in {
+      val out = ir("""struct Point
+                     |    x: i32
+                     |    y: i32
+                     |
+                     |extern "c_sum" c_sum(p: Point) -> i32
+                     |extern "c_take" c_take(f: *extern(Point) -> i32) -> i32
+                     |
+                     |print(c_take(&c_sum))
+                     |""".stripMargin)
+
+      out should include("@c_sum")
+    }
+
+    /** So is a function carrying `@export`, whose address is its **thunk's** — a definition that
+      * genuinely has the convention this rule is written about (`ExportThunk`). `15 §12` said that
+      * all along; what changed with 0137 is that it became true.
+      */
+    "and so is an exported function, whose address is the C-convention entry" in {
+      val out = ir("""struct Point
+                     |    x: i32
+                     |    y: i32
+                     |
+                     |@export("c_sum")
+                     |sum(p: Point) -> i32 = p.x + p.y
+                     |
+                     |extern "c_take" c_take(f: *extern(Point) -> i32) -> i32
+                     |
+                     |print(c_take(&sum))
+                     |""".stripMargin)
+
+      // The thunk, not the definition — which is the whole point of the address being admitted.
+      out should include("define i32 @c_sum(")
+      out should include("@c_sum)")
+      out should not include "@$sum)"
+    }
+
     // A string is three words in sysl and one in C, so it is an aggregate here for the same reason a
     // struct is — and saying so is what stops a program handing C a shape it has no reading for.
     "a string, which is a view rather than the address C would read" in {

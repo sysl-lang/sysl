@@ -249,6 +249,18 @@ object Compiler {
                         own = ownModules(mine))
           promoted <- Escape.check(typed)
           _        <- TailCalls.check(typed)
+
+          // **The same check `analyzed` runs, against the tree *this* build emits.** It was missing
+          // here outright, which made every rule about an exported symbol silent under `sysl test` —
+          // the loop a package's author actually runs. A source `sysl build` refused compiled and
+          // ran, so `private`, `@ghost`, variadic, a symbol C could not name, two exports claiming
+          // one symbol, and an export reaching computed module storage were all unreported there.
+          //
+          // `Tests.only` rather than `Tests.strip`, and that is the whole of the difference from
+          // `analyzed`. The question is about the emitted program's symbol table, so what to read is
+          // whatever *this* compilation emits — and a test build is the one build where a `@test`
+          // file's `@export` is a definition rather than something dropped.
+          _        <- Exports.check(Tests.only(typed, ownModules(mine)), ownModules(mine))
         yield
           val kept = Tests.only(typed, ownModules(mine))
 

@@ -148,20 +148,38 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    * there, and a sysl function of that name would be a second definition of one symbol. The reserved
    * name it takes instead holds two separators, which no key can (`Modules.qualify` writes one), so it
    * cannot collide with anything a program or a module could be called.
+   *
+   * **`@export` is not in here, and used to be.** It was written as the same substitution an
+   * `extern`'s link name is, pointing the other way — which made the exported symbol a *rename* of
+   * the definition, so a C caller reached a body lowered by sysl's convention rather than by its own
+   * (`ExportThunk`). The exported name now belongs to the thunk in front of the definition, and the
+   * definition keeps its mangled key, which is what a sysl caller resolves and what the thunk calls.
    */
   protected val entrySymbol = s"${Modules.sep}${Modules.sep}main"
 
   private val symbols: Map[String, String] =
     program.externs.collect { case e if e.symbol != e.name => e.name -> e.symbol }.toMap ++
-      // `@export` is the same substitution an `extern`'s link name is, pointing the other way: the
-      // definition and every sysl call to it name the C symbol rather than the mangled key
-      // (`15 §12`). Nothing else about the function changes — a caller inside sysl still resolves it
-      // by its module path and simply arrives at a different label.
-      program.funcs.collect { case f if f.exported.isDefined => f.name -> f.exported.get }.toMap ++
       program.entry.map(_.func -> entrySymbol)
 
   /** What a definition and every call to it name. */
   protected def symbolOf(name: String): String = symbols.getOrElse(name, name)
+
+  /** The exported symbol of each function that has one, which is the **thunk's** rather than the
+   * definition's (`ExportThunk`).
+   */
+  private val exportSymbols: Map[String, String] =
+    program.funcs.collect { case f if f.exported.isDefined => f.name -> f.exported.get }.toMap
+
+  /** The symbol an **address** of this function names — the one entry point that is callable under
+   * the machine's C convention, since that is the only thing a `*extern` may hold (`12 §6a`).
+   *
+   * For an ordinary sysl function the two are the same and this is `symbolOf`: its signature is all
+   * scalars, or the address would have been refused (`FuncAddress`), and a scalar crosses as itself.
+   * For an exported one they are not — the definition keeps sysl's lowering and the thunk in front
+   * of it is what C can call — so the address is the thunk's, which is what makes `&f` on an
+   * exported function mean anything.
+   */
+  protected def entryOf(name: String): String = exportSymbols.getOrElse(name, symbolOf(name))
 
   /** What a `call` names. For an ordinary function that is the result type, which is all LLVM
    * needs; for a variadic one it is the callee's *whole* function type, because the argument list

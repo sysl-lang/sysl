@@ -26,7 +26,7 @@ import scala.collection.mutable
 class Codegen private (protected val program: TProgram, promotions: Escape.Promotions,
                        protected val target: Target,
                        override protected val allocator: Allocator)
-    extends ExprEmitter {
+    extends ExprEmitter with ExportThunk {
 
   /** The ghost functions of this program, which nothing emitted may name (`17 §8`). */
   private val ghostFuncs: Set[String] = program.funcs.filter(_.ghost).map(_.name).toSet
@@ -46,6 +46,12 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // checked in the analyzer — and the clauses that may are the ones skipped below, so there is no
     // call left to resolve.
     val funcTexts       = own.filterNot(_.ghost).map(genFunction)
+    // The C-callable entry each `@export` publishes, in front of the definition it calls
+    // (`ExportThunk`). Only this compilation's own functions get one: a precompiled function's thunk
+    // was emitted into the artifact that defined it, and a second copy here would be the duplicate
+    // symbol every other cross-artifact declaration is careful to avoid.
+    val thunkTexts      = own.filterNot(_.ghost).filter(_.exported.isDefined)
+                             .map(f => genExportThunk(f, symbolOf(f.name)))
     // A library has no entry point. Emitting one would put a second `main` in every program that
     // linked against it, which the linker reports as a duplicate symbol and nothing else explains.
     val mainText =
@@ -220,6 +226,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     for t <- runtimeTexts do out ++= t; out ++= "\n"
 
     for t <- funcTexts do out ++= t; out ++= "\n"
+    for t <- thunkTexts do out ++= t; out ++= "\n"
     out ++= mainText
     // Last, so that every symbol it names has been written above it. A definition a library already
     // compiled is not in this list: its own module said it was used, and saying so again here would

@@ -41,6 +41,12 @@ object CHeader {
 
     out ++= "#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n"
 
+    // The aggregates the prototypes below name, defined before anything uses one. They are emitted
+    // in dependency order — a struct with a struct in it comes after what it holds — because C
+    // needs a complete type to lay a member out, and there is nothing here to forward-declare
+    // around: a by-value member is the case a forward declaration does not serve.
+    for t <- aggregates(exports) do out ++= s"${definition(t)}\n"
+
     if exports.isEmpty then
       // A header with nothing in it is worth writing rather than refusing: a build that exported
       // nothing is a build whose author forgot the attribute, and an empty header says so where a
@@ -97,6 +103,65 @@ object CHeader {
     s"$noReturn${spell(f.retTy)} ${f.exported.get}($params)"
   }
 
+  /** Every named aggregate the exported signatures reach, **innermost first**.
+   *
+   * A struct is reached through a parameter, a result, a pointer's pointee, a function pointer's own
+   * signature, another struct's field, or an array's element — so the walk follows all of them
+   * rather than only the top level, and a type mentioned twice is defined once.
+   */
+  private def aggregates(exports: List[TFunc]): List[Type] = {
+    val seen  = scala.collection.mutable.LinkedHashSet.empty[Type]
+    val named = scala.collection.mutable.ListBuffer.empty[Type]
+
+    def walk(t: Type): Unit =
+      val r = Type.repr(t)
+
+      if !seen.add(r) then ()
+      else
+        r match
+          case s: Type.Struct =>
+            // The fields go first, so that what this definition lays out is already complete where
+            // the C compiler reads it.
+            s.stored.foreach((_, f) => walk(f))
+            named += s
+          case a: Type.Array          => walk(a.elem)
+          case Type.Ptr(inner)        => walk(inner)
+          case Type.CFn(params, ret)  => params.foreach(walk); walk(ret)
+          case _                      => ()
+
+    for f <- exports do
+      f.params.foreach((_, t) => walk(t))
+      walk(f.retTy)
+
+    named.toList
+  }
+
+  /** One aggregate, as C declares it — a `typedef` of an anonymous struct, so that the name is
+   * usable without the `struct` keyword and reads the way a C API's own handles do.
+   */
+  private def definition(t: Type): String = t match
+    case s: Type.Struct =>
+      val fields = s.stored.map((n, f) => s"\t${member(f, n)};\n").mkString
+
+      s"typedef struct {\n$fields} ${cName(s)};\n"
+    case _ => ""
+
+  /** A field, which is where the **declarator** matters: an array's brackets go after the name, so a
+   * member is not simply its type followed by its name the way a parameter is.
+   */
+  private def member(t: Type, name: String): String = Type.repr(t) match
+    case a: Type.Array => s"${spell(a.elem)} $name[${a.length}]"
+    case _             => s"${spell(t)} $name"
+
+  /** The C name of a named type. The mangled form is already unique per instantiation — it is what
+   * the emitted IR names the aggregate — and the separators it uses are not C identifier characters,
+   * so they are replaced rather than the name being invented again here.
+   */
+  private def cName(t: Type): String = t match
+    case n: Type.Named =>
+      Type.mangled(n.base, n.targs).map(c => if c.isLetterOrDigit then c else '_')
+    case _ => "void"
+
   /** A sysl type as C spells it.
    *
    * Only the types `ExportCheck.crosses` admits reach here, so the fallthrough is unreachable rather
@@ -120,5 +185,11 @@ object CHeader {
     case Type.CFn(params, ret)               =>
       val ps = if params.isEmpty then "void" else params.map(spell).mkString(", ")
       s"${spell(ret)} (*)($ps)"
+    // A struct is named rather than written out, and `aggregates` is what put the definition above
+    // this prototype (0137). A **simple** enum is its underlying integer and is spelled as one: C's
+    // own `enum` has an implementation-defined width, so naming the integer is what states the same
+    // contract the rest of this header states.
+    case s: Type.Struct                      => cName(s)
+    case e: Type.Enum if e.simple            => spell(e.underlying)
     case other                               => s"/* no C spelling for ${other} */ void"
 }

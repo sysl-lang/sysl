@@ -82,14 +82,29 @@ trait FuncAddress extends CallCore {
     // A **narrow** scalar crosses as itself and is not one of those: the widening C expects of the
     // result is written on the definition rather than being something an address has to arrange
     // (`CAbi.extension`), so a callback answering a `bool` is reachable through here and correct.
-    for (t, i) <- (ptypes :+ ret).zipWithIndex do
-      if !crossesAsItself(t) then
-        val which = if i < ptypes.length then s"the ${ordinal(i + 1)} parameter" else "the result"
+    //
+    // **Two kinds of function are past this question rather than exempted from it**, and both used
+    // to be refused by it (0136):
+    //
+    //   - an **`extern`** is C. Sysl neither compiled it nor chose its convention, and its type is
+    //     what the header published — so there is no lowering here to be wrong about, and the
+    //     reason above is a statement about code this compiler emitted. Refusing one made every C
+    //     callback a binding wanted to register unnameable, which is most of what a callback-shaped
+    //     library is;
+    //   - a function carrying **`@export`**, whose address is its thunk's (`ExportThunk`) — a
+    //     definition that genuinely has the convention this rule is written about. `15 §12` said
+    //     that all along; what changed is that it is now true.
+    val hasCConvention = externDecls.contains(instKey) || decl.exported.isDefined
 
-        err(s"$which of '$written' is ${show(t)}, an aggregate, and an aggregate crosses to C in " +
-          "whichever registers that machine's convention names rather than the ones a sysl call " +
-          "uses — so this address would be of a function C cannot call correctly. A wrapper taking " +
-          "the parts behind a '*T' is what has an address")
+    if !hasCConvention then
+      for (t, i) <- (ptypes :+ ret).zipWithIndex do
+        if !crossesAsItself(t) then
+          val which = if i < ptypes.length then s"the ${ordinal(i + 1)} parameter" else "the result"
+
+          err(s"$which of '$written' is ${show(t)}, an aggregate, and an aggregate crosses to C in " +
+            "whichever registers that machine's convention names rather than the ones a sysl call " +
+            "uses — so this address would be of a function C cannot call correctly. A wrapper " +
+            "taking the parts behind a '*T', or '@export' on this one, is what has an address")
 
     funcsUsed += instKey
     if externDecls.contains(instKey) then externsUsed += instKey

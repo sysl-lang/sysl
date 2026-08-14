@@ -24,27 +24,42 @@ class ExportTests extends AnyFreeSpec with CodegenSupport with TestFrameworkSupp
 
   "the symbol" - {
 
-    "an exported function is emitted under its bare name, with no module path" in {
-      val out = ir("module demo\n\n@export\nadd(a: i32, b: i32) -> i32 = a + b\n")
-
-      out should include("define i32 @add(")
-      out should not include "@demo$add("
+    "the exported symbol is the bare name, with no module path" in {
+      ir("module demo\n\n@export\nadd(a: i32, b: i32) -> i32 = a + b\n") should
+        include("define i32 @add(")
     }
 
-    "and under the symbol it names, where it names one" in {
+    "and the symbol it names, where it names one" in {
+      ir("module demo\n\n@export(\"mylib_add\")\nadd(a: i32, b: i32) -> i32 = a + b\n") should
+        include("define i32 @mylib_add(")
+    }
+
+    /** **The symbol is a thunk in front of the definition rather than the definition renamed**, and
+      * that is 0137: an export has to be lowered the way the machine's C convention says, which is
+      * not what sysl does with its own definitions. The definition therefore keeps its mangled key
+      * and the exported symbol is a function of its own that calls it (`ExportThunk`).
+      *
+      * A rename is what this was until then, and for a signature of scalars the two are
+      * indistinguishable — which is why it survived. The difference shows the moment an aggregate is
+      * in the signature, and `CExportAbiTests` is where that is run rather than read.
+      */
+    "and it is a thunk, so the definition is still there under its own key" in {
       val out = ir("module demo\n\n@export(\"mylib_add\")\nadd(a: i32, b: i32) -> i32 = a + b\n")
 
       out should include("define i32 @mylib_add(")
-      out should not include "@demo$add("
+      out should include("define i32 @demo$add(")
+      out should include("call i32 @demo$add(")
     }
 
-    // The rename is what a real C API needs, since its symbols carry a prefix the sysl side gets
-    // from its module path — so the function stays `add` to everything inside sysl.
-    "a sysl caller still reaches it by its own name, and arrives at the C symbol" in {
+    // The export is what a real C API needs, since its symbols carry a prefix the sysl side gets
+    // from its module path — so the function stays `add` to everything inside sysl, and a sysl
+    // caller reaches the definition rather than paying for a conversion at a call that never leaves
+    // sysl.
+    "a sysl caller reaches the definition, not the thunk" in {
       val out = ir("module demo\n\n@export(\"mylib_add\")\nadd(a: i32, b: i32) -> i32 = a + b\n\n" +
         "print(demo.add(1, 2))\n")
 
-      out should include("call i32 @mylib_add(")
+      out should include("call i32 @demo$add(")
     }
 
     "an unmangled export is not 'internal', so a linker outside can resolve it" in {
@@ -95,22 +110,67 @@ class ExportTests extends AnyFreeSpec with CodegenSupport with TestFrameworkSupp
         include("which C has no way to spell")
     }
 
-    "a struct by value" in {
-      err("module demo\n\nstruct P\n    x: i32\n    y: i32\n@export\nf(p: P) -> i32 = p.x\n") should
-        include("take a pointer to it instead")
+    /** A struct of scalars **is** a C declaration, so it is not refused and used to be (0137). What
+      * an aggregate needed was never a refusal — it was for somebody to apply the convention, which
+      * is what the exported entry now goes through (`ExportThunk`). `CExportAbiTests` is where the
+      * bytes are checked; here it is only that the rule lets it past.
+      */
+    "a struct of scalars is not refused, since C declares one" in {
+      ir("module demo\n\nstruct P\n    x: i32\n    y: i32\n@export\nf(p: P) -> i32 = p.x\n") should
+        include("define i32 @f(")
     }
 
-    "a struct returned by value" in {
-      err("module demo\n\nstruct P\n    x: i32\n@export\nf() -> P = P(1)\n") should
-        include("which C has no way to spell")
+    "nor one returned" in {
+      ir("module demo\n\nstruct P\n    x: i32\n@export\nf() -> P = P(1)\n") should
+        include("@f(")
     }
 
-    // A pointer to a struct is fine, and this is the case the refusal above tells people to write.
-    // It is also the check that the refusal is about the *shape* rather than about the type being
-    // one the module declared, which a rule keyed on "is it named" would have got wrong.
-    "but a pointer to one is not refused" in {
+    /** **But an aggregate is asked about its fields**, which is what keeps this apart from the rule
+      * above it: the struct is a shape C has, and a `&T` inside it is a counted box that C would be
+      * handed the refcount of. The refusal names the *field*, because the declaration the reader is
+      * looking at does not mention it.
+      */
+    "a struct holding something C has no declaration for is refused, by field" in {
+      val e = err("module demo\n\nstruct Node\n    x: i32\n\nstruct P\n    x: i32\n    n: &Node\n" +
+        "@export\nf(p: P) -> i32 = p.x\n")
+
+      e should include("'n' of demo.P is &demo.Node")
+      e should include("Hand out a raw pointer")
+    }
+
+    "and so is an array of them" in {
+      err("module demo\n\n@export\nf(xs: [3]string) -> i32 = 0\n") should
+        include("its element is string")
+    }
+
+    /** A data enum is a tag beside a union sysl laid out, which is not the shape a C union has —
+      * so it stays refused where a *simple* one, which is its underlying integer and nothing else,
+      * does not.
+      */
+    "a data enum is refused, and a simple one is not" in {
+      err("module demo\n\nenum E\n    A(n: i32)\n    B\n\n@export\nf(e: E) -> i32 = 0\n") should
+        include("A data enum is a tag beside a union")
+
+      ir("module demo\n\nenum Colour\n    Red\n    Green\n\n@export\nf(c: Colour) -> i32 = 0\n") should
+        include("@f(")
+    }
+
+    // A pointer to a struct is fine, and it is the check that the rule is about the *shape* rather
+    // than about the type being one the module declared, which a rule keyed on "is it named" would
+    // have got wrong.
+    "and a pointer to one is not refused either" in {
       ir("module demo\n\nstruct P\n    x: i32\n@export\nf(p: *P) -> i32 = p.x\n") should
         include("define i32 @f(")
+    }
+
+    /** A pointer to a **trait** is not one word: it is the value beside its method table, so it is a
+      * pair, and it reached here as an ordinary pointer until 0137 — accepted, and lowered as
+      * something no C header could declare.
+      */
+    "but a pointer to a trait is, since it is two words rather than one" in {
+      val src = "module demo\n\ntrait Show\n    show(self) -> i32\n\n@export\nf(p: *Show) -> i32 = 0\n"
+
+      err(src) should include("which C has no way to spell")
     }
   }
 
@@ -307,6 +367,99 @@ class ExportTests extends AnyFreeSpec with CodegenSupport with TestFrameworkSupp
       val h = headerFor("module demo\n\n@export\nf() -> i32 = 0\n")
 
       h should include("extern \"C\" {")
+    }
+
+    /** An aggregate is a spelling **and a definition**: a prototype naming `Id` is useless to a
+      * consumer that has not been told what an `Id` is, and a by-value member is exactly the case a
+      * forward declaration does not serve. So the header defines each one before it is used (0137).
+      */
+    "defines each struct it names, before the prototype that names it" in {
+      val h = headerFor("module demo\n\nstruct Id\n    index1: i32\n    generation: u16\n\n" +
+        "@export\nbump(a: Id) -> Id = a\n")
+
+      h should include("typedef struct {")
+      h should include("int32_t index1;")
+      h should include("uint16_t generation;")
+      h.indexOf("typedef struct") should be < h.indexOf("bump(")
+    }
+
+    "defines a struct a struct holds, before the struct that holds it" in {
+      val h = headerFor("module demo\n\nstruct Inner\n    x: i32\n\nstruct Outer\n    a: Inner\n\n" +
+        "@export\nf(o: Outer) -> i32 = o.a.x\n")
+
+      h.indexOf("demo_Inner;") should be < h.indexOf("demo_Outer;")
+    }
+
+    "defines one named twice only once" in {
+      val h = headerFor("module demo\n\nstruct Id\n    x: i32\n\n@export\nf(a: Id, b: Id) -> i32 = a.x\n")
+
+      h.sliding("} demo_Id;".length).count(_ == "} demo_Id;") shouldBe 1
+    }
+
+    // A field's brackets go after the name, so a member is not its type followed by its name the way
+    // a parameter is — which is the one place the declarator syntax shows through.
+    "spells an array field with its brackets after the name" in {
+      headerFor("module demo\n\nstruct Buf\n    bytes: [4]u8\n\n@export\nf(b: Buf) -> i32 = 0\n") should
+        include("uint8_t bytes[4];")
+    }
+
+    // C's own `enum` has an implementation-defined width, so naming the integer is what states the
+    // same contract the rest of the header states.
+    "spells a simple enum as the integer it is" in {
+      headerFor("module demo\n\nenum Colour: u8\n    Red\n    Green\n\n@export\nf(c: Colour) -> i32 = 0\n") should
+        include("int32_t f(uint8_t c);")
+    }
+  }
+
+  /** **A test build is held to the same rules, and was held to none of them** (0140).
+    *
+    * `Compiler.compileTests` ran `Escape.check` and `TailCalls.check` and never `Exports.check`, so
+    * every rule above was silent under `sysl test` — the loop a package's author actually runs. The
+    * same source a `sysl build` refused compiled, linked and ran, reporting a pass.
+    *
+    * The tree it reads is `Tests.only` rather than `Tests.strip`, which is the whole of the
+    * difference from an ordinary build: the question is about the symbol table *this* compilation
+    * emits, and a test build is the one build where a `@test` file's `@export` is a definition.
+    */
+  "a test build is held to the export rules too" - {
+
+    /** The helper reports a refusal by failing, so what is asserted is the diagnostic — which means
+      * this case cannot use `testIr`.
+      */
+    def testErr(src: String): String =
+      Compiler.compileTests(List(Source("<input>", src)), Nil) match {
+        case Left(e)  => e
+        case Right(_) => fail("a test build accepted an export every other build refuses")
+      }
+
+    "a private export, which is the two promises a definition cannot both make" in {
+      testErr("module demo\n\n@export\nprivate add(a: i32) -> i32 = a\n\n" +
+        "@test\nt() = assert(1 == 1, \"one\")\n") should include("cannot make both claims")
+    }
+
+    "a variadic one" in {
+      testErr("module demo\n\n@export\nf(n: i32, ...) -> i32 = n\n\n" +
+        "@test\nt() = assert(1 == 1, \"one\")\n") should include("take a 'va_list' parameter instead")
+    }
+
+    "a parameter C has no declaration for" in {
+      testErr("module demo\n\n@export\nf(s: string) -> i32 = 0\n\n" +
+        "@test\nt() = assert(1 == 1, \"one\")\n") should include("which C has no way to spell")
+    }
+
+    // The rule most likely to be written by accident, and a silent wrong answer at run time rather
+    // than a link error — so the loop that never reported it was the worst one to be missing it from.
+    "an export reaching computed module storage" in {
+      testErr("module demo\n\ncounter() -> i32 = 7\n\nval start: i32 = counter()\n\n" +
+        "@export\nbegin() -> i32 = start\n\n@test\nt() = assert(1 == 1, \"one\")\n") should
+        include("module storage an initializer fills")
+    }
+
+    // And the export a test build legitimately has stays legitimate: a `@tests` file's `@export` is
+    // a definition *here*, which is the whole reason the tree read is `Tests.only`.
+    "while a @tests file's own export is fine, because this is the build that emits it" in {
+      testIr("module demo\n\n@tests\n\n@export(\"probe\")\nprobe(a: i32) -> i32 = a\n\n" +
+        "@test\nt() = assert(1 == 1, \"one\")\n") should include("define i32 @probe(")
     }
   }
 

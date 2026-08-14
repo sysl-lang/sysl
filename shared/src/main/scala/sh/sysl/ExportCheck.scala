@@ -111,29 +111,65 @@ object ExportCheck {
 
   /** The sentence every signature refusal ends with, written once so the two cannot drift apart. */
   val spellable: String =
-    "an integer, a float, a 'bool', a 'char', a pointer or a function pointer"
+    "an integer, a float, a 'bool', a 'char', a pointer, a function pointer, a simple enum, or a " +
+      "struct built out of those"
 
   /** Whether a type crosses to C **as itself**, which is a narrower question than whether it has a
    * meaning over there.
    *
    * A scalar and a pointer are one register on every machine sysl lowers for, and the answer needs
-   * nothing decided. An aggregate is the opposite: each ABI says which registers a struct arrives
-   * in, LLVM applies no such rule of its own, and `CAbi` exists because sysl's own lowering and C's
-   * published one genuinely differ. Passing one by value would be a corrupt call rather than a link
-   * error, which is why it is refused here rather than lowered hopefully.
+   * nothing decided. **An aggregate of them is here too**, and used not to be: each ABI says which
+   * registers a struct arrives in and LLVM applies no rule of its own, so what an aggregate needs is
+   * that somebody apply the convention — which is exactly what `CAbi` is, and what an exported
+   * function's entry now goes through (`ExportThunk`). Refusing one was the honest answer while
+   * `@export` was a rename and nothing else; it is the wrong answer now that the entry is lowered
+   * the way the target's document says, and it was what stopped a binding exporting the callbacks a
+   * C library asks for — the shape every one of them is written in.
    *
-   * A slice and a `string` are two words with a length in the second, a `&T` is a counted box whose
-   * header C would have to know the shape of, and a trait object is a pair with a method table.
-   * Each is a real sysl value and none of them is a C declaration.
+   * What is still refused is what has no C **declaration** at all, whatever convention is applied to
+   * it. A slice and a `string` are two words with a length in the second, a `&T` is a counted box
+   * whose header C would have to know the shape of, and a trait object is a pair with a method
+   * table. Each is a real sysl value and none of them is something a header could spell.
+   *
+   * **An aggregate is asked about its fields, and that is what keeps the two rules apart.** A struct
+   * of scalars is a struct C declares; a struct with a `&T` in it is a counted box with a coat on,
+   * and passing it would hand C a refcount to look after. Recurring is also what keeps ownership out
+   * of the thunk entirely: every type that reaches it is plain data, so the boundary takes and
+   * releases nothing.
    */
   def crosses(t: Type): Boolean = Type.repr(t) match
+    // **An array is not a parameter or a result in C at all**, though it is a perfectly good field.
+    // C decays an array parameter to a pointer, so there is no prototype that passes one by value —
+    // which makes this the one place the two positions differ, and the reason there are two
+    // functions here rather than one. A struct with an array in it is how C says this, and it
+    // classifies identically.
+    case _: Type.Array => false
+    case other         => carried(other)
+
+  /** The same question at a **field**, which admits the one thing a signature does not.
+   *
+   * The split is C's rather than sysl's: `int32_t xs[3]` is a member and is not a parameter.
+   * Everything else answers the same in both positions, so this is also where the recursion lives —
+   * an aggregate is asked about what it carries, and a signature asks this of its own type.
+   */
+  def carried(t: Type): Boolean = Type.repr(t) match
     case _: Type.Integer | _: Type.Floating => true
     case Type.Bool | Type.Char              => true
-    case _: Type.Ptr | _: Type.CFn          => true
+    case _: Type.CFn                        => true
+    // An **erased** pointer is a trait object — the value beside its method table — so it is a pair
+    // of words rather than the one word every other pointer is, and the `Trait` advice is the one
+    // that applies to it. It reached here as a plain pointer until 0137, and was lowered as a pair
+    // that C had no declaration for.
+    case p: Type.Ptr                        => !Type.erased(p)
     // A constrained subtype is its base with a check at the point a value is *made*, so a derived
     // one crosses exactly as its base does — nothing about the representation differs, and the
     // C side is not making the value.
-    case c: Type.Constrained                => crosses(c.base)
+    case c: Type.Constrained                => carried(c.base)
+    case s: Type.Struct                     => s.stored.forall((_, f) => carried(f))
+    case a: Type.Array                      => carried(a.elem)
+    // A simple enum **is** its underlying integer (`EnumAttrEmitter`), so it crosses as one. A data
+    // enum is a tag beside a union of payloads sysl laid out, which is not what a C union is.
+    case e: Type.Enum                       => e.simple
     case _                                  => false
 
   /** The one line of help the refusal can honestly give, which differs by what was written. Anything
@@ -149,9 +185,31 @@ object ExportCheck {
     case _: Type.Trait =>
       "A trait object is a value and a method table together. Export one function per " +
         "implementation, or take a function pointer"
-    case _: Type.Struct | _: Type.Array =>
-      "An aggregate by value is passed differently by every ABI and sysl's lowering is not C's, so " +
-        "take a pointer to it instead"
+    case p: Type.Ptr if Type.erased(p) =>
+      "A pointer to a trait is the value and its method table together, so it is two words rather " +
+        "than the one every other pointer is. Point at the concrete type instead"
+    // An aggregate itself crosses now, so arriving here means one of its **fields** does not — and
+    // naming the field is the whole of what the reader needs, since the declaration they are looking
+    // at does not mention it.
+    case s: Type.Struct =>
+      s.stored.find((_, f) => !carried(f)) match
+        case Some((name, f)) =>
+          s"'$name' of ${Type.show(t)} is ${Type.show(f)}, which is what C has no declaration for — " +
+            s"the aggregate around it is fine. ${advice(f)}"
+        case None => ""
+    // An array is refused for a reason of its own — it is a field in C and never a parameter — so
+    // the advice depends on which of the two it is. An element C cannot spell is the reader's
+    // problem; an element it can means the array itself is the only thing in the way.
+    case a: Type.Array if !carried(a.elem) =>
+      s"its element is ${Type.show(a.elem)}, which is what C has no declaration for — the array " +
+        s"around it is fine. ${advice(a.elem)}"
+    case _: Type.Array =>
+      "C decays an array parameter to a pointer, so there is no prototype that passes one by " +
+        "value. Wrap it in a struct, which is how C hands an array over as a value and lays out " +
+        "identically, or take a pointer to its first element and a length"
+    case e: Type.Enum if !e.simple =>
+      "A data enum is a tag beside a union of the payloads sysl laid out, which is not the shape a " +
+        "C union has. Export one function per variant, or take the payload as its own type"
     case _ => ""
 
   /** Whether a string is a name C could declare. ISO C also reserves a leading underscore at file

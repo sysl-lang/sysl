@@ -498,9 +498,11 @@ trait ExprEmitter extends ArithEmitter {
       if Type.zeroSized(b.ty) then { genBlockVoid(b); "" }
       else genBlockValue(b)
 
-    // A function's address is the symbol it is defined under, which is a constant — there is nothing
-    // to compute and nothing to load, the way there is for the address of a variable.
-    case TFuncAddr(_, entry, _) => s"@${symbolOf(entry)}"
+    // A function's address is the symbol its **C-callable** entry is defined under, which is a
+    // constant — there is nothing to compute and nothing to load, the way there is for the address
+    // of a variable. For an exported function that entry is the thunk rather than the definition
+    // (`CallEmitter.entryOf`), since a `*extern` may only hold something C can call.
+    case TFuncAddr(_, entry, _) => s"@${entryOf(entry)}"
 
     // A call through one goes out under C's convention, because that is what the type said was at
     // the other end. It reuses the foreign path entire: what a `call` names in front of an indirect
