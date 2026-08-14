@@ -193,7 +193,7 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
       // What `weave` renders a literate source with. The prose of a '.lsysl' file is Markdown
       // already, and `indentedCodeLanguage` is what carries the one thing the format gives up: a
       // program marked by an indent and nothing else reaches the highlighter knowing its language.
-      "io.github.edadma"         %%% "markdown"                 % "0.4.6",
+      "io.github.edadma"         %%% "markdown"                 % "0.4.7",
       // Turns the TextMate grammar into the spans the woven document's stylesheet colours, so a
       // reader needs no JavaScript for the code.
       "io.github.edadma"         %%% "highlighter"              % "0.0.10",
