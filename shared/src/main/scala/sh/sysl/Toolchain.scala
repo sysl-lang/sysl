@@ -436,6 +436,16 @@ object Toolchain {
    * Exactly one of the two is passed for a target, which `TargetTests` pins by refusing a row that
    * claims both.
    *
+   * **`-mfloat-abi` goes with it, because `soft` OVERRIDES `-mfpu` and is what a bare `eabi` triple
+   * defaults to on some clangs.** Measured: `-mfloat-abi=soft -mfpu=fpv5-sp-d16` defines no
+   * `__ARM_FP` at all — the convention wins — so naming the unit alone did not fix
+   * `thumb-freestanding-softfp` on the CI's clang 20, which had defaulted the triple to `soft` where
+   * Apple's clang 21 defaults it to `softfp`. The row's own `softFloat` says which one it means, and
+   * `softfp` is precisely *a unit, used, with arguments in core registers*. So a Thumb row states the
+   * pair — `soft`+`none`, `softfp`+its unit, or `hard`+its unit — and none of the three is left for a
+   * default to decide. The two hard rows are unmoved by saying it: their assembly is byte-identical
+   * with `-mfloat-abi=hard` and without it, as the `soft` rows' is with `-mfloat-abi=soft`.
+   *
    * **It goes on all four command lines, not only the two that emit instructions.** A package's C and
    * a `c const` probe are compiled *as* the target, and CMSIS's own
    * `#error "Compiler generates FPU instructions for a device without an FPU"` refuses them at the
@@ -450,8 +460,10 @@ object Toolchain {
    */
   private[sysl] def machineFlags(target: Target): List[String] =
     if target.cpu != Cpu.Thumb then Nil
-    else if target.noFpu then List("-mfpu=none")
-    else target.fpu.map(unit => s"-mfpu=$unit").toList
+    else if target.noFpu then List("-mfloat-abi=soft", "-mfpu=none")
+    else
+      target.fpu.toList.flatMap: unit =>
+        List(if target.softFloat then "-mfloat-abi=softfp" else "-mfloat-abi=hard", s"-mfpu=$unit")
 
   /** What a build's link directives (`15 §8`) become on **this** target's command line.
    *

@@ -111,17 +111,29 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
     // The flag is Arm's because Arm is where the triple is silent. RISC-V says it in the triple --
     // `riscv32-unknown-elf` is RV32IMAC and has no F extension to turn off -- so a row that is
     // `noFpu` there is told to clang by its name alone and gets nothing extra.
-    "says -mfpu to clang for a Thumb machine either way, and for nothing else" in {
+    "says the convention and the unit to clang for a Thumb machine, and nothing for anything else" in {
       for t <- Target.all do
         withClue(t.name) {
           Toolchain.machineFlags(t) shouldBe
             (if t.cpu != Cpu.Thumb then Nil
-             else if t.noFpu then List("-mfpu=none")
-             else t.fpu.map(unit => s"-mfpu=$unit").toList)
+             else if t.noFpu then List("-mfloat-abi=soft", "-mfpu=none")
+             else
+               t.fpu.toList.flatMap(unit =>
+                 List(if t.softFloat then "-mfloat-abi=softfp" else "-mfloat-abi=hard",
+                   s"-mfpu=$unit")))
         }
 
       Toolchain.machineFlags(Target.riscv32Freestanding) shouldBe empty
-      Toolchain.machineFlags(Target.thumbFreestandingSoftfp) shouldBe List("-mfpu=fpv5-sp-d16")
+
+      // The row the pair exists for, spelled out: `soft` would override the `-mfpu` beside it and
+      // leave the machine without a unit, which is what a clang defaulting the bare triple to `soft`
+      // did to it.
+      Toolchain.machineFlags(Target.thumbFreestandingSoftfp) shouldBe
+        List("-mfloat-abi=softfp", "-mfpu=fpv5-sp-d16")
+      Toolchain.machineFlags(Target.thumbFreestanding) shouldBe
+        List("-mfloat-abi=hard", "-mfpu=fpv5-sp-d16")
+      Toolchain.machineFlags(Target.thumbFreestandingSoft) shouldBe
+        List("-mfloat-abi=soft", "-mfpu=none")
     }
 
     // The two fields are one sentence with two halves, and a row saying both would be saying that the

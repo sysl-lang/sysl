@@ -83,7 +83,14 @@ case class Target(
       * instruction that faults on the board, which is the failure these two fields exist to prevent
       * arrived at from the other side.
       *
-      * It reaches the one decision `noFpu` reaches, the flag `Toolchain.machineFlags` puts on every
+      * **Naming the unit is half of it — the float ABI is the other half, because `soft` overrides
+      * `-mfpu`.** `-mfloat-abi=soft -mfpu=fpv5-sp-d16` defines no `__ARM_FP` whatever: the convention
+      * wins, and a clang that defaults a bare `eabi` triple to `soft` therefore ignored the unit this
+      * field names. So `machineFlags` states both, and `softFloat` is what picks the convention —
+      * `softfp` where it is true, which means exactly *a unit, used, with arguments in core
+      * registers*.
+      *
+      * It reaches the one decision `noFpu` reaches, the flags `Toolchain.machineFlags` puts on every
       * clang command line for this target. A row leaves it empty where the triple already answers —
       * every hosted target, RISC-V, Armv6-M and Armv7-M — and no row sets it beside `noFpu`, which
       * `TargetTests` pins.

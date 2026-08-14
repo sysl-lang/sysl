@@ -74,6 +74,21 @@ and Homebrew clang 22, and defines nothing at all under apt.llvm.org's clang 20.
 `thumb-freestanding-softfp` was a machine with a unit on one developer's laptop and a machine without
 one on the Linux CI, from the same source and the same registry row.
 
+**And the float ABI is said with it, because `soft` overrides `-mfpu`.** `-mfloat-abi=soft
+-mfpu=fpv5-sp-d16` defines no `__ARM_FP` at all — the convention wins over the unit — which is why
+naming the unit alone did not fix that row: the clang that had defaulted the bare triple to `soft`
+went on ignoring it. So a Thumb row states the pair, and there are exactly three:
+
+| the row | what is said |
+|---|---|
+| no unit | `-mfloat-abi=soft -mfpu=none` |
+| a unit, arguments in core registers | `-mfloat-abi=softfp -mfpu=<unit>` |
+| a unit, arguments in it | `-mfloat-abi=hard -mfpu=<unit>` |
+
+Saying it costs the rows that were already right nothing: the assembly of a float multiply, a double
+multiply and a double load is byte-identical for every hard and every soft row with these flags and
+without them. What changes is that none of the three is a default any more.
+
 **Nine of these are 32-bit, and eight of the nine are a microcontroller.** The RP2350 boots either a
 pair of Cortex-M33s or a pair of RV32IMAC Hazard3 cores; the RP2040 — the original Pico — has a pair
 of Cortex-M0+; the Armv7E-M rows are ST's parts; and Armv7-M is the Cortex-M3, which is the board
@@ -200,11 +215,12 @@ The cost of the two being conflated is paid twice, in two unrelated places:
 - **at run time**, where an image that got past the headers takes a usage fault on the first VFP
   instruction it reaches, in whatever arithmetic happened to reach one.
 
-So a target records the unit beside its calling convention, and **every** Thumb row has an `-mfpu=`
-added to every clang command line sysl builds for it — the link, the object, a package's C, and a
-`c const` probe alike. The last two matter as much as the first two: they are compiled *as* the
-target and are where the header refusal happens. A row answering *no* passes `none`; a row answering
-*yes* passes the unit's name, `fpv5-sp-d16` for the M33 and `fpv4-sp-d16` for the M4F.
+So a target records the unit beside its calling convention, and **every** Thumb row has both said on
+every clang command line sysl builds for it — the link, the object, a package's C, and a `c const`
+probe alike. The last two matter as much as the first two: they are compiled *as* the target and are
+where the header refusal happens. A row answering *no* passes `-mfloat-abi=soft -mfpu=none`; a row
+answering *yes* passes its convention and the unit's name, `fpv5-sp-d16` for the M33 and
+`fpv4-sp-d16` for the M4F.
 
 **`soft` is the name because gcc already drew this line.** `-mfloat-abi=soft` means no FPU
 instructions at all where `-mfloat-abi=softfp` means the unit is used and only the convention is in
