@@ -455,6 +455,40 @@ reads straight off; a string constant is a block of storage and a different job,
 be written `"\"foo\""` — two quotings for one value, which is a form nobody would guess. The refusal
 says so rather than leaving it to be discovered.
 
+**The declared type may be a transparent subtype of an integer, which is what makes the two blocks a
+pair.** `16 §1` says a transparent subtype *is* its base, so a constant declared at one is a constant
+declared at an integer; holding the line to a primitive *name* was this chapter reaching a case it
+was never about, and it left `c type` unable to describe the thing it exists for — a typedef whose
+width the config decides, and the constants that have to be that width:
+
+```
+c type
+    Tick = "TickType_t"
+
+c const
+    forever: Tick = "portMAX_DELAY"
+```
+
+**The name is followed against the file's own declarations** — a `c type` the same probe measures, or
+a `type` whose base reaches an integer — and a name from anywhere else is refused by name. A block is
+one question put to one file's headers, and a type measured against some other file's is not an
+answer this one can use.
+
+**A `within` range is checked while compiling, against the measured number.** That is the useful half
+of admitting a constrained type: a value nobody chose — a config macro, a `sizeof`, a `#define` in
+somebody else's tree — is held to what the program can actually do with it, which is the `@assert`
+somebody would otherwise write underneath. A **`where` predicate is refused**, because a predicate is
+a sysl function checked where a value is *made* (`16`), and a constant is folded into its uses rather
+than made anywhere; admitting one would be a check the declaration claims and the program never gets.
+A **`new` type is refused** too, and for the rule holding rather than an exception to it: reaching a
+distinct type from its base is a written conversion in both directions (`16 §2`), and a constant is
+the value it was written as, so there is nowhere on the line to write one.
+
+**The value is not carried through the C type**, which reads as the faithful thing to do and is not.
+C narrows: `(uint8_t)800` is `32`, so a constant that should have been refused would arrive looking
+like one that fits, and the range check that is the whole point of the declared type would pass. What
+crosses is the full width, and the measurement decides how to read it.
+
 **It is lowered to an ordinary `const` before anything else looks at the tree**, which is why nothing
 else in this chapter has to change: by the time a name is resolved or a bound is folded, what is there
 is `13 §7`'s constant holding a literal. A **library** is lowered before it is encoded, so an

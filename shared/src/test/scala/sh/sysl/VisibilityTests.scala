@@ -825,16 +825,18 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
           |""".stripMargin)) should include("'there' is public, but its type names 'Point'")
     }
 
-    // Why a `const` is not among them: it never gets far enough to be asked. Every user-declared type
-    // is refused as a constant's type before visibility is looked at, so there is no way to write the
-    // leak in the first place — asserted over all four forms a declaration takes rather than one, so
-    // that a form which later became constant-able would show up here.
-    "while a 'const' cannot name a declared type at all, so the question does not arise" in {
+    // A `const` used not to get far enough to be asked: every user-declared type was refused as a
+    // constant's type before visibility was looked at. That stopped being true when a **transparent**
+    // subtype became one (`16 §1`, `15 §7`), which is what the last case below is for — and it is
+    // exactly what the line in `checkExposedTypes` was written in advance for, so that widening what
+    // a constant may hold could not quietly reopen the hole `val` and `extern` had.
+    //
+    // The other three are still refused a step earlier, and are asserted here rather than only where
+    // the refusals live so that the next form to become constant-able shows up in this block too.
+    "while a 'const' naming a type that is not one is refused before the question arises" in {
       val declared = List(
         "Point" -> "struct Point\n    x: int",
         "Mode"  -> "enum Mode\n    On\n    Off",
-        "Small" -> "type Small = int within 0..<10",
-        "Tag"   -> "type Tag = new int",
       )
 
       for (named, base) <- declared do
@@ -842,6 +844,18 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
           err(s"$base\nconst c: $named = 5\nprint(1)") should
             include(s"a constant is a scalar, and $named is not")
         }
+
+      withClue("a const of 'Tag': ") {
+        err("type Tag = new int\nconst c: Tag = 5\nprint(1)") should include("is a 'new' type")
+      }
+    }
+
+    "and a 'const' at a transparent subtype, which is the one form that does reach the question" in {
+      errIn(("", "main.sysl",
+        """private type Small = int within 0..<10
+          |const c: Small = 5
+          |print(1)
+          |""".stripMargin)) should include("'c' is public, but its type names 'Small'")
     }
 
     // Both are restricted; what fails is that one subtree does not contain the other.

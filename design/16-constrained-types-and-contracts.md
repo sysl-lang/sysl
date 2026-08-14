@@ -97,6 +97,20 @@ refuse a `Meters` where an `f64` is written, and `f64(m)` is what to write. That
 rather than an exception to it: a derivation is a distinct type, and reading it as something else is
 a conversion whichever way it goes.
 
+**A `const` is declared at either kind of scalar and at a transparent subtype of one, and never at a
+derived type.** That is this section applied rather than a rule of its own: a constant is the literal
+it was written as, so a declaration at a transparent subtype is a literal at its base, and one at a
+derived type is a conversion with nowhere on the line to write it. It matters because it is what lets
+a `c const` be declared at a `c type` (`15 §7`) — the case the two blocks exist to be used as a pair
+for, a typedef whose width the config decides and the constants that have to be that width.
+
+**A `within` range on such a constant is checked while compiling**, against the value it already
+holds, which is the one place in the language where a constraint is settled without anything running.
+A **`where` predicate is refused** rather than checked, and the two are not arbitrary halves: a range
+is a comparison against a number in hand, and a predicate is a function checked where a value is
+*made* — which a constant folded into its uses is nowhere. Admitting one would be a check the
+declaration claims and the program never gets.
+
 ## 3. A derivation inherits its base's behaviour and may replace none of it
 
 A `new` type over a scalar arrives with everything the scalar could do — `==`, `<`, `+`, `-`, `*`,

@@ -210,9 +210,12 @@ everything a declaration says about itself, so it reaches the forms that have no
 field, an enum variant's payload, a type parameter's bound and its default, and the declarations that
 are a **name and one type** — a module-level `val`, and an `extern` variable. Those two are the
 easiest to overlook and are no smaller a hole than a function's result: a module that may write the
-name holds a value of a type it cannot write, which is the whole of what this section refuses. A
-`const` is spared only because it cannot reach the question — §7 holds a constant to being a scalar,
-and every scalar is a builtin nobody may restrict.
+name holds a value of a type it cannot write, which is the whole of what this section refuses. **A
+`const` is the third of them**, and it was not always: §7 held a constant to being a scalar, and every
+scalar is a builtin nobody may restrict, so there was nothing to reach the question with. A
+transparent subtype of a scalar is a constant's type now (§7, `16 §2`), and that is a declared type
+somebody may make private — so the rule that was stated in advance for a hole that did not yet exist
+is the rule that closes it.
 
 **It reaches everything a caller has to be able to write**, which is more than a parameter and a
 result: a struct's fields and an enum variant's payload, since neither has a visibility of its own; a
@@ -877,6 +880,17 @@ ever had to bind. One rule for every visibility is worth more than the four char
 one would save, and writing it is what fixes the literal's type: `const capacity: usize = 512`
 needs no suffix on the 512, by the ordinary rule that a literal takes its type from where it sits
 (`01`).
+
+**And the type is a scalar, or a transparent subtype of one.** The first half is the shape of what a
+constant expression can produce rather than a restriction anybody chose: there is no aggregate
+literal to fold to, and a table would be storage rather than a value. The second half follows from
+`16 §1` — without `new` such a type *is* its base, so a constant declared at one is a literal at an
+integer, a float or a `char` — and it is what lets a `c const` be declared at a `c type` (`15 §7`).
+A **derived** type is refused, because reaching one from its base is a written conversion (`16 §2`)
+and a constant is the value it was written as; a **`where` predicate** is refused, because a
+predicate is checked where a value is *made* and a constant is made nowhere. A **`within` range is
+checked while compiling**, which is the one thing a constant can be given that a `val` gets only at
+run time.
 
 **A constant expression** is a literal; a `const`; a conversion (`u8(x)`); a unary `-`, `!` or `~`;
 or a binary arithmetic, bitwise, shift, or comparison operator applied to constant expressions.
