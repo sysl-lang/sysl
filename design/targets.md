@@ -310,7 +310,12 @@ A target is not a description of a machine. It is the set of answers codegen ask
 - **the way to add a target is to measure it**, by compiling the equivalent C with
   `clang -target <triple> -S -emit-llvm` and reading what comes out. Every row above was
   established that way. An ABI document tells you what is specified; the C compiler on the other
-  side of the call tells you what is *done*, and it is the second one a call has to agree with.
+  side of the call tells you what is *done*, and it is the second one a call has to agree with;
+- **a measurement of a default is a measurement of one compiler**, so where a row's answer came
+  out of clang rather than out of the triple, the row says it instead. That is what `fpu` is: the
+  same `thumbv8m.main-none-eabi` reports a floating-point unit under one clang and none under
+  another, so a row that named none meant *whichever compiler is installed*. A new Thumb row
+  answers this either way — `none`, or the name of the unit its part actually has.
 
 ## How a machine names itself
 
