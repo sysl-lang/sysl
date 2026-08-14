@@ -537,5 +537,21 @@ class DeadCodeTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     "which holds for an export as much as for a destructor" in {
       irAgainstTree(res*)("main.sysl" -> "sysl.res.tick(1)\n") should include("res_tick")
     }
+
+    // The under-prune direction, and the one whose failure is a *link* error rather than a test: the
+    // program names `sysl.hand` and never `sysl.res`, so only the transitive closure of the module
+    // graph puts the destructor's module in reach. What guarantees there is such an edge is
+    // `02 § Coherence` — an `impl Drop for T` sits in `Drop`'s module or in one declaring a type
+    // named in `T`, so whatever hands the value out had to name that module to spell its own return
+    // type. Pinned for the library because it is the tree every program links.
+    "through a module that reaches it, where the program names neither" in {
+      val out = irAgainstTree(res :+ ("sysl.hand", "hand.sysl",
+        """module sysl.hand
+          |lend(n: int) -> &sysl.res.Handle = sysl.res.open(n)
+          |""".stripMargin)*)("main.sysl" -> "sysl.hand.lend(1)\n")
+
+      out should include("Handle.drop")
+      out should include("sysl.res$release")
+    }
   }
 }
