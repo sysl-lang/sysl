@@ -87,6 +87,18 @@ class ScalarRunTests extends AnyFreeSpec with RunSupport {
             |""".stripMargin) shouldBe "0.75\n"
     }
 
+    /** **And rounds one it cannot, which the sibling above reads as though it could not.** A literal
+     * crosses the emitter as a binary64 bit pattern narrowed to `float`, so a value that is not a
+     * `half` either raises a real question — and the answer is that it is rounded to the nearest
+     * one, exactly as the wider widths round. `0.1` is the shortest input that shows it: what prints
+     * is the nearest `f16` to a tenth, and is not a tenth.
+     */
+    "and rounds one it cannot to the nearest it can" in {
+      run("""var h: f16 = 0.1
+            |print(h)
+            |""".stripMargin) shouldBe "0.0999756\n"
+    }
+
     /** IEEE 754 leaves a `NaN` unequal to everything including itself, and makes `!=` the negation of
      * `==` rather than the ordered comparison the other three are. So exactly one of the five answers
      * true, and getting `!=` wrong is invisible in every test that does not use a `NaN` — which is why

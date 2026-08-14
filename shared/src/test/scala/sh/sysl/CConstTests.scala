@@ -115,6 +115,155 @@ class CConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
     }
   }
 
+  /** **A float macro is measured on the same terms an integer one is**, and the case that decides it
+    * is not the plain literal — it is the macro written as an *expression* over other macros, where
+    * transcribing means doing the arithmetic by hand and writing down the answer. Every assertion
+    * here is agreement between two spellings of one number for the reason the file gives at the top:
+    * a decimal written out in this file would be the transcription the feature abolishes.
+    */
+  "a float is measured the same way" - {
+    /** `0.25 * PI` is the shape a physics header is full of, and the half of it a reader cannot
+      * check by eye. What is asserted is that C's arithmetic and sysl's agree about the same two
+      * numbers, so nothing here depends on what either of them is.
+      */
+    "an expression over other constants, which is the case hand-copying gets wrong" in {
+      run("""c const
+            |    WHOLE:   real = "3.14159265359"
+            |    QUARTER: real = "0.25 * 3.14159265359"
+            |
+            |print(QUARTER * 4.0 == WHOLE)
+            |""".stripMargin) shouldBe "true\n"
+    }
+
+    /** `FLT_EPSILON` is the definition of the width rather than a number about it, so the assertion
+      * is the property that defines it: the smallest step above one, and half of it is no step at
+      * all. A transcription with a digit wrong passes neither half.
+      */
+    "a value from <float.h>, asserted by the property that defines it" in {
+      run("""@include("<float.h>")
+            |
+            |c const
+            |    EPS: f32 = "FLT_EPSILON"
+            |
+            |var one: f32 = 1.0
+            |
+            |print(one + EPS > one, one + EPS / 2.0 == one)
+            |""".stripMargin) shouldBe "true true\n"
+    }
+
+    /** The narrowing is sysl's, so it has to be the one sysl would do anywhere else — the same value
+      * measured at both widths and cast down has to land on the constant measured at the narrow one.
+      */
+    "a value asked for as 'f32' narrows exactly as a written cast would" in {
+      run("""c const
+            |    NARROW: f32 = "3.14159265359"
+            |    WIDE:   real = "3.14159265359"
+            |
+            |print(NARROW == f32(WIDE))
+            |""".stripMargin) shouldBe "true\n"
+    }
+
+    "'f64' and 'real' are the one width under two names" in {
+      run("""c const
+            |    A: f64  = "1.0 / 3.0"
+            |    B: real = "1.0 / 3.0"
+            |
+            |print(A == B)
+            |""".stripMargin) shouldBe "true\n"
+    }
+
+    /** The cast in the probe is C's, so an integer expression asked for as a float converts rather
+      * than being refused — which is what a header full of `#define SCALE 2` mixed in among the
+      * fractional ones needs.
+      */
+    "an integer expression asked for as a float converts" in {
+      run("""@include("<limits.h>")
+            |
+            |c const
+            |    BITS: real = "CHAR_BIT"
+            |
+            |print(BITS / 2.0)
+            |""".stripMargin) shouldBe "4\n"
+    }
+
+    /** `16 §1` again, on the other carrier: a transparent subtype *is* its base, so a float constant
+      * may be declared at one and the `within` bound is checked against the measured number.
+      */
+    "the type may be a transparent subtype of a float, bound and all" in {
+      run("""type Fraction = f32 within 0.0..1.0
+            |
+            |c const
+            |    HALF: Fraction = "1.0 / 2.0"
+            |
+            |print(HALF)
+            |""".stripMargin) shouldBe "0.5\n"
+    }
+
+    /** **The two carriers share one probe and one numbering**, so a block mixing them is where an
+      * off-by-one between the two sets of globals would show — and it would show as one line
+      * reporting another line's number, which reads as a wrong measurement rather than as a shuffle.
+      * The integers here are asked for in the same block, out of order, and each is asserted against
+      * the other spelling of itself.
+      */
+    "a block mixing floats and integers keeps each line's own answer" in {
+      run("""@include("<limits.h>")
+            |
+            |c const
+            |    HALF:    real  = "0.5"
+            |    BITS:    u32   = "CHAR_BIT"
+            |    QUARTER: real  = "0.5 / 2.0"
+            |    BYTES:   usize = "sizeof(char)"
+            |
+            |print(HALF == QUARTER * 2.0, BITS == u32(8 * BYTES), QUARTER * 4.0 == 1.0)
+            |""".stripMargin) shouldBe "true true true\n"
+    }
+
+    "a negative one survives, since the carrier is a signed double either way" in {
+      run("""c const
+            |    NEG: real = "-1.5"
+            |
+            |print(NEG + 1.5 == 0.0, NEG < 0.0)
+            |""".stripMargin) shouldBe "true true\n"
+    }
+
+    "and a bound the measured value misses is refused, as it is for an integer" in {
+      err("""type Fraction = f32 within 0.0..1.0
+            |
+            |c const
+            |    OVER: Fraction = "1.5"
+            |
+            |print(OVER)
+            |""".stripMargin) should include("Fraction")
+    }
+
+    /** The probe is compiled for the target and never run, which has to hold for a float exactly as
+      * it does for a `sizeof` — a freestanding machine has no C library to have printed it with.
+      * What is asserted is that the freestanding build and the host build carry the *same* bit
+      * pattern, which says the probe answered on both without this file naming what it answered.
+      */
+    "and it is measured for the target, on a machine with no way to run anything" in {
+      val target = Target.named("thumbv7em-freestanding").getOrElse(cancel("no such target"))
+
+      Toolchain.findClang(target).getOrElse(cancel(s"no clang here has a back end for ${target.name}"))
+
+      val src =
+        """c const
+          |    Q: f32 = "0.25 * 3.14159265359"
+          |
+          |var x: f32 = Q
+          |
+          |print(x)
+          |""".stripMargin
+
+      val emitted = raw"double (0x[0-9A-Fa-f]+) to float".r
+
+      def measured(t: Target) = emitted.findFirstMatchIn(irFor(t, src)).map(_.group(1))
+
+      measured(target) should not be None
+      measured(target) shouldBe measured(Target.default)
+    }
+  }
+
   /** **The claim the whole mechanism rests on**: the answer is the *target's*, not this machine's.
     * Nothing runs, so there is nothing here that could have been right by accident — a pointer is
     * four bytes on the 32-bit machines and eight on the 64-bit one, and the array the constant sizes
@@ -180,12 +329,77 @@ class CConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
       message should include("800")
     }
 
-    "a type that is not an integer, since a string from C is not written this way yet" in {
+    "a type that is not a number, since a string from C is not written this way" in {
       err("""c const
             |    S: string = "\"hello\""
             |
             |print(S)
-            |""".stripMargin) should include("is not an integer")
+            |""".stripMargin) should include("is not a number")
+    }
+
+    /** The two widths a C constant expression is actually written at are `float` and `double`, and
+      * `f16` is neither — so it is refused by name rather than reached by a rounding nobody asked
+      * for.
+      */
+    "'f16', which is not a width a C constant is written at" in {
+      err("""c const
+            |    H: f16 = "0.5"
+            |
+            |print(H)
+            |""".stripMargin) should include("'f16' is not a width a 'c const' is measured at")
+    }
+
+    /** C settles this one and hands back an infinity, so the refusal is sysl's rather than clang's —
+      * and it has to be, because an infinity folded into a program is a number nobody wrote.
+      */
+    "an expression that overflows while C is working it out" in {
+      err("""c const
+            |    BIG: real = "1e308 * 10"
+            |
+            |print(BIG)
+            |""".stripMargin) should include("a 'c const' carries a finite number")
+    }
+
+    "a NaN, which is not a value to carry either" in {
+      err("""c const
+            |    N: real = "__builtin_nan(\"\")"
+            |
+            |print(N)
+            |""".stripMargin) should include("is not a number here")
+    }
+
+    /** The float half of the transcription check: a value that fits the probe's `double` and not the
+      * width it was asked for has been thrown away rather than rounded, and the message names it.
+      */
+    "a value the declared float width turns into an infinity" in {
+      val message = err("""c const
+                          |    BIG: f32 = "1e300"
+                          |
+                          |print(BIG)
+                          |""".stripMargin)
+
+      message should include("which 'f32' cannot hold")
+      message should include("1.0E300")
+    }
+
+    "and one it cannot tell from zero, which is the same loss read the other way" in {
+      err("""c const
+            |    TINY: f32 = "1e-300"
+            |
+            |print(TINY)
+            |""".stripMargin) should include("cannot tell from zero")
+    }
+
+    /** Rounding is **not** in that list, deliberately: naming a narrower width is asking for the
+      * nearest value in it, which is what C does for `float x = M_PI;`. Refusing it would leave
+      * `f32` unable to read the double-typed macros that are most of them.
+      */
+    "but ordinary rounding is not refused, because that is what naming the width asked for" in {
+      run("""c const
+            |    THIRD: f32 = "1.0 / 3.0"
+            |
+            |print(THIRD > 0.333, THIRD < 0.334)
+            |""".stripMargin) shouldBe "true true\n"
     }
 
     "and a block inside a body, which has no file's headers to be compiled against" in {
@@ -414,7 +628,8 @@ class CConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
         |@include("<limits.h>")
         |
         |c const
-        |    BITS: u32 = "CHAR_BIT"
+        |    BITS: u32  = "CHAR_BIT"
+        |    HALF: real = "1.0 / 2.0"
         |""".stripMargin, List("demo")))
 
     lazy val trees: List[Program] =
@@ -428,6 +643,15 @@ class CConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
     "the artifact carries an ordinary constant holding a literal" in {
       trees.flatMap(_.body).collect { case ConstDecl("BITS", _, IntLit(v, _), _) => v } shouldBe
         List(BigInt(8))
+    }
+
+    /** A float goes the same way, and it is the one that could have gone wrong quietly: the value
+      * crosses the codec as *text*, so a rounding or a reformatting there would come back as a
+      * number nobody measured rather than as a failure to decode.
+      */
+    "a measured float crosses the codec as the same number it was measured as" in {
+      trees.flatMap(_.body).collect { case ConstDecl("HALF", _, FloatLit(t, _), _) => t.toDouble }
+        .shouldBe(List(0.5))
     }
 
     /** Compiled against the **decoded** trees, which is the path a package takes: the program never
