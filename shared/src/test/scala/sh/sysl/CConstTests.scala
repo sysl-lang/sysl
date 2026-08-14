@@ -199,6 +199,33 @@ class CConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
             |""".stripMargin) shouldBe "0.5\n"
     }
 
+    /** **The two carriers share one probe and one numbering**, so a block mixing them is where an
+      * off-by-one between the two sets of globals would show — and it would show as one line
+      * reporting another line's number, which reads as a wrong measurement rather than as a shuffle.
+      * The integers here are asked for in the same block, out of order, and each is asserted against
+      * the other spelling of itself.
+      */
+    "a block mixing floats and integers keeps each line's own answer" in {
+      run("""@include("<limits.h>")
+            |
+            |c const
+            |    HALF:    real  = "0.5"
+            |    BITS:    u32   = "CHAR_BIT"
+            |    QUARTER: real  = "0.5 / 2.0"
+            |    BYTES:   usize = "sizeof(char)"
+            |
+            |print(HALF == QUARTER * 2.0, BITS == u32(8 * BYTES), QUARTER * 4.0 == 1.0)
+            |""".stripMargin) shouldBe "true true true\n"
+    }
+
+    "a negative one survives, since the carrier is a signed double either way" in {
+      run("""c const
+            |    NEG: real = "-1.5"
+            |
+            |print(NEG + 1.5 == 0.0, NEG < 0.0)
+            |""".stripMargin) shouldBe "true true\n"
+    }
+
     "and a bound the measured value misses is refused, as it is for an integer" in {
       err("""type Fraction = f32 within 0.0..1.0
             |
@@ -601,7 +628,8 @@ class CConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
         |@include("<limits.h>")
         |
         |c const
-        |    BITS: u32 = "CHAR_BIT"
+        |    BITS: u32  = "CHAR_BIT"
+        |    HALF: real = "1.0 / 2.0"
         |""".stripMargin, List("demo")))
 
     lazy val trees: List[Program] =
@@ -615,6 +643,15 @@ class CConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
     "the artifact carries an ordinary constant holding a literal" in {
       trees.flatMap(_.body).collect { case ConstDecl("BITS", _, IntLit(v, _), _) => v } shouldBe
         List(BigInt(8))
+    }
+
+    /** A float goes the same way, and it is the one that could have gone wrong quietly: the value
+      * crosses the codec as *text*, so a rounding or a reformatting there would come back as a
+      * number nobody measured rather than as a failure to decode.
+      */
+    "a measured float crosses the codec as the same number it was measured as" in {
+      trees.flatMap(_.body).collect { case ConstDecl("HALF", _, FloatLit(t, _), _) => t.toDouble }
+        .shouldBe(List(0.5))
     }
 
     /** Compiled against the **decoded** trees, which is the path a package takes: the program never
