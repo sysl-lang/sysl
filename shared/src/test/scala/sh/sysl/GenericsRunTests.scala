@@ -286,6 +286,30 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "2 1\n"
     }
 
+    // The absent *callback*, which is the shape a C interface reads as "there is none, use the
+    // default" — and the one a binding meets, since the parameter that names `T` is usually the
+    // function's own.
+    "a *extern parameter the same solution reached takes the absent callback" in {
+      run("""hook[T](on: *extern(*T) -> unit, off: *extern(*T) -> unit, state: *T) -> bool = off == null
+            |
+            |ping(n: *int)
+            |    *n = *n + 1
+            |
+            |var x: int = 0
+            |print(hook(&ping, null, &x))
+            |""".stripMargin) shouldBe "true\n"
+    }
+
+    // Reaching the parameter is not agreeing with it. A solved `&T` is a *reference*, so what the
+    // `null` gets is the answer any reference gives it — the one naming the type it arrived at,
+    // rather than the one saying there was no context.
+    "a solved parameter that is not a pointer refuses it in that parameter's own terms" in {
+      err("""two[T](a: *T, b: &T) -> bool = true
+            |var x: int = 3
+            |print(two(&x, null))
+            |""".stripMargin) should include("a &int always points at a live object — an absent one is Option[&int]")
+    }
+
     // A variadic tail is not a parameter list, so there is nothing there to have said what the
     // pointer is — which is the answer a non-generic variadic gives too.
     "a variadic tail is still no context, generic callee or not" in {
