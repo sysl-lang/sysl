@@ -59,7 +59,8 @@ object Compiler {
    */
   def compileTrees(units: List[Program], target: Target = Target.default,
                    allocator: Allocator = Allocator.c): Either[String, String] =
-    analyzed(units, target, Set.empty, Stdlib.fromSource(target), allocator = allocator).map(_._1)
+    analyzed(units, target, Set.empty, Stdlib.fromSource(target), allocator = allocator,
+      own = ownModules(units)).map(_._1)
 
   /** Compiles a program **against a library**: the library's modules are compiled alongside it, and
    * the program reaches them by the ordinary module rules (`13 §3`) — a full path, or an `import`.
@@ -119,21 +120,32 @@ object Compiler {
                     paths: SearchPaths = SearchPaths.none, allocator: Allocator = Allocator.c)
       : Either[String, Compiled] =
     analyzed(libraries ::: units, target, precompiled, carried(std, target), provides, packages,
-      entryPoint, paths, allocator, ownModules(units, libraries))
+      entryPoint, paths, allocator, ownModules(units))
 
-  /** Which modules this compilation is **building** rather than being handed, where anything was
-   * handed to it at all.
+  /** Which modules this compilation is **building** rather than being handed.
    *
-   * `None` where nothing was, which is most compilations and is what keeps the rule below invisible
-   * to them: with no dependency there is no supplied export to qualify, and computing a set every
-   * module is in would be the same answer written out.
+   * **The standard module is handed exactly as a `--lib` root is**, and that is the whole of why
+   * this no longer asks whether anything else was. It arrives as a `Stdlib` rather than in `units`,
+   * so a set computed from the presence of *other* libraries left every compilation without one
+   * saying `None` — and `None` means every module here is the program's own, which made a library
+   * declaration nothing reaches an unconditional root. `Reachability.contributing` states the rule
+   * this feeds and the reason it is one rule for all four kinds.
+   *
+   * What that cost, before this: a `sysl.fs` destructor is emitted into `print(1)`, and on a
+   * freestanding target it brings a `declare` for `fclose` with it — from a module whose own header
+   * requires `os`, which that target does not provide. The same shape `Capabilities` closed for a
+   * `--lib` module's `requires`, one road over.
    *
    * Read off the module headers, which is what `compileLibrary` and `typedWith` already do — the
    * directory has to agree and the analyzer is what holds it to that, so a header is the answer
    * before anything is analyzed.
+   *
+   * It stays an `Option` because `None` is still meaningful to everything downstream — it is what a
+   * caller with nothing to say passes, and `Reachability.prune` and `Analyzer.analyze` both default
+   * to it. Nothing on a driver's path takes that default any more.
    */
-  private def ownModules(units: List[Program], libraries: List[Program]): Option[Set[String]] =
-    Option.when(libraries.nonEmpty)(units.map(moduleOf).toSet)
+  private def ownModules(units: List[Program]): Option[Set[String]] =
+    Some(units.map(moduleOf).toSet)
 
   /** The same compilation stopped at the **typed tree**, which is what `sysl prove` reads (`17 §9`).
    *
@@ -158,7 +170,7 @@ object Compiler {
         // module", and they are only known here — which is the same fact the analyzer is handed, for
         // the same reason.
         Analyzer.analyze(libraries ::: mine, std = carried(std, target), target = target,
-                         provides = provides, own = ownModules(mine, libraries))
+                         provides = provides, own = ownModules(mine))
           .map((_, mine.map(moduleOf).toSet))
       case errs => Left(errs.mkString("\n"))
   }
@@ -185,8 +197,11 @@ object Compiler {
     // Every file is parsed before any is rejected, so a syntax error in one does not hide the
     // syntax errors in the rest — the same reason the analyzer reports every mistake it finds.
     parsed.collect { case Left(e) => e } match
-      case Nil  => analyzed(parsed.collect { case Right(p) => p }, target, Set.empty,
-                     Stdlib.fromSource(target), allocator = allocator)
+      case Nil =>
+        val mine = parsed.collect { case Right(p) => p }
+
+        analyzed(mine, target, Set.empty, Stdlib.fromSource(target), allocator = allocator,
+          own = ownModules(mine))
       case errs => Left(errs.mkString("\n"))
   }
 
@@ -231,11 +246,11 @@ object Compiler {
 
         for
           typed    <- Analyzer.analyze(units, building, whole, target, paths = paths,
-                        own = ownModules(mine, handed))
+                        own = ownModules(mine))
           promoted <- Escape.check(typed)
           _        <- TailCalls.check(typed)
         yield
-          val kept = Tests.only(typed, ownModules(mine, handed))
+          val kept = Tests.only(typed, ownModules(mine))
 
           // A test binary is linked like any other, so it needs the same libraries. It is a
           // different compilation from the one above rather than a variant of it, which is why the
@@ -308,7 +323,7 @@ object Compiler {
       // catch, and a second removal that can never find anything reads as though there were.
       typed    <- Analyzer.analyze(Tests.stripSource(libraries ::: units), building,
                                    carried(std, target), target,
-                                   own = ownModules(units, libraries))
+                                   own = ownModules(units))
       promoted <- Escape.check(typed)
       _        <- TailCalls.check(typed)
     yield
@@ -362,12 +377,17 @@ object Compiler {
    * declaration nothing can reach is still one the program declared, and checking it is what makes a
    * mistake in it a mistake at all. Pruning is therefore the last thing that happens to the tree, and
    * the only thing between the checks and the lowering.
+   *
+   * `own` has no default, unlike everything else optional here: it is what qualifies the roots a
+   * handed module contributes (`Reachability.contributing`), the standard library is handed to every
+   * one of these, and a default of `None` would be the answer that emits an unreached library
+   * declaration into the program. Each caller says which modules are its own.
    */
   private def analyzed(units: List[Program], target: Target, precompiled: Set[String],
                        std: Stdlib, provides: Set[String] = Capability.core.toSet,
                        packages: Packages = Packages.none, entryPoint: Boolean = true,
                        paths: SearchPaths = SearchPaths.none, allocator: Allocator,
-                       own: Option[Set[String]] = None)
+                       own: Option[Set[String]])
       : Either[String, Compiled] =
     for
       typed    <- Analyzer.analyze(units, std = std, target = target, provides = provides,
