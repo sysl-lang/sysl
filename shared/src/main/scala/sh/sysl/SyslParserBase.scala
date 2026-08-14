@@ -130,6 +130,35 @@ trait SyslParserBase extends PackratParsers {
       case t: lexical.QuotedIdent  => t.name
     })
 
+  /** A reserved word, as a word — `val`, `match`, `struct`, and not `+` or `..<`.
+   *
+   * Both lex as `Keyword`, so what tells them apart is the spelling: a reserved word begins with a
+   * letter and an operator does not. That test is the whole of it, and it stays right as the set
+   * grows, which counting the list here would not.
+   *
+   * It exists for the refusals below rather than for the grammar — nothing is *read* through it, and
+   * a rule that consumed one would be claiming a word the statement grammar needs.
+   */
+  protected lazy val reservedWord: Parser[String] =
+    accept("reserved word", { case t: lexical.Keyword if t.chars.head.isLetter => t.chars })
+
+  /** The sentence a reserved word written where a name is being introduced is owed.
+   *
+   * It consumes nothing — `guard` is what puts the caret on the word rather than one token past it,
+   * which is the ranking rule `noMemberAttr` records in full: an `Error` raised after the token loses
+   * to whatever `Failure` the alternatives reach beyond it.
+   *
+   * **The backtick form is named because it works**, and nothing else tells the reader so: a quoted
+   * name is an ordinary name at every position, so `` `val` `` is a field, a parameter or a variable
+   * called `val`. Without this the reader is told a name was expected at a place where they wrote
+   * one, and the only thing wrong with it is that the language had already spent the word.
+   */
+  protected def reservedName(what: String): Parser[Nothing] =
+    guard(reservedWord) >> (w =>
+      err(s"'$w' is a reserved word, so it cannot stand as $what — write it '`$w`' if that is the " +
+        s"name you want, which is what the backticks are for: a quoted word is an ordinary name " +
+        s"wherever one may be written"))
+
   /** A name that was written without quoting, and only that — what a **module path** is made of. */
   protected lazy val bareIdent: Parser[String] =
     accept("identifier", { case t: lexical.Identifier => t.chars })

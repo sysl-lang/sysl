@@ -386,6 +386,114 @@ class TypeLevelTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         |""".stripMargin) should include("cannot be given type arguments at a call")
   }
 
+  /** The same refusal at a **constructor**, which is the other half of the call head.
+   *
+   * `10 § Open a` is one rule and it was announced at one of the two positions: a generic type's name
+   * given type arguments fell past every call form to the general complaint that the callee is not
+   * callable, which says nothing about type arguments and reads as though the type were not a type.
+   * Both bracket spellings are checked because they are different nodes — one argument parses as an
+   * `Index` and a list as a `TypeArgs`.
+   */
+  "a generic type's constructor is refused type arguments in the words a function's is" - {
+    "with a list of them" in {
+      val message = err(
+        """struct Pair[K, V]
+          |    key: K
+          |    value: V
+          |
+          |main()
+          |    var p = Pair[int, int](1, 2)
+          |    print(p.key)
+          |""".stripMargin)
+
+      message should include("'Pair' cannot be given type arguments at a call")
+      message should include("var x: Pair[…] = Pair(…)")
+    }
+
+    "with one" in {
+      err(
+        """struct Box[T]
+          |    v: T
+          |
+          |main()
+          |    var b = Box[int](1)
+          |    print(b.v)
+          |""".stripMargin) should include("'Box' cannot be given type arguments at a call")
+    }
+
+    // One step to the left, and a different node: the arguments on the type a variant is selected
+    // *from*. Nothing read the brackets as a type, so the walk called them a subscript and reported
+    // the enum's own name undefined — the one reading that cannot be true.
+    "and on the type a variant is selected from, which said the type was undefined" in {
+      val message = err(
+        """enum Maybe[T]
+          |    Nothing
+          |    Just(v: T)
+          |
+          |main()
+          |    var m = Maybe[int].Just(1)
+          |    print(1)
+          |""".stripMargin)
+
+      message should include("'Maybe' cannot be given type arguments where 'Just' is selected")
+      message should not include "undefined name"
+    }
+
+    "including where nothing is called, so no call form would have seen it" in {
+      err(
+        """enum Maybe[T]
+          |    Nothing
+          |    Just(v: T)
+          |
+          |main()
+          |    var m: Maybe[int] = Maybe[int].Nothing
+          |    print(1)
+          |""".stripMargin) should include("'Maybe' cannot be given type arguments where 'Nothing' is selected")
+    }
+
+    "while the plain name it points at is what works" in {
+      run(
+        """enum Maybe[T]
+          |    Nothing
+          |    Just(v: T)
+          |
+          |main()
+          |    var m: Maybe[int] = Just(1)
+          |    val n: int = m match
+          |        Just(v) -> v
+          |        Nothing -> 0
+          |
+          |    print(n)
+          |""".stripMargin) shouldBe "1\n"
+    }
+
+    // The shadowing test every other call form makes: a local standing over the type's name is an
+    // ordinary subscript, and its author never wrote a type argument to be told about.
+    "and a local of that name keeps its subscript" in {
+      err(
+        """struct Pair[K, V]
+          |    key: K
+          |    value: V
+          |
+          |main()
+          |    var Pair = [1, 2, 3]
+          |    print(Pair[0](1))
+          |""".stripMargin) should not include "cannot be given type arguments"
+    }
+
+    "while the annotated form the message names is the one that works" in {
+      run(
+        """struct Pair[K, V]
+          |    key: K
+          |    value: V
+          |
+          |main()
+          |    var p: Pair[int, int] = Pair(1, 2)
+          |    print(p.key, p.value)
+          |""".stripMargin) shouldBe "1 2\n"
+    }
+  }
+
   "a generic container can size storage while running, now that a bound can promise a value" in {
     // `07 § Not yet` said a repeat needs a value in its value position and no bound promises one,
     // so `var storage: []K` was the empty slice and nothing widened it. A trait declaring an

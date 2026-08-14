@@ -224,6 +224,57 @@ class AssertTests extends AnyFreeSpec with Matchers with CodegenSupport with Run
     }
   }
 
+  /** The parentheses are what make this a declaration rather than an annotation about the one under
+   * it, so leaving them off falls out of this rule and into `attributedDecl` — whose refusal
+   * enumerates every annotation the language has and does not include this one. A reader comparing
+   * their line against that roster concludes there is no `@assert`, which is the opposite of true.
+   */
+  "the parentheses left off are answered as the bracket they are" - {
+    "at a declaration's position" in {
+      val message = err(
+        """struct S
+          |    a: u64
+          |
+          |@assert sizeof(S) == 8
+          |print(1)""".stripMargin
+      )
+
+      message should include("takes its condition in parentheses")
+      message should include("@assert(sizeof(T) == 16)")
+    }
+
+    "inside a body, where it is a statement" in {
+      err(
+        """main()
+          |    @assert 1 + 1 == 2
+          |    print(1)""".stripMargin
+      ) should include("takes its condition in parentheses")
+    }
+
+    // The defect in one line: the roster is what the reader used to get, and it is exhaustive-looking
+    // and wrong. A word that genuinely is not an annotation must still get it.
+    "and the roster is kept for a word that really is not one" in {
+      val message = err(
+        """@wibble
+          |f() -> int = 1
+          |print(f())""".stripMargin
+      )
+
+      message should include("'wibble' is not an annotation")
+      message should not include "takes its condition in parentheses"
+    }
+
+    "which the parenthesised form is not touched by" in {
+      run(
+        """struct S
+          |    a: u64
+          |
+          |@assert(sizeof(S) == 8)
+          |print(1)""".stripMargin
+      ) shouldBe "1\n"
+    }
+  }
+
   "what it refuses" - {
     // A call is the line `13 §Constants` draws around a constant expression, and it is the line that
     // makes this feature necessary rather than redundant: a shim accessor is a call, so a C

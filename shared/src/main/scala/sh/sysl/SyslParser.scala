@@ -555,13 +555,32 @@ class SyslParser(val source: Source)
    * sentence written past the point of divergence is never the one reported.
    */
   protected lazy val assertDecl: PackratParser[Stmt] =
-    at(op("@") ~> attrWord("assert") ~> op("(") ~>
+    at(op("@") ~> attrWord("assert") ~> (missingAssertParens |
+      op("(") ~>
       (expression ~ opt(op(",") ~> strLit) | err(
         "'@assert' takes a condition the compiler can settle, and an optional message: " +
           "'@assert(sizeof(T) == 16, \"why\")'")) <~ op(")") ^^ {
       case (e: Expr) ~ (m: Option[?]) =>
         AssertDecl(e, m.collect { case StrLit(s) => s })
-    })
+    }))
+
+  /** `@assert cond` — the parentheses left off, which without this rule is answered by a sentence
+   * saying `@assert` is not an annotation.
+   *
+   * That message comes from `unknownAttr`, and it is reached because this rule declines at the `(`
+   * and `attributedDecl` is tried next: the two land on the same token, and at equal positions the
+   * later one wins. What it then prints is a roster of every annotation the language has, with this
+   * one absent from it — so a reader comparing their line against the list concludes there is no
+   * `@assert`, when the whole of their mistake is a missing bracket.
+   *
+   * The refusal is raised **before** the `(` rather than after it, so that it is this rule's `Error`
+   * that survives: an `Error` outranks whatever the alternatives reach, but only while nothing has
+   * consumed past the point they diverge at.
+   */
+  private lazy val missingAssertParens: Parser[Stmt] =
+    not(op("(")) ~> err("'@assert' takes its condition in parentheses — " +
+      "'@assert(sizeof(T) == 16)', with an optional message after a comma. It is the parentheses " +
+      "that make it this declaration rather than an annotation about the one under it")
 
   /** `val name [: type] = value` — a binding that is written once (`07`, `13 §7`).
    *

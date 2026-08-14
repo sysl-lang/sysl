@@ -926,6 +926,18 @@ trait ExprAnalysis
           typeNamed(written).isDefined =>
       callTypeAssociated(typeNamed(written).get, written, mname, args, expected)
 
+    // `Maybe[int].Just(1)` — the arguments written on the type a variant or an associated function is
+    // selected *from*, which is the same rule one step to the left of the constructor below. Nothing
+    // read it as a type, so the walk analyzed the brackets as an ordinary subscript and reported the
+    // type's own name undefined: the one reading guaranteed not to help, since the name is defined
+    // and is a type. Both spellings arrive as different nodes, one argument as an `Index` and a list
+    // as a `TypeArgs`.
+    case Call(Field(Index(Ident(written), _), sel), _) if genericTypeName(written) =>
+      typeArgsAtSelection(written, sel)
+
+    case Call(Field(TypeArgs(Ident(written), _), sel), _) if genericTypeName(written) =>
+      typeArgsAtSelection(written, sel)
+
     case Call(Field(recv, mname), args) =>
       callMethod(recv, mname, args, expected)
 
@@ -944,6 +956,22 @@ trait ExprAnalysis
 
     case Call(Index(Field(_, mname), _), _) if memberDecls.exists((k, d) => k._2 == mname && d.tparams.nonEmpty) =>
       err(s"'$mname' cannot be given type arguments at a call; write the type on what receives the result")
+
+    // `Pair[K, V](…)` — the same refusal at a **constructor**, which is the other half of the call
+    // head and did not have it. A generic type's name reached this way fell past every case above to
+    // the general complaint that the callee is not callable, which says nothing about type arguments
+    // and reads as though the type were not a type: the one thing a reader who has just written its
+    // name knows for certain is false.
+    //
+    // Both spellings arrive, and they arrive as different nodes: one argument is an ordinary `Index`
+    // and a list is a `TypeArgs`, which is the split `&f[T]` against `&f[A, B]` already lives with.
+    // The shadowing test is every other call form's — a local standing over the type's name is an
+    // ordinary indexed value, and telling its author about a constructor would be worse than the
+    // general complaint.
+    // Two cases rather than one alternative, because a pattern alternative may bind no variable.
+    case Call(Index(Ident(written), _), _) if genericTypeName(written) => typeArgsAtConstructor(written)
+
+    case Call(TypeArgs(Ident(written), _), _) if genericTypeName(written) => typeArgsAtConstructor(written)
 
     // A special form written with type arguments. `va_arg[int](ap)` is the one this is really for:
     // it is what somebody reaches for first, and an earlier draft of `12 §9` told them to. None of
@@ -972,6 +1000,15 @@ trait ExprAnalysis
 
     // A member read is one form with three readings — a field, a property, or an attribute of a
     // type's own name — and each reading's mistakes want their own words. `MemberExprAnalysis`.
+    // The same selection with nothing called — `Maybe[int].Nothing`, a variant that carries no
+    // payload. It reaches `fieldExpr` rather than any call form, so it needs the case said again
+    // here; without it the reader gets the same `undefined name` about a type that is declared.
+    case Field(Index(Ident(written), _), sel) if genericTypeName(written) =>
+      typeArgsAtSelection(written, sel)
+
+    case Field(TypeArgs(Ident(written), _), sel) if genericTypeName(written) =>
+      typeArgsAtSelection(written, sel)
+
     case e: Field    => fieldExpr(e, expected)
     case e: TypeAttr => typeAttrExpr(e)
     // Building a sequence and reaching into one, which share the question of how many elements
@@ -994,6 +1031,34 @@ trait ExprAnalysis
         "condition guards, and there is no such branch here. Chain it with '&&', or write 'match'")
 
 
+
+  /** Whether a written name is a **generic** nominal type — a struct's or an enum's — and is not
+   * standing behind something nearer.
+   *
+   * The shadowing test is the one every call form makes: a local holding a value of that name is an
+   * ordinary subscript, and its author never wrote a type argument to be told about.
+   */
+  private def genericTypeName(written: String): Boolean =
+    lookupOpt(written).isEmpty && typeKey(written).exists(k => nominalTparams(k).nonEmpty)
+
+  /** The refusal a constructor given written type arguments gets, which is the function form's with
+   * the annotated spelling shown — a reader who reached for the brackets is by definition not the
+   * reader who knows where the type goes instead.
+   */
+  private def typeArgsAtConstructor(written: String): TExpr =
+    err(s"'$written' cannot be given type arguments at a call; write the type on what receives the " +
+      s"result — 'var x: $written[…] = $written(…)'")
+
+  /** The same refusal one step to the left: the arguments written on the type something is selected
+   * *from*, which is what a reader writes to say which instantiation a variant belongs to.
+   *
+   * The remedy is the binding's annotation here too, and the selection is then made from the plain
+   * name — so the sentence names both halves, since neither alone is the line they have to write.
+   */
+  private def typeArgsAtSelection(written: String, sel: String): TExpr =
+    err(s"'$written' cannot be given type arguments where '$sel' is selected from it; write the " +
+      s"type on what receives the result — 'var x: $written[…] = …' — and select '$sel' from the " +
+      s"plain name")
 
   /** `++`/`--` — a step of one, which the base decides the existence of and a constrained place
    * then has to accept: the new value is checked between the addition and the store, so a counter

@@ -12,9 +12,23 @@ package sh.sysl
  */
 trait DeclParser extends ExprParser {
 
-  /** One `name: type` binding — a function parameter or a struct field. */
+  /** One `name: type` binding — a function parameter or a struct field.
+   *
+   * The name may be a **reserved word**, and what happens then is worth a rule rather than a parse
+   * failure. Neither position has anything to say about the word itself: a struct's body ends, and
+   * the reader is told `dedent expected` at a line that is plainly a field; a parameter list closes,
+   * and the reader is told `')' expected` at a token that is plainly a parameter. Both messages are
+   * about layout, which is the one thing that is not wrong.
+   *
+   * **The lookahead is the word AND the colon**, and that is what keeps this from claiming ground the
+   * expression grammar needs. A reserved word can perfectly well begin an argument — `f(true)`,
+   * `f(null)`, `f(if c then 1 else 2)` are all calls, and a declaration is only one of the readings
+   * this position is tried under, so an unconditional refusal here would take `f(true)` as a
+   * statement with it. Followed by a colon it can be nothing but a binding somebody attempted.
+   */
   protected lazy val param: Parser[Param] =
-    at(ident ~ (op(":") ~> typeRef) ^^ { case n ~ t => Param(n, t) })
+    at((ident | guard(reservedWord ~ op(":")) ~> reservedName("a parameter's name or a field's")) ~
+      (op(":") ~> typeRef) ^^ { case n ~ t => Param(n, t) })
 
   /** A function's parameter, which unlike a struct's field may say what a call that leaves it out
    * gets instead (`12 §2a`). The default is a full `expression`, so a call, a conditional, or
