@@ -164,9 +164,15 @@ trait ImportResolution extends TraitLookup {
   /** Whether anything at all is declared under a key. An import binds a *name*, and which of the
    * tables answers to it is the use site's question — the same spelling may be a type in one module
    * and a function in another, and one import serves whichever the reader meant.
+   *
+   * **Every table a name can be declared in is listed, and `constrainedDecls` was missing** — so a
+   * constrained subtype (`16`) was the one declaration that could be *used* through its module and
+   * not imported, and the message said the module declared no such thing while the qualified
+   * spelling beside it resolved. `staticVarDecls` is the one table deliberately absent: a `static`
+   * is legal only in the file a program starts in, so there is never another file to import one.
    */
   private def declaresAnything(key: String): Boolean =
     structDecls.contains(key) || enumDecls.contains(key) || traitDecls.contains(key) ||
       funcDecls.contains(key) || variantOwners.contains(key) || constDecls.contains(key) ||
-      valDecls.contains(key) || externVarDecls.contains(key)
+      valDecls.contains(key) || externVarDecls.contains(key) || constrainedDecls.contains(key)
 }

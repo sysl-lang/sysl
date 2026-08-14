@@ -79,7 +79,7 @@ object Analyzer {
               std: Stdlib = Stdlib.fromSource(Target.default), target: Target = Target.default,
               provides: Set[String] = Capability.core.toSet, packages: Packages = Packages.none,
               paths: SearchPaths = SearchPaths.none)
-      : Either[String, TProgram] = CConstants.lower(units, target, paths).flatMap(analyzing(_,
+      : Either[String, TProgram] = CProbe.lower(units, target, paths).flatMap(analyzing(_,
     building, std, target, provides, packages))
 
   /** The walk itself, over units whose `c const` blocks are already ordinary constants.

@@ -89,4 +89,30 @@ class ConstrainedClaimTests extends AnyFreeSpec with RunSupport with CodegenSupp
       run("shadow(x: int) -> int\n    var result = x * 3\n    result\nprint(shadow(4))") shouldBe "12\n"
     }
   }
+
+  /** A constrained subtype is a **module member** like any other, so both ways of reaching one from
+    * another file work — the qualified path, and the import that shortens it.
+    *
+    * The import did not. `ImportResolution.declaresAnything` asks every table a name may be declared
+    * in and did not ask `constrainedDecls`, so a type was the one declaration that could be *used*
+    * through its module and not imported: `import shape.Meters` was refused with *"'shape' declares
+    * no 'Meters'"* while `shape.Meters` beside it resolved. Found while measuring a `c type`, which
+    * lowers to exactly this declaration and so inherited the hole.
+    */
+  "a type declared in another file is reached both ways" - {
+
+    "by the qualified path" in {
+      runIn(
+        ("shape", "shape.sysl", "module shape\n\ntype Meters = f64 within 0.0..100.0\n"),
+        ("", "main.sysl", "val d: shape.Meters = 3.5\nprint(d)\n"),
+      ) shouldBe "3.5\n"
+    }
+
+    "and by an import that shortens it" in {
+      runIn(
+        ("shape", "shape.sysl", "module shape\n\ntype Meters = f64 within 0.0..100.0\n"),
+        ("", "main.sysl", "import shape.Meters\n\nval d: Meters = 3.5\nprint(d)\n"),
+      ) shouldBe "3.5\n"
+    }
+  }
 }

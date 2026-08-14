@@ -413,7 +413,7 @@ class SearchPathTests extends LibraryCliSupport {
     // **The combination a real package is actually in**, and the one the cases above miss: its
     // constants come from a `c const` block over the header it declared, and `sysl test` is how its
     // own suite runs. Those are two separate reasons to want the include path — the block is
-    // compiled by `CConstants` and the shim by the toolchain — and `test` reaches them through
+    // compiled by `CProbe` and the shim by the toolchain — and `test` reaches them through
     // `Compiler.compileTests`, which is a different call from the one `run` and `build` take.
     //
     // That call analyzed without its paths, so a tree could be run, built and turned into a library

@@ -20,6 +20,10 @@ trait ConstrainedTypes extends GenericInstantiation {
 
       val scalar = Type.underlying(base) match
         case _: Type.Integer | _: Type.Floating | Type.Char => true
+        // `bool` is a base for a measured `c type` and for nothing else, because C's `_Bool` is what
+        // sysl's `bool` already is. Nothing is given up by admitting it: there is no range and no
+        // predicate a `bool` could carry, so the one thing this allows is the alias itself.
+        case Type.Bool                                      => d.fromC
         case _                                              => false
       if !scalar then
         err(s"a constrained subtype's base must be an integer, a float, or 'char', not ${show(base)}")
@@ -36,7 +40,12 @@ trait ConstrainedTypes extends GenericInstantiation {
 
       // A transparent subtype with neither a range nor a predicate would be a plain alias, which is
       // not a form this cut accepts; `new` alone is enough, since it still changes the type's identity.
-      if lo.isEmpty && d.pred.isEmpty && !d.derived then
+      //
+      // A measured `c type` is that shape and is admitted, because it is not a decision anybody made
+      // about aliases: a C typedef *is* a second name for one integer, and the alternative — a
+      // `within` covering the whole of the base — would be a range nobody wrote and a check nobody
+      // needs. What `16` deferred was whether a person may write one, and this does not reopen it.
+      if lo.isEmpty && d.pred.isEmpty && !d.derived && !d.fromC then
         err(s"'${qn(key)}' has no constraint — add a 'within' range or a 'where' predicate, or 'new' to " +
           "make it a distinct type")
 

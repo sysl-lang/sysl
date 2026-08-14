@@ -444,6 +444,6 @@ class CConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
   "a compilation with no block never asks for a clang" in {
     val units = List(SyslParser.parse(Source("<input>", "print(1)\n"), Target.default).toOption.get)
 
-    CConstants.lower(units, Target.default) shouldBe Right(units)
+    CProbe.lower(units, Target.default) shouldBe Right(units)
   }
 }

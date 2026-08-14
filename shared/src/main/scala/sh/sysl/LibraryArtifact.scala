@@ -279,8 +279,8 @@ object LibraryArtifact {
         // inside the analyzer is what gets `--include-path` to the C compiler that has to answer it.
         // Only the library's own units go on to the metadata below — a dependency's constants are
         // its own artifact's to ship.
-        CConstants.lower(supplied, target, paths).flatMap(carriedSource =>
-        CConstants.lower(own, target, paths).flatMap(units =>
+        CProbe.lower(supplied, target, paths).flatMap(carriedSource =>
+        CProbe.lower(own, target, paths).flatMap(units =>
         rootless(units) match
           case Some(err) => Left(err)
           case None =>

@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 35
+  val Version: Int = 36
 
   private val Magic = "sysl-ast"
 
@@ -332,13 +332,20 @@ object AstCodec {
           sys.error("a 'static' declaration reached a library artifact, which is a file a program " +
             "starts in reaching one — the analyzer refuses 'static' everywhere else")
         // No token either, and for a stronger reason than `static`'s: a `c const` is *lowered* to an
-        // ordinary constant before a library is analyzed or encoded (`CConstants`), so what an
+        // ordinary constant before a library is analyzed or encoded (`CProbe`), so what an
         // artifact carries is the measured value. Reaching here means a tree skipped that lowering,
         // and the loud failure is the point — the quiet alternative is a library shipping without
         // constants a program is about to name.
         case _: CConstBlock =>
           sys.error("a 'c const' block reached a library artifact — it is lowered to an ordinary " +
-            "constant before anything is encoded, so this is a path that skipped 'CConstants.lower'")
+            "constant before anything is encoded, so this is a path that skipped 'CProbe.lower'")
+        // The same again for the type half, measured by the same probe and lowered by the same pass.
+        // What an artifact carries is the `TypeDecl` the measurement produced, which is the only
+        // honest thing to ship: an artifact is built for one target, and re-measuring the typedef
+        // somewhere else would be answering a different question under the same name.
+        case _: CTypeBlock =>
+          sys.error("a 'c type' block reached a library artifact — it is lowered to a type " +
+            "declaration before anything is encoded, so this is a path that skipped 'CProbe.lower'")
         case RefDecl(n, p)                => tok("ref"); sref(n); expr(p)
         case MultiAssign(op, ts, vs)      => tok("masg"); sref(op); list(ts)(expr); list(vs)(expr)
         case MultiDecl(ns, mut, vs)       => tok("mdcl"); list(ns)(sref); bool(mut); list(vs)(expr)
@@ -393,8 +400,9 @@ object AstCodec {
           tok("ed"); sref(n); list(tps)(sref); opt(und)(typ); list(vars)(variant); list(ms)(method)
           bounds(bs); vis(vs); tdefaults(tds); tdefaults(tvs)
 
-        case TypeDecl(n, base, der, rng, pred, vs) =>
+        case TypeDecl(n, base, der, rng, pred, vs, fromC) =>
           tok("td"); sref(n); typ(base); bool(der); opt(rng)(rangeBound); opt(pred)(expr); vis(vs)
+          bool(fromC)
 
         case TraitDecl(n, tps, ms, bs, sups, vs, tds) =>
           tok("trt"); sref(n); list(tps)(sref); list(ms)(method); bounds(bs); list(sups)(bound)
@@ -776,7 +784,7 @@ object AstCodec {
           EnumDecl(sref(), list(sref()), opt(typ()), list(variant()), list(method()),
             bounds(), vis(), tdefaults(), tdefaults())
         case "td" =>
-          TypeDecl(sref(), typ(), bool(), opt(rangeBound()), opt(expr()), vis())
+          TypeDecl(sref(), typ(), bool(), opt(rangeBound()), opt(expr()), vis(), bool())
         case "trt" =>
           TraitDecl(sref(), list(sref()), list(method()), bounds(), list(bound()), vis(), tdefaults())
         case "impl" =>
