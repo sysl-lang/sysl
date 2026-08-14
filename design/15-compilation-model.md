@@ -562,6 +562,14 @@ measurement does not reopen it.
 **It does not import the typedef.** A `c type` names one and gets an integer back; no name from the
 header becomes visible in sysl, which is §9's arrangement and is deliberately untouched.
 
+**A value computed in sysl reaches one through the type's own name** — `Tick(xs.len)` — and through
+nothing else. That is `16 §2`'s conversion rule rather than anything of this section's, and it is
+named here because this is the declaration that makes it load bearing: the base is a width the
+program is deliberately not told, so `u32(n)` is the transcription the whole feature exists to
+abolish, and `usize` is a distinct type from whatever C measured. A binding handing C a length or a
+`sizeof` is the ordinary case — a queue's item size, a task's stack depth — so without that rule a
+`c type` could be *declared* in a signature and never *called* with anything a program worked out.
+
 ### A file that says what it needs is not probed on a machine that cannot have it
 
 **A probe is a C compilation, so a file carrying one asks for headers — and a library is built for

@@ -57,11 +57,30 @@ class SubtypeErrorTests extends AnyFreeSpec with CodegenSupport {
     e should not include "$pred"
   }
 
+  /** The other half of the rule `SubtypeRunTests` pins: a transparent subtype's name converts what
+    * its base's name converts, and a pair with no meaning is still refused — naming the type the
+    * reader wrote rather than the base they did not.
+    */
+  "a transparent subtype converts only what its base does" in {
+    err("type Age = int within 0..150\nvar s = \"x\"\nprint(Age(s))") should
+      include("cannot make Age from string")
+  }
+
   "a derived type is nominally distinct" - {
     val Meters = "type Meters = new f64\n"
 
     "mixing it with its base in arithmetic is rejected" in {
       err(Meters + "print(f64(Meters(3.0) + 1.0))") should include("needs matching types")
+    }
+
+    /** `new` is what makes the type distinct, so a conversion into one is a **wrap** of a value
+      * already at the base rather than the scalar conversion a transparent subtype's name performs.
+      * This is the case that must NOT move with that rule, and it is here because the two look
+      * identical on the line: `Meters(x)` and `Age(x)` differ only in what was declared.
+      */
+    "a value that is not already at the base is rejected" in {
+      err(Meters + "var n: int = 3\nprint(f64(Meters(n)))") should
+        include("cannot make Meters from int")
     }
 
     "an implicit conversion from the base is rejected" in {

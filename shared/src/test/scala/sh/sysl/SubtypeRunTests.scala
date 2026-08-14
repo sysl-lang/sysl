@@ -85,6 +85,36 @@ class SubtypeRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  /** A transparent subtype **is** its base (`16 §2`), so its name converts what the base's name
+    * converts: `Age(n)` on a `usize` is the `int(n)` a reader would otherwise have to write. Before
+    * this the operand had to arrive already at the base, which left no way into a subtype whose base
+    * cannot be *named* — a `c type` measures a width the program is not supposed to know, so
+    * `Tick(xs.len)` had no longhand to fall back on. `CTypeTests` carries that case.
+    *
+    * The range is still checked on the way in, which is what the trapping half of each pair pins:
+    * the conversion is a conversion, not a way past the constraint.
+    */
+  "a transparent subtype's name converts as its base's name does" - {
+    "from a narrower integer" in {
+      run(Age + "var n: u8 = 30\nprint(Age(n))") shouldBe "30\n"
+    }
+    "from a usize, which is a distinct type from the base" in {
+      run(Age + "var n: usize = 42\nprint(Age(n))") shouldBe "42\n"
+    }
+    "and the range is checked on the value that arrives" in {
+      exits(Age + "var n: usize = 200\nprint(Age(n))")
+    }
+    "from a float, truncating as the base's own conversion does" in {
+      run(Age + "var f: f64 = 7.9\nprint(Age(f))") shouldBe "7\n"
+    }
+    "and into a character subtype from an integer" in {
+      run(Letter + "var n: u8 = 99\nprint(Letter(n))") shouldBe "c\n"
+    }
+    "while a value already at the base still needs no conversion" in {
+      run(Age + "var n: int = 12\nprint(Age(n))") shouldBe "12\n"
+    }
+  }
+
   // A value of one transparent subtype flows into another over the same base, re-checked against the
   // second subtype's range — the base compatibility that makes the subtype transparent. Narrowing a
   // wide value into a tighter subtype is what exposes the re-check.
