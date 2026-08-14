@@ -13,11 +13,11 @@ took the most natural name in an allocator away from the code that provides one.
 model changed with the spelling; what changed is that a capability is now said *about* a module
 rather than being a construct the language executes, which is what it always was.
 
-**The three environment capabilities are enforced too, and against the module graph rather than
+**The two environment capabilities are enforced too, and against the module graph rather than
 against a target.** Each became checkable the day the library grew a module declaring it — `sysl.fs`
-for `os` and `posix`, `sysl.thread` for `threads` — because what an environment capability gates is a
-whole module, so the rule is that a module which gave one up may not *reach* one that needs it,
-directly or through anything in between. **All four are narrowings now.** The order is the one the
+for `os`, `sysl.posix.tty` for `posix` — because what an environment capability gates is a whole
+module, so the rule is that a module which gave one up may not *reach* one that needs it, directly or
+through anything in between. **All three are narrowings now.** The order is the one the
 next capability will arrive in: declared, then gated by something, then narrowable — a clause
 enforcing nothing would read in a source file as a guarantee the compiler never made, so it is
 refused for as long as that is what it would be.
@@ -50,14 +50,13 @@ parts of the compiler:
   or heap-backed slice it was handed, because every ARC object carries its own deallocation
   hook (`03`). The **type-checker** enforces this — it is what makes "the kernel allocates
   nothing" a checked guarantee rather than a convention.
-- **`os` / `posix` / `threads` — *environment* capabilities.** They do not change the language; they
-  gate which **standard-library modules exist**. `sysl.fs` requires `os`; `sysl.thread` requires
-  `threads` and `posix` both, since pthreads is what it is built on. Enforced against the **module
-  graph**, not by the type-checker: the unit is the reference from one module to another, and the
-  diagnostic lands at the reference rather than at the clause, because that is the line a reader has
-  to change.
+- **`os` / `posix` — *environment* capabilities.** They do not change the language; they
+  gate which **standard-library modules exist**. `sysl.fs` requires `os`; everything under
+  `sysl.posix` requires `posix`. Enforced against the **module graph**, not by the type-checker: the
+  unit is the reference from one module to another, and the diagnostic lands at the reference rather
+  than at the clause, because that is the line a reader has to change.
 
-`heap` is the load-bearing one for the memory model. The other three layer on the same two-level
+`heap` is the load-bearing one for the memory model. The other two layer on the same two-level
 machinery but act at the import boundary.
 
 ## The core set
@@ -66,17 +65,27 @@ machinery but act at the import boundary.
 |---|---|---|---|
 | `heap` | language | `&T`, `weak T`, growable arrays, `&Trait`, escaping closures, allocating string ops | — |
 | `os` | environment | OS / syscall standard-library surface | — |
-| `posix` | environment | POSIX compatibility layer | `os` |
-| `threads` | environment | `sysl.thread` — spawning, joining, and the growable channel | — |
+| `posix` | environment | everything under `sysl.posix` — threads, `termios`, `getentropy` | `os` |
 
 `posix` implies `os` (POSIX needs an OS); config validation enforces the implication. The set
-is extensible, but these four are the core.
+is extensible, but these three are the core.
+
+**A fourth, `threads`, was here and has been removed** — the one capability ever taken *out* of this
+set, and the reason is worth keeping because it is the test the next addition has to pass. It gated
+one module, `sysl.thread`, and it read as a claim that the compiler tracks whether a scheduler
+exists. It does not, and nothing in the library was gated on that: what `sysl.thread` is built on is
+pthreads. So the module became `sysl.posix.threads`, requires `posix`, and the capability had nothing
+left to say. **A target with a scheduler of its own — FreeRTOS, Zephyr, a kernel written in sysl —
+has threads and no POSIX**, and binds its own kernel as a package; no capability could have made
+`pthread_create` appear on it. **Nothing gates a package**, and nothing needs to: what a package
+requires is stated in its `package.hocon` and checked against the target's set exactly as a module's
+clause is.
 
 **The capability is `heap` and the clause that gives it up is `@no_alloc`, and the two names differ
-on purpose.** The config states whether a facility **exists** — a noun, beside `os`, `posix` and
-`threads` — because whether a heap exists is a project engineering decision about the machine being
+on purpose.** The config states whether a facility **exists** — a noun, beside `os` and `posix` —
+because whether a heap exists is a project engineering decision about the machine being
 built for. A narrowing clause is a module's promise about its own **conduct**, and a promise is about
-an action: *I do not allocate, so I do not need a heap to exist.* The other three need no second word,
+an action: *I do not allocate, so I do not need a heap to exist.* The other two need no second word,
 since for them giving the facility up and not using it are the same act.
 
 `@no_heap` is refused, naming `@no_alloc`: it says a machine has no heap, which is the project's to
@@ -89,12 +98,12 @@ validated exactly as the project's own is — so refusing the old word would sto
 dependency resolving on the day it shipped, and re-tagging cannot help a consumer that has not also
 bumped its pin. `heap` is the name to write; the allowance goes once the packages have been swept.
 
-`threads` gates *spawning*, not soundness: what may cross a domain boundary is a structural
-rule (`06`), and one that has no check behind it until the channel is written. A target with no
-scheduler simply does not offer it, and a module may narrow it away to declare itself
-single-threaded. Note that a **fixed-capacity** channel needs neither `heap` nor `threads` to
-exist — allocator-free code can still receive on one, which is the same reason `sysl.sync` requires
-nothing at all while `sysl.thread` requires two.
+**What gates spawning is not soundness**: what may cross a domain boundary is a structural rule
+(`06`), and one that has no check behind it until the channel is written. `posix` gates the module
+that can start a thread, and a module may narrow it away to declare itself single-threaded. Note that
+a **fixed-capacity** channel needs neither `heap` nor `posix` to exist — allocator-free code can
+still receive on one, which is the same reason `sysl.sync` requires nothing at all while
+`sysl.posix.threads` requires an operating system.
 
 ## Two levels: target provides, module narrows
 
@@ -295,11 +304,10 @@ allocator-free everywhere.
   rather than creating one. `guide/kernel` cannot carry it at all, because its machine and its checks
   are one module. Nothing here is wrong; what it says is that **a module is a coarse unit for this
   question**, and it is the same observation the granularity bullet above makes from the other end.
-- **Narrowing is now enforced for all four.** Each became a narrowing the day there was something
+- **Narrowing is now enforced for all three.** Each became a narrowing the day there was something
   for it to gate, exactly as this bullet predicted when it named only `alloc`: `os` and `posix` when
-  `sysl.fs` was written, `threads` when `sysl.thread` was. The refusal that carried them until then
-  refuses nothing today and stays for the next capability, which will arrive declared before it is
-  gated.
+  `sysl.fs` was written. The refusal that carried them until then refuses nothing today and stays for
+  the next capability, which will arrive declared before it is gated.
 - ~~**The clause spends two ordinary words, and one of them is wanted.**~~ — **CLOSED. The clauses
   are attributes**, `@no_alloc` and `@requires(...)`, and an attribute's name arrives as an ordinary
   identifier rather than through the lexer's reserved list. `no`, `alloc`, `requires` and `link` are

@@ -82,7 +82,7 @@ trait RunSupport extends Matchers { this: Assertions =>
    *
    * **This is the only helper that can reach code gated on `is_tty`, and it exists because a whole
    * facility was otherwise being merged unexercised.** Every other run here hands the program a
-   * closed standard input, so `sysl.term.tty.raw` takes its early exit and returns `false` — which
+   * closed standard input, so `sysl.posix.tty.raw` takes its early exit and returns `false` — which
    * makes the *refusing* branch the only one a suite could see, and the succeeding branch, the one
    * that changes a real terminal's settings, unreachable. It is not a small branch: it spawns a
    * shell, and getting it wrong once turned a Ctrl-C into a deadlock rather than a tidy exit.

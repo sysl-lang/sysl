@@ -109,7 +109,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
       val e = err("@requires(sockets)\n\nf() -> int = 1\n")
 
       e should include("no capability is called 'sockets'")
-      e should include("'heap', 'os', 'posix', 'threads'")
+      e should include("'heap', 'os', 'posix'")
     }
 
     // The narrowing form carries the name in the attribute's own word, so an unknown one is a
@@ -135,11 +135,16 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
 
     /* The refusal that used to sit here refuses nothing now, and that is the state it was built to
      * reach: a narrowing is refused while it would enforce nothing, and allowed once it would. `os`
-     * and `posix` left the list the day a module requiring one existed, and `threads` left it the
-     * day `sysl.thread` did — so all four are narrowings today. What each of them then *means* is
-     * checked against the module graph, in `ThreadTests` and `FsTests`. */
+     * and `posix` left the list the day a module requiring one existed — so all three are narrowings
+     * today. What each of them then *means* is checked against the module graph, in `ThreadTests`
+     * and `FsTests`.
+     *
+     * There were four of them until `sysl.thread` became `sysl.posix.threads`. `threads` was
+     * removed rather than renamed, because a module built on pthreads requires `posix` and the
+     * compiler tracks nothing about schedulers; `ThreadTests` is where the refusal of the old
+     * spelling is pinned. */
     "while every capability there is may now be given up, since each of them gates something" in {
-      run("@no_alloc\n@no_os\n@no_posix\n@no_threads\n\nprint(1 + 1)\n") shouldBe "2\n"
+      run("@no_alloc\n@no_os\n@no_posix\n\nprint(1 + 1)\n") shouldBe "2\n"
     }
   }
 

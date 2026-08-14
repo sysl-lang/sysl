@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `sysl.thread` — starting a thread, waiting for one, and the lock that owns what it protects.
+/** `sysl.posix.threads` — starting a thread, waiting for one, and the lock that owns what it protects.
  *
  * This is the first suite in which a sysl program has **two threads in it**, so it is the first
  * place several things stop being claims about emitted text. The per-thread reaper worklist is the
@@ -19,7 +19,7 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
-  private val importing = "import sysl.sync.*\nimport sysl.thread.*\n\n"
+  private val importing = "import sysl.sync.*\nimport sysl.posix.threads.*\n\n"
 
   override protected def run(src: String): String = super.run(importing + src)
 
@@ -380,53 +380,68 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
-  /** `threads` is an environment capability, so what it gates is **which modules exist** rather than
-   * what any declaration may do — and the check is the module graph's, already written for `os` and
-   * `posix`. What changed here is only that `no threads` is a narrowing the compiler accepts, which
-   * it could not be while nothing required the capability.
+  /** `posix` is an environment capability, so what it gates is **which modules exist** rather than
+   * what any declaration may do — and the check is the module graph's, shared with `os`.
+   *
+   * **There is no `threads` capability, and this section is where that is pinned.** The module used
+   * to require one beside `posix`, on the reading that a scheduler is a thing a target either has or
+   * has not. What it is actually built on is pthreads, which is POSIX and nothing narrower — so the
+   * module moved here and the fourth capability went, because nothing in the library was ever gated
+   * on a scheduler existing. A target running its own kernel reaches threads through a package
+   * binding it, which asks the compiler for nothing.
    */
-  "the capability, now that something requires it" - {
-    "a module that gave up threads may not reach the module that needs them" in {
+  "the capability that gates it" - {
+    "a module that gave up posix may not reach it" in {
       val out = errOf(
         "quiet/work.sysl" ->
           """module quiet
-            |@no_threads
+            |@no_posix
             |
-            |import sysl.thread.Mutex
+            |import sysl.posix.threads.Mutex
             |
             |guarded() -> Mutex[int] = Mutex.new(0)
             |""".stripMargin,
         "main.sysl" -> "import quiet.guarded\n\nprint(guarded().try_lock().is_some())\n",
       )
 
-      out should include("requires 'threads'")
-      out should include("declared 'no threads'")
+      out should include("this reaches 'sysl.posix.threads', which requires 'posix'")
+      out should include("'quiet' declared 'no posix'")
     }
 
-    // pthreads is the implementation, so the module requires `posix` beside `threads` and any of the
-    // three narrowings is enough to put it out of reach. Giving up `os` gives up `posix` with it,
-    // since posix is what needs an operating system rather than the other way round.
+    // Giving up `os` gives up `posix` with it, since posix is what needs an operating system rather
+    // than the other way round — so the narrower clause is not the only one that puts this module out
+    // of reach.
     "and so may a module that gave up its operating system, since pthreads needs one" in {
       val out = errOf(
         "bare/work.sysl" ->
           """module bare
             |@no_os
             |
-            |import sysl.thread.yield_now
+            |import sysl.posix.threads.yield_now
             |
             |step() -> bool = yield_now()
             |""".stripMargin,
         "main.sysl" -> "import bare.step\n\nprint(step())\n",
       )
 
-      out should include("this reaches 'sysl.thread', which requires 'os'")
+      out should include("this reaches 'sysl.posix.threads', which requires 'os'")
       out should include("'bare' declared 'no os'")
     }
 
-    // The narrowing is now accepted where it used to be refused outright, and a module that gave
-    // threads up goes on compiling — it just cannot reach the one module that needs them.
-    "while giving them up on its own is an ordinary clause" in {
-      super.run("@no_threads\n\nprint(1 + 1)") shouldBe "2\n"
+    // A module that gives posix up goes on compiling — it just cannot reach the modules that need it.
+    "while giving it up on its own is an ordinary clause" in {
+      super.run("@no_posix\n\nprint(1 + 1)") shouldBe "2\n"
+    }
+
+    /** The capability that is gone. Written as a test rather than left to the absence of one, because
+      * an unknown capability is refused by name and that refusal is the only thing telling a reader
+      * of the old spelling where their module went.
+      */
+    "and 'threads' is no longer a capability at all" in {
+      val out = errOf("main.sysl" -> "@no_threads\n\nprint(1 + 1)\n")
+
+      out should include("no capability is called 'threads'")
+      out should include("'heap', 'os', 'posix'")
     }
   }
 
@@ -467,7 +482,7 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     "building one by naming its fields, which would let it start held" in {
       val out = err("var m = Mutex(1i32, 5)\nprint(m.try_lock().is_some())")
 
-      out should include("the constructor names every field of 'sysl.thread.Mutex' in order")
+      out should include("the constructor names every field of 'sysl.posix.threads.Mutex' in order")
       out should include("'held' is private")
       out should include("associated function")
     }

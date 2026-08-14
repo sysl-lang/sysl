@@ -171,7 +171,7 @@ class AtomicTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
     // The shape the tier exists for: a ticket taken out of a counter with no lock anywhere. Single
     // threaded here — what is being checked is that the loop of increments is the arithmetic it
-    // looks like — and the concurrent form is what `sysl.thread` will be able to state.
+    // looks like — and the concurrent form is what `sysl.posix.threads` will be able to state.
     "a counter incremented in a loop lands where the arithmetic says" in {
       val src =
         """import sysl.sync.*

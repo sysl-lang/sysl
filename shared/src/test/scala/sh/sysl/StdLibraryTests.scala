@@ -187,7 +187,7 @@ class StdLibraryTests extends AnyFreeSpec with Matchers {
     "and names each file by its place in the library rather than by where it was read from" in {
       // So that a diagnostic naming a library file reads the same on every machine. See `Std.named`
       // — this is the claim the full suite caught being broken, in two library pages that quote a
-      // refusal about a private field of `sysl.thread.Mutex`.
+      // refusal about a private field of `sysl.posix.threads.Mutex`.
       Std.sources.map(_.name) shouldBe Std.sources.map(s => s"${Std.Prefix}/${place(s)}")
     }
 

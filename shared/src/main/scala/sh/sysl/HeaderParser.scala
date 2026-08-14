@@ -118,12 +118,12 @@ trait HeaderParser extends AttrParser {
   private lazy val noAttr: Parser[List[HeaderClause]] =
     at(attrWordPrefixed("no_") ^^ (CapabilityClause(CapabilityDirection.Narrows, _))) ^^ (List(_))
 
-  /** `@requires(os)`, `@requires(threads, posix)` — what the module cannot be built without.
+  /** `@requires(os)`, `@requires(heap, posix)` — what the module cannot be built without.
    *
    * Parenthesised and plural where the narrowing form is neither, because that is how each is used:
-   * a module gives up one capability at a time and needs several at once. `sysl.thread` requires
-   * both `threads` and `posix`, and writing that as two attributes would be two lines saying one
-   * thing.
+   * a module gives up one capability at a time and needs several at once. The POSIX regex binding
+   * requires both `heap` and `posix` — a `regex_t` is caller-allocated and `regcomp` is POSIX — and
+   * writing that as two attributes would be two lines saying one thing.
    */
   private lazy val requiresAttr: Parser[List[HeaderClause]] =
     attrWord("requires") ~> op("(") ~>

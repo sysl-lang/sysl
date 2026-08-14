@@ -2,13 +2,13 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `sysl.term.tty` — whether escapes should be written at all.
+/** `sysl.posix.tty` — whether escapes should be written at all.
  *
  * **The split from `sysl.term` is the thing under test, and it is a capability claim rather than a
  * behaviour.** A capability requirement is module-wide, so the whole reason this is a second module
  * is that putting `isatty` beside the constants would have taken all forty of them away from an
  * allocator-free, OS-free program. Two tests below assert exactly that: `sysl.term` is still
- * reachable from a module that gave up everything, and `sysl.term.tty` is refused there.
+ * reachable from a module that gave up everything, and `sysl.posix.tty` is refused there.
  *
  * **What a test cannot reach is a terminal.** The harness runs a compiled program with its output on
  * a pipe, so `is_tty` is false for every descriptor a test can name and anything gated on it is
@@ -26,7 +26,7 @@ class TermTtyTests extends AnyFreeSpec with RunSupport with CodegenSupport {
    * environment into the state it wants to ask about.
    */
   private def tty(src: String): String =
-    run("import sysl.term.tty.*\nimport sysl.text.cstring\n\n" +
+    run("import sysl.posix.tty.*\nimport sysl.text.cstring\n\n" +
       "extern \"setenv\" c_setenv(name: *u8, value: *u8, overwrite: int) -> int\n" +
       "extern \"unsetenv\" c_unsetenv(name: *u8) -> int\n\n" +
       "set(name: string, value: string)\n" +
@@ -152,13 +152,13 @@ class TermTtyTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   "the split keeps the constants reachable where the check is not" - {
 
     "a module with no allocator and no OS may still name a colour" in {
-      run("@no_alloc\n@no_os\n@no_posix\n@no_threads\n\nimport sysl.term.red\n\nprint(red.len)") shouldBe "5\n"
+      run("@no_alloc\n@no_os\n@no_posix\n\nimport sysl.term.red\n\nprint(red.len)") shouldBe "5\n"
     }
 
     "while the same module may not ask whether to use it" in {
-      val e = err("@no_posix\n\nimport sysl.term.tty.color\n\nprint(color())\n")
+      val e = err("@no_posix\n\nimport sysl.posix.tty.color\n\nprint(color())\n")
 
-      e should include("sysl.term.tty")
+      e should include("sysl.posix.tty")
       e should include("posix")
     }
   }
@@ -239,7 +239,7 @@ class TermTtyTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   "cbreak mode, against a terminal that is really there" - {
 
     "raw() succeeds, where the tests above could only watch it decline" in {
-      runOnTty("import sysl.term.tty.{is_tty, raw, cooked}\n\n" +
+      runOnTty("import sysl.posix.tty.{is_tty, raw, cooked}\n\n" +
         "print(\"tty:\", is_tty(0))\nprint(\"raw:\", raw())\ncooked()\n", "") should include("raw: true")
     }
 
@@ -248,7 +248,7 @@ class TermTtyTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     "and the editor then reads what is typed, a keystroke at a time" in {
       val out = runOnTty("""import sysl.term.edit.editor
                            |import sysl.io.stdin
-                           |import sysl.term.tty.{raw, cooked}
+                           |import sysl.posix.tty.{raw, cooked}
                            |
                            |var input = stdin()
                            |
@@ -267,7 +267,7 @@ class TermTtyTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     "Ctrl-C abandons the line without ending the program" in {
       val out = runOnTty("""import sysl.term.edit.editor
                            |import sysl.io.stdin
-                           |import sysl.term.tty.{raw, cooked}
+                           |import sysl.posix.tty.{raw, cooked}
                            |
                            |var input = stdin()
                            |
@@ -287,7 +287,7 @@ class TermTtyTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // asks the terminal itself, once the program has left it, because a program that has exited
     // cannot be asked.
     "and the terminal is put back when the program leaves it" in {
-      val out = runOnTty("""import sysl.term.tty.{raw, cooked}
+      val out = runOnTty("""import sysl.posix.tty.{raw, cooked}
                            |
                            |if raw() then cooked()""".stripMargin, "",
         after = "stty -a | tr ' ' '\\n' | grep -c '^-echo$'")

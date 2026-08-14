@@ -194,7 +194,7 @@ class TermEditTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   "it requires nothing of the platform" - {
 
     "so a program with no OS and no allocator may still name it" in {
-      run("@no_os\n@no_posix\n@no_threads\n\nimport sysl.term.edit.Editor\n\nprint(\"named\")") shouldBe
+      run("@no_os\n@no_posix\n\nimport sysl.term.edit.Editor\n\nprint(\"named\")") shouldBe
         "named\n"
     }
   }

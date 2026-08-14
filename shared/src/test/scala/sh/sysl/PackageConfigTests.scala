@@ -23,7 +23,7 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
       case Right(c) => fail(s"expected a refusal, got: $c")
 
   "a project may have no file at all, and every capability is then provided" in {
-    PackageConfig.empty.provides("aarch64-macos") shouldBe Set("heap", "os", "posix", "threads")
+    PackageConfig.empty.provides("aarch64-macos") shouldBe Set("heap", "os", "posix")
   }
 
   "an empty file is a project that said nothing" in {
@@ -112,7 +112,7 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
           |}
           |""".stripMargin)
 
-      c.provides("aarch64-kernel") shouldBe Set("heap", "threads")
+      c.provides("aarch64-kernel") shouldBe Set("heap")
     }
 
     "a target the file says nothing about provides everything" in {
@@ -122,8 +122,8 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
           |}
           |""".stripMargin)
 
-      c.provides("x86_64-linux") shouldBe Set("heap", "os", "posix", "threads")
-      c.provides("aarch64-kernel") shouldBe Set("os", "posix", "threads")
+      c.provides("x86_64-linux") shouldBe Set("heap", "os", "posix")
+      c.provides("aarch64-kernel") shouldBe Set("os", "posix")
     }
 
     // Whether a heap exists is a project engineering decision, so it is stated once for the project
@@ -132,8 +132,8 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
     "a project states its own policy, for every target it builds for" in {
       val c = read("capabilities { heap = false }\n")
 
-      c.provides("aarch64-macos") shouldBe Set("os", "posix", "threads")
-      c.provides("thumbv7em-freestanding") shouldBe Set("os", "posix", "threads")
+      c.provides("aarch64-macos") shouldBe Set("os", "posix")
+      c.provides("thumbv7em-freestanding") shouldBe Set("os", "posix")
     }
 
     "and a target block layers over it, for the one machine where it is not so" in {
@@ -152,13 +152,13 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
     // discard what the project said about the others.
     "the layering is per capability, not per block" in {
       val c = read(
-        """capabilities { heap = false, threads = false }
+        """capabilities { heap = false, posix = false }
           |targets {
-          |  kernel { capabilities { threads = true } }
+          |  kernel { capabilities { posix = true } }
           |}
           |""".stripMargin)
 
-      c.provides("kernel") shouldBe Set("os", "posix", "threads")
+      c.provides("kernel") shouldBe Set("os", "posix")
     }
 
     // `alloc` is what a *module* promises about its conduct and `heap` is the facility, so the config
@@ -194,7 +194,7 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
 
       e should include("'treads'")
       e should include("is not a capability")
-      e should include("'heap', 'os', 'posix', 'threads'")
+      e should include("'heap', 'os', 'posix'")
     }
 
     "a capability that is not true or false" in {

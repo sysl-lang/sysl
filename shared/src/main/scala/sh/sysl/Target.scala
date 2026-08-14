@@ -133,7 +133,7 @@ case class Target(
    * out of the arc runtime rather than a diagnostic out of the linker.
    *
    * Nothing is lost by answering `false` there, because nothing on a bare target can spawn: the
-   * threads a program gets from sysl come from `sysl.thread`, which is `requires posix`. A kernel
+   * threads a program gets from sysl come from `sysl.posix.threads`, which is `requires posix`. A kernel
    * that implements threads of its own and shares a reference across them is outside what the
    * compiler can see either way — it does not know that scheduler exists.
    */

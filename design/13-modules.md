@@ -486,8 +486,9 @@ module oskit.arch               module oskit.arch
 
 - **`@requires(alloc)`** (and the other direction) is likewise a module-header attribute, documenting
   and early-diagnosing a hard dependency, per `capabilities.md`. It takes a **list**, because a
-  module often needs more than one at once — `sysl.thread` is `@requires(threads, posix)` — where a
-  narrowing gives up one at a time.
+  module often needs more than one at once — the POSIX regex binding is `@requires(heap, posix)`,
+  since a `regex_t` is caller-allocated and `regcomp` is POSIX — where a narrowing gives up one at a
+  time.
 - **The header has one other inhabitant, and it is deliberately not held to agreeing.** `@link("z")`
   (`15 §8`) names a library the file's `extern`s need, and the files of a module may each name their
   own. The rule differs because what is being described does: a capability is a property of the whole

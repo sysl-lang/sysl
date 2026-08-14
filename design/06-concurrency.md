@@ -2,7 +2,7 @@
 
 **Status:** model decided, and the half the language has to enforce is built — `&sync T` and what
 it may point at, and the nine atomic operations below it. Of the library surface this document
-defers, `sysl.sync` and `sysl.thread` are built and the channel is not, which leaves the crossing
+defers, `sysl.sync` and `sysl.posix.threads` are built and the channel is not, which leaves the crossing
 rule as specification with nothing checking it. It rests on the memory model — the whole design
 follows from one fact about it, stated first.
 
@@ -194,14 +194,22 @@ A growable channel needs `alloc`. A **fixed-capacity** channel — a ring buffer
 declaration — does not, so allocator-free kernel code can still use one. That matters: it means
 the message-passing idiom is available in the place least able to afford a runtime.
 
-## Threads are a capability
+## Threads are a capability, and the capability is `posix`
 
-Creating a thread needs an OS or a scheduler underneath it, so `threads` joins `os` and
-`posix` as an **environment** capability, the extension `capabilities.md` already anticipated.
-A target that has no scheduler does not offer it; a module may narrow it away to declare
-itself single-threaded. Nothing about `&T`'s soundness depends on the capability — the crossing
-rule carries that on its own — but a module that cannot spawn is a module whose author can stop
-thinking about any of this.
+Creating a thread needs an OS or a scheduler underneath it, so the module that starts one is gated by
+an **environment** capability, enforced against the module graph exactly as `capabilities.md`
+describes. A module may narrow it away to declare itself single-threaded. Nothing about `&T`'s
+soundness depends on it — the crossing rule carries that on its own — but a module that cannot spawn
+is a module whose author can stop thinking about any of this.
+
+**The capability is `posix`, and there is no separate `threads`.** There was one, and it went when
+`sysl.thread` became `sysl.posix.threads`: what the module is built on is pthreads, so `posix` is the
+whole claim, and a fourth capability asserted that the compiler tracked whether a scheduler exists
+when nothing in the library was gated on that. **A target with a scheduler of its own — FreeRTOS,
+Zephyr, a kernel being written in sysl — has threads and no POSIX**, does not reach this module, and
+binds its own scheduler as a package. That is not a hole the capability was covering: it is a
+different kernel with a different API, and no capability could have made `pthread_create` appear on
+it.
 
 ## The kernel tier
 
@@ -309,11 +317,13 @@ function beside it could add only the default, and the default is what it could 
 `Relaxed` is refused, so the wrapper would need a `Relaxed` arm whose only options are to call a form
 that refuses it or to quietly do nothing.
 
-## `sysl.thread` — spawning, joining, and the lock above the spinlock
+## `sysl.posix.threads` — spawning, joining, and the lock above the spinlock
 
-The second module is where the capability lands. `sysl.thread` is `requires threads, posix`, and both
-are written because neither implies the other: pthreads is what this is built on, and a bare-metal
-target with a scheduler of its own has threads and no POSIX.
+The second module is where the capability lands. `sysl.posix.threads` is `@requires(posix)`, and the
+namespace is the same statement written in the path: everything under `sysl.posix` needs that one
+capability, so a freestanding target reaches none of it. What is here is pthreads and nothing else —
+a bare-metal target with a scheduler of its own does not want a portable spelling of
+`pthread_create`, it wants its own kernel's API, which is a package.
 
 **`spawn(&work, &state)` takes the address of a function, not a callable.** A closure would have to be
 boxed for the new thread to reach it, which needs the allocator, and its captures would be values
@@ -364,7 +374,7 @@ There is no `async`, no `await`, and no task runtime in the language.
 Swift's version needs executors, continuations, and heap-allocated task state; Go's goroutines
 need a scheduler and growable stacks. Neither can exist under `no alloc`, and the kernel is
 exactly where threads are most real. Concurrency machinery belongs in a library that requires
-`alloc` and `threads`, not in a language that has to compile a page-fault handler.
+a heap and a scheduler, not in a language that has to compile a page-fault handler.
 
 Two things fall out of that, both good. sysl has no **actor reentrancy** hazard — the trap
 where an actor's state changes across an `await` — because there is no await-based

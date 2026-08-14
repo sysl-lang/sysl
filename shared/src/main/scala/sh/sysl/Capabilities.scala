@@ -12,25 +12,24 @@ package sh.sysl
  */
 object Capability {
 
-  val Heap    = "heap"
-  val Os      = "os"
-  val Posix   = "posix"
-  val Threads = "threads"
+  val Heap  = "heap"
+  val Os    = "os"
+  val Posix = "posix"
 
   /** The word a **module** writes to give a capability up, and the capability it gives up.
    *
-   * Three of the four are the same word and the heap is not, deliberately. `package.hocon` states
-   * whether a facility **exists** — `heap`, which is a noun beside `os`, `posix` and `threads` — while
-   * a narrowing clause is a module's promise about its own **conduct**, and a promise is about an
+   * Two of the three are the same word and the heap is not, deliberately. `package.hocon` states
+   * whether a facility **exists** — `heap`, which is a noun beside `os` and `posix` — while a
+   * narrowing clause is a module's promise about its own **conduct**, and a promise is about an
    * action. So a module writes `@no_alloc`: *I do not allocate, so I do not need a heap to exist.*
-   * For the other three, giving the facility up and not using it are the same act, so one word does.
+   * For the other two, giving the facility up and not using it are the same act, so one word does.
    *
    * A mapping rather than one shared string is what keeps each statement to exactly one spelling.
    * `@no_heap` is not a clause and `requires { alloc = true }` is not a capability, and each is
    * refused naming the other — somebody who wrote one of them meant the other.
    */
   val narrowedBy: Map[String, String] =
-    Map("alloc" -> Heap, Os -> Os, Posix -> Posix, Threads -> Threads)
+    Map("alloc" -> Heap, Os -> Os, Posix -> Posix)
 
   /** The word a narrowing is written with, given the capability — `narrowedBy` read backwards, for a
    * diagnostic that has a capability in hand and has to tell a reader what to type.
@@ -41,10 +40,10 @@ object Capability {
    * so a module that requires `posix` requires `os` whether or not it said so.
    */
   val implies: Map[String, Set[String]] =
-    Map(Heap -> Set.empty, Os -> Set.empty, Posix -> Set(Os), Threads -> Set.empty)
+    Map(Heap -> Set.empty, Os -> Set.empty, Posix -> Set(Os))
 
   /** The core set, in the order a diagnostic lists them. */
-  val core: List[String] = List(Heap, Os, Posix, Threads)
+  val core: List[String] = List(Heap, Os, Posix)
 
   /** The capabilities that gate **which standard-library modules exist**, as against `heap`, which
    * changes what the language allows (`capabilities.md § Two kinds of capability`).
@@ -54,17 +53,24 @@ object Capability {
    * module and half of it allocates. These are asked of the module **graph**, because what they gate
    * is a whole module: a program either may name `sysl.fs` or may not.
    */
-  val environment: Set[String] = Set(Os, Posix, Threads)
+  val environment: Set[String] = Set(Os, Posix)
 
-  /** The ones a module may give up today, which is now all four.
+  /** The ones a module may give up today, which is now all three.
    *
    * A capability is added here when something starts enforcing it, and not before: a clause that
    * compiled and enforced nothing would read in a source file as a guarantee the compiler never
-   * made. `os` and `posix` earned their place when the first module requiring one was written, and
-   * `threads` earned its the same way, when `sysl.thread` was. The set stays because that is the
-   * order the next capability will arrive in — declared, then gated, then narrowable.
+   * made. `os` and `posix` earned their place when the first module requiring one was written. The
+   * set stays because that is the order the next capability will arrive in — declared, then gated,
+   * then narrowable.
+   *
+   * **A fourth, `threads`, was here and is gone.** It gated `sysl.thread` and nothing else, and what
+   * that module actually needs is pthreads — so it moved to `sysl.posix.threads`, requires `posix`,
+   * and the capability had nothing left to say. A capability is removed for the mirror of the reason
+   * one is added: it claimed the compiler tracked whether a scheduler exists, and nothing in the
+   * library was ever gated on that. A target running FreeRTOS has threads and no POSIX, and reaches
+   * them through a package binding its own kernel.
    */
-  val narrowable: Set[String] = Set(Heap, Os, Posix, Threads)
+  val narrowable: Set[String] = Set(Heap, Os, Posix)
 
   /** `cap` together with everything it implies. */
   def closure(cap: String): Set[String] = implies.getOrElse(cap, Set.empty) + cap
@@ -230,9 +236,9 @@ trait Capabilities extends AnalyzerBase {
   /** Refuses a clause that names nothing, or that narrows away a capability nothing yet gates.
    *
    * The second half now refuses nothing, and that is the state it was built to reach rather than
-   * dead weight. `no alloc` is checked at every construction that makes heap storage; the other
-   * three are checked against the module graph, which none of them could be until a module requiring
-   * one existed — `sysl.fs` for `os` and `posix`, `sysl.thread` for `threads`. The check stays
+   * dead weight. `no alloc` is checked at every construction that makes heap storage; the other two
+   * are checked against the module graph, which neither could be until a module requiring one
+   * existed — `sysl.fs` for `os`, `sysl.posix.tty` for `posix`. The check stays
    * because the next capability to be declared will arrive before whatever gates it, and in that
    * window a clause that compiled and enforced nothing would read in a source file as a guarantee
    * the compiler never made.

@@ -644,7 +644,7 @@ the trees a library ships are now a per-target answer. `13 §8` has the rest.
 ## Open
 
 - **The project config — designed in `packages.md`, and built.** `package.hocon` carries
-  per-target capability sets (`capabilities.md`'s `alloc` / `os` / `posix` / `threads`), and they are
+  per-target capability sets (`capabilities.md`'s `heap` / `os` / `posix`), and they are
   parsed and enforced: a target that provides no allocator makes every module of the program
   allocator-free with no clause written anywhere. **What is left open is filename-axis platform
   selection**, and that alone — this item said "unbuilt" of the whole thing, five lines below a
