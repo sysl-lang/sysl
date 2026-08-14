@@ -12,9 +12,15 @@ package sh.sysl
  * because it carries no count at all: it is the unsafe tier, and `06 § How strong this is` names it
  * as one of the two greppable ways to share on purpose.
  *
- * This is the strict half of the chapter's structural rule. The other half — which values may
- * **cross** a domain, where a heap-backed view crosses by copying its bytes — is enforced at a
- * channel, and channels are library surface the chapter defers.
+ * This is the strict half of the chapter's structural rule, and it is asked in **two** places. The
+ * first is where a `&sync T` is written. The second is a `@crossing` parameter, where a facility
+ * says that what is passed there reaches another domain — and the strict half is the right one to
+ * ask there, because a parameter copies nothing: the crossable list's leniency towards a view is
+ * about a channel that copies its bytes, and its leniency towards a `*T` is exactly what the
+ * annotation suspends.
+ *
+ * The other half — which values may **cross by being copied** — is enforced at a channel, and
+ * channels are library surface the chapter defers.
  */
 object Sharing {
 
@@ -71,20 +77,43 @@ object Sharing {
         else if named then s"but its '${path.mkString(".")}' reaches a '${Type.show(ty)}'"
         else s"but the '${path.mkString(".")}' it captures reaches a '${Type.show(ty)}'"
 
-      val head = s"$subject — $where, "
-
-      ty match
-        case Type.Ref(i, _) =>
-          head + s"whose count is not. Hold it as a '&sync ${Type.show(i)}' ('06')"
-
-        case _: Type.Weak =>
-          head + "and a weak count has no atomic form yet ('06 § Deferred')"
-
-        case _ =>
-          val what = if ty == Type.Str then "bytes" else "elements"
-
-          head + s"which owns its $what through a count that is not atomic. A literal's $what are " +
-            s"immortal and would be safe to share, but nothing in the type says whether these are, " +
-            "so a shared object holds no view at all ('06')"
+      remedy(s"$subject — $where, ", ty)
     }
+
+  /** Why a value may not be handed to a `@crossing` parameter, or `None` when it may
+   * (`06 § Marking a domain boundary`).
+   *
+   * `subject` is the caller's words for what is crossing — the argument, or what the argument points
+   * at — because the two shapes a boundary takes are worth telling apart at the call and are not
+   * something this walk can see. Everything after it is the same sentence a `&sync T` gets, and
+   * deliberately so: the question being asked is the same one, and the answer a reader needs is the
+   * spelling that would have been sound.
+   */
+  def crossing(subject: String, crossed: Type): Option[String] =
+    unshareable(crossed).map { case Part(path, ty) =>
+      val where =
+        if path.isEmpty && ty == crossed then s"but it is a '${Type.show(ty)}'"
+        else if path.isEmpty then s"but it holds a '${Type.show(ty)}'"
+        else s"but its '${path.mkString(".")}' reaches a '${Type.show(ty)}'"
+
+      remedy(s"$subject reaches another concurrency domain, so every count inside it has to be " +
+        s"atomic — $where, ", ty)
+    }
+
+  /** What to do about the part in the way: a plain reference has an atomic spelling to reach for, a
+   * weak one has none yet, and a view has a distinction the language cannot draw.
+   */
+  private def remedy(head: String, ty: Type): String = ty match
+    case Type.Ref(i, _) =>
+      head + s"whose count is not. Hold it as a '&sync ${Type.show(i)}' ('06')"
+
+    case _: Type.Weak =>
+      head + "and a weak count has no atomic form yet ('06 § Deferred')"
+
+    case _ =>
+      val what = if ty == Type.Str then "bytes" else "elements"
+
+      head + s"which owns its $what through a count that is not atomic. A literal's $what are " +
+        s"immortal and would be safe to share, but nothing in the type says whether these are, " +
+        "so a shared object holds no view at all ('06')"
 }

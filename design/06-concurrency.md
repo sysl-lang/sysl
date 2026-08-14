@@ -1,10 +1,11 @@
 # Concurrency
 
 **Status:** model decided, and the half the language has to enforce is built — `&sync T` and what
-it may point at, and the nine atomic operations below it. Of the library surface this document
-defers, `sysl.sync` and `sysl.posix.threads` are built and the channel is not, which leaves the crossing
-rule as specification with nothing checking it. It rests on the memory model — the whole design
-follows from one fact about it, stated first.
+it may point at, the nine atomic operations below it, and `@crossing`, which is where a facility says
+that a parameter hands a value to another domain and so is where the crossing rule is asked. Of the
+library surface this document defers, `sysl.sync` and `sysl.posix.threads` are built and the channel
+is not, so the **copying** half of the crossing rule is still specification. It rests on the memory
+model — the whole design follows from one fact about it, stated first.
 
 ## The constraint that decides everything
 
@@ -69,10 +70,11 @@ prevent. This is Swift's `Sendable`, derived the way Swift derives it for value 
 structurally, from the fields — but without the protocol, because sysl needs no user-written
 conformances for it.
 
-**Where this rule is enforced is a channel**, and channels are library surface this document
-defers — so the crossing rule is specification and has no check behind it yet. What *is* built is
-the stricter rule the next section states, because that one has a place to be asked: the point a
-`&sync T` is written.
+**Where this rule is enforced is wherever a facility says it hands a value over**, which is
+`@crossing` two sections below. A **channel** is the copying case, and channels are library surface
+this document defers — so the lenient entries above, the ones that exist because a channel copies,
+have nothing checking them yet. What *is* built is the stricter rule the next section states, which
+has two places to be asked: the point a `&sync T` is written, and a `@crossing` parameter.
 
 ## `&sync T` — the deliberate exception
 
@@ -179,6 +181,59 @@ it what the running task is.
 **Nothing checks that a port's answer is honest**, and nothing can: a slot two tasks share is
 precisely the defect this exists to let a port avoid, and it is invisible from here. What the
 language owes is that the question is asked at all, rather than answered wrongly by assumption.
+
+## Marking a domain boundary
+
+`§ Crossing copies` says what may cross. **`@crossing` says where** — it is the annotation a facility
+writes above the function that hands a value to another domain, naming the parameters it hands it
+through:
+
+```
+@crossing(arg)
+spawn[T](body: *extern(*T) -> unit, arg: *T) -> Option[Thread]
+```
+
+It names parameters the way `@reads` and `@writes` name module storage, and it changes nothing about
+the call: no code is emitted, no signature moves, and a program that satisfies it is the program it
+would have been without the line. What it adds is a refusal, made at each call against the argument's
+type — so a generic facility is asked afresh per instantiation, exactly as a `&sync Box[T]` is.
+
+**It exists because a domain is not something the standard library has a monopoly on.**
+`xTaskCreate` creates one as surely as `spawn` does, and so do a Zephyr thread and a scheduler being
+written in sysl. A rule that could only be asked inside a channel — or inside `sysl.posix.threads` —
+would be a rule about the code sysl itself wrote, which is the opposite of what a rule is for. One
+line above the wrapper a binding already has is the whole of the cost of being inside the model.
+
+**What is asked is the strict half: `§ &sync T`'s question rather than the list above.** Two entries
+on that list are lenient for reasons that do not survive at a parameter.
+
+- A heap-backed view is crossable **because a channel copies its bytes**, and a parameter copies
+  nothing — so what a lenient reading would put under two domains is the buffer's own non-atomic
+  count, which is the same race one level down that a shared object is already refused.
+- A `*T` carries no count **of its own**, which says nothing about the object at the far end — and
+  that object is what crossed. So a `*T` parameter is looked **through** and its pointee is asked.
+  Suspending exactly this leniency is what the annotation is for; without it the pointer would end
+  the question, and a `&T` would reach another domain with nothing said.
+
+So there is one walk asked in two places, and a reader is told the same thing either way, including
+the spelling that would have been sound:
+
+```
+what 'arg' of 'sysl.posix.threads.spawn' points at reaches another concurrency domain, so every
+count inside it has to be atomic — but its 'node' reaches a '&Node', whose count is not. Hold it as
+a '&sync Node' ('06')
+```
+
+**What it does not reach, said plainly rather than left to be discovered.** A parameter typed `*u8`
+has thrown the pointee away before the walk runs, so the walk finds a byte and passes: a binding that
+erases its state's type at the boundary buys the check by making that parameter generic, which is what
+`spawn` does. And no annotation in this language marks a member or an `extern`, so this one is written
+above the free wrapper a binding has anyway — which is where the call a program writes goes, and so
+where the complaint belongs.
+
+**A channel, when there is one, will want the other half.** A `send` that genuinely copies may take
+the view this rule refuses, which is `§ Crossing copies` as written. That is a second walk and it
+belongs with the type that does the copying, not here.
 
 ## Channels
 
@@ -359,13 +414,13 @@ that takes it, release on the store that frees it, and a relaxed load between at
 costs is a context switch per contended attempt where a futex would cost none, and a futex-backed
 mutex is what a binding library carrying its own C shim would add.
 
-**What crossing a domain is checked to be is still nothing**, and the thread API is where that becomes
-visible rather than theoretical. `spawn` hands the new thread a `*T`, and a raw pointer is on the
-crossable list on purpose — it carries no count to make atomic, and "How strong this is" names it as
-one of the two ways a program shares deliberately. What a pointer points *at* is not examined, so a
-plain `&T` reaches another thread through one with nothing said. That is the rule as written rather
-than an escape from it, and it is why this API takes an address rather than a value: a `spawn` taking
-a `T` would be claiming a check that does not exist yet.
+**`spawn` is declared `@crossing(arg)`**, and the thread API is where the crossing rule becomes
+visible rather than theoretical. The pointer it takes is on the crossable list on purpose — it carries
+no count to make atomic, and "How strong this is" names it as one of the two ways a program shares
+deliberately — and the annotation is what asks the compiler to look *through* it, so every count the
+state reaches has to be atomic and a plain `&T` is refused where the call is written. That is also why
+this API takes an address rather than a value: what a `spawn` taking a `T` would be claiming is the
+*copying* half of the rule, which is a channel's and is not built.
 
 ## No async/await
 
@@ -392,22 +447,22 @@ guarantee the language cannot keep:
 
 | | Checked | Not checked |
 |---|---|---|
-| crossing a domain | — | **which values may cross** — specified structurally, and the check lands with the channel |
+| crossing a domain | what a `@crossing` parameter is handed, structurally | a boundary **nobody marked** — no annotation, no question |
 | refcount races | what a `&sync T` may hold, structurally | — |
 | **mutating shared state** | — | **use a `Mutex`; nothing enforces it** |
 | the kernel tier | — | `*T`, spinlocks, orderings — as in C |
 
-The first row is the one to read twice, because it is the row that will change. What may cross is
-decided structurally and there is nothing to write, but there is also nothing yet *asking* the
-question: the thread API hands the new thread an address, a raw pointer is crossable on purpose, and
-what it points at is not examined. So a plain `&T` reaches another thread today with nothing said.
+The first row is the one to read twice, because of where its "not checked" half sits. The rule is
+enforced now, and it is enforced at a place a *library author* names: an unmarked parameter is a
+boundary the compiler was never told about, so what a facility with no `@crossing` on it hands over
+is examined exactly as much as it was before the annotation existed — which is not at all. That is
+the honest shape of it, and it is better than the alternative it replaced, where the check waited on
+a channel and no binding could ever have had one.
 
-So: **a data race requires you to have shared something on purpose**, and until the channel is
-written that is a property of what the spellings make visible rather than one the compiler enforces.
-Sharing takes `&sync` or `*T`, both of which are greppable and neither of which is what an ordinary
-value is; what you cannot yet be *stopped* from doing is pointing one of them at something whose
-count is not atomic. You can also write a race by putting a mutable field in a `&sync T` and racing
-on it, and that one is permanent — it is the cost of not having a borrow checker. The trade is the
+So: **a data race requires you to have shared something on purpose**, and the compiler now says so
+wherever somebody marked the boundary. Sharing takes `&sync` or `*T`, both of which are greppable
+and neither of which is what an ordinary value is. What remains permanent is the other row: a
+mutable field in a `&sync T`, raced on, is the cost of not having a borrow checker. The trade is the
 same one the whole language makes, and the same discipline applies.
 
 ## Deferred
@@ -416,8 +471,10 @@ same one the whole language makes, and the same discipline applies.
   language must know. The atomic *operations* it will be built from are the language's and are above,
   in "The kernel tier". `Atomic[T]`, `SpinLock`, `Mutex[T]` and the thread API are built, and what is
   said of them in the two sections above is there because each answers a question this document
-  asked — where the defaults live, what a module requiring no capability can hold, and what the
-  crossing rule amounts to while nothing checks it.
+  asked — where the defaults live, what a module requiring no capability can hold, and what a
+  `@crossing` parameter amounts to on the one facility the library itself ships. What is still owed
+  here is the **copying** half of `§ Crossing copies`: a channel may take a heap-backed view because
+  it copies the bytes, which is a second walk and belongs with the type that does the copying.
 - **Whether `&sync` should be inferable.** An object allocated, never crossed, and provably
   domain-local could use non-atomic refcounts even when its type says `sync` — the same shape
   of analysis as `05`. Worth revisiting once there is something to measure.

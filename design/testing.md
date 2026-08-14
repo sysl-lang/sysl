@@ -55,15 +55,19 @@ a_broken_promise() = …
 an_index_past_the_end() = …
 ```
 
-`@test` was the language's first attribute and is no longer its only one — `@tailrec`, `@pure` and
-`@ghost` are the other three a declaration takes, and `@no_<capability>`, `@requires(...)` and
-`@link("...")` are the file-header three (`13 §4`). A word after `@` that is none of them is answered
-by name rather than as grammar, and the message says which of the two lists it was looking in. The
-attribute goes on its own line above an ordinary function declaration, which may still be `private`.
+`@test` was the language's first attribute and is a long way from being its only one. A **function**
+takes `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads(...)`, `@writes(...)` and `@crossing(...)`
+beside it; `@packed` and `@align(n)` mark a struct's layout and `@section("...")` places a binding or
+a function (`15 §1`, `§13`); and `@no_<capability>`, `@requires(...)`, `@link("...")`,
+`@include("...")` and `@tests` belong to the file's header (`13 §4`). A word after `@` that is none
+of them is answered by name rather than as grammar, and the message says which of the lists it was
+looking in. The attribute goes on its own line above an ordinary function declaration, which may
+still be `private`.
 
-What stays true is that this is *not* a general extension mechanism: the set is closed and each
-member was added deliberately. The two that would make it general are `packed` (`15 §1`) and the
-alignment attribute `00 § Open` wants, and neither is designed.
+**Do not read that growth as a general extension mechanism.** The set is closed and each member was
+added because something needed it: the list is longer than it was, and every entry on it is still one
+the compiler knows by name and does something specific about. An `@` a program invents is a
+misspelling, and is reported as one.
 
 **A conditional-compilation directive starts with `#` instead** (`targets.md § Conditional
 compilation`), and the two never meet: a directive sits at the margin and is gone before the lexer

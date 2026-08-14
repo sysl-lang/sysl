@@ -336,6 +336,7 @@ trait Hoisting extends HoistMembers {
         f.tparams.toSet, f.tpacks)
       checkBoundNames(f.name, f.bounds)
       checkSolvedDefaults("the function", f.name, f.tdefaults)
+      checkCrossingNames(f)
       // A `@test` is registered here with everything else a declaration says about itself, so that
       // the runner's list is in declaration order without anything having to sort it afterwards.
       // The checks run at the attribute, which is the part a diagnostic is about (`Tests`).
@@ -462,6 +463,28 @@ trait Hoisting extends HoistMembers {
         checkInvariantReads(s, ftypes.toMap)
 
     case _ =>
+
+  /** What `@crossing` may name: parameters of the function it is written above, each once
+   * (`06 § Marking a domain boundary`).
+   *
+   * It is the whole of what can be settled at the declaration — whether an *argument* may cross is a
+   * question about the argument, and is asked at each call. Checked here, with the rest of what a
+   * declaration says about itself, so a misspelt parameter is reported once at the annotation rather
+   * than once per call site or, worse, not at all: a name matching no parameter would otherwise mark
+   * nothing and read exactly like a rule that was being enforced.
+   */
+  private def checkCrossingNames(f: FuncDecl): Unit = {
+    val declared = f.params.map(_.name).toSet
+
+    for (n, i) <- f.crossing.zipWithIndex do
+      if !declared(n) then
+        recover(())(err(s"'@crossing' names '$n', which is not a parameter of '${f.name}'" +
+          (if f.params.isEmpty then " — it takes none"
+           else s" — its parameters are ${f.params.map(p => s"'${p.name}'").mkString(", ")}")))
+      else if f.crossing.take(i).contains(n) then
+        recover(())(err(s"'@crossing' names '$n' twice, and a parameter crosses a boundary once — " +
+          "the second says nothing the first does not"))
+  }
 
   /** Checks what every trait **requires** of the types that implement it, in a pass of its own once
    * every trait is registered — because `trait Ord: Eq` is ordinary whichever of the two is written

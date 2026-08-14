@@ -445,18 +445,36 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
-  /** `06 § Crossing copies` decides structurally what may cross a domain boundary, and says in the
-   * same breath that the check lands with channels. So this pins **what the compiler does today**,
-   * which is not the same as pinning a hole: `spawn` hands the new thread a `*T`, and a raw pointer
-   * is on the crossable list on purpose — it carries no count to make atomic, and "How strong this
-   * is" names it as one of the two ways a program shares deliberately. What a pointer *points at* is
-   * not examined, so a plain `&T` reaches another thread through one with nothing said. That is the
-   * rule as written rather than an escape from it, and it is why this API takes an address rather
-   * than a value.
+  /** `06 § Crossing copies` decides structurally what may cross a domain boundary, and `spawn` is
+   * where a program meets that rule: it is declared `@crossing(arg)`, so the pointer it takes is
+   * looked *through* and every count the state reaches has to be atomic.
+   *
+   * Until `@crossing` existed this section pinned the opposite — a plain `&T` reaching another
+   * thread with nothing said — on the reading that a raw pointer is crossable on purpose. That is
+   * still true of the *pointer*, and it was never true of the object at the far end, which is the
+   * thing that crossed. `CrossingAttrErrorTests` holds the annotation itself; these are the two
+   * answers the standard library's own thread API gives.
    */
-  "what crossing a domain is checked to be, which today is nothing" - {
-    "a plain reference reaches another thread through a pointer, unremarked" in {
+  "what crossing a domain is checked to be" - {
+    "a state whose counts are all atomic reaches another thread" in {
       run(
+        """struct Cell
+          |    v: int
+          |
+          |struct Local
+          |    r: &sync Cell
+          |
+          |look(p: *Local)
+          |    print("saw", p.r.v)
+          |
+          |var l = Local(Cell(1))
+          |
+          |spawn(&look, &l).unwrap().join()""".stripMargin
+      ) shouldBe "saw 1\n"
+    }
+
+    "and one holding a plain reference is refused at the call" in {
+      val out = err(
         """struct Cell
           |    v: int
           |
@@ -469,7 +487,11 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |var l = Local(Cell(1))
           |
           |spawn(&look, &l).unwrap().join()""".stripMargin
-      ) shouldBe "saw 1\n"
+      )
+
+      out should include("points at reaches another concurrency domain")
+      out should include("its 'r' reaches a '&Cell'")
+      out should include("Hold it as a '&sync Cell'")
     }
   }
 

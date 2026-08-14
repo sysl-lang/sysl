@@ -386,6 +386,9 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     // A variadic's tail has no declared parameter to be checked against and is analyzed below, so
     // both lists are cut to the parameters — which is also what keeps them aligned.
     val checked  = checkArgs(shown, params, args.take(params.length), pre.map(_.take(params.length)))
+
+    checkCrossings(f, shown, params, checked)
+
     val declared = externDecls.get(f.name).fold(checked)(vaPassed(checked, _))
 
     funcsUsed += name
@@ -395,6 +398,35 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
 
     TCall(name, declared ::: args.drop(params.length).map(variadicArg(_, foreign)), rtype)
   }
+
+  /** Holds each `@crossing` argument to `06`'s rule about what may reach another concurrency domain.
+   *
+   * **The check is made at the call and reads the *instantiated* signature**, which is what makes it
+   * reach a facility the language does not own: a package's `task(…)` and the library's `spawn` are
+   * one shape here, and a generic parameter has a concrete type by the time this runs, exactly as a
+   * `&sync Box[T]` is asked afresh per instantiation (`Sharing`).
+   *
+   * **A `*T` parameter is looked *through*, and that is the whole of what the annotation buys.** A
+   * raw pointer is on the crossable list because it carries no count of its own — which says nothing
+   * about the object at the far end, and the object at the far end is what crossed. Everything else
+   * is asked about the parameter's own type, because a parameter copies no buffer and shares
+   * whatever it names.
+   *
+   * Reported at the **argument**, since that is the thing that could have been written differently.
+   */
+  protected def checkCrossings(
+      f: FuncDecl,
+      shown: String,
+      params: List[(String, Type)],
+      args: List[TExpr],
+  ): Unit =
+    if f.crossing.nonEmpty then
+      for ((pname, pty), a) <- params.zip(args) if f.crossing.contains(pname) do
+        val (subject, crossed) = pty match
+          case Type.Ptr(inner) => (s"what '$pname' of '$shown' points at", inner)
+          case other           => (s"'$pname' of '$shown'", other)
+
+        at(a.pos)(Sharing.crossing(subject, crossed).foreach(err))
 
   /** The arguments of a foreign call, with each one headed for a C by-value `va_list` parameter
    * turned into what the target's ABI passes there (`targets.md`).
