@@ -985,6 +985,12 @@ highlighting grammar, to buy nothing the sigil does not.
 **It declares no name**, which is why it is not in the visibility table and why two saying the same
 thing are two checks rather than a duplicate. Nothing can refer to one.
 
+**It stands where a declaration stands**, and a type's body is not that: a struct's, an enum's, a
+trait's and an `impl`'s bodies hold members, so one written inside is refused and told to go beside
+the type — where `sizeof` and `offsetof` still name what it was about. The refusal is its own
+sentence rather than the one about what annotations mark, for the same reason the grammar reads
+`@assert` before it reads an annotation at all: this one says nothing about a declaration under it.
+
 **A constant has no address.** It is folded into each use and occupies no storage, which is why it
 needs no initialization order, why a `no alloc` module may hold one, and why `&capacity` is not a
 thing to write. That is also exactly what rules it out for the *other* half of what the guide

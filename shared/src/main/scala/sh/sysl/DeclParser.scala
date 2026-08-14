@@ -232,9 +232,17 @@ trait DeclParser extends ExprParser {
       invariantClause ^^ (StructPart.Inv(_)) |
       visibility ~ fieldParam ^^ { case v ~ f => StructPart.Fld(f.copy(vis = v).setPos(f.pos)) }
 
-  /** A member of a type's own body, which is the one kind that may say how far it is visible. */
+  /** A member of a type's own body, which is the one kind that may say how far it is visible.
+   *
+   * It opens with `noMemberAttr` so that an annotation written above a member is answered by the
+   * sentence that rule carries. A struct's body and an enum's both read their lines through here, and
+   * a member is the first alternative each tries, so the refusal is reached wherever the `@` is —
+   * including the position a field or a variant would have been read at.
+   */
   protected lazy val restrictedMember: PackratParser[MethodDecl] =
-    visibility ~ (noOverride ~> member) ^^ { case v ~ m => m.copy(vis = v).setPos(m.pos) }
+    noMemberAttr ~> visibility ~ (noOverride ~> member) ^^ { case v ~ m =>
+      m.copy(vis = v).setPos(m.pos)
+    }
 
   /** The refusal a trait's member and an `impl`'s share (`08 § Visibility`). Both are reached at the
    * reach the *trait* has — one asks for the member and the other supplies what was asked — so
@@ -439,7 +447,7 @@ trait DeclParser extends ExprParser {
    * an implementation for that member; one written with a body supplies a default instead.
    */
   protected lazy val traitMember: PackratParser[MethodDecl] =
-    noVisibility ~> noOverride ~> (member | methodSig | propertySig)
+    noMemberAttr ~> noVisibility ~> noOverride ~> (member | methodSig | propertySig)
 
   /** A trait method signature: a header with no `= body`. The receiver and parameters parse
    * exactly as a real method's do, so a signature and its implementation are compared shape for
@@ -517,7 +525,9 @@ trait DeclParser extends ExprParser {
    * implements is the only thing a member of a type can be replacing a body from.
    */
   protected lazy val implMember: PackratParser[MethodDecl] =
-    noVisibility ~> overrideMod ~ member ^^ { case ov ~ m => m.copy(overrides = ov).setPos(m.pos) }
+    noMemberAttr ~> noVisibility ~> overrideMod ~ member ^^ { case ov ~ m =>
+      m.copy(overrides = ov).setPos(m.pos)
+    }
 
   /** An optional `end Name` marker closing a declaration block, Scala-style. `end` is a soft
    * keyword; the trailing name must equal the declaration's own name, or it is a parse error.
