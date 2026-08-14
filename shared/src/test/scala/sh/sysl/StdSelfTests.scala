@@ -40,9 +40,13 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * 89 collected tests to 136, and to 155 when the UTF-8 encoder, `Buf.insert` and the sub-second
    * durations took it to 163, and to 165 when the duration unit properties and the arithmetic
    * nothing had been exercising took it to 169, and to 195 when the line editor and the two
-   * in-memory stream types took it to 201.
+   * in-memory stream types took it to 201, and to 220 when `sysl.posix.time` took it to 227.
+   *
+   * That last raise closed a drift as much as it made room: the tree had reached 222 while the floor
+   * still read 195, so a twenty-test file could have stopped being collected with nothing said. The
+   * gap this guard wants is the handful the entries above all left, not the two dozen it had grown.
    */
-  private val floor = 195
+  private val floor = 220
 
   /** The library, compiled as a **test build of itself**.
    *

@@ -1,0 +1,99 @@
+module sysl.posix.time
+@requires(posix)
+@tests
+
+import sysl.time.since
+
+// What `sysl.posix.time` claims, asserted in sysl.
+//
+// **These are the only check on the two clock ids and on the `struct timespec` mirror.** Nothing the
+// compiler does can verify either: `@assert` would want a field offset (card 0088) and a `c const`
+// reading `time.h` is refused in `library/` outright (card 0121, no sysroot when cross-compiling).
+// So the mirror is asserted by *use*, and the reason these tests are in sysl rather than in Scala is
+// that `StdSelfTests` compiles this tree on the development machine and again on CI's Linux runner --
+// where `CLOCK_MONOTONIC` is a different number and where this machine cannot read a header.
+//
+// Every assertion below is written to survive a slow machine and a loaded one. Nothing here asserts
+// an upper bound on how long anything took.
+
+const us_per_second: long = 1000000
+
+// 2020-01-01T00:00:00Z and 2100-01-01T00:00:00Z, in microseconds from 1970. Wide enough that no
+// clock a person would tolerate falls outside, and narrow enough that a reading which is not a wall
+// clock at all cannot land inside by accident.
+const after_2020: long = 1577836800 * us_per_second
+const before_2100: long = 4102444800 * us_per_second
+
+// Something the optimizer cannot fold to a closed form, so that measurable time actually passes. A
+// running sum is not enough: `n += i` over a range is Gauss's formula and LLVM knows it, which cost
+// a confusing `elapsed 0us` while this module was being written.
+private churn(rounds: int) -> long
+    var n: long = 1
+
+    for i in 0..<rounds
+        n = n * 31 + long(i)
+
+    n
+end churn
+
+@test("the wall clock reads a plausible date, which is what says the id and the layout are right")
+wall_clock_is_a_date()
+    val us = now().us
+
+    // A swapped id lands here: `CLOCK_MONOTONIC` counts from boot, so it is a few days rather than
+    // fifty-odd years and falls below the lower bound. A mirror whose halves are the wrong size, or
+    // swapped, lands here too -- `tv_nsec` scaled as though it were `tv_sec` is nowhere near either.
+    assert(us > after_2020, "the wall clock reads before 2020")
+    assert(us < before_2100, "the wall clock reads after 2100")
+end wall_clock_is_a_date
+
+@test("the monotonic clock is not the wall clock, which is the other half of the same mistake")
+monotonic_is_not_the_wall_clock()
+    // Uptime, not a date. This fails if the two ids are swapped and the test above somehow did not,
+    // and it is the assertion that would still be here if `now` were ever removed.
+    assert(monotonic().us < after_2020, "the monotonic clock reads like a date, not an uptime")
+end monotonic_is_not_the_wall_clock
+
+@test("the monotonic clock advances over work, and never backwards over any of it")
+monotonic_advances()
+    val a = monotonic()
+
+    val work = churn(2000000)
+
+    val b = monotonic()
+
+    // The whole point of the type: `b - a` is a `Duration` and the compiler would refuse it as an
+    // `Instant`, which is what stops a measurement being mistaken for a timestamp.
+    val elapsed = b - a
+
+    assert(elapsed.us >= 0, "the monotonic clock went backwards")
+    assert(elapsed.us > 0, "two million rounds took under a microsecond")
+
+    // So the loop cannot be discarded as dead, which would take the measurement with it.
+    assert(work != 0)
+end monotonic_advances
+
+@test("reading it twice in a row never goes backwards, however close together the two are")
+monotonic_never_retreats()
+    var last = monotonic()
+
+    for i in 0..<1000
+        val next = monotonic()
+
+        assert((next - last).us >= 0, "the monotonic clock went backwards between two reads")
+
+        last = next
+end monotonic_never_retreats
+
+@test("the wall clock advances, which says it is being read rather than remembered")
+wall_clock_advances()
+    val a = now()
+
+    val work = churn(2000000)
+
+    // `since` rather than `-` for the same reason it exists: it says which end is which.
+    val elapsed = since(now(), a)
+
+    assert(elapsed.us > 0, "the wall clock did not move over two million rounds")
+    assert(work != 0)
+end wall_clock_advances

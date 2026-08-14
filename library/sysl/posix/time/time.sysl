@@ -1,0 +1,126 @@
+module sysl.posix.time
+@requires(posix)
+
+import sysl.time.{Instant, Duration, micros, us_per_second}
+import sysl.slices.as_mut_ptr
+
+// Reading the two clocks the host keeps, which is the one thing `sysl.time` deliberately cannot do.
+//
+// **This is a module of its own so that `sysl.time` is not.** The calendar and the arithmetic ask for
+// no capability and run on a bare machine; `clock_gettime(2)` is asking an operating system for
+// something, and a capability requirement is module-wide -- so a `now()` written next to `Instant`
+// would cost the whole of the date-time library its freestanding reach for one function. `sysl.rand`
+// and `sysl.posix.rand` are split for exactly this reason, and that file's header makes the argument
+// at length.
+//
+// ## The two clocks are different clocks, and the return types say so
+//
+// `now` answers an `Instant`: a point on the timeline, counted from 1970, comparable with one taken
+// on another machine. It is the clock somebody can *set*, so it can move backwards, and subtracting
+// two readings of it to time something is a measurement that a passing `ntpd` can make negative.
+//
+// `monotonic` answers a `Duration`, not an `Instant`, and that is the whole of the distinction: it is
+// counted from an origin nobody specifies -- boot, usually -- so a single reading means nothing and
+// only the difference of two does. It cannot be set and cannot go backwards, which is what makes it
+// the one to measure with. Giving it a type that no calendar function accepts is what stops it being
+// mistaken for a timestamp.
+//
+// ## What a freestanding target does instead
+//
+// **Nothing here, and deliberately nothing shared with it.** A board's clock is a board's decision:
+// two boards carrying the same chip -- so the same *target* -- can count time from a different RTC,
+// which is precisely the case a `#if` on the target cannot express. So an embedded environment
+// supplies a module of its own with these two function names, in its own package, and a program picks
+// its clock by which one it imports.
+//
+// What that gives up is a program that compiles unchanged against both. The shape that would buy it
+// is a declared symbol in capability-free `sysl.time` that host and board alike link an
+// implementation of -- `sysl.harness`'s `attach` one layer down -- and it is not built here because
+// nothing yet needs it twice. The names above are chosen so that adding it later moves no caller.
+
+// `clock_gettime(2)` fills a caller-allocated `struct timespec`, and mirroring one is the only place
+// in `library/sysl` that transcribes a C structure -- everything else here is reached by symbol
+// alone. `sysl.posix.tty` states that rule and refuses `termios` under it, so the difference is worth
+// saying rather than leaving to be noticed.
+//
+// `struct termios` is a flag word set whose members and whose `c_cc` array differ by platform, and
+// nothing in a program could check that it had them right. `struct timespec` is fixed by POSIX at
+// `{ time_t tv_sec; long tv_nsec; }`, has no array and no per-platform field, and **every target that
+// can reach this module is 64-bit**: macOS arm64, Linux x86_64, Linux arm64 and Linux riscv64. Two
+// `long`s is that structure on every one of them, measured rather than assumed -- `sizeof` is 16 and
+// both members are 8 on macOS, and the assertion that it is also right on Linux is a test CI runs
+// there rather than a sentence written here.
+//
+// **`x86-linux` is the one to watch and it does not count yet**, because sysl refuses to build for it
+// at all -- no C calling convention has been measured for x86. On 32-bit glibc a `time_t` is 32 bits
+// unless `_TIME_BITS=64` says otherwise, so the mirror is wrong there and two `long`s is not that
+// structure. Whoever measures that convention inherits this line: it is a C shim in a package, or a
+// second `#if`, and it is not the two words below.
+private extern "clock_gettime" c_clock_gettime(id: int, ts: *long) -> int
+
+// A `struct timespec` counts nanoseconds and a `Duration` counts microseconds, which is the whole of
+// the conversion. The resolution being given up is settled in `sysl.time`: a `long` of nanoseconds
+// runs out in 1678-2262, and a range that quietly ends is a worse defect than a precision that never
+// begins.
+const ns_per_micro: long = 1000
+
+// The clock the caller means, as the number the kernel wants.
+//
+// **Every operating system gets a branch of its own, and the `#else` declares a symbol that does not
+// exist.** A number is not a name: `sysl.fs` selects `__error` against `__errno_location` and a third
+// platform fails at the *link* naming what it could not find, while `CLOCK_MONOTONIC` is 1 on Linux,
+// 6 on macOS and 4 on the BSDs -- so an `#else` carrying one of those values is not a failure at all
+// but a program reading the wrong clock and saying nothing.
+//
+// So the `#else` is written as an `extern` for the same reason `sysl.fs`'s is: **the library is
+// compiled whole for every target**, freestanding ones included, so a branch that simply declared
+// nothing would fail in the compiler on all seventeen of them rather than only where it matters. An
+// `extern` costs nothing until something links it, so every target goes on compiling and a POSIX
+// operating system nobody has listed fails at the link, on the one program that actually asked what
+// time it was, with the reason in the symbol's name.
+#if macos
+private realtime_id() -> int = 0
+private monotonic_id() -> int = 6
+#elif linux
+private realtime_id() -> int = 0
+private monotonic_id() -> int = 1
+#else
+private extern "sysl_posix_time_no_realtime_clock_id_for_this_os" realtime_id() -> int
+private extern "sysl_posix_time_no_monotonic_clock_id_for_this_os" monotonic_id() -> int
+#endif
+
+// One reading, in microseconds.
+//
+// **The result is not checked, and that is a consequence of the branch above rather than an
+// oversight.** `clock_gettime` fails on a clock the kernel does not have and on an address it cannot
+// write, and neither is reachable here: the id came from a branch that had to name this operating
+// system to compile at all, and the storage is a local this function owns. A check would be a
+// `Result` on every timing call, paid for by every caller, against a failure the types already
+// exclude.
+private reading(id: int) -> long
+    var ts: [2]long
+
+    c_clock_gettime(id, as_mut_ptr(ts))
+
+    ts[0] * us_per_second + ts[1] / ns_per_micro
+end reading
+
+// The wall clock: where the host thinks it is on the timeline.
+//
+// **Two readings of this may differ by anything at all**, including a negative amount, because it is
+// the clock a person and an `ntpd` are both allowed to set. Use it to stamp something, and use
+// `monotonic` to measure something.
+now() -> Instant = Instant(reading(realtime_id()))
+
+// A monotonic counter, as a length of time from an origin this deliberately does not name.
+//
+// One reading answers nothing. **Two readings subtracted answer how long something took**, and that
+// is the only question it can be asked:
+//
+//     val t0 = monotonic()
+//     work()
+//     print(s"took ${(monotonic() - t0).us}us")
+//
+// It never goes backwards and nothing can set it, which is the difference from `now` and the reason
+// a measurement wants this one.
+monotonic() -> Duration = micros(reading(monotonic_id()))

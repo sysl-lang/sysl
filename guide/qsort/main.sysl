@@ -22,16 +22,22 @@
 //     justify written type arguments; this was it, and the deferral is settled at an address while
 //     it stands at a call.
 //
-//   * **There is no clock.** `sysl.time` has `Instant`, `Duration` and the arithmetic between them,
-//     and nothing anywhere in the library reads one — no monotonic counter and no wall clock. So the
-//     comparison this program was written to make can be made for *correctness* and not for *cost*:
-//     the numbers that would answer "is the sysl sort competitive" cannot be taken by a sysl program
-//     at all. Reported rather than worked around — binding `clock_gettime` here would have put a
-//     hand-rolled clock into the reading material, which is the thing a guide program is least
-//     allowed to teach.
+//   * **There was no clock, and now there is — `sysl.posix.time`.** This program could be written
+//     for *correctness* and not for *cost*: `sysl.time` had `Instant`, `Duration` and the arithmetic
+//     between them, and nothing anywhere in the library read one, so the numbers that would answer
+//     "is the sysl sort competitive" could not be taken by a sysl program at all. It was reported
+//     rather than worked around, because binding `clock_gettime` here would have put a hand-rolled
+//     clock into the reading material — the thing a guide program is least allowed to teach, and the
+//     thing the next program to want a timing would have copied.
+//
+//     `monotonic` is what the last section below uses, and its type is the part worth noticing: it
+//     answers a `Duration` rather than an `Instant`, so one reading of it means nothing and only the
+//     difference of two does. That is the clock a measurement wants — the wall clock is the one
+//     somebody can set, and a sort timed across an `ntpd` adjustment would come out negative.
 
 import sysl.slices.{sort, sort_stable, is_sorted}
 import sysl.rand.rng
+import sysl.posix.time.monotonic
 
 check(name: string, got: string, want: string)
     if got == want then print(s"ok    $name = $got")
@@ -187,3 +193,40 @@ var scratch = copy_of(keys)
 
 check("the stable sort this one could never replace", str(sort_stable(keys, scratch)), "true")
 check("and its answer", shown(keys), "1 2 3 4 5 6 7 8")
+
+print("-- and what it costs, which is the question this program was written to settle")
+
+// The two sorts on the **same** data, which is the only comparison worth making: one of them seeing
+// an easier permutation than the other would decide the answer by itself.
+var big: []int = [0; 100000]
+
+for i in 0..<big.len
+    big[i] = int(g.next_u64() % 1000000)
+
+var mine = copy_of(big)
+var theirs = copy_of(big)
+
+val m0 = monotonic()
+
+sort(mine)
+
+val m1 = monotonic()
+
+sort_libc(theirs)
+
+val m2 = monotonic()
+
+// Reported as a ratio as well as as two numbers, because the numbers are this machine's and the
+// ratio is closer to being the language's. Neither is a benchmark: one run, one permutation, one
+// element type, and no repetition to average the noise out.
+val ours = (m1 - m0).us
+val libc = (m2 - m1).us
+
+print(s"   sysl.slices.sort   ${ours}us")
+print(s"   C library qsort    ${libc}us")
+print(s"   ratio              ${ours * 100 / libc}%")
+
+// The timing is the interesting half and the agreement is what makes it mean anything: two sorts
+// that disagree have not sorted the same data, and their durations would be measuring different
+// work.
+check("and the two agree on all hundred thousand", agree(big), "agree, in order")

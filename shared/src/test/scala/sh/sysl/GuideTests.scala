@@ -409,13 +409,22 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
     val out = guide("qsort")
 
     out should not include "FAIL"
-    checks(out) shouldBe 15
+    checks(out) shouldBe 16
     sections(out) shouldBe List(
       "-- the binding, on the smallest cases there are",
       "-- and on the shapes a sort is usually wrong about",
       "-- one body per element type, which is what the callback is",
       "-- the same data, sorted both ways",
       "-- what the C library does not promise",
+      "-- and what it costs, which is the question this program was written to settle",
     )
+
+    // The last section prints two durations and a ratio, and none of the three is asserted: they are
+    // this machine's numbers under this machine's load, so a bound tight enough to mean anything
+    // would be a test that fails on a busy runner. What is asserted is that the section produced its
+    // two lines, and — by the check above it, which is one of the sixteen — that the two sorts
+    // agreed on the data they were timed over, without which the numbers measure different work.
+    out should include("sysl.slices.sort")
+    out should include("C library qsort")
   }
 }
