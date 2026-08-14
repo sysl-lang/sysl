@@ -51,6 +51,24 @@ class ExportTests extends AnyFreeSpec with CodegenSupport with TestFrameworkSupp
       out should include("call i32 @demo$add(")
     }
 
+    /** **The root module is where the thunk and the definition would claim one symbol**, and it is
+      * the case the split above has to be careful about. A key is normally `module$name`, which no
+      * exported symbol can be — a C identifier holds no `$` — but a function in the root module has
+      * no qualification, so `@export` under its own name asks for exactly the name the definition
+      * would take. What that produced was two `define`s of one symbol, which clang reports as an
+      * invalid redefinition of a function nobody wrote twice.
+      *
+      * The **definition** is what moves, not the thunk: the exported symbol is what somebody outside
+      * has written down, and a mangled key is the compiler's own business.
+      */
+    "and in the root module the definition moves aside, so the two do not collide" in {
+      val out = ir("@export\nproduct(a: f32, b: f32) -> f32 = a * b\n\nprint(1)\n")
+
+      out should include("define float @product(")
+      out should include("define float @product$$sysl(")
+      out should include("call float @product$$sysl(")
+    }
+
     // The export is what a real C API needs, since its symbols carry a prefix the sysl side gets
     // from its module path — so the function stays `add` to everything inside sysl, and a sysl
     // caller reaches the definition rather than paying for a conversion at a call that never leaves

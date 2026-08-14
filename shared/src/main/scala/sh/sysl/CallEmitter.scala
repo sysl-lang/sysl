@@ -157,18 +157,39 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    */
   protected val entrySymbol = s"${Modules.sep}${Modules.sep}main"
 
-  private val symbols: Map[String, String] =
-    program.externs.collect { case e if e.symbol != e.name => e.name -> e.symbol }.toMap ++
-      program.entry.map(_.func -> entrySymbol)
-
-  /** What a definition and every call to it name. */
-  protected def symbolOf(name: String): String = symbols.getOrElse(name, name)
-
   /** The exported symbol of each function that has one, which is the **thunk's** rather than the
    * definition's (`ExportThunk`).
    */
   private val exportSymbols: Map[String, String] =
     program.funcs.collect { case f if f.exported.isDefined => f.name -> f.exported.get }.toMap
+
+  /** **A symbol C has claimed is not available to a sysl definition.**
+   *
+   * A key is normally `module$name`, which no exported symbol can be — `ExportCheck.cIdentifier`
+   * holds one to letters, digits and `_`, and `Modules.sep` is none of those. A function in the
+   * **root** module has no such qualification, so its key *is* the bare name, and an export under
+   * its own name there claims the very symbol the definition would be emitted under. What that
+   * produces is two definitions of one symbol, reported by clang as an invalid redefinition of a
+   * function nobody wrote twice.
+   *
+   * **Renaming the definition rather than the thunk keeps the promise the right way round**: the
+   * exported symbol is the one somebody outside has written down, and a mangled key is this
+   * compiler's own business. Which of the two moves is the whole of the decision here.
+   *
+   * A function that is not itself exported is covered too, since a `@export("add")` elsewhere in the
+   * program claims `add` whoever else wanted it.
+   */
+  private val displaced: Set[String] = exportSymbols.values.toSet
+
+  private val symbols: Map[String, String] =
+    program.externs.collect { case e if e.symbol != e.name => e.name -> e.symbol }.toMap ++
+      program.funcs.collect {
+        case f if displaced(f.name) => f.name -> s"${f.name}${Modules.sep}${Modules.sep}sysl"
+      }.toMap ++
+      program.entry.map(_.func -> entrySymbol)
+
+  /** What a definition and every call to it name. */
+  protected def symbolOf(name: String): String = symbols.getOrElse(name, name)
 
   /** The symbol an **address** of this function names — the one entry point that is callable under
    * the machine's C convention, since that is the only thing a `*extern` may hold (`12 §6a`).
