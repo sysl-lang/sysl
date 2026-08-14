@@ -187,6 +187,140 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  /** `null` is the one *value* whose type its context supplies, so at a parameter still being
+   * solved it has nothing to be analyzed against until the other arguments have been read. Holding
+   * it back to the second pass cannot lose the solution — an argument with no type of its own has
+   * nothing to unify — which is what makes the answer the same whichever end of the list it is
+   * written at.
+   *
+   * What is *not* claimed is that inference will look for a type where none was given: a call whose
+   * only argument is `null` is refused exactly as it was, and so is one where every argument is.
+   */
+  "null at a parameter still being solved" - {
+    "another argument's pointer settles which pointer it is" in {
+      run("""two[T](a: *T, b: *T) -> bool = a == b
+            |var x: int = 3
+            |print(two(&x, null))
+            |""".stripMargin) shouldBe "false\n"
+    }
+
+    "and it settles it from either side, since a held argument waits rather than queues" in {
+      run("""two[T](a: *T, b: *T) -> bool = a == b
+            |var x: int = 3
+            |print(two(null, &x))
+            |""".stripMargin) shouldBe "false\n"
+    }
+
+    "a parameter that is the type parameter itself takes it too" in {
+      run("""same[T](a: T, b: T) -> bool = true
+            |var x: int = 3
+            |print(same(&x, null))
+            |""".stripMargin) shouldBe "true\n"
+    }
+
+    "the pointee is the one the other argument gave, not a default" in {
+      run("""first[T](a: *T, b: *T) -> T = *a
+            |var x: u8 = 200
+            |print(first(&x, null))
+            |""".stripMargin) shouldBe "200\n"
+    }
+
+    "a generic method's parameter answers for it as well" in {
+      run("""struct Box[T]
+            |    v: T
+            |
+            |    beside(self, a: *T, b: *T) -> bool = a == b
+            |end Box
+            |var x: int = 3
+            |print(Box(1).beside(&x, null))
+            |""".stripMargin) shouldBe "false\n"
+    }
+
+    "a generic constructor's field answers for it" in {
+      run("""struct Pair[T]
+            |    a: *T
+            |    b: *T
+            |end Pair
+            |var x: int = 3
+            |var p = Pair(&x, null)
+            |print(p.a == p.b)
+            |""".stripMargin) shouldBe "false\n"
+    }
+
+    "a member's own type parameter answers for it, not only its type's" in {
+      run("""struct Box[T]
+            |    v: T
+            |
+            |    take[U](self, a: *U, b: *U) -> bool = a == b
+            |end Box
+            |var x: int = 3
+            |print(Box("held").take(&x, null))
+            |""".stripMargin) shouldBe "false\n"
+    }
+
+    // The receiver settles the *type's* parameters before the arguments are read at all, so this
+    // one never went through the wait — it is here because it is the case a reader asks about next.
+    "a parameter the receiver already settled takes it in the first place" in {
+      run("""struct Holder[T]
+            |    p: *T
+            |
+            |    only(self, q: *T) -> bool = q == self.p
+            |end Holder
+            |var x: int = 3
+            |print(Holder(&x).only(null))
+            |""".stripMargin) shouldBe "false\n"
+    }
+
+    "the arguments are read by name where they are written by name" in {
+      run("""two[T](a: *T, b: *T) -> bool = a == b
+            |var x: int = 3
+            |print(two(b = null, a = &x))
+            |""".stripMargin) shouldBe "false\n"
+    }
+
+    "and an overload is chosen with one among the arguments" in {
+      run("""pick(a: string) -> int = 1
+            |pick[T](a: *T, b: *T) -> int = 2
+            |var x: int = 3
+            |print(pick(&x, null), pick("s"))
+            |""".stripMargin) shouldBe "2 1\n"
+    }
+
+    // A variadic tail is not a parameter list, so there is nothing there to have said what the
+    // pointer is — which is the answer a non-generic variadic gives too.
+    "a variadic tail is still no context, generic callee or not" in {
+      err("""count[T](a: *T, ...) -> int = 0
+            |var x: int = 3
+            |print(count(&x, null))
+            |""".stripMargin) should include("'null' takes its type from its context")
+    }
+
+    "a concrete parameter beside a solved one is unaffected" in {
+      run("""two[T](a: *T, b: *int) -> bool = b == null
+            |var x: u8 = 1
+            |print(two(&x, null))
+            |""".stripMargin) shouldBe "true\n"
+    }
+
+    "nothing else to read is the refusal it always was" in {
+      err("""one[T](a: *T) -> bool = true
+            |print(one(null))
+            |""".stripMargin) should include("'null' takes its type from its context")
+    }
+
+    "and neither is two of them" in {
+      err("""two[T](a: *T, b: *T) -> bool = true
+            |print(two(null, null))
+            |""".stripMargin) should include("'null' takes its type from its context")
+    }
+
+    "a parameter that is not a pointer at all still refuses it" in {
+      err("""two[T](a: T, b: T) -> bool = true
+            |print(two(1, null))
+            |""".stripMargin) should include("'null' is a raw pointer")
+    }
+  }
+
   /** `01` lists the parameter type at a call among the positions that fix an unsuffixed literal,
    * and says nothing about the callee being generic — so a parameter written `usize` fixes one
    * whether or not the declaration beside it also has a `T` to solve. What makes this its own group

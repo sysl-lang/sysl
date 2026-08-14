@@ -487,6 +487,24 @@ var c = Node(3, null)              // the field's type says which pointer
 while walk != null do …            // the comparison's other operand says
 ```
 
+**A generic parameter is a context like any other, and it answers late.** The parameter type at a
+call fixes `null` exactly as it fixes an unsuffixed literal (`00 §`), and a callee still being
+solved is no exception: the argument with no type of its own waits for the ones that have, and is
+then read against the parameter it turned out to stand at.
+
+```
+two[T](a: *T, b: *T) -> bool
+var x: int = 3
+
+two(&x, null)                      -- the `&x` says `*int`, and the `null` is one
+two(null, &x)                      -- the same answer: waiting is not queueing
+```
+
+Waiting cannot lose the solution, which is what makes it safe rather than merely convenient: an
+argument with no type of its own has nothing to contribute to inference, so the parameter is settled
+by the other arguments or by nothing at all. **Nothing at all is still refused** — `one[T](a: *T)`
+called `one(null)` has no second argument to read, and inference does not invent a pointee.
+
 Pointers and references compare with `==` and `!=` — by address, since that is the only
 question a bare address can answer — and have no ordering.
 

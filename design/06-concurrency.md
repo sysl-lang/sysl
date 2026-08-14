@@ -385,9 +385,9 @@ boxed for the new thread to reach it, which needs the allocator, and its capture
 crossing a domain boundary with nothing yet checking that they may — so what it takes is `12 §6a`'s
 `*extern`, which is what `pthread_create` has always taken. The argument is typed: `spawn` is generic
 in what the body reads, so `T` is inferred from the body and the `ptr_cast` to C's shape happens once,
-inside. `null` is the one thing that cannot be passed, since it takes its type from its context and
-the context is the `T` being inferred; a body with nothing of its own is handed the address of
-whatever it reads instead.
+inside. **`null` is passable**, which is what a body with nothing of its own to read wants: the
+`*extern(*T) -> unit` names `T` too, so the body's own signature says which pointer the `null` is
+and the argument never has to be invented (`03 § Null`).
 
 `Thread.join` waits and answers whether it waited. **It does not carry the body's result back**, and
 that is the crossing rule rather than an oversight: a result coming out of another domain is a value

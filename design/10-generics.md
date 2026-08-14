@@ -149,6 +149,14 @@ default only where nothing else reached it: `pick(1, 2, 250u8)` is a `u8` becaus
 and two did not, while `id(7)` is still an `int` because none did. Once the parameter is a type the
 literals are read against it, which is the same order the operand rule uses inside an expression.
 
+**`null` is not consulted at all — it waits**, and what separates it from a literal is that it has no
+default to be consulted *for*. So `two[T](a: *T, b: *T)` takes `two(&x, null)` and takes
+`two(null, &x)`, both answering `*int`: the argument that cannot contribute is set aside, the rest
+solve the parameter, and it is then read against what they said (`03 § Null`). Where nothing else
+reached the parameter it is refused rather than defaulted — `one(null)` on `one[T](a: *T)` has
+nothing to read and inference does not invent a pointee. **A closure argument waits for the same
+reason**, its parameter types coming from the bound rather than from itself.
+
 **A parameter that names no type parameter is not part of the question**, and its argument is
 checked against it exactly as a plain callee's is. This is worth saying because inference has to
 look at the arguments before it knows what anything is, which would otherwise cost a generic callee

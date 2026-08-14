@@ -81,12 +81,10 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       ) shouldBe "false\n"
     }
 
-    /** `T` is inferred from the body, and `null` is what that inference cannot be given: it takes
-     * its type from its context and the context is the very thing being inferred. So an address is
-     * always written — which costs a body with nothing of its own to read nothing at all, since it
-     * is handed the address of whatever it reads instead.
+    /** `T` is inferred from the body, so a body with something of its own to read is handed its
+     * address and the inference reads `T` off that.
      */
-    "a body with nothing of its own is handed the address of what it reads" in {
+    "a body with something of its own is handed its address" in {
       run(
         """var ticks = 0
           |
@@ -98,13 +96,17 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       ) shouldBe "1\n"
     }
 
-    "and a null cannot stand in for that address, since nothing would say what it points at" in {
-      err(
+    /** And a body with nothing of its own is passed `null`, which the *body's* parameter types —
+     * `T` is in both parameters — say the type of. This was refused until the argument that has no
+     * type of its own learned to wait for the one that has.
+     */
+    "and one with nothing of its own is passed null, which the body's own type settles" in {
+      run(
         """alone(p: *int)
           |    print("nothing passed")
           |
           |spawn(&alone, null).unwrap().join()""".stripMargin
-      ) should include("'null' takes its type from its context")
+      ) shouldBe "nothing passed\n"
     }
 
     "several threads each get their own argument" in {

@@ -105,8 +105,8 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
    * A literal at a parameter that *does* name one is not analyzed at all: it stands in for its own
    * default type, `solve` consults it last, and `checkArgs` analyzes it once the parameter is a
    * type. The stand-in is a node for its type and nothing else, and never reaches the output.
-   * Anything else at such a parameter is analyzed bare, because the type it would be checked
-   * against is the thing being solved.
+   * Anything with a type of its own is analyzed bare there, because the type it would be checked
+   * against is the thing being solved — and anything without one waits for the second pass.
    *
    * The parameter types are the declaration's, so they are resolved where it was written; the
    * arguments are the caller's, and are analyzed where *they* were written.
@@ -124,10 +124,16 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
 
     // A **callable** argument is the one shape that has no type of its own to be analyzed at: a
     // closure's parameters come from the context, and a bare function name is a callable only where
-    // one is asked for. So the pass runs twice — everything else first, then the callables against
-    // the bound that the first pass has by then made concrete.
+    // one is asked for. `null` is the third, written as a value rather than as code: it is an
+    // address and nothing in it says of what. So the pass runs twice — everything else first, then
+    // these against what the first pass has by then made concrete.
+    //
+    // Holding one back cannot lose the solution, and that is what makes the wait safe rather than
+    // merely convenient: an argument with no type of its own has nothing to unify, so the parameter
+    // it stands at is settled by the others or by nothing at all. `two(&x, null)` and
+    // `two(null, &x)` therefore get one answer, which an ordering rule would not have given.
     val first = at.map { (a, e) =>
-      if callableArg(a) then None
+      if callableArg(a) || e.isEmpty && nullArg(a) then None
       else
         Some(e match
           case Some(_) => analyzeExpr(a, e)
@@ -145,9 +151,37 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     for case (r, Some(t)) <- ptypes.zip(first) do inDecl(decl)(unify(r, t.ty, tps, partial))
 
     at.zip(first).zipWithIndex.map { case (((a, _), done), i) =>
-      done.getOrElse(analyzeExpr(a, inDecl(decl)(callBound(ptypes.lift(i), tps, bounds, partial.toMap))))
+      done.getOrElse(analyzeExpr(a, inDecl(decl)(heldWant(a, ptypes.lift(i), tps, bounds, partial.toMap))))
     }
   }
+
+  /** What an argument held back from the first pass is analyzed against, once the rest have been
+   * read.
+   *
+   * A callable asks for the call trait its parameter's bound names. `null` asks for the **parameter
+   * itself**, which is a type by now wherever the other arguments settled what it mentions — so
+   * `two[T](a: *T, b: *T)` gives the `null` in `two(&x, null)` the `*int` that the `&x` said, which
+   * is what the same call to a non-generic `two` has always done.
+   *
+   * `None` in either case where something the parameter names is still unknown, which leaves the
+   * argument to report it: a closure that its parameters have no types, a `null` that its context
+   * gave it none. `one[T](a: *T)` called `one(null)` is that — there is nothing else to read, and
+   * the answer is the refusal it always was rather than a guess.
+   */
+  private def heldWant(
+      a: Expr,
+      ptype: Option[TypeRef],
+      tps: Set[String],
+      bounds: Map[String, List[BoundRef]],
+      partial: Map[String, Type],
+  ): Option[Type] = a match
+    case NullLit() => ptype.filterNot(mentions(_, tps -- partial.keySet)).map(resolveType(_, partial))
+    case _         => callBound(ptype, tps, bounds, partial)
+
+  /** `null` written as an argument, which is the one *value* whose type its context supplies. */
+  private def nullArg(a: Expr): Boolean = a match
+    case NullLit() => true
+    case _         => false
 
   /** Whether an expression is one whose type the *context* has to supply (`12 §5`, `§6`).
    *
