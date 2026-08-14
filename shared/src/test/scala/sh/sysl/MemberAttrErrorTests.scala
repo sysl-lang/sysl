@@ -151,6 +151,28 @@ class MemberAttrErrorTests extends AnyFreeSpec with ParseSupport {
       where shouldBe "<input>:8:5"
     }
 
+    // The spelling the reader this rule is for actually writes: `#[test]` above a method is Rust's,
+    // and an indented `#` never reaches the directive pass, which takes only what sits at the
+    // margin. `hashAttr`'s sentence alone would send them to write `@test`, which a member is
+    // refused all the same — so the sigil is named and the member rule is what is said.
+    "'#' above a member is answered by the member rule, with the sigil named" in {
+      val (msg, where) = refusal(
+        """struct S
+          |    v: int
+          |
+          |    #test
+          |    f(self) -> int = self.v
+          |
+          |main() =
+          |    print(1)
+          |""".stripMargin,
+      )
+
+      msg should startWith(sentence)
+      msg should include("'#' opens a directive")
+      where shouldBe "<input>:4:5"
+    }
+
     // The sentence has to say where the annotation goes instead, since deleting it is not what the
     // reader wanted — a `@test` becomes a free function that calls the member, and a `@crossing`
     // goes on the wrapper a caller already goes through (`06`).
@@ -168,6 +190,9 @@ class MemberAttrErrorTests extends AnyFreeSpec with ParseSupport {
       msg should include("above a free function")
       msg should include("'sysl test'")
       msg should include("'@crossing'")
+
+      // And the sigil is named only where it was the wrong one, so an `@` is not told about `#`.
+      msg should not include "'#' opens a directive"
     }
   }
 

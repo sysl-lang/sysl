@@ -297,8 +297,9 @@ trait SyslParserBase extends PackratParsers {
    */
   protected def contractMsg: Parser[String]
 
-  /** The refusal every member block opens each of its lines with: an `@` where a member was wanted.
-   * Defined beside the annotations it is about, and reached from the four rules that read a member.
+  /** The refusal every member block opens each of its lines with: an annotation's sigil where a
+   * member was wanted. Defined beside the annotations it is about, and reached from the rules that
+   * read a member.
    */
   protected def noMemberAttr: Parser[Unit]
 
