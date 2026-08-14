@@ -1122,6 +1122,14 @@ the meaning §5 gives it — the capture-free closure — because a spelling tha
 one slot and a C address in another would be choosing silently between two representations that share
 nothing. Where a `*extern` is wanted, the `&` is written; where a callable is wanted, it is not.
 
+**The function may be named through its module** — `&shapes.less` is the same address as `&less`
+under `import shapes.less`, and `&f[T]` may be qualified too. A name means the *declaration* rather
+than a spelling of it, which is the rule `13 §7` states for a constant and which holds here for the
+same reason: the two spellings name one function, so an address that existed under one and not the
+other would be a property of how the name was written. **A local binding shadows a module name**
+(`13 §3`), so a head bound to a value makes the chain an ordinary field read and `&` addresses that
+field — which is what keeps the two readings from turning on anything but scope.
+
 **It is its own type rather than a mode over the call trait.** `*Fn(A) -> R` was already taken, and
 by the right thing: an unowned trait object over a callable, two words, a method table beside the
 value (`02`). Spelling both the same would put a fat pointer where C reads one word, and the mistake

@@ -454,14 +454,21 @@ trait ExprAnalysis
     // `qsort`, any interface that calls back — the missing `&` is the whole of the mistake, so the
     // message names it rather than the two callable forms the reader did not want.
     case Ident(name) if lookupOpt(name).isEmpty && !ownValueName(name) && funcKey(name).isDefined =>
+      // **The name is quoted through `qn`, because it may be a key rather than what anybody wrote.**
+      // A qualified path is folded into one name before it reaches here (`throughModule`), so a
+      // reader who wrote `c.less` was being shown `c$less` — and then told to write `'&c$less'`,
+      // which carries the module separator and is not sysl. `qn` is where every message naming a
+      // declaration by its key turns it back into the path a reader would type.
+      val shown = qn(name)
+
       err(
         if expected.exists(t => cfnOf(t).isDefined) then
-          s"'$name' is a function, and what is wanted here is the address of one — write '&$name'. A " +
-            "bare name is the capture-free closure, which has no address a C interface could call"
+          s"'$shown' is a function, and what is wanted here is the address of one — write '&$shown'. " +
+            "A bare name is the capture-free closure, which has no address a C interface could call"
         else
-          s"'$name' is a function, and a function becomes a value only where a callable is wanted — " +
+          s"'$shown' is a function, and a function becomes a value only where a callable is wanted — " +
             "a bare-arrow parameter, or a '&Fn' where a concrete type is required. Nothing here asks " +
-            s"for one; where the address of code is what is wanted, that is written '&$name'",
+            s"for one; where the address of code is what is wanted, that is written '&$shown'",
       )
 
     /** A **value parameter** (`10 §9`), folded into its use exactly as a declared constant is —
@@ -596,6 +603,31 @@ trait ExprAnalysis
     // function, which `functionAddress` does with the declaration in hand.
     case Unary("&", TypeArgs(Ident(name), targs)) if lookupOpt(name).isEmpty && funcKey(name).isDefined =>
       functionAddress(name, funcKey(name).get, expected, targs)
+
+    // The same three, written **qualified**. A function is not a place, so an address is taken from
+    // the name above rather than by the walk below — and that walk is the only thing a module path is
+    // folded into the name by (`throughModule`). So a qualified spelling reached neither: it fell
+    // through to the walk, which found a function where it wanted storage and said so, quoting the
+    // key it had by then rewritten the path into.
+    //
+    // Which is the shape `0104` had at a constant expression, and the answer is that one's: a name
+    // means the declaration rather than a spelling of it, so the qualified form resolves wherever the
+    // unqualified one does. `qualifiedFunc` hands back the spelling that was written beside the key,
+    // because the message a refused address prints has to be something a reader can type.
+    case Unary("&", e) if qualifiedFunc(e).isDefined =>
+      val (written, key) = qualifiedFunc(e).get
+
+      functionAddress(written, key, expected)
+
+    case Unary("&", Index(e, targ)) if qualifiedFunc(e).isDefined =>
+      val (written, key) = qualifiedFunc(e).get
+
+      functionAddress(written, key, expected, List(targ))
+
+    case Unary("&", TypeArgs(e, targs)) if qualifiedFunc(e).isDefined =>
+      val (written, key) = qualifiedFunc(e).get
+
+      functionAddress(written, key, expected, targs)
 
     // The same node anywhere else. A subscript takes one index, so what was written is a
     // type-argument list — and `12 §6a` is the only place one may be written, which is what this

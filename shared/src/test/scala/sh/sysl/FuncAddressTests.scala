@@ -704,4 +704,121 @@ class FuncAddressTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) should include("'square' is a function")
     }
   }
+
+  /** A function named **through its module** reaches an address exactly as the imported spelling
+    * does.
+    *
+    * This is `0104`'s shape met at `&` instead of in a constant expression: a qualified name is a
+    * chain of field reads after parsing, and every case above matched a bare `Ident`, so the same
+    * declaration was addressable when imported and not when named through its module. A function is
+    * not a place, so it never reached the walk that folds a module path into the name — which is the
+    * one thing that would have rewritten the chain.
+    *
+    * The tests assert the two spellings **agree** rather than asserting an address, which is the only
+    * claim worth making here: an address is a number nobody can predict, and two spellings of one
+    * declaration disagreeing is precisely the defect.
+    */
+  "a function named through its module" - {
+    "reaches an address, and it is the address the bare spelling gives" in {
+      runIn(
+        ("shapes", "shapes.sysl", "module shapes\nless(a: int, b: int) -> bool = a < b\n"),
+        ("", "main.sysl",
+          """import shapes
+            |import shapes.less
+            |
+            |val qualified: *extern(int, int) -> bool = &shapes.less
+            |val bare: *extern(int, int) -> bool = &less
+            |
+            |print(qualified == bare, qualified(2, 5), qualified(5, 2))
+            |""".stripMargin),
+      ) shouldBe "true true false\n"
+    }
+
+    // `&f[T]` is the one position where type arguments are written, and it had the same `Ident`-only
+    // reading — so a binding's trampoline, which is what that form exists for, could not be named
+    // through the module it lives in.
+    "including an instantiation with its type argument written" in {
+      runIn(
+        ("shapes", "shapes.sysl", "module shapes\npick[T](a: T, b: T) -> T = a\n"),
+        ("", "main.sysl",
+          """import shapes
+            |
+            |val g: *extern(i32, i32) -> i32 = &shapes.pick[i32]
+            |
+            |print(g(7, 9))
+            |""".stripMargin),
+      ) shouldBe "7\n"
+    }
+
+    "and one with more than one type argument written" in {
+      runIn(
+        ("shapes", "shapes.sysl", "module shapes\neither[A, B](a: A, b: B) -> A = a\n"),
+        ("", "main.sysl",
+          """import shapes
+            |
+            |val g: *extern(i32, bool) -> i32 = &shapes.either[i32, bool]
+            |
+            |print(g(4, true))
+            |""".stripMargin),
+      ) shouldBe "4\n"
+    }
+
+    /** A path deeper than one segment is the same question asked twice, and it is worth its own case
+      * because flattening a chain of field reads is where a fix could stop one level short — which is
+      * the reason `0104` carries the matching case.
+      */
+    "however deep the module path is" in {
+      runIn(
+        ("a.b", "b.sysl", "module a.b\nless(x: int, y: int) -> bool = x < y\n"),
+        ("", "main.sysl",
+          """import a.b
+            |
+            |val f: *extern(int, int) -> bool = &a.b.less
+            |
+            |print(f(1, 2))
+            |""".stripMargin),
+      ) shouldBe "true\n"
+    }
+
+    /** The other half, and the rule this shares with every other qualified form: **a local binding
+      * shadows a module name** (`13 §3`). A head bound to a value makes the chain a field read and
+      * nothing else, so reading it as a module path would take an address of the wrong thing
+      * entirely — and silently, since both readings produce a pointer.
+      */
+    "while a local of the module's name is still a field read" in {
+      runIn(
+        ("shapes", "shapes.sysl", "module shapes\nless(a: int, b: int) -> bool = a < b\n"),
+        ("", "main.sysl",
+          """import shapes
+            |
+            |struct Holder
+            |    less: int
+            |
+            |var shapes = Holder(42)
+            |val p: *int = &shapes.less
+            |
+            |print(*p)
+            |""".stripMargin),
+      ) shouldBe "42\n"
+    }
+
+    /** The refusal that sent this card in: the message named the declaration by the **key** the table
+      * holds it under, which carries the module separator — so a reader who wrote `shapes.less` was
+      * shown `shapes$less` and told to write `'&shapes$less'`, a spelling nothing in sysl may contain.
+      *
+      * `qn` is where a key becomes the path a reader would type, and this message is now one of the
+      * messages that goes through it. The advice it gives is true as well as typable, which is the
+      * other half of this card's fix: `&shapes.less` is what the case above compiles.
+      */
+    "and a refusal quotes a spelling the reader can actually type" in {
+      val e = errIn(
+        ("shapes", "shapes.sysl", "module shapes\nless(a: int, b: int) -> bool = a < b\n"),
+        ("", "main.sysl", "import shapes\nval x: int = shapes.less\n"),
+      )
+
+      e should include("'shapes.less' is a function")
+      e should include("'&shapes.less'")
+      e should not include "shapes$less"
+    }
+  }
 }

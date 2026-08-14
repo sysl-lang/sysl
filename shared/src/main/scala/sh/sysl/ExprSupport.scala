@@ -85,6 +85,29 @@ trait ExprSupport extends SpecialForms with PatternAnalysis with StmtAnalysis {
       rest.tail.foldLeft[Expr](Ident(Modules.qualify(module, rest.head)))((acc, n) => Field(acc, n))
         .setPos(e.pos)
 
+  /** A **module-qualified function name**, flattened back into the spelling it was written as and
+   * paired with the key it resolves to — `("c.less", "c$less")` from `Field(Ident("c"), "less")`.
+   *
+   * A function is not a place, so its address is taken from the name rather than by the walk that
+   * looks for storage (`12 §6a`) — and that walk is the only thing `throughModule` sits in front of.
+   * A qualified name therefore has to be recognised here instead, which is the whole of why the
+   * unqualified spelling reached an address and the qualified one did not.
+   *
+   * **The written spelling is kept beside the key because a diagnostic has to quote it.** A key
+   * carries the module separator, which nothing in source may contain, so a message built from one
+   * tells the reader to type something that is not sysl.
+   *
+   * `funcKey` is asked the whole dotted path, which it has always accepted: `13 §3`'s last step is a
+   * qualified one, and this is the same resolution an unqualified name takes. **A local binding
+   * shadows a module name**, so the head is tested exactly as `throughModule` tests it.
+   */
+  protected def qualifiedFunc(e: Expr): Option[(String, String)] =
+    for
+      segs <- chain(e) if segs.length > 1 && lookupOpt(segs.head).isEmpty
+      written = segs.mkString(".")
+      key <- funcKey(written)
+    yield (written, key)
+
   /** Whether a place bottoms out in something bound by a `val` — either a module-level one or a
    * local. Reaching *into* one keeps the property: an element of a read-only array is read-only,
    * and so is a field of a read-only struct.
