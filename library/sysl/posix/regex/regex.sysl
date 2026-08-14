@@ -1,0 +1,186 @@
+module sysl.posix.regex
+@requires(posix)
+@include("<regex.h>")
+@include("<stddef.h>")
+
+import sysl.text.{cstring, from_cstring}
+
+// POSIX regular expressions, from the C library the machine already has.
+//
+// `regcomp`, `regexec`, `regerror` and `regfree` have been in POSIX since 1003.2 and every hosted
+// target sysl builds for already links the thing that holds them. So there is no C here, nothing to
+// install, and no `@link` -- naming `c` would be naming what the driver passes unasked (`15 §8`).
+//
+// **There are two regex engines in the library and they are for different situations.** `sysl.regex`
+// is written in sysl and runs anywhere, freestanding targets included. This one is the host's, so it
+// is the faster and better-tested of the two on a machine that has it, and it does not exist at all
+// on a machine that does not -- which is what `@requires(posix)` says and why the module lives here.
+//
+// ## Why this needs no C, when binding it used to
+//
+// Two things in `<regex.h>` are shaped so that C is the only language that can see them, and a shim
+// held both until `c const` and `c type` arrived:
+//
+//   - **`regex_t` is caller-allocated and its size is a platform's business** -- 32 bytes on Darwin,
+//     64 under glibc. `REGEX_WORDS` below asks the C compiler, so the storage is declared here and
+//     the number is never written down.
+//   - **`regmatch_t` is a layout only the header knows**, and `regoff_t` is a typedef whose width the
+//     platform decides. `c type` answers the second, and the four assertions below pin the first --
+//     so the pair of offsets is read as an ordinary sysl array rather than copied out by a shim.
+//
+// The alternative to both is transcribing the numbers, which compiles everywhere and is right on
+// whichever machine the author happened to use. Nothing would check it: sysl's own `sizeof` reports
+// what sysl laid out rather than what C did, and getting it wrong writes past the end of the storage.
+
+// The measured half. Everything here is the C compiler's answer for the machine being built for, and
+// none of it is a number anybody typed.
+c type
+    // `regoff_t` is what `regmatch_t` holds two of. It is not `int` everywhere and it is not `usize`
+    // anywhere -- it is signed, because -1 is how a group that did not participate is reported.
+    Regoff = "regoff_t"
+
+c const
+    // `regex_t` in whole `u64`s, rounded up. **A `u64` array rather than a `[N]u8` is what makes the
+    // storage aligned**: a byte array is aligned to 1, and `regcomp` writes pointers into it. Asking
+    // C to do the rounding keeps it one expression instead of arithmetic here that could be off by
+    // one in the exactly-divisible case.
+    REGEX_WORDS: usize = "(sizeof(regex_t) + sizeof(long long) - 1) / sizeof(long long)"
+
+    // What that storage would need if a `u64` were not enough, which the assertion below checks.
+    REGEX_ALIGN: usize = "_Alignof(regex_t)"
+
+    MATCH_SIZE: usize = "sizeof(regmatch_t)"
+    OFF_SO: usize     = "offsetof(regmatch_t, rm_so)"
+    OFF_EO: usize     = "offsetof(regmatch_t, rm_eo)"
+
+    // The syntax and matching flags, by the header's own names.
+    EXTENDED: int = "REG_EXTENDED"
+    ICASE: int    = "REG_ICASE"
+    NEWLINE: int  = "REG_NEWLINE"
+
+// **The layout `[2]Regoff` assumes, stated where the compiler can refuse it.**
+//
+// POSIX says `regmatch_t` has an `rm_so` and an `rm_eo` and does not say they are the first two
+// members in that order with nothing between them. They are, on every platform this has been built
+// for -- so the match storage below is an ordinary two-element array rather than a byte block read at
+// measured offsets, which needs no pointer arithmetic and stays aligned by construction.
+//
+// A platform where that is untrue does not miscompile and does not corrupt a match: it fails here,
+// while compiling, naming what it found. That is the whole reason to measure the offsets and then
+// assert on them rather than to measure them and index by them.
+@assert(REGEX_ALIGN <= 8, "regex_t needs more alignment than an array of u64 provides")
+@assert(OFF_SO == 0, "regmatch_t does not begin with rm_so")
+@assert(OFF_EO == sizeof(Regoff), "rm_eo does not sit directly after rm_so in regmatch_t")
+@assert(MATCH_SIZE == 2 * sizeof(Regoff), "regmatch_t holds something besides its two offsets")
+
+// The four functions, by symbol. Each takes the `regex_t` as a `*u8` because what is at that address
+// is C's business and never sysl's -- nothing here reads a byte of it.
+private extern "regcomp" c_regcomp(re: *u8, pattern: *u8, cflags: int) -> int
+private extern "regexec" c_regexec(re: *u8, s: *u8, nmatch: usize, pmatch: *u8, eflags: int) -> int
+private extern "regerror" c_regerror(code: int, re: *u8, buf: *u8, n: usize) -> usize
+private extern "regfree" c_regfree(re: *u8)
+
+// Where a match landed, as byte offsets into the subject.
+struct Match
+    start: usize
+    end: usize
+
+// How a pattern is to be read.
+//
+// **Extended syntax is not a field here, because it is not a choice.** POSIX basic syntax makes `+`,
+// `?`, `|` and `{m,n}` literal characters, which is a 1970s compatibility mode rather than a dialect
+// anybody writing a new program wants -- offering it would be offering a way to have `a+b` match
+// three characters. Extended is always on, and `Options` is what is left over.
+struct Options
+    // Match without regard to case.
+    icase: bool
+
+    // Treat the subject as lines: `.` and a negated bracket stop at a newline, and `^` and `$` match
+    // beside one. Without it a newline is an ordinary character and the anchors mean the two ends of
+    // the whole subject.
+    newline: bool
+
+    // The `cflags` these ask for, or'd onto extended syntax.
+    code(self) -> int
+        var flags = EXTENDED
+
+        if self.icase then flags |= ICASE
+
+        if self.newline then flags |= NEWLINE
+
+        flags
+    end code
+end Options
+
+// What `compile` uses: extended syntax, case-sensitive, and a subject that is one string rather than
+// a set of lines.
+plain() -> Options = Options(false, false)
+
+// A compiled pattern.
+//
+// **It is a `&Regex` with a destructor**, so the pattern is freed when the last reference to it goes
+// and there is nothing to release by hand. That is also what makes the storage safe to hand to C: a
+// counted box does not move, so the address `regcomp` was given stays the address `regexec` is given.
+// A `Regex` copied by value would hand two owners one set of C-allocated buffers.
+struct Regex
+
+    // `regex_t`, in storage this side owns and never reads. Private because there is nothing in it a
+    // program could use, and because its size is a measurement rather than part of the interface.
+    private storage: [REGEX_WORDS]u64
+
+    // Whether `regcomp` succeeded, which is the only thing that makes `regfree` safe.
+    //
+    // **POSIX leaves `regfree` on a pattern that failed to compile undefined**, and a destructor
+    // cannot ask the caller whether the constructor worked -- so the answer is carried. A `compile`
+    // that failed returns `Err` and drops the box on the way out, which is exactly when this matters.
+    private compiled: bool
+
+    // Whether the subject matches anywhere, which is the common question.
+    matches(&self, s: string) -> bool = self.find(s).is_some()
+
+    // Where the whole match landed, or nothing.
+    //
+    // `cstring` copies the subject into the NUL-terminated bytes `regexec` reads. Neither side ever
+    // holds a pointer into the other's storage, which is what keeps the boundary a copy in and a copy
+    // out rather than a lifetime to reason about.
+    find(&self, s: string) -> Option[Match]
+        val subject = cstring(s)
+        var m: [2]Regoff = [0, 0]
+
+        if c_regexec(ptr_cast(&self.storage[0]), subject.ptr, 1, ptr_cast(&m[0]), 0) != 0 then
+            return None
+
+        Some(Match(usize(m[0]), usize(m[1])))
+    end find
+
+end Regex
+
+// `regfree` releases what `regcomp` allocated inside the `regex_t`; the storage itself is this box's
+// and goes with it.
+impl Drop for Regex
+    drop(self)
+        if self.compiled then c_regfree(ptr_cast(&self.storage[0]))
+
+// A compiled pattern, or the message the C library gave for why it is not one.
+compile(pattern: string) -> Result[&Regex, string] = compile_with(pattern, plain())
+
+// The same, reading the pattern as `o` says.
+//
+//     val ci = compile_with("hello", Options(true, false))?
+compile_with(pattern: string, o: Options) -> Result[&Regex, string]
+    var re: &Regex = Regex([0; REGEX_WORDS], false)
+    val p          = cstring(pattern)
+    val code       = c_regcomp(ptr_cast(&re.storage[0]), p.ptr, o.code())
+
+    if code == 0
+        re.compiled = true
+        return Ok(re)
+
+    // `regerror` is specified to work on a pattern `regcomp` refused, which is the one thing about a
+    // failed `regex_t` that is defined. 256 bytes is what every implementation's longest message fits
+    // in twice over, and a truncated message is still the right message.
+    var buf: [256]u8
+
+    c_regerror(code, ptr_cast(&re.storage[0]), &buf[0], 256)
+    Err(from_cstring(&buf[0]).unwrap_or("the pattern did not compile"))
+end compile_with

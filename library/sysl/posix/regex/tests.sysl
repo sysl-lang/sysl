@@ -1,0 +1,141 @@
+module sysl.posix.regex
+@requires(posix)
+@tests
+
+// What `sysl.posix.regex` claims, asserted in sysl.
+//
+// **Every test here matches something rather than reading a number back**, and that is deliberate.
+// The measured constants are pinned at compile time by the `@assert`s beside them, so what is left
+// for a run to establish is that the flags reached `regcomp` and did what the header says they do --
+// which a test comparing `EXTENDED` to a literal would not have shown at all.
+
+// -- The ordinary path -------------------------------------------------------------------------
+
+@test("a run of digits is found, and where it is found is where it is")
+digits_are_found()
+    val digits = compile("[0-9]+").unwrap()
+
+    assert(digits.matches("abc1234"), "a run of digits matches")
+    assert(!digits.matches("abc"), "and a subject with none does not")
+
+    val m = digits.find("abc123").unwrap()
+
+    assert_eq(m.start, 3)
+    assert_eq(m.end, 6)
+
+// **The one test that says `REG_EXTENDED` crossed the boundary.** It is a `#define`, so there is no
+// symbol a linker could have failed on -- the flag either arrived as a number or the pattern is read
+// as basic syntax, where `+` is the character `+` and matches itself.
+@test("the operators are operators, which is extended syntax having arrived")
+extended_syntax_is_on()
+    val re = compile("a+b+").unwrap()
+
+    assert(re.matches("aab"), "one or more a then one or more b")
+    assert(re.matches("abbbb"), "and the repeats are independent")
+    assert(!re.matches("ba"), "while the order is not negotiable")
+    assert(!re.matches("a+b+"), "the operators are not the characters they are written as")
+
+@test("anchors mean the ends of the subject")
+anchors_bind_the_whole_subject()
+    val re = compile("^abc$").unwrap()
+
+    assert(!re.matches("xabcx"), "the subject contains abc but is not abc")
+    assert(re.matches("abc"), "while the subject that is abc matches")
+
+// A pattern that can match nothing still matches, at the first place it can, consuming nothing. It
+// is the case an offset pair reported as a length would get wrong.
+@test("an empty match is a match, and it is empty")
+an_empty_match_has_equal_ends()
+    val m = compile("x*").unwrap().find("yyy").unwrap()
+
+    assert_eq(m.start, 0)
+    assert_eq(m.end, 0)
+
+@test("'matches' is 'find' with the answer thrown away")
+matches_agrees_with_find()
+    val re = compile("ab+c").unwrap()
+
+    assert_eq(re.matches("abbbc"), re.find("abbbc").is_some())
+    assert_eq(re.matches("aaa"), re.find("aaa").is_some())
+
+// -- The flags ---------------------------------------------------------------------------------
+
+@test("REG_ICASE reaches regcomp, checked by matching rather than by reading")
+icase_changes_what_matches()
+    val exact = compile_with("hello", plain()).unwrap()
+    val loose = compile_with("hello", Options(true, false)).unwrap()
+
+    assert(exact.matches("hello"), "the pattern matches itself either way")
+    assert(loose.matches("hello"), "on both")
+
+    assert(!exact.matches("HELLO"), "without the flag the case has to agree")
+    assert(loose.matches("HELLO"), "and with it it does not")
+    assert(loose.matches("HeLlO"), "in any mixture")
+
+@test("REG_NEWLINE makes the anchors line anchors")
+newline_changes_what_the_anchors_mean()
+    val whole = compile_with("^b$", plain()).unwrap()
+    val lines = compile_with("^b$", Options(false, true)).unwrap()
+
+    assert(!whole.matches("a\nb"), "the subject is not the single line b")
+    assert(lines.matches("a\nb"), "but its second line is")
+
+    assert(whole.matches("b"), "a subject that is just b matches either way")
+    assert(lines.matches("b"), "on both")
+
+@test("the defaults are the plain ones, and the two flags compose")
+options_defaults_and_composition()
+    val o = plain()
+
+    assert(!o.icase, "case matters by default")
+    assert(!o.newline, "and a subject is one string")
+
+    assert(o.code() != Options(true, false).code(), "each flag changes what regcomp is handed")
+    assert(o.code() != Options(false, true).code(), "both of them")
+    assert(Options(true, false).code() != Options(true, true).code(), "and they compose")
+
+// -- Patterns that are not patterns --------------------------------------------------------------
+
+// The wording is BSD's or glibc's and differs between them, so only that a sentence arrived is
+// pinned. **An empty string here would mean `regerror` was handed a buffer it never wrote into**,
+// which is the failure worth catching and is invisible to a test that checked only for `Err`.
+@test("a pattern that is not one answers in the C library's own words")
+a_bad_pattern_carries_a_message()
+    compile("a{3,1}") match
+        Ok(_)    -> assert(false, "a{3,1} compiled, and it is not a pattern")
+        Err(why) -> assert(why.len > 0, "regerror wrote nothing into the buffer it was given")
+
+@test("an unclosed bracket is refused, with a reason")
+an_unclosed_bracket_is_refused()
+    compile("a[") match
+        Ok(_)    -> assert(false, "a[ compiled, and it is not a pattern")
+        Err(why) -> assert(why.len > 0, "the C library said why")
+
+// The failure path, run enough times that a corrupted allocator would show.
+//
+// **It does NOT demonstrate why the `compiled` flag is there, and saying so is the honest version.**
+// Taking the flag out was tried: `regfree` on a `regex_t` that `regcomp` refused is harmless on
+// Darwin, and all of these still passed. The flag stays because POSIX leaves that case *undefined*
+// rather than because a crash was seen -- and an undefined case that works on the machine
+// development happens to run on, and may not on the one CI runs, is the exact shape of card `0120`.
+// What this test is worth is the ordinary thing: the failure path is walked two hundred times on
+// every platform the suite runs on, so a platform where it does bite says so here.
+@test("a great many failed compiles neither crash nor corrupt anything")
+failing_to_compile_does_not_free_what_was_never_allocated()
+    var refused = 0
+
+    for i in 0..<200
+        if compile("a[").is_err() then refused += 1
+
+    assert_eq(refused, 200)
+
+// The other side of it: a great many *successful* compiles, each freed by its own destructor as the
+// reference goes. A leak does not fail a test, but a double free does.
+@test("and a great many successful ones are each released once")
+compiling_repeatedly_releases_each_pattern()
+    var matched = 0
+
+    for i in 0..<200
+        if compile("[a-z]+[0-9]+").unwrap().matches("widget42") then matched += 1
+
+    assert_eq(matched, 200)
