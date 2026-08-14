@@ -873,8 +873,9 @@ that would unwind a frame the call never pushed. A walk starting from what the p
 therefore cannot reach it, and dropping it would leave the vector table pointing at nothing — a fault
 at the worst available moment. Its address is still worth taking, which is what fills that table.
 
-**A handler a DEPENDENCY supplied is a root only where the program reaches its module**, by the rule
-§12 states for every kind of root at once. A package shipping a handler for a peripheral a consumer
+**A handler the program did not WRITE is a root only where the program reaches its module**, by the
+rule §12 states for every kind of root at once — and the library is inside that rule as much as a
+package is. A package shipping a handler for a peripheral a consumer
 never uses would otherwise put it in that consumer's vector table, and two packages shipping one for
 the same vector is the collision that rule was written for. A consumer that wants a package's handler
 names its module — an `import` is enough, and is what says so.
@@ -1105,8 +1106,8 @@ which is suppressed — the same switch a library build has always used, reached
 same reason: nothing inside the program calls it, and the whole point is that something outside will.
 A build with no entry point is what makes this load bearing, since every other root is absent there.
 
-**A root a DEPENDENCY supplied counts only where the program reaches its module**, and that is the
-one qualification on the rule above. A dependency's source root is compiled whole rather than by what
+**A root the program did not WRITE counts only where the program reaches its module**, and that is the
+one qualification on the rule above. A handed source root is compiled whole rather than by what
 the program imports (§7), so every module of every `--lib` root and every fetched package is in the
 compilation whether or not anything names it. For an ordinary declaration that costs nothing —
 pruning drops what no body reaches — but every kind of root is precisely a declaration no body
@@ -1115,12 +1116,31 @@ artifact. What that cost was a **package carrying its own program**: a test appl
 `@export("main")` reached every consumer, and the two `main`s fought at the link, which is why a
 binding's runnable half has had to live in a second repository.
 
+**THE STANDARD LIBRARY IS ONE OF THE HANDED ROOTS, and it is the one that reaches everybody.** It
+arrives as its own thing rather than among the units, so a rule stated about *dependencies* passed it
+by — and the library is linked by every program there is, so a root of any of the four kinds in
+`library/` would be a root of every program in existence. The measurement is what settles it rather
+than the principle: an `impl Drop` on `sysl.fs`'s shared state, and a program whose whole body is
+`print(1)`, gains the destructor's definition — and built for a freestanding target, gains a
+declaration of `fclose` with it, out of a module whose own header says `requires os` and which that
+target's capabilities say the program cannot reach. That is the shape §4's target-side capability
+rule already closes for a `--lib` module, one road over.
+
 **The qualification is about PROVENANCE and applies to all four kinds** — an export, an interrupt
 handler (§10), a `@section` definition (§13) and a destructor (`03 § A destructor`). Telling it per
 kind does not work, and the reason is worth stating: a root left unconditional keeps whatever else
 the same function carries, so an export that is *also* placed, or that is *also* a handler, would be
 kept for the second reason and land its C symbol in the consumer anyway. A rule about which
 attributes appear *together* is a worse rule than a rule about where the declaration came from.
+
+**The destructor is the kind that could go the other way, and coherence is what stops it.** Dropping
+one of the other three costs a symbol nobody asked for; dropping a destructor is a *link* error,
+because the release hook the emitter builds calls a name no line of the program contains. What makes
+it safe is `02 § Coherence`: an `impl Drop for T` may sit only in the module declaring `Drop` or in
+one declaring a type named in `T`, so the hook's module is always one that instantiating `T` had to
+name. The residue, stated rather than legislated against, is that the library **may** write one in
+`Drop`'s own module — which every program reaches, so an `impl Drop for File` written there rather
+than beside `File` is unconditional again. The natural spelling is beside the type.
 
 Reaching is asked of the module graph `13` §6 already builds, so an `import` counts as readily as a
 call, and it is the transitive closure — a package reached through a package is reached. That is
@@ -1203,8 +1223,8 @@ compile, link, and place nothing — the failure being the absence of a section 
 answers it the same way, which is why a placement in Zephyr or in a startup file is always written
 beside `__used`.
 
-**A placed definition a DEPENDENCY supplied is a root only where the program reaches its module**,
-which is §12's rule reaching the third of its four kinds. It bites harder here than anywhere else,
+**A placed definition the program did not WRITE is a root only where the program reaches its
+module**, which is §12's rule reaching the third of its four kinds. It bites harder here than anywhere else,
 because `used` is exactly what stops the optimizer undoing it: a placed definition kept for want of
 the rule is bytes in every consumer's image that nothing downstream will remove, in the region the
 attribute exists to manage. A consumer that wants a package's placed definition names its module.
