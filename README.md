@@ -125,14 +125,19 @@ outside this tree (`design/packages.md`) — because a binding to a library nobo
 installed is a *package*, not an example, and keeping it here made the compiler's own suite depend on
 SQLite being present.
 
-POSIX regex followed to [sysl-lang/regex](https://github.com/sysl-lang/regex), and its reason is the
-weaker one, which is the point: nothing had to be installed for it and the suite it added was green
-everywhere, so the argument was only that a library is not part of the language and does not belong
-in the language's repository. It is the organisation's worked example of binding a C library the
-machine already has — a shim for what only a header knows, no `@link` for what the driver already
-passes, and a `requires` clause naming what it needs of the target. What sysl still owns is the
-*mechanism*: `15 §7` and `15 §8` are pinned on fixtures in `LibraryBuildCliTests`, where the inputs
-can be chosen to be discriminating rather than being whatever one real library happens to do.
+POSIX regex followed to [sysl-lang/regex](https://github.com/sysl-lang/regex) on the weaker reason:
+nothing had to be installed for it and the suite it added was green everywhere, so the argument was
+only that a library is not part of the language. What sysl still owns is the *mechanism*: `15 §7` and
+`15 §8` are pinned on fixtures in `LibraryBuildCliTests`, where the inputs can be chosen to be
+discriminating rather than being whatever one real library happens to do.
+
+**And regex has since come back, as `library/sysl/posix/regex`, because the reason it was a package
+stopped being true.** It went out as the worked example of a binding that needs a shim — `regex_t`'s
+size and `regmatch_t`'s layout being things only a header knows. `c const` and `c type` answer both,
+so the binding is now pure sysl: an array length measured by the C compiler, a typedef it names, and
+four `@assert`s pinning a layout that would otherwise have been transcribed. A binding with no C to
+carry and no library to install is not a package — it is a module, and it belongs beside the
+`sysl.regex` written in sysl that a freestanding target uses instead.
 
 A program's own unit tests are `@test` functions written beside what they test, and `sysl test` is
 what runs them (`design/testing.md`):

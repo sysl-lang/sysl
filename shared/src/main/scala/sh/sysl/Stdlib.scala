@@ -257,12 +257,33 @@ object Stdlib {
    * the path that could see the tests. A test file that named a type nothing else used would have
    * been a plain divergence instead.
    */
+  /** **The library's `c const` blocks are measured here too, and this was the third call site to need
+   * saying so.** `Analyzer.analyze` lowers a program's blocks and `LibraryArtifact.build` lowers a
+   * library's on the way into an artifact; this is the path that reads the library *as source*, and
+   * without the lowering a measured constant is not a constant — so an `@assert` over one is refused
+   * for not being a constant expression, and the refusal names a library file the program's author
+   * did not write. `AstCodec` already says a block reaching it means a path skipped `CProbe.lower`;
+   * this is the same rule one layer earlier.
+   *
+   * **The strip comes first**, so a `@tests` file is never probed: it is dropped either way, and
+   * asking the C compiler about a file nothing will compile is a clang invocation for nothing. The
+   * units that survive are lowered identically to the artifact path's, which is what keeps the two
+   * comparable — `StdArtifactTests` is what would notice if they were not.
+   *
+   * A probe that fails is `Std.parsed`'s kind of failure rather than a diagnostic: the standard
+   * module is the compiler's own, so a header it cannot read is a broken installation and not
+   * something a program did.
+   */
   def fromSource(target: Target): Stdlib =
     cache.synchronized {
       cache.get(target) match
         case Some(std) => std
         case None =>
-          val std = new Stdlib(Tests.stripSource(Std.parsed(target)))
+          val units = CProbe.lower(Tests.stripSource(Std.parsed(target)), target) match
+            case Right(lowered) => lowered
+            case Left(e)        => sys.error(s"the standard module's 'c const' could not be measured: $e")
+
+          val std = new Stdlib(units)
 
           cache.clear()
           cache(target) = std
