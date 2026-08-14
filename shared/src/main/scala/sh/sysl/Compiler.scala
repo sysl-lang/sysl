@@ -149,15 +149,17 @@ object Compiler {
 
     parsed.collect { case Left(e) => e } match
       case Nil =>
-        val own = parsed.collect { case Right(p) => p }
+        val mine = parsed.collect { case Right(p) => p }
 
         // **Which modules are the program's own travels back beside the tree**, because nothing in
         // the tree says. `TProgram.mainModule` names the file that carries the statements, and a
         // module of pure declarations carries none — so a proof run over a library-shaped file would
         // have found nothing to translate. The sources given are what the reader meant by "this
-        // module", and they are only known here.
-        Analyzer.analyze(libraries ::: own, std = carried(std, target), target = target,
-                         provides = provides).map((_, own.map(moduleOf).toSet))
+        // module", and they are only known here — which is the same fact the analyzer is handed, for
+        // the same reason.
+        Analyzer.analyze(libraries ::: mine, std = carried(std, target), target = target,
+                         provides = provides, own = ownModules(mine, libraries))
+          .map((_, mine.map(moduleOf).toSet))
       case errs => Left(errs.mkString("\n"))
   }
 
@@ -228,7 +230,8 @@ object Compiler {
         val whole  = carried(std, target)
 
         for
-          typed    <- Analyzer.analyze(units, building, whole, target, paths = paths)
+          typed    <- Analyzer.analyze(units, building, whole, target, paths = paths,
+                        own = ownModules(mine, handed))
           promoted <- Escape.check(typed)
           _        <- TailCalls.check(typed)
         yield
@@ -304,7 +307,8 @@ object Compiler {
       // not a declaration. There is no branch a `@test` could be hiding inside for the typed pass to
       // catch, and a second removal that can never find anything reads as though there were.
       typed    <- Analyzer.analyze(Tests.stripSource(libraries ::: units), building,
-                                   carried(std, target), target)
+                                   carried(std, target), target,
+                                   own = ownModules(units, libraries))
       promoted <- Escape.check(typed)
       _        <- TailCalls.check(typed)
     yield
@@ -367,7 +371,7 @@ object Compiler {
       : Either[String, Compiled] =
     for
       typed    <- Analyzer.analyze(units, std = std, target = target, provides = provides,
-                    packages = packages, paths = paths)
+                    packages = packages, paths = paths, own = own)
       promoted <- Escape.check(typed)
       _        <- TailCalls.check(typed)
 

@@ -13,11 +13,14 @@ took the most natural name in an allocator away from the code that provides one.
 model changed with the spelling; what changed is that a capability is now said *about* a module
 rather than being a construct the language executes, which is what it always was.
 
-**The two environment capabilities are enforced too, and against the module graph rather than
-against a target.** Each became checkable the day the library grew a module declaring it — `sysl.fs`
-for `os`, `sysl.posix.tty` for `posix` — because what an environment capability gates is a whole
-module, so the rule is that a module which gave one up may not *reach* one that needs it, directly or
-through anything in between. **All three are narrowings now.** The order is the one the
+**The two environment capabilities are enforced too, against the module graph.** Each became
+checkable the day the library grew a module declaring it — `sysl.fs` for `os`, `sysl.posix.tty` for
+`posix` — because what an environment capability gates is a whole module, so the rule is that a module
+which may not have one may not *reach* one that needs it, directly or through anything in between.
+**Both ways of not having it are asked at that same edge**: the module gave it up, or the target never
+provided it. The second is the half that reads as the surprise, so it is worth stating plainly —
+a program is refused for reaching `sysl.fs` on a machine its own `package.hocon` says has no operating
+system, with no clause written anywhere. **All three are narrowings now.** The order is the one the
 next capability will arrive in: declared, then gated by something, then narrowable — a clause
 enforcing nothing would read in a source file as a guarantee the compiler never made, so it is
 refused for as long as that is what it would be.
@@ -159,6 +162,20 @@ fit within the target's capabilities.
   another module's declarations with no import at all (`13 §3`), so a rule stated over imports would
   have missed the case a program is most likely to write. The requirement is transitive — reaching
   `sysl.fs` through a module that says nothing itself is still reaching it.
+- **A module on a target that provides no `os` may not reach one either, and that needs no clause** —
+  it is the ceiling half of the two-level rule, so a module which inherits the target's capabilities
+  by default inherits their absence with them. It is asked at the same edge, in the same walk, and
+  differs only in what the message names: a clause the reader wrote where there is one, and the
+  config that understated the machine where there is not.
+
+**Whose modules are asked, and why a library's are not.** The edge that gets refused starts in a
+module the compilation is **producing** — the program's own, or the library's own where a library is
+what is being built. A module handed *to* it is exempt: the standard module's, a `--lib` source root's,
+a fetched package's. The reason is what the check is for. A library holding one POSIX module is not a
+library that a POSIX-less target cannot use; it is a library one module of which that program cannot
+reach — and refusing at the library's own clause would refuse a build over a module the program never
+names, in a file its author did not write and cannot change. So the target half is asked at the
+reference, where the answer is a line somebody chose to write.
 
 **Where the `heap` diagnostic actually lands, and why it is the call rather than the import.** The
 rule above is stated over modules, and the standard library is why the check cannot be: `sysl` is

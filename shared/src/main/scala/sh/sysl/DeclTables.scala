@@ -29,6 +29,24 @@ trait DeclTables extends Reporting {
    */
   protected def building: Set[String]
 
+  /** The modules this compilation is **producing** as against the ones it was **handed**, where
+   * anything was handed to it at all — a `--lib` source root's modules and a fetched package's are
+   * handed, and the program's own are not.
+   *
+   * `None` where the compilation has no libraries behind it, which is most of them, and the answer is
+   * then that every module is the program's own. This is `Reachability.contributing`'s parameter of
+   * the same name, and it means the same thing: only the caller knows, because `units` is one flat
+   * list by the time it gets here and nothing in a tree says which road it arrived by.
+   *
+   * `building` is the neighbouring fact and a different one: it names the modules of the **standard
+   * library** where this compilation is the one producing them. A library reached by `--lib` is
+   * neither — it is not the program's, and it is not the compiler's.
+   */
+  protected def own: Option[Set[String]]
+
+  /** Whether a module is one this compilation is producing rather than one handed to it. */
+  protected def ownModule(module: String): Boolean = own.forall(_.contains(module))
+
   /** The files this compilation was handed to compile. */
   protected def units: List[Program]
 
