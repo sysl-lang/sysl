@@ -342,4 +342,54 @@ class ConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pa
         include("'&' needs a variable, a field, an element, or a dereference")
     }
   }
+
+  /** A constrained subtype is a scalar for this purpose, which `16 §1` settles rather than this
+    * file: without `new` such a type *is* its base. What it adds is the `within` range, checked here
+    * against a value that is already known — the run-time check a `val` would have had, made one
+    * step earlier because a constant has no run time of its own.
+    */
+  "a constant may be declared at a constrained subtype" - {
+    "and holds a value the range admits" in {
+      run("type Age = int within 0..150\n\nconst a: Age = 42\n\nprint(str(a))\n") shouldBe "42\n"
+    }
+
+    "while a value outside it is refused where it is written, naming both ends" in {
+      val message = err("type Age = int within 0..150\n\nconst a: Age = 200\n\nprint(str(a))\n")
+
+      message should include("does not admit")
+      message should include("200")
+      message should include("150")
+    }
+
+    "an exclusive upper bound says so rather than naming a value it excludes" in {
+      err("type Slot = u8 within 0..<200\n\nconst s: Slot = 200\n\nprint(str(s))\n") should
+        include("under 200")
+    }
+
+    /** The base's own width still answers first, so the two checks do not have to agree about which
+      * mistake was made — a value no `u8` could hold is not a range's business.
+      */
+    "and the base's width is checked before the range is" in {
+      err("type Slot = u8 within 0..200\n\nconst s: Slot = 300\n\nprint(str(s))\n") should
+        include("does not fit")
+    }
+
+    /** `16 §2`: a derived type is reached only through a written conversion, in both directions and
+      * with no position excused — and a constant is the value it was written as, so there is nowhere
+      * on the line to write one.
+      */
+    "a 'new' type is refused, since a constant has nowhere to write the conversion" in {
+      err("type Meters = new int\n\nconst m: Meters = 3\n\nprint(str(m))\n") should
+        include("'new' type")
+    }
+
+    /** A predicate is a function, checked where a value is *made* — and a constant is folded into
+      * every use rather than made anywhere, so admitting one would be a check the declaration claims
+      * and the program never gets.
+      */
+    "and a 'where' predicate is refused, since there is no site to run it at" in {
+      err("type Even = int where value % 2 == 0\n\nconst n: Even = 4\n\nprint(str(n))\n") should
+        include("'where' predicate")
+    }
+  }
 }

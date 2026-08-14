@@ -68,15 +68,46 @@ trait ConstFolding extends ImportResolution {
    * would be storage rather than a value (`13 §7`). Resolving it needs none of the type tables,
    * which is what lets a constant be registered in the first hoisting pass and named from an array
    * bound in the second.
+   *
+   * **A transparent subtype of a scalar is a scalar**, and is admitted for the reason `16 §1` gives:
+   * without `new` such a type *is* its base, so refusing it here was this rule reaching a case it
+   * was never about. What it buys is the case a `c type` was built for — a typedef whose width the
+   * target decides, and the constants that have to be that width — and, for a written subtype, a
+   * `within` range checked below against a value that is already known.
    */
   protected def constType(key: String): Type = constTypes.getOrElseUpdate(key, {
     val decl = constDecls(key)
 
     inDecl(key)(resolveType(decl.typ, Map.empty)) match
       case t @ (_: Type.Integer | _: Type.Floating | Type.Bool | Type.Char | Type.Str) => t
+      case c: Type.Constrained => at(decl.pos)(constrainedConst(c, qn(key)))
       case other =>
         at(decl.pos)(err(s"a constant is a scalar, and ${show(other)} is not — '${qn(key)}'"))
   })
+
+  /** A constrained type as a constant's declared type, or the reason it is not one.
+   *
+   * **`new` is refused because reaching a distinct type from its base is a written conversion**
+   * (`16 §2`), in both directions and with no position excused — and a constant is the literal it
+   * was written as, so there is nowhere on the line for the conversion to go.
+   *
+   * **A `where` predicate is refused because there is no site to run it at.** A predicate is a sysl
+   * function, checked where a value is *made* (`16`), and a constant is folded into every use rather
+   * than made anywhere. Admitting one and never running it would be a check the declaration claims
+   * and the program does not get. A `within` range is admitted for the opposite reason: it is a
+   * comparison against a number the compiler already has in hand, which is exactly the `@assert`
+   * somebody would otherwise write underneath.
+   */
+  private def constrainedConst(c: Type.Constrained, what: String): Type =
+    if c.derived then
+      err(s"'$what' is declared ${show(c)}, which is a 'new' type — reaching one from its base is a " +
+        "written conversion, and a constant is the value it is written as, so there is nowhere here " +
+        "to write it")
+    else if c.predFn.isDefined then
+      err(s"'$what' is declared ${show(c)}, whose 'where' predicate is checked where a value is " +
+        "made — and a constant is folded into its uses rather than made anywhere, so the check has " +
+        "no site. A 'within' range is settled here; a predicate cannot be")
+    else c
 
   /** A constant's value, as the literal every use of it is folded to.
    *
@@ -107,6 +138,7 @@ trait ConstFolding extends ImportResolution {
    * a suffix-less literal would otherwise make silently.
    */
   private def checkFits(value: Expr, ty: Type, what: String, pos: Option[Pos]): Unit = (value, ty) match
+    case (_, c: Type.Constrained)                            => checkAdmits(value, c, what, pos)
     case (IntLit(v, _), i: Type.Integer) if !Type.fits(v, i) => at(pos)(err(s"$what does not fit ${show(i)}: $v"))
     case (IntLit(_, _), _: Type.Integer)                     => ()
     case (FloatLit(_, _), _: Type.Floating)                  => ()
@@ -114,6 +146,39 @@ trait ConstFolding extends ImportResolution {
     case (CharLit(_), Type.Char)                             => ()
     case (StrLit(_), Type.Str)                               => ()
     case _ => at(pos)(err(s"$what is declared ${show(ty)} but its value is ${literalKind(value)}"))
+
+  /** Whether a folded value is one its **constrained** type admits: the base's own width first, and
+   * then the `within` range.
+   *
+   * This is the check that makes a constrained constant worth writing. A `c const` measured from a
+   * header is a number nobody chose — a `#define` in somebody else's tree, a config macro, a
+   * `sizeof` — so a range on the type it is read into is a claim about the configuration the program
+   * was built against, settled while compiling rather than trusted. A written `const` gets the same
+   * check for the same reason, one step earlier than the run-time one its `val` would have had.
+   *
+   * A type with a `where` predicate never reaches here: `constrainedConst` refuses it at the
+   * declaration, because a predicate is a function and this is a comparison.
+   */
+  private def checkAdmits(value: Expr, c: Type.Constrained, what: String, pos: Option[Pos]): Unit = {
+    checkFits(value, Type.underlying(c), what, pos)
+
+    val number = value match
+      case IntLit(v, _)   => Some(BigDecimal(v))
+      case FloatLit(t, _) => Some(BigDecimal(t))
+      case CharLit(cp)    => Some(BigDecimal(cp))
+      case _              => None
+
+    for
+      v  <- number
+      lo <- c.lo
+      hi <- c.hi
+    do
+      val under = if c.exclusiveHi then v < hi else v <= hi
+      val top   = if c.exclusiveHi then s"under $hi" else hi.toString
+
+      if v < lo || !under then
+        at(pos)(err(s"$what is $v, which ${show(c)} does not admit — it holds $lo to $top"))
+  }
 
   protected def literalKind(e: Expr): String = e match
     case _: IntLit   => "an integer"

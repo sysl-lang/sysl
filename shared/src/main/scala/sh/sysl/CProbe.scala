@@ -166,8 +166,9 @@ object CProbe {
     if consts.isEmpty && types.isEmpty then Right(unit)
     else
       for
-        kinds   <- traverse(consts)(c => integerType(c, target).map(c -> _))
-        answers <- measure(unit, kinds, types, target, paths)
+        plan    <- traverse(consts)(c => declaredType(c, unit, types, target).map(c -> _))
+        answers <- measure(unit, plan, types, target, paths)
+        kinds   <- traverse(plan) { case (c, d) => measuredKind(c, d, answers).map(c -> _) }
         folded  <- traverse(kinds.zip(answers.values)) { case ((c, k), raw) => literal(c, k, raw) }
         aliases <- traverse(types.zip(answers.types)) { case (t, m) => alias(t, m, answers.charSigned) }
       yield
@@ -199,12 +200,12 @@ object CProbe {
    * header — so clang's own words are quoted rather than paraphrased, and the message says which
    * kind of block was being measured so that a reader knows which lines to look at.
    */
-  private def measure(unit: Program, kinds: List[(CConstDecl, Kind)], types: List[CTypeDecl],
+  private def measure(unit: Program, plan: List[(CConstDecl, Declared)], types: List[CTypeDecl],
                       target: Target, paths: SearchPaths): Either[String, Answers] = {
     val src = createTempFile("sysl-cprobe-", ".c")
 
     try
-      writeFile(src, probe(unit, kinds, types))
+      writeFile(src, probe(unit, plan, types))
 
       Toolchain.findClang(target).flatMap { cc =>
         val command = Seq(cc, s"--target=${target.triple}", "-S", "-emit-llvm", "-O0") ++
@@ -213,11 +214,11 @@ object CProbe {
           beside(unit) ++ paths.includeFlags ++ Seq("-o", "-", src)
 
         val result = exec(command)
-        val where  = kinds.headOption.flatMap(_._1.pos).orElse(types.headOption.flatMap(_.pos))
+        val where  = plan.headOption.flatMap(_._1.pos).orElse(types.headOption.flatMap(_.pos))
 
         if result.exitCode != 0 then
           Left(Diagnostic.render(
-            s"the C compiler refused this file's ${blocks(kinds, types)}:\n${result.stderr.trim}",
+            s"the C compiler refused this file's ${blocks(plan, types)}:\n${result.stderr.trim}",
             where))
         else
           val values = read(constEmitted, result.stdout)
@@ -225,7 +226,7 @@ object CProbe {
           val whichs = read(kindEmitted, result.stdout)
 
           for
-            found <- traverse(kinds.zipWithIndex) { case ((c, _), i) =>
+            found <- traverse(plan.zipWithIndex) { case ((c, _), i) =>
               values.get(i).toRight(silent(s"'${c.c}'", c.pos))
             }
             measured <- traverse(types.zipWithIndex) { case (t, i) =>
@@ -242,8 +243,8 @@ object CProbe {
   /** Whichever blocks this file actually wrote, for the refusal to name — a message about a `c const`
    * block sends a reader to the wrong lines when what the file has is a `c type`.
    */
-  private def blocks(kinds: List[(CConstDecl, Kind)], types: List[CTypeDecl]): String =
-    if kinds.isEmpty then "'c type' block"
+  private def blocks(plan: List[(CConstDecl, Declared)], types: List[CTypeDecl]): String =
+    if plan.isEmpty then "'c type' block"
     else if types.isEmpty then "'c const' block"
     else "'c const' and 'c type' blocks"
 
@@ -275,19 +276,32 @@ object CProbe {
    * Signedness follows the **declared sysl type**, so a constant a program asked for as `i32` is
    * printed as the negative number it is instead of arriving as a very large positive one.
    *
+   * **A constant declared at a `c type` is carried unsigned**, because the signedness that would
+   * have chosen the carrier is one of the answers this same probe is being asked for. Nothing is
+   * lost by it: the IR prints an `i64` bit pattern whichever carrier is written, so the reading is
+   * the same number once the measurement says how to read it.
+   *
+   * **It is not cast through the C type**, though that reads as the faithful thing to do. C would
+   * *narrow* — `(uint8_t)800` is `32` — and the value would then pass a range check it should have
+   * failed, which is the one refusal this feature exists for. The declared type is a claim about the
+   * value, so the value has to arrive whole enough to contradict it.
+   *
    * A type is described through an **object of it**, because that is the one form that stays legal
    * whatever the typedef turns out to be: `_Generic` wants a complete type and nothing more, so a
    * struct reaches the `default` arm instead of failing to compile, while a cast — `(T)0` — would
    * have been a C error for exactly the types the refusal below is written for.
    */
-  private def probe(unit: Program, kinds: List[(CConstDecl, Kind)], types: List[CTypeDecl]): String = {
+  private def probe(unit: Program, plan: List[(CConstDecl, Declared)], types: List[CTypeDecl]): String = {
     val headers = unit.includes.map(i => s"#include ${quoted(i.header)}").mkString("\n")
 
     val constants =
-      kinds.zipWithIndex.map { case ((c, k), i) =>
-        val ty = if k.signed then "long long" else "unsigned long long"
+      plan.zipWithIndex.map {
+        case ((c, Declared.Now(k)), i) =>
+          val ty = if k.signed then "long long" else "unsigned long long"
 
-        s"$ty $constMarker$i = ($ty)(${c.c});"
+          s"$ty $constMarker$i = ($ty)(${c.c});"
+        case ((c, Declared.Later(_, _, _)), i) =>
+          s"unsigned long long $constMarker$i = (unsigned long long)(${c.c});"
       }
 
     val typedefs =
@@ -341,29 +355,108 @@ object CProbe {
   /** An integer type, as this pass needs to know it: how wide, and whether signed. */
   private case class Kind(bits: Int, signed: Boolean, name: String)
 
-  /** The declared type of a `c const`, held to being an integer.
+  /** What a `c const`'s written type turns out to be, as far as the file alone can say — which is
+   * all of it for a primitive and half of it for a measured one.
+   *
+   * A `c type` in the same file is what the two blocks were built to be used as a pair for, and it
+   * is **circular against the probe**: the constant's global has to be written before clang runs,
+   * and how wide it should be written is one of the answers clang is being asked for. `Later` is
+   * that knot untied — the value is carried at the full unsigned width, and the same probe's
+   * measurement says how to read it and what range to hold it to.
+   */
+  private enum Declared {
+    case Now(kind: Kind)
+    case Later(index: Int, c: String, written: String)
+  }
+
+  /** The declared type of a `c const`, held to being an integer — or a transparent subtype of one.
    *
    * **The restriction is deliberate and the diagnostic says so rather than leaving it to be found.**
    * A `string` constant is a global array in the IR and a different job entirely, and it would also
    * have to be written `"\"foo\""` — two quotings for one value, which is a form nobody would guess.
    * A float is the same shape of problem read back through a different printing. Both are worth
    * having and neither is worth guessing at, so the refusal names them.
+   *
+   * **A name is followed rather than refused**, because `16 §1` says a transparent subtype *is* its
+   * base and this pass was the one place in the language where that was not true — which left the
+   * two blocks unable to describe the case they were both built for, a typedef whose width the
+   * config decides and the constants that have to be that width. What is followed is this file's own
+   * declarations: a `c type` the same probe measures, or a `type` whose base reaches an integer.
+   *
+   * **A name from another module is refused by name.** A block is one question put to one file's
+   * headers, and both halves of it are asked in the same probe; a type measured against some other
+   * file's headers is not an answer this one can use.
+   *
+   * Whether the subtype's own constraint *admits* the value is not asked here and cannot be: a
+   * `within` bound may be written over a `const` (`16`), so no bound is folded until the analyzer
+   * has run. `ConstFolding.constType` is where the declared type and the measured value meet, and it
+   * is where `new` and a `where` predicate are refused.
    */
-  private def integerType(c: CConstDecl, target: Target): Either[String, Kind] = {
+  private def declaredType(c: CConstDecl, unit: Program, types: List[CTypeDecl], target: Target)
+      : Either[String, Declared] = {
     given Word = target.word
 
-    val refused = Left(Diagnostic.render(
+    def refuse(message: String) = Left(Diagnostic.render(message, c.pos))
+
+    val notInteger = refuse(
       s"'${c.typ.show}' is not an integer, and a 'c const' reads an integer — the value is read " +
         "back out of the C compiler's own output, where an integer is a number and a string is a " +
-        "block of storage. A string or a float from C is not written this way yet",
-      c.pos))
+        "block of storage. A string or a float from C is not written this way yet")
 
-    c.typ match
+    def follow(ref: TypeRef, seen: Set[String]): Either[String, Declared] = ref match
       case NamedType(name, Nil) =>
         Type.scalars.get(name).orElse(width(name)) match
-          case Some(Type.Integer(bits, signed, _)) => Right(Kind(bits, signed, name))
-          case _                                   => refused
-      case _ => refused
+          case Some(Type.Integer(bits, signed, _)) => Right(Declared.Now(Kind(bits, signed, name)))
+          case Some(_)                             => notInteger
+          case None if seen(name) =>
+            refuse(s"'$name' is declared in terms of itself, so which integer it is has no answer")
+          case None =>
+            types.indexWhere(_.name == name) match
+              case measured if measured >= 0 =>
+                Right(Declared.Later(measured, types(measured).c, c.typ.show))
+              case _ =>
+                unit.body.collectFirst { case t: TypeDecl if t.name == name => t } match
+                  case Some(t) => follow(t.base, seen + name)
+                  case None =>
+                    refuse(s"'$name' is not a type this file declares, and a 'c const' is measured " +
+                      "against its own file — so its type is an integer, a 'c type' written beside " +
+                      "it, or a subtype of one declared here")
+      case _ => notInteger
+
+    follow(c.typ, Set.empty)
+  }
+
+  /** The `Kind` a declaration turns out to have once the probe has answered, which for a primitive
+   * is the one it always had.
+   *
+   * **A measured type that is not an integer is refused here as well as by `alias`**, and has to be:
+   * the answers are consumed in written order, so a constant reading a `_Bool` typedef is told about
+   * the constant rather than about a type declaration that is perfectly good on its own.
+   */
+  private def measuredKind(c: CConstDecl, d: Declared, answers: Answers): Either[String, Kind] =
+    d match
+      case Declared.Now(k) => Right(k)
+      case Declared.Later(i, cType, written) =>
+        integerKind(answers.types(i), answers.charSigned) match
+          case Some((bits, signed)) => Right(Kind(bits, signed, written))
+          case None =>
+            Left(Diagnostic.render(
+              s"'$written' is what the C compiler calls '$cType', which is not an integer here, and " +
+                "a 'c const' reads an integer",
+              c.pos))
+
+  /** Which integer a measurement is, and how wide. `None` covers the two answers that are not one: a
+   * `_Bool`, which a `c type` resolves and a constant cannot be read as, and the `default` arm,
+   * which is every type this feature does not resolve at all.
+   */
+  private def integerKind(m: Measured, charSigned: Boolean): Option[(Int, Boolean)] = {
+    val bits = m.size * 8
+
+    m.kind match
+      case 2                   => Some((bits, charSigned))
+      case 3 | 5 | 7 | 9 | 11  => Some((bits, true))
+      case 4 | 6 | 8 | 10 | 12 => Some((bits, false))
+      case _                   => None
   }
 
   /** `i5`, `u32` — the systematic width spellings, which are a family rather than a list.
@@ -421,20 +514,17 @@ object CProbe {
       Right(TypeDecl(t.name, NamedType(name), derived = false, None, None, t.vis, fromC = true)
         .setPos(t.pos))
 
-    val bits = m.size * 8
-
-    m.kind match
-      case 1                   => named("bool")
-      case 2                   => named(if charSigned then s"i$bits" else s"u$bits")
-      case 3 | 5 | 7 | 9 | 11  => named(s"i$bits")
-      case 4 | 6 | 8 | 10 | 12 => named(s"u$bits")
-      case _                   =>
-        Left(Diagnostic.render(
-          s"the C compiler says '${t.c}' is not an integer type, and a 'c type' names an integer — " +
-            "what comes back from one is a width and a signedness, which a float, a pointer, a " +
-            "struct or an array has not got. An address is written '*T', a float by name, and a " +
-            "struct arrives as an 'opaque struct'",
-          t.pos))
+    if m.kind == 1 then named("bool")
+    else
+      integerKind(m, charSigned) match
+        case Some((bits, signed)) => named(s"${if signed then "i" else "u"}$bits")
+        case None =>
+          Left(Diagnostic.render(
+            s"the C compiler says '${t.c}' is not an integer type, and a 'c type' names an integer " +
+              "— what comes back from one is a width and a signedness, which a float, a pointer, a " +
+              "struct or an array has not got. An address is written '*T', a float by name, and a " +
+              "struct arrives as an 'opaque struct'",
+            t.pos))
   }
 
   /** The first refusal, or every answer — `Either`'s `traverse`, which the standard library has no

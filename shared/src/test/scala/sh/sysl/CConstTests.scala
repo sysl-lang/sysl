@@ -199,6 +199,209 @@ class CConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
     }
   }
 
+  /** **The two blocks used as the pair they are** (`15 §7`): a typedef whose width the target or a
+    * `#define` decides, and the constants that have to be that width. Neither half is any use to a
+    * binding without the other — `TickType_t` spelled exactly in a signature and `portMAX_DELAY`
+    * spelled `usize` beside it is a package that does not compile on a port where the two disagree.
+    *
+    * `16 §1` is what makes this a rule holding rather than an exception: without `new` a constrained
+    * type *is* its base, so a constant declared at one is a constant declared at an integer.
+    */
+  "the type may be a transparent subtype of an integer" - {
+    "a 'c type' measured beside it, which is what the pair is for" in {
+      run("""@include("<stdint.h>")
+            |
+            |c type
+            |    T = "uint32_t"
+            |
+            |c const
+            |    N: T = "42"
+            |
+            |print(str(N))
+            |""".stripMargin) shouldBe "42\n"
+    }
+
+    /** The constant is that type rather than a number that happens to fit it, which is the half a
+      * `usize` and an `@assert` never bought: it goes where the type goes, with nothing written.
+      */
+    "and the constant is that type, so it goes where the type goes" in {
+      run("""@include("<stdint.h>")
+            |
+            |c type
+            |    T = "uint16_t"
+            |
+            |c const
+            |    N: T = "40"
+            |
+            |plus_two(x: T) -> T
+            |    x + 2
+            |
+            |print(str(plus_two(N)))
+            |""".stripMargin) shouldBe "42\n"
+    }
+
+    /** The measured signedness is what the value is read back at, which it has to be: the C side
+      * casts through the typedef and the IR prints an `i64` bit pattern either way, so a full-width
+      * unsigned answer is a negative number until the measurement says otherwise.
+      */
+    "a full-width unsigned measurement survives, read at the width C gave" in {
+      run("""@include("<stdint.h>")
+            |
+            |c type
+            |    T = "uint64_t"
+            |
+            |c const
+            |    N: T = "0xFFFFFFFFFFFFFFFFull"
+            |
+            |print(str(N))
+            |""".stripMargin) shouldBe "18446744073709551615\n"
+    }
+
+    "and a measured signed one keeps a negative value, read the other way" in {
+      run("""@include("<stdint.h>")
+            |
+            |c type
+            |    T = "int32_t"
+            |
+            |c const
+            |    N: T = "-3 * 5"
+            |
+            |print(str(N))
+            |""".stripMargin) shouldBe "-15\n"
+    }
+
+    /** The transcription error again, one layer up: the range checked is the measured type's, and
+      * the refusal quotes the name the reader wrote rather than the integer it turned out to be.
+      *
+      * **It is also what says the value is not carried through the C type**, which reads as the
+      * faithful thing to do and is not: C narrows, so `(uint8_t)800` is `32` and a constant that
+      * should have been refused arrives looking like one that fits.
+      */
+    "a value the measured type cannot hold is refused, naming it as written" in {
+      val message = err("""@include("<stdint.h>")
+                          |
+                          |c type
+                          |    T = "uint8_t"
+                          |
+                          |c const
+                          |    N: T = "sizeof(long long) * 100"
+                          |
+                          |print(str(N))
+                          |""".stripMargin)
+
+      message should include("which 'T' cannot hold")
+      message should include("800")
+    }
+
+    /** A `c type` resolves a `_Bool` and a constant cannot be read as one, so the refusal is the
+      * constant's rather than the type declaration's — which is good on its own.
+      */
+    "a measured type that is not an integer is refused at the constant" in {
+      err("""c type
+            |    T = "_Bool"
+            |
+            |c const
+            |    N: T = "1"
+            |
+            |print(str(N))
+            |""".stripMargin) should include("is not an integer")
+    }
+
+    "a written subtype is followed to its base, and admits a value in range" in {
+      run("""type Small = u32 within 0..10
+            |
+            |c const
+            |    N: Small = "3 + 4"
+            |
+            |print(str(N))
+            |""".stripMargin) shouldBe "7\n"
+    }
+
+    /** The check a program would otherwise write an `@assert` for, made against a number nobody
+      * chose — and made while compiling, because a constant has no run time to be checked at.
+      */
+    "and refuses one outside the range, naming both ends" in {
+      val message = err("""type Small = u32 within 0..10
+                          |
+                          |c const
+                          |    N: Small = "sizeof(long long) * 100"
+                          |
+                          |print(str(N))
+                          |""".stripMargin)
+
+      message should include("does not admit")
+      message should include("800")
+    }
+
+    /** The two halves composed: a width the C compiler decides, narrowed by a range the program
+      * decides. Neither check knows about the other — the width is measured here and the range is
+      * folded after the analyzer has run — and a value has to satisfy both.
+      */
+    "a written subtype over a measured one is held to both" in {
+      val source =
+        """@include("<stdint.h>")
+          |
+          |c type
+          |    Tick = "uint32_t"
+          |
+          |type Slow = Tick within 0..1000
+          |
+          |c const
+          |    N: Slow = "%s"
+          |
+          |print(str(N))
+          |""".stripMargin
+
+      run(source.format("500")) shouldBe "500\n"
+      err(source.format("sizeof(long long) * 1000")) should include("does not admit")
+    }
+
+    "a 'where' predicate is refused, since a folded constant is made nowhere" in {
+      err("""type Even = int where value % 2 == 0
+            |
+            |c const
+            |    N: Even = "4"
+            |
+            |print(str(N))
+            |""".stripMargin) should include("'where' predicate")
+    }
+
+    "a 'new' type is refused, since reaching one is a written conversion" in {
+      err("""type Ticks = new int within 0..100
+            |
+            |c const
+            |    N: Ticks = "4"
+            |
+            |print(str(N))
+            |""".stripMargin) should include("'new' type")
+    }
+
+    /** A probe answers for one file's headers, so the type it is declared at is one that file
+      * declares. A name from elsewhere is refused by name rather than approximated.
+      */
+    "a name this file does not declare is refused by name" in {
+      err("""c const
+            |    N: Nope = "1"
+            |
+            |print(str(N))
+            |""".stripMargin) should include("'Nope' is not a type this file declares")
+    }
+
+    "and a name from another module is that same refusal, not a resolution" in {
+      errIn(
+        ("other", "other.sysl", "module other\n\ntype Small = u32 within 0..10\n"),
+        ("", "main.sysl",
+          """import other.Small
+            |
+            |c const
+            |    N: Small = "1"
+            |
+            |print(str(N))
+            |""".stripMargin),
+      ) should include("is not a type this file declares")
+    }
+  }
+
   /** **The motivating shape is a package, not a program**, so the artifact path is the one that has
     * to work. A library is measured when it is *built* and ships the number, which is what lets a
     * program link a binding without the library's headers — and is the only honest arrangement
