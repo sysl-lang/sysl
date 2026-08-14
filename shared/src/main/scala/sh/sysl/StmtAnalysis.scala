@@ -729,6 +729,13 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
         "against that file's '@include' headers, and a block inside a body would be asking the " +
         "same question from a place that cannot answer it")
 
+    // A `c type` is measured by the same probe and declares a **type**, so it is out of place here
+    // twice over: for the reason above, and for the one a `struct` written in a body is.
+    case _: CTypeBlock =>
+      err("a 'c type' block is declared at the top level of a file — the C in it is compiled " +
+        "against that file's '@include' headers, and what it declares is a type, which is a module " +
+        "member rather than something a body can hold")
+
     // A function declared inside a body is a **nested function** (`12 §5a`), and the block's are
     // lowered together the first time one is reached — so the ones after it in the same block have
     // already been dealt with and contribute nothing further here.

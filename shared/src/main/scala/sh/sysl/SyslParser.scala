@@ -146,7 +146,7 @@ class SyslParser(val source: Source)
       misplacedOverride |
       staticDecl |
       visibility ~ (structDecl | enumDecl | typeDecl | traitDecl | externDecl | cConstDecl |
-        constDecl | valDecl | varDecl | funcDecl) ^^ {
+        cTypeDecl | constDecl | valDecl | varDecl | funcDecl) ^^ {
         case Visibility.Public ~ d => d
         case v ~ d                 => restrict(v, d)
       }
@@ -384,6 +384,8 @@ class SyslParser(val source: Source)
     case c: ConstDecl     => c.copy(vis = v).setPos(c.pos)
     case b: CConstBlock   =>
       CConstBlock(b.consts.map(c => c.copy(vis = v).setPos(c.pos))).setPos(b.pos)
+    case b: CTypeBlock    =>
+      CTypeBlock(b.types.map(t => t.copy(vis = v).setPos(t.pos))).setPos(b.pos)
     case l: ValDecl       => l.copy(vis = v).setPos(l.pos)
     case r: VarDecl       => r.copy(vis = v).setPos(r.pos)
     case f: FuncDecl      => f.copy(vis = v).setPos(f.pos)
@@ -510,6 +512,35 @@ class SyslParser(val source: Source)
    */
   protected lazy val cConstItem: Parser[CConstDecl] =
     at(ident ~ (op(":") ~> typeRef) ~ (op("=") ~> linkName) ^^ { case n ~ t ~ c => CConstDecl(n, t, c) })
+
+  /** `c type` — the sysl types a file's C typedefs turn out to be (`15 §7`):
+   *
+   * ```
+   * c type
+   *     Tick  = "TickType_t"
+   *     Stack = "configSTACK_DEPTH_TYPE"
+   * ```
+   *
+   * The same two words in the same order as `c const`, and for the same reason: `c` marks which
+   * language the right-hand sides are written in and stays an ordinary identifier everywhere else,
+   * which the keyword after it is what makes safe.
+   *
+   * **A line carries no sysl type**, which is the whole difference from a `c const` line — the type
+   * is the answer rather than the question, and writing one would be asserting what the measurement
+   * is for. What a program wanting to *assert* a width writes is `@assert`, against a `c const`
+   * holding the `sizeof`, which says the same thing where it can be checked.
+   */
+  protected lazy val cTypeDecl: PackratParser[Stmt] =
+    softWord("c") ~> op("type") ~> (
+      newline ~> indent ~> skipNewlines ~> rep1sep(cTypeItem, newlines) <~ skipNewlines <~ dedent ^^
+        CTypeBlock.apply |
+        err("'c type' is followed by its types, indented under it, each a name and a C type name in " +
+          "quotes: 'Tick = \"TickType_t\"'")
+    )
+
+  /** One line of a `c type` block: the sysl name, and the C type it stands for. */
+  protected lazy val cTypeItem: Parser[CTypeDecl] =
+    at(ident ~ (op("=") ~> linkName) ^^ { case n ~ c => CTypeDecl(n, c) })
 
   /** `@assert(cond)`, `@assert(cond, "why")` — a condition checked while compiling.
    *

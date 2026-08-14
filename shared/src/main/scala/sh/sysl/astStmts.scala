@@ -120,7 +120,7 @@ case class ConstDecl(name: String, typ: TypeRef, value: Expr, vis: Visibility = 
  * the diagnostic, quoted, which is what makes "any constant expression" a claim this can honour
  * rather than a subset somebody has to maintain.
  *
- * **It is lowered to an ordinary `ConstDecl` before analysis** (`CConstants`), which is why nothing
+ * **It is lowered to an ordinary `ConstDecl` before analysis** (`CProbe`), which is why nothing
  * downstream knows it exists: by the time a name is resolved, a bound is folded or a tree is
  * encoded, the value is a literal and the constant is the one `13 §7` already describes.
  *
@@ -145,6 +145,44 @@ case class CConstDecl(name: String, typ: TypeRef, c: String, vis: Visibility = V
  * would look for what governs the lines under it.
  */
 case class CConstBlock(consts: List[CConstDecl]) extends Stmt
+
+/** One line of a `c type` block: a name for the sysl type a **C typedef** turns out to be, measured
+ * by the C compiler for the target this build is for (`15 §7`).
+ *
+ * It is the type half of `c const` and exists for the same reason. A typedef whose width the target
+ * or a `#define` decides — `TickType_t`, `time_t`, `off_t`, `wchar_t`, `sqlite3_int64` — cannot be
+ * spelled in sysl, so a binding picks one integer type and is right by luck. That is not a size
+ * mismatch anything can see: it is an `extern` declaring a different argument width from the function
+ * it names, which links and then passes garbage in the high half.
+ *
+ * `c const` can already ask for `sizeof(TickType_t)` and has no way to *use* the answer, since
+ * nothing turns a constant into the type of a parameter. This is that step, and it is the one C
+ * itself takes — a typedef is a name for a type, and what the name means is a question only the
+ * headers can settle.
+ *
+ * The C is held as written and never inspected by sysl, exactly as a `c const`'s expression is. What
+ * comes back is a **size and a signedness**, and the type is whichever integer sysl spells that way.
+ *
+ * **It is lowered to a `TypeDecl` before analysis** (`CProbe`), which is why nothing downstream knows
+ * it exists: by the time a name is resolved the type is an ordinary transparent subtype of the
+ * measured integer, interchangeable with it and carrying no check.
+ *
+ * **It is not a `Stmt`**, for `CConstDecl`'s reason: it can be written only inside the block below.
+ */
+case class CTypeDecl(name: String, c: String, vis: Visibility = Visibility.Public) extends Positioned
+
+/** A `c type` block and the typedefs under it.
+ *
+ * One block rather than a declaration per line, for the reason a `c const` block is one: the types of
+ * a file are measured by a **single probe translation unit**, and that probe is the same one the
+ * file's `c const` block uses. A file writing both blocks asks the C compiler one question, not two,
+ * which is what keeps `15 §7`'s "one clang per file that writes a block" true rather than doubling it
+ * quietly.
+ *
+ * A visibility written before the block belongs to every type in it, exactly as a `c const` block's
+ * does.
+ */
+case class CTypeBlock(types: List[CTypeDecl]) extends Stmt
 
 /** `@assert(cond)`, `@assert(cond, "why")` — a condition checked while compiling.
  *
@@ -698,6 +736,12 @@ case class RangeBound(lo: Expr, hi: Expr, exclusiveHi: Boolean) extends Position
  * and at least one must be unless the type is `new` (a bare transparent alias carries no constraint
  * and is not yet a form the language accepts). Inside `pred`, the contextual name `value` binds the
  * value being checked.
+ *
+ * `fromC` marks the one declaration the compiler writes itself: a `c type` measured against the C
+ * compiler lowers to exactly the shape the paragraph above refuses — transparent, no range, no
+ * predicate — because that shape *is* what a C typedef means, a second name for one integer with no
+ * check of its own. The refusal stays for anything a person wrote; what it is protecting is the
+ * decision `16` deferred about aliases in general, and a measured typedef does not reopen it.
  */
 case class TypeDecl(
     name: String,
@@ -706,6 +750,7 @@ case class TypeDecl(
     range: Option[RangeBound],
     pred: Option[Expr],
     vis: Visibility = Visibility.Public,
+    fromC: Boolean = false,
 ) extends Stmt
 
 /** `trait Name` with indented method declarations — a method with a receiver and a parameter list,
