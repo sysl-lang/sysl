@@ -447,19 +447,59 @@ name with a keyword, so a program is free to call a variable `c`.
 the claim honest rather than a subset somebody maintains — an expression C will not settle is refused
 in clang's own words, quoted rather than paraphrased. Four more refusals go with it: a header that is
 not there, a value the declared type cannot hold (naming the value and both ends of the range), a
-type that is not an integer, and a block written inside a body, which has no file's headers to be
+type that is not a number, and a block written inside a body, which has no file's headers to be
 compiled against.
 
-**A `string` from C is not written this way, deliberately.** An integer is a number in the IR and
+**A `string` from C is not written this way, deliberately.** A number is a number in the IR and
 reads straight off; a string constant is a block of storage and a different job, and it would have to
 be written `"\"foo\""` — two quotings for one value, which is a form nobody would guess. The refusal
 says so rather than leaving it to be discovered.
 
-**The declared type may be a transparent subtype of an integer, which is what makes the two blocks a
+**A float macro is measured on exactly the terms an integer one is.** That a float can be spelled by
+name in sysl is no more an answer than that an integer can: what a name buys is a *width*, and the
+whole argument of this section is about the **value**, written down by hand, correct on one machine
+and checked by nobody. It is worse for a float than for an integer, because a physics or graphics
+header states its constants as expressions over other constants — `0.25f * B2_PI` — so transcribing
+one is not copying a number, it is doing the arithmetic by hand and writing down the answer.
+
+```
+@include("box2d/math_functions.h")
+
+c const
+    pi:           f32 = "B2_PI"
+    max_rotation: f32 = "B2_MAX_ROTATION"
+```
+
+**The probe carries the value as a `double` whatever width it was asked for**, and the narrowing to
+`f32` is sysl's. That is the paragraph below about not casting through the C type, read at the other
+carrier: `(float)1e300` is an infinity and has thrown away the number that would say which end was
+wrong, so a refusal could only report that *something* overflowed. What it costs is that a
+`long double` expression is rounded twice where C would round once, which reaches x86-64 alone —
+everywhere else `long double` **is** `double` and there is only ever the one rounding.
+
+**Rounding is allowed and silent; losing the value is not.** Naming `f32` is asking for the nearest
+`f32`, which is what C does for `float x = M_PI;`, and refusing it would leave the width unable to
+read the double-typed macros that are most of them. What is refused is a measurement that is not
+finite — the C overflowed while settling it, or the macro names an infinity or a NaN — and a finite
+value the declared width turns into an infinity or into a zero it was not. Those are not roundings;
+they are the number going missing, which is this feature's own subject.
+
+**The widths are `f32` and `f64`, and `f16` is refused by name.** C writes a constant expression as a
+`float`, a `double` or a `long double`, so those two are the widths a measurement reads back at
+without anybody guessing which one was meant.
+
+**`c type` still refuses a float, and that is not the same question.** A typedef is measured because
+its *width* is the config's to decide; `float` and `double` are IEEE binary32 and binary64 on every
+machine sysl targets, so `f32` and `f64` by name are a complete answer and a measurement would add
+nothing. It is the value that varies, never the width — which is why one block learned floats and the
+other did not.
+
+**The declared type may be a transparent subtype of a number, which is what makes the two blocks a
 pair.** `16 §1` says a transparent subtype *is* its base, so a constant declared at one is a constant
-declared at an integer; holding the line to a primitive *name* was this chapter reaching a case it
-was never about, and it left `c type` unable to describe the thing it exists for — a typedef whose
-width the config decides, and the constants that have to be that width:
+declared at that base — an integer, or a float where the base is one; holding the line to a primitive
+*name* was this chapter reaching a case it was never about, and it left `c type` unable to describe
+the thing it exists for — a typedef whose width the config decides, and the constants that have to be
+that width:
 
 ```
 c type
@@ -470,7 +510,7 @@ c const
 ```
 
 **The name is followed against the file's own declarations** — a `c type` the same probe measures, or
-a `type` whose base reaches an integer — and a name from anywhere else is refused by name. A block is
+a `type` whose base reaches an integer or a float — and a name from anywhere else is refused by name. A block is
 one question put to one file's headers, and a type measured against some other file's is not an
 answer this one can use.
 

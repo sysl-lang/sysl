@@ -99,6 +99,15 @@ object CProbe {
   private val sizeEmitted  = numbered(sizeMarker)
   private val charEmitted  = raw"@$charMarker = .*?(?:global|constant) i64 (-?\d+)".r
 
+  /** The value of one numbered `double` global. LLVM prints such a constant **two ways** and both
+   * were measured rather than assumed: `5.000000e-01` where the short decimal form reads back as the
+   * same double, and `0x400921FB60000000` — the raw binary64 bits — where it does not. Every value
+   * that is not finite takes the second form, so an infinity and a NaN arrive as bit patterns and
+   * are recognised by the reading rather than by a spelling.
+   */
+  private val constFloatEmitted =
+    raw"@$constMarker(\d+) = .*?(?:global|constant) double (\S+)".r
+
   /** Every file's blocks lowered to ordinary declarations, or the first refusal.
    *
    * A compilation with no `c const` and no `c type` anywhere returns its units untouched and never
@@ -189,7 +198,16 @@ object CProbe {
   /** What one probe answered: a value per constant and a measurement per type, in the order the
    * lines were written, plus the one answer the whole probe shares.
    */
-  private case class Answers(values: List[BigInt], types: List[Measured], charSigned: Boolean)
+  private case class Answers(values: List[Value], types: List[Measured], charSigned: Boolean)
+
+  /** One constant as the probe printed it. Which of the two a line gets is decided **before** clang
+   * runs, by the type the line was declared at — the same decision that chose the carrier its global
+   * was written with — so the two never have to be told apart by reading.
+   */
+  private enum Value {
+    case Whole(v: BigInt)
+    case Fraction(v: Double)
+  }
 
   /** One C type as the probe describes it: which integer C says it is, and how wide that is here. */
   private case class Measured(kind: Int, size: Int)
@@ -222,12 +240,19 @@ object CProbe {
             where))
         else
           val values = read(constEmitted, result.stdout)
+          val floats = readFloats(result.stdout)
           val sizes  = read(sizeEmitted, result.stdout)
           val whichs = read(kindEmitted, result.stdout)
 
           for
-            found <- traverse(plan.zipWithIndex) { case ((c, _), i) =>
-              values.get(i).toRight(silent(s"'${c.c}'", c.pos))
+            // Which map a line is looked up in is the carrier its global was written with, decided
+            // before clang ran — so a `double` is never fished for among the integers and the two
+            // shapes of answer are not told apart by reading them.
+            found <- traverse(plan.zipWithIndex) { case ((c, d), i) =>
+              (d match
+                case Declared.Now(_: Kind.Fraction) => floats.get(i).map(Value.Fraction.apply)
+                case _                              => values.get(i).map(Value.Whole.apply)
+              ).toRight(silent(s"'${c.c}'", c.pos))
             }
             measured <- traverse(types.zipWithIndex) { case (t, i) =>
               for
@@ -260,6 +285,27 @@ object CProbe {
   private def read(pattern: scala.util.matching.Regex, ir: String): Map[Int, BigInt] =
     pattern.findAllMatchIn(ir).map(m => m.group(1).toInt -> BigInt(m.group(2))).toMap
 
+  /** Every `double` global the probe printed, in the two forms LLVM writes one in.
+   *
+   * `0x` followed by sixteen hex digits is the binary64 bit pattern itself and is exact by
+   * construction; anything else is a decimal LLVM only prints where it reads back as the same
+   * double, so parsing it is exact as well. A line whose text is neither is dropped rather than
+   * guessed at, and the missing answer is reported as sysl's own bug by the caller — which is the
+   * right side to fail on, since a shape this does not know is a shape nobody has measured.
+   */
+  private def readFloats(ir: String): Map[Int, Double] =
+    constFloatEmitted.findAllMatchIn(ir).flatMap { m =>
+      val text = m.group(2).stripSuffix(",")
+
+      val value =
+        if text.startsWith("0x") && text.length == 18 then
+          scala.util.Try(java.lang.Double.longBitsToDouble(
+            java.lang.Long.parseUnsignedLong(text.drop(2), 16))).toOption
+        else text.toDoubleOption
+
+      value.map(m.group(1).toInt -> _)
+    }.toMap
+
   /** Whether plain `char` is signed here. A probe with no `c type` in it never asks, and nothing
    * reads the answer in that case.
    */
@@ -275,6 +321,16 @@ object CProbe {
    *
    * Signedness follows the **declared sysl type**, so a constant a program asked for as `i32` is
    * printed as the negative number it is instead of arriving as a very large positive one.
+   *
+   * **A constant asked for as a float is carried as `double` whatever width it was asked for**, and
+   * the narrowing to `f32` happens in sysl rather than in the probe. That is the same reasoning as
+   * the paragraph below about not casting through the C type: `(float)1e300` is an infinity and has
+   * lost the number that would have said which end was wrong, so the refusal could only report that
+   * something overflowed. What it costs is that a `long double` expression is rounded twice — once
+   * to `double` here and once to `f32` in `literal` — where C would round once, so the two can
+   * differ in the last place. That reaches x86-64 alone, whose `long double` is 80-bit; on AArch64
+   * and on every freestanding target `long double` *is* `double`, and the second rounding is the
+   * only one there ever was.
    *
    * **A constant declared at a `c type` is carried unsigned**, because the signedness that would
    * have chosen the carrier is one of the answers this same probe is being asked for. Nothing is
@@ -295,13 +351,13 @@ object CProbe {
     val headers = unit.includes.map(i => s"#include ${quoted(i.header)}").mkString("\n")
 
     val constants =
-      plan.zipWithIndex.map {
-        case ((c, Declared.Now(k)), i) =>
-          val ty = if k.signed then "long long" else "unsigned long long"
+      plan.zipWithIndex.map { case ((c, d), i) =>
+        val ty = d match
+          case Declared.Now(Kind.Whole(_, signed, _)) => if signed then "long long" else "unsigned long long"
+          case Declared.Now(_: Kind.Fraction)         => "double"
+          case Declared.Later(_, _, _)                => "unsigned long long"
 
-          s"$ty $constMarker$i = ($ty)(${c.c});"
-        case ((c, Declared.Later(_, _, _)), i) =>
-          s"unsigned long long $constMarker$i = (unsigned long long)(${c.c});"
+        s"$ty $constMarker$i = ($ty)(${c.c});"
       }
 
     val typedefs =
@@ -352,8 +408,19 @@ object CProbe {
   private def quoted(header: String): String =
     if header.startsWith("<") || header.startsWith("\"") then header else "\"" + header + "\""
 
-  /** An integer type, as this pass needs to know it: how wide, and whether signed. */
-  private case class Kind(bits: Int, signed: Boolean, name: String)
+  /** The number a `c const` was asked for, as this pass needs to know it: how wide, and — for an
+   * integer — whether signed. A float has no signedness and needs none: what decides how its value
+   * is read is the width of the carrier its global was written with, which is `double` for both.
+   */
+  private enum Kind {
+    case Whole(bits: Int, signed: Boolean, written: String)
+    case Fraction(bits: Int, written: String)
+
+    /** The type as the line spelled it, which is what a refusal has to quote — `Tick` rather than
+     * the `u32` it turned out to be, since `Tick` is the word the reader wrote.
+     */
+    def written: String
+  }
 
   /** What a `c const`'s written type turns out to be, as far as the file alone can say — which is
    * all of it for a primitive and half of it for a measured one.
@@ -369,13 +436,19 @@ object CProbe {
     case Later(index: Int, c: String, written: String)
   }
 
-  /** The declared type of a `c const`, held to being an integer — or a transparent subtype of one.
+  /** The declared type of a `c const`, held to being a number — or a transparent subtype of one.
    *
    * **The restriction is deliberate and the diagnostic says so rather than leaving it to be found.**
    * A `string` constant is a global array in the IR and a different job entirely, and it would also
    * have to be written `"\"foo\""` — two quotings for one value, which is a form nobody would guess.
-   * A float is the same shape of problem read back through a different printing. Both are worth
-   * having and neither is worth guessing at, so the refusal names them.
+   * It is worth having and not worth guessing at, so the refusal names it.
+   *
+   * **A float is read here too, and the argument for it is the argument for the whole feature.** A
+   * float macro written down by hand is correct on one machine and nothing checks it, and one that
+   * is an *expression* over other macros — `0.25f * B2_PI` — is arithmetic somebody did by hand and
+   * wrote the answer of. That a float can be spelled by name in sysl is no more an answer than that
+   * an integer can. Both carriers go through the one probe and differ only in what the global is
+   * declared as.
    *
    * **A name is followed rather than refused**, because `16 §1` says a transparent subtype *is* its
    * base and this pass was the one place in the language where that was not true — which left the
@@ -398,18 +471,28 @@ object CProbe {
 
     def refuse(message: String) = Left(Diagnostic.render(message, c.pos))
 
-    val notInteger = refuse(
-      s"'${c.typ.show}' is not an integer, and a 'c const' reads an integer — the value is read " +
-        "back out of the C compiler's own output, where an integer is a number and a string is a " +
-        "block of storage. A string or a float from C is not written this way yet")
+    val notNumber = refuse(
+      s"'${c.typ.show}' is not a number, and a 'c const' reads a number — the value is read " +
+        "back out of the C compiler's own output, where a number is a number and a string is a " +
+        "block of storage. A string from C is not written this way")
+
+    // Narrower than the widths a C constant expression is written at, and narrow enough that
+    // rounding onto it is not something the value could survive being read back through.
+    val notMeasurable = refuse(
+      "'f16' is not a width a 'c const' is measured at — C writes a constant expression as a " +
+        "'float', a 'double' or a 'long double', so the two widths that read back without " +
+        "guessing are 'f32' and 'f64'")
 
     def follow(ref: TypeRef, seen: Set[String]): Either[String, Declared] = ref match
       case NamedType(name, Nil) =>
         Type.scalars.get(name).orElse(width(name)) match
-          case Some(Type.Integer(bits, signed, _)) => Right(Declared.Now(Kind(bits, signed, name)))
-          case Some(_)                             => notInteger
+          case Some(Type.Integer(bits, signed, _)) =>
+            Right(Declared.Now(Kind.Whole(bits, signed, name)))
+          case Some(Type.Floating(16))    => notMeasurable
+          case Some(Type.Floating(bits))  => Right(Declared.Now(Kind.Fraction(bits, name)))
+          case Some(_)                    => notNumber
           case None if seen(name) =>
-            refuse(s"'$name' is declared in terms of itself, so which integer it is has no answer")
+            refuse(s"'$name' is declared in terms of itself, so which number it is has no answer")
           case None =>
             types.indexWhere(_.name == name) match
               case measured if measured >= 0 =>
@@ -419,9 +502,9 @@ object CProbe {
                   case Some(t) => follow(t.base, seen + name)
                   case None =>
                     refuse(s"'$name' is not a type this file declares, and a 'c const' is measured " +
-                      "against its own file — so its type is an integer, a 'c type' written beside " +
-                      "it, or a subtype of one declared here")
-      case _ => notInteger
+                      "against its own file — so its type is an integer or a float, a 'c type' " +
+                      "written beside it, or a subtype of one declared here")
+      case _ => notNumber
 
     follow(c.typ, Set.empty)
   }
@@ -438,7 +521,7 @@ object CProbe {
       case Declared.Now(k) => Right(k)
       case Declared.Later(i, cType, written) =>
         integerKind(answers.types(i), answers.charSigned) match
-          case Some((bits, signed)) => Right(Kind(bits, signed, written))
+          case Some((bits, signed)) => Right(Kind.Whole(bits, signed, written))
           case None =>
             Left(Diagnostic.render(
               s"'$written' is what the C compiler calls '$cType', which is not an integer here, and " +
@@ -459,16 +542,21 @@ object CProbe {
       case _                   => None
   }
 
-  /** `i5`, `u32` — the systematic width spellings, which are a family rather than a list.
+  /** `i5`, `u32`, `f64` — the systematic width spellings, which are a family rather than a list.
    * `GenericInstantiation.widthType` is the analyzer's copy and answers more: a bad width is a
-   * diagnostic there. Here a name that is not this shape simply is not an integer, and the refusal
+   * diagnostic there. Here a name that is not this shape simply is not a number, and the refusal
    * above says the useful thing.
+   *
+   * The float widths are a closed set of three where the integers are open, so `f9` is not a type
+   * and falls through to the same place any other undeclared name does.
    */
   private def width(name: String): Option[Type] = {
     val digits = name.drop(1)
 
-    if name.length < 2 || !"iu".contains(name.head) then None
+    if name.length < 2 || !"iuf".contains(name.head) then None
     else if !digits.forall(c => c >= '0' && c <= '9') || digits.head == '0' then None
+    else if name.head == 'f' then
+      digits.toIntOption.collect { case bits @ (16 | 32 | 64) => Type.Floating(bits) }
     else digits.toIntOption.map(Type.Integer(_, signed = name.head == 'i'))
   }
 
@@ -479,20 +567,76 @@ object CProbe {
    * number instead of against a remembered one. The message quotes both the C and the value, because
    * neither alone tells the reader which end was wrong.
    */
-  private def literal(c: CConstDecl, k: Kind, raw: BigInt): Either[String, ConstDecl] = {
+  private def literal(c: CConstDecl, k: Kind, raw: Value): Either[String, ConstDecl] =
+    (k, raw) match
+      case (Kind.Whole(bits, signed, name), Value.Whole(v)) => whole(c, bits, signed, name, v)
+      case (Kind.Fraction(bits, name), Value.Fraction(v))   => fraction(c, bits, name, v)
+      // The declared type chose the carrier the global was written with and the map the answer was
+      // read from, so the two agree by construction and this is sysl's bug if they ever do not.
+      case _ => Left(silent(s"'${c.c}'", c.pos))
+
+  /** The declaration a measured line becomes, which is `13 §7`'s ordinary constant holding an
+   * ordinary literal — the same shape whichever carrier the value crossed on.
+   */
+  private def held(c: CConstDecl, lit: Expr): ConstDecl =
+    ConstDecl(c.name, c.typ, lit.setPos(c.pos), c.vis).setPos(c.pos)
+
+  private def whole(c: CConstDecl, bits: Int, signed: Boolean, name: String, raw: BigInt)
+      : Either[String, ConstDecl] = {
     // The IR prints an i64 as a signed decimal whatever the C type was, so a `u64` past the signed
     // ceiling comes back negative. Only that case is reinterpreted — a genuinely negative value
     // asked for as unsigned is left as it is, and refused by the range check below.
-    val value = if !k.signed && raw < 0 then raw + (BigInt(1) << 64) else raw
+    val value = if !signed && raw < 0 then raw + (BigInt(1) << 64) else raw
 
     val (low, high) =
-      if k.signed then (-(BigInt(1) << (k.bits - 1)), (BigInt(1) << (k.bits - 1)) - 1)
-      else (BigInt(0), (BigInt(1) << k.bits) - 1)
+      if signed then (-(BigInt(1) << (bits - 1)), (BigInt(1) << (bits - 1)) - 1)
+      else (BigInt(0), (BigInt(1) << bits) - 1)
 
     if value < low || value > high then
       Left(Diagnostic.render(
-        s"'${c.c}' is $value here, which '${k.name}' cannot hold — it holds $low to $high", c.pos))
-    else Right(ConstDecl(c.name, c.typ, IntLit(value, None).setPos(c.pos), c.vis).setPos(c.pos))
+        s"'${c.c}' is $value here, which '$name' cannot hold — it holds $low to $high", c.pos))
+    else Right(held(c, IntLit(value, None)))
+  }
+
+  /** One measured float as the constant it becomes, narrowed to the width it was asked for.
+   *
+   * **Rounding is allowed and silent, and that is the deliberate half of this.** `M_PI` asked for as
+   * an `f32` is the nearest `f32` to it, which is exactly what C does for `float x = M_PI;` —
+   * refusing it would leave `f32` unable to read the double-typed macros that are most of them, for
+   * a loss the programmer asked for by naming the width.
+   *
+   * **What is refused is a value the width does not hold at all**, and there are two ways to be
+   * that. A measurement that is not finite means the C itself overflowed or the macro names an
+   * infinity, so there is no number to carry. A finite value that narrows *to* an infinity, or to a
+   * zero it was not, has been thrown away rather than rounded — which is the transcription error
+   * this feature exists to catch, made against the real number instead of a remembered one.
+   */
+  private def fraction(c: CConstDecl, bits: Int, name: String, value: Double)
+      : Either[String, ConstDecl] = {
+    def refuse(message: String) = Left(Diagnostic.render(message, c.pos))
+
+    // Reported the way it will be read back: the shortest decimal that is this exact double, which
+    // is also the text the constant is carried as.
+    val shown = value.toString
+
+    if value.isNaN then
+      refuse(s"'${c.c}' is not a number here, and a 'c const' carries one — a value the C compiler " +
+        "settles as a NaN has no constant to be folded into a program")
+    else if value.isInfinite then
+      refuse(s"'${c.c}' is $shown here, and a 'c const' carries a finite number — either the C " +
+        "expression overflowed while it was being worked out, or it names an infinity outright")
+    else
+      // Only `f32` narrows — a `double` measured at `f64` is already the value it will be — so both
+      // refusals below are about the `f32` range, and quote it.
+      val narrowed = if bits == 64 then value else value.toFloat.toDouble
+
+      if narrowed.isInfinite then
+        refuse(s"'${c.c}' is $shown here, which '$name' cannot hold — the largest it holds is " +
+          s"${Float.MaxValue}")
+      else if narrowed == 0.0 && value != 0.0 then
+        refuse(s"'${c.c}' is $shown here, which '$name' cannot tell from zero — the smallest it " +
+          s"holds that is not zero is ${Float.MinPositiveValue}")
+      else Right(held(c, FloatLit(narrowed.toString, None)))
   }
 
   /** One measured typedef as the declaration it becomes: a transparent subtype of the integer C says
