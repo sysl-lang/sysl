@@ -99,8 +99,10 @@ dependency resolving on the day it shipped, and re-tagging cannot help a consume
 bumped its pin. `heap` is the name to write; the allowance goes once the packages have been swept.
 
 **What gates spawning is not soundness**: what may cross a domain boundary is a structural rule
-(`06`), and one that has no check behind it until the channel is written. `posix` gates the module
-that can start a thread, and a module may narrow it away to declare itself single-threaded. Note that
+(`06`), checked at a `@crossing` parameter — which any facility may write, and no capability decides.
+`posix` gates the module that can start a *pthread*, and a module may narrow it away to declare
+itself single-threaded; a package binding an RTOS is outside that gate entirely and inside the
+crossing rule all the same, which is the division to keep in mind. Note that
 a **fixed-capacity** channel needs neither `heap` nor `posix` to exist — allocator-free code can
 still receive on one, which is the same reason `sysl.sync` requires nothing at all while
 `sysl.posix.threads` requires an operating system.

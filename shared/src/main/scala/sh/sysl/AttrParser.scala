@@ -16,7 +16,7 @@ trait AttrParser extends ExprParser {
    */
   protected lazy val attribute: PackratParser[Attr] =
     testAttr ^^ Attr.Test.apply | tailrecAttr | pureAttr | ghostAttr | readsAttr | writesAttr |
-      packedAttr | alignAttr | exportAttr | sectionAttr | unknownAttr | hashAttr
+      crossingAttr | packedAttr | alignAttr | exportAttr | sectionAttr | unknownAttr | hashAttr
 
   /** `@packed` — fields at their declared offsets with no interior padding, and an aggregate that
    * needs no alignment of its own (`15 §1`). It takes no arguments: there is nothing to configure
@@ -140,10 +140,35 @@ trait AttrParser extends ExprParser {
       "for none. The parentheses are what tell a frame that covers nothing from a function that " +
       "never said")
 
+  /** `@crossing(state)` — the parameters through which a value reaches another concurrency domain
+   * (`06 § Marking a domain boundary`).
+   *
+   * The parentheses are mandatory and, unlike a frame's, may **not** be empty. `@reads()` is a real
+   * claim — the function reads no module storage — while a function that hands nothing to another
+   * domain says so by not writing the annotation, so `@crossing()` would be a line that means what
+   * its absence already means.
+   *
+   * The refusal is raised **inside** the parentheses, per the rule a dead `err` taught: an
+   * alternative that fails at the `(` is outranked by one that got past it, so a sentence written
+   * after the closing parenthesis would never be the one reported.
+   */
+  protected lazy val crossingAttr: PackratParser[Attr] =
+    op("@") ~> attrWord("crossing") ~> (op("(") ~> (crossingNames | crossingErr) <~ op(")") |
+      crossingErr)
+
+  private lazy val crossingNames: Parser[Attr] =
+    rep1sep(ident, op(",")) ^^ Attr.Crossing.apply
+
+  private def crossingErr: Parser[Attr] =
+    err("'@crossing' names the parameters a value reaches another concurrency domain through, in " +
+      "parentheses — '@crossing(state)'. There is no empty form: a function that hands nothing " +
+      "across a boundary says so by not writing the annotation")
+
   private lazy val unknownAttr: PackratParser[Attr] =
     op("@") ~> ident >> (n =>
       err(s"'$n' is not an annotation a declaration takes — '@test', '@tailrec', '@pure', " +
-        "'@ghost', '@export', '@reads(...)' and '@writes(...)' mark a function, '@packed' and " +
+        "'@ghost', '@export', '@reads(...)', '@writes(...)' and '@crossing(...)' mark a function, " +
+        "'@packed' and " +
         "'@align(n)' mark a struct's layout, and '@section(\"...\")' marks either a binding or a " +
         "function. '@no_<capability>', " +
         "'@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header"))
@@ -205,6 +230,7 @@ trait AttrParser extends ExprParser {
       // the binding's alike — a `.ramfunc` is a definition placed somewhere exactly as a vector table
       // is storage placed somewhere.
       case (d, Attr.Section(s)) => d.copy(section = Some(s))
+      case (d, Attr.Crossing(ns)) => d.copy(crossing = ns)
       // A layout attribute never reaches here: the grammar routes a declaration carrying one to a
       // struct, and refuses the mix. Listed so that a new attribute makes this fold fail to compile
       // rather than silently drop what it was asked to record.

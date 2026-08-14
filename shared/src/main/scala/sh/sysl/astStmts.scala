@@ -526,6 +526,15 @@ case class FuncDecl(
     exported: Option[ExportAttr] = None,
     /** `@section("…")` — the linker section this definition is placed in (`15 §13`). */
     section: Option[String] = None,
+    /** `@crossing(…)` — the parameters through which a value reaches another concurrency domain
+      * (`06 § Marking a domain boundary`).
+      *
+      * Carried as the names that were written rather than as positions, for the reason a frame is:
+      * the refusal of a word that names no parameter has to say which word, and a position could
+      * only say which slot. A list rather than a set, so a name written twice is reported at the
+      * second one.
+      */
+    crossing: List[String] = Nil,
 ) extends Stmt
 
 /** What `@export` says about the function it is written above (`15 §12`).
@@ -612,6 +621,15 @@ enum Attr(val word: String) {
     * third time — a spelling belongs to whoever consumes it.
     */
   case Section(name: String) extends Attr("section")
+
+  /** `@crossing(state)` — the parameters a value reaches another concurrency domain through
+    * (`06 § Marking a domain boundary`).
+    *
+    * It names parameters where `@reads` and `@writes` name module storage, and carries a list for
+    * the same reason theirs do: a word that names no parameter is refused by name, and a name
+    * written twice is refused at its second position.
+    */
+  case Crossing(names: List[String]) extends Attr("crossing")
 }
 
 /** `extern name(params) -> ret` — a function this program does not define but may call, resolved

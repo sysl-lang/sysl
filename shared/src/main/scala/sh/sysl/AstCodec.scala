@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 36
+  val Version: Int = 37
 
   private val Magic = "sysl-ast"
 
@@ -366,7 +366,8 @@ object AstCodec {
         case Invariant(c, m)              => tok("inv"); expr(c); opt(m)(sref)
         case Variant(e)                   => tok("vnt"); expr(e)
 
-        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, tvs, tpk, t, cv, tr, pu, gh, rd, wr, ex, sc) =>
+        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, tvs, tpk, t, cv, tr, pu, gh, rd, wr, ex, sc,
+                      cr) =>
           tok("fn"); sref(n); list(tps)(sref); list(ps)(param); opt(rt)(typ); list(b)(stmt)
           bounds(bs); bool(va); vis(vs); tdefaults(tds); tdefaults(tvs); list(tpk.toList)(sref)
           opt(t)(testAttr)
@@ -381,6 +382,10 @@ object AstCodec {
           // And `@section` for the same reason: a definition the library placed somewhere is placed
           // there in the program that reads it back, or the linker script gathers nothing.
           opt(sc)(sref)
+          // `@crossing` travels because the check it asks for is made at the **call**, and the calls
+          // an artifact is read for are in the consumer. A declaration that dropped it would be the
+          // same signature with the rule silently off for everybody but the library's own tests.
+          list(cr)(sref)
 
         case ExternDecl(n, ps, rt, va, lk, vs) =>
           tok("ext"); sref(n); list(ps)(param); opt(rt)(typ); bool(va); opt(lk)(sref); vis(vs)
@@ -772,7 +777,8 @@ object AstCodec {
           FuncDecl(sref(), list(sref()), list(param()), opt(typ()), list(stmt()),
             bounds(), bool(), vis(), tdefaults(), tdefaults(), list(sref()).toSet, opt(testAttr()),
             opt(at(CallConv(sref(), opt(sref())))), bool(), bool(), bool(),
-            opt(list(sref())), opt(list(sref())), opt(at(ExportAttr(opt(sref())))), opt(sref()))
+            opt(list(sref())), opt(list(sref())), opt(at(ExportAttr(opt(sref())))), opt(sref()),
+            list(sref()))
         case "ext" =>
           ExternDecl(sref(), list(param()), opt(typ()), bool(), opt(sref()), vis())
         case "extv" =>
