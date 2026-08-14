@@ -174,24 +174,21 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
       decoded.decls.length shouldBe Library.carried.units.flatMap(_.body).length
     }
 
-    /** **Neither side carries an unmeasured `c const`, and that was true of only one of them too.**
+    /** **A tripwire rather than a demonstration, and it is vacuous today on purpose.**
       *
-      * The artifact path has always lowered — `LibraryArtifact.build` calls `CProbe.lower` on its way
-      * in, and ships the measured number rather than the expression. The **source** path did not, so
-      * the day the library grew its first block (`sysl.posix.regex`) a measured constant stopped
-      * being a constant on that path: `@assert` over one was refused for not being a constant
-      * expression, and the refusal named a library file the program's author did not write. It broke
-      * two thousand tests at once, because every test compiles against the source std.
+      * `library/` holds no `c const` at the moment, so both sides trivially carry no block and this
+      * cannot fail. It is here because the day somebody adds one it stops being vacuous, and what it
+      * catches is expensive to rediscover: the artifact path has always lowered — `LibraryArtifact`
+      * calls `CProbe.lower` on its way in — and the **source** path, which every test in this suite
+      * compiles against, did not. Card `0121` added the library's first block and got two thousand
+      * failures, all of them a measured constant no longer being a constant, and all of them naming a
+      * library file the reader did not write.
       *
-      * Asserted structurally rather than by compiling something that uses one, because what went
-      * wrong is a *shape* — a block still sitting in the tree where a declaration should be — and
-      * because the library is allowed to stop having a block without this test going quiet about it.
+      * Structural rather than behavioural because what goes wrong is a *shape*: a block still sitting
+      * in the tree where a declaration should be. A behavioural test would need the library to hold a
+      * block, which is the thing this cannot assume.
       */
     "and neither carries a 'c const' block that was never measured" in {
-      // Non-vacuous while the library has one, and the first line says so rather than leaving the
-      // rest to pass by having nothing to look at.
-      Std.parsed(Target.default).flatMap(_.body).exists(_.isInstanceOf[CConstBlock]) shouldBe true
-
       Library.carried.units.flatMap(_.body).exists(_.isInstanceOf[CConstBlock]) shouldBe false
       decoded.units.flatMap(_.body).exists(_.isInstanceOf[CConstBlock]) shouldBe false
     }

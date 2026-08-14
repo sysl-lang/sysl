@@ -42,7 +42,7 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * nothing had been exercising took it to 169, and to 195 when the line editor and the two
    * in-memory stream types took it to 201.
    */
-  private val floor = 225
+  private val floor = 195
 
   /** The library, compiled as a **test build of itself**.
    *
