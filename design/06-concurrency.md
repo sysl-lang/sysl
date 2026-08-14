@@ -219,8 +219,9 @@ So there is one walk asked in two places, and a reader is told the same thing ei
 the spelling that would have been sound:
 
 ```
-what 'arg' of 'spawn' points at reaches another concurrency domain, so every count inside it has to
-be atomic — but its 'node' reaches a '&Node', whose count is not. Hold it as a '&sync Node'
+what 'arg' of 'sysl.posix.threads.spawn' points at reaches another concurrency domain, so every
+count inside it has to be atomic — but its 'node' reaches a '&Node', whose count is not. Hold it as
+a '&sync Node' ('06')
 ```
 
 **What it does not reach, said plainly rather than left to be discovered.** A parameter typed `*u8`
