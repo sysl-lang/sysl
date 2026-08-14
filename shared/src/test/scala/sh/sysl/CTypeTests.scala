@@ -142,6 +142,52 @@ class CTypeTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pa
         include(s"${if signed then "" else "u"}int${width * 8}_t take(")
     }
 
+    /** **A value computed in sysl reaches the type through the type's own name**, which is the only
+      * spelling that can be portable: the measured base is `size_t` here and something else on the
+      * next target, so `u64(n)` would be this machine's answer written into the program. `usize` is
+      * a distinct type from whatever C measured, so nothing arrives at the base by itself — and a
+      * length, a `sizeof` and any arithmetic over them are exactly the values a binding has to hand
+      * back to C.
+      *
+      * Filed as `0132` from the FreeRTOS binding, where the kernel's stack depth is a
+      * `configSTACK_DEPTH_TYPE` and what has to go in it is a slice's `len`.
+      */
+    "and a value computed in sysl converts into it under its own name" in {
+      run("""@include("<stddef.h>")
+            |
+            |c type
+            |    Size = "size_t"
+            |
+            |take(n: Size) -> Size = n
+            |
+            |var xs: [3]u32 = [0, 0, 0]
+            |
+            |print(str(take(Size(xs.len)) + Size(sizeof(u32))))
+            |""".stripMargin) shouldBe "7\n"
+    }
+
+    /** The conversion is *written*, and this is what says so. A width that differs by target is the
+      * whole reason the type exists, so a `usize` sliding into one unannounced would be a narrowing
+      * that is silent here and lossy under a 16-bit typedef — the mistake `c type` was built to
+      * catch.
+      */
+    "while an unwritten one is still refused" in {
+      val e = err("""@include("<stddef.h>")
+                             |
+                             |c type
+                             |    Size = "size_t"
+                             |
+                             |take(n: Size) -> Size = n
+                             |
+                             |var n: usize = 3
+                             |
+                             |print(str(take(n)))
+                             |""".stripMargin)
+
+      e should include("Size")
+      e should include("usize")
+    }
+
     /** `_Bool` is the one answer that is not an integer and is still resolved, because sysl's `bool`
       * is what C means by it — `CAbi` already crosses one as a single unsigned byte.
       */

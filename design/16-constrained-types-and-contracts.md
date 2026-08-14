@@ -97,6 +97,21 @@ refuse a `Meters` where an `f64` is written, and `f64(m)` is what to write. That
 rather than an exception to it: a derivation is a distinct type, and reading it as something else is
 a conversion whichever way it goes.
 
+**A transparent subtype's name converts exactly what its base's name converts**, which is the same
+sentence read in call position: `Age(n)` on a `usize` is the `int(n)` a reader would otherwise write,
+narrowing by the ordinary rules, and the range is then checked on the value that arrives. A pair with
+no meaning is still refused, naming the type that was written rather than the base that was not —
+`Age(s)` on a string is *"cannot make Age from string"*. **A derived type's name does not**: `new` is
+what makes it distinct, so `Meters(x)` wraps a value already at the base and `Meters(n)` on an `int`
+is refused.
+
+It matters for a reason outside this chapter. A `c type` (`15 §7`) is a transparent subtype of a
+width **the program is not supposed to know** — that is what it is for — so `u32(n)` is this
+machine's answer written into the source, and the type's own name is the only portable spelling
+there is. Without this rule nothing computed in sysl could reach such a type at all: a length, a
+`sizeof`, and any arithmetic over them are `usize`, which is a distinct type from whatever C
+measured, and a binding handing a size back to C is the ordinary case rather than an exotic one.
+
 **A `const` is declared at either kind of scalar and at a transparent subtype of one, and never at a
 derived type.** That is this section applied rather than a rule of its own: a constant is the literal
 it was written as, so a declaration at a transparent subtype is a literal at its base, and one at a
