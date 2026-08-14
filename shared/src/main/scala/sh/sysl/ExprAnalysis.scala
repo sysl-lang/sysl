@@ -216,9 +216,19 @@ trait ExprAnalysis
    */
   private def castConstrained(c: Type.Constrained, written: String, args: List[Expr]): TExpr = {
     if args.length != 1 then err(s"a '$written' conversion takes exactly one value")
+
     val v = analyzeExpr(args.head, Some(c.base))
-    if disagree(v.ty, c.base) then err(s"cannot make ${show(c)} from ${show(v.ty)}")
-    checkInto(v, c)
+
+    // A **transparent** subtype is its base (`16 §2`), so its name converts exactly as the base's
+    // name does: `Age(n)` on an `int` base is the `int(n)` a reader would otherwise write, and the
+    // range is then checked on the way in. Without this the only way into one is to arrive already
+    // at the base, which is unwriteable for the case the feature exists for — a `c type` measures
+    // a width nobody can name, so `Tick(xs.len)` has no longhand a program could portably fall back
+    // on. A **derived** type keeps the stricter rule: `new` is what makes it a distinct type, and a
+    // conversion into one is a wrap of a value already at the base rather than a scalar conversion.
+    if !disagree(v.ty, c.base) then checkInto(v, c)
+    else if c.derived then err(s"cannot make ${show(c)} from ${show(v.ty)}")
+    else checkInto(convert(v, Type.underlying(c.base), Some(show(c))), c)
   }
 
 
