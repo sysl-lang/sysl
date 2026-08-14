@@ -116,42 +116,52 @@ trait Literals extends TypeResolution {
 
   /** An explicit scalar conversion. Every pair that has a meaning is listed; nothing widens,
    * narrows, or changes representation without being written.
+   *
+   * `asked` is what the reader actually wrote, where that is not the target's own name: a conversion
+   * into a transparent subtype is this conversion into its base, and a refusal naming the base would
+   * be answering about a type the line does not mention.
    */
-  protected def convert(t: TExpr, to: Type): TExpr = if to == Type.Str then encode(t) else {
-    // A written conversion is licensed to reach a constrained value's base representation, so the
-    // source kind is read through `underlying`: `f64(m)` unwraps a derived `Meters`, `int(age)` an
-    // `Age`. The target of a scalar conversion is always a plain scalar, so only the source strips.
-    val allowed = (Type.underlying(t.ty), to) match
-      case (_: Type.Integer, _: Type.Integer)   => true
-      case (_: Type.Integer, _: Type.Floating)  => true
-      case (_: Type.Floating, _: Type.Integer)  => true
-      case (_: Type.Floating, _: Type.Floating) => true
-      case (Type.Char, _: Type.Integer)         => true // total: every char is an integer
-      case (_: Type.Integer, Type.Char)         => true // partial: traps on a non-scalar value
-      case (Type.Char, Type.Char)               => true
-      // Enum → integer is total: every enum value is one of its declared discriminants. Only a
-      // simple enum has an integer value to give; a data enum is a tagged union, not a number.
-      case (e: Type.Enum, _: Type.Integer) =>
-        if !e.simple then err(s"only a simple enum converts to an integer — ${show(e)} carries data")
-        true
-      // A pointer → integer is total: an address *is* a number of `usize`'s width, so reading one as
-      // that number loses nothing and yields a value nothing can dereference. It goes only this way;
-      // making a pointer out of an integer is `ptr_cast` in the raw tier (`03 § Reinterpreting
-      // storage`). A pointer to a trait is two words rather than an address, so it has no number.
-      case (Type.Ptr(_: Type.Trait), _: Type.Integer) =>
-        err("a pointer to a trait is two words — the address and the table of the type it was " +
-          "erased from — so it is not a number")
-      case (_: Type.Ptr, i: Type.Integer) =>
-        if !i.pointerWidth then
-          err(s"an address is read as 'usize' or 'isize' rather than as ${show(i)} — a fixed width " +
-            "is not an address's width on every target")
-        true
-      case _                                    => false
+  protected def convert(t: TExpr, to: Type, asked: Option[String] = None): TExpr =
+    if to == Type.Str then encode(t)
+    else {
+      // A written conversion is licensed to reach a constrained value's base representation, so the
+      // source kind is read through `underlying`: `f64(m)` unwraps a derived `Meters`, `int(age)` an
+      // `Age`. The target of a scalar conversion is always a plain scalar, so only the source strips.
+      val allowed = (Type.underlying(t.ty), to) match
+        case (_: Type.Integer, _: Type.Integer)   => true
+        case (_: Type.Integer, _: Type.Floating)  => true
+        case (_: Type.Floating, _: Type.Integer)  => true
+        case (_: Type.Floating, _: Type.Floating) => true
+        case (Type.Char, _: Type.Integer)         => true // total: every char is an integer
+        case (_: Type.Integer, Type.Char)         => true // partial: traps on a non-scalar value
+        case (Type.Char, Type.Char)               => true
+        // Enum → integer is total: every enum value is one of its declared discriminants. Only a
+        // simple enum has an integer value to give; a data enum is a tagged union, not a number.
+        case (e: Type.Enum, _: Type.Integer) =>
+          if !e.simple then
+            err(s"only a simple enum converts to an integer — ${show(e)} carries data")
+          true
+        // A pointer → integer is total: an address *is* a number of `usize`'s width, so reading one
+        // as that number loses nothing and yields a value nothing can dereference. It goes only this
+        // way; making a pointer out of an integer is `ptr_cast` in the raw tier (`03 § Reinterpreting
+        // storage`). A pointer to a trait is two words rather than an address, so it has no number.
+        case (Type.Ptr(_: Type.Trait), _: Type.Integer) =>
+          err("a pointer to a trait is two words — the address and the table of the type it was " +
+            "erased from — so it is not a number")
+        case (_: Type.Ptr, i: Type.Integer) =>
+          if !i.pointerWidth then
+            err(s"an address is read as 'usize' or 'isize' rather than as ${show(i)} — a fixed " +
+              "width is not an address's width on every target")
+          true
+        case _ => false
 
-    if !allowed then err(s"cannot convert ${show(t.ty)} to ${show(to)}")
+      if !allowed then
+        err(asked match
+          case Some(name) => s"cannot make $name from ${show(t.ty)}"
+          case None       => s"cannot convert ${show(t.ty)} to ${show(to)}")
 
-    TCast(t, to)
-  }
+      TCast(t, to)
+    }
 
   /** `string(c)` — one scalar value encoded as the bytes that spell it (`04`).
    *
