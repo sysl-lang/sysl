@@ -463,4 +463,95 @@ class DeadCodeTests extends AnyFreeSpec with CodegenSupport with RunSupport {
             |""".stripMargin) shouldBe "9\n"
     }
   }
+
+  /** The four unconditional roots of `15 §12` — an export, an interrupt handler, a `@section`
+   * definition and a destructor — asked of the **library**, which is handed to every compilation
+   * there is and was the last of the handed roots to be qualified by where it came from.
+   *
+   * A stand-in library is what makes these askable at all: the real `library/` carries none of the
+   * four, which is the only reason nobody has paid for this. `sysl.res` below stands for a submodule
+   * a program has to name — `sysl.fs` is the one that will actually want a destructor, closing the
+   * handle its shared state holds.
+   */
+  /** A stand-in library in two modules, the submodule holding a type with a destructor, an export,
+   * and a function only the destructor reaches.
+   *
+   * `release` is there to be dragged: a root keeps whatever its body reaches, so the cost of an
+   * unconditional one is its transitive closure and not the handful of instructions it is itself.
+   */
+  private val res =
+    Seq(
+      ("sysl", "std.sysl",
+       """module sysl
+         |trait Drop
+         |    drop(self)
+         |mark(n: int) -> int = n + 1
+         |""".stripMargin),
+      ("sysl.res", "res.sysl",
+       """module sysl.res
+         |struct Handle
+         |    id: int
+         |end Handle
+         |
+         |open(n: int) -> &Handle = Handle(n)
+         |
+         |@export("res_tick")
+         |tick(n: int) -> int = n
+         |
+         |impl Drop for Handle
+         |    drop(self)
+         |        release(self.id)
+         |
+         |release(n: int) -> int = n
+         |""".stripMargin),
+    )
+
+  "a root the library supplies" - {
+
+    // The card this was written for: a destructor is a root because the release hook that calls it is
+    // not a tree the walk can see, and the library is linked by everything — so the first `impl Drop`
+    // in `library/` was emitted into a program whose whole body is `mark(1)`. Measured on 0.0.53 with
+    // an `impl Drop` on `sysl.fs`'s shared state: on a freestanding target the program gained a
+    // `declare` for `fclose`, out of a module whose own header requires `os`.
+    "is not emitted into a program that never reaches its module" in {
+      val out = irAgainstTree(res*)("main.sysl" -> "mark(1)\n")
+
+      out should not include "Handle.drop"
+      out should not include "sysl.res$release"
+      out should not include "res_tick"
+    }
+
+    // The other half, and the one that makes the first honest: qualifying a destructor is the kind
+    // that could under-prune, and under-pruning one is a link error against a name no line of the
+    // program contains.
+    "and is emitted into one that does" in {
+      val out = irAgainstTree(res*)("main.sysl" -> "sysl.res.open(1)\n")
+
+      out should include("Handle.drop")
+      out should include("sysl.res$release")
+    }
+
+    // The rule is about where a declaration came from rather than about which attribute it carries,
+    // so the export moves with the destructor. Asked separately because a rule told per kind would
+    // have to be told about pairs as well.
+    "which holds for an export as much as for a destructor" in {
+      irAgainstTree(res*)("main.sysl" -> "sysl.res.tick(1)\n") should include("res_tick")
+    }
+
+    // The under-prune direction, and the one whose failure is a *link* error rather than a test: the
+    // program names `sysl.hand` and never `sysl.res`, so only the transitive closure of the module
+    // graph puts the destructor's module in reach. What guarantees there is such an edge is
+    // `02 § Coherence` — an `impl Drop for T` sits in `Drop`'s module or in one declaring a type
+    // named in `T`, so whatever hands the value out had to name that module to spell its own return
+    // type. Pinned for the library because it is the tree every program links.
+    "through a module that reaches it, where the program names neither" in {
+      val out = irAgainstTree(res :+ ("sysl.hand", "hand.sysl",
+        """module sysl.hand
+          |lend(n: int) -> &sysl.res.Handle = sysl.res.open(n)
+          |""".stripMargin)*)("main.sysl" -> "sysl.hand.lend(1)\n")
+
+      out should include("Handle.drop")
+      out should include("sysl.res$release")
+    }
+  }
 }

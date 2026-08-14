@@ -76,9 +76,10 @@ object Analyzer {
    * compiler, and a C compiler that has not been told where the headers are cannot evaluate one
    * (`SearchPaths`). It reaches nothing else in the analyzer.
    */
-  /** `own` names the modules this compilation is **producing**, where a library was handed to it as
-   * more modules — a `--lib` source root or a fetched package (`Compiler.compiledWith`). `None` says
-   * there was no such library, and then every module is the program's own.
+  /** `own` names the modules this compilation is **producing**, as against the ones handed to it —
+   * a `--lib` source root, a fetched package, and the standard library, which is handed by every
+   * compilation there is (`Compiler.ownModules`). `None` says a caller had nothing to name, and then
+   * every module is the program's own.
    *
    * It is here for the reason `building` is: `units` is one flat list and nothing in a tree says
    * which road it arrived by, so a rule that has to tell a program's own file from a library's has to

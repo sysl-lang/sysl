@@ -94,10 +94,12 @@ object Reachability {
    * names one, so pruning it would leave the hook calling a symbol nothing defined, and the failure
    * would be at the link, against a name no line of the program contains.
    *
-   * **A root supplied by a DEPENDENCY counts only where the program reaches its module**, and that
+   * **A root the program did not WRITE counts only where the program reaches its module**, and that
    * is the one qualification on any of the four — the same qualification on each of them, since a
    * rule told per kind turns into a rule about which attributes a function carries *together*.
-   * `contributing` is the whole of it.
+   * `contributing` is the whole of it, and **the standard library is inside it**: it is handed to a
+   * compilation exactly as a `--lib` root is, so the first `impl Drop` in `library/` would otherwise
+   * have been emitted into every program that links it.
    */
   def entryPoints(program: TProgram, own: Option[Set[String]] = None): List[TFunc] = {
     val contributes = contributing(program, own)
@@ -125,13 +127,20 @@ object Reachability {
 
   /** Whether the module a function is in contributes roots to this compilation at all.
    *
-   * **A dependency's source root is compiled whole rather than by what the program imports**, so
-   * every module of every `--lib` root and every fetched package is in this tree whether or not
-   * anything reaches it. For an ordinary declaration that costs nothing — `prune` drops what no body
-   * names — but every kind above is precisely a declaration no body names, so an unconditional root
-   * put an unimported module's contribution into the consumer's output. What that cost was a
-   * **package carrying its own program**: a test application's `@export("main")` reached every
-   * consumer, and the two `main`s fought at the link.
+   * **A handed source root is compiled whole rather than by what the program imports**, so every
+   * module of every `--lib` root, every fetched package **and the standard library** is in this tree
+   * whether or not anything reaches it. For an ordinary declaration that costs nothing — `prune`
+   * drops what no body names — but every kind above is precisely a declaration no body names, so an
+   * unconditional root put an unimported module's contribution into the consumer's output. What that
+   * cost was a **package carrying its own program**: a test application's `@export("main")` reached
+   * every consumer, and the two `main`s fought at the link.
+   *
+   * **The library is one of the handed roots and was the last to be told so.** It travels as its own
+   * `Stdlib` rather than in the units, so a caller working `own` out from the presence of *other*
+   * libraries left it unqualified — and a library module nothing reaches then put its contribution
+   * into every program in existence. Measured with an `impl Drop` on `sysl.fs`'s shared state and a
+   * program whose whole body is `print(1)`: the destructor is emitted, and on a freestanding target
+   * it brings a `declare` for `fclose` with it, out of a module whose own header requires `os`.
    *
    * **The rule is about provenance and it is one rule for all four kinds**, which is what makes it
    * hold. Told per kind it would have to be told about *pairs* as well, since a root left
@@ -143,9 +152,16 @@ object Reachability {
    * pruning the other three costs a symbol nobody asked for; over-pruning a destructor is a *link*
    * error, since the release hook the emitter builds calls a name no line of the program contains.
    * What makes it safe is `02 § Coherence`: an `impl Drop for T` may live only in the module
-   * declaring `Drop` — the library's, so not a package's to add to — or in one declaring a type named
-   * in `T`. So the hook's module is always one that instantiating `T` had to name, and a reachable
-   * instantiation always carries an edge to it.
+   * declaring `Drop` — the library's — or in one declaring a type named in `T`. So the hook's module
+   * is always one that instantiating `T` had to name, and a reachable instantiation always carries an
+   * edge to it.
+   *
+   * **That argument was written for a package and holds word for word for the library**, with one
+   * residue worth stating rather than legislating against: the library *may* add to `Drop`'s own
+   * module, since it is the module the trait is declared in. An `impl Drop for File` written in
+   * `sysl` rather than beside `File` in `sysl.fs` is therefore unconditional again — every program
+   * reaches `sysl`. That is the author's choice, the natural spelling is beside the type, and a rule
+   * about where in the library an impl may sit would be a worse rule than coherence's.
    *
    * **What the qualification costs is that a consumer wanting a package's handler or placed
    * definition has to name its module**, and `import` is how — that is a reference like any other,
@@ -162,10 +178,13 @@ object Reachability {
    * **The transitive closure and not the direct edges**, because a package reached through another
    * package is reached: `own` is where the walk starts, and it follows the graph out.
    *
-   * `own` is `None` where the compilation has no dependencies at all, which is most of them, and the
-   * answer is then that every module is the program's own. **A supplied file with no module header is
-   * in the root module and is therefore treated as the program's own**, since the root module is the
-   * one name two trees can share — the answer that keeps a symbol is the safe one to be wrong with.
+   * `own` is `None` where a caller has nothing to say, and the answer is then that every module is
+   * the program's own. **No compilation a driver makes takes that any more** — the standard library
+   * is always handed, so `Compiler.ownModules` always answers — and it is left meaningful for the
+   * in-tree callers that legitimately have no program to name. **A supplied file with no module
+   * header is in the root module and is therefore treated as the program's own**, since the root
+   * module is the one name two trees can share — the answer that keeps a symbol is the safe one to
+   * be wrong with.
    */
   private def contributing(program: TProgram, own: Option[Set[String]]): String => Boolean = {
     val reached = reachedModules(program, own)
