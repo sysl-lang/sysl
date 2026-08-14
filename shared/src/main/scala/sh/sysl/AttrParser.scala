@@ -18,6 +18,42 @@ trait AttrParser extends ExprParser {
     testAttr ^^ Attr.Test.apply | tailrecAttr | pureAttr | ghostAttr | readsAttr | writesAttr |
       crossingAttr | packedAttr | alignAttr | exportAttr | sectionAttr | unknownAttr | hashAttr
 
+  /** An `@` where a member was wanted, which the four member blocks — a struct's body, an enum's, a
+   * trait's and an `impl`'s — each open their lines with.
+   *
+   * `attribute` is read at **statement** position and nowhere else, so no member block ever tries it
+   * and an annotation written above a method reaches whichever rule was going to complain about the
+   * line: `dedent expected` where a member had already been read, `identifier expected` where none
+   * had. Both are about indentation and about names, which is the one thing that is not wrong, and
+   * the reader is left with nothing to act on — while the reader most likely to write it is the one
+   * arriving from a language where `#[test]` on a method is ordinary.
+   *
+   * That no annotation marks a member is `06 § What it does not reach`, so this is a sentence rather
+   * than a form the grammar could still have read. `@assert` is told apart and answered separately:
+   * it stands *where* a declaration stands rather than saying anything about one, so the sentence
+   * about what annotations mark is exactly the wrong thing to say about it — the same distinction
+   * `assertDecl` is ordered before `attributedDecl` for.
+   *
+   * **The two are told apart inside one lookahead rather than by two alternatives**, and that is the
+   * whole reason the word is read through `opt(ident)` instead of `attrWord`. Two alternatives fail
+   * at two positions: `guard(op("@") ~ attrWord("assert"))` gets past the `@` before it declines, and
+   * a `Failure` one token further along **outranks** an `Error` raised back at the `@` — so the
+   * sentence a reader was meant to get lost to `'assert' expected` every time. Written this way the
+   * lookahead cannot fail past the `@`, and the one refusal it then raises points at the `@` itself.
+   */
+  protected lazy val noMemberAttr: Parser[Unit] =
+    guard(op("@") ~> opt(ident)) >> {
+      case Some("assert") =>
+        err("'@assert' stands where a declaration stands, and a type's body holds its members — " +
+          "write it beside the type rather than inside it, where 'sizeof' and 'offsetof' still name " +
+          "what it is about")
+      case _ =>
+        err("an annotation marks a function, and a member is not one — no annotation in this " +
+          "language marks a method, a property, a field or a variant, so it goes above a free " +
+          "function instead: what 'sysl test' calls is a function calling the member, and a " +
+          "'@crossing' is written on the wrapper a caller already goes through ('06')")
+    } | success(())
+
   /** `@packed` — fields at their declared offsets with no interior padding, and an aggregate that
    * needs no alignment of its own (`15 §1`). It takes no arguments: there is nothing to configure
    * about the absence of a gap.
