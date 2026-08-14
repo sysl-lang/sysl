@@ -36,11 +36,20 @@ The three parts are orthogonal and each may be left out, with one exception:
 
 The last row is the exception. A transparent alias with no constraint declares nothing: it neither
 narrows the values nor makes a new type, so writing it can only be a mistake or an attempt at a
-`typedef`, and sysl does not have one. The diagnostic says so at the declaration.
+`typedef` of one's own. The diagnostic says so at the declaration.
+
+**There is one declaration of exactly that shape, and the compiler writes it**: a `c type`
+(`15 §7`) measures what a C typedef is on this target and lowers to a transparent subtype of the
+integer it turned out to be. That is a typedef with the one thing a hand-written alias has not got —
+an answer from the C compiler about a name sysl did not invent — so it is admitted where a written
+one is refused. What this row defers is whether a *person* may write a bare alias, and a measurement
+does not settle it either way.
 
 **The base is a scalar** — an integer, a float, or a `char`. A struct, an enum or an array base is
 rejected at the declaration: a constraint here is a check on a *value*, and the two mechanisms for
-narrowing an aggregate are the struct invariant of §6 and, for an enum, having fewer variants.
+narrowing an aggregate are the struct invariant of §6 and, for an enum, having fewer variants. A
+measured `c type` may also be based on `bool`, since C's `_Bool` is what sysl's `bool` is; nothing is
+given up by it, because there is no range or predicate a `bool` could carry anyway.
 
 **`..` is inclusive and `..<` excludes the upper bound**, matching the range expressions in `00`.
 The bounds are literals — an integer, a float, or a character, optionally signed. A bound outside the

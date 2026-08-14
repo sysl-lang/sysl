@@ -116,6 +116,32 @@ class CTypeTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pa
             |""".stripMargin) shouldBe "true\n"
     }
 
+    /** The measured type reaches C in the other direction too. An `@export`ed function taking one is
+      * an ordinary export — `ExportCheck.crosses` reads a constrained subtype as its base — and the
+      * header spells the integer rather than the C name it came from, which is right: the typedef
+      * was measured for *this* target, and re-spelling it would hand the consumer a name whose width
+      * their own headers decide again.
+      */
+    "and an exported function spells it in its header as the integer it is" in {
+      val (width, signed, _) = measured("size_t", Some("<stddef.h>"))
+      val src =
+        """module demo
+          |@include("<stddef.h>")
+          |
+          |c type
+          |    Size = "size_t"
+          |
+          |@export
+          |take(n: Size) -> Size = n
+          |""".stripMargin
+      val exports = Compiler.compiled(List(Source("<input>", src))) match
+        case Right(c) => c.exports
+        case Left(e)  => fail(s"the export did not compile: $e")
+
+      CHeader.render(exports, "demo") should
+        include(s"${if signed then "" else "u"}int${width * 8}_t take(")
+    }
+
     /** `_Bool` is the one answer that is not an integer and is still resolved, because sysl's `bool`
       * is what C means by it — `CAbi` already crosses one as a single unsigned byte.
       */

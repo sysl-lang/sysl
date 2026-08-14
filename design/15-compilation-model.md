@@ -466,6 +466,68 @@ different question under the same name.
 **A file that writes no block costs nothing**, and never causes a C compiler to be looked for. Every
 file in this repository is that case.
 
+### `c type` answers for a width, which a value cannot
+
+**A `c const` can measure `sizeof(TickType_t)` and has no way to use the answer.** Nothing turns a
+constant into the type of a parameter, so a typedef whose width the target or a `#define` decides
+could be measured and not *spelled*, and a binding had to pick one integer type and be right by luck.
+
+That is the sharpest version of the transcription problem, because the mistake is invisible.
+`TickType_t` is eight bytes for the POSIX port, four on a Cortex-M and two under
+`configUSE_16_BIT_TICKS`, and every one of them appears in a signature. An `extern` declaring the
+wrong one is not a size mismatch anything can see — it links, and then passes garbage in the high
+half.
+
+**A `c type` block is the type the C compiler says a name is**, for the target being built for:
+
+```
+@include("FreeRTOS.h")
+
+c type
+    Tick  = "TickType_t"
+    Stack = "configSTACK_DEPTH_TYPE"
+
+extern "vTaskDelay" c_task_delay(ticks: Tick)
+```
+
+Everything said above about a `c const` block holds here unchanged: the same contextual `c`, the same
+quoting, the same `@include` headers, the same module-directory search, the same lowering before
+anything else looks at the tree, and the same rule that an artifact ships the answer rather than the
+expression. **A file writing both blocks is one probe and not two** — they are one question put to the
+C compiler, which is what a block is for.
+
+**A line carries no sysl type**, which is the whole difference from a `c const` line: the type is the
+answer rather than the question, and writing one would be asserting what the measurement is for. A
+program that wants to *state* a width writes `@assert` over a `c const` holding the `sizeof`, which
+says the same thing where it can be checked.
+
+**What comes back is a width and a signedness**, measured by `_Generic` over an object of the type and
+by `sizeof`. Three consequences, each measured against clang rather than assumed:
+
+- **an enum is measurable**, because it matches its compatible integer type rather than the default
+  case — so an enum typedef carries the signedness the C compiler chose for it;
+- **a qualifier needs no special case**, since `const unsigned short` loses its `const` through the
+  lvalue conversion;
+- **plain `char` is asked about, never assumed.** C leaves its signedness to the implementation, and
+  it is signed on an Apple arm64 machine and unsigned on many others.
+
+**A `_Bool` resolves to `bool`**, which is the one answer that is not an integer and is still given: C
+means by `_Bool` what sysl means by `bool`, and the two already cross as one unsigned byte.
+
+**A type C does not describe as an integer is refused by name.** A float, a pointer, a struct and an
+array each already have an answer here — a float by name, an address as `*T`, a struct as an
+`opaque struct` (§9) — and every one of them is better than a same-width integer standing in for it
+and losing what it was.
+
+**What it lowers to is a transparent subtype of the measured integer** (`16`), carrying neither a
+range nor a predicate: a second name for one integer, interchangeable with it, checking nothing. That
+is what a typedef means, and it is the one declaration the compiler writes in a shape `16` refuses
+from a person — the question deferred there is whether *anybody* may write a bare alias, and a
+measurement does not reopen it.
+
+**It does not import the typedef.** A `c type` names one and gets an integer back; no name from the
+header becomes visible in sysl, which is §9's arrangement and is deliberately untouched.
+
 **An object is named after the path it was found at**, directories included — `demo/util.c` becomes
 `demo.util.o`. A basename alone would not do: `ar r` replaces by name, so two modules each holding a
 `util.c` would have the second evict the first, and the library would ship missing whatever only the
