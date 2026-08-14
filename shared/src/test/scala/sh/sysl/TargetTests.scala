@@ -98,7 +98,7 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
     // A *different* question from the one above, and the list is deliberately not the same list:
     // `softFloat` is where a `double` travels on the way into a call, and this is whether there is a
     // unit at all. `thumb-freestanding-softfp` is the row that separates them — soft-float convention
-    // over an `fpv5-d16` that is there and used for arithmetic.
+    // over an `fpv5-sp-d16` that is there and used for arithmetic.
     "records which targets have no floating-point unit at all, which is not the same question" in {
       Target.all.filter(_.noFpu).map(_.name) shouldBe
         List("riscv64-freestanding", "thumb-freestanding-soft", "thumbv6m-freestanding",
@@ -111,15 +111,38 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
     // The flag is Arm's because Arm is where the triple is silent. RISC-V says it in the triple --
     // `riscv32-unknown-elf` is RV32IMAC and has no F extension to turn off -- so a row that is
     // `noFpu` there is told to clang by its name alone and gets nothing extra.
-    "says -mfpu=none to clang for a Thumb machine with no unit, and for nothing else" in {
+    "says -mfpu to clang for a Thumb machine either way, and for nothing else" in {
       for t <- Target.all do
         withClue(t.name) {
           Toolchain.machineFlags(t) shouldBe
-            (if t.noFpu && t.cpu == Cpu.Thumb then List("-mfpu=none") else Nil)
+            (if t.cpu != Cpu.Thumb then Nil
+             else if t.noFpu then List("-mfpu=none")
+             else t.fpu.map(unit => s"-mfpu=$unit").toList)
         }
 
       Toolchain.machineFlags(Target.riscv32Freestanding) shouldBe empty
-      Toolchain.machineFlags(Target.thumbFreestandingSoftfp) shouldBe empty
+      Toolchain.machineFlags(Target.thumbFreestandingSoftfp) shouldBe List("-mfpu=fpv5-sp-d16")
+    }
+
+    // The two fields are one sentence with two halves, and a row saying both would be saying that the
+    // unit is absent and is an `fpv5-sp-d16`. Nothing in the type stops it -- `machineFlags` would
+    // quietly prefer `-mfpu=none` and the row's own name for its unit would never reach a command
+    // line -- so the registry is asked instead, which is the only place the pair can be checked.
+    "never lets a row claim a unit and no unit at once" in {
+      Target.all.filter(t => t.noFpu && t.fpu.isDefined).map(_.name) shouldBe empty
+    }
+
+    // A Thumb row that has a unit names it, rather than leaving the answer to whichever clang is
+    // installed: the same triple defines `__ARM_FP 0xe` under Apple clang 21 and nothing at all under
+    // apt.llvm.org's clang 20, which is what made `FpuPresenceTests` pass on the development machine
+    // and fail on the Linux CI. `fpv5-sp-d16` is also the Cortex-M33's real unit, where clang's own
+    // default for `thumbv8m.main` claims a double-precision one the part has not got.
+    "names the unit on every Thumb row that has one, since the default is the toolchain's" in {
+      Target.all.filter(t => t.cpu == Cpu.Thumb && !t.noFpu).map(t => (t.name, t.fpu)) shouldBe
+        List(
+          ("thumb-freestanding", Some("fpv5-sp-d16")),
+          ("thumb-freestanding-softfp", Some("fpv5-sp-d16")),
+          ("thumbv7em-freestanding", Some("fpv4-sp-d16")))
     }
 
     // The `softfp` row and the `soft` row are one triple and two machines, which is the shape this
@@ -137,7 +160,7 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
       soft.noFpu shouldBe true
 
       Toolchain.machineFlags(soft) should contain("-mfpu=none")
-      Toolchain.machineFlags(softfp) shouldBe empty
+      Toolchain.machineFlags(softfp) should contain("-mfpu=fpv5-sp-d16")
 
       (soft.cpu, soft.os, soft.vaList, soft.vaListBytes, soft.softFloat, soft.shortEnums) shouldBe
         (softfp.cpu, softfp.os, softfp.vaList, softfp.vaListBytes, softfp.softFloat,

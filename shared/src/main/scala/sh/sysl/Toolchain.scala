@@ -419,12 +419,22 @@ object Toolchain {
    * code for it or reads a header as it.
    *
    * There is one such thing today and it is the floating-point unit. A triple names an architecture
-   * and a calling convention, and on Arm those two leave the *presence* of the unit unstated:
-   * `thumbv7em-none-eabi` and `thumbv8m.main-none-eabi` both select `vmul.f32` for a multiply and both
-   * define `__ARM_FP`, though the `eabi` suffix was only ever a statement about where arguments
-   * travel. `-mfpu=none` is the missing half of the sentence, and it does two things a board without
-   * a unit needs: the back end stops selecting VFP instructions, and `__ARM_FP` goes away, which is
-   * what a header guarding on `__FPU_PRESENT` is reading.
+   * and a calling convention, and on Arm those two leave the *presence* of the unit unstated: the
+   * `eabi` suffix was only ever a statement about where arguments travel, so what is left is clang's
+   * default for the architecture. `-mfpu=` is the missing half of the sentence, and **both answers
+   * are given, because leaving one of them to the default left it to the toolchain.**
+   *
+   *   - `-mfpu=none`, for `noFpu`, does the two things a board without a unit needs: the back end
+   *     stops selecting VFP instructions, and `__ARM_FP` goes away, which is what a header guarding
+   *     on `__FPU_PRESENT` reads;
+   *   - `-mfpu=<`the row's `fpu>`, for a board that has one, says which. Without it the answer was
+   *     whatever clang thought: `thumbv8m.main-none-eabi` defines `__ARM_FP 0xe` under Apple clang 21
+   *     and Homebrew clang 22 and defines nothing at all under apt.llvm.org's clang 20, so
+   *     `thumb-freestanding-softfp` compiled a multiply to `vmul.f32` on one machine and to
+   *     `__aeabi_fmul` on the other, and the Linux CI was red on it for two releases.
+   *
+   * Exactly one of the two is passed for a target, which `TargetTests` pins by refusing a row that
+   * claims both.
    *
    * **It goes on all four command lines, not only the two that emit instructions.** A package's C and
    * a `c const` probe are compiled *as* the target, and CMSIS's own
@@ -439,7 +449,9 @@ object Toolchain {
    * that is uniformly true beats two that have to be kept in step.
    */
   private[sysl] def machineFlags(target: Target): List[String] =
-    if target.noFpu && target.cpu == Cpu.Thumb then List("-mfpu=none") else Nil
+    if target.cpu != Cpu.Thumb then Nil
+    else if target.noFpu then List("-mfpu=none")
+    else target.fpu.map(unit => s"-mfpu=$unit").toList
 
   /** What a build's link directives (`15 §8`) become on **this** target's command line.
    *

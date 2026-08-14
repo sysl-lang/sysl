@@ -52,7 +52,7 @@ class FpuPresenceTests extends AnyFreeSpec with Matchers {
     Toolchain.compileC(src, s"$root/probe.o", t)
   }
 
-  /** Whether the object sysl produced for `t` **calls out** for a floating-point multiply.
+  /** Whether the object sysl produced for `t` **calls out** for a floating-point multiply of `width`.
    *
    * A machine with no unit has no `vmul.f32` to select, so the back end emits `bl __aeabi_fmul` and
    * the symbol is undefined in the object; a machine with one emits the instruction and the symbol
@@ -60,8 +60,11 @@ class FpuPresenceTests extends AnyFreeSpec with Matchers {
    * the artifact that goes to the link, and because an EABI libcall is a *dependency on the board's
    * runtime* — which is the thing worth pinning, the same class of requirement `__aeabi_ldivmod`
    * already is on every 32-bit row.
+   *
+   * **`f64` asks the same question of a different half of the unit**, and on the M33 rows the two
+   * answers differ: an `fpv5-sp-d16` does single precision in hardware and double by libcall.
    */
-  private def callsOutForAMultiply(t: Target): Boolean = {
+  private def callsOutForAMultiply(t: Target, width: String = "f32"): Boolean = {
     val cc  = guard(t)
     val obj = createTempFile("sysl-fpu-", ".o")
 
@@ -69,9 +72,9 @@ class FpuPresenceTests extends AnyFreeSpec with Matchers {
     // never emitted, so the object came out with no multiply in it at all and the symbol table said
     // nothing either way. A test that cannot fail is worse than no test, and this one silently could
     // not until the attribute was added.
-    val src = """@export
-                |product(a: f32, b: f32) -> f32 = a * b
-                |""".stripMargin
+    val src = s"""@export
+                 |product(a: $width, b: $width) -> $width = a * b
+                 |""".stripMargin
 
     val ir = Compiler.compile(List(Source("p.sysl", src)), t) match
       case Right(ir) => ir
@@ -86,7 +89,9 @@ class FpuPresenceTests extends AnyFreeSpec with Matchers {
     // symbol table, and a machine that cannot list one cannot be asked.
     assume(listed.exitCode == 0, "nm not available")
 
-    listed.stdout.linesIterator.exists(_.contains("__aeabi_fmul"))
+    val libcall = if width == "f64" then "__aeabi_dmul" else "__aeabi_fmul"
+
+    listed.stdout.linesIterator.exists(_.contains(libcall))
   }
 
   "a target with no floating-point unit tells the C compiler so" - {
@@ -138,6 +143,36 @@ class FpuPresenceTests extends AnyFreeSpec with Matchers {
 
     "and its hard-float sibling uses the unit" in {
       callsOutForAMultiply(Target.thumbv7emFreestanding) shouldBe false
+    }
+  }
+
+  /** That the unit each row has is the **row's** answer and not the toolchain's.
+   *
+   * Both halves above ask what the compiler did, and until the rows named their unit the compiler was
+   * answering out of clang's defaults for the triple — which are not the same defaults twice.
+   * `thumbv8m.main-none-eabi` with no `-mfpu` defines `__ARM_FP 0xe` under Apple clang 21 and
+   * Homebrew clang 22 and defines nothing at all under the apt.llvm.org clang 20 the Linux CI
+   * installs, so the two cases the `softfp` row owns were green here and red there for two releases.
+   *
+   * The single-precision half is the same fact seen on the board rather than in the toolchain: a
+   * Cortex-M33's unit is an `fpv5-sp-d16`, and clang's default of `fpv5-d16` lowers a `f64` multiply
+   * to a `vmul.f64` the part does not implement.
+   */
+  "and the unit named is the one the silicon has, not the one clang assumes" - {
+
+    "a double multiply calls out on the M33's single-precision unit" in {
+      callsOutForAMultiply(Target.thumbFreestandingSoftfp, width = "f64") shouldBe true
+    }
+
+    "and on its hard-float sibling, which is the same part" in {
+      callsOutForAMultiply(Target.thumbFreestanding, width = "f64") shouldBe true
+    }
+
+    // The float half of the same pair, so that a row losing its unit altogether cannot pass the two
+    // cases above by calling out for everything.
+    "while a float multiply on those two still uses it" in {
+      callsOutForAMultiply(Target.thumbFreestandingSoftfp) shouldBe false
+      callsOutForAMultiply(Target.thumbFreestanding) shouldBe false
     }
   }
 }

@@ -63,6 +63,32 @@ case class Target(
       * already describe a machine with no unit.
       */
     noFpu: Boolean = false,
+    /** The floating-point unit the machine **has**, spelled the way clang's `-mfpu` spells it, for a
+      * row that has one and a triple that does not settle it.
+      *
+      * **It is `noFpu`'s other half, and the pair exists because a default belongs to the
+      * toolchain.** `noFpu` says the unit is absent and passes `-mfpu=none` to say so; saying nothing
+      * in the other case left its *presence* to whatever clang defaults the triple to, and clangs
+      * disagree. Measured on `thumbv8m.main-none-eabi` with no `-mfpu`: Apple clang 21 and Homebrew
+      * clang 22 define `__ARM_FP 0xe`, and the apt.llvm.org clang 20 the Linux CI installs defines
+      * nothing at all. So `thumb-freestanding-softfp` — whose whole point is that the unit is used
+      * and only the convention is in core registers — was a hard-float target on one machine and a
+      * soft one on the other, and the paired cases `FpuPresenceTests` writes for it failed on Linux
+      * across two releases while passing here.
+      *
+      * **What is named is the silicon's unit and not the triple's default, which is a different
+      * answer.** A Cortex-M33 has an `fpv5-sp-d16`: single precision, with no double-precision
+      * arithmetic in hardware. clang's default for `thumbv8m.main` is the `fpv5-d16` above, which
+      * claims a double unit the part has not got and lowers a `f64` multiply to `vmul.f64` — an
+      * instruction that faults on the board, which is the failure these two fields exist to prevent
+      * arrived at from the other side.
+      *
+      * It reaches the one decision `noFpu` reaches, the flag `Toolchain.machineFlags` puts on every
+      * clang command line for this target. A row leaves it empty where the triple already answers —
+      * every hosted target, RISC-V, Armv6-M and Armv7-M — and no row sets it beside `noFpu`, which
+      * `TargetTests` pins.
+      */
+    fpu: Option[String] = None,
 ) {
 
   /** How wide an address is, as a value that can be handed to the two places that need it — the
@@ -286,14 +312,18 @@ object Target {
 
   /** The RP2350's Arm personality: a Cortex-M33, which is Armv8-M Mainline and executes Thumb only.
    *
-   * The triple carries the whole of what the ABI needs — `eabihf` selects the hard-float convention
-   * and clang gives `thumbv8m.main` an `fpv5-d16` by default, so arguments cross in VFP registers
-   * and `softFloat` stays false. `-mcpu=cortex-m33` refines instruction selection to the exact core
-   * and changes nothing here; it is the sub-architecture question this registry still leaves open.
+   * The triple carries the whole of what the ABI needs — `eabihf` selects the hard-float convention,
+   * so arguments cross in VFP registers and `softFloat` stays false. `-mcpu=cortex-m33` refines
+   * instruction selection to the exact core and changes nothing here; it is the sub-architecture
+   * question this registry still leaves open.
+   *
+   * **The unit is named because the triple's default is neither stable across clangs nor right for
+   * the part** — `fpv5-sp-d16` is the M33's, where clang defaults `thumbv8m.main` to a double-precision
+   * `fpv5-d16` the silicon has not got. See `fpu`.
    */
   val thumbFreestanding: Target =
     Target("thumb-freestanding", "thumbv8m.main-none-eabihf", Cpu.Thumb, Os.Freestanding,
-      VaListAbi.Loaded, 4, shortEnums = true)
+      VaListAbi.Loaded, 4, shortEnums = true, fpu = Some("fpv5-sp-d16"))
 
   /** The same core under the **other** float ABI, which is a sibling rather than a setting because
    * the two cannot link together: GNU ld refuses the mix outright, saying one object "uses VFP
@@ -306,21 +336,26 @@ object Target {
    * **`softfp` is gcc's and pico-sdk's own spelling, and that is the whole argument for the name.**
    * Somebody handed that linker message searches their build system for the word in it. It is not
    * `soft`, which says something else: `-mfloat-abi=soft` means no FPU instructions at all, while
-   * `softfp` means the `fpv5-d16` is used and only the *calling convention* is in core registers —
-   * which is exactly what `softFloat` records.
+   * `softfp` means the unit is used and only the *calling convention* is in core registers — which is
+   * exactly what `softFloat` records.
+   *
+   * **This is the row the unnamed unit broke, so it is the row `fpu` was added for.** Its triple says
+   * only where arguments travel; whether there is a unit at all was clang's default, and one clang's
+   * default is not another's. Naming `fpv5-sp-d16` is what makes "the unit is used" a fact about the
+   * row rather than about the machine the compiler is running on.
    */
   val thumbFreestandingSoftfp: Target =
     Target("thumb-freestanding-softfp", "thumbv8m.main-none-eabi", Cpu.Thumb, Os.Freestanding,
-      VaListAbi.Loaded, 4, softFloat = true, shortEnums = true)
+      VaListAbi.Loaded, 4, softFloat = true, shortEnums = true, fpu = Some("fpv5-sp-d16"))
 
   /** The **third** row for that same Cortex-M33, and the one for a board whose FPU is simply not
    * there — an Armv8-M Mainline part built without one, or a build that gates it off, which is what
    * every MPS2 defconfig in Zephyr does.
    *
    * **`softfp` was not enough, and the difference is measurable rather than a nicety.**
-   * `thumb-freestanding-softfp` carries the soft-float *ABI* and nothing more: its triple still
-   * defines `__ARM_FP 0xe`, and clang still compiles `a * b + 1.0f` to `vmla.f32` for it, because the
-   * `fpv5-d16` is there to be used and only the convention was asked about. So aiming that row at a
+   * `thumb-freestanding-softfp` carries the soft-float *ABI* and nothing more: it defines `__ARM_FP`
+   * and compiles `a * b + 1.0f` to `vmla.f32`, because the unit is there to be used and only the
+   * convention was asked about. So aiming that row at a
    * board with no unit produces an image that links, boots and takes a usage fault on the first
    * floating-point instruction — and a header that checks first refuses outright.
    *
@@ -408,13 +443,18 @@ object Target {
    * two parts are where it stops being hypothetical, since they are one triple and different
    * silicon.
    *
+   * **`fpu` writes that subset down rather than inheriting it.** `fpv4-sp-d16` is the M4F's unit and
+   * is what the bare triple already selects — the assembly for a float multiply, a double multiply
+   * and a double load is byte-identical with the flag and without it — so naming it changes nothing
+   * except that the answer is now the row's instead of the toolchain's.
+   *
    * **Atomics need nothing from a board here**, unlike the RP2040 above: Armv7E-M has
    * `ldrex`/`strex`, so an `atomicrmw` lowers inline and an object built from one carries no
    * relocation against `__atomic_*` at all. `&sync T` works as it stands.
    */
   val thumbv7emFreestanding: Target =
     Target("thumbv7em-freestanding", "thumbv7em-none-eabihf", Cpu.Thumb, Os.Freestanding,
-      VaListAbi.Loaded, 4, shortEnums = true)
+      VaListAbi.Loaded, 4, shortEnums = true, fpu = Some("fpv4-sp-d16"))
 
   /** The same Armv7E-M with the unit **absent** rather than merely unused — an STM32 F4 on a board
    * that leaves the FPU off, and `mps2/an386`, whose Zephyr defconfig sets no `CONFIG_FPU` and

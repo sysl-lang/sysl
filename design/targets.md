@@ -57,15 +57,22 @@ of what makes it different from `build`.
 **The last two columns are different questions, and the `softfp` row is where that shows.** The
 fourth is where a `double` travels on the way into a call; the fifth is whether the machine has a
 unit at all. A Cortex-M33 under `-mfloat-abi=softfp` passes arguments in core registers over an
-`fpv5-d16` that is present and used for the arithmetic, so it answers **no** and then **yes** — and
-every other row saying no in the fourth column is a machine that never had a choice to record.
+`fpv5-sp-d16` that is present and used for the arithmetic, so it answers **no** and then **yes** —
+and every other row saying no in the fourth column is a machine that never had a choice to record.
 
 **Two rows share a triple, which used to be impossible and is now the point.** A triple names an
 architecture and a calling convention, and on Arm it says nothing whatever about the *presence* of
 the floating-point unit — so `thumb-freestanding-softfp` and `thumb-freestanding-soft` are one triple
-and two machines. What separates them is `-mfpu=none`, which sysl puts on every clang command line
-for a Thumb row answering no in the last column. **A target is the whole of what is said to clang**,
-and the triple stopped being all of that.
+and two machines. What separates them is `-mfpu=`, which sysl puts on every clang command line for a
+Thumb row: `none` where the last column says no, and **the name of the unit** where it says yes.
+**A target is the whole of what is said to clang**, and the triple stopped being all of that.
+
+**Both answers are given, and giving only one of them was a bug.** A row that said nothing left the
+unit's presence to clang's default for the architecture, and defaults are the toolchain's rather than
+the language's: `thumbv8m.main-none-eabi` with no `-mfpu` defines `__ARM_FP 0xe` under Apple clang 21
+and Homebrew clang 22, and defines nothing at all under apt.llvm.org's clang 20. So
+`thumb-freestanding-softfp` was a machine with a unit on one developer's laptop and a machine without
+one on the Linux CI, from the same source and the same registry row.
 
 **Nine of these are 32-bit, and eight of the nine are a microcontroller.** The RP2350 boots either a
 pair of Cortex-M33s or a pair of RV32IMAC Hazard3 cores; the RP2040 — the original Pico — has a pair
@@ -90,10 +97,16 @@ RV32IMAC and has no F extension to use. It reaches exactly one decision, whether
 floating members is flattened into registers, and that is why it is recorded rather than derived.
 
 The Cortex-M33 goes the other way and needed checking rather than assuming: `eabihf` selects the
-hard-float convention, and clang gives `thumbv8m.main` an `fpv5-d16` unasked, so arguments really do
+hard-float convention and the row names an `fpv5-sp-d16` for the part to use, so arguments really do
 cross in VFP registers. `-mcpu=cortex-m33` refines instruction selection to the exact core and
 changes nothing about the ABI — it is the sub-architecture question left open at the bottom of this
 page, and it is not needed for a correct call.
+
+**The unit named is the silicon's and not the triple's default, which is a different answer.** An
+M33's is single precision — `fpv5-sp-d16`, sixteen D registers and no double-precision arithmetic —
+where clang defaults `thumbv8m.main` to `fpv5-d16` and will lower a `f64` multiply to a `vmul.f64`
+the part does not implement. Naming it costs a flag and buys an image that faults on neither the
+header nor the first double.
 
 **And it is the one machine here with three rows, because neither the float ABI nor the FPU's
 presence is sysl's to pick.** `thumb-freestanding-softfp` is the same Cortex-M33 with arguments
@@ -106,7 +119,7 @@ backwards for a language whose `@export` claim is that it joins somebody else's 
 `softfp` is gcc's and pico-sdk's own spelling, which is the whole argument for the name: somebody
 handed that linker message goes looking for the word in their build system, and it is that one. It is
 **not** `soft`, which means something else — no FPU instructions at all, where `softfp` uses the
-`fpv5-d16` and changes only the convention. `thumb-freestanding-soft` is that other thing, and the
+`fpv5-sp-d16` and changes only the convention. `thumb-freestanding-soft` is that other thing, and the
 section below is about it.
 
 ### Armv6-M, which is the RP2040 and is a different architecture
@@ -169,9 +182,16 @@ $ clang --target=thumbv8m.main-none-eabi -dM -E -x c /dev/null | grep __ARM_FP
 ```
 
 That is not a mistake in the triple. `eabi` versus `eabihf` is a statement about **where arguments
-travel**, and clang gives `thumbv8m.main` an `fpv5-d16` unasked in both cases, so `a * b` on an `f32`
-compiles to `vmla.f32` under either suffix. The soft-float ABI and an absent unit are different
-claims, and only the first has a triple to be written in.
+travel**, and that clang gave `thumbv8m.main` an `fpv5-d16` unasked in both cases is a statement
+about clang, so `a * b` on an `f32` compiled to `vmla.f32` under either suffix. The soft-float ABI
+and an absent unit are different claims, and only the first has a triple to be written in.
+
+**The measurement above is one clang's, which is the second half of the same lesson and was learnt
+later.** Run against apt.llvm.org's clang 20 on Linux the command prints nothing at all: the same
+triple, the same absent `-mfpu`, and the opposite answer. So a row that named no unit did not mean
+*the default* — it meant *whichever compiler is installed*, and `thumb-freestanding-softfp` was two
+machines depending on where it was built. That is why the flag is passed for both answers now, and
+why a row that has a unit names it rather than leaving the sentence for clang to finish.
 
 The cost of the two being conflated is paid twice, in two unrelated places:
 
@@ -180,10 +200,11 @@ The cost of the two being conflated is paid twice, in two unrelated places:
 - **at run time**, where an image that got past the headers takes a usage fault on the first VFP
   instruction it reaches, in whatever arithmetic happened to reach one.
 
-So a target records the unit's presence beside its calling convention, and a Thumb row that answers
-*no* has **`-mfpu=none`** added to every clang command line sysl builds for it — the link, the object,
-a package's C, and a `c const` probe alike. The last two matter as much as the first two: they are
-compiled *as* the target and are where the header refusal happens.
+So a target records the unit beside its calling convention, and **every** Thumb row has an `-mfpu=`
+added to every clang command line sysl builds for it — the link, the object, a package's C, and a
+`c const` probe alike. The last two matter as much as the first two: they are compiled *as* the
+target and are where the header refusal happens. A row answering *no* passes `none`; a row answering
+*yes* passes the unit's name, `fpv5-sp-d16` for the M33 and `fpv4-sp-d16` for the M4F.
 
 **`soft` is the name because gcc already drew this line.** `-mfloat-abi=soft` means no FPU
 instructions at all where `-mfloat-abi=softfp` means the unit is used and only the convention is in
