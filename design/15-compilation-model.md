@@ -1061,13 +1061,46 @@ parse(text: *u8, n: usize) -> i32
 prefix so that linking two of them is not a coin toss, and the sysl side has a module path doing that
 job already. `parse` in module `mylib` is the name to write inside sysl and `mylib_parse` is the name
 to publish; requiring the function to be *called* `mylib_parse` everywhere would be spelling the
-module path twice. **A sysl caller is unaffected** — it still names `mylib.parse` and simply arrives
-at a different label.
+module path twice. **A sysl caller is unaffected** — it still names `mylib.parse`, and reaches the
+definition rather than the published symbol.
 
 **`@export` implies the C convention and says nothing about any other**, which is `12` §5's rule for
 `extern` in the other direction. Whether §10's convention annotation composes with it is left until
 something needs a convention other than C; §10 was built so that adding one is a change to what the
 analyzer accepts rather than to every tree that holds a function.
+
+### The exported symbol is an entry, not a renamed definition
+
+**A rename is not a convention**, and reading `@export` as one is what made a sysl definition claim a
+C symbol while keeping sysl's own parameter lowering. For a signature of scalars the two coincide, so
+that arrangement was indistinguishable from a correct one; for an aggregate they do not, and a C
+caller passed its arguments where its convention says while the body read them where sysl's does.
+What arrived was whatever had been in the registers sysl looked at, with no diagnostic and a link
+that succeeded.
+
+So **the exported symbol is a function of its own** — an entry whose signature is what `CAbi` says
+the target's convention uses, which reassembles each parameter into the shape sysl's lowering expects
+and calls the definition. The definition keeps its own mangled name, its own lowering and its own
+callers.
+
+**It is the foreign call path read backwards**, which is the property worth stating rather than the
+mechanism: a call *out* to C classifies each argument with `CAbi` and spreads it into the registers
+the convention names, and an entry *in* classifies the same way and gathers it back. One classifier
+answers both directions, so the two cannot drift — which a second lowering written for the entry
+would eventually have done.
+
+Three things follow that a reader will meet:
+
+- **an aggregate may cross**, which the type rule below is written around;
+- **`&f` on an exported function is that entry's address** (`12` §6a), so a C library may be handed
+  the callback it asks for. That is what makes the promise usable rather than merely stated;
+- **a sysl caller pays nothing**, since it reaches the definition. The conversion exists only on the
+  path C takes.
+
+**In the root module the definition moves aside rather than the entry.** A name there is unqualified,
+so a function exported under its own name would have the definition and the entry claiming one
+symbol. The exported symbol is what somebody outside has written down; a mangled name is the
+compiler's own business, so it is the definition that takes a reserved spelling.
 
 ### Why this direction exists at all
 
@@ -1103,18 +1136,37 @@ tries:
 | a **`@ghost`** | it is erased before codegen (`17` §8), so there is no symbol at all |
 | a **`@test`** | only `sysl test` builds one, and an exported symbol has to be in the artifact a C project links |
 | a **variadic** | what a C caller promotes into the tail is decided by the prototype it compiled against, not by this declaration. A `va_list` parameter states the same thing and is what C's own `v` variants do |
-| a parameter or result that is **not a scalar, a pointer or a function pointer** | see below |
+| a parameter or result **C has no declaration for** | see below |
 | a symbol that is **not a C identifier** | there would be nothing a C declaration could spell |
 
-**The type rule is `CAbi`'s existence stated as a restriction.** A scalar and a pointer are one
-register on every machine sysl lowers for and nothing has to be decided about them. An aggregate is
-the opposite: each ABI says which registers a struct arrives in, LLVM applies no rule of its own, and
-`CAbi` exists precisely because sysl's own lowering and C's published one differ. Passing one by
-value would be a **corrupt call rather than a link error**, which is the worst available outcome, so
-it is refused rather than lowered hopefully. Every refusal names the shape to write instead — a slice
-becomes the pointer and length C's own buffer functions already take, an aggregate becomes a pointer
-to itself — because there always is one, and that is what makes the boundary writable rather than
-merely restricted.
+**The type rule is about what C can DECLARE, and it used to be about what sysl could lower.** Those
+are different questions, and while the exported symbol was a renamed definition only the second one
+could be asked: an aggregate has a different lowering on each side, so passing one by value would
+have been a corrupt call rather than a link error and every aggregate was refused. What an aggregate
+needed was never a refusal — it was for somebody to apply the convention, which is what the entry
+above now does.
+
+So a **struct** built out of things C can spell crosses, and so does a **simple enum**, which is its
+underlying integer and nothing else. What is still refused is what has no C declaration at any
+convention:
+
+| refused | because |
+|---|---|
+| a **slice** or a `string` | two words with a length in the second. C takes the pointer and the length as two parameters, which is the shape its own buffer functions already have |
+| a **`&T`** or a `weak` | a counted box whose header C would have to know the layout of. Hand out a raw pointer and keep the counted one on this side |
+| a **trait object**, including a `*T` where `T` is a trait | a value and a method table together, so it is two words where every other pointer is one |
+| a **data enum** | a tag beside a union of the payloads sysl laid out, which is not the shape a C union has |
+| a bare **array** as a parameter or result | C decays an array parameter to a pointer, so there is no prototype that passes one by value. A struct holding it says the same thing and lays out identically — and an array **field** is fine, which is where the two positions differ |
+
+**An aggregate is asked about its fields**, which is what keeps the two rules apart: a struct of
+scalars is a struct C declares, and a struct with a `&T` in it is a counted box with a coat on.
+Recurring is also what keeps ownership out of the boundary entirely — every type that reaches it is
+plain data, so the entry takes no reference and releases none, and there is no question of who owes
+a count across a language boundary.
+
+Every refusal names the shape to write instead, because there always is one, and a refusal about a
+field names the *field* — the declaration the reader is looking at does not mention it. That is what
+makes the boundary writable rather than merely restricted.
 
 ### Module storage: a computed `val` cannot be reached
 
@@ -1216,6 +1268,14 @@ the macro resolves to C11's `_Noreturn`, C++11's `[[noreturn]]`, or nothing on a
 either. It is written as a macro because the header serves both languages and `_Noreturn` is not valid
 C++; the empty definition makes a weaker declaration rather than an invalid one. What the annotation
 buys the caller is real: code after the call is dead, and a path ending in it needs no return value.
+
+**An aggregate is a spelling and a definition.** A prototype naming a struct is useless to a consumer
+that has not been told what one is, so the header defines each aggregate its prototypes reach, before
+anything uses it and **innermost first** — a struct holding a struct comes after what it holds,
+because a by-value member needs a complete type and is exactly the case a forward declaration does
+not serve. Each is a `typedef` of an anonymous struct, so the name reads the way a C API's own handles
+do. The name is module-qualified, since two modules may both declare an `Id` and the header has one
+namespace to put them in.
 
 **The header assumes C99 or any C++**, which the three includes already did before anything said so.
 

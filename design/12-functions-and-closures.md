@@ -1235,16 +1235,28 @@ nothing downstream could notice:
   implementation (§8), and one word has nowhere to put the struct.
 - **A `@test` function.** Every build but `sysl test` drops it (`testing.md`), so its address would
   be of a definition the program does not have.
-- **Any signature carrying an aggregate** — a struct, a tuple, a data enum, a view, a `string`. An
-  aggregate crosses to C in whichever registers that machine's convention names (`targets.md`), and
-  a sysl definition did not put it there. This is the one refusal that is a **restriction rather than
-  a consequence**: what closes it is an adapter emitted beside such a function, entered under the C
-  classification and calling the sysl one. Until there is one, the refusal names the parameter, since
-  an address that is quietly wrong is worse than no address. A callback taking the parts behind a
-  `*T` is the shape that works today, and it is what C interfaces overwhelmingly use anyway.
+- **A plain sysl function whose signature carries an aggregate** — a struct, a tuple, a data enum, a
+  view, a `string`. An aggregate crosses to C in whichever registers that machine's convention names
+  (`targets.md`), and a sysl definition did not put it there. The refusal names the parameter, since
+  an address that is quietly wrong is worse than no address.
 
 The test is made by **shape** rather than by asking the target's classification, so a program
 accepted for one machine is accepted for every machine.
+
+**Two kinds of function are past the aggregate question rather than exempted from it**, and both were
+once refused by it — which cost a binding every callback a C library asks to register, since those
+signatures are written in aggregates almost without exception.
+
+- **An `extern`.** It is C. This compiler neither compiled it nor chose its convention, and its type
+  is what the declaration transcribed from the published header — so there is no lowering here to be
+  wrong about, and the reason above is a statement about code sysl emitted.
+- **A function carrying `@export`.** That attribute publishes an entry lowered under the C
+  classification (`15` §12), so its address is that entry's. This is the adapter this section used to
+  say would close the restriction: it was built for `@export`, and an address is the second thing it
+  buys rather than a mechanism of its own.
+
+A plain sysl function is what is left, and `@export` on it is now the answer the refusal points at —
+a spelling in the language rather than a wrapper hand-written around it.
 
 ### What it costs today
 

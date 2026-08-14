@@ -368,6 +368,36 @@ class CExportAbiTests extends LibraryCliSupport {
     }
   }
 
+  /** A result of **nothing**, which is the one arm of the classification the cases above never
+   * reach: `void` on both sides, so the entry has neither a value to hand back nor storage to write
+   * into, and the aggregate travels in only as a parameter.
+   */
+  "an exported function answering nothing still takes its aggregate" in {
+    ranProject(
+      types +
+        """@export("probe_note")
+          |note(a: Id, out: *i32)
+          |    out[0] = a.index1 * 1000 + int(a.generation)
+          |
+          |extern "probe_ask" ask() -> int
+          |
+          |check() -> int = ask()
+          |""".stripMargin,
+      cTypes +
+        """void probe_note( Id a, int32_t *out );
+          |
+          |int probe_ask( void )
+          |{
+          |	Id a = { 7, 3, 9 };
+          |	int32_t got = 0;
+          |
+          |	probe_note( a, &got );
+          |
+          |	return got == 7009 ? 0 : 999;
+          |}
+          |""".stripMargin) shouldBe "0\n"
+  }
+
   /** The generated header, given to the compiler it is written for.
    *
    * `ExportTests` asserts what is *in* it, which is a check on the text. This is the other half: a
