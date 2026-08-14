@@ -142,22 +142,41 @@ trait SyslParserBase extends PackratParsers {
   protected lazy val reservedWord: Parser[String] =
     accept("reserved word", { case t: lexical.Keyword if t.chars.head.isLetter => t.chars })
 
-  /** The sentence a reserved word written where a name is being introduced is owed.
+  /** The sentence a reserved word written where a name is being **bound** is owed — `val: int` as a
+   * field, or as a parameter.
    *
-   * It consumes nothing — `guard` is what puts the caret on the word rather than one token past it,
-   * which is the ranking rule `noMemberAttr` records in full: an `Error` raised after the token loses
-   * to whatever `Failure` the alternatives reach beyond it.
+   * **The colon is part of the lookahead and is what keeps this off ground the expression grammar
+   * needs.** A reserved word may perfectly well begin an argument — `f(true)`, `f(null)`, `f(if c
+   * then 1 else 2)` — and a call written at statement position is tried against the *declaration*
+   * grammar first, so a refusal keyed on the word alone raises an `Error` inside the parameter list
+   * and takes every one of those with it. Followed by a colon it can only be a binding somebody
+   * attempted.
+   *
+   * **It is written out rather than assembled from `guard`, because a lookahead leaks its own
+   * position.** `guard(reservedWord ~ op(":"))` hands back the inner failure *as it stands* — at the
+   * colon, one token past the word — and a `Failure` further along the line outranks the one `ident`
+   * raises at the word itself. What that produced was `reserved word expected` where a field with no
+   * name at all should say `identifier expected`, which is the artifact `ParseDiagnosticTests` exists
+   * to catch, and did. Re-basing the failure onto `in` puts both candidates at one position, where
+   * the last of them wins and `ident` is written last for exactly that reason.
    *
    * **The backtick form is named because it works**, and nothing else tells the reader so: a quoted
    * name is an ordinary name at every position, so `` `val` `` is a field, a parameter or a variable
    * called `val`. Without this the reader is told a name was expected at a place where they wrote
    * one, and the only thing wrong with it is that the language had already spent the word.
    */
-  protected def reservedName(what: String): Parser[Nothing] =
-    guard(reservedWord) >> (w =>
-      err(s"'$w' is a reserved word, so it cannot stand as $what — write it '`$w`' if that is the " +
-        s"name you want, which is what the backticks are for: a quoted word is an ordinary name " +
-        s"wherever one may be written"))
+  protected def reservedBinding(what: String): Parser[String] =
+    Parser { in =>
+      guard(reservedWord ~ op(":"))(in) match
+        case Success(w ~ _, _) =>
+          Error(
+            s"'$w' is a reserved word, so it cannot stand as $what — write it '`$w`' if that is " +
+              s"the name you want, which is what the backticks are for: a quoted word is an " +
+              s"ordinary name wherever one may be written",
+            in,
+          )
+        case ns: NoSuccess => Failure(ns.msg, in)
+    }
 
   /** A name that was written without quoting, and only that — what a **module path** is made of. */
   protected lazy val bareIdent: Parser[String] =

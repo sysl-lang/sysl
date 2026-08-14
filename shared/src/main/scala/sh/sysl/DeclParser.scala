@@ -20,14 +20,13 @@ trait DeclParser extends ExprParser {
    * and the reader is told `')' expected` at a token that is plainly a parameter. Both messages are
    * about layout, which is the one thing that is not wrong.
    *
-   * **The lookahead is the word AND the colon**, and that is what keeps this from claiming ground the
-   * expression grammar needs. A reserved word can perfectly well begin an argument — `f(true)`,
-   * `f(null)`, `f(if c then 1 else 2)` are all calls, and a declaration is only one of the readings
-   * this position is tried under, so an unconditional refusal here would take `f(true)` as a
-   * statement with it. Followed by a colon it can be nothing but a binding somebody attempted.
+   * `reservedBinding` carries the lookahead and the reasons for its shape. **It is written first and
+   * `ident` last**, because the two land on one position and the last candidate wins a tie there: a
+   * field with no name at all — `: int` — must still say `identifier expected`, which is `ident`'s
+   * refusal and not this rule's.
    */
   protected lazy val param: Parser[Param] =
-    at((ident | guard(reservedWord ~ op(":")) ~> reservedName("a parameter's name or a field's")) ~
+    at((reservedBinding("a parameter's name or a field's") | ident) ~
       (op(":") ~> typeRef) ^^ { case n ~ t => Param(n, t) })
 
   /** A function's parameter, which unlike a struct's field may say what a call that leaves it out

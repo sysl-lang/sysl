@@ -162,6 +162,16 @@ class ParseDiagnosticTests extends AnyFreeSpec with ParseSupport {
     "a field with no name" in {
       refusal("struct S\n    : int\nend S\n") shouldBe ("identifier expected", "<input>:2:5")
     }
+
+    // The same two candidates meet in a parameter list, and neither is what is reported: an empty
+    // list is legal, so a name that is not there reads as a list that has ended and what is owed is
+    // the bracket. The assertion is here because the *wrong* answer is a live possibility — the
+    // reserved-word refusal sits at this position too, and while its lookahead reported from the
+    // colon it had reached rather than from the token it started at, it outranked the bracket and
+    // said `reserved word expected` at a line with no reserved word in it.
+    "a parameter with no name is owed the bracket, not either candidate at the name" in {
+      refusal("f(: int) -> int = 1\n") shouldBe ("')' expected", "<input>:1:3")
+    }
   }
 
   // Both landed on dev while this branch was open, and both are the shape that produces the
