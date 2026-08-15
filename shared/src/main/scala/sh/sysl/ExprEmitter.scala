@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.{Arg, LType, Val}
+
 /** The expression dispatch.
  *
  * This is the widest single `match` in the compiler and it stays one, because that is what it is:
@@ -549,7 +551,7 @@ trait ExprEmitter extends ArithEmitter {
       val argVals = argList(args)
       val entry   = freshTemp(); emit(s"$entry = getelementptr ptr, ptr $table, $word $slot")
       val fn      = freshTemp(); emit(s"$fn = load ptr, ptr $entry")
-      genSyslCall(s"${syslResult(ty)} $fn", s"ptr $data" :: argVals, ty, None)
+      genSyslCall(s"${syslResult(ty)} $fn", Arg(LType.Ptr, Val.Raw(data)) :: argVals, ty, None)
 
     // The tail walk is the ABI's, so all three are LLVM's own: two intrinsic calls and the one
     // instruction whose lowering every backend supplies for it.

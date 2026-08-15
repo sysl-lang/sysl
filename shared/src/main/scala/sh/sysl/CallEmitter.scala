@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.{Access, Arg, BinOp, ICmp, Inst, LType, Val}
+
 /** The call seam, and writing a value where it is going to live.
  *
  * What a `call` names is not simply the callee's sysl name. An `extern` may have been given a link
@@ -34,7 +36,7 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    * parameter to receive it. That keeps the two sides of the call agreeing with `genFunction`,
    * which drops the same parameters from the signature.
    */
-  protected def argList(args: List[TExpr]): List[String] = formatArgs(args.map(argValue))
+  protected def argList(args: List[TExpr]): List[Arg] = formatArgs(args.map(argValue))
 
   /** One argument, evaluated, in the form the callee receives it — or `None` where it is zero-sized
    * and there is nothing to hand over.
@@ -55,10 +57,10 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
 
       Option.unless(Type.zeroSized(a.ty))((a.ty, Right(v)))
 
-  protected def formatArgs(vals: List[Option[(Type, Either[String, String])]]): List[String] =
+  protected def formatArgs(vals: List[Option[(Type, Either[String, String])]]): List[Arg] =
     vals.flatten.map {
-      case (_, Left(addr)) => s"ptr $addr"
-      case (ty, Right(v))  => s"${ty.llvm} $v"
+      case (_, Left(addr)) => Arg(LType.Ptr, Val.Raw(addr))
+      case (ty, Right(v))  => Arg(ty.lty, Val.Raw(v))
     }
 
   /** A call the function makes to itself as the last thing it does, lowered as a jump back to its
@@ -113,13 +115,11 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
         // The count came with the bytes and stays with them: what the staging slot took is now the
         // parameter's, so nothing is retained here and nothing released.
         case Left(slot) =>
-          usesMemcpy = true
-          emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align ${layout.align(ty)} %$name.addr, " +
-            s"ptr align ${layout.align(ty)} $slot, i64 ${layout.size(ty)}, i1 false)")
+          emitMemcpy(Val.Reg(s"$name.addr"), Val.Raw(slot), layout.size(ty), layout.align(ty))
 
-        case Right(v) => emit(s"store ${ty.llvm} $v, ptr %$name.addr")
+        case Right(v) => emit(Inst.Store(ty.lty, Val.Raw(v), Val.Reg(s"$name.addr"), Access.Plain))
 
-    emitTerm(s"br label %${tailTarget.get}")
+    emitTerm(Inst.Br(tailTarget.get))
     ""
   }
 
@@ -211,6 +211,13 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
 
     s"$what ${callee.render}"
 
+  /** A call whose callee is already written down as one piece — what it returns and the symbol run
+   * together, or a variadic callee's whole function type. `calleeParts` is what splits the two, and
+   * this stays for as long as anything hands over the joined form.
+   */
+  protected def emitCallee(dest: Option[ir.Val], callee: String, args: List[Arg]): Unit =
+    emit(Inst.Call(dest, "", Val.Raw(callee), args))
+
   /** The same two things kept apart, which is how a `call` instruction carries them: what the call
    * names, and the symbol it names. `calleeOf` is this pair run together, and stays for as long as
    * anything still builds a call by interpolation.
@@ -231,26 +238,29 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    * with nowhere to put one makes a slot here and reads the value back out of it, which is correct
    * and is exactly the shape `genInto` exists to save the callers that *do* have somewhere.
    */
-  protected def genSyslCall(callee: String, argVals: List[String], ty: Type, dest: Option[String]): String =
+  protected def genSyslCall(callee: String, argVals: List[Arg], ty: Type, dest: Option[String]): String =
     syslSret(ty) match
       case Some(_) =>
-        val slot = dest.getOrElse(emitAlloca(freshTemp(), ty.llvm))
+        val slot = dest.getOrElse(emitAlloca(freshTemp(), ty.lty))
+        val out  = Arg(LType.Ptr, Val.Raw(slot), s"sret(${ty.llvm}) align ${layout.align(ty)}")
 
-        emit(s"call $callee(${(s"ptr sret(${ty.llvm}) align ${layout.align(ty)} $slot" :: argVals).mkString(", ")})")
+        emitCallee(None, callee, out :: argVals)
 
         if dest.isDefined then ""
         else
-          val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot")
-          ownTemp(r, ty)
+          val r = freshReg(); emit(Inst.Load(r, ty.lty, Val.Raw(slot), Access.Plain))
+          ownTemp(r.render, ty)
 
       case None if Type.noValue(ty) =>
-        emit(s"call $callee(${argVals.mkString(", ")})")
-        if ty == Type.Never then emitTerm("unreachable")
+        emitCallee(None, callee, argVals)
+        if ty == Type.Never then emitTerm(Inst.Unreachable)
         ""
 
       case None =>
-        val r = freshTemp(); emit(s"$r = call $callee(${argVals.mkString(", ")})")
-        ownTemp(r, ty)
+        val r = freshReg()
+
+        emitCallee(Some(r), callee, argVals)
+        ownTemp(r.render, ty)
 
   // --- writing a value where it is going to live ----------------------------------------
 
@@ -262,7 +272,7 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       val v = genExpr(e)
 
       retainValue(e.ty, v)
-      emit(s"store ${e.ty.llvm} $v, ptr $dest")
+      emit(Inst.Store(e.ty.lty, Val.Raw(v), Val.Raw(dest), Access.Plain))
     else
       e match
         // A tail self-call needs no destination: the jump keeps the frame, so the `sret` pointer the
@@ -301,36 +311,38 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       val vals   = args.zipWithIndex.map((a, i) => (genExpr(a), struct.fields(i)._2))
       val c      = buildBits(ranges, vals.collect { case (v, ft) if !Type.zeroSized(ft) => v })
 
-      emit(s"store ${containerLlvm(ranges)} $c, ptr $dest")
+      emit(Inst.Store(containerLty(ranges), Val.Raw(c), Val.Raw(dest), Access.Plain))
 
     case TStructNew(struct, args) =>
       for (a, i) <- args.zipWithIndex if !Type.zeroSized(struct.fields(i)._2) do
-        val p = freshTemp()
+        val p = freshReg()
 
-        emit(s"$p = getelementptr ${struct.llvm}, ptr $dest, i32 0, i32 ${struct.slot(i)}")
-        genBorrowedInto(p, a)
+        emit(Inst.Gep(p, struct.lty, Val.Raw(dest),
+                      List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(struct.slot(i))))))
+        genBorrowedInto(p.render, a)
 
     case TArrayLit(elems, arrayTy) =>
       for (el, i) <- elems.zipWithIndex do
-        val p = freshTemp()
+        val p = freshReg()
 
-        emit(s"$p = getelementptr ${arrayTy.elem.llvm}, ptr $dest, $word $i")
-        genBorrowedInto(p, el)
+        emit(Inst.Gep(p, arrayTy.elem.lty, Val.Raw(dest), List(Arg(wordLty, Val.Int(i)))))
+        genBorrowedInto(p.render, el)
 
     // The tag, and then the variant's own fields written into the region every variant shares.
     // Reaching the region by address is what the value form has to use a stack slot for anyway —
     // a union has no `insertvalue` — so this is the shorter of the two lowerings as well.
     case TEnumNew(en, variant, args) if !en.simple =>
-      emit(s"store i32 ${variant.tag}, ptr $dest")
+      emit(Inst.Store(i32, Val.Int(variant.tag), Val.Raw(dest), Access.Plain))
 
       if variant.carries then
         val base = payloadPtr(en, dest)
 
         for (a, i) <- args.zipWithIndex if !Type.zeroSized(variant.fields(i)._2) do
-          val p = freshTemp()
+          val p = freshReg()
 
-          emit(s"$p = getelementptr ${en.payloadLlvm(variant)}, ptr $base, i32 0, i32 ${variant.slot(i)}")
-          genBorrowedInto(p, a)
+          emit(Inst.Gep(p, en.payloadLty(variant), Val.Raw(base),
+                        List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(variant.slot(i))))))
+          genBorrowedInto(p.render, a)
 
     // The value is generated once, above the loop, exactly as the value form does — every element
     // is a copy of that one evaluation. It is generated even where there are no elements, because
@@ -339,53 +351,58 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       val v = genExpr(value)
 
       if arrayTy.length > 0 then
-        fillLoop(dest, arrayTy) { at => emit(s"store ${arrayTy.elem.llvm} $v, ptr $at") }
+        fillLoop(dest, arrayTy) { at =>
+          emit(Inst.Store(arrayTy.elem.lty, Val.Raw(v), Val.Raw(at), Access.Plain))
+        }
 
     // A copy from one place to another is a copy of bytes. Reading the value out first would make
     // a first-class aggregate of it for the length of one instruction, which is the whole cost.
     case place if hasAddress(place) =>
       val src = address(place)
 
-      usesMemcpy = true
-      emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align ${layout.align(e.ty)} $dest, " +
-        s"ptr align ${layout.align(e.ty)} $src, i64 ${layout.size(e.ty)}, i1 false)")
+      emitMemcpy(Val.Raw(dest), Val.Raw(src), layout.size(e.ty), layout.align(e.ty))
 
     case _ =>
       val v = genExpr(e)
 
-      emit(s"store ${e.ty.llvm} $v, ptr $dest")
+      emit(Inst.Store(e.ty.lty, Val.Raw(v), Val.Raw(dest), Access.Plain))
 
   /** `e` built where a value of it is wanted, for a caller that asked for a register rather than
    * offering somewhere to put one. The load is the very thing the destination forms avoid, so this
    * is the fallback and not the path anything hot takes.
    */
   protected def throughSlot(e: TExpr): String = {
-    val slot = emitAlloca(freshTemp(), e.ty.llvm)
+    val slot = emitAlloca(freshTemp(), e.ty.lty)
 
     genBorrowedInto(slot, e)
 
-    val r = freshTemp(); emit(s"$r = load ${e.ty.llvm}, ptr $slot"); r
+    val r = freshReg(); emit(Inst.Load(r, e.ty.lty, Val.Raw(slot), Access.Plain)); r.render
   }
 
   /** Runs `each` once per element of an array laid down at `base`, with the element's address. */
   private def fillLoop(base: String, arrayTy: Type.Array)(each: String => Unit): Unit = {
-    val i     = emitAlloca(freshTemp(), word)
+    val i     = emitAlloca(freshTemp(), wordLty)
     val condL = freshLabel("fill.test")
     val bodyL = freshLabel("fill.elem")
     val endL  = freshLabel("fill.done")
 
-    emit(s"store $word 0, ptr $i")
-    emitTerm(s"br label %$condL")
+    emit(Inst.Store(wordLty, Val.Int(0), Val.Raw(i), Access.Plain))
+    emitTerm(Inst.Br(condL))
     emitLabel(condL)
-    val iv   = freshTemp(); emit(s"$iv = load $word, ptr $i")
-    val more = freshTemp(); emit(s"$more = icmp ult $word $iv, ${arrayTy.length}")
-    emitTerm(s"br i1 $more, label %$bodyL, label %$endL")
+    val iv   = freshReg(); emit(Inst.Load(iv, wordLty, Val.Raw(i), Access.Plain))
+    val more = freshReg()
+
+    emit(Inst.IntCmp(more, ICmp.Ult, wordLty, iv, Val.Int(arrayTy.length)))
+    emitTerm(Inst.CondBr(more, bodyL, endL))
     emitLabel(bodyL)
-    val ep = freshTemp(); emit(s"$ep = getelementptr ${arrayTy.elem.llvm}, ptr $base, $word $iv")
-    each(ep)
-    val nxt = freshTemp(); emit(s"$nxt = add $word $iv, 1")
-    emit(s"store $word $nxt, ptr $i")
-    emitTerm(s"br label %$condL")
+    val ep = freshReg()
+
+    emit(Inst.Gep(ep, arrayTy.elem.lty, Val.Raw(base), List(Arg(wordLty, iv))))
+    each(ep.render)
+    val nxt = freshReg(); emit(Inst.Bin(nxt, BinOp.Add, wordLty, iv, Val.Int(1)))
+    emit(Inst.Store(wordLty, nxt, Val.Raw(i), Access.Plain))
+    emitTerm(Inst.Br(condL))
     emitLabel(endL)
   }
+
 }
