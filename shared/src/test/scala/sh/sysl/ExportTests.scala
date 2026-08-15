@@ -429,6 +429,177 @@ class ExportTests extends AnyFreeSpec with CodegenSupport with TestFrameworkSupp
     }
   }
 
+  /** **The name a struct carries in the header, which used to be derived and nothing else** (0142).
+    *
+    * A function's symbol was given `@export("mylib_add")` because a C library's names are its own
+    * and sysl's module path is doing that job already. Once an aggregate crossed (0137) a header
+    * began carrying *type* names too, and those had no such control: the name is the mangled
+    * instantiation with everything C would not accept replaced, which is `demo_Id` here and
+    * `sh_sysl_box2d_c_Id` in a package. `@export` on the struct is that same rename read at the
+    * other kind of declaration.
+    *
+    * **What the derived name was buying is uniqueness**, and a chosen one is a claim rather than a
+    * derivation — so the collisions below are the price of the feature and are refused where two
+    * exported symbols are.
+    */
+  "the name a struct carries in the header" - {
+
+    "is the one the attribute chose" in {
+      val h = headerFor("module demo\n\n@export(\"b2BodyId\")\nstruct Id\n    index1: i32\n\n" +
+        "@export\nbump(a: Id) -> Id = a\n")
+
+      h should include("} b2BodyId;")
+      h should include("b2BodyId bump(b2BodyId a);")
+      h should not include "demo_Id"
+    }
+
+    // The same reading `@export` has on a function, where the bare form publishes the declared name
+    // rather than the mangled key — which is the whole of what a reader would expect it to mean.
+    "and the bare form is the declared name, with the module path gone" in {
+      val h = headerFor("module demo\n\n@export\nstruct Id\n    index1: i32\n\n" +
+        "@export\nbump(a: Id) -> Id = a\n")
+
+      h should include("} Id;")
+      h should include("Id bump(Id a);")
+    }
+
+    "while a struct that names itself nothing keeps the derived name" in {
+      headerFor("module demo\n\nstruct Id\n    index1: i32\n\n@export\nbump(a: Id) -> Id = a\n") should
+        include("} demo_Id;")
+    }
+
+    // The name is used wherever the type is spelled, not only at the definition — a field, a
+    // pointee and a function pointer's signature all go through `CHeader.cName`.
+    "and it is what a field, a pointer and a callback spell too" in {
+      val h = headerFor("module demo\n\n@export(\"b2Vec2\")\nstruct V\n    x: f32\n\n" +
+        "struct Body\n    at: V\n\n@export\nshift(b: *Body, cb: *extern(V) -> unit) -> V = b.at\n")
+
+      h should include("\tb2Vec2 at;")
+      h should include("b2Vec2 shift(demo_Body * b, void (*)(b2Vec2) cb);")
+    }
+
+    // The layout pair and the name are three facts about one struct, so they compose — which is the
+    // combination a mirrored C struct actually wants.
+    "and it composes with the layout attributes, which describe the same declaration" in {
+      val h = headerFor("module demo\n\n@packed\n@export(\"wire_hdr\")\nstruct H\n    a: u8\n    b: u32\n\n" +
+        "@export\nf(h: H) -> u8 = h.a\n")
+
+      h should include("} wire_hdr;")
+      h should include("uint8_t f(wire_hdr h);")
+    }
+
+    // `@align` is the other half of that pair and is folded by a different line, so it is asserted
+    // rather than assumed to follow from `@packed` working.
+    "including the other one, which is folded separately" in {
+      headerFor("module demo\n\n@align(16)\n@export(\"aligned_hdr\")\nstruct H\n    a: u32\n\n" +
+        "@export\nf(h: H) -> u32 = h.a\n") should include("} aligned_hdr;")
+    }
+
+    // The rule that catches an annotation written twice is above the struct reading and so covers
+    // it — two names for one type say nothing the one does, and worse could disagree.
+    "and writing it twice is refused, as it is above a function" in {
+      err("module demo\n\n@export(\"a\")\n@export(\"b\")\nstruct H\n    x: i32\n") should
+        include("is written twice above one declaration")
+    }
+
+    /** **The chosen name reaches the header and nothing else.** The emitted aggregate keeps the
+      * mangled name, which is what every other part of the compiler keys on, and C links nothing on
+      * a type name — so this is a spelling for a reader rather than a fact anything depends on. It
+      * is asserted because it is the cost the card accepted rather than fixed.
+      */
+    "and the emitted aggregate is untouched, since nothing links on a type name" in {
+      ir("module demo\n\n@export(\"b2BodyId\")\nstruct Id\n    index1: i32\n\n" +
+        "@export\nbump(a: Id) -> Id = a\n") should include("%struct.demo$Id")
+    }
+
+    /** **A private struct is refused, and not for the reason a private function is.** A `typedef`
+      * has no linkage to contradict, so the function's argument does not reach — this was written
+      * as an acceptance on the strength of that and the compiler said otherwise, which is the
+      * finding. The visibility rule gets there first: a public declaration may not name a type less
+      * visible than itself, an exported function is public, so a private struct is in no signature
+      * a header carries and there is no name in one for it to take.
+      */
+    "a private struct is refused, because no export could name it in the first place" in {
+      err("module demo\n\n@export(\"b2BodyId\")\nprivate struct Id\n    index1: i32\n") should
+        include("No header can carry this type at all")
+    }
+
+    // The rule the one above defers to, asserted here so that the refusal and its reason cannot
+    // drift apart: it is what makes a private struct unreachable from a header.
+    "which is the rule that already stops a public export naming one" in {
+      err("module demo\n\nprivate struct Id\n    index1: i32\n\n@export\nbump(a: Id) -> Id = a\n") should
+        include("may not be more visible than the types it names")
+    }
+
+    "a name C could not declare is refused" in {
+      err("module demo\n\n@export(\"2bad\")\nstruct Id\n    x: i32\n") should
+        include("is not a name C can declare")
+    }
+
+    "and a backticked struct named after itself, which is the same rule from the other end" in {
+      err("module demo\n\n@export\nstruct `an id`\n    x: i32\n") should
+        include("name it instead")
+    }
+
+    // Every instantiation is a struct of its own, so one written name would be claimed by all of
+    // them at once — the argument that refuses an exported generic function, one step shorter.
+    "a generic struct is refused, because each instantiation would claim the one name" in {
+      err("module demo\n\n@export(\"Box\")\nstruct Box[T]\n    v: T\n") should
+        include("cannot be generic")
+    }
+
+    "two structs claiming one name are refused, naming both" in {
+      val e = err("module demo\n\n@export(\"Handle\")\nstruct A\n    x: i32\n\n" +
+        "@export(\"Handle\")\nstruct B\n    y: i32\n\n@export\nf(a: A, b: B) -> i32 = a.x\n")
+
+      e should include("'Handle' is the C name of")
+      e should include("'demo.A'")
+      e should include("'demo.B'")
+    }
+
+    // The collision a reader would never look for: a chosen name landing on what another struct's
+    // derived one already is. It is the same mistake and gets the same refusal.
+    "and a chosen name landing on another struct's derived one is the same refusal" in {
+      err("module demo\n\nstruct Id\n    x: i32\n\n@export(\"demo_Id\")\nstruct Other\n    y: i32\n\n" +
+        "@export\nf(a: Id, b: Other) -> i32 = a.x\n") should include("'demo_Id' is the C name of")
+    }
+
+    /** **A type and a function are one namespace in C, and two in sysl.** At file scope a `typedef`
+      * name and a function name are both ordinary identifiers, so `typedef struct { … } handle;`
+      * beside `handle handle(…)` is one name declared twice — which nothing on the sysl side hints
+      * at, since a struct and a function collide nowhere here.
+      */
+    "and a type claiming an exported function's symbol, which C has one namespace for" in {
+      val e = err("module demo\n\n@export(\"handle\")\nstruct H\n    x: i32\n\n" +
+        "@export(\"handle\")\nmake(n: i32) -> H = H(n)\n")
+
+      e should include("the type 'demo.H'")
+      e should include("the function 'demo.make'")
+    }
+
+    // And the same thing the other way round, where nobody chose anything: a function named after
+    // what a struct's derived name happens to be.
+    "including where the type's half of it was derived rather than chosen" in {
+      err("module demo\n\nstruct Id\n    x: i32\n\n@export(\"demo_Id\")\nmake(n: i32) -> Id = Id(n)\n") should
+        include("'demo_Id' is the C name of")
+    }
+
+    // Two functions claiming one symbol stay `duplicates`' case, whose sentence is about the linker
+    // and two definitions — the better one there, and the reason this check needs a type in the group.
+    "while two functions claiming one symbol keep the refusal that is about the linker" in {
+      err("module demo\n\n@export(\"go\")\na() -> i32 = 1\n\n@export(\"go\")\nb() -> i32 = 2\n") should
+        include("one symbol is one definition")
+    }
+
+    // Only what reaches the header claims a name, which is `CHeader.aggregates`' set rather than
+    // every struct in the program: two types nobody exported cannot collide in a file neither is in.
+    "while two agreeing names neither of which reaches the header are not a collision" in {
+      headerFor("module demo\n\n@export(\"Handle\")\nstruct A\n    x: i32\n\n" +
+        "@export(\"Handle\")\nstruct B\n    y: i32\n\n@export\nf(n: i32) -> i32 = n\n") should
+        include("int32_t f(int32_t n);")
+    }
+  }
+
   /** **A test build is held to the same rules, and was held to none of them** (0140).
     *
     * `Compiler.compileTests` ran `Escape.check` and `TailCalls.check` and never `Exports.check`, so
@@ -490,6 +661,34 @@ class ExportTests extends AnyFreeSpec with CodegenSupport with TestFrameworkSupp
 
     "and the unknown-annotation list mentions it, so it is discoverable" in {
       err("module demo\n\n@exprot\nadd(a: i32) -> i32 = a\n") should include("'@export'")
+    }
+
+    // `@export` marks two kinds of declaration and neither of them is a binding, so the refusal says
+    // which two rather than leaving the grammar to complain about the word after it.
+    "above a binding, which is neither of the two things it names" in {
+      err("module demo\n\n@export(\"x\")\nvar count: i32 = 0\n") should
+        include("names what C sees")
+    }
+
+    // The layout pair settles it: `@packed` cannot mark a function, so the pair together can only be
+    // about a struct and the refusal need not offer the function reading at all.
+    "and beside a layout attribute above one, where only the struct reading is left" in {
+      err("module demo\n\n@packed\n@export(\"x\")\nvar count: i32 = 0\n") should
+        include("together they mark a struct")
+    }
+
+    // A simple enum is spelled as its underlying integer, so there is no name in the header for the
+    // attribute to be about — which is the mistake worth naming, since a simple enum does cross.
+    "and above an enum, which is spelled as an integer and so has no name to choose" in {
+      err("module demo\n\n@export(\"Colour\")\nenum Colour: u8\n    Red\n    Green\n") should
+        include("no name in the header to choose")
+    }
+
+    // The mix that has always meant a function still does: `@export` composes with the function
+    // attributes exactly as before, and the struct reading is reached only by the layout pair.
+    "while an export beside a function attribute is still a function" in {
+      ir("module demo\n\n@pure\n@export(\"mylib_add\")\nadd(a: i32, b: i32) -> i32 = a + b\n") should
+        include("define i32 @mylib_add(")
     }
   }
 }

@@ -108,8 +108,12 @@ object CHeader {
    * A struct is reached through a parameter, a result, a pointer's pointee, a function pointer's own
    * signature, another struct's field, or an array's element — so the walk follows all of them
    * rather than only the top level, and a type mentioned twice is defined once.
+   *
+   * It is public because `Exports.names` asks the same question — which types land in the header —
+   * in order to refuse two of them claiming one name. Working that set out a second time is how the
+   * check and the header would come to disagree about what is in it.
    */
-  private def aggregates(exports: List[TFunc]): List[Type] = {
+  def aggregates(exports: List[TFunc]): List[Type] = {
     val seen  = scala.collection.mutable.LinkedHashSet.empty[Type]
     val named = scala.collection.mutable.ListBuffer.empty[Type]
 
@@ -153,11 +157,26 @@ object CHeader {
     case a: Type.Array => s"${spell(a.elem)} $name[${a.length}]"
     case _             => s"${spell(t)} $name"
 
-  /** The C name of a named type. The mangled form is already unique per instantiation — it is what
-   * the emitted IR names the aggregate — and the separators it uses are not C identifier characters,
-   * so they are replaced rather than the name being invented again here.
+  /** The C name of a named type — the one the author chose, or the derived one.
+   *
+   * **`@export("b2BodyId")` on the struct is what chooses it** (`15 §12`), and it exists because
+   * everything else in this header is either the author's spelling or a C fixed-width name: a
+   * binding mirroring a C library wants to hand back that library's own type names. The choice is a
+   * claim, so `Exports.names` holds it to the property the derived form gives away — that no two
+   * types in one header answer to one name.
+   *
+   * Derived, the mangled form is already unique per instantiation — it is what the emitted IR names
+   * the aggregate — and the separators it uses are not C identifier characters, so they are replaced
+   * rather than the name being invented again here.
+   *
+   * **The replacement is where uniqueness stops, which is worth knowing before trusting the derived
+   * form.** `Type.mangled` is injective and the map onto `_` is not: a `C` in module `a.b` and a
+   * `b_C` in module `a` mangle apart and land on `a_b_C` together. It has never been reachable in
+   * practice and it was never checked, and `Exports.names` now catches it — so the honest statement
+   * is that the derived name is *ordinarily* unique and the collision rule is what guarantees it.
    */
-  private def cName(t: Type): String = t match
+  def cName(t: Type): String = t match
+    case s: Type.Struct if s.cname.isDefined => s.cname.get
     case n: Type.Named =>
       Type.mangled(n.base, n.targs).map(c => if c.isLetterOrDigit then c else '_')
     case _ => "void"

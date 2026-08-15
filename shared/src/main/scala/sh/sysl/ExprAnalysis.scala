@@ -249,10 +249,16 @@ trait ExprAnalysis
       Type.readOnlyView(want)
 
 
-  /** Whether an expression yields its value through branches rather than producing one itself. */
+  /** Whether an expression yields its value through branches rather than producing one itself.
+   *
+   * A block is one of them though it has a single path: what a converting context has to reach is the
+   * expression the value actually comes from, and for a block that is its trailing expression rather
+   * than the block. Boxing or erasing the block instead would ask the whole statement list for
+   * something only its last line can give.
+   */
   private def branching(expr: Expr): Boolean = expr match
-    case _: IfExpr | _: MatchExpr | _: While | _: DoWhile | _: For => true
-    case _                                                         => false
+    case _: IfExpr | _: MatchExpr | _: While | _: DoWhile | _: For | _: Block => true
+    case _                                                                    => false
 
   /** The four conversions a context may apply to a value that does not already have its type: a
    * `T` the context wanted by reference is boxed, a `&T` the context wanted weakly is weakened,
@@ -1044,7 +1050,7 @@ trait ExprAnalysis
     // `ControlFlowExprAnalysis`.
     case e @ (_: IfExpr | _: MatchExpr | _: While | _: DoWhile | _: Loop | _: CFor | _: For |
         _: ConstFor | _: Quantifier | _: TryExpr | _: RangeExpr | _: ResultList | _: Lambda |
-        _: Tuple) =>
+        _: Tuple | _: Block) =>
       controlExpr(e, expected, discarded)
 
     // Reached only where an `is` was written somewhere a condition's terms are not read one by one:

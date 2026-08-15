@@ -153,6 +153,10 @@ trait GenericInstantiation extends ConstFolding {
           s.fields = decl.fields.map(f => (f.name, recover(Type.Unknown)(resolveQualified(f.typ, subst))))
           s.packed = decl.packed
           s.minAlign = decl.alignment.flatMap(a => recover(Option.empty[Int])(alignBound(decl.name, a)))
+          // The declared name where `@export` carried no string, which is the reading it has on a
+          // function. It is the **bare** name rather than the key: a key is `module$Name`, and being
+          // rid of the module path is the whole of what the attribute is written for.
+          s.cname = decl.cname.map(e => e.symbol.getOrElse(Modules.bare(decl.name)))
           recover(())(checkBitfields(s))
         finally
           resolving -= key

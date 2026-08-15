@@ -215,7 +215,8 @@ trait AttrParser extends ExprParser {
       err(s"'$n' is not an annotation a declaration takes — '@test', '@tailrec', '@pure', " +
         "'@ghost', '@export', '@reads(...)', '@writes(...)' and '@crossing(...)' mark a function, " +
         "'@packed' and " +
-        "'@align(n)' mark a struct's layout, and '@section(\"...\")' marks either a binding or a " +
+        "'@align(n)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C " +
+        "header, and '@section(\"...\")' marks either a binding or a " +
         "function. '@no_<capability>', " +
         "'@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header"))
 

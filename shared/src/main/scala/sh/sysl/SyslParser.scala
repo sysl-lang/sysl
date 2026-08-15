@@ -186,6 +186,12 @@ class SyslParser(val source: Source)
           err("'@packed' lays out a struct's fields and '@section(\"...\")' places one object, so " +
             "they cannot stand above one declaration — a type occupies no address of its own, and " +
             "the storage that holds a packed value is what a section would be about")
+        // `@export` is the second attribute marking either kind of thing, and it pairs with the
+        // layout attributes rather than with `@section`: a struct's C name sits beside its layout,
+        // and a function's symbol beside `@pure` and the rest. This is the struct reading, and a set
+        // holding nothing but `@export` reaches the function reading through `namedStruct`.
+        case None if as.exists(names) && as.forall(a => layout(a) || names(a)) =>
+          namedStruct(as)
         // A layout annotation and a function annotation describe different kinds of thing, so one
         // declaration cannot carry both — and saying which pair collided is more use than the
         // grammar's complaint about whichever alternative it went on to try. `@section` is in
@@ -236,10 +242,48 @@ class SyslParser(val source: Source)
             case _ ~ other                         => other
           } | err(
             "an annotation marks a function, and only a function — neither what 'sysl test' calls " +
-              "nor what recurses is anything a declaration of another kind supplies. '@packed' " +
-              "and '@align(n)' are the two that mark a struct instead",
+              "nor what recurses is anything a declaration of another kind supplies. '@packed', " +
+              "'@align(n)' and '@export(\"...\")' are the three that mark a struct instead",
           )
     }
+
+  /** A struct carrying `@export("…")`, and — where that is the only annotation above it — a function
+   * carrying it instead.
+   *
+   * The two readings are here together because `@export` names *either* kind of thing: a function's
+   * symbol and a struct's C name are one request made of the two declarations a generated header
+   * holds. `structDecl` goes first and declines without consuming, which is how `@section` reaches
+   * the function form past `storageDecl`.
+   */
+  private def namedStruct(as: List[Attr]): PackratParser[Stmt] =
+    (visibility ~ structDecl) ^^ {
+      case Visibility.Public ~ (s: StructDecl) => laidOut(s, as)
+      case v ~ (s: StructDecl)                 => restrict(v, laidOut(s, as))
+      case _ ~ other                           => other
+    } | (if !as.forall(names) then failure("not a function's annotation")
+         else
+           (visibility ~ funcDecl) ^^ {
+             case Visibility.Public ~ (f: FuncDecl) => attributed(f, as)
+             case v ~ (f: FuncDecl)                 => restrict(v, attributed(f, as))
+             case _ ~ other                         => other
+           }) | err(
+      if as.forall(names) then
+        "'@export' names what C sees — a function's symbol, or the name a struct's 'typedef' " +
+          "carries in a generated header — and this declares neither. A simple enum is spelled as " +
+          "the integer it is, so it has no name in the header to choose, and an 'extern' names " +
+          "something this program does not define"
+      else
+        "'@packed' and '@align(n)' lay out a struct and '@export(\"...\")' names one in a generated " +
+          "header, so together they mark a struct — and this declares none",
+    )
+
+  /** Whether an attribute **names** what it marks to C, which is `@export` and only `@export`. It is
+   * a category of its own for `@section`'s reason: it is one of the two attributes that mark either
+   * a struct or a function, and the pair it may be written beside differs by which.
+   */
+  private def names(a: Attr): Boolean = a match
+    case _: Attr.Export => true
+    case _              => false
 
   /** Whether an attribute describes a **layout** rather than a function. */
   private def layout(a: Attr): Boolean = a match
@@ -331,12 +375,15 @@ class SyslParser(val source: Source)
     case StaticDecl(d) => StaticDecl(placed(d, name)).setPos(s.pos)
     case other         => other
 
-  /** The struct these layout annotations describe, folded onto its declaration. */
+  /** The struct these annotations describe, folded onto its declaration — the layout pair, and the
+   * name a generated C header gives it.
+   */
   private def laidOut(s: StructDecl, as: List[Attr]): StructDecl =
     as.foldLeft(s) {
-      case (d, Attr.Packed)   => d.copy(packed = true)
-      case (d, Attr.Align(n)) => d.copy(alignment = Some(n))
-      case (d, _)             => d
+      case (d, Attr.Packed)    => d.copy(packed = true)
+      case (d, Attr.Align(n))  => d.copy(alignment = Some(n))
+      case (d, Attr.Export(e)) => d.copy(cname = Some(e))
+      case (d, _)              => d
     }
 
 
@@ -396,9 +443,35 @@ class SyslParser(val source: Source)
   protected lazy val varDecl: PackratParser[Stmt] =
     multiDecl("var", mutable = true) |
       patternDecl("var", mutable = true) |
-      op("var") ~> ident ~ opt(op(":") ~> typeRef) ~ opt(op("=") ~> expression) ^^ {
+      op("var") ~> ident ~ opt(op(":") ~> typeRef) ~ opt(op("=") ~> initializer) ^^ {
         case n ~ t ~ e => VarDecl(n, t, e.map(Placeholders.lift))
       }
+
+  /** What a binding's `=` takes: one expression, or an indented block whose trailing expression is
+   * the value (`00 § Continuing a line`).
+   *
+   * The block is tried first and costs nothing when there is not one — it opens on `Newline`+`Indent`,
+   * which no expression can begin with, so a value written on the same line as the `=` reaches
+   * `expression` having consumed nothing.
+   *
+   * **A block of a single expression is that expression.** The two are the same value written two
+   * ways, and collapsing here is what keeps a module `val` with its value on the next line a constant
+   * tree rather than a computed initializer — a distinction a reader who moved the line to fit the
+   * margin never asked to make. A block that binds anything cannot collapse and does not.
+   */
+  protected lazy val initializer: PackratParser[Expr] =
+    blockValue | expression
+
+  /** [[blockAhead]] is what keeps the diagnostic for a value that was simply forgotten: without it
+   * `val x =` is answered with `indent expected` against the following line, which describes a block
+   * the writer had not begun.
+   */
+  private lazy val blockValue: PackratParser[Expr] =
+    blockAhead ~> suite ^^ {
+      case List(ExprStmt(e)) => e
+      case stmts @ (h :: _)  => Block(stmts).setPos(h.pos)
+      case Nil               => UnitLit()
+    }
 
   /** `val (a, b) = …` / `var (a, b) = …` — a binding written as a **pattern** (`00 §13`).
    *
@@ -421,7 +494,7 @@ class SyslParser(val source: Source)
    * nowhere to carry a type, and inference covers what the form is for.
    */
   protected def patternDecl(keyword: String, mutable: Boolean): PackratParser[Stmt] =
-    (op(keyword) ~> destructuring) ~ (op("=") ~> expression) ^^ {
+    (op(keyword) ~> destructuring) ~ (op("=") ~> initializer) ^^ {
       case p ~ v => PatternDecl(p, mutable, Placeholders.lift(v))
     }
 
@@ -469,9 +542,14 @@ class SyslParser(val source: Source)
    * from a `var` at a glance as well as to the parser: a constant with no value is not a
    * declaration of anything, and a type left off would be the one declaration in the language whose
    * interface could not be read off its syntax.
+   *
+   * **A block is read here and refused in the analyzer**, which is the same arrangement a variant
+   * pattern in a binding gets and for the same reason: a `const` folds, a block does not, and leaving
+   * the form out of the grammar answers the reader who reached for it with `expression expected`
+   * rather than with the rule.
    */
   protected lazy val constDecl: PackratParser[Stmt] =
-    op("const") ~> ident ~ (op(":") ~> typeRef) ~ (op("=") ~> expression) ^^ {
+    op("const") ~> ident ~ (op(":") ~> typeRef) ~ (op("=") ~> initializer) ^^ {
       case n ~ t ~ v => ConstDecl(n, t, v)
     }
 
@@ -594,7 +672,7 @@ class SyslParser(val source: Source)
   protected lazy val valDecl: PackratParser[Stmt] =
     multiDecl("val", mutable = false) |
       patternDecl("val", mutable = false) |
-      op("val") ~> ident ~ opt(op(":") ~> typeRef) ~ (op("=") ~> expression) ^^ {
+      op("val") ~> ident ~ opt(op(":") ~> typeRef) ~ (op("=") ~> initializer) ^^ {
         case n ~ t ~ v => ValDecl(n, t, Placeholders.lift(v))
       }
 

@@ -296,6 +296,24 @@ trait SyslParserBase extends PackratParsers {
   /** An indented block of statements. */
   protected def suite: PackratParser[List[Stmt]]
 
+  /** That a [[suite]] is what comes next, without reading any of it — for the places a block is one
+   * *alternative* among others rather than the only thing that may stand there.
+   *
+   * It exists because of where the refusal lands. `suite` consumes the newline before asking for the
+   * indent, so where there is no block it fails one token further along than an `expression`
+   * alternative does — and the furthest failure is the one reported. A closure whose body was
+   * forgotten, or a binding whose value was, therefore got `indent expected` against the *following*
+   * line, demanding a block the writer had not begun and was not going to. [[asOneToken]] puts that
+   * refusal back where the search started, so both alternatives fail at one token and the later of
+   * them is the one whose message is shown.
+   *
+   * It guards the look-ahead only. Once the indent is there the block has *begun*, and a mistake
+   * inside it is reported where it was made, exactly as [[maybe]] keeps a refusal past the first
+   * token.
+   */
+  protected lazy val blockAhead: Parser[Unit] =
+    asOneToken(guard(newline ~ indent)) ^^^ (())
+
   /** A block introduced by a keyword, written inline after it or indented under it. */
   protected def body(keyword: String): Parser[List[Stmt]]
 

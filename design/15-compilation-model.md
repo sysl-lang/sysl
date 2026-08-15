@@ -1213,6 +1213,46 @@ which is suppressed — the same switch a library build has always used, reached
 same reason: nothing inside the program calls it, and the whole point is that something outside will.
 A build with no entry point is what makes this load bearing, since every other root is absent there.
 
+### A struct in the header is named by `@export` too
+
+Once an aggregate could cross, the header began carrying **type** names, and they were derived: the
+mangled instantiation with everything C would not accept replaced, so `Id` in module `demo` arrived
+as `demo_Id`, and in a package as `sh_sysl_box2d_c_Id`. That was the one name in a generated header
+nobody chose — everything else in it is the author's spelling or a C fixed-width name — and the
+audience is a C reader. `@export` above the struct chooses it, which is the rename above read at the
+other kind of declaration:
+
+```
+@export("b2BodyId")                      -- the typedef is 'b2BodyId'
+struct Id
+    index1: i32
+
+@export                                  -- the typedef is 'Handle', the declared name
+struct Handle
+    slot: u16
+```
+
+**It is the same attribute because it is the same idea** — the name C sees — and it composes with
+`@packed` and `@align(n)`, which are three facts about one struct. A binding mirroring a C library
+can therefore hand back that library's own type names, which is what made the derived form worth
+replacing rather than merely tidying.
+
+**What the derived name was buying is uniqueness, and a chosen one is a claim**, so the claim is
+checked. Two things in one header answering to one name are refused, and **a function's symbol is in
+that comparison**: at file scope C puts a `typedef` name and a function name in one namespace, where
+sysl has two, so `typedef struct { … } handle;` beside `handle handle(…)` is one name declared twice.
+A **generic** struct is refused for the reason a generic function is, one step shorter — every
+instantiation is a struct of its own, so one written name would be claimed by all of them at once.
+
+**A `private` struct is refused, and not for the reason a private definition is.** A `typedef` has no
+linkage, so §3's argument does not reach it, and the visibility rule gets there first: a public
+declaration may not name a type less visible than itself and an export is public, so a private struct
+appears in no signature a header carries and there is no name in one for it to take.
+
+**The chosen name reaches the header and nothing else.** The emitted aggregate keeps its mangled
+name, which is what §2 and the rest of the compiler key on, and C links nothing on a type name —
+which is exactly what makes this safe to let an author decide.
+
 **A root the program did not WRITE counts only where the program reaches its module**, and that is the
 one qualification on the rule above. A handed source root is compiled whole rather than by what
 the program imports (§7), so every module of every `--lib` root and every fetched package is in the

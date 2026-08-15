@@ -770,6 +770,16 @@ object Type {
       */
     var minAlign: Option[Int] = None
 
+    /** `@export("b2BodyId")` — the name a generated C header's `typedef` gives this type (`15 §12`),
+      * where `CHeader` otherwise derives one from the mangled instantiation.
+      *
+      * **It reaches the header and nothing else.** The emitted aggregate keeps the mangled name
+      * `lty` below gives it, which is what every other part of the compiler keys on, and C links
+      * nothing on a type name — so this is a spelling for a reader rather than a fact anything
+      * depends on.
+      */
+    var cname: Option[String] = None
+
     def name: String = qualified(base, targs)
 
     def lty(using Word): LType = LType.Named(s"%struct.${mangled(base, targs)}")

@@ -520,7 +520,7 @@ The rule decides the exclusions, which is the part worth stating:
 
 | excluded | because |
 |---|---|
-| `=`, `->` | already mean "an indented block starts here" — a body, a match arm |
+| `=`, `->` | already mean "an indented block starts here" — a body, a match arm, a binding's value |
 | `++`, `--`, `?` | postfix, so a line ending in one is a complete statement |
 | `..`, `..<`, `...` | can be complete: `s[..]` is the whole range, `int...` a variadic tail |
 
@@ -558,6 +558,35 @@ changed. The comma is optional *after* an element and never instead of one, so `
 parameters, type arguments, type parameters, an enum variant's payload, a variant or struct pattern,
 and an import selector list — because a rule that held for some of them would be a list to remember.
 
+**`=` was excluded on the strength of introducing a block, and for a long time introduced none.** The
+row above is about a function's or a member's body; a **binding's** `=` is neither of those, so
+`val x =` with the value on the next line was refused by both mechanisms at once — it does not
+continue the line, and there was no block for it to open. What a reader got for writing the natural
+thing was `expression expected`, pointing at the `=`.
+
+That is now what the row says it is. A binding's `=` takes an indented block whose trailing
+expression is the value, on exactly the terms a function body's does, so the exclusion is honest:
+
+```
+val limits =
+    val raw = read_config()
+    val capped = min(raw, MAX)
+    capped
+```
+
+Three consequences worth stating rather than deriving. **A block of one expression is that
+expression** — collapsed while parsing, so a module `val` whose value moved to the next line to fit
+the margin is still a constant tree rather than a computed initializer, which is not a distinction
+anybody should make by choosing where to break a line. **A `const` is refused one**, since a constant
+is folded into its uses rather than run and there is nowhere for the statements to happen; the
+grammar reads the block there anyway, so the refusal can say that instead of `expression expected`.
+And **the block is a scope**, like every other: what it binds is its own, its counted locals are
+released at its end, and a `defer` in it runs there.
+
+The cost is one typo that used to be caught and now is not: `val x =` with the value forgotten and
+the *next line indented* is a block rather than an error. A next line at the same indentation — which
+is what a forgotten value usually leaves — is still `expression expected`.
+
 **The indentation of a continuation line carries no meaning.** The suppressed newline is the one
 that would have measured it, so the next line may sit anywhere. The cost of that is the hazard every
 joining language has, brackets included: a continuation line that is *dedented* has its dedent
@@ -586,6 +615,18 @@ A branch or arm otherwise yields its block's **trailing expression**; a branch t
 effects yields `unit`. An `if` used for a value needs an `else` (a missing one leaves the
 open branch at `unit`); a `match` used for a value must be exhaustive. A branch that does not
 finish at all is the one alternative that constrains nothing — see `never` (§11).
+
+**A block with no construct in front of it is an expression too, in the one place the grammar can
+find one: under a binding's `=`.** The rules are the ones above word for word — the trailing
+expression is the value, a block that only performs effects yields `unit`, and one that does not
+finish is `never` — so it adds no rule, only a position. See § *Continuing a line*, which is where
+the missing position came from.
+
+```
+val limits =
+    val raw = read_config()
+    min(raw, MAX)
+```
 
 **Loops carry a value out through `break`.** `break expr` leaves the nearest loop and makes
 `expr` the loop's value; `continue` skips to the next iteration. An optional **`else` block**
@@ -1060,7 +1101,11 @@ work:
   need. So `if c then x = 1` and `if c` + an indented block are both written, and `while c do …`
   likewise. `do … while`'s leading `do` is the one place the word is a **head** rather than an
   introducer, and the two never meet: an introducer only ever follows a loop header on the same line,
-  so it is never a statement's first token. The *lexing* mechanics were settled earlier by adopting
+  so it is never a statement's first token. **`=` reaches further than this paragraph said it did:**
+  a *binding's* `=` opens a block too, so `val x =` with statements under it is the same arrangement
+  as a body, with the trailing expression as the value — see § *Continuing a line*, which is where
+  the gap showed up, since `=` was excluded from continuing a line on the strength of the very thing
+  it was not yet doing. The *lexing* mechanics were settled earlier by adopting
   `IndentationLexical` (see
   `front-end.md`), and the trailing-continuation operator set that was also filed here is settled in
   § *Continuing a line* below.
