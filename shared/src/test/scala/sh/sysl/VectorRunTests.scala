@@ -469,6 +469,126 @@ class VectorRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "300\n"
   }
 
+  // -- where a load's width comes from ------------------------------------------------------------
+  //
+  // A load answers a vector and has nothing of its own to say how wide, so the width is the
+  // *receiving* type's. An operand of an arithmetic expression is a receiving position and did not
+  // used to act like one: `analyzeOperands` read every non-literal at whatever the whole expression
+  // was asked for, so the load was asked with nothing and complained before its neighbour — which
+  // knew — was ever looked at. It is now the middle of three tiers.
+
+  "an arithmetic operand settles a load's width" in {
+    val src =
+      """var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]
+        |val by: <4>f32 = 10.0
+        |var out: [4]f32
+        |out.store(0, xs.load(0) * by)
+        |print(out[0], out[3])
+        |""".stripMargin
+
+    run(src) shouldBe "10 40\n"
+  }
+
+  "and on either side of the operator" in {
+    val src =
+      """var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]
+        |val by: <4>f32 = 10.0
+        |var out: [4]f32
+        |out.store(0, by - xs.load(0))
+        |print(out[0], out[3])
+        |""".stripMargin
+
+    run(src) shouldBe "9 6\n"
+  }
+
+  /** **The case the tier was built for: a width nobody can write a literal for.**
+    *
+    * At a parameterised width there is no annotation short of a `val` of its own — `<W>f32` is what
+    * the body means and `W` is a value parameter — so `xs.load(i) * by` reading its lanes off `by` is
+    * the difference between a kernel that says what it does and one carrying a line per load. Run at
+    * two widths from one body, which is what says the count came from the neighbour rather than from
+    * a guess: a guess would have to be wrong for one of them.
+    */
+  "a parameterised width comes off the neighbouring operand" in {
+    val src =
+      """scale[const W: usize](xs: []const f32, out: []f32, by: <W>f32)
+        |    out.store(0, xs.load(0) * by)
+        |
+        |var a: [8]f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        |var four: [8]f32
+        |var eight: [8]f32
+        |val by4: <4>f32 = 2.0
+        |val by8: <8>f32 = 3.0
+        |
+        |scale(a[..], four[..], by4)
+        |scale(a[..], eight[..], by8)
+        |print(four[0], four[3], four[4], eight[7])
+        |""".stripMargin
+
+    run(src) shouldBe "2 8 0 24\n"
+  }
+
+  // All three tiers in one expression, which is the shape a kernel actually writes: the operand that
+  // knows its type is read first, the load at what it said, and the literal last at what those two
+  // settled.
+  "a load, a typed operand and a bare literal settle in that order" in {
+    val src =
+      """var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]
+        |val by: <4>f32 = 10.0
+        |val v = xs.load(0) * by + 1.0
+        |print(v[0], v[3])
+        |""".stripMargin
+
+    run(src) shouldBe "11 41\n"
+  }
+
+  // A comparison reconciles its operands the same way an arithmetic operator does, so a mask is
+  // reachable from a load without a binding too.
+  "a comparison operand settles it as well" in {
+    val src =
+      """var xs: [4]f32 = [1.0, 5.0, 2.0, 8.0]
+        |val lo: <4>f32 = 3.0
+        |print((xs.load(0) > lo).all(), (xs.load(0) > lo).any())
+        |""".stripMargin
+
+    run(src) shouldBe "false true\n"
+  }
+
+  // The expected type still reaches it where there is no neighbour to read: the tiers fall back to
+  // what the whole expression was asked for, which is what carries the splat of the `2.0` as well.
+  "a literal beside a load leans on the expected type for both of them" in {
+    val src =
+      """var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]
+        |val v: <4>f32 = xs.load(0) * 2.0
+        |print(v[0], v[3])
+        |""".stripMargin
+
+    run(src) shouldBe "2 8\n"
+  }
+
+  /** **Why the tier is in the middle rather than beside the literals.**
+    *
+    * A declared `load` has a type of its own and the builtin stands aside for it, so it has to go on
+    * telling a bare literal beside it what that type is. Deferring it to the literals' tier would
+    * leave this expression with nothing in it that knows anything, and the `1` would fall to `int`
+    * against a member answering a `u8`.
+    */
+  "a declared load still tells the literal beside it what it is" in {
+    val src =
+      """trait Lanes
+        |    load(self, i: usize) -> u8
+        |
+        |impl Lanes for []const f32
+        |    load(self, i: usize) -> u8 = u8(self[i])
+        |
+        |var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]
+        |val n = xs[..].load(2) + 1
+        |print(n)
+        |""".stripMargin
+
+    run(src) shouldBe "4\n"
+  }
+
   "an atomic's own load and store are reached through a pointer" in {
     val src =
       """import sysl.sync.Atomic

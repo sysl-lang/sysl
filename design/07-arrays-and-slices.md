@@ -495,9 +495,15 @@ out.store(i, v * 2.0)                    -- the register back into W elements
 length it has, so it cannot say; guessing would be the one mistake that silently takes the wrong
 run. A binding's annotation says it, and so does a parameter or a declared result — which is what
 makes the load writable from a `[const W: usize]` body, where `<W>f32` is nameable and no literal
-could stand in. An operand of an arithmetic expression is *not* such a place: `xs.load(i) * by` is
-refused even where `by` fixes the width, because an operator does not settle its two sides in
-either order.
+could stand in.
+
+**An operand of an operator is a receiving position too**, so `xs.load(i) * by` takes its lane count
+from `by`. That is the literal rule of `01` with a tier in the middle: an operand carrying a type of
+its own is read first, a load is read at what that one said, and a bare literal is read last at
+whatever the two of them settled — so `xs.load(i) * by + 1.0` needs no annotation anywhere. What is
+*not* a receiving position is a place where any width would do. `out.store(i, xs.load(i))` is
+refused, and has to be: a store takes whatever it is handed, so every width type-checks and there is
+nothing to infer rather than something the compiler declines to look for.
 
 A store is told by the vector handed to it, so the asymmetry is in the language rather than in the
 implementation.

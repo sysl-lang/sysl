@@ -82,8 +82,8 @@ trait Literals extends TypeResolution {
 
   /** Analyzes operands that must share one type. A bare literal has no type of its own, so it
    * takes the type of a non-literal neighbour — which is what lets `n + 1` work for an `n` of
-   * any width without the literal needing a suffix, and `p == null` work for any `*T`. The
-   * non-literals are analyzed first precisely so their type is available to the literals.
+   * any width without the literal needing a suffix, and `p == null` work for any `*T`. The operands
+   * that have a type are analyzed first precisely so it is available to the ones that do not.
    *
    * What it takes is the neighbour's **representation**, which for a transparent subtype is its base:
    * the operator it is about to be an operand of is the base's, so the literal is a base value and
@@ -91,16 +91,52 @@ trait Literals extends TypeResolution {
    * temperature when what has to be one is the sum — and the sum is checked where it is stored. A
    * derived subtype is its own representation, so a literal still may not stand beside one without
    * the cast `16 §2` asks for.
+   *
+   * **There are three tiers rather than two, and the middle one is `typedByPosition`.** A form whose
+   * type the position supplies is not a literal — it may be a whole expression, and what it is owed
+   * is a shape rather than a width — but it stands where one stands: it has nothing to offer the
+   * operands beside it until something has told it what it is. So it is analyzed after everything
+   * that knows its own type and before everything that knows none, which is what lets
+   * `xs.load(i) * by` read its lane count off `by` while `out.store(i, xs.load(i))` stays refused —
+   * nothing outside that load ever says a width there, and guessing one is the thing a run of memory
+   * must never do.
+   *
+   * **The order is why this is a tier and not another case of `isLiteral`.** A *declared* member of
+   * one of those names — `sysl.sync.Atomic.load`, which the builtin stands aside for — does have a
+   * type of its own, and putting it in the same tier as the literals would leave `a.load(i) + 1` with
+   * nothing in it that knows anything: the literal would fall to `int` where the member answers a
+   * `u8`. In the middle tier it is still asked before the literals are, so it goes on supplying the
+   * type it always did.
    */
   protected def analyzeOperands(operands: List[Expr], expected: Option[Type]): List[TExpr] = {
-    val fixed = operands.map(e => Option.when(!isLiteral(e))(analyzeExpr(e, expected)))
-    val ty    = fixed.flatten.headOption.map(t => Type.repr(t.ty)).orElse(expected)
+    val own     = operands.map(e => Option.when(!isLiteral(e) && !typedByPosition(e))(analyzeExpr(e, expected)))
+    val settled = own.flatten.headOption.map(t => Type.repr(t.ty)).orElse(expected)
+    val told    = operands.zip(own).map((e, t) => t.orElse(Option.when(!isLiteral(e))(analyzeExpr(e, settled))))
+    val ty      = told.flatten.headOption.map(t => Type.repr(t.ty)).orElse(expected)
 
-    operands.zip(fixed).map {
+    operands.zip(told).map {
       case (_, Some(t)) => t
       case (e, None)    => analyzeExpr(e, ty)
     }
   }
+
+  /** Whether an expression is one whose type the position it sits in supplies, rather than one it
+   * carries itself — the middle tier above.
+   *
+   * `xs.load(i)` is the whole of the set today, and it is here for the reason `MethodCalls`'
+   * `vectorMemory` gives: a slice has whatever length it has, so how many lanes a run of it is read
+   * as is the *receiving* type's to say, and there is nothing in the receiver to read it from.
+   *
+   * **The test is on the spelling, and it is allowed to be**, because the middle tier is not a
+   * licence to skip anything — it moves an operand one place later in the order and hands it the
+   * neighbour's type as the position's, which is what an expected type is for. So a receiver
+   * declaring a `load` of its own is unharmed by matching here, while the alternative — analyzing
+   * every operand speculatively to find out which of them can stand alone — would put a sandbox
+   * around every binary operator in the language.
+   */
+  protected def typedByPosition(e: Expr): Boolean = e match
+    case Call(Field(_, "load"), List(_)) => true
+    case _                               => false
 
   /** Whether an expression is a literal with no type of its own. A suffixed numeric literal
    * has already said what it is, so it counts as fixed rather than adaptable.

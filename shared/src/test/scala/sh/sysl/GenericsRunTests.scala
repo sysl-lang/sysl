@@ -517,10 +517,25 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     // Nothing is inferred *from* an argument whose parameter is already known, so a call that
-    // leaves the type parameter unreached is an inference failure rather than a silent default.
+    // leaves the type parameter unreached is a refusal rather than a silent default. This one is the
+    // shape below — `T` is in neither the parameters nor the result — so what it is told is that no
+    // call reaches it at all, rather than that this call happened not to.
     "an argument at a known parameter settles nothing about the unknown one" in {
-      err("""only[T](n: usize) -> usize = n
-            |print(only(3))
+      val out = err("""only[T](n: usize) -> usize = n
+                      |print(only(3))
+                      |""".stripMargin)
+
+      out should include("'T' is named by no parameter and by no result")
+      out should include("what settles it is a parameter whose type mentions it")
+    }
+
+    // Where the result *does* mention it, the annotation genuinely is the remedy and is what the
+    // message asks for — this is the boundary between the two sentences.
+    "while a parameter the result mentions is asked for on the binding" in {
+      err("""empty[T](n: usize) -> T
+            |    var zero: T
+            |    return zero
+            |print(empty(3))
             |""".stripMargin) should include("cannot infer the type argument 'T'")
     }
 
@@ -532,6 +547,48 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       err("""id[T](x: T) -> T = x
             |print(id[int](3))
             |""".stripMargin) should include("'id' cannot be given type arguments at a call")
+    }
+
+    /** **The remedy the sentence names has to exist**, and for one shape of declaration it does not.
+      *
+      * A parameter named by no parameter and by no result is reached by neither of `10 §4`'s two
+      * directions: the arguments say nothing about it, and there is no receiving type to annotate
+      * either. `solve` could only report what it failed to find, so what a reader got was
+      * "annotate the expected type" about an expression with none — advice that cannot be followed,
+      * about a declaration that cannot be called from anywhere.
+      *
+      * It is easiest to write with a value parameter, and that is where it turned up: a `[const W]`
+      * kernel reading and writing through slices carries its width in no argument and answers `unit`.
+      */
+    "a type parameter nothing in the signature mentions says what would settle it" in {
+      val out = err("""scale[const W: usize](xs: []const f32, out: []f32)
+                      |    val v: <W>f32 = xs.load(0)
+                      |    out.store(0, v)
+                      |
+                      |var a: [8]f32
+                      |var b: [8]f32
+                      |scale(a[..], b[..])
+                      |""".stripMargin)
+
+      out should include("'W' is named by no parameter and by no result")
+      out should include("a parameter whose type mentions it")
+      out should not include "annotate the expected type"
+    }
+
+    // And the spelling a reader reaches for next is owed both halves: that the brackets are not
+    // written at a call, *and* that the annotation it would send them to is not there either.
+    "and the bracketed spelling of that call says both things" in {
+      val out = err("""scale[const W: usize](xs: []const f32, out: []f32)
+                      |    val v: <W>f32 = xs.load(0)
+                      |    out.store(0, v)
+                      |
+                      |var a: [8]f32
+                      |var b: [8]f32
+                      |scale[4](a[..], b[..])
+                      |""".stripMargin)
+
+      out should include("cannot be given type arguments at a call")
+      out should include("'W' is named by no parameter and by no result")
     }
 
     // A generic method is at least as likely a place to reach for the syntax, and gets the same

@@ -365,6 +365,33 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
   private def signatureOf(f: FuncDecl): String =
     s"${qn(f.name)}(${f.params.map(p => s"${p.name}: ${p.typ.show}").mkString(", ")})"
 
+  /** The type parameters of a declaration that **no call can settle**: named by none of its
+   * parameters and by no result, so both of `10 §4`'s directions are empty — the arguments say
+   * nothing about them and neither does the type the value is read into.
+   *
+   * It is a property of the *declaration* rather than of any one call, which is what makes it worth
+   * asking as its own question: a function shaped like this cannot be called anywhere, and a reader
+   * who has just written the call is owed that rather than a remedy that does not exist. The shape is
+   * easiest to reach for with a value parameter: a `[const W: usize]` kernel that reads and writes
+   * through slices carries its width in no argument and answers `unit`, so the width is nowhere a
+   * call could put it.
+   */
+  protected def unsettleable(f: FuncDecl): List[String] =
+    f.tparams.filterNot(tp =>
+      f.params.exists(p => mentions(p.typ, Set(tp))) || f.retType.exists(mentions(_, Set(tp))))
+
+  /** Why nothing at a call reaches those parameters, and what would. Said in one place because two
+   * refusals need it: the call written plainly, and the call written with the type arguments the
+   * reader reached for instead (`ExprAnalysis`).
+   */
+  protected def nothingSettles(stuck: List[String]): String = {
+    val names    = stuck.map(t => s"'$t'").mkString(" and ")
+    val (is, it) = if stuck.length == 1 then ("is", "it") else ("are", "them")
+
+    s"$names $is named by no parameter and by no result, so the arguments say nothing about $it and " +
+      s"there is nothing to annotate either — what settles $it is a parameter whose type mentions $it"
+  }
+
   protected def callFunction(f: FuncDecl, written: List[Expr], expected: Option[Type]): TExpr = {
     // A variadic callee — foreign or sysl's own — fixes only where its declared parameters stop;
     // everything after them is the tail, checked by the rule below rather than against a parameter.
@@ -406,6 +433,14 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     val (name, pre) =
       if f.tparams.isEmpty then (f.name, None)
       else
+        // Asked before the solve rather than left to it, because the solve can only report what it
+        // failed to find and the answer here is that it was never going to find it. `solve`'s message
+        // asks for an annotation on the expected type, which is the right remedy for a parameter the
+        // *result* mentions and impossible advice for one nothing mentions at all.
+        val stuck = unsettleable(f)
+
+        if stuck.nonEmpty then err(s"'$shown' cannot be called: ${nothingSettles(stuck)}")
+
         val provisional = provisionalArgs(f.name, f.tparams, f.params.map(_.typ), args, f.bounds)
         // The parameter types being matched against are the declaration's, written in the
         // declaration's terms — so a `Pair[T]` there is that module's `Pair` whichever module the

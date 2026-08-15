@@ -273,21 +273,32 @@ class VectorErrorTests extends AnyFreeSpec with CodegenSupport {
       err(src) should include("how many lanes it takes is the vector type's to say")
     }
 
-    // **An operand position does not settle a load's width, even when the other operand would.**
-    // `analyzeOperands` defers a *listed* set of forms with no type of their own — a bare numeric
-    // literal, `null` — and reads the rest at whatever the expression as a whole was asked for. A
-    // method call is not on that list, and putting it there would be a change to inference reaching
-    // far past vectors. The message names the annotation, which is one line and reads better in a
-    // kernel anyway.
-    "an arithmetic operand is not a place a width comes from" in {
+    // **An operand settles a load's width only if it has one to give.** Two loads beside each other
+    // are two questions and no answers: the middle tier is asked after everything with a type of its
+    // own has been, and here there was nothing in that tier at all.
+    "two loads beside each other still say nothing about the width" in {
       val src =
-        """f(xs: []const f32, by: <4>f32) -> f32
-          |    val r = xs.load(0) * by
+        """f(xs: []const f32, ys: []const f32) -> f32
+          |    val r = xs.load(0) * ys.load(0)
           |    r[0]
           |
           |var a: [4]f32
-          |val b: <4>f32 = 1.0
-          |print(f(a[..], b))
+          |var b: [4]f32
+          |print(f(a[..], b[..]))
+          |""".stripMargin
+
+      err(src) should include("how many lanes it takes is the vector type's to say")
+    }
+
+    // Nor does a literal, which is the tier *below* — it is waiting to be told the same thing.
+    "nor does a bare literal beside one, with nothing asked of the expression" in {
+      val src =
+        """f(xs: []const f32) -> f32
+          |    val r = xs.load(0) * 2.0
+          |    r[0]
+          |
+          |var a: [4]f32
+          |print(f(a[..]))
           |""".stripMargin
 
       err(src) should include("how many lanes it takes is the vector type's to say")

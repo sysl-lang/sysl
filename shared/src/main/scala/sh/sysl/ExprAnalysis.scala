@@ -982,9 +982,20 @@ trait ExprAnalysis
     // The name has to be a generic declaration and nothing nearer: a local shadowing one is an
     // ordinary indexed value, and telling its author about type arguments they never wrote would be
     // worse than the general complaint. That is the same shadowing test every call form above makes.
+    //
+    // **The remedy is not always there**, and where it is not the sentence must say so rather than
+    // name it anyway: a declaration carrying a parameter no call can settle has no receiving type to
+    // write the argument on either, so a reader following the advice goes looking for a binding that
+    // cannot exist. What is owed there is the reason, which is the whole of what a diagnostic can do
+    // for a signature nothing in the language reaches.
     case Call(Index(Ident(written), _), _)
         if lookupOpt(written).isEmpty && funcKey(written).exists(k => funcDecls(k).tparams.nonEmpty) =>
-      err(s"'$written' cannot be given type arguments at a call; write the type on what receives the result")
+      unsettleable(funcDecls(funcKey(written).get)) match
+        case Nil =>
+          err(s"'$written' cannot be given type arguments at a call; write the type on what receives the result")
+        case stuck =>
+          err(s"'$written' cannot be given type arguments at a call, and inference has nothing to " +
+            s"work with here either: ${nothingSettles(stuck)}")
 
     case Call(Index(Field(_, mname), _), _) if memberDecls.exists((k, d) => k._2 == mname && d.tparams.nonEmpty) =>
       err(s"'$mname' cannot be given type arguments at a call; write the type on what receives the result")
