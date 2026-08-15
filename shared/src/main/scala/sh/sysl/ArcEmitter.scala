@@ -1,6 +1,6 @@
 package sh.sysl
 
-import ir.{Access, Arg, BinOp, CastOp, FCmp, ICmp, Inst, LType, Val}
+import ir.{Access, Arg, BinOp, CastOp, ICmp, Inst, LType, Val}
 
 import scala.collection.mutable
 

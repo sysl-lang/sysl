@@ -1,6 +1,6 @@
 package sh.sysl
 
-import ir.{Access, Arg, BinOp, CastOp, FCmp, ICmp, Inst, LType, Val}
+import ir.{Arg, BinOp, CastOp, FCmp, ICmp, Inst, LType, Val}
 
 /** The scalar end of codegen: arithmetic, comparison, conversion, and printing.
  *

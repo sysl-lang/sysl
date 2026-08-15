@@ -1,6 +1,6 @@
 package sh.sysl
 
-import ir.{Access, Arg, Inst, LType, Val}
+import ir.{Arg, Inst, LType, Val}
 
 /** The method tables trait objects dispatch through (`02`).
  *

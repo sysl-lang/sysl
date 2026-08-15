@@ -8,9 +8,11 @@ package ir
  * interpolated. Keeping operands as strings while making the instructions data would have moved the
  * parser one layer in rather than removing it, so this is the half that has to come with them.
  *
- * **`toString` is `render`, deliberately.** An emitter that has not yet been converted interpolates
- * a value into a line of text, and it goes on producing exactly the characters it produced before —
- * which is what lets six hundred sites be converted a file at a time instead of all at once.
+ * **`toString` is `render`, deliberately.** A value written into a message, a log, or one of the
+ * function headers that is still assembled as text comes out as the LLVM the reader is looking for,
+ * rather than as a case-class dump. It is also what let six hundred sites be converted a file at a
+ * time while the sweep ran: a converted producer and an unconverted consumer went on agreeing about
+ * every character between them.
  */
 enum Val {
 

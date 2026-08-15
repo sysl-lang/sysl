@@ -1,6 +1,6 @@
 package sh.sysl
 
-import ir.{Access, Arg, CastOp, FCmp, ICmp, Inst, LType, Val}
+import ir.{Access, Arg, CastOp, FCmp, Inst, LType, Val}
 
 /** Everything that traps when a value turns out not to be what it was promised to be: a function's
  * `require` and `ensure` clauses (`16 §5`), a constrained subtype's `within` range and `where`

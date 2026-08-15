@@ -1,6 +1,6 @@
 package sh.sysl
 
-import ir.{Access, Arg, BinOp, CastOp, ICmp, Inst, LType, Val}
+import ir.{Access, Arg, BinOp, ICmp, Inst, Val}
 
 /** Everything that makes a basic block: `if`, `match` and its patterns, and the three loops.
  *
