@@ -30,6 +30,10 @@ private[sysl] extern "ftell" c_ftell(f: *u8) -> long
 private[sysl] extern "ferror" c_ferror(f: *u8) -> int
 private[sysl] extern "feof" c_feof(f: *u8) -> int
 
+// The module's own shim, beside this file under a per-OS directory. It takes the `FILE *` the rest
+// of these do and answers `st_size`, so `struct stat` never crosses.
+private[sysl] extern "sysl_fs_file_size" c_file_size(f: *u8) -> long
+
 // Where a seek counts from. C standardises the three names and every platform has agreed on the
 // three values since V7, but the *names* are what the calls below read, so a reader never has to
 // know which is which.
@@ -108,26 +112,24 @@ struct File
         if c_fseek(self.inner.handle, to, seek_set()) != 0 then Err(why()) else Ok(())
     end seek
 
-    // How many bytes the file holds, leaving the position where it found it.
+    // How many bytes the file holds.
     //
-    // It is a seek to the end and back rather than a `stat`, and that is the same decision the
-    // header makes: `struct stat` is laid out differently by each platform's headers and a program
-    // transcribing it would be holding numbers nothing checks, while a seek is two calls whose
-    // signatures are all there is to get right.
+    // **It asks, where it used to measure.** This was a seek to the end and back — four calls, and a
+    // position temporarily somewhere the caller did not put it — because the alternative was `fstat`
+    // and `struct stat` is laid out differently by every platform's headers, which is the
+    // transcription this module refuses. A shim reads the header and one field crosses, so the
+    // refusal costs nothing here any more.
+    //
+    // What that fixes beyond the call count: the old shape **moved the position and put it back**,
+    // so a failure between the two left it at the end of the file, and nothing else in the module
+    // could disturb a caller's position at all. It also asks about the **open file** rather than
+    // about a path, so nothing can be renamed or replaced underneath the answer.
     size(*self) -> Result[long, IoError]
         if self.inner.shut then return Err(NotOpen)
 
-        var here = c_ftell(self.inner.handle)
+        val n = c_file_size(self.inner.handle)
 
-        if here < 0 then return Err(why())
-        if c_fseek(self.inner.handle, 0, seek_end()) != 0 then return Err(why())
-
-        var n = c_ftell(self.inner.handle)
-
-        if n < 0 then return Err(why())
-        if c_fseek(self.inner.handle, here, seek_set()) != 0 then return Err(why())
-
-        Ok(n)
+        if n < 0 then Err(why()) else Ok(n)
     end size
 
     // Whether a read has already run off the end. It answers about reads that **happened**, so it is
