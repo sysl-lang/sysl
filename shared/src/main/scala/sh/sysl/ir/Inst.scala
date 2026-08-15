@@ -97,15 +97,30 @@ enum Access {
   case Atomic(ordering: Ordering)
 }
 
+/** A **relaxation of IEEE arithmetic**, which is a property of one instruction rather than of a
+ * type or a module — LLVM writes it between the opcode and the result type.
+ *
+ * There is one, because the compiler asks for one: a vector's floating sum reduces as a tree rather
+ * than as a left fold, and a tree is a different answer unless the arithmetic may be reassociated.
+ * Nothing else sysl emits gives up an exactness the language promised, so a second case belongs here
+ * only when something does.
+ */
+enum FastMath {
+  case Reassoc
+
+  def render: String = this match
+    case Reassoc => "reassoc"
+}
+
 /** An argument at a call: its type, the value, and whatever the convention attaches to it.
  *
  * `attrs` is where a foreign boundary's `byval`, `sret`, `signext` and `zeroext` live. They are the
  * caller's obligation rather than the callee's, so they are stated here and not in the callee's
  * declaration (`ForeignEmitter`, `CAbi`).
  */
-case class Arg(ty: LType, value: Val, attrs: String = "") {
+case class Arg(ty: LType, value: Val, attrs: List[Attr] = Nil) {
   def render: String =
-    val a = if attrs.isEmpty then "" else s"$attrs "
+    val a = if attrs.isEmpty then "" else Attr.text(attrs) + " "
     val v = value.render
 
     if v.isEmpty then s"${ty.render} $a".trim else s"${ty.render} $a$v"
@@ -187,10 +202,16 @@ enum Inst {
    */
   case Asm(dest: Option[Val], ret: LType, text: String, constraints: String, args: List[Arg])
 
-  /** A call. `dest` is `None` where the result is `void` or discarded, and `ret` carries the return
-   * type together with whatever attribute the convention puts in front of it.
+  /** A call. `dest` is `None` where the result is `void` or discarded.
+   *
+   * `calleeType` is the callee's **whole** function type, and is present only where the callee is
+   * variadic: the argument list alone does not say where the declared parameters stop and the
+   * ellipsis begins, so LLVM has the call state it. It is not a second answer about the result —
+   * `ret` and `retAttrs` are the same information inside it, and both are filled in either case.
    */
-  case Call(dest: Option[Val], ret: String, callee: Val, args: List[Arg], sig: Option[String] = None)
+  case Call(dest: Option[Val], ret: LType, callee: Val, args: List[Arg],
+            retAttrs: List[Attr] = Nil, calleeType: Option[FnType] = None,
+            fast: List[FastMath] = Nil)
 
   case VaArg(dest: Val, list: Val, ty: LType)
   case AtomicRmw(dest: Val, op: String, ptr: Val, ty: LType, value: Val, ordering: Ordering)
@@ -259,13 +280,13 @@ enum Inst {
 
       s"""${lhs}call ${ret.render} asm sideeffect "$text", "$cons"(${args.map(_.render).mkString(", ")})"""
 
-    case Call(d, ret, callee, args, sig) =>
+    case Call(d, ret, callee, args, retAttrs, fn, fast) =>
       val lhs  = d.map(r => s"${r.render} = ").getOrElse("")
-      // A foreign call names its callee as one piece — the whole function type of a variadic one, or
-      // the result type and the symbol run together — so `ret` is empty there and the space with it.
-      val kind = sig.getOrElse(ret)
+      // A variadic callee is named by its whole type; everything else by its result alone.
+      val kind = fn.map(_.render).getOrElse((retAttrs.map(_.render) :+ ret.render).mkString(" "))
+      val fm   = fast.map(_.render + " ").mkString
 
-      s"${lhs}call ${if kind.isEmpty then "" else s"$kind "}${callee.render}(${args.map(_.render).mkString(", ")})"
+      s"${lhs}call $fm$kind ${callee.render}(${args.map(_.render).mkString(", ")})"
 
     case VaArg(d, list, ty) => s"${d.render} = va_arg ptr ${list.render}, ${ty.render}"
 

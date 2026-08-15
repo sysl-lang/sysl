@@ -21,21 +21,18 @@ trait StaticEmitter extends StringEmitter {
    * the prologue `main` opens with. The zero it starts at is never read: `13 §7`'s ordering is what
    * guarantees that every initializer able to see the storage has already run.
    */
-  protected def genVals(vals: List[TVal]): String =
+  protected def genVals(vals: List[TVal]): List[ir.Global] =
     vals.map { v =>
-      val kind = if v.computed || v.writable then "global" else "constant"
       // `@section("…")` where one was named, and `@align(n)` where a boundary was. Nothing otherwise,
       // which leaves LLVM its own choice — the natural alignment, and the target's business rather
-      // than sysl's. The order is LLVM's: a section is written before an alignment.
-      val sec = v.section.map(s => s""", section "$s"""").getOrElse("")
-      val at  = v.align.map(n => s", align $n").getOrElse("")
-
-      v.init match
-        case Some(init) if !v.computed =>
-          s"@${v.symbol} = private $kind ${v.ty.llvm} ${constantValue(init)}$sec$at\n"
-        case _ =>
-          s"@${v.symbol} = private $kind ${v.ty.llvm} zeroinitializer$sec$at\n"
-    }.mkString
+      // than sysl's.
+      ir.Global(v.symbol,
+                constant = !(v.computed || v.writable),
+                v.ty.lty,
+                Some(v.init.filterNot(_ => v.computed).map(constantValue).getOrElse(ir.Val.Zero)),
+                section = v.section,
+                align = v.align)
+    }
 
   /** `@llvm.used` — the symbols this module places by hand and nothing in it reads (`15 §13`).
    *
@@ -48,52 +45,51 @@ trait StaticEmitter extends StringEmitter {
    * `appending` linkage is what makes the list a list: each module contributes its own and the
    * linker concatenates them.
    */
-  protected def genUsed(names: List[String]): String =
-    if names.isEmpty then ""
-    else
-      val refs = names.map(n => s"ptr @$n").mkString(", ")
-      s"@llvm.used = appending global [${names.length} x ptr] [$refs], section \"llvm.metadata\"\n"
+  protected def genUsed(names: List[String]): Option[ir.Global] =
+    Option.when(names.nonEmpty)(
+      ir.Global("llvm.used",
+                constant = false,
+                ir.LType.Arr(names.length, ir.LType.Ptr),
+                Some(ir.Val.Array(names.map(n => ir.Arg(ir.LType.Ptr, ir.Val.Global(n))))),
+                linkage = ir.Linkage.Appending,
+                section = Some("llvm.metadata")))
 
   /** A `val`'s initializer as a **constant expression** — text laid straight into the object file,
    * with no instruction emitted for any of it.
    */
-  private def constantValue(t: TExpr): String = t match
-    case TIntLit(v, _)       => v.toString
-    case TBoolLit(b)         => if b then "1" else "0"
+  private def constantValue(t: TExpr): ir.Val = t match
+    case TIntLit(v, _)       => ir.Val.Int(v)
+    // A module-level `bool` is written as its bit rather than as `true`, which is what LLVM's own
+    // constant grammar takes — the word is the *instruction* operand's spelling.
+    case TBoolLit(b)         => ir.Val.Int(if b then 1 else 0)
     case TFloatLit(bits, ty) => constantFloat(bits, ty)
     case TArrayLit(elems, arrayTy) =>
-      val elem = arrayTy.elem.llvm
-      s"[${elems.map(e => s"$elem ${constantValue(e)}").mkString(", ")}]"
+      ir.Val.Array(elems.map(e => ir.Arg(arrayTy.elem.lty, constantValue(e))))
     case TArrayFill(value, arrayTy) =>
-      val elem = arrayTy.elem.llvm
-      val v    = constantValue(value)
-      s"[${List.fill(arrayTy.length)(s"$elem $v").mkString(", ")}]"
+      ir.Val.Array(List.fill(arrayTy.length)(ir.Arg(arrayTy.elem.lty, constantValue(value))))
 
     // Three words naming bytes that are never freed. The owner is null, which is what makes the
     // whole value a constant expression rather than something a prologue has to build — and what
     // lets a `string` sit in storage that is never let go of at all (`13 §7`).
-    case TStrLit(s) => stringValue(s).render
+    case TStrLit(s) => stringValue(s)
 
     // A struct constant lists its fields in the order the type declares them, and skips the ones
     // that occupy nothing exactly as the `insertvalue` chain in the ordinary path does — the
     // initializer has to match the type this module emitted, which is built from `stored`.
     case TStructNew(struct, args) =>
-      val fields =
-        args.zipWithIndex.collect {
-          case (a, i) if !Type.zeroSized(struct.fields(i)._2) =>
-            s"${struct.fields(i)._2.llvm} ${constantValue(a)}"
-        }
-
-      s"{ ${fields.mkString(", ")} }"
+      ir.Val.Agg(args.zipWithIndex.collect {
+        case (a, i) if !Type.zeroSized(struct.fields(i)._2) =>
+          ir.Arg(struct.fields(i)._2.lty, constantValue(a))
+      })
 
     // A device address written as a number: `inttoptr` is a constant expression, so the pointer is
     // in the object file rather than stored into it by a prologue. Only an *integer* read as an
     // address arrives here, which is what `ModuleStorage.isStatic` admits — a pointer reinterpreted as
     // another pointer is a name rather than a literal, so it is code and never reaches this.
-    case TCast(v, _) => s"inttoptr (${v.ty.llvm} ${constantValue(v)} to ptr)"
+    case TCast(v, _) => ir.Val.IntToPtr(v.ty.lty, constantValue(v))
 
     // A trait pointer is two words, so its empty value is not the one-word `null`.
-    case TNullLit(ty) => if ty.llvm == "ptr" then "null" else "zeroinitializer"
+    case TNullLit(ty) => if ty.lty == ir.LType.Ptr then ir.Val.Null else ir.Val.Zero
 
     case other => sys.error(s"unreachable constant ${other.getClass.getSimpleName}")
 
@@ -104,9 +100,9 @@ trait StaticEmitter extends StringEmitter {
    * back out as the double that float is. That is the same rounding the `fptrunc` in the ordinary
    * path performs, done here instead of at run time.
    */
-  private def constantFloat(bits: Long, ty: Type): String = {
+  private def constantFloat(bits: Long, ty: Type): ir.Val = {
     val d = java.lang.Double.longBitsToDouble(bits)
 
-    (if ty == Type.Real then ir.Val.Float(bits) else ir.Val.float32(d)).render
+    if ty == Type.Real then ir.Val.Float(bits) else ir.Val.float32(d)
   }
 }

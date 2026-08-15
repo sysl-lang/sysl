@@ -57,14 +57,16 @@ object CAbi {
     case Sret(ty: LType, align: Int)
   }
 
-  /** One register's worth of an argument: the type it is named by, and whatever parameter attribute
-   * the convention puts on it. The two are kept apart because only the type describes storage — an
-   * attribute travels with the parameter and cannot be allocated or loaded.
+  /** One register's worth of an argument: the type it is named by, and whatever attribute the
+   * convention puts on it — which is exactly a declared parameter, so it **is** `ir.Param` and had
+   * been a second copy of it for as long as an attribute was a string.
+   *
+   * It keeps the name `Arg` here because that is what the conventions below call one, and it is an
+   * alias rather than an import because `Param` already means something else in this object: what a
+   * *call* passes for one declared parameter, which may be no registers or several.
    */
-  case class Arg(ty: LType, attr: String = "") {
-    def llvm: String     = ty.render
-    def declared: String = if attr.isEmpty then llvm else s"$llvm $attr"
-  }
+  type Arg = ir.Param
+  val Arg: ir.Param.type = ir.Param
 
   /** What a call passes for one declared parameter. */
   enum Param {
@@ -181,7 +183,7 @@ object CAbi {
    * clang answer to measure against because there is no C declaration to write, and following the
    * sign is what every convention that extends anything does with the widths there are.
    */
-  def extension(t: Type, target: Target): String = Type.underlying(t) match {
+  def extension(t: Type, target: Target): List[ir.Attr] = Type.underlying(t) match {
     case Type.Bool                     => widen(1, signed = false, target)
     // A `char` is a Unicode scalar in a `u32` (`Type.Char`), so it is that width's answer.
     case Type.Char                     => widen(32, signed = false, target)
@@ -189,22 +191,16 @@ object CAbi {
     // `-fshort-enums` case, and the reason this is read off the enum rather than assumed to be `int`.
     case e: Type.Enum if e.simple      => widen(e.underlying.bits, e.underlying.signed, target)
     case Type.Integer(bits, signed, _) => widen(bits, signed, target)
-    case _                             => ""
+    case _                             => Nil
   }
 
-  private def widen(bits: Int, signed: Boolean, target: Target): String =
-    if target.cpu == Cpu.Aarch64 && target.os != Os.MacOS then ""
-    else if bits == 1 then "zeroext"
-    else if target.cpu == Cpu.X86_64 && target.os == Os.Windows then ""
-    else if bits < 32 then (if signed then "signext" else "zeroext")
-    else if bits == 32 && target.cpu == Cpu.Riscv64 then "signext"
-    else ""
-
-  /** `attr` in front of `llvm`, which is where a **result** attribute goes — after the linkage and
-   * the calling convention, before the type, in a `define`, a `declare` and a `call` alike. A
-   * parameter's goes the other way round and is spelled by `Arg.declared`.
-   */
-  def returning(attr: String, llvm: String): String = if attr.isEmpty then llvm else s"$attr $llvm"
+  private def widen(bits: Int, signed: Boolean, target: Target): List[ir.Attr] =
+    if target.cpu == Cpu.Aarch64 && target.os != Os.MacOS then Nil
+    else if bits == 1 then List(ir.Attr.ZeroExt)
+    else if target.cpu == Cpu.X86_64 && target.os == Os.Windows then Nil
+    else if bits < 32 then List(if signed then ir.Attr.SignExt else ir.Attr.ZeroExt)
+    else if bits == 32 && target.cpu == Cpu.Riscv64 then List(ir.Attr.SignExt)
+    else Nil
 
   /** The registers an aggregate occupies, named twice — because a result and an argument may spell
    * the same registers differently, which is AAPCS64's case throughout and nobody else's.
@@ -267,7 +263,9 @@ object CAbi {
       case Some((elem, n)) =>
         // Away from Darwin the convention says how far to align a floating aggregate that runs out
         // of registers and lands on the stack. Darwin's variant does not ask for it.
-        Shape.Registers(t.lty, List(Arg(LType.Arr(n, elem), if macOS then "" else "alignstack(8)")))
+        Shape.Registers(t.lty,
+                        List(Arg(LType.Arr(n, elem),
+                                 if macOS then Nil else List(ir.Attr.AlignStack(8)))))
       case None if size <= 8 =>
         Shape.Registers(LType.I(size * 8), List(Arg(if addresses then LType.Ptr else LType.I(64))))
       // Two registers, and what names them is the *alignment*: sixteen bytes wanting sixteen-byte

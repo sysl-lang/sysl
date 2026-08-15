@@ -4,6 +4,24 @@ import scala.collection.mutable
 
 import ir.{Access, Arg, BinOp, CastOp, Inst, LType, Val}
 
+/** **What a `call` names between the keyword and the callee**, which is the three fields of
+ * `ir.Inst.Call` that describe the callee's type rather than its arguments.
+ *
+ * It is a bundle rather than three parameters because three functions hand it along — the call seam
+ * works out what a name refers to (`CallEmitter.calleeParts`) and passes it to whichever of the two
+ * emitters lowers the call. Splitting it into three would put the same triple in six signatures and
+ * make a caller that filled two of them and forgot the third representable.
+ *
+ * `whole` is set only for a variadic callee, and then it is what LLVM reads; `ret` and `retAttrs`
+ * hold the same answer either way, so `call` below cannot produce the two disagreeing.
+ */
+case class CallForm(ret: ir.LType, retAttrs: List[ir.Attr] = Nil,
+                    whole: Option[ir.FnType] = None) {
+
+  def call(dest: Option[ir.Val], callee: ir.Val, args: List[ir.Arg]): ir.Inst =
+    ir.Inst.Call(dest, ret, callee, args, retAttrs, whole)
+}
+
 /** The substrate every part of codegen emits into: registers, basic blocks, the entry-block
  * prologue, module-level globals, and the queue of runtime helpers.
  *
@@ -68,7 +86,7 @@ trait Emitter {
    */
   protected def wordLty: ir.LType = target.word.lty
 
-  protected val globals  = new mutable.StringBuilder
+  protected val globals  = mutable.ListBuffer.empty[ir.Global]
   private var strId      = 0
 
   /** The emitted name of every struct that asked for a boundary of its own, and the boundary
@@ -113,7 +131,7 @@ trait Emitter {
    * the name carries the width, so a program using one member at three widths needs three
    * declarations and a flag could not tell them apart.
    */
-  protected val satDecls = mutable.LinkedHashSet.empty[String]
+  protected val satDecls = mutable.LinkedHashSet.empty[ir.FuncSig]
 
   /** Box layouts to declare, keyed by their LLVM name and held in the order they were first
    * needed — a box's payload type is always declared before it.
@@ -134,7 +152,7 @@ trait Emitter {
    * may ask for another, so they are queued rather than emitted inline.
    */
   private val requested            = mutable.HashSet.empty[String]
-  protected val runtimeQueue = mutable.Queue.empty[() => String]
+  protected val runtimeQueue = mutable.Queue.empty[() => ir.Runtime]
 
   /** Which parts of the ARC runtime the module turned out to need: the heap at all, the atomic
    * pair a `&sync` uses, the null-tolerant pair a slice's owner needs, and the weak trio.
@@ -355,8 +373,17 @@ trait Emitter {
    * foreign boundary has always used (`ForeignEmitter`), asked for the same reason on a call that
    * happens to have this compiler on both sides.
    */
-  protected def syslSret(retTy: Type): Option[String] =
-    Option.when(layout.indirect(retTy))(s"ptr noalias sret(${retTy.llvm}) align ${layout.align(retTy)}")
+  protected def syslSret(retTy: Type): Option[ir.Param] =
+    Option.when(layout.indirect(retTy))(
+      ir.Param(LType.Ptr, ir.Attr.NoAlias :: sretAttrs(retTy.lty, layout.align(retTy))))
+
+  /** The out-pointer's attributes, less the `noalias` only a caller that made the storage may
+   * claim: what is at the far end, and the boundary it sits on. Written once here because a `sret`
+   * is stated four times over — on a definition, on a declaration, at the call, and on the adapter
+   * that forwards one — and the four have to agree.
+   */
+  protected def sretAttrs(ty: LType, align: Int): List[ir.Attr] =
+    List(ir.Attr.SRet(ty), ir.Attr.Align(align))
 
   /** What a sysl `define`, `declare` and `call` name as the result type.
    *
@@ -372,21 +399,18 @@ trait Emitter {
    * is the caller's obligation, so it is stated at a foreign call (`ForeignEmitter`) and nowhere
    * else. Neither end of a sysl-to-sysl call claims it, so neither may rely on it.
    */
-  protected def syslResult(retTy: Type): String =
-    CAbi.returning(if syslResultType(retTy) == "void" then "" else CAbi.extension(retTy, target),
-                   syslResultType(retTy))
+  protected def syslResult(retTy: Type): CallForm =
+    CallForm(syslResultLty(retTy),
+             if syslResultLty(retTy) == LType.Void then Nil else CAbi.extension(retTy, target))
 
-  /** The same **type**, with no attribute on it — for the `ret` instruction, which takes none.
+  /** The result's **type**, with no attribute on it — what a `ret` instruction carries.
    *
    * A return attribute belongs to the signature: `define zeroext i1 @f()` states what the function
    * guarantees, and the terminator inside it just names the value's type. LLVM refuses `ret zeroext
    * i1 %x` outright, which is a parse error in the emitted module rather than anything a test of the
-   * compiler's own types would notice — so the two spellings are kept apart here rather than at each
-   * of the places that needs one.
+   * compiler's own types would notice — so the two are kept apart here rather than at each of the
+   * places that needs one.
    */
-  protected def syslResultType(retTy: Type): String = syslResultLty(retTy).render
-
-  /** The same as a type rather than as its text, which is what a `ret` instruction carries. */
   protected def syslResultLty(retTy: Type): ir.LType =
     if Type.noValue(retTy) || layout.indirect(retTy) then ir.LType.Void else retTy.lty
 
@@ -394,9 +418,6 @@ trait Emitter {
    * holds; the callee makes its own copy at entry, which is the copy it always made — the only
    * difference is that the value crosses the boundary in memory rather than in registers.
    */
-  protected def syslParam(ty: Type): String = syslParamLty(ty).render
-
-  /** The same as a type rather than as its text. */
   protected def syslParamLty(ty: Type): ir.LType = if layout.indirect(ty) then ir.LType.Ptr else ty.lty
 
   /** The name the out-pointer takes inside a function that has one. */
@@ -536,15 +557,15 @@ trait Emitter {
    * `emitAlloca` writes one where the function begins rather than where it was needed, so that a
    * slot inside a loop does not grow the stack on every iteration.
    */
-  protected def finishFunc(header: String): ir.Func = {
+  protected def finishFunc(sig: ir.FuncSig): ir.Func = {
     closeBlock()
     val all = blocks.toList
 
-    ir.Func(header, all.head.copy(instrs = prologue.toList ::: all.head.instrs) :: all.tail)
+    ir.Func(sig, all.head.copy(instrs = prologue.toList ::: all.head.instrs) :: all.tail)
   }
 
   /** The same, written down. */
-  protected def finishFunction(header: String): String = ir.Printer.func(finishFunc(header))
+  protected def finishFunction(sig: ir.FuncSig): String = ir.Printer.func(finishFunc(sig))
 
   /** Files the block being built and starts one under `l`. The entry block is the one this begins
    * with, so a function whose body never labels anything still finishes with a block rather than
@@ -608,9 +629,9 @@ trait Emitter {
    */
   protected def emitMemcpy(dst: ir.Val, src: ir.Val, bytes: Int, align: Int): Unit = {
     usesMemcpy = true
-    emit(ir.Inst.Call(None, "void", ir.Val.Global("llvm.memcpy.p0.p0.i64"),
-                      List(ir.Arg(ir.LType.Ptr, dst, s"align $align"),
-                           ir.Arg(ir.LType.Ptr, src, s"align $align"),
+    emit(ir.Inst.Call(None, ir.LType.Void, ir.Val.Global("llvm.memcpy.p0.p0.i64"),
+                      List(ir.Arg(ir.LType.Ptr, dst, List(ir.Attr.Align(align))),
+                           ir.Arg(ir.LType.Ptr, src, List(ir.Attr.Align(align))),
                            ir.Arg(ir.LType.I(64), ir.Val.Int(bytes)),
                            ir.Arg(ir.LType.I(1), ir.Val.Bool(false)))))
   }
@@ -621,10 +642,22 @@ trait Emitter {
 
   protected def emitLabel(l: String): Unit = { closeBlock(); currentLbl = l; terminated = false }
 
+  /** A runtime helper's signature: `private`, `void`, and parameters named as the body reads them.
+   *
+   * Every helper the ownership runtime writes has this shape, which is not a coincidence — a helper
+   * is reached only from emitted code, so nothing outside may name it, and it works through the
+   * addresses it is handed rather than answering with anything.
+   */
+  protected def helperSig(name: String, params: (String, ir.LType)*): ir.FuncSig =
+    ir.FuncSig(name,
+               ir.FnType(LType.Void,
+                         params.map((n, t) => ir.Param(t, name = Some(Val.Reg(n)))).toList),
+               ir.Linkage.Private)
+
   /** Generates one whole function while another is in progress, which is how a runtime helper
    * gets written at the moment it is first asked for.
    */
-  protected def inFunction(header: String)(gen: => Unit): String = {
+  protected def inFunction(sig: ir.FuncSig)(gen: => Unit): ir.Func = {
     val saved =
       (prologue, temp, label, terminated, tempStack, owned, scratch, promoted, promotedBoxes, deferrals)
     // The blocks under construction are saved with the rest: a helper is a whole function emitted in
@@ -638,7 +671,7 @@ trait Emitter {
 
     startFunction()
     gen
-    val text = finishFunction(header)
+    val built = finishFunc(sig)
 
     prologue = saved._1; temp = saved._2; label = saved._3
     terminated = saved._4; tempStack = saved._5; owned = saved._6; scratch = saved._7
@@ -646,14 +679,30 @@ trait Emitter {
     blocks = savedBlocks._1; current = savedBlocks._2
     currentEnd = savedBlocks._3; currentLbl = savedBlocks._4
     tailTarget = savedTail._1; tailCalls = savedTail._2; tailParams = savedTail._3
-    text
+    built
   }
 
-  /** Queues a runtime helper for emission, once per name. */
-  protected def request(name: String)(gen: => String): String = {
+  /** Queues a runtime helper for emission, once per name, and hands back the name — which is what
+   * a caller wants, since it asked in order to call the thing.
+   *
+   * **Generating one may ask for another**, so it is a queue rather than a recursion, and the
+   * generator is by-name all the way down: building the value eagerly here would emit a helper in
+   * the middle of whatever asked for it.
+   */
+  private def enqueue(name: String)(gen: => ir.Runtime): String = {
     if requested.add(name) then runtimeQueue.enqueue(() => gen)
     name
   }
+
+  /** A helper the emitters **generate**, which is therefore data like every other function. */
+  protected def requestFunction(name: String)(sig: ir.FuncSig)(gen: => Unit): String =
+    enqueue(name)(ir.Runtime.Emitted(inFunction(sig)(gen)))
+
+  /** A helper written out by hand as LLVM, which is text and can only be **named** for anything
+   * that is not LLVM (`ir.Runtime`).
+   */
+  protected def requestText(name: String)(gen: => String): String =
+    enqueue(name)(ir.Runtime.Template(name, gen))
 
   // --- string interning ------------------------------------------------------------------
 
@@ -661,7 +710,8 @@ trait Emitter {
     strId += 1
     val name           = s".str$strId"
     val (escaped, len) = encode(s)
-    globals ++= s"@$name = private constant [$len x i8] c\"$escaped\"\n"
+    globals += ir.Global(name, constant = true, ir.LType.Arr(len, ir.LType.I(8)),
+                         Some(ir.Val.Bytes(escaped)))
     ir.Val.Global(name)
   }
 

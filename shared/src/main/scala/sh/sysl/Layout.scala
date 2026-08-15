@@ -216,10 +216,10 @@ case class Layout(word: Word) {
    * bytes. Counting in those units then makes the region exactly as wide as the widest variant,
    * rounded up to a whole number of them, which is where it would have had to end anyway.
    */
-  def payloadArea(e: Type.Enum): (String, Int) = {
+  def payloadArea(e: Type.Enum): (ir.LType, Int) = {
     val unit = math.max(1, payloadAlign(e))
 
-    (s"i${unit * 8}", roundUp(payloadSize(e), unit) / unit)
+    (ir.LType.I(unit * 8), roundUp(payloadSize(e), unit) / unit)
   }
 
   /** The widest a variant's payload gets. */

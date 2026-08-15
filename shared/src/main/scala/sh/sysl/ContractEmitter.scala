@@ -207,7 +207,7 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
     for pf <- c.predFn do
       val r = freshReg()
 
-      emit(Inst.Call(Some(r), "i1", Val.Global(pf), List(Arg(Type.underlying(c.base).lty, v))))
+      emit(Inst.Call(Some(r), i1, Val.Global(pf), List(Arg(Type.underlying(c.base).lty, v))))
       trapUnless(r, "where")
   }
 
@@ -244,6 +244,6 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
     }
     val ok = freshReg()
 
-    emit(Inst.Call(Some(ok), i1.render, Val.Global(invFn), args.toList))
+    emit(Inst.Call(Some(ok), i1, Val.Global(invFn), args.toList))
     trapUnless(ok, "invariant")
 }

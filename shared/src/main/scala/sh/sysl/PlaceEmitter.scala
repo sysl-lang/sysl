@@ -386,7 +386,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val p = freshReg(); emit(Inst.Gep(p, elem.lty, first, List(Arg(wordLty, start))))
     val n = freshReg(); emit(Inst.Bin(n, BinOp.Sub, wordLty, end, start))
 
-    emit(Inst.Call(None, "void", Val.Global("arc.retain_maybe"), List(Arg(LType.Ptr, ownerV))))
+    emit(Inst.Call(None, LType.Void, Val.Global("arc.retain_maybe"), List(Arg(LType.Ptr, ownerV))))
     maybeHeap = true
     heap = true
 
@@ -502,13 +502,13 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val pair  = LType.Struct(List(wordLty, i1))
     val mul   = freshReg()
 
-    emit(Inst.Call(Some(mul), pair.render, Val.Global(s"llvm.umul.with.overflow.$word"),
+    emit(Inst.Call(Some(mul), pair, Val.Global(s"llvm.umul.with.overflow.$word"),
       List(Arg(wordLty, n), Arg(wordLty, esz))))
     val bytes = freshReg(); emit(Inst.Extract(bytes, pair, mul, List(0)))
     val over1 = freshReg(); emit(Inst.Extract(over1, pair, mul, List(1)))
     val add   = freshReg()
 
-    emit(Inst.Call(Some(add), pair.render, Val.Global(s"llvm.uadd.with.overflow.$word"),
+    emit(Inst.Call(Some(add), pair, Val.Global(s"llvm.uadd.with.overflow.$word"),
       List(Arg(wordLty, bytes), Arg(wordLty, hsz))))
     val total = freshReg(); emit(Inst.Extract(total, pair, add, List(0)))
     val over2 = freshReg(); emit(Inst.Extract(over2, pair, add, List(1)))
@@ -516,7 +516,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val fits  = freshReg(); emit(Inst.Bin(fits, BinOp.Xor, i1, over, Val.Bool(true)))
     trapUnless(fits, "size")
 
-    val p   = freshReg(); emit(Inst.Call(Some(p), LType.Ptr.render, Val.Global(mallocSym), List(Arg(wordLty, total))))
+    val p   = freshReg(); emit(Inst.Call(Some(p), LType.Ptr, Val.Global(mallocSym), List(Arg(wordLty, total))))
     val got = freshReg(); emit(Inst.IntCmp(got, ICmp.Ne, LType.Ptr, p, Val.Null))
     trapUnless(got, "alloc")
 
@@ -677,7 +677,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val v    = genExpr(value)
     val addr = if fat then { val b = freshReg(); emit(Inst.Extract(b, LType.fat, v, List(1))); b } else v
 
-    val got   = freshReg(); emit(Inst.Call(Some(got), LType.Ptr.render, Val.Global("arc.upgrade"), List(Arg(LType.Ptr, addr))))
+    val got   = freshReg(); emit(Inst.Call(Some(got), LType.Ptr, Val.Global("arc.upgrade"), List(Arg(LType.Ptr, addr))))
     val live  = freshReg(); emit(Inst.IntCmp(live, ICmp.Ne, LType.Ptr, got, Val.Null))
     val slot  = emitAlloca(freshReg(), optTy.lty)
     val someL = freshLabel("weak.live")

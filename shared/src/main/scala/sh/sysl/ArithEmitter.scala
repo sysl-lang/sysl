@@ -120,7 +120,7 @@ trait ArithEmitter extends CallEmitter {
     val res              = freshReg()
     val (what, callee)   = calleeParts(d.name, resultTy)
 
-    emit(Inst.Call(Some(res), what, callee, List(Arg(lty.lty, l), Arg(rty.lty, r))))
+    emit(what.call(Some(res), callee, List(Arg(lty.lty, l), Arg(rty.lty, r))))
 
     if !d.negate then res
     else
@@ -194,14 +194,14 @@ trait ArithEmitter extends CallEmitter {
    * is always `false`, meaning a zero operand is defined rather than poison — see the call sites.
    */
   protected def intrinsic(base: String, ty: LType, args: List[Val], zeroFlag: Boolean = false): Val = {
-    val ll     = ty.render
-    val name   = s"llvm.$base.$ll"
-    val params = List.fill(args.length)(ll) ++ Option.when(zeroFlag)("i1")
-    satDecls += s"declare $ll @$name(${params.mkString(", ")})"
+    val name   = s"llvm.$base.${ty.render}"
+    val params = List.fill(args.length)(ir.Param(ty)) ++ Option.when(zeroFlag)(ir.Param(LType.I(1)))
+
+    satDecls += ir.FuncSig(name, ir.FnType(ty, params))
 
     val ops = args.map(a => Arg(ty, a)) ++ Option.when(zeroFlag)(Arg(LType.I(1), Val.Bool(false)))
     val r   = freshReg()
-    emit(Inst.Call(Some(r), ll, Val.Global(name), ops))
+    emit(Inst.Call(Some(r), ty, Val.Global(name), ops))
     r
   }
 

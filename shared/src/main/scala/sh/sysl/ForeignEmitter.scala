@@ -21,45 +21,41 @@ import ir.{Access, Inst, LType, Val}
  */
 trait ForeignEmitter extends ArcEmitter {
 
-  /** The result type a foreign declaration and every call to it name, and the parameter list. */
-  protected def foreignSignature(retTy: Type, params: List[Type], variadic: Boolean): (String, List[String]) = {
-    val sret = CAbi.result(retTy, target) match
-      // The out-parameter goes in front of everything, which is how the callee finds it whatever
-      // else the signature holds.
-      case CAbi.Result.Sret(ty, align) => List(s"ptr ${sretAttr(ty, align)}")
-      case _                           => Nil
+  /** The type a foreign declaration and every call to it name.
+   *
+   * It is one value rather than a result and a parameter list because that is what it is: a
+   * `declare` is this plus a symbol, and a variadic **call** names the whole of it, so building the
+   * two out of one thing is what keeps them from disagreeing.
+   */
+  protected def foreignSignature(retTy: Type, params: List[Type], variadic: Boolean): ir.FnType =
+    ir.FnType(foreignResult(retTy).ret,
+              // The out-parameter goes in front of everything, which is how the callee finds it
+              // whatever else the signature holds.
+              (CAbi.result(retTy, target) match
+                case CAbi.Result.Sret(ty, align) => List(ir.Param(LType.Ptr, sretAttrs(ty, align)))
+                case _                           => Nil) :::
+                params.filterNot(Type.zeroSized).flatMap(foreignParams),
+              variadic,
+              foreignResult(retTy).retAttrs)
 
-    val rest = params.filterNot(Type.zeroSized).flatMap(p => foreignParamTypes(p))
-
-    (foreignResultType(retTy), sret ::: rest ::: Option.when(variadic)("...").toList)
-  }
-
-  protected def foreignResultType(retTy: Type): String = CAbi.result(retTy, target) match
+  /** What a call to a foreign function names as its result. */
+  protected def foreignResult(retTy: Type): CallForm = CAbi.result(retTy, target) match
     // A narrow scalar is named as itself and carries the convention's extension in front of it, so
     // that what the callee widened is what this side reads back (`CAbi.extension`).
-    case CAbi.Result.Plain       => CAbi.returning(CAbi.extension(retTy, target), retTy.llvm)
-    case CAbi.Result.Coerced(l)  => l.render
-    case CAbi.Result.Sret(_, _)  => "void"
+    case CAbi.Result.Plain      => CallForm(retTy.lty, CAbi.extension(retTy, target))
+    case CAbi.Result.Coerced(l) => CallForm(l)
+    case CAbi.Result.Sret(_, _) => CallForm(LType.Void)
 
-  private def foreignParamTypes(p: Type): List[String] = CAbi.param(p, target) match
-    case CAbi.Param.Plain                     => List(CAbi.Arg(p.lty, CAbi.extension(p, target)).declared)
-    case CAbi.Param.Coerced(pieces)           => pieces.map(_.declared)
-    case CAbi.Param.Indirect(ty, align, true) => List(s"ptr ${byvalAttr(ty, align)}")
-    case CAbi.Param.Indirect(_, _, false)     => List("ptr")
+  private def foreignParams(p: Type): List[ir.Param] = CAbi.param(p, target) match
+    case CAbi.Param.Plain                     => List(ir.Param(p.lty, CAbi.extension(p, target)))
+    case CAbi.Param.Coerced(pieces)           => pieces
+    case CAbi.Param.Indirect(ty, align, true) => List(ir.Param(LType.Ptr, byvalAttrs(ty, align)))
+    case CAbi.Param.Indirect(_, _, false)     => List(ir.Param(LType.Ptr))
 
-  /** The whole function type of a variadic foreign callee, which a call has to name because the
-   * argument list alone does not say where the declared parameters stop and the ellipsis begins.
+  /** Lowers a call to a foreign function. `what` is what the `call` names between the keyword and
+   * the callee — the result type, or the callee's whole function type where it is variadic.
    */
-  protected def foreignFnType(retTy: Type, params: List[Type]): String = {
-    val (ret, ps) = foreignSignature(retTy, params, variadic = true)
-
-    s"$ret (${ps.mkString(", ")})"
-  }
-
-  /** Lowers a call to a foreign function. `callee` is what the `call` names after its type — the
-   * symbol, with the whole function type in front of it when the callee is variadic.
-   */
-  protected def genForeignCall(what: String, callee: Val, args: List[TExpr], ty: Type): Val = {
+  protected def genForeignCall(what: CallForm, callee: Val, args: List[TExpr], ty: Type): Val = {
     val result = CAbi.result(ty, target)
 
     // The storage a big result is written into is the caller's, so it exists before the call, and it
@@ -69,7 +65,7 @@ trait ForeignEmitter extends ArcEmitter {
       case CAbi.Result.Sret(ty, align) =>
         val slot = emitAlloca(freshReg(), ty)
 
-        Some((slot, ir.Arg(LType.Ptr, slot, sretAttr(ty, align))))
+        Some((slot, ir.Arg(LType.Ptr, slot, sretAttrs(ty, align))))
       case _ => None
 
     // An argument past the declared parameters is a variadic extra, and C classifies one exactly as
@@ -90,14 +86,14 @@ trait ForeignEmitter extends ArcEmitter {
             val slot = emitAlloca(freshReg(), ty)
 
             emit(Inst.Store(ty, v, slot, Access.Plain))
-            List(ir.Arg(LType.Ptr, slot, if byval then byvalAttr(ty, align) else ""))
+            List(ir.Arg(LType.Ptr, slot, if byval then byvalAttrs(ty, align) else Nil))
     }
 
     val arguments = returned.map(_._2).toList ::: passed
 
     result match
       case CAbi.Result.Sret(coerced, _) =>
-        emit(Inst.Call(None, what, callee, arguments))
+        emit(what.call(None, callee, arguments))
 
         val r = freshReg()
 
@@ -107,29 +103,28 @@ trait ForeignEmitter extends ArcEmitter {
       case CAbi.Result.Coerced(coerced) =>
         val r = freshReg()
 
-        emit(Inst.Call(Some(r), what, callee, arguments))
+        emit(what.call(Some(r), callee, arguments))
         // A homogeneous floating aggregate comes back under its own type, so there is nothing to
         // reinterpret and the round trip through memory would be a copy for its own sake.
         ownTemp(if coerced == ty.lty then r else gather(r, coerced, ty), ty)
 
       case CAbi.Result.Plain =>
         if Type.noValue(ty) then
-          emit(Inst.Call(None, what, callee, arguments))
+          emit(what.call(None, callee, arguments))
           if ty == Type.Never then emitTerm(Inst.Unreachable)
           Val.Nothing
         else
           val r = freshReg()
 
-          emit(Inst.Call(Some(r), what, callee, arguments))
+          emit(what.call(Some(r), callee, arguments))
           ownTemp(r, ty)
   }
 
-  /** The `sret` and `byval` attributes, which name the aggregate the storage holds as well as the
-   * boundary it sits on — so both are written once here rather than at the four places that state
-   * one on a declaration and at the call.
+  /** `byval`, which names the aggregate the caller's copy holds as well as the boundary it sits on.
+   * Its `sret` counterpart is on `Emitter`, because four places outside this file state one.
    */
-  private def sretAttr(ty: LType, align: Int): String  = s"sret(${ty.render}) align $align"
-  private def byvalAttr(ty: LType, align: Int): String = s"byval(${ty.render}) align $align"
+  private def byvalAttrs(ty: LType, align: Int): List[ir.Attr] =
+    List(ir.Attr.ByVal(ty), ir.Attr.Align(align))
 
   /** A value of `t`, spread into the registers the convention hands it over in. Several registers
    * are read back out of a literal struct of them, which lays each piece out at the offset of the
@@ -143,7 +138,7 @@ trait ForeignEmitter extends ArcEmitter {
       val r = freshReg()
 
       emit(Inst.Load(r, holder, slot, Access.Plain))
-      List(ir.Arg(pieces.head.ty, r, pieces.head.attr))
+      List(ir.Arg(pieces.head.ty, r, pieces.head.attrs))
     else
       pieces.zipWithIndex.map { (p, i) =>
         val at = freshReg()
@@ -152,7 +147,7 @@ trait ForeignEmitter extends ArcEmitter {
         emit(Inst.Gep(at, holder, slot,
                       List(ir.Arg(LType.I(32), Val.Int(0)), ir.Arg(LType.I(32), Val.Int(i)))))
         emit(Inst.Load(r, p.ty, at, Access.Plain))
-        ir.Arg(p.ty, r, p.attr)
+        ir.Arg(p.ty, r, p.attrs)
       }
   }
 

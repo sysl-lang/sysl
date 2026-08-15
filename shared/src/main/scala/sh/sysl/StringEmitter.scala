@@ -47,7 +47,7 @@ trait StringEmitter extends Emitter {
   protected def printStr(v: Val): Unit = {
     val (p, n) = strBytes(v)
 
-    emit(Inst.Call(None, "void", Val.Global(request("sysl.str.write")(StringEmitter.write)),
+    emit(Inst.Call(None, LType.Void, Val.Global(requestText("sysl.str.write")(StringEmitter.write)),
                    List(Arg(LType.Ptr, p), Arg(wordLty, n))))
   }
 
@@ -61,10 +61,10 @@ trait StringEmitter extends Emitter {
     heap = true
     val (ap, an) = strBytes(av)
     val (bp, bn) = strBytes(bv)
-    val fn       = request("sysl.str.concat")(StringEmitter.concat)
+    val fn       = requestText("sysl.str.concat")(StringEmitter.concat)
     val r        = freshReg()
 
-    emit(Inst.Call(Some(r), Type.Str.llvm, Val.Global(fn), strArgs(ap, an) ::: strArgs(bp, bn)))
+    emit(Inst.Call(Some(r), Type.Str.lty, Val.Global(fn), strArgs(ap, an) ::: strArgs(bp, bn)))
     r
   }
 
@@ -75,10 +75,10 @@ trait StringEmitter extends Emitter {
   protected def strCmp(av: Val, bv: Val): Val = {
     val (ap, an) = strBytes(av)
     val (bp, bn) = strBytes(bv)
-    val fn       = request("sysl.str.cmp")(StringEmitter.cmp)
+    val fn       = requestText("sysl.str.cmp")(StringEmitter.cmp)
     val r        = freshReg()
 
-    emit(Inst.Call(Some(r), "i32", Val.Global(fn), strArgs(ap, an) ::: strArgs(bp, bn)))
+    emit(Inst.Call(Some(r), i32, Val.Global(fn), strArgs(ap, an) ::: strArgs(bp, bn)))
     r
   }
 
@@ -88,10 +88,10 @@ trait StringEmitter extends Emitter {
    * past the last byte ends the string.
    */
   protected def strBoundary(p: Val, n: Val, i: Val): Val = {
-    val fn = request("sysl.str.boundary")(StringEmitter.boundary)
+    val fn = requestText("sysl.str.boundary")(StringEmitter.boundary)
     val r  = freshReg()
 
-    emit(Inst.Call(Some(r), "i1", Val.Global(fn), strArgs(p, n) :+ Arg(wordLty, i)))
+    emit(Inst.Call(Some(r), i1, Val.Global(fn), strArgs(p, n) :+ Arg(wordLty, i)))
     r
   }
 

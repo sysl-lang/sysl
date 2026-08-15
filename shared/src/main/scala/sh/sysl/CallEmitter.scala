@@ -126,12 +126,15 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
   /** Every callee declared with a `...`, foreign or sysl's own, mapped to the LLVM function type a
    * call to it must name: result type, declared parameter types, ellipsis.
    */
-  private val variadics: Map[String, String] =
-    val fromExterns = program.externs.filter(_.variadic).map(e => e.name -> foreignFnType(e.retTy, e.params))
+  private val variadics: Map[String, ir.FnType] =
+    val fromExterns = program.externs.filter(_.variadic)
+                             .map(e => e.name -> foreignSignature(e.retTy, e.params, variadic = true))
     val fromFuncs   = program.funcs.filter(_.variadic).map { f =>
-      val params = syslSret(f.retTy).toList ++ Type.stored(f.params).map(p => syslParam(p._2)) :+ "..."
+      val params = syslSret(f.retTy).toList ++
+        Type.stored(f.params).map(p => ir.Param(syslParamLty(p._2)))
+      val result = syslResult(f.retTy)
 
-      f.name -> s"${syslResult(f.retTy)} (${params.mkString(", ")})"
+      f.name -> ir.FnType(result.ret, params, variadic = true, result.retAttrs)
     }
 
     (fromExterns ++ fromFuncs).toMap
@@ -209,14 +212,14 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    * one it is the callee's *whole* function type, because the argument list alone does not say where
    * the declared parameters stop and the ellipsis begins.
    */
-  protected def calleeParts(name: String, ty: Type): (String, ir.Val.Global) =
+  protected def calleeParts(name: String, ty: Type): (CallForm, ir.Val.Global) =
     val symbol = symbolOf(name)
     // A foreign result may be named by a type the sysl signature never mentions — a coerced
     // aggregate, or `void` where the value comes back through an out-parameter. A sysl result may
     // be `void` for the second of those reasons alone.
-    val result = if foreigns.contains(name) then foreignResultType(ty) else syslResult(ty)
+    val result = if foreigns.contains(name) then foreignResult(ty) else syslResult(ty)
 
-    (variadics.getOrElse(name, result), ir.Val.Global(symbol))
+    (result.copy(whole = variadics.get(name)), ir.Val.Global(symbol))
 
   /** Emits a call from sysl to sysl and hands back the register holding its result.
    *
@@ -225,14 +228,14 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    * with nowhere to put one makes a slot here and reads the value back out of it, which is correct
    * and is exactly the shape `genInto` exists to save the callers that *do* have somewhere.
    */
-  protected def genSyslCall(what: String, callee: ir.Val, argVals: List[Arg], ty: Type,
+  protected def genSyslCall(what: CallForm, callee: ir.Val, argVals: List[Arg], ty: Type,
                             dest: Option[ir.Val]): ir.Val =
     syslSret(ty) match
       case Some(_) =>
         val slot = dest.getOrElse(emitAlloca(freshReg(), ty.lty))
-        val out  = Arg(LType.Ptr, slot, s"sret(${ty.llvm}) align ${layout.align(ty)}")
+        val out  = Arg(LType.Ptr, slot, sretAttrs(ty.lty, layout.align(ty)))
 
-        emit(Inst.Call(None, what, callee, out :: argVals))
+        emit(what.call(None, callee, out :: argVals))
 
         if dest.isDefined then Val.Nothing
         else
@@ -240,14 +243,14 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
           ownTemp(r, ty)
 
       case None if Type.noValue(ty) =>
-        emit(Inst.Call(None, what, callee, argVals))
+        emit(what.call(None, callee, argVals))
         if ty == Type.Never then emitTerm(Inst.Unreachable)
         Val.Nothing
 
       case None =>
         val r = freshReg()
 
-        emit(Inst.Call(Some(r), what, callee, argVals))
+        emit(what.call(Some(r), callee, argVals))
         ownTemp(r, ty)
 
   // --- writing a value where it is going to live ----------------------------------------

@@ -74,25 +74,25 @@ trait ArcEmitter extends Emitter {
     case Type.Ref(_: Type.Trait, sync) =>
       heap = true
       syncHeap ||= sync
-      emit(Inst.Call(None, "void", Val.Global(s"arc.retain${if sync then "_sync" else ""}"),
+      emit(Inst.Call(None, LType.Void, Val.Global(s"arc.retain${if sync then "_sync" else ""}"),
         List(Arg(LType.Ptr, erasedBox(v)))))
 
     case Type.Ref(_, sync) =>
       heap = true
       syncHeap ||= sync
-      emit(Inst.Call(None, "void", Val.Global(s"arc.retain${if sync then "_sync" else ""}"),
+      emit(Inst.Call(None, LType.Void, Val.Global(s"arc.retain${if sync then "_sync" else ""}"),
         List(Arg(LType.Ptr, v))))
     case w: Type.Weak =>
       weakHeap = true
-      emit(Inst.Call(None, "void", Val.Global("arc.weak_retain"),
+      emit(Inst.Call(None, LType.Void, Val.Global("arc.weak_retain"),
         List(Arg(LType.Ptr, weakBox(w, v)))))
 
     case w: Type.View =>
-      emit(Inst.Call(None, "void", Val.Global("arc.retain_maybe"),
+      emit(Inst.Call(None, LType.Void, Val.Global("arc.retain_maybe"),
         List(Arg(LType.Ptr, owner(w, v)))))
 
     case t if containsRef(t) =>
-      emit(Inst.Call(None, "void", Val.Global(valueHelper(t, retain = true)),
+      emit(Inst.Call(None, LType.Void, Val.Global(valueHelper(t, retain = true)),
         List(Arg(t.lty, v))))
 
     case _                   => ()
@@ -102,25 +102,25 @@ trait ArcEmitter extends Emitter {
     case Type.Ref(_: Type.Trait, sync) =>
       heap = true
       syncHeap ||= sync
-      emit(Inst.Call(None, "void", Val.Global(s"arc.release${if sync then "_sync" else ""}"),
+      emit(Inst.Call(None, LType.Void, Val.Global(s"arc.release${if sync then "_sync" else ""}"),
         List(Arg(LType.Ptr, erasedBox(v)))))
 
     case Type.Ref(_, sync) =>
       heap = true
       syncHeap ||= sync
-      emit(Inst.Call(None, "void", Val.Global(s"arc.release${if sync then "_sync" else ""}"),
+      emit(Inst.Call(None, LType.Void, Val.Global(s"arc.release${if sync then "_sync" else ""}"),
         List(Arg(LType.Ptr, v))))
     case w: Type.Weak =>
       weakHeap = true
-      emit(Inst.Call(None, "void", Val.Global("arc.weak_release"),
+      emit(Inst.Call(None, LType.Void, Val.Global("arc.weak_release"),
         List(Arg(LType.Ptr, weakBox(w, v)))))
 
     case w: Type.View =>
-      emit(Inst.Call(None, "void", Val.Global("arc.release_maybe"),
+      emit(Inst.Call(None, LType.Void, Val.Global("arc.release_maybe"),
         List(Arg(LType.Ptr, owner(w, v)))))
 
     case t if containsRef(t) =>
-      emit(Inst.Call(None, "void", Val.Global(valueHelper(t, retain = false)),
+      emit(Inst.Call(None, LType.Void, Val.Global(valueHelper(t, retain = false)),
         List(Arg(t.lty, v))))
 
     case _                   => ()
@@ -139,7 +139,7 @@ trait ArcEmitter extends Emitter {
   private def walkAt(ty: Type, p: Val, retain: Boolean): Unit =
     if containsRef(ty) then
       if layout.indirect(ty) then
-        emit(Inst.Call(None, "void", Val.Global(slotHelper(ty, retain)), List(Arg(LType.Ptr, p))))
+        emit(Inst.Call(None, LType.Void, Val.Global(slotHelper(ty, retain)), List(Arg(LType.Ptr, p))))
       else
         val v = freshReg(); emit(Inst.Load(v, ty.lty, p, Access.Plain))
         if retain then retainValue(ty, v) else releaseValue(ty, v)
@@ -151,11 +151,9 @@ trait ArcEmitter extends Emitter {
   private def slotHelper(ty: Type, retain: Boolean): String = {
     val name = s"arc.${if retain then "copy" else "dispose"}_at.${Type.mangle(ty)}"
 
-    request(name) {
-      inFunction(s"define private void @$name(ptr %p)") {
-        walkSlot(ty, Val.Reg("p"), retain)
-        emitTerm(Inst.Ret(None, None))
-      }
+    requestFunction(name)(helperSig(name, "p" -> LType.Ptr)) {
+      walkSlot(ty, Val.Reg("p"), retain)
+      emitTerm(Inst.Ret(None, None))
     }
   }
 
@@ -232,8 +230,8 @@ trait ArcEmitter extends Emitter {
       val m  = Type.mangle(payload)
       val bn = boxLty(payload)
 
-      Val.Global(request(s"arc.drop.$m") {
-        inFunction(s"define private void @arc.drop.$m(ptr %p, i1 %storage)") {
+      Val.Global(requestFunction(s"arc.drop.$m")(
+        helperSig(s"arc.drop.$m", "p" -> LType.Ptr, "storage" -> i1)) {
           val give = freshLabel("arc.give")
           val over = freshLabel("arc.over")
 
@@ -248,15 +246,14 @@ trait ArcEmitter extends Emitter {
           // taken for the call — because the count is already zero and taking one would resurrect
           // the object into a second teardown.
           for d <- destructor do
-            if layout.indirect(payload) then emit(Inst.Call(None, "void", Val.Global(d), List(Arg(LType.Ptr, pa))))
-            else emit(Inst.Call(None, "void", Val.Global(d), List(Arg(payload.lty, v))))
+            if layout.indirect(payload) then emit(Inst.Call(None, LType.Void, Val.Global(d), List(Arg(LType.Ptr, pa))))
+            else emit(Inst.Call(None, LType.Void, Val.Global(d), List(Arg(payload.lty, v))))
 
           releaseValue(payload, v)
           emitTerm(Inst.Ret(None, None))
           emitLabel(give)
           emitFree()
           emitTerm(Inst.Ret(None, None))
-        }
       })
   }
 
@@ -267,8 +264,8 @@ trait ArcEmitter extends Emitter {
    * which keeps the commonest box of all, the one holding a plain number, from costing a function.
    */
   protected def plainDropFn: Val.Global =
-    Val.Global(request("arc.drop.plain") {
-      inFunction("define private void @arc.drop.plain(ptr %p, i1 %storage)") {
+    Val.Global(requestFunction("arc.drop.plain")(
+      helperSig("arc.drop.plain", "p" -> LType.Ptr, "storage" -> i1)) {
         val give = freshLabel("arc.give")
         val over = freshLabel("arc.over")
 
@@ -278,7 +275,6 @@ trait ArcEmitter extends Emitter {
         emitLabel(give)
         emitFree()
         emitTerm(Inst.Ret(None, None))
-      }
     })
 
   /** The one place `free` is **called**. It sits inside a hook, so it reaches a module only where
@@ -289,7 +285,7 @@ trait ArcEmitter extends Emitter {
    * declaration nothing calls names no symbol in the object file. What the linker was complaining
    * about was the call, which is why the card counted calls rather than declarations.
    */
-  private def emitFree(): Unit = emit(Inst.Call(None, "void", Val.Global(freeSym), List(Arg(LType.Ptr, Val.Reg("p")))))
+  private def emitFree(): Unit = emit(Inst.Call(None, LType.Void, Val.Global(freeSym), List(Arg(LType.Ptr, Val.Reg("p")))))
 
   /** The retain / release helper for an aggregate type, which walks the fields that carry
    * references. Emitted once per type rather than inlined, since a data enum needs a tag test
@@ -298,11 +294,9 @@ trait ArcEmitter extends Emitter {
   private def valueHelper(ty: Type, retain: Boolean): String = {
     val name = s"arc.${if retain then "copy" else "dispose"}.${Type.mangle(ty)}"
 
-    request(name) {
-      inFunction(s"define private void @$name(${ty.llvm} %v)") {
-        walkValue(ty, Val.Reg("v"), retain)
-        emitTerm(Inst.Ret(None, None))
-      }
+    requestFunction(name)(helperSig(name, "v" -> ty.lty)) {
+      walkValue(ty, Val.Reg("v"), retain)
+      emitTerm(Inst.Ret(None, None))
     }
   }
 
@@ -378,7 +372,7 @@ trait ArcEmitter extends Emitter {
 
     val end  = freshReg(); emit(Inst.Gep(end, bn, Val.Null, List(Arg(i32, Val.Int(1)))))
     val size = freshReg(); emit(Inst.Cast(size, CastOp.PtrToInt, LType.Ptr, end, wordLty))
-    val p    = freshReg(); emit(Inst.Call(Some(p), LType.Ptr.render, Val.Global(mallocSym), List(Arg(wordLty, size))))
+    val p    = freshReg(); emit(Inst.Call(Some(p), LType.Ptr, Val.Global(mallocSym), List(Arg(wordLty, size))))
 
     emit(Inst.Store(wordLty, Val.Int(1), p, Access.Plain))
     val hook = freshReg(); emit(Inst.Gep(hook, bn, p, List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(1)))))
@@ -423,8 +417,8 @@ trait ArcEmitter extends Emitter {
       val m  = Type.mangle(elem)
       val bn = bufLty(elem)
 
-      Val.Global(request(s"arc.dropbuf.$m") {
-        inFunction(s"define private void @arc.dropbuf.$m(ptr %p, i1 %storage)") {
+      Val.Global(requestFunction(s"arc.dropbuf.$m")(
+        helperSig(s"arc.dropbuf.$m", "p" -> LType.Ptr, "storage" -> i1)) {
           val give = freshLabel("arc.give")
           val over = freshLabel("arc.over")
 
@@ -445,7 +439,6 @@ trait ArcEmitter extends Emitter {
           emitLabel(give)
           emitFree()
           emitTerm(Inst.Ret(None, None))
-        }
       })
 
   /** Puts one value in every one of `n` slots, taking a share for each — the elements belong to the

@@ -43,11 +43,11 @@ trait ExportThunk extends ForeignEmitter {
    * thunk in front of it. Every exported function keeps its own mangled key, which is what a sysl
    * caller resolves and what the thunk itself calls.
    */
-  protected def genExportThunk(f: TFunc, symbol: String): String = {
+  protected def genExportThunk(f: TFunc, symbol: String): ir.Func = {
     startFunction()
 
-    val stored          = Type.stored(f.params)
-    val (result, cArgs) = foreignSignature(f.retTy, stored.map(_._2), variadic = false)
+    val stored = Type.stored(f.params)
+    val cType  = foreignSignature(f.retTy, stored.map(_._2), variadic = false)
 
     // The out-pointer is in front of every declared parameter, so the names run one behind wherever
     // there is one — which is the same offset `foreignSignature` put it at.
@@ -55,13 +55,13 @@ trait ExportThunk extends ForeignEmitter {
       case CAbi.Result.Sret(_, _) => Some(Val.Reg("c.sret"))
       case _                      => None
     val incoming = names(stored.map(_._2))
-    val declared = sret.toList.zip(cArgs).map((n, t) => s"$t $n") ++
-      cArgs.drop(sret.size).zip(incoming.flatten).map((t, n) => s"$t $n")
+    val declared = cType.params.zip(sret.toList ++ incoming.flatten)
+                        .map((p, n) => p.copy(name = Some(n)))
 
     val passed = stored.zip(incoming).map((p, ns) => argument(p._2, ns))
 
     genThunkCall(f, symbol, passed, sret)
-    finishFunction(s"define $result @${f.exported.get}(${declared.mkString(", ")})")
+    finishFunc(ir.FuncSig(f.exported.get, cType.copy(params = declared)))
   }
 
   /** The LLVM name of each incoming parameter, grouped by the sysl parameter it belongs to — one
@@ -154,11 +154,11 @@ trait ExportThunk extends ForeignEmitter {
       else direct.orElse(Some(emitAlloca(freshReg(), f.retTy.lty)))
 
     val out = syslSlot.map(s =>
-      Arg(LType.Ptr, s, s"noalias sret(${f.retTy.llvm}) align ${layout.align(f.retTy)}"))
+      Arg(LType.Ptr, s, ir.Attr.NoAlias :: sretAttrs(f.retTy.lty, layout.align(f.retTy))))
     val args = out.toList ::: passed
 
     def call(dest: Option[Val]): Unit =
-      emit(Inst.Call(dest, syslResult(f.retTy), Val.Global(symbol), args))
+      emit(syslResult(f.retTy).call(dest, Val.Global(symbol), args))
 
     // A `never` result diverges, so the call does not come back and there is nothing after it. The
     // `unreachable` is what says so to LLVM, exactly as a foreign call to one does.

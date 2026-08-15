@@ -114,13 +114,13 @@ trait ExprEmitter extends ArithEmitter {
       // licenses the tree that makes this worth doing at all rather than a left fold in disguise.
       val (params, args, flags) =
         if op == "fadd" then
-          (s"${vecTy.elem.llvm}, ${vecTy.llvm}",
+          (List(ir.Param(vecTy.elem.lty), ir.Param(vecTy.lty)),
            List(Arg(vecTy.elem.lty, Val.float(-0.0)), Arg(vecTy.lty, v)),
-           "reassoc ")
-        else (vecTy.llvm, List(Arg(vecTy.lty, v)), "")
+           List(ir.FastMath.Reassoc))
+        else (List(ir.Param(vecTy.lty)), List(Arg(vecTy.lty, v)), Nil)
 
-      satDecls += s"declare ${ty.llvm} @$name($params)"
-      emit(Inst.Call(Some(r), s"$flags${ty.llvm}", Val.Global(name), args))
+      satDecls += ir.FuncSig(name, ir.FnType(ty.lty, params))
+      emit(Inst.Call(Some(r), ty.lty, Val.Global(name), args, fast = flags))
       r
 
     // One lane, read straight out of the register. There is no address and so no bounds test: the
@@ -358,11 +358,11 @@ trait ExprEmitter extends ArithEmitter {
     // ever validated. The same copy is what `str(x)` finishes through, so both spend one allocation.
     case TFromBytes(arg) =>
       heap = true
-      val fn  = request("sysl.str.from_bytes")(StringEmitter.fromBytes)
+      val fn  = requestText("sysl.str.from_bytes")(StringEmitter.fromBytes)
       val v   = genExpr(arg)
       val p   = freshReg(); emit(Inst.Extract(p, arg.ty.lty, v, List(1)))
       val n   = freshReg(); emit(Inst.Extract(n, arg.ty.lty, v, List(2)))
-      val r   = freshReg(); emit(Inst.Call(Some(r), Type.Str.llvm, Val.Global(fn), List(Arg(LType.Ptr, p), Arg(wordLty, n))))
+      val r   = freshReg(); emit(Inst.Call(Some(r), Type.Str.lty, Val.Global(fn), List(Arg(LType.Ptr, p), Arg(wordLty, n))))
       ownTemp(r, Type.Str)
 
     // Rendering into a buffer: a zeroed stack slot becomes the sink, the value writes itself into
@@ -371,7 +371,7 @@ trait ExprEmitter extends ArithEmitter {
     // inside a loop meets the same one each time round.
     case TRender(value, method, spec, vslot) =>
       heap = true
-      request("sysl.str.from_bytes")(StringEmitter.fromBytes)
+      requestText("sysl.str.from_bytes")(StringEmitter.fromBytes)
 
       val table = bufferTable()
       val v     = genExpr(value)
@@ -394,12 +394,12 @@ trait ExprEmitter extends ArithEmitter {
           val e    = freshReg(); emit(Inst.Gep(e, LType.Ptr, vt, List(Arg(wordLty, Val.Int(n)))))
           val fn   = freshReg(); emit(Inst.Load(fn, LType.Ptr, e, Access.Plain))
 
-          emit(Inst.Call(None, "void", fn, List(Arg(LType.Ptr, data), Arg(LType.fat, w), Arg(spec.ty.lty, s))))
+          emit(Inst.Call(None, LType.Void, fn, List(Arg(LType.Ptr, data), Arg(LType.fat, w), Arg(spec.ty.lty, s))))
         case None =>
-          emit(Inst.Call(None, "void", Val.Global(method), List(Arg(value.ty.lty, v), Arg(LType.fat, w), Arg(spec.ty.lty, s))))
+          emit(Inst.Call(None, LType.Void, Val.Global(method), List(Arg(value.ty.lty, v), Arg(LType.fat, w), Arg(spec.ty.lty, s))))
 
       val r = freshReg()
-      emit(Inst.Call(Some(r), Type.Str.llvm, Val.Global("sysl.w.buf.finish"), List(Arg(LType.Ptr, slot))))
+      emit(Inst.Call(Some(r), Type.Str.lty, Val.Global("sysl.w.buf.finish"), List(Arg(LType.Ptr, slot))))
       ownTemp(r, Type.Str)
 
     case TBinary(_, l, r, Type.Str) =>
@@ -666,7 +666,7 @@ trait ExprEmitter extends ArithEmitter {
     // the other end. It reuses the foreign path entire: what a `call` names in front of an indirect
     // callee is the result type and then the value, exactly where a direct one names the symbol.
     case TCallPtr(callee, args, _, ty) =>
-      genForeignCall(foreignResultType(ty), genExpr(callee), args, ty)
+      genForeignCall(foreignResult(ty), genExpr(callee), args, ty)
 
     // The last thing a recursive function does, where it is a call to itself: a jump to its own
     // entry over the frame it already has (`TailCalls`).
@@ -719,11 +719,11 @@ trait ExprEmitter extends ArithEmitter {
     // instruction whose lowering every backend supplies for it.
     case TVaStart(ap) =>
       usesVarargs = true
-      emit(Inst.Call(None, "void", Val.Global("llvm.va_start.p0"), List(Arg(LType.Ptr, genExpr(ap))))); Val.Nothing
+      emit(Inst.Call(None, LType.Void, Val.Global("llvm.va_start.p0"), List(Arg(LType.Ptr, genExpr(ap))))); Val.Nothing
 
     case TVaEnd(ap) =>
       usesVarargs = true
-      emit(Inst.Call(None, "void", Val.Global("llvm.va_end.p0"), List(Arg(LType.Ptr, genExpr(ap))))); Val.Nothing
+      emit(Inst.Call(None, LType.Void, Val.Global("llvm.va_end.p0"), List(Arg(LType.Ptr, genExpr(ap))))); Val.Nothing
 
     case TVaArg(ap, ty) =>
       val r = freshReg()
@@ -755,7 +755,7 @@ trait ExprEmitter extends ArithEmitter {
       // same expression cannot see a half-written destination.
       val d = genExpr(dst)
       val s = genExpr(src)
-      emit(Inst.Call(None, "void", Val.Global("llvm.va_copy.p0"), List(Arg(LType.Ptr, d), Arg(LType.Ptr, s)))); Val.Nothing
+      emit(Inst.Call(None, LType.Void, Val.Global("llvm.va_copy.p0"), List(Arg(LType.Ptr, d), Arg(LType.Ptr, s)))); Val.Nothing
 
     case e @ TStructNew(struct, _) if layout.indirect(struct) => throughSlot(e)
 

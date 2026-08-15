@@ -103,16 +103,16 @@ trait ScalarEmitter extends StringEmitter {
       case "*" => "mul"
       case _   => sys.error(s"unreachable checkedArith '$op'")
     val fn = s"llvm.${if ty.signed then "s" else "u"}$name.with.overflow.${ty.llvm}"
-    satDecls += s"declare {${ty.llvm}, i1} @$fn(${ty.llvm}, ${ty.llvm})"
 
-    // The intrinsic hands back the value and the overflow flag together, and it is the one place
-    // the compiler writes an aggregate LLVM names without a name: `{i32, i1}`, spelled with no
-    // interior spaces because that is what the declaration above it says.
-    val both = LType.Named(s"{${ty.llvm}, i1}")
+    // The intrinsic hands back the value and the overflow flag together, in an aggregate LLVM does
+    // not name: `{ i32, i1 }`, which the declaration and the three uses below all take from here.
+    val both = LType.Struct(List(ty.lty, i1))
+
+    satDecls += ir.FuncSig(fn, ir.FnType(both, List(ir.Param(ty.lty), ir.Param(ty.lty))))
+
     val pair = freshReg()
 
-    emit(Inst.Call(Some(pair), both.render, Val.Global(fn),
-                   List(Arg(ty.lty, lv), Arg(ty.lty, rv))))
+    emit(Inst.Call(Some(pair), both, Val.Global(fn), List(Arg(ty.lty, lv), Arg(ty.lty, rv))))
     val v   = freshReg(); emit(Inst.Extract(v, both, pair, List(0)))
     val ovf = freshReg(); emit(Inst.Extract(ovf, both, pair, List(1)))
     val ok  = freshReg(); emit(Inst.Bin(ok, BinOp.Xor, i1, ovf, Val.Bool(true)))
@@ -266,9 +266,9 @@ trait ScalarEmitter extends StringEmitter {
   private def saturatingCast(from: Type.Floating, to: Type.Integer, v: Val): Val = {
     val op   = if to.signed then "fptosi.sat" else "fptoui.sat"
     val name = s"llvm.$op.${to.llvm}.f${from.bits}"
-    satDecls += s"declare ${to.llvm} @$name(${from.llvm})"
+    satDecls += ir.FuncSig(name, ir.FnType(to.lty, List(ir.Param(from.lty))))
     val r = freshReg()
-    emit(Inst.Call(Some(r), to.llvm, Val.Global(name), List(Arg(from.lty, v))))
+    emit(Inst.Call(Some(r), to.lty, Val.Global(name), List(Arg(from.lty, v))))
     r
   }
 
@@ -300,7 +300,7 @@ trait ScalarEmitter extends StringEmitter {
 
     emitTerm(Inst.CondBr(ok, okL, badL))
     emitLabel(badL)
-    emit(Inst.Call(None, "void", Val.Global("llvm.trap"), Nil))
+    emit(Inst.Call(None, LType.Void, Val.Global("llvm.trap"), Nil))
     emitTerm(Inst.Unreachable)
     emitLabel(okL)
   }
@@ -328,11 +328,11 @@ trait ScalarEmitter extends StringEmitter {
     case Type.Char =>
       charBuf = true
       heap = true
-      request("sysl.str.from_bytes")(StringEmitter.fromBytes)
-      val fn = request("sysl.str.char")(StringEmitter.char)
+      requestText("sysl.str.from_bytes")(StringEmitter.fromBytes)
+      val fn = requestText("sysl.str.char")(StringEmitter.char)
       val cp = genExpr(arg)
       val r  = freshReg()
-      emit(Inst.Call(Some(r), Type.Str.llvm, Val.Global(fn), List(Arg(i32, cp))))
+      emit(Inst.Call(Some(r), Type.Str.lty, Val.Global(fn), List(Arg(i32, cp))))
       r
 
     // Rendered at a width that holds the value, which for anything past 64 bits is **the value's
@@ -346,23 +346,23 @@ trait ScalarEmitter extends StringEmitter {
     // and `StringEmitter.intName` gives each its own symbol.
     case i: Type.Integer =>
       heap = true
-      request("sysl.str.from_bytes")(StringEmitter.fromBytes)
+      requestText("sysl.str.from_bytes")(StringEmitter.fromBytes)
       val bits   = if i.bits > 64 then i.bits else 64
-      val fn     = request(StringEmitter.intName(bits))(StringEmitter.int(bits))
+      val fn     = requestText(StringEmitter.intName(bits))(StringEmitter.int(bits))
       val wide   = convert(i, Type.Integer(bits, i.signed), genExpr(arg))
       val r = freshReg()
 
-      emit(Inst.Call(Some(r), Type.Str.llvm, Val.Global(fn),
+      emit(Inst.Call(Some(r), Type.Str.lty, Val.Global(fn),
                      List(Arg(LType.I(bits), wide), Arg(i1, Val.Int(if i.signed then 1 else 0)))))
       r
 
     case f: Type.Floating =>
       heap = true
       usesSnprintf = true
-      val fn = request("sysl.str.float")(StringEmitter.float)
+      val fn = requestText("sysl.str.float")(StringEmitter.float)
       val v  = convert(f, Type.Real, genExpr(arg))
       val r  = freshReg()
-      emit(Inst.Call(Some(r), Type.Str.llvm, Val.Global(fn), List(Arg(LType.F(64), v))))
+      emit(Inst.Call(Some(r), Type.Str.lty, Val.Global(fn), List(Arg(LType.F(64), v))))
       r
 
     case other => sys.error(s"unreachable str of ${other.llvm}")
@@ -381,21 +381,21 @@ trait ScalarEmitter extends StringEmitter {
     val r   = freshReg()
 
     def call(fn: String, rest: List[Arg]): Unit =
-      emit(Inst.Call(Some(r), Type.Str.llvm, Val.Global(fn), Arg(LType.Ptr, fmt) :: rest))
+      emit(Inst.Call(Some(r), Type.Str.lty, Val.Global(fn), Arg(LType.Ptr, fmt) :: rest))
 
     if FormatSpec.isStr(c) then
-      val fn     = request("sysl.str.fmt_s")(StringEmitter.fmtStr)
+      val fn     = requestText("sysl.str.fmt_s")(StringEmitter.fmtStr)
       val (p, n) = strBytes(genExpr(arg))
       call(fn, List(Arg(LType.Ptr, p), Arg(wordLty, n)))
     else if FormatSpec.isFloat(c) then
-      val fn = request("sysl.str.fmt_f")(StringEmitter.fmtFloat)
+      val fn = requestText("sysl.str.fmt_f")(StringEmitter.fmtFloat)
       val v  = convert(Type.underlying(arg.ty).asInstanceOf[Type.Floating], Type.Real, genExpr(arg))
       call(fn, List(Arg(LType.F(64), v)))
     else
       // A signed conversion widens by the value's own signedness, so a decimal keeps its value; an
       // unsigned one reads the bits as unsigned, so `%x` shows exactly the value's own width. Both
       // end at 64 bits and print through a `%ll…`.
-      val fn = request("sysl.str.fmt_i")(StringEmitter.fmtInt)
+      val fn = requestText("sysl.str.fmt_i")(StringEmitter.fmtInt)
       val i  = Type.underlying(arg.ty).asInstanceOf[Type.Integer]
       val v =
         if FormatSpec.isSignedInt(c) then convert(i, Type.Integer(64, i.signed), genExpr(arg))

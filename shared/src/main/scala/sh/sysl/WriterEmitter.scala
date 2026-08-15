@@ -30,7 +30,7 @@ trait WriterEmitter extends Emitter {
   protected def bufferLayout: String = bufferLty.render
 
   /** The table for a fresh buffer, whose data word is the caller's stack slot. */
-  protected def bufferTable(): String = request("sysl.vt.buf")(WriterEmitter.buffer)
+  protected def bufferTable(): String = requestText("sysl.vt.buf")(WriterEmitter.buffer)
 }
 
 object WriterEmitter {

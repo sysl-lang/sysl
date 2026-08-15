@@ -87,6 +87,24 @@ enum Val {
    */
   case Agg(fields: List[Arg])
 
+  /** A constant **array**, which is the same idea between square brackets — LLVM spells the two
+   * differently and means the same thing by both.
+   */
+  case Array(elems: List[Arg])
+
+  /** A device address written as a number. `inttoptr` is a **constant expression**, so this is a
+   * pointer that sits in the object file rather than one a prologue has to store: `13 §7` admits
+   * exactly the integer case, and a pointer reinterpreted as another pointer is a name rather than
+   * a literal and never arrives here.
+   */
+  case IntToPtr(from: LType, value: Val)
+
+  /** A run of bytes, already escaped the way LLVM's `c"…"` wants them. This is the one value here
+   * that is characters rather than a number, and it has to be: the escaping is a property of the
+   * text form, and what a consumer wants back is the bytes — which `Emitter.encode` still has.
+   */
+  case Bytes(escaped: String)
+
   def render: String = this match
     case Reg(name)    => s"%$name"
     case Global(name) => s"@$name"
@@ -100,6 +118,9 @@ enum Val {
     case Splat(l, v)  => s"splat (${l.render} ${v.render})"
     case Nothing      => ""
     case Agg(fields)  => fields.map(_.render).mkString("{ ", ", ", " }")
+    case Array(elems) => elems.map(_.render).mkString("[", ", ", "]")
+    case IntToPtr(f, v) => s"inttoptr (${f.render} ${v.render} to ptr)"
+    case Bytes(e)     => "c\"" + e + "\""
 
   /** Whether this is a constant rather than something computed.
    *
