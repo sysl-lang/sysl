@@ -240,6 +240,28 @@ class LibraryCliTests extends LibraryCliSupport {
       notes should not include "warning"
     }
 
+    // The **second road** for the library's own C (`15 §7`, `13 §5`). Compiled from source, the
+    // library's tree is walked and its shims become objects on the link line; taken from an artifact
+    // they are already archive members, and this is what says the archive really carries them. The
+    // two roads are reached by different code and a warm cache picks this one, so a program that ran
+    // all through development can stop linking the first time somebody builds it on a clean machine.
+    "and one that reaches the library's own C, which travels inside the artifact" in {
+      assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      // `entries` is answered by a shim under `library/sysl/fs/__<os>__`. Listing `/tmp` says the
+      // shim was found *and* called: a link that could not resolve `sysl_fs_dir_next` would not have
+      // got here, and a call that returned something other than a name would not have terminated.
+      val (status, notes) = diagnostics(Config(command = "run",
+        file = program("""import sysl.fs.entries
+                         |
+                         |print(entries("/tmp").unwrap().len() >= 0)
+                         |""".stripMargin),
+        stdLib = Some(std)))
+
+      withClue(notes)(status shouldBe 0)
+    }
+
     "builds a library against one too, which is the other thing that gets compiled" in {
       assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
       assume(Toolchain.clangAvailable, "clang not available")

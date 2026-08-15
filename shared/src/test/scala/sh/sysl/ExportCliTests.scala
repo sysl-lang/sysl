@@ -308,6 +308,45 @@ class ExportCliTests extends LibraryCliSupport {
     }
   }
 
+  /** The **standard library's** own C, which is the fourth tree and the one nothing used to look at.
+   *
+   * `build-c` compiles the standard module into what it writes — that is why `--std-lib` is refused
+   * here — so a shim of the library's own is exactly as much this archive's business as the
+   * project's is, and it fails in the same silent way: the sysl compiles, the archive is written, and
+   * a C project's linker reports a symbol nobody in that project has ever heard of.
+   *
+   * The C only exists because it is under a per-OS directory (`13 §5`), so this is also what says
+   * the selection reaches this command and not only the ones that link.
+   */
+  "the standard library's own C" - {
+
+    "is a member of the archive, because build-c compiles the library into it" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+      assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
+
+      val listing =
+        """module mylib
+          |
+          |import sysl.fs.entries
+          |
+          |@export("mylib_count")
+          |count() -> i32 = i32(entries("/tmp").unwrap().len())
+          |""".stripMargin
+
+      val root = rootOf("mylib", listing)
+      val out  = s"$root/libmylib.a"
+
+      succeeds(Config(command = "build-c", file = root, output = Some(out)))
+
+      // `library/sysl/fs/__<os>__/dirent.c` is in the module `sysl.fs`, since the folder names
+      // nothing — so the member is named for the module and the file, with no trace of which
+      // operating system's copy it was.
+      Ar.members(readBytes(out)) match
+        case Right(members) => members.map(_.name) should contain("sysl.fs.dirent.o")
+        case Left(err)      => fail(err)
+    }
+  }
+
   /** A `--lib` source root holding two modules: one the program uses, and one nothing names.
    *
    * Two are the whole point. A root with one module cannot tell "a dependency's exports are dropped"

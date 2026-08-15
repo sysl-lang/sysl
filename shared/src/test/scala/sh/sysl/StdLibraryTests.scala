@@ -247,7 +247,12 @@ class StdLibraryTests extends AnyFreeSpec with Matchers {
         val moved = Project.collect(copy, Some(Target.default.os))
 
         moved.map(place).sorted shouldBe Std.sources(Target.default.os).map(place)
-        LibraryArtifact.fingerprint(moved) shouldBe Std.fingerprint(Target.default.os)
+
+        // The C moves with it, and the fingerprint is over both (`Std.files`) — so a library whose
+        // shims were left behind must not hash as the one that has them.
+        val movedC = Project.cSources(copy, Some(Target.default.os))
+
+        LibraryArtifact.fingerprint(moved ::: movedC) shouldBe Std.fingerprint(Target.default.os)
       finally discardTree(copy)
     }
 
@@ -255,8 +260,8 @@ class StdLibraryTests extends AnyFreeSpec with Matchers {
       // The other half, and the reason editing the library is now something anybody can do: the
       // artifact's path holds this fingerprint, so a changed file *is* a different path. Nothing has
       // to be invalidated and a compiler running against the unedited library is unaffected.
-      val first = Std.sources(Target.default.os).headOption.getOrElse(fail("the library has no files"))
-      val edited = Source(first.name, first.text + "\n", first.dir.getOrElse(Nil)) :: Std.sources(Target.default.os).tail
+      val first = Std.files(Target.default.os).headOption.getOrElse(fail("the library has no files"))
+      val edited = Source(first.name, first.text + "\n", first.dir.getOrElse(Nil)) :: Std.files(Target.default.os).tail
 
       LibraryArtifact.fingerprint(edited) should not be Std.fingerprint(Target.default.os)
     }

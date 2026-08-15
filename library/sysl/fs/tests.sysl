@@ -1,0 +1,108 @@
+module sysl.fs
+@requires(os)
+@tests
+
+import sysl.buf.Buf
+
+// What listing a directory promises, asserted in sysl rather than beside it in Scala.
+//
+// **These are the first tests in the library that depend on the library's own C**, which is the
+// thing worth knowing about this file: `entries` is answered by a shim under a per-OS directory
+// (`13 §5`), so a build that did not compile or did not link that shim fails here rather than in
+// whatever program first called it. The compiler's own `OsDirectoryTests` proves the mechanism on a
+// temporary tree; this proves it on the tree that ships.
+//
+// The directories are made rather than found. A test that listed something already on the machine
+// would be asserting what the machine happens to hold, which is a different test every time it runs
+// and no test at all on a fresh checkout.
+
+// `/tmp` outright rather than through `TMPDIR`. These tests run only where the shim was compiled --
+// macOS and Linux, which are the per-OS directories the module has -- and POSIX fixes this path on
+// both. There is no environment access in the library to read the variable with anyway.
+private scratch(name: string) -> string
+    val dir = "/tmp/sysl-fs-entries-" + name
+
+    clean(dir)
+    make_dir(dir).unwrap()
+    dir
+end scratch
+
+// A scratch directory removed with whatever is in it, which is what makes a test rerunnable after
+// one of them failed halfway. Written here rather than in the module because a *library* function
+// that removes a tree is a thing to design rather than a thing to need for a test -- it has to
+// answer for symlinks, for a directory it cannot descend into, and for how far it should go.
+private clean(dir: string)
+    entries(dir) match
+        Ok(names) ->
+            for name in names.view()
+                val path = dir + "/" + name
+
+                // Whichever it is; the one that does not apply reports and is ignored, because a
+                // directory being left behind is what the `remove_dir` below is for.
+                if is_dir(path) then
+                    ignore(remove_dir(path))
+                else
+                    ignore(remove_file(path))
+
+            ignore(remove_dir(dir))
+        Err(_) -> ()
+end clean
+
+private ignore(r: Result[unit, IoError]) = ()
+
+private touch(path: string) = write_text(path, "").unwrap()
+
+private has(names: Buf[string], want: string) -> bool
+    for name in names.view()
+        if name == want then return true
+
+    false
+end has
+
+@test("an empty directory lists nothing")
+empty_lists_nothing()
+    val dir = scratch("empty")
+
+    assert_eq(entries(dir).unwrap().len(), 0)
+    clean(dir)
+end empty_lists_nothing
+
+@test("every name in the directory comes back, and '.' and '..' do not")
+names_come_back()
+    val dir = scratch("names")
+
+    touch(dir + "/alpha")
+    touch(dir + "/beta")
+
+    val names = entries(dir).unwrap()
+
+    // The order is the filesystem's, so the assertion is over membership rather than over position.
+    assert_eq(names.len(), 2)
+    assert(has(names, "alpha"))
+    assert(has(names, "beta"))
+    assert(!has(names, "."))
+    assert(!has(names, ".."))
+
+    clean(dir)
+end names_come_back
+
+@test("a directory that is not there reports why rather than answering empty")
+missing_is_an_error()
+    entries("/tmp/sysl-fs-entries-nothing-is-here") match
+        Ok(_)  -> assert(false, "listing a directory that does not exist answered")
+        Err(e) -> assert_eq(e.code(), 2)
+end missing_is_an_error
+
+@test("a directory inside one is listed by name, like anything else in it")
+a_directory_is_a_name()
+    val dir = scratch("nested")
+
+    make_dir(dir + "/inner").unwrap()
+
+    val names = entries(dir).unwrap()
+
+    assert_eq(names.len(), 1)
+    assert(has(names, "inner"))
+
+    clean(dir)
+end a_directory_is_a_name

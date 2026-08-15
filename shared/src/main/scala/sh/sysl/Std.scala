@@ -224,7 +224,17 @@ object Std {
    * stale artifact nothing would notice was stale. It cost nothing while the library carried no C
    * and would have been a silent mismatch the day it did.
    */
-  def fingerprint(os: Os): String = LibraryArtifact.fingerprint(sources(os) ::: cSources(os))
+  def fingerprint(os: Os): String = LibraryArtifact.fingerprint(files(os))
+
+  /** Every file the library is made of, which is what the fingerprint is over: its sysl and its C.
+   *
+   * **It has a name of its own so that nobody has to remember the `:::`.** This fingerprint is
+   * compared against one computed somewhere else — inside [[LibraryArtifact.build]], from whatever
+   * that call was handed — and the only way the two can disagree is by one side forgetting a kind of
+   * file. A name makes that a thing to pass rather than a thing to assemble, and the tests that
+   * assert properties of the hash say the same word the production path does.
+   */
+  def files(os: Os): List[Source] = sources(os) ::: cSources(os)
 
   /** The C the library carries, for the operating system being built for.
    *

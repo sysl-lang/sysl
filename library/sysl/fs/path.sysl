@@ -1,7 +1,8 @@
 module sysl.fs
 @requires(os)
 
-import sysl.text.cstring
+import sysl.buf.{Buf, buf}
+import sysl.text.{cstring, from_cstring}
 
 // What a program can ask and change about a path without opening what is at the end of it.
 //
@@ -14,10 +15,16 @@ import sysl.text.cstring
 // signature is all there is to get right is answered here, and one that cannot is absent. `size_of`
 // opens and seeks for exactly this reason.
 //
-// The one thing genuinely missing is **listing a directory**: `readdir` hands back a
-// `struct dirent`, and finding the name in one means knowing an offset that differs between the
-// platforms. That is the same trade the module refuses everywhere else, so it is not made here
-// either.
+// **Listing a directory was the one thing genuinely missing, and it is answered now** -- `readdir`
+// hands back a `struct dirent` whose name field sits at an offset the platforms disagree about,
+// which is exactly the transcription refused above. What answers it is a shim: a `.c` beside this
+// file returns the `char *` and nothing here learns the layout. It sits under a per-OS directory so
+// that it is absent on a target with no directories to list, which is what lets this module go on
+// being compiled for every target.
+//
+// That is the shape to reach for wherever this module still stops. A question C can answer in three
+// lines is answered by C; one that would need a structure transcribed into sysl is still not
+// answered at all.
 
 private[sysl] extern "access" c_access(path: *u8, mode: int) -> int
 private[sysl] extern "unlink" c_unlink(path: *u8) -> int
@@ -31,6 +38,12 @@ private[sysl] opaque struct Dir
 
 private[sysl] extern "opendir" c_opendir(path: *u8) -> *Dir
 private[sysl] extern "closedir" c_closedir(d: *Dir) -> int
+
+// The next name in a directory stream, or null at the end of it. This is the module's own shim
+// rather than libc's `readdir`, and the difference is the whole of why listing a directory is
+// possible here at all: `readdir` answers with a `struct dirent`, and the shim answers with the one
+// field a caller wants.
+private[sysl] extern "sysl_fs_dir_next" c_dir_next(d: *Dir) -> *u8
 
 // `mode_t` is the one argument in this file whose width the two platforms disagree about, and the
 // declaration says so rather than passing the wider one and leaving the callee to ignore the top
@@ -81,6 +94,45 @@ is_dir(path: string) -> bool
     c_closedir(d)
     true
 end is_dir
+
+// Every name in a directory, with `.` and `..` left out.
+//
+// The two dots are dropped because every caller drops them: a program listing a directory is asking
+// what is *in* it, and one that genuinely wants to walk upwards has a path to build rather than a
+// name to find. Leaving them in makes the ordinary case a filter written at every call site, and a
+// recursive walk that forgets the filter does not terminate.
+//
+// **The names arrive in whatever order the filesystem keeps them**, which is not sorted and is not
+// stable between two listings of one directory. A program that wants an order applies one; there is
+// no order here to be relied on by accident.
+//
+// **A name that is not UTF-8 stops the program**, exactly as `read_text` does with a file's contents
+// and for the reason written there: answering with an error would put a case in `IoError` that no
+// filesystem ever reports. A POSIX name is bytes, so this is reachable — and a program that would
+// rather inspect than trap is one this module does not serve yet.
+entries(path: string) -> Result[Buf[string], IoError]
+    var d = c_opendir(cstring(path).ptr)
+
+    if d == null then return Err(why())
+
+    defer c_closedir(d)
+
+    var names: Buf[string] = buf()
+    var next = c_dir_next(d)
+
+    while next != null
+        val name = from_cstring(next) match
+            Ok(s) -> s
+            Err(e) ->
+                print("panic: a name in", path, "is not UTF-8 at byte", e.offset)
+                exit(1)
+
+        if name != "." && name != ".." then names.push(name)
+
+        next = c_dir_next(d)
+
+    Ok(names)
+end entries
 
 // Whether the path names something that is not a directory. A device or a socket answers `true`
 // here, which is right for what callers use it for: the question is whether opening it as a file

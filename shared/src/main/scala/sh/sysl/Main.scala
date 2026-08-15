@@ -347,10 +347,21 @@ private[sysl] def execute(cfg: Config): Int = {
       case Some(err) => return fail(err)
       case None      => ()
 
+  // **The standard library's own tree, and only where it was compiled from source.** The library is
+  // a library (`13 §8`) and may carry C exactly as any other tree may (`15 §7`) — `sysl.fs` reaches
+  // `struct dirent` through a shim under a `__<os>__` directory, which is the only way to reach a
+  // layout that differs by platform and the reason the directories exist (`13 §5`).
+  //
+  // Where the standard module arrived as an **artifact** its shims are already archive members, so
+  // adding the tree here would compile every one of them a second time and hand the linker two
+  // definitions. `coreArchive` is exactly the question *did an artifact answer this compilation*, so
+  // it is what decides.
+  val stdTree = Option.when(coreArchive.isEmpty)(Std.root.toOption).flatten.toList
+
   val native =
     if links(cfg.command) then
-      NativeSources.build(NativeSources.of(cfg.file :: roots ::: fetched.roots, target.os), target, cfg.optimize,
-        paths, cfg.verbose) match
+      NativeSources.build(NativeSources.of(cfg.file :: roots ::: fetched.roots ::: stdTree, target.os),
+        target, cfg.optimize, paths, cfg.verbose) match
         case Left(err)    => return fail(err)
         case Right(built) => built
     else NativeSources.none
@@ -394,7 +405,12 @@ private[sysl] def execute(cfg: Config): Int = {
       stdout(CHeader.render(compiled.exports, project.name.getOrElse(Project.nameOf(cfg.file)))); 0
 
     case "build-c" =>
-      buildForC(cfg, compiled, target, project.name, cfg.file :: roots ::: fetched.roots, paths)
+      // The standard library's tree goes in with the rest, on the same condition the link line uses
+      // it: `build-c` compiles the standard module into what it writes, so a shim of the library's
+      // own that the archive left out is a symbol the C project's linker reports and its author
+      // cannot supply.
+      buildForC(cfg, compiled, target, project.name, cfg.file :: roots ::: fetched.roots ::: stdTree,
+                paths)
 
     case "build" =>
       val exe = cfg.output.getOrElse(defaultOutput(cfg.file, project.name))

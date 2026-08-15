@@ -35,7 +35,8 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
    * assemble the first into an object file.
    */
   private lazy val artifact: (String, String) =
-    LibraryArtifact.build(Std.sources(Target.default.os), Target.default, LibraryArtifact.std) match
+    LibraryArtifact.build(Std.sources(Target.default.os), Target.default, LibraryArtifact.std,
+                          native = Std.cSources(Target.default.os)) match
       case Right(r)  => r
       case Left(err) => fail(s"the standard module library did not build: $err")
 
@@ -235,12 +236,12 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
     }
 
     "and the fingerprint is what tells them apart" in {
-      LibraryArtifact.fingerprint(Std.sources(Target.default.os)) shouldBe Std.fingerprint(Target.default.os)
-      LibraryArtifact.fingerprint(Std.sources(Target.default.os).reverse) shouldBe Std.fingerprint(Target.default.os)
+      LibraryArtifact.fingerprint(Std.files(Target.default.os)) shouldBe Std.fingerprint(Target.default.os)
+      LibraryArtifact.fingerprint(Std.files(Target.default.os).reverse) shouldBe Std.fingerprint(Target.default.os)
       LibraryArtifact.fingerprint(
-        Std.sources(Target.default.os).map(s => new Source(s"/elsewhere/${Project.basename(s.name)}", s.text, s.dir)))
+        Std.files(Target.default.os).map(s => new Source(s"/elsewhere/${Project.basename(s.name)}", s.text, s.dir)))
         .shouldBe(Std.fingerprint(Target.default.os))
-      LibraryArtifact.fingerprint(Std.sources(Target.default.os).tail) should not be Std.fingerprint(Target.default.os)
+      LibraryArtifact.fingerprint(Std.files(Target.default.os).tail) should not be Std.fingerprint(Target.default.os)
     }
 
     "and it is exactly the hash it says it is" in {
@@ -456,7 +457,8 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
       assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
 
       val fromDisk = LibraryArtifact.build(Project.collect(StdRoot.root.get, Some(Target.default.os)), Target.default,
-                                           LibraryArtifact.std)
+                                           LibraryArtifact.std,
+                                           native = Project.cSources(StdRoot.root.get, Some(Target.default.os)))
 
       fromDisk match
         case Right((_, meta)) =>
