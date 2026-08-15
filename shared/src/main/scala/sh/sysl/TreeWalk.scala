@@ -117,6 +117,16 @@ object TreeWalk {
     case TDowngrade(v, _)           => List(v)
     case TUpgrade(v, _, _, _)       => List(v)
     case TArrayLit(elems, _)        => elems
+    // The vector forms. None of them can carry a reference — a lane is a scalar, so there is no
+    // count to take and nothing to escape through one — and they are listed anyway, because the
+    // catch-all at the bottom of this match returns `Nil` and a node missing from here is a node
+    // whose *operands* are invisible to every walk that uses this. `(f() < g()).select(a, b)` has
+    // four calls in it and would have had none.
+    case TVectorLit(lanes, _)       => lanes
+    case TSplat(v, _)               => List(v)
+    case TVecCompare(_, l, r, _)    => List(l, r)
+    case TSelect(m, a, b, _)        => List(m, a, b)
+    case TReduce(_, r, _)           => List(r)
     case TArrayFill(v, _)           => List(v)
     case TBufLit(elems, _)          => elems
     case TBufFill(v, n, _)          => List(v, n)

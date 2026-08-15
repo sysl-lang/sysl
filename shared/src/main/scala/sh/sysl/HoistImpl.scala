@@ -649,6 +649,7 @@ trait HoistImpl extends ImplConformance {
     case RefType(inner, _)   => subjectHomes(inner)
     case WeakType(inner)     => subjectHomes(inner)
     case ArrayType(_, elem, _) => subjectHomes(elem)
+    case VectorType(_, elem)   => subjectHomes(elem)
     // A value names no type, so it declares nothing and gives a block no home. `Buf[4]` is this
     // module's for whatever reason `Buf` is, and the `4` adds nothing either way.
     case _: ValueArgType     => Set(None)

@@ -85,6 +85,25 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
       stamped should be > 1000
     }
 
+    // **The library uses no vectors, so nothing else encodes a `VectorType`** — the round trip over
+    // `Std.parsed` above would stay green with the `tvec` tag missing from the decoder entirely, and
+    // the failure would appear only when somebody put a vector in a package and read the artifact
+    // back. A tag with no encoder or no decoder is precisely what this suite exists to catch, so a
+    // type the standard library does not happen to use needs a fixture of its own.
+    "round-trips a vector type, which the library itself never writes" in {
+      val src =
+        """scale[const W: usize](v: <W>f32, by: f32) -> <W>f32 = v * by
+          |
+          |f(a: <4>u8, b: <(2 * 4)>f32) -> <4>u8 = a
+          |""".stripMargin
+
+      val one  = parsed(src)
+      val back = roundTrip(List(one))
+
+      back.map(_.body) shouldBe List(one.body)
+      positionsOf(back.map(_.body)) shouldBe positionsOf(List(one.body))
+    }
+
     "rebinds to the caller's own Source, so a decoded declaration is still the library's" in {
       val back = roundTrip(List(one), Map(one.source.name -> one.source))
 
@@ -185,6 +204,20 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     check("a constrained subtype with a range and a predicate",
       "type Age = u8 within 0..<200 where value != 13u8")
     check("a const and a module-level val", "const cap: usize = 512\nval order: [3]int = [2, 0, 1]")
+    // The one expression whose payload is a bare statement *list*. The library may well hold none
+    // today, and that is the argument for the case rather than against it: an inline function whose
+    // local is bound to a block is how one arrives, and a codec that dropped the list would decode
+    // to a binding with no value and say so nowhere. The second binding pins the other half — a
+    // block of one expression is collapsed by the parser, so what round-trips there is the sum.
+    check("a block initializer, and the single expression that collapses out of one",
+      """f() -> int
+        |    val computed =
+        |        val a = 6
+        |        a * 7
+        |    val plain =
+        |        1 + 2
+        |    computed + plain
+        |""".stripMargin)
     check("a read-only view, beside the mutable one it is not",
       // Whether a view is read-only is one `Boolean` on `ArrayType`, and dropping it on the way
       // through would still compile and still round-trip every other field — the library would just
@@ -219,6 +252,20 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     // the linker chose — in a program that read the artifact, and nowhere else, so nothing about
     // compiling that library from source would show it. The binding carries `@align` beside it
     // because the two are folded by different lines and one could travel without the other.
+    // A package's chosen C name has to survive the artifact for the reason a function's exported
+    // symbol does: a consumer generating a header from a library it read back must spell the type
+    // the way the library chose, and a codec that dropped it would silently derive one instead. The
+    // bare form is beside the named one because they are folded by one line and stored as two
+    // different things — `None` and the declared name.
+    check("a struct's C name, chosen and taken from the declaration",
+      """@export("b2BodyId")
+        |struct Id
+        |    index1: i32
+        |
+        |@export
+        |struct Handle
+        |    slot: u16
+        |""".stripMargin)
     check("a section on a binding and on a definition",
       """@align(4096)
         |@section(".noinit")

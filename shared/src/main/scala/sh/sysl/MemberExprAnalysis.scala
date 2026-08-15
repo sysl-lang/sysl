@@ -160,6 +160,9 @@ trait MemberExprAnalysis extends ExprSupport {
         // values those bytes encode. `chars` is the one that cannot be a view — the decoding is
         // what makes the characters — so it is the library's `Chars`, positioned at the start.
         case _: Type.Array | _: Type.View if f == "len" => TLen(tr, Type.usize)
+        // A vector's `len` is its lane count, which is part of its type — so this is a constant
+        // folded here rather than anything read, exactly as an array's is in the emitter.
+        case v: Type.Vector if f == "len" => TIntLit(BigInt(v.length), Type.usize)
         case Type.Str if f == "bytes"                   => TBytes(tr)
         case Type.Str if f == "chars"                   => callLibrary("chars_of", TBytes(tr))
 

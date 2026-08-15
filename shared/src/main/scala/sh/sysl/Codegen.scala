@@ -411,7 +411,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
           s"ptr align ${layout.align(ty)} %$name.param, i64 ${layout.size(ty)}, i1 false)")
         retainAt(ty, s"%$name.addr")
       else
-        emit(s"store ${ty.llvm} %$name.param, ptr %$name.addr")
+        emit(Inst.Store(ty.lty, Val.Reg(s"$name.param"), Val.Reg(s"$name.addr"), Access.Plain))
         retainValue(ty, s"%$name.param")
       ownSlot(name, ty)
 
@@ -570,9 +570,9 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       val (box, data) = genBuffer(elem, n.toString)
 
       promotedBoxes(name) = box
-      emit(s"%$name.addr = getelementptr ${elem.llvm}, ptr $data, i64 0")
+      emit(Inst.Gep(Val.Reg(s"$name.addr"), elem.lty, Val.Raw(data), List(Arg(LType.I(64), Val.Int(0)))))
       retainValue(ty, v)
-      emit(s"store ${ty.llvm} $v, ptr %$name.addr")
+      emit(Inst.Store(ty.lty, Val.Raw(v), Val.Reg(s"$name.addr"), Access.Plain))
       ownBox(name, box, elem)
 
     // The slot is laid down **before** the initializer runs, because a large one is written into it
@@ -599,7 +599,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       // to read it off — so it is recorded here and put back at every access through the name.
       if Type.volatileIn(place.placeTy) then refStorage(name) = place.placeTy
       refPlaceOf(name) = place
-      emit(s"%$name.addr = getelementptr i8, ptr $base, i64 0")
+      emit(Inst.Gep(Val.Reg(s"$name.addr"), LType.I(8), Val.Raw(base), List(Arg(LType.I(64), Val.Int(0)))))
 
     case TExprStmt(expr) =>
       genExpr(expr)
@@ -675,7 +675,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     val loaded = ins.map { o =>
       val r = freshTemp()
 
-      emit(s"$r = load ${o.ty.llvm}, ptr %${o.slot}.addr")
+      emit(Inst.Load(Val.Raw(r), o.ty.lty, Val.Reg(s"${o.slot}.addr"), Access.Plain))
       s"${o.ty.llvm} $r"
     }
 
@@ -696,7 +696,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
         val r = freshTemp()
 
         emit(s"""$r = call ${o.ty.llvm} asm sideeffect "$text", "$cons"($args)""")
-        emit(s"store ${o.ty.llvm} $r, ptr %${o.slot}.addr")
+        emit(Inst.Store(o.ty.lty, Val.Raw(r), Val.Reg(s"${o.slot}.addr"), Access.Plain))
 
       // Several outputs come back as one anonymous structure, which is LLVM's shape rather than
       // anything the language says — so it is taken apart here and never seen above this line.
@@ -710,7 +710,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
           val part = freshTemp()
 
           emit(s"$part = extractvalue $shape $r, $i")
-          emit(s"store ${o.ty.llvm} $part, ptr %${o.slot}.addr")
+          emit(Inst.Store(o.ty.lty, Val.Raw(part), Val.Reg(s"${o.slot}.addr"), Access.Plain))
   }
 
   /** Counts the assembly blocks emitted in this module, so each one's labels can be its own. */

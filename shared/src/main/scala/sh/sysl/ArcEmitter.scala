@@ -535,7 +535,7 @@ trait ArcEmitter extends Emitter {
    */
   protected def ownBox(name: String, box: String, elem: Type): Unit = {
     emitAlloca(s"%$name.box", "ptr")
-    emit(s"store ptr $box, ptr %$name.box")
+    emit(Inst.Store(LType.Ptr, Val.Raw(box), Val.Reg(s"$name.box"), Access.Plain))
     owned.head += ((s"%$name.box", Type.Ref(elem, false)))
   }
 

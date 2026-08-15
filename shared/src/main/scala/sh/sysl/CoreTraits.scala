@@ -157,7 +157,12 @@ object CoreTraits {
     // narrows which values a type has and never which operations it has. `Eq` and `Ord` already read
     // it this way through `isOrdered`; the rows below used to match the type as written, which left
     // `%`, the bitwise operators, the shifts and unary `-` off a subtype that plainly has them.
-    val t = Type.underlying(subject)
+    // **A vector is asked about at its lane**, for the reason the sentence above gives about a
+    // subtype: a register does not decide which operations a type has, only how many of them happen
+    // at once. What this settles is that the *compiler* owns `+` on a `<4>f32` and it is not looked
+    // for among the `impl` blocks — which pair is actually defined is `arithType`'s answer, and it
+    // refuses integer `/` there with a reason rather than by falling through to a missing `impl`.
+    val t = Type.opSubject(subject)
 
     traitName match {
     case "Add"                 => Type.isNumeric(t) || t == Type.Str

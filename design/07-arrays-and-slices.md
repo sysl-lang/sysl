@@ -414,6 +414,131 @@ implementation:
   releasing a slice's owner is the same instruction sequence as releasing any other reference,
   with no static type in sight.
 
+## Vectors
+
+`<N>T` is N lanes of `T` — the same values an `[N]T` holds, in the same order, with the difference
+that its operators work on every lane at once.
+
+```
+val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]
+val b = a * 2.0                          -- one instruction, four multiplications
+```
+
+**The two type constructors differ by one bracket pair because a vector is an array that computes
+lane-wise, and the spelling should say so.** The angle brackets are free in type position: type
+arguments are written `[...]`, so nothing else claims them, and a type is only ever reached after a
+`:`, a `->` or another type constructor, where a comparison cannot appear. It also mirrors LLVM's own
+`<N x T>`, which is what this lowers to.
+
+The alternative considered and refused was `f32x4`, which is Rust's spelling and C's. It is not
+composable — `i32x8`, `u8x16` and `f64x2` are three unrelated names rather than one constructor — and
+above all it cannot be written **generically over the width**, which is the whole point of the
+feature.
+
+### A lane is a scalar, and the count is part of the type
+
+An integer, a float, `bool` or `char`. LLVM has no `<4 x {float, float}>`, so an aggregate lane has
+nothing to lower to; a `volatile` lane is refused too, because it asks for per-lane access ordering
+out of a load that is one instruction for the whole register — `volatile <N>T` is the spelling that
+means something.
+
+The count has no `[]T`-style form that drops it. A slice may, because it carries a length at run
+time; a register's width is settled when the code is generated or it is not a register. So `<>f32`
+is refused by the grammar, and a literal that does not fill the lanes is refused with both numbers.
+
+The count is a literal, a `const` name, or any expression in parentheses. **The parentheses are not
+decoration**: `>` is a comparison operator, so a bare expression would read `<4>f32` as `4 > f32` and
+then want a `>` that had already been consumed. `[N]T` has no such trouble, because `]` is not an
+operator.
+
+### The lanes are read by a constant index
+
+`v[0]` is one lane, and the index must be a compile-time constant in range. This is the one subscript
+in the language not checked at run time, and the reason is that there is nothing to check against: a
+vector has no address, and LLVM's answer to an out-of-range `extractelement` is *poison* — a value
+that is not a value, spreading silently through everything computed from it. Refusing the dynamic
+form is what keeps a subscript's promise. Anyone needing a computed lane wants the values in an
+array, whose checked subscript already answers.
+
+### A comparison yields a mask, and the lane-wise `if` is `select`
+
+`a < b` on two vectors is a `<N>bool`. It is an ordinary value: it can be bound, combined with the
+bitwise operators, and reduced.
+
+```
+val m  = a < b
+val lo = m.select(a, b)                  -- a's lane where m's is true, b's where it is false
+if m.any() then ...
+```
+
+**`select` is a method rather than a keyword because it cannot be `if`.** `if` branches — it
+evaluates one side or the other — and a register has no way to take one branch in two lanes and the
+other in the remaining two. Both sides are evaluated and the mask chooses between the results, which
+is a different operation and is spelled differently for it.
+
+For the same reason **a comparison chain has no lane-wise form**. `a < b < c` joins its links with
+`&&`, which short-circuits, and nothing per lane does. Reading the chain as a lane-wise `&` would
+give the scalar spelling a different meaning, so it is refused and the reader writes the `&`.
+
+### What a vector does not have
+
+**Integer `/` and `%`.** The scalar forms trap on a zero divisor and on the one signed overflow, and
+both guards reduce a lane-wise comparison to a single `i1` — so a vector would either drop the guard
+or trap for lanes that were fine. No machine sysl targets has an integer vector divide anyway, so
+what looks like an omission costs a scalarized loop either way.
+
+**Shuffles and swizzles.** They take constant index lists, which do not generalise over a width
+parameter — and that is exactly why a C SIMD kernel is written once per architecture, since the
+gather-and-transpose half is what changes between them while the arithmetic does not. Extract and
+insert build any shuffle meanwhile, correctly and more slowly. So the "write it once" claim below is
+strongest for lane-wise math and weakest for gathers, which is worth saying rather than discovering.
+
+**A way into or out of memory, and this is the one that bounds the section below.** There is no
+conversion between `<N>T` and `[N]T`, no load from a run of a slice, and no store back — lanes go in
+through a literal or a splat and come out through a constant subscript. At a fixed width that is
+merely tedious; at a **parameterised** width it cannot be written at all, since a lane index must be
+a constant and a `[const W]` body has no way to name W of them. So a width-generic kernel may answer
+a vector or a reduction and may not fill an array of results, which is what most real ones do. Found
+by `guide/simd` and filed as card 0155; the lowering is one LLVM instruction each way and the design
+question is what a partial run at the end of an array does.
+
+**A place in a C signature.** A vector in an `extern` is refused, in both directions: which register
+one arrives in differs by target *and* by which instruction-set extensions the other side was
+compiled with, so there is no convention to emit against. Guessing would not fail to link — it would
+produce a call that resolves and corrupts its arguments, which is the failure a boundary check exists
+to prevent. The shape that does cross is a pointer to the lanes.
+
+### Writing a kernel once, for every width
+
+This is what the feature is for, and it falls out of value parameters (`10 §9`) rather than needing
+anything of its own. The lane count binds like an array's length, read off the argument:
+
+```
+solve[const W: usize](vn: <W>f32, mass: <W>f32, bias: <W>f32) -> <W>f32 =
+    val impulse = (bias - vn) * mass
+    (impulse < 0.0).select(0.0, impulse)
+```
+
+One body, instantiated per width, with no width written at any call. Box2D's `contact_solver.c`
+writes the same algorithm four times — AVX2, NEON, SSE2 and a scalar fallback, selected by `#if` —
+and over half that 2120-line file is those four copies.
+
+**And a machine with no vector unit is not a fallback to write.** LLVM legalizes: a vector wider than
+the machine becomes several registers, and one on a machine with no vector unit becomes scalars. So
+`<4>f32` compiles for a Cortex-M as four ordinary FPU operations, and the only question a program
+ever has to ask is how wide to go where it cares about speed — never whether it may write one at all.
+
+**What the claim does not cover, stated here rather than discovered.** It holds for a kernel whose
+result is a vector or a reduction, and stops at the two absences above: a gather needs shuffles, and
+storing a batch of results needs a way into memory. `guide/simd` writes the solver once and then
+cannot write the loop that would feed it, which is the honest shape of the feature today.
+
+**Choosing the width automatically is also not built.** A program picks a number. There are no
+conditional-compilation symbols for the vector unit, because `Toolchain` passes no `-march` or
+`-mattr` — clang compiles for baseline `x86-64`, so an `avx2` symbol would be false on every target
+sysl has. That wants a target-features decision of its own; meanwhile 4 is the natural width
+everywhere, NEON and SSE2 both being 128 bits and both being mandatory on their architectures.
+
 ## Not yet
 
 - **Capacity that is not yet values.** `Buf`'s spare slots hold copies of whatever seeded the last

@@ -45,11 +45,16 @@ class ParseDiagnosticTests extends AnyFreeSpec with ParseSupport {
     // A function's body is parsed as part of its declaration, so a body that will not parse makes
     // the *declaration* fail — and the position that used to survive was the declaration's own first
     // line, several lines above anything wrong.
+    //
+    // **The fixture used to indent the value under the `=`**, back when a binding's `=` introduced
+    // no block. It introduces one now, so that spelling is the feature rather than the mistake —
+    // what a forgotten value actually leaves is a following line at the *same* indentation, which is
+    // what this writes. The position claim is the point of the test and is unchanged.
     "a body that will not parse does not report against the signature above it" in {
       val src =
         """f(a: int) -> int
           |    val b =
-          |        a + 1
+          |    a + 1
           |
           |    b
           |end f
@@ -88,16 +93,28 @@ class ParseDiagnosticTests extends AnyFreeSpec with ParseSupport {
     }
   }
 
+  // Both fixtures here used to put the value on an *indented* next line, which is a block now and
+  // therefore not a mistake at all. A value that is genuinely missing leaves the following line at
+  // the same indentation, and that is what these write; the columns are what the tests are about and
+  // neither has moved.
   "a value left off the end of a line is asked for where it should have been" - {
 
     "a const" in {
-      refusal("const A: string =\n    \"x\"\n") shouldBe ("expression expected", "<input>:1:18")
+      refusal("const A: string =\nprint(1)\n") shouldBe ("expression expected", "<input>:1:18")
     }
 
     // The same shape one construct over. These two used to disagree about the column, the `var`
     // pointing at the `=` and the `const` just past it.
     "and a var, in the same column relative to its '='" in {
-      refusal("var x =\n    1 + 2\nprint(str(x))\n") shouldBe ("expression expected", "<input>:1:8")
+      refusal("var x =\nprint(str(1))\n") shouldBe ("expression expected", "<input>:1:8")
+    }
+
+    // …and the value *is* allowed on the next line, indented, which is what makes the two above the
+    // narrow case they are. A `const` takes it because a block of one expression is that expression,
+    // so nothing here has to fold a block: what reaches the folder is the string.
+    "while an indented one is the value, for a const as much as for a var" in {
+      prog("const A: string =\n    \"x\"\n") shouldBe prog("const A: string = \"x\"\n")
+      prog("var x =\n    1 + 2\n") shouldBe prog("var x = 1 + 2\n")
     }
   }
 

@@ -54,8 +54,22 @@ object AstCodec {
    * check and then been decoded as something it was not. The merge takes the next number for that
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
+   *
+   * **It has now happened twice, and this is the merge that took 39.** A block initializer and a
+   * struct's C name were built in parallel, each moving 37 to 38 against a tree the other had not
+   * touched. Caught by reading dev's value rather than by anything failing — which is the point
+   * worth keeping: the collision is invisible to the compiler, because both numbers are perfectly
+   * valid on their own branch.
+   *
+   * **Three times, and 40 is the vector branch's.** `VectorType` moved 37 to 38 in parallel with
+   * *both* of the above, so by the time it fetched dev the number it had taken was two behind.
+   * This one was caught by `git merge` raising a conflict on the line rather than by anybody
+   * reading — which is luck rather than a mechanism, and only happened because the branch that took
+   * 39 edited the same line. **Two branches that bump this from different starting values do not
+   * conflict**, and that is the case the rule above is written for: read dev's number, take the one
+   * after it, and do not assume a clean merge means the versions agree.
    */
-  val Version: Int = 37
+  val Version: Int = 40
 
   private val Magic = "sysl-ast"
 
@@ -239,6 +253,7 @@ object AstCodec {
         case RefType(inner, sy)   => tok("tr"); typ(inner); bool(sy)
         case WeakType(inner)      => tok("tw"); typ(inner)
         case ArrayType(len, elem, ro) => tok("ta"); opt(len)(expr); typ(elem); bool(ro)
+        case VectorType(lanes, elem)  => tok("tvec"); expr(lanes); typ(elem)
         case VolatileType(inner)  => tok("tv"); typ(inner)
         case TupleType(ps, res)   => tok("tt"); list(ps)(typ); bool(res)
         case PackType(n)          => tok("pk"); sref(n)
@@ -295,6 +310,7 @@ object AstCodec {
         case Lambda(ps, b)           => tok("lam"); list(ps)(lambdaParam); list(b)(stmt)
         case ArrayLit(es)            => tok("arr"); list(es)(expr)
         case ArrayFill(v, c)         => tok("afl"); expr(v); expr(c)
+        case Block(ss)               => tok("blk"); list(ss)(stmt)
         case IfExpr(c, t, e2)        => tok("if"); expr(c); list(t)(stmt); opt(e2)(b => list(b)(stmt))
         case MatchExpr(s, arms)      => tok("mat"); expr(s); list(arms)(arm)
         case IsPattern(s, ps, neg)   => tok("is"); expr(s); list(ps)(pattern); bool(neg)
@@ -393,13 +409,17 @@ object AstCodec {
         case ExternVarDecl(n, t, lk, vs) =>
           tok("extv"); sref(n); typ(t); opt(lk)(sref); vis(vs)
 
-        case StructDecl(n, tps, fs, ms, bs, invs, vs, tds, op, tvs, pk, al) =>
+        case StructDecl(n, tps, fs, ms, bs, invs, vs, tds, op, tvs, pk, al, cn) =>
           tok("sd"); sref(n); list(tps)(sref); list(fs)(param); list(ms)(method)
           bounds(bs); list(invs)(expr); vis(vs); tdefaults(tds); bool(op); tdefaults(tvs)
           // A layout travels with the declaration: an importing module computes an instantiation's
           // layout for itself (`15 §4`), so a struct whose padding or alignment an attribute decided
           // would otherwise be laid out two different ways either side of an artifact.
           bool(pk); opt(al)(expr)
+          // And the C name travels for the reason a function's exported symbol does: the header a
+          // consumer generates has to spell a package's type the way the package chose, whether it
+          // was compiled from source or read back from an artifact.
+          opt(cn)(e => { pos(e); opt(e.symbol)(sref) })
 
         case EnumDecl(n, tps, und, vars, ms, bs, vs, tds, tvs) =>
           tok("ed"); sref(n); list(tps)(sref); opt(und)(typ); list(vars)(variant); list(ms)(method)
@@ -679,6 +699,7 @@ object AstCodec {
         case "tr"  => RefType(typ(), bool())
         case "tw"  => WeakType(typ())
         case "ta"  => ArrayType(opt(expr()), typ(), bool())
+        case "tvec" => VectorType(expr(), typ())
         case "tv"  => VolatileType(typ())
         case "tt"  => TupleType(list(typ()), bool())
         case "pk"  => PackType(sref())
@@ -736,6 +757,7 @@ object AstCodec {
         case "lam"  => Lambda(list(lambdaParam()), list(stmt()))
         case "arr"  => ArrayLit(list(expr()))
         case "afl"  => ArrayFill(expr(), expr())
+        case "blk"  => Block(list(stmt()))
         case "if"   => IfExpr(expr(), list(stmt()), opt(list(stmt())))
         case "mat"  => MatchExpr(expr(), list(arm()))
         case "is"   => IsPattern(expr(), list(pattern()), bool())
@@ -785,7 +807,8 @@ object AstCodec {
           ExternVarDecl(sref(), typ(), opt(sref()), vis())
         case "sd" =>
           StructDecl(sref(), list(sref()), list(param()), list(method()),
-            bounds(), list(expr()), vis(), tdefaults(), bool(), tdefaults(), bool(), opt(expr()))
+            bounds(), list(expr()), vis(), tdefaults(), bool(), tdefaults(), bool(), opt(expr()),
+            opt(at(ExportAttr(opt(sref())))))
         case "ed" =>
           EnumDecl(sref(), list(sref()), opt(typ()), list(variant()), list(method()),
             bounds(), vis(), tdefaults(), tdefaults())

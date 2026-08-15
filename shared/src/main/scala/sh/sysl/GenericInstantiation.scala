@@ -153,6 +153,10 @@ trait GenericInstantiation extends ConstFolding {
           s.fields = decl.fields.map(f => (f.name, recover(Type.Unknown)(resolveQualified(f.typ, subst))))
           s.packed = decl.packed
           s.minAlign = decl.alignment.flatMap(a => recover(Option.empty[Int])(alignBound(decl.name, a)))
+          // The declared name where `@export` carried no string, which is the reading it has on a
+          // function. It is the **bare** name rather than the key: a key is `module$Name`, and being
+          // rid of the module path is the whole of what the attribute is written for.
+          s.cname = decl.cname.map(e => e.symbol.getOrElse(Modules.bare(decl.name)))
           recover(())(checkBitfields(s))
         finally
           resolving -= key
@@ -440,6 +444,19 @@ trait GenericInstantiation extends ConstFolding {
 
           unify(elem, e, tparams, sub)
         case _ => ()
+    // A vector's lane count binds a value parameter exactly as an array's length does, and this is
+    // the case the whole feature turns on: `solve[const W: usize](vn: <W>f32)` handed a `<8>f32`
+    // reads 8 off the argument and instantiates the kernel at eight lanes, with no width written at
+    // the call. Nothing else lets one body serve every machine.
+    case VectorType(lanes, elem) =>
+      actual match
+        case Type.Vector(n, e) =>
+          lanes match
+            case Ident(v) if tparams(v) => sub.getOrElseUpdate(v, Type.ConstArg(n, Type.usize))
+            case _                      => ()
+
+          unify(elem, e, tparams, sub)
+        case _ => ()
     // A value argument written out fixes nothing. `Buf[4]` handed a `Buf[4]` has nothing to solve,
     // and handed anything else is a mismatch the instantiated signature reports in both types'
     // terms — which is where every other structural disagreement is reported.
@@ -575,6 +592,10 @@ trait GenericInstantiation extends ConstFolding {
     // a field that costs nothing, which is the opposite of what zero-sized means.
     case t if Type.zeroSized(t) => true
     case Type.Array(_, elem)    => hasZero(elem)
+    // Every lane zeroed, which a lane always has: a lane is a scalar, and the four scalar kinds are
+    // the first line of this match. `var v: <4>f32` is therefore the ordinary declaration it looks
+    // like — and so is a `[2]<4>f32`, which is the case that found this missing.
+    case Type.Vector(_, elem)   => hasZero(elem)
     case s: Type.Struct         => s.fields.forall(f => hasZero(f._2))
     case _                      => false
 }

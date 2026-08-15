@@ -128,11 +128,16 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
       out should include("--> t.sysl:2:9")
     }
 
-    "just after the '=' of a binding whose value was left on the next line" in {
-      // A binding's value goes on its own line or on a continuation of it, and the caret lands in
-      // the space that value should have occupied: column 8, immediately past the `=` in column 7.
-      // A `const` written the same way has always reported there, and a `var` now agrees with it.
-      val out = diag("var x =\n    1 + 2\nprint(str(x))\n")
+    "just after the '=' of a binding whose value was forgotten" in {
+      // The caret lands in the space the value should have occupied: column 8, immediately past the
+      // `=` in column 7.
+      //
+      // **The fixture used to indent the following line**, back when a binding's `=` introduced no
+      // block and that was the same mistake. It introduces one now, so an indented line after it is
+      // the value rather than a missing one — what remains a mistake, and what a forgotten value
+      // actually leaves behind, is a following line at the same indentation. The position claim is
+      // unchanged and is the point of the test; only the way of making the mistake moved.
+      val out = diag("var x =\nprint(str(1))\n")
 
       out should include("--> t.sysl:1:8")
       out should include("expression expected")
@@ -146,10 +151,12 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
     // points at the construct that is wrong. It pointed several lines above it, at a line that is
     // correct, and sent the reader looking at the signature.
     "on the binding inside a body, and not on the declaration the body belongs to" in {
+      // The value is on the line below at the body's own indentation, so it is neither a
+      // continuation nor a block — the same mistake as above, one indent deeper.
       val src =
         """f(a: int) -> int
           |    val b =
-          |        a + 1
+          |    a + 1
           |
           |    b
           |end f

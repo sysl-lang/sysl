@@ -46,6 +46,86 @@ trait ExprEmitter extends ArithEmitter {
         acc = r
       acc
 
+    // A vector is built lane by lane with `insertelement`, which is the array literal's
+    // `insertvalue` chain in the register file — and never through a slot, however wide it is: a
+    // vector has no `layout.indirect` case because a value that is not storage cannot be built in
+    // storage. LLVM folds a chain of constant lanes into a literal, so a splat of constants costs
+    // nothing at run time.
+    case TVectorLit(lanes, vecTy) =>
+      val vals = lanes.map(genExpr)
+      var acc  = "zeroinitializer"
+      for (v, i) <- vals.zipWithIndex do
+        val r = freshTemp()
+        emit(s"$r = insertelement ${vecTy.llvm} $acc, ${vecTy.elem.llvm} $v, i32 $i")
+        acc = r
+      acc
+
+    // The splat, in LLVM's own idiom: put the value in lane zero and shuffle it across with an
+    // all-zero mask. `shufflevector` with a zeroinitializer mask is the pattern every back end
+    // recognises, and it lowers to one broadcast instruction where the machine has one.
+    case TSplat(value, vecTy) =>
+      val v   = genExpr(value)
+      val one = freshTemp()
+      emit(s"$one = insertelement ${vecTy.llvm} poison, ${vecTy.elem.llvm} $v, i32 0")
+      val r = freshTemp()
+      emit(s"$r = shufflevector ${vecTy.llvm} $one, ${vecTy.llvm} poison, " +
+        s"<${vecTy.length} x i32> zeroinitializer")
+      r
+
+    // A lane-wise comparison is the scalar instruction at the register's width — `fcmp olt
+    // <4 x float>` yields the `<4 x i1>` that is this language's `<4>bool`. The predicate is chosen
+    // exactly as the scalar path chooses it, from the lane's own type and signedness.
+    case TVecCompare(op, l, r, _) =>
+      val lv    = genExpr(l)
+      val rv    = genExpr(r)
+      val vecTy = Type.repr(l.ty).asInstanceOf[Type.Vector]
+      val lane  = Type.underlying(vecTy.elem)
+      val instr = if lane.isInstanceOf[Type.Floating] then "fcmp" else "icmp"
+      val res   = freshTemp()
+
+      emit(s"$res = $instr ${predicate(op, lane)} ${vecTy.llvm} $lv, $rv")
+      res
+
+    // Both sides are evaluated and the mask picks between them, which is the whole difference from
+    // an `if` and is why this is not one (`tast.scala`'s `TSelect`).
+    case TSelect(mask, whenTrue, whenFalse, ty) =>
+      val m = genExpr(mask)
+      val a = genExpr(whenTrue)
+      val b = genExpr(whenFalse)
+      val r = freshTemp()
+
+      emit(s"$r = select ${mask.ty.llvm} $m, ${ty.llvm} $a, ${ty.llvm} $b")
+      r
+
+    case TReduce(op, receiver, ty) =>
+      val v     = genExpr(receiver)
+      val vecTy = Type.repr(receiver.ty).asInstanceOf[Type.Vector]
+      val name  = s"llvm.vector.reduce.$op.${vecTy.lty.overloadSuffix}"
+      val r     = freshTemp()
+
+      // **The float sum takes a starting accumulator and the others do not**, which is not a
+      // symmetry LLVM chose lightly: floating addition is not associative, so the intrinsic makes
+      // you say what to start from and whether the order may be changed. `-0.0` is the identity —
+      // `0.0` would turn a sum of nothing but negative zeros positive — and `reassoc` is what
+      // licenses the tree that makes this worth doing at all rather than a left fold in disguise.
+      val (params, args, flags) =
+        if op == "fadd" then
+          (s"${vecTy.elem.llvm}, ${vecTy.llvm}", s"${vecTy.elem.llvm} -0.0, ${vecTy.llvm} $v", "reassoc ")
+        else (vecTy.llvm, s"${vecTy.llvm} $v", "")
+
+      satDecls += s"declare ${ty.llvm} @$name($params)"
+      emit(s"$r = call $flags${ty.llvm} @$name($args)")
+      r
+
+    // One lane, read straight out of the register. There is no address and so no bounds test: the
+    // index was held to a constant in range where it was written, which is what `TLane` is for.
+    case TLane(receiver, lane, ty) =>
+      val v = genExpr(receiver)
+      val r = freshTemp()
+
+      emit(s"$r = extractelement ${Type.repr(receiver.ty).llvm} $v, i32 $lane")
+      r
+
     // Built through memory with a loop rather than as an `insertvalue` chain, for the reason the
     // ARC walk gives: the count is a compile-time constant but it can be very large, and a repeat
     // count is where someone writes a large one on purpose. The value is generated once, above the
@@ -310,12 +390,25 @@ trait ExprEmitter extends ArithEmitter {
         case it: Type.Integer if overflowChecked(op, l, r, it) => checkedArith(op, it, lv, rv)
         case _                                                 => arith(op, bt, lv, rv)
 
+    // The vector cases come first, because `opSubject` reads through the register to the lane and
+    // the two scalar guards below would otherwise never see one. `zeroinitializer` is the whole
+    // vector's zero, so the integer form needs no splat written out.
+    case TUnary("-", operand, ty) if Type.opSubject(ty).isInstanceOf[Type.Integer] && Type.repr(ty).isInstanceOf[Type.Vector] =>
+      val v = genExpr(operand); val r = freshTemp(); emit(s"$r = sub ${ty.llvm} zeroinitializer, $v"); r
     case TUnary("-", operand, ty) if Type.underlying(ty).isInstanceOf[Type.Integer] =>
       val v = genExpr(operand); val r = freshTemp(); emit(Inst.Bin(Val.Raw(r), BinOp.Sub, ty.lty, Val.Int(0), Val.Raw(v))); r
-    case TUnary("-", operand, ty) if Type.underlying(ty).isInstanceOf[Type.Floating] =>
-      val v = genExpr(operand); val r = freshTemp(); emit(s"$r = fneg ${ty.llvm} $v"); r
+    case TUnary("-", operand, ty) if Type.opSubject(ty).isInstanceOf[Type.Floating] =>
+      val v = genExpr(operand); val r = freshTemp(); emit(Inst.Neg(Val.Raw(r), ty.lty, Val.Raw(v))); r
     case TUnary("!", operand, _) =>
       val v = genExpr(operand); val r = freshTemp(); emit(Inst.Bin(Val.Raw(r), BinOp.Xor, i1, Val.Raw(v), Val.Bool(true))); r
+    // A vector's complement flips every lane, and its all-ones constant is written `splat (iN -1)`
+    // rather than as the bare `-1` a scalar takes.
+    case TUnary("~", operand, ty) if Type.repr(ty).isInstanceOf[Type.Vector] =>
+      val v    = genExpr(operand)
+      val lane = Type.repr(ty).asInstanceOf[Type.Vector].elem
+      val r    = freshTemp()
+      emit(s"$r = xor ${ty.llvm} $v, splat (${lane.llvm} -1)")
+      r
     case TUnary("~", operand, ty) =>
       val v = genExpr(operand); val r = freshTemp(); emit(Inst.Bin(Val.Raw(r), BinOp.Xor, ty.lty, Val.Raw(v), Val.Int(-1))); r
     case TUnary(op, _, _) =>

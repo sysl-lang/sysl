@@ -151,6 +151,9 @@ trait ArithEmitter extends CallEmitter {
     case _: Type.CFn      => "null"
     case _: Type.Struct   => "zeroinitializer"
     case _: Type.Array    => "zeroinitializer"
+    // Every lane zeroed, which `zeroinitializer` says for a vector as it does for an array — a
+    // zeroed mask is every lane false, and a zeroed `<N>f32` is positive zero in each.
+    case _: Type.Vector   => "zeroinitializer"
     case _: Type.View     => "zeroinitializer"
     case Type.VaList      => "zeroinitializer"
     case e: Type.Enum     => if e.simple then "0" else "zeroinitializer"

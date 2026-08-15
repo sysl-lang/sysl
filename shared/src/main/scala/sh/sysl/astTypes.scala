@@ -24,6 +24,9 @@ sealed trait TypeRef extends Positioned {
     case ArrayType(None, elem, ro)           => s"[]${if ro then "const " else ""}${elem.show}"
     case ArrayType(Some(IntLit(n, _)), e, _) => s"[$n]${e.show}"
     case ArrayType(Some(_), elem, _)         => s"[…]${elem.show}"
+    case VectorType(IntLit(n, _), e)         => s"<$n>${e.show}"
+    case VectorType(Ident(n), e)             => s"<$n>${e.show}"
+    case VectorType(_, elem)                 => s"<…>${elem.show}"
     case VolatileType(inner)              => s"volatile ${inner.show}"
     case TupleType(parts, false)          => s"(${parts.map(_.show).mkString(", ")})"
     case TupleType(parts, true)           => parts.map(_.show).mkString(", ")
@@ -76,6 +79,16 @@ case class WeakType(inner: TypeRef) extends TypeRef
  * goes would say a program had a type called "const T".
  */
 case class ArrayType(length: Option[Expr], elem: TypeRef, readOnly: Boolean = false) extends TypeRef
+
+/** `<N>T` — N lanes of `T`, an array whose operators work on every lane at once.
+ *
+ * The lane count has no `None` case, which is the one structural difference from `ArrayType` and is
+ * the point of not reusing it: `[]T` drops the length because a slice carries its own at run time,
+ * and there is no such thing for a vector. A register's width is decided when the code is generated
+ * or it is not a register — so a written vector always says how many lanes, and `<>f32` is refused
+ * by the grammar rather than by a check further in.
+ */
+case class VectorType(lanes: Expr, elem: TypeRef) extends TypeRef
 
 /** `volatile T` — storage a device may change and a read of which may itself do something
  * (`03 § Device memory`).

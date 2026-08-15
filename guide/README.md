@@ -69,6 +69,7 @@ contract.
 | `lisp` | the reference cycle — the one shape a count cannot reclaim, `weak T` as both the cure and the instrument that measures it |
 | `table` | text measured for **display** — a column is as wide on screen as its widest cell, and both a byte count and a character count are the wrong unit |
 | `qsort` | the C boundary in the direction nothing else goes — a C routine that calls *back*, and the per-instantiation trampoline, slice address and element size it takes |
+| `simd` | one kernel compiled for more than one register width — a lane count as a value parameter, and the two places "write it once" stops being true |
 
 The rest of the set, and the coverage map that justifies each entry, is recorded outside the repo
 with the rest of the project's decisions. A candidate that does not own an axis already unclaimed is

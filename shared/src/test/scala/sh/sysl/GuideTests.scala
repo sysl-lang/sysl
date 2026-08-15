@@ -427,4 +427,25 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
     out should include("sysl.slices.sort")
     out should include("C library qsort")
   }
+
+  // **The assertion that carries this one is the third section**, where the *same* `solve` is called
+  // at four lanes and at eight and the two are then checked against each other lane by lane. A
+  // kernel that compiled at both widths and computed different things would pass every other check
+  // in the file; agreeing with itself across the instantiation, and with a scalar spelling that
+  // shares none of its machinery, is what says the one body really serves both registers.
+  "simd — one kernel compiled for more than one register width" in {
+    val out = guide("simd")
+
+    out should not include "FAIL"
+    checks(out) shouldBe 42
+    sections(out) shouldBe List(
+      "-- lane-wise arithmetic is the scalar arithmetic, W at a time",
+      "-- a comparison is a mask, and a mask is an ordinary value",
+      "-- one kernel, two register widths, from one piece of source",
+      "-- the same kernel is what a scalar loop would have computed",
+      "-- gathering, which is where the missing shuffle costs something",
+      "-- the reductions, and what each is for",
+      "-- integer lanes, and a mask over them",
+    )
+  }
 }

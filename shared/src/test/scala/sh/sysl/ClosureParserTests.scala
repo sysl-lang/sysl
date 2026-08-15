@@ -95,6 +95,18 @@ class ClosureParserTests extends AnyFreeSpec with ParseSupport {
                   |    print(x))
                   |""".stripMargin) should include("')' expected")
     }
+
+    // A body forgotten altogether. The block alternative is *looked for* rather than tried, so its
+    // refusal is recorded back at the arrow instead of one token further along — otherwise it
+    // outranks the expression alternative and the reader is told `indent expected` against the next
+    // statement, which is a demand for a block they had not begun. Found while giving a binding's
+    // `=` the same block, where the two alternatives are arranged the same way.
+    "a body left off asks for the body, not for an indent on the line after" in {
+      val out = progError("var g = x ->\nprint(1)\n")
+
+      out should include("expression expected")
+      out should not include "indent expected"
+    }
   }
 
   "what the arrow does not take over" - {

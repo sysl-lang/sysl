@@ -308,7 +308,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
     case TBindPattern(name, bty) =>
       emitAlloca(s"%$name.addr", bty.llvm)
       retainValue(bty, value)
-      emit(s"store ${bty.llvm} $value, ptr %$name.addr")
+      emit(Inst.Store(bty.lty, Val.Raw(value), Val.Reg(s"$name.addr"), Access.Plain))
       ownSlot(name, bty)
 
     // `n @ pat` binds the whole value and then whatever the inner pattern binds, both off the same
@@ -474,12 +474,12 @@ trait ControlFlowEmitter extends PlaceEmitter {
     val elseL = if elseBlock.isDefined then freshLabel("for.else") else endL
     val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
     emitAlloca(s"%$name.addr", w)
-    emit(s"store $w $loV, ptr %$name.addr")
+    emit(Inst.Store(w, Val.Raw(loV), Val.Reg(s"$name.addr"), Access.Plain))
     genLoops = GenLoop(endL, stepL, slot, ty, owned.length, tempStack.length) :: genLoops
 
     emitTerm(Inst.Br(condL))
     emitLabel(condL)
-    val iv  = freshTemp(); emit(s"$iv = load $w, ptr %$name.addr")
+    val iv  = freshTemp(); emit(Inst.Load(Val.Raw(iv), w, Val.Reg(s"$name.addr"), Access.Plain))
     val cmp = freshTemp(); emit(s"$cmp = icmp ${predicate(if inclusive then "<=" else "<", varTy)} $w $iv, $hiV")
     emitTerm(Inst.CondBr(Val.Raw(cmp), bodyL, elseL))
     emitLabel(bodyL)
@@ -489,9 +489,9 @@ trait ControlFlowEmitter extends PlaceEmitter {
     // `continue` lands here so the counter still advances before the next test.
     emitTerm(Inst.Br(stepL))
     emitLabel(stepL)
-    val cur = freshTemp(); emit(s"$cur = load $w, ptr %$name.addr")
+    val cur = freshTemp(); emit(Inst.Load(Val.Raw(cur), w, Val.Reg(s"$name.addr"), Access.Plain))
     val nxt = freshTemp(); emit(Inst.Bin(Val.Raw(nxt), BinOp.Add, w, Val.Raw(cur), Val.Int(1)))
-    emit(s"store $w $nxt, ptr %$name.addr")
+    emit(Inst.Store(w, Val.Raw(nxt), Val.Reg(s"$name.addr"), Access.Plain))
     emitTerm(Inst.Br(condL))
 
     genLoops = genLoops.tail
@@ -530,11 +530,11 @@ trait ControlFlowEmitter extends PlaceEmitter {
 
     emit(Inst.Store(i1, Val.Int(if universal then 1 else 0), Val.Raw(acc), Access.Plain))
     emitAlloca(s"%$name.addr", w)
-    emit(s"store $w $loV, ptr %$name.addr")
+    emit(Inst.Store(w, Val.Raw(loV), Val.Reg(s"$name.addr"), Access.Plain))
 
     emitTerm(Inst.Br(condL))
     emitLabel(condL)
-    val iv  = freshTemp(); emit(s"$iv = load $w, ptr %$name.addr")
+    val iv  = freshTemp(); emit(Inst.Load(Val.Raw(iv), w, Val.Reg(s"$name.addr"), Access.Plain))
     val cmp = freshTemp(); emit(s"$cmp = icmp ${predicate(if inclusive then "<=" else "<", varTy)} $w $iv, $hiV")
     emitTerm(Inst.CondBr(Val.Raw(cmp), bodyL, endL))
 
@@ -551,9 +551,9 @@ trait ControlFlowEmitter extends PlaceEmitter {
     emitTerm(Inst.Br(endL))
 
     emitLabel(stepL)
-    val cur = freshTemp(); emit(s"$cur = load $w, ptr %$name.addr")
+    val cur = freshTemp(); emit(Inst.Load(Val.Raw(cur), w, Val.Reg(s"$name.addr"), Access.Plain))
     val nxt = freshTemp(); emit(Inst.Bin(Val.Raw(nxt), BinOp.Add, w, Val.Raw(cur), Val.Int(1)))
-    emit(s"store $w $nxt, ptr %$name.addr")
+    emit(Inst.Store(w, Val.Raw(nxt), Val.Reg(s"$name.addr"), Access.Plain))
     emitTerm(Inst.Br(condL))
 
     emitLabel(endL)
@@ -639,7 +639,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
     val ev = freshTemp(); emit(Inst.Load(Val.Raw(ev), elemTy.lty, Val.Raw(ep), Access.Plain))
     emitAlloca(s"%$name.addr", elemTy.llvm)
     retainValue(elemTy, ev)
-    emit(s"store ${elemTy.llvm} $ev, ptr %$name.addr")
+    emit(Inst.Store(elemTy.lty, Val.Raw(ev), Val.Reg(s"$name.addr"), Access.Plain))
     pushOwned()
     ownSlot(name, elemTy)
     body.foreach(genStmt)
@@ -668,7 +668,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
     pushOwned()
     emitAlloca(s"%$cursor.addr", cursorTy.llvm)
     retainValue(cursorTy, iv)
-    emit(s"store ${cursorTy.llvm} $iv, ptr %$cursor.addr")
+    emit(Inst.Store(cursorTy.lty, Val.Raw(iv), Val.Reg(s"$cursor.addr"), Access.Plain))
     ownSlot(cursor, cursorTy)
 
     val condL = freshLabel("iter.cond")

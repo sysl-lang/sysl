@@ -19,7 +19,17 @@ trait ScalarEmitter extends StringEmitter {
    * Signedness picks between the division, remainder, and right-shift pairs.
    */
   protected def arith(op: String, ty: Type, lv: String, rv: String): String = {
-    val instr = ty match
+    // **A vector picks its instruction from the lane and emits at the whole register.** LLVM spells
+    // both widths of the word with one mnemonic — `fadd <4 x float>` is the same opcode as `fadd
+    // float` — so lane-wise arithmetic needs no operation of its own, only the type it is written
+    // at. Integer `/` and `%` are the one pair that would need more than this, because their guards
+    // below reduce a lane-wise comparison to a single `i1`; the analyzer refuses those on a vector,
+    // so nothing reaches here needing a guard it cannot build.
+    val lane = ty match
+      case Type.Vector(_, elem) => Type.underlying(elem)
+      case other                => other
+
+    val instr = lane match
       case i: Type.Integer =>
         op match
           case "+"  => BinOp.Add
@@ -33,6 +43,16 @@ trait ScalarEmitter extends StringEmitter {
           case "|"  => BinOp.Or
           case "^"  => BinOp.Xor
           case _    => sys.error(s"unreachable arith '$op'")
+      // A mask's lane is an `i1`, and the three bitwise instructions are the same ones an integer
+      // takes — which is why this arrives here at all rather than needing a path of its own. Only a
+      // *vector* of `bool` reaches it: a scalar `bool` has `&&` and `||`, which are control flow and
+      // are lowered somewhere else entirely.
+      case Type.Bool =>
+        op match
+          case "&" => BinOp.And
+          case "|" => BinOp.Or
+          case "^" => BinOp.Xor
+          case _   => sys.error(s"unreachable mask arith '$op'")
       case _: Type.Floating =>
         op match
           case "+" => BinOp.FAdd

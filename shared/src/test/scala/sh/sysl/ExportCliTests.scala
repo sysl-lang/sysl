@@ -129,6 +129,63 @@ class ExportCliTests extends LibraryCliSupport {
     run.stdout.trim shouldBe "5 20"
   }
 
+  /** A module handing an aggregate across under a name it chose, which is what a binding mirroring
+    * a C library looks like: the type's spelling is the library's own rather than the mangled
+    * instantiation `sh_sysl_box2d_c_Id` would give it (0142).
+    */
+  private val vectors =
+    """module mylib
+      |
+      |@export("mylib_vec2")
+      |struct Vec2
+      |    x: i32
+      |    y: i32
+      |
+      |@export("mylib_add_vec")
+      |add(a: Vec2, b: Vec2) -> Vec2 = Vec2(a.x + b.x, a.y + b.y)
+      |""".stripMargin
+
+  "the header names a struct what its '@export' said, not what the module path derives" in {
+    val text = readFile(built(vectors)._2)
+
+    text should include("} mylib_vec2;")
+    text should include("mylib_vec2 mylib_add_vec(mylib_vec2 a, mylib_vec2 b);")
+    text should not include "mylib_Vec2"
+  }
+
+  /** **The name is only worth anything if a C compiler takes it**, which is this suite's whole
+    * argument applied to the type half: everything above proves sysl agrees with itself. Here clang
+    * declares a `mylib_vec2` of its own, fills it, hands it over by value and reads the result back.
+    */
+  "and a C program declares that struct by that name, fills it and gets sysl's answer back" in {
+    val (archive, header) = built(vectors)
+    val dir               = createTempDirectory("sysl-c-named-")
+    val source            = s"$dir/main.c"
+    val exe               = s"$dir/caller"
+
+    writeFile(source,
+      s"""#include <stdio.h>
+         |#include "$header"
+         |
+         |int main(void) {
+         |    mylib_vec2 a = { 1, 2 };
+         |    mylib_vec2 b = { 10, 20 };
+         |    mylib_vec2 c = mylib_add_vec(a, b);
+         |    printf("%d %d\\n", c.x, c.y);
+         |    return 0;
+         |}
+         |""".stripMargin)
+
+    val build = exec(Seq("clang", source, archive, "-o", exe))
+
+    withClue(build.stderr)(build.exitCode shouldBe 0)
+
+    val run = exec(Seq(exe))
+
+    withClue(run.stderr)(run.exitCode shouldBe 0)
+    run.stdout.trim shouldBe "11 22"
+  }
+
   "a C program links an export that uses the standard library, which is the case a '.syslib' cannot serve" in {
     val (archive, header) = built(talkative)
     val dir               = createTempDirectory("sysl-c-printing-")

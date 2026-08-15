@@ -33,19 +33,66 @@ package sh.sysl
  */
 trait ExportCheck extends TypeResolution {
 
-  /** Holds every declaration carrying `@export`.
+  /** Holds every declaration carrying `@export` — a free function, and a struct naming itself for a
+   * generated header.
    *
-   * **Free functions are the whole of it, and that is the grammar's doing rather than a choice made
-   * here.** `SyslParser.attributedDecl` reads attributes at statement position only, so no attribute
-   * reaches a struct member, an enum member or an `impl` member — `@test` and `@pure` are as
-   * unavailable there as this one. A rule refusing `@export` on a method would therefore be a rule
-   * nothing could reach, and the refusal a reader actually meets comes from the parser.
+   * **A free function and a struct are the whole of it, and that is the grammar's doing rather than
+   * a choice made here.** `SyslParser.attributedDecl` reads attributes at statement position only,
+   * so no attribute reaches a struct member, an enum member or an `impl` member — `@test` and
+   * `@pure` are as unavailable there as this one. A rule refusing `@export` on a method would
+   * therefore be a rule nothing could reach, and the refusal a reader actually meets comes from the
+   * parser.
    */
-  protected def checkExports(): Unit =
+  protected def checkExports(): Unit = {
     for
       f <- funcDecls.values.toList
       e <- f.exported
     do recover(())(at(e.pos)(checkExport(e, f)))
+
+    for
+      s <- structDecls.values.toList
+      e <- s.cname
+    do recover(())(at(e.pos)(checkStructExport(e, s)))
+  }
+
+  /** Refuses a C name a header could not declare, or a struct that has no one name to give.
+   *
+   * **The rules are the function's, arrived at from a different direction.** A symbol and a type
+   * name are both spellings a C reader writes, so what C can name is the same question — but a
+   * `typedef` has no linkage, so `private` is not the contradiction here that it is on a function.
+   * It is refused anyway, and for a reason worth reading: the visibility rule already stops a public
+   * declaration naming a type less visible than itself, and an exported function is public. So no
+   * private struct can appear in any signature a header carries, and naming one for a header is
+   * naming it for a file it can never be in.
+   */
+  private def checkStructExport(e: ExportAttr, s: StructDecl): Unit = {
+    for n <- e.symbol if !ExportCheck.cIdentifier(n) do
+      err(s"'$n' is not a name C can declare — a type's name in a header is a C identifier, so it " +
+        "is a letter or '_' followed by letters, digits and '_'")
+
+    // Checked against the declared name, since that is what an unwritten one becomes. A
+    // backtick-quoted declaration (`09`) is the case: it may hold anything the reader wanted.
+    if e.symbol.isEmpty && !ExportCheck.cIdentifier(Modules.bare(s.name)) then
+      err(s"'${qn(s.name)}' is not a name C can declare, so naming it after itself would put a " +
+        "spelling in the header no C declaration could use — name it instead, '@export(\"...\")'")
+
+    // Not the function's reason — a type name has no linkage to contradict — but the same answer,
+    // reached through the visibility rule instead: a public declaration may not name a type less
+    // visible than itself, and an exported function is public. So a private struct appears in no
+    // signature a header carries, and this would be naming it for a file it can never be in.
+    if s.vis != Visibility.Public then
+      err(s"'${qn(s.name)}' is private, so no exported function may name it — an export is public, " +
+        "and a declaration may not be more visible than the types it names. No header can carry " +
+        "this type at all, so there is no name in one for it to take")
+
+    // Generic is refused for the reason an exported generic function is, and the argument is even
+    // shorter here: every instantiation is a struct of its own, so one written name would be
+    // claimed by all of them at once.
+    if s.tparams.nonEmpty then
+      err(s"a header names one type at one shape, so '${qn(s.name)}' cannot be generic — each " +
+        "instantiation is a struct of its own and they would all claim this one name. Wrap the " +
+        "instantiation the header carries in a struct of its own and name that")
+  }
 
   /** Refuses an export whose symbol C could not name, or whose function C could not call. */
   private def checkExport(e: ExportAttr, f: FuncDecl): Unit = {
