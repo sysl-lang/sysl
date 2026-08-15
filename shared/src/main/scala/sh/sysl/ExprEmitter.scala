@@ -140,8 +140,9 @@ trait ExprEmitter extends ArithEmitter {
 
     case TVecStore(receiver, index, value) =>
       val vecTy = Type.repr(value.ty).asInstanceOf[Type.Vector]
-      // The value first: it is the argument, and evaluating the receiver's address before it would
-      // reorder two expressions the reader wrote in the other order.
+      // The value first and the address second, which is the order `TStore` uses — this *is* an
+      // assignment to a run of elements, and the two spellings must not differ in when a side
+      // effect in the value happens relative to the bounds check on the run.
       val v = genExpr(value)
       val p = runAddr(receiver, index, vecTy.length)
 

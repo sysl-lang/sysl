@@ -137,6 +137,29 @@ trait MethodCalls extends FuncAddress {
    */
   protected val vectorMemoryMethods: Set[String] = Set("load", "store")
 
+  /** Whether `load` or `store` on this receiver is the compiler's rather than something a program
+   * wrote.
+   *
+   * **A declared member wins, and the gate is what settled that.** These are two ordinary words,
+   * not spellings only the compiler could mean — `sysl.sync.Atomic.load` was in the library before
+   * either of these existed, and a builtin that claimed the name unconditionally refused a retry
+   * loop somebody had already written. So the builtin answers only where nothing else does, which
+   * is also the precedence a reader would assume: their `impl` block is theirs.
+   */
+  private def claimsLanes(rty: Type, mname: String): Boolean =
+    vectorMemoryMethods(mname) && {
+      val (base, _) = memberKey(rty, mname)
+      !memberDecls.contains((base, mname)) && !memberAlts.contains((base, mname))
+    }
+
+  /** A receiver that is a pointer at something a lane could be — the shape somebody reaching for a
+   * vector load would have, and nothing else. A `*Atomic[long]` points at a struct and so is not
+   * one.
+   */
+  private def pointsAtALane(t: Type): Boolean = Type.repr(t) match
+    case Type.Ptr(inner) => Type.Vector.lanes(Type.underlying(inner))
+    case _               => false
+
   /** `xs.load(i)` and `xs.store(i, v)`, checked and lowered.
    *
    * **The two are asymmetric in where the width comes from, and deliberately.** A store is told by
@@ -264,21 +287,26 @@ trait MethodCalls extends FuncAddress {
       // The two that move lanes between a register and memory. They are the slice's rather than the
       // vector's because the receiver is what supplies the address and the length — a vector has
       // neither, which is the whole reason these had to exist.
-      case rty @ (_: Type.Array | _: Type.Slice) if vectorMemoryMethods(mname) =>
+      case rty @ (_: Type.Array | _: Type.Slice) if claimsLanes(rty, mname) =>
         vectorMemory(rty, autoDeref(tr), mname, args, expected)
 
       // A `*T` is a bare address, and `03`'s unchecked tier is where a program that has one already
       // is. What it does not have is a length, so there is nothing for a run to be checked against
       // — and a load that silently skipped the check would be the one vector operation that could
       // read past the end of an object while every other way of reaching those elements cannot.
-      case _ if vectorMemoryMethods(mname) && Type.repr(tr.ty).isInstanceOf[Type.Ptr] =>
+      //
+      // **Only where the pointee could be a lane**, which is what keeps this from answering for
+      // every `*T` in the language. `sysl.sync.Atomic` declares `load` and `store` and is reached
+      // through a `*self`, so a message about runs of elements would be the compiler explaining
+      // vectors to somebody writing a retry loop — and worse, refusing the call.
+      case _ if vectorMemoryMethods(mname) && pointsAtALane(tr.ty) =>
         err(s"a '${show(tr.ty)}' carries no length, so a run of its elements has nothing to be " +
           "checked against — take a slice of them first, with 'p[0..<n]'")
 
       // A string is a view of bytes that are valid UTF-8 (`04`), and a run of them is bytes rather
       // than lanes of anything the string promises — so the answer is where a program says it wants
       // the bytes, not a second spelling that quietly means the same.
-      case Type.Str if vectorMemoryMethods(mname) =>
+      case Type.Str if claimsLanes(Type.Str, mname) =>
         err(if mname == "store" then
           "a string is immutable, so there is nothing to write lanes into"
         else

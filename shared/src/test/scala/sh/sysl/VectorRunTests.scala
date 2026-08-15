@@ -446,6 +446,44 @@ class VectorRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "3 6 5\n"
   }
 
+  /** **A declared `load` or `store` beats the builtin, and the full suite is what said so.**
+    *
+    * `sysl.sync.Atomic.load` was in the library before vectors were, reached through a `*self` — so
+    * a builtin claiming these two words unconditionally did not merely shadow something hypothetical,
+    * it refused a retry loop already written in `SyncTests`. Two ordinary words are not spellings
+    * only the compiler could have meant, and the precedence a reader assumes is that their own
+    * declaration is theirs.
+    */
+  "a member declared for a slice wins over the builtin" in {
+    val src =
+      """trait Lanes
+        |    load(self, i: usize) -> f32
+        |
+        |impl Lanes for []const f32
+        |    load(self, i: usize) -> f32 = self[i] * 100.0
+        |
+        |var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]
+        |print(xs[..].load(2))
+        |""".stripMargin
+
+    run(src) shouldBe "300\n"
+  }
+
+  "an atomic's own load and store are reached through a pointer" in {
+    val src =
+      """import sysl.sync.Atomic
+        |
+        |bump(a: *Atomic[int])
+        |    a.store(a.load() + 1)
+        |
+        |var counter = Atomic(7)
+        |bump(&counter)
+        |print(counter.load())
+        |""".stripMargin
+
+    run(src) shouldBe "8\n"
+  }
+
   "a mask survives a round trip through memory" in {
     val src =
       """var xs: [4]f32 = [1.0, 5.0, 2.0, 8.0]
