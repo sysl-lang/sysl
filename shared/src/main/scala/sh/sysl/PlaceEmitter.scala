@@ -22,16 +22,28 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * `regs.status` has type `u32` and sits in storage of type `volatile u32`, and the difference
    * between those two is exactly this word.
    */
-  protected def vol(place: TExpr): String = place match
+  protected def vol(place: TExpr): String = access(place) match
+    case Access.Volatile => " volatile"
+    case _               => ""
+
+  /** How an access to this place is reached, which is the same question the marker above answers
+   * and the form an instruction carries.
+   */
+  protected def access(place: TExpr): Access = place match
     // A `ref` name carries no declaration of its own, so the qualifier comes from what the binding
     // found rather than from the node (`03 § ref`).
-    case TLoad(name, _) if refStorage.contains(name) => qualifier(refStorage(name))
-    case _                                           => qualifier(place.placeTy)
+    case TLoad(name, _) if refStorage.contains(name) => accessOf(refStorage(name))
+    case _                                           => accessOf(place.placeTy)
 
   /** The same marker read off a type directly, for the paths that have the storage's type and not
    * the node it came from.
    */
-  protected def qualifier(storage: Type): String = if Type.volatileIn(storage) then " volatile" else ""
+  protected def qualifier(storage: Type): String =
+    if Type.volatileIn(storage) then " volatile" else ""
+
+  /** The same read off a type directly, as the instruction carries it. */
+  protected def accessOf(storage: Type): Access =
+    if Type.volatileIn(storage) then Access.Volatile else Access.Plain
 
   /** Whether `address` can walk to this node without giving it a slot of its own first — which is
    * every place, and nothing else.
@@ -193,12 +205,12 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
   protected def loadPlace(place: TExpr, p: String): String = bitPlace(place) match
     case Some((recv, ranges, r)) => readBits(ranges, r, loadContainer(ranges, recv, p))
     case None =>
-      val t = freshTemp(); emit(s"$t = load${vol(place)} ${place.ty.llvm}, ptr $p"); t
+      val t = freshTemp(); emit(Inst.Load(Val.Raw(t), place.ty.lty, Val.Raw(p), access(place))); t
 
   private def loadContainer(ranges: List[BitRange], receiver: TExpr, addr: String): String = {
     val t = freshTemp()
 
-    emit(s"$t = load${qualifier(receiver.placeTy)} ${containerLlvm(ranges)}, ptr $addr")
+    emit(Inst.Load(Val.Raw(t), containerLty(ranges), Val.Raw(addr), accessOf(receiver.placeTy)))
     t
   }
 
@@ -433,7 +445,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     case other => address(other)
 
   protected def genBuffer(elem: Type, n: String): (String, String) = {
-    val bn = bufName(elem)
+    val bn = bufLty(elem)
     checked = true
 
     val e1   = freshTemp(); emit(Inst.Gep(Val.Raw(e1), elem.lty, Val.Null, List(Arg(LType.I(64), Val.Int(1)))))
@@ -460,11 +472,11 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     trapUnless(Val.Raw(got), "alloc")
 
     emit(Inst.Store(wordLty, Val.Int(1), Val.Raw(p), Access.Plain))
-    val hook = freshTemp(); emit(s"$hook = getelementptr $bn, ptr $p, i32 0, i32 1")
+    val hook = freshTemp(); emit(Inst.Gep(Val.Raw(hook), bn, Val.Raw(p), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(1)))))
     emit(Inst.Store(LType.Ptr, Val.Raw(dropBufFn(elem)), Val.Raw(hook), Access.Plain))
-    val wc   = freshTemp(); emit(s"$wc = getelementptr $bn, ptr $p, i32 0, i32 2")
+    val wc   = freshTemp(); emit(Inst.Gep(Val.Raw(wc), bn, Val.Raw(p), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(2)))))
     emit(Inst.Store(wordLty, Val.Int(1), Val.Raw(wc), Access.Plain))
-    val lenp = freshTemp(); emit(s"$lenp = getelementptr $bn, ptr $p, i32 0, i32 $headerFields")
+    val lenp = freshTemp(); emit(Inst.Gep(Val.Raw(lenp), bn, Val.Raw(p), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields)))))
     emit(Inst.Store(wordLty, Val.Raw(n), Val.Raw(lenp), Access.Plain))
     val data = freshTemp(); emit(s"$data = getelementptr $bn, ptr $p, i32 0, i32 ${headerFields + 1}")
 

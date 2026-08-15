@@ -42,11 +42,14 @@ trait ArcEmitter extends Emitter {
   /** The LLVM name of the box that holds a `T` on the heap: the two counts, the deallocation
    * hook, and the payload.
    */
-  protected def boxName(payload: Type): String = {
+  protected def boxName(payload: Type): String = boxLty(payload).render
+
+  /** The same as a type rather than as its name. */
+  protected def boxLty(payload: Type): LType.Named = {
     heap = true
     val n = s"%arc.${Type.mangle(payload)}"
     boxes.getOrElseUpdate(n, payload)
-    n
+    LType.Named(n)
   }
 
   /** The box a counted trait object holds, which is its second word — the first is the method
@@ -200,7 +203,7 @@ trait ArcEmitter extends Emitter {
     if !containsRef(payload) && destructor.isEmpty then plainDropFn
     else
       val m  = Type.mangle(payload)
-      val bn = boxName(payload)
+      val bn = boxLty(payload)
 
       "@" + request(s"arc.drop.$m") {
         inFunction(s"define private void @arc.drop.$m(ptr %p, i1 %storage)") {
@@ -209,7 +212,7 @@ trait ArcEmitter extends Emitter {
 
           emitTerm(s"br i1 %storage, label %$give, label %$over")
           emitLabel(over)
-          val pa = freshTemp(); emit(s"$pa = getelementptr $bn, ptr %p, i32 0, i32 $headerFields")
+          val pa = freshTemp(); emit(Inst.Gep(Val.Raw(pa), bn, Val.Reg("p"), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields)))))
           val v  = freshTemp(); emit(Inst.Load(Val.Raw(v), payload.lty, Val.Raw(pa), Access.Plain))
 
           // **Before the walk, not after.** The destructor is handed the value as it stands, so it
@@ -277,17 +280,17 @@ trait ArcEmitter extends Emitter {
   }
 
   private def walkValue(ty: Type, v: String, retain: Boolean): Unit = {
-    def each(fields: List[(String, Type)], aggregate: String, value: String): Unit =
+    def each(fields: List[(String, Type)], aggregate: LType, value: String): Unit =
       // A zero-sized field holds no reference, so it is skipped by the filter already — but the
       // index has to be the slot it landed in rather than the one it was written at, or a field
       // after one would be walked at the wrong offset.
       for ((_, fty), i) <- fields.zipWithIndex if containsRef(fty) do
         val f = freshTemp()
-        emit(s"$f = extractvalue $aggregate $value, ${Type.slot(fields, i)}")
+        emit(Inst.Extract(Val.Raw(f), aggregate, Val.Raw(value), List(Type.slot(fields, i))))
         if retain then retainValue(fty, f) else releaseValue(fty, f)
 
     ty match
-      case s: Type.Struct => each(s.fields, s.llvm, v)
+      case s: Type.Struct => each(s.fields, s.lty, v)
 
       // An array is walked with a loop rather than an unrolled chain: the element count is a
       // compile-time constant, but it can be very large, and the code for one element is not.
@@ -323,7 +326,7 @@ trait ArcEmitter extends Emitter {
           emitTerm(Inst.CondBr(Val.Raw(is), hitL, nextL))
           emitLabel(hitL)
           val payload = enumPayload(e, variant, v)
-          each(variant.fields, e.payloadLlvm(variant), payload)
+          each(variant.fields, e.payloadLty(variant), payload)
           emitTerm(Inst.Br(endL))
           emitLabel(nextL)
         emitTerm(Inst.Br(endL))
@@ -339,26 +342,26 @@ trait ArcEmitter extends Emitter {
    */
   protected def genBox(value: TExpr, refTy: Type.Ref): String = {
     val inner = refTy.inner
-    val bn    = boxName(inner)
+    val bn    = boxLty(inner)
     // A large payload is written into the box rather than produced and then stored into it, for the
     // reason every other destination has: the value would be a first-class aggregate of kilobytes
     // for the length of one instruction. The address is not known until the box exists, so this is
     // the one destination that cannot be handed over before the expression runs.
     val v     = if layout.indirect(inner) then "" else genExpr(value)
 
-    val end  = freshTemp(); emit(s"$end = getelementptr $bn, ptr null, i32 1")
+    val end  = freshTemp(); emit(Inst.Gep(Val.Raw(end), bn, Val.Null, List(Arg(i32, Val.Int(1)))))
     val size = freshTemp(); emit(Inst.Cast(Val.Raw(size), CastOp.PtrToInt, LType.Ptr, Val.Raw(end), wordLty))
     val p    = freshTemp(); emit(s"$p = call ptr @$mallocSym($word $size)")
 
     emit(Inst.Store(wordLty, Val.Int(1), Val.Raw(p), Access.Plain))
-    val hook = freshTemp(); emit(s"$hook = getelementptr $bn, ptr $p, i32 0, i32 1")
+    val hook = freshTemp(); emit(Inst.Gep(Val.Raw(hook), bn, Val.Raw(p), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(1)))))
     emit(Inst.Store(LType.Ptr, Val.Raw(dropFn(inner)), Val.Raw(hook), Access.Plain))
     // One weak share stands for every strong reference together, so the storage outlives the
     // object exactly as long as some weak reference is still asking about it (`03`).
-    val wc = freshTemp(); emit(s"$wc = getelementptr $bn, ptr $p, i32 0, i32 2")
+    val wc = freshTemp(); emit(Inst.Gep(Val.Raw(wc), bn, Val.Raw(p), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(2)))))
     emit(Inst.Store(wordLty, Val.Int(1), Val.Raw(wc), Access.Plain))
 
-    val slot = freshTemp(); emit(s"$slot = getelementptr $bn, ptr $p, i32 0, i32 $headerFields")
+    val slot = freshTemp(); emit(Inst.Gep(Val.Raw(slot), bn, Val.Raw(p), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields)))))
 
     if layout.indirect(inner) then genOwnedInto(slot, value)
     else
@@ -373,11 +376,14 @@ trait ArcEmitter extends Emitter {
    * because the hook is what destroys them and the hook is reached with no static type in sight —
    * which is the same reason `07` gives for the hook existing at all.
    */
-  protected def bufName(elem: Type): String = {
+  protected def bufName(elem: Type): String = bufLty(elem).render
+
+  /** The same as a type rather than as its name. */
+  protected def bufLty(elem: Type): LType.Named = {
     heap = true
     val n = s"%arc.buf.${Type.mangle(elem)}"
     bufs.getOrElseUpdate(n, elem)
-    n
+    LType.Named(n)
   }
 
   /** The function that destroys such a box: it lets go of each element it still holds and returns
@@ -388,7 +394,7 @@ trait ArcEmitter extends Emitter {
     if !containsRef(elem) then plainDropFn
     else
       val m  = Type.mangle(elem)
-      val bn = bufName(elem)
+      val bn = bufLty(elem)
 
       "@" + request(s"arc.dropbuf.$m") {
         inFunction(s"define private void @arc.dropbuf.$m(ptr %p, i1 %storage)") {
@@ -397,7 +403,7 @@ trait ArcEmitter extends Emitter {
 
           emitTerm(s"br i1 %storage, label %$give, label %$over")
           emitLabel(over)
-          val lenp = freshTemp(); emit(s"$lenp = getelementptr $bn, ptr %p, i32 0, i32 $headerFields")
+          val lenp = freshTemp(); emit(Inst.Gep(Val.Raw(lenp), bn, Val.Reg("p"), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields)))))
           val n    = freshTemp(); emit(Inst.Load(Val.Raw(n), wordLty, Val.Raw(lenp), Access.Plain))
           val data = freshTemp(); emit(s"$data = getelementptr $bn, ptr %p, i32 0, i32 ${headerFields + 1}")
 

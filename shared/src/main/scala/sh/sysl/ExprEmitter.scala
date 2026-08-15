@@ -83,7 +83,7 @@ trait ExprEmitter extends ArithEmitter {
 
     case e @ TIndex(receiver, index, ty) =>
       val p = elementAddr(receiver, index)
-      val r = freshTemp(); emit(s"$r = load${vol(e)} ${ty.llvm}, ptr $p"); r
+      val r = freshTemp(); emit(Inst.Load(Val.Raw(r), ty.lty, Val.Raw(p), access(e))); r
 
     case TSlice(base, lo, hi, inclusive, sliceTy) =>
       genSlice(base, lo, hi, inclusive, sliceTy)
@@ -165,7 +165,7 @@ trait ExprEmitter extends ArithEmitter {
 
     case e @ TDeref(operand, ty) =>
       val p = payloadAddr(operand)
-      val r = freshTemp(); emit(s"$r = load${vol(e)} ${ty.llvm}, ptr $p"); r
+      val r = freshTemp(); emit(Inst.Load(Val.Raw(r), ty.lty, Val.Raw(p), access(e))); r
 
     case TAddrOf(place, _) =>
       address(place)

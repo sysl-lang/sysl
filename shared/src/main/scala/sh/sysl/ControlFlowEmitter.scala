@@ -464,7 +464,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
 
   protected def genFor(f: TFor): String = {
     val TFor(name, varTy, lo, hi, inclusive, body, elseBlock, ty) = f
-    val w     = varTy.llvm
+    val w     = varTy.lty
     val loV   = genExpr(lo)
     val hiV   = genExpr(hi)
     val condL = freshLabel("for.cond")
@@ -490,7 +490,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
     emitTerm(Inst.Br(stepL))
     emitLabel(stepL)
     val cur = freshTemp(); emit(s"$cur = load $w, ptr %$name.addr")
-    val nxt = freshTemp(); emit(s"$nxt = add $w $cur, 1")
+    val nxt = freshTemp(); emit(Inst.Bin(Val.Raw(nxt), BinOp.Add, w, Val.Raw(cur), Val.Int(1)))
     emit(s"store $w $nxt, ptr %$name.addr")
     emitTerm(Inst.Br(condL))
 
@@ -518,7 +518,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
    */
   protected def genQuantifier(q: TQuantifier): String = {
     val TQuantifier(universal, name, varTy, lo, hi, inclusive, pred) = q
-    val w     = varTy.llvm
+    val w     = varTy.lty
     val loV   = genExpr(lo)
     val hiV   = genExpr(hi)
     val condL = freshLabel("quant.cond")
@@ -552,7 +552,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
 
     emitLabel(stepL)
     val cur = freshTemp(); emit(s"$cur = load $w, ptr %$name.addr")
-    val nxt = freshTemp(); emit(s"$nxt = add $w $cur, 1")
+    val nxt = freshTemp(); emit(Inst.Bin(Val.Raw(nxt), BinOp.Add, w, Val.Raw(cur), Val.Int(1)))
     emit(s"store $w $nxt, ptr %$name.addr")
     emitTerm(Inst.Br(condL))
 
