@@ -685,6 +685,39 @@ the trees a library ships are now a per-target answer. `13 §8` has the rest.
   half of this item, met by saying the right thing to the linker rather than by supplying anything.
   The row that would test the item properly is the WASI one, which has a sysroot and has not got it
   here.
+
+  **AND IT REACHES THE STANDARD LIBRARY NOW, WHICH IS A NARROWING AND WAS DECIDED RATHER THAN
+  DISCOVERED.** The library carries C as of 0.0.59 (`13 §5`, `15 §7`) and that C reads system headers
+  — `<dirent.h>`, `<termios.h>`, `<time.h>` — so **building the library for a hosted target needs that
+  target's sysroot**, and `sysl build-lib library --std --target x86_64-linux` on a Mac now stops on
+  `'dirent.h' file not found`. It did not before there was any C to compile.
+
+  **The split is host-or-freestanding against hosted-foreign, and it is not "the host only".** A
+  freestanding target selects no `__<os>__` directory, so it has no C, needs no header, and cross-
+  builds exactly as it always did — which is the case cross-compiling exists for here. What needs a
+  sysroot is a *hosted* target that is not this machine.
+
+  **It costs nothing that was working**, which is why it was accepted: the link for such a target
+  needed the same sysroot already, by the paragraph above, so the artifact this now refuses to build
+  was one nothing could have linked. What it does close off is adopting a prebuilt-per-target library
+  later without solving this first — which is how Rust avoids the question, by shipping a std somebody
+  else compiled where the headers were.
+
+  **This overturns card 0121's boundary**, which refused a `c const` reading a system header in
+  `library/` for exactly this reason and reverted a whole branch over it. That boundary was drawn to
+  protect a property the library no longer has, so a library `c const` may now read one — **on the
+  one condition that it sits in a `__<os>__` directory**, which is where the C beside it sits.
+
+  **That condition is not decoration, and getting it wrong is worse than the `.c` case rather than
+  equal to it.** A `.c` under `__linux__/` is handed to clang only when building *for* Linux. A `c
+  const` in an unfoldered file is measured for **every** target the library is built for, freestanding
+  included — so `@include("errno.h")` in `fs/error.sysl` stops a build for a bare board, which has no
+  `errno.h` and no business being asked for one. Measured: it was tried, and it took out the cross
+  targets rather than only the hosted-foreign ones.
+
+  So the rule that covers both is one rule: **anything reading a system header lives in a per-OS
+  directory.** A probe needing **no** system header — `sizeof(long long)` and its like — was always
+  fine anywhere and still is, since clang knows a target's basic types with no sysroot at all.
 - **Sub-architectures.** `-mcpu` / feature levels — a target today is a processor family and a
   system, and nothing yet needs finer.
 
