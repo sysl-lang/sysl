@@ -94,7 +94,7 @@ enum Ordering {
 enum Access {
   case Plain
   case Volatile
-  case Atomic(ordering: Ordering, align: Int)
+  case Atomic(ordering: Ordering)
 }
 
 /** An argument at a call: its type, the value, and whatever the convention attaches to it.
@@ -128,8 +128,20 @@ enum Inst {
   case Cast(dest: Val, op: CastOp, from: LType, v: Val, to: LType)
 
   case Alloca(dest: Val, ty: LType, align: Option[Int])
-  case Load(dest: Val, ty: LType, ptr: Val, access: Access)
-  case Store(ty: LType, value: Val, ptr: Val, access: Access)
+  /** A read, and a write.
+   *
+   * **`align` is the boundary the *access* promises, and it is separate from the type's own.** LLVM
+   * infers the natural alignment where nothing says otherwise, which is right for a slot and wrong
+   * for a run of elements read as a vector: a `[]f32` promises its elements are four-byte-aligned
+   * and promises nothing about where the run begins, so the honest number there is the element's
+   * rather than the register's. An over-aligned access is not a slow access — it is undefined
+   * behaviour the moment the address does not meet the claim.
+   *
+   * An atomic access **must** carry one, which is why the field is here rather than on
+   * `Access.Atomic`: LLVM writes it at the instruction for both, so one place is one place.
+   */
+  case Load(dest: Val, ty: LType, ptr: Val, access: Access, align: Option[Int] = None)
+  case Store(ty: LType, value: Val, ptr: Val, access: Access, align: Option[Int] = None)
 
   /** `getelementptr` — address arithmetic in units of a type rather than of bytes. The indices are
    * typed because LLVM writes them typed, and the first one steps over whole `ty`s while the rest
@@ -215,8 +227,11 @@ enum Inst {
     case Alloca(d, ty, align) =>
       s"${d.render} = alloca ${ty.render}${align.map(n => s", align $n").getOrElse("")}"
 
-    case Load(d, ty, p, acc)  => s"${d.render} = load${accessText(acc)} ${ty.render}, ptr ${p.render}${alignText(acc)}"
-    case Store(ty, v, p, acc) => s"store${accessText(acc)} ${ty.render} ${v.render}, ptr ${p.render}${alignText(acc)}"
+    case Load(d, ty, p, acc, align) =>
+      s"${d.render} = load${accessText(acc)} ${ty.render}, ptr ${p.render}${orderText(acc)}${alignText(align)}"
+
+    case Store(ty, v, p, acc, align) =>
+      s"store${accessText(acc)} ${ty.render} ${v.render}, ptr ${p.render}${orderText(acc)}${alignText(align)}"
 
     case Gep(d, ty, p, idx) =>
       s"${d.render} = getelementptr ${ty.render}, ptr ${p.render}, ${idx.map(_.render).mkString(", ")}"
@@ -279,7 +294,9 @@ enum Inst {
     case Access.Volatile  => " volatile"
     case _: Access.Atomic => " atomic"
 
-  private def alignText(a: Access): String = a match
-    case Access.Atomic(o, align) => s" ${o.render}, align $align"
-    case _                       => ""
+  private def orderText(a: Access): String = a match
+    case Access.Atomic(o) => s" ${o.render}"
+    case _                => ""
+
+  private def alignText(align: Option[Int]): String = align.map(n => s", align $n").getOrElse("")
 }

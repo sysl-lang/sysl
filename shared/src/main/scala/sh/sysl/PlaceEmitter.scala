@@ -287,24 +287,25 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * nothing — `and` is not a branch, and a wrapped `sub` is a defined value LLVM is happy to have
    * computed and then ignored.
    */
-  protected def runAddr(receiver: TExpr, index: TExpr, lanes: Int): String = {
+  protected def runAddr(receiver: TExpr, index: TExpr, lanes: Int): Val = {
     val (base, len, elem) = receiver.ty match
-      case Type.Array(n, e) => (address(receiver), n.toString, e)
+      case Type.Array(n, e) => (address(receiver), Val.Int(n), e)
       case w: Type.View =>
         val v = genExpr(receiver)
-        val p = freshTemp(); emit(s"$p = extractvalue ${w.llvm} $v, 1")
-        val l = freshTemp(); emit(s"$l = extractvalue ${w.llvm} $v, 2")
+        val p = freshReg(); emit(Inst.Extract(p, w.lty, v, List(1)))
+        val l = freshReg(); emit(Inst.Extract(l, w.lty, v, List(2)))
         (p, l, w.elem)
       case other => sys.error(s"unreachable run of ${other.llvm}")
 
     val i    = widenIndex(index)
-    val room = freshTemp(); emit(s"$room = icmp uge $word $len, $lanes")
-    val last = freshTemp(); emit(s"$last = sub $word $len, $lanes")
-    val here = freshTemp(); emit(s"$here = icmp ule $word $i, $last")
-    val ok   = freshTemp(); emit(s"$ok = and i1 $room, $here")
+    val room = freshReg(); emit(Inst.IntCmp(room, ICmp.Uge, wordLty, len, Val.Int(lanes)))
+    val last = freshReg(); emit(Inst.Bin(last, BinOp.Sub, wordLty, len, Val.Int(lanes)))
+    val here = freshReg(); emit(Inst.IntCmp(here, ICmp.Ule, wordLty, i, last))
+    val ok   = freshReg(); emit(Inst.Bin(ok, BinOp.And, i1, room, here))
+
     trapUnless(ok, "bounds")
 
-    val r = freshTemp(); emit(s"$r = getelementptr ${elem.llvm}, ptr $base, $word $i"); r
+    val r = freshReg(); emit(Inst.Gep(r, elem.lty, base, List(Arg(wordLty, i)))); r
   }
 
   /** Takes a view of some of an array's, a slice's, or a string's elements. The base is evaluated

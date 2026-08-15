@@ -142,9 +142,9 @@ trait ExprEmitter extends ArithEmitter {
     // also the free one.
     case TVecLoad(receiver, index, vecTy) =>
       val p = runAddr(receiver, index, vecTy.length)
-      val r = freshTemp()
+      val r = freshReg()
 
-      emit(s"$r = load ${vecTy.llvm}, ptr $p, align ${layout.align(vecTy.elem)}")
+      emit(Inst.Load(r, vecTy.lty, p, Access.Plain, Some(layout.align(vecTy.elem))))
       r
 
     case TVecStore(receiver, index, value) =>
@@ -155,8 +155,8 @@ trait ExprEmitter extends ArithEmitter {
       val v = genExpr(value)
       val p = runAddr(receiver, index, vecTy.length)
 
-      emit(s"store ${vecTy.llvm} $v, ptr $p, align ${layout.align(vecTy.elem)}")
-      ""
+      emit(Inst.Store(vecTy.lty, v, p, Access.Plain, Some(layout.align(vecTy.elem))))
+      Val.Nothing
 
     // Built through memory with a loop rather than as an `insertvalue` chain, for the reason the
     // ARC walk gives: the count is a compile-time constant but it can be very large, and a repeat
@@ -482,13 +482,14 @@ trait ExprEmitter extends ArithEmitter {
       val vs   = ops.map(genExpr)
       val ll   = at.lty
       val ordr = Atomics.llvm(ord)
-      val acc  = Access.Atomic(ordr, layout.align(at))
+      val acc  = Access.Atomic(ordr)
+      val al   = Some(layout.align(at))
 
       op match
         case "atomic_load" =>
-          val r = freshReg(); emit(Inst.Load(r, ll, p, acc)); r
+          val r = freshReg(); emit(Inst.Load(r, ll, p, acc, al)); r
         case "atomic_store" =>
-          emit(Inst.Store(ll, vs.head, p, acc))
+          emit(Inst.Store(ll, vs.head, p, acc, al))
           Val.Int(0)
         // `cmpxchg` answers a pair — the value it found and whether it swapped — and what this hands
         // back is the value. A caller comparing it against what they expected learns the same thing
