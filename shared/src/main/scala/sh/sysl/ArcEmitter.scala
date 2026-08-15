@@ -221,8 +221,8 @@ trait ArcEmitter extends Emitter {
           // taken for the call — because the count is already zero and taking one would resurrect
           // the object into a second teardown.
           for d <- destructor do
-            if layout.indirect(payload) then emit(s"call void @$d(ptr $pa)")
-            else emit(s"call void @$d(${payload.llvm} $v)")
+            if layout.indirect(payload) then emit(Inst.Call(None, "void", Val.Global(d), List(Arg(LType.Ptr, Val.Raw(pa)))))
+            else emit(Inst.Call(None, "void", Val.Global(d), List(Arg(payload.lty, Val.Raw(v)))))
 
           releaseValue(payload, v)
           emitTerm("ret void")
@@ -262,7 +262,7 @@ trait ArcEmitter extends Emitter {
    * declaration nothing calls names no symbol in the object file. What the linker was complaining
    * about was the call, which is why the card counted calls rather than declarations.
    */
-  private def emitFree(): Unit = emit(s"call void @$freeSym(ptr %p)")
+  private def emitFree(): Unit = emit(Inst.Call(None, "void", Val.Global(freeSym), List(Arg(LType.Ptr, Val.Reg("p")))))
 
   /** The retain / release helper for an aggregate type, which walks the fields that carry
    * references. Emitted once per type rather than inlined, since a data enum needs a tag test
@@ -351,7 +351,7 @@ trait ArcEmitter extends Emitter {
 
     val end  = freshTemp(); emit(Inst.Gep(Val.Raw(end), bn, Val.Null, List(Arg(i32, Val.Int(1)))))
     val size = freshTemp(); emit(Inst.Cast(Val.Raw(size), CastOp.PtrToInt, LType.Ptr, Val.Raw(end), wordLty))
-    val p    = freshTemp(); emit(s"$p = call ptr @$mallocSym($word $size)")
+    val p    = freshTemp(); emit(Inst.Call(Some(Val.Raw(p)), LType.Ptr.render, Val.Global(mallocSym), List(Arg(wordLty, Val.Raw(size)))))
 
     emit(Inst.Store(wordLty, Val.Int(1), Val.Raw(p), Access.Plain))
     val hook = freshTemp(); emit(Inst.Gep(Val.Raw(hook), bn, Val.Raw(p), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(1)))))

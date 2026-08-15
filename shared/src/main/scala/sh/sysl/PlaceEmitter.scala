@@ -348,7 +348,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val p = freshTemp(); emit(Inst.Gep(Val.Raw(p), elem.lty, Val.Raw(first), List(Arg(wordLty, Val.Raw(start)))))
     val n = freshTemp(); emit(Inst.Bin(Val.Raw(n), BinOp.Sub, wordLty, Val.Raw(end), Val.Raw(start)))
 
-    emit(s"call void @arc.retain_maybe(ptr $ownerV)")
+    emit(Inst.Call(None, "void", Val.Global("arc.retain_maybe"), List(Arg(LType.Ptr, Val.Raw(ownerV)))))
     maybeHeap = true
     heap = true
 
@@ -467,7 +467,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val fits  = freshTemp(); emit(Inst.Bin(Val.Raw(fits), BinOp.Xor, i1, Val.Raw(over), Val.Bool(true)))
     trapUnless(Val.Raw(fits), "size")
 
-    val p   = freshTemp(); emit(s"$p = call ptr @$mallocSym($word $total)")
+    val p   = freshTemp(); emit(Inst.Call(Some(Val.Raw(p)), LType.Ptr.render, Val.Global(mallocSym), List(Arg(wordLty, Val.Raw(total)))))
     val got = freshTemp(); emit(Inst.IntCmp(Val.Raw(got), ICmp.Ne, LType.Ptr, Val.Raw(p), Val.Null))
     trapUnless(Val.Raw(got), "alloc")
 
@@ -625,7 +625,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val v    = genExpr(value)
     val addr = if fat then { val b = freshTemp(); emit(Inst.Extract(Val.Raw(b), LType.fat, Val.Raw(v), List(1))); b } else v
 
-    val got   = freshTemp(); emit(s"$got = call ptr @arc.upgrade(ptr $addr)")
+    val got   = freshTemp(); emit(Inst.Call(Some(Val.Raw(got)), LType.Ptr.render, Val.Global("arc.upgrade"), List(Arg(LType.Ptr, Val.Raw(addr)))))
     val live  = freshTemp(); emit(Inst.IntCmp(Val.Raw(live), ICmp.Ne, LType.Ptr, Val.Raw(got), Val.Null))
     val slot  = emitAlloca(freshTemp(), optTy.llvm)
     val someL = freshLabel("weak.live")

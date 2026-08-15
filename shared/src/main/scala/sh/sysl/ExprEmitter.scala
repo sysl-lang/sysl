@@ -231,7 +231,7 @@ trait ExprEmitter extends ArithEmitter {
       val v   = genExpr(arg)
       val p   = freshTemp(); emit(Inst.Extract(Val.Raw(p), arg.ty.lty, Val.Raw(v), List(1)))
       val n   = freshTemp(); emit(Inst.Extract(Val.Raw(n), arg.ty.lty, Val.Raw(v), List(2)))
-      val r   = freshTemp(); emit(s"$r = call ${Type.Str.llvm} @$fn(ptr $p, $word $n)")
+      val r   = freshTemp(); emit(Inst.Call(Some(Val.Raw(r)), Type.Str.llvm, Val.Global(fn), List(Arg(LType.Ptr, Val.Raw(p)), Arg(wordLty, Val.Raw(n)))))
       ownTemp(r, Type.Str)
 
     // Rendering into a buffer: a zeroed stack slot becomes the sink, the value writes itself into
@@ -261,12 +261,12 @@ trait ExprEmitter extends ArithEmitter {
           val e    = freshTemp(); emit(Inst.Gep(Val.Raw(e), LType.Ptr, Val.Raw(vt), List(Arg(wordLty, Val.Int(n)))))
           val fn   = freshTemp(); emit(Inst.Load(Val.Raw(fn), LType.Ptr, Val.Raw(e), Access.Plain))
 
-          emit(s"call void $fn(ptr $data, ${Type.fatPointer} $w, ${spec.ty.llvm} $s)")
+          emit(Inst.Call(None, "void", Val.Raw(fn), List(Arg(LType.Ptr, Val.Raw(data)), Arg(LType.fat, Val.Raw(w)), Arg(spec.ty.lty, Val.Raw(s)))))
         case None =>
-          emit(s"call void @$method(${value.ty.llvm} $v, ${Type.fatPointer} $w, ${spec.ty.llvm} $s)")
+          emit(Inst.Call(None, "void", Val.Global(method), List(Arg(value.ty.lty, Val.Raw(v)), Arg(LType.fat, Val.Raw(w)), Arg(spec.ty.lty, Val.Raw(s)))))
 
       val r = freshTemp()
-      emit(s"$r = call ${Type.Str.llvm} @sysl.w.buf.finish(ptr $slot)")
+      emit(Inst.Call(Some(Val.Raw(r)), Type.Str.llvm, Val.Global("sysl.w.buf.finish"), List(Arg(LType.Ptr, Val.Raw(slot)))))
       ownTemp(r, Type.Str)
 
     case TBinary(_, l, r, Type.Str) =>
@@ -557,11 +557,11 @@ trait ExprEmitter extends ArithEmitter {
     // instruction whose lowering every backend supplies for it.
     case TVaStart(ap) =>
       usesVarargs = true
-      emit(s"call void @llvm.va_start.p0(ptr ${genExpr(ap)})"); ""
+      emit(Inst.Call(None, "void", Val.Global("llvm.va_start.p0"), List(Arg(LType.Ptr, Val.Raw(genExpr(ap)))))); ""
 
     case TVaEnd(ap) =>
       usesVarargs = true
-      emit(s"call void @llvm.va_end.p0(ptr ${genExpr(ap)})"); ""
+      emit(Inst.Call(None, "void", Val.Global("llvm.va_end.p0"), List(Arg(LType.Ptr, Val.Raw(genExpr(ap)))))); ""
 
     case TVaArg(ap, ty) =>
       val r = freshTemp()
@@ -594,7 +594,7 @@ trait ExprEmitter extends ArithEmitter {
       // same expression cannot see a half-written destination.
       val d = genExpr(dst)
       val s = genExpr(src)
-      emit(s"call void @llvm.va_copy.p0(ptr $d, ptr $s)"); ""
+      emit(Inst.Call(None, "void", Val.Global("llvm.va_copy.p0"), List(Arg(LType.Ptr, Val.Raw(d)), Arg(LType.Ptr, Val.Raw(s))))); ""
 
     case e @ TStructNew(struct, _) if layout.indirect(struct) => throughSlot(e)
 

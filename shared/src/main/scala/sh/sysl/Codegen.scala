@@ -296,7 +296,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
         val slice = Type.Slice(Type.Str)
         val r     = freshTemp()
 
-        emit(s"$r = call ${slice.llvm} @$fn(i32 %argc, ptr %argv)")
+        emit(Inst.Call(Some(Val.Raw(r)), slice.llvm, Val.Global(fn), List(Arg(i32, Val.Reg("argc")), Arg(LType.Ptr, Val.Reg("argv")))))
         s"${slice.llvm} ${ownTemp(r, slice)}"
       }
 
@@ -309,7 +309,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
           val r = freshTemp()
 
           emit(s"$r = call ${ty.llvm} @$entrySymbol(${args.getOrElse("")})")
-          emit(s"call void @$fn(${ty.llvm} $r)")
+          emit(Inst.Call(None, "void", Val.Global(fn), List(Arg(ty.lty, Val.Raw(r)))))
 
         case _ =>
           emit(s"call void @$entrySymbol(${args.getOrElse("")})")
