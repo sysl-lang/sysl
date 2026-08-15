@@ -2,6 +2,8 @@ package sh.sysl
 
 import scala.collection.mutable
 
+import ir.{Access, Arg, BinOp, CastOp, Inst, LType, Val}
+
 /** The substrate every part of codegen emits into: registers, basic blocks, the entry-block
  * prologue, module-level globals, and the queue of runtime helpers.
  *
@@ -222,18 +224,18 @@ trait Emitter {
   protected def andI1(a: String, b: String): String =
     if a == "true" then b
     else if b == "true" then a
-    else { val r = freshTemp(); emit(s"$r = and i1 $a, $b"); r }
+    else { val r = freshReg(); emit(Inst.Bin(r, BinOp.And, i1, Val.Raw(a), Val.Raw(b))); r.render }
 
   protected def orI1(a: String, b: String): String =
     if a == "true" || b == "true" then "true"
-    else { val r = freshTemp(); emit(s"$r = or i1 $a, $b"); r }
+    else { val r = freshReg(); emit(Inst.Bin(r, BinOp.Or, i1, Val.Raw(a), Val.Raw(b))); r.render }
 
   /** Negating an `i1`, with the same constant folded away — what `is not` does to the test its
    * pattern produced.
    */
   protected def notI1(a: String): String =
     if a == "true" then "false"
-    else { val r = freshTemp(); emit(s"$r = xor i1 $a, true"); r }
+    else { val r = freshReg(); emit(Inst.Bin(r, BinOp.Xor, i1, Val.Raw(a), Val.Bool(true))); r.render }
 
   // --- bit ranges of a bitfield struct's container ---------------------------------------
   //
@@ -270,14 +272,15 @@ trait Emitter {
    * that is about the range, before anything is said about what was there already.
    */
   protected def placeBits(ranges: List[BitRange], r: BitRange, v: String): String = {
-    val ct = containerLlvm(ranges)
+    val ct = containerLty(ranges)
 
     val wide =
       if r.width == Bitfields.bits(ranges) then v
-      else { val t = freshTemp(); emit(s"$t = zext i${r.width} $v to $ct"); t }
+      else
+        val t = freshReg(); emit(Inst.Cast(t, CastOp.ZExt, LType.I(r.width), Val.Raw(v), ct)); t.render
 
     if r.offset == 0 then wide
-    else { val t = freshTemp(); emit(s"$t = shl $ct $wide, ${r.offset}"); t }
+    else { val t = freshReg(); emit(Inst.Bin(t, BinOp.Shl, ct, Val.Raw(wide), Val.Int(r.offset))); t.render }
   }
 
   /** A whole container built from one value per field, which is what constructing a bitfield struct
@@ -285,10 +288,10 @@ trait Emitter {
    * is nothing to preserve: every bit of the result is being written.
    */
   protected def buildBits(ranges: List[BitRange], vals: List[String]): String = {
-    val ct = containerLlvm(ranges)
+    val ct = containerLty(ranges)
 
     ranges.zip(vals).map(placeBits(ranges, _, _)).reduceOption { (a, b) =>
-      val t = freshTemp(); emit(s"$t = or $ct $a, $b"); t
+      val t = freshReg(); emit(Inst.Bin(t, BinOp.Or, ct, Val.Raw(a), Val.Raw(b))); t.render
     }.getOrElse("0")
   }
 
@@ -300,13 +303,15 @@ trait Emitter {
    * rather than in the extraction.
    */
   protected def readBits(ranges: List[BitRange], r: BitRange, c: String): String = {
-    val ct     = containerLlvm(ranges)
+    val ct     = containerLty(ranges)
     val shifted =
       if r.offset == 0 then c
-      else { val t = freshTemp(); emit(s"$t = lshr $ct $c, ${r.offset}"); t }
+      else
+        val t = freshReg(); emit(Inst.Bin(t, BinOp.LShr, ct, Val.Raw(c), Val.Int(r.offset))); t.render
 
     if r.width == Bitfields.bits(ranges) then shifted
-    else { val t = freshTemp(); emit(s"$t = trunc $ct $shifted to i${r.width}"); t }
+    else
+      val t = freshReg(); emit(Inst.Cast(t, CastOp.Trunc, ct, Val.Raw(shifted), LType.I(r.width))); t.render
   }
 
   /** The container `c` with one range replaced by `v` — the read-modify-write a bitfield write is,
@@ -314,7 +319,7 @@ trait Emitter {
    * and one store rather than one of each per field.
    */
   protected def writeBits(ranges: List[BitRange], r: BitRange, c: String, v: String): String = {
-    val ct         = containerLlvm(ranges)
+    val ct         = containerLty(ranges)
     val bits       = Bitfields.bits(ranges)
     val (_, clear) = Bitfields.mask(r, bits)
     val shifted    = placeBits(ranges, r, v)
@@ -324,9 +329,9 @@ trait Emitter {
     // reads as a bug rather than as an identity.
     if r.width == bits then shifted
     else
-      val cleared = freshTemp(); emit(s"$cleared = and $ct $c, $clear")
-      val merged  = freshTemp(); emit(s"$merged = or $ct $cleared, $shifted")
-      merged
+      val cleared = freshReg(); emit(Inst.Bin(cleared, BinOp.And, ct, Val.Raw(c), Val.Int(clear)))
+      val merged  = freshReg(); emit(Inst.Bin(merged, BinOp.Or, ct, cleared, Val.Raw(shifted)))
+      merged.render
   }
 
   // --- how a sysl signature is spelled --------------------------------------------------
@@ -493,9 +498,9 @@ trait Emitter {
 
   /** The address of the payload region inside an enum sitting at `base`. */
   protected def payloadPtr(en: Type.Enum, base: String): String = {
-    val r = freshTemp()
-    emit(s"$r = getelementptr ${en.llvm}, ptr $base, i32 0, i32 1")
-    r
+    val r = freshReg()
+    emit(Inst.Gep(r, en.lty, Val.Raw(base), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(1)))))
+    r.render
   }
 
   /** Reads a variant's payload out of an enum value, at that variant's type.
@@ -509,13 +514,13 @@ trait Emitter {
   protected def enumPayload(en: Type.Enum, variant: Type.EnumVariant, value: String): String = {
     val slot = scratchSlot(en.llvm)
 
-    emit(s"store ${en.llvm} $value, ptr $slot")
+    emit(Inst.Store(en.lty, Val.Raw(value), Val.Raw(slot), Access.Plain))
 
     val p = payloadPtr(en, slot)
-    val r = freshTemp()
+    val r = freshReg()
 
-    emit(s"$r = load ${en.payloadLlvm(variant)}, ptr $p")
-    r
+    emit(Inst.Load(r, en.payloadLty(variant), Val.Raw(p), Access.Plain))
+    r.render
   }
 
   /** The function just emitted: its header, and the blocks it is made of.
@@ -551,7 +556,13 @@ trait Emitter {
    * both exist the numbering has to be the one sequence or the emitted names would depend on which
    * files had been converted.
    */
-  protected def freshReg(): ir.Val.Reg = { temp += 1; ir.Val.Reg(s"t$temp") }
+  protected def freshReg(): Val.Reg = { temp += 1; Val.Reg(s"t$temp") }
+
+  /** The two widths written often enough here to be worth naming: a condition, and the index a
+   * `getelementptr` steps with.
+   */
+  protected val i1: LType  = LType.I(1)
+  protected val i32: LType = LType.I(32)
 
   protected def freshTemp(): String         = freshReg().render
   protected def freshLabel(s: String): String = { label += 1; s"$s$label" }
