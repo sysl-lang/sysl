@@ -502,6 +502,11 @@ either order.
 A store is told by the vector handed to it, so the asymmetry is in the language rather than in the
 implementation.
 
+**A declared `load` or `store` wins.** These are two ordinary words rather than spellings only the
+compiler could have meant — `sysl.sync.Atomic` has had both since before vectors existed, reached
+through a `*self` — so the built-in pair answers only where the receiver has no member of that name,
+and an `impl` block is the reader's to keep.
+
 **The run is checked, and checked as a run.** `i + W <= xs.len` is not knowable until the program
 runs, so this is the one vector operation with a run-time test — the subscript's, widened from one
 element to W of them, trapping the same way. A vector is not a hole through which a program reaches
