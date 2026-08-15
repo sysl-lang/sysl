@@ -284,6 +284,80 @@ class VectorRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "4 16\n"
   }
 
+  // `v += x` is `v = v + x`, and the two spellings reach the same instruction — so the splat has to
+  // happen on this path too. It did not until a probe asked; the compound form refused the scalar
+  // while the binary form beside it took one.
+  "a compound assignment splats its scalar" in {
+    val src =
+      """f() -> unit
+        |    var v: <4>f32 = [1.0, 2.0, 3.0, 4.0]
+        |    v += 1.0
+        |    v *= 2.0
+        |    print(v[0], v[3])
+        |
+        |f()
+        |""".stripMargin
+
+    run(src) shouldBe "4 10\n"
+  }
+
+  "a compound assignment takes another vector as well" in {
+    val src =
+      """f() -> unit
+        |    var v: <4>i32 = [1, 2, 3, 4]
+        |    val w: <4>i32 = [10, 20, 30, 40]
+        |    v += w
+        |    print(v[0], v[3])
+        |
+        |f()
+        |""".stripMargin
+
+    run(src) shouldBe "11 44\n"
+  }
+
+  // A lane may be a transparent subtype, which lays out and computes as its base — so `<4>Small`
+  // is four integers and its arithmetic is the base's, exactly as a scalar `Small`'s is.
+  "a constrained lane computes at its base" in {
+    val src =
+      """type Small = int within 0..100
+        |
+        |f() -> unit
+        |    val v: <4>Small = [1, 2, 3, 4]
+        |    val w = v + v
+        |    print(w[0], w[3])
+        |
+        |f()
+        |""".stripMargin
+
+    run(src) shouldBe "2 8\n"
+  }
+
+  "a vector is a type argument like any other" in {
+    val src =
+      """id[T](x: T) -> T = x
+        |
+        |val v: <4>f32 = [1.5, 2.0, 3.0, 4.0]
+        |print(id(v)[0])
+        |""".stripMargin
+
+    run(src) shouldBe "1.5\n"
+  }
+
+  "a vector rides in an enum variant" in {
+    val src =
+      """enum Shape
+        |    Points(v: <4>f32)
+        |    Empty
+        |
+        |val s = Shape.Points([1.5, 2.0, 3.0, 4.0])
+        |s match
+        |    Shape.Points(v) -> print(v[0], v[3])
+        |    Shape.Empty -> print("none")
+        |""".stripMargin
+
+    run(src) shouldBe "1.5 4\n"
+  }
+
   "a vector lives in a struct" in {
     val src =
       """struct Body

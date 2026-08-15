@@ -85,6 +85,25 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
       stamped should be > 1000
     }
 
+    // **The library uses no vectors, so nothing else encodes a `VectorType`** — the round trip over
+    // `Std.parsed` above would stay green with the `tvec` tag missing from the decoder entirely, and
+    // the failure would appear only when somebody put a vector in a package and read the artifact
+    // back. A tag with no encoder or no decoder is precisely what this suite exists to catch, so a
+    // type the standard library does not happen to use needs a fixture of its own.
+    "round-trips a vector type, which the library itself never writes" in {
+      val src =
+        """scale[const W: usize](v: <W>f32, by: f32) -> <W>f32 = v * by
+          |
+          |f(a: <4>u8, b: <(2 * 4)>f32) -> <4>u8 = a
+          |""".stripMargin
+
+      val one  = parsed(src)
+      val back = roundTrip(List(one))
+
+      back.map(_.body) shouldBe List(one.body)
+      positionsOf(back.map(_.body)) shouldBe positionsOf(List(one.body))
+    }
+
     "rebinds to the caller's own Source, so a decoded declaration is still the library's" in {
       val back = roundTrip(List(one), Map(one.source.name -> one.source))
 

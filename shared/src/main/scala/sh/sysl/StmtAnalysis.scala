@@ -365,7 +365,11 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
         TWrite(place, m.op, tv, None, invCheckFor(place))
       else
         val binSym = m.op.dropRight(1)
-        val tv     = part.getOrElse(analyzeExpr(written, updateExpected(binSym, place.ty)))
+        val raw    = part.getOrElse(analyzeExpr(written, updateExpected(binSym, place.ty)))
+        // `v += 1.0` is `v = v + 1.0`, so the scalar splats here exactly as it does in the binary
+        // form — the two spellings reach the same instruction and have to agree about it, which is
+        // the rule this whole branch is written around.
+        val tv     = balanceLanes(TZero(place.ty), raw)._2
         val d      = updateDispatch(binSym, place, tv)
 
         if d.isEmpty && disagree(arithType(binSym, place.ty, tv.ty, tv.pos), place.ty) then

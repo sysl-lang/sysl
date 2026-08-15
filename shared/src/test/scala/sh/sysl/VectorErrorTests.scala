@@ -149,6 +149,33 @@ class VectorErrorTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
+  // **The C boundary is refused rather than guessed at**, which is the same call `Exports` makes
+  // about an aggregate and with more force: a vector's register and alignment differ by target and
+  // by which extensions the other side was compiled for, and emitting the `declare` anyway makes a
+  // corrupt call rather than a link error. This pair was *not* refused when the feature was first
+  // written — the scope said it was and nothing implemented it, which a probe found and these pin.
+  "the C boundary" - {
+    "a vector parameter on an extern" in {
+      val src =
+        """extern "libc_thing" g(v: <4>f32) -> unit
+          |""".stripMargin
+
+      err(src) should include("how a vector reaches a C function differs by target")
+    }
+
+    "a vector result from an extern" in {
+      val src =
+        """extern "libc_thing" g() -> <4>f32
+          |""".stripMargin
+
+      err(src) should include("how a vector comes back from a C function differs by target")
+    }
+
+    "an exported function may not take one either" in {
+      err("@export\nf(v: <4>f32) -> f32 = v[0]") should include("which C has no way to spell")
+    }
+  }
+
   "the methods" - {
     "select is a mask's, and a vector of numbers is told so" in {
       val src =

@@ -385,7 +385,35 @@ trait Hoisting extends HoistMembers {
         (e.params.map(p => (p.name, foreignParam(recover(Type.Unknown)(resolveType(p.typ, Map.empty))))),
          e.retType.map(t => recover(Type.Unknown)(resolveReturn(t, Map.empty))).getOrElse(Type.Unit))
 
+      // **A vector may not cross to C, and this is refused rather than lowered hopefully** — the
+      // same reasoning `Exports.signature` gives for an aggregate, and with more force. Each ABI
+      // says which register a vector arrives in and under what alignment, the answer differs by
+      // target and by which vector extensions the other side was compiled for, and `CAbi` has no
+      // rule for one. Emitting the `declare` anyway produces a **corrupt call rather than a link
+      // error**, which is the failure a boundary check exists to prevent.
+      //
+      // The shape to write instead is the one C's own SIMD-taking functions take: a pointer to the
+      // lanes, which is a `*T` on both sides and has one meaning everywhere.
+      //
+      // **Reported after the tables are filled, not before.** `err` does not return, so refusing
+      // above the two assignments would leave the name registered as a declaration and absent from
+      // `funcInsts` — and every call to it would then take the compiler down with a missing key
+      // instead of reporting this. That is `MethodCalls`' "registered and has no lowered form" trap
+      // seen from the other side, and it is why the order here is load-bearing.
       funcInsts(key) = signature
+
+      for (name, t) <- signature._1 if Type.repr(t).isInstanceOf[Type.Vector] do
+        at(e.pos)(err(s"'$name' of the 'extern' '${e.name}' is ${Type.show(t)}, and how a vector " +
+          s"reaches a C function differs by target and by what the other side was compiled for — so " +
+          s"sysl will not guess at one. Pass the lanes through memory, as a '*${Type.show(
+            Type.repr(t).asInstanceOf[Type.Vector].elem)}'"))
+
+      if Type.repr(signature._2).isInstanceOf[Type.Vector] then
+        at(e.pos)(err(s"the 'extern' '${e.name}' returns ${Type.show(signature._2)}, and how a " +
+          s"vector comes back from a C function differs by target and by what the other side was " +
+          s"compiled for — so sysl will not guess at one. Have it write the lanes through a '*${
+            Type.show(Type.repr(signature._2).asInstanceOf[Type.Vector].elem)}' the caller supplies"))
+
 
       // An intrinsic's emitted name carries the width it was declared at (`Intrinsics`), so the
       // symbol is settled here — where the signature has just been resolved — rather than being

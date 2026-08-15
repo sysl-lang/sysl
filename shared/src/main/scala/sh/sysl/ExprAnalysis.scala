@@ -738,7 +738,10 @@ trait ExprAnalysis
     case Assign(op, target, value) =>
       val place  = analyzePlace(target, s"'$op'")
       val binSym = op.dropRight(1)
-      val tv     = analyzeExpr(value, updateExpected(binSym, place.ty))
+      // `v += 1.0` is `v = v + 1.0`, so a scalar splats here exactly as it does in the binary form.
+      // The two spellings reach the same instruction and have to agree about it, which is the rule
+      // this whole branch is written around.
+      val tv     = balanceLanes(TZero(place.ty), analyzeExpr(value, updateExpected(binSym, place.ty)))._2
       val d      = updateDispatch(binSym, place, tv)
 
       // What has to hold is that the result can be stored back. A constrained place is the one case
