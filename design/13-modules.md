@@ -559,10 +559,16 @@ precedence order to state, no tie to break, and nothing to say about whether sel
 Files sitting directly in a directory are compiled for **every** target; the folders add to them
 rather than replacing them.
 
-**A `__<os>__` directory may not be nested inside another.** Two axes — an OS and a processor, an OS
-and a libc — are not what this mechanism is for: the second axis is `#if` inside the file
-(`targets.md § Conditional compilation`), or the C preprocessor inside the `.c`, which is where the
-world already keeps that knowledge.
+**A `__<os>__` directory may not be nested inside another**, however deep — a module in between makes
+no difference. Two axes — an OS and a processor, an OS and a libc — are not what this mechanism is
+for: the second axis is `#if` inside the file (`targets.md § Conditional compilation`), or the C
+preprocessor inside the `.c`, which is where the world already keeps that knowledge.
+
+**It is refused where the walk reaches it**, which is everywhere the selected folder goes and nowhere
+inside one this target passed over. That is the rule below rather than a second rule: an unselected
+tree is not read at all, so nothing in it is checked — not its names and not its source. The
+asymmetry is real and is the honest one to have, since the alternative is a walk of every folder on
+every machine to validate directories the build will never open.
 
 **Why a directory and not a filename suffix.** This section used to specify `cpu.aarch64.sysl`, and
 the reason it is replaced is that the interesting per-platform artifact is not sysl at all: it is
