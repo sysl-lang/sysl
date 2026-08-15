@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.{FCmp, ICmp}
+
 /** The scalar end of codegen: arithmetic, comparison, conversion, and printing.
  *
  * Everything here follows from `01-scalar-types-and-operators.md` — arithmetic wraps at the
@@ -110,31 +112,42 @@ trait ScalarEmitter extends StringEmitter {
    * value, so it uses the unsigned predicates over its `i32` representation.
    */
   protected def predicate(op: String, ty: Type): String = ty match
+    case _: Type.Floating => floatPred(op).render
+    case other            => intPred(op, other).render
+
+  /** The `icmp` predicate for an operator at a type. `char` compares by scalar value, so it uses the
+   * unsigned predicates over its `i32` representation.
+   */
+  protected def intPred(op: String, ty: Type): ICmp = ty match
     // Equality only: a bool and an address have no ordering, so no signed/unsigned choice.
     case Type.Bool | _: Type.Ptr | _: Type.Ref | _: Type.CFn =>
       op match
-        case "==" => "eq"; case "!=" => "ne"
+        case "==" => ICmp.Eq; case "!=" => ICmp.Ne
         case _    => sys.error(s"unreachable compare '$op'")
     case Type.Char | Type.Integer(_, false, _) =>
       op match
-        case "==" => "eq"; case "!=" => "ne"
-        case "<"  => "ult"; case ">" => "ugt"; case "<=" => "ule"; case ">=" => "uge"
+        case "==" => ICmp.Eq;  case "!=" => ICmp.Ne
+        case "<"  => ICmp.Ult; case ">"  => ICmp.Ugt
+        case "<=" => ICmp.Ule; case ">=" => ICmp.Uge
         case _    => sys.error(s"unreachable compare '$op'")
     case _: Type.Integer =>
       op match
-        case "==" => "eq"; case "!=" => "ne"
-        case "<"  => "slt"; case ">" => "sgt"; case "<=" => "sle"; case ">=" => "sge"
-        case _    => sys.error(s"unreachable compare '$op'")
-    // IEEE 754 makes `!=` the negation of `==`, and a `NaN` is equal to nothing including itself —
-    // so `!=` is **unordered** or not equal (`une`), not ordered and not equal (`one`). Every other
-    // float comparison is the ordered one, which is what makes all four of `==`, `<`, `<=` and `>=`
-    // false at a `NaN` while `!=` is true.
-    case _: Type.Floating =>
-      op match
-        case "==" => "oeq"; case "!=" => "une"
-        case "<"  => "olt"; case ">" => "ogt"; case "<=" => "ole"; case ">=" => "oge"
+        case "==" => ICmp.Eq;  case "!=" => ICmp.Ne
+        case "<"  => ICmp.Slt; case ">"  => ICmp.Sgt
+        case "<=" => ICmp.Sle; case ">=" => ICmp.Sge
         case _    => sys.error(s"unreachable compare '$op'")
     case other => sys.error(s"unreachable compare on ${other.llvm}")
+
+  /** The `fcmp` predicate. IEEE 754 makes `!=` the negation of `==`, and a `NaN` is equal to nothing
+   * including itself — so `!=` is **unordered** or not equal (`une`), not ordered and not equal
+   * (`one`). Every other float comparison is the ordered one, which is what makes all four of `==`,
+   * `<`, `<=` and `>=` false at a `NaN` while `!=` is true.
+   */
+  protected def floatPred(op: String): FCmp = op match
+    case "==" => FCmp.Oeq; case "!=" => FCmp.Une
+    case "<"  => FCmp.Olt; case ">"  => FCmp.Ogt
+    case "<=" => FCmp.Ole; case ">=" => FCmp.Oge
+    case _    => sys.error(s"unreachable compare '$op'")
 
   protected def compareValue(op: String, base: Type, av: String, bv: String): String = {
     // A constrained subtype is laid out as the type it narrows (`16 §1`), so it is compared as that

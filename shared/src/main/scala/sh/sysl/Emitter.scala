@@ -592,6 +592,21 @@ trait Emitter {
       raisedAligns.get(name).map(n => s", align $n").getOrElse("")
   }
 
+  /** A block of storage copied, at a boundary both ends are known to satisfy.
+   *
+   * The one call in the module the intrinsic is declared for, so the flag that declares it is set
+   * here rather than at each site that copies — a caller that stops copying stops declaring it, and
+   * one that starts brings the declaration with it.
+   */
+  protected def emitMemcpy(dst: ir.Val, src: ir.Val, bytes: Int, align: Int): Unit = {
+    usesMemcpy = true
+    emit(ir.Inst.Call(None, "void", ir.Val.Global("llvm.memcpy.p0.p0.i64"),
+                      List(ir.Arg(ir.LType.Ptr, dst, s"align $align"),
+                           ir.Arg(ir.LType.Ptr, src, s"align $align"),
+                           ir.Arg(ir.LType.I(64), ir.Val.Int(bytes)),
+                           ir.Arg(ir.LType.I(1), ir.Val.Bool(false)))))
+  }
+
   /** Emits a block terminator (`br` / `ret` / `unreachable`) and marks the block closed. */
   protected def emitTerm(line: String): Unit = emitTerm(ir.Inst.Raw(line))
 
