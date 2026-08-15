@@ -352,11 +352,13 @@ private[sysl] def execute(cfg: Config): Int = {
   // `struct dirent` through a shim under a `__<os>__` directory, which is the only way to reach a
   // layout that differs by platform and the reason the directories exist (`13 §5`).
   //
-  // Where the standard module arrived as an **artifact** its shims are already archive members, so
-  // adding the tree here would compile every one of them a second time and hand the linker two
-  // definitions. `coreArchive` is exactly the question *did an artifact answer this compilation*, so
-  // it is what decides.
-  val stdTree = Option.when(coreArchive.isEmpty)(Std.root.toOption).flatten.toList
+  // **Two compilations have no standard library to add, and both would add it twice.** Where one
+  // arrived as an **artifact** its shims are already archive members. And under `--std` the tree
+  // being compiled *is* the standard module (`13 §8`), so `cfg.file` is already this very directory
+  // — `sysl test library --std` is the case, and what it produced was two `sysl.fs.dirent.o` and a
+  // duplicate symbol at the link.
+  val stdTree =
+    Option.when(coreArchive.isEmpty && !cfg.std)(Std.root.toOption).flatten.toList
 
   val native =
     if links(cfg.command) then

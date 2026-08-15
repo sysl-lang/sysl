@@ -51,6 +51,12 @@ object NativeSources {
    * A root that names a **file** rather than a directory contributes nothing, which is
    * `Project.cSources`'s own rule and the right one here too: naming a file compiles that file alone
    * (`13 §1`), so there is no tree for C to have travelled with.
+   *
+   * **A tree may be named once.** Nothing deduplicates here and nothing needs to: a tree named twice
+   * declares its sysl twice, which the analyzer refuses long before a link — so a repeat that reached
+   * this far would be one the sysl walk never saw, and there is no such thing. What *did* arrive
+   * twice is the standard library, and it is kept out at the source (`Main`, `stdTree`) rather than
+   * filtered here, because the answer there is that a `--std` build has no separate library to add.
    */
   def of(roots: List[String], os: Os): List[List[Source]] =
     roots.map(Project.cSources(_, Some(os))).filter(_.nonEmpty)
