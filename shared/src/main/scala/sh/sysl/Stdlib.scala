@@ -364,6 +364,16 @@ object Stdlib {
                     val code     = s"$staging/${LibraryArtifact.codeMember}"
                     val metadata = s"$staging/${LibraryArtifact.metadataMember}"
 
+                    // **The library's own C, one member each** (`15 §7`), exactly as `build-lib`
+                    // stages a library's. `build` is handed the same files but only *fingerprints*
+                    // them — archiving is the caller's, and this caller had nothing to archive until
+                    // the library carried C. What that cost was an artifact the compiler builds for
+                    // itself on a machine with a cold cache, holding `sysl.fs$entries` and not the
+                    // shim it calls: everything compiled, and the *program* failed to link on a
+                    // symbol from the standard library.
+                    val objects = Std.cSources(target.os)
+                      .map(s => s -> s"$staging/${LibraryArtifact.nativeMember(s)}")
+
                     Project.parentOf(out).foreach(createDirectories)
 
                     // Beside its destination rather than in the staging directory, because a rename
@@ -378,11 +388,17 @@ object Stdlib {
                       for
                         _ <- Toolchain.compileObject(built._1, code, target)
                         _ <- Toolchain.compileObject(LibraryArtifact.metadataIr(built._2, target), metadata, target)
-                        _ <- Toolchain.archive(List(code, metadata), pending, archiver)
+                        // Each C file is its own member, so the linker pulls a shim in the way it
+                        // pulls anything else in: because something left its symbol undefined.
+                        _ <- objects.foldLeft[Either[String, Unit]](Right(()))((so_far, entry) =>
+                               so_far.flatMap(_ =>
+                                 Toolchain.compileC(entry._1.name, entry._2, target)))
+                        _ <- Toolchain.archive(code :: metadata :: objects.map(_._2), pending, archiver)
                         _ <- publish(pending, out)
                       yield ()
 
-                    List(code, metadata, staging, pending).foreach(Project.discard)
+                    (code :: metadata :: objects.map(_._2) ::: List(staging, pending))
+                      .foreach(Project.discard)
                     outcome
                   }
     yield ()

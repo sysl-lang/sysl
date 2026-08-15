@@ -643,6 +643,34 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
       deleteFile(out)
     }
 
+    // **The library's own C has to be in it**, and this is the road nothing covered: `build-lib
+    // --std` stages a library's shims as archive members and this routine did not, because it had
+    // nothing to stage until `library/` carried C. `LibraryArtifact.build` is handed the same files
+    // and only *fingerprints* them, so passing them there looked like enough and was not.
+    //
+    // What it cost was the artifact the compiler builds **for itself** on a machine with a cold
+    // cache — the ordinary case for anybody who has just installed it. Everything compiled, the
+    // artifact was written, it decoded, its fingerprint matched, and then a program calling
+    // `sysl.fs.entries` failed to link on a symbol from the standard library. Found by extracting a
+    // release tarball and running one program, which is the check no unit test replaces.
+    "carries the library's own C as members, so a program linking it resolves the shims" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+      assume(Toolchain.findAr(None).isRight, "llvm-ar not available")
+      assume(Std.cSources(Target.default.os).nonEmpty, "the library carries no C on this target")
+
+      val out = s"${createTempDirectory("sysl-write-c-")}/std${LibraryArtifact.extension}"
+
+      Stdlib.writeArtifact(out, Target.default) shouldBe Right(())
+
+      val wanted = Std.cSources(Target.default.os).map(LibraryArtifact.nativeMember)
+
+      Ar.members(readBytes(out)) match
+        case Right(members) => members.map(_.name) should contain allElementsOf wanted
+        case Left(err)      => fail(err)
+
+      deleteFile(out)
+    }
+
     "makes the directory it is asked to write into, which a fresh clone has never had" in {
       assume(Toolchain.clangAvailable, "clang not available")
       assume(Toolchain.findAr(None).isRight, "llvm-ar not available")
