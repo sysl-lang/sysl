@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.{Arg, BinOp, CastOp, Inst, LType, Val}
+
 /** Arithmetic, comparison, and the conversions between scalar widths.
  *
  * Two things run through all of it. The first is that a **constrained** type is laid out as its
@@ -115,13 +117,14 @@ trait ArithEmitter extends CallEmitter {
    */
   private def dispatchValue(d: TDispatch, aty: Type, bty: Type, av: String, bv: String, resultTy: Type): String = {
     val (l, lty, r, rty) = if d.swap then (bv, bty, av, aty) else (av, aty, bv, bty)
-    val res              = freshTemp()
+    val res              = freshReg()
+    val (what, callee)   = calleeParts(d.name, resultTy)
 
-    emit(s"$res = call ${calleeOf(d.name, resultTy)}(${lty.llvm} $l, ${rty.llvm} $r)")
+    emit(Inst.Call(Some(res), what, callee, List(Arg(lty.lty, Val.Raw(l)), Arg(rty.lty, Val.Raw(r)))))
 
-    if !d.negate then res
+    if !d.negate then res.render
     else
-      val n = freshTemp(); emit(s"$n = xor i1 $res, true"); n
+      val n = freshReg(); emit(Inst.Bin(n, BinOp.Xor, LType.I(1), res, Val.Bool(true))); n.render
   }
   /** The zero value of a type — what a slot holds before anything is stored into it, and what a
    * function with no trailing expression returns.
@@ -187,15 +190,16 @@ trait ArithEmitter extends CallEmitter {
    * `zeroFlag` is the extra `i1` that `ctlz` and `cttz` take and no other intrinsic here does. It
    * is always `false`, meaning a zero operand is defined rather than poison — see the call sites.
    */
-  protected def intrinsic(base: String, ll: String, args: List[String], zeroFlag: Boolean = false): String = {
+  protected def intrinsic(base: String, ty: LType, args: List[String], zeroFlag: Boolean = false): String = {
+    val ll     = ty.render
     val name   = s"llvm.$base.$ll"
     val params = List.fill(args.length)(ll) ++ Option.when(zeroFlag)("i1")
     satDecls += s"declare $ll @$name(${params.mkString(", ")})"
 
-    val ops = args.map(a => s"$ll $a") ++ Option.when(zeroFlag)("i1 false")
-    val r   = freshTemp()
-    emit(s"$r = call $ll @$name(${ops.mkString(", ")})")
-    r
+    val ops = args.map(a => Arg(ty, Val.Raw(a))) ++ Option.when(zeroFlag)(Arg(LType.I(1), Val.Bool(false)))
+    val r   = freshReg()
+    emit(Inst.Call(Some(r), ll, Val.Global(name), ops))
+    r.render
   }
 
   /** An integer value moved between two widths, unsigned. Nothing is emitted where they agree,
@@ -211,9 +215,9 @@ trait ArithEmitter extends CallEmitter {
     // instruction, since an immediate too wide for the type it is written at is not IR at all.
     if a == b || (a < b && !v.startsWith("%") && !v.startsWith("-")) then v
     else
-      val r = freshTemp()
-      emit(s"$r = ${if a < b then "zext" else "trunc"} ${from.llvm} $v to ${to.llvm}")
-      r
+      val r = freshReg()
+      emit(Inst.Cast(r, if a < b then CastOp.ZExt else CastOp.Trunc, from.lty, Val.Raw(v), to.lty))
+      r.render
   }
 
   /** A rotation amount, brought from the `u32` it is written as to the width being rotated.
@@ -229,9 +233,9 @@ trait ArithEmitter extends CallEmitter {
     val reduced =
       if (bits & (bits - 1)) == 0 || from.asInstanceOf[Type.Integer].bits <= bits then v
       else
-        val r = freshTemp()
-        emit(s"$r = urem ${from.llvm} $v, $bits")
-        r
+        val r = freshReg()
+        emit(Inst.Bin(r, BinOp.URem, from.lty, Val.Raw(v), Val.Int(bits)))
+        r.render
 
     resize(reduced, from, Type.Integer(bits, signed = false))
   }

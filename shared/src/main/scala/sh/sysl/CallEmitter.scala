@@ -207,15 +207,22 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    * alone does not say where the declared parameters stop and the ellipsis begins.
    */
   protected def calleeOf(name: String, ty: Type): String =
+    val (what, callee) = calleeParts(name, ty)
+
+    s"$what ${callee.render}"
+
+  /** The same two things kept apart, which is how a `call` instruction carries them: what the call
+   * names, and the symbol it names. `calleeOf` is this pair run together, and stays for as long as
+   * anything still builds a call by interpolation.
+   */
+  protected def calleeParts(name: String, ty: Type): (String, ir.Val.Global) =
     val symbol = symbolOf(name)
     // A foreign result may be named by a type the sysl signature never mentions — a coerced
     // aggregate, or `void` where the value comes back through an out-parameter. A sysl result may
     // be `void` for the second of those reasons alone.
     val result = if foreigns.contains(name) then foreignResultType(ty) else syslResult(ty)
 
-    variadics.get(name) match
-      case Some(fnTy) => s"$fnTy @$symbol"
-      case None       => s"$result @$symbol"
+    (variadics.getOrElse(name, result), ir.Val.Global(symbol))
 
   /** Emits a call from sysl to sysl and hands back the register holding its result.
    *

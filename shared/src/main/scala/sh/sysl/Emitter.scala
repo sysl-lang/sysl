@@ -533,7 +533,16 @@ trait Emitter {
     currentEnd = None
   }
 
-  protected def freshTemp(): String         = { temp += 1; s"%t$temp" }
+  /** A register nothing else in this function uses.
+   *
+   * The two spellings share one counter and are the same register: `freshReg` is what a converted
+   * emitter asks for and `freshTemp` is what one still building a line of text asks for, and while
+   * both exist the numbering has to be the one sequence or the emitted names would depend on which
+   * files had been converted.
+   */
+  protected def freshReg(): ir.Val.Reg = { temp += 1; ir.Val.Reg(s"t$temp") }
+
+  protected def freshTemp(): String         = freshReg().render
   protected def freshLabel(s: String): String = { label += 1; s"$s$label" }
 
   /** Emits a plain instruction, unless the current block is already terminated. */

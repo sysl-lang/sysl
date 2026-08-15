@@ -23,21 +23,6 @@ case class Func(header: String, blocks: List[Block])
  */
 case class Block(label: String, instrs: List[Inst], terminator: Option[Inst])
 
-/** One instruction.
- *
- * `Raw` is the whole of it for now and is temporary scaffolding: it carries the text an emitter
- * interpolated, so the block structure above can be captured and proved byte-identical before any of
- * the six hundred emit sites are converted. It is deleted when the last of them is, and an escape
- * hatch that dies with its last caller is not a hatch left open.
- */
-enum Inst {
-  case Raw(text: String)
-
-  /** The instruction as LLVM writes it, without the indentation a body gives it. */
-  def render: String = this match
-    case Raw(text) => text
-}
-
 /** Writing a function down. **The output is byte-identical to what the emitters printed directly**,
  * which is not a nicety: the compiler's codegen tier asserts on emitted IR by substring, including
  * the two-space indentation and the runs of `\n  store …` between instructions, so the printer

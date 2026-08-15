@@ -364,7 +364,7 @@ trait ExprEmitter extends ArithEmitter {
       val v    = genExpr(operand)
       val n    = amount.map(genExpr)
       val bits = width.asInstanceOf[Type.Integer].bits
-      val ll   = width.llvm
+      val ll   = width.lty
 
       // The bits counted at the operand's own width, then resized to the `u32` the count is
       // answered in. A count is at most the width, so narrowing one from a type wider than 32 bits
