@@ -141,8 +141,20 @@ trait Emitter {
   protected var weakHeap  = false
 
   // Per-function emission state, reset at each function boundary.
-  private var prologue   = new mutable.StringBuilder
-  private var body       = new mutable.StringBuilder
+  //
+  // The body is a list of **basic blocks** rather than a run of text (`ir.Func`). It always was one:
+  // the three writers below are the only ways anything reaches it, and `terminated` already means
+  // *this block is closed* — what changes is that the structure now survives being written down,
+  // which is what a second back end has to read.
+  //
+  // `prologue` is kept apart because a stack slot is hoisted to the top of the entry block from
+  // wherever it was needed, so the two halves of that block are built at different times and are
+  // joined only when the function is finished.
+  private var prologue   = mutable.ListBuffer.empty[ir.Inst]
+  private var blocks     = mutable.ListBuffer.empty[ir.Block]
+  private var current    = mutable.ListBuffer.empty[ir.Inst]
+  private var currentEnd: Option[ir.Inst] = None
+  private var currentLbl = "entry"
   private var temp       = 0
   private var label      = 0
   private var terminated = false
@@ -403,8 +415,11 @@ trait Emitter {
   protected def emitConstraintChecks(v: String, c: Type.Constrained): Unit
 
   protected def startFunction(): Unit = {
-    prologue = new mutable.StringBuilder
-    body = new mutable.StringBuilder
+    prologue = mutable.ListBuffer.empty
+    blocks = mutable.ListBuffer.empty
+    current = mutable.ListBuffer.empty
+    currentEnd = None
+    currentLbl = "entry"
     temp = 0
     label = 0
     terminated = false
@@ -492,16 +507,39 @@ trait Emitter {
     r
   }
 
-  /** The text of the function just emitted: its header, the hoisted slots, and its blocks. */
-  protected def finishFunction(header: String): String =
-    s"$header {\nentry:\n$prologue$body}\n"
+  /** The function just emitted: its header, and the blocks it is made of.
+   *
+   * The hoisted slots go at the front of the entry block, which is where they were always printed —
+   * `emitAlloca` writes one where the function begins rather than where it was needed, so that a
+   * slot inside a loop does not grow the stack on every iteration.
+   */
+  protected def finishFunc(header: String): ir.Func = {
+    closeBlock()
+    val all = blocks.toList
+
+    ir.Func(header, all.head.copy(instrs = prologue.toList ::: all.head.instrs) :: all.tail)
+  }
+
+  /** The same, written down. */
+  protected def finishFunction(header: String): String = ir.Printer.func(finishFunc(header))
+
+  /** Files the block being built and starts one under `l`. The entry block is the one this begins
+   * with, so a function whose body never labels anything still finishes with a block rather than
+   * with nothing.
+   */
+  private def closeBlock(): Unit = {
+    blocks += ir.Block(currentLbl, current.toList, currentEnd)
+    current = mutable.ListBuffer.empty
+    currentEnd = None
+  }
 
   protected def freshTemp(): String         = { temp += 1; s"%t$temp" }
   protected def freshLabel(s: String): String = { label += 1; s"$s$label" }
 
   /** Emits a plain instruction, unless the current block is already terminated. */
-  protected def emit(line: String): Unit =
-    if !terminated then { body ++= "  "; body ++= line; body ++= "\n" }
+  protected def emit(line: String): Unit = emit(ir.Inst.Raw(line))
+
+  protected def emit(inst: ir.Inst): Unit = if !terminated then current += inst
 
   /** Emits a stack slot into the function's entry block rather than where it is needed.
    * Every name is unique within a function, so hoisting is safe — and it keeps a slot inside
@@ -513,7 +551,7 @@ trait Emitter {
    * rule already at or above the type's.
    */
   protected def emitAlloca(name: String, ty: String, align: Option[Int] = None): String = {
-    prologue ++= s"  $name = alloca $ty${align.map(n => s", align $n").getOrElse(alignSuffix(ty))}\n"
+    prologue += ir.Inst.Raw(s"$name = alloca $ty${align.map(n => s", align $n").getOrElse(alignSuffix(ty))}")
     name
   }
 
@@ -535,17 +573,22 @@ trait Emitter {
   }
 
   /** Emits a block terminator (`br` / `ret` / `unreachable`) and marks the block closed. */
-  protected def emitTerm(line: String): Unit =
-    if !terminated then { body ++= "  "; body ++= line; body ++= "\n"; terminated = true }
+  protected def emitTerm(line: String): Unit = emitTerm(ir.Inst.Raw(line))
 
-  protected def emitLabel(l: String): Unit = { body ++= l; body ++= ":\n"; terminated = false }
+  protected def emitTerm(inst: ir.Inst): Unit =
+    if !terminated then { currentEnd = Some(inst); terminated = true }
+
+  protected def emitLabel(l: String): Unit = { closeBlock(); currentLbl = l; terminated = false }
 
   /** Generates one whole function while another is in progress, which is how a runtime helper
    * gets written at the moment it is first asked for.
    */
   protected def inFunction(header: String)(gen: => Unit): String = {
     val saved =
-      (prologue, body, temp, label, terminated, tempStack, owned, scratch, promoted, promotedBoxes, deferrals)
+      (prologue, temp, label, terminated, tempStack, owned, scratch, promoted, promotedBoxes, deferrals)
+    // The blocks under construction are saved with the rest: a helper is a whole function emitted in
+    // the middle of one, so what the interrupted function had built has to be there when it resumes.
+    val savedBlocks = (blocks, current, currentEnd, currentLbl)
     // A helper is emitted in the middle of whatever asked for it, and the asking function may be one
     // with a jump in it — so what says where that jump goes is put back too. Without this the helper's
     // reset would leave the interrupted function with no target and its remaining tail calls would be
@@ -556,9 +599,11 @@ trait Emitter {
     gen
     val text = finishFunction(header)
 
-    prologue = saved._1; body = saved._2; temp = saved._3; label = saved._4
-    terminated = saved._5; tempStack = saved._6; owned = saved._7; scratch = saved._8
-    promoted = saved._9; promotedBoxes = saved._10; deferrals = saved._11
+    prologue = saved._1; temp = saved._2; label = saved._3
+    terminated = saved._4; tempStack = saved._5; owned = saved._6; scratch = saved._7
+    promoted = saved._8; promotedBoxes = saved._9; deferrals = saved._10
+    blocks = savedBlocks._1; current = savedBlocks._2
+    currentEnd = savedBlocks._3; currentLbl = savedBlocks._4
     tailTarget = savedTail._1; tailCalls = savedTail._2; tailParams = savedTail._3
     text
   }
