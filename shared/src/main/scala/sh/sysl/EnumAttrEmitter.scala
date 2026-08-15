@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.{Access, ICmp, Inst, LType, Val}
+
 /** The seven type attributes of a simple enum — `Pos`, `Val`, `Succ`, `Pred`, `Image`, `Value`, and
  * the `Range` the analyzer folds away before it gets here (`09 §5`).
  *
@@ -18,38 +20,44 @@ trait EnumAttrEmitter extends ScalarEmitter {
   protected def genEnumAttr(kind: String, en: Type.Enum, arg: TExpr): String = {
     val vs   = en.variants
     val last = vs.length - 1
-    val uw   = en.underlying.llvm // a simple enum value's width — the type of a tag
+    val uw   = en.underlying.lty // a simple enum value's width — the type of a tag
     val v    = genExpr(arg)
 
     // A select chain over the variant list, folded from the last entry back: `pick(i)` gives the
     // i1 that selects entry `i`, and `value(i)` its result. The last entry is the default, reached
     // when nothing earlier matched — which for a valid operand means it *is* the last.
-    def chain(width: String, value: Int => String, pick: Int => String): String =
+    def chain(width: LType, value: Int => String, pick: Int => String): String =
       (last - 1 to 0 by -1).foldLeft(value(last)) { (acc, i) =>
-        val r = freshTemp(); emit(s"$r = select i1 ${pick(i)}, $width ${value(i)}, $width $acc"); r
+        val r = freshReg()
+        emit(Inst.Select(r, Val.Raw(pick(i)), width, Val.Raw(value(i)), Val.Raw(acc)))
+        r.render
       }
 
-    def tagEq(i: Int): String = { val r = freshTemp(); emit(s"$r = icmp eq $uw $v, ${vs(i).tag}"); r }
+    def tagEq(i: Int): String = {
+      val r = freshReg(); emit(Inst.IntCmp(r, ICmp.Eq, uw, Val.Raw(v), Val.Int(vs(i).tag))); r.render
+    }
 
     kind match
       case "Pos" =>
-        val iw = Type.Int.llvm
-        chain(iw, i => i.toString, tagEq)
+        chain(Type.Int.lty, i => i.toString, tagEq)
 
       case "Val" =>
-        val iw   = Type.Int.llvm
+        val iw   = Type.Int.lty
         val geLo = compareValue(">=", Type.Int, v, "0")
         val ltHi = compareValue("<", Type.Int, v, vs.length.toString)
-        val ok   = freshTemp(); emit(s"$ok = and i1 $geLo, $ltHi")
-        trapUnless(ok, "val")
-        chain(uw, i => vs(i).tag.toString, i => { val r = freshTemp(); emit(s"$r = icmp eq $iw $v, $i"); r })
+        val ok   = freshReg(); emit(Inst.Bin(ok, ir.BinOp.And, LType.I(1), Val.Raw(geLo), Val.Raw(ltHi)))
+        trapUnless(ok.render, "val")
+        chain(uw, i => vs(i).tag.toString,
+              i => { val r = freshReg(); emit(Inst.IntCmp(r, ICmp.Eq, iw, Val.Raw(v), Val.Int(i))); r.render })
 
       case "Succ" =>
         trapUnless(compareValue("!=", en.underlying, v, vs(last).tag.toString), "succ")
         // Mapping each value to the one after it: entry `i` (for `i < last`) selects `tag(i+1)`,
         // with the last value as the default the trap above keeps it from reaching.
         (last - 1 to 0 by -1).foldLeft(vs(last).tag.toString) { (acc, i) =>
-          val r = freshTemp(); emit(s"$r = select i1 ${tagEq(i)}, $uw ${vs(i + 1).tag}, $uw $acc"); r
+          val r = freshReg()
+          emit(Inst.Select(r, Val.Raw(tagEq(i)), uw, Val.Int(vs(i + 1).tag), Val.Raw(acc)))
+          r.render
         }
 
       case "Pred" =>
@@ -57,7 +65,9 @@ trait EnumAttrEmitter extends ScalarEmitter {
         // Mapping each value to the one before it: entry `i` (for `i > 0`) selects `tag(i-1)`, with
         // the first value as the default it can never actually reach after the trap above.
         (1 to last).foldLeft(vs.head.tag.toString) { (acc, i) =>
-          val r = freshTemp(); emit(s"$r = select i1 ${tagEq(i)}, $uw ${vs(i - 1).tag}, $uw $acc"); r
+          val r = freshReg()
+          emit(Inst.Select(r, Val.Raw(tagEq(i)), uw, Val.Int(vs(i - 1).tag), Val.Raw(acc)))
+          r.render
         }
 
       case "Image" =>
@@ -66,14 +76,14 @@ trait EnumAttrEmitter extends ScalarEmitter {
         val slot = emitAlloca(freshTemp(), Type.Str.llvm)
         val endL = freshLabel("image.end")
         val caseLs = vs.map(_ => freshLabel("image.case"))
-        val table = vs.init.zip(caseLs.init).map((vv, l) => s"$uw ${vv.tag}, label %$l").mkString(" ")
-        emitTerm(s"switch $uw $v, label %${caseLs.last} [ $table ]")
+        val table = vs.init.zip(caseLs.init).map((vv, l) => (BigInt(vv.tag), l))
+        emitTerm(Inst.Switch(uw, Val.Raw(v), caseLs.last, table))
         for (vv, l) <- vs.zip(caseLs) do
           emitLabel(l)
-          emit(s"store ${Type.Str.llvm} ${stringValue(vv.name)}, ptr $slot")
-          emitTerm(s"br label %$endL")
+          emit(Inst.Store(Type.Str.lty, stringConst(vv.name), Val.Raw(slot), Access.Plain))
+          emitTerm(Inst.Br(endL))
         emitLabel(endL)
-        val r = freshTemp(); emit(s"$r = load ${Type.Str.llvm}, ptr $slot"); r
+        val r = freshReg(); emit(Inst.Load(r, Type.Str.lty, Val.Raw(slot), Access.Plain)); r.render
 
       case "Value" =>
         // Each variant contributes one string comparison; the value is the tag of the one that
@@ -81,7 +91,9 @@ trait EnumAttrEmitter extends ScalarEmitter {
         val eqs = vs.map(vv => compareValue("==", Type.Str, v, stringValue(vv.name)))
         trapUnless(eqs.reduce(orI1), "value")
         (last - 1 to 0 by -1).foldLeft(vs(last).tag.toString) { (acc, i) =>
-          val r = freshTemp(); emit(s"$r = select i1 ${eqs(i)}, $uw ${vs(i).tag}, $uw $acc"); r
+          val r = freshReg()
+          emit(Inst.Select(r, Val.Raw(eqs(i)), uw, Val.Int(vs(i).tag), Val.Raw(acc)))
+          r.render
         }
 
       case other => sys.error(s"unknown enum attribute '$other'")

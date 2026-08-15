@@ -59,7 +59,12 @@ trait Emitter {
    * but it is compared against a length often enough that using this everywhere is both simpler and
    * harder to get wrong.
    */
-  protected def word: String = target.word.llvm
+  protected def word: String = wordLty.render
+
+  /** The same, as a type rather than as its text — what a converted emitter names a length, a size
+   * or an index with.
+   */
+  protected def wordLty: ir.LType = target.word.lty
 
   protected val globals  = new mutable.StringBuilder
   private var strId      = 0
@@ -367,14 +372,20 @@ trait Emitter {
    * compiler's own types would notice — so the two spellings are kept apart here rather than at each
    * of the places that needs one.
    */
-  protected def syslResultType(retTy: Type): String =
-    if Type.noValue(retTy) || layout.indirect(retTy) then "void" else retTy.llvm
+  protected def syslResultType(retTy: Type): String = syslResultLty(retTy).render
+
+  /** The same as a type rather than as its text, which is what a `ret` instruction carries. */
+  protected def syslResultLty(retTy: Type): ir.LType =
+    if Type.noValue(retTy) || layout.indirect(retTy) then ir.LType.Void else retTy.lty
 
   /** How a parameter is declared. A **large** one arrives as the address of storage the caller
    * holds; the callee makes its own copy at entry, which is the copy it always made — the only
    * difference is that the value crosses the boundary in memory rather than in registers.
    */
-  protected def syslParam(ty: Type): String = if layout.indirect(ty) then "ptr" else ty.llvm
+  protected def syslParam(ty: Type): String = syslParamLty(ty).render
+
+  /** The same as a type rather than as its text. */
+  protected def syslParamLty(ty: Type): ir.LType = if layout.indirect(ty) then ir.LType.Ptr else ty.lty
 
   /** The name the out-pointer takes inside a function that has one. */
   protected val sretParam = "%sret.out"
@@ -625,12 +636,12 @@ trait Emitter {
 
   // --- string interning ------------------------------------------------------------------
 
-  protected def stringGlobal(s: String): String = {
+  protected def stringGlobal(s: String): ir.Val.Global = {
     strId += 1
-    val name           = s"@.str$strId"
+    val name           = s".str$strId"
     val (escaped, len) = encode(s)
-    globals ++= s"$name = private constant [$len x i8] c\"$escaped\"\n"
-    name
+    globals ++= s"@$name = private constant [$len x i8] c\"$escaped\"\n"
+    ir.Val.Global(name)
   }
 
   private def encode(s: String): (String, Int) = {

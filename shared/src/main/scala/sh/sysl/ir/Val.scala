@@ -60,6 +60,12 @@ enum Val {
    */
   case Nothing
 
+  /** A constant aggregate written out member by member — `{ ptr null, ptr @.str1, i64 5 }`, which
+   * is how a string literal reaches an instruction. Each member carries its own type, because that
+   * is how LLVM writes a constant aggregate and because nothing else says what the members are.
+   */
+  case Agg(fields: List[Arg])
+
   /** Text an emitter interpolated, for a producer that has not been converted yet. Scaffolding, and
    * deleted with `Inst.Raw` when the last of them is.
    */
@@ -75,6 +81,7 @@ enum Val {
     case Undef        => "undef"
     case Zero         => "zeroinitializer"
     case Nothing      => ""
+    case Agg(fields)  => fields.map(_.render).mkString("{ ", ", ", " }")
     case Raw(text)    => text
 
   /** Whether this is a constant rather than something computed — which is what the constant folds in
@@ -82,6 +89,7 @@ enum Val {
    */
   def isConst: Boolean = this match
     case _: Reg | _: Global => false
+    case _: Agg             => true
     case Raw(text)          => !text.startsWith("%") && !text.startsWith("@")
     case _                  => true
 

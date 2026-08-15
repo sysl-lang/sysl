@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.{Arg, Inst, LType, Val}
+
 /** What a `string` means once it is bytes: how a literal becomes a value, how one is written
  * out, how two are compared, and how an offset is checked to fall between characters.
  *
@@ -22,14 +24,19 @@ trait StringEmitter extends Emitter {
    * literal can be handed to C without a copy — it is not where the string ends, which is why a
    * NUL can also appear *inside* one as an ordinary byte.
    */
-  protected def stringValue(s: String): String =
-    s"{ ptr null, ptr ${stringGlobal(s)}, $word ${s.getBytes("UTF-8").length} }"
+  protected def stringValue(s: String): String = stringConst(s).render
+
+  /** The same, as a value rather than as its text. */
+  protected def stringConst(s: String): Val.Agg =
+    Val.Agg(List(Arg(LType.Ptr, Val.Null),
+                 Arg(LType.Ptr, stringGlobal(s)),
+                 Arg(wordLty, Val.Int(s.getBytes("UTF-8").length))))
 
   /** The bytes of a string and how many there are — what every operation on its content needs. */
   protected def strBytes(v: String): (String, String) = {
-    val p = freshTemp(); emit(s"$p = extractvalue ${Type.Str.llvm} $v, 1")
-    val n = freshTemp(); emit(s"$n = extractvalue ${Type.Str.llvm} $v, 2")
-    (p, n)
+    val p = freshReg(); emit(Inst.Extract(p, Type.Str.lty, Val.Raw(v), List(1)))
+    val n = freshReg(); emit(Inst.Extract(n, Type.Str.lty, Val.Raw(v), List(2)))
+    (p.render, n.render)
   }
 
   /** Writes a string to stdout. `printf`'s `%s` stops at a NUL, and so does `%.*s` — a precision
@@ -40,7 +47,8 @@ trait StringEmitter extends Emitter {
   protected def printStr(v: String): Unit = {
     val (p, n) = strBytes(v)
 
-    emit(s"call void @${request("sysl.str.write")(StringEmitter.write)}(ptr $p, $word $n)")
+    emit(Inst.Call(None, "void", Val.Global(request("sysl.str.write")(StringEmitter.write)),
+                   List(Arg(LType.Ptr, Val.Raw(p)), Arg(wordLty, Val.Raw(n)))))
   }
 
   /** Joins two strings into a fresh one. The result owns a new `StrBuf` — an ordinary ARC box
@@ -54,10 +62,10 @@ trait StringEmitter extends Emitter {
     val (ap, an) = strBytes(av)
     val (bp, bn) = strBytes(bv)
     val fn       = request("sysl.str.concat")(StringEmitter.concat)
-    val r        = freshTemp()
+    val r        = freshReg()
 
-    emit(s"$r = call ${Type.Str.llvm} @$fn(ptr $ap, $word $an, ptr $bp, $word $bn)")
-    r
+    emit(Inst.Call(Some(r), Type.Str.llvm, Val.Global(fn), strArgs(ap, an) ::: strArgs(bp, bn)))
+    r.render
   }
 
   /** Compares two strings by their bytes, yielding the usual -1 / 0 / 1 so that every comparison
@@ -68,10 +76,10 @@ trait StringEmitter extends Emitter {
     val (ap, an) = strBytes(av)
     val (bp, bn) = strBytes(bv)
     val fn       = request("sysl.str.cmp")(StringEmitter.cmp)
-    val r        = freshTemp()
+    val r        = freshReg()
 
-    emit(s"$r = call i32 @$fn(ptr $ap, $word $an, ptr $bp, $word $bn)")
-    r
+    emit(Inst.Call(Some(r), "i32", Val.Global(fn), strArgs(ap, an) ::: strArgs(bp, bn)))
+    r.render
   }
 
   /** Whether a byte offset falls between characters rather than inside one. The caller has
@@ -81,11 +89,17 @@ trait StringEmitter extends Emitter {
    */
   protected def strBoundary(p: String, n: String, i: String): String = {
     val fn = request("sysl.str.boundary")(StringEmitter.boundary)
-    val r  = freshTemp()
+    val r  = freshReg()
 
-    emit(s"$r = call i1 @$fn(ptr $p, $word $n, $word $i)")
-    r
+    emit(Inst.Call(Some(r), "i1", Val.Global(fn), strArgs(p, n) :+ Arg(wordLty, Val.Raw(i))))
+    r.render
   }
+
+  /** A string's bytes and their count, as a call's two arguments. Every helper in the runtime takes
+   * them in that order and at those types, which is what makes this worth naming once.
+   */
+  private def strArgs(p: String, n: String): List[Arg] =
+    List(Arg(LType.Ptr, Val.Raw(p)), Arg(wordLty, Val.Raw(n)))
 }
 
 object StringEmitter {

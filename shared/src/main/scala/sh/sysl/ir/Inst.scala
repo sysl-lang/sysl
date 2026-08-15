@@ -189,7 +189,7 @@ enum Inst {
     case Switch(ty, v, default, cases) =>
       val arms = cases.map((n, l) => s"${ty.render} $n, label %$l").mkString(" ")
 
-      s"switch ${ty.render} ${v.render}, label %$default [$arms]"
+      s"switch ${ty.render} ${v.render}, label %$default [ $arms ]"
 
   private def accessText(a: Access): String = a match
     case Access.Plain     => ""

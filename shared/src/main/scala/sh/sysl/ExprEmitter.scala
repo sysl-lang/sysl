@@ -24,7 +24,7 @@ trait ExprEmitter extends ArithEmitter {
     case TStrLit(s)    => stringValue(s)
     // Every interned constant is already laid down NUL-terminated, so a C string is the same global
     // read as a plain pointer — the terminator the sysl string ignores is exactly what C reads by.
-    case TCStrLit(s)   => stringGlobal(s)
+    case TCStrLit(s)   => stringGlobal(s).render
     case TBoolLit(b)   => if b then "1" else "0"
     // A trait object is two words, so its null is a zeroed pair rather than a bare address.
     case TNullLit(ty)  => zero(ty)

@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.{Arg, Inst, LType, Val}
+
 /** The method tables trait objects dispatch through (`02`).
  *
  * A table is a constant array of function pointers, one per method the trait declares, and every
@@ -44,7 +46,7 @@ trait VtableEmitter extends ArcEmitter {
     // adapter's either — the two have to agree, and the argument was never a word to forward.
     val forwarded = slot.params.zipWithIndex.filterNot((t, _) => Type.zeroSized(t))
     val declare   = forwarded.map { case (t, i) => s"${syslParam(t)} %a$i" }
-    val pass      = forwarded.map { case (t, i) => s"${syslParam(t)} %a$i" }
+    val pass      = forwarded.map { case (t, i) => Arg(syslParamLty(t), Val.Reg(s"a$i")) }
 
     request(name) {
       inFunction(
@@ -53,9 +55,10 @@ trait VtableEmitter extends ArcEmitter {
         val payload =
           if !vt.boxed then "%d"
           else
-            val p = freshTemp()
-            emit(s"$p = getelementptr ${boxName(vt.forType)}, ptr %d, i32 0, i32 $headerFields")
-            p
+            val p = freshReg()
+            emit(Inst.Gep(p, LType.Named(boxName(vt.forType)), Val.Reg("d"),
+                          List(Arg(LType.I(32), Val.Int(0)), Arg(LType.I(32), Val.Int(headerFields)))))
+            p.render
 
         // The receiver is *borrowed* here, not owned: the implementation retains its parameters on
         // entry and releases them on return, so handing it a value loaded out of the object leaves
@@ -63,25 +66,28 @@ trait VtableEmitter extends ArcEmitter {
         val self = slot.recv match
           // A large receiver is passed at its address like any other large argument, so the
           // implementation makes the copy it was always going to make and the adapter makes none.
-          case RecvMode.ByValue if layout.indirect(vt.forType) => s"ptr $payload"
+          case RecvMode.ByValue if layout.indirect(vt.forType) => Arg(LType.Ptr, Val.Raw(payload))
           case RecvMode.ByValue =>
-            val v = freshTemp(); emit(s"$v = load ${vt.forType.llvm}, ptr $payload")
-            s"${vt.forType.llvm} $v"
-          case RecvMode.ByPtr => s"ptr $payload"
+            val v = freshReg(); emit(Inst.Load(v, vt.forType.lty, Val.Raw(payload), ir.Access.Plain))
+            Arg(vt.forType.lty, v)
+          case RecvMode.ByPtr => Arg(LType.Ptr, Val.Raw(payload))
           // A `&self` method on a raw object is refused where the object's type is formed, and on a
           // counted one the implementation is named directly, so no adapter is ever built for it.
           case RecvMode.ByRef(_) => sys.error("unreachable adapter for a '&self' method")
 
-        val forward = out.map(o => s"${o.replace("noalias ", "")} $sretParam").toList
-        val call    = (forward ::: self :: pass).mkString(", ")
+        // The out-pointer is forwarded with its `sret` intact and its `noalias` dropped: the adapter
+        // did not create the storage and cannot promise nothing else addresses it.
+        val forward = out.map(o => Arg(LType.Ptr, Val.Raw(sretParam),
+                                       o.replace("noalias ", "").stripPrefix("ptr "))).toList
+        val call    = forward ::: self :: pass
 
         if retType == "void" then
-          emit(s"call void @${slot.target}($call)")
-          emitTerm("ret void")
+          emit(Inst.Call(None, "void", Val.Global(slot.target), call))
+          emitTerm(Inst.Ret(None, None))
         else
-          val r = freshTemp()
-          emit(s"$r = call $ret @${slot.target}($call)")
-          emitTerm(s"ret $retType $r")
+          val r = freshReg()
+          emit(Inst.Call(Some(r), ret, Val.Global(slot.target), call))
+          emitTerm(Inst.Ret(Some(syslResultLty(slot.retTy)), Some(r)))
       }
     }
   }
