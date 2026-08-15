@@ -32,6 +32,11 @@ private[sysl] extern "feof" c_feof(f: *u8) -> int
 
 // The module's own shim, beside this file under a per-OS directory. It takes the `FILE *` the rest
 // of these do and answers `st_size`, so `struct stat` never crosses.
+//
+// Declared on every target and defined only where a directory supplies it. An `extern` costs nothing
+// until something links it, which is the same reason `error.sysl` declares an `errno` accessor it
+// cannot define everywhere — and the `#if` at `size` is what keeps anything from linking this where
+// no shim was compiled.
 private[sysl] extern "sysl_fs_file_size" c_file_size(f: *u8) -> long
 
 // Where a seek counts from. C standardises the three names and every platform has agreed on the
@@ -124,12 +129,30 @@ struct File
     // so a failure between the two left it at the end of the file, and nothing else in the module
     // could disturb a caller's position at all. It also asks about the **open file** rather than
     // about a path, so nothing can be renamed or replaced underneath the answer.
+    // **The seek is kept for the systems with no shim**, which is `#if` doing what it is for: one
+    // choice between two implementations, on a target fact. `sysl.fs` requires `os` and not `posix`,
+    // so `x86_64-windows` reaches this module and has no `__windows__` directory to take a shim from
+    // — and `fseek`/`ftell` are ISO C, so the old path goes on working there exactly as it did.
     size(*self) -> Result[long, IoError]
         if self.inner.shut then return Err(NotOpen)
 
+#if posix
         val n = c_file_size(self.inner.handle)
 
         if n < 0 then Err(why()) else Ok(n)
+#else
+        var here = c_ftell(self.inner.handle)
+
+        if here < 0 then return Err(why())
+        if c_fseek(self.inner.handle, 0, seek_end()) != 0 then return Err(why())
+
+        var n = c_ftell(self.inner.handle)
+
+        if n < 0 then return Err(why())
+        if c_fseek(self.inner.handle, here, seek_set()) != 0 then return Err(why())
+
+        Ok(n)
+#endif
     end size
 
     // Whether a read has already run off the end. It answers about reads that **happened**, so it is
