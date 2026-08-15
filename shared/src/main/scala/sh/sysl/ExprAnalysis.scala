@@ -166,6 +166,17 @@ trait ExprAnalysis
     // from two types that merely differ.
     case Some(v: Type.Slice) => coerce(analyzeValue(expr, Some(v)), v)
 
+    // A vector expectation is pushed down as it is, so a literal fills the lanes and a repeat
+    // splats, and `coerce` settles the case where what came back is one lane's worth — a scalar
+    // broadcast into every lane.
+    //
+    // **It belongs here rather than at each consuming site, and that is what this dispatch is
+    // for.** The splat was originally applied only where a `val` bound one and where an operator
+    // balanced its operands, so `f() -> <8>f32 = 1.0` was refused for yielding an `f32` while the
+    // `val` beside it took the same expression — two positions that ask the same question giving
+    // different answers. Every site that pushes an expected type reaches this line.
+    case Some(v: Type.Vector) => coerce(analyzeValue(expr, Some(v)), v)
+
     case _ => analyzeValue(expr, expected)
 
   /** Whether an expression is the raw-tier reinterpretation, which takes its expectation as written

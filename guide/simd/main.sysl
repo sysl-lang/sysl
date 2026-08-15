@@ -1,0 +1,281 @@
+// Solving a batch of constraints lane-wise — the checks.
+//
+// The subject is one kernel compiled for more than one register width. Box2D's `contact_solver.c`
+// is the reason: it writes the same solver four times — AVX2, NEON, SSE2 and a scalar fallback,
+// selected by `#if` — and over half of that 2120-line file is those four copies. The question this
+// program asks is whether sysl can write it once.
+//
+// It can, and the mechanism is not a vector feature at all: a lane count is a **value parameter**
+// (`10 §9`), so `solve[const W: usize]` reads its width off the argument exactly as `[N]T` reads an
+// array's length, and the two instantiations below are two bodies holding different instructions
+// from one piece of source.
+//
+// What writing it turned up:
+//
+//   * **A vector may not cross to C, and the refusal had to be built.** The scope said it was
+//     refused and nothing implemented it, so an `extern` taking a `<4>f32` emitted the declaration
+//     and made a call whose convention nothing had checked. Which register a vector arrives in
+//     differs by target and by which extensions the *other* side was compiled for, so this is a
+//     corrupt call rather than a link error — the failure mode a boundary check exists to prevent.
+//     The shape that does cross is the one C's own SIMD-taking functions take: a pointer to the
+//     lanes.
+//
+//   * **`v += 1.0` was refused while `v = v + 1.0` beside it worked.** The compound form did not
+//     broadcast its scalar, so two spellings defined to reach the same instruction disagreed about
+//     it. That is the kind of gap a program finds and a test suite does not, because a suite tests
+//     the form it was written for and a program writes whichever one reads better.
+//
+//   * **A vector's lanes cannot reach memory, and this is the finding that matters.** There is no
+//     way to move a `<W>f32` into a `[W]f32` or a `[]f32`, and no way to build one from a run of a
+//     slice — so a kernel can compute a batch of results and then has nowhere to put them. Written
+//     out lane by lane it works at a *fixed* width, which is what `insert8` below does and what the
+//     scalar cross-check does. At a **parameterised** width it cannot be written at all: a lane
+//     index is a constant, and a `[const W]` body has no way to name W constants.
+//
+//     So "one kernel, every width" holds for a kernel whose result is a vector or a reduction, and
+//     stops exactly where a kernel has to store an array of results — which is most real ones. A
+//     load and a store between a vector and a run of a slice is what closes it. Reported rather
+//     than worked around, because the workaround is per-width and would be copied.
+//
+//   * **There is no shuffle, and this program is where that costs something.** `gather8` below
+//     moves eight scattered bodies' velocities into lane order one lane at a time,
+//     because a shuffle takes a constant index list and a constant index list does not generalise
+//     over a width parameter. That is exactly why Box2D's four copies differ: the gather-and-
+//     transpose half is what changes between them, and the arithmetic is not. So "write it once"
+//     is a true claim about the solver and a weaker one about the loading, which is worth stating
+//     here rather than leaving a reader to find.
+//
+//   * **A mask is an ordinary value, and that is what makes the clamp readable.** `(v < lo)` binds,
+//     combines with `&`, and reduces — so the solver's non-negative impulse clamp is one `select`
+//     rather than a branch nothing lane-wise could take.
+
+import sysl.math.Float
+
+check(name: string, got: string, want: string)
+    if got == want then print(s"ok    $name = $got")
+    else print(s"FAIL  $name = $got, wanted $want")
+end check
+
+// A float printed to three places, so that a comparison in this file is a comparison of text and
+// does not turn on the last bit of a binary64.
+fixed(x: f32) -> string
+    // The rounding term is annotated because an `if` used as a value takes no type from its
+    // context's other operand — `01`'s rule, and the one place a float literal here needs telling.
+    val half: f32 = if x < 0.0 then -0.5 else 0.5
+    var scaled = f32(int(x * 1000.0 + half))
+    val neg = scaled < 0.0
+
+    if neg then scaled = -scaled
+
+    val whole = int(scaled) / 1000
+    val frac = int(scaled) % 1000
+    val pad = if frac < 10 then "00" else if frac < 100 then "0" else ""
+
+    return s"${if neg then "-" else ""}$whole.$pad$frac"
+end fixed
+
+// --------------------------------------------------------------------------- the kernel
+
+// One iteration of a projected Gauss-Seidel step, over W constraints at once.
+//
+// **This is the whole point of the program and it is width-agnostic.** Nothing in it names a lane
+// count: `W` comes from the argument, the mask `impulse < 0.0` is a `<W>bool` because the vector it
+// compares is a `<W>f32`, and the `select` chooses at whatever width the mask has. The same source
+// below is instantiated at four lanes and at eight.
+solve[const W: usize](vn: <W>f32, mass: <W>f32, bias: <W>f32) -> <W>f32
+    val impulse = (bias - vn) * mass
+
+    // The impulse a contact applies can only push, never pull — so a negative one is clamped away.
+    // A branch cannot do this: some lanes want the clamp and others do not, and a register takes one
+    // path for all of them. Both sides are computed and the mask picks per lane, which is what
+    // `select` is and why it is not spelled `if`.
+    return (impulse < 0.0).select(0.0, impulse)
+end solve
+
+// The relative normal velocity of W contacts, from the two bodies' velocities and the normal.
+relative[const W: usize](va: <W>f32, vb: <W>f32, n: <W>f32) -> <W>f32 = (vb - va) * n
+
+// --------------------------------------------------------------------------- the loading
+
+// Eight bodies' velocities gathered into one register, one lane at a time.
+//
+// **There is no shuffle, so this is the honest cost of a gather.** A real solver reads its bodies
+// through an index table — body 17 in lane 0, body 3 in lane 1 — and the loop below is what that
+// costs without a shuffle instruction to do it in one step. It is still correct everywhere, and on
+// a machine with no vector unit it is exactly what the scalar code would have been.
+gather8(xs: []const f32, at: []const usize) -> <8>f32
+    var out: <8>f32
+
+    for i in 0..<8
+        // A lane index has to be a constant, which is what keeps a subscript's promise: a vector has
+        // no address to bounds-check against, so a computed lane would be LLVM's `poison` rather
+        // than a trap. The eight assignments are written out for that reason.
+        if i == 0 then out = insert8(out, 0, xs[at[0]])
+        if i == 1 then out = insert8(out, 1, xs[at[1]])
+        if i == 2 then out = insert8(out, 2, xs[at[2]])
+        if i == 3 then out = insert8(out, 3, xs[at[3]])
+        if i == 4 then out = insert8(out, 4, xs[at[4]])
+        if i == 5 then out = insert8(out, 5, xs[at[5]])
+        if i == 6 then out = insert8(out, 6, xs[at[6]])
+        if i == 7 then out = insert8(out, 7, xs[at[7]])
+
+    return out
+end gather8
+
+// One lane replaced, built out of a mask and a `select` because there is no lane-write form.
+//
+// **This is the workaround the missing shuffle forces, written where a reader can see it.** A
+// vector is a value rather than storage, so there is no place to assign into — and `select` against
+// a one-hot mask is what stands in. It costs a comparison and a blend per lane where an
+// `insertelement` would cost one instruction.
+insert8(v: <8>f32, lane: usize, x: f32) -> <8>f32
+    val idx: <8>u32 = [0, 1, 2, 3, 4, 5, 6, 7]
+
+    return (idx == u32(lane)).select(x, v)
+end insert8
+
+// --------------------------------------------------------------------------- the checks
+
+print("-- lane-wise arithmetic is the scalar arithmetic, W at a time")
+
+val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]
+val b: <4>f32 = [10.0, 20.0, 30.0, 40.0]
+val sum = a + b
+
+check("a + b lane 0", fixed(sum[0]), "11.000")
+check("a + b lane 3", fixed(sum[3]), "44.000")
+check("a * 2 lane 3", fixed((a * 2.0)[3]), "8.000")
+check("10 - a lane 0", fixed((10.0 - a)[0]), "9.000")
+check("dot(a, b)", fixed((a * b).sum()), "300.000")
+check("a.len", str(a.len), "4")
+
+print("-- a comparison is a mask, and a mask is an ordinary value")
+
+val m = a < 3.0
+
+check("any below 3", str(m.any()), "true")
+check("all below 3", str(m.all()), "false")
+check("both bounds", str(((a > 1.0) & (a < 4.0)).all()), "false")
+check("select picks per lane", fixed(m.select(a, b)[0]), "1.000")
+check("select picks per lane", fixed(m.select(a, b)[3]), "40.000")
+check("a scalar splats into a select", fixed((a > 2.0).select(0.0, a)[3]), "0.000")
+
+print("-- one kernel, two register widths, from one piece of source")
+
+// Four contacts and eight, through the *same* `solve`. Neither call writes a width: each is read
+// off its argument, and what the compiler emits is two bodies — `fmul <4 x float>` in one and
+// `fmul <8 x float>` in the other.
+val vn4: <4>f32 = [-2.0, 1.0, -4.0, 0.5]
+val mass4: <4>f32 = [0.5, 0.5, 0.25, 2.0]
+val bias4: <4>f32 = [0.0, 0.0, 1.0, 0.0]
+
+val j4 = solve(vn4, mass4, bias4)
+
+check("four lanes, impulse 0", fixed(j4[0]), "1.000")
+check("four lanes, clamped", fixed(j4[1]), "0.000")
+check("four lanes, impulse 2", fixed(j4[2]), "1.250")
+check("four lanes, clamped", fixed(j4[3]), "0.000")
+
+val vn8: <8>f32 = [-2.0, 1.0, -4.0, 0.5, -1.0, 3.0, -0.5, 0.0]
+val mass8: <8>f32 = [0.5, 0.5, 0.25, 2.0, 1.0, 1.0, 4.0, 1.0]
+val bias8: <8>f32 = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+val j8 = solve(vn8, mass8, bias8)
+
+// The two kernels compose, and neither names a width: `relative` yields a `<8>f32` because its
+// arguments are, and `solve` takes its `W` from that.
+val va: <8>f32 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+val vb: <8>f32 = [-2.0, 1.0, -4.0, 0.5, -1.0, 3.0, -0.5, 0.0]
+val normals: <8>f32 = 1.0
+val composed = solve(relative(va, vb, normals), mass8, bias8)
+
+check("eight lanes, impulse 0", fixed(j8[0]), "1.000")
+check("eight lanes, clamped", fixed(j8[1]), "0.000")
+check("eight lanes, impulse 4", fixed(j8[4]), "1.000")
+check("eight lanes, impulse 6", fixed(j8[6]), "2.000")
+check("eight lanes, zero stays", fixed(j8[7]), "0.000")
+check("composed with relative", fixed(composed[0]), "1.000")
+check("composed with relative", fixed(composed[6]), "2.000")
+
+// The first four lanes of the eight-wide batch are the four-wide batch, which is the assertion that
+// says the two instantiations are the same function rather than two that happen to compile.
+check("the widths agree on lane 0", fixed(j8[0]), fixed(j4[0]))
+check("the widths agree on lane 1", fixed(j8[1]), fixed(j4[1]))
+check("the widths agree on lane 2", fixed(j8[2]), fixed(j4[2]))
+check("the widths agree on lane 3", fixed(j8[3]), fixed(j4[3]))
+
+print("-- the same kernel is what a scalar loop would have computed")
+
+// The scalar spelling of `solve`, written out, so that the lane-wise answer is checked against
+// something that shares none of its machinery.
+scalar_solve(vn: f32, mass: f32, bias: f32) -> f32
+    val impulse = (bias - vn) * mass
+
+    return if impulse < 0.0 then 0.0 else impulse
+end scalar_solve
+
+val lanes: [8]f32 = [-2.0, 1.0, -4.0, 0.5, -1.0, 3.0, -0.5, 0.0]
+val masses: [8]f32 = [0.5, 0.5, 0.25, 2.0, 1.0, 1.0, 4.0, 1.0]
+val biases: [8]f32 = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+// **The comparison is written out lane by lane, and it is written out because it has to be.** The
+// loop this wants — read lane `i`, compare, count — cannot be written: a lane index is a constant,
+// and there is no way to move a vector's lanes into an array where a computed index would work. See
+// the header; this is the program's main finding.
+val want0 = scalar_solve(lanes[0], masses[0], biases[0])
+val want1 = scalar_solve(lanes[1], masses[1], biases[1])
+val want2 = scalar_solve(lanes[2], masses[2], biases[2])
+val want3 = scalar_solve(lanes[3], masses[3], biases[3])
+val want4 = scalar_solve(lanes[4], masses[4], biases[4])
+val want5 = scalar_solve(lanes[5], masses[5], biases[5])
+val want6 = scalar_solve(lanes[6], masses[6], biases[6])
+val want7 = scalar_solve(lanes[7], masses[7], biases[7])
+
+near(a: f32, b: f32) -> int = if (a - b).abs() < 0.0001 then 1 else 0
+
+val agreed = near(want0, j8[0]) + near(want1, j8[1]) + near(want2, j8[2]) + near(want3, j8[3]) +
+             near(want4, j8[4]) + near(want5, j8[5]) + near(want6, j8[6]) + near(want7, j8[7])
+
+check("every lane matches the scalar answer", str(agreed), "8")
+
+print("-- gathering, which is where the missing shuffle costs something")
+
+val velocities: [6]f32 = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+val order: [8]usize = [5, 0, 3, 1, 4, 2, 0, 5]
+
+val gathered = gather8(velocities[..], order[..])
+
+check("gathered lane 0", fixed(gathered[0]), "60.000")
+check("gathered lane 1", fixed(gathered[1]), "10.000")
+check("gathered lane 2", fixed(gathered[2]), "40.000")
+check("gathered lane 7", fixed(gathered[7]), "60.000")
+check("gathered sum", fixed(gathered.sum()), "280.000")
+
+print("-- the reductions, and what each is for")
+
+val speeds: <8>f32 = [3.0, 1.0, 4.0, 1.5, 9.0, 2.0, 6.0, 5.0]
+
+check("sum", fixed(speeds.sum()), "31.500")
+check("min", fixed(speeds.min()), "1.000")
+check("max", fixed(speeds.max()), "9.000")
+
+// A batch is done when no constraint moved, which is a reduction over a mask — one word rather than
+// a loop with an early exit, and the shape a real solver's convergence test has.
+val moved = speeds > 8.0
+
+check("still converging", str(moved.any()), "true")
+check("count is a sum over the mask", str(moved.select(one8(), zero8()).sum()), "1")
+
+one8() -> <8>f32 = 1.0
+zero8() -> <8>f32 = 0.0
+
+print("-- integer lanes, and a mask over them")
+
+val counts: <8>i32 = [1, 2, 3, 4, 5, 6, 7, 8]
+
+check("integer sum", str(counts.sum()), "36")
+check("integer max", str(counts.max()), "8")
+check("shifted", str((counts << 1)[7]), "16")
+check("masked count", str((counts > 4).select(counts, zeros8()).sum()), "26")
+
+zeros8() -> <8>i32 = 0
