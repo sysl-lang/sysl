@@ -18,10 +18,16 @@ trait ControlFlowExprAnalysis extends ExprSupport {
    */
   protected def controlExpr(
       expr: IfExpr | MatchExpr | While | DoWhile | Loop | CFor | For | ConstFor | Quantifier |
-        TryExpr | RangeExpr | ResultList | Lambda | Tuple,
+        TryExpr | RangeExpr | ResultList | Lambda | Tuple | Block,
       expected: Option[Type],
       discarded: Boolean,
   ): TExpr = expr match
+    // An indented block under a binding's `=`. It is a value block like a branch's, asked the same
+    // question by the same context, and its scope closes with it — a name bound inside is the
+    // block's, exactly as one bound in a branch is the branch's.
+    case Block(stmts) =>
+      TBlockExpr(analyzeValueBlock(stmts, expected, discarded))
+
     // An `if` whose own value is unused hands that down: each branch is a block in statement
     // position, so neither is asked what it yields and the two have nothing to disagree about.
     case IfExpr(cond, thenBody, elseOpt) =>

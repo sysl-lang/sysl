@@ -162,6 +162,21 @@ case class Lambda(params: List[LambdaParam], body: List[Stmt]) extends Expr
 case class ArrayLit(elements: List[Expr]) extends Expr
 case class ArrayFill(value: Expr, count: Expr) extends Expr
 
+/** An indented block standing where a value is wanted — the block a binding's `=` introduces
+ * (`00 § Continuing a line`).
+ *
+ * It is the same thing a function body and a branch already are: a statement list whose trailing
+ * expression is its value, `never` where it ends in a jump, and `unit` where it ends in neither. What
+ * makes it a node of its own is that a binding has nowhere else to put one — `if`, `match` and the
+ * loops each hold their blocks inside the node the block belongs to, and `val x =` has no such node.
+ *
+ * **A block of one expression is that expression**, collapsed by the parser rather than represented:
+ * `val X: int =` with `42` under it is the constant tree it looks like, not a computed initializer
+ * wrapping one. The scope a block opens is what a single expression has no use for, so nothing is
+ * lost by not building it.
+ */
+case class Block(stmts: List[Stmt]) extends Expr
+
 /** `if cond then a else b` as an **expression**: it yields the value of the taken branch.
  * In statement position the `else` may be omitted and the whole thing has type `unit`.
  * Each branch is a statement list whose trailing expression is the branch's value.
