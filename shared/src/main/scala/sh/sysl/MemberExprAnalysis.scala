@@ -195,8 +195,15 @@ trait MemberExprAnalysis extends ExprSupport {
 
         case other => err(s"cannot read field '$f' of ${show(other)}")
 
-  /** `T::Attr` — an attribute of a type rather than of a value (`16`). */
+  /** `T::Attr` — an attribute of a type rather than of a value (`16`).
+   *
+   * A **type parameter** is tried first, because a body's own parameter shadows anything a
+   * surrounding scope declares under the same name — the same order `typeNamed` uses for `T(x)`.
+   */
   protected def typeAttrExpr(expr: TypeAttr): TExpr = expr match
+    case TypeAttr(Ident(name), attr) if lookupOpt(name).isEmpty && tsubst.contains(name) =>
+      parameterAttr(name, tsubst(name), attr, Nil)
+
     case TypeAttr(Ident(name), attr) if lookupOpt(name).isEmpty && typeKey(name).isDefined =>
       typeAttr(typeKey(name).get, attr, Nil)
 
@@ -205,6 +212,52 @@ trait MemberExprAnalysis extends ExprSupport {
 
     case TypeAttr(_, attr) =>
       err(s"'::$attr' is a type attribute, so its left side must be a type name")
+
+  /** `T::Min` and `T::Max` where `T` is a **type parameter**, answered from what the instantiation
+   * bound it to (`10`, `16 §5`).
+   *
+   * **The substitution is the same one three other forms already read.** `sizeof(T)` resolves its
+   * operand through `tsubst`, `T(x)` finds its target through `typeNamed`, and `T.f(…)` reaches the
+   * parameter's bounds — so a parameter was reachable in expression position by every route but this
+   * one, and `ConstFolding` had been folding `T::Max` in an array bound and an `@assert` all along.
+   * What was missing was the case, not the mechanism.
+   *
+   * **Only the two bounds, and that is a limit the abstract walk imposes.** The body is checked once
+   * with `T` standing at an `Abstract`, and that walk has to hand back something typed — `Min` and
+   * `Max` both answer *in `T`*, so the one placeholder below is right for both and cannot be wrong.
+   * `Valid` answers a `bool`, `Pos` a `usize`, `Image` a `string`: admitting those means restating
+   * each attribute's result type a second time, where the two copies could drift. They stay
+   * reachable on a written type name, which is where they have always been asked.
+   *
+   * **No bound is required of `T`**, following `sizeof(T)`: a parameter given something with no
+   * maximum is reported at the instantiation that gave it one, naming both.
+   */
+  protected def parameterAttr(name: String, bound: Type, attr: String, args: List[Expr]): TExpr = {
+    if attr != "Min" && attr != "Max" then
+      err(s"'$name' is a type parameter, and the only attributes one answers are '$name::Min' and " +
+        s"'$name::Max' — '::$attr' is asked on a written type name, where the type it belongs to is " +
+        "known while the body is being checked rather than once per instantiation")
+    if args.nonEmpty then err(s"'$name::$attr' takes no arguments")
+
+    bound match
+      // The walk that checks the body, where `T` stands for itself. There is no width to answer with
+      // and none is wanted: every instantiation supplies one, and this tree is discarded. It is the
+      // same deferral `sizeof(T)` takes, and the literal is typed as the parameter so that a body
+      // returning `T::Max` still agrees with its own declared result here.
+      case a: Type.Abstract => TIntLit(0, a)
+
+      // A ranged subtype answers in itself, exactly as it does under its own name — which is what
+      // lets a generic over `Age` hand back an `Age` rather than the `int` it is stored as.
+      case c: Type.Constrained if Type.underlying(c).isInstanceOf[Type.Integer] =>
+        constrainedAttr(c, c.name, attr, Nil)
+
+      case i: Type.Integer => integerAttr(i, name, attr, Nil)
+
+      case other =>
+        err(s"'$name::$attr' needs an integer type, and '$name' is ${show(other)} here — a maximum " +
+          "is a property of a range of numbers, so a type argument without one has none to answer " +
+          "with")
+  }
 
   /** The integer type a **built-in** scalar name stands for, which is where `Min`/`Max` are asked.
    *

@@ -65,7 +65,7 @@ trait CollectionExprAnalysis extends ExprSupport {
         // reason they could see. The count is still checked against the lane count, since a vector
         // that does not fill its width is the same mistake as a literal that does not.
         case Some(v: Type.Vector) =>
-          constInt(count) match
+          constInt(count, tsubst) match
             case Some(n) if n == v.length =>
             case Some(n) =>
               err(s"${show(v)} has ${v.length} lanes and this repeat makes $n")
@@ -88,7 +88,7 @@ trait CollectionExprAnalysis extends ExprSupport {
           TBufFill(tv, checked, Type.Slice(tv.ty, ro))
 
         case _ =>
-          val n = constInt(count) match
+          val n = constInt(count, tsubst) match
             case Some(v) if v >= 0 && v.isValidInt => v.toInt
             case Some(v)                           => err(s"an array cannot have $v elements")
             case None =>
@@ -186,7 +186,7 @@ trait CollectionExprAnalysis extends ExprSupport {
           if !Type.repr(ti.ty).isInstanceOf[Type.Integer] then
             at(index.pos)(err(s"an index must be an integer, not ${show(ti.ty)}"))
 
-          constInt(index) match
+          constInt(index, tsubst) match
             case Some(n) if n >= 0 && n < v.length => TLane(tr, n.toInt, Type.unqualified(v.elem))
             case Some(n) =>
               at(index.pos)(err(s"${show(v)} has lanes 0 to ${v.length - 1}, and this is $n"))

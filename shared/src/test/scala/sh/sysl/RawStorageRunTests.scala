@@ -219,6 +219,23 @@ class RawStorageRunTests extends AnyFreeSpec with RunSupport with CodegenSupport
       run(src) shouldBe "133 142\n"
     }
 
+    /** **A repeat count is a bound too**, and it reached the folder with an *empty* substitution
+      * until this was noticed — so `var buf: [sizeof(T)]u8` was accepted and `[0; sizeof(T)]`, the
+      * fill that would initialize it, was told `T` was an unknown type. The declaration and the
+      * initializer of one array disagreeing about whether its length exists is the shape of the bug.
+      */
+    "and the fill that initializes such an array measures the same parameter" in {
+      val src =
+        """cap[T](x: T) -> usize
+          |    val buf: [sizeof(T)]u8 = [0; sizeof(T)]
+          |    buf.len
+          |var a: u8 = 1
+          |var b: u32 = 1
+          |print(cap(a), cap(b))""".stripMargin
+
+      run(src) shouldBe "1 4\n"
+    }
+
     // `alignof` reaches the same folder by the same route, so it is pinned rather than assumed.
     "and 'alignof' reaches it by the same route" in {
       val src =

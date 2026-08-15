@@ -43,6 +43,26 @@ are for aarch64 (LP64, little-endian, 64-bit pointers).
   It is also why they cannot be a library table the way C's `UINT8_MAX` is — there is no finite set of
   integer types to tabulate.
 
+  **A type parameter answers them too**, from whatever the instantiation bound it to — which is what
+  makes the bounds usable by the *library* rather than only by a program. Bounded narrowing, integer
+  parsing, saturating arithmetic and a min/max reduction's identity all want `T`'s extreme, and none
+  of them can name it any other way:
+
+  ```
+  widest[T]() -> T = T::Max
+  val x: u8 = widest()        -- 255
+  ```
+
+  `Min` and `Max` are the **only** two a parameter answers. The rest — an enum's `First`, `Pos`,
+  `Image`, a subtype's `Valid`, `Succ`, `Pred` — stay on a written type name, and the reason is the
+  walk that checks a generic body once with `T` standing for itself: that walk has to hand back a
+  typed value, and `Min` and `Max` both answer *in `T`*, so one stand-in is right for both. `Valid`
+  answers a `bool` and `Pos` a `usize`, so admitting them would mean restating each attribute's
+  result type a second time in a second place.
+
+  No bound is asked of `T`. A parameter given a type with no extremes is reported at the
+  instantiation that gave it one, which is the same deferral `sizeof(T)` takes.
+
   **They are `Min`/`Max` and not `First`/`Last` because those ask a different question.** `First` and
   `Last` name the ends of a *declared sequence* — an enum's variants, a written range — and an enum's
   discriminants may be explicit and non-contiguous, so its first-declared variant need not carry the

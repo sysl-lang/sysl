@@ -826,6 +826,12 @@ trait ExprAnalysis
     case Call(Ident(name), args) if lookupOpt(name).isEmpty && typeKey(name).exists(constrainedDecls.contains) =>
       constrainedCast(typeKey(name).get, args)
 
+    // A **type parameter** in the same position, which reaches `Min` and `Max` and is told what the
+    // rest are asked on. It comes first for the reason it does in `typeAttrExpr`: a body's own
+    // parameter shadows anything a surrounding scope declares under that name.
+    case Call(TypeAttr(Ident(name), attr), args) if lookupOpt(name).isEmpty && tsubst.contains(name) =>
+      parameterAttr(name, tsubst(name), attr, args)
+
     // `T::Attr(x)` — a type attribute that takes an argument (`Valid`, `Succ`, `Pred`).
     case Call(TypeAttr(Ident(name), attr), args) if lookupOpt(name).isEmpty && typeKey(name).isDefined =>
       typeAttr(typeKey(name).get, attr, args)
