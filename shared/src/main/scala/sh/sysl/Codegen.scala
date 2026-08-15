@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.{Inst, Val}
+
 import scala.collection.mutable
 
 /** Lowers a typed program (`TProgram`) to a textual LLVM IR module.
@@ -352,7 +354,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     val enough  = freshTemp()
 
     emit(s"$enough = icmp sgt i32 %argc, 1")
-    emitTerm(s"br i1 $enough, label %$named, label %$missing")
+    emitTerm(Inst.CondBr(Val.Raw(enough), named, missing))
 
     emitLabel(named)
     val slot = freshTemp(); emit(s"$slot = getelementptr ptr, ptr %argv, i64 1")
@@ -367,7 +369,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       val cmp  = freshTemp(); emit(s"$cmp = call i32 @strcmp(ptr $want, ptr ${stringGlobal(t.func + "\u0000")})")
       val hit  = freshTemp(); emit(s"$hit = icmp eq i32 $cmp, 0")
 
-      emitTerm(s"br i1 $hit, label %$run, label %$next")
+      emitTerm(Inst.CondBr(Val.Raw(hit), run, next))
       emitLabel(run)
       emit(s"call void @${symbolOf(t.func)}()")
       emitTerm("ret i32 0")
@@ -376,7 +378,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // Falling off the end of the arms and arriving with no name at all are the same answer: this
     // binary has no such test. They share a block rather than each getting one, because a runner
     // reading the status cannot tell them apart and there is nothing it would do differently.
-    emitTerm(s"br label %$missing")
+    emitTerm(Inst.Br(missing))
     emitLabel(missing)
     emitTerm("ret i32 2")
 
@@ -429,7 +431,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
       tailParams = f.params
       tailTarget = Some(l)
-      emitTerm(s"br label %$l")
+      emitTerm(Inst.Br(l))
       emitLabel(l)
 
     for (cond, _) <- f.requires if !ghostly(cond) do emitContract(cond, "require")
@@ -630,12 +632,12 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
         emit(s"store ${t.ty.llvm} $v, ptr ${loop.slot}")
       }
       releaseToDepth(loop.ownedDepth, loop.tempDepth)
-      emitTerm(s"br label %${loop.breakL}")
+      emitTerm(Inst.Br(loop.breakL))
 
     case TContinue(depth) =>
       val loop = genLoops(depth)
       releaseToDepth(loop.ownedDepth, loop.tempDepth)
-      emitTerm(s"br label %${loop.continueL}")
+      emitTerm(Inst.Br(loop.continueL))
 
     // Reaching a `defer` emits nothing: it hands its statements to the scope, which lays them down
     // at each edge that leaves the block. Registering here rather than at the top of the block is

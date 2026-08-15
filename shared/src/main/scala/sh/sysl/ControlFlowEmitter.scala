@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.{Inst, Val}
+
 /** Everything that makes a basic block: `if`, `match` and its patterns, and the three loops.
  *
  * The shape is the same in all of them. A construct that yields a value allocates a **merge slot**,
@@ -32,13 +34,13 @@ trait ControlFlowEmitter extends PlaceEmitter {
     // The branch's value is computed before the condition's bindings are given back, so a `then`
     // that yields what it destructured has taken its own count by the time this runs.
     paths.release()
-    emitTerm(s"br label %$endL")
+    emitTerm(Inst.Br(endL))
     paths.emitCleanups()
 
     elseBlock.foreach { eb =>
       emitLabel(elseL)
       if Type.noValue(ty) then genBlockVoid(eb) else storeBlockValue(eb, ty, slot)
-      emitTerm(s"br label %$endL")
+      emitTerm(Inst.Br(endL))
     }
 
     emitLabel(endL)
@@ -66,7 +68,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
       for (label, held, slots, next) <- cleanups do
         emitLabel(label)
         if slots then releaseSlots(held) else releaseValues(held)
-        emitTerm(s"br label %$next")
+        emitTerm(Inst.Br(next))
   }
 
   /** Emits an `if`'s or a `while`'s condition as the chain of `&&`-joined terms it is (`09 §12`),
@@ -115,7 +117,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
         case TCondTest(c) =>
           val v = genExpr(c)
           popTemps()
-          emitTerm(s"br i1 $v, label %$nextL, label %$target")
+          emitTerm(Inst.CondBr(Val.Raw(v), nextL, target))
           emitLabel(nextL)
 
         case TCondIs(subject, pats, negated) =>
@@ -128,7 +130,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
           // leave the failure target where it was.
           if negated || pats.length != 1 || !bindsAny(pats.head) then
             popTemps()
-            emitTerm(s"br i1 $ok, label %$nextL, label %$target")
+            emitTerm(Inst.CondBr(Val.Raw(ok), nextL, target))
             emitLabel(nextL)
           else
             // The bind retains out of the subject, so the subject has to still be held when it runs.
@@ -142,7 +144,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
                 cleanups ::= (l, borrowed, false, target)
                 l
 
-            emitTerm(s"br i1 $ok, label %$nextL, label %$onFail")
+            emitTerm(Inst.CondBr(Val.Raw(ok), nextL, onFail))
             emitLabel(nextL)
             pushOwned()
             patternBind(pats.head, sv)
@@ -178,7 +180,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
    * one is dropped rather than emitted with nothing to say.
    */
   protected def endsNowhere(ty: Type): Unit =
-    if ty == Type.Never then emitTerm("unreachable")
+    if ty == Type.Never then emitTerm(Inst.Unreachable)
 
   protected def genMatch(scrutinee: TExpr, arms: List[TArm], ty: Type): String = {
     val sv   = genExpr(scrutinee)
@@ -198,13 +200,13 @@ trait ControlFlowEmitter extends PlaceEmitter {
 
       arm.guard match
         case None =>
-          emitTerm(s"br i1 $patCond, label %$bodyL, label %$nextL")
+          emitTerm(Inst.CondBr(Val.Raw(patCond), bodyL, nextL))
           emitLabel(bodyL)
           pushOwned()
           bind()
         case Some(g) =>
           val guardL = freshLabel("match.guard")
-          emitTerm(s"br i1 $patCond, label %$guardL, label %$nextL")
+          emitTerm(Inst.CondBr(Val.Raw(patCond), guardL, nextL))
           emitLabel(guardL)
           pushOwned()
           bind()
@@ -214,22 +216,22 @@ trait ControlFlowEmitter extends PlaceEmitter {
           // A guard that fails leaves an arm whose bindings were already made, so they are
           // given back before falling through to the next one.
           val unbindL = freshLabel("match.unbind")
-          emitTerm(s"br i1 $gv, label %$bodyL, label %$unbindL")
+          emitTerm(Inst.CondBr(Val.Raw(gv), bodyL, unbindL))
           emitLabel(unbindL)
           releaseOwned()
-          emitTerm(s"br label %$nextL")
+          emitTerm(Inst.Br(nextL))
           emitLabel(bodyL)
 
       if Type.noValue(ty) then genBlockVoid(arm.body)
       else storeBlockValue(arm.body, ty, slot)
       popOwned()
-      emitTerm(s"br label %$endL")
+      emitTerm(Inst.Br(endL))
       emitLabel(nextL)
 
     // Fallthrough with no matching arm: a value or enum match is exhaustive (the analyzer
     // required full coverage or a catch-all), so this point is unreachable; a plain scalar
     // statement match simply proceeds.
-    if Type.noValue(ty) then emitTerm(s"br label %$endL") else emitTerm("unreachable")
+    if Type.noValue(ty) then emitTerm(Inst.Br(endL)) else emitTerm(Inst.Unreachable)
     emitLabel(endL)
     endsNowhere(ty)
     if Type.noValue(ty) then ""
@@ -272,7 +274,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
         val doneL  = freshLabel("pat.done")
 
         emit(s"store i1 false, ptr $answer")
-        emitTerm(s"br i1 $tagOk, label %$testL, label %$doneL")
+        emitTerm(Inst.CondBr(Val.Raw(tagOk), testL, doneL))
         emitLabel(testL)
 
         val payload = enumPayload(en, variant, value)
@@ -282,7 +284,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
         }
 
         emit(s"store i1 $inner, ptr $answer")
-        emitTerm(s"br label %$doneL")
+        emitTerm(Inst.Br(doneL))
         emitLabel(doneL)
 
         val r = freshTemp(); emit(s"$r = load i1, ptr $answer"); r
@@ -387,7 +389,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
     // there is nothing of the test left outstanding.
     genLoops = GenLoop(endL, condL, slot, ty, owned.length, tempStack.length) :: genLoops
 
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
     emitLabel(condL)
     val paths = genCond(cond, bodyL, elseL)
     pushOwned()
@@ -396,7 +398,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
     // A binding is per-iteration: it is released at the bottom of the body and made again by the
     // next round's test, so nothing accumulates across a loop that runs a million times.
     paths.release()
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
     paths.emitCleanups()
 
     genLoops = genLoops.tail
@@ -419,19 +421,19 @@ trait ControlFlowEmitter extends PlaceEmitter {
     val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
     genLoops = GenLoop(endL, condL, slot, ty, owned.length, tempStack.length) :: genLoops
 
-    emitTerm(s"br label %$bodyL")
+    emitTerm(Inst.Br(bodyL))
     emitLabel(bodyL)
     pushOwned()
     body.foreach(genStmt)
     popOwned()
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
     emitLabel(condL)
     // Re-evaluated every round, so what the test borrows is let go before the branch rather than
     // piling up in the enclosing statement's region — as the three-clause loop's test does.
     pushTemps()
     val v = genExpr(cond)
     popTemps()
-    emitTerm(s"br i1 $v, label %$bodyL, label %$elseL")
+    emitTerm(Inst.CondBr(Val.Raw(v), bodyL, elseL))
 
     genLoops = genLoops.tail
     genLoopResult(slot, ty, elseL, endL, elseBlock)
@@ -449,12 +451,12 @@ trait ControlFlowEmitter extends PlaceEmitter {
     val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
     genLoops = GenLoop(endL, bodyL, slot, ty, owned.length, tempStack.length) :: genLoops
 
-    emitTerm(s"br label %$bodyL")
+    emitTerm(Inst.Br(bodyL))
     emitLabel(bodyL)
     pushOwned()
     body.foreach(genStmt)
     popOwned()
-    emitTerm(s"br label %$bodyL")
+    emitTerm(Inst.Br(bodyL))
 
     genLoops = genLoops.tail
     genLoopResult(slot, ty, endL, endL, None)
@@ -475,22 +477,22 @@ trait ControlFlowEmitter extends PlaceEmitter {
     emit(s"store $w $loV, ptr %$name.addr")
     genLoops = GenLoop(endL, stepL, slot, ty, owned.length, tempStack.length) :: genLoops
 
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
     emitLabel(condL)
     val iv  = freshTemp(); emit(s"$iv = load $w, ptr %$name.addr")
     val cmp = freshTemp(); emit(s"$cmp = icmp ${predicate(if inclusive then "<=" else "<", varTy)} $w $iv, $hiV")
-    emitTerm(s"br i1 $cmp, label %$bodyL, label %$elseL")
+    emitTerm(Inst.CondBr(Val.Raw(cmp), bodyL, elseL))
     emitLabel(bodyL)
     pushOwned()
     body.foreach(genStmt)
     popOwned()
     // `continue` lands here so the counter still advances before the next test.
-    emitTerm(s"br label %$stepL")
+    emitTerm(Inst.Br(stepL))
     emitLabel(stepL)
     val cur = freshTemp(); emit(s"$cur = load $w, ptr %$name.addr")
     val nxt = freshTemp(); emit(s"$nxt = add $w $cur, 1")
     emit(s"store $w $nxt, ptr %$name.addr")
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
 
     genLoops = genLoops.tail
     genLoopResult(slot, ty, elseL, endL, elseBlock)
@@ -530,29 +532,29 @@ trait ControlFlowEmitter extends PlaceEmitter {
     emitAlloca(s"%$name.addr", w)
     emit(s"store $w $loV, ptr %$name.addr")
 
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
     emitLabel(condL)
     val iv  = freshTemp(); emit(s"$iv = load $w, ptr %$name.addr")
     val cmp = freshTemp(); emit(s"$cmp = icmp ${predicate(if inclusive then "<=" else "<", varTy)} $w $iv, $hiV")
-    emitTerm(s"br i1 $cmp, label %$bodyL, label %$endL")
+    emitTerm(Inst.CondBr(Val.Raw(cmp), bodyL, endL))
 
     emitLabel(bodyL)
     pushTemps()
     val p = genExpr(pred)
     popTemps()
     // A true predicate continues a `for all` and settles a `for some`; a false one does the reverse.
-    if universal then emitTerm(s"br i1 $p, label %$stepL, label %$doneL")
-    else emitTerm(s"br i1 $p, label %$doneL, label %$stepL")
+    if universal then emitTerm(Inst.CondBr(Val.Raw(p), stepL, doneL))
+    else emitTerm(Inst.CondBr(Val.Raw(p), doneL, stepL))
 
     emitLabel(doneL)
     emit(s"store i1 ${if universal then 0 else 1}, ptr $acc")
-    emitTerm(s"br label %$endL")
+    emitTerm(Inst.Br(endL))
 
     emitLabel(stepL)
     val cur = freshTemp(); emit(s"$cur = load $w, ptr %$name.addr")
     val nxt = freshTemp(); emit(s"$nxt = add $w $cur, 1")
     emit(s"store $w $nxt, ptr %$name.addr")
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
 
     emitLabel(endL)
     val res = freshTemp(); emit(s"$res = load i1, ptr $acc"); res
@@ -577,7 +579,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
     init.foreach(genStmt)
     genLoops = GenLoop(endL, stepL, slot, ty, owned.length, tempStack.length) :: genLoops
 
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
     emitLabel(condL)
     cond match
       case Some(c) =>
@@ -586,19 +588,19 @@ trait ControlFlowEmitter extends PlaceEmitter {
         pushTemps()
         val v = genExpr(c)
         popTemps()
-        emitTerm(s"br i1 $v, label %$bodyL, label %$elseL")
-      case None => emitTerm(s"br label %$bodyL")
+        emitTerm(Inst.CondBr(Val.Raw(v), bodyL, elseL))
+      case None => emitTerm(Inst.Br(bodyL))
 
     emitLabel(bodyL)
     pushOwned()
     body.foreach(genStmt)
     popOwned()
-    emitTerm(s"br label %$stepL")
+    emitTerm(Inst.Br(stepL))
     emitLabel(stepL)
     pushTemps()
     step.foreach(genStmt)
     popTemps()
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
 
     genLoops = genLoops.tail
     genLoopResult(slot, ty, if cond.isDefined then elseL else endL, endL, elseBlock)
@@ -627,11 +629,11 @@ trait ControlFlowEmitter extends PlaceEmitter {
     emit(s"store $word 0, ptr $idx")
     genLoops = GenLoop(endL, stepL, slot, ty, owned.length, tempStack.length) :: genLoops
 
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
     emitLabel(condL)
     val iv   = freshTemp(); emit(s"$iv = load $word, ptr $idx")
     val more = freshTemp(); emit(s"$more = icmp ult $word $iv, $len")
-    emitTerm(s"br i1 $more, label %$bodyL, label %$elseL")
+    emitTerm(Inst.CondBr(Val.Raw(more), bodyL, elseL))
     emitLabel(bodyL)
     val ep = freshTemp(); emit(s"$ep = getelementptr ${elemTy.llvm}, ptr $base, $word $iv")
     val ev = freshTemp(); emit(s"$ev = load ${elemTy.llvm}, ptr $ep")
@@ -642,11 +644,11 @@ trait ControlFlowEmitter extends PlaceEmitter {
     ownSlot(name, elemTy)
     body.foreach(genStmt)
     popOwned()
-    emitTerm(s"br label %$stepL")
+    emitTerm(Inst.Br(stepL))
     emitLabel(stepL)
     val nxt = freshTemp(); emit(s"$nxt = add $word $iv, 1")
     emit(s"store $word $nxt, ptr $idx")
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
 
     genLoops = genLoops.tail
     genLoopResult(slot, ty, elseL, endL, elseBlock)
@@ -676,7 +678,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
     val elseL = if elseBlock.isDefined then freshLabel("iter.else") else endL
     val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
 
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
     emitLabel(condL)
     pushTemps()
     // `continue` goes back to the test, which is where the next element comes from: an iterating
@@ -688,7 +690,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
     genLoops = GenLoop(endL, condL, slot, ty, owned.length, tempStack.length) :: genLoops
     val opt = genExpr(next)
     val ok  = patternTest(bind, opt)
-    emitTerm(s"br i1 $ok, label %$bodyL, label %$doneL")
+    emitTerm(Inst.CondBr(Val.Raw(ok), bodyL, doneL))
 
     emitLabel(bodyL)
     pushOwned()
@@ -696,12 +698,12 @@ trait ControlFlowEmitter extends PlaceEmitter {
     releaseTemps()
     body.foreach(genStmt)
     popOwned()
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
 
     emitLabel(doneL)
     releaseTemps()
     dropTemps()
-    emitTerm(s"br label %$elseL")
+    emitTerm(Inst.Br(elseL))
 
     genLoops = genLoops.tail
     val result = genLoopResult(slot, ty, elseL, endL, elseBlock)
@@ -719,7 +721,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
       emitLabel(elseL)
       if Type.noValue(ty) then genBlockVoid(eb)
       else storeBlockValue(eb, ty, slot)
-      emitTerm(s"br label %$endL")
+      emitTerm(Inst.Br(endL))
     }
     emitLabel(endL)
     endsNowhere(ty)

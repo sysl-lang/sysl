@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.{Inst, Val}
+
 import scala.collection.mutable
 
 /** Automatic reference counting: where a count is taken, where it is given back, and what the
@@ -145,17 +147,17 @@ trait ArcEmitter extends Emitter {
         val condL = freshLabel("arc.each")
         val bodyL = freshLabel("arc.elem")
         val endL  = freshLabel("arc.done")
-        emitTerm(s"br label %$condL")
+        emitTerm(Inst.Br(condL))
         emitLabel(condL)
         val iv   = freshTemp(); emit(s"$iv = load $word, ptr $i")
         val more = freshTemp(); emit(s"$more = icmp ult $word $iv, $n")
-        emitTerm(s"br i1 $more, label %$bodyL, label %$endL")
+        emitTerm(Inst.CondBr(Val.Raw(more), bodyL, endL))
         emitLabel(bodyL)
         val ep = freshTemp(); emit(s"$ep = getelementptr ${elem.llvm}, ptr $p, $word $iv")
         walkAt(elem, ep, retain)
         val nxt = freshTemp(); emit(s"$nxt = add $word $iv, 1")
         emit(s"store $word $nxt, ptr $i")
-        emitTerm(s"br label %$condL")
+        emitTerm(Inst.Br(condL))
         emitLabel(endL)
 
       case e: Type.Enum =>
@@ -165,12 +167,12 @@ trait ArcEmitter extends Emitter {
           val hitL  = freshLabel("arc.variant")
           val nextL = freshLabel("arc.next")
           val is    = freshTemp(); emit(s"$is = icmp eq i32 $tag, ${variant.tag}")
-          emitTerm(s"br i1 $is, label %$hitL, label %$nextL")
+          emitTerm(Inst.CondBr(Val.Raw(is), hitL, nextL))
           emitLabel(hitL)
           each(variant.fields, e.payloadLlvm(variant), payloadPtr(e, p))
-          emitTerm(s"br label %$endL")
+          emitTerm(Inst.Br(endL))
           emitLabel(nextL)
-        emitTerm(s"br label %$endL")
+        emitTerm(Inst.Br(endL))
         emitLabel(endL)
 
       case _ => ()
@@ -297,18 +299,18 @@ trait ArcEmitter extends Emitter {
         val condL = freshLabel("arc.each")
         val bodyL = freshLabel("arc.elem")
         val endL  = freshLabel("arc.done")
-        emitTerm(s"br label %$condL")
+        emitTerm(Inst.Br(condL))
         emitLabel(condL)
         val iv   = freshTemp(); emit(s"$iv = load $word, ptr $i")
         val more = freshTemp(); emit(s"$more = icmp ult $word $iv, $n")
-        emitTerm(s"br i1 $more, label %$bodyL, label %$endL")
+        emitTerm(Inst.CondBr(Val.Raw(more), bodyL, endL))
         emitLabel(bodyL)
         val ep = freshTemp(); emit(s"$ep = getelementptr ${elem.llvm}, ptr $buf, $word $iv")
         val ev = freshTemp(); emit(s"$ev = load ${elem.llvm}, ptr $ep")
         if retain then retainValue(elem, ev) else releaseValue(elem, ev)
         val nxt = freshTemp(); emit(s"$nxt = add $word $iv, 1")
         emit(s"store $word $nxt, ptr $i")
-        emitTerm(s"br label %$condL")
+        emitTerm(Inst.Br(condL))
         emitLabel(endL)
 
       case e: Type.Enum =>
@@ -318,13 +320,13 @@ trait ArcEmitter extends Emitter {
           val hitL  = freshLabel("arc.variant")
           val nextL = freshLabel("arc.next")
           val is    = freshTemp(); emit(s"$is = icmp eq i32 $tag, ${variant.tag}")
-          emitTerm(s"br i1 $is, label %$hitL, label %$nextL")
+          emitTerm(Inst.CondBr(Val.Raw(is), hitL, nextL))
           emitLabel(hitL)
           val payload = enumPayload(e, variant, v)
           each(variant.fields, e.payloadLlvm(variant), payload)
-          emitTerm(s"br label %$endL")
+          emitTerm(Inst.Br(endL))
           emitLabel(nextL)
-        emitTerm(s"br label %$endL")
+        emitTerm(Inst.Br(endL))
         emitLabel(endL)
 
       case _ => ()
@@ -430,17 +432,17 @@ trait ArcEmitter extends Emitter {
     val endL  = freshLabel("buf.done")
 
     emit(s"store $word 0, ptr $i")
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
     emitLabel(condL)
     val iv   = freshTemp(); emit(s"$iv = load $word, ptr $i")
     val more = freshTemp(); emit(s"$more = icmp ult $word $iv, $n")
-    emitTerm(s"br i1 $more, label %$bodyL, label %$endL")
+    emitTerm(Inst.CondBr(Val.Raw(more), bodyL, endL))
     emitLabel(bodyL)
     val ep = freshTemp(); emit(s"$ep = getelementptr ${elem.llvm}, ptr $data, $word $iv")
     body(ep)
     val nxt = freshTemp(); emit(s"$nxt = add $word $iv, 1")
     emit(s"store $word $nxt, ptr $i")
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
     emitLabel(endL)
   }
 

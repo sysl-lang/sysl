@@ -1,6 +1,6 @@
 package sh.sysl
 
-import ir.Val
+import ir.{Inst, Val}
 
 /** Addressing a place, and building the composite values that have one.
  *
@@ -572,14 +572,14 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val noneL = freshLabel("try.none")
     val endL  = freshLabel("try.end")
 
-    emitTerm(s"br i1 $ok, label %$someL, label %$noneL")
+    emitTerm(Inst.CondBr(Val.Raw(ok), someL, noneL))
     emitLabel(someL)
     val ev = convert(vt, en.underlying, v)
     emit(s"store ${optTy.llvm} ${enumValue(optTy, some, List(ev))}, ptr $slot")
-    emitTerm(s"br label %$endL")
+    emitTerm(Inst.Br(endL))
     emitLabel(noneL)
     emit(s"store ${optTy.llvm} ${enumValue(optTy, none, Nil)}, ptr $slot")
-    emitTerm(s"br label %$endL")
+    emitTerm(Inst.Br(endL))
     emitLabel(endL)
     val r = freshTemp(); emit(s"$r = load ${optTy.llvm}, ptr $slot"); r
   }
@@ -620,7 +620,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val noneL = freshLabel("weak.gone")
     val endL  = freshLabel("weak.end")
 
-    emitTerm(s"br i1 $live, label %$someL, label %$noneL")
+    emitTerm(Inst.CondBr(Val.Raw(live), someL, noneL))
     emitLabel(someL)
     val strong =
       if !fat then got
@@ -630,10 +630,10 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
         val f1  = freshTemp(); emit(s"$f1 = insertvalue ${Type.fatPointer} $f0, ptr $got, 1")
         f1
     emit(s"store ${optTy.llvm} ${enumValue(optTy, some, List(strong))}, ptr $slot")
-    emitTerm(s"br label %$endL")
+    emitTerm(Inst.Br(endL))
     emitLabel(noneL)
     emit(s"store ${optTy.llvm} ${enumValue(optTy, none, Nil)}, ptr $slot")
-    emitTerm(s"br label %$endL")
+    emitTerm(Inst.Br(endL))
     emitLabel(endL)
     val r = freshTemp(); emit(s"$r = load ${optTy.llvm}, ptr $slot")
     ownTemp(r, optTy)
@@ -671,7 +671,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
 
     val okL   = freshLabel("try.ok")
     val failL = freshLabel("try.fail")
-    emitTerm(s"br i1 $isOk, label %$okL, label %$failL")
+    emitTerm(Inst.CondBr(Val.Raw(isOk), okL, failL))
 
     emitLabel(failL)
     val failed = enumValue(retEnum, retFail, payloadFields(en, fail, v))

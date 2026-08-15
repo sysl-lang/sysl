@@ -1,6 +1,6 @@
 package sh.sysl
 
-import ir.{Arg, LType, Val}
+import ir.{Arg, Inst, LType, Val}
 
 /** The expression dispatch.
  *
@@ -426,8 +426,8 @@ trait ExprEmitter extends ArithEmitter {
       emit(s"store i1 $lv, ptr $slot")
       val rhsL = freshLabel("sc.rhs")
       val endL = freshLabel("sc.end")
-      if op == "&&" then emitTerm(s"br i1 $lv, label %$rhsL, label %$endL")
-      else emitTerm(s"br i1 $lv, label %$endL, label %$rhsL")
+      if op == "&&" then emitTerm(Inst.CondBr(Val.Raw(lv), rhsL, endL))
+      else emitTerm(Inst.CondBr(Val.Raw(lv), endL, rhsL))
       emitLabel(rhsL)
       // The right side gets its own temp region: anything it allocates is released before the
       // merge, and if the branch is skipped that code never runs at all.
@@ -435,7 +435,7 @@ trait ExprEmitter extends ArithEmitter {
       val rv = genExpr(r)
       emit(s"store i1 $rv, ptr $slot")
       popTemps()
-      emitTerm(s"br label %$endL")
+      emitTerm(Inst.Br(endL))
       emitLabel(endL)
       val res = freshTemp(); emit(s"$res = load i1, ptr $slot"); res
 
@@ -475,10 +475,10 @@ trait ExprEmitter extends ArithEmitter {
 
         emit(s"store i1 $c, ptr $slot")
 
-        if k == cmps.length - 1 then emitTerm(s"br label %${exits(k)}")
+        if k == cmps.length - 1 then emitTerm(Inst.Br(exits(k)))
         else
           val nextL = freshLabel("cmp.next")
-          emitTerm(s"br i1 $c, label %$nextL, label %${exits(k)}")
+          emitTerm(Inst.CondBr(Val.Raw(c), nextL, exits(k)))
           emitLabel(nextL)
 
         left = right
@@ -486,7 +486,7 @@ trait ExprEmitter extends ArithEmitter {
       for k <- cmps.indices.reverse do
         emitLabel(exits(k))
         popTemps()
-        emitTerm(s"br label %${if k == 0 then endL else exits(k - 1)}")
+        emitTerm(Inst.Br(if k == 0 then endL else exits(k - 1)))
 
       emitLabel(endL)
       val res = freshTemp(); emit(s"$res = load i1, ptr $slot"); res
