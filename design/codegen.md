@@ -19,7 +19,8 @@ be unwound deliberately rather than discovered later.
   every other pass has already read. It is described under *What runs today* below; what matters
   here is that it sits between the checking and the lowering, so no diagnostic depends on it.
 - **Codegen** (`Codegen`, and the `*Emitter` files it is split across) — a straight lowering of the
-  typed tree to textual LLVM IR. It selects
+  typed tree to **an IR of case classes** (`sh.sysl.ir`), which one printer then writes down as LLVM's
+  textual form. It selects
   instructions from the types the tree carries and lays out basic blocks; it makes no semantic
   decision of its own. The one thing it decides that the tree does not carry is what a call to a
   **foreign** function looks like, because that is a fact about the machine rather than about the
@@ -27,6 +28,60 @@ be unwound deliberately rather than discovered later.
   value into and out of the registers the convention names (`targets.md`).
 
 The CLI (`sysl run` / `sysl build` / `sysl emit-llvm`) links the emitted IR with `clang`.
+
+### The IR is data, and the text is one function over it
+
+`sh.sysl.ir` holds the model and its renderers: `LType` (an LLVM type), `Val` (an operand), `Inst`
+(an instruction), `FuncSig`/`Param`/`Attr` (a signature and what a convention attaches to it),
+`Func`/`Block` (a function's basic blocks), and `Module` — the whole compilation, which is what
+`Codegen.module` answers with and what a back end is handed. `Printer` is the only thing in the
+compiler that writes LLVM's syntax, and every emitter builds values rather than lines.
+
+**`Module` is the piece that makes the rest reachable.** Its fields are groups rather than one list
+because the order is semantic: a named struct used before its `= type` line is opaque and an opaque
+type cannot be passed by value, so the declarations of a library's own functions come after the type
+definitions and an `external global` naming an aggregate comes after them too. Flattening them would
+keep the order and lose the reason for it.
+
+**The one place LLVM text survives is `Runtime.Template`, and it is named.** Most of the runtime is
+*generated* — a destructor for a payload type, a vtable adapter, the retain and release helpers —
+built by the ordinary emitters and so `Func`s like any other. The string operations and parts of the
+ownership runtime are hand-written LLVM, and there is nothing to hand a back end that is not LLVM
+except what the function has to do, which is what a name is: a consumer matches on `sysl.str.concat`
+and supplies its own.
+
+**It exists because a second back end has to consume what codegen produced.** Until this the IR was
+characters: `emit(s"$r = add ${ty.llvm} $a, $b")`, six hundred times over, so a consumer that was not
+LLVM would have had to parse the compiler's own output back into the shapes the compiler had just
+finished deciding. `~/dev/craft` is a 16-bit teaching ISA LLVM cannot build for, and it is the reason
+this was worth doing before anything else was built on top of the old shape.
+
+**The set is small because the compiler's own selection is** — about forty opcodes, of which ten carry
+nine tenths of the emitted lines. There is no `phi`, and that is a fact about the lowering rather
+than an omission: codegen keeps every local in a stack slot and reaches it with `load` and `store`, so
+what a consumer receives is memory form and may promote it or not as it likes.
+
+**Nothing else concatenates a type, an operand, an instruction, a signature or a module-level line.**
+That is what makes the model load-bearing rather than decorative — an escape hatch that let one site
+interpolate would put the parser back for that site's sake, so `Inst.Raw` and `Val.Raw` existed only
+while the sweep ran and were deleted with their last caller.
+
+**Typing a thing that was text keeps turning up a claim hidden in a string.** `resize` asked
+`!v.startsWith("%") && !v.startsWith("-")` to mean *a non-negative immediate*; `alignSuffix` searched
+a rendered type for `"%struct."`; a vtable adapter dropped a parameter attribute with
+`replace("noalias ", "")`; and `TFloatLit` carried LLVM's hexadecimal form in the **typed tree**, so
+the analyzer was rendering a number into back-end syntax at parse time. Each became a pattern match
+on the thing it was always about.
+
+**The safety property was byte identity.** The codegen tier asserts on emitted IR *including its
+two-space indentation*, and matches temporaries by `%t\d+` — so the order in which registers are
+allocated is pinned too. The whole conversion was made with no edit to any existing test file, and
+`guide/`'s seventeen programs, 117,000 lines of IR, came out character for character what they were.
+
+That is a strong oracle and it is not a complete one: it says the *text* did not move and says
+nothing about whether the data underneath is any use. `IrModuleTests` is the other half, and it
+renders nothing on purpose — it asks what a back end asks, which is which functions are there, what
+is in their blocks, and what the globals hold.
 
 The library every compilation carries is the **standard module** `sysl` (`13 §8`) — ordinary sysl
 source in real files under `library/sysl`, parsed once and hoisted ahead of the user's own declarations,

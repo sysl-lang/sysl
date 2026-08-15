@@ -221,6 +221,17 @@ file belongs to when there is no filesystem to read it from.
 node added to the AST is not a breaking change to anything compiled against this. `Sysl.canRun` says
 whether this machine has the clang that linking needs; compiling to LLVM IR needs nothing installed.
 
+### The IR, for a back end that is not LLVM
+
+`sh.sysl.ir` is the same compilation as **data** — types, globals, declarations, and functions made of
+basic blocks made of instructions. `Codegen.module` answers with an `ir.Module` and `ir.Printer` is
+what turns one into LLVM's textual form, so a tool targeting a machine LLVM does not build for reads
+the shapes the compiler decided instead of parsing them back out of what it printed.
+
+It is a sibling of `sh.sysl.api` rather than part of it, precisely because the paragraph above is a
+commitment: an IR *is* a tree. What it offers in exchange is a version to pin — **before 0.1.0
+anything in it may change in any release**.
+
 ## License
 
 ISC — see [LICENSE](LICENSE).

@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.{Access, Arg, BinOp, ICmp, Inst, Val}
+
 /** Everything that makes a basic block: `if`, `match` and its patterns, and the three loops.
  *
  * The shape is the same in all of them. A construct that yields a value allocates a **merge slot**,
@@ -17,12 +19,12 @@ package sh.sysl
  */
 trait ControlFlowEmitter extends PlaceEmitter {
 
-  protected def genIf(cond: List[TCondTerm], thenBlock: TBlock, elseBlock: Option[TBlock], ty: Type): String = {
+  protected def genIf(cond: List[TCondTerm], thenBlock: TBlock, elseBlock: Option[TBlock], ty: Type): Val = {
     val thenL  = freshLabel("if.then")
     val elseL  = freshLabel("if.else")
     val endL   = freshLabel("if.end")
     val target = if elseBlock.isDefined then elseL else endL
-    val slot   = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
+    val slot   = if Type.noValue(ty) then Val.Nothing else emitAlloca(freshReg(), ty.lty)
 
     // The last term's success edge is the branch's entry, so a condition with nothing to bind emits
     // exactly the one test and the one `br` it always did.
@@ -32,21 +34,21 @@ trait ControlFlowEmitter extends PlaceEmitter {
     // The branch's value is computed before the condition's bindings are given back, so a `then`
     // that yields what it destructured has taken its own count by the time this runs.
     paths.release()
-    emitTerm(s"br label %$endL")
+    emitTerm(Inst.Br(endL))
     paths.emitCleanups()
 
     elseBlock.foreach { eb =>
       emitLabel(elseL)
       if Type.noValue(ty) then genBlockVoid(eb) else storeBlockValue(eb, ty, slot)
-      emitTerm(s"br label %$endL")
+      emitTerm(Inst.Br(endL))
     }
 
     emitLabel(endL)
     endsNowhere(ty)
-    if Type.noValue(ty) then ""
+    if Type.noValue(ty) then Val.Nothing
     // Each branch handed its value over with a count taken, so what the merge loads is the
     // one temporary the enclosing region has to let go of.
-    else { val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot"); ownTemp(r, ty) }
+    else { val r = freshReg(); emit(Inst.Load(r, ty.lty, slot, Access.Plain)); ownTemp(r, ty) }
   }
 
   /** What emitting a condition left open: the owned scopes its `is` terms pushed for their
@@ -59,14 +61,14 @@ trait ControlFlowEmitter extends PlaceEmitter {
    * its third term releases what its first two took, and a chain that fails at its first releases
    * nothing.
    */
-  protected class CondPaths(scopes: Int, cleanups: List[(String, List[(String, Type)], Boolean, String)]) {
+  protected class CondPaths(scopes: Int, cleanups: List[(String, List[(Val, Type)], Boolean, String)]) {
     def release(): Unit = for _ <- 1 to scopes do popOwned()
 
     def emitCleanups(): Unit =
       for (label, held, slots, next) <- cleanups do
         emitLabel(label)
         if slots then releaseSlots(held) else releaseValues(held)
-        emitTerm(s"br label %$next")
+        emitTerm(Inst.Br(next))
   }
 
   /** Emits an `if`'s or a `while`'s condition as the chain of `&&`-joined terms it is (`09 §12`),
@@ -96,7 +98,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
   protected def genCond(terms: List[TCondTerm], successL: String, failL: String): CondPaths = {
     var target   = failL
     var scopes   = 0
-    var cleanups = List.empty[(String, List[(String, Type)], Boolean, String)]
+    var cleanups = List.empty[(String, List[(Val, Type)], Boolean, String)]
 
     for (term, i) <- terms.zipWithIndex do
       // The block a term hands control to when it holds: the branch's own entry for the last term,
@@ -115,7 +117,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
         case TCondTest(c) =>
           val v = genExpr(c)
           popTemps()
-          emitTerm(s"br i1 $v, label %$nextL, label %$target")
+          emitTerm(Inst.CondBr(v, nextL, target))
           emitLabel(nextL)
 
         case TCondIs(subject, pats, negated) =>
@@ -128,7 +130,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
           // leave the failure target where it was.
           if negated || pats.length != 1 || !bindsAny(pats.head) then
             popTemps()
-            emitTerm(s"br i1 $ok, label %$nextL, label %$target")
+            emitTerm(Inst.CondBr(ok, nextL, target))
             emitLabel(nextL)
           else
             // The bind retains out of the subject, so the subject has to still be held when it runs.
@@ -142,7 +144,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
                 cleanups ::= (l, borrowed, false, target)
                 l
 
-            emitTerm(s"br i1 $ok, label %$nextL, label %$onFail")
+            emitTerm(Inst.CondBr(ok, nextL, onFail))
             emitLabel(nextL)
             pushOwned()
             patternBind(pats.head, sv)
@@ -165,9 +167,9 @@ trait ControlFlowEmitter extends PlaceEmitter {
    * or returns — has no value to feed and terminates its own block, so it is run for its effect
    * and nothing is stored: the merge is reached only from the branches that do arrive.
    */
-  protected def storeBlockValue(b: TBlock, ty: Type, slot: String): Unit =
+  protected def storeBlockValue(b: TBlock, ty: Type, slot: Val): Unit =
     if b.ty == Type.Never then genBlockVoid(b)
-    else emit(s"store ${ty.llvm} ${genBlockValue(b)}, ptr $slot")
+    else emit(Inst.Store(ty.lty, genBlockValue(b), slot, Access.Plain))
 
   /** Closes the merge point of an `if`, a `match`, or a loop whose every path diverges: no branch
    * arrives, so the label control would have landed on is unreachable.
@@ -178,12 +180,12 @@ trait ControlFlowEmitter extends PlaceEmitter {
    * one is dropped rather than emitted with nothing to say.
    */
   protected def endsNowhere(ty: Type): Unit =
-    if ty == Type.Never then emitTerm("unreachable")
+    if ty == Type.Never then emitTerm(Inst.Unreachable)
 
-  protected def genMatch(scrutinee: TExpr, arms: List[TArm], ty: Type): String = {
+  protected def genMatch(scrutinee: TExpr, arms: List[TArm], ty: Type): Val = {
     val sv   = genExpr(scrutinee)
     val endL = freshLabel("match.end")
-    val slot = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
+    val slot = if Type.noValue(ty) then Val.Nothing else emitAlloca(freshReg(), ty.lty)
 
     for arm <- arms do
       val bodyL = freshLabel("match.arm")
@@ -198,13 +200,13 @@ trait ControlFlowEmitter extends PlaceEmitter {
 
       arm.guard match
         case None =>
-          emitTerm(s"br i1 $patCond, label %$bodyL, label %$nextL")
+          emitTerm(Inst.CondBr(patCond, bodyL, nextL))
           emitLabel(bodyL)
           pushOwned()
           bind()
         case Some(g) =>
           val guardL = freshLabel("match.guard")
-          emitTerm(s"br i1 $patCond, label %$guardL, label %$nextL")
+          emitTerm(Inst.CondBr(patCond, guardL, nextL))
           emitLabel(guardL)
           pushOwned()
           bind()
@@ -214,26 +216,26 @@ trait ControlFlowEmitter extends PlaceEmitter {
           // A guard that fails leaves an arm whose bindings were already made, so they are
           // given back before falling through to the next one.
           val unbindL = freshLabel("match.unbind")
-          emitTerm(s"br i1 $gv, label %$bodyL, label %$unbindL")
+          emitTerm(Inst.CondBr(gv, bodyL, unbindL))
           emitLabel(unbindL)
           releaseOwned()
-          emitTerm(s"br label %$nextL")
+          emitTerm(Inst.Br(nextL))
           emitLabel(bodyL)
 
       if Type.noValue(ty) then genBlockVoid(arm.body)
       else storeBlockValue(arm.body, ty, slot)
       popOwned()
-      emitTerm(s"br label %$endL")
+      emitTerm(Inst.Br(endL))
       emitLabel(nextL)
 
     // Fallthrough with no matching arm: a value or enum match is exhaustive (the analyzer
     // required full coverage or a catch-all), so this point is unreachable; a plain scalar
     // statement match simply proceeds.
-    if Type.noValue(ty) then emitTerm(s"br label %$endL") else emitTerm("unreachable")
+    if Type.noValue(ty) then emitTerm(Inst.Br(endL)) else emitTerm(Inst.Unreachable)
     emitLabel(endL)
     endsNowhere(ty)
-    if Type.noValue(ty) then ""
-    else { val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot"); ownTemp(r, ty) }
+    if Type.noValue(ty) then Val.Nothing
+    else { val r = freshReg(); emit(Inst.Load(r, ty.lty, slot, Access.Plain)); ownTemp(r, ty) }
   }
 
   /** The i1 result of testing a pattern against a value. Every pattern node carries the type it
@@ -245,8 +247,8 @@ trait ControlFlowEmitter extends PlaceEmitter {
    * is not merely wrong but unsafe, since comparing a `string` is a call to `sysl.str.cmp` that
    * dereferences the pointer it is handed. Everything else here is a pure value read.
    */
-  private def patternTest(p: TPattern, value: String): String = p match
-    case _: TWildPattern | _: TBindPattern => "true"
+  private def patternTest(p: TPattern, value: Val): Val = p match
+    case _: TWildPattern | _: TBindPattern => yes
     // The binding is established later, in `patternBind`; what decides the arm is the inner test
     // alone, since naming a value says nothing about whether it matched.
     case a: TAtPattern                     => patternTest(a.inner, value)
@@ -258,8 +260,8 @@ trait ControlFlowEmitter extends PlaceEmitter {
     case TVariantPattern(en, variant, args) =>
       val tagVal =
         if en.simple then value
-        else { val t = freshTemp(); emit(s"$t = extractvalue ${en.llvm} $value, 0"); t }
-      val tagOk = freshTemp(); emit(s"$tagOk = icmp eq ${en.tagLlvm} $tagVal, ${variant.tag}")
+        else { val t = freshReg(); emit(Inst.Extract(t, en.lty, value, List(0))); t }
+      val tagOk = freshReg(); emit(Inst.IntCmp(tagOk, ICmp.Eq, en.tagLty, tagVal, Val.Int(variant.tag)))
 
       // Nothing in the payload to ask about — a variant with no fields, or one destructured only
       // into bindings, which `patternBind` establishes later and after the arm has been taken.
@@ -267,31 +269,31 @@ trait ControlFlowEmitter extends PlaceEmitter {
       else
         // The tag decides whether the payload may be read at all, so its test is a branch and not
         // an operand of an `and`: the block below runs only for a value of this variant.
-        val answer = emitAlloca(freshTemp(), "i1")
+        val answer = emitAlloca(freshReg(), i1)
         val testL  = freshLabel("pat.payload")
         val doneL  = freshLabel("pat.done")
 
-        emit(s"store i1 false, ptr $answer")
-        emitTerm(s"br i1 $tagOk, label %$testL, label %$doneL")
+        emit(Inst.Store(i1, Val.Bool(false), answer, Access.Plain))
+        emitTerm(Inst.CondBr(tagOk, testL, doneL))
         emitLabel(testL)
 
         val payload = enumPayload(en, variant, value)
-        val inner = args.zipWithIndex.foldLeft("true") { case (acc, (arg, i)) =>
+        val inner = args.zipWithIndex.foldLeft(yes) { case (acc, (arg, i)) =>
           if !refutable(arg) then acc
           else andI1(acc, patternTest(arg, payloadField(en, variant, payload, i)))
         }
 
-        emit(s"store i1 $inner, ptr $answer")
-        emitTerm(s"br label %$doneL")
+        emit(Inst.Store(i1, inner, answer, Access.Plain))
+        emitTerm(Inst.Br(doneL))
         emitLabel(doneL)
 
-        val r = freshTemp(); emit(s"$r = load i1, ptr $answer"); r
+        val r = freshReg(); emit(Inst.Load(r, i1, answer, Access.Plain)); r
 
     // A struct has no tag, so the test is just its refutable fields' tests ANDed together; an
     // irrefutable field needs none, so nothing is emitted for the parts a named pattern omitted.
     // Any bindings such a field carries are established later, in `patternBind`.
     case TStructPattern(struct, args) =>
-      args.zipWithIndex.foldLeft("true") { case (acc, (arg, i)) =>
+      args.zipWithIndex.foldLeft(yes) { case (acc, (arg, i)) =>
         if !refutable(arg) then acc
         else andI1(acc, patternTest(arg, structField(struct, value, i)))
       }
@@ -299,14 +301,14 @@ trait ControlFlowEmitter extends PlaceEmitter {
   /** Establishes the bindings a pattern introduces, once its arm has been taken. Only binding
    * and (nested) variant patterns carry bindings; the rest are no-ops.
    */
-  private def patternBind(p: TPattern, value: String): Unit = p match
+  private def patternBind(p: TPattern, value: Val): Unit = p match
     // A zero-sized binding is not a slot, exactly as a `var` of one is not. The name is still in
     // scope for the arm; every read of it yields nothing.
     case TBindPattern(_, bty) if Type.zeroSized(bty) => ()
     case TBindPattern(name, bty) =>
-      emitAlloca(s"%$name.addr", bty.llvm)
+      emitAlloca(Val.Reg(s"$name.addr"), bty.lty)
       retainValue(bty, value)
-      emit(s"store ${bty.llvm} $value, ptr %$name.addr")
+      emit(Inst.Store(bty.lty, value, Val.Reg(s"$name.addr"), Access.Plain))
       ownSlot(name, bty)
 
     // `n @ pat` binds the whole value and then whatever the inner pattern binds, both off the same
@@ -325,27 +327,27 @@ trait ControlFlowEmitter extends PlaceEmitter {
   /** One field of a variant's payload, or nothing where the field is zero-sized — the same skipping
    * the layout does, seen from the reading side.
    */
-  private def payloadField(en: Type.Enum, variant: Type.EnumVariant, payload: String, i: Int): String =
-    if Type.zeroSized(variant.fields(i)._2) then ""
+  private def payloadField(en: Type.Enum, variant: Type.EnumVariant, payload: Val, i: Int): Val =
+    if Type.zeroSized(variant.fields(i)._2) then Val.Nothing
     else
-      val fv = freshTemp()
-      emit(s"$fv = extractvalue ${en.payloadLlvm(variant)} $payload, ${variant.slot(i)}")
+      val fv = freshReg()
+      emit(Inst.Extract(fv, en.payloadLty(variant), payload, List(variant.slot(i))))
       fv
 
   /** One field of a struct being destructured — a bit range of the container where the struct is a
    * bitfield struct, and a slot of the aggregate otherwise (`Bitfields`).
    */
-  private def structField(struct: Type.Struct, value: String, i: Int): String =
-    if Type.zeroSized(struct.fields(i)._2) then ""
+  private def structField(struct: Type.Struct, value: Val, i: Int): Val =
+    if Type.zeroSized(struct.fields(i)._2) then Val.Nothing
     else
       Bitfields.of(struct) match
         case Some(ranges) =>
-          val c = freshTemp()
-          emit(s"$c = extractvalue ${struct.llvm} $value, 0")
+          val c = freshReg()
+          emit(Inst.Extract(c, struct.lty, value, List(0)))
           readBits(ranges, ranges(struct.slot(i)), c)
         case None =>
-          val fv = freshTemp()
-          emit(s"$fv = extractvalue ${struct.llvm} $value, ${struct.slot(i)}")
+          val fv = freshReg()
+          emit(Inst.Extract(fv, struct.lty, value, List(struct.slot(i))))
           fv
 
   private def bindsAny(p: TPattern): Boolean = p match
@@ -374,20 +376,20 @@ trait ControlFlowEmitter extends PlaceEmitter {
   // the loop yields nothing (`unit`), there is no slot and the end is a plain merge. The `else`
   // target doubles as the end when there is no `else`, so a bare loop keeps its old shape.
 
-  protected def genWhile(w: TWhile): String = {
+  protected def genWhile(w: TWhile): Val = {
     val TWhile(cond, body, elseBlock, ty) = w
     val condL = freshLabel("while.cond")
     val bodyL = freshLabel("while.body")
     val endL  = freshLabel("while.end")
     val elseL = if elseBlock.isDefined then freshLabel("while.else") else endL
-    val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
+    val slot  = if Type.noValue(ty) then Val.Nothing else emitAlloca(freshReg(), ty.lty)
     // Recorded before the condition's bindings, so a `break` or a `continue` from the body unwinds
     // the round's bindings along with the body's own scope. The condition's *borrowing* is not the
     // loop's to unwind: each term closes its own region (`genCond`), so by the time the body runs
     // there is nothing of the test left outstanding.
     genLoops = GenLoop(endL, condL, slot, ty, owned.length, tempStack.length) :: genLoops
 
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
     emitLabel(condL)
     val paths = genCond(cond, bodyL, elseL)
     pushOwned()
@@ -396,7 +398,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
     // A binding is per-iteration: it is released at the bottom of the body and made again by the
     // next round's test, so nothing accumulates across a loop that runs a million times.
     paths.release()
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
     paths.emitCleanups()
 
     genLoops = genLoops.tail
@@ -410,28 +412,28 @@ trait ControlFlowEmitter extends PlaceEmitter {
    * then break` at its foot that a program writes instead has no test for a `continue` to reach, so
    * the first one added to it jumps over the exit and never leaves.
    */
-  protected def genDoWhile(d: TDoWhile): String = {
+  protected def genDoWhile(d: TDoWhile): Val = {
     val TDoWhile(body, cond, elseBlock, ty) = d
     val bodyL = freshLabel("dowhile.body")
     val condL = freshLabel("dowhile.cond")
     val endL  = freshLabel("dowhile.end")
     val elseL = if elseBlock.isDefined then freshLabel("dowhile.else") else endL
-    val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
+    val slot  = if Type.noValue(ty) then Val.Nothing else emitAlloca(freshReg(), ty.lty)
     genLoops = GenLoop(endL, condL, slot, ty, owned.length, tempStack.length) :: genLoops
 
-    emitTerm(s"br label %$bodyL")
+    emitTerm(Inst.Br(bodyL))
     emitLabel(bodyL)
     pushOwned()
     body.foreach(genStmt)
     popOwned()
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
     emitLabel(condL)
     // Re-evaluated every round, so what the test borrows is let go before the branch rather than
     // piling up in the enclosing statement's region — as the three-clause loop's test does.
     pushTemps()
     val v = genExpr(cond)
     popTemps()
-    emitTerm(s"br i1 $v, label %$bodyL, label %$elseL")
+    emitTerm(Inst.CondBr(v, bodyL, elseL))
 
     genLoops = genLoops.tail
     genLoopResult(slot, ty, elseL, endL, elseBlock)
@@ -442,27 +444,27 @@ trait ControlFlowEmitter extends PlaceEmitter {
    * the next iteration is all there is to do. Where nothing breaks, the loop's type is `never` and
    * the end label closes as unreachable.
    */
-  protected def genLoop(l: TLoop): String = {
+  protected def genLoop(l: TLoop): Val = {
     val TLoop(body, ty) = l
     val bodyL = freshLabel("loop.body")
     val endL  = freshLabel("loop.end")
-    val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
+    val slot  = if Type.noValue(ty) then Val.Nothing else emitAlloca(freshReg(), ty.lty)
     genLoops = GenLoop(endL, bodyL, slot, ty, owned.length, tempStack.length) :: genLoops
 
-    emitTerm(s"br label %$bodyL")
+    emitTerm(Inst.Br(bodyL))
     emitLabel(bodyL)
     pushOwned()
     body.foreach(genStmt)
     popOwned()
-    emitTerm(s"br label %$bodyL")
+    emitTerm(Inst.Br(bodyL))
 
     genLoops = genLoops.tail
     genLoopResult(slot, ty, endL, endL, None)
   }
 
-  protected def genFor(f: TFor): String = {
+  protected def genFor(f: TFor): Val = {
     val TFor(name, varTy, lo, hi, inclusive, body, elseBlock, ty) = f
-    val w     = varTy.llvm
+    val w     = varTy.lty
     val loV   = genExpr(lo)
     val hiV   = genExpr(hi)
     val condL = freshLabel("for.cond")
@@ -470,27 +472,30 @@ trait ControlFlowEmitter extends PlaceEmitter {
     val stepL = freshLabel("for.step")
     val endL  = freshLabel("for.end")
     val elseL = if elseBlock.isDefined then freshLabel("for.else") else endL
-    val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
-    emitAlloca(s"%$name.addr", w)
-    emit(s"store $w $loV, ptr %$name.addr")
+    val slot  = if Type.noValue(ty) then Val.Nothing else emitAlloca(freshReg(), ty.lty)
+    emitAlloca(Val.Reg(s"$name.addr"), w)
+    emit(Inst.Store(w, loV, Val.Reg(s"$name.addr"), Access.Plain))
     genLoops = GenLoop(endL, stepL, slot, ty, owned.length, tempStack.length) :: genLoops
 
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
     emitLabel(condL)
-    val iv  = freshTemp(); emit(s"$iv = load $w, ptr %$name.addr")
-    val cmp = freshTemp(); emit(s"$cmp = icmp ${predicate(if inclusive then "<=" else "<", varTy)} $w $iv, $hiV")
-    emitTerm(s"br i1 $cmp, label %$bodyL, label %$elseL")
+    val iv  = freshReg(); emit(Inst.Load(iv, w, Val.Reg(s"$name.addr"), Access.Plain))
+    val cmp = freshReg()
+
+    emit(Inst.IntCmp(cmp, intPred(if inclusive then "<=" else "<", varTy), w, iv,
+      hiV))
+    emitTerm(Inst.CondBr(cmp, bodyL, elseL))
     emitLabel(bodyL)
     pushOwned()
     body.foreach(genStmt)
     popOwned()
     // `continue` lands here so the counter still advances before the next test.
-    emitTerm(s"br label %$stepL")
+    emitTerm(Inst.Br(stepL))
     emitLabel(stepL)
-    val cur = freshTemp(); emit(s"$cur = load $w, ptr %$name.addr")
-    val nxt = freshTemp(); emit(s"$nxt = add $w $cur, 1")
-    emit(s"store $w $nxt, ptr %$name.addr")
-    emitTerm(s"br label %$condL")
+    val cur = freshReg(); emit(Inst.Load(cur, w, Val.Reg(s"$name.addr"), Access.Plain))
+    val nxt = freshReg(); emit(Inst.Bin(nxt, BinOp.Add, w, cur, Val.Int(1)))
+    emit(Inst.Store(w, nxt, Val.Reg(s"$name.addr"), Access.Plain))
+    emitTerm(Inst.Br(condL))
 
     genLoops = genLoops.tail
     genLoopResult(slot, ty, elseL, endL, elseBlock)
@@ -514,9 +519,9 @@ trait ControlFlowEmitter extends PlaceEmitter {
    * label, so it registers no `GenLoop` — a `break` written inside a predicate belongs to whatever
    * loop encloses the quantifier, which is what the reader of that line means.
    */
-  protected def genQuantifier(q: TQuantifier): String = {
+  protected def genQuantifier(q: TQuantifier): Val = {
     val TQuantifier(universal, name, varTy, lo, hi, inclusive, pred) = q
-    val w     = varTy.llvm
+    val w     = varTy.lty
     val loV   = genExpr(lo)
     val hiV   = genExpr(hi)
     val condL = freshLabel("quant.cond")
@@ -524,38 +529,41 @@ trait ControlFlowEmitter extends PlaceEmitter {
     val stepL = freshLabel("quant.step")
     val doneL = freshLabel("quant.done")
     val endL  = freshLabel("quant.end")
-    val acc   = emitAlloca(freshTemp(), "i1")
+    val acc   = emitAlloca(freshReg(), i1)
 
-    emit(s"store i1 ${if universal then 1 else 0}, ptr $acc")
-    emitAlloca(s"%$name.addr", w)
-    emit(s"store $w $loV, ptr %$name.addr")
+    emit(Inst.Store(i1, Val.Int(if universal then 1 else 0), acc, Access.Plain))
+    emitAlloca(Val.Reg(s"$name.addr"), w)
+    emit(Inst.Store(w, loV, Val.Reg(s"$name.addr"), Access.Plain))
 
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
     emitLabel(condL)
-    val iv  = freshTemp(); emit(s"$iv = load $w, ptr %$name.addr")
-    val cmp = freshTemp(); emit(s"$cmp = icmp ${predicate(if inclusive then "<=" else "<", varTy)} $w $iv, $hiV")
-    emitTerm(s"br i1 $cmp, label %$bodyL, label %$endL")
+    val iv  = freshReg(); emit(Inst.Load(iv, w, Val.Reg(s"$name.addr"), Access.Plain))
+    val cmp = freshReg()
+
+    emit(Inst.IntCmp(cmp, intPred(if inclusive then "<=" else "<", varTy), w, iv,
+      hiV))
+    emitTerm(Inst.CondBr(cmp, bodyL, endL))
 
     emitLabel(bodyL)
     pushTemps()
     val p = genExpr(pred)
     popTemps()
     // A true predicate continues a `for all` and settles a `for some`; a false one does the reverse.
-    if universal then emitTerm(s"br i1 $p, label %$stepL, label %$doneL")
-    else emitTerm(s"br i1 $p, label %$doneL, label %$stepL")
+    if universal then emitTerm(Inst.CondBr(p, stepL, doneL))
+    else emitTerm(Inst.CondBr(p, doneL, stepL))
 
     emitLabel(doneL)
-    emit(s"store i1 ${if universal then 0 else 1}, ptr $acc")
-    emitTerm(s"br label %$endL")
+    emit(Inst.Store(i1, Val.Int(if universal then 0 else 1), acc, Access.Plain))
+    emitTerm(Inst.Br(endL))
 
     emitLabel(stepL)
-    val cur = freshTemp(); emit(s"$cur = load $w, ptr %$name.addr")
-    val nxt = freshTemp(); emit(s"$nxt = add $w $cur, 1")
-    emit(s"store $w $nxt, ptr %$name.addr")
-    emitTerm(s"br label %$condL")
+    val cur = freshReg(); emit(Inst.Load(cur, w, Val.Reg(s"$name.addr"), Access.Plain))
+    val nxt = freshReg(); emit(Inst.Bin(nxt, BinOp.Add, w, cur, Val.Int(1)))
+    emit(Inst.Store(w, nxt, Val.Reg(s"$name.addr"), Access.Plain))
+    emitTerm(Inst.Br(condL))
 
     emitLabel(endL)
-    val res = freshTemp(); emit(s"$res = load i1, ptr $acc"); res
+    val res = freshReg(); emit(Inst.Load(res, i1, acc, Access.Plain)); res
   }
 
   /** The three-clause loop. It is `genFor`'s shape with both fixed parts opened up: the test is
@@ -565,19 +573,19 @@ trait ControlFlowEmitter extends PlaceEmitter {
    * `continue` targets the **step** block, which is the whole point of the form: a counted loop
    * written as a `while` skips its increment on the first `continue` somebody adds.
    */
-  protected def genCFor(f: TCFor): String = {
+  protected def genCFor(f: TCFor): Val = {
     val TCFor(init, cond, step, body, elseBlock, ty) = f
     val condL = freshLabel("cfor.cond")
     val bodyL = freshLabel("cfor.body")
     val stepL = freshLabel("cfor.step")
     val endL  = freshLabel("cfor.end")
     val elseL = if elseBlock.isDefined then freshLabel("cfor.else") else endL
-    val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
+    val slot  = if Type.noValue(ty) then Val.Nothing else emitAlloca(freshReg(), ty.lty)
 
     init.foreach(genStmt)
     genLoops = GenLoop(endL, stepL, slot, ty, owned.length, tempStack.length) :: genLoops
 
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
     emitLabel(condL)
     cond match
       case Some(c) =>
@@ -586,19 +594,19 @@ trait ControlFlowEmitter extends PlaceEmitter {
         pushTemps()
         val v = genExpr(c)
         popTemps()
-        emitTerm(s"br i1 $v, label %$bodyL, label %$elseL")
-      case None => emitTerm(s"br label %$bodyL")
+        emitTerm(Inst.CondBr(v, bodyL, elseL))
+      case None => emitTerm(Inst.Br(bodyL))
 
     emitLabel(bodyL)
     pushOwned()
     body.foreach(genStmt)
     popOwned()
-    emitTerm(s"br label %$stepL")
+    emitTerm(Inst.Br(stepL))
     emitLabel(stepL)
     pushTemps()
     step.foreach(genStmt)
     popTemps()
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
 
     genLoops = genLoops.tail
     genLoopResult(slot, ty, if cond.isDefined then elseL else endL, endL, elseBlock)
@@ -606,47 +614,47 @@ trait ControlFlowEmitter extends PlaceEmitter {
 
   // The sequence is evaluated once, into the statement's own region, so a slice temporary stays
   // alive for the whole loop; the loop variable is a copy, released each iteration.
-  protected def genForEach(e: TForEach): String = {
+  protected def genForEach(e: TForEach): Val = {
     val TForEach(name, elemTy, seq, body, elseBlock, ty) = e
     val (base, len) = seq.ty match
-      case Type.Array(n, _) => (address(seq), n.toString)
+      case Type.Array(n, _) => (address(seq), Val.Int(n))
       case s: Type.Slice =>
         val v = genExpr(seq)
-        val p = freshTemp(); emit(s"$p = extractvalue ${s.llvm} $v, 1")
-        val l = freshTemp(); emit(s"$l = extractvalue ${s.llvm} $v, 2")
+        val p = freshReg(); emit(Inst.Extract(p, s.lty, v, List(1)))
+        val l = freshReg(); emit(Inst.Extract(l, s.lty, v, List(2)))
         (p, l)
       case other => sys.error(s"unreachable iteration over ${other.llvm}")
 
-    val idx   = emitAlloca(freshTemp(), word)
+    val idx   = emitAlloca(freshReg(), wordLty)
     val condL = freshLabel("each.cond")
     val bodyL = freshLabel("each.body")
     val stepL = freshLabel("each.step")
     val endL  = freshLabel("each.end")
     val elseL = if elseBlock.isDefined then freshLabel("each.else") else endL
-    val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
-    emit(s"store $word 0, ptr $idx")
+    val slot  = if Type.noValue(ty) then Val.Nothing else emitAlloca(freshReg(), ty.lty)
+    emit(Inst.Store(wordLty, Val.Int(0), idx, Access.Plain))
     genLoops = GenLoop(endL, stepL, slot, ty, owned.length, tempStack.length) :: genLoops
 
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
     emitLabel(condL)
-    val iv   = freshTemp(); emit(s"$iv = load $word, ptr $idx")
-    val more = freshTemp(); emit(s"$more = icmp ult $word $iv, $len")
-    emitTerm(s"br i1 $more, label %$bodyL, label %$elseL")
+    val iv   = freshReg(); emit(Inst.Load(iv, wordLty, idx, Access.Plain))
+    val more = freshReg(); emit(Inst.IntCmp(more, ICmp.Ult, wordLty, iv, len))
+    emitTerm(Inst.CondBr(more, bodyL, elseL))
     emitLabel(bodyL)
-    val ep = freshTemp(); emit(s"$ep = getelementptr ${elemTy.llvm}, ptr $base, $word $iv")
-    val ev = freshTemp(); emit(s"$ev = load ${elemTy.llvm}, ptr $ep")
-    emitAlloca(s"%$name.addr", elemTy.llvm)
+    val ep = freshReg(); emit(Inst.Gep(ep, elemTy.lty, base, List(Arg(wordLty, iv))))
+    val ev = freshReg(); emit(Inst.Load(ev, elemTy.lty, ep, Access.Plain))
+    emitAlloca(Val.Reg(s"$name.addr"), elemTy.lty)
     retainValue(elemTy, ev)
-    emit(s"store ${elemTy.llvm} $ev, ptr %$name.addr")
+    emit(Inst.Store(elemTy.lty, ev, Val.Reg(s"$name.addr"), Access.Plain))
     pushOwned()
     ownSlot(name, elemTy)
     body.foreach(genStmt)
     popOwned()
-    emitTerm(s"br label %$stepL")
+    emitTerm(Inst.Br(stepL))
     emitLabel(stepL)
-    val nxt = freshTemp(); emit(s"$nxt = add $word $iv, 1")
-    emit(s"store $word $nxt, ptr $idx")
-    emitTerm(s"br label %$condL")
+    val nxt = freshReg(); emit(Inst.Bin(nxt, BinOp.Add, wordLty, iv, Val.Int(1)))
+    emit(Inst.Store(wordLty, nxt, idx, Access.Plain))
+    emitTerm(Inst.Br(condL))
 
     genLoops = genLoops.tail
     genLoopResult(slot, ty, elseL, endL, elseBlock)
@@ -660,13 +668,13 @@ trait ControlFlowEmitter extends PlaceEmitter {
    * let go of it separately: the body binds the element (retaining it into its own slot) and then
    * releases the option, while the exhausted path releases it with nothing taken out.
    */
-  protected def genIterate(e: TIterate): String = {
+  protected def genIterate(e: TIterate): Val = {
     val TIterate(cursor, cursorTy, init, next, bind, body, elseBlock, ty) = e
     val iv = genExpr(init)
     pushOwned()
-    emitAlloca(s"%$cursor.addr", cursorTy.llvm)
+    emitAlloca(Val.Reg(s"$cursor.addr"), cursorTy.lty)
     retainValue(cursorTy, iv)
-    emit(s"store ${cursorTy.llvm} $iv, ptr %$cursor.addr")
+    emit(Inst.Store(cursorTy.lty, iv, Val.Reg(s"$cursor.addr"), Access.Plain))
     ownSlot(cursor, cursorTy)
 
     val condL = freshLabel("iter.cond")
@@ -674,9 +682,9 @@ trait ControlFlowEmitter extends PlaceEmitter {
     val doneL = freshLabel("iter.done")
     val endL  = freshLabel("iter.end")
     val elseL = if elseBlock.isDefined then freshLabel("iter.else") else endL
-    val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
+    val slot  = if Type.noValue(ty) then Val.Nothing else emitAlloca(freshReg(), ty.lty)
 
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
     emitLabel(condL)
     pushTemps()
     // `continue` goes back to the test, which is where the next element comes from: an iterating
@@ -688,7 +696,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
     genLoops = GenLoop(endL, condL, slot, ty, owned.length, tempStack.length) :: genLoops
     val opt = genExpr(next)
     val ok  = patternTest(bind, opt)
-    emitTerm(s"br i1 $ok, label %$bodyL, label %$doneL")
+    emitTerm(Inst.CondBr(ok, bodyL, doneL))
 
     emitLabel(bodyL)
     pushOwned()
@@ -696,12 +704,12 @@ trait ControlFlowEmitter extends PlaceEmitter {
     releaseTemps()
     body.foreach(genStmt)
     popOwned()
-    emitTerm(s"br label %$condL")
+    emitTerm(Inst.Br(condL))
 
     emitLabel(doneL)
     releaseTemps()
     dropTemps()
-    emitTerm(s"br label %$elseL")
+    emitTerm(Inst.Br(elseL))
 
     genLoops = genLoops.tail
     val result = genLoopResult(slot, ty, elseL, endL, elseBlock)
@@ -713,18 +721,18 @@ trait ControlFlowEmitter extends PlaceEmitter {
    * result slot, then land at the end and hand the slot's value out as the enclosing region's to
    * release. A `unit` loop has no slot and yields nothing.
    */
-  private def genLoopResult(slot: String, ty: Type, elseL: String, endL: String,
-                            elseBlock: Option[TBlock]): String = {
+  private def genLoopResult(slot: Val, ty: Type, elseL: String, endL: String,
+                            elseBlock: Option[TBlock]): Val = {
     elseBlock.foreach { eb =>
       emitLabel(elseL)
       if Type.noValue(ty) then genBlockVoid(eb)
       else storeBlockValue(eb, ty, slot)
-      emitTerm(s"br label %$endL")
+      emitTerm(Inst.Br(endL))
     }
     emitLabel(endL)
     endsNowhere(ty)
-    if Type.noValue(ty) then ""
-    else { val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot"); ownTemp(r, ty) }
+    if Type.noValue(ty) then Val.Nothing
+    else { val r = freshReg(); emit(Inst.Load(r, ty.lty, slot, Access.Plain)); ownTemp(r, ty) }
   }
 
   protected def genBlockVoid(b: TBlock): Unit = {
@@ -740,7 +748,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
    * are released before control leaves it — that is what keeps every release site dominating
    * the value it releases — so the result is retained first and becomes the caller's to let go.
    */
-  protected def genBlockValue(b: TBlock): String = {
+  protected def genBlockValue(b: TBlock): Val = {
     pushTemps()
     pushOwned()
     b.stmts.foreach(genStmt)

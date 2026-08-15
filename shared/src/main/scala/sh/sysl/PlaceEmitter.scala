@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.{Access, Arg, BinOp, CastOp, ICmp, Inst, LType, Val}
+
 /** Addressing a place, and building the composite values that have one.
  *
  * Two things live here because they are the same subject seen from either end. A **place** is
@@ -20,16 +22,28 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * `regs.status` has type `u32` and sits in storage of type `volatile u32`, and the difference
    * between those two is exactly this word.
    */
-  protected def vol(place: TExpr): String = place match
+  protected def vol(place: TExpr): String = access(place) match
+    case Access.Volatile => " volatile"
+    case _               => ""
+
+  /** How an access to this place is reached, which is the same question the marker above answers
+   * and the form an instruction carries.
+   */
+  protected def access(place: TExpr): Access = place match
     // A `ref` name carries no declaration of its own, so the qualifier comes from what the binding
     // found rather than from the node (`03 § ref`).
-    case TLoad(name, _) if refStorage.contains(name) => qualifier(refStorage(name))
-    case _                                           => qualifier(place.placeTy)
+    case TLoad(name, _) if refStorage.contains(name) => accessOf(refStorage(name))
+    case _                                           => accessOf(place.placeTy)
 
   /** The same marker read off a type directly, for the paths that have the storage's type and not
    * the node it came from.
    */
-  protected def qualifier(storage: Type): String = if Type.volatileIn(storage) then " volatile" else ""
+  protected def qualifier(storage: Type): String =
+    if Type.volatileIn(storage) then " volatile" else ""
+
+  /** The same read off a type directly, as the instruction carries it. */
+  protected def accessOf(storage: Type): Access =
+    if Type.volatileIn(storage) then Access.Volatile else Access.Plain
 
   /** Whether `address` can walk to this node without giving it a slot of its own first — which is
    * every place, and nothing else.
@@ -51,11 +65,11 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * out either in a local's stack slot or in a pointer the program already holds, so this walks
    * the field chain with `getelementptr` rather than reading values out with `extractvalue`.
    */
-  protected def address(place: TExpr): String = place match
-    case TLoad(name, _)     => s"%$name.addr"
+  protected def address(place: TExpr): Val = place match
+    case TLoad(name, _)     => Val.Reg(s"$name.addr")
     // A `val`'s storage is the global itself, so its address needs no instruction to compute — it
     // is what makes indexing one reach into the table rather than copy it out first.
-    case g: TGlobal         => s"@${g.symbol}"
+    case g: TGlobal         => Val.Global(g.symbol)
     case TDeref(operand, _) => payloadAddr(operand)
     // A zero-sized field occupies nothing, so it is wherever its receiver is: the address is never
     // read or written through, and handing back the receiver's keeps the walk to it — and whatever
@@ -72,8 +86,9 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
 
     case TField(receiver, index, _) =>
       val base = address(receiver)
-      val r    = freshTemp()
-      emit(s"$r = getelementptr ${receiver.ty.llvm}, ptr $base, i32 0, i32 ${fieldSlot(receiver.ty, index)}")
+      val r    = freshReg()
+      emit(Inst.Gep(r, receiver.ty.lty, base,
+        List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(fieldSlot(receiver.ty, index))))))
       r
     case TIndex(receiver, index, _) => elementAddr(receiver, index)
 
@@ -81,31 +96,32 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     // first. The analyzer has already refused to *assign* through anything but a real place, so
     // this only ever happens on the way to a read.
     case other =>
-      val slot = emitAlloca(freshTemp(), other.ty.llvm)
+      val slot = emitAlloca(freshReg(), other.ty.lty)
       // A large one is written into the slot rather than produced and then stored into it — the
       // slot is what it was going to end up in either way.
       if layout.indirect(other.ty) then genBorrowedInto(slot, other)
-      else emit(s"store ${other.ty.llvm} ${genExpr(other)}, ptr $slot")
+      else emit(Inst.Store(other.ty.lty, genExpr(other), slot, Access.Plain))
       slot
 
   /** Writes `v` into the place at `p`. A slot that holds a count takes one for the value arriving
    * and lets go of the one leaving, in that order, so assigning something to itself never briefly
    * drops the last count.
    */
-  protected def storeInto(ty: Type, p: String, v: String, q: String = ""): Unit =
-    if !containsRef(ty) then emit(s"store$q ${ty.llvm} $v, ptr $p")
+  protected def storeInto(ty: Type, p: Val, v: Val, acc: Access = Access.Plain): Unit =
+    if !containsRef(ty) then emit(Inst.Store(ty.lty, v, p, acc))
     // A large aggregate gives its old contents back at the address rather than out of a value read
     // for the purpose. The order is the same one the value form keeps and for the same reason: the
     // count for the arriving value is taken first, so assigning something to itself never briefly
     // drops the last one.
-    else if layout.indirect(ty) && q.isEmpty then
+    else if layout.indirect(ty) && acc == Access.Plain then
       retainValue(ty, v)
       releaseAt(ty, p)
-      emit(s"store ${ty.llvm} $v, ptr $p")
+      emit(Inst.Store(ty.lty, v, p, Access.Plain))
     else
-      val old = freshTemp(); emit(s"$old = load$q ${ty.llvm}, ptr $p")
+      val old = freshReg(); emit(Inst.Load(old, ty.lty, p, acc))
+
       retainValue(ty, v)
-      emit(s"store$q ${ty.llvm} $v, ptr $p")
+      emit(Inst.Store(ty.lty, v, p, acc))
       releaseValue(ty, old)
 
   /** `a, b = b, a` (`00 §2`), in the phases the form promises.
@@ -126,25 +142,25 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     // locates for one is the **container's**, which is where its read-modify-write happens. Locating
     // it in this phase rather than at the write is what keeps the form's promise for a bitfield too:
     // every place's own subexpressions are evaluated once, and before anything is read.
-    val addrs = writes.map(w => if Type.zeroSized(w.place.ty) then "" else placeAddr(w.place))
+    val addrs = writes.map(w => if Type.zeroSized(w.place.ty) then Val.Nothing else placeAddr(w.place))
 
     // Every read takes a count for the statement, which is what a form that reads everything before
     // it writes anything needs and a single assignment does not. Writing into the first place lets
     // go of what was there, and in a swap what was there is exactly the value the second arm is
     // holding — so without a count of its own that value can be freed between being read and being
     // stored. The statement's counts go back at the end of the statement, as every temporary's do.
-    def held(v: String, ty: Type): String = {
+    def held(v: Val, ty: Type): Val = {
       retainValue(ty, v)
       ownTemp(v, ty)
     }
 
     val curs = writes.zip(addrs).map { (w, p) =>
-      if w.op == "=" || p.isEmpty then "" else held(loadPlace(w.place, p), w.place.ty)
+      if w.op == "=" || p == Val.Nothing then Val.Nothing else held(loadPlace(w.place, p), w.place.ty)
     }
     val vals = writes.map(w => held(genExpr(w.value), w.value.ty))
 
     for ((w, p), (cur, v)) <- writes.zip(addrs).zip(curs.zip(vals)) do
-      if p.nonEmpty then
+      if p != Val.Nothing then
         if w.op == "=" then storePlace(w.place, p, v)
         else
           val updated = combine(w.op, w.place.ty, w.value.ty, w.dispatch, cur, v)
@@ -177,7 +193,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
   /** Where a write to this place goes: a bitfield's **container**, since the field itself has no
    * address at all, and the place's own otherwise.
    */
-  protected def placeAddr(place: TExpr): String =
+  protected def placeAddr(place: TExpr): Val =
     address(bitPlace(place).map(_._1).getOrElse(place))
 
   /** What is in the place now — one load of the container and a shift for a bitfield.
@@ -188,15 +204,15 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * is bits of one word, so `volatile` on any of them qualifies the container they share, which is
    * what `Type.volatileIn` already answers by looking through a struct (`15 §1`).
    */
-  protected def loadPlace(place: TExpr, p: String): String = bitPlace(place) match
+  protected def loadPlace(place: TExpr, p: Val): Val = bitPlace(place) match
     case Some((recv, ranges, r)) => readBits(ranges, r, loadContainer(ranges, recv, p))
     case None =>
-      val t = freshTemp(); emit(s"$t = load${vol(place)} ${place.ty.llvm}, ptr $p"); t
+      val t = freshReg(); emit(Inst.Load(t, place.ty.lty, p, access(place))); t
 
-  private def loadContainer(ranges: List[BitRange], receiver: TExpr, addr: String): String = {
-    val t = freshTemp()
+  private def loadContainer(ranges: List[BitRange], receiver: TExpr, addr: Val): Val = {
+    val t = freshReg()
 
-    emit(s"$t = load${qualifier(receiver.placeTy)} ${containerLlvm(ranges)}, ptr $addr")
+    emit(Inst.Load(t, containerLty(ranges), addr, accessOf(receiver.placeTy)))
     t
   }
 
@@ -209,26 +225,26 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * two arms of one statement may be two fields of one container and the second has to see what the
    * first left behind.
    */
-  protected def storePlace(place: TExpr, p: String, v: String, cur: Option[String] = None): Unit =
+  protected def storePlace(place: TExpr, p: Val, v: Val, cur: Option[Val] = None): Unit =
     bitPlace(place) match
       case Some((recv, ranges, r)) =>
-        val q = qualifier(recv.placeTy)
-        val c = loadContainer(ranges, recv, p)
+        val acc = accessOf(recv.placeTy)
+        val c   = loadContainer(ranges, recv, p)
 
-        emit(s"store$q ${containerLlvm(ranges)} ${writeBits(ranges, r, c, v)}, ptr $p")
+        emit(Inst.Store(containerLty(ranges), writeBits(ranges, r, c, v), p, acc))
 
       case None =>
-        val ty = place.ty
-        val q  = vol(place)
+        val ty  = place.ty
+        val acc = access(place)
 
         cur match
-          case None => storeInto(ty, p, v, q)
+          case None => storeInto(ty, p, v, acc)
           case Some(old) =>
             if containsRef(ty) then
               retainValue(ty, v)
-              emit(s"store$q ${ty.llvm} $v, ptr $p")
+              emit(Inst.Store(ty.lty, v, p, acc))
               releaseValue(ty, old)
-            else emit(s"store$q ${ty.llvm} $v, ptr $p")
+            else emit(Inst.Store(ty.lty, v, p, acc))
 
   /** Where a written field index lands in the emitted aggregate, once the zero-sized fields before
    * it are dropped.
@@ -240,23 +256,23 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
   /** The address of one element, after checking that it exists. An array is indexed from its
    * own storage; a slice is indexed from the pointer it carries.
    */
-  protected def elementAddr(receiver: TExpr, index: TExpr): String = {
+  protected def elementAddr(receiver: TExpr, index: TExpr): Val = {
     // The length is what there is to check against, and a `*T` has none — so the pointer case
     // yields no length and the check is skipped. That is the whole difference between `p[i]` and
     // every other subscript, and it is `03`'s unchecked primitive doing what C's does.
     val (base, len, elem) = receiver.ty match
-      case Type.Array(n, e) => (address(receiver), Some(n.toString), e)
+      case Type.Array(n, e) => (address(receiver), Some(Val.Int(n)), e)
       case w: Type.View =>
         val v = genExpr(receiver)
-        val p = freshTemp(); emit(s"$p = extractvalue ${w.llvm} $v, 1")
-        val l = freshTemp(); emit(s"$l = extractvalue ${w.llvm} $v, 2")
+        val p = freshReg(); emit(Inst.Extract(p, w.lty, v, List(1)))
+        val l = freshReg(); emit(Inst.Extract(l, w.lty, v, List(2)))
         (p, Some(l), w.elem)
       case Type.Ptr(e) => (genExpr(receiver), None, e)
       case other       => sys.error(s"unreachable index into ${other.llvm}")
 
     val i = widenIndex(index)
     for l <- len do boundsCheck(i, l)
-    val r = freshTemp(); emit(s"$r = getelementptr ${elem.llvm}, ptr $base, $word $i"); r
+    val r = freshReg(); emit(Inst.Gep(r, elem.lty, base, List(Arg(wordLty, i)))); r
   }
 
   /** The address a run of `lanes` elements starts at, after checking that the whole run exists —
@@ -271,24 +287,25 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * nothing — `and` is not a branch, and a wrapped `sub` is a defined value LLVM is happy to have
    * computed and then ignored.
    */
-  protected def runAddr(receiver: TExpr, index: TExpr, lanes: Int): String = {
+  protected def runAddr(receiver: TExpr, index: TExpr, lanes: Int): Val = {
     val (base, len, elem) = receiver.ty match
-      case Type.Array(n, e) => (address(receiver), n.toString, e)
+      case Type.Array(n, e) => (address(receiver), Val.Int(n), e)
       case w: Type.View =>
         val v = genExpr(receiver)
-        val p = freshTemp(); emit(s"$p = extractvalue ${w.llvm} $v, 1")
-        val l = freshTemp(); emit(s"$l = extractvalue ${w.llvm} $v, 2")
+        val p = freshReg(); emit(Inst.Extract(p, w.lty, v, List(1)))
+        val l = freshReg(); emit(Inst.Extract(l, w.lty, v, List(2)))
         (p, l, w.elem)
       case other => sys.error(s"unreachable run of ${other.llvm}")
 
     val i    = widenIndex(index)
-    val room = freshTemp(); emit(s"$room = icmp uge $word $len, $lanes")
-    val last = freshTemp(); emit(s"$last = sub $word $len, $lanes")
-    val here = freshTemp(); emit(s"$here = icmp ule $word $i, $last")
-    val ok   = freshTemp(); emit(s"$ok = and i1 $room, $here")
+    val room = freshReg(); emit(Inst.IntCmp(room, ICmp.Uge, wordLty, len, Val.Int(lanes)))
+    val last = freshReg(); emit(Inst.Bin(last, BinOp.Sub, wordLty, len, Val.Int(lanes)))
+    val here = freshReg(); emit(Inst.IntCmp(here, ICmp.Ule, wordLty, i, last))
+    val ok   = freshReg(); emit(Inst.Bin(ok, BinOp.And, i1, room, here))
+
     trapUnless(ok, "bounds")
 
-    val r = freshTemp(); emit(s"$r = getelementptr ${elem.llvm}, ptr $base, $word $i"); r
+    val r = freshReg(); emit(Inst.Gep(r, elem.lty, base, List(Arg(wordLty, i)))); r
   }
 
   /** Takes a view of some of an array's, a slice's, or a string's elements. The base is evaluated
@@ -302,19 +319,22 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       hi: Option[TExpr],
       inclusive: Boolean,
       sliceTy: Type.View,
-  ): String = {
+  ): Val = {
     val elem = sliceTy.elem
 
     val (ownerV, first, len) = base.ty match
       case Type.Ref(array @ Type.Array(n, _), _) =>
         val r = genExpr(base)
-        val p = freshTemp(); emit(s"$p = getelementptr ${boxName(array)}, ptr $r, i32 0, i32 $headerFields")
-        (r, p, Some(n.toString))
+        val p = freshReg()
+
+        emit(Inst.Gep(p, boxLty(array), r,
+          List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields)))))
+        (r, p, Some(Val.Int(n)))
       case s: Type.View =>
         val v = genExpr(base)
-        val o = freshTemp(); emit(s"$o = extractvalue ${s.llvm} $v, 0")
-        val p = freshTemp(); emit(s"$p = extractvalue ${s.llvm} $v, 1")
-        val l = freshTemp(); emit(s"$l = extractvalue ${s.llvm} $v, 2")
+        val o = freshReg(); emit(Inst.Extract(o, s.lty, v, List(0)))
+        val p = freshReg(); emit(Inst.Extract(p, s.lty, v, List(1)))
+        val l = freshReg(); emit(Inst.Extract(l, s.lty, v, List(2)))
         (o, p, Some(l))
       // Storage this frame owns, or a `*T` region. A frame-backed array has no owner, so counting
       // it is a no-op — unless the escape analysis moved it to the heap, in which case the buffer
@@ -324,14 +344,14 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       // Storage this frame owns, storage inside a box the walk went through, or a `*T` region.
       case Type.Array(n, _) =>
         val (own, addr) = addressOwned(base)
-        (own, addr, Some(n.toString))
-      case Type.Ptr(Type.Array(n, _)) => ("null", genExpr(base), Some(n.toString))
+        (own, addr, Some(Val.Int(n)))
+      case Type.Ptr(Type.Array(n, _)) => (Val.Null, genExpr(base), Some(Val.Int(n)))
       // A `*T` region: no owner to count and no length to check the end against. The analyzer has
       // already insisted the end be written, since there is nothing here to supply one.
-      case _: Type.Ptr                => ("null", genExpr(base), None)
+      case _: Type.Ptr                => (Val.Null, genExpr(base), None)
       case other                      => sys.error(s"unreachable slice of ${other.llvm}")
 
-    val start = lo.map(widenIndex).getOrElse("0")
+    val start = lo.map(widenIndex).getOrElse(Val.Int(0))
 
     // The check is on the half-open interval the view ends up naming. An inclusive high end
     // additionally has to name an element that exists, which is also what stops `hi + 1` from
@@ -343,15 +363,15 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
         if !inclusive then v
         else
           for l <- len do
-            val within = freshTemp(); emit(s"$within = icmp ult $word $v, $l")
+            val within = freshReg(); emit(Inst.IntCmp(within, ICmp.Ult, wordLty, v, l))
             trapUnless(within, "bounds")
-          val e = freshTemp(); emit(s"$e = add $word $v, 1"); e
+          val e = freshReg(); emit(Inst.Bin(e, BinOp.Add, wordLty, v, Val.Int(1))); e
 
     for l <- len if hi.isDefined && !inclusive do
-      val fits = freshTemp(); emit(s"$fits = icmp ule $word $end, $l")
+      val fits = freshReg(); emit(Inst.IntCmp(fits, ICmp.Ule, wordLty, end, l))
       trapUnless(fits, "bounds")
 
-    val ordered = freshTemp(); emit(s"$ordered = icmp ule $word $start, $end")
+    val ordered = freshReg(); emit(Inst.IntCmp(ordered, ICmp.Ule, wordLty, start, end))
     trapUnless(ordered, "bounds")
 
     // A substring has to be a string, so both ends must fall between characters. This runs after
@@ -363,16 +383,16 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       trapUnless(strBoundary(first, l, start), "boundary")
       trapUnless(strBoundary(first, l, end), "boundary")
 
-    val p = freshTemp(); emit(s"$p = getelementptr ${elem.llvm}, ptr $first, $word $start")
-    val n = freshTemp(); emit(s"$n = sub $word $end, $start")
+    val p = freshReg(); emit(Inst.Gep(p, elem.lty, first, List(Arg(wordLty, start))))
+    val n = freshReg(); emit(Inst.Bin(n, BinOp.Sub, wordLty, end, start))
 
-    emit(s"call void @arc.retain_maybe(ptr $ownerV)")
+    emit(Inst.Call(None, LType.Void, Val.Global("arc.retain_maybe"), List(Arg(LType.Ptr, ownerV))))
     maybeHeap = true
     heap = true
 
-    val withOwner = freshTemp(); emit(s"$withOwner = insertvalue ${sliceTy.llvm} zeroinitializer, ptr $ownerV, 0")
-    val withPtr   = freshTemp(); emit(s"$withPtr = insertvalue ${sliceTy.llvm} $withOwner, ptr $p, 1")
-    val whole     = freshTemp(); emit(s"$whole = insertvalue ${sliceTy.llvm} $withPtr, $word $n, 2")
+    val withOwner = freshReg(); emit(Inst.Insert(withOwner, sliceTy.lty, Val.Zero, LType.Ptr, ownerV, List(0)))
+    val withPtr   = freshReg(); emit(Inst.Insert(withPtr, sliceTy.lty, withOwner, LType.Ptr, p, List(1)))
+    val whole     = freshReg(); emit(Inst.Insert(whole, sliceTy.lty, withPtr, wordLty, n, List(2)))
 
     ownTemp(whole, sliceTy)
   }
@@ -392,16 +412,16 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * (`05`): storage reached through a field or an index belongs to something else, and an array
    * parameter is the caller's layout, so neither is this body's to have moved.
    */
-  protected def promotedOwner(base: TExpr): String = base match
+  protected def promotedOwner(base: TExpr): Val = base match
     case TLoad(name, _) if promotedBoxes.contains(name) => promotedBoxes(name)
     // A `ref` names storage it did not declare, so the box belongs to whatever its place was rooted
     // at (`03 § ref`). Without this step a view taken through a ref would own nothing, and the buffer
     // the array was promoted into would be released while the view still pointed into it — a
     // promotion that silently undid itself.
     case TLoad(name, _) if refPlaceOf.contains(name)    => promotedOwner(refPlaceOf(name))
-    case _: TLoad                                       => "null"
+    case _: TLoad                                       => Val.Null
     case TIndex(r, _, _)                                => promotedOwner(r)
-    case _                                              => "null"
+    case _                                              => Val.Null
 
   /** The dereference a place walk bottoms out at, following **receivers only**.
    *
@@ -429,12 +449,14 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * another `&Struct` honest: the box that owns the storage is the **innermost** one on the chain,
    * and the ordinary walk evaluates the outermost first.
    */
-  protected def addressOwned(place: TExpr): (String, String) =
+  protected def addressOwned(place: TExpr): (Val, Val) =
     spineRoot(place) match
       case Some(root @ TDeref(operand, inner)) if operand.ty.isInstanceOf[Type.Ref] =>
         val box = genExpr(operand)
-        val at  = freshTemp()
-        emit(s"$at = getelementptr ${boxName(inner)}, ptr $box, i32 0, i32 $headerFields")
+        val at  = freshReg()
+
+        emit(Inst.Gep(at, boxLty(inner), box,
+          List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields)))))
         (box, addressUnder(place, root, at))
 
       case _ => (promotedOwner(place), address(place))
@@ -442,61 +464,73 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
   /** The rest of a place walk, once its root has been evaluated and reached. Every step is the one
    * `address` takes; what differs is only where the chain starts.
    */
-  private def addressUnder(place: TExpr, root: TDeref, at: String): String = place match
+  private def addressUnder(place: TExpr, root: TDeref, at: Val): Val = place match
     case p if p eq root                          => at
     case TField(r, _, ty) if Type.zeroSized(ty)  => addressUnder(r, root, at)
 
     case TField(r, index, _) =>
       val base = addressUnder(r, root, at)
-      val x    = freshTemp()
-      emit(s"$x = getelementptr ${r.ty.llvm}, ptr $base, i32 0, i32 ${fieldSlot(r.ty, index)}")
+      val x    = freshReg()
+      emit(Inst.Gep(x, r.ty.lty, base,
+        List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(fieldSlot(r.ty, index))))))
       x
 
     case TIndex(r, index, _) =>
       val Type.Array(n, elem) = r.ty: @unchecked
       val base = addressUnder(r, root, at)
       val i    = widenIndex(index)
-      boundsCheck(i, n.toString)
-      val x = freshTemp(); emit(s"$x = getelementptr ${elem.llvm}, ptr $base, $word $i")
+      boundsCheck(i, Val.Int(n))
+      val x = freshReg(); emit(Inst.Gep(x, elem.lty, base, List(Arg(wordLty, i))))
       x
 
     case other => address(other)
 
-  protected def genBuffer(elem: Type, n: String): (String, String) = {
-    val bn = bufName(elem)
+  protected def genBuffer(elem: Type, n: Val): (Val, Val) = {
+    val bn = bufLty(elem)
     checked = true
 
-    val e1   = freshTemp(); emit(s"$e1 = getelementptr ${elem.llvm}, ptr null, i64 1")
-    val esz  = freshTemp(); emit(s"$esz = ptrtoint ptr $e1 to $word")
-    val h1   = freshTemp(); emit(s"$h1 = getelementptr $bn, ptr null, i32 0, i32 ${headerFields + 1}")
-    val hsz  = freshTemp(); emit(s"$hsz = ptrtoint ptr $h1 to $word")
+    val e1   = freshReg(); emit(Inst.Gep(e1, elem.lty, Val.Null, List(Arg(LType.I(64), Val.Int(1)))))
+    val esz  = freshReg(); emit(Inst.Cast(esz, CastOp.PtrToInt, LType.Ptr, e1, wordLty))
+    val h1   = freshReg()
+
+    emit(Inst.Gep(h1, bn, Val.Null, List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields + 1)))))
+    val hsz  = freshReg(); emit(Inst.Cast(hsz, CastOp.PtrToInt, LType.Ptr, h1, wordLty))
 
     // The overflow intrinsics carry their width in the **name** as well as in the signature, so a
     // size computed at the machine's own width has to name the matching overload — and getting that
     // wrong is not a type error LLVM would catch, it is a call to a function that does not exist.
-    val pair  = s"{ $word, i1 }"
-    val mul   = freshTemp(); emit(s"$mul = call $pair @llvm.umul.with.overflow.$word($word $n, $word $esz)")
-    val bytes = freshTemp(); emit(s"$bytes = extractvalue $pair $mul, 0")
-    val over1 = freshTemp(); emit(s"$over1 = extractvalue $pair $mul, 1")
-    val add   = freshTemp(); emit(s"$add = call $pair @llvm.uadd.with.overflow.$word($word $bytes, $word $hsz)")
-    val total = freshTemp(); emit(s"$total = extractvalue $pair $add, 0")
-    val over2 = freshTemp(); emit(s"$over2 = extractvalue $pair $add, 1")
-    val over  = freshTemp(); emit(s"$over = or i1 $over1, $over2")
-    val fits  = freshTemp(); emit(s"$fits = xor i1 $over, true")
+    val pair  = LType.Struct(List(wordLty, i1))
+    val mul   = freshReg()
+
+    emit(Inst.Call(Some(mul), pair, Val.Global(s"llvm.umul.with.overflow.$word"),
+      List(Arg(wordLty, n), Arg(wordLty, esz))))
+    val bytes = freshReg(); emit(Inst.Extract(bytes, pair, mul, List(0)))
+    val over1 = freshReg(); emit(Inst.Extract(over1, pair, mul, List(1)))
+    val add   = freshReg()
+
+    emit(Inst.Call(Some(add), pair, Val.Global(s"llvm.uadd.with.overflow.$word"),
+      List(Arg(wordLty, bytes), Arg(wordLty, hsz))))
+    val total = freshReg(); emit(Inst.Extract(total, pair, add, List(0)))
+    val over2 = freshReg(); emit(Inst.Extract(over2, pair, add, List(1)))
+    val over  = freshReg(); emit(Inst.Bin(over, BinOp.Or, i1, over1, over2))
+    val fits  = freshReg(); emit(Inst.Bin(fits, BinOp.Xor, i1, over, Val.Bool(true)))
     trapUnless(fits, "size")
 
-    val p   = freshTemp(); emit(s"$p = call ptr @$mallocSym($word $total)")
-    val got = freshTemp(); emit(s"$got = icmp ne ptr $p, null")
+    val p   = freshReg(); emit(Inst.Call(Some(p), LType.Ptr, Val.Global(mallocSym), List(Arg(wordLty, total))))
+    val got = freshReg(); emit(Inst.IntCmp(got, ICmp.Ne, LType.Ptr, p, Val.Null))
     trapUnless(got, "alloc")
 
-    emit(s"store $word 1, ptr $p")
-    val hook = freshTemp(); emit(s"$hook = getelementptr $bn, ptr $p, i32 0, i32 1")
-    emit(s"store ptr ${dropBufFn(elem)}, ptr $hook")
-    val wc   = freshTemp(); emit(s"$wc = getelementptr $bn, ptr $p, i32 0, i32 2")
-    emit(s"store $word 1, ptr $wc")
-    val lenp = freshTemp(); emit(s"$lenp = getelementptr $bn, ptr $p, i32 0, i32 $headerFields")
-    emit(s"store $word $n, ptr $lenp")
-    val data = freshTemp(); emit(s"$data = getelementptr $bn, ptr $p, i32 0, i32 ${headerFields + 1}")
+    emit(Inst.Store(wordLty, Val.Int(1), p, Access.Plain))
+    val hook = freshReg(); emit(Inst.Gep(hook, bn, p, List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(1)))))
+    emit(Inst.Store(LType.Ptr, dropBufFn(elem), hook, Access.Plain))
+    val wc   = freshReg(); emit(Inst.Gep(wc, bn, p, List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(2)))))
+    emit(Inst.Store(wordLty, Val.Int(1), wc, Access.Plain))
+    val lenp = freshReg(); emit(Inst.Gep(lenp, bn, p, List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields)))))
+    emit(Inst.Store(wordLty, n, lenp, Access.Plain))
+    val data = freshReg()
+
+    emit(Inst.Gep(data, bn, p,
+      List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields + 1)))))
 
     (p, data)
   }
@@ -504,12 +538,12 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
   /** The view of a whole buffer: the box keeps the elements alive, and the one count it was made
    * with is the count this view holds.
    */
-  protected def bufferView(sliceTy: Type.Slice, box: String, data: String, n: String): String = {
+  protected def bufferView(sliceTy: Type.Slice, box: Val, data: Val, n: Val): Val = {
     maybeHeap = true
 
-    val withOwner = freshTemp(); emit(s"$withOwner = insertvalue ${sliceTy.llvm} zeroinitializer, ptr $box, 0")
-    val withPtr   = freshTemp(); emit(s"$withPtr = insertvalue ${sliceTy.llvm} $withOwner, ptr $data, 1")
-    val whole     = freshTemp(); emit(s"$whole = insertvalue ${sliceTy.llvm} $withPtr, $word $n, 2")
+    val withOwner = freshReg(); emit(Inst.Insert(withOwner, sliceTy.lty, Val.Zero, LType.Ptr, box, List(0)))
+    val withPtr   = freshReg(); emit(Inst.Insert(withPtr, sliceTy.lty, withOwner, LType.Ptr, data, List(1)))
+    val whole     = freshReg(); emit(Inst.Insert(whole, sliceTy.lty, withPtr, wordLty, n, List(2)))
 
     ownTemp(whole, sliceTy)
   }
@@ -522,15 +556,15 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * as every target was — and produced an `icmp` between an `i64` and an `i32` the moment one was
    * not, which is what `CrossTargetBuildTests` caught.
    */
-  protected def widenIndex(index: TExpr): String = Type.underlying(index.ty) match
+  protected def widenIndex(index: TExpr): Val = Type.underlying(index.ty) match
     case i: Type.Integer => convert(i, Type.Integer(target.word.bits, i.signed), genExpr(index))
     case other           => sys.error(s"unreachable index of type ${other.llvm}")
 
   /** Traps unless `i` names an element that exists. The comparison is unsigned at the address width,
    * so a negative index arrives as a very large one and fails the same test.
    */
-  protected def boundsCheck(i: String, len: String): Unit = {
-    val ok = freshTemp(); emit(s"$ok = icmp ult $word $i, $len")
+  protected def boundsCheck(i: Val, len: Val): Unit = {
+    val ok = freshReg(); emit(Inst.IntCmp(ok, ICmp.Ult, wordLty, i, len))
     trapUnless(ok, "bounds")
   }
 
@@ -542,25 +576,25 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * slot instead: written at the variant's own type, read back at the enum's. A nullary variant
    * never touches the region and so needs no slot at all.
    */
-  protected def enumValue(en: Type.Enum, variant: Type.EnumVariant, vals: List[String]): String =
-    if en.simple then variant.tag.toString
+  protected def enumValue(en: Type.Enum, variant: Type.EnumVariant, vals: List[Val]): Val =
+    if en.simple then Val.Int(variant.tag)
     else if !variant.carries then
-      val tagged = freshTemp()
-      emit(s"$tagged = insertvalue ${en.llvm} undef, i32 ${variant.tag}, 0")
+      val tagged = freshReg()
+      emit(Inst.Insert(tagged, en.lty, Val.Undef, i32, Val.Int(variant.tag), List(0)))
       tagged
     else
-      var payload = "undef"
+      var payload: Val = Val.Undef
       for (v, i) <- vals.zipWithIndex if !Type.zeroSized(variant.fields(i)._2) do
-        val r = freshTemp()
-        emit(s"$r = insertvalue ${en.payloadLlvm(variant)} $payload, " +
-          s"${variant.fields(i)._2.llvm} $v, ${variant.slot(i)}")
+        val r = freshReg()
+        emit(Inst.Insert(r, en.payloadLty(variant), payload,
+          variant.fields(i)._2.lty, v, List(variant.slot(i))))
         payload = r
-      val slot = scratchSlot(en.llvm)
-      emit(s"store i32 ${variant.tag}, ptr $slot")
+      val slot = scratchSlot(en.lty)
+      emit(Inst.Store(i32, Val.Int(variant.tag), slot, Access.Plain))
       val p = payloadPtr(en, slot)
-      emit(s"store ${en.payloadLlvm(variant)} $payload, ptr $p")
-      val r = freshTemp()
-      emit(s"$r = load ${en.llvm}, ptr $slot")
+      emit(Inst.Store(en.payloadLty(variant), payload, p, Access.Plain))
+      val r = freshReg()
+      emit(Inst.Load(r, en.lty, slot, Access.Plain))
       r
 
   /** Whether an integer `v` of type `vt` equals one of the enum's declared discriminants — the
@@ -568,18 +602,18 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * so a wide source cannot alias a narrow discriminant, matching how the checked `char`
    * conversion widens before testing.
    */
-  protected def enumMembership(en: Type.Enum, vt: Type.Integer, v: String): String = {
+  protected def enumMembership(en: Type.Enum, vt: Type.Integer, v: Val): Val = {
     val wide = convert(vt, Type.Integer(64, vt.signed), v)
     en.variants.map { variant =>
-      val eq = freshTemp(); emit(s"$eq = icmp eq i64 $wide, ${variant.tag}")
+      val eq = freshReg(); emit(Inst.IntCmp(eq, ICmp.Eq, LType.I(64), wide, Val.Int(variant.tag)))
       eq
-    }.reduceOption(orI1).getOrElse("false")
+    }.reduceOption(orI1).getOrElse(no)
   }
 
   /** `Color(n)` — the checked cast. Traps unless `n` is a declared discriminant, then stores the
    * value at the enum's underlying width, which is the enum's representation.
    */
-  protected def genEnumFromInt(value: TExpr, en: Type.Enum): String = {
+  protected def genEnumFromInt(value: TExpr, en: Type.Enum): Val = {
     // Through `repr`, because a transparent subtype *is* its base (`16 §1`) and the analyzer admits
     // one here on exactly that ground — the value is laid out as the base and converts as it.
     val vt = Type.repr(value.ty).asInstanceOf[Type.Integer]
@@ -593,25 +627,25 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * whose element has no refcount, so a merge slot needs no ownership bookkeeping.
    */
   protected def genEnumTry(value: TExpr, en: Type.Enum, optTy: Type.Enum,
-                         some: Type.EnumVariant, none: Type.EnumVariant): String = {
+                         some: Type.EnumVariant, none: Type.EnumVariant): Val = {
     val vt    = Type.repr(value.ty).asInstanceOf[Type.Integer]
     val v     = genExpr(value)
     val ok    = enumMembership(en, vt, v)
-    val slot  = emitAlloca(freshTemp(), optTy.llvm)
+    val slot  = emitAlloca(freshReg(), optTy.lty)
     val someL = freshLabel("try.some")
     val noneL = freshLabel("try.none")
     val endL  = freshLabel("try.end")
 
-    emitTerm(s"br i1 $ok, label %$someL, label %$noneL")
+    emitTerm(Inst.CondBr(ok, someL, noneL))
     emitLabel(someL)
     val ev = convert(vt, en.underlying, v)
-    emit(s"store ${optTy.llvm} ${enumValue(optTy, some, List(ev))}, ptr $slot")
-    emitTerm(s"br label %$endL")
+    emit(Inst.Store(optTy.lty, enumValue(optTy, some, List(ev)), slot, Access.Plain))
+    emitTerm(Inst.Br(endL))
     emitLabel(noneL)
-    emit(s"store ${optTy.llvm} ${enumValue(optTy, none, Nil)}, ptr $slot")
-    emitTerm(s"br label %$endL")
+    emit(Inst.Store(optTy.lty, enumValue(optTy, none, Nil), slot, Access.Plain))
+    emitTerm(Inst.Br(endL))
     emitLabel(endL)
-    val r = freshTemp(); emit(s"$r = load ${optTy.llvm}, ptr $slot"); r
+    val r = freshReg(); emit(Inst.Load(r, optTy.lty, slot, Access.Plain)); r
   }
 
   /** Weakens a reference: the same address, counted in the box's third word instead of its first
@@ -622,7 +656,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * share back, exactly as it would for a reference. What ends up holding it long-term is the slot
    * it is stored into, which takes a share of its own when it is written.
    */
-  protected def genDowngrade(value: TExpr, weakTy: Type.Weak): String = {
+  protected def genDowngrade(value: TExpr, weakTy: Type.Weak): Val = {
     val v = genExpr(value)
     retainValue(weakTy, v)
     ownTemp(v, weakTy)
@@ -637,48 +671,48 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * address only on the arm where there is one.
    */
   protected def genUpgrade(value: TExpr, optTy: Type.Enum, some: Type.EnumVariant,
-                           none: Type.EnumVariant): String = {
+                           none: Type.EnumVariant): Val = {
     weakHeap = true
     val fat  = value.ty.asInstanceOf[Type.Weak].inner.isInstanceOf[Type.Trait]
     val v    = genExpr(value)
-    val addr = if fat then { val b = freshTemp(); emit(s"$b = extractvalue ${Type.fatPointer} $v, 1"); b } else v
+    val addr = if fat then { val b = freshReg(); emit(Inst.Extract(b, LType.fat, v, List(1))); b } else v
 
-    val got   = freshTemp(); emit(s"$got = call ptr @arc.upgrade(ptr $addr)")
-    val live  = freshTemp(); emit(s"$live = icmp ne ptr $got, null")
-    val slot  = emitAlloca(freshTemp(), optTy.llvm)
+    val got   = freshReg(); emit(Inst.Call(Some(got), LType.Ptr, Val.Global("arc.upgrade"), List(Arg(LType.Ptr, addr))))
+    val live  = freshReg(); emit(Inst.IntCmp(live, ICmp.Ne, LType.Ptr, got, Val.Null))
+    val slot  = emitAlloca(freshReg(), optTy.lty)
     val someL = freshLabel("weak.live")
     val noneL = freshLabel("weak.gone")
     val endL  = freshLabel("weak.end")
 
-    emitTerm(s"br i1 $live, label %$someL, label %$noneL")
+    emitTerm(Inst.CondBr(live, someL, noneL))
     emitLabel(someL)
     val strong =
       if !fat then got
       else
-        val tbl = freshTemp(); emit(s"$tbl = extractvalue ${Type.fatPointer} $v, 0")
-        val f0  = freshTemp(); emit(s"$f0 = insertvalue ${Type.fatPointer} undef, ptr $tbl, 0")
-        val f1  = freshTemp(); emit(s"$f1 = insertvalue ${Type.fatPointer} $f0, ptr $got, 1")
+        val tbl = freshReg(); emit(Inst.Extract(tbl, LType.fat, v, List(0)))
+        val f0  = freshReg(); emit(Inst.Insert(f0, LType.fat, Val.Undef, LType.Ptr, tbl, List(0)))
+        val f1  = freshReg(); emit(Inst.Insert(f1, LType.fat, f0, LType.Ptr, got, List(1)))
         f1
-    emit(s"store ${optTy.llvm} ${enumValue(optTy, some, List(strong))}, ptr $slot")
-    emitTerm(s"br label %$endL")
+    emit(Inst.Store(optTy.lty, enumValue(optTy, some, List(strong)), slot, Access.Plain))
+    emitTerm(Inst.Br(endL))
     emitLabel(noneL)
-    emit(s"store ${optTy.llvm} ${enumValue(optTy, none, Nil)}, ptr $slot")
-    emitTerm(s"br label %$endL")
+    emit(Inst.Store(optTy.lty, enumValue(optTy, none, Nil), slot, Access.Plain))
+    emitTerm(Inst.Br(endL))
     emitLabel(endL)
-    val r = freshTemp(); emit(s"$r = load ${optTy.llvm}, ptr $slot")
+    val r = freshReg(); emit(Inst.Load(r, optTy.lty, slot, Access.Plain))
     ownTemp(r, optTy)
   }
 
   /** Reads every field of a variant's payload out of an enum value. */
-  protected def payloadFields(en: Type.Enum, variant: Type.EnumVariant, value: String): List[String] =
+  protected def payloadFields(en: Type.Enum, variant: Type.EnumVariant, value: Val): List[Val] =
     if !variant.carries then Nil
     else
       val p = enumPayload(en, variant, value)
       variant.fields.indices.map { i =>
-        if Type.zeroSized(variant.fields(i)._2) then ""
+        if Type.zeroSized(variant.fields(i)._2) then Val.Nothing
         else
-          val f = freshTemp()
-          emit(s"$f = extractvalue ${en.payloadLlvm(variant)} $p, ${variant.slot(i)}")
+          val f = freshReg()
+          emit(Inst.Extract(f, en.payloadLty(variant), p, List(variant.slot(i))))
           f
       }.toList
 
@@ -692,22 +726,22 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       fail: Type.EnumVariant,
       retEnum: Type.Enum,
       retFail: Type.EnumVariant,
-  ): String = {
+  ): Val = {
     val en = operand.ty.asInstanceOf[Type.Enum]
     val v  = genExpr(operand)
 
-    val tag  = freshTemp(); emit(s"$tag = extractvalue ${en.llvm} $v, 0")
-    val isOk = freshTemp(); emit(s"$isOk = icmp eq i32 $tag, ${ok.tag}")
+    val tag  = freshReg(); emit(Inst.Extract(tag, en.lty, v, List(0)))
+    val isOk = freshReg(); emit(Inst.IntCmp(isOk, ICmp.Eq, i32, tag, Val.Int(ok.tag)))
 
     val okL   = freshLabel("try.ok")
     val failL = freshLabel("try.fail")
-    emitTerm(s"br i1 $isOk, label %$okL, label %$failL")
+    emitTerm(Inst.CondBr(isOk, okL, failL))
 
     emitLabel(failL)
     val failed = enumValue(retEnum, retFail, payloadFields(en, fail, v))
     retainValue(retEnum, failed)
     releaseAll()
-    emitTerm(s"ret ${retEnum.llvm} $failed")
+    emitTerm(Inst.Ret(Some(retEnum.lty), Some(failed)))
 
     emitLabel(okL)
     payloadFields(en, ok, v).head

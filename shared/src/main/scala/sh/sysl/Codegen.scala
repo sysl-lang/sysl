@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.{Access, Arg, ICmp, Inst, LType, Val}
+
 import scala.collection.mutable
 
 /** Lowers a typed program (`TProgram`) to a textual LLVM IR module.
@@ -38,29 +40,36 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
   // --- module --------------------------------------------------------------------------
 
-  private def gen(): String = {
+  /** **The module, as data.** `gen` below is this written down.
+   *
+   * The order is not a matter of taste: a named struct used before its `= type` line is opaque, and
+   * an opaque type cannot be passed by value — so `imports` comes after the type definitions and an
+   * `external global` naming an aggregate comes after them too. `@llvm.used` is last so that every
+   * symbol it names has been written above it.
+   */
+  private def build(): ir.Module = {
     // A function a library already compiled is declared, not defined: its body is in the object file
     // the library shipped, and emitting it again would be a duplicate symbol at the link.
     val (imported, own) = program.funcs.partition(f => program.precompiled(f.name))
     // A `@ghost` function is not emitted at all (`17 §8`). Nothing executable may call one — that is
     // checked in the analyzer — and the clauses that may are the ones skipped below, so there is no
     // call left to resolve.
-    val funcTexts       = own.filterNot(_.ghost).map(genFunction)
+    val funcs           = own.filterNot(_.ghost).map(genFunction)
     // The C-callable entry each `@export` publishes, in front of the definition it calls
     // (`ExportThunk`). Only this compilation's own functions get one: a precompiled function's thunk
     // was emitted into the artifact that defined it, and a second copy here would be the duplicate
     // symbol every other cross-artifact declaration is careful to avoid.
-    val thunkTexts      = own.filterNot(_.ghost).filter(_.exported.isDefined)
+    val thunks          = own.filterNot(_.ghost).filter(_.exported.isDefined)
                              .map(f => genExportThunk(f, symbolOf(f.name)))
     // A library has no entry point. Emitting one would put a second `main` in every program that
     // linked against it, which the linker reports as a duplicate symbol and nothing else explains.
-    val mainText =
-      if !program.entryPoint then ""
-      else if program.tests.nonEmpty then genTestMain(program.vals, program.tests)
-      else genMain(program.vals, program.main, program.entry)
+    val entry =
+      if !program.entryPoint then None
+      else if program.tests.nonEmpty then Some(genTestMain(program.vals, program.tests))
+      else Some(genMain(program.vals, program.main, program.entry))
     // The tables come after the bodies because a table only exists for a type something erased, and
     // it may ask for an adapter, which the queue below is what emits.
-    val vtableText = program.vtables.map(genVtable).mkString
+    val vtables = program.vtables.map(genVtable)
 
     // Emitting a runtime helper may ask for another (a destructor releases the references its
     // payload holds), so this runs until nothing new is requested.
@@ -68,46 +77,76 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // **A helper that reaches the allocator asks for the plain hook, and it is asked here rather
     // than at the eight places that request one.** Every box a helper builds carries a hook that
     // gives its storage back, and the ones built by the string runtime hold raw bytes, so the hook
-    // they install is the one that frees and does nothing else. Reading it off the helper's own text
-    // is what keeps that from being a list somebody has to remember to add to: a helper that starts
+    // they install is the one that frees and does nothing else. Reading it off the helper itself is
+    // what keeps that from being a list somebody has to remember to add to: a helper that starts
     // allocating tomorrow brings its hook with it, and one that stops no longer asks.
-    val runtimeTexts = mutable.ListBuffer.empty[String]
+    val helpers = mutable.ListBuffer.empty[ir.Runtime]
 
     while runtimeQueue.nonEmpty do
-      val text = runtimeQueue.dequeue()()
+      val r = runtimeQueue.dequeue()()
 
-      if text.contains(s"call ptr @$mallocSym(") then plainDropFn
-      runtimeTexts += text
+      if allocates(r) then plainDropFn
+      helpers += r
 
-    val out = new mutable.StringBuilder
+    // A zero-sized field is skipped: the aggregate is what occupies storage, and `Type.slot` is what
+    // keeps every index that reaches into it agreeing with what was laid down here.
+    //
+    // **One name, one definition.** Two instantiations may share an emitted name, because a
+    // transparent subtype mangles as its base: `Box[Age]` and `Box[int]` are two types to the
+    // analyzer — only one of them checks what is written into it — and one layout here, which is
+    // exactly what sharing a representation means. Emitting per instantiation would define the name
+    // twice, and the back end rejects that rather than choosing. The layouts agree wherever the names
+    // do, since the only thing mangling collapses is a subtype into the base it is stored as.
+    //
+    // `@packed` is LLVM's `<{ }>`, which is the same declaration order with every interior gap
+    // removed and the aggregate's own alignment dropped to one — so the offsets the back end
+    // computes are the ones `Layout` computed, rather than two answers that agree until a field
+    // needs padding in front of it.
+    //
+    // `@align` is *not* written here. A type carries no alignment in LLVM's textual form: the
+    // boundary is stated where storage is created, which is what an alloca and a global carry.
+    // A **bitfield struct** has no members here at all: it is one integer, and its fields are bit
+    // ranges of that integer rather than anything LLVM is told about (`Bitfields`). Writing the
+    // container inside `<{ }>` rather than as a bare `iM` is what keeps every site that reaches into
+    // a struct — an alloca, a by-value parameter, a load of the whole of one — on the one shape.
+    val structs = program.structs.distinctBy(_.llvm).map { s =>
+      val fields = Bitfields.of(s) match
+        case Some(ranges) => List(LType.I(Bitfields.bits(ranges)))
+        case None         => s.stored.map(_._2.lty)
 
-    // The module says which machine it is for, which is what makes an invocation naming a target
-    // mean anything downstream: LLVM derives the data layout from the triple, so stating it is also
-    // what keeps a module built for one machine from being read as a module for whatever read it.
-    out ++= s"target triple = \"${target.triple}\"\n\n"
+      s.minAlign.filter(_ > 1).foreach(raisedAligns(s.llvm) = _)
+      ir.TypeDef(s.llvm, fields, s.packed)
+    }
 
-    if traps then out ++= "declare void @llvm.trap()\n"
-    // `malloc` and `snprintf` take a `size_t`, and the two overflow intrinsics carry their width in
-    // the **name** as well as the signature — so all of these are the machine's word rather than
-    // eight bytes, and naming the wrong overload is a call to a function that does not exist.
-    if heap then
-      out ++= s"declare ptr @$mallocSym($word)\n"
-      out ++= s"declare void @$freeSym(ptr)\n"
-    if checked then
-      out ++= s"declare { $word, i1 } @llvm.umul.with.overflow.$word($word, $word)\n"
-      out ++= s"declare { $word, i1 } @llvm.uadd.with.overflow.$word($word, $word)\n"
-    if usesSnprintf then out ++= s"declare i32 @snprintf(ptr, $word, ptr, ...)\n"
-    // The test dispatcher's one dependency, and the only thing in a test build that is not also in an
-    // ordinary one. It is declared from the shape of the program rather than from a flag set while
-    // emitting, because the entry point is emitted after this line runs.
-    if program.entryPoint && program.tests.nonEmpty then out ++= "declare i32 @strcmp(ptr, ptr)\n"
-    if usesVarargs then
-      out ++= "declare void @llvm.va_start.p0(ptr)\n"
-      out ++= "declare void @llvm.va_end.p0(ptr)\n"
-    if usesVaCopy then out ++= "declare void @llvm.va_copy.p0(ptr, ptr)\n"
-    if usesMemcpy then out ++= "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n"
+    // A data enum is the tag and **one** payload region, wide enough and aligned for whichever
+    // variant needs the most (`09 §3`). Each variant's own payload keeps its named aggregate type,
+    // which is what a construction stores into that region and what a match reads back out of it.
+    // Deduplicated for the reason the structs above are, and it is the same rule reaching two more
+    // definitions apiece: a variant's payload aggregate is named from the enum's mangling too, so
+    // `Option[Age]` beside `Option[int]` would define `%…Option.int.Some` twice as well.
+    val enums = program.enums.distinctBy(_.llvm).flatMap { e =>
+      val (unit, count) = layout.payloadArea(e)
 
-    // An `extern` the program calls is declared here, unless the symbol is already declared — by the
+      e.variants.filter(_.carries).map(v => ir.TypeDef(e.payloadLlvm(v), v.stored.map(_._2.lty))) :+
+        ir.TypeDef(e.llvm, List(i32, LType.Arr(count, unit)))
+    }
+
+    // A box is the strong count, the function that destroys it, the weak count, and the payload —
+    // so ARC works the same everywhere, and an object frees itself into whichever heap made it.
+    // The two counts are the machine's word, and must stay in step with `%arc.header` — the runtime
+    // reads these very fields through that type, so a disagreement is not a type error anywhere,
+    // it is a count read at the wrong width.
+    //
+    // A buffer is the same box with the element count in front of elements there may be any number
+    // of, so the hook — which is reached with no static type — can still find them all. That count
+    // is a `usize` like any other length.
+    val boxDefs =
+      boxes.toList.map((name, payload) =>
+        ir.TypeDef(name, List(wordLty, LType.Ptr, wordLty, payload.lty))) :::
+        bufs.toList.map((name, elem) =>
+          ir.TypeDef(name, List(wordLty, LType.Ptr, wordLty, wordLty, LType.Arr(0, elem.lty))))
+
+    // An `extern` the program calls is declared unless the symbol is already declared — by the
     // runtime, whose own spelling of `malloc` is the one its code calls, or by an earlier `extern`,
     // since two declarations may name one symbol under different sysl names. A module may not
     // declare one symbol twice.
@@ -119,123 +158,114 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // An aggregate does not cross to a foreign callee as itself: the convention the other side was
     // compiled against says which registers it arrives in, so that is what the declaration names
     // (`ForeignEmitter`).
-    for e <- program.externs if declared.add(e.symbol) do
-      val (ret, params) = foreignSignature(e.retTy, e.params, e.variadic)
-      out ++= s"declare $ret @${e.symbol}(${params.mkString(", ")})\n"
+    val externs = program.externs.filter(e => declared.add(e.symbol))
+                         .map(e => ir.FuncSig(e.symbol, foreignSignature(e.retTy, e.params, e.variadic)))
 
-    for d <- satDecls do out ++= d + "\n"
-    out ++= "\n"
-
-    // A zero-sized field is skipped: the aggregate is what occupies storage, and `Type.slot` is what
-    // keeps every index that reaches into it agreeing with what was laid down here.
-    //
-    // **One name, one definition.** Two instantiations may share an emitted name, because a
-    // transparent subtype mangles as its base: `Box[Age]` and `Box[int]` are two types to the
-    // analyzer — only one of them checks what is written into it — and one layout here, which is
-    // exactly what sharing a representation means. Emitting per instantiation would define the name
-    // twice, and the back end rejects that rather than choosing. The layouts agree wherever the names
-    // do, since the only thing mangling collapses is a subtype into the base it is stored as.
-    val structs = program.structs.distinctBy(_.llvm)
-
-    // `@packed` is LLVM's `<{ }>`, which is the same declaration order with every interior gap
-    // removed and the aggregate's own alignment dropped to one — so the offsets the back end
-    // computes are the ones `Layout` computed, rather than two answers that agree until a field
-    // needs padding in front of it.
-    //
-    // `@align` is *not* written here. A type carries no alignment in LLVM's textual form: the
-    // boundary is stated where storage is created, which is what `alignAttr` stamps onto an alloca
-    // and a global below.
-    // A **bitfield struct** has no members here at all: it is one integer, and its fields are bit
-    // ranges of that integer rather than anything LLVM is told about (`Bitfields`). Writing the
-    // container inside `<{ }>` rather than as a bare `iM` is what keeps every site that reaches into
-    // a struct — an alloca, a by-value parameter, a load of the whole of one — on the one shape.
-    for s <- structs do
-      val fields = Bitfields.of(s) match
-        case Some(ranges) => s"i${Bitfields.bits(ranges)}"
-        case None         => s.stored.map(_._2.llvm).mkString(", ")
-
-      out ++= (if s.packed then s"${s.llvm} = type <{ $fields }>\n" else s"${s.llvm} = type { $fields }\n")
-      s.minAlign.filter(_ > 1).foreach(raisedAligns(s.llvm) = _)
-    if structs.nonEmpty then out ++= "\n"
-
-    // A data enum is the tag and **one** payload region, wide enough and aligned for whichever
-    // variant needs the most (`09 §3`). Each variant's own payload keeps its named aggregate type,
-    // which is what a construction stores into that region and what a match reads back out of it.
-    // Deduplicated for the reason the structs above are, and it is the same rule reaching two more
-    // definitions apiece: a variant's payload aggregate is named from the enum's mangling too, so
-    // `Option[Age]` beside `Option[int]` would define `%…Option.int.Some` twice as well.
-    val enums = program.enums.distinctBy(_.llvm)
-
-    for e <- enums do
-      for v <- e.variants if v.carries do
-        out ++= s"${e.payloadLlvm(v)} = type { ${v.stored.map(_._2.llvm).mkString(", ")} }\n"
-      val (unit, count) = layout.payloadArea(e)
-      out ++= s"${e.llvm} = type { i32, [$count x $unit] }\n"
-    if enums.nonEmpty then out ++= "\n"
-
-    // A box is the strong count, the function that destroys it, the weak count, and the payload —
-    // so ARC works the same everywhere, and an object frees itself into whichever heap made it.
-    // The two counts are the machine's word, and must stay in step with `%arc.header` — the runtime
-    // reads these very fields through that type, so a disagreement is not a type error anywhere,
-    // it is a count read at the wrong width.
-    for (name, payload) <- boxes do
-      out ++= s"$name = type { $word, ptr, $word, ${payload.llvm} }\n"
-    // A buffer is the same box with the element count in front of elements there may be any number
-    // of, so the hook — which is reached with no static type — can still find them all. That count
-    // is a `usize` like any other length.
-    for (name, elem) <- bufs do
-      out ++= s"$name = type { $word, ptr, $word, $word, [0 x ${elem.llvm}] }\n"
-    if boxes.nonEmpty || bufs.nonEmpty then out ++= "\n"
-
-    // A library's own functions are declared here rather than up with the `extern`s, and it has to be
-    // **after** the type definitions: a named struct used before its `= type` line is opaque at that
-    // point, and an opaque type cannot be passed by value. Their signatures are built the way the
-    // *definition* would have built them rather than through `foreignSignature`, because these are
-    // sysl's convention and not C's — getting that wrong passes arguments the other way, which is a
-    // corrupt run rather than a link error.
-    for f <- imported do
-      val params =
-        (syslSret(f.retTy).toList ++ Type.stored(f.params).map(p => syslParam(p._2)) ++
-          Option.when(f.variadic)("...")).mkString(", ")
-      out ++= s"declare ${syslResult(f.retTy)} @${symbolOf(f.name)}($params)\n"
-    if imported.nonEmpty then out ++= "\n"
-
-    if boolStrs then
-      out ++= "@.true = private constant [5 x i8] c\"true\\00\"\n"
-      out ++= "@.false = private constant [6 x i8] c\"false\\00\"\n"
     // Storage the linker supplies: the declaration line and nothing else, since this module lays none
-    // of it down. It goes here rather than up with the `extern` functions because a named aggregate
-    // type is opaque until its `= type` line, and an `external global` naming one has to come after.
-    // Two declarations may share one symbol, so the symbol is what is declared once.
+    // of it down. Two declarations may share one symbol, so the symbol is what is declared once.
     val declaredGlobals = mutable.Set.empty[String]
+    val externVars      = program.externVars.filter(v => declaredGlobals.add(v.symbol))
+                                 .map(v => ir.Global(v.symbol, constant = false, v.ty.lty,
+                                                     linkage = ir.Linkage.External))
 
-    for v <- program.externVars if declaredGlobals.add(v.symbol) do
-      out ++= s"@${v.symbol} = external global ${v.ty.llvm}\n"
-    out ++= genVals(program.vals)
-    out ++= globals.toString
-    out ++= vtableText
-    if globals.nonEmpty || boolStrs || vtableText.nonEmpty || program.vals.nonEmpty ||
-      program.externVars.nonEmpty
-    then out ++= "\n"
-
-    if charBuf then out ++= ScalarEmitter.utf8Encoder
-    if heap then out ++= ArcEmitter.core(target)
-    if syncHeap then out ++= ArcEmitter.atomic(target)
-    if maybeHeap then out ++= ArcEmitter.maybe
-    if weakHeap then out ++= ArcEmitter.weak(target)
-    for t <- runtimeTexts do out ++= t; out ++= "\n"
-
-    for t <- funcTexts do out ++= t; out ++= "\n"
-    for t <- thunkTexts do out ++= t; out ++= "\n"
-    out ++= mainText
-    // Last, so that every symbol it names has been written above it. A definition a library already
-    // compiled is not in this list: its own module said it was used, and saying so again here would
-    // be this module claiming a symbol it does not define.
-    out ++= genUsed(
-      program.vals.filter(_.section.isDefined).map(v => v.symbol) :::
-        own.filterNot(_.ghost).filter(_.section.isDefined).map(f => symbolOf(f.name)))
-    out.toString
+    ir.Module(
+      target.triple,
+      intrinsics ::: externs ::: satDecls.toList,
+      structs,
+      enums,
+      boxDefs,
+      // A library's own functions are declared here rather than up with the `extern`s, and it has to
+      // be **after** the type definitions: a named struct used before its `= type` line is opaque at
+      // that point, and an opaque type cannot be passed by value. Their signatures are built the way
+      // the *definition* would have built them rather than through `foreignSignature`, because these
+      // are sysl's convention and not C's — getting that wrong passes arguments the other way, which
+      // is a corrupt run rather than a link error.
+      imported.map(f => ir.FuncSig(symbolOf(f.name), syslFnType(f.retTy, f.params, f.variadic))),
+      boolConstants ::: externVars ::: genVals(program.vals) ::: globals.toList ::: vtables,
+      runtimeBundles ::: helpers.toList,
+      funcs,
+      thunks,
+      entry,
+      // A definition a library already compiled is not in this list: its own module said it was
+      // used, and saying so again here would be this module claiming a symbol it does not define.
+      genUsed(program.vals.filter(_.section.isDefined).map(v => v.symbol) :::
+                own.filterNot(_.ghost).filter(_.section.isDefined).map(f => symbolOf(f.name))))
   }
+
+  /** The intrinsic and libc declarations the module turned out to need.
+   *
+   * `malloc` and `snprintf` take a `size_t`, and the two overflow intrinsics carry their width in
+   * the **name** as well as the signature — so all of these are the machine's word rather than
+   * eight bytes, and naming the wrong overload is a call to a function that does not exist.
+   */
+  private def intrinsics: List[ir.FuncSig] = {
+    def sig(name: String, ret: LType, params: LType*) =
+      ir.FuncSig(name, ir.FnType(ret, params.map(ir.Param(_)).toList))
+
+    val overflow = ir.FnType(LType.Struct(List(wordLty, i1)), List(ir.Param(wordLty), ir.Param(wordLty)))
+
+    List.concat(
+      Option.when(traps)(sig("llvm.trap", LType.Void)),
+      if heap then List(sig(mallocSym, LType.Ptr, wordLty), sig(freeSym, LType.Void, LType.Ptr))
+      else Nil,
+      if checked then
+        List(ir.FuncSig(s"llvm.umul.with.overflow.$word", overflow),
+             ir.FuncSig(s"llvm.uadd.with.overflow.$word", overflow))
+      else Nil,
+      Option.when(usesSnprintf)(
+        ir.FuncSig("snprintf",
+                   ir.FnType(i32, List(ir.Param(LType.Ptr), ir.Param(wordLty), ir.Param(LType.Ptr)),
+                             variadic = true))),
+      // The test dispatcher's one dependency, and the only thing in a test build that is not also in
+      // an ordinary one. It is declared from the shape of the program rather than from a flag set
+      // while emitting, because the entry point is emitted after this runs.
+      Option.when(program.entryPoint && program.tests.nonEmpty)(
+        sig("strcmp", i32, LType.Ptr, LType.Ptr)),
+      if usesVarargs then
+        List(sig("llvm.va_start.p0", LType.Void, LType.Ptr), sig("llvm.va_end.p0", LType.Void, LType.Ptr))
+      else Nil,
+      Option.when(usesVaCopy)(sig("llvm.va_copy.p0", LType.Void, LType.Ptr, LType.Ptr)),
+      Option.when(usesMemcpy)(
+        sig("llvm.memcpy.p0.p0.i64", LType.Void, LType.Ptr, LType.Ptr, LType.I(64), i1)),
+    )
+  }
+
+  /** The two strings a `bool` prints as, which are laid down once for the whole module. */
+  private def boolConstants: List[ir.Global] =
+    if !boolStrs then Nil
+    else
+      List(boolConstant("true"), boolConstant("false"))
+
+  private def boolConstant(word: String): ir.Global =
+    val bytes = word.getBytes("UTF-8").toList :+ 0.toByte
+
+    ir.Global(s".$word", constant = true, LType.Arr(bytes.length, LType.I(8)), Some(Val.Bytes(bytes)))
+
+  /** The parts of the runtime the module turned out to need, each a hand-written LLVM template and
+   * so reachable to anything that is not LLVM only by name (`ir.Runtime`).
+   */
+  private def runtimeBundles: List[ir.Runtime] = List.concat(
+    Option.when(charBuf)(ir.Runtime.Template("sysl.utf8", ScalarEmitter.utf8Encoder)),
+    Option.when(heap)(ir.Runtime.Template("arc.core", ArcEmitter.core(target))),
+    Option.when(syncHeap)(ir.Runtime.Template("arc.atomic", ArcEmitter.atomic(target))),
+    Option.when(maybeHeap)(ir.Runtime.Template("arc.maybe", ArcEmitter.maybe)),
+    Option.when(weakHeap)(ir.Runtime.Template("arc.weak", ArcEmitter.weak(target))),
+  )
+
+  /** Whether a runtime helper reaches the allocator, and so needs the hook that gives storage back.
+   *
+   * A generated one is **asked** rather than searched: its calls are instructions, so the question
+   * is whether one of them names the allocating symbol. A template is still text and still answered
+   * by looking for the call in it, which is what this was for every helper until the generated ones
+   * became data.
+   */
+  private def allocates(r: ir.Runtime): Boolean = r match
+    case ir.Runtime.Emitted(f) =>
+      f.blocks.exists(_.instrs.exists {
+        case Inst.Call(_, _, Val.Global(n), _, _, _, _) => n == mallocSym
+        case _                                          => false
+      })
+    case ir.Runtime.Template(_, llvm) => llvm.contains(s"call ptr @$mallocSym(")
 
   /** Filling one piece of computed module storage, at the point in a prologue where it is filled.
    *
@@ -253,7 +283,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     val value = genExpr(init)
 
     if containsRef(v.ty) then retainValue(v.ty, value)
-    emit(s"store ${v.ty.llvm} $value, ptr @${v.symbol}")
+    emit(Inst.Store(v.ty.lty, value, Val.Global(v.symbol), Access.Plain))
   }
 
   /** `@main`, which is three things in the order the language puts them: the computed `val`s, the
@@ -272,7 +302,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
    * is what lets a declared `main(args: []string)` be handed a slice: the pair is converted by an
    * ordinary library call, and neither `argc` nor `argv` appears in a sysl signature anywhere.
    */
-  private def genMain(vals: List[TVal], stmts: List[TStmt], entry: Option[TEntry]): String = {
+  private def genMain(vals: List[TVal], stmts: List[TStmt], entry: Option[TEntry]): ir.Func = {
     startFunction()
     promoted = promotions(None)
     pushTemps()
@@ -292,11 +322,11 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       pushTemps()
       val args = e.argsFn.map { fn =>
         val slice = Type.Slice(Type.Str)
-        val r     = freshTemp()
+        val r     = freshReg()
 
-        emit(s"$r = call ${slice.llvm} @$fn(i32 %argc, ptr %argv)")
-        s"${slice.llvm} ${ownTemp(r, slice)}"
-      }
+        emit(Inst.Call(Some(r), slice.lty, Val.Global(fn), List(Arg(i32, Val.Reg("argc")), Arg(LType.Ptr, Val.Reg("argv")))))
+        Arg(slice.lty, ownTemp(r, slice))
+      }.toList
 
       // **A `main` that answers with a `Result` is called for its answer**, which is then handed
       // to the reporter the walk instantiated: it is what prints the error and picks the status, and
@@ -304,19 +334,19 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       // little hand-written IR as the platform will let it.
       (e.resultFn, e.resultTy) match
         case (Some(fn), Some(ty)) =>
-          val r = freshTemp()
+          val r = freshReg()
 
-          emit(s"$r = call ${ty.llvm} @$entrySymbol(${args.getOrElse("")})")
-          emit(s"call void @$fn(${ty.llvm} $r)")
+          emit(Inst.Call(Some(r), ty.lty, Val.Global(entrySymbol), args))
+          emit(Inst.Call(None, LType.Void, Val.Global(fn), List(Arg(ty.lty, r))))
 
         case _ =>
-          emit(s"call void @$entrySymbol(${args.getOrElse("")})")
+          emit(Inst.Call(None, LType.Void, Val.Global(entrySymbol), args))
 
       popTemps()
 
     releaseAll()
-    emitTerm("ret i32 0")
-    finishFunction("define i32 @main(i32 %argc, ptr %argv)")
+    emitTerm(Inst.Ret(Some(i32), Some(Val.Int(0))))
+    finishFunc(entrySig)
   }
 
   /** `@main` for a **test build**: the entry point `sysl test` drives, which runs the one test named
@@ -336,7 +366,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
    * test reads a module's storage the same way any other function does, and skipping the
    * initialization here would leave it reading zeros.
    */
-  private def genTestMain(vals: List[TVal], tests: List[TTest]): String = {
+  private def genTestMain(vals: List[TVal], tests: List[TTest]): ir.Func = {
     startFunction()
     promoted = promotions(None)
     pushTemps()
@@ -349,14 +379,14 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
     val named   = freshLabel("test.named")
     val missing = freshLabel("test.missing")
-    val enough  = freshTemp()
+    val enough  = freshReg()
 
-    emit(s"$enough = icmp sgt i32 %argc, 1")
-    emitTerm(s"br i1 $enough, label %$named, label %$missing")
+    emit(Inst.IntCmp(enough, ICmp.Sgt, i32, Val.Reg("argc"), Val.Int(1)))
+    emitTerm(Inst.CondBr(enough, named, missing))
 
     emitLabel(named)
-    val slot = freshTemp(); emit(s"$slot = getelementptr ptr, ptr %argv, i64 1")
-    val want = freshTemp(); emit(s"$want = load ptr, ptr $slot")
+    val slot = freshReg(); emit(Inst.Gep(slot, LType.Ptr, Val.Reg("argv"), List(Arg(LType.I(64), Val.Int(1)))))
+    val want = freshReg(); emit(Inst.Load(want, LType.Ptr, slot, Access.Plain))
 
     // Each arm compares the wanted name against one test's key and calls it on a match. The keys are
     // interned with the terminator `strcmp` reads to, which an ordinary sysl string constant does not
@@ -364,30 +394,43 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     for t <- tests do
       val run  = freshLabel("test.run")
       val next = freshLabel("test.next")
-      val cmp  = freshTemp(); emit(s"$cmp = call i32 @strcmp(ptr $want, ptr ${stringGlobal(t.func + "\u0000")})")
-      val hit  = freshTemp(); emit(s"$hit = icmp eq i32 $cmp, 0")
+      val cmp  = freshReg()
 
-      emitTerm(s"br i1 $hit, label %$run, label %$next")
+      emit(Inst.Call(Some(cmp), i32, Val.Global("strcmp"),
+        List(Arg(LType.Ptr, want), Arg(LType.Ptr, stringGlobal(t.func + "\u0000")))))
+
+      val hit  = freshReg(); emit(Inst.IntCmp(hit, ICmp.Eq, i32, cmp, Val.Int(0)))
+
+      emitTerm(Inst.CondBr(hit, run, next))
       emitLabel(run)
-      emit(s"call void @${symbolOf(t.func)}()")
-      emitTerm("ret i32 0")
+      emit(Inst.Call(None, LType.Void, Val.Global(symbolOf(t.func)), Nil))
+      emitTerm(Inst.Ret(Some(i32), Some(Val.Int(0))))
       emitLabel(next)
 
     // Falling off the end of the arms and arriving with no name at all are the same answer: this
     // binary has no such test. They share a block rather than each getting one, because a runner
     // reading the status cannot tell them apart and there is nothing it would do differently.
-    emitTerm(s"br label %$missing")
+    emitTerm(Inst.Br(missing))
     emitLabel(missing)
-    emitTerm("ret i32 2")
+    emitTerm(Inst.Ret(Some(i32), Some(Val.Int(2))))
 
-    finishFunction("define i32 @main(i32 %argc, ptr %argv)")
+    finishFunc(entrySig)
   }
+
+  /** The platform's own start-up code calls `main` with two arguments whether or not the program
+   * asked for them, so this is C's signature and not a sysl one — neither `argc` nor `argv` appears
+   * in a sysl declaration anywhere.
+   */
+  private def entrySig: ir.FuncSig =
+    ir.FuncSig("main",
+               ir.FnType(i32, List(ir.Param(i32, name = Some(Val.Reg("argc"))),
+                                   ir.Param(LType.Ptr, name = Some(Val.Reg("argv"))))))
 
   /** A function owns its parameters and returns its result with a count already taken, so a caller
    * can hand over a temporary and a callee can store one without either having to know what the
    * other did with it.
    */
-  private def genFunction(f: TFunc): String = {
+  private def genFunction(f: TFunc): ir.Func = {
     startFunction()
     promoted = promotions(Some(f.name))
     pushTemps()
@@ -400,17 +443,15 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // A zero-sized parameter is not an argument: there is nothing to receive and nothing to keep,
     // so it takes no slot and the emitted signature below does not mention it.
     for (name, ty) <- f.params if !Type.zeroSized(ty) do
-      emitAlloca(s"%$name.addr", ty.llvm)
+      emitAlloca(Val.Reg(s"$name.addr"), ty.lty)
       // A large one arrived as an address, so the copy the callee makes for itself is a copy of
       // bytes and the count it takes is taken at the slot rather than off a value it never had.
       if layout.indirect(ty) then
-        usesMemcpy = true
-        emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align ${layout.align(ty)} %$name.addr, " +
-          s"ptr align ${layout.align(ty)} %$name.param, i64 ${layout.size(ty)}, i1 false)")
-        retainAt(ty, s"%$name.addr")
+        emitMemcpy(Val.Reg(s"$name.addr"), Val.Reg(s"$name.param"), layout.size(ty), layout.align(ty))
+        retainAt(ty, Val.Reg(s"$name.addr"))
       else
-        emit(s"store ${ty.llvm} %$name.param, ptr %$name.addr")
-        retainValue(ty, s"%$name.param")
+        emit(Inst.Store(ty.lty, Val.Reg(s"$name.param"), Val.Reg(s"$name.addr"), Access.Plain))
+        retainValue(ty, Val.Reg(s"$name.param"))
       ownSlot(name, ty)
 
     // Where the function calls itself as the last thing it does, that call is a jump to here rather
@@ -429,7 +470,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
       tailParams = f.params
       tailTarget = Some(l)
-      emitTerm(s"br label %$l")
+      emitTerm(Inst.Br(l))
       emitLabel(l)
 
     for (cond, _) <- f.requires if !ghostly(cond) do emitContract(cond, "require")
@@ -440,9 +481,9 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     for (oldExpr, i) <- f.olds.zipWithIndex do
       pushTemps()
       val v = genExpr(oldExpr)
-      emitAlloca(s"%old.$i.addr", oldExpr.ty.llvm)
+      emitAlloca(Val.Reg(s"old.$i.addr"), oldExpr.ty.lty)
       retainValue(oldExpr.ty, v)
-      emit(s"store ${oldExpr.ty.llvm} $v, ptr %old.$i.addr")
+      emit(Inst.Store(oldExpr.ty.lty, v, Val.Reg(s"old.$i.addr"), Access.Plain))
       ownSlot(s"old.$i", oldExpr.ty)
       popTemps()
 
@@ -457,35 +498,48 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
         retainValue(f.retTy, v)
         emitEnsures(Some(v))
         releaseAll()
-        emitTerm(s"ret ${f.retTy.llvm} $v")
+        emitTerm(Inst.Ret(Some(f.retTy.lty), Some(v)))
       case Some(r) =>
-        genExpr(r); emitEnsures(None); releaseAll(); emitTerm("ret void")
+        genExpr(r); emitEnsures(None); releaseAll(); emitTerm(Inst.Ret(None, None))
       case None if Type.noValue(f.retTy) =>
-        emitEnsures(None); releaseAll(); emitTerm("ret void")
+        emitEnsures(None); releaseAll(); emitTerm(Inst.Ret(None, None))
       case None if layout.indirect(f.retTy) =>
-        emit(s"store ${f.retTy.llvm} zeroinitializer, ptr $sretParam")
-        releaseAll(); emitTerm("ret void")
+        emit(Inst.Store(f.retTy.lty, Val.Zero, sretParam, Access.Plain))
+        releaseAll(); emitTerm(Inst.Ret(None, None))
       case None =>
-        releaseAll(); emitTerm(s"ret ${f.retTy.llvm} ${zero(f.retTy)}")
+        releaseAll(); emitTerm(Inst.Ret(Some(f.retTy.lty), Some(zero(f.retTy))))
 
-    val stored   = Type.stored(f.params)
-    val declared = stored.map { case (name, ty) => s"${syslParam(ty)}${frameOf(f, ty, name)} %$name.param" }
-    val params   =
-      (syslSret(f.retTy).map(_ + s" $sretParam").toList ++ declared ++
-        Option.when(f.variadic)("...")).mkString(", ")
     // A file-private declaration has every caller in the module that defines it (`13 §2`), so its
     // symbol is `internal`: nothing outside may resolve it, and the linker is free to discard it
     // when nothing inside calls it either — which is what an exported helper in a library artifact
     // costs today.
-    val linkage = if f.internal then "internal " else ""
+    finishFunc(
+      ir.FuncSig(symbolOf(f.name),
+                 syslFnType(f.retTy, f.params, f.variadic, Some(f)),
+                 if f.internal then ir.Linkage.Internal else ir.Linkage.Default,
+                 convention(f), attribute(f), f.section))
+  }
 
-    // `@section("…")` is written after the attributes, which is where LLVM's own grammar puts it — a
-    // section before them is a parse error rather than a different meaning.
-    val placement = f.section.map(s => s""" section "$s"""").getOrElse("")
+  /** What a sysl function looks like to LLVM, which is what its **definition** writes and what a
+   * declaration of one compiled elsewhere writes too — the two have to be the one answer, and
+   * building a precompiled function's declaration the way `foreignSignature` would is how arguments
+   * get passed the other way round.
+   *
+   * `defining` is the function itself where this is its own definition, which is what names the
+   * parameters and what settles whether the first of them is an interrupt handler's frame. A
+   * declaration has neither.
+   */
+  private def syslFnType(retTy: Type, params: List[(String, Type)], variadic: Boolean,
+                         defining: Option[TFunc] = None): ir.FnType = {
+    val result = syslResult(retTy)
+    val out    = syslSret(retTy).map(p => if defining.isEmpty then p else p.copy(name = Some(sretParam)))
+    val rest   = Type.stored(params).map { case (name, ty) =>
+      ir.Param(syslParamLty(ty),
+               defining.map(frameOf(_, ty, name)).getOrElse(Nil),
+               defining.map(_ => Val.Reg(s"$name.param")))
+    }
 
-    finishFunction(
-      s"define $linkage${convention(f)}${syslResult(f.retTy)} @${symbolOf(f.name)}($params)" +
-        s"${attribute(f)}$placement")
+    ir.FnType(result.ret, out.toList ::: rest, variadic, result.retAttrs)
   }
 
   /** The `return` of a **large** result: it is written into the caller's storage rather than handed
@@ -500,12 +554,12 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     genOwnedInto(sretParam, r)
 
     if ensures.nonEmpty then
-      val v = freshTemp(); emit(s"$v = load ${r.ty.llvm}, ptr $sretParam")
+      val v = freshReg(); emit(Inst.Load(v, r.ty.lty, sretParam, Access.Plain))
       emitEnsures(Some(v))
     else emitEnsures(None)
 
     releaseAll()
-    emitTerm("ret void")
+    emitTerm(Inst.Ret(None, None))
   }
 
   /** What a calling convention becomes on the `define` line for **this** machine (`15 §10`).
@@ -515,16 +569,16 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
    * written after the signature. The analyzer has already refused the combinations that do not
    * exist, so what is left here is the spelling.
    */
-  private def convention(f: TFunc): String =
+  private def convention(f: TFunc): Option[String] =
     f.conv.flatMap(_ => Conventions.interruptForm(target.cpu).toOption) match
-      case Some(Conventions.Form.Convention(llvm)) => s"$llvm "
-      case _                                       => ""
+      case Some(Conventions.Form.Convention(llvm)) => Some(llvm)
+      case _                                       => None
 
-  private def attribute(f: TFunc): String =
+  private def attribute(f: TFunc): List[(String, String)] =
     f.conv.zip(Conventions.interruptForm(target.cpu).toOption) match
       case Some((c, Conventions.Form.Attribute(key))) =>
-        s""" "$key"="${c.arg.getOrElse(Conventions.defaultRiscvMode)}""""
-      case _ => ""
+        List(key -> c.arg.getOrElse(Conventions.defaultRiscvMode))
+      case _ => Nil
 
   /** `byval` on an x86-64 interrupt handler's frame parameter, which the ABI requires and which is
    * the one place sysl emits a parameter attribute.
@@ -534,13 +588,13 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
    * parameter is the frame — a second one, where a vector pushes an error code, is an ordinary
    * integer passed as itself.
    */
-  private def frameOf(f: TFunc, ty: Type, name: String): String =
+  private def frameOf(f: TFunc, ty: Type, name: String): List[ir.Attr] =
     f.conv.flatMap(_ => Conventions.interruptForm(target.cpu).toOption) match
       case Some(Conventions.Form.Convention(_)) if f.params.headOption.exists(_._1 == name) =>
         ty match
-          case Type.Ptr(inner) => s" byval(${inner.llvm})"
-          case _               => ""
-      case _ => ""
+          case Type.Ptr(inner) => List(ir.Attr.ByVal(inner.lty))
+          case _               => Nil
+      case _ => Nil
 
   // --- statements ----------------------------------------------------------------------
 
@@ -565,19 +619,19 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // is an owner for the views to count against, and a release when the name goes out of scope.
     case TVarDecl(name, ty @ Type.Array(n, elem), init, _) if promoted(name) =>
       val v           = genExpr(init)
-      val (box, data) = genBuffer(elem, n.toString)
+      val (box, data) = genBuffer(elem, Val.Int(n))
 
       promotedBoxes(name) = box
-      emit(s"%$name.addr = getelementptr ${elem.llvm}, ptr $data, i64 0")
+      emit(Inst.Gep(Val.Reg(s"$name.addr"), elem.lty, data, List(Arg(LType.I(64), Val.Int(0)))))
       retainValue(ty, v)
-      emit(s"store ${ty.llvm} $v, ptr %$name.addr")
+      emit(Inst.Store(ty.lty, v, Val.Reg(s"$name.addr"), Access.Plain))
       ownBox(name, box, elem)
 
     // The slot is laid down **before** the initializer runs, because a large one is written into it
     // rather than handed to it: the callee of `val k = kernel()` needs somewhere to write.
     case TVarDecl(name, ty, init, align) =>
-      emitAlloca(s"%$name.addr", ty.llvm, align)
-      genOwnedInto(s"%$name.addr", init)
+      emitAlloca(Val.Reg(s"$name.addr"), ty.lty, align)
+      genOwnedInto(Val.Reg(s"$name.addr"), init)
       ownSlot(name, ty)
 
     // `ref name = place` (`03 § ref`). The walk to the place is made **once**, here, and its result
@@ -597,7 +651,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       // to read it off — so it is recorded here and put back at every access through the name.
       if Type.volatileIn(place.placeTy) then refStorage(name) = place.placeTy
       refPlaceOf(name) = place
-      emit(s"%$name.addr = getelementptr i8, ptr $base, i64 0")
+      emit(Inst.Gep(Val.Reg(s"$name.addr"), LType.I(8), base, List(Arg(LType.I(64), Val.Int(0)))))
 
     case TExprStmt(expr) =>
       genExpr(expr)
@@ -613,11 +667,11 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
           retainValue(t.ty, v)
           emitEnsures(Some(v))
           releaseAll()
-          emitTerm(s"ret ${t.ty.llvm} $v")
+          emitTerm(Inst.Ret(Some(t.ty.lty), Some(v)))
         case None =>
           emitEnsures(None)
           releaseAll()
-          emitTerm("ret void")
+          emitTerm(Inst.Ret(None, None))
 
     // A `break`/`continue` leaves the body from the middle, so it unwinds the body's ownership
     // regions before jumping — the same discipline as `return`, bounded to the loop. `break v`
@@ -627,15 +681,15 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       opt.foreach { t =>
         val v = genExpr(t)
         retainValue(t.ty, v)
-        emit(s"store ${t.ty.llvm} $v, ptr ${loop.slot}")
+        emit(Inst.Store(t.ty.lty, v, loop.slot, Access.Plain))
       }
       releaseToDepth(loop.ownedDepth, loop.tempDepth)
-      emitTerm(s"br label %${loop.breakL}")
+      emitTerm(Inst.Br(loop.breakL))
 
     case TContinue(depth) =>
       val loop = genLoops(depth)
       releaseToDepth(loop.ownedDepth, loop.tempDepth)
-      emitTerm(s"br label %${loop.continueL}")
+      emitTerm(Inst.Br(loop.continueL))
 
     // Reaching a `defer` emits nothing: it hands its statements to the scope, which lays them down
     // at each edge that leaves the block. Registering here rather than at the top of the block is
@@ -671,44 +725,43 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     val slot = Asm.numbering(operands)
 
     val loaded = ins.map { o =>
-      val r = freshTemp()
+      val r = freshReg()
 
-      emit(s"$r = load ${o.ty.llvm}, ptr %${o.slot}.addr")
-      s"${o.ty.llvm} $r"
+      emit(Inst.Load(r, o.ty.lty, Val.Reg(s"${o.slot}.addr"), Access.Plain))
+      Arg(o.ty.lty, r)
     }
 
     asmSite += 1
 
     val text = Asm.uniquifyLabels(lines, asmSite).map(Asm.render(_, slot.get)).mkString("\\0A")
     val cons = Asm.constraints(operands, clobbers)
-    val args = loaded.mkString(", ")
 
     // `sideeffect` says the block matters even where nothing reads its result, which is true of every
     // assembly sysl can express: the instructions worth reaching for here are the ones whose whole
     // purpose is what they do to the machine rather than what they hand back.
     outs match
       case Nil =>
-        emit(s"""call void asm sideeffect "$text", "$cons"($args)""")
+        emit(Inst.Asm(None, LType.Void, text, cons, loaded))
 
       case List(o) =>
-        val r = freshTemp()
+        val r = freshReg()
 
-        emit(s"""$r = call ${o.ty.llvm} asm sideeffect "$text", "$cons"($args)""")
-        emit(s"store ${o.ty.llvm} $r, ptr %${o.slot}.addr")
+        emit(Inst.Asm(Some(r), o.ty.lty, text, cons, loaded))
+        emit(Inst.Store(o.ty.lty, r, Val.Reg(s"${o.slot}.addr"), Access.Plain))
 
       // Several outputs come back as one anonymous structure, which is LLVM's shape rather than
       // anything the language says — so it is taken apart here and never seen above this line.
       case many =>
-        val r     = freshTemp()
-        val shape = many.map(_.ty.llvm).mkString("{ ", ", ", " }")
+        val r     = freshReg()
+        val shape = LType.Struct(many.map(_.ty.lty))
 
-        emit(s"""$r = call $shape asm sideeffect "$text", "$cons"($args)""")
+        emit(Inst.Asm(Some(r), shape, text, cons, loaded))
 
         for (o, i) <- many.zipWithIndex do
-          val part = freshTemp()
+          val part = freshReg()
 
-          emit(s"$part = extractvalue $shape $r, $i")
-          emit(s"store ${o.ty.llvm} $part, ptr %${o.slot}.addr")
+          emit(Inst.Extract(part, shape, r, List(i)))
+          emit(Inst.Store(o.ty.lty, part, Val.Reg(s"${o.slot}.addr"), Access.Plain))
   }
 
   /** Counts the assembly blocks emitted in this module, so each one's labels can be its own. */
@@ -717,18 +770,30 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
 object Codegen {
 
-  /** Lowers a typed program to an LLVM IR module, for a given machine (`targets.md`) and from a given
-   * heap (`packages.md § 13`).
+  /** Lowers a typed program to a module, for a given machine (`targets.md`) and from a given heap
+   * (`packages.md § 13`).
+   *
+   * **This is where a back end that is not LLVM starts.** What comes back is an `ir.Module` — the
+   * types, the globals, the declarations and the functions, as data — rather than the text of one,
+   * so a consumer reads the shapes the compiler decided instead of parsing them back out of what it
+   * printed.
    *
    * `allocator` defaults to libc's pair, so a caller with no opinion — every test that is not about
    * this, and every program whose packages say nothing — gets exactly the module it got before a
    * package could name one.
    */
+  def module(
+      program: TProgram,
+      promotions: Escape.Promotions = Escape.Promotions.none,
+      target: Target = Target.default,
+      allocator: Allocator = Allocator.c,
+  ): ir.Module = new Codegen(program, promotions, target, allocator).build()
+
+  /** The same module as LLVM's textual form, which is what the toolchain takes. */
   def generate(
       program: TProgram,
       promotions: Escape.Promotions = Escape.Promotions.none,
       target: Target = Target.default,
       allocator: Allocator = Allocator.c,
-  ): String =
-    new Codegen(program, promotions, target, allocator).gen()
+  ): String = ir.Printer.module(module(program, promotions, target, allocator))
 }

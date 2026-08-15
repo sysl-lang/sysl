@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.{Arg, BinOp, CastOp, Inst, LType, Val}
+
 /** Arithmetic, comparison, and the conversions between scalar widths.
  *
  * Two things run through all of it. The first is that a **constrained** type is laid out as its
@@ -23,7 +25,7 @@ trait ArithEmitter extends CallEmitter {
    * else is arithmetic.
    */
   protected def combine(op: String, ty: Type, valueTy: Type, dispatch: Option[TDispatch],
-                        cur: String, v: String): String =
+                        cur: Val, v: Val): Val =
     (ty, dispatch) match
       case (_, Some(d))  => ownTemp(dispatchValue(d, ty, valueTy, cur, v, ty), ty)
       case (Type.Str, _) => ownTemp(strConcat(cur, v), Type.Str)
@@ -93,7 +95,7 @@ trait ArithEmitter extends CallEmitter {
   /** One comparison, over two values the caller is holding: an instruction where the operand type
    * has one, the method its `Eq`/`Ord` supplies otherwise.
    */
-  protected def comparison(c: TCmp, ty: Type, av: String, bv: String): String =
+  protected def comparison(c: TCmp, ty: Type, av: Val, bv: Val): Val =
     c.dispatch match
       // A comparison stays homogeneous — `Eq` and `Ord` take no right-hand type — so both operands
       // are the one type here, unlike the arithmetic traits.
@@ -113,48 +115,49 @@ trait ArithEmitter extends CallEmitter {
    * the same one (`14 §7`): `c *= 2.0` passes a complex number and a `real`. A swap exchanges the
    * values and their types together, since it is the values that are being reordered.
    */
-  private def dispatchValue(d: TDispatch, aty: Type, bty: Type, av: String, bv: String, resultTy: Type): String = {
+  private def dispatchValue(d: TDispatch, aty: Type, bty: Type, av: Val, bv: Val, resultTy: Type): Val = {
     val (l, lty, r, rty) = if d.swap then (bv, bty, av, aty) else (av, aty, bv, bty)
-    val res              = freshTemp()
+    val res              = freshReg()
+    val (what, callee)   = calleeParts(d.name, resultTy)
 
-    emit(s"$res = call ${calleeOf(d.name, resultTy)}(${lty.llvm} $l, ${rty.llvm} $r)")
+    emit(what.call(Some(res), callee, List(Arg(lty.lty, l), Arg(rty.lty, r))))
 
     if !d.negate then res
     else
-      val n = freshTemp(); emit(s"$n = xor i1 $res, true"); n
+      val n = freshReg(); emit(Inst.Bin(n, BinOp.Xor, LType.I(1), res, Val.Bool(true))); n
   }
   /** The zero value of a type — what a slot holds before anything is stored into it, and what a
    * function with no trailing expression returns.
    */
-  protected def zero(ty: Type): String = ty match
+  protected def zero(ty: Type): Val = ty match
     // Nothing is stored for a zero-sized value, so its zero is nothing at all — the same empty
     // register every other read of one yields.
-    case t if Type.zeroSized(t) => ""
+    case t if Type.zeroSized(t) => Val.Nothing
     // A constrained subtype is laid out as its base, so its zero is the base's zero, and a qualified
     // one is laid out as what it qualifies.
     case c: Type.Constrained  => zero(Type.underlying(c))
     case Type.Volatile(inner) => zero(inner)
-    case _: Type.Integer  => "0"
-    case _: Type.Floating => "0.0"
-    case Type.Char        => "0"
-    case Type.Bool        => "0"
+    case _: Type.Integer  => Val.Int(0)
+    case _: Type.Floating => Val.float(0.0)
+    case Type.Char        => Val.Int(0)
+    case Type.Bool        => Val.Int(0)
     // A trait object is two words, so its zero is a zeroed pair rather than a null address — and,
     // like every null pointer, calling through one is the programmer's business.
-    case _: Type.Ptr | _: Type.Ref if Type.erased(ty) => "zeroinitializer"
-    case Type.Weak(inner) => if inner.isInstanceOf[Type.Trait] then "zeroinitializer" else "null"
-    case _: Type.Ptr      => "null"
-    case _: Type.Ref      => "null"
+    case _: Type.Ptr | _: Type.Ref if Type.erased(ty) => Val.Zero
+    case Type.Weak(inner) => if inner.isInstanceOf[Type.Trait] then Val.Zero else Val.Null
+    case _: Type.Ptr      => Val.Null
+    case _: Type.Ref      => Val.Null
     // C's null callback, which is a value several of its interfaces read as "do the default".
-    case _: Type.CFn      => "null"
-    case _: Type.Struct   => "zeroinitializer"
-    case _: Type.Array    => "zeroinitializer"
+    case _: Type.CFn      => Val.Null
+    case _: Type.Struct   => Val.Zero
+    case _: Type.Array    => Val.Zero
     // Every lane zeroed, which `zeroinitializer` says for a vector as it does for an array — a
     // zeroed mask is every lane false, and a zeroed `<N>f32` is positive zero in each.
-    case _: Type.Vector   => "zeroinitializer"
-    case _: Type.View     => "zeroinitializer"
-    case Type.VaList      => "zeroinitializer"
-    case e: Type.Enum     => if e.simple then "0" else "zeroinitializer"
-    case Type.Unit        => ""
+    case _: Type.Vector   => Val.Zero
+    case _: Type.View     => Val.Zero
+    case Type.VaList      => Val.Zero
+    case e: Type.Enum     => if e.simple then Val.Int(0) else Val.Zero
+    case Type.Unit        => Val.Nothing
     // Nothing is lowered from a program that has an error, and a type the analyzer could not work
     // out is only ever produced by one, so reaching here would mean codegen ran on a broken tree.
     case Type.Unknown     => sys.error("unreachable zero of an unknown type")
@@ -190,21 +193,22 @@ trait ArithEmitter extends CallEmitter {
    * `zeroFlag` is the extra `i1` that `ctlz` and `cttz` take and no other intrinsic here does. It
    * is always `false`, meaning a zero operand is defined rather than poison — see the call sites.
    */
-  protected def intrinsic(base: String, ll: String, args: List[String], zeroFlag: Boolean = false): String = {
-    val name   = s"llvm.$base.$ll"
-    val params = List.fill(args.length)(ll) ++ Option.when(zeroFlag)("i1")
-    satDecls += s"declare $ll @$name(${params.mkString(", ")})"
+  protected def intrinsic(base: String, ty: LType, args: List[Val], zeroFlag: Boolean = false): Val = {
+    val name   = s"llvm.$base.${ty.render}"
+    val params = List.fill(args.length)(ir.Param(ty)) ++ Option.when(zeroFlag)(ir.Param(LType.I(1)))
 
-    val ops = args.map(a => s"$ll $a") ++ Option.when(zeroFlag)("i1 false")
-    val r   = freshTemp()
-    emit(s"$r = call $ll @$name(${ops.mkString(", ")})")
+    satDecls += ir.FuncSig(name, ir.FnType(ty, params))
+
+    val ops = args.map(a => Arg(ty, a)) ++ Option.when(zeroFlag)(Arg(LType.I(1), Val.Bool(false)))
+    val r   = freshReg()
+    emit(Inst.Call(Some(r), ty, Val.Global(name), ops))
     r
   }
 
   /** An integer value moved between two widths, unsigned. Nothing is emitted where they agree,
    * which is the usual case and keeps the IR of a 32-bit count readable.
    */
-  protected def resize(v: String, from: Type, to: Type): String = {
+  protected def resize(v: Val, from: Type, to: Type): Val = {
     val (a, b) = (from.asInstanceOf[Type.Integer].bits, to.asInstanceOf[Type.Integer].bits)
 
     // A non-negative immediate is its own value at every width it fits in, so **widening** one is a
@@ -212,10 +216,14 @@ trait ArithEmitter extends CallEmitter {
     // `emit-llvm`, where a rotation by a literal should read as the constant funnel shift it is
     // rather than as a register one whose register is a constant. Narrowing still goes through the
     // instruction, since an immediate too wide for the type it is written at is not IR at all.
-    if a == b || (a < b && !v.startsWith("%") && !v.startsWith("-")) then v
+    val immediate = v match
+      case Val.Int(n) => n >= 0
+      case _          => false
+
+    if a == b || (a < b && immediate) then v
     else
-      val r = freshTemp()
-      emit(s"$r = ${if a < b then "zext" else "trunc"} ${from.llvm} $v to ${to.llvm}")
+      val r = freshReg()
+      emit(Inst.Cast(r, if a < b then CastOp.ZExt else CastOp.Trunc, from.lty, v, to.lty))
       r
   }
 
@@ -228,12 +236,12 @@ trait ArithEmitter extends CallEmitter {
    * narrowing to 1 and 5 does not divide 32. So a width like that reduces first, at the amount's
    * own width, where the answer is still the one the program asked for.
    */
-  protected def rotateBy(v: String, from: Type, bits: Int): String = {
+  protected def rotateBy(v: Val, from: Type, bits: Int): Val = {
     val reduced =
       if (bits & (bits - 1)) == 0 || from.asInstanceOf[Type.Integer].bits <= bits then v
       else
-        val r = freshTemp()
-        emit(s"$r = urem ${from.llvm} $v, $bits")
+        val r = freshReg()
+        emit(Inst.Bin(r, BinOp.URem, from.lty, v, Val.Int(bits)))
         r
 
     resize(reduced, from, Type.Integer(bits, signed = false))

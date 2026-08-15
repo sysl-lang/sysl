@@ -2,6 +2,26 @@ package sh.sysl
 
 import scala.collection.mutable
 
+import ir.{Access, Arg, BinOp, CastOp, Inst, LType, Val}
+
+/** **What a `call` names between the keyword and the callee**, which is the three fields of
+ * `ir.Inst.Call` that describe the callee's type rather than its arguments.
+ *
+ * It is a bundle rather than three parameters because three functions hand it along — the call seam
+ * works out what a name refers to (`CallEmitter.calleeParts`) and passes it to whichever of the two
+ * emitters lowers the call. Splitting it into three would put the same triple in six signatures and
+ * make a caller that filled two of them and forgot the third representable.
+ *
+ * `whole` is set only for a variadic callee, and then it is what LLVM reads; `ret` and `retAttrs`
+ * hold the same answer either way, so `call` below cannot produce the two disagreeing.
+ */
+case class CallForm(ret: ir.LType, retAttrs: List[ir.Attr] = Nil,
+                    whole: Option[ir.FnType] = None) {
+
+  def call(dest: Option[ir.Val], callee: ir.Val, args: List[ir.Arg]): ir.Inst =
+    ir.Inst.Call(dest, ret, callee, args, retAttrs, whole)
+}
+
 /** The substrate every part of codegen emits into: registers, basic blocks, the entry-block
  * prologue, module-level globals, and the queue of runtime helpers.
  *
@@ -59,9 +79,14 @@ trait Emitter {
    * but it is compared against a length often enough that using this everywhere is both simpler and
    * harder to get wrong.
    */
-  protected def word: String = target.word.llvm
+  protected def word: String = wordLty.render
 
-  protected val globals  = new mutable.StringBuilder
+  /** The same, as a type rather than as its text — what a converted emitter names a length, a size
+   * or an index with.
+   */
+  protected def wordLty: ir.LType = target.word.lty
+
+  protected val globals  = mutable.ListBuffer.empty[ir.Global]
   private var strId      = 0
 
   /** The emitted name of every struct that asked for a boundary of its own, and the boundary
@@ -69,9 +94,10 @@ trait Emitter {
    * *said* — LLVM's textual form gives a named type no alignment, so `@align` has to be stamped onto
    * each alloca and global rather than declared once with the type.
    *
-   * Keyed by the emitted name because that is all a slot has to go on: `emitAlloca` is handed a type
-   * string, and threading a `Type` to all forty-six of its callers would be a large change to say a
-   * thing that only ever applies to a handful of them.
+   * Keyed by the **emitted** name rather than by the sysl type, because what a slot has is an
+   * `ir.LType` and a declared struct is a `Named` — the sysl type it came from is exactly what
+   * lowering discarded, and asking a slot to carry it back would undo that for the handful of types
+   * this applies to at all.
    */
   protected val raisedAligns = mutable.Map.empty[String, Int]
   protected var boolStrs = false
@@ -105,7 +131,7 @@ trait Emitter {
    * the name carries the width, so a program using one member at three widths needs three
    * declarations and a flag could not tell them apart.
    */
-  protected val satDecls = mutable.LinkedHashSet.empty[String]
+  protected val satDecls = mutable.LinkedHashSet.empty[ir.FuncSig]
 
   /** Box layouts to declare, keyed by their LLVM name and held in the order they were first
    * needed — a box's payload type is always declared before it.
@@ -126,7 +152,7 @@ trait Emitter {
    * may ask for another, so they are queued rather than emitted inline.
    */
   private val requested            = mutable.HashSet.empty[String]
-  protected val runtimeQueue = mutable.Queue.empty[() => String]
+  protected val runtimeQueue = mutable.Queue.empty[() => ir.Runtime]
 
   /** Which parts of the ARC runtime the module turned out to need: the heap at all, the atomic
    * pair a `&sync` uses, the null-tolerant pair a slice's owner needs, and the weak trio.
@@ -141,24 +167,36 @@ trait Emitter {
   protected var weakHeap  = false
 
   // Per-function emission state, reset at each function boundary.
-  private var prologue   = new mutable.StringBuilder
-  private var body       = new mutable.StringBuilder
+  //
+  // The body is a list of **basic blocks** rather than a run of text (`ir.Func`). It always was one:
+  // the three writers below are the only ways anything reaches it, and `terminated` already means
+  // *this block is closed* — what changes is that the structure now survives being written down,
+  // which is what a second back end has to read.
+  //
+  // `prologue` is kept apart because a stack slot is hoisted to the top of the entry block from
+  // wherever it was needed, so the two halves of that block are built at different times and are
+  // joined only when the function is finished.
+  private var prologue   = mutable.ListBuffer.empty[ir.Inst]
+  private var blocks     = mutable.ListBuffer.empty[ir.Block]
+  private var current    = mutable.ListBuffer.empty[ir.Inst]
+  private var currentEnd: Option[ir.Inst] = None
+  private var currentLbl = "entry"
   private var temp       = 0
   private var label      = 0
   private var terminated = false
-  private var scratch    = mutable.HashMap.empty[String, String]
+  private var scratch    = mutable.HashMap.empty[ir.LType, ir.Val]
 
   /** References this expression owns and must let go of. The stack mirrors the regions a value
    * may not escape: a statement, and each branch of an `if` or arm of a `match`, release their
    * own before control leaves them, so every release site dominates what it releases.
    */
-  protected var tempStack: List[mutable.ListBuffer[(String, Type)]] = Nil
+  protected var tempStack: List[mutable.ListBuffer[(ir.Val, Type)]] = Nil
 
   /** Named slots — parameters, locals, pattern bindings — that hold a reference of their own,
    * innermost scope first. Each holds one count, taken when the slot is written and given back
    * when the scope ends or the function returns.
    */
-  protected var owned: List[mutable.ListBuffer[(String, Type)]] = Nil
+  protected var owned: List[mutable.ListBuffer[(ir.Val, Type)]] = Nil
 
   /** What each scope has been asked to run on its way out — the `defer` stack (`03 § defer`),
    * innermost first. It sits beside `owned` because it is pushed, popped and unwound with it and
@@ -171,7 +209,7 @@ trait Emitter {
    * depths are the sizes of `owned`/`tempStack` at loop entry, so leaving releases exactly what
    * the body accrued.
    */
-  protected case class GenLoop(breakL: String, continueL: String, slot: String, resultTy: Type,
+  protected case class GenLoop(breakL: String, continueL: String, slot: ir.Val, resultTy: Type,
                                ownedDepth: Int, tempDepth: Int)
   protected var genLoops: List[GenLoop] = Nil
 
@@ -202,21 +240,27 @@ trait Emitter {
    * pattern test that cannot fail contributes `"true"`, and ANDing that in would be an instruction
    * saying nothing. Both halves of codegen build conditions this way, so they live here.
    */
-  protected def andI1(a: String, b: String): String =
-    if a == "true" then b
-    else if b == "true" then a
-    else { val r = freshTemp(); emit(s"$r = and i1 $a, $b"); r }
+  protected def andI1(a: ir.Val, b: ir.Val): ir.Val =
+    if a == yes then b
+    else if b == yes then a
+    else { val r = freshReg(); emit(Inst.Bin(r, BinOp.And, i1, a, b)); r }
 
-  protected def orI1(a: String, b: String): String =
-    if a == "true" || b == "true" then "true"
-    else { val r = freshTemp(); emit(s"$r = or i1 $a, $b"); r }
+  protected def orI1(a: ir.Val, b: ir.Val): ir.Val =
+    if a == yes || b == yes then yes
+    else { val r = freshReg(); emit(Inst.Bin(r, BinOp.Or, i1, a, b)); r }
 
   /** Negating an `i1`, with the same constant folded away — what `is not` does to the test its
    * pattern produced.
    */
-  protected def notI1(a: String): String =
-    if a == "true" then "false"
-    else { val r = freshTemp(); emit(s"$r = xor i1 $a, true"); r }
+  protected def notI1(a: ir.Val): ir.Val =
+    if a == yes then no
+    else { val r = freshReg(); emit(Inst.Bin(r, BinOp.Xor, i1, a, Val.Bool(true))); r }
+
+  /** The two `i1` constants, which the folding above tests for by identity rather than by text —
+   * a condition that cannot fail is one of these, and there is no third spelling of it.
+   */
+  protected val yes: ir.Val = Val.Bool(true)
+  protected val no: ir.Val  = Val.Bool(false)
 
   // --- bit ranges of a bitfield struct's container ---------------------------------------
   //
@@ -252,27 +296,28 @@ trait Emitter {
   /** A field's value widened to the container and shifted to where it belongs — the half of a write
    * that is about the range, before anything is said about what was there already.
    */
-  protected def placeBits(ranges: List[BitRange], r: BitRange, v: String): String = {
-    val ct = containerLlvm(ranges)
+  protected def placeBits(ranges: List[BitRange], r: BitRange, v: ir.Val): ir.Val = {
+    val ct = containerLty(ranges)
 
     val wide =
       if r.width == Bitfields.bits(ranges) then v
-      else { val t = freshTemp(); emit(s"$t = zext i${r.width} $v to $ct"); t }
+      else
+        val t = freshReg(); emit(Inst.Cast(t, CastOp.ZExt, LType.I(r.width), v, ct)); t
 
     if r.offset == 0 then wide
-    else { val t = freshTemp(); emit(s"$t = shl $ct $wide, ${r.offset}"); t }
+    else { val t = freshReg(); emit(Inst.Bin(t, BinOp.Shl, ct, wide, Val.Int(r.offset))); t }
   }
 
   /** A whole container built from one value per field, which is what constructing a bitfield struct
    * is. It ors the placed ranges together rather than folding `writeBits` over a zero, because there
    * is nothing to preserve: every bit of the result is being written.
    */
-  protected def buildBits(ranges: List[BitRange], vals: List[String]): String = {
-    val ct = containerLlvm(ranges)
+  protected def buildBits(ranges: List[BitRange], vals: List[ir.Val]): ir.Val = {
+    val ct = containerLty(ranges)
 
     ranges.zip(vals).map(placeBits(ranges, _, _)).reduceOption { (a, b) =>
-      val t = freshTemp(); emit(s"$t = or $ct $a, $b"); t
-    }.getOrElse("0")
+      val t = freshReg(); emit(Inst.Bin(t, BinOp.Or, ct, a, b)); t
+    }.getOrElse(Val.Int(0))
   }
 
   /** One range lifted out of the container `c`.
@@ -282,22 +327,24 @@ trait Emitter {
    * own width lands the two's-complement value already in place. The signedness is in the type
    * rather than in the extraction.
    */
-  protected def readBits(ranges: List[BitRange], r: BitRange, c: String): String = {
-    val ct     = containerLlvm(ranges)
+  protected def readBits(ranges: List[BitRange], r: BitRange, c: ir.Val): ir.Val = {
+    val ct     = containerLty(ranges)
     val shifted =
       if r.offset == 0 then c
-      else { val t = freshTemp(); emit(s"$t = lshr $ct $c, ${r.offset}"); t }
+      else
+        val t = freshReg(); emit(Inst.Bin(t, BinOp.LShr, ct, c, Val.Int(r.offset))); t
 
     if r.width == Bitfields.bits(ranges) then shifted
-    else { val t = freshTemp(); emit(s"$t = trunc $ct $shifted to i${r.width}"); t }
+    else
+      val t = freshReg(); emit(Inst.Cast(t, CastOp.Trunc, ct, shifted, LType.I(r.width))); t
   }
 
   /** The container `c` with one range replaced by `v` — the read-modify-write a bitfield write is,
    * with the read already done by the caller so that the whole of a multi-field update is one load
    * and one store rather than one of each per field.
    */
-  protected def writeBits(ranges: List[BitRange], r: BitRange, c: String, v: String): String = {
-    val ct         = containerLlvm(ranges)
+  protected def writeBits(ranges: List[BitRange], r: BitRange, c: ir.Val, v: ir.Val): ir.Val = {
+    val ct         = containerLty(ranges)
     val bits       = Bitfields.bits(ranges)
     val (_, clear) = Bitfields.mask(r, bits)
     val shifted    = placeBits(ranges, r, v)
@@ -307,8 +354,8 @@ trait Emitter {
     // reads as a bug rather than as an identity.
     if r.width == bits then shifted
     else
-      val cleared = freshTemp(); emit(s"$cleared = and $ct $c, $clear")
-      val merged  = freshTemp(); emit(s"$merged = or $ct $cleared, $shifted")
+      val cleared = freshReg(); emit(Inst.Bin(cleared, BinOp.And, ct, c, Val.Int(clear)))
+      val merged  = freshReg(); emit(Inst.Bin(merged, BinOp.Or, ct, cleared, shifted))
       merged
   }
 
@@ -326,8 +373,17 @@ trait Emitter {
    * foreign boundary has always used (`ForeignEmitter`), asked for the same reason on a call that
    * happens to have this compiler on both sides.
    */
-  protected def syslSret(retTy: Type): Option[String] =
-    Option.when(layout.indirect(retTy))(s"ptr noalias sret(${retTy.llvm}) align ${layout.align(retTy)}")
+  protected def syslSret(retTy: Type): Option[ir.Param] =
+    Option.when(layout.indirect(retTy))(
+      ir.Param(LType.Ptr, ir.Attr.NoAlias :: sretAttrs(retTy.lty, layout.align(retTy))))
+
+  /** The out-pointer's attributes, less the `noalias` only a caller that made the storage may
+   * claim: what is at the far end, and the boundary it sits on. Written once here because a `sret`
+   * is stated four times over — on a definition, on a declaration, at the call, and on the adapter
+   * that forwards one — and the four have to agree.
+   */
+  protected def sretAttrs(ty: LType, align: Int): List[ir.Attr] =
+    List(ir.Attr.SRet(ty), ir.Attr.Align(align))
 
   /** What a sysl `define`, `declare` and `call` name as the result type.
    *
@@ -343,29 +399,29 @@ trait Emitter {
    * is the caller's obligation, so it is stated at a foreign call (`ForeignEmitter`) and nowhere
    * else. Neither end of a sysl-to-sysl call claims it, so neither may rely on it.
    */
-  protected def syslResult(retTy: Type): String =
-    CAbi.returning(if syslResultType(retTy) == "void" then "" else CAbi.extension(retTy, target),
-                   syslResultType(retTy))
+  protected def syslResult(retTy: Type): CallForm =
+    CallForm(syslResultLty(retTy),
+             if syslResultLty(retTy) == LType.Void then Nil else CAbi.extension(retTy, target))
 
-  /** The same **type**, with no attribute on it — for the `ret` instruction, which takes none.
+  /** The result's **type**, with no attribute on it — what a `ret` instruction carries.
    *
    * A return attribute belongs to the signature: `define zeroext i1 @f()` states what the function
    * guarantees, and the terminator inside it just names the value's type. LLVM refuses `ret zeroext
    * i1 %x` outright, which is a parse error in the emitted module rather than anything a test of the
-   * compiler's own types would notice — so the two spellings are kept apart here rather than at each
-   * of the places that needs one.
+   * compiler's own types would notice — so the two are kept apart here rather than at each of the
+   * places that needs one.
    */
-  protected def syslResultType(retTy: Type): String =
-    if Type.noValue(retTy) || layout.indirect(retTy) then "void" else retTy.llvm
+  protected def syslResultLty(retTy: Type): ir.LType =
+    if Type.noValue(retTy) || layout.indirect(retTy) then ir.LType.Void else retTy.lty
 
   /** How a parameter is declared. A **large** one arrives as the address of storage the caller
    * holds; the callee makes its own copy at entry, which is the copy it always made — the only
    * difference is that the value crosses the boundary in memory rather than in registers.
    */
-  protected def syslParam(ty: Type): String = if layout.indirect(ty) then "ptr" else ty.llvm
+  protected def syslParamLty(ty: Type): ir.LType = if layout.indirect(ty) then ir.LType.Ptr else ty.lty
 
   /** The name the out-pointer takes inside a function that has one. */
-  protected val sretParam = "%sret.out"
+  protected val sretParam = Val.Reg("sret.out")
 
   // --- hooks provided by the Codegen class ---------------------------------------------
   //
@@ -373,17 +429,17 @@ trait Emitter {
   // back into them.
 
   /** Lowers an expression, returning the register or immediate holding its value. */
-  protected def genExpr(expr: TExpr): String
+  protected def genExpr(expr: TExpr): ir.Val
 
   /** Lowers an expression into the storage at `dest`, leaving the destination owning what lands
    * there — a count taken for every reference inside (`CallEmitter`).
    */
-  protected def genOwnedInto(dest: String, e: TExpr): Unit
+  protected def genOwnedInto(dest: ir.Val, e: TExpr): Unit
 
   /** The same, taking no counts: what lands at `dest` is borrowed, exactly as the register
    * `genExpr` hands back is (`CallEmitter`).
    */
-  protected def genBorrowedInto(dest: String, e: TExpr): Unit
+  protected def genBorrowedInto(dest: ir.Val, e: TExpr): Unit
 
   /** Lowers one statement for its effects. */
   protected def genStmt(stmt: TStmt): Unit
@@ -392,19 +448,22 @@ trait Emitter {
    * and the value on the right, whether that is an instruction or a trait method (`14 §3`).
    */
   protected def combine(op: String, ty: Type, valueTy: Type, dispatch: Option[TDispatch],
-                        cur: String, v: String): String
+                        cur: ir.Val, v: ir.Val): ir.Val
 
   /** Traps unless a struct's `invariant` clauses hold of the value in `v` (`16 §6`). */
-  protected def emitInvCheck(v: String, struct: Type.Struct, invFn: String): Unit
+  protected def emitInvCheck(v: ir.Val, struct: Type.Struct, invFn: String): Unit
 
   /** Traps unless `v` satisfies everything the constrained subtype `c` asks of its values — its
    * `within` range and its `where` predicate (`16 §4`).
    */
-  protected def emitConstraintChecks(v: String, c: Type.Constrained): Unit
+  protected def emitConstraintChecks(v: ir.Val, c: Type.Constrained): Unit
 
   protected def startFunction(): Unit = {
-    prologue = new mutable.StringBuilder
-    body = new mutable.StringBuilder
+    prologue = mutable.ListBuffer.empty
+    blocks = mutable.ListBuffer.empty
+    current = mutable.ListBuffer.empty
+    currentEnd = None
+    currentLbl = "entry"
     temp = 0
     label = 0
     terminated = false
@@ -454,7 +513,7 @@ trait Emitter {
    * it as its owner, where a frame-backed array has none.
    */
   protected var promoted: Set[String]                 = Set.empty
-  protected var promotedBoxes: mutable.HashMap[String, String] = mutable.HashMap.empty
+  protected var promotedBoxes: mutable.HashMap[String, ir.Val] = mutable.HashMap.empty
 
   /** One stack slot per LLVM type per function, for the type punning a union needs: a value goes
    * in written as one type and comes back out read as another. Sharing the slot is safe because
@@ -462,13 +521,13 @@ trait Emitter {
    * doing because a function that matches on an enum in a hundred places would otherwise carry a
    * hundred slots it uses one at a time.
    */
-  protected def scratchSlot(ty: String): String =
-    scratch.getOrElseUpdate(ty, emitAlloca(freshTemp(), ty))
+  protected def scratchSlot(ty: ir.LType): ir.Val =
+    scratch.getOrElseUpdate(ty, emitAlloca(freshReg(), ty))
 
   /** The address of the payload region inside an enum sitting at `base`. */
-  protected def payloadPtr(en: Type.Enum, base: String): String = {
-    val r = freshTemp()
-    emit(s"$r = getelementptr ${en.llvm}, ptr $base, i32 0, i32 1")
+  protected def payloadPtr(en: Type.Enum, base: ir.Val): ir.Val = {
+    val r = freshReg()
+    emit(Inst.Gep(r, en.lty, base, List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(1)))))
     r
   }
 
@@ -480,28 +539,57 @@ trait Emitter {
    * there — which is what a pattern test does before it knows the tag, and the tag test beside it is
    * what makes the answer count.
    */
-  protected def enumPayload(en: Type.Enum, variant: Type.EnumVariant, value: String): String = {
-    val slot = scratchSlot(en.llvm)
+  protected def enumPayload(en: Type.Enum, variant: Type.EnumVariant, value: ir.Val): ir.Val = {
+    val slot = scratchSlot(en.lty)
 
-    emit(s"store ${en.llvm} $value, ptr $slot")
+    emit(Inst.Store(en.lty, value, slot, Access.Plain))
 
     val p = payloadPtr(en, slot)
-    val r = freshTemp()
+    val r = freshReg()
 
-    emit(s"$r = load ${en.payloadLlvm(variant)}, ptr $p")
+    emit(Inst.Load(r, en.payloadLty(variant), p, Access.Plain))
     r
   }
 
-  /** The text of the function just emitted: its header, the hoisted slots, and its blocks. */
-  protected def finishFunction(header: String): String =
-    s"$header {\nentry:\n$prologue$body}\n"
+  /** The function just emitted: its header, and the blocks it is made of.
+   *
+   * The hoisted slots go at the front of the entry block, which is where they were always printed —
+   * `emitAlloca` writes one where the function begins rather than where it was needed, so that a
+   * slot inside a loop does not grow the stack on every iteration.
+   */
+  protected def finishFunc(sig: ir.FuncSig): ir.Func = {
+    closeBlock()
+    val all = blocks.toList
 
-  protected def freshTemp(): String         = { temp += 1; s"%t$temp" }
+    ir.Func(sig, all.head.copy(instrs = prologue.toList ::: all.head.instrs) :: all.tail)
+  }
+
+  /** The same, written down. */
+  protected def finishFunction(sig: ir.FuncSig): String = ir.Printer.func(finishFunc(sig))
+
+  /** Files the block being built and starts one under `l`. The entry block is the one this begins
+   * with, so a function whose body never labels anything still finishes with a block rather than
+   * with nothing.
+   */
+  private def closeBlock(): Unit = {
+    blocks += ir.Block(currentLbl, current.toList, currentEnd)
+    current = mutable.ListBuffer.empty
+    currentEnd = None
+  }
+
+  /** A register nothing else in this function uses. */
+  protected def freshReg(): Val.Reg = { temp += 1; Val.Reg(s"t$temp") }
+
+  /** The two widths written often enough here to be worth naming: a condition, and the index a
+   * `getelementptr` steps with.
+   */
+  protected val i1: LType  = LType.I(1)
+  protected val i32: LType = LType.I(32)
+
   protected def freshLabel(s: String): String = { label += 1; s"$s$label" }
 
   /** Emits a plain instruction, unless the current block is already terminated. */
-  protected def emit(line: String): Unit =
-    if !terminated then { body ++= "  "; body ++= line; body ++= "\n" }
+  protected def emit(inst: ir.Inst): Unit = if !terminated then current += inst
 
   /** Emits a stack slot into the function's entry block rather than where it is needed.
    * Every name is unique within a function, so hoisting is safe — and it keeps a slot inside
@@ -512,40 +600,69 @@ trait Emitter {
    * larger of the two is what satisfies both claims, and one written on the declaration is by that
    * rule already at or above the type's.
    */
-  protected def emitAlloca(name: String, ty: String, align: Option[Int] = None): String = {
-    prologue ++= s"  $name = alloca $ty${align.map(n => s", align $n").getOrElse(alignSuffix(ty))}\n"
+  protected def emitAlloca(name: ir.Val, ty: ir.LType, align: Option[Int] = None): ir.Val = {
+    prologue += ir.Inst.Alloca(name, ty, align.orElse(raisedAlign(ty)))
     name
   }
 
-  /** `, align n` where the type this storage holds asked for a boundary, and nothing otherwise —
-   * LLVM's own choice is the natural alignment, which is right for everything that did not ask.
+  /** The boundary the type this storage holds asked for, and nothing where it did not — LLVM's own
+   * choice is the natural alignment, which is right for everything that made no claim.
    *
-   * An array is covered by the same lookup: `[8 x %struct.Frame]` names the struct it is made of, so
-   * a region of aligned elements begins where its first element must, which is what makes an aligned
-   * type usable as a buffer rather than only as a single value.
+   * **An aggregate is searched rather than only asked about**, which is what makes `[8 x
+   * %struct.Frame]` land on `Frame`'s boundary: a region of aligned elements begins where its first
+   * element must, and that is what makes an aligned type usable as a buffer and not only as a single
+   * value. The first declared struct in the type's own written order is the one that answers, which
+   * is where the search stops.
    */
-  protected def alignSuffix(ty: String): String = {
-    val at = ty.indexOf("%struct.")
+  private def raisedAlign(ty: ir.LType): Option[Int] = ty match
+    case ir.LType.Named(n)     => raisedAligns.get(n)
+    case ir.LType.Arr(_, elem) => raisedAlign(elem)
+    case ir.LType.Vec(_, elem) => raisedAlign(elem)
+    case ir.LType.Struct(fs)   => fs.iterator.map(raisedAlign).collectFirst { case Some(n) => n }
+    case _                     => None
 
-    if at < 0 then ""
-    else
-      val name = ty.drop(at).takeWhile(c => c.isLetterOrDigit || c == '.' || c == '_' || c == '%')
-
-      raisedAligns.get(name).map(n => s", align $n").getOrElse("")
+  /** A block of storage copied, at a boundary both ends are known to satisfy.
+   *
+   * The one call in the module the intrinsic is declared for, so the flag that declares it is set
+   * here rather than at each site that copies — a caller that stops copying stops declaring it, and
+   * one that starts brings the declaration with it.
+   */
+  protected def emitMemcpy(dst: ir.Val, src: ir.Val, bytes: Int, align: Int): Unit = {
+    usesMemcpy = true
+    emit(ir.Inst.Call(None, ir.LType.Void, ir.Val.Global("llvm.memcpy.p0.p0.i64"),
+                      List(ir.Arg(ir.LType.Ptr, dst, List(ir.Attr.Align(align))),
+                           ir.Arg(ir.LType.Ptr, src, List(ir.Attr.Align(align))),
+                           ir.Arg(ir.LType.I(64), ir.Val.Int(bytes)),
+                           ir.Arg(ir.LType.I(1), ir.Val.Bool(false)))))
   }
 
   /** Emits a block terminator (`br` / `ret` / `unreachable`) and marks the block closed. */
-  protected def emitTerm(line: String): Unit =
-    if !terminated then { body ++= "  "; body ++= line; body ++= "\n"; terminated = true }
+  protected def emitTerm(inst: ir.Inst): Unit =
+    if !terminated then { currentEnd = Some(inst); terminated = true }
 
-  protected def emitLabel(l: String): Unit = { body ++= l; body ++= ":\n"; terminated = false }
+  protected def emitLabel(l: String): Unit = { closeBlock(); currentLbl = l; terminated = false }
+
+  /** A runtime helper's signature: `private`, `void`, and parameters named as the body reads them.
+   *
+   * Every helper the ownership runtime writes has this shape, which is not a coincidence — a helper
+   * is reached only from emitted code, so nothing outside may name it, and it works through the
+   * addresses it is handed rather than answering with anything.
+   */
+  protected def helperSig(name: String, params: (String, ir.LType)*): ir.FuncSig =
+    ir.FuncSig(name,
+               ir.FnType(LType.Void,
+                         params.map((n, t) => ir.Param(t, name = Some(Val.Reg(n)))).toList),
+               ir.Linkage.Private)
 
   /** Generates one whole function while another is in progress, which is how a runtime helper
    * gets written at the moment it is first asked for.
    */
-  protected def inFunction(header: String)(gen: => Unit): String = {
+  protected def inFunction(sig: ir.FuncSig)(gen: => Unit): ir.Func = {
     val saved =
-      (prologue, body, temp, label, terminated, tempStack, owned, scratch, promoted, promotedBoxes, deferrals)
+      (prologue, temp, label, terminated, tempStack, owned, scratch, promoted, promotedBoxes, deferrals)
+    // The blocks under construction are saved with the rest: a helper is a whole function emitted in
+    // the middle of one, so what the interrupted function had built has to be there when it resumes.
+    val savedBlocks = (blocks, current, currentEnd, currentLbl)
     // A helper is emitted in the middle of whatever asked for it, and the asking function may be one
     // with a jump in it — so what says where that jump goes is put back too. Without this the helper's
     // reset would leave the interrupted function with no target and its remaining tail calls would be
@@ -554,39 +671,53 @@ trait Emitter {
 
     startFunction()
     gen
-    val text = finishFunction(header)
+    val built = finishFunc(sig)
 
-    prologue = saved._1; body = saved._2; temp = saved._3; label = saved._4
-    terminated = saved._5; tempStack = saved._6; owned = saved._7; scratch = saved._8
-    promoted = saved._9; promotedBoxes = saved._10; deferrals = saved._11
+    prologue = saved._1; temp = saved._2; label = saved._3
+    terminated = saved._4; tempStack = saved._5; owned = saved._6; scratch = saved._7
+    promoted = saved._8; promotedBoxes = saved._9; deferrals = saved._10
+    blocks = savedBlocks._1; current = savedBlocks._2
+    currentEnd = savedBlocks._3; currentLbl = savedBlocks._4
     tailTarget = savedTail._1; tailCalls = savedTail._2; tailParams = savedTail._3
-    text
+    built
   }
 
-  /** Queues a runtime helper for emission, once per name. */
-  protected def request(name: String)(gen: => String): String = {
+  /** Queues a runtime helper for emission, once per name, and hands back the name — which is what
+   * a caller wants, since it asked in order to call the thing.
+   *
+   * **Generating one may ask for another**, so it is a queue rather than a recursion, and the
+   * generator is by-name all the way down: building the value eagerly here would emit a helper in
+   * the middle of whatever asked for it.
+   */
+  private def enqueue(name: String)(gen: => ir.Runtime): String = {
     if requested.add(name) then runtimeQueue.enqueue(() => gen)
     name
   }
 
+  /** A helper the emitters **generate**, which is therefore data like every other function. */
+  protected def requestFunction(name: String)(sig: ir.FuncSig)(gen: => Unit): String =
+    enqueue(name)(ir.Runtime.Emitted(inFunction(sig)(gen)))
+
+  /** A helper written out by hand as LLVM, which is text and can only be **named** for anything
+   * that is not LLVM (`ir.Runtime`).
+   */
+  protected def requestText(name: String)(gen: => String): String =
+    enqueue(name)(ir.Runtime.Template(name, gen))
+
   // --- string interning ------------------------------------------------------------------
 
-  protected def stringGlobal(s: String): String = {
+  protected def stringGlobal(s: String): ir.Val.Global = {
     strId += 1
-    val name           = s"@.str$strId"
-    val (escaped, len) = encode(s)
-    globals ++= s"$name = private constant [$len x i8] c\"$escaped\"\n"
-    name
+    val name  = s".str$strId"
+    val bytes = encode(s)
+
+    globals += ir.Global(name, constant = true, ir.LType.Arr(bytes.length, ir.LType.I(8)),
+                         Some(ir.Val.Bytes(bytes)))
+    ir.Val.Global(name)
   }
 
-  private def encode(s: String): (String, Int) = {
-    val bytes = s.getBytes("UTF-8")
-    val sb    = new mutable.StringBuilder
-    for b <- bytes do
-      val u = b & 0xff
-      if u == '"'.toInt || u == '\\'.toInt || u < 0x20 || u >= 0x7f then sb ++= f"\\$u%02X"
-      else sb += u.toChar
-    sb ++= "\\00"
-    (sb.toString, bytes.length + 1)
-  }
+  /** A string's bytes as an interned constant holds them: UTF-8, with the terminator a C caller
+   * reads by — which a `string`, knowing its own length, has never had a use for.
+   */
+  private def encode(s: String): List[Byte] = s.getBytes("UTF-8").toList :+ 0.toByte
 }

@@ -59,6 +59,10 @@ enum LType {
    * four scalar operations where there is nothing wider to put them in, so this lowers on a Cortex-M
    * without the back end being asked whether it should. That is why nothing here, and nothing in
    * `Target`, gates on a vector unit being present.
+   *
+   * **A C convention names one too**, independently of anything a program wrote: System V calls an
+   * eightbyte that two floating members share a `<2 x float>` (`CAbi.floatingChunk`), so this shape
+   * is reachable from a struct that has no vector in it at all.
    */
   case Vec(length: Int, elem: LType)
 

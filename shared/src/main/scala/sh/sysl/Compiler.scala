@@ -28,8 +28,21 @@ package sh.sysl
  * one question: a header naming a function the object does not define, or missing one it does, is
  * exactly the failure a C project cannot diagnose — it links, and calls something that is not there.
  */
-case class Compiled(ir: String, notes: List[String], links: List[String],
-                    exports: List[TFunc] = Nil)
+/** `module` is the compilation's result **as data** (`ir.Module`) and `ir` is that written down.
+ *
+ * **The constructor is private and the factory below is the only way to build one**, so the text is
+ * always the printing of the data beside it. A driver hands `ir` to clang and a back end that is
+ * not LLVM reads `module`; the point of the two being one value is that they cannot be two answers.
+ */
+case class Compiled private (ir: String, notes: List[String], links: List[String],
+                             exports: List[TFunc], module: sh.sysl.ir.Module)
+
+object Compiled {
+
+  def apply(module: sh.sysl.ir.Module, notes: List[String], links: List[String],
+            exports: List[TFunc] = Nil): Compiled =
+    Compiled(sh.sysl.ir.Printer.module(module), notes, links, exports, module)
+}
 
 object Compiler {
 
@@ -60,7 +73,7 @@ object Compiler {
   def compileTrees(units: List[Program], target: Target = Target.default,
                    allocator: Allocator = Allocator.c): Either[String, String] =
     analyzed(units, target, Set.empty, Stdlib.fromSource(target), allocator = allocator,
-      own = ownModules(units)).map(_._1)
+      own = ownModules(units)).map(_.ir)
 
   /** Compiles a program **against a library**: the library's modules are compiled alongside it, and
    * the program reaches them by the ordinary module rules (`13 §3`) — a full path, or an `import`.
@@ -268,7 +281,7 @@ object Compiler {
           // different compilation from the one above rather than a variant of it, which is why the
           // collection is repeated here instead of shared: what the two keep differs, and only what
           // they link is the same.
-          (Compiled(Codegen.generate(kept.copy(precompiled = precompiled), promoted, target, allocator),
+          (Compiled(Codegen.module(kept.copy(precompiled = precompiled), promoted, target, allocator),
                     promoted.explanations,
                     LinkDirectives.required(units ::: whole.units)),
            kept.tests)
@@ -438,8 +451,8 @@ object Compiler {
       // module is emitted with no `main`, so the C project supplies its own and this object is
       // something its linker takes rather than something that wanted to be a program. It is the same
       // switch a library build has always used, reached from a second command.
-      Compiled(Codegen.generate(pruned.copy(precompiled = precompiled, entryPoint = entryPoint),
-                                promoted, target, allocator),
+      Compiled(Codegen.module(pruned.copy(precompiled = precompiled, entryPoint = entryPoint),
+                              promoted, target, allocator),
                promoted.explanations,
                LinkDirectives.required(units ::: std.units),
                pruned.funcs.filter(_.exported.isDefined))

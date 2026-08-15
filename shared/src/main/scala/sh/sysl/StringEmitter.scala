@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.{Arg, Inst, LType, Val}
+
 /** What a `string` means once it is bytes: how a literal becomes a value, how one is written
  * out, how two are compared, and how an offset is checked to fall between characters.
  *
@@ -22,13 +24,18 @@ trait StringEmitter extends Emitter {
    * literal can be handed to C without a copy — it is not where the string ends, which is why a
    * NUL can also appear *inside* one as an ordinary byte.
    */
-  protected def stringValue(s: String): String =
-    s"{ ptr null, ptr ${stringGlobal(s)}, $word ${s.getBytes("UTF-8").length} }"
+  protected def stringValue(s: String): Val = stringConst(s)
+
+  /** The same, as a value rather than as its text. */
+  protected def stringConst(s: String): Val.Agg =
+    Val.Agg(List(Arg(LType.Ptr, Val.Null),
+                 Arg(LType.Ptr, stringGlobal(s)),
+                 Arg(wordLty, Val.Int(s.getBytes("UTF-8").length))))
 
   /** The bytes of a string and how many there are — what every operation on its content needs. */
-  protected def strBytes(v: String): (String, String) = {
-    val p = freshTemp(); emit(s"$p = extractvalue ${Type.Str.llvm} $v, 1")
-    val n = freshTemp(); emit(s"$n = extractvalue ${Type.Str.llvm} $v, 2")
+  protected def strBytes(v: Val): (Val, Val) = {
+    val p = freshReg(); emit(Inst.Extract(p, Type.Str.lty, v, List(1)))
+    val n = freshReg(); emit(Inst.Extract(n, Type.Str.lty, v, List(2)))
     (p, n)
   }
 
@@ -37,10 +44,11 @@ trait StringEmitter extends Emitter {
    * time instead. It goes through `putchar` rather than `write`, so it shares stdio's buffer
    * with the `printf` that carries the rest of a `print` and the two cannot come out of order.
    */
-  protected def printStr(v: String): Unit = {
+  protected def printStr(v: Val): Unit = {
     val (p, n) = strBytes(v)
 
-    emit(s"call void @${request("sysl.str.write")(StringEmitter.write)}(ptr $p, $word $n)")
+    emit(Inst.Call(None, LType.Void, Val.Global(requestText("sysl.str.write")(StringEmitter.write)),
+                   List(Arg(LType.Ptr, p), Arg(wordLty, n))))
   }
 
   /** Joins two strings into a fresh one. The result owns a new `StrBuf` — an ordinary ARC box
@@ -49,14 +57,14 @@ trait StringEmitter extends Emitter {
    * concatenation, so the validity invariant needs no re-checking. Both operands are copied out,
    * so neither is retained; the caller records the result as an owned temporary.
    */
-  protected def strConcat(av: String, bv: String): String = {
+  protected def strConcat(av: Val, bv: Val): Val = {
     heap = true
     val (ap, an) = strBytes(av)
     val (bp, bn) = strBytes(bv)
-    val fn       = request("sysl.str.concat")(StringEmitter.concat)
-    val r        = freshTemp()
+    val fn       = requestText("sysl.str.concat")(StringEmitter.concat)
+    val r        = freshReg()
 
-    emit(s"$r = call ${Type.Str.llvm} @$fn(ptr $ap, $word $an, ptr $bp, $word $bn)")
+    emit(Inst.Call(Some(r), Type.Str.lty, Val.Global(fn), strArgs(ap, an) ::: strArgs(bp, bn)))
     r
   }
 
@@ -64,13 +72,13 @@ trait StringEmitter extends Emitter {
    * operator is one `icmp` against the result. For well-formed UTF-8 the byte order is also
    * codepoint order, which is the ordering worth having.
    */
-  protected def strCmp(av: String, bv: String): String = {
+  protected def strCmp(av: Val, bv: Val): Val = {
     val (ap, an) = strBytes(av)
     val (bp, bn) = strBytes(bv)
-    val fn       = request("sysl.str.cmp")(StringEmitter.cmp)
-    val r        = freshTemp()
+    val fn       = requestText("sysl.str.cmp")(StringEmitter.cmp)
+    val r        = freshReg()
 
-    emit(s"$r = call i32 @$fn(ptr $ap, $word $an, ptr $bp, $word $bn)")
+    emit(Inst.Call(Some(r), i32, Val.Global(fn), strArgs(ap, an) ::: strArgs(bp, bn)))
     r
   }
 
@@ -79,13 +87,19 @@ trait StringEmitter extends Emitter {
    * it names: anything that is not a continuation byte starts a character, and the offset one
    * past the last byte ends the string.
    */
-  protected def strBoundary(p: String, n: String, i: String): String = {
-    val fn = request("sysl.str.boundary")(StringEmitter.boundary)
-    val r  = freshTemp()
+  protected def strBoundary(p: Val, n: Val, i: Val): Val = {
+    val fn = requestText("sysl.str.boundary")(StringEmitter.boundary)
+    val r  = freshReg()
 
-    emit(s"$r = call i1 @$fn(ptr $p, $word $n, $word $i)")
+    emit(Inst.Call(Some(r), i1, Val.Global(fn), strArgs(p, n) :+ Arg(wordLty, i)))
     r
   }
+
+  /** A string's bytes and their count, as a call's two arguments. Every helper in the runtime takes
+   * them in that order and at those types, which is what makes this worth naming once.
+   */
+  private def strArgs(p: Val, n: Val): List[Arg] =
+    List(Arg(LType.Ptr, p), Arg(wordLty, n))
 }
 
 object StringEmitter {
@@ -97,8 +111,8 @@ object StringEmitter {
    * `sext i32 %n to i32` is not an instruction at all. So this answers with the line to emit,
    * which may be empty, and the name to read afterwards, which may be the original.
    */
-  private def counted(using w: Word): (String, String) =
-    if w.bits > 32 then (s"  %n64 = sext i32 %n to ${w.llvm}", "%n64") else ("", "%n")
+  private def counted(using w: Word): (String, Val) =
+    if w.bits > 32 then (s"  %n64 = sext i32 %n to ${w.llvm}", Val.Reg("n64")) else ("", Val.Reg("n"))
 
   /** The three header words every `StrBuf` starts with — a strong count of one, no deallocation
    * hook that gives the bytes back and does nothing else, and a share count of one. The header's own

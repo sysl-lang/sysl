@@ -219,7 +219,7 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
    * analyzed it. `checkArgs` replaces every one of them.
    */
   private def standIn(ty: Type): TExpr = ty match
-    case _: Type.Floating => TFloatLit("0x0p+0", ty)
+    case _: Type.Floating => TFloatLit(0L, ty)
     case _                => TIntLit(0, ty)
 
   /** A call to a name, which may stand for one function or for several (`12 §1a`).

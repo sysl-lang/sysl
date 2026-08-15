@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.{Access, Arg, BinOp, ICmp, Inst, LType, Val}
+
 /** The call seam, and writing a value where it is going to live.
  *
  * What a `call` names is not simply the callee's sysl name. An `extern` may have been given a link
@@ -34,7 +36,7 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    * parameter to receive it. That keeps the two sides of the call agreeing with `genFunction`,
    * which drops the same parameters from the signature.
    */
-  protected def argList(args: List[TExpr]): List[String] = formatArgs(args.map(argValue))
+  protected def argList(args: List[TExpr]): List[Arg] = formatArgs(args.map(argValue))
 
   /** One argument, evaluated, in the form the callee receives it — or `None` where it is zero-sized
    * and there is nothing to hand over.
@@ -48,17 +50,17 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    * the values themselves: `17 §4`'s measure is evaluated over the arguments, and reaching them by
    * evaluating the arguments a second time would run whatever they do twice.
    */
-  protected def argValue(a: TExpr): Option[(Type, Either[String, String])] =
+  protected def argValue(a: TExpr): Option[(Type, Either[ir.Val, ir.Val])] =
     if layout.indirect(a.ty) then Some((a.ty, Left(address(a))))
     else
       val v = genExpr(a)
 
       Option.unless(Type.zeroSized(a.ty))((a.ty, Right(v)))
 
-  protected def formatArgs(vals: List[Option[(Type, Either[String, String])]]): List[String] =
+  protected def formatArgs(vals: List[Option[(Type, Either[ir.Val, ir.Val])]]): List[Arg] =
     vals.flatten.map {
-      case (_, Left(addr)) => s"ptr $addr"
-      case (ty, Right(v))  => s"${ty.llvm} $v"
+      case (_, Left(addr)) => Arg(LType.Ptr, addr)
+      case (ty, Right(v))  => Arg(ty.lty, v)
     }
 
   /** A call the function makes to itself as the last thing it does, lowered as a jump back to its
@@ -75,7 +77,7 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    * no register because there is no value — the call does not come back, and everything the emitters
    * would have gone on to lay down is dropped by `emit`, exactly as it is after a `-> never` call.
    */
-  protected def genTailSelfCall(args: List[TExpr]): String = {
+  protected def genTailSelfCall(args: List[TExpr]): ir.Val = {
     // A large argument is staged in a slot of its own rather than a register, because that is how a
     // large value moves at all here. The staging slot is what makes it safe as well: `address` on an
     // argument that is simply a parameter hands back that parameter's own slot, so writing straight
@@ -84,7 +86,7 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       tailParams.zip(args).map { case ((_, ty), a) =>
         if Type.zeroSized(ty) then { genExpr(a); None }
         else if layout.indirect(ty) then
-          val slot = emitAlloca(freshTemp(), ty.llvm)
+          val slot = emitAlloca(freshReg(), ty.lty)
 
           genOwnedInto(slot, a)
           Some(Left(slot))
@@ -113,25 +115,26 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
         // The count came with the bytes and stays with them: what the staging slot took is now the
         // parameter's, so nothing is retained here and nothing released.
         case Left(slot) =>
-          usesMemcpy = true
-          emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align ${layout.align(ty)} %$name.addr, " +
-            s"ptr align ${layout.align(ty)} $slot, i64 ${layout.size(ty)}, i1 false)")
+          emitMemcpy(Val.Reg(s"$name.addr"), slot, layout.size(ty), layout.align(ty))
 
-        case Right(v) => emit(s"store ${ty.llvm} $v, ptr %$name.addr")
+        case Right(v) => emit(Inst.Store(ty.lty, v, Val.Reg(s"$name.addr"), Access.Plain))
 
-    emitTerm(s"br label %${tailTarget.get}")
-    ""
+    emitTerm(Inst.Br(tailTarget.get))
+    Val.Nothing
   }
 
   /** Every callee declared with a `...`, foreign or sysl's own, mapped to the LLVM function type a
    * call to it must name: result type, declared parameter types, ellipsis.
    */
-  private val variadics: Map[String, String] =
-    val fromExterns = program.externs.filter(_.variadic).map(e => e.name -> foreignFnType(e.retTy, e.params))
+  private val variadics: Map[String, ir.FnType] =
+    val fromExterns = program.externs.filter(_.variadic)
+                             .map(e => e.name -> foreignSignature(e.retTy, e.params, variadic = true))
     val fromFuncs   = program.funcs.filter(_.variadic).map { f =>
-      val params = syslSret(f.retTy).toList ++ Type.stored(f.params).map(p => syslParam(p._2)) :+ "..."
+      val params = syslSret(f.retTy).toList ++
+        Type.stored(f.params).map(p => ir.Param(syslParamLty(p._2)))
+      val result = syslResult(f.retTy)
 
-      f.name -> s"${syslResult(f.retTy)} (${params.mkString(", ")})"
+      f.name -> ir.FnType(result.ret, params, variadic = true, result.retAttrs)
     }
 
     (fromExterns ++ fromFuncs).toMap
@@ -202,20 +205,21 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    */
   protected def entryOf(name: String): String = exportSymbols.getOrElse(name, symbolOf(name))
 
-  /** What a `call` names. For an ordinary function that is the result type, which is all LLVM
-   * needs; for a variadic one it is the callee's *whole* function type, because the argument list
-   * alone does not say where the declared parameters stop and the ellipsis begins.
+  /** The two things a `call` names, kept apart because that is how the instruction carries them:
+   * **what** the call names, and the symbol it names.
+   *
+   * For an ordinary function the first is the result type, which is all LLVM needs; for a variadic
+   * one it is the callee's *whole* function type, because the argument list alone does not say where
+   * the declared parameters stop and the ellipsis begins.
    */
-  protected def calleeOf(name: String, ty: Type): String =
+  protected def calleeParts(name: String, ty: Type): (CallForm, ir.Val.Global) =
     val symbol = symbolOf(name)
     // A foreign result may be named by a type the sysl signature never mentions — a coerced
     // aggregate, or `void` where the value comes back through an out-parameter. A sysl result may
     // be `void` for the second of those reasons alone.
-    val result = if foreigns.contains(name) then foreignResultType(ty) else syslResult(ty)
+    val result = if foreigns.contains(name) then foreignResult(ty) else syslResult(ty)
 
-    variadics.get(name) match
-      case Some(fnTy) => s"$fnTy @$symbol"
-      case None       => s"$result @$symbol"
+    (result.copy(whole = variadics.get(name)), ir.Val.Global(symbol))
 
   /** Emits a call from sysl to sysl and hands back the register holding its result.
    *
@@ -224,25 +228,29 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    * with nowhere to put one makes a slot here and reads the value back out of it, which is correct
    * and is exactly the shape `genInto` exists to save the callers that *do* have somewhere.
    */
-  protected def genSyslCall(callee: String, argVals: List[String], ty: Type, dest: Option[String]): String =
+  protected def genSyslCall(what: CallForm, callee: ir.Val, argVals: List[Arg], ty: Type,
+                            dest: Option[ir.Val]): ir.Val =
     syslSret(ty) match
       case Some(_) =>
-        val slot = dest.getOrElse(emitAlloca(freshTemp(), ty.llvm))
+        val slot = dest.getOrElse(emitAlloca(freshReg(), ty.lty))
+        val out  = Arg(LType.Ptr, slot, sretAttrs(ty.lty, layout.align(ty)))
 
-        emit(s"call $callee(${(s"ptr sret(${ty.llvm}) align ${layout.align(ty)} $slot" :: argVals).mkString(", ")})")
+        emit(what.call(None, callee, out :: argVals))
 
-        if dest.isDefined then ""
+        if dest.isDefined then Val.Nothing
         else
-          val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot")
+          val r = freshReg(); emit(Inst.Load(r, ty.lty, slot, Access.Plain))
           ownTemp(r, ty)
 
       case None if Type.noValue(ty) =>
-        emit(s"call $callee(${argVals.mkString(", ")})")
-        if ty == Type.Never then emitTerm("unreachable")
-        ""
+        emit(what.call(None, callee, argVals))
+        if ty == Type.Never then emitTerm(Inst.Unreachable)
+        Val.Nothing
 
       case None =>
-        val r = freshTemp(); emit(s"$r = call $callee(${argVals.mkString(", ")})")
+        val r = freshReg()
+
+        emit(what.call(Some(r), callee, argVals))
         ownTemp(r, ty)
 
   // --- writing a value where it is going to live ----------------------------------------
@@ -250,12 +258,12 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
   /** Writes `e`'s value into `dest` and leaves the destination **owning** it: a count taken for
    * every reference inside, which is what a slot that will later release them needs.
    */
-  protected def genOwnedInto(dest: String, e: TExpr): Unit =
+  protected def genOwnedInto(dest: ir.Val, e: TExpr): Unit =
     if !layout.indirect(e.ty) then
       val v = genExpr(e)
 
       retainValue(e.ty, v)
-      emit(s"store ${e.ty.llvm} $v, ptr $dest")
+      emit(Inst.Store(e.ty.lty, v, dest, Access.Plain))
     else
       e match
         // A tail self-call needs no destination: the jump keeps the frame, so the `sret` pointer the
@@ -271,7 +279,9 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
           val staged = args.map(argValue)
 
           if checksVariant(name) then genVariantAtCall(staged)
-          genSyslCall(calleeOf(name, ty), formatArgs(staged), ty, Some(dest))
+          val (what, callee) = calleeParts(name, ty)
+
+          genSyslCall(what, callee, formatArgs(staged), ty, Some(dest))
 
         case _ =>
           genBorrowedInto(dest, e)
@@ -286,7 +296,7 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    * a large result is nested inside a literal that is itself being built in place, which is rare
    * and is what the code did before any of this.
    */
-  protected def genBorrowedInto(dest: String, e: TExpr): Unit = e match
+  protected def genBorrowedInto(dest: ir.Val, e: TExpr): Unit = e match
     // A bitfield struct has one slot however many fields were written, so there is nothing to build
     // field by field: the container is assembled as a value and stored once (`Bitfields`).
     case TStructNew(struct, args) if Bitfields.of(struct).isDefined =>
@@ -294,35 +304,37 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       val vals   = args.zipWithIndex.map((a, i) => (genExpr(a), struct.fields(i)._2))
       val c      = buildBits(ranges, vals.collect { case (v, ft) if !Type.zeroSized(ft) => v })
 
-      emit(s"store ${containerLlvm(ranges)} $c, ptr $dest")
+      emit(Inst.Store(containerLty(ranges), c, dest, Access.Plain))
 
     case TStructNew(struct, args) =>
       for (a, i) <- args.zipWithIndex if !Type.zeroSized(struct.fields(i)._2) do
-        val p = freshTemp()
+        val p = freshReg()
 
-        emit(s"$p = getelementptr ${struct.llvm}, ptr $dest, i32 0, i32 ${struct.slot(i)}")
+        emit(Inst.Gep(p, struct.lty, dest,
+                      List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(struct.slot(i))))))
         genBorrowedInto(p, a)
 
     case TArrayLit(elems, arrayTy) =>
       for (el, i) <- elems.zipWithIndex do
-        val p = freshTemp()
+        val p = freshReg()
 
-        emit(s"$p = getelementptr ${arrayTy.elem.llvm}, ptr $dest, $word $i")
+        emit(Inst.Gep(p, arrayTy.elem.lty, dest, List(Arg(wordLty, Val.Int(i)))))
         genBorrowedInto(p, el)
 
     // The tag, and then the variant's own fields written into the region every variant shares.
     // Reaching the region by address is what the value form has to use a stack slot for anyway —
     // a union has no `insertvalue` — so this is the shorter of the two lowerings as well.
     case TEnumNew(en, variant, args) if !en.simple =>
-      emit(s"store i32 ${variant.tag}, ptr $dest")
+      emit(Inst.Store(i32, Val.Int(variant.tag), dest, Access.Plain))
 
       if variant.carries then
         val base = payloadPtr(en, dest)
 
         for (a, i) <- args.zipWithIndex if !Type.zeroSized(variant.fields(i)._2) do
-          val p = freshTemp()
+          val p = freshReg()
 
-          emit(s"$p = getelementptr ${en.payloadLlvm(variant)}, ptr $base, i32 0, i32 ${variant.slot(i)}")
+          emit(Inst.Gep(p, en.payloadLty(variant), base,
+                        List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(variant.slot(i))))))
           genBorrowedInto(p, a)
 
     // The value is generated once, above the loop, exactly as the value form does — every element
@@ -332,53 +344,58 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       val v = genExpr(value)
 
       if arrayTy.length > 0 then
-        fillLoop(dest, arrayTy) { at => emit(s"store ${arrayTy.elem.llvm} $v, ptr $at") }
+        fillLoop(dest, arrayTy) { at =>
+          emit(Inst.Store(arrayTy.elem.lty, v, at, Access.Plain))
+        }
 
     // A copy from one place to another is a copy of bytes. Reading the value out first would make
     // a first-class aggregate of it for the length of one instruction, which is the whole cost.
     case place if hasAddress(place) =>
       val src = address(place)
 
-      usesMemcpy = true
-      emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align ${layout.align(e.ty)} $dest, " +
-        s"ptr align ${layout.align(e.ty)} $src, i64 ${layout.size(e.ty)}, i1 false)")
+      emitMemcpy(dest, src, layout.size(e.ty), layout.align(e.ty))
 
     case _ =>
       val v = genExpr(e)
 
-      emit(s"store ${e.ty.llvm} $v, ptr $dest")
+      emit(Inst.Store(e.ty.lty, v, dest, Access.Plain))
 
   /** `e` built where a value of it is wanted, for a caller that asked for a register rather than
    * offering somewhere to put one. The load is the very thing the destination forms avoid, so this
    * is the fallback and not the path anything hot takes.
    */
-  protected def throughSlot(e: TExpr): String = {
-    val slot = emitAlloca(freshTemp(), e.ty.llvm)
+  protected def throughSlot(e: TExpr): ir.Val = {
+    val slot = emitAlloca(freshReg(), e.ty.lty)
 
     genBorrowedInto(slot, e)
 
-    val r = freshTemp(); emit(s"$r = load ${e.ty.llvm}, ptr $slot"); r
+    val r = freshReg(); emit(Inst.Load(r, e.ty.lty, slot, Access.Plain)); r
   }
 
   /** Runs `each` once per element of an array laid down at `base`, with the element's address. */
-  private def fillLoop(base: String, arrayTy: Type.Array)(each: String => Unit): Unit = {
-    val i     = emitAlloca(freshTemp(), word)
+  private def fillLoop(base: ir.Val, arrayTy: Type.Array)(each: ir.Val => Unit): Unit = {
+    val i     = emitAlloca(freshReg(), wordLty)
     val condL = freshLabel("fill.test")
     val bodyL = freshLabel("fill.elem")
     val endL  = freshLabel("fill.done")
 
-    emit(s"store $word 0, ptr $i")
-    emitTerm(s"br label %$condL")
+    emit(Inst.Store(wordLty, Val.Int(0), i, Access.Plain))
+    emitTerm(Inst.Br(condL))
     emitLabel(condL)
-    val iv   = freshTemp(); emit(s"$iv = load $word, ptr $i")
-    val more = freshTemp(); emit(s"$more = icmp ult $word $iv, ${arrayTy.length}")
-    emitTerm(s"br i1 $more, label %$bodyL, label %$endL")
+    val iv   = freshReg(); emit(Inst.Load(iv, wordLty, i, Access.Plain))
+    val more = freshReg()
+
+    emit(Inst.IntCmp(more, ICmp.Ult, wordLty, iv, Val.Int(arrayTy.length)))
+    emitTerm(Inst.CondBr(more, bodyL, endL))
     emitLabel(bodyL)
-    val ep = freshTemp(); emit(s"$ep = getelementptr ${arrayTy.elem.llvm}, ptr $base, $word $iv")
+    val ep = freshReg()
+
+    emit(Inst.Gep(ep, arrayTy.elem.lty, base, List(Arg(wordLty, iv))))
     each(ep)
-    val nxt = freshTemp(); emit(s"$nxt = add $word $iv, 1")
-    emit(s"store $word $nxt, ptr $i")
-    emitTerm(s"br label %$condL")
+    val nxt = freshReg(); emit(Inst.Bin(nxt, BinOp.Add, wordLty, iv, Val.Int(1)))
+    emit(Inst.Store(wordLty, nxt, i, Access.Plain))
+    emitTerm(Inst.Br(condL))
     emitLabel(endL)
   }
+
 }

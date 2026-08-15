@@ -41,7 +41,7 @@ case class TIntLit(value: BigInt, ty: Type) extends TExpr
 /** A floating-point constant, held as the bits of its `double` value. A narrower type is
  * reached by rounding that constant down to it, which costs nothing at run time.
  */
-case class TFloatLit(bits: String, ty: Type) extends TExpr
+case class TFloatLit(bits: Long, ty: Type) extends TExpr
 
 case class TStrLit(value: String)   extends TExpr { def ty: Type = Type.Str  }
 case class TBoolLit(value: Boolean) extends TExpr { def ty: Type = Type.Bool }

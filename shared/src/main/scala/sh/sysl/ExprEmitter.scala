@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.{Access, Arg, BinOp, CastOp, ICmp, Inst, LType, Val}
+
 /** The expression dispatch.
  *
  * This is the widest single `match` in the compiler and it stays one, because that is what it is:
@@ -19,16 +21,16 @@ trait ExprEmitter extends ArithEmitter {
   /** Lowers an expression, returning the register or immediate holding its value (empty for a
    * unit-typed expression, whose value is never read).
    */
-  protected def genExpr(expr: TExpr): String = expr match
-    case TIntLit(v, _) => v.toString
+  protected def genExpr(expr: TExpr): Val = expr match
+    case TIntLit(v, _) => Val.Int(v)
     case TStrLit(s)    => stringValue(s)
     // Every interned constant is already laid down NUL-terminated, so a C string is the same global
     // read as a plain pointer — the terminator the sysl string ignores is exactly what C reads by.
     case TCStrLit(s)   => stringGlobal(s)
-    case TBoolLit(b)   => if b then "1" else "0"
+    case TBoolLit(b)   => Val.Int(if b then 1 else 0)
     // A trait object is two words, so its null is a zeroed pair rather than a bare address.
     case TNullLit(ty)  => zero(ty)
-    case TUnitLit()    => ""
+    case TUnitLit()    => Val.Nothing
     case TZero(ty)     => zero(ty)
 
     // A large one is built where it is going to live and read back out only because this caller
@@ -37,10 +39,10 @@ trait ExprEmitter extends ArithEmitter {
 
     case TArrayLit(elems, arrayTy) =>
       val vals = elems.map(genExpr)
-      var acc  = "zeroinitializer"
+      var acc: Val = Val.Zero
       for (v, i) <- vals.zipWithIndex do
-        val r = freshTemp()
-        emit(s"$r = insertvalue ${arrayTy.llvm} $acc, ${arrayTy.elem.llvm} $v, $i")
+        val r = freshReg()
+        emit(Inst.Insert(r, arrayTy.lty, acc, arrayTy.elem.lty, v, List(i)))
         acc = r
       acc
 
@@ -51,10 +53,11 @@ trait ExprEmitter extends ArithEmitter {
     // nothing at run time.
     case TVectorLit(lanes, vecTy) =>
       val vals = lanes.map(genExpr)
-      var acc  = "zeroinitializer"
+      var acc: Val = Val.Zero
       for (v, i) <- vals.zipWithIndex do
-        val r = freshTemp()
-        emit(s"$r = insertelement ${vecTy.llvm} $acc, ${vecTy.elem.llvm} $v, i32 $i")
+        val r = freshReg()
+        emit(Inst.InsertElement(r, vecTy.lty, acc, vecTy.elem.lty, v,
+          Arg(i32, Val.Int(i))))
         acc = r
       acc
 
@@ -63,11 +66,12 @@ trait ExprEmitter extends ArithEmitter {
     // recognises, and it lowers to one broadcast instruction where the machine has one.
     case TSplat(value, vecTy) =>
       val v   = genExpr(value)
-      val one = freshTemp()
-      emit(s"$one = insertelement ${vecTy.llvm} poison, ${vecTy.elem.llvm} $v, i32 0")
-      val r = freshTemp()
-      emit(s"$r = shufflevector ${vecTy.llvm} $one, ${vecTy.llvm} poison, " +
-        s"<${vecTy.length} x i32> zeroinitializer")
+      val one = freshReg()
+      emit(Inst.InsertElement(one, vecTy.lty, Val.Poison, vecTy.elem.lty, v,
+        Arg(i32, Val.Int(0))))
+      val r = freshReg()
+      emit(Inst.Shuffle(r, vecTy.lty, one, Val.Poison,
+        Arg(LType.Vec(vecTy.length, i32), Val.Zero)))
       r
 
     // A lane-wise comparison is the scalar instruction at the register's width — `fcmp olt
@@ -78,10 +82,12 @@ trait ExprEmitter extends ArithEmitter {
       val rv    = genExpr(r)
       val vecTy = Type.repr(l.ty).asInstanceOf[Type.Vector]
       val lane  = Type.underlying(vecTy.elem)
-      val instr = if lane.isInstanceOf[Type.Floating] then "fcmp" else "icmp"
-      val res   = freshTemp()
+      val res   = freshReg()
 
-      emit(s"$res = $instr ${predicate(op, lane)} ${vecTy.llvm} $lv, $rv")
+      emit(
+        if lane.isInstanceOf[Type.Floating] then
+          Inst.FloatCmp(res, floatPred(op), vecTy.lty, lv, rv)
+        else Inst.IntCmp(res, intPred(op, lane), vecTy.lty, lv, rv))
       res
 
     // Both sides are evaluated and the mask picks between them, which is the whole difference from
@@ -90,16 +96,16 @@ trait ExprEmitter extends ArithEmitter {
       val m = genExpr(mask)
       val a = genExpr(whenTrue)
       val b = genExpr(whenFalse)
-      val r = freshTemp()
+      val r = freshReg()
 
-      emit(s"$r = select ${mask.ty.llvm} $m, ${ty.llvm} $a, ${ty.llvm} $b")
+      emit(Inst.Select(r, m, ty.lty, a, b, mask.ty.lty))
       r
 
     case TReduce(op, receiver, ty) =>
       val v     = genExpr(receiver)
       val vecTy = Type.repr(receiver.ty).asInstanceOf[Type.Vector]
       val name  = s"llvm.vector.reduce.$op.${vecTy.lty.overloadSuffix}"
-      val r     = freshTemp()
+      val r     = freshReg()
 
       // **The float sum takes a starting accumulator and the others do not**, which is not a
       // symmetry LLVM chose lightly: floating addition is not associative, so the intrinsic makes
@@ -108,20 +114,23 @@ trait ExprEmitter extends ArithEmitter {
       // licenses the tree that makes this worth doing at all rather than a left fold in disguise.
       val (params, args, flags) =
         if op == "fadd" then
-          (s"${vecTy.elem.llvm}, ${vecTy.llvm}", s"${vecTy.elem.llvm} -0.0, ${vecTy.llvm} $v", "reassoc ")
-        else (vecTy.llvm, s"${vecTy.llvm} $v", "")
+          (List(ir.Param(vecTy.elem.lty), ir.Param(vecTy.lty)),
+           List(Arg(vecTy.elem.lty, Val.float(-0.0)), Arg(vecTy.lty, v)),
+           List(ir.FastMath.Reassoc))
+        else (List(ir.Param(vecTy.lty)), List(Arg(vecTy.lty, v)), Nil)
 
-      satDecls += s"declare ${ty.llvm} @$name($params)"
-      emit(s"$r = call $flags${ty.llvm} @$name($args)")
+      satDecls += ir.FuncSig(name, ir.FnType(ty.lty, params))
+      emit(Inst.Call(Some(r), ty.lty, Val.Global(name), args, fast = flags))
       r
 
     // One lane, read straight out of the register. There is no address and so no bounds test: the
     // index was held to a constant in range where it was written, which is what `TLane` is for.
     case TLane(receiver, lane, ty) =>
       val v = genExpr(receiver)
-      val r = freshTemp()
+      val r = freshReg()
 
-      emit(s"$r = extractelement ${Type.repr(receiver.ty).llvm} $v, i32 $lane")
+      emit(Inst.ExtractElement(r, Type.repr(receiver.ty).lty, v,
+        Arg(i32, Val.Int(lane))))
       r
 
     // **The alignment is the element's, not the register's, and that is what a slice can promise.**
@@ -133,9 +142,9 @@ trait ExprEmitter extends ArithEmitter {
     // also the free one.
     case TVecLoad(receiver, index, vecTy) =>
       val p = runAddr(receiver, index, vecTy.length)
-      val r = freshTemp()
+      val r = freshReg()
 
-      emit(s"$r = load ${vecTy.llvm}, ptr $p, align ${layout.align(vecTy.elem)}")
+      emit(Inst.Load(r, vecTy.lty, p, Access.Plain, Some(layout.align(vecTy.elem))))
       r
 
     case TVecStore(receiver, index, value) =>
@@ -146,8 +155,8 @@ trait ExprEmitter extends ArithEmitter {
       val v = genExpr(value)
       val p = runAddr(receiver, index, vecTy.length)
 
-      emit(s"store ${vecTy.llvm} $v, ptr $p, align ${layout.align(vecTy.elem)}")
-      ""
+      emit(Inst.Store(vecTy.lty, v, p, Access.Plain, Some(layout.align(vecTy.elem))))
+      Val.Nothing
 
     // Built through memory with a loop rather than as an `insertvalue` chain, for the reason the
     // ARC walk gives: the count is a compile-time constant but it can be very large, and a repeat
@@ -155,7 +164,7 @@ trait ExprEmitter extends ArithEmitter {
     // loop — every element is a copy of that one evaluation. Its references are borrowed here and
     // retained by whatever binds the array, whose ARC walk visits all n elements.
     case TArrayFill(value, arrayTy) if arrayTy.length == 0 =>
-      genExpr(value); "zeroinitializer"
+      genExpr(value); Val.Zero
 
     case e: TArrayFill => throughSlot(e)
 
@@ -164,14 +173,14 @@ trait ExprEmitter extends ArithEmitter {
     // that lands in one is retained as it is stored, exactly as a slot that binds an array is.
     case TBufLit(elems, sliceTy) =>
       val vals       = elems.map(genExpr)
-      val (box, data) = genBuffer(sliceTy.elem, vals.length.toString)
+      val (box, data) = genBuffer(sliceTy.elem, Val.Int(vals.length))
 
       for (v, i) <- vals.zipWithIndex do
         retainValue(sliceTy.elem, v)
-        val ep = freshTemp(); emit(s"$ep = getelementptr ${sliceTy.elem.llvm}, ptr $data, $word $i")
-        emit(s"store ${sliceTy.elem.llvm} $v, ptr $ep")
+        val ep = freshReg(); emit(Inst.Gep(ep, sliceTy.elem.lty, data, List(Arg(wordLty, Val.Int(i)))))
+        emit(Inst.Store(sliceTy.elem.lty, v, ep, Access.Plain))
 
-      bufferView(sliceTy, box, data, vals.length.toString)
+      bufferView(sliceTy, box, data, Val.Int(vals.length))
 
     // The value is generated once, above the loop, which is what makes `[tick(); n]` one call
     // whose result lands in n places — the repeat's own rule (`07`), and the reason the count may
@@ -186,17 +195,17 @@ trait ExprEmitter extends ArithEmitter {
 
     case e @ TIndex(receiver, index, ty) =>
       val p = elementAddr(receiver, index)
-      val r = freshTemp(); emit(s"$r = load${vol(e)} ${ty.llvm}, ptr $p"); r
+      val r = freshReg(); emit(Inst.Load(r, ty.lty, p, access(e))); r
 
     case TSlice(base, lo, hi, inclusive, sliceTy) =>
       genSlice(base, lo, hi, inclusive, sliceTy)
 
     case TLen(receiver, _) =>
       receiver.ty match
-        case Type.Array(n, _) => genExpr(receiver); n.toString
+        case Type.Array(n, _) => genExpr(receiver); Val.Int(n)
         case w: Type.View =>
           val v = genExpr(receiver)
-          val r = freshTemp(); emit(s"$r = extractvalue ${w.llvm} $v, 2"); r
+          val r = freshReg(); emit(Inst.Extract(r, w.lty, v, List(2))); r
         case other => sys.error(s"unreachable length of ${other.llvm}")
 
     // A string and a `[]u8` are the same three words, so looking at one as the other is nothing
@@ -206,8 +215,12 @@ trait ExprEmitter extends ArithEmitter {
 
     // A narrower float is the `double` constant rounded to it, which folds away entirely.
     case TFloatLit(bits, ty) =>
-      if ty == Type.Real then bits
-      else { val r = freshTemp(); emit(s"$r = fptrunc double $bits to ${ty.llvm}"); r }
+      if ty == Type.Real then Val.Float(bits)
+      else
+        val r = freshReg()
+
+        emit(Inst.Cast(r, CastOp.FPTrunc, LType.F(64), Val.Float(bits), ty.lty))
+        r
 
     case TCast(operand, ty) =>
       // A constrained operand converts from its base representation — `f64(m)` reaches the double a
@@ -217,18 +230,21 @@ trait ExprEmitter extends ArithEmitter {
     case TConstrainedValid(value, c) =>
       val v    = genExpr(value)
       val base = Type.underlying(c.base)
-      val geLo = compareValue(">=", base, v, c.lo.get.toBigInt.toString)
-      val leHi = compareValue(if c.exclusiveHi then "<" else "<=", base, v, c.hi.get.toBigInt.toString)
-      val r = freshTemp(); emit(s"$r = and i1 $geLo, $leHi"); r
+      val geLo = compareValue(">=", base, v, Val.Int(c.lo.get.toBigInt))
+      val leHi = compareValue(if c.exclusiveHi then "<" else "<=", base, v, Val.Int(c.hi.get.toBigInt))
+      val r = freshReg(); emit(Inst.Bin(r, BinOp.And, i1, geLo, leHi)); r
 
     case TConstrainedStep(value, c, up, _) =>
       val v    = genExpr(value)
       val base = Type.underlying(c.base)
       val last = if c.exclusiveHi then c.hi.get - 1 else c.hi.get
       // `Succ` traps at `Last`, `Pred` at `First`; the value is otherwise one step along the base.
-      if up then trapUnless(compareValue("<", base, v, last.toBigInt.toString), "succ")
-      else trapUnless(compareValue(">", base, v, c.lo.get.toBigInt.toString), "pred")
-      val r = freshTemp(); emit(s"$r = ${if up then "add" else "sub"} ${base.llvm} $v, 1"); r
+      if up then trapUnless(compareValue("<", base, v, Val.Int(last.toBigInt)), "succ")
+      else trapUnless(compareValue(">", base, v, Val.Int(c.lo.get.toBigInt)), "pred")
+      val r = freshReg()
+
+      emit(Inst.Bin(r, if up then BinOp.Add else BinOp.Sub, base.lty, v, Val.Int(1)))
+      r
 
     case TConstrainedCheck(value, target) =>
       val v = genExpr(value)
@@ -248,27 +264,36 @@ trait ExprEmitter extends ArithEmitter {
       v
 
     // Nothing is stored for a zero-sized binding, so there is nothing to read back.
-    case TLoad(_, ty) if Type.zeroSized(ty) => ""
+    case TLoad(_, ty) if Type.zeroSized(ty) => Val.Nothing
 
     // The qualifier comes off the value's type for an ordinary local, whose slot is its own, and off
     // the recorded storage for a `ref`, whose slot is somebody else's and may be a register
     // (`03 § ref`, `03 § Device memory`).
     case TLoad(name, ty) =>
-      val q = if refStorage.contains(name) then qualifier(refStorage(name)) else qualifier(ty)
-      val r = freshTemp(); emit(s"$r = load$q ${ty.llvm}, ptr %$name.addr"); r
+      val acc = accessOf(if refStorage.contains(name) then refStorage(name) else ty)
+      val r   = freshReg()
+
+      emit(Inst.Load(r, ty.lty, Val.Reg(s"$name.addr"), acc))
+      r
 
     case TResult(_) =>
       resultSSA.getOrElse(sys.error("'result' lowered outside an ensure postcondition"))
 
     case TOld(index, ty) =>
-      val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr %old.$index.addr"); r
+      val r = freshReg()
+
+      emit(Inst.Load(r, ty.lty, Val.Reg(s"old.$index.addr"), Access.Plain))
+      r
 
     case TGlobal(symbol, ty, _) =>
-      val r = freshTemp(); emit(s"$r = load${qualifier(ty)} ${ty.llvm}, ptr @$symbol"); r
+      val r = freshReg()
+
+      emit(Inst.Load(r, ty.lty, Val.Global(symbol), accessOf(ty)))
+      r
 
     case e @ TDeref(operand, ty) =>
       val p = payloadAddr(operand)
-      val r = freshTemp(); emit(s"$r = load${vol(e)} ${ty.llvm}, ptr $p"); r
+      val r = freshReg(); emit(Inst.Load(r, ty.lty, p, access(e))); r
 
     case TAddrOf(place, _) =>
       address(place)
@@ -279,7 +304,7 @@ trait ExprEmitter extends ArithEmitter {
     case TStore(place, value, ty) if Type.zeroSized(ty) =>
       genExpr(value)
       address(place)
-      ""
+      Val.Nothing
 
     // The three forms that write through a place go through `placeAddr`/`loadPlace`/`storePlace`
     // rather than through `address` and a `load`, because a **bitfield** is a range of a container
@@ -305,7 +330,10 @@ trait ExprEmitter extends ArithEmitter {
     case TIncDec(place, op, pre, ty, check) =>
       val p   = placeAddr(place)
       val cur = loadPlace(place, p)
-      val nv  = freshTemp(); emit(s"$nv = ${if op == "++" then "add" else "sub"} ${ty.llvm} $cur, 1")
+      val nv  = freshReg()
+
+      emit(Inst.Bin(nv, if op == "++" then BinOp.Add else BinOp.Sub, ty.lty, cur,
+        Val.Int(1)))
 
       for c <- check do emitConstraintChecks(nv, c)
 
@@ -330,11 +358,11 @@ trait ExprEmitter extends ArithEmitter {
     // ever validated. The same copy is what `str(x)` finishes through, so both spend one allocation.
     case TFromBytes(arg) =>
       heap = true
-      val fn  = request("sysl.str.from_bytes")(StringEmitter.fromBytes)
+      val fn  = requestText("sysl.str.from_bytes")(StringEmitter.fromBytes)
       val v   = genExpr(arg)
-      val p   = freshTemp(); emit(s"$p = extractvalue ${arg.ty.llvm} $v, 1")
-      val n   = freshTemp(); emit(s"$n = extractvalue ${arg.ty.llvm} $v, 2")
-      val r   = freshTemp(); emit(s"$r = call ${Type.Str.llvm} @$fn(ptr $p, $word $n)")
+      val p   = freshReg(); emit(Inst.Extract(p, arg.ty.lty, v, List(1)))
+      val n   = freshReg(); emit(Inst.Extract(n, arg.ty.lty, v, List(2)))
+      val r   = freshReg(); emit(Inst.Call(Some(r), Type.Str.lty, Val.Global(fn), List(Arg(LType.Ptr, p), Arg(wordLty, n))))
       ownTemp(r, Type.Str)
 
     // Rendering into a buffer: a zeroed stack slot becomes the sink, the value writes itself into
@@ -343,33 +371,35 @@ trait ExprEmitter extends ArithEmitter {
     // inside a loop meets the same one each time round.
     case TRender(value, method, spec, vslot) =>
       heap = true
-      request("sysl.str.from_bytes")(StringEmitter.fromBytes)
+      requestText("sysl.str.from_bytes")(StringEmitter.fromBytes)
 
       val table = bufferTable()
       val v     = genExpr(value)
       val s     = genExpr(spec)
-      val slot  = emitAlloca(freshTemp(), bufferLayout)
+      val slot  = emitAlloca(freshReg(), bufferLty)
 
-      emit(s"store $bufferLayout zeroinitializer, ptr $slot")
-      val a = freshTemp(); emit(s"$a = insertvalue ${Type.fatPointer} undef, ptr @$table, 0")
-      val w = freshTemp(); emit(s"$w = insertvalue ${Type.fatPointer} $a, ptr $slot, 1")
+      emit(Inst.Store(bufferLty, Val.Zero, slot, Access.Plain))
+      val a = freshReg()
+
+      emit(Inst.Insert(a, LType.fat, Val.Undef, LType.Ptr, Val.Global(table), List(0)))
+      val w = freshReg(); emit(Inst.Insert(w, LType.fat, a, LType.Ptr, slot, List(1)))
 
       // A trait object renders through the table it carries, so the callee and the receiver both
       // come out of the value: the data word is the receiver a slot's entry expects, exactly as it
       // is for any other call through one.
       vslot match
         case Some(n) =>
-          val vt   = freshTemp(); emit(s"$vt = extractvalue ${Type.fatPointer} $v, 0")
-          val data = freshTemp(); emit(s"$data = extractvalue ${Type.fatPointer} $v, 1")
-          val e    = freshTemp(); emit(s"$e = getelementptr ptr, ptr $vt, $word $n")
-          val fn   = freshTemp(); emit(s"$fn = load ptr, ptr $e")
+          val vt   = freshReg(); emit(Inst.Extract(vt, LType.fat, v, List(0)))
+          val data = freshReg(); emit(Inst.Extract(data, LType.fat, v, List(1)))
+          val e    = freshReg(); emit(Inst.Gep(e, LType.Ptr, vt, List(Arg(wordLty, Val.Int(n)))))
+          val fn   = freshReg(); emit(Inst.Load(fn, LType.Ptr, e, Access.Plain))
 
-          emit(s"call void $fn(ptr $data, ${Type.fatPointer} $w, ${spec.ty.llvm} $s)")
+          emit(Inst.Call(None, LType.Void, fn, List(Arg(LType.Ptr, data), Arg(LType.fat, w), Arg(spec.ty.lty, s))))
         case None =>
-          emit(s"call void @$method(${value.ty.llvm} $v, ${Type.fatPointer} $w, ${spec.ty.llvm} $s)")
+          emit(Inst.Call(None, LType.Void, Val.Global(method), List(Arg(value.ty.lty, v), Arg(LType.fat, w), Arg(spec.ty.lty, s))))
 
-      val r = freshTemp()
-      emit(s"$r = call ${Type.Str.llvm} @sysl.w.buf.finish(ptr $slot)")
+      val r = freshReg()
+      emit(Inst.Call(Some(r), Type.Str.lty, Val.Global("sysl.w.buf.finish"), List(Arg(LType.Ptr, slot))))
       ownTemp(r, Type.Str)
 
     case TBinary(_, l, r, Type.Str) =>
@@ -388,15 +418,15 @@ trait ExprEmitter extends ArithEmitter {
         case Type.Ptr(e) => layout.size(e)
         case _           => 1
       val (lv, rv) = (genExpr(l), genExpr(r))
-      val (la, ra) = (freshTemp(), freshTemp())
-      emit(s"$la = ptrtoint ptr $lv to ${Type.isize.llvm}")
-      emit(s"$ra = ptrtoint ptr $rv to ${Type.isize.llvm}")
-      val bytes = freshTemp()
-      emit(s"$bytes = sub ${Type.isize.llvm} $la, $ra")
+      val (la, ra) = (freshReg(), freshReg())
+      emit(Inst.Cast(la, CastOp.PtrToInt, LType.Ptr, lv, Type.isize.lty))
+      emit(Inst.Cast(ra, CastOp.PtrToInt, LType.Ptr, rv, Type.isize.lty))
+      val bytes = freshReg()
+      emit(Inst.Bin(bytes, BinOp.Sub, Type.isize.lty, la, ra))
       if stride <= 1 then bytes
       else
-        val n = freshTemp()
-        emit(s"$n = sdiv ${Type.isize.llvm} $bytes, $stride")
+        val n = freshReg()
+        emit(Inst.Bin(n, BinOp.SDiv, Type.isize.lty, bytes, Val.Int(stride)))
         n
 
     case TBinary(op, l, r, _) =>
@@ -417,23 +447,23 @@ trait ExprEmitter extends ArithEmitter {
     // the two scalar guards below would otherwise never see one. `zeroinitializer` is the whole
     // vector's zero, so the integer form needs no splat written out.
     case TUnary("-", operand, ty) if Type.opSubject(ty).isInstanceOf[Type.Integer] && Type.repr(ty).isInstanceOf[Type.Vector] =>
-      val v = genExpr(operand); val r = freshTemp(); emit(s"$r = sub ${ty.llvm} zeroinitializer, $v"); r
+      val v = genExpr(operand); val r = freshReg(); emit(Inst.Bin(r, BinOp.Sub, ty.lty, Val.Zero, v)); r
     case TUnary("-", operand, ty) if Type.underlying(ty).isInstanceOf[Type.Integer] =>
-      val v = genExpr(operand); val r = freshTemp(); emit(s"$r = sub ${ty.llvm} 0, $v"); r
+      val v = genExpr(operand); val r = freshReg(); emit(Inst.Bin(r, BinOp.Sub, ty.lty, Val.Int(0), v)); r
     case TUnary("-", operand, ty) if Type.opSubject(ty).isInstanceOf[Type.Floating] =>
-      val v = genExpr(operand); val r = freshTemp(); emit(s"$r = fneg ${ty.llvm} $v"); r
+      val v = genExpr(operand); val r = freshReg(); emit(Inst.Neg(r, ty.lty, v)); r
     case TUnary("!", operand, _) =>
-      val v = genExpr(operand); val r = freshTemp(); emit(s"$r = xor i1 $v, true"); r
+      val v = genExpr(operand); val r = freshReg(); emit(Inst.Bin(r, BinOp.Xor, i1, v, Val.Bool(true))); r
     // A vector's complement flips every lane, and its all-ones constant is written `splat (iN -1)`
     // rather than as the bare `-1` a scalar takes.
     case TUnary("~", operand, ty) if Type.repr(ty).isInstanceOf[Type.Vector] =>
       val v    = genExpr(operand)
       val lane = Type.repr(ty).asInstanceOf[Type.Vector].elem
-      val r    = freshTemp()
-      emit(s"$r = xor ${ty.llvm} $v, splat (${lane.llvm} -1)")
+      val r    = freshReg()
+      emit(Inst.Bin(r, BinOp.Xor, ty.lty, v, Val.Splat(lane.lty, Val.Int(-1))))
       r
     case TUnary("~", operand, ty) =>
-      val v = genExpr(operand); val r = freshTemp(); emit(s"$r = xor ${ty.llvm} $v, -1"); r
+      val v = genExpr(operand); val r = freshReg(); emit(Inst.Bin(r, BinOp.Xor, ty.lty, v, Val.Int(-1))); r
     case TUnary(op, _, _) =>
       sys.error(s"unreachable unary '$op'")
 
@@ -441,8 +471,8 @@ trait ExprEmitter extends ArithEmitter {
     // and no value to hand back. `syncscope` is deliberately absent: the default is the whole
     // system, which is what a program sharing memory with another thread or a device needs.
     case TFence(ord) =>
-      emit(s"fence ${Atomics.llvm(ord)}")
-      "0"
+      emit(Inst.Fence(Atomics.llvm(ord)))
+      Val.Int(0)
 
     // One atomic access. `at` rather than the node's own type decides the width, since a store
     // answers nothing and would otherwise lower at `void`; the alignment is stated because LLVM
@@ -450,31 +480,41 @@ trait ExprEmitter extends ArithEmitter {
     case TAtomic(op, addr, ops, ord, at, ty) =>
       val p    = genExpr(addr)
       val vs   = ops.map(genExpr)
-      val ll   = at.llvm
+      val ll   = at.lty
       val ordr = Atomics.llvm(ord)
-      val al   = layout.align(at)
+      val acc  = Access.Atomic(ordr)
+      val al   = Some(layout.align(at))
 
       op match
         case "atomic_load" =>
-          val r = freshTemp(); emit(s"$r = load atomic $ll, ptr $p $ordr, align $al"); r
+          val r = freshReg(); emit(Inst.Load(r, ll, p, acc, al)); r
         case "atomic_store" =>
-          emit(s"store atomic $ll ${vs.head}, ptr $p $ordr, align $al")
-          "0"
+          emit(Inst.Store(ll, vs.head, p, acc, al))
+          Val.Int(0)
         // `cmpxchg` answers a pair — the value it found and whether it swapped — and what this hands
         // back is the value. A caller comparing it against what they expected learns the same thing
         // the flag would have told them, which is why the raw form has one result rather than a
         // tuple the library would immediately take apart.
         case "atomic_cas" =>
-          val pair = freshTemp()
-          emit(s"$pair = cmpxchg ptr $p, $ll ${vs.head}, $ll ${vs(1)} $ordr ${Atomics.failure(ord)}")
-          val r = freshTemp(); emit(s"$r = extractvalue { $ll, i1 } $pair, 0"); r
+          val pair = freshReg()
+          emit(Inst.CmpXchg(pair, p, ll, vs.head, vs(1), ordr))
+          val r = freshReg()
+          emit(Inst.Extract(r, LType.Struct(List(ll, i1)), pair, List(0)))
+          r
         // The rest are one `atomicrmw`, which answers the value that was there *before* — the
         // property that makes an atomic increment usable as a ticket.
         case _ =>
           val kind = op.stripPrefix("atomic_") match
-            case "swap" => "xchg"
-            case k      => k
-          val r = freshTemp(); emit(s"$r = atomicrmw $kind ptr $p, $ll ${vs.head} $ordr"); r
+            case "swap" => ir.RmwOp.Xchg
+            case "add"  => ir.RmwOp.Add
+            case "sub"  => ir.RmwOp.Sub
+            case "and"  => ir.RmwOp.And
+            case "or"   => ir.RmwOp.Or
+            case "xor"  => ir.RmwOp.Xor
+            case other  => sys.error(s"unreachable atomic '$other'")
+          val r = freshReg()
+          emit(Inst.AtomicRmw(r, kind, p, ll, vs.head, ordr))
+          r
 
     // The operand is read into a register once and the comparisons index off that, which is the
     // whole reason these are a node rather than a tree of the operators they mean (`14 §5`).
@@ -482,35 +522,40 @@ trait ExprEmitter extends ArithEmitter {
       val v    = genExpr(operand)
       val n    = amount.map(genExpr)
       val bits = width.asInstanceOf[Type.Integer].bits
-      val ll   = width.llvm
+      val ll   = width.lty
 
       // The bits counted at the operand's own width, then resized to the `u32` the count is
       // answered in. A count is at most the width, so narrowing one from a type wider than 32 bits
       // cannot lose anything.
-      def counted(base: String, of: String, zeroFlag: Boolean = false) =
+      def counted(base: String, of: Val, zeroFlag: Boolean = false) =
         resize(intrinsic(base, ll, List(of), zeroFlag), width, ty)
 
       // `~x`, which is what turns a count of zeroes into a count of ones. The trait has both pairs
       // because the complement is the caller's to get wrong, not because the machine has four
       // instructions.
-      def complement = { val r = freshTemp(); emit(s"$r = xor $ll $v, -1"); r }
+      def complement = {
+        val r = freshReg(); emit(Inst.Bin(r, BinOp.Xor, ll, v, Val.Int(-1))); r
+      }
 
       op match
         // `x < 0 ? -x : x`, and the negation is the wrapping one the language's own `-` is — so at
         // the most negative value both answer that value, rather than the member disagreeing with
         // the operator beside it.
         case "abs" =>
-          val neg = freshTemp(); emit(s"$neg = sub $ll 0, $v")
-          val lt  = freshTemp(); emit(s"$lt = icmp slt $ll $v, 0")
-          val r   = freshTemp(); emit(s"$r = select i1 $lt, $ll $neg, $ll $v")
+          val neg = freshReg(); emit(Inst.Bin(neg, BinOp.Sub, ll, Val.Int(0), v))
+          val lt  = freshReg(); emit(Inst.IntCmp(lt, ICmp.Slt, ll, v, Val.Int(0)))
+          val r   = freshReg()
+          emit(Inst.Select(r, lt, ll, neg, v))
           r
         // Two comparisons rather than a subtraction of them, because `(x > 0) - (x < 0)` would have
         // to widen both booleans to the operand's width first and says less about what it computes.
         case "signum" =>
-          val pos = freshTemp(); emit(s"$pos = icmp sgt $ll $v, 0")
-          val neg = freshTemp(); emit(s"$neg = icmp slt $ll $v, 0")
-          val hi  = freshTemp(); emit(s"$hi = select i1 $pos, $ll 1, $ll 0")
-          val r   = freshTemp(); emit(s"$r = select i1 $neg, $ll -1, $ll $hi")
+          val pos = freshReg(); emit(Inst.IntCmp(pos, ICmp.Sgt, ll, v, Val.Int(0)))
+          val neg = freshReg(); emit(Inst.IntCmp(neg, ICmp.Slt, ll, v, Val.Int(0)))
+          val hi  = freshReg()
+          emit(Inst.Select(hi, pos, ll, Val.Int(1), Val.Int(0)))
+          val r = freshReg()
+          emit(Inst.Select(r, neg, ll, Val.Int(-1), hi))
           r
 
         case "count_ones"  => counted("ctpop", v)
@@ -538,22 +583,22 @@ trait ExprEmitter extends ArithEmitter {
     // result defaults to the left value and is overwritten by the right only when it is reached.
     case TLogical(op, l, r) =>
       val lv   = genExpr(l)
-      val slot = emitAlloca(freshTemp(), "i1")
-      emit(s"store i1 $lv, ptr $slot")
+      val slot = emitAlloca(freshReg(), i1)
+      emit(Inst.Store(i1, lv, slot, Access.Plain))
       val rhsL = freshLabel("sc.rhs")
       val endL = freshLabel("sc.end")
-      if op == "&&" then emitTerm(s"br i1 $lv, label %$rhsL, label %$endL")
-      else emitTerm(s"br i1 $lv, label %$endL, label %$rhsL")
+      if op == "&&" then emitTerm(Inst.CondBr(lv, rhsL, endL))
+      else emitTerm(Inst.CondBr(lv, endL, rhsL))
       emitLabel(rhsL)
       // The right side gets its own temp region: anything it allocates is released before the
       // merge, and if the branch is skipped that code never runs at all.
       pushTemps()
       val rv = genExpr(r)
-      emit(s"store i1 $rv, ptr $slot")
+      emit(Inst.Store(i1, rv, slot, Access.Plain))
       popTemps()
-      emitTerm(s"br label %$endL")
+      emitTerm(Inst.Br(endL))
       emitLabel(endL)
-      val res = freshTemp(); emit(s"$res = load i1, ptr $slot"); res
+      val res = freshReg(); emit(Inst.Load(res, i1, slot, Access.Plain)); res
 
     // One comparison has nothing to short-circuit, so it stays straight-line — which is what the
     // overwhelming majority of comparisons are.
@@ -577,11 +622,11 @@ trait ExprEmitter extends ArithEmitter {
     // pops for the regions it entered, and no others. Where nothing is owned, which is the usual
     // case, every pop is empty and the ladder is branches alone.
     case TCompare(operands, cmps) =>
-      val slot  = emitAlloca(freshTemp(), "i1")
+      val slot  = emitAlloca(freshReg(), i1)
       val exits = cmps.indices.map(_ => freshLabel("cmp.exit")).toList
       val endL  = freshLabel("cmp.end")
 
-      var left = ""
+      var left: Val = Val.Nothing
 
       for k <- cmps.indices do
         pushTemps()
@@ -589,12 +634,12 @@ trait ExprEmitter extends ArithEmitter {
         val right = genExpr(operands(k + 1))
         val c     = comparison(cmps(k), operands(k).ty, left, right)
 
-        emit(s"store i1 $c, ptr $slot")
+        emit(Inst.Store(i1, c, slot, Access.Plain))
 
-        if k == cmps.length - 1 then emitTerm(s"br label %${exits(k)}")
+        if k == cmps.length - 1 then emitTerm(Inst.Br(exits(k)))
         else
           val nextL = freshLabel("cmp.next")
-          emitTerm(s"br i1 $c, label %$nextL, label %${exits(k)}")
+          emitTerm(Inst.CondBr(c, nextL, exits(k)))
           emitLabel(nextL)
 
         left = right
@@ -602,31 +647,31 @@ trait ExprEmitter extends ArithEmitter {
       for k <- cmps.indices.reverse do
         emitLabel(exits(k))
         popTemps()
-        emitTerm(s"br label %${if k == 0 then endL else exits(k - 1)}")
+        emitTerm(Inst.Br(if k == 0 then endL else exits(k - 1)))
 
       emitLabel(endL)
-      val res = freshTemp(); emit(s"$res = load i1, ptr $slot"); res
+      val res = freshReg(); emit(Inst.Load(res, i1, slot, Access.Plain)); res
 
     case TSeq(exprs) =>
-      exprs.foreach(genExpr); ""
+      exprs.foreach(genExpr); Val.Nothing
 
     // One copy of an unrolled `for const` (`10 §10`), which is a block wherever it stands. A copy
     // that yields nothing is emitted for its effects, which is what every copy of a loop body does.
     case TBlockExpr(b) =>
-      if Type.zeroSized(b.ty) then { genBlockVoid(b); "" }
+      if Type.zeroSized(b.ty) then { genBlockVoid(b); Val.Nothing }
       else genBlockValue(b)
 
     // A function's address is the symbol its **C-callable** entry is defined under, which is a
     // constant — there is nothing to compute and nothing to load, the way there is for the address
     // of a variable. For an exported function that entry is the thunk rather than the definition
     // (`CallEmitter.entryOf`), since a `*extern` may only hold something C can call.
-    case TFuncAddr(_, entry, _) => s"@${entryOf(entry)}"
+    case TFuncAddr(_, entry, _) => Val.Global(entryOf(entry))
 
     // A call through one goes out under C's convention, because that is what the type said was at
     // the other end. It reuses the foreign path entire: what a `call` names in front of an indirect
     // callee is the result type and then the value, exactly where a direct one names the symbol.
     case TCallPtr(callee, args, _, ty) =>
-      genForeignCall(s"${foreignResultType(ty)} ${genExpr(callee)}", args, ty)
+      genForeignCall(foreignResult(ty), genExpr(callee), args, ty)
 
     // The last thing a recursive function does, where it is a call to itself: a jump to its own
     // entry over the frame it already has (`TailCalls`).
@@ -635,7 +680,9 @@ trait ExprEmitter extends ArithEmitter {
     // A call to a foreign function is lowered under the other side's convention rather than sysl's
     // own, which is a difference only an aggregate can see (`ForeignEmitter`).
     case TCall(name, args, ty, _) if foreigns.contains(name) =>
-      genForeignCall(calleeOf(name, ty), args, ty)
+      val (what, callee) = calleeParts(name, ty)
+
+      genForeignCall(what, callee, args, ty)
 
     // A call to something declared `-> never` does not come back, so the block ends at it: what
     // follows in the same block is unreachable and `emit` drops it, which is exactly why a
@@ -647,41 +694,45 @@ trait ExprEmitter extends ArithEmitter {
       // gone down. It sits before the call rather than inside the callee, which is what lets it be
       // made out of values already in hand.
       if checksVariant(name) then genVariantAtCall(staged)
-      genSyslCall(calleeOf(name, ty), formatArgs(staged), ty, None)
+      val (what, callee) = calleeParts(name, ty)
+
+      genSyslCall(what, callee, formatArgs(staged), ty, None)
 
     // Erasing costs one word: the value goes on pointing where it pointed, and the table for the
     // type it is losing is a constant beside it. Nothing is retained — a counted object holds the
     // count its operand already had, which is what makes `f(&T)` and `f(&Trait)` the same handover.
     case TErase(operand, vtable, _) =>
       val d = genExpr(operand)
-      val a = freshTemp(); emit(s"$a = insertvalue ${Type.fatPointer} undef, ptr @$vtable, 0")
-      val b = freshTemp(); emit(s"$b = insertvalue ${Type.fatPointer} $a, ptr $d, 1")
+      val a = freshReg()
+
+      emit(Inst.Insert(a, LType.fat, Val.Undef, LType.Ptr, Val.Global(vtable), List(0)))
+      val b = freshReg(); emit(Inst.Insert(b, LType.fat, a, LType.Ptr, d, List(1)))
       b
 
     // A call whose callee is a word in the object's table rather than a name. The data word goes in
     // front of the declared arguments, which is the shape every slot was built to.
     case TVCall(receiver, slot, args, ty, _) =>
       val obj     = genExpr(receiver)
-      val table   = freshTemp(); emit(s"$table = extractvalue ${Type.fatPointer} $obj, 0")
-      val data    = freshTemp(); emit(s"$data = extractvalue ${Type.fatPointer} $obj, 1")
+      val table   = freshReg(); emit(Inst.Extract(table, LType.fat, obj, List(0)))
+      val data    = freshReg(); emit(Inst.Extract(data, LType.fat, obj, List(1)))
       val argVals = argList(args)
-      val entry   = freshTemp(); emit(s"$entry = getelementptr ptr, ptr $table, $word $slot")
-      val fn      = freshTemp(); emit(s"$fn = load ptr, ptr $entry")
-      genSyslCall(s"${syslResult(ty)} $fn", s"ptr $data" :: argVals, ty, None)
+      val entry   = freshReg(); emit(Inst.Gep(entry, LType.Ptr, table, List(Arg(wordLty, Val.Int(slot)))))
+      val fn      = freshReg(); emit(Inst.Load(fn, LType.Ptr, entry, Access.Plain))
+      genSyslCall(syslResult(ty), fn, Arg(LType.Ptr, data) :: argVals, ty, None)
 
     // The tail walk is the ABI's, so all three are LLVM's own: two intrinsic calls and the one
     // instruction whose lowering every backend supplies for it.
     case TVaStart(ap) =>
       usesVarargs = true
-      emit(s"call void @llvm.va_start.p0(ptr ${genExpr(ap)})"); ""
+      emit(Inst.Call(None, LType.Void, Val.Global("llvm.va_start.p0"), List(Arg(LType.Ptr, genExpr(ap))))); Val.Nothing
 
     case TVaEnd(ap) =>
       usesVarargs = true
-      emit(s"call void @llvm.va_end.p0(ptr ${genExpr(ap)})"); ""
+      emit(Inst.Call(None, LType.Void, Val.Global("llvm.va_end.p0"), List(Arg(LType.Ptr, genExpr(ap))))); Val.Nothing
 
     case TVaArg(ap, ty) =>
-      val r = freshTemp()
-      emit(s"$r = va_arg ptr ${genExpr(ap)}, ${ty.llvm}")
+      val r = freshReg()
+      emit(Inst.VaArg(r, genExpr(ap), ty.lty))
       r
 
     // The one place the C ABI is not the same on every machine, so the one place codegen reads the
@@ -695,13 +746,12 @@ trait ExprEmitter extends ArithEmitter {
         case VaListAbi.Address => addr
 
         case VaListAbi.Loaded =>
-          val r = freshTemp(); emit(s"$r = load ptr, ptr $addr"); r
+          val r = freshReg(); emit(Inst.Load(r, LType.Ptr, addr, Access.Plain)); r
 
         case VaListAbi.Copied =>
-          usesMemcpy = true
-          val copy = emitAlloca(freshTemp(), Type.VaList.llvm)
-          emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align 8 $copy, ptr align 8 $addr, " +
-            s"i64 ${target.vaListBytes}, i1 false)")
+          val copy = emitAlloca(freshReg(), Type.VaList.lty)
+
+          emitMemcpy(copy, addr, target.vaListBytes, 8)
           copy
 
     case TVaCopy(dst, src) =>
@@ -710,7 +760,7 @@ trait ExprEmitter extends ArithEmitter {
       // same expression cannot see a half-written destination.
       val d = genExpr(dst)
       val s = genExpr(src)
-      emit(s"call void @llvm.va_copy.p0(ptr $d, ptr $s)"); ""
+      emit(Inst.Call(None, LType.Void, Val.Global("llvm.va_copy.p0"), List(Arg(LType.Ptr, d), Arg(LType.Ptr, s)))); Val.Nothing
 
     case e @ TStructNew(struct, _) if layout.indirect(struct) => throughSlot(e)
 
@@ -725,17 +775,18 @@ trait ExprEmitter extends ArithEmitter {
       val ranges = Bitfields.of(struct).get
       val vals   = args.zipWithIndex.map((a, i) => (genExpr(a), struct.fields(i)._2))
       val c      = buildBits(ranges, vals.collect { case (v, ft) if !Type.zeroSized(ft) => v })
-      val r      = freshTemp()
+      val r      = freshReg()
 
-      emit(s"$r = insertvalue ${struct.llvm} undef, ${containerLlvm(ranges)} $c, 0")
+      emit(Inst.Insert(r, struct.lty, Val.Undef, containerLty(ranges), c, List(0)))
       r
 
     case TStructNew(struct, args) =>
       val vals = args.map(genExpr)
-      var acc  = "undef"
+      var acc: Val = Val.Undef
       for (v, i) <- vals.zipWithIndex if !Type.zeroSized(struct.fields(i)._2) do
-        val r = freshTemp()
-        emit(s"$r = insertvalue ${struct.llvm} $acc, ${struct.fields(i)._2.llvm} $v, ${struct.slot(i)}")
+        val r = freshReg()
+        emit(Inst.Insert(r, struct.lty, acc, struct.fields(i)._2.lty, v,
+          List(struct.slot(i))))
         acc = r
       acc
 
@@ -761,7 +812,7 @@ trait ExprEmitter extends ArithEmitter {
       genTry(operand, ok, fail, retEnum, retFail)
 
     case TField(receiver, _, ty) if Type.zeroSized(ty) =>
-      genExpr(receiver); ""
+      genExpr(receiver); Val.Nothing
 
     // A bitfield is read out of its container, and the container is reached the way the *receiver*
     // is: at its address where it has one, so that a field of a `volatile` register block is one
@@ -770,7 +821,7 @@ trait ExprEmitter extends ArithEmitter {
     // of the **field**, and a bitfield has none (`15 §1`).
     case TField(receiver, index, _) if bitfieldOf(receiver.ty).isDefined =>
       val ranges = bitfieldOf(receiver.ty).get
-      val ct     = containerLlvm(ranges)
+      val ct     = containerLty(ranges)
 
       // The container is read at the receiver's address where the receiver is large enough to be
       // handed about through memory, and lifted out of its value otherwise — the same choice the two
@@ -782,14 +833,14 @@ trait ExprEmitter extends ArithEmitter {
       // struct followed by an `extractvalue` (`15 §1`). `volatile` is a property of the container
       // rather than of one range of it — every field of a bitfield struct is bits of the same word —
       // which is why the qualifier is asked of the receiver's storage and not of the field.
-      val q = qualifier(receiver.placeTy)
+      val acc = accessOf(receiver.placeTy)
       val c =
-        if hasAddress(receiver) && (layout.indirect(receiver.ty) || q.nonEmpty) then
+        if hasAddress(receiver) && (layout.indirect(receiver.ty) || acc != Access.Plain) then
           val p = address(receiver)
-          val t = freshTemp(); emit(s"$t = load$q $ct, ptr $p"); t
+          val t = freshReg(); emit(Inst.Load(t, ct, p, acc)); t
         else
           val rv = genExpr(receiver)
-          val t  = freshTemp(); emit(s"$t = extractvalue ${receiver.ty.llvm} $rv, 0"); t
+          val t  = freshReg(); emit(Inst.Extract(t, receiver.ty.lty, rv, List(0))); t
 
       readBits(ranges, bitRange(receiver.ty, index).get, c)
 
@@ -798,18 +849,18 @@ trait ExprEmitter extends ArithEmitter {
     // one register (`03 § Device memory`).
     case e @ TField(receiver, _, ty) if Type.volatileIn(e.placeTy) && hasAddress(receiver) =>
       val p = address(e)
-      val r = freshTemp(); emit(s"$r = load volatile ${ty.llvm}, ptr $p"); r
+      val r = freshReg(); emit(Inst.Load(r, ty.lty, p, Access.Volatile)); r
 
     // So is a field of a **large** struct, for a reason that is arithmetic rather than hardware:
     // lifting one field out of a value means producing the whole value first, and for a receiver of
     // kilobytes that is a first-class aggregate emitted to read four bytes out of it.
     case e @ TField(receiver, _, ty) if layout.indirect(receiver.ty) && hasAddress(receiver) =>
       val p = address(e)
-      val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $p"); r
+      val r = freshReg(); emit(Inst.Load(r, ty.lty, p, Access.Plain)); r
 
     case TField(receiver, index, ty) =>
-      val rv = genExpr(receiver); val r = freshTemp()
-      emit(s"$r = extractvalue ${receiver.ty.llvm} $rv, ${fieldSlot(receiver.ty, index)}"); r
+      val rv = genExpr(receiver); val r = freshReg()
+      emit(Inst.Extract(r, receiver.ty.lty, rv, List(fieldSlot(receiver.ty, index)))); r
 
     case TIf(cond, thenBlock, elseBlock, ty) =>
       genIf(cond, thenBlock, elseBlock, ty)

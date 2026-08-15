@@ -77,7 +77,7 @@ trait Literals extends TypeResolution {
           case Some(a: Type.Abstract) => a
           case _                      => Type.Real
 
-    TFloatLit(hexDouble(text), ty)
+    TFloatLit(java.lang.Double.doubleToLongBits(text.toDouble), ty)
   }
 
   /** Analyzes operands that must share one type. A bare literal has no type of its own, so it
@@ -332,6 +332,4 @@ trait Literals extends TypeResolution {
   /** Renders a decimal float literal as an LLVM hex double — the textual form that survives
    * the round-trip without losing bits.
    */
-  protected def hexDouble(text: String): String =
-    f"0x${java.lang.Double.doubleToLongBits(text.toDouble)}%016X"
 }

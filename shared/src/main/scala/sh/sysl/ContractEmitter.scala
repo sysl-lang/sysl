@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.{Access, Arg, CastOp, FCmp, Inst, LType, Val}
+
 /** Everything that traps when a value turns out not to be what it was promised to be: a function's
  * `require` and `ensure` clauses (`16 §5`), a constrained subtype's `within` range and `where`
  * predicate (`16 §4`), and a struct's `invariant` (`16 §6`).
@@ -25,7 +27,7 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
    * not be handed the last function's.
    */
   protected var ensures: List[(TExpr, Option[String])] = Nil
-  protected var resultSSA: Option[String]              = None
+  protected var resultSSA: Option[Val]                 = None
 
   /** What the function being emitted is called, what its parameters are, and the `variant` it
    * declared — the three things a self-call needs to check the measure (`17 §4`).
@@ -59,7 +61,7 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
    * shape both call paths already produce: an address for a large value, a register for the rest,
    * and nothing at all for a zero-sized parameter.
    */
-  protected def genVariantAtCall(staged: List[Option[(Type, Either[String, String])]]): Unit = {
+  protected def genVariantAtCall(staged: List[Option[(Type, Either[Val, Val])]]): Unit = {
     val variant = selfVariant.get
 
     pushTemps()
@@ -70,18 +72,19 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
     // see both of the call's values and neither of the frame's.
     val saved =
       for case ((name, ty), Some((_, arg))) <- selfParams.zip(staged) yield
-        val keep = emitAlloca(freshTemp(), ty.llvm)
+        val keep = emitAlloca(freshReg(), ty.lty)
 
         arg match
           case Left(addr) =>
-            memcpy(keep, s"%$name.addr", ty)
-            memcpy(s"%$name.addr", addr, ty)
+            memcpy(keep, Val.Reg(s"$name.addr"), ty)
+            memcpy(Val.Reg(s"$name.addr"), addr, ty)
           case Right(v) =>
-            val old = freshTemp()
+            val old  = freshReg()
+            val addr = Val.Reg(s"$name.addr")
 
-            emit(s"$old = load ${ty.llvm}, ptr %$name.addr")
-            emit(s"store ${ty.llvm} $old, ptr $keep")
-            emit(s"store ${ty.llvm} $v, ptr %$name.addr")
+            emit(Inst.Load(old, ty.lty, addr, Access.Plain))
+            emit(Inst.Store(ty.lty, old, keep, Access.Plain))
+            emit(Inst.Store(ty.lty, v, addr, Access.Plain))
         (name, ty, keep)
 
     pushTemps()
@@ -89,21 +92,20 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
     popTemps()
 
     for (name, ty, keep) <- saved do
-      if layout.indirect(ty) then memcpy(s"%$name.addr", keep, ty)
+      if layout.indirect(ty) then memcpy(Val.Reg(s"$name.addr"), keep, ty)
       else
-        val back = freshTemp(); emit(s"$back = load ${ty.llvm}, ptr $keep")
-        emit(s"store ${ty.llvm} $back, ptr %$name.addr")
+        val back = freshReg(); emit(Inst.Load(back, ty.lty, keep, Access.Plain))
+        emit(Inst.Store(ty.lty, back, Val.Reg(s"$name.addr"), Access.Plain))
 
-    val ok = freshTemp()
+    val ok = freshReg()
 
-    emit(s"$ok = icmp ${predicate("<", variant.ty)} ${variant.ty.llvm} $nxt, $cur")
+    emit(Inst.IntCmp(ok, intPred("<", variant.ty), variant.ty.lty, nxt, cur))
     trapUnless(ok, "variant")
   }
 
-  private def memcpy(dst: String, src: String, ty: Type): Unit = {
+  private def memcpy(dst: Val, src: Val, ty: Type): Unit = {
     usesMemcpy = true
-    emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align ${layout.align(ty)} $dst, " +
-      s"ptr align ${layout.align(ty)} $src, i64 ${layout.size(ty)}, i1 false)")
+    emitMemcpy(dst, src, layout.size(ty), layout.align(ty))
   }
 
   /** Emits a contract clause as a trap-on-false check, discarding any temporaries the condition
@@ -117,7 +119,7 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
   }
 
   /** Runs every postcondition with `result` bound to the value about to be returned. */
-  protected def emitEnsures(result: Option[String]): Unit =
+  protected def emitEnsures(result: Option[Val]): Unit =
     if ensures.nonEmpty then
       resultSSA = result
       for (cond, _) <- ensures do emitContract(cond, "ensure")
@@ -131,10 +133,10 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
    * entry's first measure against the first entry's last, and trap on a loop that was decreasing
    * perfectly well.
    */
-  protected def genCheckedLoop(slot: String, varTy: Type, loop: TExpr): String = {
-    emitAlloca(s"%$slot.prev", varTy.llvm)
-    emitAlloca(s"%$slot.armed", "i1")
-    emit(s"store i1 0, ptr %$slot.armed")
+  protected def genCheckedLoop(slot: String, varTy: Type, loop: TExpr): Val = {
+    emitAlloca(Val.Reg(s"$slot.prev"), varTy.lty)
+    emitAlloca(Val.Reg(s"$slot.armed"), i1)
+    emit(Inst.Store(LType.I(1), Val.Int(0), Val.Reg(s"$slot.armed"), Access.Plain))
     genExpr(loop)
   }
 
@@ -148,25 +150,25 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
    */
   protected def genVariantCheck(v: TVariantCheck): Unit = {
     val TVariantCheck(slot, varTy, expr) = v
-    val w = varTy.llvm
+    val w = varTy.lty
 
     pushTemps()
     val cur = genExpr(expr)
     popTemps()
 
-    val armedV = freshTemp(); emit(s"$armedV = load i1, ptr %$slot.armed")
+    val armedV = freshReg(); emit(Inst.Load(armedV, LType.I(1), Val.Reg(s"$slot.armed"), Access.Plain))
     val cmpL   = freshLabel("variant.cmp")
     val setL   = freshLabel("variant.set")
 
-    emitTerm(s"br i1 $armedV, label %$cmpL, label %$setL")
+    emitTerm(Inst.CondBr(armedV, cmpL, setL))
     emitLabel(cmpL)
-    val prev = freshTemp(); emit(s"$prev = load $w, ptr %$slot.prev")
-    val ok   = freshTemp(); emit(s"$ok = icmp ${predicate("<", varTy)} $w $cur, $prev")
+    val prev = freshReg(); emit(Inst.Load(prev, w, Val.Reg(s"$slot.prev"), Access.Plain))
+    val ok   = freshReg(); emit(Inst.IntCmp(ok, intPred("<", varTy), w, cur, prev))
     trapUnless(ok, "variant")
-    emitTerm(s"br label %$setL")
+    emitTerm(Inst.Br(setL))
     emitLabel(setL)
-    emit(s"store $w $cur, ptr %$slot.prev")
-    emit(s"store i1 1, ptr %$slot.armed")
+    emit(Inst.Store(w, cur, Val.Reg(s"$slot.prev"), Access.Plain))
+    emit(Inst.Store(LType.I(1), Val.Int(1), Val.Reg(s"$slot.armed"), Access.Plain))
   }
 
   /** Emits the `within`-range checks for a value produced into a constrained subtype: a lower- and
@@ -175,18 +177,23 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
    * float bounds compare in double precision, widening a narrower value so one rendering of the
    * bound serves every float width.
    */
-  private def emitRangeChecks(v: String, c: Type.Constrained): Unit =
+  private def emitRangeChecks(v: Val, c: Type.Constrained): Unit =
     Type.underlying(c.base) match
       case f: Type.Floating =>
         val wide =
           if f.bits == 64 then v
-          else { val r = freshTemp(); emit(s"$r = fpext ${f.llvm} $v to double"); r }
-        for lo <- c.lo do trapUnless(fcmpConst("oge", wide, lo), "within")
-        for hi <- c.hi do trapUnless(fcmpConst(if c.exclusiveHi then "olt" else "ole", wide, hi), "within")
+          else
+            val r = freshReg()
+
+            emit(Inst.Cast(r, CastOp.FPExt, f.lty, v, LType.F(64)))
+            r
+        for lo <- c.lo do trapUnless(fcmpConst(FCmp.Oge, wide, lo), "within")
+        for hi <- c.hi do trapUnless(fcmpConst(if c.exclusiveHi then FCmp.Olt else FCmp.Ole, wide, hi), "within")
       case base =>
-        for lo <- c.lo do trapUnless(compareValue(">=", base, v, lo.toBigInt.toString), "within")
+        for lo <- c.lo do trapUnless(compareValue(">=", base, v, Val.Int(lo.toBigInt)), "within")
         for hi <- c.hi do
-          trapUnless(compareValue(if c.exclusiveHi then "<" else "<=", base, v, hi.toBigInt.toString), "within")
+          trapUnless(compareValue(if c.exclusiveHi then "<" else "<=", base, v, Val.Int(hi.toBigInt)),
+                     "within")
 
   /** Everything a constrained subtype asks of a value: the `within` range, then the `where`
    * predicate — a synthesised `i1`-returning function over the base value, which traps exactly as
@@ -194,27 +201,30 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
    * compute and store in one step, so a value cannot reach a constrained slot by a path that tests
    * less of it than another.
    */
-  protected def emitConstraintChecks(v: String, c: Type.Constrained): Unit = {
+  protected def emitConstraintChecks(v: Val, c: Type.Constrained): Unit = {
     emitRangeChecks(v, c)
 
     for pf <- c.predFn do
-      val r = freshTemp()
-      emit(s"$r = call i1 @$pf(${Type.underlying(c.base).llvm} $v)")
+      val r = freshReg()
+
+      emit(Inst.Call(Some(r), i1, Val.Global(pf), List(Arg(Type.underlying(c.base).lty, v))))
       trapUnless(r, "where")
   }
 
-  private def fcmpConst(pred: String, wide: String, bound: BigDecimal): String = {
-    val c = f"0x${java.lang.Double.doubleToLongBits(bound.toDouble)}%016X"
-    val r = freshTemp(); emit(s"$r = fcmp $pred double $wide, $c"); r
+  private def fcmpConst(pred: FCmp, wide: Val, bound: BigDecimal): Val = {
+    val r = freshReg()
+
+    emit(Inst.FloatCmp(r, pred, LType.F(64), wide, Val.float(bound.toDouble)))
+    r
   }
 
   /** Checks a struct value against its `invariant` function: read each stored field out of the
    * aggregate `v`, call `invFn`, and trap on a false result. The fields are handed over exactly as
    * an ordinary call's arguments are — the callee borrows, so no count is taken here.
    */
-  protected def emitInvCheck(v: String, struct: Type.Struct, invFn: String): Unit =
+  protected def emitInvCheck(v: Val, struct: Type.Struct, invFn: String): Unit =
     val container = Bitfields.of(struct).map { ranges =>
-      val c = freshTemp(); emit(s"$c = extractvalue ${struct.llvm} $v, 0"); (ranges, c)
+      val c = freshReg(); emit(Inst.Extract(c, struct.lty, v, List(0))); (ranges, c)
     }
 
     val args = struct.fields.zipWithIndex.collect {
@@ -225,10 +235,15 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
         val r = container match
           case Some((ranges, c)) => readBits(ranges, ranges(struct.slot(i)), c)
           case None =>
-            val t = freshTemp(); emit(s"$t = extractvalue ${struct.llvm} $v, ${struct.slot(i)}"); t
+            val t = freshReg()
 
-        s"${ft.llvm} $r"
+            emit(Inst.Extract(t, struct.lty, v, List(struct.slot(i))))
+            t
+
+        Arg(ft.lty, r)
     }
-    val ok = freshTemp(); emit(s"$ok = call i1 @$invFn(${args.mkString(", ")})")
+    val ok = freshReg()
+
+    emit(Inst.Call(Some(ok), i1, Val.Global(invFn), args.toList))
     trapUnless(ok, "invariant")
 }
