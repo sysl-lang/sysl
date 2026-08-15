@@ -162,6 +162,48 @@ class PurityTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) should include("storage it did not create")
     }
 
+    // **`TreeWalk` ends in `case _ => Nil`, so a node missing from it hides its own operands.**
+    // `TLane` was missing, which made the call inside `g()[0]` invisible to every walk that uses it
+    // — this one, the escape analysis and the ARC insertion. The lane read is not the observable
+    // thing; the call underneath it is, and the test is that the walk got there at all.
+    "call an impure function and read one lane of what it answers" in {
+      err("""g() -> <4>f32 = [1.0, 2.0, 3.0, 4.0]
+            |
+            |@pure
+            |f() -> f32 = g()[0]
+            |
+            |print(f())
+            |""".stripMargin) should include("not marked '@pure'")
+    }
+
+    "call an impure function inside the index of a load" in {
+      err("""g() -> usize = 0
+            |
+            |@pure
+            |f(xs: []const f32) -> f32
+            |    val v: <4>f32 = xs.load(g())
+            |    v[0]
+            |
+            |var a: [8]f32
+            |print(f(a[..]))
+            |""".stripMargin) should include("not marked '@pure'")
+    }
+
+    // `xs.store(i, v)` is the one write that is not a `TStore`, so it is listed in `observable`
+    // rather than reached by the walk — and a write missing from that list is a `@pure` function
+    // that writes.
+    "store a vector's lanes into a reference it was handed" in {
+      err("""@pure
+            |f(a: &[8]f32) -> int
+            |    val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]
+            |    a.store(0, v)
+            |    1
+            |
+            |var b: &[8]f32
+            |print(f(b))
+            |""".stripMargin) should include("storage it did not create")
+    }
+
     "write into a field of a reference it was handed" in {
       err("""struct Cell
             |    n: int

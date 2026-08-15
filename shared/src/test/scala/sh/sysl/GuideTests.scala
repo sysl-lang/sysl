@@ -437,13 +437,14 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
     val out = guide("simd")
 
     out should not include "FAIL"
-    checks(out) shouldBe 42
+    checks(out) shouldBe 47
     sections(out) shouldBe List(
       "-- lane-wise arithmetic is the scalar arithmetic, W at a time",
       "-- a comparison is a mask, and a mask is an ordinary value",
       "-- one kernel, two register widths, from one piece of source",
       "-- the same kernel is what a scalar loop would have computed",
       "-- gathering, which is where the missing shuffle costs something",
+      "-- a whole array, W at a time, with the answers written back",
       "-- the reductions, and what each is for",
       "-- integer lanes, and a mask over them",
     )

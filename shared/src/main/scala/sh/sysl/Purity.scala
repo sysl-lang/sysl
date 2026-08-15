@@ -69,6 +69,13 @@ trait Purity extends AnalyzerBase {
     case TIncDec(place, _, _, _, _) if !ownStorage(place) =>
       Some("writes through a reference to storage it did not create")
 
+    // `xs.store(i, v)` is a write like any other, judged by the same question: elements reached
+    // without going through a dereference are storage this call made, and elements reached through
+    // a `&[N]T` are its caller's. It is listed rather than left to the walk because what the walk
+    // reports is *nodes*, and this is the one write that is not a `TStore`.
+    case TVecStore(receiver, _, _) if !ownStorage(receiver) =>
+      Some("writes through a reference to storage it did not create")
+
     case TGlobal(symbol, _, true) =>
       Some(s"reaches '${Modules.show(symbol)}', which is storage outside the call and may change under it")
 

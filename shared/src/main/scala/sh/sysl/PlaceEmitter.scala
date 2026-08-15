@@ -275,6 +275,38 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val r = freshReg(); emit(Inst.Gep(r, elem.lty, base, List(Arg(wordLty, i)))); r
   }
 
+  /** The address a run of `lanes` elements starts at, after checking that the whole run exists —
+   * what `xs.load(i)` and `xs.store(i, v)` reach through.
+   *
+   * **The test is `i + lanes <= len` written so that it cannot overflow.** The obvious spelling
+   * adds first and compares after, and on a `usize` an `i` near the top wraps to a small number
+   * that passes — which is the one arithmetic mistake a bounds check must not make, since it turns
+   * a check into a licence. Subtracting instead keeps both sides inside the range: the run fits
+   * only if there are `lanes` elements at all *and* `i` is no further in than `len - lanes`. The
+   * subtraction is evaluated either way and is meaningless when the first test fails, which costs
+   * nothing — `and` is not a branch, and a wrapped `sub` is a defined value LLVM is happy to have
+   * computed and then ignored.
+   */
+  protected def runAddr(receiver: TExpr, index: TExpr, lanes: Int): String = {
+    val (base, len, elem) = receiver.ty match
+      case Type.Array(n, e) => (address(receiver), n.toString, e)
+      case w: Type.View =>
+        val v = genExpr(receiver)
+        val p = freshTemp(); emit(s"$p = extractvalue ${w.llvm} $v, 1")
+        val l = freshTemp(); emit(s"$l = extractvalue ${w.llvm} $v, 2")
+        (p, l, w.elem)
+      case other => sys.error(s"unreachable run of ${other.llvm}")
+
+    val i    = widenIndex(index)
+    val room = freshTemp(); emit(s"$room = icmp uge $word $len, $lanes")
+    val last = freshTemp(); emit(s"$last = sub $word $len, $lanes")
+    val here = freshTemp(); emit(s"$here = icmp ule $word $i, $last")
+    val ok   = freshTemp(); emit(s"$ok = and i1 $room, $here")
+    trapUnless(ok, "bounds")
+
+    val r = freshTemp(); emit(s"$r = getelementptr ${elem.llvm}, ptr $base, $word $i"); r
+  }
+
   /** Takes a view of some of an array's, a slice's, or a string's elements. The base is evaluated
    * once and gives up three things — what keeps the elements alive, where the first of them is,
    * and how many there are — and the view is built by narrowing the last two and taking a share

@@ -133,6 +133,31 @@ trait ExprEmitter extends ArithEmitter {
         Arg(i32, Val.Int(lane))))
       r
 
+    // **The alignment is the element's, not the register's, and that is what a slice can promise.**
+    // A `[]f32` says its elements are four-byte-aligned and says nothing whatever about where the
+    // run begins — a slice of one is a slice of any of them. Claiming the vector's own alignment
+    // would be a promise the type does not make, and an over-aligned `load` is not a slow load but
+    // undefined behaviour the moment it is wrong. Every machine sysl targets has an unaligned
+    // vector load that costs the same as the aligned one on aligned data, so the honest number is
+    // also the free one.
+    case TVecLoad(receiver, index, vecTy) =>
+      val p = runAddr(receiver, index, vecTy.length)
+      val r = freshTemp()
+
+      emit(s"$r = load ${vecTy.llvm}, ptr $p, align ${layout.align(vecTy.elem)}")
+      r
+
+    case TVecStore(receiver, index, value) =>
+      val vecTy = Type.repr(value.ty).asInstanceOf[Type.Vector]
+      // The value first and the address second, which is the order `TStore` uses — this *is* an
+      // assignment to a run of elements, and the two spellings must not differ in when a side
+      // effect in the value happens relative to the bounds check on the run.
+      val v = genExpr(value)
+      val p = runAddr(receiver, index, vecTy.length)
+
+      emit(s"store ${vecTy.llvm} $v, ptr $p, align ${layout.align(vecTy.elem)}")
+      ""
+
     // Built through memory with a loop rather than as an `insertvalue` chain, for the reason the
     // ARC walk gives: the count is a compile-time constant but it can be very large, and a repeat
     // count is where someone writes a large one on purpose. The value is generated once, above the

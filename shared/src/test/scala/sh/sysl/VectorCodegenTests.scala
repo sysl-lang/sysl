@@ -138,4 +138,96 @@ class VectorCodegenTests extends AnyFreeSpec with CodegenSupport {
 
     ir(src) should include("<4 x float>")
   }
+
+  // -- load and store ---------------------------------------------------------------------------
+
+  // The claim that makes these worth having at all: a run of four floats is **one** instruction and
+  // not four. A load lowered elementwise would compute the same numbers, and `VectorRunTests` would
+  // be exactly as green.
+  "a load is one instruction at the register's width" in {
+    val src =
+      """var xs: [8]f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        |val v: <4>f32 = xs.load(1)
+        |print(v[0])
+        |""".stripMargin
+
+    ir(src) should include("load <4 x float>")
+  }
+
+  "a store is one instruction at the register's width" in {
+    val src =
+      """var xs: [8]f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        |val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]
+        |xs.store(0, v)
+        |print(xs[0])
+        |""".stripMargin
+
+    ir(src) should include("store <4 x float>")
+  }
+
+  /** **The alignment is the element's, and asserting the number is the whole point of this test.**
+    *
+    * A `[]f32` promises its elements are four-byte aligned and promises nothing about where a run
+    * begins — a slice of one element is a slice of any of them. `align 16` would be a claim the
+    * type does not support, and an over-aligned load is undefined behaviour rather than a slow
+    * load: the difference between a correct program and one that works until somebody slices at an
+    * odd offset.
+    */
+  "a load claims only the alignment a slice can promise" in {
+    val src =
+      """var xs: [8]f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        |val v: <4>f32 = xs[1..<5].load(0)
+        |print(v[0])
+        |""".stripMargin
+
+    val out = ir(src)
+
+    out should include("load <4 x float>, ptr")
+    out should include("align 4")
+    out should not include "align 16"
+  }
+
+  // The run is checked before it is read, and the check is a pair of comparisons rather than an
+  // addition — `add` then one `icmp` would wrap at the top of `usize` and pass.
+  "the run is bounds-checked without an addition that could wrap" in {
+    val src =
+      """f(xs: []const f32, i: usize) -> f32
+        |    val v: <4>f32 = xs.load(i)
+        |    v[0]
+        |
+        |var a: [8]f32
+        |print(f(a[..], 0))
+        |""".stripMargin
+
+    val out = ir(src)
+
+    out should include("icmp uge")
+    out should include("icmp ule")
+  }
+
+  "one kernel emits a load and a store at each width it is instantiated at" in {
+    val src =
+      """scale[const W: usize](xs: []const f32, out: []f32, by: <W>f32)
+        |    var i: usize = 0
+        |    while i + W <= xs.len
+        |        val v: <W>f32 = xs.load(i)
+        |        out.store(i, v * by)
+        |        i += W
+        |end scale
+        |
+        |var src: [8]f32
+        |var out: [8]f32
+        |val by4: <4>f32 = 1.0
+        |val by8: <8>f32 = 1.0
+        |scale(src[..], out[..], by4)
+        |scale(src[..], out[..], by8)
+        |""".stripMargin
+
+    val out = ir(src)
+
+    out should include("load <4 x float>")
+    out should include("store <4 x float>")
+    out should include("load <8 x float>")
+    out should include("store <8 x float>")
+  }
 }

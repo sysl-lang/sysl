@@ -39,6 +39,25 @@ trait AnalyzerBase extends Scoping {
       (TSplat(l, v).setPos(l.pos), r)
     case _ => (l, r)
 
+  /** An index or a slice bound, held to a width the bounds test can actually be made at.
+   *
+   * Reaching an element is `usize` arithmetic (`00 §7`), and a narrower index is *widened* into it —
+   * value-preserving, so nothing has to be written. A **wider** one cannot be: it would have to be
+   * truncated, and a truncated index is not the index that was written. At 128 bits `2^64 + 5` would
+   * arrive as 5 and pass the test on a six-element array — checked, and wrong, which is worse than
+   * unchecked. No array can hold more than `usize` elements, so a wider index is either a mistake or
+   * a narrowing the programmer means; either way it is written, exactly as `01`'s rule says a
+   * conversion that can lose information is.
+   *
+   * It sits here rather than beside the subscript that first needed it because a subscript is no
+   * longer the only thing that takes one: `xs.load(i)` is a subscript of `W` elements, held to
+   * exactly this rule, and resolved in a trait below the one indexing lives in.
+   */
+  protected def checkedIndexWidth(t: TExpr, i: Type.Integer): TExpr =
+    if i.bits <= target.pointerBits then t
+    else
+      err(s"an index is reached at ${target.pointerBits} bits and ${show(t.ty)} is wider, so it cannot " +
+        "be one without losing what it holds — write 'usize(i)' to say which value is meant")
 
   /** Inside a closure's body, the captured names — keyed by the unique name the scope gave each —
    * paired with the field read that reaches one (`12 §7`).

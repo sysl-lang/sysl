@@ -259,4 +259,174 @@ class VectorErrorTests extends AnyFreeSpec with CodegenSupport {
       err(src) should include("reverse")
     }
   }
+
+  "load and store" - {
+    // **The one that decides the shape of the whole pair.** A load has nothing to read its width
+    // off, so the message has to name where the width belongs rather than guess one — guessing is
+    // the single mistake that would make a kernel silently take the wrong run.
+    "a load with nothing to take its width from names where the width belongs" in {
+      val src =
+        """var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]
+          |print(xs.load(0)[0])
+          |""".stripMargin
+
+      err(src) should include("how many lanes it takes is the vector type's to say")
+    }
+
+    // **An operand position does not settle a load's width, even when the other operand would.**
+    // `analyzeOperands` defers a *listed* set of forms with no type of their own — a bare numeric
+    // literal, `null` — and reads the rest at whatever the expression as a whole was asked for. A
+    // method call is not on that list, and putting it there would be a change to inference reaching
+    // far past vectors. The message names the annotation, which is one line and reads better in a
+    // kernel anyway.
+    "an arithmetic operand is not a place a width comes from" in {
+      val src =
+        """f(xs: []const f32, by: <4>f32) -> f32
+          |    val r = xs.load(0) * by
+          |    r[0]
+          |
+          |var a: [4]f32
+          |val b: <4>f32 = 1.0
+          |print(f(a[..], b))
+          |""".stripMargin
+
+      err(src) should include("how many lanes it takes is the vector type's to say")
+    }
+
+    // The store cannot supply one either, and here it is not an implementation limit: a run of any
+    // width would type-check, so there is genuinely no answer to infer.
+    "a store's own value does not settle a load's width" in {
+      val src =
+        """f(xs: []const f32, out: []f32)
+          |    out.store(0, xs.load(0))
+          |
+          |var a: [4]f32
+          |var b: [4]f32
+          |f(a[..], b[..])
+          |""".stripMargin
+
+      err(src) should include("how many lanes it takes is the vector type's to say")
+    }
+
+    "a load wanted at a scalar type says so" in {
+      val src =
+        """var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]
+          |val v: f32 = xs.load(0)
+          |print(v)
+          |""".stripMargin
+
+      err(src) should include("'load' answers a vector")
+    }
+
+    "the lane type is the element's" in {
+      val src =
+        """var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]
+          |val v: <4>int = xs.load(0)
+          |print(v[0])
+          |""".stripMargin
+
+      err(src) should include("is a run of f32")
+    }
+
+    "a store takes a vector rather than a scalar" in {
+      val src =
+        """var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]
+          |xs.store(0, 1.0)
+          |""".stripMargin
+
+      err(src) should include("'store' writes a vector's lanes")
+    }
+
+    "the arity is named with the form that has it right" in {
+      val src =
+        """var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]
+          |val v: <4>f32 = xs.load()
+          |print(v[0])
+          |""".stripMargin
+
+      err(src) should include("'xs.load(i)'")
+    }
+
+    // The store's writability is the subscript's, asked of a run: whatever refuses `xs[i] = v`
+    // refuses this, in the same words, because it is the same question.
+    "a read-only view has nothing to store through" in {
+      val src =
+        """f(xs: []const f32)
+          |    val v: <4>f32 = [0.0, 0.0, 0.0, 0.0]
+          |    xs.store(0, v)
+          |
+          |var a: [4]f32
+          |f(a[..])
+          |""".stripMargin
+
+      err(src) should include("views elements it may not write")
+    }
+
+    "a 'val' array has nothing to store through" in {
+      val src =
+        """val xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]
+          |val v: <4>f32 = [0.0, 0.0, 0.0, 0.0]
+          |xs.store(0, v)
+          |""".stripMargin
+
+      err(src) should include("a 'val' is written once")
+    }
+
+    // **A `volatile` element is the refusal worth having.** Dropping the qualifier is what the
+    // naive reading does, and what it produces is a program that reads a device once where it said
+    // it would read it four times — which compiles, links, and is wrong on the hardware only.
+    "a run of volatile elements is refused rather than quietly widened" in {
+      val src =
+        """f(xs: []volatile f32)
+          |    val v: <4>f32 = xs.load(0)
+          |    print(v[0])
+          |
+          |var a: [4]f32
+          |f(a[..])
+          |""".stripMargin
+
+      err(src) should include("the qualifier cannot be kept")
+    }
+
+    "a '*T' has no length for a run to be checked against" in {
+      val src =
+        """var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]
+          |val p = &xs[0]
+          |val v: <4>f32 = p.load(0)
+          |print(v[0])
+          |""".stripMargin
+
+      err(src) should include("carries no length")
+    }
+
+    "a string is a view of UTF-8 and says where the bytes are" in {
+      val src =
+        """val s = "hello world"
+          |val v: <4>u8 = s.load(0)
+          |print(v[0])
+          |""".stripMargin
+
+      err(src) should include("'s.bytes.load(i)'")
+    }
+
+    "a string has nothing to store into" in {
+      val src =
+        """val s = "hello world"
+          |val v: <4>u8 = [0u8, 0u8, 0u8, 0u8]
+          |s.store(0, v)
+          |""".stripMargin
+
+      err(src) should include("a string is immutable")
+    }
+
+    "the index is an integer" in {
+      val src =
+        """var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]
+          |val v: <4>f32 = xs.load("two")
+          |print(v[0])
+          |""".stripMargin
+
+      err(src) should include("must be an integer")
+    }
+  }
 }
