@@ -219,6 +219,68 @@ class ControlFlowParserTests extends AnyFreeSpec with ParseSupport {
     }
   }
 
+  // `if` is an expression, so a binding may be initialized with one — and the block forms are the
+  // ones worth pinning, because the `else` has to be found across a dedent that the binding's own
+  // line did not open. The inline form reads as an ordinary expression and could hardly break; the
+  // block form is where an initializer and the indentation lexer meet.
+  "an if as a binding's initializer" - {
+    "a block-bodied if on the right of a val" in {
+      prog("val x = if c\n    1\nelse\n    2") shouldBe List(
+        ValDecl("x", None, IfExpr(Ident("c"), List(ExprStmt(i(1))), Some(List(ExprStmt(i(2))))))
+      )
+    }
+
+    "a `then`-introduced block on the right of a var" in {
+      prog("var x = if c then\n    1\nelse\n    2") shouldBe
+        prog("var x = if c\n    1\nelse\n    2")
+    }
+
+    "the inline form, with a statement after it" in {
+      prog("val x = if c then 1 else 2\nprint(x)") shouldBe List(
+        ValDecl("x", None, IfExpr(Ident("c"), List(ExprStmt(i(1))), Some(List(ExprStmt(i(2)))))),
+        printStmt(Ident("x")),
+      )
+    }
+
+    // The dedent case: the `else` closes the branch block, and the statement after the binding has
+    // to land back in the function's body rather than in either branch.
+    "a block-bodied if initializing a local, inside a function body" in {
+      prog("f(b: bool) -> int =\n    val x = if b then\n        1\n    else\n        2\n    x") shouldBe List(
+        FuncDecl(
+          "f",
+          Nil,
+          List(Param("b", NamedType("bool"))),
+          Some(NamedType("int")),
+          List(
+            ValDecl("x", None, IfExpr(Ident("b"), List(ExprStmt(i(1))), Some(List(ExprStmt(i(2)))))),
+            ExprStmt(Ident("x")),
+          ),
+        )
+      )
+    }
+
+    "an elif chain on the right of a val" in {
+      prog("val x = if a then 1 elif b then 2 else 3") shouldBe List(
+        ValDecl(
+          "x",
+          None,
+          IfExpr(
+            Ident("a"),
+            List(ExprStmt(i(1))),
+            Some(List(ExprStmt(IfExpr(Ident("b"), List(ExprStmt(i(2))), Some(List(ExprStmt(i(3)))))))),
+          ),
+        )
+      )
+    }
+
+    // A binding's `=` takes an expression and not a body, so the initializer stays on the line that
+    // names it — `=` is excluded from the continuation set (`00 § Continuing a line`) precisely
+    // because it introduces a *body*, and a binding has none to introduce.
+    "an initializer may not start on the next line" in {
+      progError("val x =\n    if c then 1 else 2") should include("expression expected")
+    }
+  }
+
   "elif chains" - {
     "an elif chain nests into the else branch" in {
       prog("if a then\n    print(1)\nelif b then\n    print(2)\nelse\n    print(3)") shouldBe List(

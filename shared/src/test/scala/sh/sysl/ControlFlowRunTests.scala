@@ -168,6 +168,22 @@ class ControlFlowRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "odd\n"
   }
 
+  // The block form of the same thing: each branch is a statement list, so the value is its
+  // trailing expression rather than the one thing written after `then`.
+  "a block-bodied if used as a value yields its branch's trailing expression" in {
+    val src =
+      """var n = 7
+        |var doubled = if n % 2 == 0 then
+        |    val half = n / 2
+        |    half * 2
+        |else
+        |    val up = n + 1
+        |    up * 10
+        |print(doubled)""".stripMargin
+
+    run(src) shouldBe "80\n"
+  }
+
   // A `&T` context reaches each branch, so a value branch is boxed to `&T` and meets an
   // already-`&T` branch there — the whole `if` is `&Point`. This is the design's documented
   // conditional-boxing example; boxing the aggregate instead would reject the mismatch.
