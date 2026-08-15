@@ -104,15 +104,22 @@ class IrModuleTests extends AnyFreeSpec with Matchers {
       case other                 => fail(s"@llvm.used is not an array of symbols: $other")
   }
 
-  // The interned bytes carry the terminator a C caller reads by, which a `string` — knowing its own
-  // length — has never had a use for.
-  "a string literal is bytes in a global of its own" in {
-    val m     = module("print(\"hi\")\n")
+  /** The interned bytes carry the terminator a C caller reads by, which a `string` — knowing its own
+   * length — has never had a use for.
+   *
+   * **And they are bytes rather than LLVM's escaping of them.** A back end emitting a `.byte`
+   * directive wants the numbers; `c"h\\C3\\A9\\00"` is one back end's spelling, produced by
+   * `render` and nowhere else.
+   */
+  "a string literal is the bytes of one, in a global of its own" in {
+    val m     = module("print(\"h\u00e9\")\n")
     val bytes = m.globals.collect {
-      case Global(_, _, LType.Arr(n, LType.I(8)), Some(Val.Bytes(e)), _, _, _) => (n, e)
+      case Global(_, _, LType.Arr(n, LType.I(8)), Some(Val.Bytes(bs)), _, _, _) => (n, bs)
     }
+    val utf8  = List[Byte](0x68, 0xc3.toByte, 0xa9.toByte, 0)
 
-    bytes should contain((3, "hi\\00"))
+    bytes should contain((4, utf8))
+    Val.Bytes(utf8).render shouldBe "c\"h\\C3\\A9\\00\""
   }
 
   /** The `sret` case, which is what the signature model exists for: the attribute names a *type*

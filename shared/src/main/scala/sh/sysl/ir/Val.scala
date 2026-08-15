@@ -99,11 +99,14 @@ enum Val {
    */
   case IntToPtr(from: LType, value: Val)
 
-  /** A run of bytes, already escaped the way LLVM's `c"…"` wants them. This is the one value here
-   * that is characters rather than a number, and it has to be: the escaping is a property of the
-   * text form, and what a consumer wants back is the bytes — which `Emitter.encode` still has.
+  /** A run of bytes — a string constant's contents, terminator included.
+   *
+   * **The bytes rather than LLVM's escaping of them**, which is the distinction the whole package is
+   * about: `c"h\\C3\\A9\\00"` is one back end's spelling and what a consumer wants is the three
+   * bytes. The escaping happens in `render` and nowhere else, so a back end emitting a `.byte`
+   * directive never has to undo it.
    */
-  case Bytes(escaped: String)
+  case Bytes(bytes: List[Byte])
 
   def render: String = this match
     case Reg(name)    => s"%$name"
@@ -120,7 +123,7 @@ enum Val {
     case Agg(fields)  => fields.map(_.render).mkString("{ ", ", ", " }")
     case Array(elems) => elems.map(_.render).mkString("[", ", ", "]")
     case IntToPtr(f, v) => s"inttoptr (${f.render} ${v.render} to ptr)"
-    case Bytes(e)     => "c\"" + e + "\""
+    case Bytes(bs)    => bs.foldLeft(new StringBuilder("c\""))(escapeInto).append('"').toString
 
   /** Whether this is a constant rather than something computed.
    *
@@ -132,6 +135,15 @@ enum Val {
   def isConst: Boolean = this match
     case _: Reg | _: Global => false
     case _                  => true
+
+  /** LLVM's own escaping: a quote, a backslash and anything outside printable ASCII go as `\\XX`,
+   * and everything else stands for itself.
+   */
+  private def escapeInto(sb: StringBuilder, b: Byte): StringBuilder =
+    val u = b & 0xff
+
+    if u == '"'.toInt || u == '\\'.toInt || u < 0x20 || u >= 0x7f then sb ++= f"\\$u%02X"
+    else sb += u.toChar
 
   override def toString: String = render
 }

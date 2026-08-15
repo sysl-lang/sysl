@@ -505,8 +505,13 @@ trait ExprEmitter extends ArithEmitter {
         // property that makes an atomic increment usable as a ticket.
         case _ =>
           val kind = op.stripPrefix("atomic_") match
-            case "swap" => "xchg"
-            case k      => k
+            case "swap" => ir.RmwOp.Xchg
+            case "add"  => ir.RmwOp.Add
+            case "sub"  => ir.RmwOp.Sub
+            case "and"  => ir.RmwOp.And
+            case "or"   => ir.RmwOp.Or
+            case "xor"  => ir.RmwOp.Xor
+            case other  => sys.error(s"unreachable atomic '$other'")
           val r = freshReg()
           emit(Inst.AtomicRmw(r, kind, p, ll, vs.head, ordr))
           r

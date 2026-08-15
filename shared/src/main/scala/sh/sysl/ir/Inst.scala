@@ -112,6 +112,21 @@ enum FastMath {
     case Reassoc => "reassoc"
 }
 
+/** What an `atomicrmw` does to the word it is reading and writing.
+ *
+ * A closed set, and a small one, because it is the set `Atomics` admits — `atomic_swap`, `add`,
+ * `sub`, `and`, `or`, `xor`, and nothing else. LLVM has more; a case belongs here when the language
+ * grows a name for one, not before.
+ *
+ * The odd spelling is `Xchg`, which is `atomic_swap` in sysl: LLVM's mnemonic and the language's
+ * word for the same operation differ, and this is the one place they meet.
+ */
+enum RmwOp {
+  case Xchg, Add, Sub, And, Or, Xor
+
+  def render: String = toString.toLowerCase
+}
+
 /** An argument at a call: its type, the value, and whatever the convention attaches to it.
  *
  * `attrs` is where a foreign boundary's `byval`, `sret`, `signext` and `zeroext` live. They are the
@@ -214,7 +229,7 @@ enum Inst {
             fast: List[FastMath] = Nil)
 
   case VaArg(dest: Val, list: Val, ty: LType)
-  case AtomicRmw(dest: Val, op: String, ptr: Val, ty: LType, value: Val, ordering: Ordering)
+  case AtomicRmw(dest: Val, op: RmwOp, ptr: Val, ty: LType, value: Val, ordering: Ordering)
 
   /** `cmpxchg`, which takes **two** orderings where a program writes one — see `Ordering.onFailure`
    * for why the second is derived rather than asked for.
@@ -291,7 +306,7 @@ enum Inst {
     case VaArg(d, list, ty) => s"${d.render} = va_arg ptr ${list.render}, ${ty.render}"
 
     case AtomicRmw(d, op, p, ty, v, ord) =>
-      s"${d.render} = atomicrmw $op ptr ${p.render}, ${ty.render} ${v.render} ${ord.render}"
+      s"${d.render} = atomicrmw ${op.render} ptr ${p.render}, ${ty.render} ${v.render} ${ord.render}"
 
     case CmpXchg(d, p, ty, e, n, ord) =>
       s"${d.render} = cmpxchg ptr ${p.render}, ${ty.render} ${e.render}, ${ty.render} ${n.render} " +

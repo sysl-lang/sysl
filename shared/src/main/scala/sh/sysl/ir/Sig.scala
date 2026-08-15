@@ -170,6 +170,11 @@ enum Linkage {
 case class FuncSig(name: String, ty: FnType, linkage: Linkage = Linkage.Default,
                    cconv: Option[String] = None, attrs: List[(String, String)] = Nil,
                    section: Option[String] = None) {
+  // `cconv` and `attrs` are the two fields here that are still LLVM's own spelling, and knowingly:
+  // both carry an interrupt handler's declaration (`15 §10`), which LLVM writes two different ways
+  // — x86-64's is a calling convention and RISC-V's a function attribute — and neither is a set the
+  // compiler closes, since a new target may bring its own. `Conventions` is where they come from.
+
 
   /** The `define` line, without the brace the printer adds. */
   def define: String =

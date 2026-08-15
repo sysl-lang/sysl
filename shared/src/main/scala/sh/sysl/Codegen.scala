@@ -234,8 +234,12 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
   private def boolConstants: List[ir.Global] =
     if !boolStrs then Nil
     else
-      List(ir.Global(".true", constant = true, LType.Arr(5, LType.I(8)), Some(Val.Bytes("true\\00"))),
-           ir.Global(".false", constant = true, LType.Arr(6, LType.I(8)), Some(Val.Bytes("false\\00"))))
+      List(boolConstant("true"), boolConstant("false"))
+
+  private def boolConstant(word: String): ir.Global =
+    val bytes = word.getBytes("UTF-8").toList :+ 0.toByte
+
+    ir.Global(s".$word", constant = true, LType.Arr(bytes.length, LType.I(8)), Some(Val.Bytes(bytes)))
 
   /** The parts of the runtime the module turned out to need, each a hand-written LLVM template and
    * so reachable to anything that is not LLVM only by name (`ir.Runtime`).

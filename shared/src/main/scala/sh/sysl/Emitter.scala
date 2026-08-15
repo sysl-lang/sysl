@@ -708,21 +708,16 @@ trait Emitter {
 
   protected def stringGlobal(s: String): ir.Val.Global = {
     strId += 1
-    val name           = s".str$strId"
-    val (escaped, len) = encode(s)
-    globals += ir.Global(name, constant = true, ir.LType.Arr(len, ir.LType.I(8)),
-                         Some(ir.Val.Bytes(escaped)))
+    val name  = s".str$strId"
+    val bytes = encode(s)
+
+    globals += ir.Global(name, constant = true, ir.LType.Arr(bytes.length, ir.LType.I(8)),
+                         Some(ir.Val.Bytes(bytes)))
     ir.Val.Global(name)
   }
 
-  private def encode(s: String): (String, Int) = {
-    val bytes = s.getBytes("UTF-8")
-    val sb    = new mutable.StringBuilder
-    for b <- bytes do
-      val u = b & 0xff
-      if u == '"'.toInt || u == '\\'.toInt || u < 0x20 || u >= 0x7f then sb ++= f"\\$u%02X"
-      else sb += u.toChar
-    sb ++= "\\00"
-    (sb.toString, bytes.length + 1)
-  }
+  /** A string's bytes as an interned constant holds them: UTF-8, with the terminator a C caller
+   * reads by — which a `string`, knowing its own length, has never had a use for.
+   */
+  private def encode(s: String): List[Byte] = s.getBytes("UTF-8").toList :+ 0.toByte
 }
