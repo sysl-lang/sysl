@@ -168,6 +168,12 @@ object CHeader {
    * Derived, the mangled form is already unique per instantiation — it is what the emitted IR names
    * the aggregate — and the separators it uses are not C identifier characters, so they are replaced
    * rather than the name being invented again here.
+   *
+   * **The replacement is where uniqueness stops, which is worth knowing before trusting the derived
+   * form.** `Type.mangled` is injective and the map onto `_` is not: a `C` in module `a.b` and a
+   * `b_C` in module `a` mangle apart and land on `a_b_C` together. It has never been reachable in
+   * practice and it was never checked, and `Exports.names` now catches it — so the honest statement
+   * is that the derived name is *ordinarily* unique and the collision rule is what guarantees it.
    */
   def cName(t: Type): String = t match
     case s: Type.Struct if s.cname.isDefined => s.cname.get
