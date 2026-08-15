@@ -109,6 +109,7 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
     case RefType(inner, sync)               => RefType(spellSelf(inner, selfRef), sync)
     case WeakType(inner)                    => WeakType(spellSelf(inner, selfRef))
     case ArrayType(len, elem, ro)           => ArrayType(len, spellSelf(elem, selfRef), ro)
+    case VectorType(lanes, elem)            => VectorType(lanes, spellSelf(elem, selfRef))
     // A value argument names no type, so there is no `Self` in it to spell.
     case v: ValueArgType                    => v
     case VolatileType(inner)                => VolatileType(spellSelf(inner, selfRef))
@@ -445,6 +446,38 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
         case None => err("an array length must be a constant — a literal, or a 'const' naming one")
       Type.Array(n, addressable(resolveQualified(elem, subst), "an array"))
 
+    // `<N>T` — a vector. The lane count is a compile-time constant on the same terms an array's
+    // length is, and reaches the same substitution, so a kernel generic over its width writes
+    // `<W>f32` against its own `[const W: usize]` and is instantiated once per width.
+    case VectorType(lanes, elem) =>
+      checkLengthArithmetic(lanes, subst)
+      checkLengthNotAType(lanes, subst)
+
+      val resolved = resolveQualified(elem, subst)
+
+      // A lane is a scalar, and the reason is LLVM's rather than a choice: `<4 x {float, float}>`
+      // is not a type, so an aggregate lane has no representation to lower to. The abstract case is
+      // let through untouched — during the walk that checks a generic body there is no `T` yet, and
+      // the instantiation walk is where a real type arrives to be held to this.
+      if !Type.mentionsAbstract(resolved) && !Type.Vector.lanes(resolved) then
+        err(s"a vector's lanes are scalars, and ${show(resolved)} is not one — an integer, a float, " +
+          s"'bool' or 'char' may be a lane, and an aggregate has no lane-wise arithmetic to give")
+
+      val n = constInt(lanes, subst) match
+        case Some(v) if v > 0 && v.isValidInt => v.toInt
+        case Some(v) if v == 0 =>
+          err("a vector of no lanes holds nothing and computes nothing — an array may be empty " +
+            "because it is storage, and a register cannot be")
+        case Some(v)                                   => err(s"a vector cannot have $v lanes")
+        // One lane rather than the zero an array stands at, because this stand-in is *lowered* on
+        // the walk that checks a generic body and `<0 x float>` is not a type LLVM has. Every
+        // vector the program actually gets is built by the instantiation pass, where the width
+        // answers.
+        case None if awaitsInstantiation(lanes, subst) => 1
+        case None => err("a vector's lane count must be a constant — a literal, or a 'const' naming one")
+
+      Type.Vector(n, resolved)
+
     // `(..A)` — the tuple of a pack (`10 §10`). The pack is looked up rather than resolved, because
     // what stands for it in the substitution is already the list of parts: for the walk that checks
     // a generic body that is the two stand-ins, and for an instantiation it is the parts the subject
@@ -731,6 +764,7 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
     case RefType(i, _)       => mentionsAny(i, names)
     case WeakType(i)         => mentionsAny(i, names)
     case ArrayType(_, e, _)  => mentionsAny(e, names)
+    case VectorType(_, e)    => mentionsAny(e, names)
     // The question this answers is about erasure — whether a **type** is named — and a value
     // argument names none, so it can hold no forgotten one.
     case _: ValueArgType     => false

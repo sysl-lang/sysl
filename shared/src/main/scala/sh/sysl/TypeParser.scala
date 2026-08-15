@@ -71,6 +71,20 @@ trait TypeParser extends ExprParser {
               s"one — read-only storage is declared with 'val', as 'val name: [N]${t.show}'")
           case n ~ ro ~ t => success(ArrayType(n, t, readOnly = ro.isDefined))
         }) |
+        // `<N>T`, a vector (`01 § Vectors`). The angle brackets are free in type position: type
+        // arguments are spelled `[...]`, and nothing reaches `coreType` except after a `:`, a `->`
+        // or another type constructor, where a comparison cannot appear.
+        //
+        // The empty spelling is caught here rather than left to fail as a stray `>`, because
+        // somebody writing it has read `[]T` and is owed the reason the two are not parallel.
+        (op("<") ~> op(">") ~> coreType >> { t =>
+          err(s"a vector's lane count is part of its type, so '<>${t.show}' has no meaning — a " +
+            s"slice drops its length because it carries one at run time, and a register's width is " +
+            s"settled when the code is generated; write '<4>${t.show}' for four lanes")
+        }) |
+        ((op("<") ~> expression <~ op(">")) ~ coreType ^^ {
+          case n ~ t => VectorType(n, t)
+        }) |
         // `volatile T` (`03 § Device memory`). It stays a soft word like `sync`, so it is special
         // only in front of another type — a program with a type of its own named `volatile` still
         // parses, since this alternative needs a second type after the word and the name

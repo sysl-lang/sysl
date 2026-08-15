@@ -7,6 +7,19 @@ package sh.sysl
  */
 trait Literals extends TypeResolution {
 
+  /** The scalar type a context wants, seen through a vector: a position asking for `<4>f32` wants
+   * `f32` out of a bare literal, which is then splatted into every lane.
+   *
+   * **This is what keeps `a * 2.0` free of a suffix and free of a construction**, and it is the same
+   * reading `repr` already performs for a transparent subtype — the position's type is not what the
+   * literal denotes, and both cases exist because a literal has no type of its own to defend. Without
+   * it a float literal under a `<4>f32` falls all the way to `real` and is then refused for being
+   * one, which reads as a missing conversion rather than as a lane count nobody wrote.
+   */
+  private def scalarWanted(t: Type): Type = Type.repr(t) match
+    case Type.Vector(_, lane) => Type.repr(lane)
+    case other                => other
+
   /** An integer literal takes its type from its suffix, else from the type the context
    * expects, else `int`. The default is never magnitude-dependent: a value too large for the
    * type it landed in is an error asking for a suffix, not a silent widening.
@@ -28,7 +41,7 @@ trait Literals extends TypeResolution {
           case Some(i: Type.Integer) => i
           case _                     => err(s"'$s' is not an integer type")
       case None =>
-        expected.map(Type.repr) match
+        expected.map(scalarWanted) match
           case Some(i: Type.Integer) => i
           // A type **parameter**, during the definition-time pass of `14 §4`. It is opaque, so there
           // is no width to check against and no representation to pick — but it is still the type
@@ -59,7 +72,7 @@ trait Literals extends TypeResolution {
           case Some(f: Type.Floating) => f
           case _                      => err(s"'$s' is not a floating-point type")
       case None =>
-        expected.map(Type.repr) match
+        expected.map(scalarWanted) match
           case Some(f: Type.Floating) => f
           case Some(a: Type.Abstract) => a
           case _                      => Type.Real
@@ -225,6 +238,27 @@ trait Literals extends TypeResolution {
       // inverse of `&p[n]` (`03`) — which is why the pointee decides the stride and why two pointers
       // into different objects are the programmer's business, exactly as `p[i]` already is.
       case (Type.Ptr(_), "-")                                                             => Type.isize
+      // **A vector's operators are its lane's, applied to every lane.** There is no promotion here
+      // either, so the two registers agree on width and lane type before this is reached and the
+      // result is that same type.
+      //
+      // A mask — `<N>bool` — has the bitwise three and nothing else, which is what makes
+      // `(a < b) & (c < d)` the way two conditions are combined. `&&` is not among them and cannot
+      // be: it short-circuits, and there is no such thing per lane.
+      case (Type.Vector(_, lane), _) =>
+        (Type.underlying(lane), op) match
+          case (_: Type.Integer, "+" | "-" | "*" | "&" | "|" | "^" | "<<" | ">>") => result
+          case (_: Type.Floating, "+" | "-" | "*" | "/")                          => result
+          case (Type.Bool, "&" | "|" | "^")                                       => result
+          // Integer division is refused rather than unimplemented, and the reason is worth the
+          // sentence: the scalar form traps on a zero divisor and on the one signed overflow, and
+          // both guards reduce a lane-wise comparison to a single `i1` — so a vector would either
+          // drop the guard or trap for lanes that were fine. No machine sysl targets has an integer
+          // vector divide anyway, so what looks like an omission costs a scalarized loop either way.
+          case (_: Type.Integer, "/" | "%") =>
+            err(s"'$op' is not defined on ${show(a)} — integer division traps per lane and a " +
+              s"register traps as a whole, so divide the lanes in a loop over an array")
+          case _ => err(s"operator '$op' is not defined for ${show(a)}")
       case _ => err(s"operator '$op' is not defined for ${show(a)}")
   }
 

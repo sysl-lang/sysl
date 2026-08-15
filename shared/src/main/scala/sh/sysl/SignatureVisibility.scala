@@ -258,6 +258,7 @@ trait SignatureVisibility extends TypeResolution {
     case RefType(inner, _)  => namesIn(inner, skip)
     case WeakType(inner)    => namesIn(inner, skip)
     case ArrayType(_, elem, _) => namesIn(elem, skip)
+    case VectorType(_, elem)   => namesIn(elem, skip)
     // A value argument names no declaration, so a signature can expose nothing through one — the
     // same reason an array's length is not walked one line up.
     case _: ValueArgType     => Nil

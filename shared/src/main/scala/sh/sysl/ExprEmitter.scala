@@ -44,6 +44,74 @@ trait ExprEmitter extends ArithEmitter {
         acc = r
       acc
 
+    // A vector is built lane by lane with `insertelement`, which is the array literal's
+    // `insertvalue` chain in the register file — and never through a slot, however wide it is: a
+    // vector has no `layout.indirect` case because a value that is not storage cannot be built in
+    // storage. LLVM folds a chain of constant lanes into a literal, so a splat of constants costs
+    // nothing at run time.
+    case TVectorLit(lanes, vecTy) =>
+      val vals = lanes.map(genExpr)
+      var acc  = "zeroinitializer"
+      for (v, i) <- vals.zipWithIndex do
+        val r = freshTemp()
+        emit(s"$r = insertelement ${vecTy.llvm} $acc, ${vecTy.elem.llvm} $v, i32 $i")
+        acc = r
+      acc
+
+    // The splat, in LLVM's own idiom: put the value in lane zero and shuffle it across with an
+    // all-zero mask. `shufflevector` with a zeroinitializer mask is the pattern every back end
+    // recognises, and it lowers to one broadcast instruction where the machine has one.
+    case TSplat(value, vecTy) =>
+      val v   = genExpr(value)
+      val one = freshTemp()
+      emit(s"$one = insertelement ${vecTy.llvm} poison, ${vecTy.elem.llvm} $v, i32 0")
+      val r = freshTemp()
+      emit(s"$r = shufflevector ${vecTy.llvm} $one, ${vecTy.llvm} poison, " +
+        s"<${vecTy.length} x i32> zeroinitializer")
+      r
+
+    // A lane-wise comparison is the scalar instruction at the register's width — `fcmp olt
+    // <4 x float>` yields the `<4 x i1>` that is this language's `<4>bool`. The predicate is chosen
+    // exactly as the scalar path chooses it, from the lane's own type and signedness.
+    case TVecCompare(op, l, r, _) =>
+      val lv    = genExpr(l)
+      val rv    = genExpr(r)
+      val vecTy = Type.repr(l.ty).asInstanceOf[Type.Vector]
+      val lane  = Type.underlying(vecTy.elem)
+      val instr = if lane.isInstanceOf[Type.Floating] then "fcmp" else "icmp"
+      val res   = freshTemp()
+
+      emit(s"$res = $instr ${predicate(op, lane)} ${vecTy.llvm} $lv, $rv")
+      res
+
+    // Both sides are evaluated and the mask picks between them, which is the whole difference from
+    // an `if` and is why this is not one (`tast.scala`'s `TSelect`).
+    case TSelect(mask, whenTrue, whenFalse, ty) =>
+      val m = genExpr(mask)
+      val a = genExpr(whenTrue)
+      val b = genExpr(whenFalse)
+      val r = freshTemp()
+
+      emit(s"$r = select ${mask.ty.llvm} $m, ${ty.llvm} $a, ${ty.llvm} $b")
+      r
+
+    case TReduce(op, receiver, ty) =>
+      val v     = genExpr(receiver)
+      val vecTy = Type.repr(receiver.ty).asInstanceOf[Type.Vector]
+      val r     = freshTemp()
+
+      // A float sum takes a starting value LLVM calls the accumulator, and `-0.0` is the one that
+      // is the identity for addition — `0.0` would turn a sum of nothing but negative zeros into a
+      // positive one. It is passed unordered (`reassoc`), which is what makes the reduction a tree
+      // rather than a left fold and is the whole reason to use the intrinsic instead of a loop.
+      val args =
+        if op == "fadd" then s"${vecTy.elem.llvm} -0.0, ${vecTy.llvm} $v"
+        else s"${vecTy.llvm} $v"
+      val flags = if op == "fadd" then "reassoc " else ""
+
+      emit(s"$r = call $flags${ty.llvm} @llvm.vector.reduce.$op.${vecTy.lty.overloadSuffix}($args)")
+      r
+
     // Built through memory with a loop rather than as an `insertvalue` chain, for the reason the
     // ARC walk gives: the count is a compile-time constant but it can be very large, and a repeat
     // count is where someone writes a large one on purpose. The value is generated once, above the

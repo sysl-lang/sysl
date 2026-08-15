@@ -75,6 +75,61 @@ case class TZero(ty: Type) extends TExpr
 case class TArrayLit(elems: List[TExpr], arrayTy: Type.Array) extends TExpr { def ty: Type = arrayTy }
 case class TArrayFill(value: TExpr, arrayTy: Type.Array)      extends TExpr { def ty: Type = arrayTy }
 
+/** `[a, b, c, d]` written where a `<4>T` was expected — a vector built from its lanes.
+ *
+ * It is the array literal's spelling because it is the array literal's meaning: the same values in
+ * the same order. What differs is where they end up, and a register is not storage — which is why
+ * this is a distinct node rather than a `TArrayLit` with a different type on it. An array is built
+ * in a slot and filled through it; a vector is built by `insertelement` and never has an address at
+ * all unless something takes one.
+ */
+case class TVectorLit(lanes: List[TExpr], vecTy: Type.Vector) extends TExpr { def ty: Type = vecTy }
+
+/** A scalar broadcast into every lane — the splat.
+ *
+ * Written nowhere: it is what a scalar becomes where a vector was asked for, so `a * 2.0` and
+ * `val v: <4>f32 = 0.0` both reach it through `coerce`. Giving it a spelling of its own would put a
+ * word in the way of the one thing every SIMD kernel does on nearly every line.
+ */
+case class TSplat(value: TExpr, vecTy: Type.Vector) extends TExpr { def ty: Type = vecTy }
+
+/** `v[0]` — one lane read out of a vector.
+ *
+ * **The index is a compile-time constant and the node carries it as an `Int`**, which is the one
+ * way this differs from `TIndex` and is not a limitation so much as what a register is. An array
+ * index is checked against the length at run time and traps; a vector has no address to check
+ * against, and LLVM's answer to an out-of-range `extractelement` is poison — a value that is not a
+ * value, spreading silently through everything computed from it. Refusing the dynamic form is
+ * therefore the only reading that keeps sysl's promise about a subscript. Somebody who needs a
+ * computed lane wants the vector in memory, where an array's checked subscript already answers.
+ */
+case class TLane(receiver: TExpr, lane: Int, ty: Type) extends TExpr
+
+/** A lane-wise comparison — `a < b` on two vectors, yielding a mask.
+ *
+ * **It is not a `TCompare`, and the difference is that a chain is meaningless here.** `a < b < c`
+ * on scalars is two comparisons sharing a middle operand and `&&`-ed together, and there is no
+ * lane-wise `&&` to do the joining with. So this is exactly two operands, and a written chain of
+ * vectors is refused where it is written rather than lowered into something that reads like it
+ * short-circuits.
+ */
+case class TVecCompare(op: String, left: TExpr, right: TExpr, ty: Type) extends TExpr
+
+/** `m.select(a, b)` — `a`'s lane where `m`'s is true and `b`'s where it is false.
+ *
+ * **This is the lane-wise `if`, and it is a method rather than a keyword because it cannot be one.**
+ * `if` branches: it evaluates one side or the other, and a register has no way to take one branch in
+ * two lanes and the other in the remaining two. So both sides are evaluated and the mask chooses
+ * between the results, which is a different operation from the one `if` names and is spelled
+ * differently for that reason.
+ */
+case class TSelect(mask: TExpr, whenTrue: TExpr, whenFalse: TExpr, ty: Type) extends TExpr
+
+/** A vector collapsed to a scalar — `v.sum()`, `v.min()`, `v.max()`, and a mask's `any()` and
+ * `all()`. `op` is the LLVM reduction's own name, which is what the emitter writes.
+ */
+case class TReduce(op: String, receiver: TExpr, ty: Type) extends TExpr
+
 /** The same two forms written where a `[]T` was expected: storage of the program's own, and a view
  * of all of it. The count of a `TBufFill` is an ordinary expression rather than part of a type,
  * which is the whole reason these exist — an array's length is fixed when it is compiled, and a

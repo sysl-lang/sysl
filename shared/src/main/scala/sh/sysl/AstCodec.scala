@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 37
+  val Version: Int = 38
 
   private val Magic = "sysl-ast"
 
@@ -239,6 +239,7 @@ object AstCodec {
         case RefType(inner, sy)   => tok("tr"); typ(inner); bool(sy)
         case WeakType(inner)      => tok("tw"); typ(inner)
         case ArrayType(len, elem, ro) => tok("ta"); opt(len)(expr); typ(elem); bool(ro)
+        case VectorType(lanes, elem)  => tok("tvec"); expr(lanes); typ(elem)
         case VolatileType(inner)  => tok("tv"); typ(inner)
         case TupleType(ps, res)   => tok("tt"); list(ps)(typ); bool(res)
         case PackType(n)          => tok("pk"); sref(n)
@@ -679,6 +680,7 @@ object AstCodec {
         case "tr"  => RefType(typ(), bool())
         case "tw"  => WeakType(typ())
         case "ta"  => ArrayType(opt(expr()), typ(), bool())
+        case "tvec" => VectorType(expr(), typ())
         case "tv"  => VolatileType(typ())
         case "tt"  => TupleType(list(typ()), bool())
         case "pk"  => PackType(sref())

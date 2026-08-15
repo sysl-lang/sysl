@@ -440,6 +440,19 @@ trait GenericInstantiation extends ConstFolding {
 
           unify(elem, e, tparams, sub)
         case _ => ()
+    // A vector's lane count binds a value parameter exactly as an array's length does, and this is
+    // the case the whole feature turns on: `solve[const W: usize](vn: <W>f32)` handed a `<8>f32`
+    // reads 8 off the argument and instantiates the kernel at eight lanes, with no width written at
+    // the call. Nothing else lets one body serve every machine.
+    case VectorType(lanes, elem) =>
+      actual match
+        case Type.Vector(n, e) =>
+          lanes match
+            case Ident(v) if tparams(v) => sub.getOrElseUpdate(v, Type.ConstArg(n, Type.usize))
+            case _                      => ()
+
+          unify(elem, e, tparams, sub)
+        case _ => ()
     // A value argument written out fixes nothing. `Buf[4]` handed a `Buf[4]` has nothing to solve,
     // and handed anything else is a mismatch the instantiated signature reports in both types'
     // terms — which is where every other structural disagreement is reported.

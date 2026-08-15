@@ -1,7 +1,7 @@
 package sh.sysl
 package ir
 
-/** **An LLVM type, as data.** The seven shapes the back end lowers a sysl type to, and the one
+/** **An LLVM type, as data.** The eight shapes the back end lowers a sysl type to, and the one
  * function that writes one down.
  *
  * Every LLVM type text the compiler emits comes from `render` here. Nothing else concatenates one:
@@ -47,6 +47,21 @@ enum LType {
   /** `[N x T]`, which is an array and also how a `va_list`'s reserved bytes are spelled. */
   case Arr(length: Int, elem: LType)
 
+  /** `<N x T>`, which is an array whose arithmetic happens in every lane at once.
+   *
+   * **The difference from `Arr` is what the instructions do, not what the bytes are.** LLVM's
+   * arithmetic mnemonics are the same for both widths of the word — `fadd <4 x float>` is the same
+   * opcode as `fadd float` — so a vector needs no operation of its own anywhere in the emitter, and
+   * an array needs no lane semantics. Two shapes that render one bracket pair apart is the whole of
+   * the distinction, and it is exactly the distinction the language draws between `[N]T` and `<N>T`.
+   *
+   * **A machine with no vector unit is not a special case.** LLVM legalizes: `<4 x float>` becomes
+   * four scalar operations where there is nothing wider to put them in, so this lowers on a Cortex-M
+   * without the back end being asked whether it should. That is why nothing here, and nothing in
+   * `Target`, gates on a vector unit being present.
+   */
+  case Vec(length: Int, elem: LType)
+
   /** An **anonymous** aggregate — `{ ptr, ptr }` for a trait object, `{ ptr, ptr, i64 }` for a view.
    * A declared struct is `Named` instead: LLVM gives one a name at module level and refers to it by
    * that name everywhere afterwards, which is what keeps a recursive type writable.
@@ -72,12 +87,31 @@ enum LType {
     case Ptr             => "ptr"
     case Void            => "void"
     case Arr(n, elem)    => s"[$n x ${elem.render}]"
+    case Vec(n, elem)    => s"<$n x ${elem.render}>"
     // An aggregate with nothing in it renders as `{}` rather than as `{  }`, which is what LLVM
     // itself writes. Nothing the compiler lowers produces one — a zero-sized value takes no storage
     // at all — so this is here to be right rather than because anything reaches it.
     case Struct(Nil)     => "{}"
     case Struct(fields)  => fields.map(_.render).mkString("{ ", ", ", " }")
     case Named(name)     => name
+
+  /** The suffix LLVM spells an **overloaded intrinsic's** operand type with — `v4f32` in
+   * `llvm.vector.reduce.fadd.v4f32`.
+   *
+   * **It is not `render` with the spaces taken out, which is the mistake worth naming**: a float is
+   * `float` in a type and `f32` in a name, so the two spellings genuinely differ and a suffix built
+   * by filtering the rendered text produces `4xfloat`, which names no intrinsic. LLVM accepts that
+   * silently at the text level and fails in the verifier, one layer further on than the mistake.
+   *
+   * Only the shapes an intrinsic sysl emits is overloaded on are here. An aggregate has no suffix
+   * because no intrinsic the compiler reaches takes one.
+   */
+  def overloadSuffix: String = this match
+    case I(bits)      => s"i$bits"
+    case F(bits)      => s"f$bits"
+    case Ptr          => "p0"
+    case Vec(n, elem) => s"v$n${elem.overloadSuffix}"
+    case other        => sys.error(s"no intrinsic overload suffix for ${other.render}")
 
   override def toString: String = render
 }

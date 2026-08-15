@@ -29,6 +29,7 @@ trait WrittenTypes extends GenericInstantiation {
     case WeakType(inner)    => mentions(inner, tps)
     case ArrayType(len, elem, _) =>
       len.exists(lengthMentions(_, tps)) || mentions(elem, tps)
+    case VectorType(lanes, elem) => lengthMentions(lanes, tps) || mentions(elem, tps)
     // A value argument is not a type and is still not *fixed* until whatever it names is:
     // `Buf[N]` inside a block declaring `N` is as unresolved as `Box[T]` is.
     case ValueArgType(e)     => lengthMentions(e, tps)
@@ -125,6 +126,10 @@ trait WrittenTypes extends GenericInstantiation {
           lengthArithmetic(l, names)
           lengthIsNotAType(l, tparams -- names)
         }
+        walk(elem)
+      case VectorType(lanes, elem) =>
+        lengthArithmetic(lanes, names)
+        lengthIsNotAType(lanes, tparams -- names)
         walk(elem)
       case NamedType(_, args)      => args.foreach(walk)
       // A written value argument is held to the same rule a length is, and for the same reason:

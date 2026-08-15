@@ -34,7 +34,15 @@ trait CollectionExprAnalysis extends ExprSupport {
         // view of it and it takes whichever form was asked for. Under a `[]const T` that is a
         // buffer written by its own literal and never again.
         case Some(Type.Slice(_, ro)) => TBufLit(ts, Type.Slice(elemTy, ro))
-        case _                       => TArrayLit(ts, Type.Array(ts.length, elemTy))
+        // The lane count is part of the type, so a literal that does not fill it is a mistake with
+        // an exact number in it — unlike an array, whose length the literal is free to decide.
+        case Some(v: Type.Vector) =>
+          if ts.length != v.length then
+            err(s"${show(v)} has ${v.length} lanes and this literal has ${ts.length} — a vector's " +
+              s"width is part of its type, so the two have to agree")
+
+          TVectorLit(ts, Type.Vector(v.length, elemTy))
+        case _ => TArrayLit(ts, Type.Array(ts.length, elemTy))
 
     // `[v; n]` — the form for an array whose element type has no zero, or has one that is not the
     // wanted starting value. The value is evaluated **once** and copied into every element, which
@@ -150,6 +158,30 @@ trait CollectionExprAnalysis extends ExprSupport {
         case _: Type.Ptr             => raw
         case _                       => autoDeref(raw)
 
+      Type.repr(tr.ty) match
+        // A lane, which is read out of a register rather than through an address — so the index is
+        // held to being a constant and checked here, where there is a number to name. See `TLane`.
+        case v: Type.Vector =>
+          val ti = analyzeExpr(index, Some(Type.usize))
+
+          constInt(index) match
+            case Some(n) if n >= 0 && n < v.length => TLane(tr, n.toInt, Type.unqualified(v.elem))
+            case Some(n) =>
+              at(index.pos)(err(s"${show(v)} has lanes 0 to ${v.length - 1}, and this is $n"))
+            case None =>
+              at(index.pos)(err(s"a lane index is part of the instruction that reads it, so it has " +
+                s"to be a constant — a literal, or a 'const' naming one. To index ${show(v)} by a " +
+                s"computed number, keep the values in a '[${v.length}]${Type.show(v.elem)}'"))
+
+        case _ => indexNonVector(raw, tr, index, expected)
+
+  /** Everything a subscript may be applied to that is not a vector — an array, a view, a `*T`, or a
+   * type with an `Index` of its own. Split out only so the vector case above can stand beside it.
+   *
+   * `raw` is the receiver as written and `tr` the same one dereferenced; the trait path needs the
+   * first, because a method is looked up on what the reader named.
+   */
+  private def indexNonVector(raw: TExpr, tr: TExpr, index: Expr, expected: Option[Type]): TExpr =
       Type.element(tr.ty) match
         case Some(elem) =>
           val ti = analyzeExpr(index, Some(Type.usize))

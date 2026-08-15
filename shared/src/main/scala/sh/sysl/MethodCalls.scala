@@ -41,6 +41,77 @@ trait MethodCalls extends FuncAddress {
    * to know it was a method call uses, so the receiver is analyzed once and the analysis that
    * decided is the one that runs.
    */
+  /** The names a vector answers to. Kept as a set so that a *different* name on a vector falls
+   * through to the ordinary complaint, which names the type and says no member of that name exists
+   * — rather than being caught here and answered with a list.
+   */
+  protected val vectorMethods: Set[String] = Set("select", "sum", "min", "max", "any", "all")
+
+  /** One of the six, checked and lowered.
+   *
+   * The reductions divide on what they reduce rather than on their names: `sum`, `min` and `max`
+   * are arithmetic and belong to a numeric lane, while `any` and `all` are a mask's and belong to a
+   * `bool` one. `select` is the only one that is not a reduction at all — it is the lane-wise `if`,
+   * so it is a *mask's* method and yields a vector rather than a scalar.
+   */
+  private def vectorMethod(v: Type.Vector, tr: TExpr, mname: String, args: List[Expr]): TExpr = {
+    val lane   = Type.underlying(v.elem)
+    val isMask = lane == Type.Bool
+
+    def noArgs(): Unit =
+      if args.nonEmpty then
+        err(s"'$mname' takes no arguments — it reduces the ${show(v)} it is read off")
+
+    (mname, lane) match
+      case ("select", _) if !isMask =>
+        err(s"'select' chooses between two vectors lane by lane, so it is read off a mask — the " +
+          s"'<${v.length}>bool' a comparison yields, as in '(a < b).select(a, b)'. ${show(v)} is not one")
+
+      case ("select", _) =>
+        if args.length != 2 then
+          err(s"'select' takes the two vectors to choose between — 'm.select(whenTrue, whenFalse)', " +
+            s"and ${args.length} argument${if args.length == 1 then " was" else "s were"} given")
+
+        val a = analyzeExpr(args.head, None)
+        val b = analyzeExpr(args(1), Some(a.ty))
+
+        // Both sides are the same vector, at the mask's width: a mask of four lanes cannot choose
+        // between registers of eight, and the answer's type is the type being chosen between.
+        (Type.repr(a.ty), Type.repr(b.ty)) match
+          case (x: Type.Vector, y: Type.Vector) if x == y && x.length == v.length =>
+            TSelect(tr, a, b, a.ty)
+          case (x: Type.Vector, y: Type.Vector) if x == y =>
+            err(s"a ${show(v)} chooses between ${v.length} lanes, and ${show(a.ty)} has ${x.length}")
+          case _ =>
+            err(s"'select' chooses between two vectors of one type, and this pair is " +
+              s"${show(a.ty)} and ${show(b.ty)}")
+
+      case ("any" | "all", Type.Bool) =>
+        noArgs()
+        TReduce(if mname == "any" then "or" else "and", tr, Type.Bool)
+
+      case ("any" | "all", _) =>
+        err(s"'$mname' asks whether any lane is true, so it is read off a mask — the " +
+          s"'<${v.length}>bool' a comparison yields. ${show(v)} is not one")
+
+      case (_, Type.Bool) =>
+        err(s"'$mname' adds or orders its lanes, and a mask's are 'bool' — 'any()' and 'all()' " +
+          s"are what a ${show(v)} reduces with")
+
+      case ("sum", _: Type.Floating) => noArgs(); TReduce("fadd", tr, v.elem)
+      case ("sum", _: Type.Integer)  => noArgs(); TReduce("add", tr, v.elem)
+
+      // The float minimum is `fmin` rather than `fminimum`: it is the one that matches `sysl.math`'s
+      // `min`, answering the other operand at a NaN instead of propagating it, so a program does not
+      // get two different answers depending on whether it reduced or folded.
+      case ("min", _: Type.Floating) => noArgs(); TReduce("fmin", tr, v.elem)
+      case ("max", _: Type.Floating) => noArgs(); TReduce("fmax", tr, v.elem)
+      case ("min", i: Type.Integer)  => noArgs(); TReduce(if i.signed then "smin" else "umin", tr, v.elem)
+      case ("max", i: Type.Integer)  => noArgs(); TReduce(if i.signed then "smax" else "umax", tr, v.elem)
+
+      case _ => err(s"'$mname' is not defined for ${show(v)}")
+  }
+
   protected def callMethodOn(
       tr: TExpr,
       mname: String,
@@ -60,6 +131,12 @@ trait MethodCalls extends FuncAddress {
       case Type.Str if mname == "copy" =>
         if args.nonEmpty then err("'copy' takes no arguments — it copies the string it is read off")
         TFromBytes(TBytes(tr))
+
+      // The vector's own methods, which are the compiler's for the reason `Intrinsics`' table is
+      // closed: each is one LLVM operation and none of them can be written in sysl. `select` is an
+      // instruction, and the reductions are intrinsics overloaded on the register's whole type — so
+      // an `impl` block would have nothing to put in its bodies.
+      case v: Type.Vector if vectorMethods(mname) => vectorMethod(v, tr, mname, args)
 
       case rty =>
         val (base, _) = memberKey(rty, mname)

@@ -67,6 +67,13 @@ case class Layout(word: Word) {
     // Three: an address, a length and a capacity.
     case _: Type.View                    => pointerBytes * 3
     case Type.Array(n, elem)             => n * size(elem)
+    // A vector's lanes are packed with no padding between them, exactly as an array's elements are,
+    // so the two agree on size and differ only on alignment. A `<N>bool` is the one that does not
+    // follow from that: LLVM packs `<N x i1>` to N *bits*, so its size is rounded up to the byte
+    // rather than being N — the shape a mask has in memory is not the shape it has in a register,
+    // and this is the number that matters when one is stored.
+    case Type.Vector(n, elem) =>
+      if Type.underlying(elem) == Type.Bool then (n + 7) / 8 else n * size(elem)
     case s: Type.Struct                  => structLayout(s)._1
     case e: Type.Enum                    => if e.simple then size(e.underlying) else enumSize(e)
     case other                           => sys.error(s"unreachable size of ${other.llvm}")
@@ -97,6 +104,12 @@ case class Layout(word: Word) {
     case _: Type.CFn                     => pointerBytes
     case _: Type.View                    => pointerBytes
     case Type.Array(_, elem)             => align(elem)
+    // **A vector aligns to its whole size, not to its lane**, which is the one place it parts
+    // company with the array it otherwise matches: `<4>f32` wants 16 bytes where `[4]f32` wants 4.
+    // That is LLVM's rule and it is the machine's — an aligned vector load is one instruction and
+    // an unaligned one is a slower path or a fault, depending on the target. Rounding up to a power
+    // of two is LLVM's too, so a `<3>f32` aligns to 16 rather than to 12.
+    case v: Type.Vector                  => Integer.highestOneBit(math.max(size(v) * 2 - 1, 1))
     case s: Type.Struct                  => structLayout(s)._2
     case e: Type.Enum                    => if e.simple then align(e.underlying) else enumAlign(e)
     case other                           => sys.error(s"unreachable alignment of ${other.llvm}")

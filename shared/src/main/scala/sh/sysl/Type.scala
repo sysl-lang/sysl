@@ -319,6 +319,53 @@ object Type {
     val shape: String = "[N]"
   }
 
+  /** `<N>T` — N lanes of `T`, which is an array whose operators work on every lane at once.
+   *
+   * **The bytes are an array's; the arithmetic is what differs.** `<4>f32` holds the same four
+   * floats `[4]f32` does and in the same order, and `a + b` on the first is one instruction
+   * computing four sums where on the second it is not an operation at all. That the two type
+   * constructors differ by one bracket pair is deliberate: a vector *is* an array that computes
+   * lane-wise, and the spelling says so.
+   *
+   * **The element is a scalar, and the length is what the machine can hold — neither is checked
+   * here.** A lane of a struct, of a view or of another vector has no LLVM meaning, and a length of
+   * zero has none either; both are refused where the type is *written*, which is where there is a
+   * position to report and a spelling to quote. What reaches this constructor has already been held
+   * to that.
+   *
+   * **No target gates it.** LLVM legalizes a vector wider than the machine into several registers
+   * and one on a machine with no vector unit into scalars, so `<4>f32` compiles for a Cortex-M as
+   * four ordinary FPU operations. A program therefore never has to ask whether it may write one —
+   * only, where it cares about speed, how wide to make it, which is what the conditional-compilation
+   * symbols answer.
+   */
+  case class Vector(length: Int, elem: Type) extends Type {
+    def lty(using Word): LType = LType.Vec(length, elem.lty)
+  }
+
+  object Vector {
+
+    /** Whether `t` may be a lane.
+     *
+     * LLVM's vectors are of scalars: an integer or a float. `bool` is in because a comparison has to
+     * produce a mask — `<N>bool` is LLVM's `<N x i1>` — and `char` is in because it lowers to `i32`
+     * like any other integer. Everything else, an aggregate above all, has no lane-wise arithmetic
+     * to give and is refused where the type is written.
+     *
+     * **A constrained lane is allowed and a volatile one is not**, which is not a symmetry anyone
+     * would guess and so is decided here rather than by `underlying`. A subtype is a set of values
+     * and lays out as its base, so a lane of one is a lane of the base — the same reason arithmetic
+     * on a constrained scalar reaches the base's instruction. A `volatile` lane would be asking for
+     * per-lane access ordering out of a load that is one instruction for the whole register, which
+     * LLVM has no way to give; `volatile <N>T` says the thing that can be honoured, and is spelled
+     * the other way round.
+     */
+    def lanes(t: Type): Boolean = t match
+      case c: Constrained                         => lanes(c.base)
+      case _: Integer | _: Floating | Bool | Char => true
+      case _                                      => false
+  }
+
   /** The argument bound to a **value** parameter (`10 §9`) — `3` where the declaration wrote
    * `[const N: usize]`.
    *
@@ -409,6 +456,10 @@ object Type {
   /** The element type of whatever a subscript may be applied to. */
   def element(t: Type): Option[Type] = t match
     case Array(_, e) => Some(e)
+    // A lane, which is read by `extractelement` rather than by reaching through an address — the
+    // one subscript in the language whose subject need never be in memory. What it answers here is
+    // only the type; `PlaceEmitter` is where the difference in how it is reached lives.
+    case Vector(_, e) => Some(e)
     case v: View     => Some(v.elem)
     // A `*T` is a bare address, so its `i`th element is C's `p[i]` — unchecked, since there is no
     // length in the type to check against (`03`).
@@ -486,6 +537,7 @@ object Type {
     case Weak(inner)              => s"weak ${show(inner)}"
     case CFn(ps, r)               => s"*extern(${ps.map(show).mkString(", ")}) -> ${show(r)}"
     case Array(n, elem)           => s"[$n]${show(elem)}"
+    case Vector(n, elem)          => s"<$n>${show(elem)}"
     case Slice(elem, ro)          => s"[]${if ro then "const " else ""}${show(elem)}"
     case Volatile(inner)          => s"volatile ${show(inner)}"
     // A **pack member**'s stand-in is named `A#0` so that two of them are two types (`Abstract` is
@@ -552,6 +604,7 @@ object Type {
     case Ref(inner, _)    => mentionsAbstract(inner)
     case Weak(inner)      => mentionsAbstract(inner)
     case Array(_, elem)   => mentionsAbstract(elem)
+    case Vector(_, elem)  => mentionsAbstract(elem)
     case Slice(elem, _)   => mentionsAbstract(elem)
     case Volatile(inner)  => mentionsAbstract(inner)
     case CFn(ps, r)       => ps.exists(mentionsAbstract) || mentionsAbstract(r)
@@ -572,6 +625,7 @@ object Type {
     case Ref(inner, _)    => mentionsUnknown(inner)
     case Weak(inner)      => mentionsUnknown(inner)
     case Array(_, elem)   => mentionsUnknown(elem)
+    case Vector(_, elem)  => mentionsUnknown(elem)
     case Slice(elem, _)   => mentionsUnknown(elem)
     case Volatile(inner)  => mentionsUnknown(inner)
     case CFn(ps, r)       => ps.exists(mentionsUnknown) || mentionsUnknown(r)
@@ -580,6 +634,26 @@ object Type {
   def isNumeric(t: Type): Boolean = underlying(t) match
     case _: Integer | _: Floating => true
     case _                        => false
+
+  /** The type whose operator table applies — a vector's **lane**, and any other type itself.
+   *
+   * A vector has exactly the operators its lane has, applied to every lane, so every question of
+   * the form "does this type have `*`" is answered about the lane. It is deliberately separate from
+   * `underlying`, which strips what a *subtype* added: this strips what the register added, and a
+   * caller wanting one nearly always does not want the other. `<4>Celsius` reaches `int` through
+   * both, and in that order.
+   */
+  def opSubject(t: Type): Type = underlying(t) match
+    case Vector(_, lane) => underlying(lane)
+    case other           => other
+
+  /** Whether a type computes with the numeric operators — a number, or a vector of them.
+   *
+   * What this gates is the **expected type flowing into an operand**, so that the `2.0` in
+   * `v * 2.0` is read at `f32` rather than falling to `real`. `isNumeric` is the narrower question
+   * and stays narrow: a literal *pattern* may not match a vector, and a vector is not a number.
+   */
+  def computesNumerically(t: Type): Boolean = isNumeric(opSubject(t))
 
   /** Whether `<`, `<=`, `>`, `>=` are defined — the numeric types, `char`, and `string`, which
    * orders by its bytes and so, being well-formed UTF-8, by codepoint. A constrained subtype
@@ -931,6 +1005,11 @@ object Type {
     case Ref(inner, true)  => s"sync.${mangleOne(inner)}"
     case Weak(inner)       => s"weak.${mangleOne(inner)}"
     case Array(n, elem)    => s"arr$n.${mangleOne(elem)}"
+    // A vector's lane count is mangled for the reason an array's length is, and it matters more
+    // here: a kernel generic over its width is instantiated once per width and the two bodies hold
+    // different instructions, so a name that dropped the count would give `solve` at 4 lanes and
+    // `solve` at 8 one body.
+    case Vector(n, elem)   => s"vec$n.${mangleOne(elem)}"
     // **A value argument is part of the mangled name**, for exactly the reason a type argument is:
     // two instantiations that differ only in it are two bodies, and a name that dropped it would let
     // `total` at length 3 share a body with `total` at length 4 (`10 §9`).

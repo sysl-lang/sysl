@@ -305,6 +305,17 @@ trait ExprAnalysis
     // because of it.
     case v: Type.Slice => arrayView(t, v).map(coerce(_, v)).getOrElse(t)
 
+    // A scalar where a vector was asked for — the splat, which puts the one value in every lane.
+    // It is a coercion rather than a spelling because it is what `a * 2.0` means and what
+    // `val v: <4>f32 = 0.0` means, and a construction written at each of those would be a word in
+    // front of the commonest line in any kernel that uses this.
+    //
+    // The lane type has to match exactly, by the identity everything else here uses: `<4>f32` takes
+    // an `f32` and not a `real`, for the same reason `f32` arithmetic does not take one. What makes
+    // that painless is that a bare literal has already been read at the lane type (`Literals`'
+    // `scalarWanted`), so the only values refused here are ones that were refused as scalars too.
+    case v: Type.Vector if Type.repr(t.ty) == Type.repr(v.elem) => TSplat(t, v).setPos(t.pos)
+
     case _ => t
 
   /** The whole-array view an array coerces to, where its elements are the ones the slice wants.
@@ -543,8 +554,8 @@ trait ExprAnalysis
       TLogical(op, analyzeBool(l), analyzeBool(r))
 
     case Binary(op, l, r) =>
-      val List(tl, provisional) = analyzeOperands(List(l, r), expected.filter(Type.isNumeric))
-      val tr                    = operandRhs(op, tl, r, provisional)
+      val List(tl0, provisional) = analyzeOperands(List(l, r), expected.filter(Type.computesNumerically))
+      val (tl, tr)               = balanceLanes(tl0, operandRhs(op, tl0, r, provisional))
 
       operatorCall(op, tl, tr).getOrElse(produced(TBinary(op, tl, tr, arithType(op, tl.ty, tr.ty, tr.pos))))
 
@@ -552,8 +563,8 @@ trait ExprAnalysis
     // has, never which operations it has — so the match reads through it and the node is typed by
     // `unaryType`, which keeps a derived result in its own type.
     case Unary("-", e) =>
-      val t = analyzeExpr(e, expected.filter(Type.isNumeric))
-      prefixCall("-", t).getOrElse(Type.underlying(t.ty) match
+      val t = analyzeExpr(e, expected.filter(Type.computesNumerically))
+      prefixCall("-", t).getOrElse(Type.opSubject(t.ty) match
         case i: Type.Integer if i.signed => produced(TUnary("-", t, unaryType(t.ty)))
         case _: Type.Floating            => produced(TUnary("-", t, unaryType(t.ty)))
         case _: Type.Integer => err(s"unary '-' is not defined for the unsigned type ${show(t.ty)}")
@@ -563,8 +574,8 @@ trait ExprAnalysis
       TUnary("!", analyzeBool(e), Type.Bool)
 
     case Unary("~", e) =>
-      val t = analyzeExpr(e, expected.filter(Type.isNumeric))
-      prefixCall("~", t).getOrElse(Type.underlying(t.ty) match
+      val t = analyzeExpr(e, expected.filter(Type.computesNumerically))
+      prefixCall("~", t).getOrElse(Type.opSubject(t.ty) match
         case _: Type.Integer => produced(TUnary("~", t, unaryType(t.ty)))
         case _               => err(s"unary '~' is not defined for ${show(t.ty)}"))
 
@@ -683,7 +694,8 @@ trait ExprAnalysis
     case Compare(operands, ops) =>
       val ts = analyzeOperands(operands, None)
 
-      compareChain(ts, ops.indices.map(i => compareLink(ops(i), ts(i), ts(i + 1))).toList)
+      if ts.exists(t => Type.repr(t.ty).isInstanceOf[Type.Vector]) then vecCompare(ts, ops)
+      else compareChain(ts, ops.indices.map(i => compareLink(ops(i), ts(i), ts(i + 1))).toList)
 
     // A parameter's default, spliced in where the argument was not written (`12 §2a`). It is
     // analyzed in the declaration's own terms and with nothing local in scope, which is what makes
@@ -1105,6 +1117,61 @@ trait ExprAnalysis
    * further than ordering (`01`); a link a trait supplies had both checked against the trait's own
    * signature when `compareLink` resolved it.
    */
+  /** The two operands of a binary form, with a scalar beside a vector splatted into one.
+   *
+   * This is where `a * 2.0` and `a < 0.0` become lane-wise: the scalar is the same value in every
+   * lane, which is what the reader means and what every SIMD API in any language provides. It runs
+   * after the literal has been read at the lane type, so what arrives here is either already the
+   * lane type or a mismatch worth reporting in the operator's own message rather than as a failed
+   * broadcast.
+   *
+   * Two vectors of different widths are left alone: `arithType` reports them as the mismatched
+   * types they are, which names both widths, where a splat here could only fail silently.
+   */
+  protected def balanceLanes(l: TExpr, r: TExpr): (TExpr, TExpr) = (Type.repr(l.ty), Type.repr(r.ty)) match
+    case (v: Type.Vector, s) if !s.isInstanceOf[Type.Vector] && s == Type.repr(v.elem) =>
+      (l, TSplat(r, v).setPos(r.pos))
+    case (s, v: Type.Vector) if !s.isInstanceOf[Type.Vector] && s == Type.repr(v.elem) =>
+      (TSplat(l, v).setPos(l.pos), r)
+    case _ => (l, r)
+
+  /** A comparison where either side is a vector: one link, and a mask rather than a `bool`.
+   *
+   * **A chain is refused rather than lowered.** `a < b < c` on scalars is two comparisons joined by
+   * `&&`, and `&&` short-circuits — which is a thing no register does, since every lane is computed
+   * either way. Reading the chain as a lane-wise `&` would give it the shape of the scalar spelling
+   * and a different meaning, so the reader is told to write the `&` themselves and see it.
+   */
+  private def vecCompare(ts: List[TExpr], ops: List[String]): TExpr = {
+    if ts.length > 2 then
+      err("a comparison chain joins its links with '&&', which short-circuits and so has no " +
+        "lane-wise form — compare two vectors at a time and combine the masks with '&'")
+
+    val (l, r) = balanceLanes(ts.head, ts(1))
+    val op     = ops.head
+
+    if Type.repr(l.ty) != Type.repr(r.ty) then
+      err(s"cannot compare ${show(l.ty)} with ${show(r.ty)}")
+
+    val lane = Type.repr(l.ty) match
+      case v: Type.Vector => Type.underlying(v.elem)
+      case other          => other
+
+    val equality = op == "==" || op == "!="
+
+    // A mask is `<N>bool`, which is what makes `(a < b).select(x, y)` and `(a < b) & (c < d)`
+    // ordinary values rather than a comparison's private business. `bool` lanes have equality and
+    // no ordering, exactly as a scalar `bool` does.
+    lane match
+      case _: Type.Integer | _: Type.Floating =>
+      case Type.Bool if equality              =>
+      case _ => err(s"'$op' is not defined for ${show(l.ty)}")
+
+    val n = Type.repr(l.ty).asInstanceOf[Type.Vector].length
+
+    TVecCompare(op, l, r, Type.Vector(n, Type.Bool))
+  }
+
   protected def compareChain(ts: List[TExpr], cmps: List[TCmp]): TExpr = {
     for i <- cmps.indices if cmps(i).dispatch.isEmpty do
       val op       = cmps(i).op
