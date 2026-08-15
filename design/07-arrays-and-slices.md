@@ -493,8 +493,20 @@ gather-and-transpose half is what changes between them while the arithmetic does
 insert build any shuffle meanwhile, correctly and more slowly. So the "write it once" claim below is
 strongest for lane-wise math and weakest for gathers, which is worth saying rather than discovering.
 
-**A place in a C signature.** A vector in an `extern` is refused: vector calling conventions are per
-target and belong with the rest of `CAbi`'s work, and nothing needs them yet.
+**A way into or out of memory, and this is the one that bounds the section below.** There is no
+conversion between `<N>T` and `[N]T`, no load from a run of a slice, and no store back — lanes go in
+through a literal or a splat and come out through a constant subscript. At a fixed width that is
+merely tedious; at a **parameterised** width it cannot be written at all, since a lane index must be
+a constant and a `[const W]` body has no way to name W of them. So a width-generic kernel may answer
+a vector or a reduction and may not fill an array of results, which is what most real ones do. Found
+by `guide/simd` and filed as card 0155; the lowering is one LLVM instruction each way and the design
+question is what a partial run at the end of an array does.
+
+**A place in a C signature.** A vector in an `extern` is refused, in both directions: which register
+one arrives in differs by target *and* by which instruction-set extensions the other side was
+compiled with, so there is no convention to emit against. Guessing would not fail to link — it would
+produce a call that resolves and corrupts its arguments, which is the failure a boundary check exists
+to prevent. The shape that does cross is a pointer to the lanes.
 
 ### Writing a kernel once, for every width
 
@@ -515,6 +527,17 @@ and over half that 2120-line file is those four copies.
 the machine becomes several registers, and one on a machine with no vector unit becomes scalars. So
 `<4>f32` compiles for a Cortex-M as four ordinary FPU operations, and the only question a program
 ever has to ask is how wide to go where it cares about speed — never whether it may write one at all.
+
+**What the claim does not cover, stated here rather than discovered.** It holds for a kernel whose
+result is a vector or a reduction, and stops at the two absences above: a gather needs shuffles, and
+storing a batch of results needs a way into memory. `guide/simd` writes the solver once and then
+cannot write the loop that would feed it, which is the honest shape of the feature today.
+
+**Choosing the width automatically is also not built.** A program picks a number. There are no
+conditional-compilation symbols for the vector unit, because `Toolchain` passes no `-march` or
+`-mattr` — clang compiles for baseline `x86-64`, so an `avx2` symbol would be false on every target
+sysl has. That wants a target-features decision of its own; meanwhile 4 is the natural width
+everywhere, NEON and SSE2 both being 128 bits and both being mandatory on their architectures.
 
 ## Not yet
 
