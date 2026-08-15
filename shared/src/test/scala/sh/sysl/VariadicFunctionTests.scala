@@ -345,12 +345,10 @@ class VariadicFunctionTests extends AnyFreeSpec with CodegenSupport with RunSupp
     }
 
     // An earlier draft of `12 §9` spelled this form `va_arg[T](ap)` and called the type argument
-    // "the same position every other generic puts one in". There is no such position — square
-    // brackets in an expression are indexing (`10 §2`) and call-site type arguments are refused
-    // language-wide (`10 § Open a`) — so the spelling a reader tries first has to name what to
-    // write instead. Without a case of its own it falls through to the general complaint about a
-    // callee that is not a name, which is the reading `10 § Open a` says this case must not get.
-    "va_arg takes no type arguments, and says what stands in for them" in {
+    // "the same position every other generic puts one in". There was no such position when this
+    // suite was written, and there is one now (`10 §2`) — so the spelling a reader tries first is
+    // the spelling, and it reads the type it is given rather than the one the context supplies.
+    "va_arg reads a type argument written on it" in {
       val src =
         """f(n: int, ...) -> int
           |    var ap: va_list
@@ -363,9 +361,7 @@ class VariadicFunctionTests extends AnyFreeSpec with CodegenSupport with RunSupp
           |end f
           |print(f(1, 2))""".stripMargin
 
-      err(src) should include("'va_arg' takes no type arguments")
-      err(src) should include("annotate the variable it is read into")
-      err(src) should not include "must be a name"
+      run(src) shouldBe "2\n"
     }
 
     // The same case covers the rest of the forms, which have no type to be given either.
