@@ -49,6 +49,41 @@ class PkgConfigTests extends PackageCacheSupport {
     root
   }
 
+  /** A project that declares nothing of its own, so what a case using it measures is what the root or
+   * the dependency beside it declared.
+   */
+  private def plainProject(): String = {
+    val root = createTempDirectory("sysl-pkgc-plain-")
+
+    writeFile(s"$root/main.sysl", "print(42)\n")
+    root
+  }
+
+  /** A package on disk whose manifest declares a `pkg_config` requirement, and one module. */
+  private def declaringPackage(needs: String): String = {
+    val root = createTempDirectory("sysl-pkgc-dep-")
+
+    writeFile(s"$root/${PackageConfig.FileName}",
+      s"""package { name = "dep", version = "1.0.0" }
+         |requires { pkg_config { $needs } }
+         |""".stripMargin)
+    createDirectories(s"$root/dep")
+    writeFile(s"$root/dep/dep.sysl", "module dep\n\ndouble(n: int) -> int = n * 2\n")
+    root
+  }
+
+  /** A project that depends on one, by path so nothing reaches the network. */
+  private def dependingProject(dep: String): String = {
+    val root = createTempDirectory("sysl-pkgc-app-")
+
+    writeFile(s"$root/${PackageConfig.FileName}",
+      s"""package { name = "app", version = "0.1.0" }
+         |dependencies { d { path = "$dep" } }
+         |""".stripMargin)
+    writeFile(s"$root/main.sysl", "print(dep.double(21))\n")
+    root
+  }
+
   private def ran(cfg: Config): String = {
     val out    = new java.io.ByteArrayOutputStream
     val notes  = new java.io.ByteArrayOutputStream
@@ -126,6 +161,44 @@ class PkgConfigTests extends PackageCacheSupport {
 
       ran(Config(command = "run",
                  file = project(s"""${someModule.get} = "a library this machine has" """))) shouldBe "42\n"
+    }
+  }
+
+  /** The declaration is worth the same whichever road the package arrived by, which is the rule
+   * `packages.md § 8` already states for header requirements. These are the two roads a *package's*
+   * declaration travels — the project's own is every other case in this suite.
+   */
+  "a package that arrived some other way" - {
+
+    // The whole point of the requirement: the refusal names the package that wanted the library, not
+    // the project that merely depends on it, so the reader knows who to go and read.
+    "is asked when it came through dependencies, and the refusal names it rather than the project" in {
+      val notes = refusalFrom(Config(command = "run",
+        file = dependingProject(declaringPackage("""kayro = "a library nothing has" """))))
+
+      notes should include("needs the 'kayro' library")
+      notes should include("a library nothing has")
+      notes should not include "this project"
+    }
+
+    // A dependency that asks for something this machine has does not stop anything, and the program
+    // it came for still runs — which is what says the check above is a check and not a wall.
+    "and builds when the library it named is one this machine has" in {
+      assume(someModule.isDefined)
+      assume(Toolchain.clangAvailable)
+
+      ran(Config(command = "run",
+        file = dependingProject(declaringPackage(s"""${someModule.get} = "one this machine has" """)))) shouldBe "42\n"
+    }
+
+    // The same package handed over as a directory rather than fetched. It used to be the road that
+    // fell through for header requirements, so it is the one worth pinning here from the start.
+    "is asked when it came as a --lib source root" in {
+      val notes = refusalFrom(Config(command = "run", file = plainProject(),
+        libs = List(declaringPackage("""kayro = "a library nothing has" """))))
+
+      notes should include("needs the 'kayro' library")
+      notes should include("a library nothing has")
     }
   }
 
