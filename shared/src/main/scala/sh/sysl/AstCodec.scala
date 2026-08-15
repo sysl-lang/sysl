@@ -54,8 +54,14 @@ object AstCodec {
    * check and then been decoded as something it was not. The merge takes the next number for that
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
+   *
+   * **It has now happened twice, and this is the merge that took 39.** A block initializer and a
+   * struct's C name were built in parallel, each moving 37 to 38 against a tree the other had not
+   * touched. Caught by reading dev's value rather than by anything failing — which is the point
+   * worth keeping: the collision is invisible to the compiler, because both numbers are perfectly
+   * valid on their own branch.
    */
-  val Version: Int = 38
+  val Version: Int = 39
 
   private val Magic = "sysl-ast"
 
