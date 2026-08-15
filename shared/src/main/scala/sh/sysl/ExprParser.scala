@@ -83,9 +83,13 @@ trait ExprParser extends SyslParserBase {
    * `x -> _ + 1` is a closure yielding a closure rather than one arrow with two parameters. That is
    * also what lets [[Placeholders.free]] stop at a [[Lambda]]: one can hold no placeholder that is
    * still looking for its parameter list.
+   *
+   * The block is reached through `blockAhead` rather than tried outright, which is what stops a
+   * closure whose body was forgotten — `val g = x ->` and then the next statement — being answered
+   * with `indent expected` against a line the writer never meant as a body.
    */
   protected lazy val lambdaBody: PackratParser[List[Stmt]] =
-    suite | expression ^^ (e => List(ExprStmt(Placeholders.lift(e)).setPos(e.pos)))
+    blockAhead ~> suite | expression ^^ (e => List(ExprStmt(Placeholders.lift(e)).setPos(e.pos)))
 
   protected def binOp(sym: String): Parser[(Expr, Expr) => Expr] =
     op(sym) ^^^ ((l: Expr, r: Expr) => Binary(sym, l, r))

@@ -123,6 +123,17 @@ trait ConstFolding extends ImportResolution {
 
       at(decl.pos)(err(s"constant '${qn(key)}' is defined in terms of itself: $loop → ${qn(key)}"))
 
+    // A block is read by the grammar wherever a binding's `=` is, so it reaches a `const` too — and a
+    // `const` is folded into its uses rather than run, so there is no point at which the statements
+    // would happen. Said here rather than left to the sentence below, because a reader who has just
+    // learnt the form from `val` is owed the rule and not a verdict.
+    decl.value match
+      case _: Block =>
+        at(decl.value.pos)(err(s"'${qn(key)}' is a 'const', so its value is folded into every use of " +
+          "it — a block is run, and there is nowhere here for it to run. Write a 'val', whose " +
+          "initializer is code"))
+      case _ => ()
+
     constsInProgress += key
     try
       val value = inDecl(key)(fold(decl.value).getOrElse(

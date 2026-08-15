@@ -185,6 +185,20 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     check("a constrained subtype with a range and a predicate",
       "type Age = u8 within 0..<200 where value != 13u8")
     check("a const and a module-level val", "const cap: usize = 512\nval order: [3]int = [2, 0, 1]")
+    // The one expression whose payload is a bare statement *list*. The library may well hold none
+    // today, and that is the argument for the case rather than against it: an inline function whose
+    // local is bound to a block is how one arrives, and a codec that dropped the list would decode
+    // to a binding with no value and say so nowhere. The second binding pins the other half — a
+    // block of one expression is collapsed by the parser, so what round-trips there is the sum.
+    check("a block initializer, and the single expression that collapses out of one",
+      """f() -> int
+        |    val computed =
+        |        val a = 6
+        |        a * 7
+        |    val plain =
+        |        1 + 2
+        |    computed + plain
+        |""".stripMargin)
     check("a read-only view, beside the mutable one it is not",
       // Whether a view is read-only is one `Boolean` on `ArrayType`, and dropping it on the way
       // through would still compile and still round-trip every other field — the library would just

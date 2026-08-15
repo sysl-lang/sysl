@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 37
+  val Version: Int = 38
 
   private val Magic = "sysl-ast"
 
@@ -295,6 +295,7 @@ object AstCodec {
         case Lambda(ps, b)           => tok("lam"); list(ps)(lambdaParam); list(b)(stmt)
         case ArrayLit(es)            => tok("arr"); list(es)(expr)
         case ArrayFill(v, c)         => tok("afl"); expr(v); expr(c)
+        case Block(ss)               => tok("blk"); list(ss)(stmt)
         case IfExpr(c, t, e2)        => tok("if"); expr(c); list(t)(stmt); opt(e2)(b => list(b)(stmt))
         case MatchExpr(s, arms)      => tok("mat"); expr(s); list(arms)(arm)
         case IsPattern(s, ps, neg)   => tok("is"); expr(s); list(ps)(pattern); bool(neg)
@@ -736,6 +737,7 @@ object AstCodec {
         case "lam"  => Lambda(list(lambdaParam()), list(stmt()))
         case "arr"  => ArrayLit(list(expr()))
         case "afl"  => ArrayFill(expr(), expr())
+        case "blk"  => Block(list(stmt()))
         case "if"   => IfExpr(expr(), list(stmt()), opt(list(stmt())))
         case "mat"  => MatchExpr(expr(), list(arm()))
         case "is"   => IsPattern(expr(), list(pattern()), bool())

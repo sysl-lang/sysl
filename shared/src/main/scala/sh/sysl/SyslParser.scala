@@ -396,9 +396,35 @@ class SyslParser(val source: Source)
   protected lazy val varDecl: PackratParser[Stmt] =
     multiDecl("var", mutable = true) |
       patternDecl("var", mutable = true) |
-      op("var") ~> ident ~ opt(op(":") ~> typeRef) ~ opt(op("=") ~> expression) ^^ {
+      op("var") ~> ident ~ opt(op(":") ~> typeRef) ~ opt(op("=") ~> initializer) ^^ {
         case n ~ t ~ e => VarDecl(n, t, e.map(Placeholders.lift))
       }
+
+  /** What a binding's `=` takes: one expression, or an indented block whose trailing expression is
+   * the value (`00 § Continuing a line`).
+   *
+   * The block is tried first and costs nothing when there is not one — it opens on `Newline`+`Indent`,
+   * which no expression can begin with, so a value written on the same line as the `=` reaches
+   * `expression` having consumed nothing.
+   *
+   * **A block of a single expression is that expression.** The two are the same value written two
+   * ways, and collapsing here is what keeps a module `val` with its value on the next line a constant
+   * tree rather than a computed initializer — a distinction a reader who moved the line to fit the
+   * margin never asked to make. A block that binds anything cannot collapse and does not.
+   */
+  protected lazy val initializer: PackratParser[Expr] =
+    blockValue | expression
+
+  /** [[blockAhead]] is what keeps the diagnostic for a value that was simply forgotten: without it
+   * `val x =` is answered with `indent expected` against the following line, which describes a block
+   * the writer had not begun.
+   */
+  private lazy val blockValue: PackratParser[Expr] =
+    blockAhead ~> suite ^^ {
+      case List(ExprStmt(e)) => e
+      case stmts @ (h :: _)  => Block(stmts).setPos(h.pos)
+      case Nil               => UnitLit()
+    }
 
   /** `val (a, b) = …` / `var (a, b) = …` — a binding written as a **pattern** (`00 §13`).
    *
@@ -421,7 +447,7 @@ class SyslParser(val source: Source)
    * nowhere to carry a type, and inference covers what the form is for.
    */
   protected def patternDecl(keyword: String, mutable: Boolean): PackratParser[Stmt] =
-    (op(keyword) ~> destructuring) ~ (op("=") ~> expression) ^^ {
+    (op(keyword) ~> destructuring) ~ (op("=") ~> initializer) ^^ {
       case p ~ v => PatternDecl(p, mutable, Placeholders.lift(v))
     }
 
@@ -469,9 +495,14 @@ class SyslParser(val source: Source)
    * from a `var` at a glance as well as to the parser: a constant with no value is not a
    * declaration of anything, and a type left off would be the one declaration in the language whose
    * interface could not be read off its syntax.
+   *
+   * **A block is read here and refused in the analyzer**, which is the same arrangement a variant
+   * pattern in a binding gets and for the same reason: a `const` folds, a block does not, and leaving
+   * the form out of the grammar answers the reader who reached for it with `expression expected`
+   * rather than with the rule.
    */
   protected lazy val constDecl: PackratParser[Stmt] =
-    op("const") ~> ident ~ (op(":") ~> typeRef) ~ (op("=") ~> expression) ^^ {
+    op("const") ~> ident ~ (op(":") ~> typeRef) ~ (op("=") ~> initializer) ^^ {
       case n ~ t ~ v => ConstDecl(n, t, v)
     }
 
@@ -594,7 +625,7 @@ class SyslParser(val source: Source)
   protected lazy val valDecl: PackratParser[Stmt] =
     multiDecl("val", mutable = false) |
       patternDecl("val", mutable = false) |
-      op("val") ~> ident ~ opt(op(":") ~> typeRef) ~ (op("=") ~> expression) ^^ {
+      op("val") ~> ident ~ opt(op(":") ~> typeRef) ~ (op("=") ~> initializer) ^^ {
         case n ~ t ~ v => ValDecl(n, t, Placeholders.lift(v))
       }
 
