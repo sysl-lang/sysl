@@ -480,6 +480,51 @@ For the same reason **a comparison chain has no lane-wise form**. `a < b < c` jo
 `&&`, which short-circuits, and nothing per lane does. Reading the chain as a lane-wise `&` would
 give the scalar spelling a different meaning, so it is refused and the reader writes the `&`.
 
+### Reaching memory
+
+A vector holds the lanes a kernel computes with; an array or a slice holds the data a program has.
+The two forms that move a run between them are the receiver's, not the vector's, because what the
+move needs is an address and a length and a vector has neither:
+
+```
+val v: <4>f32 = xs.load(i)               -- W elements starting at i, into a register
+out.store(i, v * 2.0)                    -- the register back into W elements
+```
+
+**The width of a load comes from what receives the value, and nothing else.** A slice has whatever
+length it has, so it cannot say; guessing would be the one mistake that silently takes the wrong
+run. A binding's annotation says it, and so does a parameter or a declared result — which is what
+makes the load writable from a `[const W: usize]` body, where `<W>f32` is nameable and no literal
+could stand in. An operand of an arithmetic expression is *not* such a place: `xs.load(i) * by` is
+refused even where `by` fixes the width, because an operator does not settle its two sides in
+either order.
+
+A store is told by the vector handed to it, so the asymmetry is in the language rather than in the
+implementation.
+
+**The run is checked, and checked as a run.** `i + W <= xs.len` is not knowable until the program
+runs, so this is the one vector operation with a run-time test — the subscript's, widened from one
+element to W of them, trapping the same way. A vector is not a hole through which a program reaches
+past the end of an array. The test is written as two comparisons rather than an addition, because
+`i + W` on a `usize` near the top of the range wraps to a small number and passes.
+
+**A partial run traps, and the scalar tail is the caller's to write.** An array whose length is not
+a multiple of the width ends with fewer elements left than there are lanes; a masked load would
+answer that in one instruction, and it needs a mask, a value for the lanes it skips, and a decision
+about what a masked *store* does to them. None of those has to be settled for the pair above to be
+useful, and adding it later takes nothing back.
+
+**The alignment claimed is the element's.** A `[]f32` promises four bytes and says nothing about
+where a run begins — a slice of one element is a slice of any of them — so a vector's own alignment
+would be a claim the type does not support, and an over-aligned load is undefined behaviour rather
+than a slow one. Every machine sysl targets has an unaligned vector load costing what the aligned
+one costs on aligned data.
+
+**A run of `volatile` elements is refused rather than quietly widened**, because one access per
+element is not one access and LLVM cannot promise per-lane ordering out of a single instruction.
+`volatile <N>T` is the shape that can be honoured, and is spelled the other way round. A `*T` is
+refused too: no length, so nothing to check against.
+
 ### What a vector does not have
 
 **Integer `/` and `%`.** The scalar forms trap on a zero divisor and on the one signed overflow, and
@@ -490,17 +535,10 @@ what looks like an omission costs a scalarized loop either way.
 **Shuffles and swizzles.** They take constant index lists, which do not generalise over a width
 parameter — and that is exactly why a C SIMD kernel is written once per architecture, since the
 gather-and-transpose half is what changes between them while the arithmetic does not. Extract and
-insert build any shuffle meanwhile, correctly and more slowly. So the "write it once" claim below is
-strongest for lane-wise math and weakest for gathers, which is worth saying rather than discovering.
-
-**A way into or out of memory, and this is the one that bounds the section below.** There is no
-conversion between `<N>T` and `[N]T`, no load from a run of a slice, and no store back — lanes go in
-through a literal or a splat and come out through a constant subscript. At a fixed width that is
-merely tedious; at a **parameterised** width it cannot be written at all, since a lane index must be
-a constant and a `[const W]` body has no way to name W of them. So a width-generic kernel may answer
-a vector or a reduction and may not fill an array of results, which is what most real ones do. Found
-by `guide/simd` and filed as card 0155; the lowering is one LLVM instruction each way and the design
-question is what a partial run at the end of an array does.
+insert build any shuffle meanwhile, correctly and more slowly — and since `store` and `load` exist,
+a gather is a loop over a scratch array rather than a run of hand-written lane writes, which is
+better and is still not one instruction. So the "write it once" claim below is strongest for
+lane-wise math and weakest for gathers, which is worth saying rather than discovering.
 
 **A place in a C signature.** A vector in an `extern` is refused, in both directions: which register
 one arrives in differs by target *and* by which instruction-set extensions the other side was
@@ -528,10 +566,15 @@ the machine becomes several registers, and one on a machine with no vector unit 
 `<4>f32` compiles for a Cortex-M as four ordinary FPU operations, and the only question a program
 ever has to ask is how wide to go where it cares about speed — never whether it may write one at all.
 
-**What the claim does not cover, stated here rather than discovered.** It holds for a kernel whose
-result is a vector or a reduction, and stops at the two absences above: a gather needs shuffles, and
-storing a batch of results needs a way into memory. `guide/simd` writes the solver once and then
-cannot write the loop that would feed it, which is the honest shape of the feature today.
+**What the claim does not cover, stated here rather than discovered.** It reaches a kernel that
+loops over an array and writes its answers back, which is what most real ones do — `guide/simd`
+writes the solver once and runs the same body over ten contacts at four lanes and at eight. Two
+things bound it. A gather is still a scratch array and a loop rather than one instruction, because
+a shuffle takes a constant index list; and **the width has to enter through a parameter**, since a
+written type argument at a call is refused (`10 § Open a`), so a kernel whose every parameter is a
+slice has nowhere to be told its width. The second is not usually felt — a SIMD kernel's constants
+are broadcast vectors anyway, which is where `guide/simd`'s `batch` reads its `W` from — but it is
+worth knowing before a signature is designed around it.
 
 **Choosing the width automatically is also not built.** A program picks a number. There are no
 conditional-compilation symbols for the vector unit, because `Toolchain` passes no `-march` or

@@ -25,25 +25,31 @@
 //     it. That is the kind of gap a program finds and a test suite does not, because a suite tests
 //     the form it was written for and a program writes whichever one reads better.
 //
-//   * **A vector's lanes cannot reach memory, and this is the finding that matters.** There is no
-//     way to move a `<W>f32` into a `[W]f32` or a `[]f32`, and no way to build one from a run of a
-//     slice — so a kernel can compute a batch of results and then has nowhere to put them. Written
-//     out lane by lane it works at a *fixed* width, which is what `insert8` below does and what the
-//     scalar cross-check does. At a **parameterised** width it cannot be written at all: a lane
-//     index is a constant, and a `[const W]` body has no way to name W constants.
+//   * **A vector's lanes could not reach memory, and that was this program's main finding.** There
+//     was no way to move a `<W>f32` into a `[W]f32` or a `[]f32` and no way to build one from a run
+//     of a slice, so a kernel could compute a batch of results and had nowhere to put them — and at
+//     a *parameterised* width it could not be written at all, since a lane index is a constant and
+//     a `[const W]` body has no constant to write. It was reported rather than worked around,
+//     because the workaround is per-width and would have been copied.
 //
-//     So "one kernel, every width" holds for a kernel whose result is a vector or a reduction, and
-//     stops exactly where a kernel has to store an array of results — which is most real ones. A
-//     load and a store between a vector and a run of a slice is what closes it. Reported rather
-//     than worked around, because the workaround is per-width and would be copied.
+//     **`xs.load(i)` and `xs.store(i, v)` are what closed it**, and `batch` below is the program
+//     the finding said could not be written: one body, holding a load, arithmetic and a store, run
+//     here at four lanes and at eight. `gather` and the scalar cross-check are written as loops now
+//     for the same reason — a scratch array is a place a computed lane index works, which it had
+//     no way to be before.
 //
-//   * **There is no shuffle, and this program is where that costs something.** `gather8` below
-//     moves eight scattered bodies' velocities into lane order one lane at a time,
-//     because a shuffle takes a constant index list and a constant index list does not generalise
-//     over a width parameter. That is exactly why Box2D's four copies differ: the gather-and-
-//     transpose half is what changes between them, and the arithmetic is not. So "write it once"
-//     is a true claim about the solver and a weaker one about the loading, which is worth stating
-//     here rather than leaving a reader to find.
+//     What is *not* closed is where the width comes from. A load takes it from what receives the
+//     value, so `val v: <W>f32 = xs.load(i)` says it and `xs.load(i) * by` is refused; and a
+//     written type argument at a call is still refused (`10 § Open a`), which is why `batch` takes
+//     its scale factor as a `<W>f32` rather than an `f32`. That is not a contortion — a SIMD
+//     kernel's constants are vectors anyway — but it is the reason the signature reads as it does.
+//
+//   * **There is still no shuffle, and `gather` is where that shows.** Moving eight scattered
+//     bodies' velocities into lane order now costs a scratch array and eight scalar stores rather
+//     than eight `select`s, which is better and is still not one instruction. That is exactly why
+//     Box2D's four copies differ: the gather-and-transpose half is what changes between them and
+//     the arithmetic is not. So "write it once" is a true claim about the solver and a weaker one
+//     about the loading, which is worth stating here rather than leaving a reader to find.
 //
 //   * **A mask is an ordinary value, and that is what makes the clamp readable.** `(v < lo)` binds,
 //     combines with `&`, and reduces — so the solver's non-negative impulse clamp is one `select`
@@ -95,44 +101,65 @@ end solve
 // The relative normal velocity of W contacts, from the two bodies' velocities and the normal.
 relative[const W: usize](va: <W>f32, vb: <W>f32, n: <W>f32) -> <W>f32 = (vb - va) * n
 
+// A whole array of contacts solved W at a time, with the answers written back.
+//
+// **This is the program the header's finding said could not be written.** Nothing in it names a
+// lane count either: the loads take their width from the annotation, which names `W`; the store
+// takes its width from the vector handed to it; and the arithmetic is `solve`'s, which is the same
+// body four lanes and eight lanes away. What comes out is `load <4 x float>` in one instantiation
+// and `load <8 x float>` in the other, from these lines.
+//
+// **The tail is the caller's and it is written here rather than hidden**, because every kernel over
+// real data has one: an array whose length is not a multiple of the register's width ends with
+// fewer elements left than there are lanes, and a load of that run traps rather than reading past
+// the end. A masked load would answer it in one instruction and sysl has none; a scalar loop
+// answers it in three lines and is what C's SIMD code writes anyway.
+//
+// **`relax` is a vector rather than an `f32`, and that is where `W` comes from.** A written type
+// argument at a call is still refused (`10 § Open a`), so a kernel whose every parameter is a slice
+// has no way to be told its width. It is not a stand-in: the relaxation factor of a Gauss-Seidel
+// step is a constant broadcast across the lanes, and every real SIMD solver passes its constants
+// as vectors for exactly this reason. But a kernel with *no* such constant would have nowhere to
+// put its width, and that is worth knowing before one is designed.
+batch[const W: usize](vn: []const f32, mass: []const f32, bias: []const f32, out: []f32, relax: <W>f32)
+    var i: usize = 0
+
+    while i + W <= vn.len
+        val v: <W>f32 = vn.load(i)
+        val m: <W>f32 = mass.load(i)
+        val b: <W>f32 = bias.load(i)
+
+        out.store(i, solve(v, m, b) * relax)
+        i += W
+
+    while i < vn.len
+        out[i] = scalar_solve(vn[i], mass[i], bias[i]) * relax[0]
+        i += 1
+end batch
+
 // --------------------------------------------------------------------------- the loading
 
-// Eight bodies' velocities gathered into one register, one lane at a time.
+// Eight bodies' velocities gathered into one register, through a scratch array.
 //
-// **There is no shuffle, so this is the honest cost of a gather.** A real solver reads its bodies
-// through an index table — body 17 in lane 0, body 3 in lane 1 — and the loop below is what that
-// costs without a shuffle instruction to do it in one step. It is still correct everywhere, and on
-// a machine with no vector unit it is exactly what the scalar code would have been.
-gather8(xs: []const f32, at: []const usize) -> <8>f32
-    var out: <8>f32
-
-    for i in 0..<8
-        // A lane index has to be a constant, which is what keeps a subscript's promise: a vector has
-        // no address to bounds-check against, so a computed lane would be LLVM's `poison` rather
-        // than a trap. The eight assignments are written out for that reason.
-        if i == 0 then out = insert8(out, 0, xs[at[0]])
-        if i == 1 then out = insert8(out, 1, xs[at[1]])
-        if i == 2 then out = insert8(out, 2, xs[at[2]])
-        if i == 3 then out = insert8(out, 3, xs[at[3]])
-        if i == 4 then out = insert8(out, 4, xs[at[4]])
-        if i == 5 then out = insert8(out, 5, xs[at[5]])
-        if i == 6 then out = insert8(out, 6, xs[at[6]])
-        if i == 7 then out = insert8(out, 7, xs[at[7]])
-
-    return out
-end gather8
-
-// One lane replaced, built out of a mask and a `select` because there is no lane-write form.
+// **There is no shuffle, so this is the honest cost of a gather** — but it is now a loop rather
+// than eight written-out lane writes. A real solver reads its bodies through an index table (body
+// 17 in lane 0, body 3 in lane 1), and what that costs here is one pass writing the elements into
+// contiguous storage and one `load` to pick the whole run up. A machine with a gather instruction
+// would do it in one; a machine with no vector unit at all does exactly what the scalar code would
+// have done.
 //
-// **This is the workaround the missing shuffle forces, written where a reader can see it.** A
-// vector is a value rather than storage, so there is no place to assign into — and `select` against
-// a one-hot mask is what stands in. It costs a comparison and a blend per lane where an
-// `insertelement` would cost one instruction.
-insert8(v: <8>f32, lane: usize, x: f32) -> <8>f32
-    val idx: <8>u32 = [0, 1, 2, 3, 4, 5, 6, 7]
+// **The scratch array is what makes the loop possible**, and it is the load that makes the scratch
+// array worth having: a lane index has to be a constant, because a vector has no address to
+// bounds-check against and a computed lane would be LLVM's `poison` rather than a trap. An array
+// index is checked and may be computed, so `scratch[i]` is the form that takes an `i`.
+gather(xs: []const f32, at: []const usize) -> <8>f32
+    var scratch: [8]f32
 
-    return (idx == u32(lane)).select(x, v)
-end insert8
+    for i in 0..<at.len
+        scratch[i] = xs[at[i]]
+
+    return scratch.load(0)
+end gather
 
 // --------------------------------------------------------------------------- the checks
 
@@ -218,23 +245,21 @@ val lanes: [8]f32 = [-2.0, 1.0, -4.0, 0.5, -1.0, 3.0, -0.5, 0.0]
 val masses: [8]f32 = [0.5, 0.5, 0.25, 2.0, 1.0, 1.0, 4.0, 1.0]
 val biases: [8]f32 = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
-// **The comparison is written out lane by lane, and it is written out because it has to be.** The
-// loop this wants — read lane `i`, compare, count — cannot be written: a lane index is a constant,
-// and there is no way to move a vector's lanes into an array where a computed index would work. See
-// the header; this is the program's main finding.
-val want0 = scalar_solve(lanes[0], masses[0], biases[0])
-val want1 = scalar_solve(lanes[1], masses[1], biases[1])
-val want2 = scalar_solve(lanes[2], masses[2], biases[2])
-val want3 = scalar_solve(lanes[3], masses[3], biases[3])
-val want4 = scalar_solve(lanes[4], masses[4], biases[4])
-val want5 = scalar_solve(lanes[5], masses[5], biases[5])
-val want6 = scalar_solve(lanes[6], masses[6], biases[6])
-val want7 = scalar_solve(lanes[7], masses[7], biases[7])
+// **The comparison is a loop, and until `store` existed it could not be.** Reading lane `i` of a
+// vector needs `i` to be a constant, so the eight lines this replaces were written out one per
+// lane. A store moves the whole register into an array in one instruction, and an array index may
+// be computed — so the loop below is the ordinary spelling of "check every lane", reached by
+// putting the lanes somewhere a subscript works.
+var got: [8]f32
+
+got.store(0, j8)
 
 near(a: f32, b: f32) -> int = if (a - b).abs() < 0.0001 then 1 else 0
 
-val agreed = near(want0, j8[0]) + near(want1, j8[1]) + near(want2, j8[2]) + near(want3, j8[3]) +
-             near(want4, j8[4]) + near(want5, j8[5]) + near(want6, j8[6]) + near(want7, j8[7])
+var agreed = 0
+
+for i in 0..<8
+    agreed += near(scalar_solve(lanes[i], masses[i], biases[i]), got[i])
 
 check("every lane matches the scalar answer", str(agreed), "8")
 
@@ -243,13 +268,47 @@ print("-- gathering, which is where the missing shuffle costs something")
 val velocities: [6]f32 = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
 val order: [8]usize = [5, 0, 3, 1, 4, 2, 0, 5]
 
-val gathered = gather8(velocities[..], order[..])
+val gathered = gather(velocities[..], order[..])
 
 check("gathered lane 0", fixed(gathered[0]), "60.000")
 check("gathered lane 1", fixed(gathered[1]), "10.000")
 check("gathered lane 2", fixed(gathered[2]), "40.000")
 check("gathered lane 7", fixed(gathered[7]), "60.000")
 check("gathered sum", fixed(gathered.sum()), "280.000")
+
+print("-- a whole array, W at a time, with the answers written back")
+
+// Ten contacts, which is not a multiple of either width — so both instantiations take a scalar
+// tail, and the two have to agree with each other and with the scalar spelling anyway.
+val many_vn: [10]f32 = [-2.0, 1.0, -4.0, 0.5, -1.0, 3.0, -0.5, 0.0, -3.0, 2.0]
+val many_mass: [10]f32 = [0.5, 0.5, 0.25, 2.0, 1.0, 1.0, 4.0, 1.0, 0.5, 1.0]
+val many_bias: [10]f32 = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+var by4: [10]f32
+var by8: [10]f32
+var scalar: [10]f32
+
+val relax4: <4>f32 = 1.0
+val relax8: <8>f32 = 1.0
+
+batch(many_vn[..], many_mass[..], many_bias[..], by4[..], relax4)
+batch(many_vn[..], many_mass[..], many_bias[..], by8[..], relax8)
+
+for i in 0..<10
+    scalar[i] = scalar_solve(many_vn[i], many_mass[i], many_bias[i])
+
+var same = 0
+
+for i in 0..<10
+    same += near(by4[i], scalar[i]) * near(by8[i], scalar[i])
+
+// The interesting elements are the ones the *tail* wrote: at four lanes that is the last two, and
+// at eight it is the last two as well, reached by a different route.
+check("four lanes, first element", fixed(by4[0]), "1.000")
+check("eight lanes, first element", fixed(by8[0]), "1.000")
+check("four lanes, the tail", fixed(by4[9]), "0.000")
+check("eight lanes, the tail", fixed(by8[9]), "0.000")
+check("every element agrees, both widths", str(same), "10")
 
 print("-- the reductions, and what each is for")
 
