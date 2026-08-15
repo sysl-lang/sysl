@@ -1,6 +1,6 @@
 package sh.sysl
 
-import ir.{Inst, Val}
+import ir.{Access, Arg, BinOp, CastOp, FCmp, ICmp, Inst, LType, Val}
 
 /** Addressing a place, and building the composite values that have one.
  *
@@ -87,7 +87,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       // A large one is written into the slot rather than produced and then stored into it — the
       // slot is what it was going to end up in either way.
       if layout.indirect(other.ty) then genBorrowedInto(slot, other)
-      else emit(s"store ${other.ty.llvm} ${genExpr(other)}, ptr $slot")
+      else emit(Inst.Store(other.ty.lty, Val.Raw(genExpr(other)), Val.Raw(slot), Access.Plain))
       slot
 
   /** Writes `v` into the place at `p`. A slot that holds a count takes one for the value arriving
@@ -103,7 +103,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     else if layout.indirect(ty) && q.isEmpty then
       retainValue(ty, v)
       releaseAt(ty, p)
-      emit(s"store ${ty.llvm} $v, ptr $p")
+      emit(Inst.Store(ty.lty, Val.Raw(v), Val.Raw(p), Access.Plain))
     else
       val old = freshTemp(); emit(s"$old = load$q ${ty.llvm}, ptr $p")
       retainValue(ty, v)
@@ -250,15 +250,15 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       case Type.Array(n, e) => (address(receiver), Some(n.toString), e)
       case w: Type.View =>
         val v = genExpr(receiver)
-        val p = freshTemp(); emit(s"$p = extractvalue ${w.llvm} $v, 1")
-        val l = freshTemp(); emit(s"$l = extractvalue ${w.llvm} $v, 2")
+        val p = freshTemp(); emit(Inst.Extract(Val.Raw(p), w.lty, Val.Raw(v), List(1)))
+        val l = freshTemp(); emit(Inst.Extract(Val.Raw(l), w.lty, Val.Raw(v), List(2)))
         (p, Some(l), w.elem)
       case Type.Ptr(e) => (genExpr(receiver), None, e)
       case other       => sys.error(s"unreachable index into ${other.llvm}")
 
     val i = widenIndex(index)
     for l <- len do boundsCheck(i, l)
-    val r = freshTemp(); emit(s"$r = getelementptr ${elem.llvm}, ptr $base, $word $i"); r
+    val r = freshTemp(); emit(Inst.Gep(Val.Raw(r), elem.lty, Val.Raw(base), List(Arg(wordLty, Val.Raw(i))))); r
   }
 
   /** Takes a view of some of an array's, a slice's, or a string's elements. The base is evaluated
@@ -282,9 +282,9 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
         (r, p, Some(n.toString))
       case s: Type.View =>
         val v = genExpr(base)
-        val o = freshTemp(); emit(s"$o = extractvalue ${s.llvm} $v, 0")
-        val p = freshTemp(); emit(s"$p = extractvalue ${s.llvm} $v, 1")
-        val l = freshTemp(); emit(s"$l = extractvalue ${s.llvm} $v, 2")
+        val o = freshTemp(); emit(Inst.Extract(Val.Raw(o), s.lty, Val.Raw(v), List(0)))
+        val p = freshTemp(); emit(Inst.Extract(Val.Raw(p), s.lty, Val.Raw(v), List(1)))
+        val l = freshTemp(); emit(Inst.Extract(Val.Raw(l), s.lty, Val.Raw(v), List(2)))
         (o, p, Some(l))
       // Storage this frame owns, or a `*T` region. A frame-backed array has no owner, so counting
       // it is a no-op — unless the escape analysis moved it to the heap, in which case the buffer
@@ -313,15 +313,15 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
         if !inclusive then v
         else
           for l <- len do
-            val within = freshTemp(); emit(s"$within = icmp ult $word $v, $l")
+            val within = freshTemp(); emit(Inst.IntCmp(Val.Raw(within), ICmp.Ult, wordLty, Val.Raw(v), Val.Raw(l)))
             trapUnless(Val.Raw(within), "bounds")
-          val e = freshTemp(); emit(s"$e = add $word $v, 1"); e
+          val e = freshTemp(); emit(Inst.Bin(Val.Raw(e), BinOp.Add, wordLty, Val.Raw(v), Val.Int(1))); e
 
     for l <- len if hi.isDefined && !inclusive do
-      val fits = freshTemp(); emit(s"$fits = icmp ule $word $end, $l")
+      val fits = freshTemp(); emit(Inst.IntCmp(Val.Raw(fits), ICmp.Ule, wordLty, Val.Raw(end), Val.Raw(l)))
       trapUnless(Val.Raw(fits), "bounds")
 
-    val ordered = freshTemp(); emit(s"$ordered = icmp ule $word $start, $end")
+    val ordered = freshTemp(); emit(Inst.IntCmp(Val.Raw(ordered), ICmp.Ule, wordLty, Val.Raw(start), Val.Raw(end)))
     trapUnless(Val.Raw(ordered), "bounds")
 
     // A substring has to be a string, so both ends must fall between characters. This runs after
@@ -333,16 +333,16 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       trapUnless(Val.Raw(strBoundary(first, l, start)), "boundary")
       trapUnless(Val.Raw(strBoundary(first, l, end)), "boundary")
 
-    val p = freshTemp(); emit(s"$p = getelementptr ${elem.llvm}, ptr $first, $word $start")
-    val n = freshTemp(); emit(s"$n = sub $word $end, $start")
+    val p = freshTemp(); emit(Inst.Gep(Val.Raw(p), elem.lty, Val.Raw(first), List(Arg(wordLty, Val.Raw(start)))))
+    val n = freshTemp(); emit(Inst.Bin(Val.Raw(n), BinOp.Sub, wordLty, Val.Raw(end), Val.Raw(start)))
 
     emit(s"call void @arc.retain_maybe(ptr $ownerV)")
     maybeHeap = true
     heap = true
 
-    val withOwner = freshTemp(); emit(s"$withOwner = insertvalue ${sliceTy.llvm} zeroinitializer, ptr $ownerV, 0")
-    val withPtr   = freshTemp(); emit(s"$withPtr = insertvalue ${sliceTy.llvm} $withOwner, ptr $p, 1")
-    val whole     = freshTemp(); emit(s"$whole = insertvalue ${sliceTy.llvm} $withPtr, $word $n, 2")
+    val withOwner = freshTemp(); emit(Inst.Insert(Val.Raw(withOwner), sliceTy.lty, Val.Zero, LType.Ptr, Val.Raw(ownerV), List(0)))
+    val withPtr   = freshTemp(); emit(Inst.Insert(Val.Raw(withPtr), sliceTy.lty, Val.Raw(withOwner), LType.Ptr, Val.Raw(p), List(1)))
+    val whole     = freshTemp(); emit(Inst.Insert(Val.Raw(whole), sliceTy.lty, Val.Raw(withPtr), wordLty, Val.Raw(n), List(2)))
 
     ownTemp(whole, sliceTy)
   }
@@ -427,7 +427,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       val base = addressUnder(r, root, at)
       val i    = widenIndex(index)
       boundsCheck(i, n.toString)
-      val x = freshTemp(); emit(s"$x = getelementptr ${elem.llvm}, ptr $base, $word $i")
+      val x = freshTemp(); emit(Inst.Gep(Val.Raw(x), elem.lty, Val.Raw(base), List(Arg(wordLty, Val.Raw(i)))))
       x
 
     case other => address(other)
@@ -436,10 +436,10 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val bn = bufName(elem)
     checked = true
 
-    val e1   = freshTemp(); emit(s"$e1 = getelementptr ${elem.llvm}, ptr null, i64 1")
-    val esz  = freshTemp(); emit(s"$esz = ptrtoint ptr $e1 to $word")
+    val e1   = freshTemp(); emit(Inst.Gep(Val.Raw(e1), elem.lty, Val.Null, List(Arg(LType.I(64), Val.Int(1)))))
+    val esz  = freshTemp(); emit(Inst.Cast(Val.Raw(esz), CastOp.PtrToInt, LType.Ptr, Val.Raw(e1), wordLty))
     val h1   = freshTemp(); emit(s"$h1 = getelementptr $bn, ptr null, i32 0, i32 ${headerFields + 1}")
-    val hsz  = freshTemp(); emit(s"$hsz = ptrtoint ptr $h1 to $word")
+    val hsz  = freshTemp(); emit(Inst.Cast(Val.Raw(hsz), CastOp.PtrToInt, LType.Ptr, Val.Raw(h1), wordLty))
 
     // The overflow intrinsics carry their width in the **name** as well as in the signature, so a
     // size computed at the machine's own width has to name the matching overload — and getting that
@@ -451,21 +451,21 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val add   = freshTemp(); emit(s"$add = call $pair @llvm.uadd.with.overflow.$word($word $bytes, $word $hsz)")
     val total = freshTemp(); emit(s"$total = extractvalue $pair $add, 0")
     val over2 = freshTemp(); emit(s"$over2 = extractvalue $pair $add, 1")
-    val over  = freshTemp(); emit(s"$over = or i1 $over1, $over2")
-    val fits  = freshTemp(); emit(s"$fits = xor i1 $over, true")
+    val over  = freshTemp(); emit(Inst.Bin(Val.Raw(over), BinOp.Or, i1, Val.Raw(over1), Val.Raw(over2)))
+    val fits  = freshTemp(); emit(Inst.Bin(Val.Raw(fits), BinOp.Xor, i1, Val.Raw(over), Val.Bool(true)))
     trapUnless(Val.Raw(fits), "size")
 
     val p   = freshTemp(); emit(s"$p = call ptr @$mallocSym($word $total)")
-    val got = freshTemp(); emit(s"$got = icmp ne ptr $p, null")
+    val got = freshTemp(); emit(Inst.IntCmp(Val.Raw(got), ICmp.Ne, LType.Ptr, Val.Raw(p), Val.Null))
     trapUnless(Val.Raw(got), "alloc")
 
-    emit(s"store $word 1, ptr $p")
+    emit(Inst.Store(wordLty, Val.Int(1), Val.Raw(p), Access.Plain))
     val hook = freshTemp(); emit(s"$hook = getelementptr $bn, ptr $p, i32 0, i32 1")
-    emit(s"store ptr ${dropBufFn(elem)}, ptr $hook")
+    emit(Inst.Store(LType.Ptr, Val.Raw(dropBufFn(elem)), Val.Raw(hook), Access.Plain))
     val wc   = freshTemp(); emit(s"$wc = getelementptr $bn, ptr $p, i32 0, i32 2")
-    emit(s"store $word 1, ptr $wc")
+    emit(Inst.Store(wordLty, Val.Int(1), Val.Raw(wc), Access.Plain))
     val lenp = freshTemp(); emit(s"$lenp = getelementptr $bn, ptr $p, i32 0, i32 $headerFields")
-    emit(s"store $word $n, ptr $lenp")
+    emit(Inst.Store(wordLty, Val.Raw(n), Val.Raw(lenp), Access.Plain))
     val data = freshTemp(); emit(s"$data = getelementptr $bn, ptr $p, i32 0, i32 ${headerFields + 1}")
 
     (p, data)
@@ -477,9 +477,9 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
   protected def bufferView(sliceTy: Type.Slice, box: String, data: String, n: String): String = {
     maybeHeap = true
 
-    val withOwner = freshTemp(); emit(s"$withOwner = insertvalue ${sliceTy.llvm} zeroinitializer, ptr $box, 0")
-    val withPtr   = freshTemp(); emit(s"$withPtr = insertvalue ${sliceTy.llvm} $withOwner, ptr $data, 1")
-    val whole     = freshTemp(); emit(s"$whole = insertvalue ${sliceTy.llvm} $withPtr, $word $n, 2")
+    val withOwner = freshTemp(); emit(Inst.Insert(Val.Raw(withOwner), sliceTy.lty, Val.Zero, LType.Ptr, Val.Raw(box), List(0)))
+    val withPtr   = freshTemp(); emit(Inst.Insert(Val.Raw(withPtr), sliceTy.lty, Val.Raw(withOwner), LType.Ptr, Val.Raw(data), List(1)))
+    val whole     = freshTemp(); emit(Inst.Insert(Val.Raw(whole), sliceTy.lty, Val.Raw(withPtr), wordLty, Val.Raw(n), List(2)))
 
     ownTemp(whole, sliceTy)
   }
@@ -500,7 +500,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * so a negative index arrives as a very large one and fails the same test.
    */
   protected def boundsCheck(i: String, len: String): Unit = {
-    val ok = freshTemp(); emit(s"$ok = icmp ult $word $i, $len")
+    val ok = freshTemp(); emit(Inst.IntCmp(Val.Raw(ok), ICmp.Ult, wordLty, Val.Raw(i), Val.Raw(len)))
     trapUnless(Val.Raw(ok), "bounds")
   }
 
@@ -516,7 +516,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     if en.simple then variant.tag.toString
     else if !variant.carries then
       val tagged = freshTemp()
-      emit(s"$tagged = insertvalue ${en.llvm} undef, i32 ${variant.tag}, 0")
+      emit(Inst.Insert(Val.Raw(tagged), en.lty, Val.Undef, i32, Val.Int(variant.tag), List(0)))
       tagged
     else
       var payload = "undef"
@@ -526,11 +526,11 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
           s"${variant.fields(i)._2.llvm} $v, ${variant.slot(i)}")
         payload = r
       val slot = scratchSlot(en.llvm)
-      emit(s"store i32 ${variant.tag}, ptr $slot")
+      emit(Inst.Store(i32, Val.Int(variant.tag), Val.Raw(slot), Access.Plain))
       val p = payloadPtr(en, slot)
-      emit(s"store ${en.payloadLlvm(variant)} $payload, ptr $p")
+      emit(Inst.Store(en.payloadLty(variant), Val.Raw(payload), Val.Raw(p), Access.Plain))
       val r = freshTemp()
-      emit(s"$r = load ${en.llvm}, ptr $slot")
+      emit(Inst.Load(Val.Raw(r), en.lty, Val.Raw(slot), Access.Plain))
       r
 
   /** Whether an integer `v` of type `vt` equals one of the enum's declared discriminants — the
@@ -541,7 +541,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
   protected def enumMembership(en: Type.Enum, vt: Type.Integer, v: String): String = {
     val wide = convert(vt, Type.Integer(64, vt.signed), v)
     en.variants.map { variant =>
-      val eq = freshTemp(); emit(s"$eq = icmp eq i64 $wide, ${variant.tag}")
+      val eq = freshTemp(); emit(Inst.IntCmp(Val.Raw(eq), ICmp.Eq, LType.I(64), Val.Raw(wide), Val.Int(variant.tag)))
       eq
     }.reduceOption(orI1).getOrElse("false")
   }
@@ -575,13 +575,13 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     emitTerm(Inst.CondBr(Val.Raw(ok), someL, noneL))
     emitLabel(someL)
     val ev = convert(vt, en.underlying, v)
-    emit(s"store ${optTy.llvm} ${enumValue(optTy, some, List(ev))}, ptr $slot")
+    emit(Inst.Store(optTy.lty, Val.Raw(enumValue(optTy, some, List(ev))), Val.Raw(slot), Access.Plain))
     emitTerm(Inst.Br(endL))
     emitLabel(noneL)
-    emit(s"store ${optTy.llvm} ${enumValue(optTy, none, Nil)}, ptr $slot")
+    emit(Inst.Store(optTy.lty, Val.Raw(enumValue(optTy, none, Nil)), Val.Raw(slot), Access.Plain))
     emitTerm(Inst.Br(endL))
     emitLabel(endL)
-    val r = freshTemp(); emit(s"$r = load ${optTy.llvm}, ptr $slot"); r
+    val r = freshTemp(); emit(Inst.Load(Val.Raw(r), optTy.lty, Val.Raw(slot), Access.Plain)); r
   }
 
   /** Weakens a reference: the same address, counted in the box's third word instead of its first
@@ -611,10 +611,10 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     weakHeap = true
     val fat  = value.ty.asInstanceOf[Type.Weak].inner.isInstanceOf[Type.Trait]
     val v    = genExpr(value)
-    val addr = if fat then { val b = freshTemp(); emit(s"$b = extractvalue ${Type.fatPointer} $v, 1"); b } else v
+    val addr = if fat then { val b = freshTemp(); emit(Inst.Extract(Val.Raw(b), LType.fat, Val.Raw(v), List(1))); b } else v
 
     val got   = freshTemp(); emit(s"$got = call ptr @arc.upgrade(ptr $addr)")
-    val live  = freshTemp(); emit(s"$live = icmp ne ptr $got, null")
+    val live  = freshTemp(); emit(Inst.IntCmp(Val.Raw(live), ICmp.Ne, LType.Ptr, Val.Raw(got), Val.Null))
     val slot  = emitAlloca(freshTemp(), optTy.llvm)
     val someL = freshLabel("weak.live")
     val noneL = freshLabel("weak.gone")
@@ -625,17 +625,17 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val strong =
       if !fat then got
       else
-        val tbl = freshTemp(); emit(s"$tbl = extractvalue ${Type.fatPointer} $v, 0")
-        val f0  = freshTemp(); emit(s"$f0 = insertvalue ${Type.fatPointer} undef, ptr $tbl, 0")
-        val f1  = freshTemp(); emit(s"$f1 = insertvalue ${Type.fatPointer} $f0, ptr $got, 1")
+        val tbl = freshTemp(); emit(Inst.Extract(Val.Raw(tbl), LType.fat, Val.Raw(v), List(0)))
+        val f0  = freshTemp(); emit(Inst.Insert(Val.Raw(f0), LType.fat, Val.Undef, LType.Ptr, Val.Raw(tbl), List(0)))
+        val f1  = freshTemp(); emit(Inst.Insert(Val.Raw(f1), LType.fat, Val.Raw(f0), LType.Ptr, Val.Raw(got), List(1)))
         f1
-    emit(s"store ${optTy.llvm} ${enumValue(optTy, some, List(strong))}, ptr $slot")
+    emit(Inst.Store(optTy.lty, Val.Raw(enumValue(optTy, some, List(strong))), Val.Raw(slot), Access.Plain))
     emitTerm(Inst.Br(endL))
     emitLabel(noneL)
-    emit(s"store ${optTy.llvm} ${enumValue(optTy, none, Nil)}, ptr $slot")
+    emit(Inst.Store(optTy.lty, Val.Raw(enumValue(optTy, none, Nil)), Val.Raw(slot), Access.Plain))
     emitTerm(Inst.Br(endL))
     emitLabel(endL)
-    val r = freshTemp(); emit(s"$r = load ${optTy.llvm}, ptr $slot")
+    val r = freshTemp(); emit(Inst.Load(Val.Raw(r), optTy.lty, Val.Raw(slot), Access.Plain))
     ownTemp(r, optTy)
   }
 
@@ -648,7 +648,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
         if Type.zeroSized(variant.fields(i)._2) then ""
         else
           val f = freshTemp()
-          emit(s"$f = extractvalue ${en.payloadLlvm(variant)} $p, ${variant.slot(i)}")
+          emit(Inst.Extract(Val.Raw(f), en.payloadLty(variant), Val.Raw(p), List(variant.slot(i))))
           f
       }.toList
 
@@ -666,8 +666,8 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val en = operand.ty.asInstanceOf[Type.Enum]
     val v  = genExpr(operand)
 
-    val tag  = freshTemp(); emit(s"$tag = extractvalue ${en.llvm} $v, 0")
-    val isOk = freshTemp(); emit(s"$isOk = icmp eq i32 $tag, ${ok.tag}")
+    val tag  = freshTemp(); emit(Inst.Extract(Val.Raw(tag), en.lty, Val.Raw(v), List(0)))
+    val isOk = freshTemp(); emit(Inst.IntCmp(Val.Raw(isOk), ICmp.Eq, i32, Val.Raw(tag), Val.Int(ok.tag)))
 
     val okL   = freshLabel("try.ok")
     val failL = freshLabel("try.fail")

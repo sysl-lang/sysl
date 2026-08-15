@@ -1,6 +1,6 @@
 package sh.sysl
 
-import ir.{Inst, Val}
+import ir.{Access, Arg, BinOp, CastOp, FCmp, ICmp, Inst, LType, Val}
 
 import scala.collection.mutable
 
@@ -353,12 +353,12 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     val missing = freshLabel("test.missing")
     val enough  = freshTemp()
 
-    emit(s"$enough = icmp sgt i32 %argc, 1")
+    emit(Inst.IntCmp(Val.Raw(enough), ICmp.Sgt, i32, Val.Raw("%argc"), Val.Int(1)))
     emitTerm(Inst.CondBr(Val.Raw(enough), named, missing))
 
     emitLabel(named)
-    val slot = freshTemp(); emit(s"$slot = getelementptr ptr, ptr %argv, i64 1")
-    val want = freshTemp(); emit(s"$want = load ptr, ptr $slot")
+    val slot = freshTemp(); emit(Inst.Gep(Val.Raw(slot), LType.Ptr, Val.Raw("%argv"), List(Arg(LType.I(64), Val.Int(1)))))
+    val want = freshTemp(); emit(Inst.Load(Val.Raw(want), LType.Ptr, Val.Raw(slot), Access.Plain))
 
     // Each arm compares the wanted name against one test's key and calls it on a match. The keys are
     // interned with the terminator `strcmp` reads to, which an ordinary sysl string constant does not
@@ -367,7 +367,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       val run  = freshLabel("test.run")
       val next = freshLabel("test.next")
       val cmp  = freshTemp(); emit(s"$cmp = call i32 @strcmp(ptr $want, ptr ${stringGlobal(t.func + "\u0000")})")
-      val hit  = freshTemp(); emit(s"$hit = icmp eq i32 $cmp, 0")
+      val hit  = freshTemp(); emit(Inst.IntCmp(Val.Raw(hit), ICmp.Eq, i32, Val.Raw(cmp), Val.Int(0)))
 
       emitTerm(Inst.CondBr(Val.Raw(hit), run, next))
       emitLabel(run)
@@ -465,7 +465,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       case None if Type.noValue(f.retTy) =>
         emitEnsures(None); releaseAll(); emitTerm("ret void")
       case None if layout.indirect(f.retTy) =>
-        emit(s"store ${f.retTy.llvm} zeroinitializer, ptr $sretParam")
+        emit(Inst.Store(f.retTy.lty, Val.Zero, Val.Raw(sretParam), Access.Plain))
         releaseAll(); emitTerm("ret void")
       case None =>
         releaseAll(); emitTerm(s"ret ${f.retTy.llvm} ${zero(f.retTy)}")
@@ -502,7 +502,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     genOwnedInto(sretParam, r)
 
     if ensures.nonEmpty then
-      val v = freshTemp(); emit(s"$v = load ${r.ty.llvm}, ptr $sretParam")
+      val v = freshTemp(); emit(Inst.Load(Val.Raw(v), r.ty.lty, Val.Raw(sretParam), Access.Plain))
       emitEnsures(Some(v))
     else emitEnsures(None)
 
@@ -629,7 +629,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       opt.foreach { t =>
         val v = genExpr(t)
         retainValue(t.ty, v)
-        emit(s"store ${t.ty.llvm} $v, ptr ${loop.slot}")
+        emit(Inst.Store(t.ty.lty, Val.Raw(v), Val.Raw(loop.slot), Access.Plain))
       }
       releaseToDepth(loop.ownedDepth, loop.tempDepth)
       emitTerm(Inst.Br(loop.breakL))

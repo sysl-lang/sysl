@@ -1,6 +1,6 @@
 package sh.sysl
 
-import ir.{Inst, Val}
+import ir.{Access, Arg, BinOp, CastOp, ICmp, Inst, LType, Val}
 
 /** Everything that makes a basic block: `if`, `match` and its patterns, and the three loops.
  *
@@ -48,7 +48,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
     if Type.noValue(ty) then ""
     // Each branch handed its value over with a count taken, so what the merge loads is the
     // one temporary the enclosing region has to let go of.
-    else { val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot"); ownTemp(r, ty) }
+    else { val r = freshTemp(); emit(Inst.Load(Val.Raw(r), ty.lty, Val.Raw(slot), Access.Plain)); ownTemp(r, ty) }
   }
 
   /** What emitting a condition left open: the owned scopes its `is` terms pushed for their
@@ -169,7 +169,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
    */
   protected def storeBlockValue(b: TBlock, ty: Type, slot: String): Unit =
     if b.ty == Type.Never then genBlockVoid(b)
-    else emit(s"store ${ty.llvm} ${genBlockValue(b)}, ptr $slot")
+    else emit(Inst.Store(ty.lty, Val.Raw(genBlockValue(b)), Val.Raw(slot), Access.Plain))
 
   /** Closes the merge point of an `if`, a `match`, or a loop whose every path diverges: no branch
    * arrives, so the label control would have landed on is unreachable.
@@ -235,7 +235,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
     emitLabel(endL)
     endsNowhere(ty)
     if Type.noValue(ty) then ""
-    else { val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot"); ownTemp(r, ty) }
+    else { val r = freshTemp(); emit(Inst.Load(Val.Raw(r), ty.lty, Val.Raw(slot), Access.Plain)); ownTemp(r, ty) }
   }
 
   /** The i1 result of testing a pattern against a value. Every pattern node carries the type it
@@ -260,8 +260,8 @@ trait ControlFlowEmitter extends PlaceEmitter {
     case TVariantPattern(en, variant, args) =>
       val tagVal =
         if en.simple then value
-        else { val t = freshTemp(); emit(s"$t = extractvalue ${en.llvm} $value, 0"); t }
-      val tagOk = freshTemp(); emit(s"$tagOk = icmp eq ${en.tagLlvm} $tagVal, ${variant.tag}")
+        else { val t = freshTemp(); emit(Inst.Extract(Val.Raw(t), en.lty, Val.Raw(value), List(0))); t }
+      val tagOk = freshTemp(); emit(Inst.IntCmp(Val.Raw(tagOk), ICmp.Eq, en.tagLty, Val.Raw(tagVal), Val.Int(variant.tag)))
 
       // Nothing in the payload to ask about — a variant with no fields, or one destructured only
       // into bindings, which `patternBind` establishes later and after the arm has been taken.
@@ -273,7 +273,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
         val testL  = freshLabel("pat.payload")
         val doneL  = freshLabel("pat.done")
 
-        emit(s"store i1 false, ptr $answer")
+        emit(Inst.Store(i1, Val.Bool(false), Val.Raw(answer), Access.Plain))
         emitTerm(Inst.CondBr(Val.Raw(tagOk), testL, doneL))
         emitLabel(testL)
 
@@ -283,11 +283,11 @@ trait ControlFlowEmitter extends PlaceEmitter {
           else andI1(acc, patternTest(arg, payloadField(en, variant, payload, i)))
         }
 
-        emit(s"store i1 $inner, ptr $answer")
+        emit(Inst.Store(i1, Val.Raw(inner), Val.Raw(answer), Access.Plain))
         emitTerm(Inst.Br(doneL))
         emitLabel(doneL)
 
-        val r = freshTemp(); emit(s"$r = load i1, ptr $answer"); r
+        val r = freshTemp(); emit(Inst.Load(Val.Raw(r), i1, Val.Raw(answer), Access.Plain)); r
 
     // A struct has no tag, so the test is just its refutable fields' tests ANDed together; an
     // irrefutable field needs none, so nothing is emitted for the parts a named pattern omitted.
@@ -331,7 +331,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
     if Type.zeroSized(variant.fields(i)._2) then ""
     else
       val fv = freshTemp()
-      emit(s"$fv = extractvalue ${en.payloadLlvm(variant)} $payload, ${variant.slot(i)}")
+      emit(Inst.Extract(Val.Raw(fv), en.payloadLty(variant), Val.Raw(payload), List(variant.slot(i))))
       fv
 
   /** One field of a struct being destructured — a bit range of the container where the struct is a
@@ -343,11 +343,11 @@ trait ControlFlowEmitter extends PlaceEmitter {
       Bitfields.of(struct) match
         case Some(ranges) =>
           val c = freshTemp()
-          emit(s"$c = extractvalue ${struct.llvm} $value, 0")
+          emit(Inst.Extract(Val.Raw(c), struct.lty, Val.Raw(value), List(0)))
           readBits(ranges, ranges(struct.slot(i)), c)
         case None =>
           val fv = freshTemp()
-          emit(s"$fv = extractvalue ${struct.llvm} $value, ${struct.slot(i)}")
+          emit(Inst.Extract(Val.Raw(fv), struct.lty, Val.Raw(value), List(struct.slot(i))))
           fv
 
   private def bindsAny(p: TPattern): Boolean = p match
@@ -528,7 +528,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
     val endL  = freshLabel("quant.end")
     val acc   = emitAlloca(freshTemp(), "i1")
 
-    emit(s"store i1 ${if universal then 1 else 0}, ptr $acc")
+    emit(Inst.Store(i1, Val.Int(if universal then 1 else 0), Val.Raw(acc), Access.Plain))
     emitAlloca(s"%$name.addr", w)
     emit(s"store $w $loV, ptr %$name.addr")
 
@@ -547,7 +547,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
     else emitTerm(Inst.CondBr(Val.Raw(p), doneL, stepL))
 
     emitLabel(doneL)
-    emit(s"store i1 ${if universal then 0 else 1}, ptr $acc")
+    emit(Inst.Store(i1, Val.Int(if universal then 0 else 1), Val.Raw(acc), Access.Plain))
     emitTerm(Inst.Br(endL))
 
     emitLabel(stepL)
@@ -557,7 +557,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
     emitTerm(Inst.Br(condL))
 
     emitLabel(endL)
-    val res = freshTemp(); emit(s"$res = load i1, ptr $acc"); res
+    val res = freshTemp(); emit(Inst.Load(Val.Raw(res), i1, Val.Raw(acc), Access.Plain)); res
   }
 
   /** The three-clause loop. It is `genFor`'s shape with both fixed parts opened up: the test is
@@ -614,8 +614,8 @@ trait ControlFlowEmitter extends PlaceEmitter {
       case Type.Array(n, _) => (address(seq), n.toString)
       case s: Type.Slice =>
         val v = genExpr(seq)
-        val p = freshTemp(); emit(s"$p = extractvalue ${s.llvm} $v, 1")
-        val l = freshTemp(); emit(s"$l = extractvalue ${s.llvm} $v, 2")
+        val p = freshTemp(); emit(Inst.Extract(Val.Raw(p), s.lty, Val.Raw(v), List(1)))
+        val l = freshTemp(); emit(Inst.Extract(Val.Raw(l), s.lty, Val.Raw(v), List(2)))
         (p, l)
       case other => sys.error(s"unreachable iteration over ${other.llvm}")
 
@@ -626,17 +626,17 @@ trait ControlFlowEmitter extends PlaceEmitter {
     val endL  = freshLabel("each.end")
     val elseL = if elseBlock.isDefined then freshLabel("each.else") else endL
     val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
-    emit(s"store $word 0, ptr $idx")
+    emit(Inst.Store(wordLty, Val.Int(0), Val.Raw(idx), Access.Plain))
     genLoops = GenLoop(endL, stepL, slot, ty, owned.length, tempStack.length) :: genLoops
 
     emitTerm(Inst.Br(condL))
     emitLabel(condL)
-    val iv   = freshTemp(); emit(s"$iv = load $word, ptr $idx")
-    val more = freshTemp(); emit(s"$more = icmp ult $word $iv, $len")
+    val iv   = freshTemp(); emit(Inst.Load(Val.Raw(iv), wordLty, Val.Raw(idx), Access.Plain))
+    val more = freshTemp(); emit(Inst.IntCmp(Val.Raw(more), ICmp.Ult, wordLty, Val.Raw(iv), Val.Raw(len)))
     emitTerm(Inst.CondBr(Val.Raw(more), bodyL, elseL))
     emitLabel(bodyL)
-    val ep = freshTemp(); emit(s"$ep = getelementptr ${elemTy.llvm}, ptr $base, $word $iv")
-    val ev = freshTemp(); emit(s"$ev = load ${elemTy.llvm}, ptr $ep")
+    val ep = freshTemp(); emit(Inst.Gep(Val.Raw(ep), elemTy.lty, Val.Raw(base), List(Arg(wordLty, Val.Raw(iv)))))
+    val ev = freshTemp(); emit(Inst.Load(Val.Raw(ev), elemTy.lty, Val.Raw(ep), Access.Plain))
     emitAlloca(s"%$name.addr", elemTy.llvm)
     retainValue(elemTy, ev)
     emit(s"store ${elemTy.llvm} $ev, ptr %$name.addr")
@@ -646,8 +646,8 @@ trait ControlFlowEmitter extends PlaceEmitter {
     popOwned()
     emitTerm(Inst.Br(stepL))
     emitLabel(stepL)
-    val nxt = freshTemp(); emit(s"$nxt = add $word $iv, 1")
-    emit(s"store $word $nxt, ptr $idx")
+    val nxt = freshTemp(); emit(Inst.Bin(Val.Raw(nxt), BinOp.Add, wordLty, Val.Raw(iv), Val.Int(1)))
+    emit(Inst.Store(wordLty, Val.Raw(nxt), Val.Raw(idx), Access.Plain))
     emitTerm(Inst.Br(condL))
 
     genLoops = genLoops.tail
@@ -726,7 +726,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
     emitLabel(endL)
     endsNowhere(ty)
     if Type.noValue(ty) then ""
-    else { val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot"); ownTemp(r, ty) }
+    else { val r = freshTemp(); emit(Inst.Load(Val.Raw(r), ty.lty, Val.Raw(slot), Access.Plain)); ownTemp(r, ty) }
   }
 
   protected def genBlockVoid(b: TBlock): Unit = {

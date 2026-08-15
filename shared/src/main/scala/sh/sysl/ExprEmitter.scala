@@ -1,6 +1,6 @@
 package sh.sysl
 
-import ir.{Arg, Inst, LType, Val}
+import ir.{Access, Arg, BinOp, CastOp, FCmp, ICmp, Inst, LType, Val}
 
 /** The expression dispatch.
  *
@@ -65,8 +65,8 @@ trait ExprEmitter extends ArithEmitter {
 
       for (v, i) <- vals.zipWithIndex do
         retainValue(sliceTy.elem, v)
-        val ep = freshTemp(); emit(s"$ep = getelementptr ${sliceTy.elem.llvm}, ptr $data, $word $i")
-        emit(s"store ${sliceTy.elem.llvm} $v, ptr $ep")
+        val ep = freshTemp(); emit(Inst.Gep(Val.Raw(ep), sliceTy.elem.lty, Val.Raw(data), List(Arg(wordLty, Val.Int(i)))))
+        emit(Inst.Store(sliceTy.elem.lty, Val.Raw(v), Val.Raw(ep), Access.Plain))
 
       bufferView(sliceTy, box, data, vals.length.toString)
 
@@ -93,7 +93,7 @@ trait ExprEmitter extends ArithEmitter {
         case Type.Array(n, _) => genExpr(receiver); n.toString
         case w: Type.View =>
           val v = genExpr(receiver)
-          val r = freshTemp(); emit(s"$r = extractvalue ${w.llvm} $v, 2"); r
+          val r = freshTemp(); emit(Inst.Extract(Val.Raw(r), w.lty, Val.Raw(v), List(2))); r
         case other => sys.error(s"unreachable length of ${other.llvm}")
 
     // A string and a `[]u8` are the same three words, so looking at one as the other is nothing
@@ -104,7 +104,7 @@ trait ExprEmitter extends ArithEmitter {
     // A narrower float is the `double` constant rounded to it, which folds away entirely.
     case TFloatLit(bits, ty) =>
       if ty == Type.Real then bits
-      else { val r = freshTemp(); emit(s"$r = fptrunc double $bits to ${ty.llvm}"); r }
+      else { val r = freshTemp(); emit(Inst.Cast(Val.Raw(r), CastOp.FPTrunc, LType.F(64), Val.Raw(bits), ty.lty)); r }
 
     case TCast(operand, ty) =>
       // A constrained operand converts from its base representation — `f64(m)` reaches the double a
@@ -116,7 +116,7 @@ trait ExprEmitter extends ArithEmitter {
       val base = Type.underlying(c.base)
       val geLo = compareValue(">=", base, v, c.lo.get.toBigInt.toString)
       val leHi = compareValue(if c.exclusiveHi then "<" else "<=", base, v, c.hi.get.toBigInt.toString)
-      val r = freshTemp(); emit(s"$r = and i1 $geLo, $leHi"); r
+      val r = freshTemp(); emit(Inst.Bin(Val.Raw(r), BinOp.And, i1, Val.Raw(geLo), Val.Raw(leHi))); r
 
     case TConstrainedStep(value, c, up, _) =>
       val v    = genExpr(value)
@@ -229,8 +229,8 @@ trait ExprEmitter extends ArithEmitter {
       heap = true
       val fn  = request("sysl.str.from_bytes")(StringEmitter.fromBytes)
       val v   = genExpr(arg)
-      val p   = freshTemp(); emit(s"$p = extractvalue ${arg.ty.llvm} $v, 1")
-      val n   = freshTemp(); emit(s"$n = extractvalue ${arg.ty.llvm} $v, 2")
+      val p   = freshTemp(); emit(Inst.Extract(Val.Raw(p), arg.ty.lty, Val.Raw(v), List(1)))
+      val n   = freshTemp(); emit(Inst.Extract(Val.Raw(n), arg.ty.lty, Val.Raw(v), List(2)))
       val r   = freshTemp(); emit(s"$r = call ${Type.Str.llvm} @$fn(ptr $p, $word $n)")
       ownTemp(r, Type.Str)
 
@@ -249,17 +249,17 @@ trait ExprEmitter extends ArithEmitter {
 
       emit(s"store $bufferLayout zeroinitializer, ptr $slot")
       val a = freshTemp(); emit(s"$a = insertvalue ${Type.fatPointer} undef, ptr @$table, 0")
-      val w = freshTemp(); emit(s"$w = insertvalue ${Type.fatPointer} $a, ptr $slot, 1")
+      val w = freshTemp(); emit(Inst.Insert(Val.Raw(w), LType.fat, Val.Raw(a), LType.Ptr, Val.Raw(slot), List(1)))
 
       // A trait object renders through the table it carries, so the callee and the receiver both
       // come out of the value: the data word is the receiver a slot's entry expects, exactly as it
       // is for any other call through one.
       vslot match
         case Some(n) =>
-          val vt   = freshTemp(); emit(s"$vt = extractvalue ${Type.fatPointer} $v, 0")
-          val data = freshTemp(); emit(s"$data = extractvalue ${Type.fatPointer} $v, 1")
-          val e    = freshTemp(); emit(s"$e = getelementptr ptr, ptr $vt, $word $n")
-          val fn   = freshTemp(); emit(s"$fn = load ptr, ptr $e")
+          val vt   = freshTemp(); emit(Inst.Extract(Val.Raw(vt), LType.fat, Val.Raw(v), List(0)))
+          val data = freshTemp(); emit(Inst.Extract(Val.Raw(data), LType.fat, Val.Raw(v), List(1)))
+          val e    = freshTemp(); emit(Inst.Gep(Val.Raw(e), LType.Ptr, Val.Raw(vt), List(Arg(wordLty, Val.Int(n)))))
+          val fn   = freshTemp(); emit(Inst.Load(Val.Raw(fn), LType.Ptr, Val.Raw(e), Access.Plain))
 
           emit(s"call void $fn(ptr $data, ${Type.fatPointer} $w, ${spec.ty.llvm} $s)")
         case None =>
@@ -286,14 +286,14 @@ trait ExprEmitter extends ArithEmitter {
         case _           => 1
       val (lv, rv) = (genExpr(l), genExpr(r))
       val (la, ra) = (freshTemp(), freshTemp())
-      emit(s"$la = ptrtoint ptr $lv to ${Type.isize.llvm}")
-      emit(s"$ra = ptrtoint ptr $rv to ${Type.isize.llvm}")
+      emit(Inst.Cast(Val.Raw(la), CastOp.PtrToInt, LType.Ptr, Val.Raw(lv), Type.isize.lty))
+      emit(Inst.Cast(Val.Raw(ra), CastOp.PtrToInt, LType.Ptr, Val.Raw(rv), Type.isize.lty))
       val bytes = freshTemp()
-      emit(s"$bytes = sub ${Type.isize.llvm} $la, $ra")
+      emit(Inst.Bin(Val.Raw(bytes), BinOp.Sub, Type.isize.lty, Val.Raw(la), Val.Raw(ra)))
       if stride <= 1 then bytes
       else
         val n = freshTemp()
-        emit(s"$n = sdiv ${Type.isize.llvm} $bytes, $stride")
+        emit(Inst.Bin(Val.Raw(n), BinOp.SDiv, Type.isize.lty, Val.Raw(bytes), Val.Int(stride)))
         n
 
     case TBinary(op, l, r, _) =>
@@ -311,13 +311,13 @@ trait ExprEmitter extends ArithEmitter {
         case _                                                 => arith(op, bt, lv, rv)
 
     case TUnary("-", operand, ty) if Type.underlying(ty).isInstanceOf[Type.Integer] =>
-      val v = genExpr(operand); val r = freshTemp(); emit(s"$r = sub ${ty.llvm} 0, $v"); r
+      val v = genExpr(operand); val r = freshTemp(); emit(Inst.Bin(Val.Raw(r), BinOp.Sub, ty.lty, Val.Int(0), Val.Raw(v))); r
     case TUnary("-", operand, ty) if Type.underlying(ty).isInstanceOf[Type.Floating] =>
       val v = genExpr(operand); val r = freshTemp(); emit(s"$r = fneg ${ty.llvm} $v"); r
     case TUnary("!", operand, _) =>
-      val v = genExpr(operand); val r = freshTemp(); emit(s"$r = xor i1 $v, true"); r
+      val v = genExpr(operand); val r = freshTemp(); emit(Inst.Bin(Val.Raw(r), BinOp.Xor, i1, Val.Raw(v), Val.Bool(true))); r
     case TUnary("~", operand, ty) =>
-      val v = genExpr(operand); val r = freshTemp(); emit(s"$r = xor ${ty.llvm} $v, -1"); r
+      val v = genExpr(operand); val r = freshTemp(); emit(Inst.Bin(Val.Raw(r), BinOp.Xor, ty.lty, Val.Raw(v), Val.Int(-1))); r
     case TUnary(op, _, _) =>
       sys.error(s"unreachable unary '$op'")
 
@@ -423,7 +423,7 @@ trait ExprEmitter extends ArithEmitter {
     case TLogical(op, l, r) =>
       val lv   = genExpr(l)
       val slot = emitAlloca(freshTemp(), "i1")
-      emit(s"store i1 $lv, ptr $slot")
+      emit(Inst.Store(i1, Val.Raw(lv), Val.Raw(slot), Access.Plain))
       val rhsL = freshLabel("sc.rhs")
       val endL = freshLabel("sc.end")
       if op == "&&" then emitTerm(Inst.CondBr(Val.Raw(lv), rhsL, endL))
@@ -433,11 +433,11 @@ trait ExprEmitter extends ArithEmitter {
       // merge, and if the branch is skipped that code never runs at all.
       pushTemps()
       val rv = genExpr(r)
-      emit(s"store i1 $rv, ptr $slot")
+      emit(Inst.Store(i1, Val.Raw(rv), Val.Raw(slot), Access.Plain))
       popTemps()
       emitTerm(Inst.Br(endL))
       emitLabel(endL)
-      val res = freshTemp(); emit(s"$res = load i1, ptr $slot"); res
+      val res = freshTemp(); emit(Inst.Load(Val.Raw(res), i1, Val.Raw(slot), Access.Plain)); res
 
     // One comparison has nothing to short-circuit, so it stays straight-line — which is what the
     // overwhelming majority of comparisons are.
@@ -473,7 +473,7 @@ trait ExprEmitter extends ArithEmitter {
         val right = genExpr(operands(k + 1))
         val c     = comparison(cmps(k), operands(k).ty, left, right)
 
-        emit(s"store i1 $c, ptr $slot")
+        emit(Inst.Store(i1, Val.Raw(c), Val.Raw(slot), Access.Plain))
 
         if k == cmps.length - 1 then emitTerm(Inst.Br(exits(k)))
         else
@@ -489,7 +489,7 @@ trait ExprEmitter extends ArithEmitter {
         emitTerm(Inst.Br(if k == 0 then endL else exits(k - 1)))
 
       emitLabel(endL)
-      val res = freshTemp(); emit(s"$res = load i1, ptr $slot"); res
+      val res = freshTemp(); emit(Inst.Load(Val.Raw(res), i1, Val.Raw(slot), Access.Plain)); res
 
     case TSeq(exprs) =>
       exprs.foreach(genExpr); ""
@@ -539,18 +539,18 @@ trait ExprEmitter extends ArithEmitter {
     case TErase(operand, vtable, _) =>
       val d = genExpr(operand)
       val a = freshTemp(); emit(s"$a = insertvalue ${Type.fatPointer} undef, ptr @$vtable, 0")
-      val b = freshTemp(); emit(s"$b = insertvalue ${Type.fatPointer} $a, ptr $d, 1")
+      val b = freshTemp(); emit(Inst.Insert(Val.Raw(b), LType.fat, Val.Raw(a), LType.Ptr, Val.Raw(d), List(1)))
       b
 
     // A call whose callee is a word in the object's table rather than a name. The data word goes in
     // front of the declared arguments, which is the shape every slot was built to.
     case TVCall(receiver, slot, args, ty, _) =>
       val obj     = genExpr(receiver)
-      val table   = freshTemp(); emit(s"$table = extractvalue ${Type.fatPointer} $obj, 0")
-      val data    = freshTemp(); emit(s"$data = extractvalue ${Type.fatPointer} $obj, 1")
+      val table   = freshTemp(); emit(Inst.Extract(Val.Raw(table), LType.fat, Val.Raw(obj), List(0)))
+      val data    = freshTemp(); emit(Inst.Extract(Val.Raw(data), LType.fat, Val.Raw(obj), List(1)))
       val argVals = argList(args)
-      val entry   = freshTemp(); emit(s"$entry = getelementptr ptr, ptr $table, $word $slot")
-      val fn      = freshTemp(); emit(s"$fn = load ptr, ptr $entry")
+      val entry   = freshTemp(); emit(Inst.Gep(Val.Raw(entry), LType.Ptr, Val.Raw(table), List(Arg(wordLty, Val.Int(slot)))))
+      val fn      = freshTemp(); emit(Inst.Load(Val.Raw(fn), LType.Ptr, Val.Raw(entry), Access.Plain))
       genSyslCall(s"${syslResult(ty)} $fn", Arg(LType.Ptr, Val.Raw(data)) :: argVals, ty, None)
 
     // The tail walk is the ABI's, so all three are LLVM's own: two intrinsic calls and the one
@@ -579,7 +579,7 @@ trait ExprEmitter extends ArithEmitter {
         case VaListAbi.Address => addr
 
         case VaListAbi.Loaded =>
-          val r = freshTemp(); emit(s"$r = load ptr, ptr $addr"); r
+          val r = freshTemp(); emit(Inst.Load(Val.Raw(r), LType.Ptr, Val.Raw(addr), Access.Plain)); r
 
         case VaListAbi.Copied =>
           usesMemcpy = true
@@ -611,7 +611,7 @@ trait ExprEmitter extends ArithEmitter {
       val c      = buildBits(ranges, vals.collect { case (v, ft) if !Type.zeroSized(ft) => v })
       val r      = freshTemp()
 
-      emit(s"$r = insertvalue ${struct.llvm} undef, ${containerLlvm(ranges)} $c, 0")
+      emit(Inst.Insert(Val.Raw(r), struct.lty, Val.Undef, containerLty(ranges), Val.Raw(c), List(0)))
       r
 
     case TStructNew(struct, args) =>
@@ -673,7 +673,7 @@ trait ExprEmitter extends ArithEmitter {
           val t = freshTemp(); emit(s"$t = load$q $ct, ptr $p"); t
         else
           val rv = genExpr(receiver)
-          val t  = freshTemp(); emit(s"$t = extractvalue ${receiver.ty.llvm} $rv, 0"); t
+          val t  = freshTemp(); emit(Inst.Extract(Val.Raw(t), receiver.ty.lty, Val.Raw(rv), List(0))); t
 
       readBits(ranges, bitRange(receiver.ty, index).get, c)
 
@@ -689,11 +689,11 @@ trait ExprEmitter extends ArithEmitter {
     // kilobytes that is a first-class aggregate emitted to read four bytes out of it.
     case e @ TField(receiver, _, ty) if layout.indirect(receiver.ty) && hasAddress(receiver) =>
       val p = address(e)
-      val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $p"); r
+      val r = freshTemp(); emit(Inst.Load(Val.Raw(r), ty.lty, Val.Raw(p), Access.Plain)); r
 
     case TField(receiver, index, ty) =>
       val rv = genExpr(receiver); val r = freshTemp()
-      emit(s"$r = extractvalue ${receiver.ty.llvm} $rv, ${fieldSlot(receiver.ty, index)}"); r
+      emit(Inst.Extract(Val.Raw(r), receiver.ty.lty, Val.Raw(rv), List(fieldSlot(receiver.ty, index)))); r
 
     case TIf(cond, thenBlock, elseBlock, ty) =>
       genIf(cond, thenBlock, elseBlock, ty)
