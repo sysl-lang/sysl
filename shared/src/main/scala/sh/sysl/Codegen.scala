@@ -255,7 +255,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     val value = genExpr(init)
 
     if containsRef(v.ty) then retainValue(v.ty, value)
-    emit(Inst.Store(v.ty.lty, Val.Raw(value), Val.Global(v.symbol), Access.Plain))
+    emit(Inst.Store(v.ty.lty, value, Val.Global(v.symbol), Access.Plain))
   }
 
   /** `@main`, which is three things in the order the language puts them: the computed `val`s, the
@@ -294,10 +294,10 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       pushTemps()
       val args = e.argsFn.map { fn =>
         val slice = Type.Slice(Type.Str)
-        val r     = freshTemp()
+        val r     = freshReg()
 
-        emit(Inst.Call(Some(Val.Raw(r)), slice.llvm, Val.Global(fn), List(Arg(i32, Val.Reg("argc")), Arg(LType.Ptr, Val.Reg("argv")))))
-        Arg(slice.lty, Val.Raw(ownTemp(r, slice)))
+        emit(Inst.Call(Some(r), slice.llvm, Val.Global(fn), List(Arg(i32, Val.Reg("argc")), Arg(LType.Ptr, Val.Reg("argv")))))
+        Arg(slice.lty, ownTemp(r, slice))
       }.toList
 
       // **A `main` that answers with a `Result` is called for its answer**, which is then handed
@@ -306,10 +306,10 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       // little hand-written IR as the platform will let it.
       (e.resultFn, e.resultTy) match
         case (Some(fn), Some(ty)) =>
-          val r = freshTemp()
+          val r = freshReg()
 
-          emit(Inst.Call(Some(Val.Raw(r)), ty.llvm, Val.Global(entrySymbol), args))
-          emit(Inst.Call(None, "void", Val.Global(fn), List(Arg(ty.lty, Val.Raw(r)))))
+          emit(Inst.Call(Some(r), ty.llvm, Val.Global(entrySymbol), args))
+          emit(Inst.Call(None, "void", Val.Global(fn), List(Arg(ty.lty, r))))
 
         case _ =>
           emit(Inst.Call(None, "void", Val.Global(entrySymbol), args))
@@ -351,14 +351,14 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
     val named   = freshLabel("test.named")
     val missing = freshLabel("test.missing")
-    val enough  = freshTemp()
+    val enough  = freshReg()
 
-    emit(Inst.IntCmp(Val.Raw(enough), ICmp.Sgt, i32, Val.Raw("%argc"), Val.Int(1)))
-    emitTerm(Inst.CondBr(Val.Raw(enough), named, missing))
+    emit(Inst.IntCmp(enough, ICmp.Sgt, i32, Val.Reg("argc"), Val.Int(1)))
+    emitTerm(Inst.CondBr(enough, named, missing))
 
     emitLabel(named)
-    val slot = freshTemp(); emit(Inst.Gep(Val.Raw(slot), LType.Ptr, Val.Raw("%argv"), List(Arg(LType.I(64), Val.Int(1)))))
-    val want = freshTemp(); emit(Inst.Load(Val.Raw(want), LType.Ptr, Val.Raw(slot), Access.Plain))
+    val slot = freshReg(); emit(Inst.Gep(slot, LType.Ptr, Val.Reg("argv"), List(Arg(LType.I(64), Val.Int(1)))))
+    val want = freshReg(); emit(Inst.Load(want, LType.Ptr, slot, Access.Plain))
 
     // Each arm compares the wanted name against one test's key and calls it on a match. The keys are
     // interned with the terminator `strcmp` reads to, which an ordinary sysl string constant does not
@@ -366,14 +366,14 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     for t <- tests do
       val run  = freshLabel("test.run")
       val next = freshLabel("test.next")
-      val cmp  = freshTemp()
+      val cmp  = freshReg()
 
-      emit(Inst.Call(Some(Val.Raw(cmp)), "i32", Val.Global("strcmp"),
-        List(Arg(LType.Ptr, Val.Raw(want)), Arg(LType.Ptr, stringGlobal(t.func + "\u0000")))))
+      emit(Inst.Call(Some(cmp), "i32", Val.Global("strcmp"),
+        List(Arg(LType.Ptr, want), Arg(LType.Ptr, stringGlobal(t.func + "\u0000")))))
 
-      val hit  = freshTemp(); emit(Inst.IntCmp(Val.Raw(hit), ICmp.Eq, i32, Val.Raw(cmp), Val.Int(0)))
+      val hit  = freshReg(); emit(Inst.IntCmp(hit, ICmp.Eq, i32, cmp, Val.Int(0)))
 
-      emitTerm(Inst.CondBr(Val.Raw(hit), run, next))
+      emitTerm(Inst.CondBr(hit, run, next))
       emitLabel(run)
       emit(Inst.Call(None, "void", Val.Global(symbolOf(t.func)), Nil))
       emitTerm(Inst.Ret(Some(i32), Some(Val.Int(0))))
@@ -406,15 +406,15 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // A zero-sized parameter is not an argument: there is nothing to receive and nothing to keep,
     // so it takes no slot and the emitted signature below does not mention it.
     for (name, ty) <- f.params if !Type.zeroSized(ty) do
-      emitAlloca(s"%$name.addr", ty.lty)
+      emitAlloca(Val.Reg(s"$name.addr"), ty.lty)
       // A large one arrived as an address, so the copy the callee makes for itself is a copy of
       // bytes and the count it takes is taken at the slot rather than off a value it never had.
       if layout.indirect(ty) then
         emitMemcpy(Val.Reg(s"$name.addr"), Val.Reg(s"$name.param"), layout.size(ty), layout.align(ty))
-        retainAt(ty, s"%$name.addr")
+        retainAt(ty, Val.Reg(s"$name.addr"))
       else
         emit(Inst.Store(ty.lty, Val.Reg(s"$name.param"), Val.Reg(s"$name.addr"), Access.Plain))
-        retainValue(ty, s"%$name.param")
+        retainValue(ty, Val.Reg(s"$name.param"))
       ownSlot(name, ty)
 
     // Where the function calls itself as the last thing it does, that call is a jump to here rather
@@ -444,9 +444,9 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     for (oldExpr, i) <- f.olds.zipWithIndex do
       pushTemps()
       val v = genExpr(oldExpr)
-      emitAlloca(s"%old.$i.addr", oldExpr.ty.lty)
+      emitAlloca(Val.Reg(s"old.$i.addr"), oldExpr.ty.lty)
       retainValue(oldExpr.ty, v)
-      emit(Inst.Store(oldExpr.ty.lty, Val.Raw(v), Val.Reg(s"old.$i.addr"), Access.Plain))
+      emit(Inst.Store(oldExpr.ty.lty, v, Val.Reg(s"old.$i.addr"), Access.Plain))
       ownSlot(s"old.$i", oldExpr.ty)
       popTemps()
 
@@ -461,16 +461,16 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
         retainValue(f.retTy, v)
         emitEnsures(Some(v))
         releaseAll()
-        emitTerm(Inst.Ret(Some(f.retTy.lty), Some(Val.Raw(v))))
+        emitTerm(Inst.Ret(Some(f.retTy.lty), Some(v)))
       case Some(r) =>
         genExpr(r); emitEnsures(None); releaseAll(); emitTerm(Inst.Ret(None, None))
       case None if Type.noValue(f.retTy) =>
         emitEnsures(None); releaseAll(); emitTerm(Inst.Ret(None, None))
       case None if layout.indirect(f.retTy) =>
-        emit(Inst.Store(f.retTy.lty, Val.Zero, Val.Raw(sretParam), Access.Plain))
+        emit(Inst.Store(f.retTy.lty, Val.Zero, sretParam, Access.Plain))
         releaseAll(); emitTerm(Inst.Ret(None, None))
       case None =>
-        releaseAll(); emitTerm(Inst.Ret(Some(f.retTy.lty), Some(Val.Raw(zero(f.retTy)))))
+        releaseAll(); emitTerm(Inst.Ret(Some(f.retTy.lty), Some(zero(f.retTy))))
 
     val stored   = Type.stored(f.params)
     val declared = stored.map { case (name, ty) => s"${syslParam(ty)}${frameOf(f, ty, name)} %$name.param" }
@@ -504,7 +504,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     genOwnedInto(sretParam, r)
 
     if ensures.nonEmpty then
-      val v = freshTemp(); emit(Inst.Load(Val.Raw(v), r.ty.lty, Val.Raw(sretParam), Access.Plain))
+      val v = freshReg(); emit(Inst.Load(v, r.ty.lty, sretParam, Access.Plain))
       emitEnsures(Some(v))
     else emitEnsures(None)
 
@@ -569,19 +569,19 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // is an owner for the views to count against, and a release when the name goes out of scope.
     case TVarDecl(name, ty @ Type.Array(n, elem), init, _) if promoted(name) =>
       val v           = genExpr(init)
-      val (box, data) = genBuffer(elem, n.toString)
+      val (box, data) = genBuffer(elem, Val.Int(n))
 
       promotedBoxes(name) = box
-      emit(Inst.Gep(Val.Reg(s"$name.addr"), elem.lty, Val.Raw(data), List(Arg(LType.I(64), Val.Int(0)))))
+      emit(Inst.Gep(Val.Reg(s"$name.addr"), elem.lty, data, List(Arg(LType.I(64), Val.Int(0)))))
       retainValue(ty, v)
-      emit(Inst.Store(ty.lty, Val.Raw(v), Val.Reg(s"$name.addr"), Access.Plain))
+      emit(Inst.Store(ty.lty, v, Val.Reg(s"$name.addr"), Access.Plain))
       ownBox(name, box, elem)
 
     // The slot is laid down **before** the initializer runs, because a large one is written into it
     // rather than handed to it: the callee of `val k = kernel()` needs somewhere to write.
     case TVarDecl(name, ty, init, align) =>
-      emitAlloca(s"%$name.addr", ty.lty, align)
-      genOwnedInto(s"%$name.addr", init)
+      emitAlloca(Val.Reg(s"$name.addr"), ty.lty, align)
+      genOwnedInto(Val.Reg(s"$name.addr"), init)
       ownSlot(name, ty)
 
     // `ref name = place` (`03 § ref`). The walk to the place is made **once**, here, and its result
@@ -601,7 +601,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       // to read it off — so it is recorded here and put back at every access through the name.
       if Type.volatileIn(place.placeTy) then refStorage(name) = place.placeTy
       refPlaceOf(name) = place
-      emit(Inst.Gep(Val.Reg(s"$name.addr"), LType.I(8), Val.Raw(base), List(Arg(LType.I(64), Val.Int(0)))))
+      emit(Inst.Gep(Val.Reg(s"$name.addr"), LType.I(8), base, List(Arg(LType.I(64), Val.Int(0)))))
 
     case TExprStmt(expr) =>
       genExpr(expr)
@@ -617,7 +617,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
           retainValue(t.ty, v)
           emitEnsures(Some(v))
           releaseAll()
-          emitTerm(Inst.Ret(Some(t.ty.lty), Some(Val.Raw(v))))
+          emitTerm(Inst.Ret(Some(t.ty.lty), Some(v)))
         case None =>
           emitEnsures(None)
           releaseAll()
@@ -631,7 +631,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       opt.foreach { t =>
         val v = genExpr(t)
         retainValue(t.ty, v)
-        emit(Inst.Store(t.ty.lty, Val.Raw(v), Val.Raw(loop.slot), Access.Plain))
+        emit(Inst.Store(t.ty.lty, v, loop.slot, Access.Plain))
       }
       releaseToDepth(loop.ownedDepth, loop.tempDepth)
       emitTerm(Inst.Br(loop.breakL))
@@ -675,10 +675,10 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     val slot = Asm.numbering(operands)
 
     val loaded = ins.map { o =>
-      val r = freshTemp()
+      val r = freshReg()
 
-      emit(Inst.Load(Val.Raw(r), o.ty.lty, Val.Reg(s"${o.slot}.addr"), Access.Plain))
-      Arg(o.ty.lty, Val.Raw(r))
+      emit(Inst.Load(r, o.ty.lty, Val.Reg(s"${o.slot}.addr"), Access.Plain))
+      Arg(o.ty.lty, r)
     }
 
     asmSite += 1
@@ -694,24 +694,24 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
         emit(Inst.Asm(None, LType.Void, text, cons, loaded))
 
       case List(o) =>
-        val r = freshTemp()
+        val r = freshReg()
 
-        emit(Inst.Asm(Some(Val.Raw(r)), o.ty.lty, text, cons, loaded))
-        emit(Inst.Store(o.ty.lty, Val.Raw(r), Val.Reg(s"${o.slot}.addr"), Access.Plain))
+        emit(Inst.Asm(Some(r), o.ty.lty, text, cons, loaded))
+        emit(Inst.Store(o.ty.lty, r, Val.Reg(s"${o.slot}.addr"), Access.Plain))
 
       // Several outputs come back as one anonymous structure, which is LLVM's shape rather than
       // anything the language says — so it is taken apart here and never seen above this line.
       case many =>
-        val r     = freshTemp()
+        val r     = freshReg()
         val shape = LType.Struct(many.map(_.ty.lty))
 
-        emit(Inst.Asm(Some(Val.Raw(r)), shape, text, cons, loaded))
+        emit(Inst.Asm(Some(r), shape, text, cons, loaded))
 
         for (o, i) <- many.zipWithIndex do
-          val part = freshTemp()
+          val part = freshReg()
 
-          emit(Inst.Extract(Val.Raw(part), shape, Val.Raw(r), List(i)))
-          emit(Inst.Store(o.ty.lty, Val.Raw(part), Val.Reg(s"${o.slot}.addr"), Access.Plain))
+          emit(Inst.Extract(part, shape, r, List(i)))
+          emit(Inst.Store(o.ty.lty, part, Val.Reg(s"${o.slot}.addr"), Access.Plain))
   }
 
   /** Counts the assembly blocks emitted in this module, so each one's labels can be its own. */

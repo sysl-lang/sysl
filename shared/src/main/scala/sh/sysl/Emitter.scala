@@ -166,19 +166,19 @@ trait Emitter {
   private var temp       = 0
   private var label      = 0
   private var terminated = false
-  private var scratch    = mutable.HashMap.empty[ir.LType, String]
+  private var scratch    = mutable.HashMap.empty[ir.LType, ir.Val]
 
   /** References this expression owns and must let go of. The stack mirrors the regions a value
    * may not escape: a statement, and each branch of an `if` or arm of a `match`, release their
    * own before control leaves them, so every release site dominates what it releases.
    */
-  protected var tempStack: List[mutable.ListBuffer[(String, Type)]] = Nil
+  protected var tempStack: List[mutable.ListBuffer[(ir.Val, Type)]] = Nil
 
   /** Named slots — parameters, locals, pattern bindings — that hold a reference of their own,
    * innermost scope first. Each holds one count, taken when the slot is written and given back
    * when the scope ends or the function returns.
    */
-  protected var owned: List[mutable.ListBuffer[(String, Type)]] = Nil
+  protected var owned: List[mutable.ListBuffer[(ir.Val, Type)]] = Nil
 
   /** What each scope has been asked to run on its way out — the `defer` stack (`03 § defer`),
    * innermost first. It sits beside `owned` because it is pushed, popped and unwound with it and
@@ -191,7 +191,7 @@ trait Emitter {
    * depths are the sizes of `owned`/`tempStack` at loop entry, so leaving releases exactly what
    * the body accrued.
    */
-  protected case class GenLoop(breakL: String, continueL: String, slot: String, resultTy: Type,
+  protected case class GenLoop(breakL: String, continueL: String, slot: ir.Val, resultTy: Type,
                                ownedDepth: Int, tempDepth: Int)
   protected var genLoops: List[GenLoop] = Nil
 
@@ -222,21 +222,27 @@ trait Emitter {
    * pattern test that cannot fail contributes `"true"`, and ANDing that in would be an instruction
    * saying nothing. Both halves of codegen build conditions this way, so they live here.
    */
-  protected def andI1(a: String, b: String): String =
-    if a == "true" then b
-    else if b == "true" then a
-    else { val r = freshReg(); emit(Inst.Bin(r, BinOp.And, i1, Val.Raw(a), Val.Raw(b))); r.render }
+  protected def andI1(a: ir.Val, b: ir.Val): ir.Val =
+    if a == yes then b
+    else if b == yes then a
+    else { val r = freshReg(); emit(Inst.Bin(r, BinOp.And, i1, a, b)); r }
 
-  protected def orI1(a: String, b: String): String =
-    if a == "true" || b == "true" then "true"
-    else { val r = freshReg(); emit(Inst.Bin(r, BinOp.Or, i1, Val.Raw(a), Val.Raw(b))); r.render }
+  protected def orI1(a: ir.Val, b: ir.Val): ir.Val =
+    if a == yes || b == yes then yes
+    else { val r = freshReg(); emit(Inst.Bin(r, BinOp.Or, i1, a, b)); r }
 
   /** Negating an `i1`, with the same constant folded away — what `is not` does to the test its
    * pattern produced.
    */
-  protected def notI1(a: String): String =
-    if a == "true" then "false"
-    else { val r = freshReg(); emit(Inst.Bin(r, BinOp.Xor, i1, Val.Raw(a), Val.Bool(true))); r.render }
+  protected def notI1(a: ir.Val): ir.Val =
+    if a == yes then no
+    else { val r = freshReg(); emit(Inst.Bin(r, BinOp.Xor, i1, a, Val.Bool(true))); r }
+
+  /** The two `i1` constants, which the folding above tests for by identity rather than by text —
+   * a condition that cannot fail is one of these, and there is no third spelling of it.
+   */
+  protected val yes: ir.Val = Val.Bool(true)
+  protected val no: ir.Val  = Val.Bool(false)
 
   // --- bit ranges of a bitfield struct's container ---------------------------------------
   //
@@ -272,28 +278,28 @@ trait Emitter {
   /** A field's value widened to the container and shifted to where it belongs — the half of a write
    * that is about the range, before anything is said about what was there already.
    */
-  protected def placeBits(ranges: List[BitRange], r: BitRange, v: String): String = {
+  protected def placeBits(ranges: List[BitRange], r: BitRange, v: ir.Val): ir.Val = {
     val ct = containerLty(ranges)
 
     val wide =
       if r.width == Bitfields.bits(ranges) then v
       else
-        val t = freshReg(); emit(Inst.Cast(t, CastOp.ZExt, LType.I(r.width), Val.Raw(v), ct)); t.render
+        val t = freshReg(); emit(Inst.Cast(t, CastOp.ZExt, LType.I(r.width), v, ct)); t
 
     if r.offset == 0 then wide
-    else { val t = freshReg(); emit(Inst.Bin(t, BinOp.Shl, ct, Val.Raw(wide), Val.Int(r.offset))); t.render }
+    else { val t = freshReg(); emit(Inst.Bin(t, BinOp.Shl, ct, wide, Val.Int(r.offset))); t }
   }
 
   /** A whole container built from one value per field, which is what constructing a bitfield struct
    * is. It ors the placed ranges together rather than folding `writeBits` over a zero, because there
    * is nothing to preserve: every bit of the result is being written.
    */
-  protected def buildBits(ranges: List[BitRange], vals: List[String]): String = {
+  protected def buildBits(ranges: List[BitRange], vals: List[ir.Val]): ir.Val = {
     val ct = containerLty(ranges)
 
     ranges.zip(vals).map(placeBits(ranges, _, _)).reduceOption { (a, b) =>
-      val t = freshReg(); emit(Inst.Bin(t, BinOp.Or, ct, Val.Raw(a), Val.Raw(b))); t.render
-    }.getOrElse("0")
+      val t = freshReg(); emit(Inst.Bin(t, BinOp.Or, ct, a, b)); t
+    }.getOrElse(Val.Int(0))
   }
 
   /** One range lifted out of the container `c`.
@@ -303,23 +309,23 @@ trait Emitter {
    * own width lands the two's-complement value already in place. The signedness is in the type
    * rather than in the extraction.
    */
-  protected def readBits(ranges: List[BitRange], r: BitRange, c: String): String = {
+  protected def readBits(ranges: List[BitRange], r: BitRange, c: ir.Val): ir.Val = {
     val ct     = containerLty(ranges)
     val shifted =
       if r.offset == 0 then c
       else
-        val t = freshReg(); emit(Inst.Bin(t, BinOp.LShr, ct, Val.Raw(c), Val.Int(r.offset))); t.render
+        val t = freshReg(); emit(Inst.Bin(t, BinOp.LShr, ct, c, Val.Int(r.offset))); t
 
     if r.width == Bitfields.bits(ranges) then shifted
     else
-      val t = freshReg(); emit(Inst.Cast(t, CastOp.Trunc, ct, Val.Raw(shifted), LType.I(r.width))); t.render
+      val t = freshReg(); emit(Inst.Cast(t, CastOp.Trunc, ct, shifted, LType.I(r.width))); t
   }
 
   /** The container `c` with one range replaced by `v` — the read-modify-write a bitfield write is,
    * with the read already done by the caller so that the whole of a multi-field update is one load
    * and one store rather than one of each per field.
    */
-  protected def writeBits(ranges: List[BitRange], r: BitRange, c: String, v: String): String = {
+  protected def writeBits(ranges: List[BitRange], r: BitRange, c: ir.Val, v: ir.Val): ir.Val = {
     val ct         = containerLty(ranges)
     val bits       = Bitfields.bits(ranges)
     val (_, clear) = Bitfields.mask(r, bits)
@@ -330,9 +336,9 @@ trait Emitter {
     // reads as a bug rather than as an identity.
     if r.width == bits then shifted
     else
-      val cleared = freshReg(); emit(Inst.Bin(cleared, BinOp.And, ct, Val.Raw(c), Val.Int(clear)))
-      val merged  = freshReg(); emit(Inst.Bin(merged, BinOp.Or, ct, cleared, Val.Raw(shifted)))
-      merged.render
+      val cleared = freshReg(); emit(Inst.Bin(cleared, BinOp.And, ct, c, Val.Int(clear)))
+      val merged  = freshReg(); emit(Inst.Bin(merged, BinOp.Or, ct, cleared, shifted))
+      merged
   }
 
   // --- how a sysl signature is spelled --------------------------------------------------
@@ -394,7 +400,7 @@ trait Emitter {
   protected def syslParamLty(ty: Type): ir.LType = if layout.indirect(ty) then ir.LType.Ptr else ty.lty
 
   /** The name the out-pointer takes inside a function that has one. */
-  protected val sretParam = "%sret.out"
+  protected val sretParam = Val.Reg("sret.out")
 
   // --- hooks provided by the Codegen class ---------------------------------------------
   //
@@ -402,17 +408,17 @@ trait Emitter {
   // back into them.
 
   /** Lowers an expression, returning the register or immediate holding its value. */
-  protected def genExpr(expr: TExpr): String
+  protected def genExpr(expr: TExpr): ir.Val
 
   /** Lowers an expression into the storage at `dest`, leaving the destination owning what lands
    * there — a count taken for every reference inside (`CallEmitter`).
    */
-  protected def genOwnedInto(dest: String, e: TExpr): Unit
+  protected def genOwnedInto(dest: ir.Val, e: TExpr): Unit
 
   /** The same, taking no counts: what lands at `dest` is borrowed, exactly as the register
    * `genExpr` hands back is (`CallEmitter`).
    */
-  protected def genBorrowedInto(dest: String, e: TExpr): Unit
+  protected def genBorrowedInto(dest: ir.Val, e: TExpr): Unit
 
   /** Lowers one statement for its effects. */
   protected def genStmt(stmt: TStmt): Unit
@@ -421,15 +427,15 @@ trait Emitter {
    * and the value on the right, whether that is an instruction or a trait method (`14 §3`).
    */
   protected def combine(op: String, ty: Type, valueTy: Type, dispatch: Option[TDispatch],
-                        cur: String, v: String): String
+                        cur: ir.Val, v: ir.Val): ir.Val
 
   /** Traps unless a struct's `invariant` clauses hold of the value in `v` (`16 §6`). */
-  protected def emitInvCheck(v: String, struct: Type.Struct, invFn: String): Unit
+  protected def emitInvCheck(v: ir.Val, struct: Type.Struct, invFn: String): Unit
 
   /** Traps unless `v` satisfies everything the constrained subtype `c` asks of its values — its
    * `within` range and its `where` predicate (`16 §4`).
    */
-  protected def emitConstraintChecks(v: String, c: Type.Constrained): Unit
+  protected def emitConstraintChecks(v: ir.Val, c: Type.Constrained): Unit
 
   protected def startFunction(): Unit = {
     prologue = mutable.ListBuffer.empty
@@ -486,7 +492,7 @@ trait Emitter {
    * it as its owner, where a frame-backed array has none.
    */
   protected var promoted: Set[String]                 = Set.empty
-  protected var promotedBoxes: mutable.HashMap[String, String] = mutable.HashMap.empty
+  protected var promotedBoxes: mutable.HashMap[String, ir.Val] = mutable.HashMap.empty
 
   /** One stack slot per LLVM type per function, for the type punning a union needs: a value goes
    * in written as one type and comes back out read as another. Sharing the slot is safe because
@@ -494,14 +500,14 @@ trait Emitter {
    * doing because a function that matches on an enum in a hundred places would otherwise carry a
    * hundred slots it uses one at a time.
    */
-  protected def scratchSlot(ty: ir.LType): String =
-    scratch.getOrElseUpdate(ty, emitAlloca(freshTemp(), ty))
+  protected def scratchSlot(ty: ir.LType): ir.Val =
+    scratch.getOrElseUpdate(ty, emitAlloca(freshReg(), ty))
 
   /** The address of the payload region inside an enum sitting at `base`. */
-  protected def payloadPtr(en: Type.Enum, base: String): String = {
+  protected def payloadPtr(en: Type.Enum, base: ir.Val): ir.Val = {
     val r = freshReg()
-    emit(Inst.Gep(r, en.lty, Val.Raw(base), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(1)))))
-    r.render
+    emit(Inst.Gep(r, en.lty, base, List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(1)))))
+    r
   }
 
   /** Reads a variant's payload out of an enum value, at that variant's type.
@@ -512,16 +518,16 @@ trait Emitter {
    * there — which is what a pattern test does before it knows the tag, and the tag test beside it is
    * what makes the answer count.
    */
-  protected def enumPayload(en: Type.Enum, variant: Type.EnumVariant, value: String): String = {
+  protected def enumPayload(en: Type.Enum, variant: Type.EnumVariant, value: ir.Val): ir.Val = {
     val slot = scratchSlot(en.lty)
 
-    emit(Inst.Store(en.lty, Val.Raw(value), Val.Raw(slot), Access.Plain))
+    emit(Inst.Store(en.lty, value, slot, Access.Plain))
 
     val p = payloadPtr(en, slot)
     val r = freshReg()
 
-    emit(Inst.Load(r, en.payloadLty(variant), Val.Raw(p), Access.Plain))
-    r.render
+    emit(Inst.Load(r, en.payloadLty(variant), p, Access.Plain))
+    r
   }
 
   /** The function just emitted: its header, and the blocks it is made of.
@@ -550,13 +556,7 @@ trait Emitter {
     currentEnd = None
   }
 
-  /** A register nothing else in this function uses.
-   *
-   * The two spellings share one counter and are the same register: `freshReg` is what a converted
-   * emitter asks for and `freshTemp` is what one still building a line of text asks for, and while
-   * both exist the numbering has to be the one sequence or the emitted names would depend on which
-   * files had been converted.
-   */
+  /** A register nothing else in this function uses. */
   protected def freshReg(): Val.Reg = { temp += 1; Val.Reg(s"t$temp") }
 
   /** The two widths written often enough here to be worth naming: a condition, and the index a
@@ -565,7 +565,6 @@ trait Emitter {
   protected val i1: LType  = LType.I(1)
   protected val i32: LType = LType.I(32)
 
-  protected def freshTemp(): String         = freshReg().render
   protected def freshLabel(s: String): String = { label += 1; s"$s$label" }
 
   /** Emits a plain instruction, unless the current block is already terminated. */
@@ -580,8 +579,8 @@ trait Emitter {
    * larger of the two is what satisfies both claims, and one written on the declaration is by that
    * rule already at or above the type's.
    */
-  protected def emitAlloca(name: String, ty: ir.LType, align: Option[Int] = None): String = {
-    prologue += ir.Inst.Alloca(ir.Val.Raw(name), ty, align.orElse(raisedAlign(ty)))
+  protected def emitAlloca(name: ir.Val, ty: ir.LType, align: Option[Int] = None): ir.Val = {
+    prologue += ir.Inst.Alloca(name, ty, align.orElse(raisedAlign(ty)))
     name
   }
 

@@ -55,73 +55,73 @@ trait ArcEmitter extends Emitter {
   /** The box a counted trait object holds, which is its second word — the first is the method
    * table, a constant that owns nothing.
    */
-  protected def erasedBox(v: String): String = {
-    val b = freshTemp(); emit(Inst.Extract(Val.Raw(b), LType.fat, Val.Raw(v), List(1))); b
+  protected def erasedBox(v: Val): Val = {
+    val b = freshReg(); emit(Inst.Extract(b, LType.fat, v, List(1))); b
   }
 
   /** The address a weak reference counts against: the box itself, or — behind a trait object —
    * the second of its two words.
    */
-  private def weakBox(ty: Type.Weak, v: String): String =
+  private def weakBox(ty: Type.Weak, v: Val): Val =
     if ty.inner.isInstanceOf[Type.Trait] then erasedBox(v) else v
 
   /** Takes a share of everything a value refers to. A bare reference is one refcount; an
    * aggregate delegates to a per-type helper that walks its reference-carrying fields.
    */
-  protected def retainValue(ty: Type, v: String): Unit = ty match
+  protected def retainValue(ty: Type, v: Val): Unit = ty match
     // A `&Trait` counts exactly as the `&T` it was made from does: the box carries its own
     // destructor, so letting go of one needs no more knowledge of the payload than this has.
     case Type.Ref(_: Type.Trait, sync) =>
       heap = true
       syncHeap ||= sync
       emit(Inst.Call(None, "void", Val.Global(s"arc.retain${if sync then "_sync" else ""}"),
-        List(Arg(LType.Ptr, Val.Raw(erasedBox(v))))))
+        List(Arg(LType.Ptr, erasedBox(v)))))
 
     case Type.Ref(_, sync) =>
       heap = true
       syncHeap ||= sync
       emit(Inst.Call(None, "void", Val.Global(s"arc.retain${if sync then "_sync" else ""}"),
-        List(Arg(LType.Ptr, Val.Raw(v)))))
+        List(Arg(LType.Ptr, v))))
     case w: Type.Weak =>
       weakHeap = true
       emit(Inst.Call(None, "void", Val.Global("arc.weak_retain"),
-        List(Arg(LType.Ptr, Val.Raw(weakBox(w, v))))))
+        List(Arg(LType.Ptr, weakBox(w, v)))))
 
     case w: Type.View =>
       emit(Inst.Call(None, "void", Val.Global("arc.retain_maybe"),
-        List(Arg(LType.Ptr, Val.Raw(owner(w, v))))))
+        List(Arg(LType.Ptr, owner(w, v)))))
 
     case t if containsRef(t) =>
       emit(Inst.Call(None, "void", Val.Global(valueHelper(t, retain = true)),
-        List(Arg(t.lty, Val.Raw(v)))))
+        List(Arg(t.lty, v))))
 
     case _                   => ()
 
   /** Gives back a share of everything a value refers to. */
-  protected def releaseValue(ty: Type, v: String): Unit = ty match
+  protected def releaseValue(ty: Type, v: Val): Unit = ty match
     case Type.Ref(_: Type.Trait, sync) =>
       heap = true
       syncHeap ||= sync
       emit(Inst.Call(None, "void", Val.Global(s"arc.release${if sync then "_sync" else ""}"),
-        List(Arg(LType.Ptr, Val.Raw(erasedBox(v))))))
+        List(Arg(LType.Ptr, erasedBox(v)))))
 
     case Type.Ref(_, sync) =>
       heap = true
       syncHeap ||= sync
       emit(Inst.Call(None, "void", Val.Global(s"arc.release${if sync then "_sync" else ""}"),
-        List(Arg(LType.Ptr, Val.Raw(v)))))
+        List(Arg(LType.Ptr, v))))
     case w: Type.Weak =>
       weakHeap = true
       emit(Inst.Call(None, "void", Val.Global("arc.weak_release"),
-        List(Arg(LType.Ptr, Val.Raw(weakBox(w, v))))))
+        List(Arg(LType.Ptr, weakBox(w, v)))))
 
     case w: Type.View =>
       emit(Inst.Call(None, "void", Val.Global("arc.release_maybe"),
-        List(Arg(LType.Ptr, Val.Raw(owner(w, v))))))
+        List(Arg(LType.Ptr, owner(w, v)))))
 
     case t if containsRef(t) =>
       emit(Inst.Call(None, "void", Val.Global(valueHelper(t, retain = false)),
-        List(Arg(t.lty, Val.Raw(v)))))
+        List(Arg(t.lty, v))))
 
     case _                   => ()
 
@@ -132,16 +132,16 @@ trait ArcEmitter extends Emitter {
    * the whole point of lowering it through memory. Everything smaller is read out and walked as
    * before, so the two forms agree on what they count — only on where they read it from.
    */
-  protected def retainAt(ty: Type, p: String): Unit = walkAt(ty, p, retain = true)
+  protected def retainAt(ty: Type, p: Val): Unit = walkAt(ty, p, retain = true)
 
-  protected def releaseAt(ty: Type, p: String): Unit = walkAt(ty, p, retain = false)
+  protected def releaseAt(ty: Type, p: Val): Unit = walkAt(ty, p, retain = false)
 
-  private def walkAt(ty: Type, p: String, retain: Boolean): Unit =
+  private def walkAt(ty: Type, p: Val, retain: Boolean): Unit =
     if containsRef(ty) then
       if layout.indirect(ty) then
-        emit(Inst.Call(None, "void", Val.Global(slotHelper(ty, retain)), List(Arg(LType.Ptr, Val.Raw(p)))))
+        emit(Inst.Call(None, "void", Val.Global(slotHelper(ty, retain)), List(Arg(LType.Ptr, p))))
       else
-        val v = freshTemp(); emit(Inst.Load(Val.Raw(v), ty.lty, Val.Raw(p), Access.Plain))
+        val v = freshReg(); emit(Inst.Load(v, ty.lty, p, Access.Plain))
         if retain then retainValue(ty, v) else releaseValue(ty, v)
 
   /** The retain / release helper a large aggregate takes at its address. Same walk as the one over
@@ -153,18 +153,18 @@ trait ArcEmitter extends Emitter {
 
     request(name) {
       inFunction(s"define private void @$name(ptr %p)") {
-        walkSlot(ty, "%p", retain)
+        walkSlot(ty, Val.Reg("p"), retain)
         emitTerm(Inst.Ret(None, None))
       }
     }
   }
 
-  private def walkSlot(ty: Type, p: String, retain: Boolean): Unit = {
-    def each(fields: List[(String, Type)], aggregate: LType, base: String): Unit =
+  private def walkSlot(ty: Type, p: Val, retain: Boolean): Unit = {
+    def each(fields: List[(String, Type)], aggregate: LType, base: Val): Unit =
       for ((_, fty), i) <- fields.zipWithIndex if containsRef(fty) do
-        val f = freshTemp()
+        val f = freshReg()
 
-        emit(Inst.Gep(Val.Raw(f), aggregate, Val.Raw(base),
+        emit(Inst.Gep(f, aggregate, base,
           List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(Type.slot(fields, i))))))
         walkAt(fty, f, retain)
 
@@ -172,32 +172,32 @@ trait ArcEmitter extends Emitter {
       case s: Type.Struct => each(s.fields, s.lty, p)
 
       case Type.Array(n, elem) =>
-        val i = emitAlloca(freshTemp(), wordLty)
-        emit(Inst.Store(wordLty, Val.Int(0), Val.Raw(i), Access.Plain))
+        val i = emitAlloca(freshReg(), wordLty)
+        emit(Inst.Store(wordLty, Val.Int(0), i, Access.Plain))
         val condL = freshLabel("arc.each")
         val bodyL = freshLabel("arc.elem")
         val endL  = freshLabel("arc.done")
         emitTerm(Inst.Br(condL))
         emitLabel(condL)
-        val iv   = freshTemp(); emit(Inst.Load(Val.Raw(iv), wordLty, Val.Raw(i), Access.Plain))
-        val more = freshTemp(); emit(Inst.IntCmp(Val.Raw(more), ICmp.Ult, wordLty, Val.Raw(iv), Val.Int(n)))
-        emitTerm(Inst.CondBr(Val.Raw(more), bodyL, endL))
+        val iv   = freshReg(); emit(Inst.Load(iv, wordLty, i, Access.Plain))
+        val more = freshReg(); emit(Inst.IntCmp(more, ICmp.Ult, wordLty, iv, Val.Int(n)))
+        emitTerm(Inst.CondBr(more, bodyL, endL))
         emitLabel(bodyL)
-        val ep = freshTemp(); emit(Inst.Gep(Val.Raw(ep), elem.lty, Val.Raw(p), List(Arg(wordLty, Val.Raw(iv)))))
+        val ep = freshReg(); emit(Inst.Gep(ep, elem.lty, p, List(Arg(wordLty, iv))))
         walkAt(elem, ep, retain)
-        val nxt = freshTemp(); emit(Inst.Bin(Val.Raw(nxt), BinOp.Add, wordLty, Val.Raw(iv), Val.Int(1)))
-        emit(Inst.Store(wordLty, Val.Raw(nxt), Val.Raw(i), Access.Plain))
+        val nxt = freshReg(); emit(Inst.Bin(nxt, BinOp.Add, wordLty, iv, Val.Int(1)))
+        emit(Inst.Store(wordLty, nxt, i, Access.Plain))
         emitTerm(Inst.Br(condL))
         emitLabel(endL)
 
       case e: Type.Enum =>
-        val tag  = freshTemp(); emit(Inst.Load(Val.Raw(tag), i32, Val.Raw(p), Access.Plain))
+        val tag  = freshReg(); emit(Inst.Load(tag, i32, p, Access.Plain))
         val endL = freshLabel("arc.done")
         for variant <- e.variants if variant.fields.exists(f => containsRef(f._2)) do
           val hitL  = freshLabel("arc.variant")
           val nextL = freshLabel("arc.next")
-          val is    = freshTemp(); emit(Inst.IntCmp(Val.Raw(is), ICmp.Eq, i32, Val.Raw(tag), Val.Int(variant.tag)))
-          emitTerm(Inst.CondBr(Val.Raw(is), hitL, nextL))
+          val is    = freshReg(); emit(Inst.IntCmp(is, ICmp.Eq, i32, tag, Val.Int(variant.tag)))
+          emitTerm(Inst.CondBr(is, hitL, nextL))
           emitLabel(hitL)
           each(variant.fields, e.payloadLty(variant), payloadPtr(e, p))
           emitTerm(Inst.Br(endL))
@@ -211,17 +211,17 @@ trait ArcEmitter extends Emitter {
   /** The owner word of a view — the reference that keeps its elements alive, or null when they
    * are static (every string literal), on a frame, or reached through a `*T`.
    */
-  protected def owner(ty: Type.View, v: String): String = {
+  protected def owner(ty: Type.View, v: Val): Val = {
     heap = true
     maybeHeap = true
-    val o = freshTemp(); emit(Inst.Extract(Val.Raw(o), ty.lty, Val.Raw(v), List(0))); o
+    val o = freshReg(); emit(Inst.Extract(o, ty.lty, v, List(0))); o
   }
 
   /** The function that destroys a box of this payload type: it lets go of whatever the payload
    * holds and then returns the storage. Installed in the box at construction, which is what
    * makes releasing a reference type-erased — a slice's owner has no static type to consult.
    */
-  protected def dropFn(payload: Type): String = {
+  protected def dropFn(payload: Type): Val.Global = {
     // A type with a destructor needs a hook of its own even when nothing in it is counted
     // (`03 § A destructor`): the walk has nothing to do and the `drop` still has to be called, so
     // the plain hook — which is shared by every payload that holds nothing — cannot serve.
@@ -232,15 +232,15 @@ trait ArcEmitter extends Emitter {
       val m  = Type.mangle(payload)
       val bn = boxLty(payload)
 
-      "@" + request(s"arc.drop.$m") {
+      Val.Global(request(s"arc.drop.$m") {
         inFunction(s"define private void @arc.drop.$m(ptr %p, i1 %storage)") {
           val give = freshLabel("arc.give")
           val over = freshLabel("arc.over")
 
           emitTerm(Inst.CondBr(Val.Reg("storage"), give, over))
           emitLabel(over)
-          val pa = freshTemp(); emit(Inst.Gep(Val.Raw(pa), bn, Val.Reg("p"), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields)))))
-          val v  = freshTemp(); emit(Inst.Load(Val.Raw(v), payload.lty, Val.Raw(pa), Access.Plain))
+          val pa = freshReg(); emit(Inst.Gep(pa, bn, Val.Reg("p"), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields)))))
+          val v  = freshReg(); emit(Inst.Load(v, payload.lty, pa, Access.Plain))
 
           // **Before the walk, not after.** The destructor is handed the value as it stands, so it
           // may read a field to close what that field names; releasing first would hand it a value
@@ -248,8 +248,8 @@ trait ArcEmitter extends Emitter {
           // taken for the call — because the count is already zero and taking one would resurrect
           // the object into a second teardown.
           for d <- destructor do
-            if layout.indirect(payload) then emit(Inst.Call(None, "void", Val.Global(d), List(Arg(LType.Ptr, Val.Raw(pa)))))
-            else emit(Inst.Call(None, "void", Val.Global(d), List(Arg(payload.lty, Val.Raw(v)))))
+            if layout.indirect(payload) then emit(Inst.Call(None, "void", Val.Global(d), List(Arg(LType.Ptr, pa))))
+            else emit(Inst.Call(None, "void", Val.Global(d), List(Arg(payload.lty, v))))
 
           releaseValue(payload, v)
           emitTerm(Inst.Ret(None, None))
@@ -257,7 +257,7 @@ trait ArcEmitter extends Emitter {
           emitFree()
           emitTerm(Inst.Ret(None, None))
         }
-      }
+      })
   }
 
   /** The hook for a box whose payload holds nothing: there is no walk to make, so the only phase
@@ -266,8 +266,8 @@ trait ArcEmitter extends Emitter {
    * One per module rather than one per payload type, because nothing in it depends on the payload —
    * which keeps the commonest box of all, the one holding a plain number, from costing a function.
    */
-  protected def plainDropFn: String =
-    "@" + request("arc.drop.plain") {
+  protected def plainDropFn: Val.Global =
+    Val.Global(request("arc.drop.plain") {
       inFunction("define private void @arc.drop.plain(ptr %p, i1 %storage)") {
         val give = freshLabel("arc.give")
         val over = freshLabel("arc.over")
@@ -279,7 +279,7 @@ trait ArcEmitter extends Emitter {
         emitFree()
         emitTerm(Inst.Ret(None, None))
       }
-    }
+    })
 
   /** The one place `free` is **called**. It sits inside a hook, so it reaches a module only where
    * that module builds a box — which is a module that has already called `malloc`, and therefore
@@ -300,20 +300,20 @@ trait ArcEmitter extends Emitter {
 
     request(name) {
       inFunction(s"define private void @$name(${ty.llvm} %v)") {
-        walkValue(ty, "%v", retain)
+        walkValue(ty, Val.Reg("v"), retain)
         emitTerm(Inst.Ret(None, None))
       }
     }
   }
 
-  private def walkValue(ty: Type, v: String, retain: Boolean): Unit = {
-    def each(fields: List[(String, Type)], aggregate: LType, value: String): Unit =
+  private def walkValue(ty: Type, v: Val, retain: Boolean): Unit = {
+    def each(fields: List[(String, Type)], aggregate: LType, value: Val): Unit =
       // A zero-sized field holds no reference, so it is skipped by the filter already — but the
       // index has to be the slot it landed in rather than the one it was written at, or a field
       // after one would be walked at the wrong offset.
       for ((_, fty), i) <- fields.zipWithIndex if containsRef(fty) do
-        val f = freshTemp()
-        emit(Inst.Extract(Val.Raw(f), aggregate, Val.Raw(value), List(Type.slot(fields, i))))
+        val f = freshReg()
+        emit(Inst.Extract(f, aggregate, value, List(Type.slot(fields, i))))
         if retain then retainValue(fty, f) else releaseValue(fty, f)
 
     ty match
@@ -322,35 +322,35 @@ trait ArcEmitter extends Emitter {
       // An array is walked with a loop rather than an unrolled chain: the element count is a
       // compile-time constant, but it can be very large, and the code for one element is not.
       case Type.Array(n, elem) =>
-        val buf = emitAlloca(freshTemp(), ty.lty)
-        emit(Inst.Store(ty.lty, Val.Raw(v), Val.Raw(buf), Access.Plain))
-        val i = emitAlloca(freshTemp(), wordLty)
-        emit(Inst.Store(wordLty, Val.Int(0), Val.Raw(i), Access.Plain))
+        val buf = emitAlloca(freshReg(), ty.lty)
+        emit(Inst.Store(ty.lty, v, buf, Access.Plain))
+        val i = emitAlloca(freshReg(), wordLty)
+        emit(Inst.Store(wordLty, Val.Int(0), i, Access.Plain))
         val condL = freshLabel("arc.each")
         val bodyL = freshLabel("arc.elem")
         val endL  = freshLabel("arc.done")
         emitTerm(Inst.Br(condL))
         emitLabel(condL)
-        val iv   = freshTemp(); emit(Inst.Load(Val.Raw(iv), wordLty, Val.Raw(i), Access.Plain))
-        val more = freshTemp(); emit(Inst.IntCmp(Val.Raw(more), ICmp.Ult, wordLty, Val.Raw(iv), Val.Int(n)))
-        emitTerm(Inst.CondBr(Val.Raw(more), bodyL, endL))
+        val iv   = freshReg(); emit(Inst.Load(iv, wordLty, i, Access.Plain))
+        val more = freshReg(); emit(Inst.IntCmp(more, ICmp.Ult, wordLty, iv, Val.Int(n)))
+        emitTerm(Inst.CondBr(more, bodyL, endL))
         emitLabel(bodyL)
-        val ep = freshTemp(); emit(Inst.Gep(Val.Raw(ep), elem.lty, Val.Raw(buf), List(Arg(wordLty, Val.Raw(iv)))))
-        val ev = freshTemp(); emit(Inst.Load(Val.Raw(ev), elem.lty, Val.Raw(ep), Access.Plain))
+        val ep = freshReg(); emit(Inst.Gep(ep, elem.lty, buf, List(Arg(wordLty, iv))))
+        val ev = freshReg(); emit(Inst.Load(ev, elem.lty, ep, Access.Plain))
         if retain then retainValue(elem, ev) else releaseValue(elem, ev)
-        val nxt = freshTemp(); emit(Inst.Bin(Val.Raw(nxt), BinOp.Add, wordLty, Val.Raw(iv), Val.Int(1)))
-        emit(Inst.Store(wordLty, Val.Raw(nxt), Val.Raw(i), Access.Plain))
+        val nxt = freshReg(); emit(Inst.Bin(nxt, BinOp.Add, wordLty, iv, Val.Int(1)))
+        emit(Inst.Store(wordLty, nxt, i, Access.Plain))
         emitTerm(Inst.Br(condL))
         emitLabel(endL)
 
       case e: Type.Enum =>
-        val tag  = freshTemp(); emit(Inst.Extract(Val.Raw(tag), e.lty, Val.Raw(v), List(0)))
+        val tag  = freshReg(); emit(Inst.Extract(tag, e.lty, v, List(0)))
         val endL = freshLabel("arc.done")
         for variant <- e.variants if variant.fields.exists(f => containsRef(f._2)) do
           val hitL  = freshLabel("arc.variant")
           val nextL = freshLabel("arc.next")
-          val is    = freshTemp(); emit(Inst.IntCmp(Val.Raw(is), ICmp.Eq, i32, Val.Raw(tag), Val.Int(variant.tag)))
-          emitTerm(Inst.CondBr(Val.Raw(is), hitL, nextL))
+          val is    = freshReg(); emit(Inst.IntCmp(is, ICmp.Eq, i32, tag, Val.Int(variant.tag)))
+          emitTerm(Inst.CondBr(is, hitL, nextL))
           emitLabel(hitL)
           val payload = enumPayload(e, variant, v)
           each(variant.fields, e.payloadLty(variant), payload)
@@ -367,33 +367,33 @@ trait ArcEmitter extends Emitter {
   /** Puts a value on the heap: one count for the reference this yields, the hook that will
    * destroy it, and a copy of the payload — whose own references the box now holds a share of.
    */
-  protected def genBox(value: TExpr, refTy: Type.Ref): String = {
+  protected def genBox(value: TExpr, refTy: Type.Ref): Val = {
     val inner = refTy.inner
     val bn    = boxLty(inner)
     // A large payload is written into the box rather than produced and then stored into it, for the
     // reason every other destination has: the value would be a first-class aggregate of kilobytes
     // for the length of one instruction. The address is not known until the box exists, so this is
     // the one destination that cannot be handed over before the expression runs.
-    val v     = if layout.indirect(inner) then "" else genExpr(value)
+    val v     = if layout.indirect(inner) then Val.Nothing else genExpr(value)
 
-    val end  = freshTemp(); emit(Inst.Gep(Val.Raw(end), bn, Val.Null, List(Arg(i32, Val.Int(1)))))
-    val size = freshTemp(); emit(Inst.Cast(Val.Raw(size), CastOp.PtrToInt, LType.Ptr, Val.Raw(end), wordLty))
-    val p    = freshTemp(); emit(Inst.Call(Some(Val.Raw(p)), LType.Ptr.render, Val.Global(mallocSym), List(Arg(wordLty, Val.Raw(size)))))
+    val end  = freshReg(); emit(Inst.Gep(end, bn, Val.Null, List(Arg(i32, Val.Int(1)))))
+    val size = freshReg(); emit(Inst.Cast(size, CastOp.PtrToInt, LType.Ptr, end, wordLty))
+    val p    = freshReg(); emit(Inst.Call(Some(p), LType.Ptr.render, Val.Global(mallocSym), List(Arg(wordLty, size))))
 
-    emit(Inst.Store(wordLty, Val.Int(1), Val.Raw(p), Access.Plain))
-    val hook = freshTemp(); emit(Inst.Gep(Val.Raw(hook), bn, Val.Raw(p), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(1)))))
-    emit(Inst.Store(LType.Ptr, Val.Raw(dropFn(inner)), Val.Raw(hook), Access.Plain))
+    emit(Inst.Store(wordLty, Val.Int(1), p, Access.Plain))
+    val hook = freshReg(); emit(Inst.Gep(hook, bn, p, List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(1)))))
+    emit(Inst.Store(LType.Ptr, dropFn(inner), hook, Access.Plain))
     // One weak share stands for every strong reference together, so the storage outlives the
     // object exactly as long as some weak reference is still asking about it (`03`).
-    val wc = freshTemp(); emit(Inst.Gep(Val.Raw(wc), bn, Val.Raw(p), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(2)))))
-    emit(Inst.Store(wordLty, Val.Int(1), Val.Raw(wc), Access.Plain))
+    val wc = freshReg(); emit(Inst.Gep(wc, bn, p, List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(2)))))
+    emit(Inst.Store(wordLty, Val.Int(1), wc, Access.Plain))
 
-    val slot = freshTemp(); emit(Inst.Gep(Val.Raw(slot), bn, Val.Raw(p), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields)))))
+    val slot = freshReg(); emit(Inst.Gep(slot, bn, p, List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields)))))
 
     if layout.indirect(inner) then genOwnedInto(slot, value)
     else
       retainValue(inner, v)
-      emit(Inst.Store(inner.lty, Val.Raw(v), Val.Raw(slot), Access.Plain))
+      emit(Inst.Store(inner.lty, v, slot, Access.Plain))
 
     ownTemp(p, refTy)
   }
@@ -417,28 +417,28 @@ trait ArcEmitter extends Emitter {
    * the storage. Elements that hold nothing need no walk, so the plain hook is enough — it still
    * gives the bytes back, which is the phase every box needs whatever it holds.
    */
-  protected def dropBufFn(elem: Type): String =
+  protected def dropBufFn(elem: Type): Val.Global =
     if !containsRef(elem) then plainDropFn
     else
       val m  = Type.mangle(elem)
       val bn = bufLty(elem)
 
-      "@" + request(s"arc.dropbuf.$m") {
+      Val.Global(request(s"arc.dropbuf.$m") {
         inFunction(s"define private void @arc.dropbuf.$m(ptr %p, i1 %storage)") {
           val give = freshLabel("arc.give")
           val over = freshLabel("arc.over")
 
           emitTerm(Inst.CondBr(Val.Reg("storage"), give, over))
           emitLabel(over)
-          val lenp = freshTemp(); emit(Inst.Gep(Val.Raw(lenp), bn, Val.Reg("p"), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields)))))
-          val n    = freshTemp(); emit(Inst.Load(Val.Raw(n), wordLty, Val.Raw(lenp), Access.Plain))
-          val data = freshTemp()
+          val lenp = freshReg(); emit(Inst.Gep(lenp, bn, Val.Reg("p"), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields)))))
+          val n    = freshReg(); emit(Inst.Load(n, wordLty, lenp, Access.Plain))
+          val data = freshReg()
 
-          emit(Inst.Gep(Val.Raw(data), bn, Val.Reg("p"),
+          emit(Inst.Gep(data, bn, Val.Reg("p"),
             List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields + 1)))))
 
           eachElement(elem, data, n) { ep =>
-            val ev = freshTemp(); emit(Inst.Load(Val.Raw(ev), elem.lty, Val.Raw(ep), Access.Plain))
+            val ev = freshReg(); emit(Inst.Load(ev, elem.lty, ep, Access.Plain))
             releaseValue(elem, ev)
           }
           emitTerm(Inst.Ret(None, None))
@@ -446,38 +446,38 @@ trait ArcEmitter extends Emitter {
           emitFree()
           emitTerm(Inst.Ret(None, None))
         }
-      }
+      })
 
   /** Puts one value in every one of `n` slots, taking a share for each — the elements belong to the
    * buffer, and it is the hook above that eventually lets them go.
    */
-  protected def fillElements(elem: Type, data: String, n: String, v: String): Unit =
+  protected def fillElements(elem: Type, data: Val, n: Val, v: Val): Unit =
     eachElement(elem, data, n) { ep =>
       retainValue(elem, v)
-      emit(Inst.Store(elem.lty, Val.Raw(v), Val.Raw(ep), Access.Plain))
+      emit(Inst.Store(elem.lty, v, ep, Access.Plain))
     }
 
   /** Walks `n` elements starting at `data`, handing each element's address to `body`. A loop rather
    * than a straight line for the reason the ARC walk over an array gives: the count is exactly the
    * thing that may be large here.
    */
-  protected def eachElement(elem: Type, data: String, n: String)(body: String => Unit): Unit = {
-    val i     = emitAlloca(freshTemp(), wordLty)
+  protected def eachElement(elem: Type, data: Val, n: Val)(body: Val => Unit): Unit = {
+    val i     = emitAlloca(freshReg(), wordLty)
     val condL = freshLabel("buf.test")
     val bodyL = freshLabel("buf.elem")
     val endL  = freshLabel("buf.done")
 
-    emit(Inst.Store(wordLty, Val.Int(0), Val.Raw(i), Access.Plain))
+    emit(Inst.Store(wordLty, Val.Int(0), i, Access.Plain))
     emitTerm(Inst.Br(condL))
     emitLabel(condL)
-    val iv   = freshTemp(); emit(Inst.Load(Val.Raw(iv), wordLty, Val.Raw(i), Access.Plain))
-    val more = freshTemp(); emit(Inst.IntCmp(Val.Raw(more), ICmp.Ult, wordLty, Val.Raw(iv), Val.Raw(n)))
-    emitTerm(Inst.CondBr(Val.Raw(more), bodyL, endL))
+    val iv   = freshReg(); emit(Inst.Load(iv, wordLty, i, Access.Plain))
+    val more = freshReg(); emit(Inst.IntCmp(more, ICmp.Ult, wordLty, iv, n))
+    emitTerm(Inst.CondBr(more, bodyL, endL))
     emitLabel(bodyL)
-    val ep = freshTemp(); emit(Inst.Gep(Val.Raw(ep), elem.lty, Val.Raw(data), List(Arg(wordLty, Val.Raw(iv)))))
+    val ep = freshReg(); emit(Inst.Gep(ep, elem.lty, data, List(Arg(wordLty, iv))))
     body(ep)
-    val nxt = freshTemp(); emit(Inst.Bin(Val.Raw(nxt), BinOp.Add, wordLty, Val.Raw(iv), Val.Int(1)))
-    emit(Inst.Store(wordLty, Val.Raw(nxt), Val.Raw(i), Access.Plain))
+    val nxt = freshReg(); emit(Inst.Bin(nxt, BinOp.Add, wordLty, iv, Val.Int(1)))
+    emit(Inst.Store(wordLty, nxt, i, Access.Plain))
     emitTerm(Inst.Br(condL))
     emitLabel(endL)
   }
@@ -485,14 +485,14 @@ trait ArcEmitter extends Emitter {
   /** Where a pointer's pointee actually lives. A `*T` addresses its value directly; a `&T`
    * addresses the box, whose payload sits after the refcount and the deallocation hook.
    */
-  protected def payloadAddr(operand: TExpr): String = {
+  protected def payloadAddr(operand: TExpr): Val = {
     val p = genExpr(operand)
 
     operand.ty match
       case Type.Ref(inner, _) =>
-        val r = freshTemp()
+        val r = freshReg()
 
-        emit(Inst.Gep(Val.Raw(r), boxLty(inner), Val.Raw(p),
+        emit(Inst.Gep(r, boxLty(inner), p,
           List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields)))))
         r
       case _ => p
@@ -500,12 +500,12 @@ trait ArcEmitter extends Emitter {
 
   // --- ownership regions ---------------------------------------------------------------------
 
-  protected def pushTemps(): Unit = tempStack = mutable.ListBuffer.empty[(String, Type)] :: tempStack
+  protected def pushTemps(): Unit = tempStack = mutable.ListBuffer.empty[(Val, Type)] :: tempStack
 
   /** Records a value the expression owns outright — a fresh box, or a call result, which every
    * function returns with a count already taken.
    */
-  protected def ownTemp(v: String, ty: Type): String = {
+  protected def ownTemp(v: Val, ty: Type): Val = {
     if containsRef(ty) then tempStack.head += ((v, ty))
     v
   }
@@ -527,9 +527,9 @@ trait ArcEmitter extends Emitter {
    * other than where the region is closed — a condition term that branches before it can release,
    * because the branch it guards retains out of the very value being held (`09 §12`).
    */
-  protected def tempsHere: List[(String, Type)] = tempStack.head.toList
+  protected def tempsHere: List[(Val, Type)] = tempStack.head.toList
 
-  protected def releaseValues(vs: List[(String, Type)]): Unit =
+  protected def releaseValues(vs: List[(Val, Type)]): Unit =
     for (v, ty) <- vs.reverse do releaseValue(ty, v)
   protected def dropTemps(): Unit    = tempStack = tempStack.tail
 
@@ -548,13 +548,13 @@ trait ArcEmitter extends Emitter {
   private def runDeferrals(scope: mutable.ListBuffer[TStmt]): Unit = scope.reverse.foreach(genStmt)
 
   protected def pushOwned(): Unit = {
-    owned = mutable.ListBuffer.empty[(String, Type)] :: owned
+    owned = mutable.ListBuffer.empty[(Val, Type)] :: owned
     deferrals = mutable.ListBuffer.empty[TStmt] :: deferrals
   }
 
   /** Records a slot that holds a count of its own, after it has been written. */
   protected def ownSlot(name: String, ty: Type): Unit =
-    if containsRef(ty) then owned.head += ((s"%$name.addr", ty))
+    if containsRef(ty) then owned.head += ((Val.Reg(s"$name.addr"), ty))
 
   /** Registers the buffer a promoted array lives in, so the scope that declared it gives back its
    * share on the way out. A buffer is what a `&T` points at, so it is registered as one and the
@@ -565,10 +565,10 @@ trait ArcEmitter extends Emitter {
    * returned or stored, so the release below takes the declaration's share and the storage outlives
    * the frame exactly as long as some view of it does.
    */
-  protected def ownBox(name: String, box: String, elem: Type): Unit = {
-    emitAlloca(s"%$name.box", LType.Ptr)
-    emit(Inst.Store(LType.Ptr, Val.Raw(box), Val.Reg(s"$name.box"), Access.Plain))
-    owned.head += ((s"%$name.box", Type.Ref(elem, false)))
+  protected def ownBox(name: String, box: Val, elem: Type): Unit = {
+    emitAlloca(Val.Reg(s"$name.box"), LType.Ptr)
+    emit(Inst.Store(LType.Ptr, box, Val.Reg(s"$name.box"), Access.Plain))
+    owned.head += ((Val.Reg(s"$name.box"), Type.Ref(elem, false)))
   }
 
   /** Emits the releases for the innermost scope without popping it — the guard-failure path out
@@ -584,11 +584,11 @@ trait ArcEmitter extends Emitter {
    * leaves without ever reaching the branch. Its releases are emitted after the success path has
    * already popped, so the slots have to be read out while the scope is still there.
    */
-  protected def ownedHere: List[(String, Type)] = owned.head.toList
+  protected def ownedHere: List[(Val, Type)] = owned.head.toList
 
-  protected def releaseSlots(slots: List[(String, Type)]): Unit =
+  protected def releaseSlots(slots: List[(Val, Type)]): Unit =
     for (slot, ty) <- slots.reverse do
-      val v = freshTemp(); emit(Inst.Load(Val.Raw(v), ty.lty, Val.Raw(slot), Access.Plain))
+      val v = freshReg(); emit(Inst.Load(v, ty.lty, slot, Access.Plain))
       releaseValue(ty, v)
 
   protected def popOwned(): Unit = {
@@ -617,7 +617,7 @@ trait ArcEmitter extends Emitter {
     for (scope, ds) <- scopes do
       runDeferrals(ds)
       for (slot, ty) <- scope.reverse do
-        val v = freshTemp(); emit(Inst.Load(Val.Raw(v), ty.lty, Val.Raw(slot), Access.Plain))
+        val v = freshReg(); emit(Inst.Load(v, ty.lty, slot, Access.Plain))
         releaseValue(ty, v)
   }
 
@@ -638,7 +638,7 @@ trait ArcEmitter extends Emitter {
     for (scope, ds) <- scopes do
       runDeferrals(ds)
       for (slot, ty) <- scope.reverse do
-        val v = freshTemp(); emit(Inst.Load(Val.Raw(v), ty.lty, Val.Raw(slot), Access.Plain))
+        val v = freshReg(); emit(Inst.Load(v, ty.lty, slot, Access.Plain))
         releaseValue(ty, v)
   }
 }
@@ -738,7 +738,7 @@ object ArcEmitter {
 
     val fetchSlot = if !supplied then "" else s"  %s = call ptr @$reaperSlot()\n"
 
-    val slot = if supplied then "%s" else "@arc.reaper.self"
+    val slot = if supplied then Val.Reg("s") else "@arc.reaper.self"
 
     // The two counts are pointer-width. Nothing forces that — a reference count is not an address —
     // but the alternative is a fixed `i64`, which costs sixteen bytes of header on a machine whose

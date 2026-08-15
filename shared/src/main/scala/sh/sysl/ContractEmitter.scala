@@ -27,7 +27,7 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
    * not be handed the last function's.
    */
   protected var ensures: List[(TExpr, Option[String])] = Nil
-  protected var resultSSA: Option[String]              = None
+  protected var resultSSA: Option[Val]                 = None
 
   /** What the function being emitted is called, what its parameters are, and the `variant` it
    * declared — the three things a self-call needs to check the measure (`17 §4`).
@@ -61,7 +61,7 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
    * shape both call paths already produce: an address for a large value, a register for the rest,
    * and nothing at all for a zero-sized parameter.
    */
-  protected def genVariantAtCall(staged: List[Option[(Type, Either[String, String])]]): Unit = {
+  protected def genVariantAtCall(staged: List[Option[(Type, Either[Val, Val])]]): Unit = {
     val variant = selfVariant.get
 
     pushTemps()
@@ -72,19 +72,19 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
     // see both of the call's values and neither of the frame's.
     val saved =
       for case ((name, ty), Some((_, arg))) <- selfParams.zip(staged) yield
-        val keep = emitAlloca(freshTemp(), ty.lty)
+        val keep = emitAlloca(freshReg(), ty.lty)
 
         arg match
           case Left(addr) =>
-            memcpy(keep, s"%$name.addr", ty)
-            memcpy(s"%$name.addr", addr, ty)
+            memcpy(keep, Val.Reg(s"$name.addr"), ty)
+            memcpy(Val.Reg(s"$name.addr"), addr, ty)
           case Right(v) =>
             val old  = freshReg()
             val addr = Val.Reg(s"$name.addr")
 
             emit(Inst.Load(old, ty.lty, addr, Access.Plain))
-            emit(Inst.Store(ty.lty, old, Val.Raw(keep), Access.Plain))
-            emit(Inst.Store(ty.lty, Val.Raw(v), addr, Access.Plain))
+            emit(Inst.Store(ty.lty, old, keep, Access.Plain))
+            emit(Inst.Store(ty.lty, v, addr, Access.Plain))
         (name, ty, keep)
 
     pushTemps()
@@ -92,20 +92,20 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
     popTemps()
 
     for (name, ty, keep) <- saved do
-      if layout.indirect(ty) then memcpy(s"%$name.addr", keep, ty)
+      if layout.indirect(ty) then memcpy(Val.Reg(s"$name.addr"), keep, ty)
       else
-        val back = freshReg(); emit(Inst.Load(back, ty.lty, Val.Raw(keep), Access.Plain))
+        val back = freshReg(); emit(Inst.Load(back, ty.lty, keep, Access.Plain))
         emit(Inst.Store(ty.lty, back, Val.Reg(s"$name.addr"), Access.Plain))
 
     val ok = freshReg()
 
-    emit(Inst.IntCmp(ok, intPred("<", variant.ty), variant.ty.lty, Val.Raw(nxt), Val.Raw(cur)))
+    emit(Inst.IntCmp(ok, intPred("<", variant.ty), variant.ty.lty, nxt, cur))
     trapUnless(ok, "variant")
   }
 
-  private def memcpy(dst: String, src: String, ty: Type): Unit = {
+  private def memcpy(dst: Val, src: Val, ty: Type): Unit = {
     usesMemcpy = true
-    emitMemcpy(Val.Raw(dst), Val.Raw(src), layout.size(ty), layout.align(ty))
+    emitMemcpy(dst, src, layout.size(ty), layout.align(ty))
   }
 
   /** Emits a contract clause as a trap-on-false check, discarding any temporaries the condition
@@ -115,11 +115,11 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
     pushTemps()
     val ok = genExpr(cond)
     popTemps()
-    trapUnless(Val.Raw(ok), kind)
+    trapUnless(ok, kind)
   }
 
   /** Runs every postcondition with `result` bound to the value about to be returned. */
-  protected def emitEnsures(result: Option[String]): Unit =
+  protected def emitEnsures(result: Option[Val]): Unit =
     if ensures.nonEmpty then
       resultSSA = result
       for (cond, _) <- ensures do emitContract(cond, "ensure")
@@ -133,9 +133,9 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
    * entry's first measure against the first entry's last, and trap on a loop that was decreasing
    * perfectly well.
    */
-  protected def genCheckedLoop(slot: String, varTy: Type, loop: TExpr): String = {
-    emitAlloca(s"%$slot.prev", varTy.lty)
-    emitAlloca(s"%$slot.armed", i1)
+  protected def genCheckedLoop(slot: String, varTy: Type, loop: TExpr): Val = {
+    emitAlloca(Val.Reg(s"$slot.prev"), varTy.lty)
+    emitAlloca(Val.Reg(s"$slot.armed"), i1)
     emit(Inst.Store(LType.I(1), Val.Int(0), Val.Reg(s"$slot.armed"), Access.Plain))
     genExpr(loop)
   }
@@ -163,11 +163,11 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
     emitTerm(Inst.CondBr(armedV, cmpL, setL))
     emitLabel(cmpL)
     val prev = freshReg(); emit(Inst.Load(prev, w, Val.Reg(s"$slot.prev"), Access.Plain))
-    val ok   = freshReg(); emit(Inst.IntCmp(ok, intPred("<", varTy), w, Val.Raw(cur), prev))
+    val ok   = freshReg(); emit(Inst.IntCmp(ok, intPred("<", varTy), w, cur, prev))
     trapUnless(ok, "variant")
     emitTerm(Inst.Br(setL))
     emitLabel(setL)
-    emit(Inst.Store(w, Val.Raw(cur), Val.Reg(s"$slot.prev"), Access.Plain))
+    emit(Inst.Store(w, cur, Val.Reg(s"$slot.prev"), Access.Plain))
     emit(Inst.Store(LType.I(1), Val.Int(1), Val.Reg(s"$slot.armed"), Access.Plain))
   }
 
@@ -177,7 +177,7 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
    * float bounds compare in double precision, widening a narrower value so one rendering of the
    * bound serves every float width.
    */
-  private def emitRangeChecks(v: String, c: Type.Constrained): Unit =
+  private def emitRangeChecks(v: Val, c: Type.Constrained): Unit =
     Type.underlying(c.base) match
       case f: Type.Floating =>
         val wide =
@@ -185,14 +185,14 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
           else
             val r = freshReg()
 
-            emit(Inst.Cast(r, CastOp.FPExt, f.lty, Val.Raw(v), LType.F(64)))
-            r.render
+            emit(Inst.Cast(r, CastOp.FPExt, f.lty, v, LType.F(64)))
+            r
         for lo <- c.lo do trapUnless(fcmpConst(FCmp.Oge, wide, lo), "within")
         for hi <- c.hi do trapUnless(fcmpConst(if c.exclusiveHi then FCmp.Olt else FCmp.Ole, wide, hi), "within")
       case base =>
-        for lo <- c.lo do trapUnless(Val.Raw(compareValue(">=", base, v, lo.toBigInt.toString)), "within")
+        for lo <- c.lo do trapUnless(compareValue(">=", base, v, Val.Int(lo.toBigInt)), "within")
         for hi <- c.hi do
-          trapUnless(Val.Raw(compareValue(if c.exclusiveHi then "<" else "<=", base, v, hi.toBigInt.toString)),
+          trapUnless(compareValue(if c.exclusiveHi then "<" else "<=", base, v, Val.Int(hi.toBigInt)),
                      "within")
 
   /** Everything a constrained subtype asks of a value: the `within` range, then the `where`
@@ -201,20 +201,20 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
    * compute and store in one step, so a value cannot reach a constrained slot by a path that tests
    * less of it than another.
    */
-  protected def emitConstraintChecks(v: String, c: Type.Constrained): Unit = {
+  protected def emitConstraintChecks(v: Val, c: Type.Constrained): Unit = {
     emitRangeChecks(v, c)
 
     for pf <- c.predFn do
       val r = freshReg()
 
-      emit(Inst.Call(Some(r), "i1", Val.Global(pf), List(Arg(Type.underlying(c.base).lty, Val.Raw(v)))))
+      emit(Inst.Call(Some(r), "i1", Val.Global(pf), List(Arg(Type.underlying(c.base).lty, v))))
       trapUnless(r, "where")
   }
 
-  private def fcmpConst(pred: FCmp, wide: String, bound: BigDecimal): Val = {
+  private def fcmpConst(pred: FCmp, wide: Val, bound: BigDecimal): Val = {
     val r = freshReg()
 
-    emit(Inst.FloatCmp(r, pred, LType.F(64), Val.Raw(wide), Val.float(bound.toDouble)))
+    emit(Inst.FloatCmp(r, pred, LType.F(64), wide, Val.float(bound.toDouble)))
     r
   }
 
@@ -222,9 +222,9 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
    * aggregate `v`, call `invFn`, and trap on a false result. The fields are handed over exactly as
    * an ordinary call's arguments are — the callee borrows, so no count is taken here.
    */
-  protected def emitInvCheck(v: String, struct: Type.Struct, invFn: String): Unit =
+  protected def emitInvCheck(v: Val, struct: Type.Struct, invFn: String): Unit =
     val container = Bitfields.of(struct).map { ranges =>
-      val c = freshReg(); emit(Inst.Extract(c, struct.lty, Val.Raw(v), List(0))); (ranges, c.render)
+      val c = freshReg(); emit(Inst.Extract(c, struct.lty, v, List(0))); (ranges, c)
     }
 
     val args = struct.fields.zipWithIndex.collect {
@@ -237,13 +237,13 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
           case None =>
             val t = freshReg()
 
-            emit(Inst.Extract(t, struct.lty, Val.Raw(v), List(struct.slot(i))))
-            t.render
+            emit(Inst.Extract(t, struct.lty, v, List(struct.slot(i))))
+            t
 
-        Arg(ft.lty, Val.Raw(r))
+        Arg(ft.lty, r)
     }
-    val ok = freshTemp()
+    val ok = freshReg()
 
-    emit(Inst.Call(Some(Val.Raw(ok)), i1.render, Val.Global(invFn), args.toList))
-    trapUnless(Val.Raw(ok), "invariant")
+    emit(Inst.Call(Some(ok), i1.render, Val.Global(invFn), args.toList))
+    trapUnless(ok, "invariant")
 }

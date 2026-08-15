@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
-import ir.{Block, Func, Inst, Printer}
+import ir.{Access, BinOp, Block, Func, Inst, LType, Printer, Val}
 
 /** Writing a function down (`ir.Printer`).
  *
@@ -20,11 +20,13 @@ import ir.{Block, Func, Inst, Printer}
  */
 class IrPrinterTests extends AnyFreeSpec with Matchers {
 
-  private def raw(s: String) = Inst.Raw(s)
+  private val i32 = LType.I(32)
+  private val t1  = Val.Reg("t1")
 
   "a function is its header, a brace, its blocks, and a closing brace on its own line" in {
-    val f = Func("define i32 @main()",
-                 List(Block("entry", List(raw("%t1 = add i32 1, 2")), Some(raw("ret i32 %t1")))))
+    val add = Inst.Bin(t1, BinOp.Add, i32, Val.Int(1), Val.Int(2))
+    val f   = Func("define i32 @main()",
+                   List(Block("entry", List(add), Some(Inst.Ret(Some(i32), Some(t1))))))
 
     Printer.func(f) shouldBe
       """|define i32 @main() {
@@ -36,9 +38,10 @@ class IrPrinterTests extends AnyFreeSpec with Matchers {
   }
 
   "an instruction is indented two spaces and a label is not, which is what makes one findable" in {
-    val f = Func("define void @f()",
-                 List(Block("entry", Nil, Some(raw("br label %body"))),
-                      Block("body", List(raw("store i32 0, ptr %p")), Some(raw("ret void")))))
+    val store = Inst.Store(i32, Val.Int(0), Val.Reg("p"), Access.Plain)
+    val f     = Func("define void @f()",
+                     List(Block("entry", Nil, Some(Inst.Br("body"))),
+                          Block("body", List(store), Some(Inst.Ret(None, None)))))
 
     Printer.func(f) shouldBe
       """|define void @f() {
@@ -55,9 +58,9 @@ class IrPrinterTests extends AnyFreeSpec with Matchers {
   // them would break every codegen assertion that matches a run of instructions across a boundary.
   "blocks run together, with the label as the only separator" in {
     val f = Func("define void @f()",
-                 List(Block("entry", Nil, Some(raw("br label %a"))),
-                      Block("a", Nil, Some(raw("br label %b"))),
-                      Block("b", Nil, Some(raw("ret void")))))
+                 List(Block("entry", Nil, Some(Inst.Br("a"))),
+                      Block("a", Nil, Some(Inst.Br("b"))),
+                      Block("b", Nil, Some(Inst.Ret(None, None)))))
 
     Printer.func(f) shouldBe "define void @f() {\nentry:\n  br label %a\na:\n  br label %b\nb:\n  ret void\n}\n"
   }
@@ -67,13 +70,14 @@ class IrPrinterTests extends AnyFreeSpec with Matchers {
    * diagnostic has to be about, and a printer that repaired this would hide the bug that made it.
    */
   "an unterminated block is printed unterminated rather than repaired" in {
-    val f = Func("define void @f()", List(Block("entry", List(raw("%t1 = load i32, ptr %p")), None)))
+    val load = Inst.Load(t1, i32, Val.Reg("p"), Access.Plain)
+    val f    = Func("define void @f()", List(Block("entry", List(load), None)))
 
     Printer.func(f) shouldBe "define void @f() {\nentry:\n  %t1 = load i32, ptr %p\n}\n"
   }
 
   "and a block with nothing in it at all is its label and its terminator" in {
-    val f = Func("define void @f()", List(Block("entry", Nil, Some(raw("unreachable")))))
+    val f = Func("define void @f()", List(Block("entry", Nil, Some(Inst.Unreachable))))
 
     Printer.func(f) shouldBe "define void @f() {\nentry:\n  unreachable\n}\n"
   }

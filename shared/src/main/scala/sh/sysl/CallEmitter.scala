@@ -50,17 +50,17 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    * the values themselves: `17 §4`'s measure is evaluated over the arguments, and reaching them by
    * evaluating the arguments a second time would run whatever they do twice.
    */
-  protected def argValue(a: TExpr): Option[(Type, Either[String, String])] =
+  protected def argValue(a: TExpr): Option[(Type, Either[ir.Val, ir.Val])] =
     if layout.indirect(a.ty) then Some((a.ty, Left(address(a))))
     else
       val v = genExpr(a)
 
       Option.unless(Type.zeroSized(a.ty))((a.ty, Right(v)))
 
-  protected def formatArgs(vals: List[Option[(Type, Either[String, String])]]): List[Arg] =
+  protected def formatArgs(vals: List[Option[(Type, Either[ir.Val, ir.Val])]]): List[Arg] =
     vals.flatten.map {
-      case (_, Left(addr)) => Arg(LType.Ptr, Val.Raw(addr))
-      case (ty, Right(v))  => Arg(ty.lty, Val.Raw(v))
+      case (_, Left(addr)) => Arg(LType.Ptr, addr)
+      case (ty, Right(v))  => Arg(ty.lty, v)
     }
 
   /** A call the function makes to itself as the last thing it does, lowered as a jump back to its
@@ -77,7 +77,7 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    * no register because there is no value — the call does not come back, and everything the emitters
    * would have gone on to lay down is dropped by `emit`, exactly as it is after a `-> never` call.
    */
-  protected def genTailSelfCall(args: List[TExpr]): String = {
+  protected def genTailSelfCall(args: List[TExpr]): ir.Val = {
     // A large argument is staged in a slot of its own rather than a register, because that is how a
     // large value moves at all here. The staging slot is what makes it safe as well: `address` on an
     // argument that is simply a parameter hands back that parameter's own slot, so writing straight
@@ -86,7 +86,7 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       tailParams.zip(args).map { case ((_, ty), a) =>
         if Type.zeroSized(ty) then { genExpr(a); None }
         else if layout.indirect(ty) then
-          val slot = emitAlloca(freshTemp(), ty.lty)
+          val slot = emitAlloca(freshReg(), ty.lty)
 
           genOwnedInto(slot, a)
           Some(Left(slot))
@@ -115,12 +115,12 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
         // The count came with the bytes and stays with them: what the staging slot took is now the
         // parameter's, so nothing is retained here and nothing released.
         case Left(slot) =>
-          emitMemcpy(Val.Reg(s"$name.addr"), Val.Raw(slot), layout.size(ty), layout.align(ty))
+          emitMemcpy(Val.Reg(s"$name.addr"), slot, layout.size(ty), layout.align(ty))
 
-        case Right(v) => emit(Inst.Store(ty.lty, Val.Raw(v), Val.Reg(s"$name.addr"), Access.Plain))
+        case Right(v) => emit(Inst.Store(ty.lty, v, Val.Reg(s"$name.addr"), Access.Plain))
 
     emitTerm(Inst.Br(tailTarget.get))
-    ""
+    Val.Nothing
   }
 
   /** Every callee declared with a `...`, foreign or sysl's own, mapped to the LLVM function type a
@@ -202,25 +202,12 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    */
   protected def entryOf(name: String): String = exportSymbols.getOrElse(name, symbolOf(name))
 
-  /** What a `call` names. For an ordinary function that is the result type, which is all LLVM
-   * needs; for a variadic one it is the callee's *whole* function type, because the argument list
-   * alone does not say where the declared parameters stop and the ellipsis begins.
-   */
-  protected def calleeOf(name: String, ty: Type): String =
-    val (what, callee) = calleeParts(name, ty)
-
-    s"$what ${callee.render}"
-
-  /** A call whose callee is already written down as one piece — what it returns and the symbol run
-   * together, or a variadic callee's whole function type. `calleeParts` is what splits the two, and
-   * this stays for as long as anything hands over the joined form.
-   */
-  protected def emitCallee(dest: Option[ir.Val], callee: String, args: List[Arg]): Unit =
-    emit(Inst.Call(dest, "", Val.Raw(callee), args))
-
-  /** The same two things kept apart, which is how a `call` instruction carries them: what the call
-   * names, and the symbol it names. `calleeOf` is this pair run together, and stays for as long as
-   * anything still builds a call by interpolation.
+  /** The two things a `call` names, kept apart because that is how the instruction carries them:
+   * **what** the call names, and the symbol it names.
+   *
+   * For an ordinary function the first is the result type, which is all LLVM needs; for a variadic
+   * one it is the callee's *whole* function type, because the argument list alone does not say where
+   * the declared parameters stop and the ellipsis begins.
    */
   protected def calleeParts(name: String, ty: Type): (String, ir.Val.Global) =
     val symbol = symbolOf(name)
@@ -238,41 +225,42 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    * with nowhere to put one makes a slot here and reads the value back out of it, which is correct
    * and is exactly the shape `genInto` exists to save the callers that *do* have somewhere.
    */
-  protected def genSyslCall(callee: String, argVals: List[Arg], ty: Type, dest: Option[String]): String =
+  protected def genSyslCall(what: String, callee: ir.Val, argVals: List[Arg], ty: Type,
+                            dest: Option[ir.Val]): ir.Val =
     syslSret(ty) match
       case Some(_) =>
-        val slot = dest.getOrElse(emitAlloca(freshTemp(), ty.lty))
-        val out  = Arg(LType.Ptr, Val.Raw(slot), s"sret(${ty.llvm}) align ${layout.align(ty)}")
+        val slot = dest.getOrElse(emitAlloca(freshReg(), ty.lty))
+        val out  = Arg(LType.Ptr, slot, s"sret(${ty.llvm}) align ${layout.align(ty)}")
 
-        emitCallee(None, callee, out :: argVals)
+        emit(Inst.Call(None, what, callee, out :: argVals))
 
-        if dest.isDefined then ""
+        if dest.isDefined then Val.Nothing
         else
-          val r = freshReg(); emit(Inst.Load(r, ty.lty, Val.Raw(slot), Access.Plain))
-          ownTemp(r.render, ty)
+          val r = freshReg(); emit(Inst.Load(r, ty.lty, slot, Access.Plain))
+          ownTemp(r, ty)
 
       case None if Type.noValue(ty) =>
-        emitCallee(None, callee, argVals)
+        emit(Inst.Call(None, what, callee, argVals))
         if ty == Type.Never then emitTerm(Inst.Unreachable)
-        ""
+        Val.Nothing
 
       case None =>
         val r = freshReg()
 
-        emitCallee(Some(r), callee, argVals)
-        ownTemp(r.render, ty)
+        emit(Inst.Call(Some(r), what, callee, argVals))
+        ownTemp(r, ty)
 
   // --- writing a value where it is going to live ----------------------------------------
 
   /** Writes `e`'s value into `dest` and leaves the destination **owning** it: a count taken for
    * every reference inside, which is what a slot that will later release them needs.
    */
-  protected def genOwnedInto(dest: String, e: TExpr): Unit =
+  protected def genOwnedInto(dest: ir.Val, e: TExpr): Unit =
     if !layout.indirect(e.ty) then
       val v = genExpr(e)
 
       retainValue(e.ty, v)
-      emit(Inst.Store(e.ty.lty, Val.Raw(v), Val.Raw(dest), Access.Plain))
+      emit(Inst.Store(e.ty.lty, v, dest, Access.Plain))
     else
       e match
         // A tail self-call needs no destination: the jump keeps the frame, so the `sret` pointer the
@@ -288,7 +276,9 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
           val staged = args.map(argValue)
 
           if checksVariant(name) then genVariantAtCall(staged)
-          genSyslCall(calleeOf(name, ty), formatArgs(staged), ty, Some(dest))
+          val (what, callee) = calleeParts(name, ty)
+
+          genSyslCall(what, callee, formatArgs(staged), ty, Some(dest))
 
         case _ =>
           genBorrowedInto(dest, e)
@@ -303,7 +293,7 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    * a large result is nested inside a literal that is itself being built in place, which is rare
    * and is what the code did before any of this.
    */
-  protected def genBorrowedInto(dest: String, e: TExpr): Unit = e match
+  protected def genBorrowedInto(dest: ir.Val, e: TExpr): Unit = e match
     // A bitfield struct has one slot however many fields were written, so there is nothing to build
     // field by field: the container is assembled as a value and stored once (`Bitfields`).
     case TStructNew(struct, args) if Bitfields.of(struct).isDefined =>
@@ -311,28 +301,28 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       val vals   = args.zipWithIndex.map((a, i) => (genExpr(a), struct.fields(i)._2))
       val c      = buildBits(ranges, vals.collect { case (v, ft) if !Type.zeroSized(ft) => v })
 
-      emit(Inst.Store(containerLty(ranges), Val.Raw(c), Val.Raw(dest), Access.Plain))
+      emit(Inst.Store(containerLty(ranges), c, dest, Access.Plain))
 
     case TStructNew(struct, args) =>
       for (a, i) <- args.zipWithIndex if !Type.zeroSized(struct.fields(i)._2) do
         val p = freshReg()
 
-        emit(Inst.Gep(p, struct.lty, Val.Raw(dest),
+        emit(Inst.Gep(p, struct.lty, dest,
                       List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(struct.slot(i))))))
-        genBorrowedInto(p.render, a)
+        genBorrowedInto(p, a)
 
     case TArrayLit(elems, arrayTy) =>
       for (el, i) <- elems.zipWithIndex do
         val p = freshReg()
 
-        emit(Inst.Gep(p, arrayTy.elem.lty, Val.Raw(dest), List(Arg(wordLty, Val.Int(i)))))
-        genBorrowedInto(p.render, el)
+        emit(Inst.Gep(p, arrayTy.elem.lty, dest, List(Arg(wordLty, Val.Int(i)))))
+        genBorrowedInto(p, el)
 
     // The tag, and then the variant's own fields written into the region every variant shares.
     // Reaching the region by address is what the value form has to use a stack slot for anyway —
     // a union has no `insertvalue` — so this is the shorter of the two lowerings as well.
     case TEnumNew(en, variant, args) if !en.simple =>
-      emit(Inst.Store(i32, Val.Int(variant.tag), Val.Raw(dest), Access.Plain))
+      emit(Inst.Store(i32, Val.Int(variant.tag), dest, Access.Plain))
 
       if variant.carries then
         val base = payloadPtr(en, dest)
@@ -340,9 +330,9 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
         for (a, i) <- args.zipWithIndex if !Type.zeroSized(variant.fields(i)._2) do
           val p = freshReg()
 
-          emit(Inst.Gep(p, en.payloadLty(variant), Val.Raw(base),
+          emit(Inst.Gep(p, en.payloadLty(variant), base,
                         List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(variant.slot(i))))))
-          genBorrowedInto(p.render, a)
+          genBorrowedInto(p, a)
 
     // The value is generated once, above the loop, exactly as the value form does — every element
     // is a copy of that one evaluation. It is generated even where there are no elements, because
@@ -352,7 +342,7 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
 
       if arrayTy.length > 0 then
         fillLoop(dest, arrayTy) { at =>
-          emit(Inst.Store(arrayTy.elem.lty, Val.Raw(v), Val.Raw(at), Access.Plain))
+          emit(Inst.Store(arrayTy.elem.lty, v, at, Access.Plain))
         }
 
     // A copy from one place to another is a copy of bytes. Reading the value out first would make
@@ -360,36 +350,36 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     case place if hasAddress(place) =>
       val src = address(place)
 
-      emitMemcpy(Val.Raw(dest), Val.Raw(src), layout.size(e.ty), layout.align(e.ty))
+      emitMemcpy(dest, src, layout.size(e.ty), layout.align(e.ty))
 
     case _ =>
       val v = genExpr(e)
 
-      emit(Inst.Store(e.ty.lty, Val.Raw(v), Val.Raw(dest), Access.Plain))
+      emit(Inst.Store(e.ty.lty, v, dest, Access.Plain))
 
   /** `e` built where a value of it is wanted, for a caller that asked for a register rather than
    * offering somewhere to put one. The load is the very thing the destination forms avoid, so this
    * is the fallback and not the path anything hot takes.
    */
-  protected def throughSlot(e: TExpr): String = {
-    val slot = emitAlloca(freshTemp(), e.ty.lty)
+  protected def throughSlot(e: TExpr): ir.Val = {
+    val slot = emitAlloca(freshReg(), e.ty.lty)
 
     genBorrowedInto(slot, e)
 
-    val r = freshReg(); emit(Inst.Load(r, e.ty.lty, Val.Raw(slot), Access.Plain)); r.render
+    val r = freshReg(); emit(Inst.Load(r, e.ty.lty, slot, Access.Plain)); r
   }
 
   /** Runs `each` once per element of an array laid down at `base`, with the element's address. */
-  private def fillLoop(base: String, arrayTy: Type.Array)(each: String => Unit): Unit = {
-    val i     = emitAlloca(freshTemp(), wordLty)
+  private def fillLoop(base: ir.Val, arrayTy: Type.Array)(each: ir.Val => Unit): Unit = {
+    val i     = emitAlloca(freshReg(), wordLty)
     val condL = freshLabel("fill.test")
     val bodyL = freshLabel("fill.elem")
     val endL  = freshLabel("fill.done")
 
-    emit(Inst.Store(wordLty, Val.Int(0), Val.Raw(i), Access.Plain))
+    emit(Inst.Store(wordLty, Val.Int(0), i, Access.Plain))
     emitTerm(Inst.Br(condL))
     emitLabel(condL)
-    val iv   = freshReg(); emit(Inst.Load(iv, wordLty, Val.Raw(i), Access.Plain))
+    val iv   = freshReg(); emit(Inst.Load(iv, wordLty, i, Access.Plain))
     val more = freshReg()
 
     emit(Inst.IntCmp(more, ICmp.Ult, wordLty, iv, Val.Int(arrayTy.length)))
@@ -397,10 +387,10 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     emitLabel(bodyL)
     val ep = freshReg()
 
-    emit(Inst.Gep(ep, arrayTy.elem.lty, Val.Raw(base), List(Arg(wordLty, iv))))
-    each(ep.render)
+    emit(Inst.Gep(ep, arrayTy.elem.lty, base, List(Arg(wordLty, iv))))
+    each(ep)
     val nxt = freshReg(); emit(Inst.Bin(nxt, BinOp.Add, wordLty, iv, Val.Int(1)))
-    emit(Inst.Store(wordLty, nxt, Val.Raw(i), Access.Plain))
+    emit(Inst.Store(wordLty, nxt, i, Access.Plain))
     emitTerm(Inst.Br(condL))
     emitLabel(endL)
   }

@@ -59,7 +59,7 @@ trait ForeignEmitter extends ArcEmitter {
   /** Lowers a call to a foreign function. `callee` is what the `call` names after its type — the
    * symbol, with the whole function type in front of it when the callee is variadic.
    */
-  protected def genForeignCall(callee: String, args: List[TExpr], ty: Type): String = {
+  protected def genForeignCall(what: String, callee: Val, args: List[TExpr], ty: Type): Val = {
     val result = CAbi.result(ty, target)
 
     // The storage a big result is written into is the caller's, so it exists before the call, and it
@@ -67,9 +67,9 @@ trait ForeignEmitter extends ArcEmitter {
     // signature holds.
     val returned = result match
       case CAbi.Result.Sret(ty, align) =>
-        val slot = emitAlloca(freshTemp(), ty)
+        val slot = emitAlloca(freshReg(), ty)
 
-        Some((slot, ir.Arg(LType.Ptr, Val.Raw(slot), sretAttr(ty, align))))
+        Some((slot, ir.Arg(LType.Ptr, slot, sretAttr(ty, align))))
       case _ => None
 
     // An argument past the declared parameters is a variadic extra, and C classifies one exactly as
@@ -84,44 +84,44 @@ trait ForeignEmitter extends ArcEmitter {
           // **caller's** obligation and the call is where the caller is: it is this line that makes
           // the back end widen the value before it goes into the register.
           case CAbi.Param.Plain =>
-            List(ir.Arg(a.ty.lty, Val.Raw(v), CAbi.extension(a.ty, target)))
+            List(ir.Arg(a.ty.lty, v, CAbi.extension(a.ty, target)))
           case CAbi.Param.Coerced(pieces) => spread(v, a.ty, pieces)
           case CAbi.Param.Indirect(ty, align, byval) =>
-            val slot = emitAlloca(freshTemp(), ty)
+            val slot = emitAlloca(freshReg(), ty)
 
-            emit(Inst.Store(ty, Val.Raw(v), Val.Raw(slot), Access.Plain))
-            List(ir.Arg(LType.Ptr, Val.Raw(slot), if byval then byvalAttr(ty, align) else ""))
+            emit(Inst.Store(ty, v, slot, Access.Plain))
+            List(ir.Arg(LType.Ptr, slot, if byval then byvalAttr(ty, align) else ""))
     }
 
     val arguments = returned.map(_._2).toList ::: passed
 
     result match
       case CAbi.Result.Sret(coerced, _) =>
-        emitForeign(None, callee, arguments)
+        emit(Inst.Call(None, what, callee, arguments))
 
         val r = freshReg()
 
-        emit(Inst.Load(r, coerced, Val.Raw(returned.get._1), Access.Plain))
-        ownTemp(r.render, ty)
+        emit(Inst.Load(r, coerced, returned.get._1, Access.Plain))
+        ownTemp(r, ty)
 
       case CAbi.Result.Coerced(coerced) =>
         val r = freshReg()
 
-        emitForeign(Some(r), callee, arguments)
+        emit(Inst.Call(Some(r), what, callee, arguments))
         // A homogeneous floating aggregate comes back under its own type, so there is nothing to
         // reinterpret and the round trip through memory would be a copy for its own sake.
-        ownTemp(if coerced == ty.lty then r.render else gather(r.render, coerced, ty), ty)
+        ownTemp(if coerced == ty.lty then r else gather(r, coerced, ty), ty)
 
       case CAbi.Result.Plain =>
         if Type.noValue(ty) then
-          emitForeign(None, callee, arguments)
+          emit(Inst.Call(None, what, callee, arguments))
           if ty == Type.Never then emitTerm(Inst.Unreachable)
-          ""
+          Val.Nothing
         else
           val r = freshReg()
 
-          emitForeign(Some(r), callee, arguments)
-          ownTemp(r.render, ty)
+          emit(Inst.Call(Some(r), what, callee, arguments))
+          ownTemp(r, ty)
   }
 
   /** The `sret` and `byval` attributes, which name the aggregate the storage holds as well as the
@@ -131,32 +131,25 @@ trait ForeignEmitter extends ArcEmitter {
   private def sretAttr(ty: LType, align: Int): String  = s"sret(${ty.render}) align $align"
   private def byvalAttr(ty: LType, align: Int): String = s"byval(${ty.render}) align $align"
 
-  /** A call whose callee is already written down — the symbol with what it returns in front of it,
-   * or a variadic callee's whole function type. Splitting the two apart is `CallEmitter.calleeParts`
-   * and is a change to the foreign signature machinery rather than to this call.
-   */
-  private def emitForeign(dest: Option[Val], callee: String, args: List[ir.Arg]): Unit =
-    emit(Inst.Call(dest, "", Val.Raw(callee), args))
-
   /** A value of `t`, spread into the registers the convention hands it over in. Several registers
    * are read back out of a literal struct of them, which lays each piece out at the offset of the
    * eightbyte it stands for.
    */
-  private def spread(v: String, t: Type, pieces: List[CAbi.Arg]): List[ir.Arg] = {
+  private def spread(v: Val, t: Type, pieces: List[CAbi.Arg]): List[ir.Arg] = {
     val holder = if pieces.length == 1 then pieces.head.ty else LType.Struct(pieces.map(_.ty))
     val slot   = reinterpret(v, t.lty, holder, layout.size(t))
 
     if pieces.length == 1 then
       val r = freshReg()
 
-      emit(Inst.Load(r, holder, Val.Raw(slot), Access.Plain))
+      emit(Inst.Load(r, holder, slot, Access.Plain))
       List(ir.Arg(pieces.head.ty, r, pieces.head.attr))
     else
       pieces.zipWithIndex.map { (p, i) =>
         val at = freshReg()
         val r  = freshReg()
 
-        emit(Inst.Gep(at, holder, Val.Raw(slot),
+        emit(Inst.Gep(at, holder, slot,
                       List(ir.Arg(LType.I(32), Val.Int(0)), ir.Arg(LType.I(32), Val.Int(i)))))
         emit(Inst.Load(r, p.ty, at, Access.Plain))
         ir.Arg(p.ty, r, p.attr)
@@ -164,12 +157,12 @@ trait ForeignEmitter extends ArcEmitter {
   }
 
   /** A value that arrived in the registers `llvm` names, read back as the `t` it stands for. */
-  private def gather(v: String, coerced: LType, t: Type): String = {
+  private def gather(v: Val, coerced: LType, t: Type): Val = {
     val slot = reinterpret(v, coerced, t.lty, layout.size(t))
     val r    = freshReg()
 
-    emit(Inst.Load(r, t.lty, Val.Raw(slot), Access.Plain))
-    r.render
+    emit(Inst.Load(r, t.lty, slot, Access.Plain))
+    r
   }
 
   /** Writes `v` down as `from` and hands back a slot of `to` holding the same `bytes` bytes. The
@@ -183,12 +176,12 @@ trait ForeignEmitter extends ArcEmitter {
    * lost by understating it — the guarantee is a floor, and LLVM refines it from the `alloca` it can
    * see right above.
    */
-  private def reinterpret(v: String, from: LType, to: LType, bytes: Int): String = {
-    val src = emitAlloca(freshTemp(), from)
-    val dst = emitAlloca(freshTemp(), to)
+  private def reinterpret(v: Val, from: LType, to: LType, bytes: Int): Val = {
+    val src = emitAlloca(freshReg(), from)
+    val dst = emitAlloca(freshReg(), to)
 
-    emit(Inst.Store(from, Val.Raw(v), Val.Raw(src), Access.Plain))
-    emitMemcpy(Val.Raw(dst), Val.Raw(src), bytes, 1)
+    emit(Inst.Store(from, v, src, Access.Plain))
+    emitMemcpy(dst, src, bytes, 1)
     dst
   }
 }

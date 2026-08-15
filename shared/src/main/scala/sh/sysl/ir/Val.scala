@@ -85,11 +85,6 @@ enum Val {
    */
   case Agg(fields: List[Arg])
 
-  /** Text an emitter interpolated, for a producer that has not been converted yet. Scaffolding, and
-   * deleted with `Inst.Raw` when the last of them is.
-   */
-  case Raw(text: String)
-
   def render: String = this match
     case Reg(name)    => s"%$name"
     case Global(name) => s"@$name"
@@ -103,15 +98,16 @@ enum Val {
     case Splat(l, v)  => s"splat (${l.render} ${v.render})"
     case Nothing      => ""
     case Agg(fields)  => fields.map(_.render).mkString("{ ", ", ", " }")
-    case Raw(text)    => text
 
-  /** Whether this is a constant rather than something computed — which is what the constant folds in
-   * codegen are really asking when they test a value's first character.
+  /** Whether this is a constant rather than something computed.
+   *
+   * It used to be a test of a value's first character, which is the shape a string operand forces:
+   * anything not beginning with `%` or `@` was taken for a literal. Reading it off the case instead
+   * is the same answer with nothing to get wrong — and a register named `@` is now unrepresentable
+   * rather than merely unlikely.
    */
   def isConst: Boolean = this match
     case _: Reg | _: Global => false
-    case _: Agg             => true
-    case Raw(text)          => !text.startsWith("%") && !text.startsWith("@")
     case _                  => true
 
   override def toString: String = render

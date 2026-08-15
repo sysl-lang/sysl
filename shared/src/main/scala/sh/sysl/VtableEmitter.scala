@@ -53,12 +53,12 @@ trait VtableEmitter extends ArcEmitter {
         s"define private $ret @$name(" +
           (out.map(_ + s" $sretParam").toList ::: "ptr %d" :: declare).mkString(", ") + ")") {
         val payload =
-          if !vt.boxed then "%d"
+          if !vt.boxed then Val.Reg("d")
           else
             val p = freshReg()
             emit(Inst.Gep(p, LType.Named(boxName(vt.forType)), Val.Reg("d"),
                           List(Arg(LType.I(32), Val.Int(0)), Arg(LType.I(32), Val.Int(headerFields)))))
-            p.render
+            p
 
         // The receiver is *borrowed* here, not owned: the implementation retains its parameters on
         // entry and releases them on return, so handing it a value loaded out of the object leaves
@@ -66,18 +66,18 @@ trait VtableEmitter extends ArcEmitter {
         val self = slot.recv match
           // A large receiver is passed at its address like any other large argument, so the
           // implementation makes the copy it was always going to make and the adapter makes none.
-          case RecvMode.ByValue if layout.indirect(vt.forType) => Arg(LType.Ptr, Val.Raw(payload))
+          case RecvMode.ByValue if layout.indirect(vt.forType) => Arg(LType.Ptr, payload)
           case RecvMode.ByValue =>
-            val v = freshReg(); emit(Inst.Load(v, vt.forType.lty, Val.Raw(payload), ir.Access.Plain))
+            val v = freshReg(); emit(Inst.Load(v, vt.forType.lty, payload, ir.Access.Plain))
             Arg(vt.forType.lty, v)
-          case RecvMode.ByPtr => Arg(LType.Ptr, Val.Raw(payload))
+          case RecvMode.ByPtr => Arg(LType.Ptr, payload)
           // A `&self` method on a raw object is refused where the object's type is formed, and on a
           // counted one the implementation is named directly, so no adapter is ever built for it.
           case RecvMode.ByRef(_) => sys.error("unreachable adapter for a '&self' method")
 
         // The out-pointer is forwarded with its `sret` intact and its `noalias` dropped: the adapter
         // did not create the storage and cannot promise nothing else addresses it.
-        val forward = out.map(o => Arg(LType.Ptr, Val.Raw(sretParam),
+        val forward = out.map(o => Arg(LType.Ptr, sretParam,
                                        o.replace("noalias ", "").stripPrefix("ptr "))).toList
         val call    = forward ::: self :: pass
 

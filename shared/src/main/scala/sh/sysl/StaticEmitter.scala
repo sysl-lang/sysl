@@ -72,7 +72,7 @@ trait StaticEmitter extends StringEmitter {
     // Three words naming bytes that are never freed. The owner is null, which is what makes the
     // whole value a constant expression rather than something a prologue has to build — and what
     // lets a `string` sit in storage that is never let go of at all (`13 §7`).
-    case TStrLit(s) => stringValue(s)
+    case TStrLit(s) => stringValue(s).render
 
     // A struct constant lists its fields in the order the type declares them, and skips the ones
     // that occupy nothing exactly as the `insertvalue` chain in the ordinary path does — the
@@ -104,10 +104,9 @@ trait StaticEmitter extends StringEmitter {
    * back out as the double that float is. That is the same rounding the `fptrunc` in the ordinary
    * path performs, done here instead of at run time.
    */
-  private def constantFloat(bits: String, ty: Type): String = {
-    val d = java.lang.Double.longBitsToDouble(java.lang.Long.parseUnsignedLong(bits.drop(2), 16))
+  private def constantFloat(bits: Long, ty: Type): String = {
+    val d = java.lang.Double.longBitsToDouble(bits)
 
-    if ty == Type.Real then bits
-    else f"0x${java.lang.Double.doubleToLongBits(d.toFloat.toDouble)}%016X"
+    (if ty == Type.Real then ir.Val.Float(bits) else ir.Val.float32(d)).render
   }
 }
