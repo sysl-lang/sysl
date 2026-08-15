@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.Val
+
 /** Addressing a place, and building the composite values that have one.
  *
  * Two things live here because they are the same subject seen from either end. A **place** is
@@ -312,15 +314,15 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
         else
           for l <- len do
             val within = freshTemp(); emit(s"$within = icmp ult $word $v, $l")
-            trapUnless(within, "bounds")
+            trapUnless(Val.Raw(within), "bounds")
           val e = freshTemp(); emit(s"$e = add $word $v, 1"); e
 
     for l <- len if hi.isDefined && !inclusive do
       val fits = freshTemp(); emit(s"$fits = icmp ule $word $end, $l")
-      trapUnless(fits, "bounds")
+      trapUnless(Val.Raw(fits), "bounds")
 
     val ordered = freshTemp(); emit(s"$ordered = icmp ule $word $start, $end")
-    trapUnless(ordered, "bounds")
+    trapUnless(Val.Raw(ordered), "bounds")
 
     // A substring has to be a string, so both ends must fall between characters. This runs after
     // the bounds checks, which is what makes reading the byte at either end safe.
@@ -328,8 +330,8 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       // A string is a view and so always has one; only a `*T` region does not.
       val l = len.getOrElse(sys.error("unreachable string slice with no length"))
 
-      trapUnless(strBoundary(first, l, start), "boundary")
-      trapUnless(strBoundary(first, l, end), "boundary")
+      trapUnless(Val.Raw(strBoundary(first, l, start)), "boundary")
+      trapUnless(Val.Raw(strBoundary(first, l, end)), "boundary")
 
     val p = freshTemp(); emit(s"$p = getelementptr ${elem.llvm}, ptr $first, $word $start")
     val n = freshTemp(); emit(s"$n = sub $word $end, $start")
@@ -451,11 +453,11 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val over2 = freshTemp(); emit(s"$over2 = extractvalue $pair $add, 1")
     val over  = freshTemp(); emit(s"$over = or i1 $over1, $over2")
     val fits  = freshTemp(); emit(s"$fits = xor i1 $over, true")
-    trapUnless(fits, "size")
+    trapUnless(Val.Raw(fits), "size")
 
     val p   = freshTemp(); emit(s"$p = call ptr @$mallocSym($word $total)")
     val got = freshTemp(); emit(s"$got = icmp ne ptr $p, null")
-    trapUnless(got, "alloc")
+    trapUnless(Val.Raw(got), "alloc")
 
     emit(s"store $word 1, ptr $p")
     val hook = freshTemp(); emit(s"$hook = getelementptr $bn, ptr $p, i32 0, i32 1")
@@ -499,7 +501,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    */
   protected def boundsCheck(i: String, len: String): Unit = {
     val ok = freshTemp(); emit(s"$ok = icmp ult $word $i, $len")
-    trapUnless(ok, "bounds")
+    trapUnless(Val.Raw(ok), "bounds")
   }
 
   /** Builds an enum value from already-lowered payload values: the tag, then the variant's payload
@@ -552,7 +554,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     // one here on exactly that ground — the value is laid out as the base and converts as it.
     val vt = Type.repr(value.ty).asInstanceOf[Type.Integer]
     val v  = genExpr(value)
-    trapUnless(enumMembership(en, vt, v), "enum")
+    trapUnless(Val.Raw(enumMembership(en, vt, v)), "enum")
     convert(vt, en.underlying, v)
   }
 

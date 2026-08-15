@@ -46,12 +46,12 @@ trait EnumAttrEmitter extends ScalarEmitter {
         val geLo = compareValue(">=", Type.Int, v, "0")
         val ltHi = compareValue("<", Type.Int, v, vs.length.toString)
         val ok   = freshReg(); emit(Inst.Bin(ok, ir.BinOp.And, LType.I(1), Val.Raw(geLo), Val.Raw(ltHi)))
-        trapUnless(ok.render, "val")
+        trapUnless(ok, "val")
         chain(uw, i => vs(i).tag.toString,
               i => { val r = freshReg(); emit(Inst.IntCmp(r, ICmp.Eq, iw, Val.Raw(v), Val.Int(i))); r.render })
 
       case "Succ" =>
-        trapUnless(compareValue("!=", en.underlying, v, vs(last).tag.toString), "succ")
+        trapUnless(Val.Raw(compareValue("!=", en.underlying, v, vs(last).tag.toString)), "succ")
         // Mapping each value to the one after it: entry `i` (for `i < last`) selects `tag(i+1)`,
         // with the last value as the default the trap above keeps it from reaching.
         (last - 1 to 0 by -1).foldLeft(vs(last).tag.toString) { (acc, i) =>
@@ -61,7 +61,7 @@ trait EnumAttrEmitter extends ScalarEmitter {
         }
 
       case "Pred" =>
-        trapUnless(compareValue("!=", en.underlying, v, vs.head.tag.toString), "pred")
+        trapUnless(Val.Raw(compareValue("!=", en.underlying, v, vs.head.tag.toString)), "pred")
         // Mapping each value to the one before it: entry `i` (for `i > 0`) selects `tag(i-1)`, with
         // the first value as the default it can never actually reach after the trap above.
         (1 to last).foldLeft(vs.head.tag.toString) { (acc, i) =>
@@ -89,7 +89,7 @@ trait EnumAttrEmitter extends ScalarEmitter {
         // Each variant contributes one string comparison; the value is the tag of the one that
         // matched, and no match at all traps.
         val eqs = vs.map(vv => compareValue("==", Type.Str, v, stringValue(vv.name)))
-        trapUnless(eqs.reduce(orI1), "value")
+        trapUnless(Val.Raw(eqs.reduce(orI1)), "value")
         (last - 1 to 0 by -1).foldLeft(vs(last).tag.toString) { (acc, i) =>
           val r = freshReg()
           emit(Inst.Select(r, Val.Raw(eqs(i)), uw, Val.Int(vs(i).tag), Val.Raw(acc)))

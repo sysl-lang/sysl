@@ -1,6 +1,6 @@
 package sh.sysl
 
-import ir.{FCmp, ICmp}
+import ir.{Access, Arg, BinOp, CastOp, FCmp, ICmp, Inst, LType, Val}
 
 /** The scalar end of codegen: arithmetic, comparison, conversion, and printing.
  *
@@ -22,23 +22,23 @@ trait ScalarEmitter extends StringEmitter {
     val instr = ty match
       case i: Type.Integer =>
         op match
-          case "+"  => "add"
-          case "-"  => "sub"
-          case "*"  => "mul"
-          case "/"  => if i.signed then "sdiv" else "udiv"
-          case "%"  => if i.signed then "srem" else "urem"
-          case "<<" => "shl"
-          case ">>" => if i.signed then "ashr" else "lshr"
-          case "&"  => "and"
-          case "|"  => "or"
-          case "^"  => "xor"
+          case "+"  => BinOp.Add
+          case "-"  => BinOp.Sub
+          case "*"  => BinOp.Mul
+          case "/"  => if i.signed then BinOp.SDiv else BinOp.UDiv
+          case "%"  => if i.signed then BinOp.SRem else BinOp.URem
+          case "<<" => BinOp.Shl
+          case ">>" => if i.signed then BinOp.AShr else BinOp.LShr
+          case "&"  => BinOp.And
+          case "|"  => BinOp.Or
+          case "^"  => BinOp.Xor
           case _    => sys.error(s"unreachable arith '$op'")
       case _: Type.Floating =>
         op match
-          case "+" => "fadd"
-          case "-" => "fsub"
-          case "*" => "fmul"
-          case "/" => "fdiv"
+          case "+" => BinOp.FAdd
+          case "-" => BinOp.FSub
+          case "*" => BinOp.FMul
+          case "/" => BinOp.FDiv
           case _   => sys.error(s"unreachable arith '$op'")
       case other => sys.error(s"unreachable arith on ${other.llvm}")
 
@@ -50,22 +50,24 @@ trait ScalarEmitter extends StringEmitter {
     var divisor = rv
     ty match
       case i: Type.Integer if op == "/" || op == "%" =>
-        val nz = freshTemp(); emit(s"$nz = icmp ne ${ty.llvm} $rv, 0")
+        val nz = freshReg(); emit(Inst.IntCmp(nz, ICmp.Ne, ty.lty, Val.Raw(rv), Val.Int(0)))
         trapUnless(nz, "div")
         if i.signed then
-          val neg1 = freshTemp(); emit(s"$neg1 = icmp eq ${ty.llvm} $rv, -1")
+          val neg1 = freshReg(); emit(Inst.IntCmp(neg1, ICmp.Eq, ty.lty, Val.Raw(rv), Val.Int(-1)))
           if op == "/" then
-            val min   = (-(BigInt(2).pow(i.bits - 1))).toString
-            val isMin = freshTemp(); emit(s"$isMin = icmp eq ${ty.llvm} $lv, $min")
-            val ovf   = freshTemp(); emit(s"$ovf = and i1 $isMin, $neg1")
-            val ok    = freshTemp(); emit(s"$ok = xor i1 $ovf, true")
+            val min   = -(BigInt(2).pow(i.bits - 1))
+            val isMin = freshReg(); emit(Inst.IntCmp(isMin, ICmp.Eq, ty.lty, Val.Raw(lv), Val.Int(min)))
+            val ovf   = freshReg(); emit(Inst.Bin(ovf, BinOp.And, i1, isMin, neg1))
+            val ok    = freshReg(); emit(Inst.Bin(ok, BinOp.Xor, i1, ovf, Val.Bool(true)))
             trapUnless(ok, "overflow")
           else
-            val safe = freshTemp(); emit(s"$safe = select i1 $neg1, ${ty.llvm} 1, ${ty.llvm} $rv")
-            divisor = safe
+            val safe = freshReg()
+
+            emit(Inst.Select(safe, neg1, ty.lty, Val.Int(1), Val.Raw(rv)))
+            divisor = safe.render
       case _ =>
 
-    val r = freshTemp(); emit(s"$r = $instr ${ty.llvm} $lv, $divisor"); r
+    val r = freshReg(); emit(Inst.Bin(r, instr, ty.lty, Val.Raw(lv), Val.Raw(divisor))); r.render
   }
 
   /** Integer `+`, `-`, `*` where the operands' declared ranges allow a result the base width cannot
@@ -83,12 +85,19 @@ trait ScalarEmitter extends StringEmitter {
     val fn = s"llvm.${if ty.signed then "s" else "u"}$name.with.overflow.${ty.llvm}"
     satDecls += s"declare {${ty.llvm}, i1} @$fn(${ty.llvm}, ${ty.llvm})"
 
-    val pair = freshTemp(); emit(s"$pair = call {${ty.llvm}, i1} @$fn(${ty.llvm} $lv, ${ty.llvm} $rv)")
-    val v    = freshTemp(); emit(s"$v = extractvalue {${ty.llvm}, i1} $pair, 0")
-    val ovf  = freshTemp(); emit(s"$ovf = extractvalue {${ty.llvm}, i1} $pair, 1")
-    val ok   = freshTemp(); emit(s"$ok = xor i1 $ovf, true")
+    // The intrinsic hands back the value and the overflow flag together, and it is the one place
+    // the compiler writes an aggregate LLVM names without a name: `{i32, i1}`, spelled with no
+    // interior spaces because that is what the declaration above it says.
+    val both = LType.Named(s"{${ty.llvm}, i1}")
+    val pair = freshReg()
+
+    emit(Inst.Call(Some(pair), both.render, Val.Global(fn),
+                   List(Arg(ty.lty, Val.Raw(lv)), Arg(ty.lty, Val.Raw(rv)))))
+    val v   = freshReg(); emit(Inst.Extract(v, both, pair, List(0)))
+    val ovf = freshReg(); emit(Inst.Extract(ovf, both, pair, List(1)))
+    val ok  = freshReg(); emit(Inst.Bin(ok, BinOp.Xor, i1, ovf, Val.Bool(true)))
     trapUnless(ok, "overflow")
-    v
+    v.render
   }
 
   /** A left shift of a value produced through a ranged type. There is no overflow intrinsic for a
@@ -98,14 +107,16 @@ trait ScalarEmitter extends StringEmitter {
    * left to wrap and never reach here.
    */
   protected def checkedShl(ty: Type.Integer, lv: String, sh: String): String = {
-    val amtOk = freshTemp(); emit(s"$amtOk = icmp ult ${ty.llvm} $sh, ${ty.bits}")
+    val amtOk = freshReg(); emit(Inst.IntCmp(amtOk, ICmp.Ult, ty.lty, Val.Raw(sh), Val.Int(ty.bits)))
     trapUnless(amtOk, "overflow")
 
-    val r    = freshTemp(); emit(s"$r = shl ${ty.llvm} $lv, $sh")
-    val back = freshTemp(); emit(s"$back = ${if ty.signed then "ashr" else "lshr"} ${ty.llvm} $r, $sh")
-    val ok   = freshTemp(); emit(s"$ok = icmp eq ${ty.llvm} $back, $lv")
+    val r    = freshReg(); emit(Inst.Bin(r, BinOp.Shl, ty.lty, Val.Raw(lv), Val.Raw(sh)))
+    val back = freshReg()
+
+    emit(Inst.Bin(back, if ty.signed then BinOp.AShr else BinOp.LShr, ty.lty, r, Val.Raw(sh)))
+    val ok = freshReg(); emit(Inst.IntCmp(ok, ICmp.Eq, ty.lty, back, Val.Raw(lv)))
     trapUnless(ok, "overflow")
-    r
+    r.render
   }
 
   /** The `icmp` / `fcmp` predicate for an operator at a type. `char` compares by scalar
@@ -168,14 +179,17 @@ trait ScalarEmitter extends StringEmitter {
     // operator then reads the same -1 / 0 / 1 the way it would read a subtraction.
     if ty == Type.Str then
       val c = strCmp(av, bv)
-      val r = freshTemp()
-      emit(s"$r = icmp ${predicate(op, Type.Int)} i32 $c, 0")
-      r
+      val r = freshReg()
+      emit(Inst.IntCmp(r, intPred(op, Type.Int), i32, Val.Raw(c), Val.Int(0)))
+      r.render
     else
-      val instr = if ty.isInstanceOf[Type.Floating] then "fcmp" else "icmp"
-      val r     = freshTemp()
-      emit(s"$r = $instr ${predicate(op, ty)} ${ty.llvm} $av, $bv")
-      r
+      val r = freshReg()
+
+      ty match
+        case _: Type.Floating => emit(Inst.FloatCmp(r, floatPred(op), ty.lty, Val.Raw(av), Val.Raw(bv)))
+        case _                => emit(Inst.IntCmp(r, intPred(op, ty), ty.lty, Val.Raw(av), Val.Raw(bv)))
+
+      r.render
   }
 
   // --- conversions ---------------------------------------------------------------------
@@ -188,12 +202,12 @@ trait ScalarEmitter extends StringEmitter {
 
     case (a: Type.Integer, b: Type.Integer) =>
       if b.bits == a.bits then v
-      else if b.bits < a.bits then castOp("trunc", a, b, v)
-      else castOp(if a.signed then "sext" else "zext", a, b, v)
+      else if b.bits < a.bits then castOp(CastOp.Trunc, a, b, v)
+      else castOp(if a.signed then CastOp.SExt else CastOp.ZExt, a, b, v)
 
-    case (a: Type.Integer, b: Type.Floating)  => castOp(if a.signed then "sitofp" else "uitofp", a, b, v)
+    case (a: Type.Integer, b: Type.Floating)  => castOp(if a.signed then CastOp.SIToFP else CastOp.UIToFP, a, b, v)
     case (a: Type.Floating, b: Type.Integer)  => saturatingCast(a, b, v)
-    case (a: Type.Floating, b: Type.Floating) => castOp(if b.bits > a.bits then "fpext" else "fptrunc", a, b, v)
+    case (a: Type.Floating, b: Type.Floating) => castOp(if b.bits > a.bits then CastOp.FPExt else CastOp.FPTrunc, a, b, v)
 
     case (Type.Char, b: Type.Integer) => convert(Type.Integer(32, signed = false), b, v)
     case (a: Type.Integer, Type.Char) => checkedChar(a, v)
@@ -206,21 +220,21 @@ trait ScalarEmitter extends StringEmitter {
     // opaque pointers, so reading one as the other is nothing at all at this level — which is
     // exactly the claim the language is making about it.
     case (_: Type.Ptr, _: Type.Ptr)      => v
-    case (a: Type.Ptr, b: Type.Integer)  => castOp("ptrtoint", a, b, v)
-    case (a: Type.Integer, b: Type.Ptr)  => castOp("inttoptr", a, b, v)
+    case (a: Type.Ptr, b: Type.Integer)  => castOp(CastOp.PtrToInt, a, b, v)
+    case (a: Type.Integer, b: Type.Ptr)  => castOp(CastOp.IntToPtr, a, b, v)
 
     // An address of code and an address of bytes are the same word, which is what makes `dlsym`
     // usable in one direction and a `*u8` callback table usable in the other (`12 §6a`).
     case (_: Type.Ptr, _: Type.CFn)      => v
     case (_: Type.CFn, _: Type.Ptr)      => v
     case (_: Type.CFn, _: Type.CFn)      => v
-    case (a: Type.CFn, b: Type.Integer)  => castOp("ptrtoint", a, b, v)
-    case (a: Type.Integer, b: Type.CFn)  => castOp("inttoptr", a, b, v)
+    case (a: Type.CFn, b: Type.Integer)  => castOp(CastOp.PtrToInt, a, b, v)
+    case (a: Type.Integer, b: Type.CFn)  => castOp(CastOp.IntToPtr, a, b, v)
 
     case _ => sys.error(s"unreachable conversion from ${from.llvm} to ${to.llvm}")
 
-  private def castOp(instr: String, from: Type, to: Type, v: String): String = {
-    val r = freshTemp(); emit(s"$r = $instr ${from.llvm} $v to ${to.llvm}"); r
+  private def castOp(instr: CastOp, from: Type, to: Type, v: String): String = {
+    val r = freshReg(); emit(Inst.Cast(r, instr, from.lty, Val.Raw(v), to.lty)); r.render
   }
 
   /** Float-to-integer, saturating. A plain `fptosi`/`fptoui` is poison when the source is out of
@@ -233,9 +247,9 @@ trait ScalarEmitter extends StringEmitter {
     val op   = if to.signed then "fptosi.sat" else "fptoui.sat"
     val name = s"llvm.$op.${to.llvm}.f${from.bits}"
     satDecls += s"declare ${to.llvm} @$name(${from.llvm})"
-    val r = freshTemp()
-    emit(s"$r = call ${to.llvm} @$name(${from.llvm} $v)")
-    r
+    val r = freshReg()
+    emit(Inst.Call(Some(r), to.llvm, Val.Global(name), List(Arg(from.lty, Val.Raw(v)))))
+    r.render
   }
 
   /** `char(u)` — a checked conversion. A Unicode scalar value is at most `0x10FFFF` and never
@@ -244,29 +258,30 @@ trait ScalarEmitter extends StringEmitter {
    */
   private def checkedChar(from: Type.Integer, v: String): String = {
     val wide     = convert(from, Type.Integer(64, from.signed), v)
-    val inRange  = freshTemp(); emit(s"$inRange = icmp ule i64 $wide, 1114111")
-    val belowLow = freshTemp(); emit(s"$belowLow = icmp ult i64 $wide, 55296")
-    val aboveTop = freshTemp(); emit(s"$aboveTop = icmp ugt i64 $wide, 57343")
-    val scalar   = freshTemp(); emit(s"$scalar = or i1 $belowLow, $aboveTop")
-    val ok       = freshTemp(); emit(s"$ok = and i1 $inRange, $scalar")
+    val i64      = LType.I(64)
+    val inRange  = freshReg(); emit(Inst.IntCmp(inRange, ICmp.Ule, i64, Val.Raw(wide), Val.Int(1114111)))
+    val belowLow = freshReg(); emit(Inst.IntCmp(belowLow, ICmp.Ult, i64, Val.Raw(wide), Val.Int(55296)))
+    val aboveTop = freshReg(); emit(Inst.IntCmp(aboveTop, ICmp.Ugt, i64, Val.Raw(wide), Val.Int(57343)))
+    val scalar   = freshReg(); emit(Inst.Bin(scalar, BinOp.Or, i1, belowLow, aboveTop))
+    val ok       = freshReg(); emit(Inst.Bin(ok, BinOp.And, i1, inRange, scalar))
 
     trapUnless(ok, "char")
-    castOp("trunc", Type.Integer(64, from.signed), Type.Char, wide)
+    castOp(CastOp.Trunc, Type.Integer(64, from.signed), Type.Char, wide)
   }
 
   /** Traps unless a condition holds. This is the shape every runtime check takes: a compare, a
    * branch, `llvm.trap`, and an unreachable arm, with the checked path falling through.
    */
-  protected def trapUnless(ok: String, what: String): Unit = {
+  protected def trapUnless(ok: Val, what: String): Unit = {
     traps = true
 
     val okL  = freshLabel(s"$what.ok")
     val badL = freshLabel(s"$what.bad")
 
-    emitTerm(s"br i1 $ok, label %$okL, label %$badL")
+    emitTerm(Inst.CondBr(ok, okL, badL))
     emitLabel(badL)
-    emit("call void @llvm.trap()")
-    emitTerm("unreachable")
+    emit(Inst.Call(None, "void", Val.Global("llvm.trap"), Nil))
+    emitTerm(Inst.Unreachable)
     emitLabel(okL)
   }
 
@@ -283,9 +298,12 @@ trait ScalarEmitter extends StringEmitter {
     case Type.Bool =>
       boolStrs = true
       val v   = genExpr(arg)
-      val ptr = freshTemp(); emit(s"$ptr = select i1 $v, ptr @.true, ptr @.false")
-      val len = freshTemp(); emit(s"$len = select i1 $v, $word 4, $word 5")
-      strView("null", ptr, len)
+      val ptr = freshReg()
+      val len = freshReg()
+
+      emit(Inst.Select(ptr, Val.Raw(v), LType.Ptr, Val.Global(".true"), Val.Global(".false")))
+      emit(Inst.Select(len, Val.Raw(v), wordLty, Val.Int(4), Val.Int(5)))
+      strView(Val.Null, ptr, len)
 
     case Type.Char =>
       charBuf = true
@@ -293,9 +311,9 @@ trait ScalarEmitter extends StringEmitter {
       request("sysl.str.from_bytes")(StringEmitter.fromBytes)
       val fn = request("sysl.str.char")(StringEmitter.char)
       val cp = genExpr(arg)
-      val r  = freshTemp()
-      emit(s"$r = call ${Type.Str.llvm} @$fn(i32 $cp)")
-      r
+      val r  = freshReg()
+      emit(Inst.Call(Some(r), Type.Str.llvm, Val.Global(fn), List(Arg(i32, Val.Raw(cp)))))
+      r.render
 
     // Rendered at a width that holds the value, which for anything past 64 bits is **the value's
     // own**. Up to 64 it goes through the renderer every program has always used — one instance,
@@ -312,19 +330,20 @@ trait ScalarEmitter extends StringEmitter {
       val bits   = if i.bits > 64 then i.bits else 64
       val fn     = request(StringEmitter.intName(bits))(StringEmitter.int(bits))
       val wide   = convert(i, Type.Integer(bits, i.signed), genExpr(arg))
-      val signed = if i.signed then "1" else "0"
-      val r      = freshTemp()
-      emit(s"$r = call ${Type.Str.llvm} @$fn(i$bits $wide, i1 $signed)")
-      r
+      val r = freshReg()
+
+      emit(Inst.Call(Some(r), Type.Str.llvm, Val.Global(fn),
+                     List(Arg(LType.I(bits), Val.Raw(wide)), Arg(i1, Val.Int(if i.signed then 1 else 0)))))
+      r.render
 
     case f: Type.Floating =>
       heap = true
       usesSnprintf = true
       val fn = request("sysl.str.float")(StringEmitter.float)
       val v  = convert(f, Type.Real, genExpr(arg))
-      val r  = freshTemp()
-      emit(s"$r = call ${Type.Str.llvm} @$fn(double $v)")
-      r
+      val r  = freshReg()
+      emit(Inst.Call(Some(r), Type.Str.llvm, Val.Global(fn), List(Arg(LType.F(64), Val.Raw(v)))))
+      r.render
 
     case other => sys.error(s"unreachable str of ${other.llvm}")
 
@@ -339,16 +358,19 @@ trait ScalarEmitter extends StringEmitter {
 
     val c   = FormatSpec.conversion(spec)
     val fmt = stringGlobal(FormatSpec.cFormat(spec))
-    val r   = freshTemp()
+    val r   = freshReg()
+
+    def call(fn: String, rest: List[Arg]): Unit =
+      emit(Inst.Call(Some(r), Type.Str.llvm, Val.Global(fn), Arg(LType.Ptr, fmt) :: rest))
 
     if FormatSpec.isStr(c) then
       val fn     = request("sysl.str.fmt_s")(StringEmitter.fmtStr)
       val (p, n) = strBytes(genExpr(arg))
-      emit(s"$r = call ${Type.Str.llvm} @$fn(ptr $fmt, ptr $p, $word $n)")
+      call(fn, List(Arg(LType.Ptr, Val.Raw(p)), Arg(wordLty, Val.Raw(n))))
     else if FormatSpec.isFloat(c) then
       val fn = request("sysl.str.fmt_f")(StringEmitter.fmtFloat)
       val v  = convert(Type.underlying(arg.ty).asInstanceOf[Type.Floating], Type.Real, genExpr(arg))
-      emit(s"$r = call ${Type.Str.llvm} @$fn(ptr $fmt, double $v)")
+      call(fn, List(Arg(LType.F(64), Val.Raw(v))))
     else
       // A signed conversion widens by the value's own signedness, so a decimal keeps its value; an
       // unsigned one reads the bits as unsigned, so `%x` shows exactly the value's own width. Both
@@ -360,17 +382,18 @@ trait ScalarEmitter extends StringEmitter {
         else
           val unsigned = convert(i, Type.Integer(i.bits, signed = false), genExpr(arg))
           convert(Type.Integer(i.bits, signed = false), Type.Integer(64, signed = false), unsigned)
-      emit(s"$r = call ${Type.Str.llvm} @$fn(ptr $fmt, i64 $v)")
+      call(fn, List(Arg(LType.I(64), Val.Raw(v))))
 
-    r
+    r.render
   }
 
   /** Builds a string value from its three words. */
-  private def strView(owner: String, ptr: String, len: String): String = {
-    val v0 = freshTemp(); emit(s"$v0 = insertvalue ${Type.Str.llvm} undef, ptr $owner, 0")
-    val v1 = freshTemp(); emit(s"$v1 = insertvalue ${Type.Str.llvm} $v0, ptr $ptr, 1")
-    val v2 = freshTemp(); emit(s"$v2 = insertvalue ${Type.Str.llvm} $v1, $word $len, 2")
-    v2
+  private def strView(owner: Val, ptr: Val, len: Val): String = {
+    val str = Type.Str.lty
+    val v0  = freshReg(); emit(Inst.Insert(v0, str, Val.Undef, LType.Ptr, owner, List(0)))
+    val v1  = freshReg(); emit(Inst.Insert(v1, str, v0, LType.Ptr, ptr, List(1)))
+    val v2  = freshReg(); emit(Inst.Insert(v2, str, v1, wordLty, len, List(2)))
+    v2.render
   }
 }
 

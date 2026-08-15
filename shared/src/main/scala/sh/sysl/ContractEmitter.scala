@@ -100,7 +100,7 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
     val ok = freshReg()
 
     emit(Inst.IntCmp(ok, intPred("<", variant.ty), variant.ty.lty, Val.Raw(nxt), Val.Raw(cur)))
-    trapUnless(ok.render, "variant")
+    trapUnless(ok, "variant")
   }
 
   private def memcpy(dst: String, src: String, ty: Type): Unit = {
@@ -115,7 +115,7 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
     pushTemps()
     val ok = genExpr(cond)
     popTemps()
-    trapUnless(ok, kind)
+    trapUnless(Val.Raw(ok), kind)
   }
 
   /** Runs every postcondition with `result` bound to the value about to be returned. */
@@ -164,7 +164,7 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
     emitLabel(cmpL)
     val prev = freshReg(); emit(Inst.Load(prev, w, Val.Reg(s"$slot.prev"), Access.Plain))
     val ok   = freshReg(); emit(Inst.IntCmp(ok, intPred("<", varTy), w, Val.Raw(cur), prev))
-    trapUnless(ok.render, "variant")
+    trapUnless(ok, "variant")
     emitTerm(Inst.Br(setL))
     emitLabel(setL)
     emit(Inst.Store(w, Val.Raw(cur), Val.Reg(s"$slot.prev"), Access.Plain))
@@ -190,9 +190,10 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
         for lo <- c.lo do trapUnless(fcmpConst(FCmp.Oge, wide, lo), "within")
         for hi <- c.hi do trapUnless(fcmpConst(if c.exclusiveHi then FCmp.Olt else FCmp.Ole, wide, hi), "within")
       case base =>
-        for lo <- c.lo do trapUnless(compareValue(">=", base, v, lo.toBigInt.toString), "within")
+        for lo <- c.lo do trapUnless(Val.Raw(compareValue(">=", base, v, lo.toBigInt.toString)), "within")
         for hi <- c.hi do
-          trapUnless(compareValue(if c.exclusiveHi then "<" else "<=", base, v, hi.toBigInt.toString), "within")
+          trapUnless(Val.Raw(compareValue(if c.exclusiveHi then "<" else "<=", base, v, hi.toBigInt.toString)),
+                     "within")
 
   /** Everything a constrained subtype asks of a value: the `within` range, then the `where`
    * predicate — a synthesised `i1`-returning function over the base value, which traps exactly as
@@ -207,14 +208,14 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
       val r = freshReg()
 
       emit(Inst.Call(Some(r), "i1", Val.Global(pf), List(Arg(Type.underlying(c.base).lty, Val.Raw(v)))))
-      trapUnless(r.render, "where")
+      trapUnless(r, "where")
   }
 
-  private def fcmpConst(pred: FCmp, wide: String, bound: BigDecimal): String = {
+  private def fcmpConst(pred: FCmp, wide: String, bound: BigDecimal): Val = {
     val r = freshReg()
 
     emit(Inst.FloatCmp(r, pred, LType.F(64), Val.Raw(wide), Val.float(bound.toDouble)))
-    r.render
+    r
   }
 
   /** Checks a struct value against its `invariant` function: read each stored field out of the
@@ -242,5 +243,5 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
         s"${ft.llvm} $r"
     }
     val ok = freshTemp(); emit(s"$ok = call i1 @$invFn(${args.mkString(", ")})")
-    trapUnless(ok, "invariant")
+    trapUnless(Val.Raw(ok), "invariant")
 }

@@ -123,8 +123,8 @@ trait ExprEmitter extends ArithEmitter {
       val base = Type.underlying(c.base)
       val last = if c.exclusiveHi then c.hi.get - 1 else c.hi.get
       // `Succ` traps at `Last`, `Pred` at `First`; the value is otherwise one step along the base.
-      if up then trapUnless(compareValue("<", base, v, last.toBigInt.toString), "succ")
-      else trapUnless(compareValue(">", base, v, c.lo.get.toBigInt.toString), "pred")
+      if up then trapUnless(Val.Raw(compareValue("<", base, v, last.toBigInt.toString)), "succ")
+      else trapUnless(Val.Raw(compareValue(">", base, v, c.lo.get.toBigInt.toString)), "pred")
       val r = freshTemp(); emit(s"$r = ${if up then "add" else "sub"} ${base.llvm} $v, 1"); r
 
     case TConstrainedCheck(value, target) =>
