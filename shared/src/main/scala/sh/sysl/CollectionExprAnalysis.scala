@@ -79,10 +79,11 @@ trait CollectionExprAnalysis extends ExprSupport {
           val tc = analyzeExpr(count)
 
           // A count is an index's twin, so it takes a transparent subtype for the same reason one
-          // does — and refuses a derived one for the same reason too, and is held to the same width
-          // for the same reason: a truncated count would size the storage by a number nobody wrote.
+          // does — and refuses a derived one for the same reason too. A count wider than an address
+          // needs no rule of its own either: it reaches `widenIndex` like every index does, and that
+          // traps on a value which does not fit rather than sizing storage by a number nobody wrote.
           val checked = Type.repr(tc.ty) match
-            case i: Type.Integer => checkedIndexWidth(tc, i)
+            case _: Type.Integer => tc
             case _ => err(s"a repeat count is a number of elements, and ${show(tc.ty)} is not an integer")
 
           TBufFill(tv, checked, Type.Slice(tv.ty, ro))
@@ -214,7 +215,7 @@ trait CollectionExprAnalysis extends ExprSupport {
           Type.repr(ti.ty) match
             // The element's qualifier stays on the receiver's type and comes off the value read out
             // of it, exactly as a field's does (`03 § Device memory`).
-            case i: Type.Integer => TIndex(tr, checkedIndexWidth(ti, i), Type.unqualified(elem))
+            case _: Type.Integer => TIndex(tr, ti, Type.unqualified(elem))
             // At the index's own position rather than the subscript's: the message is about what
             // was written between the brackets, and a caret on the `[` points one character to the
             // left of the thing being complained about.
@@ -245,7 +246,7 @@ trait CollectionExprAnalysis extends ExprSupport {
     val t = analyzeExpr(e, Some(Type.usize))
 
     t.ty match
-      case i: Type.Integer => checkedIndexWidth(t, i)
+      case _: Type.Integer => t
       case other           => err(s"a slice bound must be an integer, not ${show(other)}")
   }
 

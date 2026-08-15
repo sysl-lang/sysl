@@ -555,10 +555,39 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * against is a length, and a length is a `usize`. Widening to a constant 64 was right for as long
    * as every target was — and produced an `icmp` between an `i64` and an `i32` the moment one was
    * not, which is what `CrossTargetBuildTests` caught.
+   *
+   * **A *wider* index is narrowed, and the test that makes that safe is emitted here rather than
+   * refused in the analyzer.** No storage can hold more than `usize` elements, so an index that does
+   * not fit in one names nothing — which makes it an ordinary out-of-bounds index and not a program
+   * the compiler has to decline. Testing before the truncation is what keeps it honest: `2^64 + 5`
+   * at 128 bits would arrive as 5 and pass a six-element check, so the fit is asked at the *index's*
+   * width, where the value is still all there.
+   *
+   * It is read **unsigned** for that test, exactly as the bounds check below reads it, so a negative
+   * index arrives as a very large one and fails — the same answer it gets on a machine where it
+   * would have needed no narrowing at all.
+   *
+   * **Sixteen bits is what made this the ordinary case rather than an exotic one.** Until CRAFT
+   * every target's address was as wide as an `int` or wider, so the only index this reached was a
+   * `u128`, and refusing those cost nothing. On a machine with a 64 KiB address space `int` is
+   * wider than `usize`, so `for i in 0..<4 do b[i] …` is the case — which `07 § Indexing` names in
+   * as many words as the thing that must not need a conversion.
    */
   protected def widenIndex(index: TExpr): Val = Type.underlying(index.ty) match
-    case i: Type.Integer => convert(i, Type.Integer(target.word.bits, i.signed), genExpr(index))
-    case other           => sys.error(s"unreachable index of type ${other.llvm}")
+    case i: Type.Integer if i.bits <= target.word.bits =>
+      convert(i, Type.Integer(target.word.bits, i.signed), genExpr(index))
+
+    case i: Type.Integer =>
+      val v     = genExpr(index)
+      val wide  = LType.I(i.bits)
+      val limit = Val.Int((BigInt(1) << target.word.bits) - 1)
+      val fits  = freshReg()
+
+      emit(Inst.IntCmp(fits, ICmp.Ule, wide, v, limit))
+      trapUnless(fits, "bounds")
+      convert(i, Type.Integer(target.word.bits, i.signed), v)
+
+    case other => sys.error(s"unreachable index of type ${other.llvm}")
 
   /** Traps unless `i` names an element that exists. The comparison is unsigned at the address width,
    * so a negative index arrives as a very large one and fails the same test.

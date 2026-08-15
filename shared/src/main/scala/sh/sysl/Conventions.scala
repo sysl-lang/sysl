@@ -85,6 +85,17 @@ object Conventions {
       Left("a wasm module is only ever entered by its embedder calling an exported function, so " +
         "nothing arrives asynchronously and there is no handler for a convention to describe")
 
+    // **CRAFT has traps and still has nothing for a convention to describe**, which makes it the
+    // most interesting refusal here: the three above are machines whose entry is assembly, or is
+    // already an ordinary function, or does not exist at all. This machine has exactly *one* vector
+    // and a `cause` register — so what the hardware reaches is never the handler, it is the kernel's
+    // decoder, which reads `cause` and dispatches. A per-handler convention would be arranging a
+    // prologue for a function nothing enters directly.
+    case Cpu.Craft =>
+      Left("CRAFT enters every trap at one vector with the reason in 'cause', so what the hardware " +
+        "reaches is the kernel's own decoder rather than a handler — write that entry in assembly, " +
+        "and let it call an ordinary function for each cause it decodes")
+
     // 32-bit x86 has the convention, but i386 is not lowerable for want of a measured C ABI
     // (`Target.supported`), so nothing can reach this and saying so is better than implying support.
     case Cpu.X86 =>

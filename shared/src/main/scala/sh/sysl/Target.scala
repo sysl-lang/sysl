@@ -166,6 +166,29 @@ case class Target(
    */
   def supported: Boolean = Cpu.buildable.contains(cpu)
 
+  /** Whether there is a **clang** for this machine — which is a different question from whether sysl
+   * can lower for it, and CRAFT is where the two part company.
+   *
+   * Every other row in the registry is a triple some installed clang accepts, so `build`, `run`,
+   * `build-c`, `build-lib` and a `c const` probe all work by handing it one. CRAFT's back end is out
+   * of tree and is an `llc` rather than a driver, and the machine has no libc, no object format and
+   * no linker — so there is nothing for any of those to call. What sysl does for it is write the
+   * LLVM; `llc -march=craft` and `craft as` are the reader's own two commands.
+   *
+   * It is asked rather than derived from `Os.Freestanding`, because every other freestanding row
+   * has a perfectly good cross clang. The distinction is the toolchain's existence, not the
+   * machine's bareness.
+   */
+  def buildsWithClang: Boolean = cpu != Cpu.Craft
+
+  /** What to say to somebody who asked for a build sysl cannot drive — the sentence, once, so the
+   * five subcommands that refuse do not each invent their own half of it.
+   */
+  def noToolchain: String =
+    s"'$name' has no C toolchain — its LLVM back end is out of tree, and the machine has no libc, " +
+      "no object format and no linker for sysl to drive. Write the LLVM with 'sysl emit-llvm " +
+      s"--target $name', then 'llc -march=${cpu.backend}' and 'craft as'"
+
   /** Why not, where not — `None` for a target that builds.
    *
    * **It is here rather than at either reader because there are two of them**, and the same person
@@ -215,6 +238,22 @@ enum Cpu(val bits: Int) {
   case Wasm32  extends Cpu(32)
   case X86     extends Cpu(32)
 
+  /** CRAFT — *Compact RISC Architecture For Teaching*, and the first machine here narrower than a
+    * `long`, an `int`, or the pointer every other row shares a width with.
+    *
+    * **Sixteen bits is the whole of what makes it different, and it reaches further than any other
+    * field in this registry does.** `Word(16)` is what `usize` and `isize` become, so a view is
+    * `{ ptr, ptr, i16 }` and a program's whole address space is the 64 KiB one length can name. An
+    * `int` stays 32 bits and a `long` stays 64, because a width is the language's answer and not the
+    * machine's — so on this target the ordinary arithmetic of an ordinary program is multi-word, and
+    * the back end below expands it.
+    *
+    * There is deliberately no `Craft32`, and there never will be: the ISA's own positioning is that
+    * *"the moment CRAFT grows to 32 bits, RISC-V does it better and the reason to exist evaporates"*.
+    * The name carries no width for that reason — one machine, one row.
+    */
+  case Craft   extends Cpu(16)
+
   /** How a source file names this processor — in a `#if` condition and in an assembly arm alike.
    * One spelling for both, so a program that gates on a processor and one that writes instructions
    * for it are naming the same thing.
@@ -231,6 +270,7 @@ enum Cpu(val bits: Int) {
     case Thumb   => "thumb"
     case Wasm32  => "wasm32"
     case X86     => "x86"
+    case Craft   => "craft"
 
   /** The name LLVM registers this processor's back end under, which is what `clang -print-targets`
    * lists and so what says whether a given clang can produce objects for this target at all.
@@ -253,6 +293,10 @@ enum Cpu(val bits: Int) {
     case Thumb   => "thumb"
     case Wasm32  => "wasm32"
     case X86     => "x86"
+    // Registered by an **out-of-tree** back end rather than by any clang somebody installs, so this
+    // is the one name `Toolchain.findClang` never goes looking for: `craftFreestanding` is refused a
+    // toolchain outright and reaches `llc` only by the reader's own hand.
+    case Craft   => "craft"
 }
 
 object Cpu {
@@ -533,6 +577,32 @@ object Target {
     Target("wasm32-freestanding", "wasm32-unknown-unknown", Cpu.Wasm32, Os.Freestanding,
       VaListAbi.Loaded, 4)
 
+  /** CRAFT — a 16-bit load/store teaching machine with a 64 KiB virtual address space, and the first
+   * row here that **no clang can build for**.
+   *
+   * Its back end lives out of tree, in the CRAFT repository, and is symlinked into an unmodified
+   * `llvm-project` rather than forked into one — so what exists is an `llc` somebody built, not a
+   * compiler driver anybody installs. There is no craft clang, no libc, no object format and **no
+   * linker**: `craft as` reads one assembly file and resolves every label inside it. So sysl writes
+   * the LLVM and stops, and `Toolchain` refuses this target rather than going looking for a driver
+   * that is not there (`buildsWithClang`).
+   *
+   * **Everything a target usually records about a C call is unanswerable here, which is a fact about
+   * the machine rather than a measurement nobody made.** `targets.md § Adding one` says an ABI
+   * answer comes from compiling the equivalent C and reading what clang did; there is no C on the
+   * other side of any call on this machine, so there is nothing to agree with. The fields below are
+   * therefore what the *LLVM back end* does, and `CAbi` says so where it is asked.
+   *
+   * `softFloat` and `noFpu` are both plainly true: there is no floating-point unit and no plan for
+   * one, so every operation on a `float` or a `double` is a call to a runtime routine the back end
+   * appends to the program that called it.
+   *
+   * The name carries no width because there is only ever going to be one CRAFT — see `Cpu.Craft`.
+   */
+  val craftFreestanding: Target =
+    Target("craft-freestanding", "craft", Cpu.Craft, Os.Freestanding, VaListAbi.Loaded, 2,
+      softFloat = true, noFpu = true)
+
   /** A target that is listed and cannot be built for. It is here rather than left out because the
    * limit is the compiler's and not the machine's, and a reader who names it deserves to be told
    * what is missing rather than told the name is unknown.
@@ -565,6 +635,7 @@ object Target {
       thumbv7emFreestandingSoft,
       riscv32Freestanding,
       wasm32Freestanding,
+      craftFreestanding,
       x86Linux,
     )
 

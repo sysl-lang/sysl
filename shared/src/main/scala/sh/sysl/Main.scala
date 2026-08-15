@@ -171,7 +171,7 @@ private[sysl] def execute(cfg: Config): Int = {
   // Which standard module this compilation is compiled against — an error if there is none, the same
   // as any other missing library.
   val Stdlib.Resolved(std, coreSymbols, coreArchive) =
-    Stdlib.resolve(stdChoice(cfg), target, allocator) match
+    Stdlib.resolve(stdChoice(cfg, target), target, allocator) match
     case Left(err) => return fail(err)
     case Right(c)  => c
 
@@ -183,6 +183,20 @@ private[sysl] def execute(cfg: Config): Int = {
     coreArchive match
       case Some(archive) => trace(s"standard module linked from $archive")
       case None          => trace("standard module compiled from source, not linked from an artifact")
+
+  // **A machine with no C toolchain is refused before anything is compiled**, because every command
+  // below this line that produces an artifact produces it by handing a triple to clang — and CRAFT
+  // has no clang to hand one to. Its back end is an out-of-tree `llc` rather than a driver, and the
+  // machine has no libc, no object format and no linker (`Target.buildsWithClang`).
+  //
+  // It is refused *here*, at the target, rather than at the point each subcommand reaches for a
+  // driver: the reader asked for a build of a machine that cannot be built, which is one mistake
+  // with one answer, and five separate failures deep in the toolchain would each describe the last
+  // step rather than the first. The answer names what *does* work, since there is one.
+  // `emit-llvm` is the whole of what this machine supports and `prove` never lowers at all, so both
+  // go through — the list is what needs a *driver* rather than what needs a target.
+  if !target.buildsWithClang && !Set("emit-llvm", "prove")(cfg.command) then
+    return fail(target.noToolchain)
 
   // Running the result is what makes `run` different from `build`, and only this machine can do
   // that — so a cross target is refused here rather than built and then failed to execute.
@@ -668,8 +682,14 @@ private def cLibrary(command: String): Boolean = command == "build-c" || command
  * unusable by the only tool that was ever going to read it. Folding the library in is what
  * `--no-std-lib` asks for everywhere else; here there is nothing else to ask for.
  */
-private def stdChoice(cfg: Config): Stdlib.Choice =
-  if cfg.noStdLib || cfg.std || cLibrary(cfg.command) then Stdlib.Choice.FromSource
+private def stdChoice(cfg: Config, target: Target): Stdlib.Choice =
+  // **A machine with no C toolchain takes the source, and has no choice about it.** An artifact is
+  // an *archive of objects* — the cache path compiles the library's IR with clang and archives it —
+  // so on a target with no object format, no archiver and no clang there is nothing an artifact
+  // could be. Compiling the library's source into the program is the same road bootstrap takes, for
+  // the same reason: it is the one that needs no toolchain at all.
+  if !target.buildsWithClang then Stdlib.Choice.FromSource
+  else if cfg.noStdLib || cfg.std || cLibrary(cfg.command) then Stdlib.Choice.FromSource
   else
     cfg.stdLib match
       case Some(named) => Stdlib.Choice.Artifact(named)

@@ -145,6 +145,9 @@ object CAbi {
   private def stackCopy(t: Type, target: Target)(using l: Layout): Option[Int] = target.cpu match
     case Cpu.X86_64 if target.os != Os.Windows => Some(math.max(l.align(t), 8))
     case Cpu.Wasm32                            => Some(l.align(t))
+    // CRAFT states the type's own alignment for wasm's reason and not System V's: there is no
+    // convention here declaring a floor, so the only honest number is what the type itself needs.
+    case Cpu.Craft                             => Some(l.align(t))
     case _                                     => None
 
   /** How a scalar **narrower than a register** is widened to fill one — `signext`, `zeroext`, or
@@ -195,7 +198,13 @@ object CAbi {
   }
 
   private def widen(bits: Int, signed: Boolean, target: Target): List[ir.Attr] =
-    if target.cpu == Cpu.Aarch64 && target.os != Os.MacOS then Nil
+    // **CRAFT widens nothing, because a widening is a promise made to a C compiler and there is no
+    // C compiler here.** Every entry below says what some clang does with the bits above a narrow
+    // value; this machine has none to disagree with, and its register is two bytes rather than the
+    // four or eight every one of those rules is stated against — so `signext i8` would be an
+    // instruction bought to keep a bargain nobody is on the other end of.
+    if target.cpu == Cpu.Craft then Nil
+    else if target.cpu == Cpu.Aarch64 && target.os != Os.MacOS then Nil
     else if bits == 1 then List(ir.Attr.ZeroExt)
     else if target.cpu == Cpu.X86_64 && target.os == Os.Windows then Nil
     else if bits < 32 then List(if signed then ir.Attr.SignExt else ir.Attr.ZeroExt)
@@ -238,6 +247,14 @@ object CAbi {
       case Cpu.Riscv32                           => riscv(t, size, target.hardFloat, xlen = 4)
       case Cpu.Thumb                             => aapcs32(t, size, target.hardFloat)
       case Cpu.Wasm32                            => wasm(t, size)
+      // **CRAFT has no C compiler, so there is no convention to agree with**, and that is the answer
+      // rather than a measurement nobody made. Every other row here was established by compiling the
+      // equivalent C and reading what clang did (`targets.md § Adding one`); this machine has no
+      // libc, no craft clang and no linker, so nothing on the other side of a call is C. What is
+      // left is the **back end's own** lowering, and passing an aggregate through memory is what it
+      // does: a register is two bytes, so anything past a single scalar is already indirect, and
+      // `CanLowerReturn` demotes a result wider than the two registers a return travels in.
+      case Cpu.Craft                             => craft(t, size)
       // i386 is refused at the registry (`Target.supported`) for want of exactly this, so nothing
       // reaches here — and when its convention is measured, this is the line that gains it.
       case Cpu.X86                               => Shape.Memory
@@ -484,6 +501,25 @@ object CAbi {
    * `AbiAgainstClangTests` re-asks it every run.
    */
   private def wasm(t: Type, size: Int)(using l: Layout): Shape =
+    onlyScalar(t, size) match
+      case Some(scalar) => alike(List(scalar.lty))
+      case None         => Shape.Memory
+
+  // --- CRAFT -----------------------------------------------------------------------------
+
+  /** CRAFT, whose rule reads like wasm's and is arrived at from the opposite direction — which is
+   * why it is written twice rather than shared.
+   *
+   * wasm flattens nothing because the machine has no registers for an aggregate to be flattened
+   * *into*. CRAFT has eight of them and they are **two bytes each**, so a rule that put an aggregate
+   * in registers would be spending the whole register file on a struct of four fields. The back end
+   * does not: anything past a single scalar travels through memory, and a result too wide for the
+   * two registers a return uses is demoted to an out-pointer by `CanLowerReturn`.
+   *
+   * The one thing that *is* unwrapped is a struct of exactly one scalar with no padding round it,
+   * because there is nothing there to pass indirectly.
+   */
+  private def craft(t: Type, size: Int)(using l: Layout): Shape =
     onlyScalar(t, size) match
       case Some(scalar) => alike(List(scalar.lty))
       case None         => Shape.Memory

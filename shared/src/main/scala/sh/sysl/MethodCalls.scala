@@ -204,7 +204,7 @@ trait MethodCalls extends FuncAddress {
     def runStart(e: Expr): TExpr = {
       val ti = analyzeExpr(e, Some(Type.usize))
       Type.repr(ti.ty) match
-        case i: Type.Integer => checkedIndexWidth(ti, i)
+        case _: Type.Integer => ti
         case other           => err(s"the index a run starts at must be an integer, not ${show(other)}")
     }
 
