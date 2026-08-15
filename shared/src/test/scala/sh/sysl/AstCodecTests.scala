@@ -219,6 +219,20 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     // the linker chose — in a program that read the artifact, and nowhere else, so nothing about
     // compiling that library from source would show it. The binding carries `@align` beside it
     // because the two are folded by different lines and one could travel without the other.
+    // A package's chosen C name has to survive the artifact for the reason a function's exported
+    // symbol does: a consumer generating a header from a library it read back must spell the type
+    // the way the library chose, and a codec that dropped it would silently derive one instead. The
+    // bare form is beside the named one because they are folded by one line and stored as two
+    // different things — `None` and the declared name.
+    check("a struct's C name, chosen and taken from the declaration",
+      """@export("b2BodyId")
+        |struct Id
+        |    index1: i32
+        |
+        |@export
+        |struct Handle
+        |    slot: u16
+        |""".stripMargin)
     check("a section on a binding and on a definition",
       """@align(4096)
         |@section(".noinit")

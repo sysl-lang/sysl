@@ -27,7 +27,8 @@ object Exports {
    */
   def check(program: TProgram, own: Option[Set[String]] = None): Either[String, Unit] = {
     val exported = Reachability.exports(program, own)
-    val refused  = exported.flatMap(signature) ::: duplicates(exported) ::: storage(exported, program)
+    val refused  = exported.flatMap(signature) ::: duplicates(exported) ::: names(exported) :::
+      storage(exported, program)
 
     if refused.nonEmpty then Left(Diagnostic.report(refused)) else Right(())
   }
@@ -84,6 +85,46 @@ object Exports {
             "— one symbol is one definition, and the linker has no way to tell which was meant",
           None)
       }
+
+  /** Two things in one header answering to one name.
+   *
+   * **This is the property `@export("…")` on a struct takes away, so it is the property this hands
+   * back.** A derived name is the mangled instantiation, which is unique because a module path is in
+   * it; a chosen one is a claim the author makes, and two of them may agree — or one may land on
+   * another struct's derived name. Both are the same mistake, and it is `duplicates` above read at
+   * the other kind of declaration.
+   *
+   * **A function is in the list too, because C has one namespace and not two.** At file scope a
+   * `typedef` name and a function name are both ordinary identifiers, so a header carrying
+   * `typedef struct { … } add;` beside `add add(…)` is not two declarations that happen to rhyme —
+   * it is one name declared twice, and the consumer's compiler says so. Nothing on the sysl side
+   * suggests it: the two are a type and a function, which collide nowhere here.
+   *
+   * The types are `CHeader.aggregates`' rather than every struct in the program, because a name is
+   * only claimed where the type actually reaches the header: two modules may each declare a `Point`
+   * and name it, and while only one is in an exported signature there is nothing to collide. Asking
+   * the renderer is also what keeps the two from disagreeing about what is in the file.
+   *
+   * A symbol claimed by two *functions* is left to `duplicates`, whose sentence is about the linker
+   * and is the better one for that case — hence the group having to hold a type to be reported here.
+   */
+  private def names(exported: List[TFunc]): List[String] = {
+    val types = CHeader.aggregates(exported).map(t => CHeader.cName(t) -> s"the type '${Type.show(t)}'")
+    val syms  = exported.map(f => f.exported.get -> s"the function '${Modules.show(f.name)}'")
+    val typed = types.map(_._1).toSet
+
+    (types ::: syms)
+      .groupBy(_._1)
+      .toList
+      .sortBy(_._1)
+      .collect { case (name, xs) if xs.length > 1 && typed(name) =>
+        Diagnostic.render(
+          s"'$name' is the C name of ${xs.map(_._2).sorted.mkString(" and ")} — a header declares " +
+            "both in one namespace, so a C project including it would see the name twice. Give " +
+            "each the name it should carry, '@export(\"...\")'",
+          None)
+      }
+  }
 
   /** An exported function that reaches a **computed** module `val`.
    *

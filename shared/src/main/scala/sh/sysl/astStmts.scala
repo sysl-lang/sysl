@@ -605,6 +605,13 @@ enum Attr(val word: String) {
 
   /** `@export` and `@export("mylib_parse")` — the definition is C-callable under an unmangled
     * symbol (`15 §12`). See `ExportAttr` for why the rename is the form that matters.
+    *
+    * **It marks a struct as well as a function, and the two are one idea: the name C sees.** On a
+    * function that is the symbol the linker resolves; on a struct it is the name the `typedef`
+    * carries in the generated header, which is otherwise derived from the mangled instantiation and
+    * so reads `sh_sysl_box2d_c_Id` in a package. A binding mirroring a C library wants to hand back
+    * that library's own spellings, and the type name was the one thing in a generated header nobody
+    * chose.
     */
   case Export(attr: ExportAttr) extends Attr("export")
 
@@ -709,6 +716,14 @@ case class StructDecl(
       * analyzer rather than the parser, so what is held here is the expression.
       */
     alignment: Option[Expr] = None,
+    /** `@export("b2BodyId")` — the name this type's `typedef` carries in a generated C header
+      * (`15 §12`), where without it the name is derived from the mangled instantiation.
+      *
+      * The whole attribute is held rather than the string, so a refusal can point at the annotation
+      * rather than at the declaration under it — and a bare `@export` is a real form here, meaning
+      * the declared name.
+      */
+    cname: Option[ExportAttr] = None,
 ) extends Stmt
 
 /** One variant of an `enum`. A variant with `fields` is a data-carrying (tagged-union)
