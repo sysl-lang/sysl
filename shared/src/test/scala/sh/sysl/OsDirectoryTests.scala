@@ -172,6 +172,39 @@ class OsDirectoryTests extends LibraryCliSupport {
     }
   }
 
+  /** `13 §4`: a capability is a property of the **module**, so every file of one states it. A file
+   * inside a folder is a file of the module holding the folder, so the clause reaches in there too —
+   * which is a consequence of §5 rather than a rule of its own, and is exactly what
+   * `library/sysl/fs/tests.sysl` tripped over on the way to being written.
+   */
+  "a capability clause" - {
+
+    "must appear on a file inside a per-OS directory, like every other file of the module" in {
+      val root = projectOf(
+        "main.sysl"             -> "print(1)\n",
+        "demo/common.sysl"      -> "module demo\n@requires(os)\n\nloud(s: string) -> string = s\n",
+        s"demo/$here/impl.sysl" -> "module demo\n\ntag() -> string = loud(\"x\")\n",
+      )
+
+      val (status, notes) = diagnostics(Config(command = "run", file = root))
+
+      status should not be 0
+      notes should include("capabilit")
+    }
+
+    "and the two agreeing is what a module with a per-OS half looks like" in {
+      val root = projectOf(
+        "main.sysl"             -> "print(demo.tag())\n",
+        "demo/common.sysl"      -> "module demo\n@requires(os)\n\nloud(s: string) -> string = s + \"!\"\n",
+        s"demo/$here/impl.sysl" -> "module demo\n@requires(os)\n\ntag() -> string = loud(\"selected\")\n",
+      )
+
+      // Discriminating against the case above: without this the refusal could be about the folder
+      // rather than about the clause, and would look exactly as green.
+      ran(Config(command = "run", file = root)) shouldBe "selected!\n"
+    }
+  }
+
   "a directory that looks like one and is not" - {
 
     // A misspelling that read as an ordinary directory would compile nothing on any target and be
