@@ -198,7 +198,9 @@ case class Word(bits: Int) {
   /** The integer that is exactly one address wide — what `usize` and `isize` lower to, and what a
    * view's length is.
    */
-  def llvm: String = s"i$bits"
+  def lty: ir.LType = ir.LType.I(bits)
+
+  def llvm: String = lty.render
 }
 
 /** The processor, and the two things about it the compiler asks: how wide an address is, and which

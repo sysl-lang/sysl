@@ -245,7 +245,9 @@ trait Emitter {
     case _              => None
 
   /** The container type a bitfield struct's fields are ranges of. */
-  protected def containerLlvm(ranges: List[BitRange]): String = s"i${Bitfields.bits(ranges)}"
+  protected def containerLty(ranges: List[BitRange]): ir.LType = ir.LType.I(Bitfields.bits(ranges))
+
+  protected def containerLlvm(ranges: List[BitRange]): String = containerLty(ranges).render
 
   /** A field's value widened to the container and shifted to where it belongs — the half of a write
    * that is about the range, before anything is said about what was there already.

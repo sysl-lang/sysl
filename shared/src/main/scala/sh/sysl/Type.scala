@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.LType
+
 /** A sysl type, as resolved by the analyzer: the scalar table of
  * `01-scalar-types-and-operators.md` plus value structs and enums, carrying just enough to
  * drive instruction selection in codegen. It grows toward the memory-mode qualifiers.
@@ -10,8 +12,20 @@ package sh.sysl
  */
 sealed trait Type {
 
-  /** The LLVM type this lowers to. */
-  def llvm(using Word): String
+  /** The LLVM type this lowers to (`ir.LType`).
+   *
+   * This is the lowering — the step that erases everything the language knows and the back end must
+   * not see. A `Constrained` answers with its base's, a `Volatile` with its inner's, every reference
+   * mode with an address, and the four types that have no representation at all throw rather than
+   * inventing one.
+   */
+  def lty(using Word): LType
+
+  /** The same, written down. Every LLVM type text in the compiler comes from here, and none of it
+   * is built by concatenation: `lty` is what decides the shape and `LType.render` is what spells
+   * it, so the two questions have one answer each rather than one answer between them.
+   */
+  final def llvm(using Word): String = lty.render
 }
 
 object Type {
@@ -32,24 +46,21 @@ object Type {
    * match on this one — converting between the two is a cast the programmer writes.
    */
   case class Integer(bits: Int, signed: Boolean, pointerWidth: Boolean = false) extends Type {
-    def llvm(using Word): String = s"i$bits"
+    def lty(using Word): LType = LType.I(bits)
   }
 
   /** An IEEE binary floating-point type: `f16`, `f32`, `f64`. A closed set, not a family. */
   case class Floating(bits: Int) extends Type {
-    def llvm(using Word): String = bits match
-      case 16 => "half"
-      case 32 => "float"
-      case _  => "double"
+    def lty(using Word): LType = LType.F(bits)
   }
 
   /** A Unicode scalar value. Layout-compatible with `u32` but not type-compatible: it has
    * equality and ordering and no arithmetic at all, so reaching a codepoint means casting.
    */
-  case object Char extends Type { def llvm(using Word) = "i32" }
+  case object Char extends Type { def lty(using Word) = LType.I(32) }
 
-  case object Bool extends Type { def llvm(using Word) = "i1"  }
-  case object Unit extends Type { def llvm(using Word) = "void" }
+  case object Bool extends Type { def lty(using Word) = LType.I(1) }
+  case object Unit extends Type { def lty(using Word) = LType.Void }
 
   /** The state of a walk through a variadic function's tail (`12 §9`) — C's `va_list`.
    *
@@ -59,7 +70,7 @@ object Type {
    * prefix the ABI defines is ever touched — over-reserving a stack slot costs nothing, while
    * under-reserving would be silent corruption.
    */
-  case object VaList extends Type { def llvm(using Word) = "[4 x ptr]" }
+  case object VaList extends Type { def lty(using Word) = LType.Arr(4, LType.Ptr) }
 
   /** The type of an expression that does not finish — a call to something that never returns, and
    * so the arm of a `match` or `if` that aborts rather than yielding a value.
@@ -73,7 +84,7 @@ object Type {
    * about. Nothing is ever *of* type `never` at run time — there is no value of it — so it lowers
    * to `void` and takes no slot, no register, and no `phi`.
    */
-  case object Never extends Type { def llvm(using Word) = "void" }
+  case object Never extends Type { def lty(using Word) = LType.Void }
 
   /** The type of something whose real type could not be worked out, because the thing that would
    * have decided it was already reported as an error.
@@ -84,7 +95,7 @@ object Type {
    * reaches codegen — a program with an error is never lowered — and touching a value of it
    * raises `Poisoned`, which abandons the statement without reporting a second time.
    */
-  case object Unknown extends Type { def llvm(using Word) = "void" }
+  case object Unknown extends Type { def lty(using Word) = LType.Void }
 
   /** A type parameter as the body that declares it sees it: opaque, and licensed to do exactly
    * what `bounds` promise (`14 §4`).
@@ -99,7 +110,7 @@ object Type {
    * a representation for a type that has none.
    */
   case class Abstract(name: String, bounds: List[Bound]) extends Type {
-    def llvm(using Word): String =
+    def lty(using Word): LType =
       throw new IllegalStateException(s"the type parameter '$name' reached codegen")
 
     /** Identity is the **name**, and deliberately not the bounds, for the reason `Bound.key` is a
@@ -150,7 +161,7 @@ object Type {
      */
     def bound: Bound = Bound(name, args)
 
-    def llvm(using Word): String =
+    def lty(using Word): LType =
       throw new IllegalStateException(s"the trait '$name' reached codegen as a type of its own")
   }
 
@@ -183,7 +194,7 @@ object Type {
   /** The layout of a trait object: the method table for the type it forgot, and the value itself.
    * Two words rather than one, which is the whole of what a `dyn` keyword would have announced.
    */
-  val fatPointer = "{ ptr, ptr }"
+  val fatPointer: String = LType.fat.render
 
   /** Whether a memory mode points at a trait rather than at a concrete type, and so is fat. */
   def erased(t: Type): Boolean = erasedTrait(t).isDefined
@@ -199,7 +210,7 @@ object Type {
    * sigil is so a reader can find every place a program takes on C's risks.
    */
   case class Ptr(inner: Type) extends Type {
-    def llvm(using Word): String = if inner.isInstanceOf[Trait] then fatPointer else "ptr"
+    def lty(using Word): LType = if inner.isInstanceOf[Trait] then LType.fat else LType.Ptr
   }
 
   /** `*extern(A, B) -> R` — the address of a function that obeys the machine's C convention, which
@@ -216,7 +227,7 @@ object Type {
    * promise the `*` announces, the same one every raw pointer announces.
    */
   case class CFn(params: List[Type], ret: Type) extends Type {
-    def llvm(using Word): String = "ptr"
+    def lty(using Word): LType = LType.Ptr
 
     /** The written spelling, so a debug rendering reads the way the program does. What a diagnostic
      * shows goes through `show`, and what the emitter writes in front of an indirect callee is the
@@ -238,7 +249,7 @@ object Type {
    * it looks like. What the qualifier changes is the instruction that reaches it, and only that.
    */
   case class Volatile(inner: Type) extends Type {
-    def llvm(using Word): String = inner.llvm
+    def lty(using Word): LType = inner.lty
   }
 
   /** A type with any `volatile` taken off the front of it — the type of the **value** read out of a
@@ -269,7 +280,7 @@ object Type {
    * conversion either way: atomicity is fixed when the object is allocated.
    */
   case class Ref(inner: Type, sync: Boolean) extends Type {
-    def llvm(using Word): String = if inner.isInstanceOf[Trait] then fatPointer else "ptr"
+    def lty(using Word): LType = if inner.isInstanceOf[Trait] then LType.fat else LType.Ptr
   }
 
   /** `weak T` — a reference that does not keep its referent alive (`03`).
@@ -280,7 +291,7 @@ object Type {
    * is still there and handed back an `Option[&T]`.
    */
   case class Weak(inner: Type) extends Type {
-    def llvm(using Word): String = if inner.isInstanceOf[Trait] then fatPointer else "ptr"
+    def lty(using Word): LType = if inner.isInstanceOf[Trait] then LType.fat else LType.Ptr
 
     /** The reference this weakens, which is what `get()` yields and what makes one. */
     def strong: Ref = Ref(inner, sync = false)
@@ -291,7 +302,7 @@ object Type {
    * lets every index be checked against a constant.
    */
   case class Array(length: Int, elem: Type) extends Type {
-    def llvm(using Word): String = s"[$length x ${elem.llvm}]"
+    def lty(using Word): LType = LType.Arr(length, elem.lty)
   }
 
   object Array {
@@ -322,7 +333,7 @@ object Type {
    * representation.
    */
   case class ConstArg(value: BigInt, ty: Type) extends Type {
-    def llvm(using Word): String =
+    def lty(using Word): LType =
       throw new IllegalStateException(s"the value argument '$value' reached codegen")
   }
 
@@ -339,7 +350,7 @@ object Type {
    * codegen means the tuple it stands for was never formed.
    */
   case class Pack(elems: List[Type]) extends Type {
-    def llvm(using Word): String =
+    def lty(using Word): LType =
       throw new IllegalStateException(s"a type pack of ${elems.length} reached codegen")
   }
 
@@ -354,7 +365,7 @@ object Type {
     /** Three words: where the elements are, where they end, and how many there are. The length is a
      * `usize`, so this is the one LLVM type in the language whose text depends on the machine.
      */
-    def llvm(using w: Word): String = s"{ ptr, ptr, ${w.llvm} }"
+    def lty(using Word): LType = LType.view
   }
 
   /** `[]T` — a view of any elements at all, and `[]const T` when the elements may not be written
@@ -687,7 +698,7 @@ object Type {
 
     def name: String = qualified(base, targs)
 
-    def llvm(using Word): String = s"%struct.${mangled(base, targs)}"
+    def lty(using Word): LType = LType.Named(s"%struct.${mangled(base, targs)}")
 
     def fieldIndex(field: String): Int = fields.indexWhere(_._1 == field)
 
@@ -757,7 +768,7 @@ object Type {
    * the typed tree, and nothing in codegen, ever meets one.
    */
   final class Results(val parts: Tuple) extends Type {
-    def llvm(using Word): String = parts.llvm
+    def lty(using Word): LType = parts.lty
 
     override def equals(other: Any): Boolean = other match
       case r: Results => r.parts == parts
@@ -807,19 +818,23 @@ object Type {
 
     def name: String = qualified(base, targs)
 
-    def llvm(using Word): String = if simple then underlying.llvm else s"%enum.${mangled(base, targs)}"
+    def lty(using Word): LType = if simple then underlying.lty else LType.Named(s"%enum.${mangled(base, targs)}")
 
     /** The type a discriminant is compared at. A simple enum **is** its discriminant, so the width
      * is whatever its `: iN` annotation said; a data enum keeps its tag in the aggregate's first
      * field, which is always `i32`. Reading it off the enum rather than assuming `i32` is what
      * keeps a narrow simple enum's variant test well-typed.
      */
-    def tagLlvm(using Word): String = if simple then underlying.llvm else "i32"
+    def tagLty(using Word): LType = if simple then underlying.lty else LType.I(32)
+
+    def tagLlvm(using Word): String = tagLty.render
 
     def variant(v: String): Option[EnumVariant] = variants.find(_.name == v)
 
     /** The payload aggregate type name for a data variant, e.g. `%Shape.Circle`. */
-    def payloadLlvm(v: EnumVariant): String = s"%${mangled(base, targs)}.${v.name}"
+    def payloadLty(v: EnumVariant): LType.Named = LType.Named(s"%${mangled(base, targs)}.${v.name}")
+
+    def payloadLlvm(v: EnumVariant): String = payloadLty(v).render
 
     override def equals(other: Any): Boolean = other match
       case e: Enum => e.base == base && e.targs == targs
@@ -848,7 +863,7 @@ object Type {
       exclusiveHi: Boolean,
       predFn: Option[String],
   ) extends Type {
-    def llvm(using Word): String = base.llvm
+    def lty(using Word): LType = base.lty
   }
 
   /** A transparent constrained subtype seen as its base — the identity for type *agreement*, so a
