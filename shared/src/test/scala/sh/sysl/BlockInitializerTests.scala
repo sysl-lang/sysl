@@ -314,11 +314,22 @@ class BlockInitializerTests extends AnyFreeSpec with CodegenSupport with RunSupp
     }
   }
 
-  "a 'const' is refused one, with the rule" in {
-    val out = err("const C: int =\n    val a = 1\n    a + 1\nprint(C)")
+  "a 'const'" - {
 
-    out should include("folded into every use")
-    out should include("Write a 'val'")
+    "is refused a block, with the rule" in {
+      val out = err("const C: int =\n    val a = 1\n    a + 1\nprint(C)")
+
+      out should include("folded into every use")
+      out should include("Write a 'val'")
+    }
+
+    // The collapse reaches the refusal too, and that is the right answer rather than an escape from
+    // it: a lone expression under the `=` never becomes a block, so there is nothing for the folder
+    // to be asked to fold and a value moved down to fit the margin still folds. What stays refused
+    // is a block that *binds* something, which is the case with statements to run.
+    "still takes a value on the next line, because one expression is not a block" in {
+      run("const C: int =\n    6 * 7\nprint(C)") shouldBe "42\n"
+    }
   }
 
   "what still ends the statement" - {
