@@ -19,7 +19,8 @@ be unwound deliberately rather than discovered later.
   every other pass has already read. It is described under *What runs today* below; what matters
   here is that it sits between the checking and the lowering, so no diagnostic depends on it.
 - **Codegen** (`Codegen`, and the `*Emitter` files it is split across) — a straight lowering of the
-  typed tree to textual LLVM IR. It selects
+  typed tree to **an IR of case classes** (`sh.sysl.ir`), which one printer then writes down as LLVM's
+  textual form. It selects
   instructions from the types the tree carries and lays out basic blocks; it makes no semantic
   decision of its own. The one thing it decides that the tree does not carry is what a call to a
   **foreign** function looks like, because that is a fact about the machine rather than about the
@@ -27,6 +28,33 @@ be unwound deliberately rather than discovered later.
   value into and out of the registers the convention names (`targets.md`).
 
 The CLI (`sysl run` / `sysl build` / `sysl emit-llvm`) links the emitted IR with `clang`.
+
+### The IR is data, and the text is one function over it
+
+`sh.sysl.ir` is four types and their renderers: `LType` (an LLVM type), `Val` (an operand), `Inst`
+(an instruction), and `Func`/`Block` (a function's basic blocks). `Printer.func` is the only thing in
+the compiler that writes LLVM's syntax, and every emitter builds values rather than lines.
+
+**It exists because a second back end has to consume what codegen produced.** Until this the IR was
+characters: `emit(s"$r = add ${ty.llvm} $a, $b")`, six hundred times over, so a consumer that was not
+LLVM would have had to parse the compiler's own output back into the shapes the compiler had just
+finished deciding. `~/dev/craft` is a 16-bit teaching ISA LLVM cannot build for, and it is the reason
+this was worth doing before anything else was built on top of the old shape.
+
+**The set is small because the compiler's own selection is** — about forty opcodes, of which ten carry
+nine tenths of the emitted lines. There is no `phi`, and that is a fact about the lowering rather
+than an omission: codegen keeps every local in a stack slot and reaches it with `load` and `store`, so
+what a consumer receives is memory form and may promote it or not as it likes.
+
+**Nothing else concatenates a type, an operand, or an instruction.** That is what makes the model
+load-bearing rather than decorative — an escape hatch that let one site interpolate would put the
+parser back for that site's sake, so `Inst.Raw` and `Val.Raw` existed only while the sweep ran and
+were deleted with their last caller.
+
+**The safety property was byte identity.** The codegen tier asserts on emitted IR *including its
+two-space indentation*, and matches temporaries by `%t\d+` — so the order in which registers are
+allocated is pinned too. The whole conversion was made with no edit to any existing test file, and
+`guide/`'s seventeen programs, 117,000 lines of IR, came out character for character what they were.
 
 The library every compilation carries is the **standard module** `sysl` (`13 §8`) — ordinary sysl
 source in real files under `library/sysl`, parsed once and hoisted ahead of the user's own declarations,

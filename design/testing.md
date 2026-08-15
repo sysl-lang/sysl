@@ -15,9 +15,16 @@ Everything checkable *statically*, run as plain ScalaTest with no external toolc
 - **parsing** — tokens → AST;
 - **analysis** — AST → typed AST, plus the full set of **error cases** (a bad program must be
   rejected with the right diagnostic);
-- **IR-shape checks** — codegen emits **textual LLVM IR**, and the test asserts on that text
-  *without running it* (the IR contains / matches the expected pattern). These catch codegen
-  regressions cheaply and are pure-Scala because the IR is just a string.
+- **IR-shape checks** — codegen produces an IR of case classes (`sh.sysl.ir`) and one printer
+  writes it down as LLVM's textual form, and the test asserts on that text *without running it* (the
+  IR contains / matches the expected pattern). These catch codegen regressions cheaply and need no
+  toolchain, because what they read is the compiler's own output.
+
+  **They assert on the printed text rather than on the tree, and that is deliberate.** The text is
+  what clang consumes, so a test that matched the model instead would agree with the emitter about
+  anything the two got wrong together — and it is exactly this property that let the whole IR become
+  data with no test file edited: the assertions could not tell, which is what proved the change
+  carried no behaviour with it.
 
 Tier 1 is the **fast feedback loop** — millisecond runs, no LLVM toolchain. Since the restart
 has **no interpreter**, this static tier carries the iteration speed the interpreter used to
@@ -347,9 +354,10 @@ lexer → parser (AST) → analyzer (typed AST) → LLVM codegen → sysl @test 
 
 Two decisions the run-it tiers force, settled now:
 
-- **Codegen emits textual LLVM IR** (`.ll`), not via an in-memory LLVM-C binding. Simplest and
-  most portable (no native bindings), and it makes the Tier-1 IR-shape checks trivial — you
-  assert on the emitted string.
+- **Codegen writes textual LLVM IR** (`.ll`), not via an in-memory LLVM-C binding. Simplest and
+  most portable (no native bindings), and it makes the Tier-1 IR-shape checks trivial — you assert on
+  the emitted string. What it *builds* is `sh.sysl.ir`, a tree of case classes, and the text is one
+  function over that (`codegen.md`); the `.ll` file is unchanged either way.
 - **Tests execute through `clang → native`**, and that is worth stating plainly because this
   document used to record the opposite as settled. The plan was `lli` / ORC-JIT for speed, with
   `clang → native` as the "real" build; what exists is `Toolchain.build`, which writes a `.ll`,
