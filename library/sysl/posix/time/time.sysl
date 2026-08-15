@@ -1,8 +1,7 @@
 module sysl.posix.time
 @requires(posix)
 
-import sysl.time.{Instant, Duration, micros, us_per_second}
-import sysl.slices.as_mut_ptr
+import sysl.time.{Instant, Duration, micros}
 
 // Reading the two clocks the host keeps, which is the one thing `sysl.time` deliberately cannot do.
 //
@@ -38,83 +37,37 @@ import sysl.slices.as_mut_ptr
 // implementation of -- `sysl.harness`'s `attach` one layer down -- and it is not built here because
 // nothing yet needs it twice. The names above are chosen so that adding it later moves no caller.
 
-// `clock_gettime(2)` fills a caller-allocated `struct timespec`, and mirroring one is the only place
-// in `library/sysl` that transcribes a C structure -- everything else here is reached by symbol
-// alone. `sysl.posix.tty` states that rule and refuses `termios` under it, so the difference is worth
-// saying rather than leaving to be noticed.
+// **Nothing here transcribes a C structure, and nothing here names a clock by number.** Both of those
+// were done in sysl until the library could carry C, and both were the same mistake in different
+// clothes: `struct timespec` is caller-allocated, and `CLOCK_MONOTONIC` is a `#define` whose value is
+// 1 on Linux, 6 on macOS and 4 on the BSDs. `15 §7` names a layout and a macro as the two things only
+// C can reach, and this file needed both.
 //
-// `struct termios` is a flag word set whose members and whose `c_cc` array differ by platform, and
-// nothing in a program could check that it had them right. `struct timespec` is fixed by POSIX at
-// `{ time_t tv_sec; long tv_nsec; }`, has no array and no per-platform field, and **every target that
-// can reach this module is 64-bit**: macOS arm64, Linux x86_64, Linux arm64 and Linux riscv64. Two
-// `long`s is that structure on every one of them, measured rather than assumed -- `sizeof` is 16 and
-// both members are 8 on macOS, and the assertion that it is also right on Linux is a test CI runs
-// there rather than a sentence written here.
+// The shim beside this one answers with the finished number, so neither crosses. What that retires:
 //
-// **`x86-linux` is the one to watch and it does not count yet**, because sysl refuses to build for it
-// at all -- no C calling convention has been measured for x86. On 32-bit glibc a `time_t` is 32 bits
-// unless `_TIME_BITS=64` says otherwise, so the mirror is wrong there and two `long`s is not that
-// structure. Whoever measures that convention inherits this line: it is a C shim in a package, or a
-// second `#if`, and it is not the two words below.
-private extern "clock_gettime" c_clock_gettime(id: int, ts: *long) -> int
-
-// A `struct timespec` counts nanoseconds and a `Duration` counts microseconds, which is the whole of
-// the conversion. The resolution being given up is settled in `sysl.time`: a `long` of nanoseconds
-// runs out in 1678-2262, and a range that quietly ends is a worse defect than a precision that never
-// begins.
-const ns_per_micro: long = 1000
-
-// The clock the caller means, as the number the kernel wants.
-//
-// **Every operating system gets a branch of its own, and the `#else` declares a symbol that does not
-// exist.** A number is not a name: `sysl.fs` selects `__error` against `__errno_location` and a third
-// platform fails at the *link* naming what it could not find, while `CLOCK_MONOTONIC` is 1 on Linux,
-// 6 on macOS and 4 on the BSDs -- so an `#else` carrying one of those values is not a failure at all
-// but a program reading the wrong clock and saying nothing.
-//
-// So the `#else` is written as an `extern` for the same reason `sysl.fs`'s is: **the library is
-// compiled whole for every target**, freestanding ones included, so a branch that simply declared
-// nothing would fail in the compiler on all seventeen of them rather than only where it matters. An
-// `extern` costs nothing until something links it, so every target goes on compiling and a POSIX
-// operating system nobody has listed fails at the link, on the one program that actually asked what
-// time it was, with the reason in the symbol's name.
-#if macos
-private realtime_id() -> int = 0
-private monotonic_id() -> int = 6
-#elif linux
-private realtime_id() -> int = 0
-private monotonic_id() -> int = 1
-#else
-private extern "sysl_posix_time_no_realtime_clock_id_for_this_os" realtime_id() -> int
-private extern "sysl_posix_time_no_monotonic_clock_id_for_this_os" monotonic_id() -> int
-#endif
-
-// One reading, in microseconds.
-//
-// **The result is not checked, and that is a consequence of the branch above rather than an
-// oversight.** `clock_gettime` fails on a clock the kernel does not have and on an address it cannot
-// write, and neither is reachable here: the id came from a branch that had to name this operating
-// system to compile at all, and the storage is a local this function owns. A check would be a
-// `Result` on every timing call, paid for by every caller, against a failure the types already
-// exclude.
-//
-// The question a C reader asks next is what an unwritten `ts` would hold, and the answer is zero: a
-// `var` of an array type is zero-initialized, so the unreachable path reads two zeros rather than
-// whatever was on the stack.
-private reading(id: int) -> long
-    var ts: [2]long
-
-    c_clock_gettime(id, as_mut_ptr(ts))
-
-    ts[0] * us_per_second + ts[1] / ns_per_micro
-end reading
+//   - **the mirror.** `[2]long` was `struct timespec` on every target that could reach this module,
+//     which was true and unverifiable -- nothing in a program could check it, and `sizeof` would have
+//     reported what sysl laid out rather than what C did. It was also the one place in `library/sysl`
+//     that transcribed a structure at all, which `sysl.posix.tty` used to cite as the exception to
+//     its own rule. There is now no exception.
+//   - **the id table**, and with it the `#else` that declared a symbol nobody defines. That existed
+//     because the library is compiled whole for every target, so a branch declaring nothing would
+//     have failed in the compiler on all of them rather than at the link on the one that mattered.
+//     A per-OS directory says the same thing without the trick: an operating system with no folder
+//     here has no shim, and a program that asks the time fails at the link naming the symbol it could
+//     not find. Same behaviour, and now it is the general mechanism rather than a hand-written one.
+//   - **the 32-bit worry.** `x86-linux` was the target to watch, because a 32-bit glibc `time_t` is
+//     not a `long` unless `_TIME_BITS=64` says so, and two `long`s is then not that structure. The
+//     shim reads the header, so whoever measures i386's calling convention inherits nothing here.
+private[sysl] extern "sysl_posix_time_realtime_us" c_realtime_us() -> long
+private[sysl] extern "sysl_posix_time_monotonic_us" c_monotonic_us() -> long
 
 // The wall clock: where the host thinks it is on the timeline.
 //
 // **Two readings of this may differ by anything at all**, including a negative amount, because it is
 // the clock a person and an `ntpd` are both allowed to set. Use it to stamp something, and use
 // `monotonic` to measure something.
-now() -> Instant = Instant(reading(realtime_id()))
+now() -> Instant = Instant(c_realtime_us())
 
 // A monotonic counter, as a length of time from an origin this deliberately does not name.
 //
@@ -127,4 +80,4 @@ now() -> Instant = Instant(reading(realtime_id()))
 //
 // It never goes backwards and nothing can set it, which is the difference from `now` and the reason
 // a measurement wants this one.
-monotonic() -> Duration = micros(reading(monotonic_id()))
+monotonic() -> Duration = micros(c_monotonic_us())

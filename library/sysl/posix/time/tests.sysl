@@ -6,12 +6,16 @@ import sysl.time.since
 
 // What `sysl.posix.time` claims, asserted in sysl.
 //
-// **These are the only check on the two clock ids and on the `struct timespec` mirror.** Nothing the
-// compiler does can verify either: `@assert` would want a field offset (card 0088) and a `c const`
-// reading `time.h` is refused in `library/` outright (card 0121, no sysroot when cross-compiling).
-// So the mirror is asserted by *use*, and the reason these tests are in sysl rather than in Scala is
-// that `StdSelfTests` compiles this tree on the development machine and again on CI's Linux runner --
-// where `CLOCK_MONOTONIC` is a different number and where this machine cannot read a header.
+// **These were the only check on the two clock ids and on the `struct timespec` mirror, and there is
+// now neither.** Both moved into a shim beside the module, where the header answers for them, so
+// what these assert is no longer a transcription somebody typed but a shim that has to compile,
+// link, and mean what it says. That is a weaker thing to get wrong and a stronger thing to test:
+// there is no longer any way for the *numbers* to be wrong on a platform nobody ran on.
+//
+// They stay in sysl rather than moving to Scala, and the reason is unchanged: `StdSelfTests` compiles
+// this tree on the development machine and again on CI's Linux runner, where `CLOCK_MONOTONIC` is a
+// different number and where this machine cannot read a header. A shim is compiled per target too,
+// so the thing being checked still differs between the two runs.
 //
 // Every assertion below is written to survive a slow machine and a loaded one. Nothing here asserts
 // an upper bound on how long anything took.
@@ -36,20 +40,22 @@ private churn(rounds: int) -> long
     n
 end churn
 
-@test("the wall clock reads a plausible date, which is what says the id and the layout are right")
+@test("the wall clock reads a plausible date, which is what says the shim reads the right clock")
 wall_clock_is_a_date()
     val us = now().us
 
-    // A swapped id lands here: `CLOCK_MONOTONIC` counts from boot, so it is a few days rather than
-    // fifty-odd years and falls below the lower bound. A mirror whose halves are the wrong size, or
-    // swapped, lands here too -- `tv_nsec` scaled as though it were `tv_sec` is nowhere near either.
+    // A shim reading the wrong clock lands here: `CLOCK_MONOTONIC` counts from boot, so it is a few
+    // days rather than fifty-odd years and falls below the lower bound. So does one that scales
+    // wrongly on the way out -- nanoseconds handed back as microseconds are a thousand times too
+    // large, and seconds alone a million times too small.
     assert(us > after_2020, "the wall clock reads before 2020")
     assert(us < before_2100, "the wall clock reads after 2100")
 end wall_clock_is_a_date
 
 @test("the monotonic clock is not the wall clock, which is the other half of the same mistake")
 monotonic_is_not_the_wall_clock()
-    // Uptime, not a date. This fails if the two ids are swapped and the test above somehow did not,
+    // Uptime, not a date. This fails if the shim's two clocks are swapped and the test above somehow
+    // did not,
     // and it is the assertion that would still be here if `now` were ever removed.
     assert(monotonic().us < after_2020, "the monotonic clock reads like a date, not an uptime")
 end monotonic_is_not_the_wall_clock
