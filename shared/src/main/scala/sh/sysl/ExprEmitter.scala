@@ -42,7 +42,7 @@ trait ExprEmitter extends ArithEmitter {
       var acc  = "zeroinitializer"
       for (v, i) <- vals.zipWithIndex do
         val r = freshTemp()
-        emit(s"$r = insertvalue ${arrayTy.llvm} $acc, ${arrayTy.elem.llvm} $v, $i")
+        emit(Inst.Insert(Val.Raw(r), arrayTy.lty, Val.Raw(acc), arrayTy.elem.lty, Val.Raw(v), List(i)))
         acc = r
       acc
 
@@ -56,7 +56,8 @@ trait ExprEmitter extends ArithEmitter {
       var acc  = "zeroinitializer"
       for (v, i) <- vals.zipWithIndex do
         val r = freshTemp()
-        emit(s"$r = insertelement ${vecTy.llvm} $acc, ${vecTy.elem.llvm} $v, i32 $i")
+        emit(Inst.InsertElement(Val.Raw(r), vecTy.lty, Val.Raw(acc), vecTy.elem.lty, Val.Raw(v),
+          Arg(i32, Val.Int(i))))
         acc = r
       acc
 
@@ -66,10 +67,11 @@ trait ExprEmitter extends ArithEmitter {
     case TSplat(value, vecTy) =>
       val v   = genExpr(value)
       val one = freshTemp()
-      emit(s"$one = insertelement ${vecTy.llvm} poison, ${vecTy.elem.llvm} $v, i32 0")
+      emit(Inst.InsertElement(Val.Raw(one), vecTy.lty, Val.Poison, vecTy.elem.lty, Val.Raw(v),
+        Arg(i32, Val.Int(0))))
       val r = freshTemp()
-      emit(s"$r = shufflevector ${vecTy.llvm} $one, ${vecTy.llvm} poison, " +
-        s"<${vecTy.length} x i32> zeroinitializer")
+      emit(Inst.Shuffle(Val.Raw(r), vecTy.lty, Val.Raw(one), Val.Poison,
+        Arg(LType.Vec(vecTy.length, i32), Val.Zero)))
       r
 
     // A lane-wise comparison is the scalar instruction at the register's width — `fcmp olt
@@ -80,10 +82,12 @@ trait ExprEmitter extends ArithEmitter {
       val rv    = genExpr(r)
       val vecTy = Type.repr(l.ty).asInstanceOf[Type.Vector]
       val lane  = Type.underlying(vecTy.elem)
-      val instr = if lane.isInstanceOf[Type.Floating] then "fcmp" else "icmp"
       val res   = freshTemp()
 
-      emit(s"$res = $instr ${predicate(op, lane)} ${vecTy.llvm} $lv, $rv")
+      emit(
+        if lane.isInstanceOf[Type.Floating] then
+          Inst.FloatCmp(Val.Raw(res), floatPred(op), vecTy.lty, Val.Raw(lv), Val.Raw(rv))
+        else Inst.IntCmp(Val.Raw(res), intPred(op, lane), vecTy.lty, Val.Raw(lv), Val.Raw(rv)))
       res
 
     // Both sides are evaluated and the mask picks between them, which is the whole difference from
@@ -94,7 +98,7 @@ trait ExprEmitter extends ArithEmitter {
       val b = genExpr(whenFalse)
       val r = freshTemp()
 
-      emit(s"$r = select ${mask.ty.llvm} $m, ${ty.llvm} $a, ${ty.llvm} $b")
+      emit(Inst.Select(Val.Raw(r), Val.Raw(m), ty.lty, Val.Raw(a), Val.Raw(b), mask.ty.lty))
       r
 
     case TReduce(op, receiver, ty) =>
@@ -110,11 +114,13 @@ trait ExprEmitter extends ArithEmitter {
       // licenses the tree that makes this worth doing at all rather than a left fold in disguise.
       val (params, args, flags) =
         if op == "fadd" then
-          (s"${vecTy.elem.llvm}, ${vecTy.llvm}", s"${vecTy.elem.llvm} -0.0, ${vecTy.llvm} $v", "reassoc ")
-        else (vecTy.llvm, s"${vecTy.llvm} $v", "")
+          (s"${vecTy.elem.llvm}, ${vecTy.llvm}",
+           List(Arg(vecTy.elem.lty, Val.float(-0.0)), Arg(vecTy.lty, Val.Raw(v))),
+           "reassoc ")
+        else (vecTy.llvm, List(Arg(vecTy.lty, Val.Raw(v))), "")
 
       satDecls += s"declare ${ty.llvm} @$name($params)"
-      emit(s"$r = call $flags${ty.llvm} @$name($args)")
+      emit(Inst.Call(Some(Val.Raw(r)), s"$flags${ty.llvm}", Val.Global(name), args))
       r
 
     // One lane, read straight out of the register. There is no address and so no bounds test: the
@@ -123,7 +129,8 @@ trait ExprEmitter extends ArithEmitter {
       val v = genExpr(receiver)
       val r = freshTemp()
 
-      emit(s"$r = extractelement ${Type.repr(receiver.ty).llvm} $v, i32 $lane")
+      emit(Inst.ExtractElement(Val.Raw(r), Type.repr(receiver.ty).lty, Val.Raw(v),
+        Arg(i32, Val.Int(lane))))
       r
 
     // Built through memory with a loop rather than as an `insertvalue` chain, for the reason the
@@ -407,7 +414,7 @@ trait ExprEmitter extends ArithEmitter {
       val v    = genExpr(operand)
       val lane = Type.repr(ty).asInstanceOf[Type.Vector].elem
       val r    = freshTemp()
-      emit(s"$r = xor ${ty.llvm} $v, splat (${lane.llvm} -1)")
+      emit(Inst.Bin(Val.Raw(r), BinOp.Xor, ty.lty, Val.Raw(v), Val.Splat(lane.lty, Val.Int(-1))))
       r
     case TUnary("~", operand, ty) =>
       val v = genExpr(operand); val r = freshTemp(); emit(Inst.Bin(Val.Raw(r), BinOp.Xor, ty.lty, Val.Raw(v), Val.Int(-1))); r
@@ -418,7 +425,7 @@ trait ExprEmitter extends ArithEmitter {
     // and no value to hand back. `syncscope` is deliberately absent: the default is the whole
     // system, which is what a program sharing memory with another thread or a device needs.
     case TFence(ord) =>
-      emit(s"fence ${Atomics.llvm(ord)}")
+      emit(Inst.Fence(Atomics.llvm(ord)))
       "0"
 
     // One atomic access. `at` rather than the node's own type decides the width, since a store
@@ -427,15 +434,15 @@ trait ExprEmitter extends ArithEmitter {
     case TAtomic(op, addr, ops, ord, at, ty) =>
       val p    = genExpr(addr)
       val vs   = ops.map(genExpr)
-      val ll   = at.llvm
+      val ll   = at.lty
       val ordr = Atomics.llvm(ord)
-      val al   = layout.align(at)
+      val acc  = Access.Atomic(ordr, layout.align(at))
 
       op match
         case "atomic_load" =>
-          val r = freshTemp(); emit(s"$r = load atomic $ll, ptr $p $ordr, align $al"); r
+          val r = freshTemp(); emit(Inst.Load(Val.Raw(r), ll, Val.Raw(p), acc)); r
         case "atomic_store" =>
-          emit(s"store atomic $ll ${vs.head}, ptr $p $ordr, align $al")
+          emit(Inst.Store(ll, Val.Raw(vs.head), Val.Raw(p), acc))
           "0"
         // `cmpxchg` answers a pair — the value it found and whether it swapped — and what this hands
         // back is the value. A caller comparing it against what they expected learns the same thing
@@ -443,15 +450,19 @@ trait ExprEmitter extends ArithEmitter {
         // tuple the library would immediately take apart.
         case "atomic_cas" =>
           val pair = freshTemp()
-          emit(s"$pair = cmpxchg ptr $p, $ll ${vs.head}, $ll ${vs(1)} $ordr ${Atomics.failure(ord)}")
-          val r = freshTemp(); emit(s"$r = extractvalue { $ll, i1 } $pair, 0"); r
+          emit(Inst.CmpXchg(Val.Raw(pair), Val.Raw(p), ll, Val.Raw(vs.head), Val.Raw(vs(1)), ordr))
+          val r = freshTemp()
+          emit(Inst.Extract(Val.Raw(r), LType.Struct(List(ll, i1)), Val.Raw(pair), List(0)))
+          r
         // The rest are one `atomicrmw`, which answers the value that was there *before* — the
         // property that makes an atomic increment usable as a ticket.
         case _ =>
           val kind = op.stripPrefix("atomic_") match
             case "swap" => "xchg"
             case k      => k
-          val r = freshTemp(); emit(s"$r = atomicrmw $kind ptr $p, $ll ${vs.head} $ordr"); r
+          val r = freshTemp()
+          emit(Inst.AtomicRmw(Val.Raw(r), kind, Val.Raw(p), ll, Val.Raw(vs.head), ordr))
+          r
 
     // The operand is read into a register once and the comparisons index off that, which is the
     // whole reason these are a node rather than a tree of the operators they mean (`14 §5`).
@@ -470,24 +481,29 @@ trait ExprEmitter extends ArithEmitter {
       // `~x`, which is what turns a count of zeroes into a count of ones. The trait has both pairs
       // because the complement is the caller's to get wrong, not because the machine has four
       // instructions.
-      def complement = { val r = freshTemp(); emit(s"$r = xor $ll $v, -1"); r }
+      def complement = {
+        val r = freshTemp(); emit(Inst.Bin(Val.Raw(r), BinOp.Xor, ll, Val.Raw(v), Val.Int(-1))); r
+      }
 
       op match
         // `x < 0 ? -x : x`, and the negation is the wrapping one the language's own `-` is — so at
         // the most negative value both answer that value, rather than the member disagreeing with
         // the operator beside it.
         case "abs" =>
-          val neg = freshTemp(); emit(s"$neg = sub $ll 0, $v")
-          val lt  = freshTemp(); emit(s"$lt = icmp slt $ll $v, 0")
-          val r   = freshTemp(); emit(s"$r = select i1 $lt, $ll $neg, $ll $v")
+          val neg = freshTemp(); emit(Inst.Bin(Val.Raw(neg), BinOp.Sub, ll, Val.Int(0), Val.Raw(v)))
+          val lt  = freshTemp(); emit(Inst.IntCmp(Val.Raw(lt), ICmp.Slt, ll, Val.Raw(v), Val.Int(0)))
+          val r   = freshTemp()
+          emit(Inst.Select(Val.Raw(r), Val.Raw(lt), ll, Val.Raw(neg), Val.Raw(v)))
           r
         // Two comparisons rather than a subtraction of them, because `(x > 0) - (x < 0)` would have
         // to widen both booleans to the operand's width first and says less about what it computes.
         case "signum" =>
-          val pos = freshTemp(); emit(s"$pos = icmp sgt $ll $v, 0")
-          val neg = freshTemp(); emit(s"$neg = icmp slt $ll $v, 0")
-          val hi  = freshTemp(); emit(s"$hi = select i1 $pos, $ll 1, $ll 0")
-          val r   = freshTemp(); emit(s"$r = select i1 $neg, $ll -1, $ll $hi")
+          val pos = freshTemp(); emit(Inst.IntCmp(Val.Raw(pos), ICmp.Sgt, ll, Val.Raw(v), Val.Int(0)))
+          val neg = freshTemp(); emit(Inst.IntCmp(Val.Raw(neg), ICmp.Slt, ll, Val.Raw(v), Val.Int(0)))
+          val hi  = freshTemp()
+          emit(Inst.Select(Val.Raw(hi), Val.Raw(pos), ll, Val.Int(1), Val.Int(0)))
+          val r = freshTemp()
+          emit(Inst.Select(Val.Raw(r), Val.Raw(neg), ll, Val.Int(-1), Val.Raw(hi)))
           r
 
         case "count_ones"  => counted("ctpop", v)

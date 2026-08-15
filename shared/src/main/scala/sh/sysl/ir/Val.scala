@@ -51,6 +51,25 @@ enum Val {
    */
   case Zero
 
+  /** A value whose bits are not merely unknown but may **differ between two reads of it**, which is
+   * the whole difference from `Undef` and the reason LLVM grew a second word for it.
+   *
+   * It is what a vector is built out of: `insertelement` into `poison` says every lane not yet
+   * written is one nobody may look at, so a lane the splat leaves alone costs no instruction to
+   * initialize. `Undef` in the same place is weaker and stops some of the folds that make a splat
+   * one broadcast instruction.
+   */
+  case Poison
+
+  /** Every lane of a vector holding the same constant — `splat (i32 -1)`, which is the all-ones mask
+   * a lane-wise `~` inverts against.
+   *
+   * The lane type is here and the vector's width is not, because that is how LLVM writes one: the
+   * count comes from the type the instruction already names, so a splat that carried its own could
+   * disagree with it.
+   */
+  case Splat(lane: LType, value: Val)
+
   /** **No value at all.** A zero-sized type occupies nothing, so reading one produces nothing to
    * name, and this is what the emitters carried as the empty string.
    *
@@ -80,6 +99,8 @@ enum Val {
     case Null         => "null"
     case Undef        => "undef"
     case Zero         => "zeroinitializer"
+    case Poison       => "poison"
+    case Splat(l, v)  => s"splat (${l.render} ${v.render})"
     case Nothing      => ""
     case Agg(fields)  => fields.map(_.render).mkString("{ ", ", ", " }")
     case Raw(text)    => text

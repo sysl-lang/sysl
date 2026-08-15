@@ -240,8 +240,10 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
             emit(Inst.Extract(t, struct.lty, Val.Raw(v), List(struct.slot(i))))
             t.render
 
-        s"${ft.llvm} $r"
+        Arg(ft.lty, Val.Raw(r))
     }
-    val ok = freshTemp(); emit(s"$ok = call i1 @$invFn(${args.mkString(", ")})")
+    val ok = freshTemp()
+
+    emit(Inst.Call(Some(Val.Raw(ok)), i1.render, Val.Global(invFn), args.toList))
     trapUnless(Val.Raw(ok), "invariant")
 }

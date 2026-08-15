@@ -255,7 +255,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     val value = genExpr(init)
 
     if containsRef(v.ty) then retainValue(v.ty, value)
-    emit(s"store ${v.ty.llvm} $value, ptr @${v.symbol}")
+    emit(Inst.Store(v.ty.lty, Val.Raw(value), Val.Global(v.symbol), Access.Plain))
   }
 
   /** `@main`, which is three things in the order the language puts them: the computed `val`s, the
@@ -297,8 +297,8 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
         val r     = freshTemp()
 
         emit(Inst.Call(Some(Val.Raw(r)), slice.llvm, Val.Global(fn), List(Arg(i32, Val.Reg("argc")), Arg(LType.Ptr, Val.Reg("argv")))))
-        s"${slice.llvm} ${ownTemp(r, slice)}"
-      }
+        Arg(slice.lty, Val.Raw(ownTemp(r, slice)))
+      }.toList
 
       // **A `main` that answers with a `Result` is called for its answer**, which is then handed
       // to the reporter the walk instantiated: it is what prints the error and picks the status, and
@@ -308,11 +308,11 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
         case (Some(fn), Some(ty)) =>
           val r = freshTemp()
 
-          emit(s"$r = call ${ty.llvm} @$entrySymbol(${args.getOrElse("")})")
+          emit(Inst.Call(Some(Val.Raw(r)), ty.llvm, Val.Global(entrySymbol), args))
           emit(Inst.Call(None, "void", Val.Global(fn), List(Arg(ty.lty, Val.Raw(r)))))
 
         case _ =>
-          emit(s"call void @$entrySymbol(${args.getOrElse("")})")
+          emit(Inst.Call(None, "void", Val.Global(entrySymbol), args))
 
       popTemps()
 
@@ -366,12 +366,16 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     for t <- tests do
       val run  = freshLabel("test.run")
       val next = freshLabel("test.next")
-      val cmp  = freshTemp(); emit(s"$cmp = call i32 @strcmp(ptr $want, ptr ${stringGlobal(t.func + "\u0000")})")
+      val cmp  = freshTemp()
+
+      emit(Inst.Call(Some(Val.Raw(cmp)), "i32", Val.Global("strcmp"),
+        List(Arg(LType.Ptr, Val.Raw(want)), Arg(LType.Ptr, stringGlobal(t.func + "\u0000")))))
+
       val hit  = freshTemp(); emit(Inst.IntCmp(Val.Raw(hit), ICmp.Eq, i32, Val.Raw(cmp), Val.Int(0)))
 
       emitTerm(Inst.CondBr(Val.Raw(hit), run, next))
       emitLabel(run)
-      emit(s"call void @${symbolOf(t.func)}()")
+      emit(Inst.Call(None, "void", Val.Global(symbolOf(t.func)), Nil))
       emitTerm("ret i32 0")
       emitLabel(next)
 
@@ -406,9 +410,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       // A large one arrived as an address, so the copy the callee makes for itself is a copy of
       // bytes and the count it takes is taken at the slot rather than off a value it never had.
       if layout.indirect(ty) then
-        usesMemcpy = true
-        emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align ${layout.align(ty)} %$name.addr, " +
-          s"ptr align ${layout.align(ty)} %$name.param, i64 ${layout.size(ty)}, i1 false)")
+        emitMemcpy(Val.Reg(s"$name.addr"), Val.Reg(s"$name.param"), layout.size(ty), layout.align(ty))
         retainAt(ty, s"%$name.addr")
       else
         emit(Inst.Store(ty.lty, Val.Reg(s"$name.param"), Val.Reg(s"$name.addr"), Access.Plain))
@@ -444,7 +446,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       val v = genExpr(oldExpr)
       emitAlloca(s"%old.$i.addr", oldExpr.ty.llvm)
       retainValue(oldExpr.ty, v)
-      emit(s"store ${oldExpr.ty.llvm} $v, ptr %old.$i.addr")
+      emit(Inst.Store(oldExpr.ty.lty, Val.Raw(v), Val.Reg(s"old.$i.addr"), Access.Plain))
       ownSlot(s"old.$i", oldExpr.ty)
       popTemps()
 
@@ -676,40 +678,39 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       val r = freshTemp()
 
       emit(Inst.Load(Val.Raw(r), o.ty.lty, Val.Reg(s"${o.slot}.addr"), Access.Plain))
-      s"${o.ty.llvm} $r"
+      Arg(o.ty.lty, Val.Raw(r))
     }
 
     asmSite += 1
 
     val text = Asm.uniquifyLabels(lines, asmSite).map(Asm.render(_, slot.get)).mkString("\\0A")
     val cons = Asm.constraints(operands, clobbers)
-    val args = loaded.mkString(", ")
 
     // `sideeffect` says the block matters even where nothing reads its result, which is true of every
     // assembly sysl can express: the instructions worth reaching for here are the ones whose whole
     // purpose is what they do to the machine rather than what they hand back.
     outs match
       case Nil =>
-        emit(s"""call void asm sideeffect "$text", "$cons"($args)""")
+        emit(Inst.Asm(None, LType.Void, text, cons, loaded))
 
       case List(o) =>
         val r = freshTemp()
 
-        emit(s"""$r = call ${o.ty.llvm} asm sideeffect "$text", "$cons"($args)""")
+        emit(Inst.Asm(Some(Val.Raw(r)), o.ty.lty, text, cons, loaded))
         emit(Inst.Store(o.ty.lty, Val.Raw(r), Val.Reg(s"${o.slot}.addr"), Access.Plain))
 
       // Several outputs come back as one anonymous structure, which is LLVM's shape rather than
       // anything the language says — so it is taken apart here and never seen above this line.
       case many =>
         val r     = freshTemp()
-        val shape = many.map(_.ty.llvm).mkString("{ ", ", ", " }")
+        val shape = LType.Struct(many.map(_.ty.lty))
 
-        emit(s"""$r = call $shape asm sideeffect "$text", "$cons"($args)""")
+        emit(Inst.Asm(Some(Val.Raw(r)), shape, text, cons, loaded))
 
         for (o, i) <- many.zipWithIndex do
           val part = freshTemp()
 
-          emit(s"$part = extractvalue $shape $r, $i")
+          emit(Inst.Extract(Val.Raw(part), shape, Val.Raw(r), List(i)))
           emit(Inst.Store(o.ty.lty, Val.Raw(part), Val.Reg(s"${o.slot}.addr"), Access.Plain))
   }
 

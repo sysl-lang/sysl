@@ -480,7 +480,10 @@ trait ControlFlowEmitter extends PlaceEmitter {
     emitTerm(Inst.Br(condL))
     emitLabel(condL)
     val iv  = freshTemp(); emit(Inst.Load(Val.Raw(iv), w, Val.Reg(s"$name.addr"), Access.Plain))
-    val cmp = freshTemp(); emit(s"$cmp = icmp ${predicate(if inclusive then "<=" else "<", varTy)} $w $iv, $hiV")
+    val cmp = freshTemp()
+
+    emit(Inst.IntCmp(Val.Raw(cmp), intPred(if inclusive then "<=" else "<", varTy), w, Val.Raw(iv),
+      Val.Raw(hiV)))
     emitTerm(Inst.CondBr(Val.Raw(cmp), bodyL, elseL))
     emitLabel(bodyL)
     pushOwned()
@@ -535,7 +538,10 @@ trait ControlFlowEmitter extends PlaceEmitter {
     emitTerm(Inst.Br(condL))
     emitLabel(condL)
     val iv  = freshTemp(); emit(Inst.Load(Val.Raw(iv), w, Val.Reg(s"$name.addr"), Access.Plain))
-    val cmp = freshTemp(); emit(s"$cmp = icmp ${predicate(if inclusive then "<=" else "<", varTy)} $w $iv, $hiV")
+    val cmp = freshTemp()
+
+    emit(Inst.IntCmp(Val.Raw(cmp), intPred(if inclusive then "<=" else "<", varTy), w, Val.Raw(iv),
+      Val.Raw(hiV)))
     emitTerm(Inst.CondBr(Val.Raw(cmp), bodyL, endL))
 
     emitLabel(bodyL)

@@ -57,30 +57,22 @@ object Atomics {
    */
   val names: Set[String] = operands.keySet + "atomic_fence"
 
-  /** What LLVM spells each ordering, which is the whole of the translation. They are named after
-   * these to begin with, so the one that is not simply lowercased is `Relaxed` — LLVM kept C11's
-   * *semantics* under its own older name, `monotonic`.
-   */
-  val llvm: Map[String, String] =
-    Map(
-      "Relaxed" -> "monotonic",
-      "Acquire" -> "acquire",
-      "Release" -> "release",
-      "AcqRel"  -> "acq_rel",
-      "SeqCst"  -> "seq_cst",
-    )
-
-  /** The ordering a failed compare-and-swap gets, given the one written for success.
+  /** Which back-end ordering each variant of the language's `Ordering` names, which is the whole of
+   * the translation — the two are named after C11 alike, so this is a lookup rather than a mapping.
    *
-   * `cmpxchg` takes two, and a program writes one. A failure is a load that stored nothing, so it
-   * may not carry a release — and LLVM refuses the instruction if it does. The rule is C11's: drop
-   * the release half and keep whatever acquire was asked for, which is the strongest ordering the
-   * failure path is allowed to have and therefore never weaker than the author expected.
+   * It is keyed by the **variant's name as written**, because that is what reaches here from the
+   * analyzer: an ordering is refused as a runtime value, so what an atomic carries is the name of
+   * the variant somebody spelled at the call. What each of these renders as is `ir.Ordering`'s
+   * business and is not repeated here.
    */
-  def failure(success: String): String = success match
-    case "Release" => "monotonic"
-    case "AcqRel"  => "acquire"
-    case other     => llvm(other)
+  val llvm: Map[String, ir.Ordering] =
+    Map(
+      "Relaxed" -> ir.Ordering.Relaxed,
+      "Acquire" -> ir.Ordering.Acquire,
+      "Release" -> ir.Ordering.Release,
+      "AcqRel"  -> ir.Ordering.AcqRel,
+      "SeqCst"  -> ir.Ordering.SeqCst,
+    )
 }
 
 trait Atomics extends ExprSupport {

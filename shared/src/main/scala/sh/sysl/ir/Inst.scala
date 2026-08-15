@@ -51,6 +51,39 @@ enum FCmp {
   def render: String = toString.toLowerCase
 }
 
+/** How strongly an atomic access is ordered against the accesses around it.
+ *
+ * These are C11's five, and they are named after C11 rather than after LLVM — with the one exception
+ * LLVM itself made: it kept C11's *semantics* for the weakest under its own older name, `monotonic`,
+ * so `Relaxed` is the single member whose text is not its own name lowercased.
+ *
+ * **It is an enum rather than the string it used to be because an ordering is not free-form.** LLVM
+ * accepts exactly these words at exactly these instructions, and one built by interpolation is one
+ * nothing can check — the failure of a misspelled ordering is a module the verifier rejects, a layer
+ * further on than the mistake.
+ */
+enum Ordering {
+  case Relaxed, Acquire, Release, AcqRel, SeqCst
+
+  def render: String = this match
+    case Relaxed => "monotonic"
+    case AcqRel  => "acq_rel"
+    case SeqCst  => "seq_cst"
+    case other   => other.toString.toLowerCase
+
+  /** The ordering the **failure** path of this compare-and-swap gets.
+   *
+   * `cmpxchg` takes two and a program writes one. A failure is a load that stored nothing, so it may
+   * carry no release — LLVM refuses the instruction if it does — and the rule is C11's: drop the
+   * release half and keep whatever acquire was asked for, which is the strongest the failure path is
+   * allowed and so never weaker than the author expected.
+   */
+  def onFailure: Ordering = this match
+    case Release => Relaxed
+    case AcqRel  => Acquire
+    case other   => other
+}
+
 /** How an access is reached: ordinarily, as a device effect, or indivisibly.
  *
  * `Volatile` is not an optimization barrier and does not order anything — it says the access is an
@@ -61,7 +94,7 @@ enum FCmp {
 enum Access {
   case Plain
   case Volatile
-  case Atomic(ordering: String, align: Int)
+  case Atomic(ordering: Ordering, align: Int)
 }
 
 /** An argument at a call: its type, the value, and whatever the convention attaches to it.
@@ -109,7 +142,41 @@ enum Inst {
 
   case Extract(dest: Val, ty: LType, agg: Val, indices: List[Int])
   case Insert(dest: Val, ty: LType, agg: Val, valueTy: LType, value: Val, indices: List[Int])
-  case Select(dest: Val, cond: Val, ty: LType, a: Val, b: Val)
+
+  /** `select`, which evaluates **both** arms and keeps one — the whole difference from an `if`, and
+   * why the language has a construct of its own for it (`tast.scala`'s `TSelect`).
+   *
+   * `condTy` is `i1` for a scalar and `<N x i1>` for the lane-wise form, where the answer is a
+   * different value in every lane. It defaults because all but one caller is the scalar one.
+   */
+  case Select(dest: Val, cond: Val, ty: LType, a: Val, b: Val, condTy: LType = LType.I(1))
+
+  /** `insertelement` — one lane written into a vector, which is the register file's answer to
+   * `insertvalue` and the way a vector literal is built up.
+   */
+  case InsertElement(dest: Val, ty: LType, vec: Val, elemTy: LType, value: Val, index: Arg)
+
+  /** `extractelement` — one lane read back out. There is no address and so no bounds test: the index
+   * was held to a constant in range where it was written.
+   */
+  case ExtractElement(dest: Val, ty: LType, vec: Val, index: Arg)
+
+  /** `shufflevector` — lanes taken from two vectors in whatever order the mask says.
+   *
+   * The compiler selects exactly one shuffle, the splat: lane zero of the first operand across an
+   * all-zero mask. It is the idiom every back end recognises, and it lowers to a single broadcast
+   * instruction on a machine that has one.
+   */
+  case Shuffle(dest: Val, ty: LType, a: Val, b: Val, mask: Arg)
+
+  /** A block of the target's own assembly, with the operands LLVM has to satisfy around it.
+   *
+   * `sideeffect` is unconditional and is not a flag here for that reason: every assembly sysl can
+   * express is worth keeping whether or not anything reads its result, which is the point of
+   * reaching for it at all. Several outputs come back as one anonymous struct — LLVM's shape rather
+   * than the language's — and it is taken apart at the emit site.
+   */
+  case Asm(dest: Option[Val], ret: LType, text: String, constraints: String, args: List[Arg])
 
   /** A call. `dest` is `None` where the result is `void` or discarded, and `ret` carries the return
    * type together with whatever attribute the convention puts in front of it.
@@ -117,9 +184,13 @@ enum Inst {
   case Call(dest: Option[Val], ret: String, callee: Val, args: List[Arg], sig: Option[String] = None)
 
   case VaArg(dest: Val, list: Val, ty: LType)
-  case AtomicRmw(dest: Val, op: String, ptr: Val, ty: LType, value: Val, ordering: String)
-  case CmpXchg(dest: Val, ptr: Val, ty: LType, expected: Val, desired: Val, success: String, failure: String)
-  case Fence(ordering: String)
+  case AtomicRmw(dest: Val, op: String, ptr: Val, ty: LType, value: Val, ordering: Ordering)
+
+  /** `cmpxchg`, which takes **two** orderings where a program writes one — see `Ordering.onFailure`
+   * for why the second is derived rather than asked for.
+   */
+  case CmpXchg(dest: Val, ptr: Val, ty: LType, expected: Val, desired: Val, ordering: Ordering)
+  case Fence(ordering: Ordering)
 
   // --- terminators -----------------------------------------------------------------------
 
@@ -161,8 +232,22 @@ enum Inst {
     case Insert(d, ty, agg, vty, v, idx) =>
       s"${d.render} = insertvalue ${ty.render} ${agg.render}, ${vty.render} ${v.render}, ${idx.mkString(", ")}"
 
-    case Select(d, c, ty, a, b) =>
-      s"${d.render} = select i1 ${c.render}, ${ty.render} ${a.render}, ${ty.render} ${b.render}"
+    case Select(d, c, ty, a, b, ct) =>
+      s"${d.render} = select ${ct.render} ${c.render}, ${ty.render} ${a.render}, ${ty.render} ${b.render}"
+
+    case InsertElement(d, ty, vec, ety, v, i) =>
+      s"${d.render} = insertelement ${ty.render} ${vec.render}, ${ety.render} ${v.render}, ${i.render}"
+
+    case ExtractElement(d, ty, vec, i) =>
+      s"${d.render} = extractelement ${ty.render} ${vec.render}, ${i.render}"
+
+    case Shuffle(d, ty, a, b, mask) =>
+      s"${d.render} = shufflevector ${ty.render} ${a.render}, ${ty.render} ${b.render}, ${mask.render}"
+
+    case Asm(d, ret, text, cons, args) =>
+      val lhs = d.map(r => s"${r.render} = ").getOrElse("")
+
+      s"""${lhs}call ${ret.render} asm sideeffect "$text", "$cons"(${args.map(_.render).mkString(", ")})"""
 
     case Call(d, ret, callee, args, sig) =>
       val lhs  = d.map(r => s"${r.render} = ").getOrElse("")
@@ -175,12 +260,13 @@ enum Inst {
     case VaArg(d, list, ty) => s"${d.render} = va_arg ptr ${list.render}, ${ty.render}"
 
     case AtomicRmw(d, op, p, ty, v, ord) =>
-      s"${d.render} = atomicrmw $op ptr ${p.render}, ${ty.render} ${v.render} $ord"
+      s"${d.render} = atomicrmw $op ptr ${p.render}, ${ty.render} ${v.render} ${ord.render}"
 
-    case CmpXchg(d, p, ty, e, n, s, f) =>
-      s"${d.render} = cmpxchg ptr ${p.render}, ${ty.render} ${e.render}, ${ty.render} ${n.render} $s $f"
+    case CmpXchg(d, p, ty, e, n, ord) =>
+      s"${d.render} = cmpxchg ptr ${p.render}, ${ty.render} ${e.render}, ${ty.render} ${n.render} " +
+        s"${ord.render} ${ord.onFailure.render}"
 
-    case Fence(ord) => s"fence $ord"
+    case Fence(ord) => s"fence ${ord.render}"
 
     case Br(l)             => s"br label %$l"
     case CondBr(c, t, f)   => s"br i1 ${c.render}, label %$t, label %$f"
@@ -199,6 +285,6 @@ enum Inst {
     case _: Access.Atomic => " atomic"
 
   private def alignText(a: Access): String = a match
-    case Access.Atomic(o, align) => s" $o, align $align"
+    case Access.Atomic(o, align) => s" ${o.render}, align $align"
     case _                       => ""
 }
