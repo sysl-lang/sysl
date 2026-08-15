@@ -46,11 +46,11 @@
 //     where a reader wants one. `out.store(i, xs.load(i))` is still refused and always will be:
 //     a store takes whatever width it is handed, so there is nothing there to infer.
 //
-//     What is *not* closed is a **written type argument at a call**, which is why `batch` takes its
-//     scale factor as a `<W>f32` rather than an `f32`: `W` would otherwise appear nowhere in the
-//     signature, and there would be nothing at a call site to say what it is. That is not a
-//     contortion — a SIMD kernel's constants are vectors anyway — but it is the reason the
-//     signature reads as it does, and a kernel with no constant at all has nowhere to put its width.
+//     **The other half of that finding was where the width comes from at a *call*, and it is closed
+//     too.** `batch` takes its scale factor as a `<W>f32` rather than an `f32`, which is what a real
+//     solver does anyway — but a kernel with no such constant named `W` nowhere in its signature and
+//     could not be called from anywhere, since type arguments were not written at a call. They are
+//     now (`10 §2`): `add[8](a, b, out)` says the width where the reader is already standing.
 //
 //   * **There is still no shuffle, and `gather` is where that shows.** Moving eight scattered
 //     bodies' velocities into lane order now costs a scratch array and eight scalar stores rather
@@ -123,12 +123,16 @@ relative[const W: usize](va: <W>f32, vb: <W>f32, n: <W>f32) -> <W>f32 = (vb - va
 // the end. A masked load would answer it in one instruction and sysl has none; a scalar loop
 // answers it in three lines and is what C's SIMD code writes anyway.
 //
-// **`relax` is a vector rather than an `f32`, and that is where `W` comes from.** A written type
-// argument at a call is still refused (`10 § Open a`), so a kernel whose every parameter is a slice
-// has no way to be told its width. It is not a stand-in: the relaxation factor of a Gauss-Seidel
-// step is a constant broadcast across the lanes, and every real SIMD solver passes its constants
-// as vectors for exactly this reason. But a kernel with *no* such constant would have nowhere to
-// put its width, and that is worth knowing before one is designed.
+// **`relax` is a vector rather than an `f32`, and it is a choice rather than a workaround.** The
+// relaxation factor of a Gauss-Seidel step is a constant broadcast across the lanes, and every real
+// SIMD solver passes its constants as vectors for exactly that reason — so the parameter says what
+// the kernel does, and `W` falls out of it.
+//
+// It was also, when this was written, the only place `W` could enter: a kernel whose every parameter
+// was a slice had no way to be told its width, since type arguments were not written at a call. That
+// was this program's second finding and `10 §2` answered it — `batch[4](…)` would work now too, and
+// `add[8](a, b, out)`, which mentions `W` nowhere at all, is a kernel that could not be called
+// before. The signature below is unchanged because it was never the workaround.
 batch[const W: usize](vn: []const f32, mass: []const f32, bias: []const f32, out: []f32, relax: <W>f32)
     var i: usize = 0
 

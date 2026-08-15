@@ -109,12 +109,29 @@ Square brackets are reused for two things, disambiguated by **position**, with n
   application.
 
 This reuse is deliberate and unambiguous because a type and an expression never occupy the same
-grammatical slot. The cost is that **explicit type arguments at a call site collide with
-indexing** — `id[int](7)` in expression position reads as "index `id` by `int`, then call" — so
-call-site type arguments are not offered; inference (§4) supplies them instead, and the one
-case inference cannot reach is answered by annotating the result, not by a turbofish (`§ Open a`).
-The single exception is an **address**, `&f[T]`, where there is no indexing to collide with and no
-annotation that could stand in — `12 §6a` has the case that earned it.
+grammatical slot. The apparent cost is that **explicit type arguments at a call head look like
+indexing** — `id[int](7)` reads as "index `id` by `int`, then call" — and for a long time they were
+not offered for that reason.
+
+**They are offered now, and what tells them apart is name resolution rather than the grammar.** A
+function is not a thing that can be indexed, so where the head of a call resolves to a *declaration*
+and to nothing nearer, the brackets have no second reading to protect:
+
+```
+id[int](7)                      -- a type argument: `id` is a function
+handlers[i](7)                  -- an index: `handlers` is a value holding callables
+```
+
+The nearest binding wins, which is the rule every other call form follows: a local named `id`
+standing over a function of that name makes the first line an index too. Four heads take the list —
+a **function**, a **constructor**, a **method**, and the special forms `va_arg` and `ptr_cast` — and
+so does the address, `&f[T]` (`12 §6a`), which had the exception first.
+
+**Inference (§4) is still what supplies them nearly everywhere**, and writing a list that inference
+would have found is noise. What earns the syntax is the signature neither direction reaches: a
+`[const W: usize]` kernel reading and writing through slices names its width in no parameter and
+answers `unit`, so there is nothing at the call to infer from and nothing to annotate. That case is
+`§ Open a`, which this closes.
 
 ## 3. Type arguments and construction
 
@@ -537,8 +554,9 @@ what it may not do is put the result in a type.
 **A value argument is inferred from the argument's type**, by §4's existing bidirectional rule with
 one more thing to unify: matching `[3]int` against `[N]int` binds `N` to 3, exactly as matching
 `Box[int]` against `Box[T]` binds `T`. `sum(a)` where `a: [3]int` needs nothing written. Where
-nothing can be inferred from, `§ Open a` applies unchanged — the argument is supplied by annotating
-what receives the result, since there is still no call-site argument syntax.
+nothing can be inferred from, the argument is written at the call — `sum[3]()` — or supplied by
+annotating what receives the result. A value argument is written exactly as a type one is, because
+the two share a list and a position (§2).
 
 **Monomorphization keys on the value arguments beside the type arguments** (§7): `sum` at `N = 3`
 and `N = 4` are two functions, exactly as `id` at `int` and `real` are two. Nothing about the cost
@@ -715,7 +733,9 @@ types. Making the first out of the second is a plausible future and is not this.
 
 **A pack is inferred by unifying `(..A)` against the argument's type**, by §4's existing rule: a
 `(int, string, bool)` matched against `(..A)` binds `A` to those three, exactly as `[3]int` against
-`[N]int` binds `N` to 3. There is nothing to write at a call.
+`[N]int` binds `N` to 3. A pack is the one parameter with **no** written form (§2): `..A` is not an
+expression in any reading, and one written argument per element would be a different arity from the
+declaration's.
 
 **Monomorphization keys on the pack's members** (§7), so a `(int, string)` and a `(int, bool)` are
 two instantiations of one block and two functions in the object file — the same trade every generic
@@ -750,62 +770,52 @@ missing is a way to name a field list. That is the deriving question, and `14 §
 
 ## Open (not yet decided)
 
-- **a. Explicit type arguments at a *call*.** Still open — but the case this item was waiting for
-  arrived and was answered somewhere narrower than a call, so read this alongside the settled half
-  below.
+- ~~**a. Explicit type arguments at a *call*.**~~ — **settled and built. Not open.**
 
-  **Settled: at an address, the arguments are written — `&f[T]`, `&f[A, B]` (`12 §6a`).** That is
-  the one position in the language that takes them, and what earned it is the class of cases in the
-  paragraphs further down: a C callback's signature is fixed by the interface, so a trampoline
-  mentions its own type parameter nowhere and *no* annotation anywhere else can supply it. The
-  discrimination against indexing turned out not to need new syntax at all — the analyzer already
-  told `&f[T]` from `&xs[i]` by name resolution, in order to refuse the first by name, so what
-  changed was the action and not the decision.
+  **The list is written at a call head**, and at all four of them: `id[int](7)`, `Pair[K, V](…)`,
+  `x.m[T](…)`, and the special forms `va_arg[int](ap)` and `ptr_cast[*u8](p)`. A **value** argument
+  goes the same way, `sum[3]()`, since §9 gave the two kinds one list and one position. The address
+  form `&f[T]` (`12 §6a`) had it first and is unchanged.
 
-  **Still deferred: `f[T](x)` at a call head**, along with `buf[u8]()` and `va_arg[int](ap)`.
-  Inference (§4) plus result annotation covers those, and what stands in for the syntax there is a
-  word — the type on the binding that was going to be written anyway — rather than the whole shape
-  it was costing at an address. The naive spelling still collides with indexing (§2), and if it
-  proves necessary it needs the same decision as before: a turbofish marker, or a rule that a
-  type-argument list is only read in a call head.
+  **The ambiguity this item rested on was never in the language — it was in where it was being
+  looked for.** A type-argument list and a subscript are one grammar, so the *parser* cannot tell
+  them apart; but the analyzer resolves the head, and a function is not a thing that can be indexed.
+  The compiler was already making exactly that distinction, by name resolution, in order to produce
+  the bespoke refusal this item asked for — so accepting the form cost no new syntax, no turbofish,
+  and no rule about where a bracket may be read as a type. The nearest binding wins, exactly as it
+  does at every other call form: a local shadowing a function's name keeps the subscript.
 
-  The reach for it is common enough to be worth a sentence of its own, because a **nullary**
-  generic has no argument to be inferred from: `buf()` and `map()` are solved by what receives the
-  result and nothing else, so `buf[u8]()` is the first thing a reader tries. That form is refused
-  by name — `'buf' cannot be given type arguments at a call; write the type on what receives the
-  result` — for a generic free function and a generic method alike, rather than by the general
-  complaint about a callee that is not a name. The message is the whole of the mitigation: the
-  syntax stays deferred, and the case that would otherwise look like a compiler limitation now
-  names the annotation that stands in for it. The **special forms** are refused the same way and
-  for the same reason, `va_arg[int](ap)` above all.
+  **What earned it is a signature neither direction of §4 reaches, and it is a class rather than a
+  corner.** A width-generic kernel — `add[const W: usize](a: []const f32, b: []const f32, out:
+  []f32)` — names `W` in no parameter and answers `unit`, so the arguments say nothing about it and
+  there is no receiving type to annotate. It could not be called from anywhere. That is the plainest
+  SIMD kernel there is, and it is the same asymmetry that earned the address form: a trampoline over
+  `*u8` mentions its type parameter nowhere either.
 
-  **`va_arg` is the strongest case against the deferral, and worth recording as such.** Everywhere
-  else the annotation is a word — the type on the binding that was going to be written anyway. A
-  variadic body reads its tail into whatever the surrounding expression is, so `total += va_arg(ap)`
-  and `take(va_arg(ap))` are answered by the place and the parameter; but a bare `print(va_arg(ap))`
-  has nothing to read from and costs a whole statement to write. That is one position rather than a
-  class of them, which is why the deferral stands — but it is the first place the missing syntax
-  costs more than a word, and a second one would be the case this item is waiting for.
+  **The two cases this item recorded while it was open both work now**, and both are worth keeping as
+  the record of why it moved:
 
-  **The second one arrived, and unlike the first it was a class — which is why it was built.** A C
-  routine that calls back takes a comparison of one fixed shape — `int (*)(const void *, const void
-  *)` — so the natural trampoline is `compare[T](a: *u8, b: *u8) -> int`, with the cast inside it
-  where a C programmer would write one. That function had **no address**: `&compare` reads its
-  instantiation off the expected type (`12 §6a`), the expected type is `*extern(*u8, *u8) -> int`,
-  and `T` is nowhere in it. What got written instead was a trampoline over `*T`, a second `ptr_cast`
-  on the function pointer itself, and a `val` whose only job was to be somewhere to write the type.
+  - **the nullary generic.** `buf[u8]()` and `map[string, int]()` are solved by what receives the
+    result and nothing else, so writing the arguments is the first thing a reader tries. The refusal
+    that used to name the annotation instead was the whole of the mitigation, and is gone.
+  - **`va_arg`, which was the strongest case against the deferral.** Everywhere else the annotation
+    standing in is a word on a binding that was going to be written anyway; a variadic body reading
+    its tail straight into `print(va_arg(ap))` had nothing to read from and cost a whole statement.
+    `print(va_arg[int](ap))` is that statement's replacement.
 
-  It is a class rather than a position because **every** C callback has this shape: the interface
-  fixes the signature and the payload type is the caller's, which is the sentence `12 §6a` opens
-  with. `qsort` is merely the smallest instance of it — `bsearch`, `atexit`-style registries,
-  `sqlite3_exec`, and every `userdata` parameter in the org's own bindings are the same. So the cost
-  was not one awkward line but a shape imposed on every binding that would ever be written.
+  **Two things are deliberately still refused.** The first is a **type pack**: `..A` stands for a
+  list rather than one type and has no expression spelling, so its instantiation is inferred (§10).
+  The second is an **associated function selected from an applied type** — `Box[int].of(…)` — whose
+  own parameters and its type's are solved from a single list, so honouring the brackets would mean
+  fixing half of that list and solving the rest, which is a different question from the one the form
+  asks; the annotation reaches it and, unlike the kernel above, is always available, since an
+  associated function has a result for the arguments to be read off. A *variant* selected the same
+  way — `Maybe[int].Just(1)` — **is** accepted, because a variant is a construction of its type.
 
-  **`&` is also where the ambiguity this item rests on is cheapest to settle**, and that decided the
-  scope: `&xs[i]` is the address of an *element*, so `&f[T]` naming a function is not a second
-  reading of anything. The compiler was already making exactly that distinction, by name resolution,
-  to produce a bespoke refusal — so accepting the form cost no new syntax and no new decision, while
-  opening the call head would have settled a question this item deliberately keeps open.
+  **And one honest hole, shared with `&f[T]`:** the brackets read the *expression* grammar, so a type
+  a type-and-expression cannot spell alike has no form there. `[]int`, `weak T`, `volatile T`, `<4>f32`
+  and a callable all fail in the **parser**, before any message of this feature's is reached. The
+  annotation still reaches every one of them, and that is what the refusal says to write.
 - **b. Members on generic types** — settled and implemented, and no longer open. A method or
   property is instantiated from the receiver's own type arguments, so `Box[int].get` and
   `Box[real].get` are two monomorphized functions exactly as two instantiations of a free generic

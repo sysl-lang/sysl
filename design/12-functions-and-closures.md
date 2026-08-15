@@ -1198,10 +1198,10 @@ that is C's shape and nothing here changes it. What is no longer needed is the s
 was forcing: a trampoline written over `*T` because it could not be written over `*u8`, a second
 `ptr_cast` of the function pointer, and a `val` whose only job was to be somewhere to put the type.
 
-**This is the one position in the language where type arguments are written**, and the deferral it
-closes is `10 § Open a`'s. The general form `f[T](x)` is still refused, because the annotation that
-stands in for it there is a word — the type on the binding that was going to be written anyway —
-while here it was a whole shape.
+**This was the first position in the language where type arguments are written**, and the case that
+opened `10 § Open a`'s deferral at all. The general form `f[T](x)` followed it, on the same
+discrimination and for a case of the same shape — a signature neither direction of inference reaches
+— so what is written here is now the ordinary spelling rather than an exception.
 
 **The grammar gives `&f[T]` and `&xs[i]` one shape, and the *analyzer* is what separates them.** Both
 are a name, a bracket and something inside, so nothing at the parse decides it; the name resolving to
@@ -1396,14 +1396,12 @@ the refusal names the walk as the reason.
   same place `None` and `Ok(5)` get theirs. Where the context says nothing the form is refused rather
   than guessed at, and the diagnostic names the annotation to write.
 
-  *(An earlier draft of this section spelled it `va_arg[T](ap)` and called the type argument "the
-  same position every other generic puts one in". There is no such position: `10` §2 gives square
-  brackets in an expression to indexing, and type arguments are not written at a call,
-  `10 § Open a`. What that leaves is context and an annotation, which is what the implementation
-  does. `va_arg` is the strongest customer that open item still has — the annotation costs a whole
-  statement in the one position, a bare `print(va_arg(ap))`, where the surrounding expression says
-  nothing. The item's other customer, a callback trampoline, was answered at an **address** rather
-  than at a call (`§6a`), which is a position `va_arg` does not have.)*
+  **The type may also be written on the form** — `print(va_arg[int](ap))` — which is `10 §2`'s list
+  at a special form. That is the position an earlier draft of this section assumed existed, was told
+  did not, and which `10 § Open a` then closed: a bare `print(va_arg(ap))` has nothing around it to
+  read a type from, and the annotation cost a whole statement. Everywhere the context does say —
+  `var v: int = va_arg(ap)`, `total += va_arg(ap)`, `take(va_arg(ap))` — writing the type is noise,
+  and the context is still what the form reads first.
 - **`va_end(ap)`** finishes with it.
 - **`va_copy(dst, src)`** starts `dst` where `src` has reached, so a tail can be walked twice.
 

@@ -931,11 +931,11 @@ language can express it — a `Zero` trait with `zero()` is an ordinary trait to
 decided is whether the compiler should supply the membership for the open `iN`/`uN` families the way
 `14 §8 a` does for the operators.
 
-A related gap the mechanism makes visible: a routine can now be entirely *about* a type and mention
-it nowhere in its signature, and such a function cannot be called, because inference reads the
-binding and a call cannot write its type arguments (`10 § Open a`). `describe[T: Word]() -> string`
-is well-formed and unreachable. Taking a value of `T` is the workaround, and it is the same one the
-type-argument entry already records.
+A routine can be entirely *about* a type and mention it nowhere in its signature —
+`describe[T: Word]() -> string` — and such a function used to be well-formed and unreachable, since
+inference reads the arguments and the binding and this signature offers neither. It is reached by
+writing the argument at the call, `describe[u32]()` (`10 §2`), which is the shape that closed
+`10 § Open a` and which this was one of the two cases for.
 
 ## Details still to settle
 

@@ -24,8 +24,14 @@ trait MethodCalls extends FuncAddress {
    * A method with type parameters **of its own** is the one shape the receiver does not settle, and
    * `callGenericMethod` is where the rest of the answer comes from.
    */
-  protected def callMethod(recv: Expr, mname: String, args: List[Expr], expected: Option[Type]): TExpr =
-    callMethodOn(analyzeExpr(recv), mname, args, expected, receiverBound(recv))
+  protected def callMethod(
+      recv: Expr,
+      mname: String,
+      args: List[Expr],
+      expected: Option[Type],
+      writtenTargs: List[Expr] = Nil,
+  ): TExpr =
+    callMethodOn(analyzeExpr(recv), mname, args, expected, receiverBound(recv), writtenTargs)
 
   /** The traits the receiver's own **bound** promised, read off the expression as written.
    *
@@ -264,6 +270,10 @@ trait MethodCalls extends FuncAddress {
       args: List[Expr],
       expected: Option[Type],
       via: Set[String] = Set.empty,
+      // Written at the call — `x.m[T](…)` (`10 §2`). Only the last branch below can be reached with
+      // a list in hand, because what routes a call here with one is a guard that has already found a
+      // **declared method** of that name on the receiver's own type.
+      writtenTargs: List[Expr] = Nil,
   ): TExpr = {
     receiverType(tr.ty) match
       case a: Type.Abstract => callBoundMethod(a, tr, mname, args)
@@ -322,9 +332,19 @@ trait MethodCalls extends FuncAddress {
           case Some(m) if m.receiver.isDefined && m.tparams.nonEmpty =>
             checkMemberVisible(base, chosen, m)
             callGenericMethod(genericMembers((base, chosen)), m, targs, tr,
-              bindArgs(s"method '$base.$chosen'", Some(base), m.params, args, m.variadic), expected)
+              bindArgs(s"method '$base.$chosen'", Some(base), m.params, args, m.variadic), expected,
+              writtenTargs)
           case Some(m) if m.receiver.isDefined =>
             checkMemberVisible(base, chosen, m)
+
+            // A list written on a member that has no parameters for it. The receiver's arguments are
+            // not among them — they are the *type*'s and are already settled by the value in hand —
+            // so this is the method's own emptiness rather than the type's.
+            if writtenTargs.nonEmpty then
+              err(s"'$chosen' is not generic, so it has no type arguments to write — the call is " +
+                s"'$mname(…)'. The arguments of ${show(rty)} are the receiver's and are already " +
+                "settled by the value it is read off")
+
             val fname = memberFuncName(rty, chosen)
             // **A member whose own signature did not resolve is registered and has no lowered
             // form**, which is `MemberLowering`'s deliberate order — the declaration is filed
@@ -576,6 +596,7 @@ trait MethodCalls extends FuncAddress {
       recv: TExpr,
       args: List[Expr],
       expected: Option[Type],
+      writtenTargs: List[Expr],
   ): TExpr = {
     val shown = qn(fd.name)
 
@@ -587,15 +608,22 @@ trait MethodCalls extends FuncAddress {
     val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)((ref, _) => spellSelf(_, ref))
     val ptypes      = fd.params.tail.map(p => spell(p.typ))
     val provisional = provisionalArgs(fd.name, fd.tparams, ptypes, passed, m.bounds)
-    val own = inDecl(fd.name)(solve(
-      shown,
-      m.tparams,
-      ptypes,
-      provisional.map(_.ty),
-      fd.retType.map(spell),
-      expected,
-      passed.map(isLiteral),
-    ))
+    // **Only the member's own parameters are written**, and they settle the call outright where they
+    // are: the owner's arrived with the receiver and were never a question, and the solve below is
+    // what the written list replaces rather than something it is checked against.
+    val own =
+      if writtenTargs.nonEmpty then
+        writtenTypeArgs(m.name, m.tparams, m.tvalues, m.tpacks, writtenTargs, atCall = true)
+      else
+        inDecl(fd.name)(solve(
+          shown,
+          m.tparams,
+          ptypes,
+          provisional.map(_.ty),
+          fd.retType.map(spell),
+          expected,
+          passed.map(isLiteral),
+        ))
 
     inDecl(fd.name)(checkParamBounds(shown, m.tparams, fd.bounds, own))
 

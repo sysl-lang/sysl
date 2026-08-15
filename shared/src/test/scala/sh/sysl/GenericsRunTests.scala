@@ -525,8 +525,8 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
                       |print(only(3))
                       |""".stripMargin)
 
-      out should include("'T' is named by no parameter and by no result")
-      out should include("what settles it is a parameter whose type mentions it")
+      out should include("'T' is in neither the parameters of 'only' nor its result")
+      out should include("write it out, as 'only[…](…)'")
     }
 
     // Where the result *does* mention it, the annotation genuinely is the remedy and is what the
@@ -539,28 +539,23 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) should include("cannot infer the type argument 'T'")
     }
 
-    // Call-site type arguments are deliberately absent (`10 § Open a`) because the list and an
-    // index share a grammar. The reach for them is natural enough — a nullary generic has no
-    // argument to be inferred from — so the complaint names the rule and the annotation that
-    // stands in for it, rather than reporting a callee that is not a name.
-    "type arguments at a call are refused by name" in {
-      err("""id[T](x: T) -> T = x
+    // Call-site type arguments were deliberately absent (`10 § Open a`) because the list and an
+    // index share a grammar. What settles that is name resolution rather than the parser, and
+    // `WrittenTypeArgsTests` is where the form is covered — this is the reach a reader makes first.
+    "type arguments at a call name the instantiation" in {
+      run("""id[T](x: T) -> T = x
             |print(id[int](3))
-            |""".stripMargin) should include("'id' cannot be given type arguments at a call")
+            |""".stripMargin) shouldBe "3\n"
     }
 
-    /** **The remedy the sentence names has to exist**, and for one shape of declaration it does not.
+    /** **A call that says nothing about a parameter is sent to the place that would.**
       *
       * A parameter named by no parameter and by no result is reached by neither of `10 §4`'s two
-      * directions: the arguments say nothing about it, and there is no receiving type to annotate
-      * either. `solve` could only report what it failed to find, so what a reader got was
-      * "annotate the expected type" about an expression with none — advice that cannot be followed,
-      * about a declaration that cannot be called from anywhere.
-      *
-      * It is easiest to write with a value parameter, and that is where it turned up: a `[const W]`
-      * kernel reading and writing through slices carries its width in no argument and answers `unit`.
+      * directions, so `solve` could only report what it failed to find — and what it asked for, an
+      * annotation on the expected type, is impossible advice for an expression that has none. Since
+      * `10 §2` the list may be written at the call, which is the one thing that does settle it.
       */
-    "a type parameter nothing in the signature mentions says what would settle it" in {
+    "a type parameter nothing in the signature mentions is sent to the written list" in {
       val out = err("""scale[const W: usize](xs: []const f32, out: []f32)
                       |    val v: <W>f32 = xs.load(0)
                       |    out.store(0, v)
@@ -570,49 +565,9 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
                       |scale(a[..], b[..])
                       |""".stripMargin)
 
-      out should include("'W' is named by no parameter and by no result")
-      out should include("a parameter whose type mentions it")
+      out should include("'W' is in neither the parameters of 'scale' nor its result")
+      out should include("write it out, as 'scale[…](…)'")
       out should not include "annotate the expected type"
-    }
-
-    // And the spelling a reader reaches for next is owed both halves: that the brackets are not
-    // written at a call, *and* that the annotation it would send them to is not there either.
-    "and the bracketed spelling of that call says both things" in {
-      val out = err("""scale[const W: usize](xs: []const f32, out: []f32)
-                      |    val v: <W>f32 = xs.load(0)
-                      |    out.store(0, v)
-                      |
-                      |var a: [8]f32
-                      |var b: [8]f32
-                      |scale[4](a[..], b[..])
-                      |""".stripMargin)
-
-      out should include("cannot be given type arguments at a call")
-      out should include("'W' is named by no parameter and by no result")
-    }
-
-    // A generic method is at least as likely a place to reach for the syntax, and gets the same
-    // sentence — the receiver settles nothing about it, since the list is written after the name.
-    "including on a generic method" in {
-      err("""struct Box
-            |    n: int
-            |    pick[T](self, x: T) -> T = x
-            |var b = Box(1)
-            |print(b.pick[int](3))
-            |""".stripMargin) should include("'pick' cannot be given type arguments at a call")
-    }
-
-    // The improved wording is for a generic callee only: anything else applied to an index is
-    // still whatever the general complaint says it is, and telling a reader about type arguments
-    // they never wrote would be worse than saying less.
-    "and a non-generic name indexed and applied is not told about type arguments" in {
-      val out = err("""plain(x: int) -> int = x
-                      |var xs: []int = [1, 2, 3]
-                      |print(plain[1](3))
-                      |""".stripMargin)
-
-      out should include("the thing being called must be a name")
-      out should not include "type arguments"
     }
 
     // Nor is a local that happens to share a generic function's name: what is indexed there is the

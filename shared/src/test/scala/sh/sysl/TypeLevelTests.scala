@@ -373,82 +373,87 @@ class TypeLevelTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         |""".stripMargin) shouldBe "64\n"
   }
 
-  "a routine entirely about a type is well-formed and cannot be called" in {
-    // The gap the mechanism makes visible (`10 § Open a`): inference reads the binding, and a call
-    // may not write its type arguments — so a function whose parameter appears nowhere in its
-    // signature has no way to say which instantiation is meant. Taking a value of `T` is the
-    // workaround, and the diagnostic is the one that entry already gives.
-    err(width +
+  "a routine entirely about a type is called by writing the type" in {
+    // The gap the mechanism made visible (`10 § Open a`), and the shape that closed it: a function
+    // whose parameter appears nowhere in its signature is reached by neither direction of inference,
+    // so the list written at the call is the only thing that can say which instantiation is meant.
+    run(width +
       """describe[T: Width]() -> usize = T.bits()
         |
         |main()
         |    print(describe[u32]())
-        |""".stripMargin) should include("cannot be given type arguments at a call")
+        |""".stripMargin) shouldBe "32\n"
   }
 
-  /** The same refusal at a **constructor**, which is the other half of the call head.
+  /** The **constructor**, which is the other half of the call head and takes the same list.
    *
-   * `10 § Open a` is one rule and it was announced at one of the two positions: a generic type's name
-   * given type arguments fell past every call form to the general complaint that the callee is not
-   * callable, which says nothing about type arguments and reads as though the type were not a type.
-   * Both bracket spellings are checked because they are different nodes — one argument parses as an
-   * `Index` and a list as a `TypeArgs`.
+   * A generic type's name given type arguments used to fall past every call form to the general
+   * complaint that the callee is not callable, which says nothing about type arguments and reads as
+   * though the type were not a type. Both bracket spellings are checked because they are different
+   * nodes — one argument parses as an `Index` and a list as a `TypeArgs`.
+   *
+   * The one that keeps a refusal is a **selection**: an associated function reads its type's
+   * arguments and its own from a single solve, so settling half of that list is a different question
+   * from the one the form asks. `WrittenTypeArgsTests` carries the whole surface.
    */
-  "a generic type's constructor is refused type arguments in the words a function's is" - {
+  "a generic type's constructor takes type arguments the way a function does" - {
     "with a list of them" in {
-      val message = err(
+      run(
         """struct Pair[K, V]
           |    key: K
           |    value: V
           |
           |main()
-          |    var p = Pair[int, int](1, 2)
-          |    print(p.key)
-          |""".stripMargin)
-
-      message should include("'Pair' cannot be given type arguments at a call")
-      message should include("var x: Pair[…] = Pair(…)")
+          |    var p = Pair[int, real](1, 2.5)
+          |    print(p.key, p.value)
+          |""".stripMargin) shouldBe "1 2.5\n"
     }
 
     "with one" in {
-      err(
+      run(
         """struct Box[T]
           |    v: T
           |
           |main()
           |    var b = Box[int](1)
           |    print(b.v)
-          |""".stripMargin) should include("'Box' cannot be given type arguments at a call")
+          |""".stripMargin) shouldBe "1\n"
     }
 
     // One step to the left, and a different node: the arguments on the type a variant is selected
     // *from*. Nothing read the brackets as a type, so the walk called them a subscript and reported
-    // the enum's own name undefined — the one reading that cannot be true.
+    // the enum's own name undefined — the one reading that cannot be true. A variant is a
+    // construction of its type, so the arguments mean here what they mean at a constructor.
     "and on the type a variant is selected from, which said the type was undefined" in {
-      val message = err(
+      run(
         """enum Maybe[T]
           |    Nothing
           |    Just(v: T)
           |
           |main()
           |    var m = Maybe[int].Just(1)
-          |    print(1)
-          |""".stripMargin)
-
-      message should include("'Maybe' cannot be given type arguments where 'Just' is selected")
-      message should not include "undefined name"
+          |    val n: int = m match
+          |        Just(v) -> v
+          |        Nothing -> 0
+          |
+          |    print(n)
+          |""".stripMargin) shouldBe "1\n"
     }
 
     "including where nothing is called, so no call form would have seen it" in {
-      err(
+      run(
         """enum Maybe[T]
           |    Nothing
           |    Just(v: T)
           |
           |main()
           |    var m: Maybe[int] = Maybe[int].Nothing
-          |    print(1)
-          |""".stripMargin) should include("'Maybe' cannot be given type arguments where 'Nothing' is selected")
+          |    val n: int = m match
+          |        Just(v) -> v
+          |        Nothing -> 0
+          |
+          |    print(n)
+          |""".stripMargin) shouldBe "0\n"
     }
 
     "while the plain name it points at is what works" in {

@@ -240,16 +240,21 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
    * The cost is analyzing the arguments once per candidate, and it is paid only where a name is
    * overloaded at all.
    */
-  protected def callOverloaded(plain: String, written: List[Expr], expected: Option[Type]): TExpr = {
+  protected def callOverloaded(
+      plain: String,
+      written: List[Expr],
+      expected: Option[Type],
+      targs: List[Expr] = Nil,
+  ): TExpr = {
     val keys = overloadKeys(plain)
 
-    if keys.length == 1 then callFunction(funcDecls(plain), written, expected)
+    if keys.length == 1 then callFunction(funcDecls(plain), written, expected, targs)
     else
       val candidates = keys.map(funcDecls)
-      val fitting    = candidates.flatMap(f => fitSignature(f, written, expected).map(f -> _))
+      val fitting    = candidates.flatMap(f => fitSignature(f, written, expected, targs).map(f -> _))
 
       narrow(fitting, written) match
-        case List((one, _)) => callFunction(one, written, expected)
+        case List((one, _)) => callFunction(one, written, expected, targs)
 
         // Nothing fits. Where exactly one candidate could have taken this many arguments, its own
         // complaint is the useful message — the reader wrote a call meaning that one and got a type
@@ -266,7 +271,7 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
 
           val plausible = candidates.filter(f => arityFits(f.params.length, f.variadic, written.length))
 
-          if plausible.length == 1 then callFunction(plausible.head, written, expected)
+          if plausible.length == 1 then callFunction(plausible.head, written, expected, targs)
           else
             err(s"no '${qn(plain)}' takes these arguments — the declarations of that name are:\n" +
               candidates.map(f => s"    ${signatureOf(f)}").mkString("\n"))
@@ -297,9 +302,10 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
       f: FuncDecl,
       written: List[Expr],
       expected: Option[Type],
+      targs: List[Expr],
   ): Option[List[Type]] =
     probe {
-      val TCall(inst, _, _, _) = callFunction(f, written, expected): @unchecked
+      val TCall(inst, _, _, _) = callFunction(f, written, expected, targs): @unchecked
       funcInsts(inst)._1.map(_._2)
     }
 
@@ -365,34 +371,140 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
   private def signatureOf(f: FuncDecl): String =
     s"${qn(f.name)}(${f.params.map(p => s"${p.name}: ${p.typ.show}").mkString(", ")})"
 
-  /** The type parameters of a declaration that **no call can settle**: named by none of its
-   * parameters and by no result, so both of `10 §4`'s directions are empty — the arguments say
-   * nothing about them and neither does the type the value is read into.
+  /** The type parameters of a declaration that **inference cannot reach from a call**: named by none
+   * of its parameters and by no result, so both of `10 §4`'s directions are empty — the arguments
+   * say nothing about them and neither does the type the value is read into.
    *
    * It is a property of the *declaration* rather than of any one call, which is what makes it worth
-   * asking as its own question: a function shaped like this cannot be called anywhere, and a reader
-   * who has just written the call is owed that rather than a remedy that does not exist. The shape is
-   * easiest to reach for with a value parameter: a `[const W: usize]` kernel that reads and writes
-   * through slices carries its width in no argument and answers `unit`, so the width is nowhere a
-   * call could put it.
+   * asking as its own question: no call of a function shaped like this can be solved, so the reader
+   * is owed the one thing that does settle it rather than a remedy that does not apply. `solve` could
+   * only say what it failed to find, and what it asked for — an annotation on the expected type — is
+   * impossible advice where the result mentions nothing.
+   *
+   * The shape is easiest to reach for with a value parameter: a `[const W: usize]` kernel that reads
+   * and writes through slices carries its width in no argument and answers `unit`. **That is the
+   * shape that earned the written list**, so this now names it.
    */
   protected def unsettleable(f: FuncDecl): List[String] =
     f.tparams.filterNot(tp =>
       f.params.exists(p => mentions(p.typ, Set(tp))) || f.retType.exists(mentions(_, Set(tp))))
 
-  /** Why nothing at a call reaches those parameters, and what would. Said in one place because two
-   * refusals need it: the call written plainly, and the call written with the type arguments the
-   * reader reached for instead (`ExprAnalysis`).
+  /** Which copy of a generic declaration a **written** type-argument list names — `&f[T]` at an
+   * address (`12 §6a`) and `f[T](x)` at a call (`10 §2`).
+   *
+   * The two positions share every rule and differ only in what a refusal points at, which is what
+   * `atCall` is for. They were one position for as long as the call head was deferred; what settled
+   * that deferral is the shape a *value* parameter makes reachable, where a kernel reading and
+   * writing through slices names its width in no argument and answers `unit`, so neither of `10 §4`'s
+   * directions carries it and there is no binding to annotate.
+   *
+   * The expected type is not consulted. Where both are present the written arguments win outright
+   * rather than being checked against it, because the result is checked against the expected type
+   * anyway by whatever it is being handed to — a second check here would report the same mismatch in
+   * worse words.
    */
-  protected def nothingSettles(stuck: List[String]): String = {
-    val names    = stuck.map(t => s"'$t'").mkString(" and ")
-    val (is, it) = if stuck.length == 1 then ("is", "it") else ("are", "them")
+  protected def instantiationWritten(
+      written: String,
+      decl: FuncDecl,
+      targs: List[Expr],
+      atCall: Boolean,
+  ): String = {
+    val types = writtenTypeArgs(written, decl.tparams, decl.tvalues, decl.tpacks, targs, atCall)
 
-    s"$names $is named by no parameter and by no result, so the arguments say nothing about $it and " +
-      s"there is nothing to annotate either — what settles $it is a parameter whose type mentions $it"
+    // The same check a call makes on the arguments it solved (`checkBounds`). Writing them out does
+    // not exempt them: a bound is what the body was compiled against, and an unsatisfied one would
+    // otherwise surface as a missing method inside a monomorphized body the reader never wrote.
+    checkBounds(decl, types)
+    instantiateFunc(decl, types)
   }
 
-  protected def callFunction(f: FuncDecl, written: List[Expr], expected: Option[Type]): TExpr = {
+  /** The types a written list stands for, checked against the parameters it is a list *for*.
+   *
+   * It takes the three lists rather than a declaration because a **member** carries its own set
+   * beside the ones it inherits from the receiver's type: `fd.tparams` for a method is the owner's
+   * arguments followed by the member's, and only the member's half is ever written at a call.
+   */
+  protected def writtenTypeArgs(
+      written: String,
+      tparams: List[String],
+      tvalues: Map[String, TypeRef],
+      tpacks: Set[String],
+      targs: List[Expr],
+      atCall: Boolean,
+  ): List[Type] = {
+    if tparams.isEmpty then
+      err(s"'$written' is not generic, so it has no type arguments to write — " +
+        (if atCall then s"the call is '$written(…)'" else s"its address is '&$written'"))
+
+    if targs.length != tparams.length then
+      err(s"'$written' takes ${quantity(tparams.length, "type argument")} " +
+        s"(${tparams.map(t => s"'$t'").mkString(", ")}), and ${targs.length} " +
+        s"${if targs.length == 1 then "was" else "were"} written")
+
+    // A type **pack** stands for a list of types rather than one, so it has no written argument to
+    // stand against: `..A` is not an expression in any reading, and writing out one argument per
+    // element would be a different arity from the declaration's.
+    for tp <- tparams if tpacks(tp) do
+      err(s"'$tp' is a type pack, which stands for a list of types rather than one, so it has no " +
+        "written form here — a declaration taking one has its instantiation read off " +
+        (if atCall then "the arguments at the call" else "the type its address is wanted at"))
+
+    // A declaration's parameters are one list and one argument position whichever kind each of them
+    // is (`10 §9`), so this walks the two lists together: a `const` parameter folds its argument to
+    // a value of the type the declaration wrote, and every other one resolves as a type.
+    tparams.zip(targs).map { (tp, e) =>
+      tvalues.get(tp) match
+        case Some(vt) => at(e.pos)(valueArg(ValueArgType(e), recover(Type.Unknown)(rt(vt)), tsubst))
+        case None     => rt(typeArgWritten(e, atCall))
+    }
+  }
+
+  /** A written type argument, as the *expression* grammar delivered it.
+   *
+   * `&f[T]` and `f[T](x)` are both parsed as a subscript, because a name followed by a bracket is a
+   * subscript everywhere else in the language and the parser is not the thing that knows what `f`
+   * is. So what arrives is an expression to be read back as the type it was written as, and the
+   * shapes that survive the round trip are the ones a type and an expression spell identically: a
+   * name, a qualified name, a name applied to arguments, `*T`, `&T`, a tuple, and an integer for a
+   * value parameter (`10 §9`).
+   *
+   * **The rest are refused by name rather than misread.** A slice, a `weak`, a `volatile`, a vector
+   * and a callable have spellings the expression grammar has no production for, so there is nothing
+   * here to recover them from. That is a hole in this form and not in the language: an annotation on
+   * what receives the value still reaches every one of them, which is what the message says to write.
+   */
+  protected def typeArgWritten(e: Expr, atCall: Boolean): TypeRef = at(e.pos) {
+    e match
+      case Ident(n)          => NamedType(n)
+      case Unary("*", inner) => PtrType(typeArgWritten(inner, atCall))
+      case Unary("&", inner) => RefType(typeArgWritten(inner, atCall), sync = false)
+      case Tuple(parts)      => TupleType(parts.map(typeArgWritten(_, atCall)))
+      case n: IntLit         => ValueArgType(n)
+      case Index(r, i)       => NamedType(typeArgName(r), List(typeArgWritten(i, atCall)))
+      case TypeArgs(r, as)   => NamedType(typeArgName(r), as.map(typeArgWritten(_, atCall)))
+      case f: Field          => NamedType(typeArgName(f))
+      case _ =>
+        err("this is not a type — what is written in the brackets is a type argument, and they read " +
+          "it out of the expression grammar, so a slice, a 'weak', a 'volatile', a vector and a " +
+          "callable have no spelling here. " +
+          (if atCall then "Annotate what receives the result and let the call infer it instead"
+           else "Write the type on the binding instead: 'var f: *extern(…) -> … = &…'"))
+  }
+
+  /** The name a written type argument applies its own arguments to — `Box` in `Box[int]`, and the
+   * whole dotted path in `mod.Box[int]`, which is one name to the type grammar (`qualifiedName`).
+   */
+  protected def typeArgName(e: Expr): String = e match
+    case Ident(n)    => n
+    case Field(r, n) => s"${typeArgName(r)}.$n"
+    case _           => err("this is not a type name, so it cannot be given type arguments")
+
+  protected def callFunction(
+      f: FuncDecl,
+      written: List[Expr],
+      expected: Option[Type],
+      targs: List[Expr] = Nil,
+  ): TExpr = {
     // A variadic callee — foreign or sysl's own — fixes only where its declared parameters stop;
     // everything after them is the tail, checked by the rule below rather than against a parameter.
     val variadic = f.variadic
@@ -431,25 +543,34 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     if externDecls.contains(f.name) then externsUsed += f.name
 
     val (name, pre) =
-      if f.tparams.isEmpty then (f.name, None)
+      // **Written out, they are what settles the instantiation and nothing else is consulted**
+      // (`10 §2`) — not the arguments, and not the expected type. Their whole reason for existing is
+      // the call inference cannot reach, so a solve running first would report a failure about a
+      // question the reader has already answered.
+      if targs.nonEmpty then (instantiationWritten(shown, f, targs, atCall = true), None)
+      else if f.tparams.isEmpty then (f.name, None)
       else
         // Asked before the solve rather than left to it, because the solve can only report what it
-        // failed to find and the answer here is that it was never going to find it. `solve`'s message
-        // asks for an annotation on the expected type, which is the right remedy for a parameter the
-        // *result* mentions and impossible advice for one nothing mentions at all.
+        // failed to find and the answer here is that it was never going to find it — and, since the
+        // list may be written, that there is somewhere to say so.
         val stuck = unsettleable(f)
 
-        if stuck.nonEmpty then err(s"'$shown' cannot be called: ${nothingSettles(stuck)}")
+        if stuck.nonEmpty then
+          val names    = stuck.map(t => s"'$t'").mkString(" and ")
+          val (is, it) = if stuck.length == 1 then ("is", "it") else ("are", "them")
+
+          err(s"$names $is in neither the parameters of '$shown' nor its result, so nothing in this " +
+            s"call says what $it should be — write $it out, as '$shown[…](…)'")
 
         val provisional = provisionalArgs(f.name, f.tparams, f.params.map(_.typ), args, f.bounds)
         // The parameter types being matched against are the declaration's, written in the
         // declaration's terms — so a `Pair[T]` there is that module's `Pair` whichever module the
         // call was written in.
-        val targs = inDecl(f.name)(
+        val solved = inDecl(f.name)(
           solve(shown, f.tparams, f.params.map(_.typ), provisional.map(_.ty), f.retType, expected,
             args.map(isLiteral)))
-        checkBounds(f, targs)
-        (instantiateFunc(f, targs), Some(provisional))
+        checkBounds(f, solved)
+        (instantiateFunc(f, solved), Some(provisional))
 
     val (params, rtype) = funcInsts(name)
     // A variadic's tail has no declared parameter to be checked against and is analyzed below, so

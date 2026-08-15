@@ -759,13 +759,10 @@ offset wants.
 
 **The other two directions produce a pointer, and they are the unsafe ones**, so they share one form
 that says what it is doing. `ptr_cast(x)` takes a `*A` or an address-sized integer and produces the
-`*B` its context asks for. The target type is **not written in the call** — it comes from whatever
-receives the result, the same way `va_arg` (`12 §9`), a bare `None`, and a bare `null` all take
-theirs. That is not a shortcut: square brackets in an expression are indexing, and type arguments are
-not written at a call (`10 § Open a`), so a written target would need a syntax the language offers in
-one place only — an address, `&f[T]` (`12 §6a`), where there is no element to index and so nothing to
-collide with. Where nothing says which pointer is wanted, the program is told to annotate what
-receives it.
+`*B` its context asks for. The target type comes from whatever receives the result, the same way
+`va_arg` (`12 §9`), a bare `None`, and a bare `null` all take theirs — and where that is not where a
+reader wants to say it, it may be **written at the form**: `ptr_cast[*Header](p)` (`10 §2`). Where
+neither says which pointer is wanted, the program is told to annotate what receives it.
 
 **`ptr_cast` never produces a `&T`.** A reference is a safe-tier value: non-null, refcounted, and
 relied on by everything the safe subset promises. An address invented from bytes has no count for ARC

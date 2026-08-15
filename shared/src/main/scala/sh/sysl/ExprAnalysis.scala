@@ -964,68 +964,89 @@ trait ExprAnalysis
     // type's own name undefined: the one reading guaranteed not to help, since the name is defined
     // and is a type. Both spellings arrive as different nodes, one argument as an `Index` and a list
     // as a `TypeArgs`.
-    case Call(Field(Index(Ident(written), _), sel), _) if genericTypeName(written) =>
-      typeArgsAtSelection(written, sel)
+    case Call(Field(Index(Ident(written), targ), sel), args) if genericTypeName(written) =>
+      typeArgsAtSelection(written, List(targ), sel, args)
 
-    case Call(Field(TypeArgs(Ident(written), _), sel), _) if genericTypeName(written) =>
-      typeArgsAtSelection(written, sel)
+    case Call(Field(TypeArgs(Ident(written), targs), sel), args) if genericTypeName(written) =>
+      typeArgsAtSelection(written, targs, sel, args)
 
     case Call(Field(recv, mname), args) =>
       callMethod(recv, mname, args, expected)
 
-    // `f[T](…)` and `x.m[T](…)` — type arguments written at a call. Their absence is deliberate and
-    // recorded (`10 § Open a`): a type-argument list and an index are the same grammar, so the two
-    // cannot be told apart at a call head. What is left for the diagnostic is to say so and to name
-    // what to write instead, since the inference that stands in for them reads the *binding* rather
-    // than the call — which is exactly what somebody reaching for this syntax does not yet know.
+    // `f[T](…)` — type arguments written at a call (`10 §2`). The list and a subscript are one
+    // grammar, so what tells them apart is not the parser: the name is resolved, and a **function**
+    // is not a thing that can be indexed, so there is no second reading of the brackets to protect.
+    // That is the discrimination `&f[T]` already made in order to refuse this by name, turned from a
+    // refusal into a solve.
     //
-    // The name has to be a generic declaration and nothing nearer: a local shadowing one is an
-    // ordinary indexed value, and telling its author about type arguments they never wrote would be
-    // worse than the general complaint. That is the same shadowing test every call form above makes.
+    // The name has to be a declaration and nothing nearer: a local shadowing one is an ordinary
+    // indexed value called through, and reading its author's subscript as a type argument would be
+    // worse than any message. That is the same shadowing test every call form above makes. It is
+    // tested on being a *function* rather than a generic one, so `plain[i32](3)` is owed the message
+    // that `plain` has no type arguments rather than a general complaint about callables.
     //
-    // **The remedy is not always there**, and where it is not the sentence must say so rather than
-    // name it anyway: a declaration carrying a parameter no call can settle has no receiving type to
-    // write the argument on either, so a reader following the advice goes looking for a binding that
-    // cannot exist. What is owed there is the reason, which is the whole of what a diagnostic can do
-    // for a signature nothing in the language reaches.
-    case Call(Index(Ident(written), _), _)
-        if lookupOpt(written).isEmpty && funcKey(written).exists(k => funcDecls(k).tparams.nonEmpty) =>
-      unsettleable(funcDecls(funcKey(written).get)) match
-        case Nil =>
-          err(s"'$written' cannot be given type arguments at a call; write the type on what receives the result")
-        case stuck =>
-          err(s"'$written' cannot be given type arguments at a call, and inference has nothing to " +
-            s"work with here either: ${nothingSettles(stuck)}")
+    // Both spellings arrive, and as different nodes: one argument is an ordinary `Index` and a list
+    // is a `TypeArgs`, which is the split `&f[T]` against `&f[A, B]` already lives with.
+    case Call(Index(Ident(name), targ), args) if lookupOpt(name).isEmpty && funcKey(name).isDefined =>
+      callOverloaded(funcKey(name).get, args, expected, List(targ))
 
-    case Call(Index(Field(_, mname), _), _) if memberDecls.exists((k, d) => k._2 == mname && d.tparams.nonEmpty) =>
-      err(s"'$mname' cannot be given type arguments at a call; write the type on what receives the result")
+    case Call(TypeArgs(Ident(name), targs), args) if lookupOpt(name).isEmpty && funcKey(name).isDefined =>
+      callOverloaded(funcKey(name).get, args, expected, targs)
 
-    // `Pair[K, V](…)` — the same refusal at a **constructor**, which is the other half of the call
-    // head and did not have it. A generic type's name reached this way fell past every case above to
-    // the general complaint that the callee is not callable, which says nothing about type arguments
-    // and reads as though the type were not a type: the one thing a reader who has just written its
-    // name knows for certain is false.
+    // The same, written **qualified**. A module path is folded into the name by `qualifiedFunc`,
+    // exactly as it is at an address, so `mod.f[T](x)` resolves wherever the unqualified spelling
+    // does rather than falling to the general complaint about a callee that is not a name.
+    case Call(Index(e, targ), args) if qualifiedFunc(e).isDefined =>
+      callOverloaded(qualifiedFunc(e).get._2, args, expected, List(targ))
+
+    case Call(TypeArgs(e, targs), args) if qualifiedFunc(e).isDefined =>
+      callOverloaded(qualifiedFunc(e).get._2, args, expected, targs)
+
+    // `x.m[T](…)` — the same list on a **method**, and the one head where the second reading is
+    // live: `x.handlers[i](…)` is a field holding a table of callables, indexed and called, which
+    // is an ordinary thing to write. So the discrimination is stricter than the free function's — the
+    // receiver is analyzed and asked whether it declares a *method* of that name, rather than a name
+    // being looked for among the declarations of every type in the program. A field wins, because a
+    // field is what the subscript would have been reaching into.
+    case Call(Index(Field(recv, mname), targ), args) if methodWritten(recv, mname) =>
+      callMethod(recv, mname, args, expected, List(targ))
+
+    case Call(TypeArgs(Field(recv, mname), targs), args) if methodWritten(recv, mname) =>
+      callMethod(recv, mname, args, expected, targs)
+
+    // `Pair[K, V](…)` — the same list at a **constructor**, which is the other half of the call head.
+    // A type applied to arguments is what a type argument list *is* everywhere else in the language,
+    // so this is the spelling with the least to learn, and it means what the annotation means: the
+    // instantiation is fixed and the arguments are checked against it rather than solving it.
     //
     // Both spellings arrive, and they arrive as different nodes: one argument is an ordinary `Index`
     // and a list is a `TypeArgs`, which is the split `&f[T]` against `&f[A, B]` already lives with.
     // The shadowing test is every other call form's — a local standing over the type's name is an
-    // ordinary indexed value, and telling its author about a constructor would be worse than the
-    // general complaint.
+    // ordinary indexed value, and reading its author's subscript as a type argument would be worse
+    // than any message.
     // Two cases rather than one alternative, because a pattern alternative may bind no variable.
-    case Call(Index(Ident(written), _), _) if genericTypeName(written) => typeArgsAtConstructor(written)
+    case Call(Index(Ident(written), targ), args) if genericTypeName(written) =>
+      constructWritten(written, List(targ), args)
 
-    case Call(TypeArgs(Ident(written), _), _) if genericTypeName(written) => typeArgsAtConstructor(written)
+    case Call(TypeArgs(Ident(written), targs), args) if genericTypeName(written) =>
+      constructWritten(written, targs, args)
 
-    // A special form written with type arguments. `va_arg[int](ap)` is the one this is really for:
-    // it is what somebody reaches for first, and an earlier draft of `12 §9` told them to. None of
-    // the forms takes any, for the reason nothing else does — square brackets in an expression are
-    // indexing (`10 §2`) — and without this case the reading is the general complaint about a
-    // callee that is not a name, which is the one `10 § Open a` says this case must not get.
-    case Call(Index(Ident(name), _), _) if lookupOpt(name).isEmpty && specialFormNames(name) =>
-      if name == "va_arg" then
-        err("'va_arg' takes no type arguments; the type it reads comes from the context the value " +
-          "is read into, so annotate the variable it is read into")
-      else err(s"'$name' takes no type arguments")
+    // A special form written with type arguments. **`va_arg[int](ap)` is the one this is for**, and
+    // `12 §9` named it as the strongest case for the syntax: everywhere else the annotation that
+    // stands in is a word on a binding that was going to be written anyway, and a variadic body
+    // reading its tail straight into `print` has no binding at all. `ptr_cast[T](p)` is the same
+    // shape from the raw tier — both take their type from what receives the value, so writing it
+    // here is writing it where the value is made.
+    //
+    // The rest take none, for the reason a non-generic function takes none: there is nothing for an
+    // argument to be an argument *of*.
+    case Call(Index(Ident(name), targ), args) if lookupOpt(name).isEmpty && specialFormNames(name) =>
+      val written = Some(rt(typeArgWritten(targ, atCall = true)))
+
+      name match
+        case "va_arg"   => vaArg(args, written)
+        case "ptr_cast" => ptrCast(args, written)
+        case _          => err(s"'$name' takes no type arguments")
 
     // Anything that *is* a callable may be called, wherever it was read from — an element of an
     // array of them, a part of a tuple, a container's item (`12 §6`). The head of a call is looked
@@ -1046,11 +1067,11 @@ trait ExprAnalysis
     // The same selection with nothing called — `Maybe[int].Nothing`, a variant that carries no
     // payload. It reaches `fieldExpr` rather than any call form, so it needs the case said again
     // here; without it the reader gets the same `undefined name` about a type that is declared.
-    case Field(Index(Ident(written), _), sel) if genericTypeName(written) =>
-      typeArgsAtSelection(written, sel)
+    case Field(Index(Ident(written), targ), sel) if genericTypeName(written) =>
+      typeArgsAtSelection(written, List(targ), sel, Nil)
 
-    case Field(TypeArgs(Ident(written), _), sel) if genericTypeName(written) =>
-      typeArgsAtSelection(written, sel)
+    case Field(TypeArgs(Ident(written), targs), sel) if genericTypeName(written) =>
+      typeArgsAtSelection(written, targs, sel, Nil)
 
     case e: Field    => fieldExpr(e, expected)
     case e: TypeAttr => typeAttrExpr(e)
@@ -1084,24 +1105,80 @@ trait ExprAnalysis
   private def genericTypeName(written: String): Boolean =
     lookupOpt(written).isEmpty && typeKey(written).exists(k => nominalTparams(k).nonEmpty)
 
-  /** The refusal a constructor given written type arguments gets, which is the function form's with
-   * the annotated spelling shown — a reader who reached for the brackets is by definition not the
-   * reader who knows where the type goes instead.
-   */
-  private def typeArgsAtConstructor(written: String): TExpr =
-    err(s"'$written' cannot be given type arguments at a call; write the type on what receives the " +
-      s"result — 'var x: $written[…] = $written(…)'")
-
-  /** The same refusal one step to the left: the arguments written on the type something is selected
-   * *from*, which is what a reader writes to say which instantiation a variant belongs to.
+  /** Whether `recv.mname` names a **declared method** of the receiver's own type, which is what
+   * decides that a bracket after it is a type-argument list rather than a subscript.
    *
-   * The remedy is the binding's annotation here too, and the selection is then made from the plain
-   * name — so the sentence names both halves, since neither alone is the line they have to write.
+   * It is the strictest of the four guards, and it has to be: a field may hold an array of callables,
+   * so `x.handlers[i](…)` is a reading the language already gives and this must not take. Asking the
+   * receiver settles it — a field is not a member — where asking whether *any* type in the program
+   * declares a generic member of that name, which is what the refusal this replaces did, would have
+   * answered yes for a field whose name some unrelated type happened to share.
+   *
+   * A receiver reached through a bound, a trait object or a weak reference is left out: each has a
+   * dispatch of its own that never sees a written list, so a guard that admitted one would accept
+   * the brackets and silently drop them.
    */
-  private def typeArgsAtSelection(written: String, sel: String): TExpr =
-    err(s"'$written' cannot be given type arguments where '$sel' is selected from it; write the " +
-      s"type on what receives the result — 'var x: $written[…] = …' — and select '$sel' from the " +
-      s"plain name")
+  private def methodWritten(recv: Expr, mname: String): Boolean =
+    probe(analyzeExpr(recv)).map(t => receiverType(t.ty)).exists {
+      case _: Type.Abstract | _: Type.Trait | _: Type.Weak => false
+      case rty =>
+        val (base, _) = memberKey(rty, mname)
+
+        memberDecls.get((base, mname)).exists(_.receiver.isDefined)
+    }
+
+  /** `Pair[K, V](…)` — a construction whose instantiation is written rather than inferred.
+   *
+   * It is the annotation's meaning moved to the constructor: the type is resolved from the name and
+   * the arguments in the brackets, and the ordinary construction is then asked for exactly that
+   * type. So `Pair[int, real](1, 2)` and `var p: Pair[int, real] = Pair(1, 2)` build the same value
+   * and refuse the same mistakes, and a literal in the arguments is read at the parameter the
+   * written instantiation gave it rather than at its own default.
+   *
+   * An **enum** reaches here too, since a name applied to arguments is one grammar — and a bare enum
+   * name is not a constructor at all, so what it is owed is the sentence about variants rather than
+   * a type it cannot build.
+   */
+  private def constructWritten(written: String, targs: List[Expr], args: List[Expr]): TExpr = {
+    val ty = rt(NamedType(written, targs.map(typeArgWritten(_, atCall = true))))
+
+    typeKey(written) match
+      case Some(k) if structDecls.contains(k) => constructStruct(written, args, Some(ty))
+      case _ =>
+        err(s"'$written' is an enum, so it is not built by calling its name — a variant is what " +
+          s"carries a value, as '$written[…].Name(…)'")
+  }
+
+  /** The same list one step to the left: written on the type something is selected *from*, which is
+   * what a reader writes to say which instantiation a **variant** belongs to — `Maybe[int].Just(1)`,
+   * and `Maybe[int].Nothing` with nothing called at all.
+   *
+   * A variant is a construction of the type it belongs to, so the written arguments mean here what
+   * they mean at a constructor: the instantiation is fixed and the payload is checked against it.
+   *
+   * **An associated function is not that**, and keeps the refusal. Its instantiation is solved from
+   * the call — the type's parameters and its own arrive in one list and are read together (`10 §4`)
+   * — so honouring the brackets would mean settling half of that list and solving the rest, which is
+   * a different question from the one this form asks. The annotation on the binding reaches it, and
+   * unlike the corner a call head could not reach, it is always there: an associated function has a
+   * result, and the result is what its type arguments are read off.
+   */
+  private def typeArgsAtSelection(
+      written: String,
+      targs: List[Expr],
+      sel: String,
+      args: List[Expr],
+  ): TExpr = {
+    val tname = typeKey(written).get
+
+    if enumDecls.get(tname).exists(_.variants.exists(_.name == sel)) then
+      constructVariant(Modules.qualify(Modules.moduleOf(tname), sel), args,
+        Some(rt(NamedType(written, targs.map(typeArgWritten(_, atCall = true))))), Some(tname))
+    else
+      err(s"'$written' cannot be given type arguments where '$sel' is selected from it; write the " +
+        s"type on what receives the result — 'var x: $written[…] = …' — and select '$sel' from the " +
+        s"plain name")
+  }
 
   /** `++`/`--` — a step of one, which the base decides the existence of and a constrained place
    * then has to accept: the new value is checked between the addition and the store, so a counter

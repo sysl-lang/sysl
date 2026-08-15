@@ -580,12 +580,14 @@ ever has to ask is how wide to go where it cares about speed — never whether i
 **What the claim does not cover, stated here rather than discovered.** It reaches a kernel that
 loops over an array and writes its answers back, which is what most real ones do — `guide/simd`
 writes the solver once and runs the same body over ten contacts at four lanes and at eight. Two
-things bound it. A gather is still a scratch array and a loop rather than one instruction, because
-a shuffle takes a constant index list; and **the width has to enter through a parameter**, since a
-written type argument at a call is refused (`10 § Open a`), so a kernel whose every parameter is a
-slice has nowhere to be told its width. The second is not usually felt — a SIMD kernel's constants
-are broadcast vectors anyway, which is where `guide/simd`'s `batch` reads its `W` from — but it is
-worth knowing before a signature is designed around it.
+one thing bounds it: a gather is still a scratch array and a loop rather than one instruction,
+because a shuffle takes a constant index list.
+
+**Where the width enters is no longer one of them.** It reads best through a parameter — a SIMD
+kernel's constants are broadcast vectors anyway, which is where `guide/simd`'s `batch` gets its `W`
+— and a kernel whose every parameter is a slice writes it at the call instead, `add[8](a, b, out)`
+(`10 §2`). That signature had no way to be called at all until the list was, which is the case that
+closed `10 § Open a`.
 
 **Choosing the width automatically is also not built.** A program picks a number. There are no
 conditional-compilation symbols for the vector unit, because `Toolchain` passes no `-march` or
