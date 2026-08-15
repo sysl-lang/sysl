@@ -166,9 +166,11 @@ enum Inst {
 
     case Call(d, ret, callee, args, sig) =>
       val lhs  = d.map(r => s"${r.render} = ").getOrElse("")
-      val kind = sig.map(s => s"$s ").getOrElse(s"$ret ")
+      // A foreign call names its callee as one piece — the whole function type of a variadic one, or
+      // the result type and the symbol run together — so `ret` is empty there and the space with it.
+      val kind = sig.getOrElse(ret)
 
-      s"${lhs}call $kind${callee.render}(${args.map(_.render).mkString(", ")})"
+      s"${lhs}call ${if kind.isEmpty then "" else s"$kind "}${callee.render}(${args.map(_.render).mkString(", ")})"
 
     case VaArg(d, list, ty) => s"${d.render} = va_arg ptr ${list.render}, ${ty.render}"
 

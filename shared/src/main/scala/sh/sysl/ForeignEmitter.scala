@@ -1,5 +1,7 @@
 package sh.sysl
 
+import ir.{Access, Inst, LType, Val}
+
 /** The seam with a foreign function: what an `extern` is declared as, and what a call to one emits.
  *
  * A call from sysl to sysl needs none of this. Both sides are this compiler, so whatever it does
@@ -24,8 +26,8 @@ trait ForeignEmitter extends ArcEmitter {
     val sret = CAbi.result(retTy, target) match
       // The out-parameter goes in front of everything, which is how the callee finds it whatever
       // else the signature holds.
-      case CAbi.Result.Sret(llvm, align) => List(s"ptr sret($llvm) align $align")
-      case _                             => Nil
+      case CAbi.Result.Sret(ty, align) => List(s"ptr ${sretAttr(ty, align)}")
+      case _                           => Nil
 
     val rest = params.filterNot(Type.zeroSized).flatMap(p => foreignParamTypes(p))
 
@@ -36,14 +38,14 @@ trait ForeignEmitter extends ArcEmitter {
     // A narrow scalar is named as itself and carries the convention's extension in front of it, so
     // that what the callee widened is what this side reads back (`CAbi.extension`).
     case CAbi.Result.Plain       => CAbi.returning(CAbi.extension(retTy, target), retTy.llvm)
-    case CAbi.Result.Coerced(l)  => l
+    case CAbi.Result.Coerced(l)  => l.render
     case CAbi.Result.Sret(_, _)  => "void"
 
   private def foreignParamTypes(p: Type): List[String] = CAbi.param(p, target) match
-    case CAbi.Param.Plain                       => List(CAbi.Arg(p.llvm, CAbi.extension(p, target)).declared)
-    case CAbi.Param.Coerced(pieces)             => pieces.map(_.declared)
-    case CAbi.Param.Indirect(llvm, align, true) => List(s"ptr byval($llvm) align $align")
-    case CAbi.Param.Indirect(_, _, false)       => List("ptr")
+    case CAbi.Param.Plain                     => List(CAbi.Arg(p.lty, CAbi.extension(p, target)).declared)
+    case CAbi.Param.Coerced(pieces)           => pieces.map(_.declared)
+    case CAbi.Param.Indirect(ty, align, true) => List(s"ptr ${byvalAttr(ty, align)}")
+    case CAbi.Param.Indirect(_, _, false)     => List("ptr")
 
   /** The whole function type of a variadic foreign callee, which a call has to name because the
    * argument list alone does not say where the declared parameters stop and the ellipsis begins.
@@ -64,10 +66,10 @@ trait ForeignEmitter extends ArcEmitter {
     // is named in front of every argument — which is how the callee finds it whatever else the
     // signature holds.
     val returned = result match
-      case CAbi.Result.Sret(llvm, align) =>
-        val slot = emitAlloca(freshTemp(), llvm)
+      case CAbi.Result.Sret(ty, align) =>
+        val slot = emitAlloca(freshTemp(), ty)
 
-        Some((slot, s"ptr sret($llvm) align $align $slot"))
+        Some((slot, ir.Arg(LType.Ptr, Val.Raw(slot), sretAttr(ty, align))))
       case _ => None
 
     // An argument past the declared parameters is a variadic extra, and C classifies one exactly as
@@ -81,77 +83,93 @@ trait ForeignEmitter extends ArcEmitter {
           // The extension is stated at the call as well as on the declaration, because it is the
           // **caller's** obligation and the call is where the caller is: it is this line that makes
           // the back end widen the value before it goes into the register.
-          case CAbi.Param.Plain           => List(s"${CAbi.Arg(a.ty.llvm, CAbi.extension(a.ty, target)).declared} $v")
+          case CAbi.Param.Plain =>
+            List(ir.Arg(a.ty.lty, Val.Raw(v), CAbi.extension(a.ty, target)))
           case CAbi.Param.Coerced(pieces) => spread(v, a.ty, pieces)
-          case CAbi.Param.Indirect(llvm, align, byval) =>
-            val slot = emitAlloca(freshTemp(), llvm)
+          case CAbi.Param.Indirect(ty, align, byval) =>
+            val slot = emitAlloca(freshTemp(), ty)
 
-            emit(s"store $llvm $v, ptr $slot")
-            List(if byval then s"ptr byval($llvm) align $align $slot" else s"ptr $slot")
+            emit(Inst.Store(ty, Val.Raw(v), Val.Raw(slot), Access.Plain))
+            List(ir.Arg(LType.Ptr, Val.Raw(slot), if byval then byvalAttr(ty, align) else ""))
     }
 
-    val arguments = (returned.map(_._2).toList ::: passed).mkString(", ")
+    val arguments = returned.map(_._2).toList ::: passed
 
     result match
-      case CAbi.Result.Sret(llvm, _) =>
-        emit(s"call $callee($arguments)")
+      case CAbi.Result.Sret(coerced, _) =>
+        emitForeign(None, callee, arguments)
 
-        val r = freshTemp()
+        val r = freshReg()
 
-        emit(s"$r = load $llvm, ptr ${returned.get._1}")
-        ownTemp(r, ty)
+        emit(Inst.Load(r, coerced, Val.Raw(returned.get._1), Access.Plain))
+        ownTemp(r.render, ty)
 
-      case CAbi.Result.Coerced(llvm) =>
-        val r = freshTemp()
+      case CAbi.Result.Coerced(coerced) =>
+        val r = freshReg()
 
-        emit(s"$r = call $callee($arguments)")
+        emitForeign(Some(r), callee, arguments)
         // A homogeneous floating aggregate comes back under its own type, so there is nothing to
         // reinterpret and the round trip through memory would be a copy for its own sake.
-        ownTemp(if llvm == ty.llvm then r else gather(r, llvm, ty), ty)
+        ownTemp(if coerced == ty.lty then r.render else gather(r.render, coerced, ty), ty)
 
       case CAbi.Result.Plain =>
         if Type.noValue(ty) then
-          emit(s"call $callee($arguments)")
-          if ty == Type.Never then emitTerm("unreachable")
+          emitForeign(None, callee, arguments)
+          if ty == Type.Never then emitTerm(Inst.Unreachable)
           ""
         else
-          val r = freshTemp()
+          val r = freshReg()
 
-          emit(s"$r = call $callee($arguments)")
-          ownTemp(r, ty)
+          emitForeign(Some(r), callee, arguments)
+          ownTemp(r.render, ty)
   }
+
+  /** The `sret` and `byval` attributes, which name the aggregate the storage holds as well as the
+   * boundary it sits on — so both are written once here rather than at the four places that state
+   * one on a declaration and at the call.
+   */
+  private def sretAttr(ty: LType, align: Int): String  = s"sret(${ty.render}) align $align"
+  private def byvalAttr(ty: LType, align: Int): String = s"byval(${ty.render}) align $align"
+
+  /** A call whose callee is already written down — the symbol with what it returns in front of it,
+   * or a variadic callee's whole function type. Splitting the two apart is `CallEmitter.calleeParts`
+   * and is a change to the foreign signature machinery rather than to this call.
+   */
+  private def emitForeign(dest: Option[Val], callee: String, args: List[ir.Arg]): Unit =
+    emit(Inst.Call(dest, "", Val.Raw(callee), args))
 
   /** A value of `t`, spread into the registers the convention hands it over in. Several registers
    * are read back out of a literal struct of them, which lays each piece out at the offset of the
    * eightbyte it stands for.
    */
-  private def spread(v: String, t: Type, pieces: List[CAbi.Arg]): List[String] = {
-    val holder = if pieces.length == 1 then pieces.head.llvm else s"{ ${pieces.map(_.llvm).mkString(", ")} }"
-    val slot   = reinterpret(v, t.llvm, holder, layout.size(t))
+  private def spread(v: String, t: Type, pieces: List[CAbi.Arg]): List[ir.Arg] = {
+    val holder = if pieces.length == 1 then pieces.head.ty else LType.Struct(pieces.map(_.ty))
+    val slot   = reinterpret(v, t.lty, holder, layout.size(t))
 
     if pieces.length == 1 then
-      val r = freshTemp()
+      val r = freshReg()
 
-      emit(s"$r = load $holder, ptr $slot")
-      List(s"${pieces.head.declared} $r")
+      emit(Inst.Load(r, holder, Val.Raw(slot), Access.Plain))
+      List(ir.Arg(pieces.head.ty, r, pieces.head.attr))
     else
       pieces.zipWithIndex.map { (p, i) =>
-        val at = freshTemp()
-        val r  = freshTemp()
+        val at = freshReg()
+        val r  = freshReg()
 
-        emit(s"$at = getelementptr $holder, ptr $slot, i32 0, i32 $i")
-        emit(s"$r = load ${p.llvm}, ptr $at")
-        s"${p.declared} $r"
+        emit(Inst.Gep(at, holder, Val.Raw(slot),
+                      List(ir.Arg(LType.I(32), Val.Int(0)), ir.Arg(LType.I(32), Val.Int(i)))))
+        emit(Inst.Load(r, p.ty, at, Access.Plain))
+        ir.Arg(p.ty, r, p.attr)
       }
   }
 
   /** A value that arrived in the registers `llvm` names, read back as the `t` it stands for. */
-  private def gather(v: String, llvm: String, t: Type): String = {
-    val slot = reinterpret(v, llvm, t.llvm, layout.size(t))
-    val r    = freshTemp()
+  private def gather(v: String, coerced: LType, t: Type): String = {
+    val slot = reinterpret(v, coerced, t.lty, layout.size(t))
+    val r    = freshReg()
 
-    emit(s"$r = load ${t.llvm}, ptr $slot")
-    r
+    emit(Inst.Load(r, t.lty, Val.Raw(slot), Access.Plain))
+    r.render
   }
 
   /** Writes `v` down as `from` and hands back a slot of `to` holding the same `bytes` bytes. The
@@ -165,13 +183,12 @@ trait ForeignEmitter extends ArcEmitter {
    * lost by understating it — the guarantee is a floor, and LLVM refines it from the `alloca` it can
    * see right above.
    */
-  private def reinterpret(v: String, from: String, to: String, bytes: Int): String = {
+  private def reinterpret(v: String, from: LType, to: LType, bytes: Int): String = {
     val src = emitAlloca(freshTemp(), from)
     val dst = emitAlloca(freshTemp(), to)
 
-    usesMemcpy = true
-    emit(s"store $from $v, ptr $src")
-    emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align 1 $dst, ptr align 1 $src, i64 $bytes, i1 false)")
+    emit(Inst.Store(from, Val.Raw(v), Val.Raw(src), Access.Plain))
+    emitMemcpy(Val.Raw(dst), Val.Raw(src), bytes, 1)
     dst
   }
 }

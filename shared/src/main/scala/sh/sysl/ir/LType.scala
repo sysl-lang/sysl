@@ -53,6 +53,12 @@ enum LType {
    */
   case Struct(fields: List[LType])
 
+  /** A **vector** — `<2 x float>`, which is what System V names an eightbyte that two floating
+   * members share. It is the one shape here that no sysl type lowers to: it exists because a C
+   * convention names one, and it is written the way clang writes it.
+   */
+  case Vec(length: Int, elem: LType)
+
   /** A type LLVM knows by name — `%struct.Point`, `%enum.Shape`, `%Shape.Circle`, `%arc.Point`.
    * The sigil is part of the name, because it is part of every use of it.
    */
@@ -72,6 +78,7 @@ enum LType {
     case Ptr             => "ptr"
     case Void            => "void"
     case Arr(n, elem)    => s"[$n x ${elem.render}]"
+    case Vec(n, elem)    => s"<$n x ${elem.render}>"
     // An aggregate with nothing in it renders as `{}` rather than as `{  }`, which is what LLVM
     // itself writes. Nothing the compiler lowers produces one — a zero-sized value takes no storage
     // at all — so this is here to be right rather than because anything reaches it.

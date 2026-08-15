@@ -570,6 +570,11 @@ trait Emitter {
    * larger of the two is what satisfies both claims, and one written on the declaration is by that
    * rule already at or above the type's.
    */
+  protected def emitAlloca(name: String, ty: ir.LType): String = emitAlloca(name, ty.render)
+
+  protected def emitAlloca(name: String, ty: ir.LType, align: Option[Int]): String =
+    emitAlloca(name, ty.render, align)
+
   protected def emitAlloca(name: String, ty: String, align: Option[Int] = None): String = {
     prologue += ir.Inst.Raw(s"$name = alloca $ty${align.map(n => s", align $n").getOrElse(alignSuffix(ty))}")
     name
