@@ -98,18 +98,30 @@ trait ExprEmitter extends ArithEmitter {
     case TReduce(op, receiver, ty) =>
       val v     = genExpr(receiver)
       val vecTy = Type.repr(receiver.ty).asInstanceOf[Type.Vector]
+      val name  = s"llvm.vector.reduce.$op.${vecTy.lty.overloadSuffix}"
       val r     = freshTemp()
 
-      // A float sum takes a starting value LLVM calls the accumulator, and `-0.0` is the one that
-      // is the identity for addition — `0.0` would turn a sum of nothing but negative zeros into a
-      // positive one. It is passed unordered (`reassoc`), which is what makes the reduction a tree
-      // rather than a left fold and is the whole reason to use the intrinsic instead of a loop.
-      val args =
-        if op == "fadd" then s"${vecTy.elem.llvm} -0.0, ${vecTy.llvm} $v"
-        else s"${vecTy.llvm} $v"
-      val flags = if op == "fadd" then "reassoc " else ""
+      // **The float sum takes a starting accumulator and the others do not**, which is not a
+      // symmetry LLVM chose lightly: floating addition is not associative, so the intrinsic makes
+      // you say what to start from and whether the order may be changed. `-0.0` is the identity —
+      // `0.0` would turn a sum of nothing but negative zeros positive — and `reassoc` is what
+      // licenses the tree that makes this worth doing at all rather than a left fold in disguise.
+      val (params, args, flags) =
+        if op == "fadd" then
+          (s"${vecTy.elem.llvm}, ${vecTy.llvm}", s"${vecTy.elem.llvm} -0.0, ${vecTy.llvm} $v", "reassoc ")
+        else (vecTy.llvm, s"${vecTy.llvm} $v", "")
 
-      emit(s"$r = call $flags${ty.llvm} @llvm.vector.reduce.$op.${vecTy.lty.overloadSuffix}($args)")
+      satDecls += s"declare ${ty.llvm} @$name($params)"
+      emit(s"$r = call $flags${ty.llvm} @$name($args)")
+      r
+
+    // One lane, read straight out of the register. There is no address and so no bounds test: the
+    // index was held to a constant in range where it was written, which is what `TLane` is for.
+    case TLane(receiver, lane, ty) =>
+      val v = genExpr(receiver)
+      val r = freshTemp()
+
+      emit(s"$r = extractelement ${Type.repr(receiver.ty).llvm} $v, i32 $lane")
       r
 
     // Built through memory with a loop rather than as an `insertvalue` chain, for the reason the
@@ -376,12 +388,25 @@ trait ExprEmitter extends ArithEmitter {
         case it: Type.Integer if overflowChecked(op, l, r, it) => checkedArith(op, it, lv, rv)
         case _                                                 => arith(op, bt, lv, rv)
 
+    // The vector cases come first, because `opSubject` reads through the register to the lane and
+    // the two scalar guards below would otherwise never see one. `zeroinitializer` is the whole
+    // vector's zero, so the integer form needs no splat written out.
+    case TUnary("-", operand, ty) if Type.opSubject(ty).isInstanceOf[Type.Integer] && Type.repr(ty).isInstanceOf[Type.Vector] =>
+      val v = genExpr(operand); val r = freshTemp(); emit(s"$r = sub ${ty.llvm} zeroinitializer, $v"); r
     case TUnary("-", operand, ty) if Type.underlying(ty).isInstanceOf[Type.Integer] =>
       val v = genExpr(operand); val r = freshTemp(); emit(s"$r = sub ${ty.llvm} 0, $v"); r
-    case TUnary("-", operand, ty) if Type.underlying(ty).isInstanceOf[Type.Floating] =>
+    case TUnary("-", operand, ty) if Type.opSubject(ty).isInstanceOf[Type.Floating] =>
       val v = genExpr(operand); val r = freshTemp(); emit(s"$r = fneg ${ty.llvm} $v"); r
     case TUnary("!", operand, _) =>
       val v = genExpr(operand); val r = freshTemp(); emit(s"$r = xor i1 $v, true"); r
+    // A vector's complement flips every lane, and its all-ones constant is written `splat (iN -1)`
+    // rather than as the bare `-1` a scalar takes.
+    case TUnary("~", operand, ty) if Type.repr(ty).isInstanceOf[Type.Vector] =>
+      val v    = genExpr(operand)
+      val lane = Type.repr(ty).asInstanceOf[Type.Vector].elem
+      val r    = freshTemp()
+      emit(s"$r = xor ${ty.llvm} $v, splat (${lane.llvm} -1)")
+      r
     case TUnary("~", operand, ty) =>
       val v = genExpr(operand); val r = freshTemp(); emit(s"$r = xor ${ty.llvm} $v, -1"); r
     case TUnary(op, _, _) =>

@@ -72,8 +72,24 @@ trait MethodCalls extends FuncAddress {
           err(s"'select' takes the two vectors to choose between — 'm.select(whenTrue, whenFalse)', " +
             s"and ${args.length} argument${if args.length == 1 then " was" else "s were"} given")
 
-        val a = analyzeExpr(args.head, None)
-        val b = analyzeExpr(args(1), Some(a.ty))
+        // **Either side may be a scalar, and nearly always one of them is** — `(v > hi).select(hi,
+        // v)` is what clamping looks like, and requiring a written construction on the constant
+        // would be a word in front of the commonest use this method has. So the pair is read the
+        // way `analyzeOperands` reads a literal beside a typed neighbour: whichever side turns out
+        // to be a vector supplies the lane type, the other is re-read at it, and `balanceLanes`
+        // splats. Without the re-read the `4.0` lands as `real` and is refused for being one.
+        val first  = analyzeExpr(args.head, None)
+        val second = analyzeExpr(args(1), None)
+
+        def isVec(t: TExpr) = Type.repr(t.ty).isInstanceOf[Type.Vector]
+
+        val (a, b) = List(first, second).find(isVec).map(t => Type.repr(t.ty).asInstanceOf[Type.Vector]) match
+          case Some(vec) =>
+            balanceLanes(
+              if isVec(first) then first else analyzeExpr(args.head, Some(vec.elem)),
+              if isVec(second) then second else analyzeExpr(args(1), Some(vec.elem)),
+            )
+          case None => (first, second)
 
         // Both sides are the same vector, at the mask's width: a mask of four lanes cannot choose
         // between registers of eight, and the answer's type is the type being chosen between.

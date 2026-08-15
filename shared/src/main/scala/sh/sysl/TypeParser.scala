@@ -82,7 +82,7 @@ trait TypeParser extends ExprParser {
             s"slice drops its length because it carries one at run time, and a register's width is " +
             s"settled when the code is generated; write '<4>${t.show}' for four lanes")
         }) |
-        ((op("<") ~> expression <~ op(">")) ~ coreType ^^ {
+        ((op("<") ~> laneCount <~ op(">")) ~ coreType ^^ {
           case n ~ t => VectorType(n, t)
         }) |
         // `volatile T` (`03 § Device memory`). It stays a soft word like `sync`, so it is special
@@ -97,6 +97,22 @@ trait TypeParser extends ExprParser {
         op("..") ~> ident ^^ PackType.apply |
         qualifiedName ~ opt(typeArgs) ^^ { case n ~ args => NamedType(n, args.getOrElse(Nil)) },
     )
+
+  /** A vector's lane count: a literal, a name, or any expression **in parentheses**.
+   *
+   * **The closing `>` is why this is not simply `expression`, and the failure it prevents is a
+   * silent one.** `>` is a comparison operator, so `<4>f32` handed to the general expression parser
+   * reads `4 > f32` as a comparison and then wants the `>` that has already been eaten — the reader
+   * gets *"'>' expected"* pointing at the end of the line, about a type they wrote correctly. An
+   * array's `[N]T` has no such trouble, because `]` is not an operator and so cannot be mistaken for
+   * part of what precedes it.
+   *
+   * The parenthesized form is the escape hatch, and it costs nothing to allow: `<(N * 2)>f32` is
+   * unambiguous because the parentheses close before the `>` is reached. Everything the feature
+   * actually needs — a literal width and a `const` parameter — is in the two bare forms.
+   */
+  protected lazy val laneCount: Parser[Expr] =
+    at(intLit | (ident ^^ Ident.apply) | (op("(") ~> expression <~ op(")")))
 
   /** `(A, B)` — a tuple type. A single part is refused rather than read as a grouping, because the
    * two spellings would then differ by a comma and mean different things; `(T)` is the shape

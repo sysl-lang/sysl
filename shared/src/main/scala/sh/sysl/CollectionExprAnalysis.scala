@@ -59,6 +59,22 @@ trait CollectionExprAnalysis extends ExprSupport {
       if Type.noValue(tv.ty) then err(s"an array cannot hold ${show(tv.ty)} values")
 
       expected match
+        // `[v; n]` where a vector was asked for is the splat written out, and it is accepted for
+        // the reason the array literal's spelling is: the reader has written the array form of a
+        // thing a vector also has, and refusing it would send them to a different spelling for no
+        // reason they could see. The count is still checked against the lane count, since a vector
+        // that does not fill its width is the same mistake as a literal that does not.
+        case Some(v: Type.Vector) =>
+          constInt(count) match
+            case Some(n) if n == v.length =>
+            case Some(n) =>
+              err(s"${show(v)} has ${v.length} lanes and this repeat makes $n")
+            case None =>
+              err(s"${show(v)} has ${v.length} lanes, which is part of its type — so a repeat " +
+                "filling one needs a constant count")
+
+          TSplat(coerce(tv, v.elem), v)
+
         case Some(Type.Slice(_, ro)) =>
           val tc = analyzeExpr(count)
 
@@ -162,7 +178,13 @@ trait CollectionExprAnalysis extends ExprSupport {
         // A lane, which is read out of a register rather than through an address — so the index is
         // held to being a constant and checked here, where there is a number to name. See `TLane`.
         case v: Type.Vector =>
+          // The index is analyzed for its *type* even though its value comes from `constInt`, so
+          // that `v[k]` where `k` is a string is told it is not an integer rather than told it is
+          // not a constant — which is true of it and is the second thing wrong with it.
           val ti = analyzeExpr(index, Some(Type.usize))
+
+          if !Type.repr(ti.ty).isInstanceOf[Type.Integer] then
+            at(index.pos)(err(s"an index must be an integer, not ${show(ti.ty)}"))
 
           constInt(index) match
             case Some(n) if n >= 0 && n < v.length => TLane(tr, n.toInt, Type.unqualified(v.elem))

@@ -21,6 +21,25 @@ import scala.collection.mutable
  */
 trait AnalyzerBase extends Scoping {
 
+  /** The two operands of a binary form, with a scalar beside a vector splatted into one.
+   *
+   * This is where `a * 2.0` and `a < 0.0` become lane-wise: the scalar is the same value in every
+   * lane, which is what the reader means and what every SIMD API in any language provides. It runs
+   * after the literal has been read at the lane type, so what arrives here is either already the
+   * lane type or a mismatch worth reporting in the operator's own message rather than as a failed
+   * broadcast.
+   *
+   * Two vectors of different widths are left alone: `arithType` reports them as the mismatched
+   * types they are, which names both widths, where a splat here could only fail silently.
+   */
+  protected def balanceLanes(l: TExpr, r: TExpr): (TExpr, TExpr) = (Type.repr(l.ty), Type.repr(r.ty)) match
+    case (v: Type.Vector, s) if !s.isInstanceOf[Type.Vector] && s == Type.repr(v.elem) =>
+      (l, TSplat(r, v).setPos(r.pos))
+    case (s, v: Type.Vector) if !s.isInstanceOf[Type.Vector] && s == Type.repr(v.elem) =>
+      (TSplat(l, v).setPos(l.pos), r)
+    case _ => (l, r)
+
+
   /** Inside a closure's body, the captured names — keyed by the unique name the scope gave each —
    * paired with the field read that reaches one (`12 §7`).
    *

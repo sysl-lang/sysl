@@ -41,6 +41,16 @@ trait ScalarEmitter extends StringEmitter {
           case "|"  => "or"
           case "^"  => "xor"
           case _    => sys.error(s"unreachable arith '$op'")
+      // A mask's lane is an `i1`, and the three bitwise instructions are the same ones an integer
+      // takes — which is why this arrives here at all rather than needing a path of its own. Only a
+      // *vector* of `bool` reaches it: a scalar `bool` has `&&` and `||`, which are control flow and
+      // are lowered somewhere else entirely.
+      case Type.Bool =>
+        op match
+          case "&" => "and"
+          case "|" => "or"
+          case "^" => "xor"
+          case _   => sys.error(s"unreachable mask arith '$op'")
       case _: Type.Floating =>
         op match
           case "+" => "fadd"

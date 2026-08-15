@@ -588,6 +588,10 @@ trait GenericInstantiation extends ConstFolding {
     // a field that costs nothing, which is the opposite of what zero-sized means.
     case t if Type.zeroSized(t) => true
     case Type.Array(_, elem)    => hasZero(elem)
+    // Every lane zeroed, which a lane always has: a lane is a scalar, and the four scalar kinds are
+    // the first line of this match. `var v: <4>f32` is therefore the ordinary declaration it looks
+    // like — and so is a `[2]<4>f32`, which is the case that found this missing.
+    case Type.Vector(_, elem)   => hasZero(elem)
     case s: Type.Struct         => s.fields.forall(f => hasZero(f._2))
     case _                      => false
 }
