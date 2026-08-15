@@ -394,7 +394,7 @@ trait ExprEmitter extends ArithEmitter {
     // the two scalar guards below would otherwise never see one. `zeroinitializer` is the whole
     // vector's zero, so the integer form needs no splat written out.
     case TUnary("-", operand, ty) if Type.opSubject(ty).isInstanceOf[Type.Integer] && Type.repr(ty).isInstanceOf[Type.Vector] =>
-      val v = genExpr(operand); val r = freshTemp(); emit(s"$r = sub ${ty.llvm} zeroinitializer, $v"); r
+      val v = genExpr(operand); val r = freshTemp(); emit(Inst.Bin(Val.Raw(r), BinOp.Sub, ty.lty, Val.Zero, Val.Raw(v))); r
     case TUnary("-", operand, ty) if Type.underlying(ty).isInstanceOf[Type.Integer] =>
       val v = genExpr(operand); val r = freshTemp(); emit(Inst.Bin(Val.Raw(r), BinOp.Sub, ty.lty, Val.Int(0), Val.Raw(v))); r
     case TUnary("-", operand, ty) if Type.opSubject(ty).isInstanceOf[Type.Floating] =>
