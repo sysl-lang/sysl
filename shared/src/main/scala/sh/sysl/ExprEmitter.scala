@@ -212,7 +212,10 @@ trait ExprEmitter extends ArithEmitter {
       // `Succ` traps at `Last`, `Pred` at `First`; the value is otherwise one step along the base.
       if up then trapUnless(Val.Raw(compareValue("<", base, v, last.toBigInt.toString)), "succ")
       else trapUnless(Val.Raw(compareValue(">", base, v, c.lo.get.toBigInt.toString)), "pred")
-      val r = freshTemp(); emit(s"$r = ${if up then "add" else "sub"} ${base.llvm} $v, 1"); r
+      val r = freshTemp()
+
+      emit(Inst.Bin(Val.Raw(r), if up then BinOp.Add else BinOp.Sub, base.lty, Val.Raw(v), Val.Int(1)))
+      r
 
     case TConstrainedCheck(value, target) =>
       val v = genExpr(value)
@@ -238,17 +241,26 @@ trait ExprEmitter extends ArithEmitter {
     // the recorded storage for a `ref`, whose slot is somebody else's and may be a register
     // (`03 § ref`, `03 § Device memory`).
     case TLoad(name, ty) =>
-      val q = if refStorage.contains(name) then qualifier(refStorage(name)) else qualifier(ty)
-      val r = freshTemp(); emit(s"$r = load$q ${ty.llvm}, ptr %$name.addr"); r
+      val acc = accessOf(if refStorage.contains(name) then refStorage(name) else ty)
+      val r   = freshTemp()
+
+      emit(Inst.Load(Val.Raw(r), ty.lty, Val.Reg(s"$name.addr"), acc))
+      r
 
     case TResult(_) =>
       resultSSA.getOrElse(sys.error("'result' lowered outside an ensure postcondition"))
 
     case TOld(index, ty) =>
-      val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr %old.$index.addr"); r
+      val r = freshTemp()
+
+      emit(Inst.Load(Val.Raw(r), ty.lty, Val.Reg(s"old.$index.addr"), Access.Plain))
+      r
 
     case TGlobal(symbol, ty, _) =>
-      val r = freshTemp(); emit(s"$r = load${qualifier(ty)} ${ty.llvm}, ptr @$symbol"); r
+      val r = freshTemp()
+
+      emit(Inst.Load(Val.Raw(r), ty.lty, Val.Global(symbol), accessOf(ty)))
+      r
 
     case e @ TDeref(operand, ty) =>
       val p = payloadAddr(operand)
@@ -289,7 +301,10 @@ trait ExprEmitter extends ArithEmitter {
     case TIncDec(place, op, pre, ty, check) =>
       val p   = placeAddr(place)
       val cur = loadPlace(place, p)
-      val nv  = freshTemp(); emit(s"$nv = ${if op == "++" then "add" else "sub"} ${ty.llvm} $cur, 1")
+      val nv  = freshTemp()
+
+      emit(Inst.Bin(Val.Raw(nv), if op == "++" then BinOp.Add else BinOp.Sub, ty.lty, Val.Raw(cur),
+        Val.Int(1)))
 
       for c <- check do emitConstraintChecks(nv, c)
 
@@ -332,10 +347,12 @@ trait ExprEmitter extends ArithEmitter {
       val table = bufferTable()
       val v     = genExpr(value)
       val s     = genExpr(spec)
-      val slot  = emitAlloca(freshTemp(), bufferLayout)
+      val slot  = emitAlloca(freshTemp(), bufferLty)
 
-      emit(s"store $bufferLayout zeroinitializer, ptr $slot")
-      val a = freshTemp(); emit(s"$a = insertvalue ${Type.fatPointer} undef, ptr @$table, 0")
+      emit(Inst.Store(bufferLty, Val.Zero, Val.Raw(slot), Access.Plain))
+      val a = freshTemp()
+
+      emit(Inst.Insert(Val.Raw(a), LType.fat, Val.Undef, LType.Ptr, Val.Global(table), List(0)))
       val w = freshTemp(); emit(Inst.Insert(Val.Raw(w), LType.fat, Val.Raw(a), LType.Ptr, Val.Raw(slot), List(1)))
 
       // A trait object renders through the table it carries, so the callee and the receiver both
@@ -531,7 +548,7 @@ trait ExprEmitter extends ArithEmitter {
     // result defaults to the left value and is overwritten by the right only when it is reached.
     case TLogical(op, l, r) =>
       val lv   = genExpr(l)
-      val slot = emitAlloca(freshTemp(), "i1")
+      val slot = emitAlloca(freshTemp(), i1)
       emit(Inst.Store(i1, Val.Raw(lv), Val.Raw(slot), Access.Plain))
       val rhsL = freshLabel("sc.rhs")
       val endL = freshLabel("sc.end")
@@ -570,7 +587,7 @@ trait ExprEmitter extends ArithEmitter {
     // pops for the regions it entered, and no others. Where nothing is owned, which is the usual
     // case, every pop is empty and the ladder is branches alone.
     case TCompare(operands, cmps) =>
-      val slot  = emitAlloca(freshTemp(), "i1")
+      val slot  = emitAlloca(freshTemp(), i1)
       val exits = cmps.indices.map(_ => freshLabel("cmp.exit")).toList
       val endL  = freshLabel("cmp.end")
 
@@ -647,7 +664,9 @@ trait ExprEmitter extends ArithEmitter {
     // count its operand already had, which is what makes `f(&T)` and `f(&Trait)` the same handover.
     case TErase(operand, vtable, _) =>
       val d = genExpr(operand)
-      val a = freshTemp(); emit(s"$a = insertvalue ${Type.fatPointer} undef, ptr @$vtable, 0")
+      val a = freshTemp()
+
+      emit(Inst.Insert(Val.Raw(a), LType.fat, Val.Undef, LType.Ptr, Val.Global(vtable), List(0)))
       val b = freshTemp(); emit(Inst.Insert(Val.Raw(b), LType.fat, Val.Raw(a), LType.Ptr, Val.Raw(d), List(1)))
       b
 
@@ -674,7 +693,7 @@ trait ExprEmitter extends ArithEmitter {
 
     case TVaArg(ap, ty) =>
       val r = freshTemp()
-      emit(s"$r = va_arg ptr ${genExpr(ap)}, ${ty.llvm}")
+      emit(Inst.VaArg(Val.Raw(r), Val.Raw(genExpr(ap)), ty.lty))
       r
 
     // The one place the C ABI is not the same on every machine, so the one place codegen reads the
@@ -691,10 +710,9 @@ trait ExprEmitter extends ArithEmitter {
           val r = freshTemp(); emit(Inst.Load(Val.Raw(r), LType.Ptr, Val.Raw(addr), Access.Plain)); r
 
         case VaListAbi.Copied =>
-          usesMemcpy = true
-          val copy = emitAlloca(freshTemp(), Type.VaList.llvm)
-          emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align 8 $copy, ptr align 8 $addr, " +
-            s"i64 ${target.vaListBytes}, i1 false)")
+          val copy = emitAlloca(freshTemp(), Type.VaList.lty)
+
+          emitMemcpy(Val.Raw(copy), Val.Raw(addr), target.vaListBytes, 8)
           copy
 
     case TVaCopy(dst, src) =>
@@ -728,7 +746,8 @@ trait ExprEmitter extends ArithEmitter {
       var acc  = "undef"
       for (v, i) <- vals.zipWithIndex if !Type.zeroSized(struct.fields(i)._2) do
         val r = freshTemp()
-        emit(s"$r = insertvalue ${struct.llvm} $acc, ${struct.fields(i)._2.llvm} $v, ${struct.slot(i)}")
+        emit(Inst.Insert(Val.Raw(r), struct.lty, Val.Raw(acc), struct.fields(i)._2.lty, Val.Raw(v),
+          List(struct.slot(i))))
         acc = r
       acc
 
@@ -763,7 +782,7 @@ trait ExprEmitter extends ArithEmitter {
     // of the **field**, and a bitfield has none (`15 §1`).
     case TField(receiver, index, _) if bitfieldOf(receiver.ty).isDefined =>
       val ranges = bitfieldOf(receiver.ty).get
-      val ct     = containerLlvm(ranges)
+      val ct     = containerLty(ranges)
 
       // The container is read at the receiver's address where the receiver is large enough to be
       // handed about through memory, and lifted out of its value otherwise — the same choice the two
@@ -775,11 +794,11 @@ trait ExprEmitter extends ArithEmitter {
       // struct followed by an `extractvalue` (`15 §1`). `volatile` is a property of the container
       // rather than of one range of it — every field of a bitfield struct is bits of the same word —
       // which is why the qualifier is asked of the receiver's storage and not of the field.
-      val q = qualifier(receiver.placeTy)
+      val acc = accessOf(receiver.placeTy)
       val c =
-        if hasAddress(receiver) && (layout.indirect(receiver.ty) || q.nonEmpty) then
+        if hasAddress(receiver) && (layout.indirect(receiver.ty) || acc != Access.Plain) then
           val p = address(receiver)
-          val t = freshTemp(); emit(s"$t = load$q $ct, ptr $p"); t
+          val t = freshTemp(); emit(Inst.Load(Val.Raw(t), ct, Val.Raw(p), acc)); t
         else
           val rv = genExpr(receiver)
           val t  = freshTemp(); emit(Inst.Extract(Val.Raw(t), receiver.ty.lty, Val.Raw(rv), List(0))); t
@@ -791,7 +810,7 @@ trait ExprEmitter extends ArithEmitter {
     // one register (`03 § Device memory`).
     case e @ TField(receiver, _, ty) if Type.volatileIn(e.placeTy) && hasAddress(receiver) =>
       val p = address(e)
-      val r = freshTemp(); emit(s"$r = load volatile ${ty.llvm}, ptr $p"); r
+      val r = freshTemp(); emit(Inst.Load(Val.Raw(r), ty.lty, Val.Raw(p), Access.Volatile)); r
 
     // So is a field of a **large** struct, for a reason that is arithmetic rather than hardware:
     // lifting one field out of a value means producing the whole value first, and for a receiver of

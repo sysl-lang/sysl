@@ -74,15 +74,27 @@ trait ArcEmitter extends Emitter {
     case Type.Ref(_: Type.Trait, sync) =>
       heap = true
       syncHeap ||= sync
-      emit(s"call void @arc.retain${if sync then "_sync" else ""}(ptr ${erasedBox(v)})")
+      emit(Inst.Call(None, "void", Val.Global(s"arc.retain${if sync then "_sync" else ""}"),
+        List(Arg(LType.Ptr, Val.Raw(erasedBox(v))))))
 
     case Type.Ref(_, sync) =>
       heap = true
       syncHeap ||= sync
-      emit(s"call void @arc.retain${if sync then "_sync" else ""}(ptr $v)")
-    case w: Type.Weak        => weakHeap = true; emit(s"call void @arc.weak_retain(ptr ${weakBox(w, v)})")
-    case w: Type.View        => emit(s"call void @arc.retain_maybe(ptr ${owner(w, v)})")
-    case t if containsRef(t) => emit(s"call void @${valueHelper(t, retain = true)}(${t.llvm} $v)")
+      emit(Inst.Call(None, "void", Val.Global(s"arc.retain${if sync then "_sync" else ""}"),
+        List(Arg(LType.Ptr, Val.Raw(v)))))
+    case w: Type.Weak =>
+      weakHeap = true
+      emit(Inst.Call(None, "void", Val.Global("arc.weak_retain"),
+        List(Arg(LType.Ptr, Val.Raw(weakBox(w, v))))))
+
+    case w: Type.View =>
+      emit(Inst.Call(None, "void", Val.Global("arc.retain_maybe"),
+        List(Arg(LType.Ptr, Val.Raw(owner(w, v))))))
+
+    case t if containsRef(t) =>
+      emit(Inst.Call(None, "void", Val.Global(valueHelper(t, retain = true)),
+        List(Arg(t.lty, Val.Raw(v)))))
+
     case _                   => ()
 
   /** Gives back a share of everything a value refers to. */
@@ -90,15 +102,27 @@ trait ArcEmitter extends Emitter {
     case Type.Ref(_: Type.Trait, sync) =>
       heap = true
       syncHeap ||= sync
-      emit(s"call void @arc.release${if sync then "_sync" else ""}(ptr ${erasedBox(v)})")
+      emit(Inst.Call(None, "void", Val.Global(s"arc.release${if sync then "_sync" else ""}"),
+        List(Arg(LType.Ptr, Val.Raw(erasedBox(v))))))
 
     case Type.Ref(_, sync) =>
       heap = true
       syncHeap ||= sync
-      emit(s"call void @arc.release${if sync then "_sync" else ""}(ptr $v)")
-    case w: Type.Weak        => weakHeap = true; emit(s"call void @arc.weak_release(ptr ${weakBox(w, v)})")
-    case w: Type.View        => emit(s"call void @arc.release_maybe(ptr ${owner(w, v)})")
-    case t if containsRef(t) => emit(s"call void @${valueHelper(t, retain = false)}(${t.llvm} $v)")
+      emit(Inst.Call(None, "void", Val.Global(s"arc.release${if sync then "_sync" else ""}"),
+        List(Arg(LType.Ptr, Val.Raw(v)))))
+    case w: Type.Weak =>
+      weakHeap = true
+      emit(Inst.Call(None, "void", Val.Global("arc.weak_release"),
+        List(Arg(LType.Ptr, Val.Raw(weakBox(w, v))))))
+
+    case w: Type.View =>
+      emit(Inst.Call(None, "void", Val.Global("arc.release_maybe"),
+        List(Arg(LType.Ptr, Val.Raw(owner(w, v))))))
+
+    case t if containsRef(t) =>
+      emit(Inst.Call(None, "void", Val.Global(valueHelper(t, retain = false)),
+        List(Arg(t.lty, Val.Raw(v)))))
+
     case _                   => ()
 
   /** Takes a share of everything the value **at an address** refers to, and gives one back.
@@ -114,7 +138,8 @@ trait ArcEmitter extends Emitter {
 
   private def walkAt(ty: Type, p: String, retain: Boolean): Unit =
     if containsRef(ty) then
-      if layout.indirect(ty) then emit(s"call void @${slotHelper(ty, retain)}(ptr $p)")
+      if layout.indirect(ty) then
+        emit(Inst.Call(None, "void", Val.Global(slotHelper(ty, retain)), List(Arg(LType.Ptr, Val.Raw(p)))))
       else
         val v = freshTemp(); emit(Inst.Load(Val.Raw(v), ty.lty, Val.Raw(p), Access.Plain))
         if retain then retainValue(ty, v) else releaseValue(ty, v)
@@ -129,23 +154,25 @@ trait ArcEmitter extends Emitter {
     request(name) {
       inFunction(s"define private void @$name(ptr %p)") {
         walkSlot(ty, "%p", retain)
-        emitTerm("ret void")
+        emitTerm(Inst.Ret(None, None))
       }
     }
   }
 
   private def walkSlot(ty: Type, p: String, retain: Boolean): Unit = {
-    def each(fields: List[(String, Type)], aggregate: String, base: String): Unit =
+    def each(fields: List[(String, Type)], aggregate: LType, base: String): Unit =
       for ((_, fty), i) <- fields.zipWithIndex if containsRef(fty) do
         val f = freshTemp()
-        emit(s"$f = getelementptr $aggregate, ptr $base, i32 0, i32 ${Type.slot(fields, i)}")
+
+        emit(Inst.Gep(Val.Raw(f), aggregate, Val.Raw(base),
+          List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(Type.slot(fields, i))))))
         walkAt(fty, f, retain)
 
     ty match
-      case s: Type.Struct => each(s.fields, s.llvm, p)
+      case s: Type.Struct => each(s.fields, s.lty, p)
 
       case Type.Array(n, elem) =>
-        val i = emitAlloca(freshTemp(), word)
+        val i = emitAlloca(freshTemp(), wordLty)
         emit(Inst.Store(wordLty, Val.Int(0), Val.Raw(i), Access.Plain))
         val condL = freshLabel("arc.each")
         val bodyL = freshLabel("arc.elem")
@@ -172,7 +199,7 @@ trait ArcEmitter extends Emitter {
           val is    = freshTemp(); emit(Inst.IntCmp(Val.Raw(is), ICmp.Eq, i32, Val.Raw(tag), Val.Int(variant.tag)))
           emitTerm(Inst.CondBr(Val.Raw(is), hitL, nextL))
           emitLabel(hitL)
-          each(variant.fields, e.payloadLlvm(variant), payloadPtr(e, p))
+          each(variant.fields, e.payloadLty(variant), payloadPtr(e, p))
           emitTerm(Inst.Br(endL))
           emitLabel(nextL)
         emitTerm(Inst.Br(endL))
@@ -210,7 +237,7 @@ trait ArcEmitter extends Emitter {
           val give = freshLabel("arc.give")
           val over = freshLabel("arc.over")
 
-          emitTerm(s"br i1 %storage, label %$give, label %$over")
+          emitTerm(Inst.CondBr(Val.Reg("storage"), give, over))
           emitLabel(over)
           val pa = freshTemp(); emit(Inst.Gep(Val.Raw(pa), bn, Val.Reg("p"), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields)))))
           val v  = freshTemp(); emit(Inst.Load(Val.Raw(v), payload.lty, Val.Raw(pa), Access.Plain))
@@ -225,10 +252,10 @@ trait ArcEmitter extends Emitter {
             else emit(Inst.Call(None, "void", Val.Global(d), List(Arg(payload.lty, Val.Raw(v)))))
 
           releaseValue(payload, v)
-          emitTerm("ret void")
+          emitTerm(Inst.Ret(None, None))
           emitLabel(give)
           emitFree()
-          emitTerm("ret void")
+          emitTerm(Inst.Ret(None, None))
         }
       }
   }
@@ -245,12 +272,12 @@ trait ArcEmitter extends Emitter {
         val give = freshLabel("arc.give")
         val over = freshLabel("arc.over")
 
-        emitTerm(s"br i1 %storage, label %$give, label %$over")
+        emitTerm(Inst.CondBr(Val.Reg("storage"), give, over))
         emitLabel(over)
-        emitTerm("ret void")
+        emitTerm(Inst.Ret(None, None))
         emitLabel(give)
         emitFree()
-        emitTerm("ret void")
+        emitTerm(Inst.Ret(None, None))
       }
     }
 
@@ -274,7 +301,7 @@ trait ArcEmitter extends Emitter {
     request(name) {
       inFunction(s"define private void @$name(${ty.llvm} %v)") {
         walkValue(ty, "%v", retain)
-        emitTerm("ret void")
+        emitTerm(Inst.Ret(None, None))
       }
     }
   }
@@ -295,9 +322,9 @@ trait ArcEmitter extends Emitter {
       // An array is walked with a loop rather than an unrolled chain: the element count is a
       // compile-time constant, but it can be very large, and the code for one element is not.
       case Type.Array(n, elem) =>
-        val buf = emitAlloca(freshTemp(), ty.llvm)
+        val buf = emitAlloca(freshTemp(), ty.lty)
         emit(Inst.Store(ty.lty, Val.Raw(v), Val.Raw(buf), Access.Plain))
-        val i = emitAlloca(freshTemp(), word)
+        val i = emitAlloca(freshTemp(), wordLty)
         emit(Inst.Store(wordLty, Val.Int(0), Val.Raw(i), Access.Plain))
         val condL = freshLabel("arc.each")
         val bodyL = freshLabel("arc.elem")
@@ -401,20 +428,23 @@ trait ArcEmitter extends Emitter {
           val give = freshLabel("arc.give")
           val over = freshLabel("arc.over")
 
-          emitTerm(s"br i1 %storage, label %$give, label %$over")
+          emitTerm(Inst.CondBr(Val.Reg("storage"), give, over))
           emitLabel(over)
           val lenp = freshTemp(); emit(Inst.Gep(Val.Raw(lenp), bn, Val.Reg("p"), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields)))))
           val n    = freshTemp(); emit(Inst.Load(Val.Raw(n), wordLty, Val.Raw(lenp), Access.Plain))
-          val data = freshTemp(); emit(s"$data = getelementptr $bn, ptr %p, i32 0, i32 ${headerFields + 1}")
+          val data = freshTemp()
+
+          emit(Inst.Gep(Val.Raw(data), bn, Val.Reg("p"),
+            List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields + 1)))))
 
           eachElement(elem, data, n) { ep =>
             val ev = freshTemp(); emit(Inst.Load(Val.Raw(ev), elem.lty, Val.Raw(ep), Access.Plain))
             releaseValue(elem, ev)
           }
-          emitTerm("ret void")
+          emitTerm(Inst.Ret(None, None))
           emitLabel(give)
           emitFree()
-          emitTerm("ret void")
+          emitTerm(Inst.Ret(None, None))
         }
       }
 
@@ -432,7 +462,7 @@ trait ArcEmitter extends Emitter {
    * thing that may be large here.
    */
   protected def eachElement(elem: Type, data: String, n: String)(body: String => Unit): Unit = {
-    val i     = emitAlloca(freshTemp(), word)
+    val i     = emitAlloca(freshTemp(), wordLty)
     val condL = freshLabel("buf.test")
     val bodyL = freshLabel("buf.elem")
     val endL  = freshLabel("buf.done")
@@ -461,7 +491,9 @@ trait ArcEmitter extends Emitter {
     operand.ty match
       case Type.Ref(inner, _) =>
         val r = freshTemp()
-        emit(s"$r = getelementptr ${boxName(inner)}, ptr $p, i32 0, i32 $headerFields")
+
+        emit(Inst.Gep(Val.Raw(r), boxLty(inner), Val.Raw(p),
+          List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields)))))
         r
       case _ => p
   }
@@ -534,7 +566,7 @@ trait ArcEmitter extends Emitter {
    * the frame exactly as long as some view of it does.
    */
   protected def ownBox(name: String, box: String, elem: Type): Unit = {
-    emitAlloca(s"%$name.box", "ptr")
+    emitAlloca(s"%$name.box", LType.Ptr)
     emit(Inst.Store(LType.Ptr, Val.Raw(box), Val.Reg(s"$name.box"), Access.Plain))
     owned.head += ((s"%$name.box", Type.Ref(elem, false)))
   }

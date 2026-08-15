@@ -25,7 +25,9 @@ trait WriterEmitter extends Emitter {
    * machine cannot address, and the string this buffer finishes into carries its length as a
    * `usize` anyway.
    */
-  protected def bufferLayout: String = s"{ ptr, $word, $word }"
+  protected def bufferLty: ir.LType = ir.LType.Struct(List(ir.LType.Ptr, wordLty, wordLty))
+
+  protected def bufferLayout: String = bufferLty.render
 
   /** The table for a fresh buffer, whose data word is the caller's stack slot. */
   protected def bufferTable(): String = request("sysl.vt.buf")(WriterEmitter.buffer)

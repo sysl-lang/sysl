@@ -86,7 +86,7 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       tailParams.zip(args).map { case ((_, ty), a) =>
         if Type.zeroSized(ty) then { genExpr(a); None }
         else if layout.indirect(ty) then
-          val slot = emitAlloca(freshTemp(), ty.llvm)
+          val slot = emitAlloca(freshTemp(), ty.lty)
 
           genOwnedInto(slot, a)
           Some(Left(slot))

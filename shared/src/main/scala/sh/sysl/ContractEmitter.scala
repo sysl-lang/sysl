@@ -72,7 +72,7 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
     // see both of the call's values and neither of the frame's.
     val saved =
       for case ((name, ty), Some((_, arg))) <- selfParams.zip(staged) yield
-        val keep = emitAlloca(freshTemp(), ty.llvm)
+        val keep = emitAlloca(freshTemp(), ty.lty)
 
         arg match
           case Left(addr) =>
@@ -134,8 +134,8 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
    * perfectly well.
    */
   protected def genCheckedLoop(slot: String, varTy: Type, loop: TExpr): String = {
-    emitAlloca(s"%$slot.prev", varTy.llvm)
-    emitAlloca(s"%$slot.armed", "i1")
+    emitAlloca(s"%$slot.prev", varTy.lty)
+    emitAlloca(s"%$slot.armed", i1)
     emit(Inst.Store(LType.I(1), Val.Int(0), Val.Reg(s"$slot.armed"), Access.Plain))
     genExpr(loop)
   }

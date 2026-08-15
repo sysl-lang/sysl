@@ -317,7 +317,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       popTemps()
 
     releaseAll()
-    emitTerm("ret i32 0")
+    emitTerm(Inst.Ret(Some(i32), Some(Val.Int(0))))
     finishFunction("define i32 @main(i32 %argc, ptr %argv)")
   }
 
@@ -376,7 +376,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       emitTerm(Inst.CondBr(Val.Raw(hit), run, next))
       emitLabel(run)
       emit(Inst.Call(None, "void", Val.Global(symbolOf(t.func)), Nil))
-      emitTerm("ret i32 0")
+      emitTerm(Inst.Ret(Some(i32), Some(Val.Int(0))))
       emitLabel(next)
 
     // Falling off the end of the arms and arriving with no name at all are the same answer: this
@@ -384,7 +384,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // reading the status cannot tell them apart and there is nothing it would do differently.
     emitTerm(Inst.Br(missing))
     emitLabel(missing)
-    emitTerm("ret i32 2")
+    emitTerm(Inst.Ret(Some(i32), Some(Val.Int(2))))
 
     finishFunction("define i32 @main(i32 %argc, ptr %argv)")
   }
@@ -406,7 +406,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // A zero-sized parameter is not an argument: there is nothing to receive and nothing to keep,
     // so it takes no slot and the emitted signature below does not mention it.
     for (name, ty) <- f.params if !Type.zeroSized(ty) do
-      emitAlloca(s"%$name.addr", ty.llvm)
+      emitAlloca(s"%$name.addr", ty.lty)
       // A large one arrived as an address, so the copy the callee makes for itself is a copy of
       // bytes and the count it takes is taken at the slot rather than off a value it never had.
       if layout.indirect(ty) then
@@ -444,7 +444,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     for (oldExpr, i) <- f.olds.zipWithIndex do
       pushTemps()
       val v = genExpr(oldExpr)
-      emitAlloca(s"%old.$i.addr", oldExpr.ty.llvm)
+      emitAlloca(s"%old.$i.addr", oldExpr.ty.lty)
       retainValue(oldExpr.ty, v)
       emit(Inst.Store(oldExpr.ty.lty, Val.Raw(v), Val.Reg(s"old.$i.addr"), Access.Plain))
       ownSlot(s"old.$i", oldExpr.ty)
@@ -461,16 +461,16 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
         retainValue(f.retTy, v)
         emitEnsures(Some(v))
         releaseAll()
-        emitTerm(s"ret ${f.retTy.llvm} $v")
+        emitTerm(Inst.Ret(Some(f.retTy.lty), Some(Val.Raw(v))))
       case Some(r) =>
-        genExpr(r); emitEnsures(None); releaseAll(); emitTerm("ret void")
+        genExpr(r); emitEnsures(None); releaseAll(); emitTerm(Inst.Ret(None, None))
       case None if Type.noValue(f.retTy) =>
-        emitEnsures(None); releaseAll(); emitTerm("ret void")
+        emitEnsures(None); releaseAll(); emitTerm(Inst.Ret(None, None))
       case None if layout.indirect(f.retTy) =>
         emit(Inst.Store(f.retTy.lty, Val.Zero, Val.Raw(sretParam), Access.Plain))
-        releaseAll(); emitTerm("ret void")
+        releaseAll(); emitTerm(Inst.Ret(None, None))
       case None =>
-        releaseAll(); emitTerm(s"ret ${f.retTy.llvm} ${zero(f.retTy)}")
+        releaseAll(); emitTerm(Inst.Ret(Some(f.retTy.lty), Some(Val.Raw(zero(f.retTy)))))
 
     val stored   = Type.stored(f.params)
     val declared = stored.map { case (name, ty) => s"${syslParam(ty)}${frameOf(f, ty, name)} %$name.param" }
@@ -509,7 +509,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     else emitEnsures(None)
 
     releaseAll()
-    emitTerm("ret void")
+    emitTerm(Inst.Ret(None, None))
   }
 
   /** What a calling convention becomes on the `define` line for **this** machine (`15 §10`).
@@ -580,7 +580,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // The slot is laid down **before** the initializer runs, because a large one is written into it
     // rather than handed to it: the callee of `val k = kernel()` needs somewhere to write.
     case TVarDecl(name, ty, init, align) =>
-      emitAlloca(s"%$name.addr", ty.llvm, align)
+      emitAlloca(s"%$name.addr", ty.lty, align)
       genOwnedInto(s"%$name.addr", init)
       ownSlot(name, ty)
 
@@ -617,11 +617,11 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
           retainValue(t.ty, v)
           emitEnsures(Some(v))
           releaseAll()
-          emitTerm(s"ret ${t.ty.llvm} $v")
+          emitTerm(Inst.Ret(Some(t.ty.lty), Some(Val.Raw(v))))
         case None =>
           emitEnsures(None)
           releaseAll()
-          emitTerm("ret void")
+          emitTerm(Inst.Ret(None, None))
 
     // A `break`/`continue` leaves the body from the middle, so it unwinds the body's ownership
     // regions before jumping — the same discipline as `return`, bounded to the loop. `break v`

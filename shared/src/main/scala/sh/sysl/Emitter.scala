@@ -76,9 +76,10 @@ trait Emitter {
    * *said* — LLVM's textual form gives a named type no alignment, so `@align` has to be stamped onto
    * each alloca and global rather than declared once with the type.
    *
-   * Keyed by the emitted name because that is all a slot has to go on: `emitAlloca` is handed a type
-   * string, and threading a `Type` to all forty-six of its callers would be a large change to say a
-   * thing that only ever applies to a handful of them.
+   * Keyed by the **emitted** name rather than by the sysl type, because what a slot has is an
+   * `ir.LType` and a declared struct is a `Named` — the sysl type it came from is exactly what
+   * lowering discarded, and asking a slot to carry it back would undo that for the handful of types
+   * this applies to at all.
    */
   protected val raisedAligns = mutable.Map.empty[String, Int]
   protected var boolStrs = false
@@ -165,7 +166,7 @@ trait Emitter {
   private var temp       = 0
   private var label      = 0
   private var terminated = false
-  private var scratch    = mutable.HashMap.empty[String, String]
+  private var scratch    = mutable.HashMap.empty[ir.LType, String]
 
   /** References this expression owns and must let go of. The stack mirrors the regions a value
    * may not escape: a statement, and each branch of an `if` or arm of a `match`, release their
@@ -493,7 +494,7 @@ trait Emitter {
    * doing because a function that matches on an enum in a hundred places would otherwise carry a
    * hundred slots it uses one at a time.
    */
-  protected def scratchSlot(ty: String): String =
+  protected def scratchSlot(ty: ir.LType): String =
     scratch.getOrElseUpdate(ty, emitAlloca(freshTemp(), ty))
 
   /** The address of the payload region inside an enum sitting at `base`. */
@@ -512,7 +513,7 @@ trait Emitter {
    * what makes the answer count.
    */
   protected def enumPayload(en: Type.Enum, variant: Type.EnumVariant, value: String): String = {
-    val slot = scratchSlot(en.llvm)
+    val slot = scratchSlot(en.lty)
 
     emit(Inst.Store(en.lty, Val.Raw(value), Val.Raw(slot), Access.Plain))
 
@@ -568,8 +569,6 @@ trait Emitter {
   protected def freshLabel(s: String): String = { label += 1; s"$s$label" }
 
   /** Emits a plain instruction, unless the current block is already terminated. */
-  protected def emit(line: String): Unit = emit(ir.Inst.Raw(line))
-
   protected def emit(inst: ir.Inst): Unit = if !terminated then current += inst
 
   /** Emits a stack slot into the function's entry block rather than where it is needed.
@@ -581,32 +580,26 @@ trait Emitter {
    * larger of the two is what satisfies both claims, and one written on the declaration is by that
    * rule already at or above the type's.
    */
-  protected def emitAlloca(name: String, ty: ir.LType): String = emitAlloca(name, ty.render)
-
-  protected def emitAlloca(name: String, ty: ir.LType, align: Option[Int]): String =
-    emitAlloca(name, ty.render, align)
-
-  protected def emitAlloca(name: String, ty: String, align: Option[Int] = None): String = {
-    prologue += ir.Inst.Raw(s"$name = alloca $ty${align.map(n => s", align $n").getOrElse(alignSuffix(ty))}")
+  protected def emitAlloca(name: String, ty: ir.LType, align: Option[Int] = None): String = {
+    prologue += ir.Inst.Alloca(ir.Val.Raw(name), ty, align.orElse(raisedAlign(ty)))
     name
   }
 
-  /** `, align n` where the type this storage holds asked for a boundary, and nothing otherwise —
-   * LLVM's own choice is the natural alignment, which is right for everything that did not ask.
+  /** The boundary the type this storage holds asked for, and nothing where it did not — LLVM's own
+   * choice is the natural alignment, which is right for everything that made no claim.
    *
-   * An array is covered by the same lookup: `[8 x %struct.Frame]` names the struct it is made of, so
-   * a region of aligned elements begins where its first element must, which is what makes an aligned
-   * type usable as a buffer rather than only as a single value.
+   * **An aggregate is searched rather than only asked about**, which is what makes `[8 x
+   * %struct.Frame]` land on `Frame`'s boundary: a region of aligned elements begins where its first
+   * element must, and that is what makes an aligned type usable as a buffer and not only as a single
+   * value. The first declared struct in the type's own written order is the one that answers, which
+   * is where the search stops.
    */
-  protected def alignSuffix(ty: String): String = {
-    val at = ty.indexOf("%struct.")
-
-    if at < 0 then ""
-    else
-      val name = ty.drop(at).takeWhile(c => c.isLetterOrDigit || c == '.' || c == '_' || c == '%')
-
-      raisedAligns.get(name).map(n => s", align $n").getOrElse("")
-  }
+  private def raisedAlign(ty: ir.LType): Option[Int] = ty match
+    case ir.LType.Named(n)     => raisedAligns.get(n)
+    case ir.LType.Arr(_, elem) => raisedAlign(elem)
+    case ir.LType.Vec(_, elem) => raisedAlign(elem)
+    case ir.LType.Struct(fs)   => fs.iterator.map(raisedAlign).collectFirst { case Some(n) => n }
+    case _                     => None
 
   /** A block of storage copied, at a boundary both ends are known to satisfy.
    *
@@ -624,8 +617,6 @@ trait Emitter {
   }
 
   /** Emits a block terminator (`br` / `ret` / `unreachable`) and marks the block closed. */
-  protected def emitTerm(line: String): Unit = emitTerm(ir.Inst.Raw(line))
-
   protected def emitTerm(inst: ir.Inst): Unit =
     if !terminated then { currentEnd = Some(inst); terminated = true }
 

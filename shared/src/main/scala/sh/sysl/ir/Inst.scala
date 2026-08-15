@@ -121,9 +121,6 @@ case class Arg(ty: LType, value: Val, attrs: String = "") {
  */
 enum Inst {
 
-  /** Text an emitter interpolated. Scaffolding, and deleted when the last emit site is converted. */
-  case Raw(text: String)
-
   case Bin(dest: Val, op: BinOp, ty: LType, a: Val, b: Val)
   case Neg(dest: Val, ty: LType, v: Val)
   case IntCmp(dest: Val, pred: ICmp, ty: LType, a: Val, b: Val)
@@ -209,8 +206,6 @@ enum Inst {
 
   /** The instruction as LLVM writes it, without the indentation a body gives it. */
   def render: String = this match
-    case Raw(text) => text
-
     case Bin(d, op, ty, a, b)      => s"${d.render} = ${op.render} ${ty.render} ${a.render}, ${b.render}"
     case Neg(d, ty, v)            => s"${d.render} = fneg ${ty.render} ${v.render}"
     case IntCmp(d, p, ty, a, b)   => s"${d.render} = icmp ${p.render} ${ty.render} ${a.render}, ${b.render}"

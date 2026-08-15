@@ -73,7 +73,7 @@ trait EnumAttrEmitter extends ScalarEmitter {
       case "Image" =>
         // The result is a string aggregate, so it is chosen through memory rather than a `select`:
         // each variant's block stores its name, and the default lands on the last.
-        val slot = emitAlloca(freshTemp(), Type.Str.llvm)
+        val slot = emitAlloca(freshTemp(), Type.Str.lty)
         val endL = freshLabel("image.end")
         val caseLs = vs.map(_ => freshLabel("image.case"))
         val table = vs.init.zip(caseLs.init).map((vv, l) => (BigInt(vv.tag), l))

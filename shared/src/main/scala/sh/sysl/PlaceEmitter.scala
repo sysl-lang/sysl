@@ -87,7 +87,8 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     case TField(receiver, index, _) =>
       val base = address(receiver)
       val r    = freshTemp()
-      emit(s"$r = getelementptr ${receiver.ty.llvm}, ptr $base, i32 0, i32 ${fieldSlot(receiver.ty, index)}")
+      emit(Inst.Gep(Val.Raw(r), receiver.ty.lty, Val.Raw(base),
+        List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(fieldSlot(receiver.ty, index))))))
       r
     case TIndex(receiver, index, _) => elementAddr(receiver, index)
 
@@ -95,7 +96,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     // first. The analyzer has already refused to *assign* through anything but a real place, so
     // this only ever happens on the way to a read.
     case other =>
-      val slot = emitAlloca(freshTemp(), other.ty.llvm)
+      val slot = emitAlloca(freshTemp(), other.ty.lty)
       // A large one is written into the slot rather than produced and then stored into it — the
       // slot is what it was going to end up in either way.
       if layout.indirect(other.ty) then genBorrowedInto(slot, other)
@@ -106,20 +107,21 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * and lets go of the one leaving, in that order, so assigning something to itself never briefly
    * drops the last count.
    */
-  protected def storeInto(ty: Type, p: String, v: String, q: String = ""): Unit =
-    if !containsRef(ty) then emit(s"store$q ${ty.llvm} $v, ptr $p")
+  protected def storeInto(ty: Type, p: String, v: String, acc: Access = Access.Plain): Unit =
+    if !containsRef(ty) then emit(Inst.Store(ty.lty, Val.Raw(v), Val.Raw(p), acc))
     // A large aggregate gives its old contents back at the address rather than out of a value read
     // for the purpose. The order is the same one the value form keeps and for the same reason: the
     // count for the arriving value is taken first, so assigning something to itself never briefly
     // drops the last one.
-    else if layout.indirect(ty) && q.isEmpty then
+    else if layout.indirect(ty) && acc == Access.Plain then
       retainValue(ty, v)
       releaseAt(ty, p)
       emit(Inst.Store(ty.lty, Val.Raw(v), Val.Raw(p), Access.Plain))
     else
-      val old = freshTemp(); emit(s"$old = load$q ${ty.llvm}, ptr $p")
+      val old = freshTemp(); emit(Inst.Load(Val.Raw(old), ty.lty, Val.Raw(p), acc))
+
       retainValue(ty, v)
-      emit(s"store$q ${ty.llvm} $v, ptr $p")
+      emit(Inst.Store(ty.lty, Val.Raw(v), Val.Raw(p), acc))
       releaseValue(ty, old)
 
   /** `a, b = b, a` (`00 §2`), in the phases the form promises.
@@ -226,23 +228,23 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
   protected def storePlace(place: TExpr, p: String, v: String, cur: Option[String] = None): Unit =
     bitPlace(place) match
       case Some((recv, ranges, r)) =>
-        val q = qualifier(recv.placeTy)
-        val c = loadContainer(ranges, recv, p)
+        val acc = accessOf(recv.placeTy)
+        val c   = loadContainer(ranges, recv, p)
 
-        emit(s"store$q ${containerLlvm(ranges)} ${writeBits(ranges, r, c, v)}, ptr $p")
+        emit(Inst.Store(containerLty(ranges), Val.Raw(writeBits(ranges, r, c, v)), Val.Raw(p), acc))
 
       case None =>
-        val ty = place.ty
-        val q  = vol(place)
+        val ty  = place.ty
+        val acc = access(place)
 
         cur match
-          case None => storeInto(ty, p, v, q)
+          case None => storeInto(ty, p, v, acc)
           case Some(old) =>
             if containsRef(ty) then
               retainValue(ty, v)
-              emit(s"store$q ${ty.llvm} $v, ptr $p")
+              emit(Inst.Store(ty.lty, Val.Raw(v), Val.Raw(p), acc))
               releaseValue(ty, old)
-            else emit(s"store$q ${ty.llvm} $v, ptr $p")
+            else emit(Inst.Store(ty.lty, Val.Raw(v), Val.Raw(p), acc))
 
   /** Where a written field index lands in the emitted aggregate, once the zero-sized fields before
    * it are dropped.
@@ -290,7 +292,10 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val (ownerV, first, len) = base.ty match
       case Type.Ref(array @ Type.Array(n, _), _) =>
         val r = genExpr(base)
-        val p = freshTemp(); emit(s"$p = getelementptr ${boxName(array)}, ptr $r, i32 0, i32 $headerFields")
+        val p = freshTemp()
+
+        emit(Inst.Gep(Val.Raw(p), boxLty(array), Val.Raw(r),
+          List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields)))))
         (r, p, Some(n.toString))
       case s: Type.View =>
         val v = genExpr(base)
@@ -416,7 +421,9 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       case Some(root @ TDeref(operand, inner)) if operand.ty.isInstanceOf[Type.Ref] =>
         val box = genExpr(operand)
         val at  = freshTemp()
-        emit(s"$at = getelementptr ${boxName(inner)}, ptr $box, i32 0, i32 $headerFields")
+
+        emit(Inst.Gep(Val.Raw(at), boxLty(inner), Val.Raw(box),
+          List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields)))))
         (box, addressUnder(place, root, at))
 
       case _ => (promotedOwner(place), address(place))
@@ -431,7 +438,8 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     case TField(r, index, _) =>
       val base = addressUnder(r, root, at)
       val x    = freshTemp()
-      emit(s"$x = getelementptr ${r.ty.llvm}, ptr $base, i32 0, i32 ${fieldSlot(r.ty, index)}")
+      emit(Inst.Gep(Val.Raw(x), r.ty.lty, Val.Raw(base),
+        List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(fieldSlot(r.ty, index))))))
       x
 
     case TIndex(r, index, _) =>
@@ -450,19 +458,27 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
 
     val e1   = freshTemp(); emit(Inst.Gep(Val.Raw(e1), elem.lty, Val.Null, List(Arg(LType.I(64), Val.Int(1)))))
     val esz  = freshTemp(); emit(Inst.Cast(Val.Raw(esz), CastOp.PtrToInt, LType.Ptr, Val.Raw(e1), wordLty))
-    val h1   = freshTemp(); emit(s"$h1 = getelementptr $bn, ptr null, i32 0, i32 ${headerFields + 1}")
+    val h1   = freshTemp()
+
+    emit(Inst.Gep(Val.Raw(h1), bn, Val.Null, List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields + 1)))))
     val hsz  = freshTemp(); emit(Inst.Cast(Val.Raw(hsz), CastOp.PtrToInt, LType.Ptr, Val.Raw(h1), wordLty))
 
     // The overflow intrinsics carry their width in the **name** as well as in the signature, so a
     // size computed at the machine's own width has to name the matching overload — and getting that
     // wrong is not a type error LLVM would catch, it is a call to a function that does not exist.
-    val pair  = s"{ $word, i1 }"
-    val mul   = freshTemp(); emit(s"$mul = call $pair @llvm.umul.with.overflow.$word($word $n, $word $esz)")
-    val bytes = freshTemp(); emit(s"$bytes = extractvalue $pair $mul, 0")
-    val over1 = freshTemp(); emit(s"$over1 = extractvalue $pair $mul, 1")
-    val add   = freshTemp(); emit(s"$add = call $pair @llvm.uadd.with.overflow.$word($word $bytes, $word $hsz)")
-    val total = freshTemp(); emit(s"$total = extractvalue $pair $add, 0")
-    val over2 = freshTemp(); emit(s"$over2 = extractvalue $pair $add, 1")
+    val pair  = LType.Struct(List(wordLty, i1))
+    val mul   = freshTemp()
+
+    emit(Inst.Call(Some(Val.Raw(mul)), pair.render, Val.Global(s"llvm.umul.with.overflow.$word"),
+      List(Arg(wordLty, Val.Raw(n)), Arg(wordLty, Val.Raw(esz)))))
+    val bytes = freshTemp(); emit(Inst.Extract(Val.Raw(bytes), pair, Val.Raw(mul), List(0)))
+    val over1 = freshTemp(); emit(Inst.Extract(Val.Raw(over1), pair, Val.Raw(mul), List(1)))
+    val add   = freshTemp()
+
+    emit(Inst.Call(Some(Val.Raw(add)), pair.render, Val.Global(s"llvm.uadd.with.overflow.$word"),
+      List(Arg(wordLty, Val.Raw(bytes)), Arg(wordLty, Val.Raw(hsz)))))
+    val total = freshTemp(); emit(Inst.Extract(Val.Raw(total), pair, Val.Raw(add), List(0)))
+    val over2 = freshTemp(); emit(Inst.Extract(Val.Raw(over2), pair, Val.Raw(add), List(1)))
     val over  = freshTemp(); emit(Inst.Bin(Val.Raw(over), BinOp.Or, i1, Val.Raw(over1), Val.Raw(over2)))
     val fits  = freshTemp(); emit(Inst.Bin(Val.Raw(fits), BinOp.Xor, i1, Val.Raw(over), Val.Bool(true)))
     trapUnless(Val.Raw(fits), "size")
@@ -478,7 +494,10 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     emit(Inst.Store(wordLty, Val.Int(1), Val.Raw(wc), Access.Plain))
     val lenp = freshTemp(); emit(Inst.Gep(Val.Raw(lenp), bn, Val.Raw(p), List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields)))))
     emit(Inst.Store(wordLty, Val.Raw(n), Val.Raw(lenp), Access.Plain))
-    val data = freshTemp(); emit(s"$data = getelementptr $bn, ptr $p, i32 0, i32 ${headerFields + 1}")
+    val data = freshTemp()
+
+    emit(Inst.Gep(Val.Raw(data), bn, Val.Raw(p),
+      List(Arg(i32, Val.Int(0)), Arg(i32, Val.Int(headerFields + 1)))))
 
     (p, data)
   }
@@ -534,10 +553,10 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       var payload = "undef"
       for (v, i) <- vals.zipWithIndex if !Type.zeroSized(variant.fields(i)._2) do
         val r = freshTemp()
-        emit(s"$r = insertvalue ${en.payloadLlvm(variant)} $payload, " +
-          s"${variant.fields(i)._2.llvm} $v, ${variant.slot(i)}")
+        emit(Inst.Insert(Val.Raw(r), en.payloadLty(variant), Val.Raw(payload),
+          variant.fields(i)._2.lty, Val.Raw(v), List(variant.slot(i))))
         payload = r
-      val slot = scratchSlot(en.llvm)
+      val slot = scratchSlot(en.lty)
       emit(Inst.Store(i32, Val.Int(variant.tag), Val.Raw(slot), Access.Plain))
       val p = payloadPtr(en, slot)
       emit(Inst.Store(en.payloadLty(variant), Val.Raw(payload), Val.Raw(p), Access.Plain))
@@ -579,7 +598,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val vt    = Type.repr(value.ty).asInstanceOf[Type.Integer]
     val v     = genExpr(value)
     val ok    = enumMembership(en, vt, v)
-    val slot  = emitAlloca(freshTemp(), optTy.llvm)
+    val slot  = emitAlloca(freshTemp(), optTy.lty)
     val someL = freshLabel("try.some")
     val noneL = freshLabel("try.none")
     val endL  = freshLabel("try.end")
@@ -627,7 +646,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
 
     val got   = freshTemp(); emit(Inst.Call(Some(Val.Raw(got)), LType.Ptr.render, Val.Global("arc.upgrade"), List(Arg(LType.Ptr, Val.Raw(addr)))))
     val live  = freshTemp(); emit(Inst.IntCmp(Val.Raw(live), ICmp.Ne, LType.Ptr, Val.Raw(got), Val.Null))
-    val slot  = emitAlloca(freshTemp(), optTy.llvm)
+    val slot  = emitAlloca(freshTemp(), optTy.lty)
     val someL = freshLabel("weak.live")
     val noneL = freshLabel("weak.gone")
     val endL  = freshLabel("weak.end")
@@ -689,7 +708,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val failed = enumValue(retEnum, retFail, payloadFields(en, fail, v))
     retainValue(retEnum, failed)
     releaseAll()
-    emitTerm(s"ret ${retEnum.llvm} $failed")
+    emitTerm(Inst.Ret(Some(retEnum.lty), Some(Val.Raw(failed))))
 
     emitLabel(okL)
     payloadFields(en, ok, v).head
