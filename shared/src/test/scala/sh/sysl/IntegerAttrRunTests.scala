@@ -68,6 +68,32 @@ class IntegerAttrRunTests extends AnyFreeSpec with RunSupport with CodegenSuppor
     }
   }
 
+  /** A subtype that narrows **nothing** answers its base's extremes, because that is what it can
+   * hold. `16 §1` makes a transparent one *be* its base, so the alternative — refusing for want of a
+   * `within` range — was the subtype claiming to be a different type than its own chapter says. It
+   * is not a corner: a `c type` (`15 §7`) lowers to exactly this, so every measured typedef in the
+   * kernel and Pico packages is one.
+   */
+  "a subtype that narrows nothing answers the integer it is" - {
+    /** A bare transparent alias is refused at the declaration (`16 §1`), so a **derived** one is the
+      * shape a person can write. The attribute answers in the subtype, as every one but `Valid`
+      * does, which is why the value needs a cast to print.
+      */
+    "a derived subtype with no constraint has its base's maximum" in {
+      run("type Handle = new u16\nwidest() -> u16 = u16(Handle::Max)\nprint(widest())") shouldBe "65535\n"
+    }
+    "and its base's minimum, which is where the signed case shows" in {
+      run("type Off = new i8\nprint(i8(Off::Min))") shouldBe "-128\n"
+    }
+
+    /** `First` and `Last` still need a range, and the asymmetry is the point: they name the ends of
+      * a range as *written*, while `Min` and `Max` name what the type can hold.
+      */
+    "but 'First' still needs a range, because that is a different question" in {
+      err("type Handle = new u16\nprint(u16(Handle::First))") should include("needs a 'within' range")
+    }
+  }
+
   "the bounds are constants, not calls" - {
     // `13 §5` admits no call in a `const` initializer, so an attribute that resolved as one would be
     // unusable in the two places bounds are most wanted. This is the test that pins that.
@@ -120,14 +146,14 @@ class IntegerAttrRunTests extends AnyFreeSpec with RunSupport with CodegenSuppor
         "150\n"
     }
 
-    /** A **transparent** subtype answers differently depending on how the parameter was *solved*,
-      * and the attribute is not what differs — it reports whatever `T` was bound to. The three cases
-      * are pinned rather than reconciled here, because which of them is right is a question about
-      * inference and not about attributes.
+    /** A **transparent** subtype binds the parameter to itself, whichever of the three routes solved
+      * it: a written argument, an argument's own type, or the type the result is expected at. The
+      * reader wrote `Age`, so `T` carries `Age` and answers `Age`'s bound.
       *
-      * `T::Max` is simply the first thing that makes the split visible. Everything else a body can
-      * do with a `T` behaves the same whether it is bound to `Age` or to `int` — that is what
-      * transparent *means* — so nothing had a reason to ask before.
+      * `T::Max` is the first question whose answer distinguishes the subtype from its base.
+      * Everything else a body can do with a `T` behaves the same either way — that is what
+      * transparent *means* — which is why the three routes could disagree unnoticed until the bounds
+      * became askable through a parameter.
       */
     "a transparent one answers its own bound when the argument is written" in {
       run("type Age = int within 0..150\nwidest[T]() -> T = T::Max\nprint(int(widest[Age]()))") shouldBe
@@ -138,17 +164,48 @@ class IntegerAttrRunTests extends AnyFreeSpec with RunSupport with CodegenSuppor
             "val a = Age(3)\nprint(int(widest(a)))") shouldBe "150\n"
     }
 
-    /** **And its base's when solved from the expected type**, which is the one route out of step.
-      * `Type.repr` strips a transparent subtype for agreement, so `val a: Age = widest()` solves
-      * `T = int` — and `int::Min` is then outside `Age`, which the produce site checks and traps on.
-      * The trap is the only way to observe it: every value both readings agree on is a value that
-      * cannot tell them apart.
+    /** **And its own again when solved from the expected type**, which is the route that used to
+      * answer the base's. It is the case with nothing else to go on, so it is the one a library
+      * writer is likeliest to reach: the annotation on the binding is the only thing that says what
+      * `T` is.
       */
-    "and its base's when solved from the expected type, which the produce site then refuses" in {
-      exits("""type NonNeg = int within 0..2147483647
-              |least[T]() -> T = T::Min
-              |val a: NonNeg = least()
-              |print(int(a))""".stripMargin)
+    "and its own again when solved from the expected type" in {
+      run("type Age = int within 0..150\nwidest[T]() -> T = T::Max\nval a: Age = widest()\nprint(int(a))") shouldBe
+        "150\n"
+    }
+
+    /** The bound the old reading produced was outside the subtype, so the disagreement was
+      * observable only as a **trap** — every value the two readings agree on is a value that cannot
+      * tell them apart. This is that case, and it now yields the subtype's own minimum instead of
+      * `int`'s.
+      */
+    "a lower bound outside the subtype's range is the case that made the split visible" in {
+      run("""type NonNeg = int within 0..2147483647
+            |least[T]() -> T = T::Min
+            |val a: NonNeg = least()
+            |print(int(a))""".stripMargin) shouldBe "0\n"
+    }
+    "and a base other than 'int' answers the same way" in {
+      run("type Small = u8 within 0..10\nwidest[T]() -> T = T::Max\nval a: Small = widest()\nprint(u8(a))") shouldBe
+        "10\n"
+    }
+
+    /** The subtype reaching the parameter does not put it outside its base's traffic, which is the
+      * half worth pinning: a transparent subtype *is* its base for every value that flows (`16 §1`),
+      * so a bound written over the base is satisfied and the arithmetic inside the body is the
+      * base's. Only the bound answers differently.
+      */
+    "a bound written over the base is still satisfied by the subtype" in {
+      run("""type Age = int within 0..150
+            |twice[T: Add](x: T) -> T = x + x
+            |val a: Age = twice(Age(3))
+            |print(int(a))""".stripMargin) shouldBe "6\n"
+    }
+    "and the body's arithmetic is the base's, so a parameter solved from the annotation adds" in {
+      run("""type Age = int within 0..150
+            |sum[T: Add](a: T, b: T) -> T = a + b
+            |val a: Age = sum(Age(1), Age(2))
+            |print(int(a))""".stripMargin) shouldBe "3\n"
     }
 
     /** Only the two bounds. Every other attribute answers in a type of its own — `Valid` a `bool`,

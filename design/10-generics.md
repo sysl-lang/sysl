@@ -174,6 +174,20 @@ reached the parameter it is refused rather than defaulted — `one(null)` on `on
 nothing to read and inference does not invent a pointee. **A closure argument waits for the same
 reason**, its parameter types coming from the bound rather than from itself.
 
+**A parameter is solved to the type that was written, and a transparent subtype (`16 §1`) is a type
+that was written.** So `type Age = int within 0..150` and `widest[T]() -> T = T::Max` answer `Age`'s
+150 down all three routes — `widest[Age]()`, `widest(anAge)`, and `val a: Age = widest()` — rather
+than `int`'s maximum down the last. The three have to agree, because nothing distinguishes them from
+the reader's side: each is a way of saying which type this call is at, and the answer cannot depend
+on which one was available.
+
+**That a transparent subtype *is* its base does not make it the same thing to bind a parameter to**,
+and this is the one place the two come apart. §1's rule is about agreement — an `Age` stands where an
+`int` is asked for, and the reverse — and it holds unchanged for every value that flows. A **type
+parameter** is not a value: it is a name for the type a body is being written about, and the body may
+ask it questions its base would answer differently. Binding the base would make `widest[Age]()` hand
+back `int`'s maximum, which is not defensible to whoever wrote the type argument.
+
 **A parameter that names no type parameter is not part of the question**, and its argument is
 checked against it exactly as a plain callee's is. This is worth saying because inference has to
 look at the arguments before it knows what anything is, which would otherwise cost a generic callee

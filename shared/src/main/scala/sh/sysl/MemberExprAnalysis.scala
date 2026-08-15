@@ -342,6 +342,16 @@ trait MemberExprAnalysis extends ExprSupport {
       case (Some(lo), Some(hi)) => (lo, hi)
       case _                    => err(s"'${qn(key)}::$attr' needs a 'within' range")
 
+    /** One extreme of the subtype: the end the range names where it names one, the base's otherwise.
+     * A `where` predicate narrows the type without saying to what, so an end it leaves open is
+     * refused rather than answered by the base — `type Small = int where self < 10` would otherwise
+     * report `int`'s maximum as a `Small`, which is a value the produce site traps on.
+     */
+    def extreme(end: Option[BigDecimal], ofBase: => BigInt): BigInt = end match
+      case Some(v)                  => v.toBigInt
+      case None if c.predFn.isEmpty => ofBase
+      case None                     => err(s"'${qn(key)}::$attr' needs a 'within' range")
+
     def noArgs(): Unit = if args.nonEmpty then err(s"'${qn(key)}::$attr' takes no arguments")
 
     def oneArg(want: Type): TExpr =
@@ -364,8 +374,19 @@ trait MemberExprAnalysis extends ExprSupport {
       // written, `Min`/`Max` the extremes the type can hold. Refusing `Min` on the one type whose
       // whole purpose is bounds would be the odd outcome — and a reader who learned `Min` on `u32`
       // should not have to learn that a subtype of `u32` renamed it.
-      case "Min" => noArgs(); TIntLit(ranged._1.toBigInt, c)
-      case "Max" => noArgs(); val (_, hi) = ranged; TIntLit((if c.exclusiveHi then hi - 1 else hi).toBigInt, c)
+      //
+      // **An end the declaration does not narrow is the base's**, because that is what the type can
+      // hold. This is the case a `c type` (`15 §7`) is always in — it lowers to a transparent subtype
+      // carrying no range at all — and asking a measured `size_t` for its maximum is asking about the
+      // integer C said it is. A `where` predicate is the exception and keeps the refusal: it narrows
+      // the type without saying where to, so its extremes are not something to read off a
+      // declaration. `First` and `Last` still need a range whatever the predicate says, and that
+      // asymmetry is the same one the paragraph above draws — they name the ends of a range as
+      // *written*, and an unranged subtype has none.
+      case "Min" => noArgs(); TIntLit(extreme(c.lo, Type.minOf(base)), c)
+      case "Max" =>
+        noArgs()
+        TIntLit(extreme(c.hi.map(hi => if c.exclusiveHi then hi - 1 else hi), Type.maxOf(base)), c)
       case "Valid" => val x = oneArg(base); ranged; TConstrainedValid(x, c)
       case "Succ"  => val x = oneArg(c); ranged; TConstrainedStep(x, c, up = true, c)
       case "Pred"  => val x = oneArg(c); ranged; TConstrainedStep(x, c, up = false, c)

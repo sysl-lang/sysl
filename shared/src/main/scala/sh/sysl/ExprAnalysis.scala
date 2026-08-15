@@ -149,12 +149,14 @@ trait ExprAnalysis
             "'get()' hands back for one")
         case _ => coerce(analyzeValue(expr, Some(w)), w)
 
-    // A value produced into a transparent constrained subtype is analyzed at the subtype's base — so
-    // a literal and arithmetic type as that base — and then checked into the subtype. A value that
-    // does not agree with the base is left unwrapped for the caller to diagnose, and one that already
-    // has this exact subtype is not re-checked.
+    // A value produced into a transparent constrained subtype is analyzed at the **subtype**, and
+    // then checked into it. The expectation is passed down whole rather than as the base because a
+    // type parameter is solved from it: `val a: Age = widest()` binds `T` to what the reader wrote,
+    // agreeing with the two routes that already do — a written argument, and an argument's own type.
+    // Nothing else needs the base, since every reading of an expectation that must see through a
+    // transparent subtype already goes through `repr`, which is the identity `disagree` uses.
     case Some(c: Type.Constrained) if !c.derived =>
-      val v = analyzeValue(expr, Some(c.base))
+      val v = analyzeValue(expr, Some(c))
       if disagree(v.ty, c.base) then v
       else if v.ty == c then v
       else checkInto(v, c)

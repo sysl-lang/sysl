@@ -19,6 +19,15 @@ class TypeAttrErrorTests extends AnyFreeSpec with CodegenSupport {
     err("type Even = int where value % 2 == 0\nprint(Even::First)") should include("needs a 'within' range")
   }
 
+  /** `Min` and `Max` are the two that fall back to the base where the declaration narrows nothing —
+    * an unranged subtype can hold whatever the integer can. A **predicate** is not that case: it
+    * narrows the type without saying to what, so reporting the base's extreme would hand back a
+    * value the produce site traps on.
+    */
+  "and so is a bound on a predicate-only type, which narrows without saying where to" in {
+    err("type Small = int where value < 10\nprint(Small::Max)") should include("needs a 'within' range")
+  }
+
   "a bounded attribute rejects the wrong arity" - {
     "First takes no arguments" in {
       err(Age + "print(Age::First(1))") should include("takes no arguments")

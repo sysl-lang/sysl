@@ -293,6 +293,17 @@ what a `within`-ranged integer subtype offers:
 | `T::Pred(x)` | the previous value | a `T` from a `T`; traps at `T::First` |
 | `T::Range` | the range itself | only as a `for` loop's iterable, `First..Last` inclusive, the variable a `T` |
 
+**And they come apart where a subtype narrows NOTHING, which is where the distinction earns itself.**
+A subtype with no `within` range has no declared sequence, so `First` and `Last` are refused — but it
+can still hold whatever its base can, so `Min` and `Max` answer the base's extremes, in the subtype.
+That is the case a **`c type`** (`15 §7`) is always in: it lowers to a transparent subtype carrying no
+range, and asking a measured `size_t` for its maximum is asking about the integer C said it is.
+Refusing there would have the subtype claim to be a different type from the one §1 says it is.
+
+**A `where` predicate is not that case and keeps the refusal.** It narrows the type without saying to
+what, so there is no extreme to read off the declaration — `type Small = int where it < 10` would
+otherwise report `int`'s maximum as a `Small`, which is precisely a value §4's produce site traps on.
+
 **`Min`/`Max` are not aliases of `First`/`Last`, and the reason matters where they are not equal.**
 `First` and `Last` name the ends of a *declared sequence*; `Min` and `Max` the extremes a type can
 hold. A `within` range is written in order, so the two questions have the same answer here and both
@@ -303,11 +314,18 @@ discriminants may be explicit and non-contiguous, so the first-declared variant 
 smallest one (`09 §2`).
 
 **Every attribute but `Valid` speaks the subtype.** A bound of `T` is a value of `T`, the step from
-one `T` is another, and the values `Range` walks are `T`'s. This is invisible on a transparent
+one `T` is another, and the values `Range` walks are `T`'s. This is nearly invisible on a transparent
 subtype, where `T` and its base agree anyway (§1) — it is what makes the set usable on a **derived**
 one, which is otherwise the only kind of type whose own attributes would have to be cast back into
 it. A `new` subtype exists to stay out of its base's traffic, and an attribute surface that handed
 back the base would make its own declaration the thing you had to undo to use it.
+
+**Nearly, because a bound is the one answer that can fall outside the subtype.** `Age::Max` is 150
+and `int::Max` is not an `Age` at all, so which of the two a name stands for is a question with a
+visible answer — and it is the *only* such question, since every value the two readings agree on is
+by construction a value that cannot tell them apart. It matters where the name is a **type
+parameter**: `10` rules that one is solved to the type that was written, so a generic asked for
+`T::Max` at an `Age` answers `Age`'s, however the call said `Age`.
 
 `Valid` is the exception and the asymmetry is its job: it takes the **base**, because asking whether
 a value is a `T` is only a question about something that is not one yet. Handed a `T` it is refused,

@@ -116,6 +116,46 @@ class CTypeTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pa
             |""".stripMargin) shouldBe "true\n"
     }
 
+    /** **Its bounds are the measured integer's**, asked of C in the same program so that the claim
+      * is agreement rather than transcription. A `c type` is the one transparent subtype carrying no
+      * `within` range at all, so this is the case that says `16 §1` holds for the attributes too: a
+      * measured `size_t` *is* the integer it turned out to be, and asking its maximum asks about
+      * that integer.
+      */
+    "and its maximum is the maximum of the integer C said it is" in {
+      run("""@include("<stddef.h>")
+            |
+            |c const
+            |    W: usize = "sizeof(size_t)"
+            |
+            |c type
+            |    Size = "size_t"
+            |
+            |print(str(u128(Size::Max) == (1u128 << u128(W * 8)) - 1), str(Size::Min == 0))
+            |""".stripMargin) shouldBe "true true\n"
+    }
+
+    /** The same bound through a **type parameter**, which is the route a library takes. `10` solves a
+      * parameter to the type that was *written*, so the annotation on the binding puts `Size` in `T`
+      * and the answer is `Size`'s — the measured integer's, again.
+      */
+    "and a generic solved from it answers the same bound" in {
+      run("""@include("<stddef.h>")
+            |
+            |c const
+            |    W: usize = "sizeof(size_t)"
+            |
+            |c type
+            |    Size = "size_t"
+            |
+            |widest[T]() -> T = T::Max
+            |
+            |val m: Size = widest()
+            |
+            |print(str(u128(m) == (1u128 << u128(W * 8)) - 1))
+            |""".stripMargin) shouldBe "true\n"
+    }
+
     /** The measured type reaches C in the other direction too. An `@export`ed function taking one is
       * an ordinary export — `ExportCheck.crosses` reads a constrained subtype as its base — and the
       * header spells the integer rather than the C name it came from, which is right: the typedef
