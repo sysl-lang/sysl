@@ -79,6 +79,11 @@ with whichever sibling happened to be read first. The location is the *driver's*
 what walks the tree — so a file handed to the compiler with no project around it carries none, and
 its header is then the whole of what says which module it is in.
 
+**One kind of directory is transparent to this rule and is the only one**: a directory named
+`__<os>__` selects source for an operating system and contributes no segment to any name, so a file
+inside one belongs to the module of the directory that holds it (§5). Everything above is otherwise
+exact — the path is the name.
+
 A file with **no header at all** is in the **anonymous root module**, whose name is the empty path.
 This is what lets a program be one file with no ceremony — the one-file case is not a special form,
 it is a module that happens to be unnamed — and it is also why a file with nothing in it is a file
@@ -523,22 +528,59 @@ module oskit.arch               module oskit.arch
   of the two ways to write the mistake. The diagnostic lands at the reference for the same reason
   `alloc`'s lands at the call: that is the line a reader has to change.
 
-## 5. Platform selection rides the same name
+## 5. Platform selection rides the same name — `__<os>__`
 
-A module's members may be **split across platform-specific files** — `cpu.aarch64.sysl` and
-`cpu.x86_64.sysl` contributing to the same `oskit.arch` — with the active target selecting which
-file contributes. The **module name is unchanged by the platform suffix**: importers write
-`import oskit.arch` and name `oskit.arch` members regardless of which platform's file is compiled
-in, which is what lets the kernel import one arch module and get whichever platform it was built
-for (`cross-platform.md`, and the pattern the old compiler reached for with its path-prefix
-relaxation).
+A module's implementation may be **split across operating systems** by a directory named
+`__<os>__`. Such a directory **selects but does not name**: it is not a module, contributes no
+segment to any name, and the files inside it belong to the directory that *holds* it, exactly as if
+they had been written there.
 
-The **exact suffix grammar and the resolution rule** — which filename shapes mark a platform, how
-the active target is chosen, and the `package.hocon` schema that ties it together — belong to
-**`packages.md`**, which now carries the schema; the suffix grammar itself is the one part of that
-promise still unwritten. This chapter fixes
-only that the *module identity* is invariant under platform selection; the file axis lives below
-the module name, not beside it.
+```
+library/sysl/posix/time.sysl              module sysl.posix.time — every target
+library/sysl/posix/__linux__/clock.sysl   module sysl.posix.time — Linux only
+library/sysl/posix/__linux__/clock.c      compiled on Linux, ABSENT everywhere else
+library/sysl/posix/__macos__/clock.sysl   module sysl.posix.time — macOS only
+```
+
+An importer writes `import sysl.posix.time` and names its members, and which files went into it is
+not something they can see or have to know. That is what this section always fixed — **module
+identity is invariant under platform selection** — and it is now a rule about directories rather
+than a promise about a filename grammar.
+
+**The vocabulary is exactly the operating systems `targets.md` names**, and it is derived from that
+enum rather than written down a second time: `__macos__`, `__linux__`, `__windows__`,
+`__freestanding__`. A directory whose name has the `__x__` shape and is not one of them is an
+**error** rather than a silent miss — a misspelling that quietly compiles nothing is the failure
+this shape exists to make impossible, and it would present as a missing function.
+
+**Exactly one operating system is true of a target**, which is what makes the rest fall out with no
+further rules: at most one `__<os>__` directory is selected at any one level, so there is no
+precedence order to state, no tie to break, and nothing to say about whether selection is additive.
+Files sitting directly in a directory are compiled for **every** target; the folders add to them
+rather than replacing them.
+
+**A `__<os>__` directory may not be nested inside another.** Two axes — an OS and a processor, an OS
+and a libc — are not what this mechanism is for: the second axis is `#if` inside the file
+(`targets.md § Conditional compilation`), or the C preprocessor inside the `.c`, which is where the
+world already keeps that knowledge.
+
+**Why a directory and not a filename suffix.** This section used to specify `cpu.aarch64.sysl`, and
+the reason it is replaced is that the interesting per-platform artifact is not sysl at all: it is
+**C**. A `.c` file cannot carry a sysl attribute and will not be given a sysl-shaped name, so any
+selector living inside the source text, or in the filename grammar of sysl files, leaves the C
+behind — and the C is the whole unlock, because it is what lets a module reach a system header that
+`c const` cannot reach from a cross-compile (`15 §7`). A directory takes the `.sysl` and the `.c`
+together, which is also how the two are written.
+
+**An unselected directory is never read.** Its files are not parsed, not analyzed, and not
+fingerprinted, so a program builds on macOS with a Linux implementation that does not compile — and
+the only thing that finds it is a build on Linux. That cost is accepted deliberately: sysl cannot
+cross-link to a hosted target without that target's sysroot (`targets.md § Open`), so there is no
+arrangement in which one machine could have checked both.
+
+The **smallest thing that differs** goes in the folder. The public surface is written once in the
+common files and calls down into a private primitive that each OS supplies; a public API duplicated
+per OS is two APIs that will drift.
 
 ## 6. The module graph is acyclic
 

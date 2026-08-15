@@ -45,13 +45,13 @@ import io.github.edadma.cross_platform.*
  * Writing it is not fatal if it fails: a read-only checkout should still build, and the alternative
  * is refusing to compile over a file that exists to be compared against next time.
  */
-private def dependencies(cfg: Config, project: PackageConfig, roots: List[String])
+private def dependencies(cfg: Config, project: PackageConfig, roots: List[String], os: Os)
     : Either[String, PackageSources] =
   for
     fromRoots <- libDependencies(roots)
     declared   = project.dependencies ::: fromRoots
     got       <- if declared.isEmpty then Right(PackageSources.none)
-                 else resolveDependencies(cfg, project.copy(dependencies = declared), roots)
+                 else resolveDependencies(cfg, project.copy(dependencies = declared), roots, os)
   yield got
 
 /** Resolving a non-empty dependency list against this machine's cache, and recording what it got.
@@ -60,7 +60,7 @@ private def dependencies(cfg: Config, project: PackageConfig, roots: List[String
  * modules sit in the project's own name space, so they are names a dependency may not also claim
  * (`§ 9`), and nothing in a manifest tells `Resolve` they are there.
  */
-private def resolveDependencies(cfg: Config, project: PackageConfig, roots: List[String])
+private def resolveDependencies(cfg: Config, project: PackageConfig, roots: List[String], os: Os)
     : Either[String, PackageSources] = {
   val root = projectRoot(cfg.file)
 
@@ -68,7 +68,7 @@ private def resolveDependencies(cfg: Config, project: PackageConfig, roots: List
     cache <- Fetch.cacheRoot
     sums  <- readSums(root)
     graph <- Resolve.graph(root, project, sums, cache, roots)
-    files <- collectPackages(graph)
+    files <- collectPackages(graph, os)
   yield
     if graph.sumsChanged then writeSums(root, graph.sums)
     files
@@ -91,11 +91,11 @@ private def libDependencies(roots: List[String]): Either[String, List[Dependency
 /** Each fetched package's source, filed under the canonical prefix that keeps its module names
  * apart from every other package's — and each one's directory, which is a tree the C walk visits.
  */
-private def collectPackages(graph: Resolve.Graph): Either[String, PackageSources] = {
+private def collectPackages(graph: Resolve.Graph, os: Os): Either[String, PackageSources] = {
   val fetched = graph.packages.filterNot(_.isRoot)
 
   try
-    val each = fetched.map(p => p -> Project.collect(p.root))
+    val each = fetched.map(p => p -> Project.collect(p.root, Some(os)))
 
     each.find(_._2.isEmpty) match
       case Some((p, _)) => Left(s"'${p.canonical}' holds no sysl source files")

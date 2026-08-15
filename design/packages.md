@@ -649,9 +649,12 @@ code reaches.
 - **Build scripts, install hooks, and plugins** — §7, and this one is load-bearing.
 - **A lockfile** — MVS makes version selection a function of the manifests (§5); `sysl.sum` covers
   content (§6).
-- **Feature flags / conditional compilation per dependency.** `targets.md` already has `#if` on
-  target facts, which is the case that has come up. Cargo-style features interact with MVS badly
-  enough that Go declined them too.
+- **Feature flags / conditional compilation per dependency.** Cargo-style features interact with MVS
+  badly enough that Go declined them too, and the cases that have actually come up are all *target*
+  facts rather than consumer choices: `targets.md`'s `#if` answers them inside a file, and `13 §5`'s
+  `__<os>__` directory answers them for a whole implementation — including its `.c`, which is the
+  half no flag could have reached. **Both are the target's answer and neither is the consumer's**,
+  which is exactly the property that keeps resolution a function of the manifests.
 - **Workspaces / multi-package repositories.** A `path` dependency covers developing two packages
   together, which is the part that has actually been wanted.
 - **Publishing.** There is nothing to publish *to* — a tagged git repository is the published form.

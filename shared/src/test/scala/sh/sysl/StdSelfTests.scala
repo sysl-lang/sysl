@@ -71,7 +71,7 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
       }
 
     val (built, tests) =
-      Compiler.compileTests(Project.collect(root.get), Nil, target, precompiled, Some(std),
+      Compiler.compileTests(Project.collect(root.get, Some(target.os)), Nil, target, precompiled, Some(std),
                             LibraryArtifact.std) match {
         case Right(result) => result
         case Left(err)     => fail(s"the standard library did not compile as a test build:\n$err")

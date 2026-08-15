@@ -23,24 +23,25 @@ private[sysl] def execute(cfg: Config): Int = {
   if cfg.command == "help" then return printUsage()
   if cfg.command == "targets" then return listTargets()
 
-  val sources =
-    try Project.collect(cfg.file)
-    catch case e: Exception => return fail(s"cannot read ${cfg.file}: ${e.getMessage}")
-
-  if sources.isEmpty then return fail(s"${cfg.file} holds no sysl source files")
-
-  // The files, in the order the walk found them, which is the order the compiler reads them in.
-  if cfg.verbose then
-    trace(s"${sources.length} source file(s) under ${cfg.file}")
-    sources.foreach(src => trace(s"  read ${src.name}"))
-
   // Rendering is a **source-level** job and stops here, above everything a compilation needs. It
   // asks for no target, no standard module and no library, which is not a shortcut but the whole
   // reason the command is usable: a package's prose is worth reading on a machine that could not
   // build it, and a document that could only be produced by a successful build would be missing
   // exactly when somebody wanted it.
-  if cfg.command == "weave" then return weave(cfg, sources)
-  if cfg.command == "tangle" then return tangle(cfg, sources)
+  //
+  // **So it reads every per-OS directory** (`Project.Every`), which is the only answer available with
+  // no target chosen and is the right one either way: two implementations of one function are two
+  // things worth reading, and `tangle` writes the tree back out with its shape intact.
+  if cfg.command == "weave" || cfg.command == "tangle" then
+    val rendered =
+      try Project.collect(cfg.file, Project.Every)
+      catch
+        case e: SelectionError => return fail(e.getMessage)
+        case e: Exception      => return fail(s"cannot read ${cfg.file}: ${e.getMessage}")
+
+    if rendered.isEmpty then return fail(s"${cfg.file} holds no sysl source files")
+
+    return if cfg.command == "weave" then weave(cfg, rendered) else tangle(cfg, rendered)
 
   val project = readPackageConfig(cfg.file) match
     case Left(err) => return fail(err)
@@ -49,6 +50,27 @@ private[sysl] def execute(cfg: Config): Int = {
   val target = chooseTarget(cfg.target, project.defaultTarget) match
     case Left(err) => return fail(err)
     case Right(t)  => t
+
+  // **Below the target, because which files a tree holds is a question the target answers** — a
+  // module's Linux implementation and its macOS one are different files, and `13 §5` selects between
+  // them by the directory they sit in. This used to sit above everything, which was free while a
+  // tree meant the same thing to every machine.
+  //
+  // A malformed one is reported as itself rather than as a tree that would not read. The two are
+  // different mistakes: one is a name somebody typed wrong, which the message can name and explain,
+  // and the other is a permission or a missing path.
+  val sources =
+    try Project.collect(cfg.file, Some(target.os))
+    catch
+      case e: SelectionError => return fail(e.getMessage)
+      case e: Exception      => return fail(s"cannot read ${cfg.file}: ${e.getMessage}")
+
+  if sources.isEmpty then return fail(s"${cfg.file} holds no sysl source files")
+
+  // The files, in the order the walk found them, which is the order the compiler reads them in.
+  if cfg.verbose then
+    trace(s"${sources.length} source file(s) under ${cfg.file}")
+    sources.foreach(src => trace(s"  read ${src.name}"))
 
   val provides = project.provides(target.name)
 
@@ -112,7 +134,7 @@ private[sysl] def execute(cfg: Config): Int = {
   val fetched =
     if cfg.command == "build-lib" then PackageSources.none
     else
-      dependencies(cfg, project, roots) match
+      dependencies(cfg, project, roots, target.os) match
         case Left(err) => return fail(err)
         case Right(d)  => d
 
@@ -191,8 +213,10 @@ private[sysl] def execute(cfg: Config): Int = {
     case None    => ()
 
   val collected =
-    try roots.map(root => root -> Project.collect(root))
-    catch case e: Exception => return fail(s"cannot read a library: ${e.getMessage}")
+    try roots.map(root => root -> Project.collect(root, Some(target.os)))
+    catch
+      case e: SelectionError => return fail(e.getMessage)
+      case e: Exception      => return fail(s"cannot read a library: ${e.getMessage}")
 
   collected.find(_._2.isEmpty) match
     case Some((root, _)) => return fail(s"$root holds no sysl source files")
@@ -325,7 +349,7 @@ private[sysl] def execute(cfg: Config): Int = {
 
   val native =
     if links(cfg.command) then
-      NativeSources.build(NativeSources.of(cfg.file :: roots ::: fetched.roots), target, cfg.optimize,
+      NativeSources.build(NativeSources.of(cfg.file :: roots ::: fetched.roots, target.os), target, cfg.optimize,
         paths, cfg.verbose) match
         case Left(err)    => return fail(err)
         case Right(built) => built

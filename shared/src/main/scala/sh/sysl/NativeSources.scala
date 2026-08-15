@@ -52,7 +52,8 @@ object NativeSources {
    * `Project.cSources`'s own rule and the right one here too: naming a file compiles that file alone
    * (`13 §1`), so there is no tree for C to have travelled with.
    */
-  def of(roots: List[String]): List[List[Source]] = roots.map(Project.cSources).filter(_.nonEmpty)
+  def of(roots: List[String], os: Os): List[List[Source]] =
+    roots.map(Project.cSources(_, Some(os))).filter(_.nonEmpty)
 
   /** Compiles them, or says which one did not compile.
    *

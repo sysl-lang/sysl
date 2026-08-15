@@ -320,7 +320,7 @@ object Stdlib {
   def read(name: String, metadata: String, target: Target, allocator: Allocator = Allocator.c)
       : Either[String, (Stdlib, Set[String])] =
     LibraryArtifact.read(name, metadata, target, allocator).flatMap((units, precompiled, source) =>
-      if source == Std.fingerprint then Right((new Stdlib(units), precompiled))
+      if source == Std.fingerprint(target.os) then Right((new Stdlib(units), precompiled))
       else
         Left(s"$name was built from a different standard module than this compiler's — " +
           "rebuild it with 'sysl build-lib <library root> --std'"))
@@ -356,8 +356,9 @@ object Stdlib {
                     allocator: Allocator = Allocator.c): Either[String, Unit] =
     for
       archiver <- Toolchain.findAr(ar)
-      built    <- LibraryArtifact.build(Std.sources, target, LibraryArtifact.std,
-                                        Some(fromSource(target)), allocator = allocator)
+      built    <- LibraryArtifact.build(Std.sources(target.os), target, LibraryArtifact.std,
+                                        Some(fromSource(target)), native = Std.cSources(target.os),
+                                        allocator = allocator)
       _        <- {
                     val staging  = createTempDirectory("sysl-std-")
                     val code     = s"$staging/${LibraryArtifact.codeMember}"

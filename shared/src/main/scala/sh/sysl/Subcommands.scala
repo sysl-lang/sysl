@@ -140,7 +140,7 @@ private def buildForC(cfg: Config, compiled: Compiled, target: Target, named: Op
   // path inside its own tree, so two trees can still land on one name — which `collisions` reports,
   // rather than `ar r` replacing by name and shipping an archive quietly missing half of what one of
   // them defined.
-  val native = roots.flatMap(Project.cSources)
+  val native = roots.flatMap(Project.cSources(_, Some(target.os)))
 
   LibraryArtifact.collisions(native) match
     case Some(err) => return fail(err)
@@ -282,7 +282,7 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
   // compiled to (`15 §7`). Checked for a name collision here rather than after the build, for the
   // same reason the archiver is: the compile is the slow part, and a name that cannot be archived is
   // known before any of it has run.
-  val native = Project.cSources(cfg.file)
+  val native = Project.cSources(cfg.file, Some(target.os))
 
   LibraryArtifact.collisions(native) match
     case Some(err) => return fail(err)

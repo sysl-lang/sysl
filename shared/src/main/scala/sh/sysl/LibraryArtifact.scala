@@ -218,7 +218,7 @@ object LibraryArtifact {
    */
   def stdDefault(target: Target, allocator: Allocator = Allocator.c): String =
     cacheDirectory
-      .map(c => s"$c/sysl/${BuildInfo.version}-${Std.fingerprint}-${target.name}" +
+      .map(c => s"$c/sysl/${BuildInfo.version}-${Std.fingerprint(target.os)}-${target.name}" +
         s"-${allocator.alloc}-${allocator.free}/std$extension")
       .getOrElse(stdLocal)
 

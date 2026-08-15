@@ -11,6 +11,15 @@ import io.github.edadma.cross_platform.*
  * compiles a program written on disk asks the same question, and asking it a second way would let
  * the two disagree about what a project is.
  */
+/** What a malformed per-OS directory raises (`13 §5`).
+ *
+ * It has a type of its own because one caller — `Project.modules` — deliberately tolerates a
+ * directory it cannot read, and a mistake in the tree must not be swallowed by that tolerance. There
+ * is no source position to hang it on: the mistake is a *name on disk*, so the message names the
+ * directory and the driver reports it as it reports any other unreadable tree.
+ */
+final class SelectionError(message: String) extends Exception(message)
+
 object Project {
 
   /** The source files one invocation compiles.
@@ -21,10 +30,26 @@ object Project {
    * holds its `module` header to.
    *
    * Naming a single **file** compiles that file alone, as the root module with nothing else in it.
+   *
+   * `os` is which operating system's per-OS directories to take (`13 §5`), and it has **no default**
+   * on purpose: a walk that guessed would drop half a tree with nothing said, which is the one
+   * failure mode this whole axis has. `None` takes every one of them, which is what a command that
+   * reads a tree rather than compiling it wants — see [[Every]].
    */
-  def collect(path: String): List[Source] =
-    if isDirectory(path) then walk(path, Nil, sysl)
+  def collect(path: String, os: Option[Os]): List[Source] =
+    if isDirectory(path) then walk(path, Nil, sysl, os, None)
     else List(Source(path, readFile(path), Nil))
+
+  /** The selection a command that **renders** a tree makes: every per-OS directory, because there is
+   * no target to choose one with and no compilation for the extra files to collide in.
+   *
+   * `weave` and `tangle` are the callers. Both are deliberately above target selection — a package's
+   * prose is worth reading on a machine that could not build it — and both keep working here for the
+   * same reason: `weave` renders a document, where two implementations of one function are two things
+   * worth reading, and `tangle` writes the tree back out with its shape intact, `__<os>__` directories
+   * and all.
+   */
+  val Every: Option[Os] = None
 
   /** The two suffixes a program may be written under: the ordinary one, and the literate one whose
    * program is the indented part of a Markdown document (`Literate`). A directory may hold both, and
@@ -62,9 +87,13 @@ object Project {
    * Naming a single file is not offered, and gets `Nil` rather than an error. Naming a file compiles
    * that file alone (`13 §1`), so there is no tree for C to have travelled with — and a lone C file
    * is not a program.
+   *
+   * **The per-OS directories of `13 §5` matter most here**, because C is what they exist for: a
+   * module binds one system's header in a `.c` under `__linux__/` and another's under `__macos__/`,
+   * and neither file is compiled — or read — on a target it was not written for.
    */
-  def cSources(path: String): List[Source] =
-    if isDirectory(path) then walkModules(path, Nil, List(".c")) else Nil
+  def cSources(path: String, os: Option[Os]): List[Source] =
+    if isDirectory(path) then walkModules(path, Nil, List(".c"), os, None) else Nil
 
   /** The modules a tree offers to something outside it: the shallowest directories under `root` that
    * hold source, as dotted paths (`13 §1`).
@@ -84,28 +113,43 @@ object Project {
    * A file sitting directly in `root` belongs to the anonymous root module, which has no name to
    * import and so is not offered.
    */
+  /** **Every per-OS directory is taken here, whatever machine is asking.** What a package *offers* is
+   * a property of the package rather than of the build consuming it, so a name that came and went
+   * with the target would make a dependency's mount resolve on one machine and not on another — and
+   * the collision check below it would be checking a different table each time. Taking every one is
+   * also the safe direction for that check: it can only find more collisions, never fewer.
+   */
   def modules(root: String): Set[String] = {
-    def under(path: String, dir: List[String]): List[String] = {
-      val entries = try listFiles(path).toList.sorted catch case _: Exception => Nil
+    def under(path: String, dir: List[String], within: Option[String]): List[String] = {
+      // A directory that will not list is nothing to offer and never was — a dependency's root may
+      // be anything on disk. A *malformed* selector is a different thing entirely and travels: it is
+      // a mistake somebody made in the tree, and a package that silently offered nothing because of
+      // one would be the exact failure `selected` exists to refuse.
+      val (files, subs) =
+        try contents(path, Every, within)
+        catch
+          case e: SelectionError => throw e
+          case _: Exception      => (Nil, Nil)
 
-      if dir.nonEmpty && entries.exists(f => isFile(f) && sysl.exists(f.endsWith)) then List(dir.mkString("."))
+      if dir.nonEmpty && files.exists(f => sysl.exists(f.endsWith)) then List(dir.mkString("."))
       else
-        entries.filter(isDirectory).filterNot(d => basename(d).startsWith("."))
-          .flatMap(d => under(d, dir :+ basename(d)))
+        subs.filterNot((d, _) => basename(d).startsWith("."))
+          .flatMap((d, w) => under(d, dir :+ basename(d), w))
     }
 
-    under(root, Nil).toSet
+    under(root, Nil, None).toSet
   }
 
   /** One directory of the project: its own files of the wanted kinds, then the sub-directories under
    * it. A directory holding no source is not a module and contributes nothing; it is still walked,
    * since modules further down are reached through it.
    */
-  private def walk(path: String, dir: List[String], exts: List[String]): List[Source] = {
-    val entries = listFiles(path).toList.sorted
-    val here    = entries.filter(f => isFile(f) && exts.exists(f.endsWith)).map(f => Source(f, readFile(f), dir))
+  private def walk(path: String, dir: List[String], exts: List[String], os: Option[Os],
+                   within: Option[String]): List[Source] = {
+    val (files, subs) = contents(path, os, within)
+    val here          = files.filter(f => exts.exists(f.endsWith)).map(f => Source(f, readFile(f), dir))
 
-    here ::: entries.filter(isDirectory).flatMap(sub => walk(sub, dir :+ basename(sub), exts))
+    here ::: subs.flatMap((sub, w) => walk(sub, dir :+ basename(sub), exts, os, w))
   }
 
   /** `walk`, taking a directory's own files only where that directory is a **module** — where it
@@ -121,15 +165,82 @@ object Project {
    * namespaced by reverse DNS has no sysl at its root, and the C belonging to no single module goes
    * there. `dir` is empty at exactly one place and that is the place.
    */
-  private def walkModules(path: String, dir: List[String], exts: List[String]): List[Source] = {
-    val entries = listFiles(path).toList.sorted
-    val files   = entries.filter(isFile)
-    val mine    = dir.isEmpty || files.exists(f => sysl.exists(f.endsWith))
-    val here    = if mine then files.filter(f => exts.exists(f.endsWith)).map(f => Source(f, readFile(f), dir))
-                  else Nil
+  private def walkModules(path: String, dir: List[String], exts: List[String], os: Option[Os],
+                          within: Option[String]): List[Source] = {
+    val (files, subs) = contents(path, os, within)
+    val mine          = dir.isEmpty || files.exists(f => sysl.exists(f.endsWith))
+    val here          = if mine then files.filter(f => exts.exists(f.endsWith)).map(f => Source(f, readFile(f), dir))
+                        else Nil
 
-    here ::: entries.filter(isDirectory).flatMap(sub => walkModules(sub, dir :+ basename(sub), exts))
+    here ::: subs.flatMap((sub, w) => walkModules(sub, dir :+ basename(sub), exts, os, w))
   }
+
+  /** One directory's contents with per-OS selection already applied: the files that belong to it, and
+   * the sub-directories below it paired with whichever `__<os>__` directory each is inside.
+   *
+   * **This is the whole of the mechanism, and it is one function on purpose.** All three walks above
+   * split a listing into files and sub-directories and then apply a rule of their own; giving them a
+   * listing that has already had the selection folded into it means every one of those rules — the
+   * shallowest-module rule, `walkModules`' *is this a module*, the `dir` segments a `Source` carries
+   * — goes on being written once and goes on being true. A directory's files are its own plus the
+   * selected `__<os>__` child's, and its sub-directories are its own plus that child's: the folder
+   * disappears, which is exactly what `13 §5` says it does.
+   *
+   * The pairing is what carries the nesting refusal down. A sub-directory found inside a selected
+   * folder is under it however deep it goes, so `__linux__/fs/__macos__/` is refused for the same
+   * reason `__linux__/__macos__/` is, rather than quietly selecting nothing forever.
+   */
+  private def contents(path: String, os: Option[Os], within: Option[String])
+      : (List[String], List[(String, Option[String])]) = {
+    val entries            = listFiles(path).toList.sorted
+    val (dirs, files)      = entries.partition(isDirectory)
+    val (selectors, plain) = dirs.partition(d => marked(basename(d)))
+
+    // Every selector is validated, not only the ones this target takes — a misspelling in the Linux
+    // half is a mistake a macOS build should report, exactly as `Conditional` checks the conditions
+    // on branches it is not taking. What is *not* looked at is the inside of a folder this target did
+    // not select, which `13 §5` states outright: an unselected tree is never read.
+    val taken = selectors.filter { d =>
+      val which = selected(basename(d), within)
+
+      os.forall(_ == which)
+    }
+
+    val (nestedFiles, nestedSubs) = taken.map(d => contents(d, os, Some(basename(d)))).unzip
+
+    (files ::: nestedFiles.flatten,
+     plain.map(_ -> within) ::: nestedSubs.flatten)
+  }
+
+  /** Whether a directory's name has the shape that says *this selects rather than names*.
+   *
+   * The shape is matched before the spelling so that a name which was **meant** to select and is
+   * misspelled is an error rather than an ordinary directory — a `__linx__` read as a module would
+   * compile nothing on any target and be reported, eventually, as a missing function.
+   */
+  private def marked(name: String): Boolean =
+    name.length > 4 && name.startsWith("__") && name.endsWith("__")
+
+  /** Which operating system a `__<os>__` directory selects for, or the mistake it is.
+   *
+   * The vocabulary is `Os`'s own, through the spelling `Conditional` already gives it, so a new
+   * operating system reaches this by existing and the two places a source file can name one cannot
+   * come to disagree.
+   */
+  private def selected(name: String, within: Option[String]): Os = {
+    for outer <- within do
+      throw SelectionError(s"'$name' sits inside '$outer', and both select source for an operating " +
+        "system — a target has exactly one, so nothing could ever be selected by both. Two axes are " +
+        "'#if' inside a sysl file, or the C preprocessor inside a '.c' (`13 §5`)")
+
+    Os.values.find(o => spelling(o) == name).getOrElse(
+      throw SelectionError(s"'$name' names no operating system this compiler knows, and a directory " +
+        s"named '__<os>__' selects source for one. The ones there are: " +
+        Os.values.map(spelling).mkString(", ")))
+  }
+
+  /** What a per-OS directory is called for a given operating system. */
+  private[sysl] def spelling(os: Os): String = s"__${Conditional.osSymbol(os)}__"
 
   /** The last segment of a path, whichever separator the platform wrote it with. */
   def basename(path: String): String = {

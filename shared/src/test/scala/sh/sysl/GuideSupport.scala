@@ -29,7 +29,7 @@ trait GuideSupport extends Matchers { this: Assertions =>
     assume(Toolchain.clangAvailable, "clang not available")
     assume(isDirectory(dir), s"$dir is not reachable from the working directory")
 
-    Toolchain.compileAndRun(Project.collect(dir)) match {
+    Toolchain.compileAndRun(Project.collect(dir, Some(Target.default.os))) match {
       case Right((0, out))    => out
       case Right((code, out)) => fail(s"$dir exited with $code:\n$out")
       case Left(err)          => fail(s"$dir did not compile:\n$err")
@@ -49,7 +49,7 @@ trait GuideSupport extends Matchers { this: Assertions =>
     assume(Toolchain.clangAvailable, "clang not available")
     assume(isDirectory(dir), s"$dir is not reachable from the working directory")
 
-    val (built, tests) = Compiler.compileTests(Project.collect(dir), Nil) match {
+    val (built, tests) = Compiler.compileTests(Project.collect(dir, Some(Target.default.os)), Nil) match {
       case Right(result) => result
       case Left(err)     => fail(s"$dir did not compile:\n$err")
     }

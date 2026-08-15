@@ -172,7 +172,13 @@ object Conditional {
    */
   private case class Frame(line: Int, taken: Boolean, chosen: Boolean, elseLine: Int = 0)
 
-  private def osSymbol(os: Os): String = os match
+  /** What an operating system is called where a *source file* names one.
+   *
+   * Visible to the package because `Project`'s `__<os>__` directories select on the same vocabulary
+   * (`13 §5`), and they have to be the same words: `#if linux` and `__linux__/` are one reader's one
+   * idea, and two spellings of it would be a thing to look up rather than a thing to know.
+   */
+  private[sysl] def osSymbol(os: Os): String = os match
     case Os.MacOS        => "macos"
     case Os.Linux        => "linux"
     case Os.Windows      => "windows"

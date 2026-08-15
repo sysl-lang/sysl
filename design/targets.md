@@ -643,13 +643,18 @@ the trees a library ships are now a per-target answer. `13 §8` has the rest.
 
 ## Open
 
-- **The project config — designed in `packages.md`, and built.** `package.hocon` carries
-  per-target capability sets (`capabilities.md`'s `heap` / `os` / `posix`), and they are
-  parsed and enforced: a target that provides no allocator makes every module of the program
-  allocator-free with no clause written anywhere. **What is left open is filename-axis platform
-  selection**, and that alone — this item said "unbuilt" of the whole thing, five lines below a
-  header on this same page saying the capability sets were built, which is the ordinary way a status
-  claim written twice goes stale in one of its two places. The registry here is the fixed table that config
+- ~~**The project config**~~ **— built, and so is the source-selection axis it used to be waiting
+  on.** `package.hocon` carries per-target capability sets (`capabilities.md`'s `heap` / `os` /
+  `posix`), and they are parsed and enforced: a target that provides no allocator makes every module
+  of the program allocator-free with no clause written anywhere.
+
+  What this item held open after that was **filename-axis platform selection**, and it is closed by
+  being answered somewhere else: the axis is a **directory** named `__<os>__` (`13 §5`), not a
+  filename suffix, and it needs no `package.hocon` key at all — there is no sources block to write
+  one in, because sources are found by walking. The suffix was refused for a reason worth keeping:
+  the file that most needs selecting is a `.c`, which cannot carry a sysl-shaped name or a sysl
+  attribute, so a grammar over sysl filenames would have selected everything except the thing the
+  whole feature is for. The registry here is the fixed table that config
   extends, and deliberately does not try to be one: a target's *capabilities* are exactly the part
   a project has an opinion about. `packages.md § 2` states the boundary the other way round —
   **a config may add capabilities to a registry target, and may not overrule a measured ABI fact** —

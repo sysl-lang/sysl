@@ -35,7 +35,7 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
    * assemble the first into an object file.
    */
   private lazy val artifact: (String, String) =
-    LibraryArtifact.build(Std.sources, Target.default, LibraryArtifact.std) match
+    LibraryArtifact.build(Std.sources(Target.default.os), Target.default, LibraryArtifact.std) match
       case Right(r)  => r
       case Left(err) => fail(s"the standard module library did not build: $err")
 
@@ -68,10 +68,10 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
    * artifact was built amounts to.
    */
   private lazy val drifted: String = {
-    val edited = Std.sources.head
+    val edited = Std.sources(Target.default.os).head
 
     LibraryArtifact.build(
-      new Source(edited.name, edited.text + "\nunreachable() -> int = 1\n", edited.dir) :: Std.sources.tail,
+      new Source(edited.name, edited.text + "\nunreachable() -> int = 1\n", edited.dir) :: Std.sources(Target.default.os).tail,
       Target.default, LibraryArtifact.std) match
       case Right((_, meta)) => meta
       case Left(err)        => fail(s"the altered std did not build: $err")
@@ -235,12 +235,12 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
     }
 
     "and the fingerprint is what tells them apart" in {
-      LibraryArtifact.fingerprint(Std.sources) shouldBe Std.fingerprint
-      LibraryArtifact.fingerprint(Std.sources.reverse) shouldBe Std.fingerprint
+      LibraryArtifact.fingerprint(Std.sources(Target.default.os)) shouldBe Std.fingerprint(Target.default.os)
+      LibraryArtifact.fingerprint(Std.sources(Target.default.os).reverse) shouldBe Std.fingerprint(Target.default.os)
       LibraryArtifact.fingerprint(
-        Std.sources.map(s => new Source(s"/elsewhere/${Project.basename(s.name)}", s.text, s.dir)))
-        .shouldBe(Std.fingerprint)
-      LibraryArtifact.fingerprint(Std.sources.tail) should not be Std.fingerprint
+        Std.sources(Target.default.os).map(s => new Source(s"/elsewhere/${Project.basename(s.name)}", s.text, s.dir)))
+        .shouldBe(Std.fingerprint(Target.default.os))
+      LibraryArtifact.fingerprint(Std.sources(Target.default.os).tail) should not be Std.fingerprint(Target.default.os)
     }
 
     "and it is exactly the hash it says it is" in {
@@ -447,7 +447,7 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
     "and one library built two ways has one object half, whichever `Source` objects carried it" in {
       // A regression test, and the failure it guards is a silent one. Which declarations are held
       // back until something reaches them was decided by `Stdlib.owns` alone, which is identity on the
-      // `Source` — so building the standard module from `Std.sources`, the copy already in memory, held back
+      // `Source` — so building the standard module from `Std.sources(Target.default.os)`, the copy already in memory, held back
       // *every* function in it. Nothing reached any of them, and the artifact came out with an empty
       // object half: it still carried every tree, so every program compiled and ran, and the whole
       // point of precompiling was gone with nothing failing to say so. Read off disk the same files
@@ -455,7 +455,8 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
       // that module as supplied to it (`AnalyzerBase.suppliedByLibrary`).
       assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
 
-      val fromDisk = LibraryArtifact.build(Project.collect(StdRoot.root.get), Target.default, LibraryArtifact.std)
+      val fromDisk = LibraryArtifact.build(Project.collect(StdRoot.root.get, Some(Target.default.os)), Target.default,
+                                           LibraryArtifact.std)
 
       fromDisk match
         case Right((_, meta)) =>

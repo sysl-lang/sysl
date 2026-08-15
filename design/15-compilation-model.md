@@ -334,6 +334,14 @@ one, since a module may sit any depth below a directory that holds nothing itsel
 namespaced by reverse DNS has its modules at `sh/sysl/foo/` and nothing at all at the top, so a C
 file belonging to no single module has nowhere else to go.
 
+**A module's C may differ per operating system, and that is what `13 §5`'s `__<os>__` directory is
+for.** Such a directory is transparent — its `.c` is the holding module's C, on the targets it names
+and on no others — so a module binds `clock_gettime` on Linux and `clock_gettime_nsec_np` on macOS
+with two four-line files and no condition written anywhere. **This is the case the whole selection
+mechanism exists for**: everything else that varies by platform can be said with `#if` inside a sysl
+file, and a `.c` can carry no sysl attribute at all, so the path is the only place its selector could
+have gone. The unselected file is not compiled and is not read.
+
 The cost is that a vendored C library laid out in sub-directories of its own loses the ones holding
 no sysl, and a link error naming the symbols is the signal. That is the right trade rather than a
 regret: the looser rules either prune a pure-C directory *inside* a module just the same, or let the

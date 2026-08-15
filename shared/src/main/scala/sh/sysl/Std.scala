@@ -147,10 +147,15 @@ object Std {
    * agree with (`13 §1`). They are read by the same walk that reads a user's library, because they
    * *are* a library: `sysl build-lib library --std` is pointed at this same tree and gets these same
    * values.
+   *
+   * **A function of the operating system rather than a `lazy val`, because a library is a tree and a
+   * tree is a per-target answer** (`13 §5`). The library binds one system's `readdir` under
+   * `__linux__/` and another's under `__macos__/`, so what "the library's files" are is a question
+   * with a machine in it — the same shape [[parsed]] already had for the same reason one layer up.
    */
-  lazy val sources: List[Source] = root match
+  def sources(os: Os): List[Source] = root match
     case Right(dir) =>
-      val found = Project.collect(dir).sortBy(place)
+      val found = Project.collect(dir, Some(os)).sortBy(place)
 
       // A directory that answers the search and holds nothing readable is a *different* failure from
       // not finding one, and it has to say so: every program would otherwise fail at its first free
@@ -212,8 +217,29 @@ object Std {
    * and the second needed a test of its own to catch. Now an edit to `library/sysl` moves this the next
    * time the compiler runs, the artifact keyed by it is a different file, and the drift the second
    * copy made possible cannot occur.
+   *
+   * **The C is fingerprinted with the sysl and not apart from it**, which is what
+   * [[LibraryArtifact.build]] does on the other side of the comparison — a shim is as much the
+   * library's source as a module is, and an artifact that did not change when one was edited is a
+   * stale artifact nothing would notice was stale. It cost nothing while the library carried no C
+   * and would have been a silent mismatch the day it did.
    */
-  lazy val fingerprint: String = LibraryArtifact.fingerprint(sources)
+  def fingerprint(os: Os): String = LibraryArtifact.fingerprint(sources(os) ::: cSources(os))
+
+  /** The C the library carries, for the operating system being built for.
+   *
+   * **It is empty on a target whose `__<os>__` directory the library does not have, and that is the
+   * feature rather than a gap.** A shim calling `readdir` cannot exist on a freestanding target and
+   * must not be compiled there; a directory that selects is how it comes to be absent, without a
+   * condition written anywhere and without the file having to compile.
+   *
+   * Read through `Project.cSources`, which is the same walk every other tree's C is found by — the
+   * library is a library (`13 §8`), and the one thing that used to be true of it and of nothing else
+   * was that nobody ever looked here.
+   */
+  def cSources(os: Os): List[Source] = root match
+    case Right(dir) => Project.cSources(dir, Some(os)).sortBy(place)
+    case Left(_)    => Nil
 
   /** The parsed standard module, **for a target** — and the trees of **one** target are kept, not
    * every target's.
@@ -241,7 +267,7 @@ object Std {
       cache.get(target) match
         case Some(programs) => programs
         case None =>
-          val programs = sources.map(s =>
+          val programs = sources(target.os).map(s =>
             SyslParser.parse(s, target) match
               case Right(p) => p
               case Left(e)  => sys.error(s"the standard module does not parse: $e"),

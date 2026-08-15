@@ -179,16 +179,16 @@ class StdLibraryTests extends AnyFreeSpec with Matchers {
       // The development-loop claim, and the one the whole suite rests on: what every test compiles
       // against is the tree a reader can open and edit. Compared by place and by text, so a file
       // added to the tree and not seen by the compiler fails here.
-      val onDisk = Project.collect(StdRoot.root.get).map(s => place(s) -> s.text).toMap
+      val onDisk = Project.collect(StdRoot.root.get, Some(Target.default.os)).map(s => place(s) -> s.text).toMap
 
-      Std.sources.map(s => place(s) -> s.text).toMap shouldBe onDisk
+      Std.sources(Target.default.os).map(s => place(s) -> s.text).toMap shouldBe onDisk
     }
 
     "and names each file by its place in the library rather than by where it was read from" in {
       // So that a diagnostic naming a library file reads the same on every machine. See `Std.named`
       // — this is the claim the full suite caught being broken, in two library pages that quote a
       // refusal about a private field of `sysl.posix.threads.Mutex`.
-      Std.sources.map(_.name) shouldBe Std.sources.map(s => s"${Std.Prefix}/${place(s)}")
+      Std.sources(Target.default.os).map(_.name) shouldBe Std.sources(Target.default.os).map(s => s"${Std.Prefix}/${place(s)}")
     }
 
     "the same name whether it was read from a checkout or from an install" in {
@@ -214,19 +214,19 @@ class StdLibraryTests extends AnyFreeSpec with Matchers {
     }
 
     "in a fixed order, decided by the library rather than by a directory listing" in {
-      Std.sources.map(place) shouldBe Std.sources.map(place).sorted
+      Std.sources(Target.default.os).map(place) shouldBe Std.sources(Target.default.os).map(place).sorted
     }
 
     "with every file in the module its own location says, however deep" in {
       // The tree claim, asked of the real library rather than of a string helper: a file's `dir` is
       // exactly the directories between the root and it, so its path has to end with them.
-      for s <- Std.sources do withClue(s"${s.name}: ")(s.name should endWith(place(s)))
+      for s <- Std.sources(Target.default.os) do withClue(s"${s.name}: ")(s.name should endWith(place(s)))
 
-      Std.sources.foreach(_.dir.get.head shouldBe Std.module)
+      Std.sources(Target.default.os).foreach(_.dir.get.head shouldBe Std.module)
 
       // And the deep case is genuinely exercised — `sysl.math.complex` is two below the standard
       // module — so the claim above is not being met by a flat directory.
-      Std.sources.map(_.dir.get.length).max should be >= 3
+      Std.sources(Target.default.os).map(_.dir.get.length).max should be >= 3
     }
   }
 
@@ -244,10 +244,10 @@ class StdLibraryTests extends AnyFreeSpec with Matchers {
       try
         copyTree(StdRoot.root.get, copy)
 
-        val moved = Project.collect(copy)
+        val moved = Project.collect(copy, Some(Target.default.os))
 
-        moved.map(place).sorted shouldBe Std.sources.map(place)
-        LibraryArtifact.fingerprint(moved) shouldBe Std.fingerprint
+        moved.map(place).sorted shouldBe Std.sources(Target.default.os).map(place)
+        LibraryArtifact.fingerprint(moved) shouldBe Std.fingerprint(Target.default.os)
       finally discardTree(copy)
     }
 
@@ -255,10 +255,10 @@ class StdLibraryTests extends AnyFreeSpec with Matchers {
       // The other half, and the reason editing the library is now something anybody can do: the
       // artifact's path holds this fingerprint, so a changed file *is* a different path. Nothing has
       // to be invalidated and a compiler running against the unedited library is unaffected.
-      val first = Std.sources.headOption.getOrElse(fail("the library has no files"))
-      val edited = Source(first.name, first.text + "\n", first.dir.getOrElse(Nil)) :: Std.sources.tail
+      val first = Std.sources(Target.default.os).headOption.getOrElse(fail("the library has no files"))
+      val edited = Source(first.name, first.text + "\n", first.dir.getOrElse(Nil)) :: Std.sources(Target.default.os).tail
 
-      LibraryArtifact.fingerprint(edited) should not be Std.fingerprint
+      LibraryArtifact.fingerprint(edited) should not be Std.fingerprint(Target.default.os)
     }
   }
 
@@ -267,14 +267,14 @@ class StdLibraryTests extends AnyFreeSpec with Matchers {
     "puts every file in the module its own header names" in {
       // The header and the directory both say it, and the driver is what checks they agree — so
       // this is the same question `build-lib library` would ask, asked without building anything.
-      for source <- Std.sources do
+      for source <- Std.sources(Target.default.os) do
         SyslParser.parse(source) match
           case Right(p)  => p.module.map(_.show) shouldBe Some(source.dir.get.mkString("."))
           case Left(err) => fail(s"${source.name} does not parse: $err")
     }
 
     "and every module those headers name is one the library says it declares" in {
-      Std.sources.map(_.dir.get.mkString(".")).toSet shouldBe Library.modules.toSet
+      Std.sources(Target.default.os).map(_.dir.get.mkString(".")).toSet shouldBe Library.modules.toSet
     }
   }
 

@@ -222,7 +222,7 @@ class WeaveTests extends AnyFreeSpec with Matchers {
 
       assume(root.isDefined, "the library is not reachable from the test working directory")
 
-      val files = Project.collect(s"${root.get}/sysl/regex").filter(s => Literate.named(s.name))
+      val files = Project.collect(s"${root.get}/sysl/regex", Project.Every).filter(s => Literate.named(s.name))
 
       files should not be empty
       files.foreach(roundTrips)
@@ -283,7 +283,7 @@ class WeaveTests extends AnyFreeSpec with Matchers {
       assume(root.isDefined, "the library is not reachable from the test working directory")
 
       val dir     = s"${createTempDirectory("sysl-weave-tree-")}/regex"
-      val sources = Project.collect(s"${root.get}/sysl/regex").filter(s => Literate.named(s.name))
+      val sources = Project.collect(s"${root.get}/sysl/regex", Project.Every).filter(s => Literate.named(s.name))
 
       ran(Config(command = "weave", file = s"${root.get}/sysl/regex", output = Some(dir)))
 

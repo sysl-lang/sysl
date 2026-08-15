@@ -624,7 +624,7 @@ class LibraryBuildCliTests extends LibraryCliSupport {
           // disk and named by where it was found while the carried copy is named by where the
           // generator read it. If the fingerprint were over paths rather than contents, the guard in
           // `Stdlib.read` would reject every artifact the documented command produces.
-          fingerprint shouldBe Std.fingerprint
+          fingerprint shouldBe Std.fingerprint(Target.default.os)
         case Left(err) => fail(err)
 
       deleteFile(out)

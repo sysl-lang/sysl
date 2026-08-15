@@ -89,7 +89,7 @@ class LibraryTests extends LibrarySeamSupport {
       // `Display.display` names `Writer` from the other file. That direction is what says a module's
       // members are one set however many files they came from, and it is why neither file imports
       // the other.
-      Std.sources.count(_.dir.contains(List(Std.module))) should be > 1
+      Std.sources(Target.default.os).count(_.dir.contains(List(Std.module))) should be > 1
     }
 
     "declares the whole of what the library declares" in {
@@ -120,7 +120,7 @@ class LibraryTests extends LibrarySeamSupport {
     }
 
     "and every file sits in one of them, however deep the tree goes" in {
-      Std.sources.map(_.dir.get.mkString(".")).distinct.sorted shouldBe Library.modules
+      Std.sources(Target.default.os).map(_.dir.get.mkString(".")).distinct.sorted shouldBe Library.modules
     }
   }
 

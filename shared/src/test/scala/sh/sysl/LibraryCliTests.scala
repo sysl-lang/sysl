@@ -427,7 +427,7 @@ class LibraryCliTests extends LibraryCliSupport {
         // different path rather than a stale hit at the same one.
         assume(cacheDirectory.isDefined, "this machine has no cache directory")
 
-        LibraryArtifact.stdDefault(Target.default) should include(Std.fingerprint)
+        LibraryArtifact.stdDefault(Target.default) should include(Std.fingerprint(Target.default.os))
       }
 
       "and by the compiler too, so an upgrade cannot read back what its predecessor built" in {
@@ -483,7 +483,7 @@ class LibraryCliTests extends LibraryCliSupport {
         assume(cacheDirectory.isDefined, "this machine has no cache directory")
 
         LibraryArtifact.stdDefault(Target.default) shouldBe
-          s"${cacheDirectory.get}/sysl/${BuildInfo.version}-${Std.fingerprint}-${Target.default.name}" +
+          s"${cacheDirectory.get}/sysl/${BuildInfo.version}-${Std.fingerprint(Target.default.os)}-${Target.default.name}" +
             s"-${Allocator.c.alloc}-${Allocator.c.free}/std${LibraryArtifact.extension}"
       }
 
@@ -696,7 +696,7 @@ class LibraryCliTests extends LibraryCliSupport {
       val root = rootOf("demo", withDefault.replace("private tripled", "tripled"))
 
       def symbols(): Set[String] =
-        LibraryArtifact.build(Project.collect(root), Target.default, LibraryArtifact.std) match
+        LibraryArtifact.build(Project.collect(root, Some(Target.default.os)), Target.default, LibraryArtifact.std) match
           case Right((_, meta)) =>
             LibraryArtifact.read("twice.syslib", meta, Target.default) match
               case Right((_, syms, _)) => syms
