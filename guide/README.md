@@ -15,7 +15,9 @@ sbt "syslJVM/run run guide/json"
 ```
 
 Each directory is a **project root**, so the files in it are the anonymous root module and any
-sub-directory is a module named by its path (`13 §1`).
+sub-directory is a module named by its path (`13 §1`). One kind of sub-directory is the exception and
+none of these programs has one: a directory named `__<os>__` selects source for an operating system
+and names nothing, so its files belong to the directory holding it (`13 §5`).
 
 **Each program checks itself.** Every line it prints is either a `--` section header or `ok`
 followed by what was checked, so a failure is a line that says otherwise. `GuideTests` runs each
