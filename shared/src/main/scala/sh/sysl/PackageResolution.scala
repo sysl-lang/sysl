@@ -108,6 +108,8 @@ private def collectPackages(graph: Resolve.Graph): Either[String, PackageSources
           fetched.map(_.root),
           fetched.flatMap(p =>
             p.config.headers.toList.sortBy(_._1).map((name, why) => HeaderNeed(p.canonical, name, why))),
+          fetched.flatMap(p =>
+            p.config.pkgConfig.toList.sortBy(_._1).map((mod, why) => LibNeed(p.canonical, mod, why))),
           fetched.flatMap(p => p.config.allocator.map(p.canonical -> _)),
         ))
   catch case e: Exception => Left(s"cannot read a package: ${e.getMessage}")

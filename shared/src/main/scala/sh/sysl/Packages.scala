@@ -69,6 +69,17 @@ case class Packages(of: Map[Source, String] = Map.empty, imports: Map[String, Ma
  */
 case class HeaderNeed(who: String, name: String, why: String)
 
+/** One package's declared need of an **installed library**, under the name `pkg-config` files it as
+ * (`packages.md § 8`).
+ *
+ * The same shape as `HeaderNeed` and deliberately not the same type. A header requirement is answered
+ * by a directory somebody types; this one is answered by asking the machine, and the two produce
+ * different refusals — one says *say where these headers are*, the other says *install this library,
+ * or say where it is*. Folding them together would mean one message that has to hedge about which it
+ * is talking about.
+ */
+case class LibNeed(who: String, module: String, why: String)
+
 /** What a project's `dependencies` block brings to one compilation.
  *
  * Five things and not one, because a package reaches a build by more than one road. Its `.sysl` is
@@ -90,6 +101,7 @@ case class HeaderNeed(who: String, name: String, why: String)
  */
 case class PackageSources(sources: List[Source], packages: Packages, roots: List[String],
                           needs: List[HeaderNeed] = Nil,
+                          libs: List[LibNeed] = Nil,
                           allocators: List[(String, Allocator)] = Nil)
 
 object PackageSources {

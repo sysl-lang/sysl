@@ -54,7 +54,8 @@ import io.github.edadma.cross_platform.*
  * that fails somewhere the author cannot reach.
  */
 case class SearchPaths(link: List[String] = Nil, include: List[String] = Nil,
-                       defines: List[String] = Nil) {
+                       defines: List[String] = Nil,
+                       probed: List[String] = Nil, probedLibs: List[String] = Nil) {
 
   /** What the linker is told, as clang spells it. Joined rather than passed as two arguments, which
    * is how `-L` has been written since cc and what a reader comparing this line against a hand-run
@@ -62,7 +63,18 @@ case class SearchPaths(link: List[String] = Nil, include: List[String] = Nil,
    */
   def linkFlags: List[String] = link.map(d => s"-L$d")
 
-  def includeFlags: List[String] = include.map(d => s"-I$d")
+  /** What a probe answered for the libraries a package named, which goes at the **end** of the link
+   * line rather than into `linkFlags`.
+   *
+   * `linkFlags` is `-L` only and sits above the objects, which is where a search path belongs. A
+   * probe's answer is not only search paths: it carries the `-l` for the library itself, and a `-l`
+   * placed above the objects that need it is discarded by any linker resolving an archive in one
+   * pass. So the tokens travel together, in the order pkg-config printed them, after everything that
+   * could refer to them.
+   */
+  def probedLinkFlags: List[String] = probedLibs
+
+  def includeFlags: List[String] = include.map(d => s"-I$d") ::: probed
 
   /** The macros the C is compiled with, as clang spells them — `-DNAME` or `-DNAME=value`.
    *
@@ -391,7 +403,7 @@ object Toolchain {
     List(cc, s"--target=${target.triple}", "-Wno-override-module", flag(level)) :::
       machineFlags(target) ::: linkerFlags(target) ::: deadStrip(target) :::
       paths.linkFlags ::: List(ll) ::: objects ::: archives ::: libraryFlags(links, target) :::
-      List("-o", exe)
+      paths.probedLinkFlags ::: List("-o", exe)
 
   /** What a target needs said to the **linker** beyond its triple, which today is WebAssembly's and
    * nobody else's.

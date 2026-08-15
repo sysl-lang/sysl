@@ -290,6 +290,58 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  /** The `pkg_config` sub-block: which installed libraries this package binds, each under the name
+   * `pkg-config` files it as (`packages.md § 8`).
+   *
+   * A requirement kind of its own rather than a field on `headers`, because it answers both halves of
+   * one fact — the headers to compile against and the library to link — and a consumer who has one of
+   * those has not got a build.
+   */
+  "the pkg-config libraries a package requires" - {
+
+    "are read as a module name and the reason the consumer is given" in {
+      read(
+        """requires {
+          |  pkg_config { sdl3 = "SDL3 — brew install sdl3, or Debian's libsdl3-dev" }
+          |}
+          |""".stripMargin).pkgConfig shouldBe Map("sdl3" -> "SDL3 — brew install sdl3, or Debian's libsdl3-dev")
+    }
+
+    // Three kinds of requirement now share the block, so each has to survive the other two being
+    // there. Read as a capability, `pkg_config` would be refused as a name that is not one.
+    "sit beside the capabilities and the headers without disturbing either" in {
+      val c = read(
+        """requires {
+          |  os = true
+          |  headers { lwip = "lwIP's headers" }
+          |  pkg_config { sdl3 = "SDL3" }
+          |}
+          |""".stripMargin)
+
+      c.requires shouldBe Set("os")
+      c.headers.keySet shouldBe Set("lwip")
+      c.pkgConfig.keySet shouldBe Set("sdl3")
+    }
+
+    "and a file that declares none needs none" in {
+      read("requires { os = true }").pkgConfig shouldBe empty
+    }
+
+    // A consumer overrides this with `--include-path <name>=<dir>`, exactly as they answer a header
+    // requirement, so the name has to survive the same flag.
+    "a name a command line could not carry is refused" in {
+      refused("""requires { pkg_config { "sd/l3" = "why" } }""") should include("--include-path <name>=<dir>")
+    }
+
+    "a reason that says nothing is refused, because the reason is the point" in {
+      refused("""requires { pkg_config { sdl3 = "" } }""") should include("says nothing about what it needs")
+    }
+
+    "and a version where the reason belongs is refused as the wrong kind of thing" in {
+      refused("""requires { pkg_config { sdl3 = 3 } }""") should include("must be a string")
+    }
+  }
+
   "the dependencies block" - {
 
     "a coordinate and a version" in {

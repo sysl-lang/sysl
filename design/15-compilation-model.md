@@ -738,6 +738,13 @@ says what its C must be able to find, and `--include-path lwip=<dir>` answers it
 all, since a `.c` is found by a walk and declares nothing (`§ 7`), so there is no file for an
 `@include`-shaped attribute to sit in and no `extern` for it to sit beside.
 
+**And for most libraries the machine can be asked instead of a person.** `packages.md § 8` builds a
+second requirement kind on the same split — `requires { pkg_config { sdl3 = "…" } }`, answered by
+`pkg-config` on the machine being built *on*, which supplies both halves at once. It changes nothing
+here: the package still names a library and never a flag, and this section's own division of labour is
+what decides that the answer comes from the host and only for the host. A cross build is not asked,
+and `--include-path` and `--link-path` remain the answer whenever anybody wants to give it themselves.
+
 **The environment already worked, and that is why the flags exist rather than why they don't.**
 `LIBRARY_PATH` and `CPATH` are read by clang, which sysl execs, so a developer who exports them has
 always had a build that links. But a build that works only because of one person's shell is one

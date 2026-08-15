@@ -128,7 +128,7 @@ private def write(path: String, text: String): Int = {
  * compiled cleanly and only the C project's linker ever notices.
  */
 private def buildForC(cfg: Config, compiled: Compiled, target: Target, named: Option[String],
-                      roots: List[String]): Int = {
+                      roots: List[String], paths: SearchPaths): Int = {
   // Before the compile rather than after, exactly as `build-lib` does it: the archiver is not needed
   // until the end, so discovering it late would make "there is no llvm-ar" a thing somebody waited
   // the whole build for.
@@ -163,7 +163,7 @@ private def buildForC(cfg: Config, compiled: Compiled, target: Target, named: Op
       _ <- Toolchain.compileObject(compiled.ir, code, target, cfg.optimize)
       _ <- objects.foldLeft[Either[String, Unit]](Right(()))((so_far, entry) =>
              so_far.flatMap(_ => Toolchain.compileC(entry._1.name, entry._2, target, cfg.optimize,
-               SearchPaths(cfg.linkPaths, cfg.includePaths, cfg.defines), cfg.verbose)))
+               paths, cfg.verbose)))
       _ <- Toolchain.archive(code :: objects.map(_._2), out, ar)
     yield ()
 
@@ -257,7 +257,8 @@ private def moduleName(path: String): String = {
  */
 private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std: Stdlib,
                          project: PackageConfig, libraries: List[Source],
-                         libraryTrees: List[Program], allocator: Allocator): Int = {
+                         libraryTrees: List[Program], allocator: Allocator,
+                         paths: SearchPaths): Int = {
   val named = project.name
 
   // Said before anything is compiled, and said as a *request* the driver cannot meet rather than as
@@ -288,7 +289,7 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
     case None      => ()
 
   LibraryArtifact.build(sources, target, if cfg.std then LibraryArtifact.std else Set.empty, Some(std),
-                        native, SearchPaths(cfg.linkPaths, cfg.includePaths, cfg.defines),
+                        native, paths,
                         libraries, libraryTrees, allocator) match
     case Left(err) => report(err)
     case Right((ir, meta)) =>
@@ -326,7 +327,7 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
           // in anything else: because something left its symbol undefined.
           _ <- objects.foldLeft[Either[String, Unit]](Right(()))((so_far, entry) =>
                  so_far.flatMap(_ => Toolchain.compileC(entry._1.name, entry._2, target, cfg.optimize,
-                   SearchPaths(cfg.linkPaths, cfg.includePaths, cfg.defines))))
+                   paths)))
           _ <- Toolchain.archive(code :: metadata :: objects.map(_._2), out, ar)
         yield ()
 

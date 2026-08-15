@@ -94,6 +94,7 @@ case class PackageConfig(
     capabilities: Map[String, Boolean] = Map.empty,
     requires: Set[String] = Set.empty,
     headers: Map[String, String] = Map.empty,
+    pkgConfig: Map[String, String] = Map.empty,
     dependencies: List[Dependency] = Nil,
     allocator: Option[Allocator] = None,
 ) {
@@ -132,6 +133,11 @@ object PackageConfig {
   /** The sub-block of `requires` that names headers rather than capabilities. */
   val HeadersKey = "headers"
 
+  /** The sub-block of `requires` that names libraries this machine is asked about by `pkg-config`
+   * (`packages.md § 8`).
+   */
+  val PkgConfigKey = "pkg_config"
+
   /** Whether a header requirement may be called this.
    *
    * A name reaches a command line as `--include-path <name>=<dir>`, so it must be tellable from a
@@ -168,6 +174,7 @@ object PackageConfig {
         needed  <- readCapabilityFlags(capabilitiesOf(block2(root, "requires")), "requires")
         _       <- checkNotNarrowing(needed)
         headers <- readHeaders(block2(root, "requires"))
+        pkgs    <- readPkgConfig(block2(root, "requires"))
         deps    <- readDependencies(root)
         alloc   <- readAllocator(root)
       yield PackageConfig(
@@ -178,6 +185,7 @@ object PackageConfig {
         capabilities = project.toMap,
         requires = needed.collect { case (name, true) => name }.toSet.flatMap(Capability.closure),
         headers = headers,
+        pkgConfig = pkgs,
         dependencies = deps,
         allocator = alloc,
       )
@@ -296,7 +304,7 @@ object PackageConfig {
    * by `readHeaders`.
    */
   private def capabilitiesOf(section: Option[ConfigObject]): Option[ConfigObject] =
-    section.map(caps => ConfigObject(caps.fields - HeadersKey))
+    section.map(caps => ConfigObject(caps.fields - HeadersKey - PkgConfigKey))
 
   /** The `headers` sub-block of `requires` — the C headers this package's own C includes and does not
    * carry, each under a name the consumer satisfies with `--include-path <name>=<dir>`
@@ -330,6 +338,44 @@ object PackageConfig {
             case _ =>
               Left(s"$FileName: 'requires.$HeadersKey.$name' must be a string saying what these " +
                 "headers are and where they come from")
+        }.map(_.toMap)
+
+  /** The `pkg_config` sub-block of `requires` — the installed libraries this package binds, each under
+   * the name `pkg-config` files it as (`packages.md § 8`).
+   *
+   * ==Both halves of one declaration==
+   *
+   * A `headers` requirement is answered by `--include-path` and a `@link` directive by
+   * `--link-path`, and a package binding an installed library needs both: its headers to compile and
+   * its archive to link. They are one requirement rather than two because they are one fact — *this
+   * machine must have SDL3* — and a consumer who answered one of them has not got a build.
+   *
+   * So this is a requirement kind beside `headers` rather than a field on it. The value is prose for
+   * a person, for `readHeaders`' reason: it is quoted back at whoever has to install the library, and
+   * it is the only part of the refusal nothing in the compiler could have written.
+   *
+   * ==A `.pc` name, which is not the `@link` name==
+   *
+   * The name is what `pkg-config` answers to, and `PkgConfig` says why it cannot be derived from
+   * anything already in the package: sdl3 writes `@link("SDL3")` and files as `sdl3`.
+   *
+   * The name is checked by `isHeaderName` because a consumer overrides this exactly as they answer a
+   * header requirement — `--include-path <name>=<dir>` — so it has to survive the same flag.
+   */
+  private def readPkgConfig(section: Option[ConfigObject]): Either[String, Map[String, String]] =
+    section.flatMap(s => block2(s, PkgConfigKey)) match
+      case None => Right(Map.empty)
+      case Some(mods) =>
+        collect(mods.fields.toList.sortBy(_._1)) { (name, value) =>
+          value match
+            case ConfigString(why) if why.trim.nonEmpty => checkHeaderName(name).map(_ => name -> why)
+            case ConfigString(_) =>
+              Left(s"$FileName: 'requires.$PkgConfigKey.$name' says nothing about what it needs — the " +
+                "text is quoted back at whoever has to install the library, so an empty one helps " +
+                "nobody")
+            case _ =>
+              Left(s"$FileName: 'requires.$PkgConfigKey.$name' must be a string saying what this " +
+                "library is and how it is installed")
         }.map(_.toMap)
 
   /** The keys an `allocator` block has, both required. */

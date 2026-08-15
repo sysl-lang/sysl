@@ -416,6 +416,62 @@ nothing the refusal above does not. And **defines are the same shape and are not
 path alone is not always enough, since a project of any size configures its headers with macros, and
 `--define` supplies them today with no way for a package to say which it needs.
 
+### And where the library is installed, which the machine can be asked
+
+A `headers` requirement puts the path in the consumer's hands, which is right and is not always
+necessary. **Most libraries a package binds already answer the question themselves**, through
+`pkg-config`: a `.pc` file installed beside the library says where its headers are and what its link
+line is, per library, on this machine.
+
+```hocon
+requires {
+  pkg_config { sdl3 = "SDL3 — brew install sdl3, or Debian's libsdl3-dev" }
+}
+```
+
+```
+sysl run .
+```
+
+**The split above is unchanged: the package names the requirement and something else supplies the
+path.** What differs is only who that something else is — the *machine*, rather than a person
+transcribing its layout onto a command line. Nothing the package wrote is a path, and nothing here runs
+code the package supplied, so `§ 7` is untouched: the compiler asks a well-known tool a question,
+exactly as it asks `clang` what a `c const` measures to.
+
+**One declaration answers both halves**, which is why this is a requirement kind of its own rather than
+a field on `headers`. A package binding an installed library needs its headers to compile *and* its
+archive to link, and a consumer who has one of those has not got a build. `--cflags` feeds every C
+compilation in the tree; `--libs` feeds the link line, and carries the `-Wl,-rpath` that decides
+whether a dynamically-linked program finds its library at **run** time — which is the half a
+hand-written `--link-path` silently omits.
+
+**The name is declared and not derived, and both available derivations are wrong.** From the `@link`
+directive: the sdl3 package writes `@link("SDL3")` where the module is `sdl3`, and `-lSDL3` and
+`sdl3.pc` are two naming conventions that happen to share a word. From a `headers` requirement's name:
+a name that happened to match some `.pc` on the consumer's box would satisfy a requirement nobody
+answered — the accident this section exists to prevent — on the machine of whoever built it and
+nowhere else.
+
+**It is asked only for the host.** `pkg-config` answers for the machine it runs on, and a cross build's
+headers and archives are the *target's*. A freestanding program compiled against this machine's
+`/opt/homebrew` would link and be wrong somewhere nobody can see, so a target that is not this machine
+probes nothing and the declaration falls back to the flags — which is where a cross build's paths were
+always going to come from.
+
+**`--include-path <name>=<dir>` answers it exactly as it answers a header requirement, and stops the
+probe.** That is what keeps a hermetic build, a hand-built prefix and a machine with a broken `.pc`
+from being hostage to what happens to be installed, and it is why this could be added without any build
+that works today changing what it does.
+
+**Absent is not failed.** A machine with no `pkg-config`, or one whose `pkg-config` has never heard of
+the module, lands exactly where it was before this existed: the requirement goes unanswered and the
+build stops with the sentence above. The two failures are told apart, because they send the reader to
+different places — a missing `pkg-config` is one install away and has nothing to do with the library,
+where a `pkg-config` that does not know the module means the library itself is not there. It is not on
+a Mac by default and is not pulled in by the libraries either, which is why the brew formula makes it a
+dependency of sysl.
+
 ## 9. Namespacing — local names, an optional mount, and no silent winners
 
 **This is the one part of Go's model that does not port, and the part most worth getting right.**

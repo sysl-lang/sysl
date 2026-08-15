@@ -222,9 +222,20 @@ private[sysl] def execute(cfg: Config): Int = {
       case Some(err) => return fail(err)
       case None      => ()
 
+    // The same narrowing, for the same reason: this command compiles this package's C and no other,
+    // so it is asked about the libraries *this* manifest names and nothing a root or a dependency
+    // declared. A `.pc` answer reaches the C compiler here exactly as it does for a `build`.
+    val libPaths = probeLibs(
+      project.pkgConfig.toList.sortBy(_._1).map((mod, why) => LibNeed("this project", mod, why)),
+      cfg.namedIncludes.keySet, target, cfg.verbose) match
+      case Left(err)     => return fail(err)
+      case Right(answer) => answer
+
     return buildLibrary(cfg, sources, target, std, project,
                         collected.flatMap(_._2), decoded.collect { case Right(r) => r._1 }.flatten,
-                        allocator)
+                        allocator,
+                        SearchPaths(cfg.linkPaths, cfg.includePaths, cfg.defines,
+                                    libPaths.probed, libPaths.probedLibs))
 
   val librarySources = collected.flatMap(_._2) ::: fetched.sources
   val packages       = fetched.packages
@@ -252,7 +263,26 @@ private[sysl] def execute(cfg: Config): Int = {
   // value rather than two lists threaded separately, because the two halves are one setting: a
   // binding to a library outside the default prefix needs its headers to compile and its archive to
   // link, and a build given only one of them fails at whichever step comes first.
-  val paths = SearchPaths(cfg.linkPaths, cfg.includePaths, cfg.defines)
+  // What this machine answered about the installed libraries the packages named (`packages.md § 8`).
+  // Asked under the same guard as the header requirements below and for the same reason — a command
+  // compiling no C opens none of these — and asked *here* because the answer is part of the paths
+  // every C compilation and the link are given.
+  val probed =
+    if links(cfg.command) || cLibrary(cfg.command) then
+      val fromLibs = libPkgNeeds(roots) match
+        case Left(err)   => return fail(err)
+        case Right(need) => need
+
+      val own = project.pkgConfig.toList.sortBy(_._1)
+        .map((mod, why) => LibNeed("this project", mod, why))
+
+      probeLibs(own ::: fetched.libs ::: fromLibs, cfg.namedIncludes.keySet, target, cfg.verbose) match
+        case Left(err)     => return fail(err)
+        case Right(answer) => answer
+    else SearchPaths()
+
+  val paths = SearchPaths(cfg.linkPaths, cfg.includePaths, cfg.defines,
+                          probed.probed, probed.probedLibs)
 
   if cfg.verbose then
     for lib <- cfg.libs do trace(s"library: $lib")
@@ -340,7 +370,7 @@ private[sysl] def execute(cfg: Config): Int = {
       stdout(CHeader.render(compiled.exports, project.name.getOrElse(Project.nameOf(cfg.file)))); 0
 
     case "build-c" =>
-      buildForC(cfg, compiled, target, project.name, cfg.file :: roots ::: fetched.roots)
+      buildForC(cfg, compiled, target, project.name, cfg.file :: roots ::: fetched.roots, paths)
 
     case "build" =>
       val exe = cfg.output.getOrElse(defaultOutput(cfg.file, project.name))
@@ -443,6 +473,80 @@ private def libHeaderNeeds(roots: List[String]): Either[String, List[HeaderNeed]
       config <- readPackageConfig(root)
     yield seen ::: config.headers.toList.sortBy(_._1).map((name, why) => HeaderNeed(root, name, why))
   }
+
+/** What the `--lib` **source roots** declare they need an installed library for (`packages.md § 8`).
+ *
+ * Read off the same manifest as `libHeaderNeeds`, on the same road and for the same reason: a package
+ * handed over as a directory is the same package it is by coordinate, so what it needs of this
+ * machine does not depend on how it got here.
+ */
+private def libPkgNeeds(roots: List[String]): Either[String, List[LibNeed]] =
+  roots.foldLeft[Either[String, List[LibNeed]]](Right(Nil)) { (acc, root) =>
+    for
+      seen   <- acc
+      config <- readPackageConfig(root)
+    yield seen ::: config.pkgConfig.toList.sortBy(_._1).map((mod, why) => LibNeed(root, mod, why))
+  }
+
+/** What this machine says about the libraries the packages named, or the one line the build stops on
+ * (`packages.md § 8`, `PkgConfig`).
+ *
+ * ==Asked only for the host==
+ *
+ * `pkg-config` answers for the machine it runs on. A cross build's headers and archives are the
+ * *target's*, and there is no sense in which this machine's `/opt/homebrew` belongs in a compilation
+ * for a Cortex-M — so a target that is not this machine probes nothing and the declaration falls back
+ * to being answered by the flags, which is where a cross build's paths were always going to come
+ * from. Silence here would be the worst outcome available: a freestanding program that compiled
+ * against the host's headers would link, and be wrong somewhere nobody can see.
+ *
+ * ==A supplied name is an answer, and stops the probe==
+ *
+ * `--include-path <name>=<dir>` satisfies this exactly as it satisfies a header requirement, and it
+ * takes precedence over anything a probe would have found. That is what keeps a hermetic build, a
+ * hand-built prefix and a machine with a broken `.pc` from being hostage to what happens to be
+ * installed — and it is the reason this can be added at all without any build that works today
+ * changing what it does.
+ *
+ * ==One at a time, and the two failures are told apart==
+ *
+ * The first unanswered requirement stops the build, as `unmetHeaders` does. The sentence differs by
+ * *why* it could not be answered, because the two send the reader to different places: a machine with
+ * no `pkg-config` is one `brew install pkgconf` away and has nothing to do with the library, where a
+ * `pkg-config` that does not know the module means the library itself is not installed.
+ */
+private def probeLibs(needs: List[LibNeed], supplied: Set[String], target: Target,
+                      verbose: Boolean): Either[String, SearchPaths] = {
+  val wanted = needs.filterNot(n => supplied.contains(n.module))
+
+  if wanted.isEmpty then Right(SearchPaths())
+  else if !Target.host.contains(target) then
+    Left(s"${wanted.head.who} needs the '${wanted.head.module}' library and this is a build for " +
+      s"'${target.name}' rather than for this machine, so there is nothing to ask where it is — " +
+      s"${wanted.head.why}. Say where it is with '--include-path ${wanted.head.module}=<dir>' and " +
+      "'--link-path <dir>'")
+  else
+    wanted.foldLeft[Either[String, SearchPaths]](Right(SearchPaths())) { (acc, need) =>
+      for
+        so_far <- acc
+        answer <- PkgConfig.query(need.module).left.map { why =>
+                    s"${need.who} needs the '${need.module}' library and $why — ${need.why}. " +
+                      (if PkgConfig.available then
+                         s"Install it, or say where it is with '--include-path ${need.module}=<dir>' " +
+                           "and '--link-path <dir>'"
+                       else
+                         "Install pkg-config and sysl will ask it where the library is — 'brew " +
+                           "install pkgconf', or your system's package of that name — or say where " +
+                           s"it is with '--include-path ${need.module}=<dir>' and '--link-path <dir>'")
+                  }
+      yield
+        if verbose then
+          trace(s"pkg-config ${need.module}: ${(answer.cflags ::: answer.ldflags).mkString(" ")}")
+
+        so_far.copy(probed = so_far.probed ::: answer.cflags,
+                    probedLibs = so_far.probedLibs ::: answer.ldflags)
+    }
+}
 
 /** The header requirements nothing on this command line answered, as the one line a build stops on
  * (`packages.md § 8`).
