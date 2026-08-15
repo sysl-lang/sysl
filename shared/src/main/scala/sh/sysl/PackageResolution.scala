@@ -112,7 +112,12 @@ private def collectPackages(graph: Resolve.Graph, os: Os): Either[String, Packag
             p.config.pkgConfig.toList.sortBy(_._1).map((mod, why) => LibNeed(p.canonical, mod, why))),
           fetched.flatMap(p => p.config.allocator.map(p.canonical -> _)),
         ))
-  catch case e: Exception => Left(s"cannot read a package: ${e.getMessage}")
+  // A malformed per-OS directory is a mistake in the package rather than a package that would not
+  // read (`13 §5`), and the message names the directory and lists the operating systems there are —
+  // so wrapping it in "cannot read a package" would bury the only part worth having.
+  catch
+    case e: SelectionError => Left(e.getMessage)
+    case e: Exception      => Left(s"cannot read a package: ${e.getMessage}")
 }
 
 private def readSums(root: String): Either[String, Sums] = {
