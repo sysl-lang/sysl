@@ -1,8 +1,6 @@
 module sysl.posix.tty
 @requires(posix)
 
-import sysl.text.cstring
-
 // Getting the kernel out of the way, so a program can read a terminal a keystroke at a time.
 //
 // **This is what makes one program run at a macOS terminal and over a serial cable to a board.** At a
@@ -16,21 +14,28 @@ import sysl.text.cstring
 // cooked terminal, the kernel does the work, and that is the right facility for anything that is not
 // drawing its own line.
 //
-// ## It is `stty`, and that is a decision rather than an expedient
+// ## It is `termios`, through a shim, and it used to be `stty`
 //
-// The C way is `tcgetattr` / `cfmakeraw` / `tcsetattr`, and `struct termios` is caller-allocated --
-// so a binding needs either its size, which only the header knows, or a C shim to hold it. **The
-// standard library can have neither.** `sysl.fs` states the constraint the whole of `library/sysl` is
-// written under -- everything is reached by symbol alone, no header included and no C structure
-// transcribed -- and it is why `stat` and `readdir` are absent there rather than merely unwritten.
+// This file argued at length for `system("stty …")`, and the argument had two halves. The first still
+// stands: `struct termios` is caller-allocated and laid out differently on every platform, so a
+// binding needs either its size or somewhere to keep it, and transcribing it into sysl is the thing
+// `library/sysl` refuses everywhere.
 //
-// A shim would break something larger: the library works the same for every target *because* it is
-// one tree of sysl that every target compiles, and library C is compiled by sysl for the target, so a
-// `.c` here would need a C compiler and a sysroot on every target that did not prune it. That is a
-// guarantee traded for a convenience, and it is not a good trade for two flags.
+// **The second half was that a shim was impossible here, and it is not any more.** It read: *a `.c`
+// here would need a C compiler and a sysroot on every target that did not prune it.* Pruning is what
+// a per-OS directory does (`13 §5`) -- `__macos__/termios.c` and `__linux__/termios.c` are compiled
+// where there is a terminal to configure and are absent everywhere else, so a freestanding build
+// never sees a `#include <termios.h>` it could not answer. The guarantee the paragraph was protecting
+// is intact and the convenience is no longer traded away for it.
 //
-// `system("stty …")` is one extern of `*u8 -> int`, reached by symbol alone, transcribing nothing.
-// The cost is a shell spawn, which for something called twice at the edges of a session is nothing.
+// What that buys, in order of how much it matters:
+//
+//   - **No shell spawn.** `system` forked a shell twice a session to set two flags.
+//   - **`cooked` restores what was actually there.** The shell version had to name flags to put back
+//     -- `icanon echo isig` -- which restores a *different* terminal from the one it found if
+//     anything else had been changed. The shim saves the whole `struct termios` on the way in.
+//   - **It works when input is not the shell's.** `stty` acted on its own standard input, inherited
+//     through `system`; the shim is handed a descriptor.
 //
 // ## What it actually sets: `-icanon -echo -isig`, and what it deliberately leaves alone
 //
@@ -63,30 +68,38 @@ import sysl.text.cstring
 // the terminal is never left broken, and that **a Mac behaves exactly like the board** — which has no
 // signals to disable in the first place.
 
-// `system` runs a command through the shell and answers its exit status; `atexit` runs a function on
-// the way out, which is what a *process* needs here rather than a destructor: the terminal's mode is
-// the process's, not a value's, so there is no value whose death would restore it (`03 § A
-// destructor` also does not run for module storage at exit).
+// `atexit` runs a function on the way out, which is what a *process* needs here rather than a
+// destructor: the terminal's mode is the process's, not a value's, so there is no value whose death
+// would restore it (`03 § A destructor` also does not run for module storage at exit).
 //
-// **There is no signal handler here, and that is a decision this file paid for once.** `atexit` runs
-// on `exit` and not when a signal terminates a process, so an earlier version of this installed
-// handlers for SIGINT and SIGTERM that restored the terminal and exited. It **hung**, reliably, and
-// the reason is worth writing down: restoring means `cooked`, which means `stty`, which builds a
-// command string -- an **allocation** -- and hands it to `system`, which **forks**. Neither is
-// async-signal-safe. A handler that allocates while the interrupted code holds the allocator's lock
-// waits for a lock only the interrupted code can release, and a program that would merely have left
-// the terminal in a bad state instead stops responding entirely.
+// **There is no signal handler here, and the reason changed with the mechanism.** An earlier version
+// installed handlers for SIGINT and SIGTERM that restored the terminal and exited, and it **hung**,
+// reliably: restoring meant `stty`, which built a command string -- an allocation -- and handed it to
+// `system`, which forked, and neither is async-signal-safe. A handler that allocates while the
+// interrupted code holds the allocator's lock waits for a lock only the interrupted code can release.
 //
-// **Without `termios` there is no way to restore a terminal from a handler at all**, because every
-// route to it allocates or forks. So the signal is removed instead of handled: `-isig` below means
-// Ctrl-C never becomes one, and every exit is then an ordinary exit that `atexit` really does catch.
+// That is now a fact about a mechanism this file no longer uses. `cooked` is one `tcsetattr` on a
+// saved struct: it allocates nothing, forks nothing, and `tcsetattr` is on POSIX's own list of
+// async-signal-safe functions -- so a handler **could** be written now, and this is the file to write
+// it in if it is ever wanted.
+//
+// **It is still not written, and that is now a choice rather than an impossibility.** `-isig` below
+// means Ctrl-C never becomes a signal at all, so there is nothing for a handler to catch and every
+// exit is an ordinary one that `atexit` covers. What that costs is stated further down and has not
+// changed: a wedged program cannot be interrupted from its own terminal. What it buys is that **a Mac
+// behaves exactly like the board**, which has no signals to disable in the first place -- and that
+// symmetry is the reason to keep it rather than a limitation to route around.
 //
 // Declared here rather than in `sysl.sys`, following `sysl.fs` and the file beside this one:
 // `sysl.sys` is the printing-and-reading core, carries no capability, and a POSIX-only symbol in it
 // would be a requirement filed where nothing declares one.
-private[sysl] extern "system" c_system(cmd: *u8) -> int
 private[sysl] extern "atexit" c_atexit(f: *extern() -> unit) -> int
 private[sysl] extern "fflush" c_fflush(stream: *u8) -> int
+
+// The two halves of the shim beside this file. They take a descriptor and answer a status, which is
+// the whole of what crosses -- `struct termios` stays in the C, where the header knows its shape.
+private[sysl] extern "sysl_tty_raw" c_tty_raw(fd: int) -> int
+private[sysl] extern "sysl_tty_cooked" c_tty_cooked(fd: int) -> int
 
 // The descriptor a terminal's input arrives on, named beside the two the file already names.
 private stdin_fd() -> int = 0
@@ -102,18 +115,6 @@ private var entered: bool = false
 // Whether the exit hook has been registered, so that repeated `raw()` calls register one hook rather
 // than one per call.
 private var hooked: bool = false
-
-// One `stty` invocation, answering whether it worked.
-//
-// It names no device. `stty` acts on **its own standard input**, which through `system` is the
-// shell's, which is this program's -- so there is no `-f` (BSD) against `-F` (GNU) divergence to
-// handle, and one command string serves both platforms. A program whose input is redirected gets a
-// failure here rather than a silent no-op, which is what `raw` reports on.
-private stty(args: string) -> bool
-    val c = cstring("stty " + args)
-
-    c_system(c.ptr) == 0
-end stty
 
 // Put the terminal into cbreak mode: keystrokes arrive as they are typed and nothing is echoed.
 //
@@ -134,7 +135,7 @@ end stty
 raw() -> bool
     if entered then return true
     if !is_tty(stdin_fd()) then return false
-    if !stty("-icanon -echo -isig opost onlcr min 1 time 0") then return false
+    if c_tty_raw(stdin_fd()) != 0 then return false
 
     entered = true
 
@@ -159,13 +160,15 @@ end raw
 
 // Put back what `raw` changed, and only what it changed.
 //
-// **`icanon echo isig` rather than `stty sane`**, which would also reset everything else the terminal
-// was set to -- settings this program did not choose and has no business having an opinion about.
-// Doing nothing when `raw` was never called or has already been undone is part of the same rule.
+// **Exactly what was there**, which is what the shim's saved `struct termios` holds. The shell
+// version could not do this: it named `icanon echo isig` to put back, which restores a *different*
+// terminal from the one it found if anything else had been changed in between -- and `stty sane`,
+// the other option, resets settings this program never chose and has no business having an opinion
+// about. Doing nothing when `raw` was never called or has already been undone is the same rule.
 cooked()
     if !entered then return
 
-    stty("icanon echo isig")
+    c_tty_cooked(stdin_fd())
     entered = false
 end cooked
 

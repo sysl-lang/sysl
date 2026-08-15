@@ -1,0 +1,41 @@
+module sysl.posix.tty
+@requires(posix)
+@tests
+
+// What the terminal-mode facility promises where there is no terminal, which is where a test runs.
+//
+// **These cannot put a terminal into cbreak mode and assert that it happened** — the suite's standard
+// input is a pipe, so there is nothing to configure and `raw` says so. What they *can* do is the half
+// that used to be untestable and now matters: the shim under `__macos__`/`__linux__` is real C that
+// has to compile and link, and a program calling `raw` that could not resolve `sysl_tty_raw` does not
+// build at all. Every assertion below is reached only by a binary that linked it.
+//
+// That is the same shape as `sysl.fs`'s: the interesting claim is *the C is there*, and the way to
+// assert it is to call through it and get an answer.
+
+@test("raw reports rather than pretending, where standard input is not a terminal")
+raw_answers_without_a_terminal()
+    // The suite's input is a pipe. `raw` checks `is_tty` before it touches the terminal, so this is
+    // `false` and not an error -- a program whose input is redirected wants `sysl.io.console_lines`
+    // instead, which is a different situation rather than a failure.
+    assert(!is_tty(0), "the suite's standard input should not be a terminal")
+    assert(!raw(), "raw should answer false where there is no terminal to change")
+end raw_answers_without_a_terminal
+
+@test("cooked does nothing when raw was never called")
+cooked_is_a_no_op_unentered()
+    // It is guarded on the module's own `entered`, so this must not reach the shim at all -- a
+    // program that never changed the terminal must not have it "restored" to settings it never chose.
+    cooked()
+    cooked()
+
+    assert(!raw(), "the guard is unchanged by a restore that had nothing to undo")
+end cooked_is_a_no_op_unentered
+
+@test("a terminal's own descriptor is what is asked about, not a global")
+is_tty_answers_per_descriptor()
+    // `is_tty` is the check `raw` leans on, and it takes a descriptor rather than assuming one. A
+    // descriptor nothing has opened is not a terminal, which is the answer that keeps `raw` from
+    // configuring something it does not own.
+    assert(!is_tty(9999), "an unopened descriptor is not a terminal")
+end is_tty_answers_per_descriptor

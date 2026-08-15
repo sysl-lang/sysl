@@ -45,13 +45,15 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * That raise closed a drift as much as it made room: the tree had reached 222 while the floor
    * still read 195, so a twenty-test file could have stopped being collected with nothing said. The
    * gap this guard wants is the handful the entries above all left, not the two dozen it had grown.
-   * Raised again to 224 when `sysl.fs` got a `tests.sysl` and took the tree to 231.
+   * Raised again to 224 when `sysl.fs` got a `tests.sysl` and took the tree to 231, and to 234
+   * when `sysl.posix.tty` got one and took it to 234 — that raise leaves no slack on purpose,
+   * because it is what proved the new file was collected at all rather than silently skipped.
    *
    * **`sysl.fs`'s are the first tests that depend on the library's own C**, so this floor now guards
    * a second thing: a build that stopped compiling or stopped linking the shim under
    * `library/sysl/fs/__<os>__` fails outright rather than quietly collecting fewer tests.
    */
-  private val floor = 224
+  private val floor = 234
 
   /** The library, compiled as a **test build of itself**.
    *
