@@ -697,10 +697,37 @@ object Toolchain {
     compiled.flatMap { c =>
       val exe = createTempFile("sysl-", "")
 
-      build(c.ir, exe, Target.default, archives, defaultOptimization, c.links).map { _ =>
-        val result = exec(exe :: args)
-        deleteFile(exe)
-        (result.exitCode, result.stdout, result.stderr)
+      libraryObjects.flatMap { objects =>
+        build(c.ir, exe, Target.default, archives, defaultOptimization, c.links, objects).map { _ =>
+          val result = exec(exe :: args)
+          deleteFile(exe)
+          (result.exitCode, result.stdout, result.stderr)
+        }
       }
     }
+
+  /** The standard library's own C, compiled for this machine **once for the whole process** and put
+   * on every link this runs.
+   *
+   * **It is here because this is the link, and there turned out to be three of them.** The driver
+   * adds the library's tree to `NativeSources` (`Main`), `StdSelfTests` compiles it for its own
+   * link, and then `guide/qsort` — which calls `sysl.posix.time.monotonic` — failed to resolve the
+   * clock shim through a *third* path nobody had thought about. Every one of those is "link a
+   * program that was compiled against the library from source", so the knowledge belongs at the link
+   * rather than at each caller, where the next harness would have missed it too.
+   *
+   * **Objects rather than an archive, and it costs nothing where they are not wanted.** An object is
+   * linked whether or not anything needed it, so a program reaching none of the library's C carries
+   * a few hundred unused bytes; an archive would be pulled on demand but would need `ar`, which this
+   * path has no other reason to require. Where the standard module arrived as an **artifact** its
+   * shims are archive members already, and a member is pulled only to resolve a symbol still
+   * undefined — so the object here wins and the member is simply never reached, rather than the two
+   * colliding.
+   *
+   * Compiled once because the alternative is once per test, and there are thousands of them.
+   */
+  private lazy val libraryObjects: Either[String, List[String]] =
+    NativeSources.of(Std.root.toOption.toList, Target.default.os) match
+      case Nil   => Right(Nil)
+      case trees => NativeSources.build(trees, Target.default).map(_.objects)
 }
