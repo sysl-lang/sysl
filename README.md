@@ -119,6 +119,22 @@ the flag is refused by name rather than by a header you have never heard of — 
 { lwip = "…" } }` in its `package.hocon`, answered with `--include-path lwip=<dir>`
 (`design/packages.md § 8`).
 
+**For an ordinary installed library, neither flag is needed at all** — a package names the library and
+this machine is asked where it is:
+
+```hocon
+requires {
+  pkg_config { sdl3 = "SDL3 — brew install sdl3, or Debian's libsdl3-dev" }
+}
+```
+
+`sysl run .` then works with nothing on the command line: `pkg-config --cflags` reaches every C
+compilation and `--libs` reaches the link line, including the `-Wl,-rpath` a hand-written
+`--link-path` leaves out. The package still names a library and never a path — what supplies the path
+is the machine rather than a person copying its layout. Asked only for the **host**, since a cross
+build's headers are the target's, and overridden by `--include-path <name>=<dir>` whenever you would
+rather say it yourself.
+
 **Both bindings that used to live here have repositories of their own now, and `bindings/` is gone.**
 SQLite went first — [sysl-lang/sqlite3](https://github.com/sysl-lang/sqlite3), the first sysl package
 outside this tree (`design/packages.md`) — because a binding to a library nobody is obliged to have

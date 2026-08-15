@@ -240,4 +240,41 @@ class LinkCommandTests extends AnyFreeSpec with Matchers {
     cmd should contain("-lm")
     cmd.indexOf("-lm") should be > cmd.indexOf("prog.ll")
   }
+
+  /** Where what `pkg-config` answered lands on the line (`packages.md § 8`).
+   *
+   * This is the suite's own argument exactly: **macOS cannot find this bug.** `ld64` gathers every
+   * `-L` before it resolves anything, so both orders link here — checked with clang rather than
+   * assumed. GNU ld applies a `-L` only to the `-l` options that come *after* it, so a probed search
+   * path arriving at the end of the line leaves a `@link` directive's `-l` unresolvable on any Linux
+   * where the library sits outside the default prefix.
+   */
+  "what a probe answered" - {
+
+    val probed = SearchPaths(probedLibs = List("-L/opt/pfx/lib", "-Wl,-rpath,/opt/pfx/lib", "-lcairo"))
+
+    "puts its search paths above the objects, where a -l from a directive can still see them" in {
+      val cmd = Toolchain.linkCommand("prog.ll", Nil, "prog", Target.aarch64Linux,
+                                      Toolchain.defaultOptimization, List("cairo"), paths = probed)
+
+      cmd.indexOf("-L/opt/pfx/lib") should be < cmd.indexOf("prog.ll")
+    }
+
+    // The other half of the same constraint: a `-l` above the objects is dropped by any linker
+    // resolving an archive in one pass, so the library itself has to come after them.
+    "and puts the library itself, and its rpath, after everything that could refer to it" in {
+      val cmd = Toolchain.linkCommand("prog.ll", List("std.syslib"), "prog", Target.aarch64Linux,
+                                      Toolchain.defaultOptimization, Nil, paths = probed)
+
+      cmd.indexOf("-lcairo") should be > cmd.indexOf("std.syslib")
+      cmd.indexOf("-Wl,-rpath,/opt/pfx/lib") should be > cmd.indexOf("prog.ll")
+    }
+
+    // Nothing is added to a link for a program whose packages named no library, which is every build
+    // in this repository.
+    "and adds nothing at all when nothing was probed" in {
+      Toolchain.linkCommand("prog.ll", Nil, "prog", Target.aarch64Linux) shouldBe
+        Toolchain.linkCommand("prog.ll", Nil, "prog", Target.aarch64Linux, paths = SearchPaths())
+    }
+  }
 }

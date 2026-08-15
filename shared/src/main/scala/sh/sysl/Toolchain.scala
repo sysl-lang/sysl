@@ -57,22 +57,26 @@ case class SearchPaths(link: List[String] = Nil, include: List[String] = Nil,
                        defines: List[String] = Nil,
                        probed: List[String] = Nil, probedLibs: List[String] = Nil) {
 
-  /** What the linker is told, as clang spells it. Joined rather than passed as two arguments, which
-   * is how `-L` has been written since cc and what a reader comparing this line against a hand-run
-   * clang expects to see.
-   */
-  def linkFlags: List[String] = link.map(d => s"-L$d")
-
-  /** What a probe answered for the libraries a package named, which goes at the **end** of the link
-   * line rather than into `linkFlags`.
+  /** What the linker is told, as clang spells it — `--link-path`'s directories, then any a probe
+   * answered with. Joined rather than passed as two arguments, which is how `-L` has been written
+   * since cc and what a reader comparing this line against a hand-run clang expects to see.
    *
-   * `linkFlags` is `-L` only and sits above the objects, which is where a search path belongs. A
-   * probe's answer is not only search paths: it carries the `-l` for the library itself, and a `-l`
-   * placed above the objects that need it is discarded by any linker resolving an archive in one
-   * pass. So the tokens travel together, in the order pkg-config printed them, after everything that
-   * could refer to them.
+   * **A probe's `-L` belongs here rather than at the end, because `-L` is order-sensitive on GNU ld**
+   * — it does not apply to a `-l` that appeared before it. A `@link("cairo")` directive puts `-lcairo`
+   * on the line above the objects, so a probed `-L` arriving after it would leave that `-l`
+   * unresolvable on any Linux where the library is outside the default prefix. macOS's `ld64` gathers
+   * every `-L` before resolving and does not care, which is exactly why this cannot be caught here.
    */
-  def probedLinkFlags: List[String] = probedLibs
+  def linkFlags: List[String] = link.map(d => s"-L$d") ::: probedLibs.filter(_.startsWith("-L"))
+
+  /** The rest of what a probe answered — the `-l` for the library itself, and the `-Wl,-rpath` that
+   * decides whether a dynamically-linked program finds it at run time.
+   *
+   * This half goes at the **end** of the link line: a `-l` placed above the objects that need it is
+   * discarded by any linker resolving an archive in one pass. The rpath's position is immaterial and
+   * it travels with its own `-l` rather than being separated for no gain.
+   */
+  def probedLinkFlags: List[String] = probedLibs.filterNot(_.startsWith("-L"))
 
   def includeFlags: List[String] = include.map(d => s"-I$d") ::: probed
 
