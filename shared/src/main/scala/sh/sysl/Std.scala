@@ -152,8 +152,22 @@ object Std {
    * tree is a per-target answer** (`13 §5`). The library binds one system's `readdir` under
    * `__linux__/` and another's under `__macos__/`, so what "the library's files" are is a question
    * with a machine in it — the same shape [[parsed]] already had for the same reason one layer up.
+   *
+   * **Memoized, and that is a correctness requirement rather than a saving.** A `Source` compares by
+   * **identity** (`Diagnostics`), and `Stdlib.owns` — which decides whether an unreached declaration
+   * may be dropped — asks whether a tree's `Source` *is* one of the library's. Re-reading the files
+   * makes new objects, so a second ask would answer about a different library that happens to hold
+   * the same bytes. The `lazy val` this replaced gave that for nothing; a function has to say it.
+   *
+   * A map rather than a single slot, because there are four operating systems and a run asks about
+   * one or two. What it holds is file *text*, which is a fraction of what [[parsed]]'s trees cost —
+   * that one is bounded to a single target for a reason, and this one does not need to be.
    */
-  def sources(os: Os): List[Source] = root match
+  def sources(os: Os): List[Source] = read.synchronized(read.getOrElseUpdate(os, collect(os)))
+
+  private val read = collection.mutable.Map.empty[Os, List[Source]]
+
+  private def collect(os: Os): List[Source] = root match
     case Right(dir) =>
       val found = Project.collect(dir, Some(os)).sortBy(place)
 
@@ -247,9 +261,11 @@ object Std {
    * library is a library (`13 §8`), and the one thing that used to be true of it and of nothing else
    * was that nobody ever looked here.
    */
-  def cSources(os: Os): List[Source] = root match
+  def cSources(os: Os): List[Source] = readC.synchronized(readC.getOrElseUpdate(os, root match
     case Right(dir) => Project.cSources(dir, Some(os)).sortBy(place)
-    case Left(_)    => Nil
+    case Left(_)    => Nil))
+
+  private val readC = collection.mutable.Map.empty[Os, List[Source]]
 
   /** The parsed standard module, **for a target** — and the trees of **one** target are kept, not
    * every target's.

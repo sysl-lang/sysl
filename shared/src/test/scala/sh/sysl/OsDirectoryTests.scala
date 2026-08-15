@@ -149,6 +149,27 @@ class OsDirectoryTests extends LibraryCliSupport {
       // what makes `demo` a module at all, and `walkModules` takes its C only because of that.
       ran(Config(command = "run", file = root)) shouldBe "42\n"
     }
+
+    // `15 §7`'s root exemption meets the folder. The root is the tree rather than a directory in it,
+    // so its C is taken whether or not it holds sysl — and a folder at the root has to inherit that,
+    // or a package namespaced by reverse DNS could not put a per-OS shim where its other C goes.
+    "is taken at the tree's own root, where no module is declared" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val root = projectOf(
+        "main.sysl"      -> "print(demo.seven_times(6))\n",
+        "demo/demo.sysl" -> """module demo
+                              |
+                              |extern "demo_seven" c_seven() -> int
+                              |
+                              |seven_times(n: int) -> int = c_seven() * n
+                              |""".stripMargin,
+        s"$here/shim.c"  -> shim,
+        s"$other/shim.c" -> refuses,
+      )
+
+      ran(Config(command = "run", file = root)) shouldBe "42\n"
+    }
   }
 
   "a directory that looks like one and is not" - {

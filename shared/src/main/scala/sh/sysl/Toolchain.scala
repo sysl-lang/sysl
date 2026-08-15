@@ -625,7 +625,11 @@ object Toolchain {
       val result = exec(command)
 
       if result.exitCode == 0 then Right(())
-      else Left(s"$source did not compile (exit ${result.exitCode}):\n${result.stderr.trim}")
+      // The file first, because a build compiles many and which one failed is the thing to act on —
+      // and the compiler after it, so that a diagnostic the *driver* provoked (a bad `-O`, a triple
+      // it will not take) reads as the tool's report rather than as sysl's own. The link path names
+      // it for the same reason.
+      else Left(s"$source did not compile ($cc, exit ${result.exitCode}):\n${result.stderr.trim}")
     }
   }
 
