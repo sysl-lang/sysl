@@ -382,4 +382,235 @@ class VectorRunTests extends AnyFreeSpec with RunSupport {
 
     run(src) shouldBe "2 8\n"
   }
+
+  // -- load and store ---------------------------------------------------------------------------
+  //
+  // The pair that gives a vector an address to come from and go to. Everything above computes with
+  // lanes that were written as literals; a kernel over real data gets them from a slice, and until
+  // these existed it had nowhere to put its answers.
+
+  "a run of an array loads into a vector" in {
+    val src =
+      """var xs: [6]f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        |val v: <4>f32 = xs.load(1)
+        |print(v[0], v[3])
+        |""".stripMargin
+
+    run(src) shouldBe "2 5\n"
+  }
+
+  "a vector stores back into a run of an array" in {
+    val src =
+      """var xs: [5]f32 = [0.0, 0.0, 0.0, 0.0, 9.0]
+        |val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]
+        |xs.store(0, v * 10.0)
+        |print(xs[0], xs[3], xs[4])
+        |""".stripMargin
+
+    run(src) shouldBe "10 40 9\n"
+  }
+
+  // A slice's run is measured from the slice, so the elements written are the ones the *slice*
+  // names — which is what makes a kernel taking a `[]f32` parameter mean anything.
+  "a slice loads and stores the elements it views" in {
+    val src =
+      """var xs: [8]f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        |val s = xs[2..<6]
+        |val v: <4>f32 = s.load(0)
+        |s.store(0, v + 100.0)
+        |print(xs[1], xs[2], xs[5], xs[6])
+        |""".stripMargin
+
+    run(src) shouldBe "2 103 106 7\n"
+  }
+
+  "an integer run loads and stores" in {
+    val src =
+      """var xs = [1, 2, 3, 4]
+        |val v: <4>int = xs.load(0)
+        |xs.store(0, v * v)
+        |print(xs[0], xs[1], xs[2], xs[3])
+        |""".stripMargin
+
+    run(src) shouldBe "1 4 9 16\n"
+  }
+
+  "a reference to an array is a receiver like the array" in {
+    val src =
+      """var b: &[8]f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        |val v: <4>f32 = b.load(2)
+        |b.store(0, v)
+        |print(b[0], b[3], b[4])
+        |""".stripMargin
+
+    run(src) shouldBe "3 6 5\n"
+  }
+
+  "a mask survives a round trip through memory" in {
+    val src =
+      """var xs: [4]f32 = [1.0, 5.0, 2.0, 8.0]
+        |val v: <4>f32 = xs.load(0)
+        |xs.store(0, (v > 3.0).select(0.0, v))
+        |print(xs[0], xs[1], xs[2], xs[3])
+        |""".stripMargin
+
+    run(src) shouldBe "1 0 2 0\n"
+  }
+
+  // -- the run is checked as a run --------------------------------------------------------------
+
+  "a run exactly reaching the end is in bounds" in {
+    val src =
+      """var xs: [5]f32 = [1.0, 2.0, 3.0, 4.0, 5.0]
+        |val v: <4>f32 = xs.load(1)
+        |print(v[0], v[3])
+        |""".stripMargin
+
+    run(src) shouldBe "2 5\n"
+  }
+
+  // The whole difference between this and a subscript: index 3 exists, and the run starting at 3
+  // does not. A check made at the first element only would let this through.
+  "a run whose tail is past the end traps" in {
+    exits(
+      """var xs: [5]f32 = [1.0, 2.0, 3.0, 4.0, 5.0]
+        |val v: <4>f32 = xs.load(3)
+        |print(v[0])""".stripMargin
+    )
+  }
+
+  "a store whose tail is past the end traps" in {
+    exits(
+      """var xs: [5]f32 = [1.0, 2.0, 3.0, 4.0, 5.0]
+        |val v: <4>f32 = [0.0, 0.0, 0.0, 0.0]
+        |xs.store(2, v)""".stripMargin
+    )
+  }
+
+  // **The overflow case, and it is why `runAddr` subtracts rather than adds.** `i + 4` on a `usize`
+  // at the top of the range wraps to 3, so a check written the obvious way would pass and the load
+  // would read four floats from wherever the wrapped address lands.
+  "an index at the top of usize does not wrap past the check" in {
+    exits(
+      """var xs: [5]f32 = [1.0, 2.0, 3.0, 4.0, 5.0]
+        |val i: usize = 18446744073709551615
+        |val v: <4>f32 = xs.load(i)
+        |print(v[0])""".stripMargin
+    )
+  }
+
+  // The other half of the same arithmetic: `len - lanes` on a slice shorter than the vector wraps
+  // to an enormous number, which every index is below. The length test in front of it is what
+  // catches this one, and nothing else would.
+  "a slice shorter than the vector traps rather than wrapping" in {
+    exits(
+      """var xs: [2]f32 = [1.0, 2.0]
+        |val v: <4>f32 = xs[..].load(0)
+        |print(v[0])""".stripMargin
+    )
+  }
+
+  // -- one kernel, every width --------------------------------------------------------------------
+
+  /** **This is what card 0155 was filed for, and what `guide/simd` could not write.**
+    *
+    * The width is a parameter, so neither the load nor the store can name its lanes — a lane index
+    * has to be a constant, and there is no constant to write. Both are written once here and the
+    * body is instantiated at 4 and at 8, which is the claim the vector type was added to make and
+    * which held only for the arithmetic until these two existed.
+    *
+    * `by` is a vector rather than an `f32` because that is where `W` enters: a written type
+    * argument at a call is still refused (`10 § Open a`), so a kernel whose parameters are all
+    * slices has no way to be told its width. It is not a workaround — a SIMD kernel's constants are
+    * vectors anyway — but it is the reason the signature reads as it does.
+    */
+  "one kernel loads, computes and stores at more than one width" in {
+    val src =
+      """scale[const W: usize](xs: []const f32, out: []f32, by: <W>f32)
+        |    var i: usize = 0
+        |
+        |    while i + W <= xs.len
+        |        val v: <W>f32 = xs.load(i)
+        |        out.store(i, v * by)
+        |        i += W
+        |
+        |    while i < xs.len
+        |        out[i] = xs[i] * by[0]
+        |        i += 1
+        |end scale
+        |
+        |var src: [10]f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+        |var four: [10]f32
+        |var eight: [10]f32
+        |val by4: <4>f32 = 3.0
+        |val by8: <8>f32 = 3.0
+        |
+        |scale(src[..], four[..], by4)
+        |scale(src[..], eight[..], by8)
+        |
+        |for i in 0..<10
+        |    if four[i] != eight[i] then print(s"differ at $i")
+        |
+        |print(four[0], four[9], eight[0], eight[9])
+        |""".stripMargin
+
+    run(src) shouldBe "3 30 3 30\n"
+  }
+
+  // The tail is the caller's, written as a scalar loop, and the two halves have to agree at the
+  // boundary. Ten elements at a width of four is two full runs and two left over, which is the
+  // case a kernel gets wrong.
+  "the scalar tail covers what the runs do not" in {
+    val src =
+      """scale[const W: usize](xs: []const f32, out: []f32, by: <W>f32)
+        |    var i: usize = 0
+        |
+        |    while i + W <= xs.len
+        |        val v: <W>f32 = xs.load(i)
+        |        out.store(i, v * by)
+        |        i += W
+        |
+        |    while i < xs.len
+        |        out[i] = xs[i] * by[0]
+        |        i += 1
+        |end scale
+        |
+        |var src: [10]f32 = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        |var out: [10]f32
+        |val by: <4>f32 = 7.0
+        |
+        |scale(src[..], out[..], by)
+        |print(out[7], out[8], out[9])
+        |""".stripMargin
+
+    run(src) shouldBe "7 7 7\n"
+  }
+
+  // **A load's width comes from what receives it, and an operand position does not receive it.**
+  // `xs.load(i) * by` is refused even though `by` fixes the width, because an operator does not
+  // decide its two sides in either order — the deferral `analyzeOperands` makes for a bare literal
+  // is a narrow, listed one and a method call is not on the list. A parameter *is* a receiving
+  // position, which is this case.
+  "a load takes its width from a parameter it is passed to" in {
+    val src =
+      """first(v: <4>f32) -> f32 = v[0]
+        |
+        |var xs: [4]f32 = [2.5, 0.0, 0.0, 0.0]
+        |print(first(xs.load(0)))
+        |""".stripMargin
+
+    run(src) shouldBe "2.5\n"
+  }
+
+  "a load takes its width from the function's declared result" in {
+    val src =
+      """grab[const W: usize](xs: []const f32) -> <W>f32 = xs.load(0)
+        |
+        |var xs: [8]f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        |val v: <4>f32 = grab(xs[..])
+        |print(v[0], v[3])
+        |""".stripMargin
+
+    run(src) shouldBe "1 4\n"
+  }
 }

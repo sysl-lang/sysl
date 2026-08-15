@@ -127,6 +127,12 @@ object TreeWalk {
     case TVecCompare(_, l, r, _)    => List(l, r)
     case TSelect(m, a, b, _)        => List(m, a, b)
     case TReduce(_, r, _)           => List(r)
+    case TLane(r, _, _)             => List(r)
+    // The two that reach memory, and the two that make the paragraph above more than a precaution:
+    // a load's receiver is a slice, which *can* carry a reference, so leaving these out would hide
+    // an owner from the escape and ARC walks rather than merely hiding a call.
+    case TVecLoad(r, i, _)          => List(r, i)
+    case TVecStore(r, i, v)         => List(r, i, v)
     case TArrayFill(v, _)           => List(v)
     case TBufLit(elems, _)          => elems
     case TBufFill(v, n, _)          => List(v, n)

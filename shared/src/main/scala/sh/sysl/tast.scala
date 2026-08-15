@@ -130,6 +130,32 @@ case class TSelect(mask: TExpr, whenTrue: TExpr, whenFalse: TExpr, ty: Type) ext
  */
 case class TReduce(op: String, receiver: TExpr, ty: Type) extends TExpr
 
+/** `xs.load(i)` — a run of an array's or a slice's elements read into a vector.
+ *
+ * **This is the one vector operation that touches memory, and so the only one with a run-time
+ * check.** Everything else a vector does is a register operation that cannot fail; a run of `W`
+ * elements starting at `i` needs `i + W <= xs.len`, which is not knowable until the program runs.
+ * The check is the subscript's, widened from one element to `W` of them, and it traps the same way
+ * — a vector is not a hole through which a program reaches past the end of an array.
+ *
+ * **The width is the answer's rather than the receiver's**, which is why the whole vector type is
+ * carried here: a slice has whatever length it has, and how many of its elements one load takes is
+ * the type asked for. That is what makes this usable from a `[const W: usize]` body, where the
+ * width is a parameter and no literal could stand in for it.
+ */
+case class TVecLoad(receiver: TExpr, index: TExpr, vecTy: Type.Vector) extends TExpr {
+  def ty: Type = vecTy
+}
+
+/** `xs.store(i, v)` — a vector's lanes written into a run of an array's or a slice's elements.
+ *
+ * The mirror of `TVecLoad`, checked identically. It answers `unit`, because what it is for is the
+ * effect and a value could only be the vector handed back.
+ */
+case class TVecStore(receiver: TExpr, index: TExpr, value: TExpr) extends TExpr {
+  def ty: Type = Type.Unit
+}
+
 /** The same two forms written where a `[]T` was expected: storage of the program's own, and a view
  * of all of it. The count of a `TBufFill` is an ordinary expression rather than part of a type,
  * which is the whole reason these exist — an array's length is fixed when it is compiled, and a
