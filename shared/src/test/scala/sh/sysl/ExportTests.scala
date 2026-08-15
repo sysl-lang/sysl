@@ -488,6 +488,20 @@ class ExportTests extends AnyFreeSpec with CodegenSupport with TestFrameworkSupp
       h should include("uint8_t f(wire_hdr h);")
     }
 
+    // `@align` is the other half of that pair and is folded by a different line, so it is asserted
+    // rather than assumed to follow from `@packed` working.
+    "including the other one, which is folded separately" in {
+      headerFor("module demo\n\n@align(16)\n@export(\"aligned_hdr\")\nstruct H\n    a: u32\n\n" +
+        "@export\nf(h: H) -> u32 = h.a\n") should include("} aligned_hdr;")
+    }
+
+    // The rule that catches an annotation written twice is above the struct reading and so covers
+    // it — two names for one type say nothing the one does, and worse could disagree.
+    "and writing it twice is refused, as it is above a function" in {
+      err("module demo\n\n@export(\"a\")\n@export(\"b\")\nstruct H\n    x: i32\n") should
+        include("is written twice above one declaration")
+    }
+
     /** **The chosen name reaches the header and nothing else.** The emitted aggregate keeps the
       * mangled name, which is what every other part of the compiler keys on, and C links nothing on
       * a type name — so this is a spelling for a reader rather than a fact anything depends on. It
