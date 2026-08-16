@@ -444,48 +444,93 @@ class WideIntegerTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     err("var x: u128 = 340282366920938463463374607431768211456") should include("does not fit")
   }
 
-  /** Reaching an element happens at `usize`, and a wider index would have to be truncated to get
-   * there. Truncating is what makes a bounds test lie: `2^64 + 5` arrives as 5 and passes on a
-   * six-element array, so the program reads an element that the index it wrote does not name. The
-   * refusal is the no-implicit-narrowing rule (`01`) reaching one more position.
+  /** Reaching an element happens at `usize`, so a wider index has to be narrowed to get there — and
+   * the order is the whole of it. Narrowing first makes the bounds test lie: `2^64 + 5` arrives as 5
+   * and passes on a six-element array, so the program reads an element the index it wrote does not
+   * name.
+   *
+   * **This was a refusal until CRAFT, and the argument above is why it was a good one.** What was
+   * wrong was the conclusion. Nothing holds more than `usize` elements, so an index that does not
+   * fit names no element at all — which makes it an ordinary index out of range rather than a
+   * program to decline — and asking whether it fits *before* narrowing costs one comparison and
+   * keeps every word of the value while the question is asked.
+   *
+   * `07 § Indexing` had said so all along: the index may be any integer type, because requiring
+   * `usize` would make `for i in 0..<10 do a[i] …` need a conversion for no benefit. On a 64-bit
+   * machine the only index that reached the refusal was a `u128`, so it cost nothing and nobody
+   * noticed; on a 16-bit one an `int` is wider than an address, and the standard library stopped
+   * compiling in twelve places.
    */
-  "a width past 64 bits is not an index" - {
-    "reading an element with one is refused, and the message names the narrowing" in {
-      val e = err("""var xs: [6]int = [7; 6]
-                    |var i: u128 = 18446744073709551621
-                    |print(xs[i])""".stripMargin)
-      e should include("wider")
-      e should include("usize(i)")
+  "a width past 64 bits is an index like any other" - {
+    "reading an element with one lands where it says" in {
+      run("""var xs: [6]int = [7; 6]
+            |var i: u128 = 5
+            |print(xs[i])""".stripMargin) shouldBe "7\n"
     }
 
-    "so is writing through one, since a place and a read take one selection" in {
-      err("""var xs: [6]int = [7; 6]
-            |var i: u128 = 1
-            |xs[i] = 0""".stripMargin) should include("wider")
+    // The case the old refusal existed for, and the one that says the test happens before the
+    // narrowing: 2^64 + 5 truncated to an address is 5, which this array has.
+    "and one past what an address can name traps rather than wrapping onto a valid one" in {
+      exits("""var xs: [6]int = [7; 6]
+              |var i: u128 = 18446744073709551621
+              |print(xs[i])""".stripMargin)
     }
 
-    "and so is a slice bound at either end" in {
-      err("""var xs: [6]int = [7; 6]
-            |var i: u128 = 1
-            |var v = xs[i..<3usize]""".stripMargin) should include("wider")
-      err("""var xs: [6]int = [7; 6]
-            |var i: u128 = 3
-            |var v = xs[0usize..<i]""".stripMargin) should include("wider")
+    "writing through one goes the same way, since a place and a read take one selection" in {
+      run("""var xs: [6]int = [7; 6]
+            |var i: u128 = 5
+            |xs[i] = 42
+            |print(xs[i], xs[0])""".stripMargin) shouldBe "42 7\n"
     }
 
-    "and a repeat count, which would otherwise size storage by a truncated number" in {
-      err("""var n: u128 = 3
-            |var xs: []int = [0; n]""".stripMargin) should include("wider")
+    "and a write past the width traps too" in {
+      exits("""var xs: [6]int = [7; 6]
+              |var i: u128 = 18446744073709551621
+              |xs[i] = 0""".stripMargin)
     }
 
-    "the narrowing written out is ordinary, and lands where it says" in {
+    "a slice bound is one at either end" in {
+      run("""var xs: [6]int = [7; 6]
+            |var lo: u128 = 1
+            |var hi: u128 = 3
+            |print(xs[lo..<3usize].len, xs[0usize..<hi].len)""".stripMargin) shouldBe "2 3\n"
+    }
+
+    "and a bound past the width traps" in {
+      exits("""var xs: [6]int = [7; 6]
+              |var hi: u128 = 18446744073709551621
+              |var v = xs[0usize..<hi]""".stripMargin)
+    }
+
+    // A count reaches the same narrowing as an index, so it needs no rule of its own -- and what it
+    // would cost to get this wrong is storage sized by a number nobody wrote.
+    "a repeat count reaches the same check" in {
+      run("""var n: u128 = 3
+            |var xs: []int = [0; n]
+            |print(xs.len)""".stripMargin) shouldBe "3\n"
+    }
+
+    "and one past the width traps rather than sizing storage by its low half" in {
+      exits("""var n: u128 = 18446744073709551616
+              |var xs: []int = [0; n]""".stripMargin)
+    }
+
+    // Read unsigned for the fit exactly as for the bounds test, so -1 is above everything an
+    // address can name and fails at the first of the two rather than by luck at the second.
+    "a negative index of a wider type fails, and at the same test as always" in {
+      exits("""var xs: [6]int = [7; 6]
+              |var i: i128 = -1
+              |print(xs[i])""".stripMargin)
+    }
+
+    "the narrowing written out is still ordinary, and still lands where it says" in {
       run("""var xs: [6]int = [7; 6]
             |var i: u128 = 5
             |xs[usize(i)] = 42
             |print(xs[usize(i)], xs[0])""".stripMargin) shouldBe "42 7\n"
     }
 
-    "a narrower index still widens with nothing written, which is the other half of the rule" in {
+    "a narrower index widens with nothing written, which is the other half of the rule" in {
       run("""var xs: [6]int = [7; 6]
             |var i: u8 = 5
             |xs[i] = 42

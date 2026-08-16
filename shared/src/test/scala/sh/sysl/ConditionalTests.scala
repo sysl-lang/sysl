@@ -189,12 +189,21 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
 
   "the symbols" - {
 
+    // **Read off the registry rather than written out.** The symbol set is derived from `Os` and
+    // `Cpu` precisely so that adding a machine adds its symbol; a list spelled here turns that one
+    // registry entry into a stale fixture, which is what happened when `craft` arrived and this went
+    // on counting the seven processors it knew about. What the test is about is the *exactly one*.
     "every target defines exactly one operating system and one processor" in {
+      val systems    = Os.values.map(_.toString.toLowerCase).toSet
+      val processors = Cpu.values.map(_.symbol).toSet
+
       for t <- Target.all do
         val on = Conditional.defined(t)
 
-        on.count(Set("macos", "linux", "windows", "freestanding")) shouldBe 1
-        on.count(Set("aarch64", "x86_64", "riscv64", "riscv32", "thumb", "wasm32", "x86")) shouldBe 1
+        withClue(t.name) {
+          on.count(systems) shouldBe 1
+          on.count(processors) shouldBe 1
+        }
     }
 
     "nothing a target defines is outside the closed set" in {
