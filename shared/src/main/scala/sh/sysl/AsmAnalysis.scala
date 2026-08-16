@@ -87,7 +87,7 @@ trait AsmAnalysis extends TypeResolution {
 
     // Commas up to the last, which takes the "or". Joining the lot with "or" was fine while the
     // registry had three processors and an arm was rarely missing more than two; a bare `asm` block
-    // now names five, and "'a' or 'b' or 'c' or 'd' or 'e'" is a list a reader has to parse rather
+    // now names six, and "'a' or 'b' or 'c' or 'd' or 'e'" is a list a reader has to parse rather
     // than read. The registry is what grew, so the sentence is what has to give.
     if missing.nonEmpty then
       val named =

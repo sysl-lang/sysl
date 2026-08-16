@@ -133,7 +133,7 @@ class InlineAssemblyTests extends AnyFreeSpec with Matchers with CodegenSupport 
 
       // And named as a *list*: commas up to the last, which takes the "or". Joining them all with
       // "or" was fine while three processors meant an arm was rarely missing more than two; a bare
-      // block now names five, and "'a' or 'b' or 'c' or 'd' or 'e'" is parsed rather than read.
+      // block now names six, and "'a' or 'b' or 'c' or 'd' or 'e'" is parsed rather than read.
       val listed = Cpu.buildable.filterNot(_ == Cpu.X86_64).map(c => s"'${c.symbol}'")
 
       e should include(s"no arm for ${listed.init.mkString(", ")} or ${listed.last}.")
