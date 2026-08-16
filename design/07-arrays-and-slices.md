@@ -227,9 +227,21 @@ nothing said about arrays in particular.
 
 **The index may be any integer type.** Requiring `usize` would make `for i in 0..<10 do
 a[i] …` need a conversion for no benefit, since the check has to happen anyway. The index is
-widened to 64 bits and compared **unsigned** against the length, which is one comparison and
-which rejects a negative index as a very large one — the same trick a bounds check has always
-used.
+widened to **the address width** and compared **unsigned** against the length, which is one
+comparison and which rejects a negative index as a very large one — the same trick a bounds check
+has always used. (This read *"widened to 64 bits"* until targets of other widths arrived; what it is
+widened to is a `usize`, because a length is one.)
+
+**An index already *wider* than an address is narrowed, and asked whether it fits first.** No
+storage holds more than `usize` elements, so a value that does not fit names nothing — which makes
+it an ordinary out-of-bounds index rather than a program to refuse. The order is what makes that
+honest: `2^64 + 5` truncated to 64 bits arrives as 5 and would pass on a six-element array, so the
+fit is tested at the index's own width, where the value is still all there. It is read unsigned for
+that test exactly as it is for the bounds check, so a negative one fails at both.
+
+That is ordinary rather than exotic on a machine narrower than an `int`. `craft-freestanding`'s
+address space is 64 KiB, so `for i in 0..<4 do b[i] …` is precisely this case — and it is the
+sentence above that says it must not need a conversion.
 
 A failed check **traps**. It is the same runtime-safety category as the partial `char(u)`
 conversion, and it gets the same treatment.

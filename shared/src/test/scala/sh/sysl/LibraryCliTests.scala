@@ -435,7 +435,7 @@ class LibraryCliTests extends LibraryCliSupport {
         // A config naming nothing asks for the default *without saying what it is*, which is what
         // defers the path to the moment it is used.
         Config().stdSearch shouldBe None
-        stdChoice(Config()) shouldBe Stdlib.Choice.Default(None)
+        stdChoice(Config(), Target.default) shouldBe Stdlib.Choice.Default(None)
         LibraryArtifact.stdDefault(Target.default) should endWith(LibraryArtifact.extension)
       }
 

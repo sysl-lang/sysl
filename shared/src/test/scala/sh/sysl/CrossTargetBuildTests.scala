@@ -75,7 +75,11 @@ class CrossTargetBuildTests extends AnyFreeSpec with Matchers {
         |""".stripMargin,
   )
 
-  for t <- Target.all if t.supported do
+  // CRAFT is not here because there is no clang to assemble what it lowers to — its back end is an
+  // out-of-tree `llc`, and `llvm-mc` would need it too. What this sweep does for every other target,
+  // `CraftTargetTests` does for that one by reading the module instead: it is the only check
+  // available, which is exactly why that file says so rather than leaving the gap to be noticed.
+  for t <- Target.all if t.supported && t.buildsWithClang do
     s"a module for ${t.name}" - {
       for (what, src) <- programs do
         s"verifies and assembles: $what" in {

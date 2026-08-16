@@ -52,6 +52,7 @@ of what makes it different from `build`.
 | `thumbv7em-freestanding-soft` | `thumbv7em-none-eabi` | loaded | **no** | **no** |
 | `riscv32-freestanding` | `riscv32-unknown-elf` | loaded | **no** | **no** |
 | `wasm32-freestanding` | `wasm32-unknown-unknown` | loaded | yes | yes |
+| `craft-freestanding` | `craft` | *no C to have one* | **no** | **no** |
 | `x86-linux` | `i386-unknown-linux-gnu` | *no measured C ABI* | | |
 
 **The last two columns are different questions, and the `softfp` row is where that shows.** The
@@ -99,6 +100,10 @@ embedded C, and nearly all of that is 32-bit.
 
 The ninth is `wasm32-freestanding`, which is 32-bit for an unrelated reason and is not a
 microcontroller at all — see *WebAssembly, which is not a processor* below.
+
+**And one is 16-bit, which is a width no other row shares with any C the machine could link.**
+`craft-freestanding` is a teaching ISA with a 64 KiB virtual address space, and it is the first row
+where `usize` is narrower than an `int` — see *CRAFT, a machine with no C compiler* below.
 
 `thumb` rather than `arm` names the Arm half, and the reason is the assembly arm rather than the
 architecture family — a Cortex-M executes Thumb only, so an arm written for A32 would assemble for a
@@ -317,6 +322,48 @@ that runs rather than a module that is called — and it needs a wasi-libc sysro
 convention with an operating system above it, and it is a row to be measured when there is a sysroot
 to measure it against, not one to be reasoned into existence from this one.
 
+### CRAFT, a machine with no C compiler
+
+`craft-freestanding` is **CRAFT** — *Compact RISC Architecture For Teaching* — a 16-bit load/store
+machine with eight registers, a 64 KiB virtual address space over 20 bits of physical memory, and a
+software-managed TLB. It is a teaching ISA rather than a part anybody ships, and it is here because
+it is the first machine sysl can be built for that nothing else in this registry prepares you for.
+
+**Two things about it are new, and the second is the one that reaches into the language.**
+
+**It has no clang.** Its LLVM back end lives out of tree — symlinked into an unmodified
+`llvm-project` rather than forked into one — so what exists is an `llc` somebody built, not a driver
+anybody installs. Nor is there anything for a driver to do: no libc, no object format, and **no
+linker** at all, since `craft as` assembles one file and resolves every label inside it. So sysl
+writes the LLVM and stops. `sysl emit-llvm --target craft-freestanding` is the whole surface, and
+`llc -march=craft` and `craft as` are the reader's own two commands; every other subcommand is
+refused, by name, with that sentence.
+
+Two things follow that are worth stating rather than discovering. The **standard module is taken
+from source** there — an artifact is an archive of objects, and this machine has neither — which is
+the road bootstrap already takes for the same reason. And `AbiAgainstClangTests` **cannot ask about
+this row**: it is not that the measurement has not been made, it is that there is no C on the far
+side of any call to disagree with. What `CAbi` does here is the back end's own lowering, and it says
+so: an aggregate travels through memory, because a register is two bytes and putting one in registers
+would spend the whole file on a struct of four fields.
+
+**And it is sixteen bits, which is the fact that reaches furthest.** `usize` and `isize` are
+pointer-width by definition, so a view is `{ ptr, ptr, i16 }` and the length of everything is bounded
+by the address space it lives in — which is right, and is what a 64 KiB machine means. What is *not*
+sixteen bits is `int`, at 32, or `long`, at 64: a width is the language's answer and not the
+machine's, so the ordinary arithmetic of an ordinary program here is multi-word, and the back end
+expands it exactly as every 32-bit row already expands a `long`.
+
+**Where that showed was indexing, and it was a real narrowness rather than a cost of the target.**
+`a[i]` with `i: int` is the first line of nearly every loop, and the compiler had been refusing an
+index wider than an address — on the argument that a truncated index is not the index that was
+written, which is true. The answer is to ask whether it fits *before* narrowing it, where the value
+is still all there: no storage holds more than `usize` elements, so an index that does not fit names
+nothing, which makes it an ordinary out-of-bounds index and not a program to decline. `07 § Indexing`
+already said the index may be any integer type, and named `for i in 0..<10 do a[i]` as the thing that
+must not need a conversion. On every earlier target the only index this reached was a `u128`, so
+refusing cost nothing and the gap went unnoticed; here it was the standard library, in twelve places.
+
 ### Adding one
 
 A target is not a description of a machine. It is the set of answers codegen asks for, so:
@@ -325,8 +372,15 @@ A target is not a description of a machine. It is the set of answers codegen ask
   nothing can be wrong about;
 - **the way to add a target is to measure it**, by compiling the equivalent C with
   `clang -target <triple> -S -emit-llvm` and reading what comes out. Every row above was
-  established that way. An ABI document tells you what is specified; the C compiler on the other
-  side of the call tells you what is *done*, and it is the second one a call has to agree with;
+  established that way, **bar one**. An ABI document tells you what is specified; the C compiler on
+  the other side of the call tells you what is *done*, and it is the second one a call has to agree
+  with;
+- **the exception is a machine with no C on the other side of the call, and it has to say so rather
+  than leave the row blank.** `craft-freestanding` has no clang, no libc and no linker, so there is
+  nothing to measure and nothing to agree with — what it records is its own back end's lowering,
+  named as that. It is a narrow exception and not a loophole: the test is whether a C compiler for
+  the machine *exists*, not whether one is installed, and a row that skipped the measurement for any
+  other reason would be recording a guess;
 - **a measurement of a default is a measurement of one compiler**, so where a row's answer came
   out of clang rather than out of the triple, the row says it instead. That is what `fpu` is: the
   same `thumbv8m.main-none-eabi` reports a floating-point unit under one clang and none under

@@ -148,7 +148,13 @@ class AbiAgainstClangTests extends AnyFreeSpec with Matchers with CodegenSupport
     (declaring(t, ir, "give"), declaring(t, ir, "take"))
   }
 
-  for t <- Target.all if t.supported do
+  // **CRAFT is left out, and it is the one exclusion here that is not about an installation.**
+  // Every other row is a triple some clang accepts, so a machine that has not got the back end
+  // cancels below and a machine that has measures. There is no craft clang at all — what exists is
+  // an out-of-tree `llc` — so nothing could ever answer for it. Nor is there a question: that
+  // machine has no libc and no linker, so nothing on the far side of a call is C, and `CAbi.craft`
+  // says so from the other side.
+  for t <- Target.all if t.supported && t.buildsWithClang do
     s"${t.name} agrees with clang about" - {
       for s <- shapes do
         s.what in {

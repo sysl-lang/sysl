@@ -40,10 +40,14 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
     }
 
     // What decides whether a target can be built for is whether a C calling convention has been
-    // measured for its processor -- not how wide its addresses are. Both widths are now built for,
-    // and `x86-linux` is refused for the reason it was always really refused for.
-    "builds for both address widths, and refuses only what it has no convention for" in {
-      Target.all.filter(_.supported).map(_.pointerBits).distinct.sorted shouldBe List(32, 64)
+    // measured for its processor -- not how wide its addresses are. All three widths are now built
+    // for, and `x86-linux` is refused for the reason it was always really refused for.
+    //
+    // Sixteen joined the list with CRAFT, which is the width that reaches furthest: an `int` is
+    // wider than an address there, so it is the first row where indexing a slice with one is a
+    // narrowing rather than a widening.
+    "builds for every address width, and refuses only what it has no convention for" in {
+      Target.all.filter(_.supported).map(_.pointerBits).distinct.sorted shouldBe List(16, 32, 64)
       Target.all.filterNot(_.supported).map(_.name) shouldBe List("x86-linux")
 
       Target.all.filterNot(_.supported).map(_.cpu).distinct shouldBe List(Cpu.X86)
@@ -92,7 +96,7 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
       Target.all.filterNot(_.hardFloat).map(_.name) shouldBe
         List("riscv64-freestanding", "thumb-freestanding-softfp", "thumb-freestanding-soft",
           "thumbv6m-freestanding", "thumbv7m-freestanding", "thumbv7em-freestanding-soft",
-          "riscv32-freestanding")
+          "riscv32-freestanding", "craft-freestanding")
     }
 
     // A *different* question from the one above, and the list is deliberately not the same list:
@@ -102,7 +106,8 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
     "records which targets have no floating-point unit at all, which is not the same question" in {
       Target.all.filter(_.noFpu).map(_.name) shouldBe
         List("riscv64-freestanding", "thumb-freestanding-soft", "thumbv6m-freestanding",
-          "thumbv7m-freestanding", "thumbv7em-freestanding-soft", "riscv32-freestanding")
+          "thumbv7m-freestanding", "thumbv7em-freestanding-soft", "riscv32-freestanding",
+          "craft-freestanding")
 
       Target.thumbFreestandingSoftfp.softFloat shouldBe true
       Target.thumbFreestandingSoftfp.noFpu shouldBe false
@@ -266,7 +271,8 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
           // The one row here where the keyword is accepted and means nothing rather than reaching
           // storage nobody set up: LLVM compiles a wasm `thread_local` to an ordinary data symbol
           // unless the module is built for threads, which this one is not.
-          "wasm32-freestanding"
+          "wasm32-freestanding",
+          "craft-freestanding",
         )
     }
 
@@ -531,21 +537,36 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
       val widths = Target.all.filter(_.supported).groupBy(_.word).toList.sortBy(_._1.bits)
       val lines  = widths.map((_, g) => typeLines(g.head))
 
-      widths.map(_._1.bits) shouldBe List(32, 64)
+      val bits = widths.map(_._1.bits)
 
-      val (narrow, wide) = (lines.head, lines.last)
-      val name           = (s: String) => s.takeWhile(_ != '=').trim
+      bits shouldBe List(16, 32, 64)
 
-      narrow.map(name) shouldBe wide.map(name)
+      val name = (s: String) => s.takeWhile(_ != '=').trim
 
-      val moved = narrow.zip(wide).filter(_ != _)
+      // Every width declares the same types under the same names -- that is the "nothing else about
+      // a type" half, and it is asked of all three rather than of the two extremes, since a middle
+      // one that had grown a type of its own would slip between them.
+      for l <- lines do l.map(name) shouldBe lines.head.map(name)
 
-      withClue("no type moved at all, so this proved nothing")(moved should not be empty)
+      // And the other half: something moved between each adjacent pair, so the comparison is not
+      // vacuous at any of them. Asked pairwise because the claim is about *a* doubling rather than
+      // about the span -- 16 against 64 would leave the middle unexamined.
+      for ((n, w), (nb, wb)) <- lines.init.zip(lines.tail).zip(bits.init.zip(bits.tail)) do
+        withClue(s"no type moved between $nb and $wb, so this proved nothing")(
+          n.zip(w).filter(_ != _) should not be empty)
 
-      for (n, w) <- moved do
-        withClue(s"\n$n\n$w") {
-          n should include("i32")
-          w should include("i64")
+      // What each moved line *is* is asked of 32 against 64 only, and the 16-bit row is why that is
+      // now a narrower claim than it reads. A data enum's payload region is a blob sized to the
+      // widest payload and counted in the **strictest member's** unit -- which is a member's
+      // alignment and not the machine's word -- so `%enum.sysl.args$Arg` is `[2 x i32]` at sixteen
+      // bits and `[3 x i32]` at thirty-two: the element stayed put and the count moved. Between 32
+      // and 64 the two coincide, because there the word is the strictest thing in that enum.
+      val (thirtyTwo, sixtyFour) = (lines(1), lines(2))
+
+      for (a, b) <- thirtyTwo.zip(sixtyFour).filter(_ != _) do
+        withClue(s"\n$a\n$b") {
+          a should include("i32")
+          b should include("i64")
         }
     }
 

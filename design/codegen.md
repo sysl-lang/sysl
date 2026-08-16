@@ -543,9 +543,13 @@ arity.
    than written once at the widest. `00 §5` records the two reasons this was believed to stop at
    128 and why neither held. `f128` has no such route, since rendering a float is `snprintf`'s job
    either way, and it stays the open question it was.
-   `usize` / `isize` are fixed at 64 bits by a constant. There **is** a
-   target description now (`targets.md`) and this does not read it, for the reason `Layout` does
-   not: every target in the registry is 64-bit, and the registry refuses one that is not.
+   ~~`usize` / `isize` are fixed at 64 bits by a constant.~~ **Not any more — and the reason this
+   gave for it, *"every target in the registry is 64-bit, and the registry refuses one that is
+   not"*, went stale when 32-bit targets shipped and is doubly wrong now.** The width is the
+   target's, carried as `Word`, and the registry holds 16-, 32- and 64-bit rows.
+   `craft-freestanding` is the one where `usize` is *narrower* than an `int`, which is what a 64 KiB
+   address space means and which is why an index wider than an address is now checked rather than
+   refused (`targets.md § CRAFT`).
    A narrower float constant is emitted as the `double` constant rounded
    down to it, which is correctly rounded except in the rare double-rounding case.
 2. **~~Every string is a literal or part of one.~~** No longer a shortcut — every operation `04`
