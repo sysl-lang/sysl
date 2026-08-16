@@ -194,7 +194,7 @@ unsaved buffer, a test with an inline program — has no file and no reason to m
 compiler is on Maven Central and takes a string:
 
 ```scala
-libraryDependencies += "sh.sysl" %% "sysl" % "0.0.59"   // %%% in a cross-project
+libraryDependencies += "sh.sysl" %% "sysl" % "0.0.60"   // %%% in a cross-project
 ```
 
 The Maven Central badge at the top of this page is the published version, so it is what to check this
