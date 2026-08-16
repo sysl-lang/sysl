@@ -198,14 +198,19 @@ private[sysl] def execute(cfg: Config): Int = {
   if !target.buildsWithClang && !Set("emit-llvm", "prove")(cfg.command) then
     return fail(target.noToolchain)
 
-  // Running the result is what makes `run` different from `build`, and only this machine can do
-  // that — so a cross target is refused here rather than built and then failed to execute.
+  // Running the result is what makes `run` and `test` different from `build`, and only this machine
+  // can do that — so a cross target is refused here rather than built and then failed to execute.
   //
-  // `test` is the same and refuses it in `TestRunner`, where the rest of what it does is: it is one
-  // compilation and one link like the two above, and then a run per test rather than a run.
-  if cfg.command == "run" && !Target.host.contains(target) then
-    return fail(s"'run' executes what it builds, and '${target.name}' is not this machine — " +
-      s"use 'sysl build --target ${target.name}'")
+  // **`test` used to refuse it in `TestRunner`, one step too late.** `TestRunner.run` is *handed*
+  // the objects a tree's C compiled to, so by the time it reached its own check the library's C had
+  // already been compiled for the cross target — and a shim under a `__<os>__` directory only
+  // compiles on a host that has that system's headers. On Linux the first cross target in the
+  // registry is `aarch64-macos`, so `sysl test --target <cross>` reported that
+  // `library/sysl/fs/__macos__/dirent.c` would not compile, in place of the refusal it was about to
+  // make anyway. `TestRunner` keeps its own check, since it is reachable without this driver.
+  if Set("run", "test")(cfg.command) && !Target.host.contains(target) then
+    return fail(s"'${cfg.command}' ${if cfg.command == "run" then "executes" else "runs"} what it " +
+      s"builds, and '${target.name}' is not this machine — use 'sysl build --target ${target.name}'")
 
   // Only the metadata is read here. The object half stays in the file and reaches the linker as the
   // archive it already is — there is nothing to unwrap, nothing to write to a temporary, and nothing
@@ -374,19 +379,31 @@ private[sysl] def execute(cfg: Config): Int = {
   val stdTree =
     Option.when(coreArchive.isEmpty && !cfg.std)(Std.root.toOption).flatten.toList
 
-  val native =
+  // **A function rather than a value, because *when* the C is compiled is a decision.** It used to be
+  // computed here, above both the test branch and the compilation below — so a program the analyzer
+  // was going to refuse paid for a C compile first, and where that C could not be compiled at all the
+  // error from it arrived *instead of* the diagnostic. On Linux, `sysl build --target aarch64-macos`
+  // said `library/sysl/fs/__macos__/dirent.c` would not compile — true, since a macOS shim needs
+  // macOS headers, and nothing to do with the program in front of it.
+  //
+  // So each command asks for it where it needs it: a test build below its own branch, and an
+  // ordinary build below the analysis. What a reader gets from a program that will not compile is
+  // now the reason it will not compile.
+  def nativeSources(): Either[String, NativeSources.Built] =
     if links(cfg.command) then
       NativeSources.build(NativeSources.of(cfg.file :: roots ::: fetched.roots ::: stdTree, target.os),
-        target, cfg.optimize, paths, cfg.verbose) match
-        case Left(err)    => return fail(err)
-        case Right(built) => built
-    else NativeSources.none
+        target, cfg.optimize, paths, cfg.verbose)
+    else Right(NativeSources.none)
 
   // A test build is its own compilation and branches before the one below, rather than sharing it:
   // it keeps the `@test` functions every other build drops, and it lowers a different entry point
   // (`Tests`). Everything up to here — the libraries, the standard module, the target — is the same,
   // which is why the branch is here and not at the top.
   if cfg.command == "test" then
+    val native = nativeSources() match
+      case Left(err)    => return fail(err)
+      case Right(built) => built
+
     val status =
       TestRunner.run(cfg, sources, libraryTrees, target, precompiled, std, archives,
         native.objects, paths, allocator, librarySources)
@@ -412,6 +429,11 @@ private[sysl] def execute(cfg: Config): Int = {
         if result.notes.isEmpty then Console.err.println("no arrays were promoted to the heap")
         else result.notes.foreach(Console.err.println)
       result
+
+  // Below the compilation, which is the whole point of it being a function — see `nativeSources`.
+  val native = nativeSources() match
+    case Left(err)    => return fail(err)
+    case Right(built) => built
 
   val status = cfg.command match
     case "emit-llvm" =>
