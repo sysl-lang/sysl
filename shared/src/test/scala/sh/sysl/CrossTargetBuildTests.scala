@@ -84,15 +84,24 @@ class CrossTargetBuildTests extends AnyFreeSpec with Matchers {
       for (what, src) <- programs do
         s"verifies and assembles: $what" in {
           // A clang without this target's back end cannot answer, and saying so is better than
-          // passing. Apple's clang has no RISC-V at all, which is why `findClang` looks further.
-          val cc = Toolchain.findClang(t).getOrElse(cancel(s"no clang for ${t.name}"))
+          // passing. Apple's clang has no RISC-V at all, which is why the search looks further.
+          //
+          // **`findBackendClang` and not `findClang`, because the question here is about the IR.**
+          // What is being asserted is that what sysl emits for this machine verifies and assembles,
+          // and a `.ll` names its own triple and includes no header — so the back end is the whole
+          // of what answering needs. `findClang` asks the stronger question of whether a *program*
+          // could be built for the machine, which on Android means an installed NDK; asking it here
+          // would skip this sweep's Android row on every machine that has not got one, for a
+          // sysroot nothing in the sweep can reach.
+          val cc = Toolchain.findBackendClang(t).getOrElse(cancel(s"no clang for ${t.name}"))
 
           val obj = createTempFile("sysl-cross-", ".o")
           val ir  = Compiler.compile(List(Source("p.sysl", src)), t) match
             case Right(ir) => ir
             case Left(why) => fail(s"did not compile for ${t.name}: $why")
 
-          withClue(s"$cc, ${t.triple}: ")(Toolchain.compileObject(ir, obj, t) shouldBe Right(()))
+          withClue(s"$cc, ${t.triple}: ")(
+            Toolchain.compileObject(ir, obj, t, named = Some(cc)) shouldBe Right(()))
         }
     }
 
@@ -229,8 +238,13 @@ class CrossTargetBuildTests extends AnyFreeSpec with Matchers {
    * to catch.
    */
   "an Android object carries no absolute relocation in code, so an archive of them links into a .so" in {
-    val t  = Target.aarch64Android
-    val cc = Toolchain.findClang(t).getOrElse(cancel(s"no clang for ${t.name}"))
+    val t = Target.aarch64Android
+
+    // The back end and not the toolchain, for the reason the sweep above gives at length: this reads
+    // relocations out of an object assembled from IR, and no header or library is involved in making
+    // one. Asking `findClang` would make the test need an installed NDK, which the Linux CI has not
+    // got — and this is precisely the test that had to be taught to run there.
+    val cc = Toolchain.findBackendClang(t).getOrElse(cancel(s"no clang for ${t.name}"))
 
     // Enough of a program to reach a global, a string constant, a call into the standard module and
     // a call into libc — the four things a `.text` relocation here can be about. A program of locals
@@ -248,7 +262,8 @@ class CrossTargetBuildTests extends AnyFreeSpec with Matchers {
       case Right(ir) => ir
       case Left(why) => fail(s"did not compile for ${t.name}: $why")
 
-    withClue(s"$cc, ${t.triple}: ")(Toolchain.compileObject(ir, obj, t) shouldBe Right(()))
+    withClue(s"$cc, ${t.triple}: ")(
+      Toolchain.compileObject(ir, obj, t, named = Some(cc)) shouldBe Right(()))
 
     // **The tool has to be one that can name AArch64's relocations, and running is not that test.**
     // GNU binutils' `objdump` is built for the host's architecture: handed an AArch64 object on an

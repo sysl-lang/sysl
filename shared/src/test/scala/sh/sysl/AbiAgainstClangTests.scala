@@ -20,8 +20,15 @@ import org.scalatest.matchers.should.Matchers
  * as a practice.**
  *
  * It needs no emulator, no linker script and no hardware — only a clang with the back end, which is
- * what `Toolchain.findClang` finds. A target whose back end this machine's clang does not have is
- * **cancelled and named**, never silently passed.
+ * what `Toolchain.findBackendClang` finds. A target whose back end this machine's clang does not have
+ * is **cancelled and named**, never silently passed.
+ *
+ * **The back end and not the toolchain, which is a distinction Android made real.** The C compiled
+ * here is declarations and one call — it includes no header and is never linked — so a sysroot has
+ * nothing to contribute to the answer, and every triple's convention is a property of clang rather
+ * than of what happens to be installed for that platform. `Toolchain.findClang` asks the stronger
+ * question and would cancel Android's row on any machine without an NDK, retiring the oracle for the
+ * one target most recently added to it.
  */
 class AbiAgainstClangTests extends AnyFreeSpec with Matchers with CodegenSupport {
 
@@ -158,7 +165,7 @@ class AbiAgainstClangTests extends AnyFreeSpec with Matchers with CodegenSupport
     s"${t.name} agrees with clang about" - {
       for s <- shapes do
         s.what in {
-          val cc = Toolchain.findClang(t).getOrElse(cancel(s"no clang here has a back end for ${t.name}"))
+          val cc = Toolchain.findBackendClang(t).getOrElse(cancel(s"no clang here has a back end for ${t.name}"))
 
           val (cGive, cTake) = clangSays(cc, t, s.c, s.packed)
           val (mGive, mTake) = syslSays(t, s.sysl, s.packed)
@@ -203,7 +210,7 @@ class AbiAgainstClangTests extends AnyFreeSpec with Matchers with CodegenSupport
   )
 
   private def scalarsAgree(t: Target): Unit = {
-    val cc  = Toolchain.findClang(t).getOrElse(cancel(s"no clang here has a back end for ${t.name}"))
+    val cc  = Toolchain.findBackendClang(t).getOrElse(cancel(s"no clang here has a back end for ${t.name}"))
     val src = createTempFile("sysl-abi-scalar-", ".c")
 
     val fromClang =

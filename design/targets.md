@@ -180,17 +180,46 @@ thread-local's control block is ordinary data holding a pointer, and a pointer i
 dynamic linker relocates. A rule reading "no absolute relocation anywhere" would fail a correct
 program.
 
-**What it does need is a clang that is not the one on the PATH, AND THERE IS NO WAY TO SAY SO YET.**
+**What it does need is a clang that is not the one on the PATH, and the search asks for it by name.**
 Apple's clang emits correct IR and objects for this triple — it has the back end, and the ABI is the
 processor's — but it has no Bionic sysroot, so anything that reads a header or reaches the linker is
-the NDK clang's job. `findClang` chooses by back end alone, so it picks the host's and the build fails
-at the first `#include <dirent.h>` in the standard library's own C, which reads as a broken library
+the NDK clang's job. A search choosing by back end alone picks the host's, and the build then fails at
+the first `#include <dirent.h>` in the standard library's own C, which reads as a broken library
 rather than as the wrong compiler.
 
-`Toolchain.findClang` takes a named compiler and **nothing has ever passed one**: three of its own
-diagnostics say *"name one with `--cc`"* and no such flag exists. So this row is registered, measured
-and correct, and a build for it cannot yet be driven end to end. What that costs, and the three shapes
-a fix could take, is an open question rather than an oversight — see *Open*.
+**So having the back end and having the toolchain are two questions, and this is the first row where
+they part company.** `Toolchain.findBackendClang` answers the first: *can this machine lower for that
+one*, which is all that turning a `.ll` into an object needs, because a `.ll` names its own triple and
+includes nothing. `Toolchain.findClang` answers the second: *can this machine build a program for it*,
+which additionally needs the target's headers and its libraries. Every other row answers both with one
+compiler, which is why the distinction had nowhere to show itself until now.
+
+**For an Android build the environment must say where the NDK is, and where it does not the build is
+refused.** `ANDROID_NDK_ROOT` or `ANDROID_NDK_HOME` names one outright; otherwise `ANDROID_SDK_ROOT`
+or `ANDROID_HOME` names the SDK and the newest `ndk/<version>` beneath it is taken. Nothing else is
+consulted — no home directory is searched and no default location is assumed:
+
+```
+building for Android needs the NDK's own clang, and nothing here says where it is — no clang outside
+the NDK carries Bionic's headers, so one picked for having the back end fails at the first '#include'.
+Set ANDROID_SDK_ROOT to the Android SDK (the directory holding 'ndk/'), or ANDROID_NDK_ROOT to one
+NDK directly
+```
+
+**The refusal is the design and not a gap in it.** An NDK sits wherever the person installing it chose,
+so a compiler that went looking would find *an* NDK on the machine it was written on and none anywhere
+else — and the failure mode of guessing is silently building against the wrong platform headers, which
+is worse than not building. A sentence naming a variable is something the reader can act on; the
+`dirent.h` diagnostic it replaces sends them to the wrong tree.
+
+**Naming the binary is the whole of what is required.** Since r19 the NDK's clang resolves a sysroot
+relative to its own path, so no `--sysroot`, no `-isystem` and no library path is passed for it —
+`clang --target=aarch64-linux-android24` compiles and links against Bionic on its own. Two details of
+the layout are worth writing down because both mislead: the version directories under `ndk/` are
+compared **as numbers**, since `9.0.111` sorts above `30.0.222` as text; and the host directory under
+`toolchains/llvm/prebuilt/` is **listed rather than composed**, because it is named `darwin-x86_64`
+even on an Apple Silicon Mac — the clang inside is a universal binary with a real arm64 slice, and the
+path has simply never been renamed.
 
 ### Armv6-M, which is the RP2040 and is a different architecture
 
@@ -747,28 +776,29 @@ the trees a library ships are now a per-target answer. `13 §8` has the rest.
 
 ## Open
 
-- **Naming the compiler — `findClang` takes one and no caller supplies one.** Its signature is
-  `findClang(target, named)`, three of its diagnostics tell the reader to *"name one with `--cc`"*,
-  and there is no such flag: nothing anywhere passes the parameter. It went unnoticed because every
-  target until now was one the PATH clang could serve — RISC-V sends the search on to Homebrew's
-  LLVM, and that is the whole of what the search was ever asked to do.
+- ~~**Naming the compiler for Android**~~ **— answered by the search reading the environment, which
+  is what *Android, whose triple carries a version number* above now describes.** `findClang` finds
+  the NDK from `ANDROID_SDK_ROOT` (or the three other spellings) and refuses, naming the variable,
+  where nothing says where one is. `sysl build --target aarch64-android` needs no flag.
 
-  **`aarch64-android` is the first target where having the back end is not having the toolchain.** It
-  needs a *sysroot*, so the compiler is the NDK's; and a build that cannot be told which compiler to
-  use cannot be driven at all. The failure is a missing `<dirent.h>`, which reads as a broken library.
+  **What is still open is the flag itself, and it is narrower than it was.** Three of `findClang`'s
+  diagnostics tell the reader to *"name one with `--cc`"* and there is no such flag: nothing on a
+  command line passes the parameter, though `compileObject` now takes it for the one caller that has
+  a compiler in hand and no toolchain — a test asking what sysl's output lowers to for a machine it
+  could not build a whole program for.
 
-  Three shapes, and they are not equivalent:
+  So the remaining question is **not** how Android gets built, which is settled. It is whether a
+  person can override the choice — for a second NDK, for a CMake-driven build that wants to pass the
+  compiler Gradle picked, or for any target at all. The reach is what it always was: `findClang` is
+  called from `CProbe`, which is reached through the analyzer, so a threaded parameter travels most
+  of the pipeline — or rides `SearchPaths`, which already goes nearly everywhere and is already
+  *"where on this machine"*, at the cost of a type about `-I`/`-L` flags carrying a compiler path.
 
-  1. **A `--cc` flag, threaded.** Makes the existing diagnostics true and is what a CMake-driven
-     build wants to pass. The reach is the question: `findClang` is called from `CProbe`, which is
-     reached through the analyzer, so the parameter travels most of the pipeline — or rides
-     `SearchPaths`, which already goes nearly everywhere and is already *"where on this machine"*,
-     at the cost of a type about `-I`/`-L` flags carrying a compiler path.
-  2. **`findClang` learns to find an NDK**, from `ANDROID_NDK_HOME`/`ANDROID_NDK_ROOT` or the SDK's
-     own layout, exactly as `clangCandidates` already knows Homebrew's two prefixes. One function, no
-     threading, and `sysl build --target aarch64-android` then works unasked — at the cost of the
-     compiler knowing something about one platform's tooling.
-  3. **Both**, with the flag winning, which is what `--ar` and the search already are.
+  **The half-measure to avoid is unchanged**: a `--cc` honoured by `build` and not by the standard
+  module's auto-build is a flag that appears to work and then does not, since `Stdlib.writeArtifact`
+  reaches the toolchain by a path that carries no `SearchPaths` today. Until that is threaded too,
+  the three diagnostics naming the flag are the one thing in the search that is not yet true, and
+  the environment is what answers instead.
 
 - ~~**The project config**~~ **— built, and so is the source-selection axis it used to be waiting
   on.** `package.hocon` carries per-target capability sets (`capabilities.md`'s `heap` / `os` /

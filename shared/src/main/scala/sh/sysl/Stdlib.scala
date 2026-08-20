@@ -190,6 +190,13 @@ object Stdlib {
    * there is no artifact to make, and what the reader needs then is the sentence naming the command
    * and the flag — the same one they would have got before — with the reason the compiler could not
    * do it for them appended.
+   *
+   * **Except where the reason is that there is no compiler at all, and then those two suggestions are
+   * worse than nothing.** Both need the very thing that is missing: `build-lib --std` reaches the same
+   * toolchain, and `--no-std-lib` compiles the library's source into the program and still has to link
+   * it. Offering them buries the one sentence that would fix the problem inside two that cannot,
+   * wrapped in a complaint about the standard module — which is exactly the misreading Android's
+   * missing NDK produces, since a toolchain fault there already looks like a broken library.
    */
   private def found(path: String, target: Target, allocator: Allocator): Either[String, Resolved] = {
     val already = if isFile(path) then load(path, target, allocator) else Left(s"$path does not exist")
@@ -200,12 +207,27 @@ object Stdlib {
         Console.err.println(s"building the standard module at $path ($why)")
 
         writeArtifact(path, target, allocator = allocator) match
-          case Right(_) => load(path, target, allocator)
-          case Left(err) =>
-            Left(s"cannot find or build the standard module — build it with " +
-              s"'sysl build-lib library --std', or pass --no-std-lib to compile against the copy built " +
-              s"into the compiler ($err)")
+          case Right(_)  => load(path, target, allocator)
+          case Left(err) => Left(rebuildFailure(err, Toolchain.findClang(target)))
   }
+
+  /** What to say when the rebuild above did not happen: the toolchain's own sentence where there is
+   * no compiler for this target, and the two suggestions otherwise.
+   *
+   * **The toolchain is asked rather than inferred from the message.** What makes the advice wrong is
+   * that this machine cannot compile for this target at all, which is `findClang`'s question — not
+   * something to recognize by the shape of a string, which would go on matching after the wording
+   * moved and would misclassify any other failure that happened to mention a compiler.
+   *
+   * Separate from `found` so that both branches can be asserted on a machine where every registered
+   * target does have a clang, which is every developer machine and the CI runner.
+   */
+  private[sysl] def rebuildFailure(err: String, toolchain: Either[String, String]): String =
+    toolchain match
+      case Left(noToolchain) => noToolchain
+      case Right(_) =>
+        s"cannot find or build the standard module — build it with 'sysl build-lib library --std', " +
+          s"or pass --no-std-lib to compile against the copy built into the compiler ($err)"
 
   /** A prebuilt standard module read back: the trees to compile against, the symbols its object half
    * already defines, and the archive to link that half from — which is the file itself, since it is

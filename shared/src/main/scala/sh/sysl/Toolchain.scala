@@ -294,13 +294,45 @@ object Toolchain {
     else r.stdout.linesIterator.map(_.trim.takeWhile(!_.isWhitespace)).filter(_.nonEmpty).toSet
   })
 
-  /** The clang to build for `target` with, or why there is none.
+  /** A clang that can **emit code** for `target`, or why there is none — which is a weaker question
+   * than `findClang`'s and is deliberately kept separate from it.
    *
    * **The PATH's clang is preferred and is nearly always the answer** — a host build must not quietly
    * change compiler because some other LLVM happens to be installed. What sends the search further is
    * a target the PATH clang has no back end for, which on a Mac is every RISC-V one: Apple's clang is
    * trimmed to Apple's processors, so it can parse `-target riscv32-unknown-elf` and then fail to
    * produce an object for it. That failure is not a compiler bug and reads exactly like one.
+   *
+   * What this answers for is turning **IR into an object**, and a `.ll` names its own triple and
+   * includes no header, so nothing outside the back end is needed to lower it. Compiling a `.c` or
+   * linking a program needs the target's headers and its libraries as well, and that is the question
+   * `findClang` asks — the two part company on Android and nowhere else so far.
+   */
+  def findBackendClang(target: Target): Either[String, String] =
+    clangCandidates.find(p => runs(p) && backends(p).contains(target.cpu.backend)).toRight(
+      clangCandidates.find(runs) match
+        case Some(found) =>
+          s"no clang here has the '${target.cpu.backend}' back end that '${target.name}' needs. " +
+            s"'$found' registers ${shown(backends(found))} — a vendor's clang is often trimmed to " +
+            "that vendor's processors. Install LLVM ('brew install llvm'), or name one with --cc"
+        case None =>
+          "cannot find clang, which building needs — install LLVM, or name one with --cc")
+
+  /** The clang to **build** for `target` with, or why there is none: one that has the back end *and*
+   * can reach the machine's headers and libraries.
+   *
+   * ==Having the back end is not having the toolchain, and Android is where that first bites==
+   *
+   * Every target until Android was one the host's own clang could serve outright, so this and
+   * `findBackendClang` were one function and nothing noticed. A host build compiles against the
+   * machine's own headers; a freestanding one includes nothing at all; RISC-V sends the search on to
+   * Homebrew's LLVM, which is still a whole toolchain for the triple.
+   *
+   * **Android has a sysroot of its own and no clang outside the NDK carries it.** Apple's clang has
+   * `aarch64`, so a search by back end picks it and it then cannot find `<dirent.h>` — which reads as
+   * a broken standard library rather than as the wrong compiler, and is the reason this is a separate
+   * question rather than a fallback. The NDK's clang needs no `--sysroot` flag from us: since r19 it
+   * resolves one relative to its own path, so naming the binary is the whole of what is required.
    *
    * A named one is **not** searched past and not fallen back from, by the rule `findAr` states: a
    * person who wrote down which compiler to use is owed an error rather than a different one.
@@ -312,15 +344,8 @@ object Toolchain {
         Either.cond(backends(path).contains(target.cpu.backend), path,
           s"'$path' has no '${target.cpu.backend}' back end, so it cannot build for " +
             s"'${target.name}' — it registers ${shown(backends(path))}")
-    case None =>
-      clangCandidates.find(p => runs(p) && backends(p).contains(target.cpu.backend)).toRight(
-        clangCandidates.find(runs) match
-          case Some(found) =>
-            s"no clang here has the '${target.cpu.backend}' back end that '${target.name}' needs. " +
-              s"'$found' registers ${shown(backends(found))} — a vendor's clang is often trimmed to " +
-              "that vendor's processors. Install LLVM ('brew install llvm'), or name one with --cc"
-          case None =>
-            "cannot find clang, which building needs — install LLVM, or name one with --cc")
+    case None if target.os == Os.Android => androidClang
+    case None                            => findBackendClang(target)
 
   private def shown(bs: Set[String]): String =
     if bs.isEmpty then "none" else bs.toList.sorted.mkString(", ")
@@ -328,6 +353,87 @@ object Toolchain {
   private def runs(path: String): Boolean =
     try exec(Seq(path, "--version")).exitCode == 0
     catch case _: Exception => false
+
+  /** The NDK's clang, found from the environment, or the sentence saying what to set.
+   *
+   * **The environment is the only place it is looked for, and where the environment is silent this
+   * refuses rather than guessing.** An NDK is not installed anywhere in particular — it sits under
+   * whichever SDK directory the person chose — so a compiler that went hunting through home
+   * directories would be right on the machine it was written on and wrong afterwards, and the way it
+   * would be wrong is by finding *an* NDK rather than none. A refusal naming the variable is a
+   * sentence somebody can act on; a silently chosen toolchain is not.
+   *
+   * `ANDROID_NDK_ROOT`/`ANDROID_NDK_HOME` name an NDK outright and win, which is what a standalone
+   * install has. Otherwise `ANDROID_SDK_ROOT`/`ANDROID_HOME` name the SDK and the newest `ndk/<version>`
+   * under it is taken — both spellings, because Google has changed its mind about which is current
+   * twice and both are in wide use.
+   */
+  private def androidClang: Either[String, String] =
+    androidClangIn(envVar("ANDROID_NDK_ROOT").orElse(envVar("ANDROID_NDK_HOME")),
+                   envVar("ANDROID_SDK_ROOT").orElse(envVar("ANDROID_HOME")))
+      .flatMap(cc => Either.cond(runs(cc), cc, s"cannot run '$cc', which is the NDK's clang"))
+
+  /** The path resolution behind `androidClang`, taking its two directories rather than reading them,
+   * so that what it decides can be asserted on a machine with no NDK on it.
+   */
+  private[sysl] def androidClangIn(ndkRoot: Option[String], sdkRoot: Option[String])
+      : Either[String, String] =
+    ndkRoot match
+      case Some(ndk) => clangUnderNdk(ndk)
+      case None =>
+        sdkRoot match
+          case None =>
+            Left("building for Android needs the NDK's own clang, and nothing here says where it is " +
+              "— no clang outside the NDK carries Bionic's headers, so one picked for having the " +
+              "back end fails at the first '#include'. Set ANDROID_SDK_ROOT to the Android SDK " +
+              "(the directory holding 'ndk/'), or ANDROID_NDK_ROOT to one NDK directly")
+          case Some(sdk) =>
+            val installed = s"$sdk/ndk"
+
+            if !isDirectory(installed) then
+              Left(s"ANDROID_SDK_ROOT names '$sdk', which holds no 'ndk' directory — the NDK is a " +
+                "separate download, installed from Android Studio's SDK Manager under SDK Tools as " +
+                "'NDK (Side by side)'")
+            else
+              // Several may be installed side by side, which is what the directory is named for, and
+              // the newest is the one to take. Sorted on the version read as *numbers* — `9.x` sorts
+              // above `30.x` as text, which is the whole reason this is not a plain `.sorted`.
+              listFiles(installed).toList.filter(isDirectory).sortBy(d => versionKey(Project.basename(d)))
+                .lastOption match
+                case Some(newest) => clangUnderNdk(newest)
+                case None =>
+                  Left(s"'$installed' holds no NDK — the directory is there and empty, so an install " +
+                    "was started and did not finish")
+
+  /** The clang inside one NDK, or why that directory is not one.
+   *
+   * **The host directory is listed rather than computed, and that is not laziness.** It is named for
+   * the platform the toolchain was *built* for, which on an Apple Silicon Mac is still
+   * `darwin-x86_64` — the clang inside is a universal binary with a real arm64 slice and runs
+   * natively, and the path has simply never been renamed. Anything that spells the directory from
+   * the host's own architecture finds nothing on the machine it most needs to work on.
+   */
+  private def clangUnderNdk(ndk: String): Either[String, String] = {
+    val prebuilt = s"$ndk/toolchains/llvm/prebuilt"
+
+    if !isDirectory(prebuilt) then
+      Left(s"'$ndk' is not an Android NDK — it has no 'toolchains/llvm/prebuilt' in it")
+    else
+      listFiles(prebuilt).toList.filter(isDirectory).sorted.headOption match
+        case None => Left(s"'$prebuilt' holds no toolchain for any host")
+        case Some(host) =>
+          val cc = s"$host/bin/clang"
+
+          Either.cond(isFile(cc), cc, s"'$ndk' has no clang at '$cc'")
+  }
+
+  /** A dotted version as something sortable, each numeric part widened so that the comparison is by
+   * value rather than by first digit. A part that is not a number is left as it is, which puts it
+   * after every number rather than throwing.
+   */
+  private def versionKey(name: String): String =
+    name.split('.').map(p => if p.nonEmpty && p.forall(_.isDigit) then "0" * (12 - p.length) + p else p)
+      .mkString(".")
 
   /** Objects gathered into an archive the linker takes as it is.
    *
@@ -564,10 +670,17 @@ object Toolchain {
    * side of that pair and useless without the linker side, and on Mach-O it is redundant rather than
    * wrong — atoms are already per-definition there. Passed unconditionally so that an artifact built
    * on one host still strips when linked for another.
+   *
+   * `named` says which compiler to use instead of searching for one, and is `findClang`'s parameter
+   * of the same name reached from here. **It is on this one of the four because assembling IR is the
+   * step that needs no sysroot** — a `.ll` includes nothing — so a caller asking *what does sysl's
+   * output lower to for this machine* can be answered by any clang with the back end, on a machine
+   * that could not build a whole program for that target at all. `findBackendClang` finds one.
    */
   def compileObject(ir: String, obj: String, target: Target = Target.default,
-                    level: String = defaultOptimization): Either[String, Unit] = {
-    findClang(target).flatMap { cc =>
+                    level: String = defaultOptimization,
+                    named: Option[String] = None): Either[String, Unit] = {
+    findClang(target, named).flatMap { cc =>
       val ll = createTempFile("sysl-", ".ll")
       writeFile(ll, ir)
 
