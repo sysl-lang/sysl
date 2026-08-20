@@ -250,12 +250,38 @@ class CrossTargetBuildTests extends AnyFreeSpec with Matchers {
 
     withClue(s"$cc, ${t.triple}: ")(Toolchain.compileObject(ir, obj, t) shouldBe Right(()))
 
-    val listed = exec(List("objdump", "-r", obj))
+    // **The tool has to be one that can name AArch64's relocations, and running is not that test.**
+    // GNU binutils' `objdump` is built for the host's architecture: handed an AArch64 object on an
+    // x86_64 Linux it opens the ELF quite happily, reports `file format elf64-little` rather than
+    // `elf64-littleaarch64`, exits 0, and prints `UNKNOWN` as the type of every record. So an exit
+    // status says nothing here, and the first version of this test read that `UNKNOWN` as "no
+    // PC-relative relocation present" and failed on CI while passing on the development machine.
+    //
+    // It passed here because macOS's `/usr/bin/objdump` **is** llvm-objdump — byte-identical output
+    // to Homebrew's, checked — and LLVM's knows every architecture it was built with. The candidates
+    // below are therefore the same shape as `Toolchain.clangCandidates` and exist for the same
+    // reason: the capable tool is commonly installed and not always the one a bare name resolves to.
+    // The Linux CI has `llvm-objdump` on its PATH, from the pinned LLVM it installs for clang.
+    val dumpers = List(
+      "llvm-objdump",
+      "objdump",
+      "/opt/homebrew/opt/llvm/bin/llvm-objdump",
+      "/usr/local/opt/llvm/bin/llvm-objdump",
+    )
+
+    val attempts = dumpers.map(d => d -> util.Try(exec(List(d, "-r", obj))).toOption)
+    val answered = attempts.collectFirst {
+      case (d, Some(r)) if r.exitCode == 0 && r.stdout.contains("R_AARCH64_") => d -> r
+    }
+
     deleteFile(obj)
 
-    // Skipped rather than failed where there is no `objdump`: this asserts something about the
-    // object format, and a machine that cannot list relocations cannot be asked about it.
-    assume(listed.exitCode == 0, "objdump not available")
+    // Skipped rather than failed where nothing here can answer: this asserts something about the
+    // object format, and a machine with no tool that understands AArch64 relocations cannot be asked
+    // about it. Naming what was tried is what stops a skip being mistaken for a pass.
+    assume(answered.isDefined, s"no objdump here names AArch64 relocations — tried ${dumpers.mkString(", ")}")
+
+    val (dumper, listed) = answered.get
 
     // `objdump -r` writes `RELOCATION RECORDS FOR [<section>]` and then one record per line. Walking
     // it keeps each record with the section it was found under, which is the whole distinction being
@@ -275,14 +301,14 @@ class CrossTargetBuildTests extends AnyFreeSpec with Matchers {
 
     // The positive half first. Without it a build that emitted no code relocations at all would pass
     // by having nothing to be wrong about, which is exactly how the first version of this failed.
-    withClue(listed.stdout) {
+    withClue(s"$dumper:\n${listed.stdout}") {
       code should not be empty
       code should contain("R_AARCH64_ADR_PREL_PG_HI21")
     }
 
     // By exact name rather than by looking for "ABS": the perfectly position-independent
     // `ADD_ABS_LO12_NC` is the second half of every PC-relative pair above and contains it.
-    withClue(listed.stdout) {
+    withClue(s"$dumper:\n${listed.stdout}") {
       code.filter(r => r == "R_AARCH64_ABS64" || r == "R_AARCH64_ABS32") shouldBe empty
     }
   }
