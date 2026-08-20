@@ -22,7 +22,7 @@ trait DefaultParams extends StmtAnalysis with SignatureVisibility {
 
     for ((tname, mname), m) <- memberDecls.toList do
       inDecl(tname)(check(s"${qn(tname)}.$mname", Some(tname), m.params, m.variadic,
-        m.tparams.nonEmpty || typeIsGeneric(tname), _ => None))
+        m.tparams.nonEmpty || typeIsGeneric(tname), memberTyped(tname, mname, m.recvMode.size)))
 
     // An `impl` block's members are the one kind refused outright, so they are not checked for
     // anything else — the refusal is the whole of what this has to say about them.
@@ -109,6 +109,19 @@ trait DefaultParams extends StmtAnalysis with SignatureVisibility {
    */
   private def typed(key: String)(i: Int): Option[Type] =
     funcInsts.get(key).map(_._1).filter(i < _.length).map(_(i)._2)
+
+  /** The same, for a member — whose parameters a call writes, and whose lowered signature has the
+   * **receiver** in front of them. `skip` is how many of those a receiver took, so that the `i`th
+   * parameter as written is looked up where it actually landed; an associated function takes none
+   * and the two indices coincide.
+   *
+   * A member is lowered under its type mangled rather than under the key it is filed by, so the
+   * name comes from `memberFuncs` rather than being spelled here. Where there is no entry — a
+   * generic type's member, whose signature is not resolved until a call fixes it — this answers
+   * nothing, and the default is held to naming something that exists and nothing more.
+   */
+  private def memberTyped(tname: String, mname: String, skip: Int)(i: Int): Option[Type] =
+    memberFuncs.get((tname, mname)).flatMap(typed(_)(i + skip))
 
   private def typeIsGeneric(tname: String): Boolean =
     structDecls.get(tname).exists(_.tparams.nonEmpty) ||
