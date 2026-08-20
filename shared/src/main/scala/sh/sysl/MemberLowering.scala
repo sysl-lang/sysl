@@ -342,6 +342,10 @@ trait MemberLowering extends TypeResolution {
         out += fd
         if home.fixed.nonEmpty then memberSelf(fd.name) = home.fixed
         funcInsts(fd.name) = signature
+        // Which function this member became, for the passes that read the member table and have no
+        // receiver type to build the name from. Recorded in this branch alone: the signature is
+        // what it is for, and a generic member has none until a call fixes its parameters.
+        memberFuncs((home.key, filed)) = fd.name
 
         // The destructor is the one member nothing in the source reaches, so nothing else would
         // mark it (`03 § A destructor`). Marked here, where the lowered name exists.

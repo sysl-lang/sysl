@@ -93,6 +93,42 @@ class ArgumentTests
              |""".stripMargin) shouldBe "15\n6\n"
     }
 
+    // `12 §2a`: a default "is written in the declaration's terms", and the parameter's own type is
+    // the first of those terms. `None` alone says what it is `None` *of* only if something tells
+    // it, and the parameter is what tells it — so a member whose default was read against nothing
+    // could not take a `None` at all, while the identical free function could.
+    "is read at the parameter's type on a method, so a nullary variant needs no annotation" in {
+      run("""|struct Box
+             |    n: int
+             |
+             |    grown(self, by: Option[int] = None) -> int = by match
+             |        Some(k) -> self.n + k
+             |        None -> self.n
+             |end Box
+             |
+             |var b = Box(5)
+             |print(b.grown())
+             |print(b.grown(Some(4)))
+             |""".stripMargin) shouldBe "5\n9\n"
+    }
+
+    // The same on the receiverless kind, whose lowered parameter list has no `self` in front of it —
+    // which is the offset the expected type is read at, so getting it wrong shows up here and
+    // nowhere else.
+    "and at the parameter's type on an associated function, which has no receiver in front" in {
+      run("""|struct Box
+             |    n: int
+             |
+             |    of(first: Option[int] = None, base: int = 2) -> Box = first match
+             |        Some(k) -> Box(k + base)
+             |        None -> Box(base)
+             |end Box
+             |
+             |print(Box.of().n)
+             |print(Box.of(Some(40)).n)
+             |""".stripMargin) shouldBe "2\n42\n"
+    }
+
     "reaches an associated function" in {
       run("""|struct Box
              |    n: int
@@ -215,6 +251,19 @@ class ArgumentTests
       err("""|f(s: string = 3) -> string = s
              |print(1)
              |""".stripMargin) should include("the default for 's'")
+    }
+
+    // The other half of reading a member's default at its parameter's type: what the type gives it
+    // is also what it is held to. Nothing calls `grown` here either.
+    "and a method's is refused there too, at the type its parameter declares" in {
+      err("""|struct Box
+             |    n: int
+             |
+             |    grown(self, by: string = 3) -> int = self.n
+             |end Box
+             |
+             |print(1)
+             |""".stripMargin) should include("the default for 'by'")
     }
 
     // `13 §2`, applied to the one part of a signature a call does not write. Without this a caller

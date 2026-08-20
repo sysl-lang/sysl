@@ -464,6 +464,23 @@ trait DeclTables extends Reporting {
    */
   protected val genericMembers = mutable.LinkedHashMap.empty[(String, String), FuncDecl]
 
+  /** The function a member was lowered to, keyed the way the member table is — (type name, the name
+   * it is filed under).
+   *
+   * The two names are not the same string and cannot be derived from each other: a member is *filed*
+   * under the key an `impl` may name and *lowered* under that type mangled, and a type an `impl` may
+   * name is not always a name — `[]int` is a fine key and an impossible LLVM symbol, so its members
+   * are emitted under `slice.int`. Everything that starts from a receiver's **type** builds the
+   * lowered name with `Type.memberSymbol`; this is for the passes that start from the member table
+   * instead and have no type in hand.
+   *
+   * What it buys is the member's resolved signature: `funcInsts` holds one under the lowered name
+   * for every member of a concrete type, so a pass reading a declaration can ask what a parameter's
+   * type actually came out as. A generic type's members have no entry there — their signatures are
+   * written in terms nothing has fixed — and are absent here for the same reason.
+   */
+  protected val memberFuncs = mutable.LinkedHashMap.empty[(String, String), String]
+
   /** What `Self` means inside one lowered member, keyed by the name it was lowered to.
    *
    * A member of a concrete type — its own, or one an `impl` gave it — may write `Self` for the type
