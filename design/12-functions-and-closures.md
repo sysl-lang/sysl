@@ -432,6 +432,25 @@ finding some `n` at the call site: the parameters are bound by the very call bei
 default that read one would fix an evaluation order among arguments that nothing else in the language
 fixes.
 
+What it is analyzed *against* is **the type its own parameter declares**, which is the other half of
+being written in the declaration's terms. So a value that says nothing about its own type needs no
+annotation beside it — `None` where an `Option[int]` is wanted is that parameter's `None` — and a
+default whose type disagrees is refused at the declaration rather than at whichever call first left
+the argument out. **A member is no different**, and the receiver is simply not one of the arguments a
+call writes:
+
+```
+struct Room
+    seats: int
+
+    free(self, taken: Option[int] = None) -> int = …
+end Room
+```
+
+**A generic declaration's defaults are the exception, and they are analyzed against nothing.** Its
+parameter types are written in terms nothing has fixed yet, so there is no type to hold a default to
+until a call chooses one — which is what the paragraph about closure literals below is really about.
+
 **Analyzed in the declaration's scope; positioned at the call site.** Those are two different
 questions and this section used to answer only the first, because until an expression could ask
 *where it was written* nothing needed the second. The paragraph above is about **name resolution**
@@ -455,12 +474,14 @@ a line in the declaration's file, which is precisely the answer this is for avoi
 call entered wins, and every built-in in the nest names the one place a reader actually wrote a call.
 
 **A closure literal is not yet one of the expressions a default may be**, though "standing exactly
-where the argument would have been written" says it should be: an argument there takes the
-parameter's declared type as what it is being used as, and a default does not, so `f: int -> int = y
--> y * 2` is refused for having nothing to infer `y` from. The placeholder form `= _ * 2` is refused
-identically and for the same reason — this is a gap in what a default is analyzed *against*, not in
-either spelling of the closure. Written out at the call site both forms work. The fix is to expect
-the parameter's own type where the default is analyzed; nothing in this section has to change for it.
+where the argument would have been written" says it should be: `f: int -> int = y -> y * 2` is
+refused for having nothing to infer `y` from, and the placeholder form `= _ * 2` is refused
+identically. It is the generic exception above, wearing a spelling that does not look generic: a
+parameter written with a **bare arrow is a bounded type parameter** (§6), so the declaration carrying
+one *is* generic and its defaults are analyzed against nothing. This is a gap in what a default is
+analyzed *against*, not in either spelling of the closure — written out at the call site both forms
+work. The fix is to expect the parameter's own type there too; nothing in this section has to change
+for it.
 
 **A default is exposed, so `13 §2` applies** — a declaration may not be more visible than what it
 names. A public function whose default calls a private one has published a call its callers can
