@@ -31,6 +31,17 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
       Target.all.map(_.triple).distinct.length should be < Target.all.length
     }
 
+    // **Which rows want position-independent C, asked of the registry rather than of one target.**
+    // The flag is only ever right where the output is loaded as a shared object, and wrong on a bare
+    // machine, where it would add a GOT nothing sets up — so this pins both halves at once and a new
+    // row has to choose deliberately.
+    "wants position-independent carried C exactly where a program is loaded as a shared object" in {
+      Target.all.filter(_.positionIndependent).map(_.name) shouldBe List("aarch64-android")
+
+      for t <- Target.all if t.os == Os.Freestanding do
+        withClue(t.name)(t.positionIndependent shouldBe false)
+    }
+
     "names no target it cannot answer the ABI questions for" in {
       for t <- Target.all do
         withClue(t.name) {

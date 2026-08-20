@@ -180,6 +180,30 @@ thread-local's control block is ordinary data holding a pointer, and a pointer i
 dynamic linker relocates. A rule reading "no absolute relocation anywhere" would fail a correct
 program.
 
+**That finding is about sysl's OWN object, and the C a package carries is the other half — which does
+need the flag.** The paragraph above turns entirely on every emitted global being `Linkage.Private`;
+a vendored library's globals are ordinary C globals and *are* preemptible, so clang refers to one by
+an absolute page address unless told otherwise, and the shared link every Android program ends in
+refuses it:
+
+```
+ld.lld: error: relocation R_AARCH64_ADR_PREL_PG_HI21 cannot be used against symbol
+  'b2AssertHandler'; recompile with -fPIC
+```
+
+So `Target.positionIndependent` is true for this row and `Toolchain.compileC` passes `-fPIC` where it
+is. With the flag the same reference goes through the GOT (`ADR_GOT_PAGE`), which is what a `.so`
+wants. **What is still true is that sysl needs no relocation-model *field*** — nothing about the
+emitted module changes, and `-fno-pic` on a `.ll` was measured to change nothing at all, because
+`dso_local` is what decides there.
+
+Found building `sysl-lang/androidkit` against `sh.sysl.box2d`, whose vendored Box2D has exactly such
+globals. **The failure lands in Gradle's build naming a symbol from somebody else's C**, so it reads
+as a broken package rather than as a missing compiler flag — which is why the rule is written down
+here rather than left to the next person to rediscover.
+
+Freestanding rows answer `false` and must: `-fPIC` on a bare-metal image adds a GOT nothing sets up.
+
 **What it does need is a clang that is not the one on the PATH, and the search asks for it by name.**
 Apple's clang emits correct IR and objects for this triple — it has the back end, and the ABI is the
 processor's — but it has no Bionic sysroot, so anything that reads a header or reaches the linker is

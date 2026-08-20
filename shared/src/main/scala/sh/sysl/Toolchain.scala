@@ -735,6 +735,21 @@ object Toolchain {
    * again: a header found at its path and compiled without the macros its project configures it with
    * is a header that refuses on its own terms. `SearchPaths.defineFlags` has the worked example.
    *
+   * **`-fPIC` where the target says so (`Target.positionIndependent`), and its absence was silent.**
+   * A package's C has ordinary C globals, which are preemptible — so without the flag clang emits an
+   * absolute-page reference to the symbol and the shared link refuses it. That is a *link* error in
+   * somebody else's build system, naming a symbol from a vendored library:
+   * `relocation R_AARCH64_ADR_PREL_PG_HI21 cannot be used against symbol 'b2AssertHandler';
+   * recompile with -fPIC`. It reads as a broken package and is not one.
+   *
+   * **This does not contradict `targets.md § Android`'s finding that sysl needs no relocation
+   * model.** That was measured on sysl's *own* object, whose globals are all `Linkage.Private` and
+   * therefore not preemptible. Carried C is the half that finding did not cover.
+   *
+   * `named` says which compiler to use instead of searching for one, exactly as `compileObject`'s
+   * does and for the same narrow reason: a C file that includes nothing needs no sysroot, so a test
+   * asking what a flag does to an object can be answered by any clang with the back end.
+   *
    * `-fshort-enums` where the target says so (`Target.shortEnums`), because a package's C is being
    * compiled to link against a C project that sysl did not start. Clang and GNU's `arm-none-eabi`
    * default opposite ways on the same triple, so passing nothing means whichever this clang prefers —
@@ -745,10 +760,12 @@ object Toolchain {
    */
   def compileC(source: String, obj: String, target: Target = Target.default,
                level: String = defaultOptimization,
-               paths: SearchPaths = SearchPaths.none, verbose: Boolean = false): Either[String, Unit] = {
-    findClang(target).flatMap { cc =>
+               paths: SearchPaths = SearchPaths.none, verbose: Boolean = false,
+               named: Option[String] = None): Either[String, Unit] = {
+    findClang(target, named).flatMap { cc =>
       val command = Seq(cc, s"--target=${target.triple}", flag(level)) ++ machineFlags(target) ++
-        Option.when(target.shortEnums)("-fshort-enums") ++ paths.defineFlags ++
+        Option.when(target.shortEnums)("-fshort-enums") ++
+        Option.when(target.positionIndependent)("-fPIC") ++ paths.defineFlags ++
         paths.includeFlags ++
         Seq("-ffunction-sections", "-fdata-sections", "-c", source, "-o", obj)
 

@@ -184,6 +184,36 @@ case class Target(
    */
   def buildsWithClang: Boolean = cpu != Cpu.Craft
 
+  /** Whether a program for this machine is **loaded as a shared object**, which decides whether the C
+   * a package carries has to be position-independent.
+   *
+   * **Android is the only row where it is true, and it is true of every Android program.** There is
+   * no executable to run: `SDLActivity` — or any other host — `dlopen`s a `.so` and calls into it, so
+   * everything sysl compiles for that machine ends up inside one.
+   *
+   * ==Why this is about the CARRIED C and not about sysl's own output==
+   *
+   * `targets.md § Android` establishes that sysl's own objects need no relocation model: every global
+   * the emitter writes is `Linkage.Private`, so it is not preemptible and lowers to a PC-relative
+   * pair against a local section. That is still true and nothing here changes it.
+   *
+   * **A package's vendored C is the other half, and it has ordinary C globals.** Those *are*
+   * preemptible, so without `-fPIC` clang emits `ADR_PREL_PG_HI21` against the symbol itself and the
+   * shared link refuses it — `relocation R_AARCH64_ADR_PREL_PG_HI21 cannot be used against symbol
+   * 'b2AssertHandler'; recompile with -fPIC`. With the flag the same reference goes through the GOT
+   * (`ADR_GOT_PAGE`), which is what a `.so` needs. Found building `sysl-lang/androidkit` against
+   * `sh.sysl.box2d`, whose vendored Box2D has exactly such globals.
+   *
+   * **It is asked rather than derived from `os.inherentCapabilities`,** because it is not a property
+   * of the operating system's services: Linux hosts shared libraries perfectly well and a sysl
+   * program for it is an ordinary executable. What this records is the shape of the *output*, which
+   * is a fact about the platform's convention rather than about its libc.
+   *
+   * Freestanding rows answer `false` and must: `-fPIC` on a bare-metal image adds a GOT nothing sets
+   * up.
+   */
+  def positionIndependent: Boolean = os == Os.Android
+
   /** What to say to somebody who asked for a build sysl cannot drive — the sentence, once, so the
    * five subcommands that refuse do not each invent their own half of it.
    */

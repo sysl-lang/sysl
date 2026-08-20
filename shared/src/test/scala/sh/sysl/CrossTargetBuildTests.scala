@@ -208,6 +208,74 @@ class CrossTargetBuildTests extends AnyFreeSpec with Matchers {
     withClue(defs.head)(defs.head should include(" T "))
   }
 
+  /** That the **C a package carries** is compiled position-independently for Android, which is the
+   * half `targets.md § Android` did not cover and the half that actually breaks.
+   *
+   * The finding there is about sysl's own object and stands: every global the emitter writes is
+   * `Linkage.Private`, so it is not preemptible and needs no relocation model. **A vendored library's
+   * globals are ordinary C globals and are preemptible**, so without `-fPIC` clang refers to one by
+   * an absolute page address, and the shared link an Android program always ends in refuses it:
+   *
+   * {{{
+   * ld.lld: error: relocation R_AARCH64_ADR_PREL_PG_HI21 cannot be used against symbol
+   *   'b2AssertHandler'; recompile with -fPIC
+   * }}}
+   *
+   * That is a link error in Gradle's build, naming a symbol from somebody else's C — so it reads as a
+   * broken package rather than as a missing compiler flag. Found building `sysl-lang/androidkit`
+   * against `sh.sysl.box2d`.
+   *
+   * **The assertion is on the relocation rather than on the flag**, because the flag is a means: what
+   * has to be true is that a reference to a global goes through the GOT. `ADR_GOT_PAGE` is that, and
+   * it is what the same compile produces with `-fPIC` and never produces without.
+   */
+  "the C a package carries is position-independent for Android, so a .so can link it" in {
+    val t = Target.aarch64Android
+
+    // The back end and not the toolchain, for the reason the sweep above gives: this C includes no
+    // header, so no sysroot is involved in compiling it, and asking `findClang` would make the test
+    // need an NDK the Linux CI has not got.
+    val cc = Toolchain.findBackendClang(t).getOrElse(cancel(s"no clang for ${t.name}"))
+
+    // A global and a function that reads it — the smallest thing that has to reach a symbol whose
+    // address the loader may change. A function calling only itself would carry no such relocation
+    // and would pass whatever the flag did.
+    val src = createTempFile("sysl-pic-", ".c")
+    val obj = createTempFile("sysl-pic-", ".o")
+
+    writeFile(src, "int carried_global = 7;\nint carried_read(void) { return carried_global; }\n")
+
+    withClue(s"$cc, ${t.triple}: ")(
+      Toolchain.compileC(src, obj, t, named = Some(cc)) shouldBe Right(()))
+
+    val dumpers = List(
+      "llvm-objdump",
+      "objdump",
+      "/opt/homebrew/opt/llvm/bin/llvm-objdump",
+      "/usr/local/opt/llvm/bin/llvm-objdump",
+    )
+
+    val attempts = dumpers.map(d => d -> util.Try(exec(List(d, "-r", obj))).toOption)
+    val answered = attempts.collectFirst {
+      case (d, Some(r)) if r.exitCode == 0 && r.stdout.contains("R_AARCH64_") => d -> r
+    }
+
+    deleteFile(src)
+    deleteFile(obj)
+
+    // Skipped rather than failed where nothing here can name AArch64's relocations, and naming what
+    // was tried is what stops a skip being mistaken for a pass — the lesson the sibling test above
+    // was written from.
+    assume(answered.isDefined, s"no objdump here names AArch64 relocations — tried ${dumpers.mkString(", ")}")
+
+    val listed = answered.get._2.stdout
+
+    withClue(listed) {
+      listed should include("R_AARCH64_ADR_GOT_PAGE")
+      listed should not include "R_AARCH64_ADR_PREL_PG_HI21"
+    }
+  }
+
   /** That an object built for Android is **position-independent in the object**, which is what an
    * archive destined for a `.so` has to be and the one claim the emitted text cannot settle.
    *
