@@ -244,6 +244,26 @@ happens to be spelled like a field, so a trait can promise it. A **field** stays
 whatever the bounds say, because a field is layout and no promise about behaviour reaches one
 (`10 §5`) — which is what the diagnostic on `x.v` says when nothing declares a property of the name.
 
+**And it may ask for the write half too**, by declaring the setter beside it (`08 § A property may
+be settable`):
+
+```
+trait Counter
+    count -> int
+    set count(n)
+```
+
+That needed nothing added here either, and the reason is worth stating because it is what made the
+feature cheap: a setter is an ordinary method with a `*self` receiver, so it takes a table slot
+beside the others, a bound licenses writing exactly as it licenses reading, and **object safety is
+untouched** — the receiver is the only place `Self` appears. A trait asking for a setter is asking
+about a property it also declares, which is the one rule that is this section's rather than `08`'s.
+
+A property reached through a bound or a table belongs to the **trait**, so that is where a setter for
+it is declared. Writing one the trait does not ask for is refused with the trait named, and not with
+the concrete type an instantiation happened to supply — an inherent setter there would not license
+the write, so naming it would be advice that does not work.
+
 ## An `impl` is for a type, and a type is not always a name
 
 `impl Trait for Type` names its subject with a **type reference**, not an identifier, so the types

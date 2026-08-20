@@ -742,6 +742,49 @@ trait ExprAnalysis
       err(s"'$op' on an element read through '${qn(Library.key("Index"))}' would evaluate the " +
         s"receiver and the index twice — write it out as 'b[i] = b[i] ${op.dropRight(1)} …'")
 
+    // `p.count = v` where `count` is a settable property is a **call**, exactly as `b[i] = v` on a
+    // container is (`14 §7`, `00 §2`): a property computes rather than naming storage, so there is
+    // no place for a store to write through, and the setter takes the value instead.
+    case Assign("=", Field(receiver, name), value) if settable(receiver, name) =>
+      callMethod(receiver, DeclParser.setterName(name), List(value), None)
+
+    // The compound forms, which is where a property parts company with `IndexSet`. `14 §7` refuses
+    // `b[i] += v` because the receiver *and the index* would each be evaluated twice; a property has
+    // no index, so taking the receiver's address once is the whole of what the form needs — and it
+    // is the line the feature exists for, `count += 1` rather than the two calls written out.
+    //
+    // It is desugared into source rather than built here, so every rule arrives through its ordinary
+    // spelling: `&` refuses a receiver with no address, the setter's own `*self` refuses a `val`,
+    // and the arithmetic is whatever `+` means for that type. The temporary holds the **address**,
+    // since a copy of the receiver would be written and thrown away.
+    case a @ Assign(op, Field(receiver, name), value) if settable(receiver, name) =>
+      if !addressable(receiver) then
+        err(s"'$op' reads '$name' and writes it back, so it needs a receiver it can reach twice — " +
+          "this one is computed, and has no address. Bind it to a 'var' first")
+
+      val tmp                    = s"${Modules.sep}recv"
+      def here[T <: Positioned](e: T): T = e.setPos(a.pos)
+      def through: Expr          = here(Field(here(Unary("*", here(Ident(tmp)))), name))
+
+      analyzeExpr(
+        here(Block(List[Stmt](
+          here(ValDecl(tmp, None, here(Unary("&", receiver)))),
+          here(ExprStmt(here(Assign("=", through, here(Binary(op.dropRight(1), through, value)))))),
+        ))),
+        expected,
+      )
+
+    // A property with no setter. The ordinary path would report an expression with no address, which
+    // is true and is not what the reader needs to know: what is missing is the member, and the
+    // sentence that says so also says what to write.
+    case Assign(op, Field(receiver, name), _) if readOnlyProperty(receiver, name).isDefined =>
+      val p   = readOnlyProperty(receiver, name).get
+      val msg = s"'$name' is a property of '${p.of}', which computes rather than naming storage, " +
+        s"so ${if op == "=" then "there is nothing to assign through" else s"'$op' has nothing to write back"} " +
+        s"— write 'set $name(…)' ${p.where} to give it a setter"
+
+      if p.viaBound then boundErr(msg) else err(msg)
+
     case Assign("=", target, value) =>
       val place = analyzePlace(target, "assignment")
       val tv    = analyzeExpr(value, Some(place.ty))

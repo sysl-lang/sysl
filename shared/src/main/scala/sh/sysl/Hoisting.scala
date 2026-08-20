@@ -113,7 +113,10 @@ trait Hoisting extends HoistMembers {
       val key = Modules.qualify(currentModule, t.name)
 
       if typeNameTaken(key, t.name) then err(s"the name '${t.name}' is already declared")
-      traitDecls(key) = t.copy(name = key).setPos(t.pos)
+      // A trait asking for a setter is asking about a property it also declares, so the two are put
+      // together here — before anything reads the trait's signatures — exactly as a type's own
+      // members are paired when they are hoisted.
+      traitDecls(key) = t.copy(name = key, methods = pairSetters(t.methods, t.name)).setPos(t.pos)
       declScope(key) = currentScope
       recordAccess(key, t.vis)
       // A trait's members take no modifier of their own, so each is recorded at the trait's reach —

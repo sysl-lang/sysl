@@ -44,11 +44,13 @@ trait ImplConformance extends MemberLowering {
           checkOverrideMarking(shown, tm, im)
         case None if tm.body.nonEmpty => inherited += tm
         case None =>
-          err(s"'${home.label}' does not implement '$shown': ${kind(tm)} '${tm.name}' is missing")
+          err(s"'${home.label}' does not implement '$shown': ${kind(tm)} " +
+            s"'${DeclParser.sourceName(tm.name)}' is missing")
 
     for im <- impl.methods do
       if !declared.contains(im.name) then
-        err(s"trait '$shown' declares no ${kind(im)} '${im.name}', so this 'impl' cannot define it")
+        err(s"trait '$shown' declares no ${kind(im)} '${DeclParser.sourceName(im.name)}', so this " +
+          "'impl' cannot define it")
 
     inherited.toList
   }
@@ -70,11 +72,16 @@ trait ImplConformance extends MemberLowering {
     // an `impl` of a trait with several defaults would otherwise put every one of these on its
     // opening line and leave the reader to work out which member was meant.
     at(im.pos) {
+    val written = DeclParser.sourceName(tm.name)
+    // The words to write, which for a setter are not its name: `override set count(x)` is the whole
+    // member, and telling a reader to say `override count` would send them to the getter.
+    val say     = if DeclParser.isSetter(tm.name) then s"set $written" else written
+
     if tm.body.nonEmpty && !im.overrides then
-      err(s"trait '$traitName' supplies a body for ${kind(tm)} '${tm.name}', so writing one here " +
-        s"replaces it — say 'override ${tm.name}', or leave the member out to keep the trait's")
+      err(s"trait '$traitName' supplies a body for ${kind(tm)} '$written', so writing one here " +
+        s"replaces it — say 'override $say', or leave the member out to keep the trait's")
     else if tm.body.isEmpty && im.overrides then
-      err(s"trait '$traitName' declares ${kind(tm)} '${tm.name}' without a body, so this member " +
+      err(s"trait '$traitName' declares ${kind(tm)} '$written' without a body, so this member " +
         "supplies what the trait asked for rather than replacing anything — 'override' says a body " +
         "was replaced")
     }
@@ -84,7 +91,10 @@ trait ImplConformance extends MemberLowering {
    * mistake.
    */
   protected def kind(m: MethodDecl): String =
-    if m.isProperty then "property" else if m.receiver.isEmpty then "associated function" else "method"
+    if DeclParser.isSetter(m.name) then "setter for property"
+    else if m.isProperty then "property"
+    else if m.receiver.isEmpty then "associated function"
+    else "method"
 
   /** Compares one implementing method against the trait's signature: same receiver mode, same
    * parameter types in order, and the same result.
@@ -110,32 +120,37 @@ trait ImplConformance extends MemberLowering {
       self: Map[String, Type],
       traitScope: Scope,
   ): Unit = {
+    // A message names the member the way it was **written**: a setter is filed under a name holding
+    // `$`, which is not sysl and must never reach a reader.
+    val name = DeclParser.sourceName(im.name)
+
     // Which *kind* of member it is comes first, because two of the three kinds have no receiver
     // between them: a property and an associated function both answer `None`, so the receiver
     // comparison below would let one stand for the other without ever noticing.
     if tm.isProperty != im.isProperty then
       if tm.isProperty then
-        err(s"'${im.name}' is a property of trait '$traitName', so an implementation writes it as " +
-          s"'${im.name} -> …' with no parameter list")
+        err(s"'$name' is a property of trait '$traitName', so an implementation writes it as " +
+          s"'$name -> …' with no parameter list")
       else
-        err(s"'${im.name}' is a method of trait '$traitName', so an implementation writes it with a " +
+        err(s"'$name' is a method of trait '$traitName', so an implementation writes it with a " +
           "parameter list — a property has none")
     if tm.receiver != im.receiver then
-      err(s"method '${im.name}' of 'impl $traitName for $forType' takes a different receiver than the trait declares")
+      err(s"method '$name' of 'impl $traitName for $forType' takes a different receiver than " +
+        "the trait declares")
     // A member of an `impl` is the trait's member supplied, so its shape is the trait's — including
     // how many types of its own it is generic over. The trait declares none today, which makes this
     // the diagnostic for writing a generic method in an `impl`.
     if tm.tparams.length != im.tparams.length then
-      err(s"${kind(im)} '${im.name}' of 'impl $traitName for $forType' declares " +
+      err(s"${kind(im)} '$name' of 'impl $traitName for $forType' declares " +
         s"${quantity(im.tparams.length, "type parameter")}, but trait '$traitName' declares " +
         s"${tm.tparams.length}")
     if tm.params.length != im.params.length then
-      err(s"method '${im.name}' of 'impl $traitName for $forType' takes ${im.params.length} " +
+      err(s"method '$name' of 'impl $traitName for $forType' takes ${im.params.length} " +
         s"parameters, but the trait declares ${tm.params.length}")
     // A `...` is part of what a caller may write, so an implementation that has one where the trait
     // has none — or the other way about — is a different promise, not a wider one.
     if tm.variadic != im.variadic then
-      err(s"method '${im.name}' of 'impl $traitName for $forType' " +
+      err(s"method '$name' of 'impl $traitName for $forType' " +
         s"${if im.variadic then "takes" else "does not take"} a '...', but trait '$traitName' " +
         s"declares ${if tm.variadic then "one" else "none"}")
 
@@ -147,12 +162,13 @@ trait ImplConformance extends MemberLowering {
       val want = inScope(traitScope)(resolveType(tp.typ, self))
       val got  = resolveType(ip.typ, self)
       if want != got then
-        err(s"parameter '${ip.name}' of method '${im.name}' is ${show(got)}, but trait '$traitName' declares ${show(want)}")
+        err(s"parameter '${ip.name}' of method '$name' is ${show(got)}, but trait '$traitName' " +
+          s"declares ${show(want)}")
 
     val want = inScope(traitScope)(tm.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit))
     val got  = im.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
     if want != got then
-      err(s"method '${im.name}' returns ${show(got)}, but trait '$traitName' declares ${show(want)}")
+      err(s"method '$name' returns ${show(got)}, but trait '$traitName' declares ${show(want)}")
   }
 
   /** Builds the function a member lowers to: the receiver becomes an ordinary first parameter

@@ -10,6 +10,18 @@ package sh.sysl
  *
  * Split out of `ExprAnalysis`, whose expression dispatch calls in here.
  */
+/** A property that cannot be written, as the refusal needs to say it: what it is a property **of**,
+ * where a setter for it would go, and whether the receiver reached it through a **bound**.
+ *
+ * The last of those decides which complaint this is. A body written against a type parameter is
+ * checked once, at its definition, and everything there that the bounds do not license is checked
+ * *only* there — an instantiation resolves the same read against a concrete implementation, which
+ * has an inherent setter or has not and either way is answering a different question. So a write no
+ * bound licenses is `boundErr`'s to report, and reporting it at the instantiation would name the
+ * concrete type and tell the reader to add a member the bound would still not reach.
+ */
+case class ReadOnlyProperty(of: String, where: String, viaBound: Boolean)
+
 trait MemberExprAnalysis extends ExprSupport {
 
   /** `receiver.name` in all its readings. */
@@ -473,6 +485,68 @@ trait MemberExprAnalysis extends ExprSupport {
     tsubst.get(f).collect {
       case Type.ConstArg(v, _: Type.Integer) if v.isValidInt => v.toInt
     }
+
+  /** The type a member would be read off, asked of an assignment target **before** the statement has
+   * committed to being a store. Whatever goes wrong typing the receiver is left for the ordinary
+   * path to report, in the place the programmer wrote it — which is `indexes`' rule for the same
+   * question one node over, and for the same reason.
+   */
+  private def receiverProbe(receiver: Expr): Option[Type] =
+    probe(autoDeref(analyzeExpr(receiver)).ty)
+
+  /** Whether this type has a setter for `name` (`08 § A property may be settable`).
+   *
+   * The three receivers a property can be read off are the three a property can be written through,
+   * and each is asked the question the same way its read asks it: a bound consults what it licenses,
+   * a trait object consults the table's members, and everything else consults the type's own.
+   */
+  protected def hasSetter(ty: Type, name: String): Boolean = {
+    val filed = DeclParser.setterName(name)
+
+    ty match
+      case _ if Type.erased(ty) =>
+        Type.erasedTrait(ty).exists(t =>
+          traitMembers(Type.Bound(t.name, t.args)).exists(_._2.name == filed))
+      case a: Type.Abstract => boundMember(a, filed).isDefined
+      case _                => memberDecls.contains((memberKey(ty, filed)._1, filed))
+  }
+
+  /** Whether `recv.name = …` reaches a setter rather than storage. */
+  protected def settable(receiver: Expr, name: String): Boolean =
+    receiverProbe(receiver).exists(hasSetter(_, name))
+
+  /** Where `recv.name` is a property with **no** setter: what it is a property of, and where the
+   * setter would have to be written. This is the assignment the ordinary path would otherwise report
+   * as an expression with no address — true, and not what the reader needs to know, since what is
+   * missing is a member and the sentence that says so can also say where it goes.
+   *
+   * The three receivers are the three `hasSetter` asks about, and the answer differs in one word:
+   * a property reached through a bound or through a table belongs to the **trait**, so that is
+   * where a setter for it is declared, and saying "on 'Cell'" there would send the reader to write
+   * a member no bound would license.
+   */
+  protected def readOnlyProperty(receiver: Expr, name: String): Option[ReadOnlyProperty] =
+    receiverProbe(receiver).filter(ty => !hasSetter(ty, name)).flatMap { ty =>
+      def inTrait(t: Type.Bound, viaBound: Boolean) =
+        ReadOnlyProperty(show(ty), s"in trait '${qn(t.name)}'", viaBound)
+
+      ty match
+        case _ if Type.erased(ty) =>
+          Type
+            .erasedTrait(ty)
+            .filter(t => traitMembers(Type.Bound(t.name, t.args)).exists(m => m._2.name == name && m._2.isProperty))
+            .map(t => inTrait(Type.Bound(t.name, t.args), viaBound = false))
+        case a: Type.Abstract =>
+          boundMember(a, name).filter(_._3.isProperty).map(m => inTrait(m._1, viaBound = true))
+        case _ =>
+          Option.when(memberDecls.get((memberKey(ty, name)._1, name)).exists(_.isProperty))(
+            ReadOnlyProperty(show(ty), s"on '${show(ty)}'", viaBound = false))
+    }
+
+  /** Whether this receiver has an address, asked of a compound assignment to a property — which
+   * reads and writes and so needs the receiver twice. */
+  protected def addressable(receiver: Expr): Boolean =
+    probe(isPlace(autoDeref(analyzeExpr(receiver)))).getOrElse(true)
 
   protected def readProperty(tr: TExpr, ty: Type, f: String, via: Set[String] = Set.empty): TExpr = {
     val (base, _) = memberKey(ty, f)

@@ -34,7 +34,12 @@ trait HoistImpl extends ImplConformance {
     // filed under the key that names — so the block carries the resolved name from here on and
     // nothing downstream has to resolve it a second time.
     val tr   = traitKey(block.traitName).map(traitDecls).getOrElse(err(s"unknown trait '${block.traitName}'"))
-    val impl = block.copy(traitName = tr.name).setPos(block.pos)
+    // A setter's parameter takes the property's type, and the property may be the **trait's** — an
+    // `impl` supplying only the write half is supplying exactly what the trait left open. Paired
+    // here, before conformance reads a signature, since an unpaired one resolves to nothing.
+    val impl = block
+      .copy(traitName = tr.name, methods = pairSetters(block.methods, block.forType.show, tr.methods))
+      .setPos(block.pos)
 
     val (ty, target)     = implTarget(impl)
     val (bound, written) = implBound(impl, tr)

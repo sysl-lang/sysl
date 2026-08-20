@@ -10,6 +10,33 @@ package sh.sysl
  * the same `methodTail` serves a struct's method, an enum's, a trait's requirement, and an `impl`'s
  * definition, because in this language those differ in where they appear and not in how they read.
  */
+/** The two names the setter form needs on both sides of the parser, and the one rule about them.
+ *
+ * A **source name cannot hold `Modules.sep`**, so a setter filed under `count$set` is out of reach of
+ * every lookup for a written name and collides with nothing a program can spell. What that buys is
+ * that a setter is an ordinary method everywhere after the parser; what it costs is one rule, and it
+ * is the rule 0139 is a card about: **no diagnostic may print the filed name.** Everything that has
+ * to name one says *the setter of `count`*, which `sourceName` is here to make easy.
+ */
+object DeclParser {
+
+  /** The name a setter is filed under, given the property it writes. */
+  def setterName(name: String): String = s"$name${Modules.sep}set"
+
+  /** The placeholder a setter's parameter carries until the property it pairs with supplies the
+   * type. Nothing resolves it: `hoistMemberList` replaces it, and a setter with no getter is
+   * refused there rather than reaching name resolution with this in hand.
+   */
+  val setterValue: String = s"${Modules.sep}value"
+
+  /** Whether a filed member name is a setter's. */
+  def isSetter(name: String): Boolean = name.endsWith(s"${Modules.sep}set")
+
+  /** The name a setter was written with, for a diagnostic. Any other name is its own. */
+  def sourceName(name: String): String =
+    if isSetter(name) then name.dropRight(4) else name
+}
+
 trait DeclParser extends ExprParser {
 
   /** One `name: type` binding — a function parameter or a struct field.
@@ -253,7 +280,7 @@ trait DeclParser extends ExprParser {
    * including the position a field or a variant would have been read at.
    */
   protected lazy val restrictedMember: PackratParser[MethodDecl] =
-    noMemberAttr ~> visibility ~ (noOverride ~> member) ^^ { case v ~ m =>
+    noMemberAttr ~> visibility ~ (noOverride ~> (setter | member)) ^^ { case v ~ m =>
       m.copy(vis = v).setPos(m.pos)
     }
 
@@ -322,6 +349,48 @@ trait DeclParser extends ExprParser {
     (op("->") ~> typeRef) ~ funcBody <~ endName(name) ^^ {
       case ret ~ body => MethodDecl(name, None, isProperty = true, Nil, Nil, Some(ret), body)
     }
+
+  /** `set count(x)` — the write half of a property (`08 § A property may be settable`).
+   *
+   * **`set` is a soft keyword**, read only where a member declaration begins, so the word stays an
+   * ordinary name everywhere else — a set is a container the library may yet want, and taking the
+   * word outright to introduce one member would be a poor trade.
+   *
+   * **The parameter is named and untyped.** Its type is the getter's result and can be nothing else,
+   * so writing it would be a second place for one fact to live and a disagreement to diagnose;
+   * `hoistMemberList` fills it in from the property this pairs with. Swift, Kotlin and C# all leave
+   * it out for the same reason, and all three then differ from this one by leaving the *name* out
+   * too — an unwritten binding appearing in a body is the wart every one of them carries.
+   *
+   * The declaration it becomes is an ordinary **method**: a `*self` receiver, one parameter, and a
+   * name holding `Modules.sep` so that nothing a program spells can reach it and no lookup for the
+   * written name finds it by accident. Conformance, visibility, lowering and the method table then
+   * need to know nothing about setters at all.
+   */
+  protected lazy val setter: PackratParser[MethodDecl] =
+    at(
+      (softWord("set") ~> ident) ~ (op("(") ~> ident <~ op(")")) >> { case name ~ param =>
+        funcBody <~ endName(name) ^^ { body =>
+          MethodDecl(DeclParser.setterName(name), Some(RecvMode.ByPtr), isProperty = false, Nil,
+            List(Param(param, NamedType(DeclParser.setterValue))), None, body)
+        }
+      },
+    )
+
+  /** `set count(x)` with no body: a trait asking an implementation for the write half of a property.
+   *
+   * The parameter is named here exactly as a method signature's are, and for the same reason — the
+   * name is the trait's way of saying what the value *is*, and an implementation is free to call it
+   * something else. Its type is still the property's, so a trait asking for a setter is asking for a
+   * property it also declares; `hoistMemberList` is where the two are put together.
+   */
+  protected lazy val setterSig: PackratParser[MethodDecl] =
+    at(
+      (softWord("set") ~> ident) ~ (op("(") ~> ident <~ op(")")) ^^ { case name ~ param =>
+        MethodDecl(DeclParser.setterName(name), Some(RecvMode.ByPtr), isProperty = false, Nil,
+          List(Param(param, NamedType(DeclParser.setterValue))), None, Nil)
+      },
+    )
 
   /** The parenthesised part of a method: an optional receiver shorthand (`self`, `*self`,
    * `&self`, `&sync self`) followed by ordinary `name: type` parameters. With no receiver the
@@ -460,7 +529,7 @@ trait DeclParser extends ExprParser {
    * an implementation for that member; one written with a body supplies a default instead.
    */
   protected lazy val traitMember: PackratParser[MethodDecl] =
-    noMemberAttr ~> noVisibility ~> noOverride ~> (member | methodSig | propertySig)
+    noMemberAttr ~> noVisibility ~> noOverride ~> (setter | setterSig | member | methodSig | propertySig)
 
   /** A trait method signature: a header with no `= body`. The receiver and parameters parse
    * exactly as a real method's do, so a signature and its implementation are compared shape for
@@ -538,7 +607,7 @@ trait DeclParser extends ExprParser {
    * implements is the only thing a member of a type can be replacing a body from.
    */
   protected lazy val implMember: PackratParser[MethodDecl] =
-    noMemberAttr ~> noVisibility ~> overrideMod ~ member ^^ { case ov ~ m =>
+    noMemberAttr ~> noVisibility ~> overrideMod ~ (setter | member) ^^ { case ov ~ m =>
       m.copy(overrides = ov).setPos(m.pos)
     }
 

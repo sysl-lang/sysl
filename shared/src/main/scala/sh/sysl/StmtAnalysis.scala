@@ -348,6 +348,12 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
           at(t.pos)(err(s"an element set through '${qn(Library.key("Index"))}' is a call rather " +
             "than a store, so it cannot be one place of a multiple assignment — write that one " +
             "on its own"))
+        // A property set through a setter is the second form of the same kind, and refused for the
+        // same reason (`00 §2`): the call both reads and writes, so there is nothing to separate
+        // into the two halves this form's ordering rule is about.
+        case Field(receiver, name) if settable(receiver, name) =>
+          at(t.pos)(err(s"'$name' is set by a call rather than by a store, so it cannot be one " +
+            "place of a multiple assignment — write that one on its own"))
         case _ =>
 
     val what   = if m.op == "=" then "assignment" else s"'${m.op}'"

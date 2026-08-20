@@ -316,7 +316,55 @@ trait AnalyzerBase extends Scoping {
   protected def requirePlace(t: TExpr, target: Expr, what: String, writes: Boolean = true): TExpr
   protected def invCheckFor(place: TExpr): List[(TExpr, Type.Struct, String)]
   protected def describe(target: Expr): String
+  /** Pairs each setter in a member list with the property it writes, filling in the parameter type
+   * the source deliberately leaves out (`08 § A property may be settable`).
+   *
+   * The type is the property's result and can be nothing else, so writing it on the setter as well
+   * would be one fact kept in two places and a disagreement to diagnose. Doing it here is also what
+   * refuses a setter with no property: the pairing is what gives the parameter a type at all, so an
+   * unpaired one would otherwise reach name resolution carrying a placeholder and be reported as a
+   * type nobody wrote.
+   *
+   * `inherited` is the other list a getter may be found in — the members of the trait an `impl`
+   * block is keeping, which the block itself need not restate.
+   */
+  protected def pairSetters(
+      members: List[MethodDecl],
+      label: String,
+      inherited: List[MethodDecl] = Nil,
+  ): List[MethodDecl] = {
+    val getters = (inherited ::: members).filter(m => m.isProperty).map(m => m.name -> m).toMap
+
+    // A member list may be walked more than once on its way in — an `impl` block's is paired when
+    // the block is hoisted and again with the defaults it inherited — so a setter whose parameter
+    // already has a type is left exactly as it is. Pairing is idempotent, and the refusal below then
+    // fires only for a setter that has never found its property.
+    def unpaired(m: MethodDecl): Boolean =
+      m.params.exists(_.typ match
+        case NamedType(n, _) => n == DeclParser.setterValue
+        case _               => false)
+
+    members.map { m =>
+      if !DeclParser.isSetter(m.name) || !unpaired(m) then m
+      else
+        val written = DeclParser.sourceName(m.name)
+
+        getters.get(written).flatMap(_.retType) match
+          case Some(ret) => m.copy(params = m.params.map(_.copy(typ = ret))).setPos(m.pos)
+          case None =>
+            at(m.pos)(err(s"'set $written' writes a property called '$written', and '$label' " +
+              "declares none — a property is read as well as written, and its result is where the " +
+              "value's type comes from"))
+    }
+  }
+
   protected def indexes(traitName: String, receiver: Expr): Boolean
+
+  /** Whether `recv.name = …` reaches a **setter** rather than storage (`08 § A property may be
+   * settable`), asked here for the reason `indexes` is: a multiple assignment has to know before it
+   * commits to a store, and it is not where the answer lives.
+   */
+  protected def settable(receiver: Expr, name: String): Boolean
   protected def arithType(op: String, a: Type, b: Type, rhs: Option[Pos]): Type
   protected def constraintOf(t: Type): Option[Type.Constrained]
   protected def updateExpected(op: String, placeTy: Type): Option[Type]

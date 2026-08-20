@@ -138,8 +138,8 @@ var b = greeting.bytes
 
 A property's receiver is an implicit **borrow** — it reads the instance and does not consume or
 mutate it, so no sigil is written and none is needed. Inside the body, `self` is in scope and
-refers to the instance. A property is read-only for now; a settable property (a paired getter
-and setter, so `p.name = v` runs code) is a later addition and is noted under *Not yet*.
+refers to the instance. A property may also be **written**, by declaring the setter beside it; that
+is the section after next, and everything here is the read half.
 
 **A property's body is the body a method has**, so all three spellings are available: `= expr`, an
 `=` opening an indented block, or a block with no `=` at all, with the trailing expression as the
@@ -188,6 +188,128 @@ property/method distinction because it *carries information* — parentheses mea
 something," their absence means "this is a projection of what is already there." In a language
 whose memory model rests on costs being visible, throwing that signal away to save a concept is
 the wrong trade.
+
+## A property may be settable
+
+A property with a **setter** beside it is written as well as read, so `p.count = v` runs code:
+
+```
+struct Cell
+    v: int
+
+    count -> int = self.v
+
+    set count(x)
+        self.v = x
+end Cell
+```
+
+```
+var c = Cell(1)
+c.count = 4                     // the setter's body runs
+c.count += 1                    // and so does the getter's, once
+```
+
+**`set` is a soft keyword** — read only where a member declaration begins, and an ordinary
+identifier everywhere else, exactly as `end`, `sync` and `invariant` are. A set is a container the
+library may yet want, and taking the word outright to introduce one member would be a poor trade.
+
+**The parameter is named and carries no type.** Its type is the property's result and can be nothing
+else, so writing it here would be one fact kept in two places and a disagreement to diagnose. Swift,
+Kotlin and C# all leave it out for that reason — and all three then leave the *name* out too, which
+is the one place this differs from them: an unwritten binding (`newValue`, `value`) appearing inside
+a body is a wart every language that has one carries, and naming the parameter costs a word.
+
+**The receiver is an implicit `*self`**, as the getter's is an implicit borrow. A setter writes, so
+it takes the address of what it is called on — and that is not a detail of the lowering but the rule
+the form is checked by. Everything a `*self` method demands, a setter demands: a receiver with an
+address, and not a `val`.
+
+```
+val c = Cell(1)
+c.count = 2                     // refused: a 'val' is written once
+```
+
+**A setter needs a property of the same name.** A set-only property would leave `p.count` meaning
+nothing and would have nowhere to take its parameter's type from, so it is refused at the
+declaration.
+
+**Visibility is the ordinary member modifier**, which gives Swift's `private(set)` with no form of
+its own: `private set count(x)` beside a public `count -> int` is a property the world reads and only
+the type writes.
+
+### What a write becomes
+
+**`p.count = v` is a call, not a store.** A property computes rather than naming storage, so there is
+no place for an assignment to write through — the setter takes the value instead. That is exactly
+what `b[i] = v` already is on a container that implements `Index` (`14 §7`), and the three
+consequences are the same three, for the same reason:
+
+- **The expression yields what the setter yields**, which is `unit`. `00 §2` says an assignment
+  yields the assigned value; an element set through `IndexSet` already does not, and this is the
+  second of the same kind. `a = p.count = 5` is refused by an ordinary type error rather than by a
+  rule of its own.
+- **It cannot be one place of a multiple assignment** (`00 §2`). The call both reads and writes, so
+  there is nothing to separate into the two halves that form's ordering rule is about; the
+  diagnostic says to write that one on its own line.
+- **`&p.count` is refused.** A computed property has no address, and no setter changes that.
+
+### The compound forms, and why they work here
+
+`14 §7` refuses `b[i] += v` on a container, because the receiver *and the index* would each be
+evaluated twice and both are the program's own expressions. **A property has no index**, so what is
+left is the receiver — and the receiver already has to be a place, since `*self` demands an address.
+Taking that address once is the whole of what the form needs:
+
+```
+p.count += 1        is        val t = &p ; (*t).count = (*t).count + 1
+```
+
+So `c.count += 1` calls the getter once and the setter once, and a receiver with side effects in it —
+`cells[which(0)].count += 10` — evaluates them once. This is the line the feature exists for: a cell
+whose writes have to be noticed is written `count += 1`, not `count.set(count.get + 1)`.
+
+### A trait may ask for one
+
+```
+trait Counter
+    count -> int
+    set count(n)
+```
+
+The signature form is the declaration with the body left off, exactly as a method's is, and the
+parameter is named there for the same reason a method signature names its parameters — the trait is
+saying what the value *is*, and an implementation may call it something else.
+
+An implementation supplies both halves, or inherits either from the trait as a default; a block
+supplying only the setter is supplying exactly what the trait left open, and need not restate the
+property to do it. **Object safety is untouched**: a setter has a receiver and mentions `Self`
+nowhere else, so a trait that asks for one still erases (`02 § Object safety`), and the table simply
+carries a second slot. A write through a bound and a write through a trait object are then the
+static and dynamic halves of one thing, exactly as a call is.
+
+**A property reached through a bound belongs to the trait, and the refusal says so.** Writing one the
+bound does not license names the trait to declare the setter in rather than the concrete type the
+instantiation happened to supply — adding an inherent setter to that type would not license the write,
+and a message naming it would be advice that does not work.
+
+### How it is represented, and the one rule that costs
+
+A setter is not a new kind of member: it is an ordinary method with a `*self` receiver and one
+parameter, filed under a name carrying `$`, which is the character a source name cannot hold. So
+conformance, visibility, lowering, the method table and the serialized AST all treat it as the method
+it is, and nothing downstream of the parser learns a new concept.
+
+What that buys is worth the one thing it costs, which is a rule rather than a mechanism: **no
+diagnostic may print the name a setter is filed under.** Every message says *the setter of `count`*,
+and the tests pin it by asserting that no `$` reaches the reader.
+
+### What is deliberately not here
+
+**`didSet` / `willSet` on a stored field.** It is the neighbouring feature and it is sugar over this
+one: a field that notices its own writes can be written as a private field with a settable property
+in front of it. Whether the shorter spelling is worth a second form is a question for whoever wants
+it, and it should be argued on its own rather than arriving because a setter did.
 
 ## Associated functions
 
@@ -512,12 +634,15 @@ while a public method of that same struct may not, exactly as a public function 
 
 ## Not yet
 
-- **Settable properties.** A property is read-only. A getter/setter pair, so that `p.name = v`
-  runs code, is a later addition; until then a value that must be written is a field.
+- ~~**Settable properties.**~~ **Built — see *A property may be settable*.** The entry said a value
+  that must be written is a field until then, and what retired it was a customer for whom that is not
+  true: a cell that has to *notice* its own writes has no field spelling at all.
 - **Static (type-level) properties and stored associated constants.** An associated *function*
   reaches everything one would — `real.max_value()`, `Point.origin()` — and a trait may declare one,
-  so what is deferred is only the spelling without the parentheses (`int.max`, `Point.origin`). It
-  waits on settable properties, since both turn on the same accessor machinery, and it is cosmetic
-  rather than a gap in what can be expressed.
+  so what is deferred is only the spelling without the parentheses (`int.max`, `Point.origin`). This
+  entry used to say it waited on settable properties, since both turn on "the same accessor
+  machinery"; that turned out to be wrong in the direction that matters — a setter needed no accessor
+  machinery at all, being an ordinary method under a name a program cannot spell — so nothing was
+  unblocked here and this waits on its own merits, which are cosmetic.
 - **Default trait method bodies and trait-level invariants** — those are `02`'s open items, not
   this document's.

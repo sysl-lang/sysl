@@ -185,7 +185,11 @@ trait MemberLowering extends TypeResolution {
   ): List[FuncDecl] = {
     val lowered = mutable.ListBuffer.empty[FuncDecl]
 
-    for original <- members do
+    // An `impl` block need not restate the property it is writing: the trait declared it, and a
+    // block supplying only the setter is supplying exactly what the trait left open.
+    val inherited = home.fromTrait.toList.flatMap(tr => traitDecls.get(tr).toList.flatMap(_.methods))
+
+    for original <- pairSetters(members, home.label, inherited) do
       val m = callBounds(original.tparams, original.params).fold(original) { (tps, ps, bs) =>
         original.copy(tparams = tps, params = ps, bounds = original.bounds ++ bs).setPos(original.pos)
       }
@@ -222,10 +226,17 @@ trait MemberLowering extends TypeResolution {
       // told apart by.
       val filed = m.name + home.alt
 
+      // Both messages name the member the way it was **written**, which for a setter is the
+      // property it writes rather than the name it is filed under — nothing a reader could type
+      // holds a `$`, and telling them one would be 0139 in a fresh place.
+      val written = DeclParser.sourceName(m.name)
+
       if memberDecls.contains((home.key, filed)) then
-        err(s"type '${home.label}' already has a member named '${m.name}'")
+        if DeclParser.isSetter(m.name) then
+          err(s"type '${home.label}' already has a setter for '$written'")
+        else err(s"type '${home.label}' already has a member named '$written'")
       if home.taken.contains(m.name) then
-        err(s"type '${home.label}' has both a ${home.noun} and a member named '${m.name}'")
+        err(s"type '${home.label}' has both a ${home.noun} and a member named '$written'")
 
       // A composed type's members and its shape's are one namespace, so that a name reaches one
       // member however the type came by it. Both directions are asked, since a file may write the

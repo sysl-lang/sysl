@@ -157,11 +157,18 @@ that rule the form would be a way of accidentally calling something twice.
 dereference — the same set a single `=` accepts, and the types must match pairwise. The two sides
 must be the same length, which is a compile-time check.
 
-The one place that set is *smaller* than a single `=`'s is an element of a container, where `b[i] =
-v` is a call to `index_set` rather than a store (`14`). Such an element has no address for the
-locating phase to find, and the call both reads and writes, so there is nothing to separate into the
-two halves this form's ordering rule is about. It is refused, with a diagnostic saying so; a program
-that wants one writes that assignment on its own line.
+The one place that set is *smaller* than a single `=`'s is a place that is really a **call**, and
+there are two of them: an element of a container, where `b[i] = v` calls `index_set` rather than
+storing (`14`), and a **settable property**, where `p.count = v` calls the setter (`08 § A property
+may be settable`). Neither has an address for the locating phase to find, and the call both reads and
+writes, so there is nothing to separate into the two halves this form's ordering rule is about. Both
+are refused, with a diagnostic saying so; a program that wants one writes that assignment on its own
+line.
+
+The same two are the exception to this section's opening sentence, that an assignment yields the
+assigned value: a call yields what the call yields, which for both of these is `unit`. So `a = b[i] =
+v` and `a = p.count = v` are refused by an ordinary type error rather than by a rule, and nothing
+else about assignment-as-an-expression changes.
 
 **A binding takes the same comma list**: `val a, b = 1, 2` and `var lo, hi = 0, n` name several
 things at once, with each part's type inferred from its own value. The right side is produced before

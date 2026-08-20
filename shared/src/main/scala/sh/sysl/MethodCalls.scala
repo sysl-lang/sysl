@@ -865,7 +865,7 @@ trait MethodCalls extends FuncAddress {
    * applied it to, so a `T: From[int]` has a `from` that takes an `int` and one bounded by
    * `From[U]` has one that takes whatever `U` turns out to be.
    */
-  private def boundMember(a: Type.Abstract, mname: String): Option[(Type.Bound, Map[String, Type], MethodDecl)] =
+  protected def boundMember(a: Type.Abstract, mname: String): Option[(Type.Bound, Map[String, Type], MethodDecl)] =
     a.bounds.iterator
       .flatMap(traitClosure(_, selfBinding(a)))
       .flatMap(b => traitDecls.get(b.name).map((b, _)))
