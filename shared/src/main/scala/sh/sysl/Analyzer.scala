@@ -44,6 +44,7 @@ class Analyzer private (
     protected val provides: Set[String],
     protected val packages: Packages,
     protected val own: Option[Set[String]],
+    protected val hasEntryPoint: Boolean,
 ) extends ProgramWalk with ExprAnalysis {
 
   /** Every error the walk found, rendered and in source order. */
@@ -89,9 +90,10 @@ object Analyzer {
   def analyze(units: List[Program], building: Set[String] = Set.empty,
               std: Stdlib = Stdlib.fromSource(Target.default), target: Target = Target.default,
               provides: Set[String] = Capability.core.toSet, packages: Packages = Packages.none,
-              paths: SearchPaths = SearchPaths.none, own: Option[Set[String]] = None)
+              paths: SearchPaths = SearchPaths.none, own: Option[Set[String]] = None,
+              entryPoint: Boolean = true)
       : Either[String, TProgram] = CProbe.lower(units, target, paths).flatMap(analyzing(_,
-    building, std, target, provides, packages, own))
+    building, std, target, provides, packages, own, entryPoint))
 
   /** The walk itself, over units whose `c const` blocks are already ordinary constants.
    *
@@ -102,9 +104,10 @@ object Analyzer {
    * callers and this has one.
    */
   private def analyzing(units: List[Program], building: Set[String], std: Stdlib, target: Target,
-                        provides: Set[String], packages: Packages, own: Option[Set[String]])
+                        provides: Set[String], packages: Packages, own: Option[Set[String]],
+                        entryPoint: Boolean)
       : Either[String, TProgram] = {
-    val analyzer = new Analyzer(units, building, std, target, provides, packages, own)
+    val analyzer = new Analyzer(units, building, std, target, provides, packages, own, entryPoint)
 
     val outcome =
       try Right(analyzer.analyze())

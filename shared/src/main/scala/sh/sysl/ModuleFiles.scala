@@ -121,6 +121,15 @@ trait ModuleFiles
    * A program with none of either is a complete program that does nothing, which is what a tree of
    * pure declarations should compile to: a library is not an error.
    */
+  /** Whether this compilation emits a beginning at all.
+    *
+    * False for `build-c` and `build-lib`, where the artifact is something else's to start: the C
+    * project supplies its own `main`, and a library is linked into a program that has one. It is what
+    * the fallback below asks before reading a lone `var` as a body's local, since a body that is
+    * never emitted has no locals.
+    */
+  protected def hasEntryPoint: Boolean
+
   protected def entryFile(files: List[(Program, Scope)]): Option[(Program, Scope)] = {
     def carries(u: Program, what: Stmt => Boolean) = u.body.exists(s => !Bodies.isDeclaration(s) && what(s))
 
@@ -158,6 +167,20 @@ trait ModuleFiles
       // and the whole thing is a library that does nothing. Picking a winner among them would be
       // arbitrary, and would make one file's bindings local and invisible to the rest for no reason a
       // reader could see.
+      //
+      // **And only where this compilation HAS a beginning.** `build-c` and `build-lib` emit no
+      // `main` — the C project or the program linking the artifact supplies its own — so there is no
+      // body for a `var` to be a local of, and inventing one is not a smaller mistake than picking
+      // the wrong file. What it cost: the chosen file's functions became *nested* functions of a body
+      // that is never emitted, which renames them into an environment (`$env0.setit`) and drops the
+      // `@export` on the way — so an archive came out with no entry point at all, one warning saying
+      // the module exports nothing, and no error anywhere. Card `0167`.
+      //
+      // This is the same fix the `module` header condition below is, arrived at from the other side:
+      // that one says a file which names a module cannot be a body, this one says a compilation with
+      // no beginning has no body for any file to be.
+      case Nil if !hasEntryPoint => None
+
       case Nil =>
         files.filter((u, _) => u.module.isEmpty && carries(u, Bodies.isTopLevelBinding)) match
           case one :: Nil => Some(one)

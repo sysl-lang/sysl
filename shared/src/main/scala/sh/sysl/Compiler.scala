@@ -415,8 +415,12 @@ object Compiler {
                        own: Option[Set[String]])
       : Either[String, Compiled] =
     for
+      // **`entryPoint` reaches the analyzer and not only the emitter.** It has always decided
+      // whether a `main` is written; it also has to decide whether a lone top-level `var` is read as
+      // a body's local, because a body nothing emits has no locals for it to be one of — see
+      // `ModuleFiles.entryFile`.
       typed    <- Analyzer.analyze(units, std = std, target = target, provides = provides,
-                    packages = packages, paths = paths, own = own)
+                    packages = packages, paths = paths, own = own, entryPoint = entryPoint)
       promoted <- Escape.check(typed)
       _        <- TailCalls.check(typed)
 

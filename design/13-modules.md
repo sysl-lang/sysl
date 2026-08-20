@@ -853,6 +853,20 @@ nested function may not be — `private`, and generic. Which meant a module hold
 when a program imported it, because the program supplied a beginning, and be refused by `build-lib`,
 where there is none. Found on 2026-08-06 by the first library that kept state.
 
+**And a compilation with no beginning has no body for any file to be, which is the same bound reached
+from the other side.** The paragraph above turns on the file's own header; this one turns on what is
+being built. `build-c` and `build-lib` emit no entry point — the C project supplies its own `main`,
+and a library is linked into a program that has one — so there is nothing for a `var` to be a local
+*of*, and the fallback must not invent one.
+
+Without that, a header-less module keeping state exported **nothing**, and said so in a warning meant
+for a module that had marked nothing: the file was chosen as the beginning, so every function in it
+became a nested function of a body that is never emitted, which renames it into an environment
+(`$env0.setit`) and drops its `@export` on the way. Every export in the file went, not only the one
+that reached the storage. The archive linked, contained none of the program, and failed at `dlsym` in
+whatever loaded it. Found on 2026-08-20 writing a JNI entry point for `sysl-lang/androidkit`; card
+`0167`.
+
 ### `main` — the named form of the entry point
 
 A program may instead declare a function called `main`:

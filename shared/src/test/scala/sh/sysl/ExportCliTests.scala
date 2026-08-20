@@ -56,6 +56,70 @@ class ExportCliTests extends LibraryCliSupport {
     (out, s"$out.h")
   }
 
+  /** A **headerless** module that keeps state — which is what a boundary layer usually is, and which
+    * silently exported nothing until card `0167` was fixed.
+    *
+    * `ModuleFiles.entryFile` reads a lone top-level `var` in a file with no `module` header as a
+    * *body's local*, since that is what keeps a one-file `var n = 1` meaning what it always has in a
+    * program. `build-c` emits no `main`, so there is no body — and the file was chosen anyway, its
+    * functions became nested functions of a body nothing emits, and that renamed them into an
+    * environment and dropped the `@export` on the way.
+    *
+    * **Both exports go, not just the one that touches the storage**, which is the part worth pinning:
+    * a fix that only re-rooted the reaching function would still pass a one-export test.
+    */
+  private val stateful =
+    """var counter: i32 = 0
+      |
+      |@export("bump_set")
+      |bump_set(n: i32)
+      |    counter = n
+      |end bump_set
+      |
+      |@export("bump_get")
+      |bump_get() -> i32 = counter
+      |""".stripMargin
+
+  "a header-less module that keeps state still exports, and exports all of it" in {
+    val root = createTempDirectory("sysl-cli-state-")
+
+    writeFile(s"$root/main.sysl", stateful)
+
+    val out = s"$root/libstate.a"
+
+    succeeds(Config(command = "build-c", file = root, output = Some(out)))
+
+    val header = readFile(s"$out.h")
+
+    withClue(header) {
+      header should include("void bump_set(int32_t n);")
+      header should include("int32_t bump_get(void);")
+      header should not include "exports nothing"
+    }
+  }
+
+  /** The same shape read the other way: the storage is what makes it interesting, so a build that
+    * kept the exports and lost the `var` would pass the test above and be just as wrong.
+    */
+  "and the storage it keeps is the module's, reachable from both" in {
+    val root = createTempDirectory("sysl-cli-state-")
+
+    writeFile(s"$root/main.sysl", stateful)
+
+    val out = s"$root/libstate.a"
+
+    succeeds(Config(command = "build-c", file = root, output = Some(out)))
+
+    // Both symbols are *defined* in the archive rather than merely declared in the header, which is
+    // what the C project's linker will ask.
+    val listed = exec(List("nm", out))
+
+    withClue(listed.stdout) {
+      listed.stdout should include("bump_set")
+      listed.stdout should include("bump_get")
+    }
+  }
+
   "build-c writes an archive and a header beside it" in {
     val (archive, header) = built()
 
