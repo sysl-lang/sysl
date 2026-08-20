@@ -304,6 +304,29 @@ What that buys is worth the one thing it costs, which is a rule rather than a me
 diagnostic may print the name a setter is filed under.** Every message says *the setter of `count`*,
 and the tests pin it by asserting that no `$` reaches the reader.
 
+### An accessor may not reach the member it is defining
+
+```
+count -> int = self.count          // refused
+set count(x)
+    self.count = x                 // refused
+```
+
+Both call themselves. There is no reading under which either is what the author meant — the value a
+property computes is not the property, and there is no `super` to reach past it — so both are
+refused where they are written rather than left to run out of stack.
+
+**The line is the member, not the name.** Reading `self.count` *inside* `set count` is left alone,
+because that calls the **getter**, which is a different member and terminates; so is reading a
+different property, and so is `Outer.count` reading an `Inner.count`. It is a check on one body —
+this receiver is `self`, and this member is the one being defined — rather than a reachability
+analysis, because a call to a method that happens to read `count` is ordinary code.
+
+The getter half of this predates the setter and was quiet for as long as it existed. What made it
+worth refusing is that a settable property makes the shape likely rather than rare: the field and the
+property want the same name, and `self.v` against `self.count` is one character. Swift diagnoses the
+same shape, as a warning; sysl has no warning tier, and nothing legitimate is being refused.
+
 ### What is deliberately not here
 
 **`didSet` / `willSet` on a stored field.** It is the neighbouring feature and it is sugar over this

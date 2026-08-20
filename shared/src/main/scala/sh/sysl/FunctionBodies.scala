@@ -76,6 +76,7 @@ trait FunctionBodies extends ModuleStorage {
     // body see the empty state that reset establishes. Restored below with everything else, since
     // this walk interrupts a function that is still going.
     val savedFuncName = currentFunctionName
+    val savedMember   = currentMemberName
 
     // And whether that function is one a test build keeps, for the same reason: a closure written
     // inside a test is scaffolding exactly as the test is, and nothing about the lowered body says
@@ -85,6 +86,7 @@ trait FunctionBodies extends ModuleStorage {
     try
       resetFunction()
       currentFunctionName = savedFuncName
+      currentMemberName = savedMember
       inTestBody = savedInTest
       retTy = declaredResult.getOrElse(Type.Unknown)
       retIsList = false
@@ -158,6 +160,7 @@ trait FunctionBodies extends ModuleStorage {
       (TFunc(name, tparams, result, tbody, variadic, requires, ensures, olds), result)
     finally
       currentFunctionName = savedFuncName
+      currentMemberName = savedMember
       inTestBody = savedInTest
       scopes = savedScopes
       used.clear(); used ++= savedUsed
@@ -195,6 +198,9 @@ trait FunctionBodies extends ModuleStorage {
     // `__FUNCTION__` reports what a reader wrote, and one written function is one name however many
     // times a generic was lowered.
     currentFunctionName = Modules.bare(f.name)
+    // Whole, for the reason `currentMemberName` carries: the split above cuts a setter's name in the
+    // wrong place, and which member this body is has to be answerable.
+    currentMemberName = f.name
     // Read off the declaration for the same reason, and off the declaration's own name rather than
     // off `name`: an instantiation of a generic written in a test file is scaffolding exactly as the
     // generic is, and its mangled key is in no table that remembers which file wrote it.

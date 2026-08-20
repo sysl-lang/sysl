@@ -758,6 +758,7 @@ trait ExprAnalysis
     // container is (`14 §7`, `00 §2`): a property computes rather than naming storage, so there is
     // no place for a store to write through, and the setter takes the value instead.
     case Assign("=", Field(receiver, name), value) if settable(receiver, name) =>
+      checkNotOwnSetter(receiver, name)
       callMethod(receiver, DeclParser.setterName(name), List(value), None)
 
     // The compound forms, which is where a property parts company with `IndexSet`. `14 §7` refuses
@@ -770,6 +771,10 @@ trait ExprAnalysis
     // and the arithmetic is whatever `+` means for that type. The temporary holds the **address**,
     // since a copy of the receiver would be written and thrown away.
     case a @ Assign(op, Field(receiver, name), value) if settable(receiver, name) =>
+      // Asked of the receiver as **written**, and before the desugaring below replaces it with the
+      // temporary holding its address — after that there is no `self` left to recognize.
+      checkNotOwnSetter(receiver, name)
+
       if !addressable(receiver) then
         err(s"'$op' reads '$name' and writes it back, so it needs a receiver it can reach twice — " +
           "this one is computed, and has no address. Bind it to a 'var' first")
@@ -1443,6 +1448,24 @@ trait ExprAnalysis
     t
   }
 
+
+  /** Refuses a setter that writes the property it is defining, which calls itself.
+   *
+   * The mirror of the read `MemberExprAnalysis` refuses, and it is asked of the receiver as the
+   * program **wrote** it rather than of the analyzed one: a compound form is rewritten into a
+   * temporary holding the receiver's address before anything is analyzed, so `self` has to be
+   * recognized while it is still there.
+   *
+   * Reading `self.count` inside `set count` is left alone, and deliberately: that calls the
+   * *getter*, which is a different member and terminates. Only the write comes back here.
+   */
+  protected def checkNotOwnSetter(receiver: Expr, name: String): Unit =
+    receiver match
+      case Ident("self") | Unary("*", Ident("self")) if enclosingMember == DeclParser.setterName(name) =>
+        err(s"'$name' writes the property it is defining, so it calls itself — a setter is what " +
+          "writing the property means, and there is nothing further in for it to reach. What a body " +
+          "like this means to write is the field it is in front of")
+      case _ =>
 
   /** One level of automatic dereference, so a field is selected through a `*T` or a `&T`
    * exactly as it is on the value itself. One level only: reaching through a `**T` is written.
