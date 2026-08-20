@@ -22,6 +22,12 @@ class OsDirectoryTests extends LibraryCliSupport {
   private val other: String =
     Project.spelling(if Target.default.os == Os.MacOS then Os.Linux else Os.MacOS)
 
+  /** The same two as bare symbols, for building a comma-separated selector out of them. */
+  private val hereSym: String = Conditional.osSymbol(Target.default.os)
+
+  private val otherSym: String =
+    Conditional.osSymbol(if Target.default.os == Os.MacOS then Os.Linux else Os.MacOS)
+
   private def projectOf(files: (String, String)*): String = {
     val root = createTempDirectory("sysl-osdir-")
 
@@ -210,7 +216,7 @@ class OsDirectoryTests extends LibraryCliSupport {
     // A misspelling that read as an ordinary directory would compile nothing on any target and be
     // reported, eventually, as a missing function — which is the failure the closed vocabulary of
     // `Conditional.symbols` exists to refuse, in the other place a source tree names an OS.
-    "is refused, and the message says which operating systems there are" in {
+    "is refused, and the message says which machines there are" in {
       val root = projectOf(
         "main.sysl"            -> "print(demo.tag())\n",
         "demo/__linx__/x.sysl" -> "module demo\n\ntag() -> string = \"typo\"\n",
@@ -220,7 +226,11 @@ class OsDirectoryTests extends LibraryCliSupport {
 
       status should not be 0
       notes should include("__linx__")
-      notes should include("__linux__")
+      // The vocabulary is listed as **bare symbols** rather than as `__linux__`, because a selector
+      // may name several of them at once and what a reader has to write inside the underscores is
+      // one element of a list. This assertion said `__linux__` while a directory could name exactly
+      // one machine, and there was no difference between the two spellings then.
+      notes should include("linux")
     }
 
     "is refused whichever machine is asking" in {
@@ -271,6 +281,162 @@ class OsDirectoryTests extends LibraryCliSupport {
       // The refusal follows the folder down rather than stopping at its own listing, which is why
       // `contents` pairs each sub-directory with the folder it came out of.
       refused(Config(command = "run", file = root))
+    }
+  }
+
+  /** A selector names one or more symbols and is taken when **any** of them holds — so it may name
+   * a family (`posix`) or a list (`macos,linux`) as well as one operating system.
+   *
+   * **The vocabulary is `#if`'s**, which is what makes this one idea rather than two: `Conditional`
+   * already had `posix` and `hosted` beside every operating system, and a source line could test
+   * them while a directory could not name them. What is *not* in it is a processor — this walk has
+   * an operating system and nothing else to ask.
+   */
+  "a selector naming more than one machine" - {
+
+    "selects for a family, which is what a POSIX shim actually means" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val root = projectOf(
+        "main.sysl"      -> "print(demo.seven_times(6))\n",
+        "demo/demo.sysl" -> """module demo
+                              |
+                              |extern "demo_seven" c_seven() -> int
+                              |
+                              |seven_times(n: int) -> int = c_seven() * n
+                              |""".stripMargin,
+        "demo/__posix__/shim.c" -> shim,
+      )
+
+      ran(Config(command = "run", file = root)) shouldBe "42\n"
+    }
+
+    "and for 'hosted', which is the same claim one step weaker" in {
+      val root = projectOf(
+        "main.sysl"                    -> "print(demo.tag())\n",
+        "demo/__hosted__/impl.sysl"    -> "module demo\n\ntag() -> string = \"hosted\"\n",
+      )
+
+      ran(Config(command = "run", file = root)) shouldBe "hosted\n"
+    }
+
+    "and for a comma-separated list, when one of its names is this machine" in {
+      val root = projectOf(
+        "main.sysl"                              -> "print(demo.tag())\n",
+        s"demo/__$hereSym,${otherSym}__/impl.sysl" -> "module demo\n\ntag() -> string = \"listed\"\n",
+      )
+
+      ran(Config(command = "run", file = root)) shouldBe "listed\n"
+    }
+
+    // The negative half, and it is the one worth having: a list is *any*, so a list naming neither
+    // must be as unread as a single name that does not match. Source that cannot lex says so.
+    "and is not read at all when none of its names is" in {
+      val root = projectOf(
+        "main.sysl"                              -> "print(demo.tag())\n",
+        "demo/impl.sysl"                         -> "module demo\n\ntag() -> string = \"outside\"\n",
+        "demo/__windows,freestanding__/no.sysl"  -> "module demo\n\n((( this is not sysl at all\n",
+      )
+
+      ran(Config(command = "run", file = root)) shouldBe "outside\n"
+    }
+
+    // The card this was written for: a freestanding machine has neither capability, so neither
+    // folder is taken and the module contributes no C. Asked of the walk rather than of a build,
+    // because there is no freestanding clang here to run one against.
+    "so a freestanding machine takes neither, while the folder naming it is taken" in {
+      val root = projectOf(
+        "demo/demo.sysl"                -> "module demo\n",
+        "demo/__posix__/posix.c"        -> shim,
+        "demo/__hosted__/hosted.c"      -> shim,
+        "demo/__freestanding__/bare.c"  -> shim,
+      )
+
+      val bare = Project.cSources(root, Some(Os.Freestanding)).map(s => Project.basename(s.name))
+
+      bare shouldBe List("bare.c")
+      Project.cSources(root, Some(Os.Linux)).map(s => Project.basename(s.name)).sorted shouldBe
+        List("hosted.c", "posix.c")
+    }
+
+    // The same question asked of the tree that ships, which is the one the card was filed about: the
+    // library's four shims are POSIX and must reach a hosted build and no other.
+    "which is what keeps the library's own shims off a bare machine" in {
+      val bare   = Std.cSources(Os.Freestanding).map(s => Project.basename(s.name))
+      val hosted = Std.cSources(Os.Linux).map(s => Project.basename(s.name)).sorted
+
+      bare shouldBe empty
+      hosted shouldBe List("clock.c", "dirent.c", "stat.c", "termios.c")
+
+      // And macOS sees the same four files, which is the deduplication itself: before this they were
+      // two directories of identical copies, and a build could only ever have seen one of them.
+      Std.cSources(Os.MacOS).map(s => Project.basename(s.name)).sorted shouldBe hosted
+    }
+
+    "names the element that is wrong, not the whole directory" in {
+      val root = projectOf(
+        "main.sysl"                        -> "print(1)\n",
+        s"demo/__$hereSym,linxu__/x.sysl"  -> "module demo\n",
+      )
+
+      val (status, notes) = diagnostics(Config(command = "run", file = root))
+
+      status should not be 0
+      notes should include("linxu")
+    }
+
+    // The deliberate hole, pinned so that widening it is a decision rather than a drift. A processor
+    // is not answerable to a walk that has only an operating system.
+    "and refuses a processor, which is what '#if' is for" in {
+      val root = projectOf("main.sysl" -> "print(1)\n", "demo/__aarch64__/x.sysl" -> "module demo\n")
+
+      val (status, notes) = diagnostics(Config(command = "run", file = root))
+
+      status should not be 0
+      notes should include("aarch64")
+    }
+
+    // Two selectors that both answer is not itself the fault, and this is the case that says so:
+    // every POSIX machine is hosted, so these two are true together always, and a module may
+    // reasonably want to say both *needs an operating system* and *needs POSIX*.
+    "so two that both answer are taken together, when what they hold differs" in {
+      val root = projectOf(
+        "demo/demo.sysl"           -> "module demo\n",
+        "demo/__hosted__/any.c"    -> shim,
+        "demo/__posix__/posix.c"   -> shim,
+      )
+
+      Project.cSources(root, Some(Os.Linux)).map(s => Project.basename(s.name)).sorted shouldBe
+        List("any.c", "posix.c")
+    }
+
+    // The fault is the name, and it is one a selector naming a single operating system could never
+    // produce. Two files of one name is a duplicate symbol reported a long way from the directories
+    // that caused it, so it is refused where it can still be explained.
+    "and refuses two selectors that both answer and hold one name between them" in {
+      val root = projectOf(
+        "main.sysl"                     -> "print(1)\n",
+        "demo/demo.sysl"                -> "module demo\n",
+        "demo/__posix__/shim.c"         -> shim,
+        s"demo/$here/shim.c"            -> shim,
+      )
+
+      val thrown = the[SelectionError] thrownBy Project.cSources(root, Some(Target.default.os))
+
+      thrown.getMessage should include("__posix__")
+      thrown.getMessage should include(here)
+    }
+
+    // The other side of it: the pair a module actually wants is one that no machine takes together,
+    // which is the shape `library/sysl/fs` will have when Windows arrives.
+    "while a family and a machine outside it live together" in {
+      val root = projectOf(
+        "main.sysl"                    -> "print(demo.tag())\n",
+        "demo/__posix__/impl.sysl"     -> "module demo\n\ntag() -> string = \"posix\"\n",
+        "demo/__windows__/impl.sysl"   -> "module demo\n\ntag() -> string = \"windows\"\n",
+      )
+
+      ran(Config(command = "run", file = root)) shouldBe "posix\n"
     }
   }
 

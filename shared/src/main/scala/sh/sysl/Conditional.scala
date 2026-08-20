@@ -57,11 +57,34 @@ object Conditional {
    * reading either file alone.
    */
   def defined(target: Target): Set[String] =
-    val machine = target.inherentCapabilities
+    osDefined(target.os) + cpuSymbol(target.cpu)
 
-    Set(osSymbol(target.os), cpuSymbol(target.cpu)) ++
+  /** The symbols an **operating system alone** settles, true for it and false for every other.
+   *
+   * This is the half a directory selects on (`13 §5`), and the reason it is a function of `Os`
+   * rather than of a whole target: the walk that reads a tree has an operating system and no
+   * processor, so a selector may name anything answerable from one and nothing that is not. Every
+   * one of these is also a `#if` symbol, because [[defined]] is this plus the processor — the two
+   * places a source file can name a machine share a vocabulary, and here is where that stops being
+   * a claim and becomes an equation.
+   */
+  def osDefined(os: Os): Set[String] =
+    val machine = os.inherentCapabilities
+
+    Set(osSymbol(os)) ++
       Option.when(machine(Capability.Os))(Hosted) ++
       Option.when(machine(Capability.Posix))(Posix)
+
+  /** Every symbol a **directory** may select on — the operating systems, plus the two environment
+   * facts that are answerable without a processor.
+   *
+   * Closed, and closed for the same reason [[symbols]] is: a misspelled folder that read as false
+   * would gate source out of a build with nothing said. A processor symbol is deliberately not here
+   * — a directory is chosen by a walk that has no processor to ask, and source that varies by one is
+   * what `#if` and the C preprocessor are for.
+   */
+  lazy val directorySymbols: Set[String] =
+    Os.values.map(osSymbol).toSet ++ Set(Hosted, Posix)
 
   /** The source as this target sees it, or the first thing wrong with its directives.
    *

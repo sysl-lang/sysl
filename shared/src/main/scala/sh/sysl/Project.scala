@@ -201,12 +201,36 @@ object Project {
     // on branches it is not taking. What is *not* looked at is the inside of a folder this target did
     // not select, which `13 §5` states outright: an unselected tree is never read.
     val taken = selectors.filter { d =>
-      val which = selected(basename(d), within)
+      val named = selects(basename(d), within)
 
-      os.forall(_ == which)
+      os.forall(o => named.exists(Conditional.osDefined(o)))
     }
 
     val (nestedFiles, nestedSubs) = taken.map(d => contents(d, os, Some(basename(d)))).unzip
+
+    // **Two selectors that both answer, each holding a file of the same name.** It could not happen
+    // while a selector named exactly one operating system — no machine is two of those — and it can
+    // now that one may name a family: `__posix__` and `__macos__` are both true on macOS. What it
+    // produces is two files of one name, which is a duplicate symbol at the link or two declarations
+    // of one function, reported a long way from the directories that caused it.
+    //
+    // **The name colliding is the fault, not the two folders answering.** `__hosted__` and
+    // `__posix__` are both true of every POSIX machine and are a perfectly good pair while what they
+    // hold is different — one is *needs an operating system*, the other *needs POSIX*, and a module
+    // may want to say both. Refusing every overlap would have forbidden that to catch a collision
+    // this catches exactly.
+    //
+    // Asked only where a machine was named. With none there is no such thing as answering for it, and
+    // taking every selector is what `Project.modules` is doing on purpose.
+    if os.isDefined && taken.length > 1 then
+      val byName = nestedFiles.flatten.groupBy(basename).filter(_._2.length > 1)
+
+      for (name, paths) <- byName.toList.sortBy(_._1) do
+        throw SelectionError(s"'$name' is in more than one directory that selects source for this " +
+          s"machine — ${paths.map(p => s"'${basename(parentOf(p).getOrElse(p))}'").sorted.mkString(" and ")}. " +
+          "A selector may name a family, so two of them can answer at once and both files would be " +
+          "taken. Give them different names, or name the machines so that at most one matches " +
+          "(`13 §5`)")
 
     (files ::: nestedFiles.flatten,
      plain.map(_ -> within) ::: nestedSubs.flatten)
@@ -221,22 +245,46 @@ object Project {
   private def marked(name: String): Boolean =
     name.length > 4 && name.startsWith("__") && name.endsWith("__")
 
-  /** Which operating system a `__<os>__` directory selects for, or the mistake it is.
+  /** Which machines a selector directory names, or the mistake it is.
    *
-   * The vocabulary is `Os`'s own, through the spelling `Conditional` already gives it, so a new
-   * operating system reaches this by existing and the two places a source file can name one cannot
-   * come to disagree.
+   * **A selector names one or more symbols, separated by commas, and is taken when ANY of them holds
+   * for the target** — so `__macos__` selects one operating system, `__macos,linux__` either of two,
+   * and `__posix__` whichever of them POSIX means. One rule covers all three, and it is `#if`'s rule:
+   * the vocabulary is `Conditional.directorySymbols` and the test is `Conditional.osDefined`, so a
+   * new operating system reaches this by existing and the two places a source file can name a
+   * machine cannot come to disagree.
+   *
+   * **Prefer the name that says why over the list that says which.** `__posix__` and
+   * `__macos,linux__` select the same two machines today and are not the same claim: which operating
+   * systems are POSIX is written in exactly one place (`Os.inherentCapabilities`), so the first
+   * derives from it and the second copies it. Add a third POSIX system and every `__posix__` folder
+   * covers it untouched while every `__macos,linux__` folder silently does not. The list earns its
+   * keep on a set no capability names — macOS and Windows but not Linux — which is a reason to have
+   * the form rather than to reach for it.
+   *
+   * A **processor** is not nameable here and that is the one deliberate hole: this walk has an
+   * operating system and nothing else to ask. Source that varies by processor is `#if`'s, or the C
+   * preprocessor's inside a `.c`.
    */
-  private def selected(name: String, within: Option[String]): Os = {
+  private def selects(name: String, within: Option[String]): List[String] = {
     for outer <- within do
-      throw SelectionError(s"'$name' sits inside '$outer', and both select source for an operating " +
-        "system — a target has exactly one, so nothing could ever be selected by both. Two axes are " +
-        "'#if' inside a sysl file, or the C preprocessor inside a '.c' (`13 §5`)")
+      throw SelectionError(s"'$name' sits inside '$outer', and both select source for a machine — " +
+        "an unselected directory is never read, so nothing inside one could ever be taken. Write " +
+        "them beside each other, or use '#if' inside a sysl file or the C preprocessor inside a " +
+        "'.c' (`13 §5`)")
 
-    Os.values.find(o => spelling(o) == name).getOrElse(
-      throw SelectionError(s"'$name' names no operating system this compiler knows, and a directory " +
-        s"named '__<os>__' selects source for one. The ones there are: " +
-        Os.values.map(spelling).mkString(", ")))
+    val written = name.stripPrefix("__").stripSuffix("__").split(",", -1).toList.map(_.trim)
+
+    // Each element is checked, not just the first bad one's folder, so a reader fixing a four-way
+    // selector is told which quarter of it is wrong rather than being handed the whole name back.
+    for symbol <- written do
+      if !Conditional.directorySymbols(symbol) then
+        throw SelectionError(s"'$symbol', in the directory '$name', names no machine this compiler " +
+          "selects source for. A selector names operating systems and the two facts that hold " +
+          s"without naming one, separated by commas: ${Conditional.directorySymbols.toList.sorted.mkString(", ")}. " +
+          "A processor is not among them — that is what '#if' is for")
+
+    written
   }
 
   /** What a per-OS directory is called for a given operating system. */

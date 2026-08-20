@@ -155,10 +155,13 @@ case class Target(
    *
    * **`Conditional` derives its two facts from this**, so the compiler holds one answer to "is this
    * machine hosted" rather than two that can drift apart.
+   *
+   * **It is the operating system's answer and not the whole machine's**, which is why the work is
+   * `Os`'s. A directory selects on what the walk that finds it knows, and that is an `Os` — so a
+   * selector naming `posix` has to be answerable without a processor, and this is where that is
+   * settled for both askers at once (`13 §5`).
    */
-  def inherentCapabilities: Set[String] =
-    Option.when(os != Os.Freestanding)(Capability.Os).toSet ++
-      Option.when(os == Os.MacOS || os == Os.Linux)(Capability.Posix)
+  def inherentCapabilities: Set[String] = os.inherentCapabilities
 
   /** Whether the compiler can lower for this target at all. A target it knows and cannot lower for
    * is worth naming: the diagnostic then says what is missing instead of leaving the name unknown,
@@ -321,6 +324,18 @@ object Cpu {
  */
 enum Os {
   case MacOS, Linux, Windows, Freestanding
+
+  /** The environment capabilities a machine running this operating system has **at all** — the
+   * physical half of the two-level rule, as against what `package.hocon` says a target offers.
+   *
+   * It lives here rather than on `Target` because it needs nothing else about the machine, and two
+   * askers depend on that: `Conditional` gates a `#if` on it, and a `__<os>__` directory selects on
+   * it during a walk that has an operating system and no processor. One answer, so a machine cannot
+   * be hosted for one asker and bare for the other.
+   */
+  def inherentCapabilities: Set[String] =
+    Option.when(this != Os.Freestanding)(Capability.Os).toSet ++
+      Option.when(this == Os.MacOS || this == Os.Linux)(Capability.Posix)
 }
 
 /** What a call hands a C function whose parameter is a `va_list` (`12 §9`).

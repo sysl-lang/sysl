@@ -537,8 +537,8 @@ they had been written there.
 
 ```
 library/sysl/posix/time.sysl              module sysl.posix.time — every target
+library/sysl/posix/__posix__/clock.c      compiled where POSIX is, ABSENT on a bare machine
 library/sysl/posix/__linux__/clock.sysl   module sysl.posix.time — Linux only
-library/sysl/posix/__linux__/clock.c      compiled on Linux, ABSENT everywhere else
 library/sysl/posix/__macos__/clock.sysl   module sysl.posix.time — macOS only
 ```
 
@@ -547,22 +547,57 @@ not something they can see or have to know. That is what this section always fix
 identity is invariant under platform selection** — and it is now a rule about directories rather
 than a promise about a filename grammar.
 
-**The vocabulary is exactly the operating systems `targets.md` names**, and it is derived from that
-enum rather than written down a second time: `__macos__`, `__linux__`, `__windows__`,
-`__freestanding__`. A directory whose name has the `__x__` shape and is not one of them is an
-**error** rather than a silent miss — a misspelling that quietly compiles nothing is the failure
-this shape exists to make impossible, and it would present as a missing function.
+**A selector names one or more symbols, separated by commas, and is taken when ANY of them holds for
+the target.** So `__macos__` selects one operating system, `__macos,linux__` either of two, and
+`__posix__` whichever of them POSIX means.
 
-**Exactly one operating system is true of a target**, which is what makes the rest fall out with no
-further rules: at most one `__<os>__` directory is selected at any one level, so there is no
-precedence order to state, no tie to break, and nothing to say about whether selection is additive.
-Files sitting directly in a directory are compiled for **every** target; the folders add to them
+**The vocabulary is `#if`'s own** (`targets.md § Conditional compilation`): the operating systems
+`targets.md` names — `macos`, `linux`, `windows`, `freestanding` — plus the two facts that hold
+without naming one, `hosted` and `posix`. Both halves are derived rather than written down a second
+time, so a new operating system reaches this by existing and a source file cannot name a machine one
+way in a directory and another in a `#if`. A directory whose name has the `__x__` shape and whose
+symbols are not among them is an **error** rather than a silent miss — a misspelling that quietly
+compiles nothing is the failure this shape exists to make impossible, and it would present as a
+missing function. The diagnostic names the element that is wrong rather than the whole directory.
+
+**A processor is deliberately not nameable**, and it is the one gap in the shared vocabulary: a
+directory is chosen by a walk that has an operating system and nothing else to ask. Source that
+varies by processor is `#if`'s, or the C preprocessor's inside a `.c`.
+
+**Prefer the name that says why over the list that says which.** `__posix__` and `__macos,linux__`
+select the same two machines today and are not the same claim. Which operating systems are POSIX is
+written in exactly one place, so the first derives from it and the second copies it: add a third
+POSIX system and every `__posix__` directory covers it untouched while every `__macos,linux__`
+directory silently does not. The list form earns its keep on a set no capability names — macOS and
+Windows but not Linux — which is a reason to have the form rather than a reason to reach for it.
+
+**This is what a shim that needs an operating system says**, and it is why the form exists. A
+`.c` calling `readdir` is not *different* on macOS and Linux — it is identical, because absorbing
+the difference between them is the shim's whole job — it simply cannot exist where there is no
+operating system. Written as two per-OS directories that says the wrong thing and costs two
+byte-identical copies to say it; written as `__posix__` it says what is true, once.
+
+**Files sitting directly in a directory are compiled for every target**; the folders add to them
 rather than replacing them.
 
-**A `__<os>__` directory may not be nested inside another**, however deep — a module in between makes
-no difference. Two axes — an OS and a processor, an OS and a libc — are not what this mechanism is
-for: the second axis is `#if` inside the file (`targets.md § Conditional compilation`), or the C
-preprocessor inside the `.c`, which is where the world already keeps that knowledge.
+**Two selectors may both answer for one machine, and are both taken.** `__hosted__` and `__posix__`
+are true together of every POSIX machine, and a module may reasonably want to say both *needs an
+operating system* and *needs POSIX*. Selection stays additive, exactly as it is for the files
+sitting beside the folders.
+
+**What is refused is the two of them holding a file of the same name.** That could not arise while a
+selector named exactly one operating system — no machine is two of those — and it produces two files
+of one name, which is a duplicate symbol at the link or two declarations of one function, reported a
+long way from the directories that caused it. The name is the fault rather than the overlap, so that
+is what the diagnostic names, and there is still no precedence order to state.
+
+**A selector directory may not be nested inside another**, however deep — a module in between makes
+no difference. An unselected directory is never read, so nothing inside one could be taken however
+it were named; where a family and one of its members both need saying, they go beside each other and
+the overlap rule above decides. Two axes — an OS and a processor, an OS and a libc — are not what
+this mechanism is for either: the second axis is `#if` inside the file (`targets.md § Conditional
+compilation`), or the C preprocessor inside the `.c`, which is where the world already keeps that
+knowledge.
 
 **It is refused where the walk reaches it**, which is everywhere the selected folder goes and nowhere
 inside one this target passed over. That is the rule below rather than a second rule: an unselected
