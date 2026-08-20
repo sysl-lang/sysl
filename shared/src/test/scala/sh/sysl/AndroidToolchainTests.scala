@@ -39,11 +39,16 @@ class AndroidToolchainTests extends AnyFreeSpec with Matchers {
     // The refusal is the feature. A compiler that went looking through home directories would find
     // *an* NDK on the machine it was written on and none anywhere else, and the way it would be
     // wrong is by silently choosing one.
-    "refuses, and names the variable to set" in {
+    // **`ANDROID_HOME`, not `ANDROID_SDK_ROOT`.** Google's own variables page marks the second
+    // deprecated and says the tools check the two agree where both are set, so recommending it would
+    // be advice that ages into a second problem. Both are still read — a machine already set up
+    // either way goes on working — and only the sentence is opinionated.
+    "refuses, and names the variable that is not deprecated" in {
       val why = Toolchain.androidClangIn(None, None).left.getOrElse(fail("found a clang from nothing"))
 
-      why should include("ANDROID_SDK_ROOT")
+      why should include("ANDROID_HOME")
       why should include("ANDROID_NDK_ROOT")
+      why should not include "ANDROID_SDK_ROOT"
     }
 
     // The whole point of the message: it has to displace the `dirent.h` diagnostic in the reader's
@@ -86,8 +91,8 @@ class AndroidToolchainTests extends AnyFreeSpec with Matchers {
 
       why should include(sdk)
       why should include("ndk")
-      why should not include "ANDROID_SDK_ROOT"
       why should not include "ANDROID_HOME"
+      why should not include "ANDROID_SDK_ROOT"
     }
 
     "refuses an 'ndk' directory that is there and empty" in {

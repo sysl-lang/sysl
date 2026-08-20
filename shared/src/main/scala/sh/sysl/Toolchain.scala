@@ -364,13 +364,18 @@ object Toolchain {
    * sentence somebody can act on; a silently chosen toolchain is not.
    *
    * `ANDROID_NDK_ROOT`/`ANDROID_NDK_HOME` name an NDK outright and win, which is what a standalone
-   * install has. Otherwise `ANDROID_SDK_ROOT`/`ANDROID_HOME` name the SDK and the newest `ndk/<version>`
-   * under it is taken — both spellings, because Google has changed its mind about which is current
-   * twice and both are in wide use.
+   * install has. Otherwise the SDK is named and the newest `ndk/<version>` under it is taken.
+   *
+   * **`ANDROID_HOME` is the SDK's current name and `ANDROID_SDK_ROOT` is DEPRECATED, so the first is
+   * what the refusal tells anybody to set.** Google has swapped these twice — `ANDROID_HOME`
+   * originally, `ANDROID_SDK_ROOT` in between, and `ANDROID_HOME` again now, with the tools checking
+   * the two agree where both are set. Both are read here because both are in wide use and a machine
+   * that has one working must go on working; only the *advice* is opinionated, and it names the one
+   * that is not deprecated.
    */
   private def androidClang: Either[String, String] =
     androidClangIn(envVar("ANDROID_NDK_ROOT").orElse(envVar("ANDROID_NDK_HOME")),
-                   envVar("ANDROID_SDK_ROOT").orElse(envVar("ANDROID_HOME")))
+                   envVar("ANDROID_HOME").orElse(envVar("ANDROID_SDK_ROOT")))
       .flatMap(cc => Either.cond(runs(cc), cc, s"cannot run '$cc', which is the NDK's clang"))
 
   /** The path resolution behind `androidClang`, taking its two directories rather than reading them,
@@ -383,9 +388,13 @@ object Toolchain {
       case None =>
         sdkRoot match
           case None =>
+            // `ANDROID_HOME` and not `ANDROID_SDK_ROOT`: the second is deprecated, and telling
+            // somebody to export a deprecated variable is advice that ages into a second problem.
+            // Both are still *read* — see `androidClang` — so a machine already set up either way
+            // goes on working, and only what this sentence recommends is opinionated.
             Left("building for Android needs the NDK's own clang, and nothing here says where it is " +
               "— no clang outside the NDK carries Bionic's headers, so one picked for having the " +
-              "back end fails at the first '#include'. Set ANDROID_SDK_ROOT to the Android SDK " +
+              "back end fails at the first '#include'. Set ANDROID_HOME to the Android SDK " +
               "(the directory holding 'ndk/'), or ANDROID_NDK_ROOT to one NDK directly")
           case Some(sdk) =>
             val installed = s"$sdk/ndk"

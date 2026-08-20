@@ -195,16 +195,25 @@ which additionally needs the target's headers and its libraries. Every other row
 compiler, which is why the distinction had nowhere to show itself until now.
 
 **For an Android build the environment must say where the NDK is, and where it does not the build is
-refused.** `ANDROID_NDK_ROOT` or `ANDROID_NDK_HOME` names one outright; otherwise `ANDROID_SDK_ROOT`
-or `ANDROID_HOME` names the SDK and the newest `ndk/<version>` beneath it is taken. Nothing else is
+refused.** `ANDROID_NDK_ROOT` or `ANDROID_NDK_HOME` names one outright; otherwise `ANDROID_HOME` or
+`ANDROID_SDK_ROOT` names the SDK and the newest `ndk/<version>` beneath it is taken. Nothing else is
 consulted — no home directory is searched and no default location is assumed:
 
 ```
 building for Android needs the NDK's own clang, and nothing here says where it is — no clang outside
 the NDK carries Bionic's headers, so one picked for having the back end fails at the first '#include'.
-Set ANDROID_SDK_ROOT to the Android SDK (the directory holding 'ndk/'), or ANDROID_NDK_ROOT to one
-NDK directly
+Set ANDROID_HOME to the Android SDK (the directory holding 'ndk/'), or ANDROID_NDK_ROOT to one NDK
+directly
 ```
+
+**Four spellings are read and only one is recommended, which is deliberate.** `ANDROID_HOME` is the
+SDK's current name and **`ANDROID_SDK_ROOT` is deprecated** — Google has swapped the two twice, and
+its tools now check they agree wherever both are set. Reading both means a machine already configured
+either way goes on working; naming only the current one in the refusal means the advice does not age
+into a second problem. For the same reason the message about an SDK with no `ndk/` under it names the
+**directory** rather than a variable: two spellings reach that code and it cannot tell which was set,
+so pointing at `ANDROID_SDK_ROOT` would send somebody who exported `ANDROID_HOME` to look at a
+variable that is empty and correct.
 
 **The refusal is the design and not a gap in it.** An NDK sits wherever the person installing it chose,
 so a compiler that went looking would find *an* NDK on the machine it was written on and none anywhere
