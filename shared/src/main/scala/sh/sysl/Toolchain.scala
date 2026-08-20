@@ -391,8 +391,13 @@ object Toolchain {
             val installed = s"$sdk/ndk"
 
             if !isDirectory(installed) then
-              Left(s"ANDROID_SDK_ROOT names '$sdk', which holds no 'ndk' directory — the NDK is a " +
-                "separate download, installed from Android Studio's SDK Manager under SDK Tools as " +
+              // **The path and not the variable, because two spellings reach here and this cannot
+              // tell which one was set.** Naming `ANDROID_SDK_ROOT` at somebody who set
+              // `ANDROID_HOME` sends them to look at a variable that is empty and correct — the same
+              // class of misdirection as the `dirent.h` diagnostic this whole search exists to
+              // replace. The directory is in the message, so the setting that produced it is clear.
+              Left(s"the Android SDK at '$sdk' holds no 'ndk' directory — the NDK is a separate " +
+                "download, installed from Android Studio's SDK Manager under SDK Tools as " +
                 "'NDK (Side by side)'")
             else
               // Several may be installed side by side, which is what the directory is named for, and

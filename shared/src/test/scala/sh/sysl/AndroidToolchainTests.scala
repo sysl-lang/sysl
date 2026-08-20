@@ -76,12 +76,18 @@ class AndroidToolchainTests extends AnyFreeSpec with Matchers {
       Toolchain.androidClangIn(None, Some(sdk)) shouldBe Right(newest)
     }
 
-    "refuses an SDK with no NDK downloaded, and says it is a separate download" in {
+    // **It names the directory and not the variable, because two spellings reach here and this cannot
+    // tell which was set.** Telling somebody who set `ANDROID_HOME` to look at `ANDROID_SDK_ROOT`
+    // points them at a variable that is empty and correct — which is the same misdirection as the
+    // `dirent.h` diagnostic the whole search exists to replace, reintroduced one step further in.
+    "refuses an SDK with no NDK downloaded, naming the directory rather than a variable" in {
       val sdk = createTempDirectory("sysl-sdk-")
       val why = Toolchain.androidClangIn(None, Some(sdk)).left.getOrElse(fail("found a clang"))
 
       why should include(sdk)
       why should include("ndk")
+      why should not include "ANDROID_SDK_ROOT"
+      why should not include "ANDROID_HOME"
     }
 
     "refuses an 'ndk' directory that is there and empty" in {
