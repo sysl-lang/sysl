@@ -61,6 +61,18 @@ nine tenths of the emitted lines. There is no `phi`, and that is a fact about th
 than an omission: codegen keeps every local in a stack slot and reaches it with `load` and `store`, so
 what a consumer receives is memory form and may promote it or not as it likes.
 
+**A block that is closed swallows everything written into it, and that reaches the blocks it opens.**
+Codegen walks unreachable code rather than skipping it — an `exit` followed by a value is legal, and
+is how a `match` whose arms do not all produce one still has a type — so the emitters produce
+instructions for code that can never run and the substrate drops them. Dropping only the
+instructions is not enough: a value whose lowering opens blocks of its own would then be written in
+halves, its registers dropped with the closed block and the blocks reading them emitted whole, which
+is a module clang refuses rather than dead code left lying about. So a label opened while no emitted
+terminator names it starts closed as well. LLVM has no fall-through — a block is entered only by a
+terminator naming it — so such a label is reachable at most by a back edge out of the region it
+opens, and that region is unreachable by the same argument. What survives is the labels themselves,
+each holding `unreachable`.
+
 **Nothing else concatenates a type, an operand, an instruction, a signature or a module-level line.**
 That is what makes the model load-bearing rather than decorative — an escape hatch that let one site
 interpolate would put the parser back for that site's sake, so `Inst.Raw` and `Val.Raw` existed only

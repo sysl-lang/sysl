@@ -229,4 +229,39 @@ trait CodegenSupport extends Matchers { this: Assertions =>
 
   /** The IR of `main` alone. */
   protected def irMain(src: String): String = mainOf(ir(src))
+
+  /** Every temporary a function reads without ever writing — the one thing an emitter can produce
+   * that is not merely wrong but *unassembleable*, and which nothing here would otherwise see.
+   *
+   * `freshReg` names temporaries `%tN` and nothing else does, so a `%tN` with no `%tN =` in the
+   * same function is a use of a value the function never defined; clang answers it with `use of
+   * undefined value` and no test that only reads the text would notice.
+   *
+   * **Per function rather than per module, which is the whole difficulty.** The counter restarts at
+   * each function, so `%t17` exists in most of them — a module-wide census finds a definition for
+   * every use and reports nothing, however broken the block it was read in. That is exactly how the
+   * defect behind card 0165 reached a release.
+   */
+  protected def undefinedRegisters(out: String): List[String] = {
+    val reg  = """%(t\d+)\b""".r
+    val defn = """^\s*%(t\d+) = """.r
+
+    functions(out).flatMap { body =>
+      val defined = body.iterator.flatMap(l => defn.findPrefixMatchOf(l).map(_.group(1))).toSet
+
+      body.iterator.flatMap(reg.findAllMatchIn(_).map(_.group(1))).filterNot(defined).toList
+    }
+  }
+
+  /** Asserts that a program's IR reads no temporary it does not define. */
+  protected def definesEveryRegisterItReads(src: String): Unit =
+    undefinedRegisters(ir(src)) shouldBe empty
+
+  /** The body of each function in a module, as lines — `define` down to the closing brace. */
+  private def functions(out: String): List[List[String]] = {
+    val lines = out.linesIterator.toList
+
+    lines.zipWithIndex.collect { case (l, i) if l.startsWith("define") => i }
+      .map(i => lines.drop(i).takeWhile(_ != "}"))
+  }
 }

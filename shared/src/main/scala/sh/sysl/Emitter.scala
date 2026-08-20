@@ -186,6 +186,11 @@ trait Emitter {
   private var terminated = false
   private var scratch    = mutable.HashMap.empty[ir.LType, ir.Val]
 
+  /** Every label an emitted terminator names, which is what `emitLabel` asks to decide whether the
+   * block it is opening can be reached at all.
+   */
+  private var reached = mutable.HashSet.empty[String]
+
   /** References this expression owns and must let go of. The stack mirrors the regions a value
    * may not escape: a statement, and each branch of an `if` or arm of a `match`, release their
    * own before control leaves them, so every release site dominates what it releases.
@@ -467,6 +472,7 @@ trait Emitter {
     temp = 0
     label = 0
     terminated = false
+    reached = mutable.HashSet.empty
     tempStack = Nil
     owned = Nil
     deferrals = Nil
@@ -572,7 +578,13 @@ trait Emitter {
    * with nothing.
    */
   private def closeBlock(): Unit = {
-    blocks += ir.Block(currentLbl, current.toList, currentEnd)
+    // A block still marked closed at the moment it is filed never had a terminator of its own,
+    // because everything emitted into it was dropped — it is unreachable code, and `unreachable`
+    // is what it says. A block that is *not* closed is one the emitters left unfinished, which is
+    // a defect in them rather than something to paper over here, so it is filed as it stands.
+    val end = currentEnd.orElse(Option.when(terminated)(ir.Inst.Unreachable))
+
+    blocks += ir.Block(currentLbl, current.toList, end)
     current = mutable.ListBuffer.empty
     currentEnd = None
   }
@@ -636,11 +648,39 @@ trait Emitter {
                            ir.Arg(ir.LType.I(1), ir.Val.Bool(false)))))
   }
 
-  /** Emits a block terminator (`br` / `ret` / `unreachable`) and marks the block closed. */
+  /** Emits a block terminator (`br` / `ret` / `unreachable`), marks the block closed, and records
+   * wherever it sends control — which is what makes the labels it names reachable.
+   */
   protected def emitTerm(inst: ir.Inst): Unit =
-    if !terminated then { currentEnd = Some(inst); terminated = true }
+    if !terminated then {
+      currentEnd = Some(inst)
+      terminated = true
+      inst match
+        case ir.Inst.Br(l)               => reached += l
+        case ir.Inst.CondBr(_, t, f)     => reached += t; reached += f
+        case ir.Inst.Switch(_, _, d, cs) => reached += d; reached ++= cs.map(_._2)
+        case _                           =>
+    }
 
-  protected def emitLabel(l: String): Unit = { closeBlock(); currentLbl = l; terminated = false }
+  /** Opens a block under `l`.
+   *
+   * **A label nothing has branched to is unreachable, and emission stays suppressed through it.**
+   * LLVM has no fall-through — a block is entered only by a terminator naming it — so a label
+   * opened while no emitted branch mentions it can be reached at most by a back edge from the
+   * region it opens, which is unreachable from the entry by the same argument.
+   *
+   * Without this the suppression that `emit` performs stops at the first label, and dead code is
+   * emitted in pieces: the instructions in the closed block are dropped while the blocks *after*
+   * it survive, still naming the registers that went with them. That is not a dead-code
+   * inefficiency but invalid IR — clang rejects the module with `use of undefined value` — and it
+   * needs both a divergence and a value whose lowering opens a block of its own, which is why it
+   * survived so long. A slice repeat (`[0; 0]`) after an `exit` is the shape that found it.
+   */
+  protected def emitLabel(l: String): Unit = {
+    closeBlock()
+    currentLbl = l
+    terminated = !reached.contains(l)
+  }
 
   /** A runtime helper's signature: `private`, `void`, and parameters named as the body reads them.
    *
@@ -662,7 +702,7 @@ trait Emitter {
       (prologue, temp, label, terminated, tempStack, owned, scratch, promoted, promotedBoxes, deferrals)
     // The blocks under construction are saved with the rest: a helper is a whole function emitted in
     // the middle of one, so what the interrupted function had built has to be there when it resumes.
-    val savedBlocks = (blocks, current, currentEnd, currentLbl)
+    val savedBlocks = (blocks, current, currentEnd, currentLbl, reached)
     // A helper is emitted in the middle of whatever asked for it, and the asking function may be one
     // with a jump in it — so what says where that jump goes is put back too. Without this the helper's
     // reset would leave the interrupted function with no target and its remaining tail calls would be
@@ -677,7 +717,7 @@ trait Emitter {
     terminated = saved._4; tempStack = saved._5; owned = saved._6; scratch = saved._7
     promoted = saved._8; promotedBoxes = saved._9; deferrals = saved._10
     blocks = savedBlocks._1; current = savedBlocks._2
-    currentEnd = savedBlocks._3; currentLbl = savedBlocks._4
+    currentEnd = savedBlocks._3; currentLbl = savedBlocks._4; reached = savedBlocks._5
     tailTarget = savedTail._1; tailCalls = savedTail._2; tailParams = savedTail._3
     built
   }
