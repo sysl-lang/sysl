@@ -237,21 +237,24 @@ class PlaceholderTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "42\n"
     }
 
-    // `§2a`'s default is produced afresh at each call that omits it, and a closure written there
-    // is refused for having nothing to infer from — the parameter's own declared type is not
-    // pushed into its default. **This is not about placeholders**: the arrow form beside it is
-    // refused the same way, which is what says the gap is `§2a`'s and not `§5c`'s. Both are
-    // asserted so that whichever is fixed cannot quietly leave the other behind.
-    "but not a default parameter value, where nothing pushes the parameter's type into it" in {
-      err("""go(x: int, f: int -> int = _ * 2) -> int = f(x)
+    // `§2a`'s default is produced afresh at each call that omits it, and it is read at the type its
+    // own parameter declares — so a placeholder there stands for what the parameter takes, exactly
+    // as one written at the call does. **This is not about placeholders**: the arrow form beside it
+    // is read the same way, which is what says the rule is `§2a`'s and not `§5c`'s. Both are
+    // asserted so that neither can quietly stop working while the other goes on.
+    //
+    // Both were refusals until the type was pushed into a default, and they were the pair that
+    // proved the gap belonged to `§2a`.
+    "and a default parameter value, where the parameter's own type says what it stands for" in {
+      run("""go(x: int, f: int -> int = _ * 2) -> int = f(x)
             |print(go(21))
-            |""".stripMargin) should include("this '_' has no type here")
+            |""".stripMargin) shouldBe "42\n"
     }
 
-    "which is the arrow form's answer there too, so the gap is the default's and not the placeholder's" in {
-      err("""go(x: int, f: int -> int = y -> y * 2) -> int = f(x)
+    "which is the arrow form's answer there too, so the rule is the default's and not the placeholder's" in {
+      run("""go(x: int, f: int -> int = y -> y * 2) -> int = f(x)
             |print(go(21))
-            |""".stripMargin) should include("'y' has no type here")
+            |""".stripMargin) shouldBe "42\n"
     }
 
     "though an argument that is written out still reaches the parameter" in {

@@ -447,9 +447,17 @@ struct Room
 end Room
 ```
 
-**A generic declaration's defaults are the exception, and they are analyzed against nothing.** Its
-parameter types are written in terms nothing has fixed yet, so there is no type to hold a default to
-until a call chooses one — which is what the paragraph about closure literals below is really about.
+**A generic declaration is no exception**, though its parameter types are written in terms nothing
+has fixed yet. Its defaults are read with each type parameter standing for **itself** — the same
+substitution the definition-time pass of `14 §4` walks a generic body under — so a default at
+`Option[T]` is read at `Option[T]`, and one at a bare-arrow parameter is read at the callable bound
+that says what it takes. What such a default is *not* held to is agreeing with a stand-in: what the
+parameter is solved to is the call's answer, and the comparison happens there.
+
+**It is read at that type again where the call puts it**, which is the same rule seen from the other
+end and is not automatic — a filled default is a *spliced* expression, and the shapes whose type
+comes from their context (a closure literal, `null`) have to be recognised through the splice rather
+than around it.
 
 **Analyzed in the declaration's scope; positioned at the call site.** Those are two different
 questions and this section used to answer only the first, because until an expression could ask
@@ -473,15 +481,19 @@ leaves *that* argument out, the inner filling's call site is a position inside t
 a line in the declaration's file, which is precisely the answer this is for avoiding. So the first
 call entered wins, and every built-in in the nest names the one place a reader actually wrote a call.
 
-**A closure literal is not yet one of the expressions a default may be**, though "standing exactly
-where the argument would have been written" says it should be: `f: int -> int = y -> y * 2` is
-refused for having nothing to infer `y` from, and the placeholder form `= _ * 2` is refused
-identically. It is the generic exception above, wearing a spelling that does not look generic: a
-parameter written with a **bare arrow is a bounded type parameter** (§6), so the declaration carrying
-one *is* generic and its defaults are analyzed against nothing. This is a gap in what a default is
-analyzed *against*, not in either spelling of the closure — written out at the call site both forms
-work. The fix is to expect the parameter's own type there too; nothing in this section has to change
-for it.
+**A closure literal is one of the expressions a default may be**, which is what "standing exactly
+where the argument would have been written" asks for: an argument there takes the parameter's
+declared type as what it is being used as, and so does a default.
+
+```
+apply(g: int -> int = y -> y * 2) -> int = g(21)
+apply(g: &Fn(int) -> int = y -> y * 2) -> int = g(21)
+```
+
+`y` needs no annotation in either, and the placeholder form `= _ * 2` needs none for the same reason.
+Both spellings a callable parameter has are covered, and they arrive by different roads: the **bare
+arrow is a bounded type parameter** (§6), so what says what the closure takes is that bound, while a
+boxed `&Fn` is a type and says it outright.
 
 **A default is exposed, so `13 §2` applies** — a declaration may not be more visible than what it
 names. A public function whose default calls a private one has published a call its callers can

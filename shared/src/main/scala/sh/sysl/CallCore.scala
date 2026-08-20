@@ -179,7 +179,7 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     case _         => callBound(ptype, tps, bounds, partial)
 
   /** `null` written as an argument, which is the one *value* whose type its context supplies. */
-  private def nullArg(a: Expr): Boolean = a match
+  private def nullArg(a: Expr): Boolean = written(a) match
     case NullLit() => true
     case _         => false
 
@@ -191,10 +191,23 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
    * analyzed first and converted afterwards, which is what separates them from every other
    * expression a converting context meets.
    */
-  protected def callableArg(a: Expr): Boolean = a match
+  protected def callableArg(a: Expr): Boolean = written(a) match
     case _: Lambda => true
     case Ident(n)  => lookupOpt(n).isEmpty && funcKey(n).isDefined
     case _         => false
+
+  /** What was actually written at an argument position, which for a **filled default** is inside
+   * the wrapper the binding put around it (`12 §2a`).
+   *
+   * Both questions above are about the *shape* of an expression, and a wrapper has a shape of its
+   * own that answers no to each — so a default of a closure literal was neither held back for the
+   * callable it is nor given the bound that says what it takes, and reported that its parameters had
+   * no types. A default stands exactly where the argument would have been written, so what is asked
+   * about it is what would have been asked about the expression written there.
+   */
+  private def written(a: Expr): Expr = a match
+    case DefaultArg(_, e) => written(e)
+    case _                => a
 
   /** The call trait a callable argument is being asked for, read off the bound of the parameter it
    * stands at, under whatever the other arguments have already settled.

@@ -18,11 +18,17 @@ trait DefaultParams extends StmtAnalysis with SignatureVisibility {
   /** Every parameter list that may carry a default, checked once each. */
   protected def checkValueDefaults(): Unit = {
     for (key, f) <- funcDecls.toList do
-      inScope(scopeFor(key))(check(qn(key), Some(key), f.params, f.variadic, f.tparams.nonEmpty, typed(key)))
+      inScope(scopeFor(key))(check(qn(key), Some(key), f.params, f.variadic, expectedAt(key, f, 0)))
 
     for ((tname, mname), m) <- memberDecls.toList do
       inDecl(tname)(check(s"${qn(tname)}.$mname", Some(tname), m.params, m.variadic,
-        m.tparams.nonEmpty || typeIsGeneric(tname), memberTyped(tname, mname, m.recvMode.size)))
+        // A member whose signature is written in terms nothing has fixed — its type's parameters,
+        // its own, or the one a bare arrow added — is kept as it was written, and *that* is the
+        // list its defaults are read against. Its lowered form carries the type's parameters as
+        // well as the member's, which is why the answer comes from there rather than from `m`.
+        genericMembers.get((tname, mname)) match
+          case Some(fd) => expectedAt(fd.name, fd, m.recvMode.size)
+          case None     => memberTyped(tname, mname, m.recvMode.size)))
 
     // An `impl` block's members are the one kind refused outright, so they are not checked for
     // anything else — the refusal is the whole of what this has to say about them.
@@ -34,7 +40,7 @@ trait DefaultParams extends StmtAnalysis with SignatureVisibility {
   }
 
   /** One parameter list. `expectedAt` says what type an argument at a position would be checked
-   * against, where that is cheap to know; a default is analyzed against nothing where it is not,
+   * against; a default is analyzed against nothing only where the declaration is too broken to say,
    * which still holds it to naming something that exists and to naming nothing local.
    */
   private def check(
@@ -42,7 +48,6 @@ trait DefaultParams extends StmtAnalysis with SignatureVisibility {
       owner: Option[String],
       params: List[Param],
       variadic: Boolean,
-      generic: Boolean,
       expectedAt: Int => Option[Type],
   ): Unit = {
     if params.exists(_.default.isDefined) then
@@ -72,9 +77,14 @@ trait DefaultParams extends StmtAnalysis with SignatureVisibility {
         // Analyzed exactly as the call that takes it will analyze it: in this declaration's terms
         // and with nothing local in scope, so a default naming a parameter is undefined here and
         // says so rather than finding a caller's variable of that name.
-        val t = inDefault(owner)(analyzeExpr(d, if generic then None else expectedAt(i)))
+        val t = inDefault(owner)(analyzeExpr(d, expectedAt(i)))
 
-        for want <- (if generic then None else expectedAt(i)) if disagree(t.ty, want) do
+        // **Asked only of a parameter whose type is settled here.** Where a type parameter stands
+        // for itself the two sides are not comparable: a closure default at a `$F0` yields the
+        // struct that closure became, which is what an instantiation *solves* `$F0` to, so a
+        // mismatch here would be the stand-in disagreeing with the thing it stands for. That
+        // comparison belongs to the call that fixes it, and it happens there.
+        for want <- expectedAt(i) if !Type.mentionsAbstract(want) && disagree(t.ty, want) do
           err(s"the default for '${p.name}' is ${show(t.ty)}, and the parameter is ${show(want)}")
 
         for key <- owner do exposed(shown, key, p.name, t)
@@ -123,9 +133,31 @@ trait DefaultParams extends StmtAnalysis with SignatureVisibility {
   private def memberTyped(tname: String, mname: String, skip: Int)(i: Int): Option[Type] =
     memberFuncs.get((tname, mname)).flatMap(typed(_)(i + skip))
 
-  private def typeIsGeneric(tname: String): Boolean =
-    structDecls.get(tname).exists(_.tparams.nonEmpty) ||
-      enumDecls.get(tname).exists(_.tparams.nonEmpty) ||
-      traitDecls.get(tname).exists(_.tparams.nonEmpty)
+  /** What an argument standing at the `i`th parameter **a call writes** would be checked against,
+   * in the declaration's own terms. `skip` is how many parameters the receiver took, since a
+   * member's lowered list carries `self` in front of the ones a call writes.
+   *
+   * Two roads to one answer. A declaration whose signature is already resolved has it in
+   * `funcInsts`, which is the very list the call will check the argument against. A **generic** one
+   * has no resolved signature — its parameters are written in terms nothing has fixed yet — so the
+   * written type is resolved with each type parameter standing for **itself**, which is the
+   * substitution `14 §4`'s definition-time pass walks a generic body under, and for the same
+   * reason: it is what a declaration can be held to before any call exists.
+   *
+   * **The second road is what lets a closure literal be a default at all.** A parameter written
+   * with a bare arrow *is* a bounded type parameter (`12 §6`), so the only thing that says what the
+   * closure takes is that bound — and a stand-in carries its bounds, which is exactly what a call
+   * reads a held-back callable argument against. Without it the arrow, the one spelling made for
+   * taking a closure, was the one spelling whose default could not be one.
+   */
+  private def expectedAt(lowered: String, f: FuncDecl, skip: Int)(i: Int): Option[Type] =
+    typed(lowered)(i + skip).orElse(
+      f.params
+        .lift(i + skip)
+        .flatMap(p =>
+          recoverOpt(resolveType(
+            p.typ,
+            withSelf(lowered, abstractSubst(f.tparams, f.bounds, f.tvalues, f.tpacks)),
+          ))))
 
 }

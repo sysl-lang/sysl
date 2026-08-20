@@ -163,6 +163,44 @@ class ArgumentTests
              |print(second("x", "y", true))
              |""".stripMargin) shouldBe "2\nx\n"
     }
+
+    // `12 §2a`: a default stands exactly where the argument would have been written, and at that
+    // position a closure literal takes its parameter types from what is asking for it. The bare
+    // arrow is a **bounded type parameter** (`12 §6`), so what says what `y` is here is the bound —
+    // which is what makes this the one spelling meant for taking a closure that could not default
+    // to one.
+    "may be a closure literal at a parameter written with the bare arrow" in {
+      run("""|apply(g: int -> int = y -> y * 2) -> int = g(21)
+             |print(apply())
+             |print(apply(x -> x + 1))
+             |""".stripMargin) shouldBe "42\n22\n"
+    }
+
+    // The boxed spelling is a different road to the same place and broke in a different way: this
+    // one was accepted where it was written and refused at the first call that took it. Both are
+    // pinned because either alone would have looked fixed.
+    "and at one written as a boxed callable, which a call fills rather than the declaration" in {
+      run("""|apply(g: &Fn(int) -> int = y -> y * 2) -> int = g(21)
+             |print(apply())
+             |print(apply(x -> x + 1))
+             |""".stripMargin) shouldBe "42\n22\n"
+    }
+
+    // `12 §5c`'s placeholder is the same expression with the parameter unwritten, so it is fixed by
+    // the same thing and would be a separate hole if it were not.
+    "and may be written with the placeholder, which needs the same thing to say what it stands for" in {
+      run("""|apply(g: int -> int = _ * 2) -> int = g(21)
+             |print(apply())
+             |""".stripMargin) shouldBe "42\n"
+    }
+
+    // The error path, and it is the declaration that reports it: nothing calls `apply`, so a
+    // closure held to nothing would have been checked by nobody.
+    "while a closure default that takes the wrong number of parameters is refused where it stands" in {
+      err("""|apply(g: int -> int = (a: int, b: int) -> a + b) -> int = 1
+             |print(1)
+             |""".stripMargin) should include("this closure takes 2 parameters, and what it is being used as takes 1")
+    }
   }
 
   "a trait's default" - {

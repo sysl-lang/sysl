@@ -99,6 +99,18 @@ trait ExprAnalysis
     case other     => sys.error(s"a result list arrived on a ${other.getClass.getSimpleName}")
 
   private def analyzeExpected(expr: Expr, expected: Option[Type]): TExpr = expected match
+    // A default filled at a call arrives **wrapped**, and a wrapper is not a shape. Every arm below
+    // asks what the expression *is* — a `ptr_cast`, a branching form, a closure literal, `null` —
+    // and each of them would answer about the wrapper rather than about what was written inside it,
+    // so the expression would be reached having already lost the expectation those arms exist to
+    // push down. A closure default at a callable parameter is where that showed: `apply(g: &Fn(int)
+    // -> int = y -> y * 2)` was accepted at its declaration and refused at the first call that took
+    // it, for `y` having no type.
+    //
+    // The wrapper is entered first instead, with the expectation intact: it puts the declaration's
+    // scope back and comes straight back here with the expression that was actually written.
+    case Some(_) if expr.isInstanceOf[DefaultArg] => analyzeValue(expr, expected)
+
     // `ptr_cast` is answered against the type that was **written**, rather than against whatever a
     // converting context would have asked an ordinary expression for. Every arm below hands the
     // expression something other than the annotation — a `&T` asks for the payload it would box, a
