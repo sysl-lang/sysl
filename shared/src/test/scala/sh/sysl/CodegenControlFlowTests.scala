@@ -110,6 +110,30 @@ class CodegenControlFlowTests extends AnyFreeSpec with CodegenSupport with RunSu
       exitsWith(src, 3)
     }
 
+    // The case the rule's own argument rests on, so it is pinned rather than reasoned about: a body
+    // that diverges leaves the loop's back edge in the dropped region, so the condition block is
+    // entered from before the loop and from nowhere else. Whether a label already opened is
+    // reachable is never asked again — what the rule decides is what happens to labels opened
+    // *after* the divergence, and a loop is where one of those would have a back edge pointing at it.
+    "a loop body that diverges takes the rest of its round with it" in {
+      val src = """drain(n: int) -> usize
+                  |    var total: usize = 0
+                  |
+                  |    while total < usize(n)
+                  |        exit(1)
+                  |        var xs: []u8 = [0; total]
+                  |        total += xs.len
+                  |
+                  |    total
+                  |end drain
+                  |
+                  |print(drain(0))
+                  |""".stripMargin
+
+      definesEveryRegisterItReads(src)
+      run(src) shouldBe "0\n"
+    }
+
     // The blocks are not merely harmless — they carry nothing. What the arm computed is gone, so a
     // dead region cannot allocate, cannot loop, and cannot be jumped into from the live code that
     // follows it.
