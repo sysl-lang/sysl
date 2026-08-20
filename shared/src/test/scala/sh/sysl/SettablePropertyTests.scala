@@ -335,10 +335,7 @@ class SettablePropertyTests extends AnyFreeSpec with CodegenSupport with RunSupp
       m should not include "already"
     }
 
-    // An accessor that reaches its own member calls itself, and today nothing says so — both of
-    // these compile and then run until the stack runs out. The assertions are what the diagnostic
-    // should say; the getter half is the older of the two and is the reason this is a pair.
-    "a getter that reads its own property is refused" ignore {
+    "a getter that reads its own property is refused" in {
       err(
         """struct Cell
           |    v: int
@@ -348,7 +345,7 @@ class SettablePropertyTests extends AnyFreeSpec with CodegenSupport with RunSupp
       ) should include("reads the property it is defining")
     }
 
-    "a setter that writes its own property is refused" ignore {
+    "a setter that writes its own property is refused" in {
       err(
         """struct Cell
           |    v: int

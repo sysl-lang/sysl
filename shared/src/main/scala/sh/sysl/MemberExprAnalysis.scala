@@ -548,6 +548,30 @@ trait MemberExprAnalysis extends ExprSupport {
   protected def addressable(receiver: Expr): Boolean =
     probe(isPlace(autoDeref(analyzeExpr(receiver)))).getOrElse(true)
 
+  /** Whether this receiver is the enclosing member's own `self`, however it was spelled — a by-value
+   * receiver loads it, a `*self` one is reached through a dereference, and a name the analyzer gave a
+   * scope suffix is still the same binding.
+   */
+  protected def isSelfReceiver(tr: TExpr): Boolean = tr match
+    case TLoad(n, _)      => n.takeWhile(_ != '.') == "self"
+    case TDeref(inner, _) => isSelfReceiver(inner)
+    case _                => false
+
+  /** The member the body being analyzed *is*, as it was filed — `count` in `Cell.count`, and
+   * `count$set` in `Cell.count$set`.
+   *
+   * A member lowers to a function named for its type and itself, and `currentMemberName` is set from
+   * the **declaration** rather than from an instantiation's key (`FunctionBodies`), so this answers
+   * the same thing for `Box[int].value` as for `Box[string].value` — and for a trait default, which
+   * is materialized per implementing type, it answers the copy's name, which is what makes the
+   * question about the accessor rather than about where it was written.
+   *
+   * It reads `currentMemberName` and not `currentFunctionName` because the latter is split at the
+   * first `$` and a setter's name holds one — see `AnalyzerBase`, where the trap is written down.
+   */
+  protected def enclosingMember: String =
+    currentMemberName.drop(currentMemberName.lastIndexOf('.') + 1)
+
   protected def readProperty(tr: TExpr, ty: Type, f: String, via: Set[String] = Set.empty): TExpr = {
     val (base, _) = memberKey(ty, f)
     // A property takes no arguments, so where two implementations of one trait both supply one there
@@ -556,6 +580,13 @@ trait MemberExprAnalysis extends ExprSupport {
 
     memberDecls.get((base, chosen)) match
       case Some(m) if m.isProperty =>
+        // A property that reads itself calls itself, and there is no reading under which that is
+        // what was meant: the value a property computes is not the property, and there is no `super`
+        // to reach past it. Refused here rather than left to run out of stack, which is what it did.
+        if isSelfReceiver(tr) && enclosingMember == chosen then
+          err(s"'$f' reads the property it is defining, so it calls itself — the value a property " +
+            "computes is not the property. What a body like this means to read is the field it is " +
+            "in front of")
         checkMemberVisible(base, chosen, m)
         val fname = memberFuncName(ty, chosen)
         // A property whose own signature did not resolve is registered and has no lowered form, so

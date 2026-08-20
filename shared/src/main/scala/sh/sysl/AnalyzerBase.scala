@@ -192,12 +192,28 @@ trait AnalyzerBase extends Scoping {
    */
   protected var currentFunctionName: String = ""
 
+  /** The **declaration name** of the body being analyzed, kept whole where `currentFunctionName` is
+   * split — `Cell.count$set`, not `set`.
+   *
+   * The two differ for one reason and it is worth stating, because the difference is a trap rather
+   * than a choice: `currentFunctionName` is `Modules.bare` of the name, and `Modules.bare` splits at
+   * the **first** `$`, which is the module separator. A member filed under a name that itself holds
+   * one — a setter, `count$set` (`08 § A property may be settable`) — is therefore cut in the wrong
+   * place in a file with no module prefix to consume the first `$`, and comes back as `set`.
+   *
+   * `currentFunctionName` stays as it is, because what it is for is `__FUNCTION__` and a name a
+   * *reader* wrote never holds a `$`. What needs the whole thing is a question about which member
+   * this body is, so that question asks here.
+   */
+  protected var currentMemberName: String = ""
+
   protected def resetFunction(): Unit = {
     // Cleared here rather than left to whoever sets it, because "outside any body" has to be a state
     // the analyzer can actually be in. Left uncleared it held the last name analyzed, so a module
     // `val`'s `__FUNCTION__` silently reported some unrelated function that a *previous pass* had
     // walked — the definition-time pass of `14 §4`, which runs before any storage is laid down.
     currentFunctionName = ""
+    currentMemberName = ""
     // Cleared for the same reason, and it matters for the same one: a body left over from the last
     // declaration walked would make a closure lowered outside any of them — in `main`, in a module
     // `val`'s initializer — inherit whether *that* was a test.
