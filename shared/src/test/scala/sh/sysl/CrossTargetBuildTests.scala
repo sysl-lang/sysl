@@ -198,4 +198,92 @@ class CrossTargetBuildTests extends AnyFreeSpec with Matchers {
     withClue(listed.stdout)(defs.length shouldBe 1)
     withClue(defs.head)(defs.head should include(" T "))
   }
+
+  /** That an object built for Android is **position-independent in the object**, which is what an
+   * archive destined for a `.so` has to be and the one claim the emitted text cannot settle.
+   *
+   * An Android program is a shared library that `SDLActivity` or a `NativeActivity` loads, so
+   * whatever sysl produces is linked into one rather than into an executable. What a `.so` link
+   * refuses is an **absolute** relocation in code: an address written into the instruction stream
+   * cannot be fixed up once the object has been mapped wherever the loader chose. The ordinary
+   * answer is a relocation model on the command line, and the reason sysl needs no such flag is
+   * below.
+   *
+   * **Sysl's globals are all `Linkage.Private`, so they are not preemptible and lower to a
+   * PC-relative pair** — `ADR_PREL_PG_HI21` with `ADD_ABS_LO12_NC`, against a local section, which
+   * is position-independent by construction. Its calls out to the C library and to the standard
+   * module's own half are `CALL26`, which the linker routes through a PLT. Neither depends on where
+   * the module lands, so neither needs a flag to be told so.
+   *
+   * **Measured, and the census is worth writing down** because one entry looks like a counterexample
+   * and is not: a real program's object carries exactly one `ABS64`, and it sits in
+   * `.data.__emutls_v.arc.reaper.self` rather than in any code. Android is an *emulated*-TLS target,
+   * so a thread-local's control block is ordinary data holding a pointer, and a pointer in data is
+   * precisely what the dynamic linker relocates. Asserting "no absolute relocation anywhere" would
+   * therefore fail on a program that is perfectly correct, which is why this asks about executable
+   * sections rather than about the object.
+   *
+   * It is asked of the object rather than of the IR, because the claim is about what the linker will
+   * be handed. A test that grepped the text for the absence of a word would go on passing if the
+   * emitter learned to say `dso_local` for some unrelated good reason, which is the case this exists
+   * to catch.
+   */
+  "an Android object carries no absolute relocation in code, so an archive of them links into a .so" in {
+    val t  = Target.aarch64Android
+    val cc = Toolchain.findClang(t).getOrElse(cancel(s"no clang for ${t.name}"))
+
+    // Enough of a program to reach a global, a string constant, a call into the standard module and
+    // a call into libc — the four things a `.text` relocation here can be about. A program of locals
+    // carries no relocations at all, and the first version of this test passed a program that had
+    // been folded down to exactly that.
+    val src = """var total: int = 0
+                |bump(n: int)
+                |    total += n
+                |bump(2)
+                |print("total is " + str(total))
+                |""".stripMargin
+
+    val obj = createTempFile("sysl-android-pic-", ".o")
+    val ir = Compiler.compile(List(Source("p.sysl", src)), t) match
+      case Right(ir) => ir
+      case Left(why) => fail(s"did not compile for ${t.name}: $why")
+
+    withClue(s"$cc, ${t.triple}: ")(Toolchain.compileObject(ir, obj, t) shouldBe Right(()))
+
+    val listed = exec(List("objdump", "-r", obj))
+    deleteFile(obj)
+
+    // Skipped rather than failed where there is no `objdump`: this asserts something about the
+    // object format, and a machine that cannot list relocations cannot be asked about it.
+    assume(listed.exitCode == 0, "objdump not available")
+
+    // `objdump -r` writes `RELOCATION RECORDS FOR [<section>]` and then one record per line. Walking
+    // it keeps each record with the section it was found under, which is the whole distinction being
+    // drawn — the same relocation is fine in data and fatal in code.
+    var section   = ""
+    val inSection = collection.mutable.ListBuffer.empty[(String, String)]
+
+    for line <- listed.stdout.linesIterator do
+      val row = line.trim
+
+      if row.startsWith("RELOCATION RECORDS FOR [") then
+        section = row.stripPrefix("RELOCATION RECORDS FOR [").stripSuffix("]:")
+      else
+        row.split("\\s+").find(_.startsWith("R_AARCH64_")).foreach(kind => inSection += (section -> kind))
+
+    val code = inSection.filter(_._1.startsWith(".text")).map(_._2).toList
+
+    // The positive half first. Without it a build that emitted no code relocations at all would pass
+    // by having nothing to be wrong about, which is exactly how the first version of this failed.
+    withClue(listed.stdout) {
+      code should not be empty
+      code should contain("R_AARCH64_ADR_PREL_PG_HI21")
+    }
+
+    // By exact name rather than by looking for "ABS": the perfectly position-independent
+    // `ADD_ABS_LO12_NC` is the second half of every PC-relative pair above and contains it.
+    withClue(listed.stdout) {
+      code.filter(r => r == "R_AARCH64_ABS64" || r == "R_AARCH64_ABS32") shouldBe empty
+    }
+  }
 }

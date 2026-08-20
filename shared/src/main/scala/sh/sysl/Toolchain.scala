@@ -525,7 +525,12 @@ object Toolchain {
       // libSystem and the CRT carry both, and the driver links them without being asked.
       case Os.MacOS | Os.Windows => Set("c", "m")
       // clang links libc itself; the mathematics is a file of its own.
-      case Os.Linux => Set("c")
+      //
+      // Android is here rather than beside Darwin because Bionic keeps them apart the same way, and
+      // that was measured rather than assumed: an NDK link of a program calling `tgamma` fails on an
+      // undefined symbol without `-lm`. (`sqrt` alone is not the test — it lowers to an instruction
+      // and links either way, which is the shape of the mistake this line would otherwise make.)
+      case Os.Linux | Os.Android => Set("c")
       // No libc exists here, so there is nothing to pass for one.
       case Os.Freestanding => Set("c", "m")
 

@@ -323,7 +323,7 @@ object Cpu {
  * hosted one of the same processor only where the OS is what fixed the convention.
  */
 enum Os {
-  case MacOS, Linux, Windows, Freestanding
+  case MacOS, Linux, Windows, Freestanding, Android
 
   /** The environment capabilities a machine running this operating system has **at all** — the
    * physical half of the two-level rule, as against what `package.hocon` says a target offers.
@@ -332,10 +332,17 @@ enum Os {
    * askers depend on that: `Conditional` gates a `#if` on it, and a `__<os>__` directory selects on
    * it during a walk that has an operating system and no processor. One answer, so a machine cannot
    * be hosted for one asker and bare for the other.
+   *
+   * **Android answers both the way Linux does, and it is a separate case anyway.** Bionic is a POSIX
+   * libc and there is a kernel under it, so a program that gates on `posix` or `hosted` wants this
+   * machine included. What it is *not* is glibc: the `-l` names differ, `pkg-config` does not exist,
+   * and the graphics and logging a program reaches for are `libandroid`/`liblog` rather than
+   * anything a desktop has. Answering `linux` to those questions would be answering them wrong, and
+   * a symbol a source file can test is exactly where that has to be distinguishable.
    */
   def inherentCapabilities: Set[String] =
     Option.when(this != Os.Freestanding)(Capability.Os).toSet ++
-      Option.when(this == Os.MacOS || this == Os.Linux)(Capability.Posix)
+      Option.when(this == Os.MacOS || this == Os.Linux || this == Os.Android)(Capability.Posix)
 }
 
 /** What a call hands a C function whose parameter is a `va_list` (`12 §9`).
@@ -384,6 +391,35 @@ object Target {
 
   val x86_64Windows: Target =
     Target("x86_64-windows", "x86_64-pc-windows-msvc", Cpu.X86_64, Os.Windows, VaListAbi.Loaded, 8)
+
+  /** A 64-bit Arm phone, which is the only Android worth a row: it is what every device sold since
+   * 2019 runs and it is what the emulator runs on an Apple-silicon host, so one row serves both and
+   * developing against the emulator costs no second build. `x86_64` would be for an Intel host or a
+   * CI runner and `armeabi-v7a` for pre-2015 hardware; neither is a machine anybody here has.
+   *
+   * **Its ABI answers are `aarch64-linux`'s, and that is measured rather than inherited.** Compiling
+   * a `va_start`/forward pair for this triple copies thirty-two bytes into a fresh `%struct.__va_list`
+   * and passes its address, exactly as the GNU triple does — AAPCS64 is AAPCS64, and Bionic did not
+   * vary it. What Bionic varies is everything above the ABI, which is why the `Os` is its own.
+   *
+   * **The API level belongs in the triple and a bare `aarch64-linux-android` is a trap.** With no
+   * level, clang defines neither `__ANDROID_API__` nor `__ANDROID_MIN_SDK_VERSION__` — measured — so
+   * the first Bionic header that guards a declaration on the level fails to compile, one step before
+   * anything has been lowered. `24` is the floor chosen: the NDK's own range is 21 to 36
+   * (`meta/platforms.json`), Vulkan starts at 24, and it is what a new Gradle project defaults to.
+   * **The number here and the kit's `minSdk` are one fact stated twice** — a program compiled against
+   * a higher level than the APK declares links and then fails to load on a device that has not got
+   * the symbol.
+   *
+   * **The row needs no relocation-model field, which was the expected blocker and is not one.**
+   * An archive linked into a `.so` must carry no **absolute** relocation in code, and sysl's objects
+   * do not: every global it emits is `private`, so it is not preemptible and lowers to a PC-relative
+   * pair against a local section, while its calls out to libc and to the standard module go through
+   * a PLT. `CrossTargetBuildTests` measures this off the object, and its docstring carries the one
+   * `ABS64` a correct program does have and why it is not this.
+   */
+  val aarch64Android: Target =
+    Target("aarch64-android", "aarch64-linux-android24", Cpu.Aarch64, Os.Android, VaListAbi.Copied, 32)
 
   val aarch64Freestanding: Target =
     Target("aarch64-freestanding", "aarch64-none-elf", Cpu.Aarch64, Os.Freestanding, VaListAbi.Copied, 32)
@@ -638,6 +674,7 @@ object Target {
       x86_64Linux,
       riscv64Linux,
       x86_64Windows,
+      aarch64Android,
       aarch64Freestanding,
       x86_64Freestanding,
       riscv64Freestanding,

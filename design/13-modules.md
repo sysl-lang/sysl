@@ -552,10 +552,10 @@ the target.** So `__macos__` selects one operating system, `__macos,linux__` eit
 `__posix__` whichever of them POSIX means.
 
 **The vocabulary is `#if`'s own** (`targets.md § Conditional compilation`): the operating systems
-`targets.md` names — `macos`, `linux`, `windows`, `freestanding` — plus the two facts that hold
-without naming one, `hosted` and `posix`. Both halves are derived rather than written down a second
-time, so a new operating system reaches this by existing and a source file cannot name a machine one
-way in a directory and another in a `#if`. A directory whose name has the `__x__` shape and whose
+`targets.md` names — `macos`, `linux`, `windows`, `freestanding`, `android` — plus the two facts that
+hold without naming one, `hosted` and `posix`. Both halves are derived rather than written down a
+second time, so a new operating system reaches this by existing and a source file cannot name a
+machine one way in a directory and another in a `#if`. A directory whose name has the `__x__` shape and whose
 symbols are not among them is an **error** rather than a silent miss — a misspelling that quietly
 compiles nothing is the failure this shape exists to make impossible, and it would present as a
 missing function. The diagnostic names the element that is wrong rather than the whole directory.
@@ -568,7 +568,13 @@ varies by processor is `#if`'s, or the C preprocessor's inside a `.c`.
 select the same two machines today and are not the same claim. Which operating systems are POSIX is
 written in exactly one place, so the first derives from it and the second copies it: add a third
 POSIX system and every `__posix__` directory covers it untouched while every `__macos,linux__`
-directory silently does not. The list form earns its keep on a set no capability names — macOS and
+directory silently does not.
+
+**That stopped being a prediction when `android` arrived.** It is the third POSIX system, and the
+library's three selector directories — `sysl/fs/`, `sysl/posix/tty/` and `sysl/posix/time/` — are all
+`__posix__`, so every one of them covered the new machine with nothing edited. Had any of them
+spelled the list, the failure would have been a `sysl.fs` with no `entries` on Android and no
+diagnostic anywhere: a directory that selects nothing is not an error, only an absence. The list form earns its keep on a set no capability names — macOS and
 Windows but not Linux — which is a reason to have the form rather than a reason to reach for it.
 
 **This is what a shim that needs an operating system says**, and it is why the form exists. A

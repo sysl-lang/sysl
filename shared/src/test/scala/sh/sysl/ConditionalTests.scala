@@ -217,9 +217,38 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
       for t <- Target.all do Conditional.defined(t).contains("hosted") shouldBe (t.os != Os.Freestanding)
     }
 
-    "'posix' is exactly macOS and Linux" in {
+    // Android is the third of them, and it is why this reads as a set rather than as a pair: Bionic
+    // is a POSIX libc with a kernel under it, so a program gating on `posix` wants a phone included.
+    // What Android is *not* is Linux, which is the next case down.
+    "'posix' is exactly macOS, Linux and Android" in {
       for t <- Target.all do
-        Conditional.defined(t).contains("posix") shouldBe Set(Os.MacOS, Os.Linux).contains(t.os)
+        Conditional.defined(t).contains("posix") shouldBe
+          Set(Os.MacOS, Os.Linux, Os.Android).contains(t.os)
+    }
+
+    // The distinction the `android` symbol exists for, asserted from both sides. Answering `linux`
+    // on a phone would answer a question about glibc with a fact about a kernel — the `-l` names,
+    // the headers and the absence of `pkg-config` all differ — and a source file that needs the two
+    // together writes `#if linux || android`, which is a thing it can only write if they are two
+    // symbols.
+    "'android' and 'linux' are different symbols, and no target defines both" in {
+      Conditional.symbols should contain("android")
+
+      Conditional.defined(Target.aarch64Android) should contain("android")
+      Conditional.defined(Target.aarch64Android) should not contain "linux"
+      Conditional.defined(Target.aarch64Linux) should not contain "android"
+
+      for t <- Target.all do
+        withClue(t.name)(Conditional.defined(t).intersect(Set("android", "linux")).size should be <= 1)
+    }
+
+    // The equation `13 § 5` rests on: a directory selects on what an operating system alone settles,
+    // so every symbol a `__<os>__` folder may name has to be one a `#if` names too. A new operating
+    // system is where that could quietly come apart, since the two sets are derived separately.
+    "a new operating system reaches the directory vocabulary and the '#if' one alike" in {
+      Conditional.directorySymbols should contain("android")
+      Conditional.directorySymbols.subsetOf(Conditional.symbols) shouldBe true
+      Conditional.osDefined(Os.Android) shouldBe Set("android", "hosted", "posix")
     }
 
     "every symbol is true of at least one target in the registry" in {

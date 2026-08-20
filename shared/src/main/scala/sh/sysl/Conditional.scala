@@ -206,6 +206,11 @@ object Conditional {
     case Os.Linux        => "linux"
     case Os.Windows      => "windows"
     case Os.Freestanding => "freestanding"
+    // `android` and not `linux`, though there is a Linux kernel under it: what a source file gating
+    // on a system is asking about is the libc and the libraries, and Bionic is neither glibc's set
+    // of `-l` names nor its headers. A program wanting both says `#if linux || android`, which is
+    // the same shape `posix` exists to shorten.
+    case Os.Android      => "android"
 
   private def cpuSymbol(cpu: Cpu): String = cpu.symbol
 

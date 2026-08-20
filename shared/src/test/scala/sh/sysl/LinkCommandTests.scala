@@ -47,10 +47,15 @@ class LinkCommandTests extends AnyFreeSpec with Matchers {
 
     // A target added to the registry without a decision here would fall into whichever arm the match
     // happened to reach. Asking every target in the registry is what makes adding one a decision.
-    "every target in the registry has an answer, and only Linux's asks for it" in {
+    // Android is the second, and it was measured rather than assumed to be Linux's twin: an NDK link
+    // of a program calling `tgamma` fails on an undefined symbol without `-lm`. `sqrt` alone would
+    // have answered the other way and answered wrong — it lowers to an instruction and links either
+    // way, which is exactly the shape of mistake a guess here makes.
+    "every target in the registry has an answer, and only Linux's and Android's ask for it" in {
       val asking = Target.all.filter(t => Toolchain.libraryFlags(List("m"), t).nonEmpty).map(_.os).distinct
 
-      asking shouldBe List(Os.Linux)
+      asking shouldBe List(Os.Linux, Os.Android)
+      Toolchain.libraryFlags(List("m"), Target.aarch64Android) shouldBe List("-lm")
     }
 
     // The directive is what makes it happen at all now. Before `15 §8` the driver appended `-lm` to

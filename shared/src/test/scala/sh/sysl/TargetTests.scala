@@ -284,6 +284,47 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
       aarch64.map(_.os) should contain allOf (Os.MacOS, Os.Linux, Os.Freestanding)
       aarch64.map(_.vaList).distinct.length shouldBe 2
     }
+
+    // Android's ABI answers are the GNU aarch64 row's, and that is a measurement rather than an
+    // inheritance: compiling a `va_start` and forward for `aarch64-linux-android24` copies
+    // thirty-two bytes into a fresh `__va_list` and passes its address, which is character for
+    // character what `aarch64-unknown-linux-gnu` does. AAPCS64 is AAPCS64 and Bionic did not vary it.
+    //
+    // What it does not share is the `Os`, and that is the whole reason it is a row rather than a
+    // spelling of the Linux one — the libraries, the absence of `pkg-config`, and the symbol a
+    // source file tests all hang off it.
+    "records Android's ABI as aarch64-linux's, and its system as its own" in {
+      val gnu     = Target.aarch64Linux
+      val android = Target.aarch64Android
+
+      (android.cpu, android.vaList, android.vaListBytes, android.softFloat) shouldBe
+        (gnu.cpu, gnu.vaList, gnu.vaListBytes, gnu.softFloat)
+
+      android.os shouldBe Os.Android
+      android.os should not be gnu.os
+    }
+
+    // **The API level is in the triple because clang puts it there.** A bare `aarch64-linux-android`
+    // defines neither `__ANDROID_API__` nor `__ANDROID_MIN_SDK_VERSION__` — measured — so the first
+    // Bionic header guarding a declaration on the level refuses to compile, one step before anything
+    // has been lowered. A row that dropped the number would fail at an `#include` rather than at
+    // anything a reader could connect to the target, which is why this is pinned rather than left to
+    // whoever next tidies the triple.
+    "keeps the API level in Android's triple, which a bare android triple does not supply" in {
+      Target.aarch64Android.triple should endWith("android24")
+      Target.aarch64Android.triple should fullyMatch regex """.*-android\d+"""
+    }
+
+    // Android is the third POSIX system, and it is what turns `13 § 5`'s prediction about
+    // `__posix__` against `__macos,linux__` into a fact: the derived selector covers it and a spelled
+    // list would silently not. Both halves are asserted because `Conditional` reads this one answer
+    // for a `#if` and `Project` reads it for a directory, and a machine that was hosted for one and
+    // bare for the other is the bug `Os.inherentCapabilities` exists to make impossible.
+    "answers hosted and posix for Android, which is what makes it the third POSIX system" in {
+      Target.aarch64Android.inherentCapabilities shouldBe Set(Capability.Os, Capability.Posix)
+      Target.aarch64Android.inherentCapabilities shouldBe Target.aarch64Linux.inherentCapabilities
+      Target.aarch64Android.hasThreadLocalStorage shouldBe true
+    }
   }
 
   "naming one" - {

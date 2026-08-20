@@ -359,6 +359,45 @@ class OsDirectoryTests extends LibraryCliSupport {
         List("hosted.c", "posix.c")
     }
 
+    // **`13 § 5`'s claim, now that there is a third POSIX system to test it with.** The chapter says
+    // to prefer the name that says why over the list that says which, and predicts exactly this: a
+    // `__posix__` folder covers a new POSIX machine untouched while a `__macos,linux__` folder
+    // silently does not. Both halves are asserted, because the failure is an **absence** — a folder
+    // that selects nothing is not an error, so the list form would have produced a module missing its
+    // shim with no diagnostic anywhere, surfacing much later as a function that is not there.
+    //
+    // The library follows its own advice: all three of its selector directories are `__posix__`, so
+    // adding this machine to the registry cost them nothing.
+    "so Android takes every __posix__ folder, and a spelled list of the other two silently misses it" in {
+      val root = projectOf(
+        "demo/demo.sysl"               -> "module demo\n",
+        "demo/__posix__/why.c"         -> shim,
+        "demo/__macos,linux__/which.c" -> shim,
+      )
+
+      Project.cSources(root, Some(Os.Android)).map(s => Project.basename(s.name)) shouldBe List("why.c")
+
+      // The control: on Linux both are taken, so the difference above is Android's and not something
+      // wrong with the tree.
+      Project.cSources(root, Some(Os.Linux)).map(s => Project.basename(s.name)).sorted shouldBe
+        List("which.c", "why.c")
+    }
+
+    // A machine's own folder is taken as well as the family one, which is what makes an Android-only
+    // shim writable at all — logcat and `ANativeWindow` are on no other POSIX system.
+    "and its own __android__ folder besides, which no other machine reads" in {
+      val root = projectOf(
+        "demo/demo.sysl"           -> "module demo\n",
+        "demo/__android__/log.c"   -> shim,
+        "demo/__posix__/shared.c"  -> shim,
+      )
+
+      Project.cSources(root, Some(Os.Android)).map(s => Project.basename(s.name)).sorted shouldBe
+        List("log.c", "shared.c")
+      Project.cSources(root, Some(Os.Linux)).map(s => Project.basename(s.name)) shouldBe List("shared.c")
+      Project.cSources(root, Some(Os.MacOS)).map(s => Project.basename(s.name)) shouldBe List("shared.c")
+    }
+
     // The same question asked of the tree that ships, which is the one the card was filed about: the
     // library's four shims are POSIX and must reach a hosted build and no other.
     "which is what keeps the library's own shims off a bare machine" in {

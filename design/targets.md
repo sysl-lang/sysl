@@ -40,6 +40,7 @@ of what makes it different from `build`.
 | `x86_64-linux` | `x86_64-unknown-linux-gnu` | address | yes | yes |
 | `riscv64-linux` | `riscv64-unknown-linux-gnu` | loaded | yes | yes |
 | `x86_64-windows` | `x86_64-pc-windows-msvc` | loaded | yes | yes |
+| `aarch64-android` | `aarch64-linux-android24` | copied | yes | yes |
 | `aarch64-freestanding` | `aarch64-none-elf` | copied | yes | yes |
 | `x86_64-freestanding` | `x86_64-unknown-none-elf` | address | yes | yes |
 | `riscv64-freestanding` | `riscv64-unknown-elf` | loaded | **no** | **no** |
@@ -141,6 +142,55 @@ handed that linker message goes looking for the word in their build system, and 
 **not** `soft`, which means something else — no FPU instructions at all, where `softfp` uses the
 `fpv5-sp-d16` and changes only the convention. `thumb-freestanding-soft` is that other thing, and the
 section below is about it.
+
+### Android, whose triple carries a version number
+
+`aarch64-android` is the first row whose triple names something other than a machine. `24` is an
+**API level** — a statement about which of Bionic's declarations exist — and it is in the triple
+because clang puts it there rather than because sysl wanted it: a bare `aarch64-linux-android`
+defines neither `__ANDROID_API__` nor `__ANDROID_MIN_SDK_VERSION__`, so the first header that guards
+a declaration on the level refuses to compile, one step before anything has been lowered. The row
+therefore states a floor, and the NDK's own range is 21 to 36.
+
+**The ABI is `aarch64-linux`'s and that was measured, not inherited.** AAPCS64 is AAPCS64: a
+`va_start` and forward for this triple copies thirty-two bytes into a fresh `__va_list` and passes
+its address, which is `aarch64-linux`'s answer to the character. Bionic varies what is *above* the
+ABI — which libraries exist, what they are called, and that there is no `pkg-config` to ask — and
+that is the half an `Os` records.
+
+**So the `Os` is its own and `android` is a symbol a source file may test.** Answering `linux` would
+be answering a question about glibc with a fact about a kernel, and the two disagree exactly where a
+program would care: `-landroid` and `-llog` are the platform's, `libm` is separate here as it is on
+Linux but `fontconfig` and `pkg-config` are on neither. Code wanting both writes `#if linux ||
+android`, and code wanting only what a kernel guarantees writes `posix`, which this machine answers
+yes to.
+
+**It needs no relocation-model field, which was the expected cost and is not one.** An Android
+program is a shared library that something else loads, so what a link refuses is an **absolute**
+relocation in code — an address written into the instruction stream cannot be fixed up once the
+object has been mapped wherever the loader chose. Sysl's objects carry none. Every global it emits is
+`private`, so it is not preemptible and lowers to a PC-relative pair (`ADR_PREL_PG_HI21` with
+`ADD_ABS_LO12_NC`) against a local section; its calls out to libc and to the standard module are
+`CALL26`, which the linker routes through a PLT. Neither depends on where the module lands.
+
+**One entry in the census looks like a counterexample and is not**, which is why the check is about
+*executable sections* rather than about the object. A real program's object holds exactly one
+`ABS64`, in `.data.__emutls_v.arc.reaper.self`: Android is an **emulated**-TLS target, so a
+thread-local's control block is ordinary data holding a pointer, and a pointer in data is what the
+dynamic linker relocates. A rule reading "no absolute relocation anywhere" would fail a correct
+program.
+
+**What it does need is a clang that is not the one on the PATH, AND THERE IS NO WAY TO SAY SO YET.**
+Apple's clang emits correct IR and objects for this triple — it has the back end, and the ABI is the
+processor's — but it has no Bionic sysroot, so anything that reads a header or reaches the linker is
+the NDK clang's job. `findClang` chooses by back end alone, so it picks the host's and the build fails
+at the first `#include <dirent.h>` in the standard library's own C, which reads as a broken library
+rather than as the wrong compiler.
+
+`Toolchain.findClang` takes a named compiler and **nothing has ever passed one**: three of its own
+diagnostics say *"name one with `--cc`"* and no such flag exists. So this row is registered, measured
+and correct, and a build for it cannot yet be driven end to end. What that costs, and the three shapes
+a fix could take, is an open question rather than an oversight — see *Open*.
 
 ### Armv6-M, which is the RP2040 and is a different architecture
 
@@ -634,9 +684,9 @@ marker disturbs nothing.
 
 | kind | symbols |
 |---|---|
-| operating system | `macos`, `linux`, `windows`, `freestanding` |
+| operating system | `macos`, `linux`, `windows`, `freestanding`, `android` |
 | processor | `aarch64`, `x86_64`, `riscv64`, `riscv32`, `thumb`, `x86` |
-| derived | `hosted` (not `freestanding`), `posix` (`macos` or `linux`) |
+| derived | `hosted` (not `freestanding`), `posix` (`macos`, `linux` or `android`) |
 
 That is the whole vocabulary. There is no `#define`, nothing a project can add, and **no dependence
 on the project config** that is still open below — which is what let this be built at all. A
@@ -696,6 +746,29 @@ writes.
 the trees a library ships are now a per-target answer. `13 §8` has the rest.
 
 ## Open
+
+- **Naming the compiler — `findClang` takes one and no caller supplies one.** Its signature is
+  `findClang(target, named)`, three of its diagnostics tell the reader to *"name one with `--cc`"*,
+  and there is no such flag: nothing anywhere passes the parameter. It went unnoticed because every
+  target until now was one the PATH clang could serve — RISC-V sends the search on to Homebrew's
+  LLVM, and that is the whole of what the search was ever asked to do.
+
+  **`aarch64-android` is the first target where having the back end is not having the toolchain.** It
+  needs a *sysroot*, so the compiler is the NDK's; and a build that cannot be told which compiler to
+  use cannot be driven at all. The failure is a missing `<dirent.h>`, which reads as a broken library.
+
+  Three shapes, and they are not equivalent:
+
+  1. **A `--cc` flag, threaded.** Makes the existing diagnostics true and is what a CMake-driven
+     build wants to pass. The reach is the question: `findClang` is called from `CProbe`, which is
+     reached through the analyzer, so the parameter travels most of the pipeline — or rides
+     `SearchPaths`, which already goes nearly everywhere and is already *"where on this machine"*,
+     at the cost of a type about `-I`/`-L` flags carrying a compiler path.
+  2. **`findClang` learns to find an NDK**, from `ANDROID_NDK_HOME`/`ANDROID_NDK_ROOT` or the SDK's
+     own layout, exactly as `clangCandidates` already knows Homebrew's two prefixes. One function, no
+     threading, and `sysl build --target aarch64-android` then works unasked — at the cost of the
+     compiler knowing something about one platform's tooling.
+  3. **Both**, with the flag winning, which is what `--ar` and the search already are.
 
 - ~~**The project config**~~ **— built, and so is the source-selection axis it used to be waiting
   on.** `package.hocon` carries per-target capability sets (`capabilities.md`'s `heap` / `os` /
