@@ -74,8 +74,17 @@ class PrebuiltStdTests extends AnyFreeSpec with Matchers {
     "is resolved once, however many times it is asked for" in {
       assume(Toolchain.clangAvailable, "clang not available")
 
-      val first  = Stdlib.resolve(Stdlib.Choice.Default(), Target.default)
-      val second = Stdlib.resolve(Stdlib.Choice.Default(), Target.default)
+      // **The memo holds one answer and clears on a miss**, so another suite resolving a different
+      // key between these two calls evicts the first and the second decodes afresh. Holding the
+      // memo's own monitor across both is what makes this assert memoization instead of testing the
+      // scheduler — without it the assertion fails a few runs in a hundred, which is worse than
+      // failing always because it reads as an unrelated regression in whatever branch is gating.
+      val (first, second) = Stdlib.memo.synchronized {
+        (
+          Stdlib.resolve(Stdlib.Choice.Default(), Target.default),
+          Stdlib.resolve(Stdlib.Choice.Default(), Target.default),
+        )
+      }
 
       first.toOption.get.std should be theSameInstanceAs second.toOption.get.std
     }

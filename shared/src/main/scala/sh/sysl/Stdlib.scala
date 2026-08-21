@@ -165,6 +165,17 @@ object Stdlib {
   /** How many answers are held, so a test can pin the bound. See `Std.cachedTargets`. */
   private[sysl] def cachedResolutions: Int = resolved.synchronized(resolved.size)
 
+  /** The monitor the memo above is guarded by.
+   *
+   * **It is exposed so that a test asserting two resolutions share an instance can make its own
+   * precondition true.** One answer is kept and a miss clears it, so *any* resolution of a different
+   * key between two calls evicts the first — and in a parallel suite run that is a property of the
+   * scheduler rather than of `resolve`. A test that does not hold this fails a few runs in a hundred
+   * and passes the rest, which is worse than one that fails always. The monitor is reentrant, so
+   * `resolve`'s own `synchronized` nests inside a caller already holding it.
+   */
+  private[sysl] def memo: AnyRef = resolved
+
   /** The standard module at the path both ends agree on, **built there when what is there is not
    * one.**
    *
