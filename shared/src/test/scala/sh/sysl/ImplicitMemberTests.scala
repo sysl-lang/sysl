@@ -28,6 +28,20 @@ class ImplicitMemberTests extends AnyFreeSpec with RunSupport with CodegenSuppor
       |        Blue -> 3
       |""".stripMargin
 
+  /** The same enum in a module of its own, which is what makes a use site's spelling worth
+   * measuring: reaching `Green` there otherwise needs the module path, the type, or an import.
+   */
+  private val paint =
+    """module paint
+      |enum Colour
+      |    Red
+      |    Green
+      |code(c: Colour) -> int
+      |    c match
+      |        Red -> 1
+      |        Green -> 2
+      |""".stripMargin
+
   "the expected type supplies the qualifier" - {
     "at an argument" in {
       run(colour + "print(code(.Green))") shouldBe "2\n"
@@ -200,6 +214,32 @@ class ImplicitMemberTests extends AnyFreeSpec with RunSupport with CodegenSuppor
             |val a: Age = .fresh()
             |print(int(a))
             |""".stripMargin) shouldBe "1\n"
+    }
+  }
+
+  /** The qualifier the dot leaves off may be one the file never wrote — which is the case the form
+   * is *for*: a module's enum is reached through the type the signature already names, so a use site
+   * needs neither the module path nor an import to say a variant.
+   */
+  "the type it resolves against need not be nameable here" - {
+    "a variant of another module's enum, with no import and no path" in {
+      runIn(
+        ("paint", "paint.sysl", paint),
+        ("", "main.sysl", "print(paint.code(.Green))\n"),
+      ) shouldBe "2\n"
+    }
+
+    // Visibility is still the type's to decide: what the dot leaves off is the *spelling*, not the
+    // check, and an associated function goes through the same one the qualified call does.
+    "and a private associated function is still refused" in {
+      errIn(
+        ("paint", "paint.sysl", paint +
+          """struct Pen
+            |    c: Colour
+            |    private make() -> Pen = Pen(Red)
+            |""".stripMargin),
+        ("", "main.sysl", "val p: paint.Pen = .make()\nprint(1)\n"),
+      ) should include("private")
     }
   }
 
