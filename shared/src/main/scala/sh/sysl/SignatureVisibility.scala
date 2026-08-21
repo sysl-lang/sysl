@@ -74,7 +74,20 @@ trait SignatureVisibility extends TypeResolution {
    */
   protected def checkTraitSignatures(): Unit =
     for (key, t) <- traitDecls.toList do
-      inDecl(key) {
+      // **In a sandbox of its own, and it is not tidiness** — it is the rule `checkAbstractLayouts`
+      // already states for the same reason. A `Type.Abstract` is identified by its *name*, so this
+      // trait's `T` and any other declaration's `T` are one type as far as a cache key is concerned;
+      // resolving `Option[T]` here registers an `Option` instantiated at a stand-in carrying **this
+      // trait's** bounds, and every later walk asking for `Option[T]` is handed that one.
+      //
+      // What that looked like: `trait Sink[T]` promising an `Option[T]` left the library's
+      // `impl[T: Eq] Eq for Option[T]` being walked at an *unbounded* `T`, and the block was told
+      // its own body assumed what its own bounds promise. The trait was unrelated to the impl in
+      // every way but the letter its parameter is spelled with.
+      //
+      // Nothing is lost by dropping it: this pass resolves names in order to report the ones that
+      // stand for nothing, and every instantiation it makes is one a real use makes again.
+      sandboxed(inDecl(key) {
         // The parameters are read here rather than outside, because a bound on one of them names a
         // trait in the terms of the file that wrote it: `[T: Scale]` under an `import` means the
         // imported trait, and read from anywhere else means nothing at all.
@@ -92,7 +105,7 @@ trait SignatureVisibility extends TypeResolution {
 
             checkSignatureRules(s"${qn(key)}.${m.name}", recv ::: m.params, m.retType, m.variadic)
           })
-      }
+      })
 
   /** Reports every type a declaration exposes that does not reach as far as the declaration does.
    *

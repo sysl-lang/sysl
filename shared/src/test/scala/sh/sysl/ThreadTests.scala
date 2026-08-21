@@ -538,10 +538,15 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
      * checks. The two differ by one character, so the diagnostic is the whole of what stands between
      * the reader and the fix, and it names the `&`.
      *
-     * It is the *general* form of the message rather than the sharp one `ClosureRunTests` pins,
-     * because the sharp one asks what the context wanted and `spawn`'s parameter is generic — a
-     * type argument still being inferred is not yet a `*extern` for the question to be answered
-     * against. The `&` is named either way, which is the part a reader needs.
+     * **It is the sharp form, and it did not use to be.** The sharp message asks what the context
+     * wanted, and `spawn`'s parameter is generic — so while an argument was analyzed before its
+     * type parameter was solved, there was no `*extern` for the question to be answered against and
+     * the general form was all a reader got. An argument whose own analysis cannot get off the
+     * ground now waits for the solution instead, so by the time the name is read `T` is the `int`
+     * that `&n` settled and the parameter is the `*extern(*int) -> unit` it always was.
+     *
+     * The `&` was named either way, which is the part a reader needs; what the sharp form adds is
+     * that a bare name is the *closure*, which is the thing they wrote and not a thing they meant.
      */
     "handing a thread a callable rather than the address of one" in {
       val out = err(
@@ -554,7 +559,8 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       )
 
       out should include("'work' is a function")
-      out should include("that is written '&work'")
+      out should include("write '&work'")
+      out should include("no address a C interface could call")
     }
   }
 }

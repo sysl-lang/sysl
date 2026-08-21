@@ -302,21 +302,36 @@ class CoreTraitRunTests extends AnyFreeSpec with RunSupport with CodegenSupport 
       err(src) should include("'==' is not defined for Money")
     }
 
-    // The catalog's memberships are written one type at a time, and the library's own generic
-    // enums have none — so "is this the same link" over an `Option` is written by taking both
-    // sides apart, even where the payload compares perfectly well on its own.
-    "and an Option is not equatable, whatever it holds" in {
-      err("""var a: Option[u8] = Some(3u8)
+    // **An `Option` is equatable exactly when its payload is**, which is one `impl` in the library
+    // rather than a membership the compiler hands out — the block below is the shape of it, and the
+    // library writes the same one for its own two enums. `Some` is never equal to `None`, and both
+    // directions are asked, since a comparison reading the left operand's variant alone answers one
+    // of them correctly by accident.
+    "and an Option is equatable when what it holds is" in {
+      run("""var a: Option[u8] = Some(3u8)
             |var b: Option[u8] = Some(3u8)
-            |print(a == b)
-            |""".stripMargin) should include(s"'==' is not defined for ${lib("Option")}[byte]")
+            |var c: Option[u8] = Some(4u8)
+            |var n: Option[u8] = None
+            |print(a == b, a == c, a == n, n == a, n == n)
+            |""".stripMargin) shouldBe "true false false false true\n"
     }
 
-    // What it costs to write by hand, and that the payload's own equality is what answers it. The
-    // enum is the program's own, because `Option` is not: `Eq` and `Option` are both the library's,
-    // and an `impl` for a generic type covers every instantiation at once — so there is no
-    // `Option[MyType]` to give the block a home, and only the library could write this row.
-    "though the implementation it wants is writable for an enum of its own" in {
+    // And the bound is on the **payload**, so an option of something incomparable is refused — at
+    // the comparison, naming the half that is missing rather than the option.
+    "but not when it holds something that is not" in {
+      err("""struct Opaque
+            |    n: int
+            |var a: Option[Opaque] = Some(Opaque(1))
+            |var b: Option[Opaque] = Some(Opaque(2))
+            |print(a == b)
+            |""".stripMargin) should include("asks 'sysl.Eq' of Opaque, which does not implement it")
+    }
+
+    // The same row written for an enum of the program's own, which is what the library's block looks
+    // like from the outside — and the one a program has to write for itself, since `Eq` and `Option`
+    // are both the library's and an `impl` for a generic type covers every instantiation at once, so
+    // there is no `Option[MyType]` to give a block of one's own a home.
+    "and the row itself is writable for an enum of its own" in {
       run("""enum Maybe[T]
             |    Just(v: T)
             |    Nothing

@@ -314,11 +314,21 @@ trait AnalyzerBase extends Scoping {
    */
   protected def attempt[T](body: => T): Option[T] = {
     val saved = registrations
+    val said  = complaints
 
-    try Some(body)
+    def undo(): None.type = { rewind(saved); restoreComplaints(said); None }
+
+    try
+      val answer = body
+
+      // **Coming back is not the same as succeeding**, which is the half a `catch` cannot see. A
+      // region that failed inside a `recover` records its complaint and hands back a fallback, so
+      // an attempt reading only the exception would keep a node built out of a mistake *and* leave
+      // the mistake reported — a reading nobody kept, blamed on the reader.
+      if complaints.length > said.length then undo() else Some(answer)
     catch
-      case AnalyzerError(_, _, _) => rewind(saved); None
-      case Poisoned()             => rewind(saved); None
+      case AnalyzerError(_, _, _) => undo()
+      case Poisoned()             => undo()
   }
 
   /** Whether asking that question failed on a mistake **somebody has already been told about**,
