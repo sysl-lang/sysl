@@ -806,12 +806,13 @@ class PackageBuildTests extends PackageCacheSupport {
 
     "do not reach a C file the block does not name" in {
       val pkg = packageSaying(
-        """defines { "geom/other.c" { DOUBLED = true } }""",
+        """defines { "other.c" { DOUBLED = true } }""",
         "geom-lib", "geom",
         """extern "sized_value" c() -> int
           |
           |value() -> int = c()""".stripMargin,
-        "", "geom/shim.c" -> impl, "geom/sized.h" -> header)
+        "", "geom/shim.c" -> impl, "geom/sized.h" -> header,
+        "other.c" -> "int other_unused(void) { return 0; }\n")
 
       run(app("""print(geom.value())""", s"""g { path = "$pkg" }""")) shouldBe "1\n"
     }
@@ -854,7 +855,7 @@ class PackageBuildTests extends PackageCacheSupport {
      */
     "do not reach a probe in a different directory" in {
       val pkg = packageSaying(
-        """defines { "elsewhere/other.c" { WIDE = 1 } }""",
+        """defines { "other.c" { WIDE = 1 } }""",
         "geom-lib", "geom",
         """@include("sized.h")
           |
@@ -863,9 +864,30 @@ class PackageBuildTests extends PackageCacheSupport {
           |
           |size() -> usize = SIZE""".stripMargin,
         "", "geom/sized.h" -> header,
-        "elsewhere/other.c" -> "int elsewhere_unused(void) { return 0; }\n")
+        "other.c" -> "int other_unused(void) { return 0; }\n")
 
       run(app("""print(geom.size())""", s"""g { path = "$pkg" }""")) shouldBe "8\n"
+    }
+
+    /* The one mistake a `defines` block can make that reading the manifest cannot catch. Everything
+     * else is refused at parse time; a path that is merely wrong would otherwise leave the macros
+     * reaching nothing, the C compiling under its defaults, and the build looking fine.
+     *
+     * It also catches naming C the walk does not collect at all -- a directory holding no sysl is
+     * not a module, so its C is not compiled and a block configuring it is configuring nothing.
+     */
+    "naming a file the package does not carry stops the build" in {
+      val pkg = packageSaying(
+        """defines { "geom/typo.c" { DOUBLED = true } }""",
+        "geom-lib", "geom",
+        """extern "sized_value" c() -> int
+          |
+          |value() -> int = c()""".stripMargin,
+        "", "geom/shim.c" -> impl, "geom/sized.h" -> header)
+
+      val e = refused(app("""print(geom.value())""", s"""g { path = "$pkg" }"""))
+
+      e should include("names a file this package does not carry")
     }
 
     /* A macro is one package's business. Two packages carrying C compiled with the same option name

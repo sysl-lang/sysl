@@ -102,7 +102,19 @@ private def collectPackages(graph: Resolve.Graph, os: Os): Either[String, Packag
       case None =>
         val owned = each.flatMap((p, sources) => sources.map(_ -> p.canonical)).toMap
 
-        Right(PackageSources(
+        // Keyed by where each package's C actually is, which is what the compilation will name it
+        // — and walked only for a package that declared something, so a build depending on packages
+        // that use no macros reads no C here at all.
+        val declared = fetched.filter(_.config.defines.nonEmpty).foldLeft[
+            Either[String, Map[String, List[String]]]](Right(Map.empty)) { (acc, p) =>
+          for
+            seen <- acc
+            mine <- p.config.carriedDefines(Project.cSources(p.root, Some(os)).map(_.name))
+              .left.map(err => s"'${p.canonical}': $err")
+          yield seen ++ mine
+        }
+
+        declared.flatMap(defines => Right(PackageSources(
           each.flatMap(_._2),
           Packages(owned, graph.packages.map(p => p.canonical -> p.imports).toMap),
           fetched.map(_.root),
@@ -111,8 +123,8 @@ private def collectPackages(graph: Resolve.Graph, os: Os): Either[String, Packag
           fetched.flatMap(p =>
             p.config.pkgConfig.toList.sortBy(_._1).map((mod, why) => LibNeed(p.canonical, mod, why))),
           fetched.flatMap(p => p.config.allocator.map(p.canonical -> _)),
-          fetched.map(p => p.config.carriedDefines(p.root)).foldLeft(Map.empty[String, List[String]])(_ ++ _),
-        ))
+          defines,
+        )))
   // A malformed per-OS directory is a mistake in the package rather than a package that would not
   // read (`13 §5`), and the message names the directory and lists the operating systems there are —
   // so wrapping it in "cannot read a package" would bury the only part worth having.

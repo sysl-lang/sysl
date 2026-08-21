@@ -683,12 +683,13 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
       refused("""defines { "a.c" = true }""") should include("is not a block of macros")
     }
 
-    /* A `c const` block is measured from a translation unit the compiler synthesises, so the
-     * manifest has no path to name it by and it inherits from the directory it sits in. The rule
-     * itself lives in `SearchPaths.probeFlagsFor`, which is where both clang call sites can reach
-     * it; what is checked here is the shape this hands it.
+    /* The manifest writes a relative path and the compilation names the file by whatever the source
+     * walk produced -- which is absolute whatever the reader typed, so `sysl test .` in a package's
+     * own tree yields an absolute path for a root of `.`. Keying off the root instead was the defect
+     * this replaced: it matched only when the root happened to be typed the same way the walk
+     * spells it, and when it did not match, the C compiled under its defaults with nothing to say so.
      */
-    "the macros are keyed by the path the file is compiled from" in {
+    "are keyed by the path the source walk found, not by the one the manifest wrote" in {
       val c = read(
         """defines {
           |  "sh/sysl/miniz/c/miniz.c" { MINIZ_NO_MALLOC = true }
@@ -696,9 +697,43 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
           |}
         """.stripMargin)
 
-      c.carriedDefines("/cache/miniz") shouldBe Map(
-        "/cache/miniz/sh/sysl/miniz/c/miniz.c" -> List("MINIZ_NO_MALLOC"),
-        "/cache/miniz/sh/sysl/miniz/c/shim.c"  -> List("MINIZ_NO_MALLOC"))
+      val found = List("/private/tmp/miniz/sh/sysl/miniz/c/miniz.c",
+                       "/private/tmp/miniz/sh/sysl/miniz/c/shim.c",
+                       "/private/tmp/miniz/sh/sysl/miniz/c/unrelated.c")
+
+      c.carriedDefines(found) shouldBe Right(Map(
+        "/private/tmp/miniz/sh/sysl/miniz/c/miniz.c" -> List("MINIZ_NO_MALLOC"),
+        "/private/tmp/miniz/sh/sysl/miniz/c/shim.c"  -> List("MINIZ_NO_MALLOC")))
+    }
+
+    "a C file at the package root is matched by its own name" in {
+      val c = read("""defines { "thing.c" { X = true } }""")
+
+      c.carriedDefines(List("/pkg/thing.c")) shouldBe Right(Map("/pkg/thing.c" -> List("X")))
+    }
+
+    /* The one mistake in a `defines` block that reading the file cannot catch, and the one that is
+     * otherwise silent: everything else is refused at parse time, while a path that is merely wrong
+     * would leave the macros reaching nothing and the C compiling under its defaults.
+     */
+    "a path naming no file the package carries is refused rather than passed over" in {
+      val c = read("""defines { "sh/sysl/miniz/c/typo.c" { X = true } }""")
+
+      c.carriedDefines(List("/pkg/sh/sysl/miniz/c/miniz.c")) match
+        case Left(e)  => e should include("names a file this package does not carry")
+        case Right(m) => fail(s"expected a refusal, got: $m")
+    }
+
+    /* Suffix matching is within one package's own file list, so a name that merely ends the same way
+     * as another package's does not reach across -- the list handed in is that package's C and
+     * nothing else.
+     */
+    "a partial segment is not a match" in {
+      val c = read("""defines { "c/util.c" { X = true } }""")
+
+      c.carriedDefines(List("/pkg/src/notc/util.c")) match
+        case Left(e)  => e should include("does not carry")
+        case Right(m) => fail(s"expected a refusal, got: $m")
     }
 
     "a macro name is one the preprocessor would take" in {
