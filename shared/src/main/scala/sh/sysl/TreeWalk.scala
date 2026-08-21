@@ -87,6 +87,7 @@ object TreeWalk {
     case TCast(v, _)                => List(v)
     case TDeref(v, _)               => List(v)
     case TAddrOf(v, _)              => List(v)
+    case TTypeId(v, _)              => List(v)
     case TTempAddr(v, _)            => List(v)
     case TStore(p, v, _)            => List(p, v)
     case TUpdate(p, _, v, _, _, _)  => List(p, v)

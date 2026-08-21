@@ -298,6 +298,14 @@ trait ExprEmitter extends ArithEmitter {
     case TAddrOf(place, _) =>
       address(place)
 
+    // `o::Id` — the first word of the table the object points at (`VtableEmitter`). The table is a
+    // constant global, so this is a load from read-only storage and nothing else.
+    case TTypeId(receiver, _) =>
+      val obj   = genExpr(receiver)
+      val table = freshReg(); emit(Inst.Extract(table, LType.fat, obj, List(0)))
+      val r     = freshReg(); emit(Inst.Load(r, wordLty, table, Access.Plain))
+      r
+
     // `&value` — the storage a computed value has no address for. The slot is an ordinary alloca, so
     // it belongs to the **frame** rather than to the block that wrote it, and the count it takes is
     // the one a `var`'s slot takes: registered with the scope being emitted, released where that
@@ -402,7 +410,9 @@ trait ExprEmitter extends ArithEmitter {
         case Some(n) =>
           val vt   = freshReg(); emit(Inst.Extract(vt, LType.fat, v, List(0)))
           val data = freshReg(); emit(Inst.Extract(data, LType.fat, v, List(1)))
-          val e    = freshReg(); emit(Inst.Gep(e, LType.Ptr, vt, List(Arg(wordLty, Val.Int(n)))))
+          val e    = freshReg(); emit(Inst.Gep(e, vtableLty, vt,
+                       List(Arg(LType.I(32), Val.Int(0)), Arg(LType.I(32), Val.Int(1)),
+                            Arg(wordLty, Val.Int(n)))))
           val fn   = freshReg(); emit(Inst.Load(fn, LType.Ptr, e, Access.Plain))
 
           emit(Inst.Call(None, LType.Void, fn, List(Arg(LType.Ptr, data), Arg(LType.fat, w), Arg(spec.ty.lty, s))))
@@ -741,7 +751,9 @@ trait ExprEmitter extends ArithEmitter {
       val table   = freshReg(); emit(Inst.Extract(table, LType.fat, obj, List(0)))
       val data    = freshReg(); emit(Inst.Extract(data, LType.fat, obj, List(1)))
       val argVals = argList(args)
-      val entry   = freshReg(); emit(Inst.Gep(entry, LType.Ptr, table, List(Arg(wordLty, Val.Int(slot)))))
+      val entry   = freshReg(); emit(Inst.Gep(entry, vtableLty, table,
+                      List(Arg(LType.I(32), Val.Int(0)), Arg(LType.I(32), Val.Int(1)),
+                           Arg(wordLty, Val.Int(slot)))))
       val fn      = freshReg(); emit(Inst.Load(fn, LType.Ptr, entry, Access.Plain))
       genSyslCall(syslResult(ty), fn, Arg(LType.Ptr, data) :: argVals, ty, None)
 

@@ -169,7 +169,7 @@ trait TraitObjects extends TypeResolution {
         TVSlot(fname, m.recvMode.get, params.tail.map(_._2), rtype)
       }
 
-      vtables(name) = TVtable(name, tr.name, ty, boxed, slots)
+      vtables(name) = TVtable(name, tr.name, ty, boxed, slots, typeIdOf(ty))
 
     name
   }

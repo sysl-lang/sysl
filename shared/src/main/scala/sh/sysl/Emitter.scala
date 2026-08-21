@@ -86,6 +86,17 @@ trait Emitter {
    */
   protected def wordLty: ir.LType = target.word.lty
 
+  /** A method table's shape as a **call site** has to spell it: the type's identity, then the slots
+   * (`VtableEmitter`).
+   *
+   * The slot array is written with **no length**, which is what lets one type serve every trait: a
+   * `getelementptr` needs the aggregate only to compute an offset, and `[0 x ptr]` and `[n x ptr]`
+   * begin at the same one. A call site knows the trait's slot number and not how many slots the
+   * table has — the table it reaches is chosen at run time — so a length here would be a number it
+   * could not supply.
+   */
+  protected def vtableLty: ir.LType = ir.LType.Struct(List(wordLty, ir.LType.Arr(0, ir.LType.Ptr)))
+
   protected val globals  = mutable.ListBuffer.empty[ir.Global]
   private var strId      = 0
 

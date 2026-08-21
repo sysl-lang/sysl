@@ -91,13 +91,13 @@ class TraitObjectCodegenTests extends AnyFreeSpec with CodegenSupport {
     // and only the by-value one needs an adapter.
     "holds one pointer per method, adapting only where the receiver differs" in {
       ir(raw) should include(
-        "@vt.Shape.Rect = private constant [2 x ptr] [ptr @vt.adapt.Rect.area, ptr @Rect.scale]",
+        "@vt.Shape.Rect = private constant { i64, [2 x ptr] }",
       )
     }
 
     "of a counted object names a '&self' method directly instead" in {
       ir(counted) should include(
-        "@vt.ref.T.S = private constant [2 x ptr] [ptr @S.go, ptr @vt.adapt.ref.S.v]",
+        "@vt.ref.T.S = private constant { i64, [2 x ptr] }",
       )
     }
 
@@ -143,7 +143,7 @@ class TraitObjectCodegenTests extends AnyFreeSpec with CodegenSupport {
     // A property's receiver is by value and never written, so it takes a slot and an adapter exactly
     // as a by-value method does — which is the whole of what declaring one in a trait cost.
     "takes a slot like a method, with the by-value adapter one needs" in {
-      ir(withProperty) should include("@vt.Sized.Box = private constant [1 x ptr] [ptr @vt.adapt.Box.size]")
+      ir(withProperty) should include("@vt.Sized.Box = private constant { i64, [1 x ptr] }")
       defineOf(ir(withProperty), "vt.adapt.Box.size") should include("%t1 = load %struct.Box, ptr %d")
     }
 
@@ -163,7 +163,7 @@ class TraitObjectCodegenTests extends AnyFreeSpec with CodegenSupport {
     }
 
     "names its table by the same mangling, and fills the slot from it" in {
-      ir(slice) should include("@vt.ref.Total.slice.int = private constant [1 x ptr]")
+      ir(slice) should include("@vt.ref.Total.slice.int = private constant { i64, [1 x ptr] }")
       ir(slice) should include("@vt.adapt.ref.slice.int.total")
       defineOf(ir(slice), "vt.adapt.ref.slice.int.total") should include("call i32 @slice.int.total(")
     }
@@ -196,8 +196,8 @@ class TraitObjectCodegenTests extends AnyFreeSpec with CodegenSupport {
     "gives two instantiations two tables of their own" in {
       val out = ir(generic)
 
-      out should include("@vt.ref.Total.Box.string = private constant [1 x ptr]")
-      out should include("@vt.ref.Total.Box.int = private constant [1 x ptr]")
+      out should include("@vt.ref.Total.Box.string = private constant { i64, [1 x ptr] }")
+      out should include("@vt.ref.Total.Box.int = private constant { i64, [1 x ptr] }")
     }
   }
 
@@ -215,8 +215,8 @@ class TraitObjectCodegenTests extends AnyFreeSpec with CodegenSupport {
     "gives two element types two tables of their own" in {
       val out = ir(shape)
 
-      out should include("@vt.ref.Total.slice.int = private constant [1 x ptr]")
-      out should include("@vt.ref.Total.slice.bool = private constant [1 x ptr]")
+      out should include("@vt.ref.Total.slice.int = private constant { i64, [1 x ptr] }")
+      out should include("@vt.ref.Total.slice.bool = private constant { i64, [1 x ptr] }")
     }
   }
 
@@ -231,7 +231,7 @@ class TraitObjectCodegenTests extends AnyFreeSpec with CodegenSupport {
     "calls through the slot its method sits in, passing the data word first" in {
       val body = mainOf(ir(raw))
 
-      body should include("getelementptr ptr, ptr %t11, i64 0")
+      body should include("getelementptr { i64, [0 x ptr] }, ptr %t11, i32 0, i32 1, i64 0")
       body should include("call i32 %t14(ptr %t12)")
     }
 

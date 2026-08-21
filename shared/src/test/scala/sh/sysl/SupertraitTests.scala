@@ -494,7 +494,7 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       // property the table and every call site have to agree on.
       val out = ir(shape + "var o: &Shape = Rect(3, 4)\nprint(o.area())\nprint(o)")
 
-      out should include("@vt.ref.Shape.Rect = private constant [2 x ptr] [ptr @vt.adapt.ref.Rect.display, ptr @vt.adapt.ref.Rect.area]")
+      out should include("[2 x ptr] [ptr @vt.adapt.ref.Rect.display, ptr @vt.adapt.ref.Rect.area]")
     }
   }
 
@@ -965,7 +965,7 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |print(o.area())""".stripMargin,
       )
 
-      out should include("@vt.ref.Shape.Rect = private constant [2 x ptr] [ptr @vt.adapt.ref.Rect.area, ptr @vt.adapt.ref.Rect.perimeter]")
+      out should include("[2 x ptr] [ptr @vt.adapt.ref.Rect.area, ptr @vt.adapt.ref.Rect.perimeter]")
     }
   }
 }

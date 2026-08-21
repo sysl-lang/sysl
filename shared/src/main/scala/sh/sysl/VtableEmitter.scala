@@ -16,12 +16,23 @@ import ir.{Arg, Inst, LType, Val}
  */
 trait VtableEmitter extends ArcEmitter {
 
-  /** One table's constant, with whatever adapters its slots need queued for emission. */
+  /** One table's constant, with whatever adapters its slots need queued for emission.
+   *
+   * **The type's identity is the first word, and the slots follow it** (`TypeId`). That is what an
+   * erased value carries `o::Id` in: the object's first word is this table's address, so one load
+   * answers a question the value itself has forgotten. It costs a word per table — one per (trait,
+   * implementing type, memory mode) — and nothing per value.
+   *
+   * The layout is a struct rather than a longer array of pointers with an `inttoptr` in front,
+   * because that is what is actually there: a word and then function pointers. `VtableEmitter` and
+   * the one call site that indexes a slot are the only two things that know it.
+   */
   protected def genVtable(vt: TVtable): ir.Global = {
     val entries = vt.slots.map(s => Arg(LType.Ptr, Val.Global(slotFn(vt, s))))
+    val slots   = LType.Arr(vt.slots.length, LType.Ptr)
 
-    ir.Global(vt.name, constant = true, LType.Arr(vt.slots.length, LType.Ptr),
-              Some(Val.Array(entries)))
+    ir.Global(vt.name, constant = true, LType.Struct(List(wordLty, slots)),
+              Some(Val.Agg(List(Arg(wordLty, Val.Int(vt.typeId)), Arg(slots, Val.Array(entries))))))
   }
 
   /** The function a slot holds: the implementation itself where its receiver already *is* the data

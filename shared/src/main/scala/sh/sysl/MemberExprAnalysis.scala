@@ -311,6 +311,23 @@ trait MemberExprAnalysis extends ExprSupport {
    * surrounding scope declares under the same name — the same order `typeNamed` uses for `T(x)`.
    */
   protected def typeAttrExpr(expr: TypeAttr): TExpr = expr match
+    // **`Id` is answered before the dispatch below, because it is the one attribute EVERY type
+    // has.** The arms under this one reach a constrained subtype, an enum and a built-in integer,
+    // and a struct name is told it has no type attributes at all — which is right for `Max` and
+    // wrong for an identity. So the type is resolved and asked directly, whatever kind it is.
+    case TypeAttr(Ident(name), "Id") if lookupOpt(name).isEmpty && tsubst.contains(name) =>
+      parameterId(tsubst(name))
+
+    case TypeAttr(Ident(name), "Id") if lookupOpt(name).isEmpty && typeKey(name).isDefined =>
+      // Resolved through the ordinary type resolver rather than through one of the declaration
+      // tables, because `Id` is asked of every kind of type and those tables are one kind each. A
+      // **generic** name has no single type to resolve to and is refused there, in the same words
+      // `X::Max` is refused on a generic enum.
+      TIntLit(typeIdOf(resolveType(NamedType(name), tsubst)), Type.usize)
+
+    case TypeAttr(Ident(name), "Id") if lookupOpt(name).isEmpty && builtinInteger(name).isDefined =>
+      TIntLit(typeIdOf(builtinInteger(name).get), Type.usize)
+
     case TypeAttr(Ident(name), attr) if lookupOpt(name).isEmpty && tsubst.contains(name) =>
       parameterAttr(name, tsubst(name), attr, Nil)
 
@@ -320,8 +337,35 @@ trait MemberExprAnalysis extends ExprSupport {
     case TypeAttr(Ident(name), attr) if lookupOpt(name).isEmpty && builtinInteger(name).isDefined =>
       integerAttr(builtinInteger(name).get, name, attr, Nil)
 
+    // **`::Id` is the one attribute a VALUE answers, and only where the value is erased.** That is
+    // the case the form exists for: an object has forgotten which type is inside it, and this is the
+    // one fact about that type it still carries. Everywhere else the static type is known and
+    // `T::Id` is how to ask — offering `x::Id` there would be two spellings for one answer, and
+    // would invite the reading "the runtime type", which is a promise the form could not keep.
+    case TypeAttr(recv, "Id") =>
+      val t = analyzeExpr(recv)
+
+      if !Type.erased(t.ty) then
+        err(s"'::Id' on a value reads the identity an erased value carries, and this one is a " +
+          s"${show(t.ty)}, whose type is known right here — write '${show(Type.unqualified(t.ty))}::Id'")
+
+      TTypeId(t, Type.usize)
+
     case TypeAttr(_, attr) =>
       err(s"'::$attr' is a type attribute, so its left side must be a type name")
+
+  /** `T::Id` where `T` is a **type parameter**, answered from what the instantiation bound it to.
+   *
+   * Unlike `Min` and `Max` this needs no bound of any kind and admits every type, which is what
+   * makes it the one attribute a parameter can be asked for without narrowing what the parameter may
+   * be. The abstract walk is the same deferral those two take: the body is checked once with `T`
+   * standing at an `Abstract`, there is no identity to answer with there, and the tree is discarded.
+   * The literal is typed `usize` rather than as the parameter, because that is what `Id` answers
+   * whatever `T` turns out to be.
+   */
+  private def parameterId(bound: Type): TExpr = bound match
+    case _: Type.Abstract => TIntLit(0, Type.usize)
+    case concrete         => TIntLit(typeIdOf(concrete), Type.usize)
 
   /** `T::Min` and `T::Max` where `T` is a **type parameter**, answered from what the instantiation
    * bound it to (`10`, `16 §5`).

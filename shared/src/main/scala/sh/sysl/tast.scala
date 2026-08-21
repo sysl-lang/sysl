@@ -248,6 +248,15 @@ case class TGlobal(symbol: String, ty: Type, writable: Boolean = false) extends 
 /** `*p` — reads through a pointer or reference. */
 case class TDeref(operand: TExpr, ty: Type) extends TExpr
 
+/** `o::Id` on an **erased** value — the compile-time identity of the type inside it, read out of
+ * the method table the object points at (`02`, `TypeId`).
+ *
+ * It is a *load* rather than a constant, and that is the whole of what separates it from `T::Id`:
+ * the type is not known here, which is the case the form exists for. What it costs is one load from
+ * a constant global, and the object was already going to be dereferenced to call anything on it.
+ */
+case class TTypeId(receiver: TExpr, ty: Type) extends TExpr
+
 /** `&place` — the address of a place, as a raw pointer. */
 case class TAddrOf(place: TExpr, ty: Type) extends TExpr
 
@@ -927,7 +936,15 @@ case class TExternVar(symbol: String, ty: Type)
  * the reference-counted box the value sits inside, so the two reach the same implementation through
  * different arithmetic.
  */
-case class TVtable(name: String, traitName: String, forType: Type, boxed: Boolean, slots: List[TVSlot])
+case class TVtable(name: String, traitName: String, forType: Type, boxed: Boolean, slots: List[TVSlot],
+                   /** The implementing type's compile-time identity, which the table carries as its
+                     * first word so that `o::Id` on an erased value can be read (`02`, `TypeId`).
+                     *
+                     * It is a property of `forType` rather than of the table, and there are two
+                     * tables per type where both memory modes are erased — so both carry the same
+                     * number, which is what makes `*Shape` and `&Shape` over one type compare equal.
+                     */
+                   typeId: BigInt)
 
 /** One slot of a method table: the function it ends at, how that function wants its receiver, and
  * the signature a call site sees. Between the data word and the receiver the function declared

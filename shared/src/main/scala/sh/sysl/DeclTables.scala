@@ -227,6 +227,39 @@ trait DeclTables extends Reporting {
    */
   protected var inTestBody = false
 
+  /** Every type an id has been asked for, by the id it got — the collision check `TypeId` says it
+   * owes (`02`).
+   *
+   * A hash is what makes two compilations agree about one type, and the price is that two *different*
+   * types could hash alike. Nothing downstream could notice: the ids would simply compare equal, and
+   * a cache keyed on one would answer with the other's entry. So every id this compilation hands out
+   * is recorded under the name it was computed from, and a second name arriving at the same number
+   * stops the compilation instead.
+   *
+   * It cannot see across a compilation boundary and does not claim to. What it covers is every type
+   * that meets in one program, which is every pair that could be compared.
+   */
+  private val typeIdsIssued = mutable.HashMap.empty[BigInt, String]
+
+  /** The compile-time identity of a type, checked for collision against everything asked so far.
+   *
+   * Both readers go through here — `T::Id` folded into a literal, and the word a method table
+   * carries — so the two cannot drift, and the check sees the union of what either asked.
+   */
+  protected def typeIdOf(ty: Type): BigInt = {
+    val id   = TypeId.of(ty)
+    val name = Type.memberSymbol(ty)
+
+    typeIdsIssued.get(id) match
+      case Some(other) if other != name =>
+        err(s"'${show(ty)}' and '$other' have the same compile-time identity, which two different " +
+          "types may not — '::Id' is a hash of the type's name, so this is a collision rather than " +
+          "a mistake in either declaration. Renaming either type moves it")
+      case _ =>
+        typeIdsIssued(id) = name
+        id
+  }
+
   /** Types whose *declaration* was reported as a mistake, so that using one does not report it
    * again. A declaration is instantiated eagerly and therefore judged once, but a name can be
    * mentioned any number of times afterwards, and each mention would otherwise rebuild the same

@@ -66,6 +66,12 @@ object WriterEmitter {
     val word = w.llvm
     val str  = Type.Str.llvm
     val slot = s"{ ptr, $word, $word }"
+    // Every method table carries its type's identity in front of the slots (`VtableEmitter`), and
+    // this one is a table like any other as far as a call site is concerned — a `*Writer` handed to
+    // a `display` implementation may be this buffer, and `out::Id` on it has to answer something.
+    // There is no `Type` here to ask, so the name is hashed directly; it begins with the module
+    // separator, which nothing a program can declare does.
+    val id   = TypeId.ofName(s"${Modules.sep}buf")
 
     s"""define private void @sysl.w.buf.write(ptr %self, $str %b) {
        |entry:
@@ -150,7 +156,7 @@ object WriterEmitter {
        |  ret $str %s
        |}
        |
-       |@sysl.vt.buf = private constant [2 x ptr] [ptr @sysl.w.buf.failed, ptr @sysl.w.buf.write]
+       |@sysl.vt.buf = private constant { $word, [2 x ptr] } { $word $id, [2 x ptr] [ptr @sysl.w.buf.failed, ptr @sysl.w.buf.write] }
        |""".stripMargin
   }
 }
