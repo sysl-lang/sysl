@@ -29,7 +29,7 @@ class PackageBuildTests extends PackageCacheSupport {
 
   /** The same, plus whatever else the manifest says — a `defines` block, for the suite below. */
   private def packageSaying(extra: String, name: String, module: String, text: String,
-                            deps: String = "", files: (String, String)*): String = {
+                            deps: String, files: (String, String)*): String = {
     val root = createTempDirectory("sysl-pkg-")
     val leaf = Project.basename(module)
 
