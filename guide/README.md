@@ -57,7 +57,6 @@ contract.
 | directory | axis it owns |
 |---|---|
 | `json` | recursive ownership — a value that contains itself through `&T` |
-| `hashmap` | the trait system under load — bounds, the behaviour they promise, and ownership at once |
 | `bytecode` | the module system, and the set's one end-to-end assertion — source in, bytecode out, run it |
 | `png` | the byte level — endianness, bit streams, checksums, a format someone else defined |
 | `fft` | an algorithm checked against its own definition |

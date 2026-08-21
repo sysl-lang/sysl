@@ -1,6 +1,7 @@
 module sysl.term.edit
 
 import sysl.buf.{Buf, buf}
+import sysl.container.deque.{Deque, deque}
 import sysl.io.Reader
 import sysl.text.{char_columns, str_builder}
 
@@ -90,7 +91,12 @@ struct Editor
     // powered, so a list that only grows is a leak with a slow fuse — and the entries are `string`s,
     // each its own allocation. What the cap costs is the oldest line, which is the one nobody was
     // going to reach for.
-    hist: Buf[string]
+    // A `Deque` rather than a `Buf`, because the cap is enforced by dropping the **oldest** entry
+    // and that is the one end a growable sequence has no cheap answer for: `remove(0)` shifts every
+    // remaining entry down one, so a capped history pays the whole cap on every line entered once it
+    // is full. `push_back` and `pop_front` are what the rule actually says, and neither moves
+    // anything.
+    hist: Deque[string]
 
     // Which entry the arrows are showing. `hist.len()` means *none of them* — the line being typed,
     // which is where every `getline` starts and where Down eventually returns.
@@ -558,7 +564,7 @@ struct Editor
         if self.browse == self.hist.len() then self.draft = self.text_of()
 
         self.browse -= 1
-        self.replace(self.hist.view()[self.browse])
+        self.replace(self.hist[self.browse])
     end earlier
 
     // Down: one step towards the line being typed, and then to the draft itself.
@@ -570,7 +576,7 @@ struct Editor
         if self.browse == self.hist.len() then
             self.replace(self.draft)
         else
-            self.replace(self.hist.view()[self.browse])
+            self.replace(self.hist[self.browse])
     end later
 
     // What a finished line leaves behind.
@@ -581,11 +587,12 @@ struct Editor
     // moments, and dropping the second would put the arrows somewhere surprising.
     remember(*self, line: string)
         if line == "" then return
-        if !self.hist.is_empty() && self.hist.view()[self.hist.len() - 1] == line then return
+        if !self.hist.is_empty() && self.hist[self.hist.len() - 1] == line then return
 
-        if self.hist.len() >= history_limit then self.hist.remove(0)
+        if self.hist.len() >= history_limit
+            self.hist.pop_front()
 
-        self.hist.push(line)
+        self.hist.push_back(line)
     end remember
 end Editor
 
@@ -606,4 +613,4 @@ impl Iterate[string] for Editor
 // lifetime for it: one console, one history, and nothing to save or load. A program wanting it to
 // survive a restart would have to write it somewhere, and where is a question about that program.
 editor(r: *Reader, w: *Writer) -> Editor =
-    Editor(r, w, buf(), 0, [0; 64], [], 0, false, false, buf(), 0, "")
+    Editor(r, w, buf(), 0, [0; 64], [], 0, false, false, deque(), 0, "")

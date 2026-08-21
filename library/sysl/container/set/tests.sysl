@@ -1,0 +1,191 @@
+module sysl.container.set
+@tests
+
+// What the set promises. The table underneath it is the map's and is tested there; what is asserted
+// here is the surface a set adds -- that `add` reports novelty, that the algebra is the algebra, and
+// that a value column nobody reads never shows up.
+
+@test("a fresh set is empty")
+fresh_is_empty()
+    var s: Set[int] = set()
+
+    assert_eq(s.len(), 0)
+    assert(s.is_empty())
+    assert(!s.has(1))
+end fresh_is_empty
+
+// The answer is what makes a set the "have I seen this" test, so it is the property to pin: the
+// first `add` of a key is true and every later one is false, and the length follows the first.
+@test("add reports whether the key was new")
+add_reports_novelty()
+    var s: Set[string] = set()
+
+    assert(s.add("a"))
+    assert(!s.add("a"))
+    assert(s.add("b"))
+
+    assert_eq(s.len(), 2)
+    assert(s.has("a"))
+    assert(s.has("b"))
+end add_reports_novelty
+
+@test("remove reports whether the key was there, and only the first time")
+remove_reports()
+    var s: Set[int] = set()
+
+    s.add(1)
+
+    assert(s.remove(1))
+    assert(!s.remove(1))
+    assert(!s.remove(99))
+    assert(s.is_empty())
+end remove_reports
+
+@test("clear empties the set")
+clear_empties()
+    var s: Set[int] = set()
+
+    for i in 0..<50
+        s.add(i)
+
+    s.clear()
+
+    assert_eq(s.len(), 0)
+    assert(!s.has(3))
+end clear_empties
+
+@test("a set built from a slice collapses duplicates")
+set_of_dedups()
+    val s = set_of([1, 2, 3, 2, 1, 3, 1])
+
+    assert_eq(s.len(), 3)
+    assert(s.has(1))
+    assert(s.has(2))
+    assert(s.has(3))
+    assert(!s.has(4))
+end set_of_dedups
+
+@test("many keys survive the growth that adding them causes")
+growth_keeps_everything()
+    var s: Set[int] = set()
+
+    for i in 0..<1000
+        assert(s.add(i))
+
+    assert_eq(s.len(), 1000)
+
+    for i in 0..<1000
+        assert(s.has(i))
+
+    assert(!s.has(1000))
+end growth_keeps_everything
+
+// -- walking --------------------------------------------------------------------------------------
+
+@test("a walk yields every key once")
+walk_yields_each_key()
+    val s = set_of([3, 1, 4, 1, 5, 9, 2, 6])
+    var seen = 0
+    var total = 0
+
+    for k in s.walk()
+        seen += 1
+        total += k
+
+    assert_eq(seen, 7)
+    assert_eq(total, 30)
+end walk_yields_each_key
+
+@test("a walk of an empty set yields nothing")
+walk_of_empty()
+    var s: Set[int] = set()
+    var seen = 0
+
+    for k in s.walk()
+        seen += 1
+
+    assert_eq(seen, 0)
+end walk_of_empty
+
+// -- the algebra ----------------------------------------------------------------------------------
+
+@test("union holds the keys of either")
+union_is_either()
+    val u = union(set_of([1, 2, 3]), set_of([3, 4, 5]))
+
+    assert_eq(u.len(), 5)
+
+    for k in 1..<6
+        assert(u.has(k))
+end union_is_either
+
+// Walking the smaller side is an optimization inside `intersection`, so the answer must not depend
+// on which argument is larger -- both orders are asserted for that reason.
+@test("intersection holds the keys of both, whichever way round the arguments go")
+intersection_is_both()
+    val a = set_of([1, 2, 3, 4, 5, 6])
+    val b = set_of([4, 5, 9])
+
+    val ab = intersection(a, b)
+    val ba = intersection(b, a)
+
+    assert_eq(ab.len(), 2)
+    assert_eq(ba.len(), 2)
+    assert(ab.has(4))
+    assert(ab.has(5))
+    assert(ba.has(4))
+    assert(ba.has(5))
+    assert(!ab.has(9))
+    assert(!ab.has(1))
+end intersection_is_both
+
+@test("difference is not symmetric")
+difference_is_one_sided()
+    val a = set_of([1, 2, 3])
+    val b = set_of([3, 4])
+
+    val ab = difference(a, b)
+    val ba = difference(b, a)
+
+    assert_eq(ab.len(), 2)
+    assert(ab.has(1))
+    assert(ab.has(2))
+    assert(!ab.has(3))
+
+    assert_eq(ba.len(), 1)
+    assert(ba.has(4))
+end difference_is_one_sided
+
+@test("an empty set intersects to nothing and unions to the other")
+algebra_with_an_empty_set()
+    val e: Set[int] = set()
+    val a = set_of([1, 2])
+
+    assert_eq(intersection(a, e).len(), 0)
+    assert_eq(intersection(e, a).len(), 0)
+    assert_eq(union(a, e).len(), 2)
+    assert_eq(union(e, a).len(), 2)
+    assert_eq(difference(a, e).len(), 2)
+    assert_eq(difference(e, a).len(), 0)
+end algebra_with_an_empty_set
+
+@test("a subset is contained, and a bigger set never is")
+subset_holds_both_ways()
+    val a = set_of([1, 2, 3])
+
+    assert(is_subset(set_of([1, 3]), a))
+    assert(is_subset(a, a))
+    assert(!is_subset(set_of([1, 9]), a))
+    assert(!is_subset(a, set_of([1, 2])))
+end subset_holds_both_ways
+
+// The empty set is a subset of everything, which is the edge the count check has to get right rather
+// than trip over.
+@test("the empty set is a subset of anything, including itself")
+empty_is_a_subset()
+    val e: Set[int] = set()
+
+    assert(is_subset(e, e))
+    assert(is_subset(e, set_of([1, 2])))
+    assert(!is_subset(set_of([1]), e))
+end empty_is_a_subset
