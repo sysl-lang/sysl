@@ -316,6 +316,38 @@ class CoreTraitRunTests extends AnyFreeSpec with RunSupport with CodegenSupport 
             |""".stripMargin) shouldBe "true false false false true\n"
     }
 
+    /** **The literal spelling, which is the one a reader reaches for first.** `Some(166)` written
+     * beside an `Option[usize]` reads as an `Option[int]` on its own, and one does not become the
+     * other by any conversion — so a comparison written the natural way was refused for a difference
+     * nobody put there, while the same comparison between two *named* options worked.
+     *
+     * An operand is settled by its neighbour here exactly as an argument is settled by the solution
+     * at a call (`12 §5`): whichever side has a type of its own supplies it, and the other is read
+     * again against it. `None` takes the same road one step earlier — it has no reading of its own
+     * at all, so it waits for the neighbour rather than being asked first.
+     */
+    "and the literal spelling of either side reads at the other's type" in {
+      run("""var a: Option[usize] = Some(166)
+            |var n: Option[usize] = None
+            |print(a == Some(166), a == Some(167), a == n, n == None, a != n)
+            |""".stripMargin) shouldBe "true false false true true\n"
+    }
+
+    "a result reads the same way, at both of its payloads" in {
+      run("""var ok: Result[usize, usize] = Ok(3)
+            |var bad: Result[usize, usize] = Err(3)
+            |print(ok == Ok(3), bad == Err(3), ok == bad, ok == Ok(4))
+            |""".stripMargin) shouldBe "true true false false\n"
+    }
+
+    // Reading the neighbour is not agreeing with it. An operand that cannot be read at the other
+    // side's type is refused in the terms it always was.
+    "an operand that cannot be read at the other's type is still refused" in {
+      err("""var a: Option[usize] = Some(166)
+            |print(a == "no")
+            |""".stripMargin) should include("needs matching types")
+    }
+
     // And the bound is on the **payload**, so an option of something incomparable is refused — at
     // the comparison, naming the half that is missing rather than the option.
     "but not when it holds something that is not" in {

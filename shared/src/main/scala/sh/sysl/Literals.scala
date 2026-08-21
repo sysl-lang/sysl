@@ -108,14 +108,48 @@ trait Literals extends TypeResolution {
    * `u8`. In the middle tier it is still asked before the literals are, so it goes on supplying the
    * type it always did.
    */
+  /** A last reading of an expression at the type its position turned out to have, taken only where
+   * the reading it already has is about to be reported as a mismatch.
+   *
+   * The tiers above cover what the answer changes *outright* — a bare literal, an array standing
+   * where a slice was asked for — and they are unconditional, because the node they replace is a
+   * stand-in that must not reach the output. This covers the rest of the same shape: anything whose
+   * type came out of an analysis with no expected type and would have come out differently had
+   * there been one.
+   *
+   * `Some(3)` is the case that found it, at both of the two places a position is settled late. As an
+   * argument at a `T` the other arguments solved to `Option[usize]` it reads as an `Option[int]`
+   * alone, and `Option[int]` does not coerce to `Option[usize]`; as the right operand of an `==`
+   * whose left is an `Option[usize]` it reads the same way and for the same reason. Either way the
+   * call or the comparison is refused for a difference the reader never wrote.
+   *
+   * **Conditional on the disagreement, unlike the tiers above, and deliberately so.** A re-reading
+   * that succeeds can only turn a refusal into what the same expression at a *written* type would
+   * already have been; one that fails changes nothing and leaves the original complaint to whoever
+   * was going to report it. So this cannot alter anything that resolves today, which is what makes
+   * it safe to offer every remaining expression rather than a list of shapes somebody has to keep.
+   */
+  protected def reread(t: TExpr, src: Option[Expr], want: Type): TExpr =
+    if !disagree(t.ty, want) then t
+    else src.flatMap(e => attempt(analyzeExpr(e, Some(want)))).filterNot(r => disagree(r.ty, want)).getOrElse(t)
+
   protected def analyzeOperands(operands: List[Expr], expected: Option[Type]): List[TExpr] = {
-    val own     = operands.map(e => Option.when(!isLiteral(e) && !typedByPosition(e))(analyzeExpr(e, expected)))
+    // **The top tier is allowed to come back empty**, which is what lets an operand with no type of
+    // its own fall to the tier below rather than raising from the tier that has nothing to offer it.
+    // `n == None` is the case: `None` is not a literal and not a load, so it is asked first — and
+    // asking it alone is asking what an `Option` of nothing in particular holds. Held over, it is
+    // read against what the *other* operand settled, which is the whole of what a comparison's
+    // second side needs and exactly what `12 §5`'s held-back argument already gets at a call.
+    val own     = operands.map(e =>
+      if isLiteral(e) || typedByPosition(e) then None else attempt(analyzeExpr(e, expected)))
     val settled = own.flatten.headOption.map(t => Type.repr(t.ty)).orElse(expected)
     val told    = operands.zip(own).map((e, t) => t.orElse(Option.when(!isLiteral(e))(analyzeExpr(e, settled))))
     val ty      = told.flatten.headOption.map(t => Type.repr(t.ty)).orElse(expected)
 
+    // And the same last reading the tiers above earn: an operand whose type came out of the top
+    // tier, before the other side had said anything, is read again at what the pair settled to.
     operands.zip(told).map {
-      case (_, Some(t)) => t
+      case (e, Some(t)) => ty.fold(t)(reread(t, Some(e), _))
       case (e, None)    => analyzeExpr(e, ty)
     }
   }

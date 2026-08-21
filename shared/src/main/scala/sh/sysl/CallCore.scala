@@ -93,27 +93,6 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     ts
   }
 
-  /** A last reading of an argument at the parameter it turned out to have, taken only where the
-   * reading it already has is about to be reported as a mismatch.
-   *
-   * The two cases above cover an argument the solution changes *outright* — a bare literal, an array
-   * standing where a slice was asked for — and they are unconditional because the node they replace
-   * is a stand-in that must not reach the output. This covers the rest of the same shape: anything
-   * whose type came out of a bare analysis and would have come out differently had the parameter
-   * been known. `Some(3)` at a `T` the other arguments solved to `Option[usize]` is that — it reads
-   * as `Option[int]` alone, and `Option[int]` does not coerce to `Option[usize]`, so the call is
-   * refused for a difference the reader never wrote.
-   *
-   * **Conditional on the disagreement, unlike the two above, and deliberately so.** A re-reading
-   * that succeeds can only turn a refusal into the call a non-generic callee would already have
-   * taken; one that fails changes nothing and leaves the original diagnostic to be reported by the
-   * loop below. So this cannot alter a call that resolves today, which is what makes it safe to
-   * apply to every remaining argument rather than to a list of shapes somebody has to keep.
-   */
-  private def reread(t: TExpr, src: Option[Expr], pty: Type): TExpr =
-    if !disagree(t.ty, pty) then t
-    else src.flatMap(a => attempt(analyzeExpr(a, Some(pty)))).filterNot(r => disagree(r.ty, pty)).getOrElse(t)
-
   /** The arguments of a generic call, analyzed once for the inference that follows — each against
    * its parameter's type wherever that type is already known.
    *
