@@ -75,9 +75,13 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
     // is a table pointing at it rather than a body the compiler wrote. That the body reaches
     // `putbytes` is `print.sysl`'s business now, and the run suite's.
     "through a table pointing at the library's own writer" in {
-      ir(point + "print(Point(1, 2))") should include(
-        s"@$outTable = private constant [2 x ptr] " +
-          s"[ptr @${Library.key("Stdout")}.failed, ptr @${Library.key("Stdout")}.write]")
+      // The table's own line carries the type's identity in front of the slots, and that number is a
+      // hash — so what is asserted is the shape and the slot list, which is what this is about.
+      val table = ir(point + "print(Point(1, 2))")
+
+      table should include(s"@$outTable = private constant { i64, [2 x ptr] }")
+      table should include(
+        s"[2 x ptr] [ptr @${Library.key("Stdout")}.failed, ptr @${Library.key("Stdout")}.write]")
     }
   }
 
@@ -112,10 +116,11 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
     "hold failed first and write second, the order the trait offers them" in {
       val out = ir(point + "print(Point(1, 2))\nprint(str(Point(3, 4)))")
 
-      out should include(s"@$outTable = private constant [2 x ptr] " +
-        s"[ptr @${Library.key("Stdout")}.failed, ptr @${Library.key("Stdout")}.write]")
-      out should include("@sysl.vt.buf = private constant [2 x ptr] " +
-        "[ptr @sysl.w.buf.failed, ptr @sysl.w.buf.write]")
+      out should include(s"@$outTable = private constant { i64, [2 x ptr] }")
+      out should include(
+        s"[2 x ptr] [ptr @${Library.key("Stdout")}.failed, ptr @${Library.key("Stdout")}.write]")
+      out should include("@sysl.vt.buf = private constant { i64, [2 x ptr] }")
+      out should include("[2 x ptr] [ptr @sysl.w.buf.failed, ptr @sysl.w.buf.write]")
     }
 
     "are emitted once however many values render" in {
@@ -206,7 +211,7 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
         // The required trait's slot comes first, and `C.failed` is the **default** `Fallible`
         // supplied — an implementation that writes nothing still fills the slot, which is what makes
         // the block optional rather than merely short.
-        s"@vt.${Library.key("Writer")}.C = private constant [2 x ptr] [ptr @C.failed, ptr @C.write]")
+        s"[2 x ptr] [ptr @C.failed, ptr @C.write]")
     }
   }
 }

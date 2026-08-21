@@ -493,7 +493,7 @@ class DefaultTypeParamTests extends AnyFreeSpec with RunSupport with CodegenSupp
       )
 
       out should include(
-        "@vt.ref.Shown.P = private constant [2 x ptr] [ptr @vt.adapt.ref.P.tag, ptr @vt.adapt.ref.P.show]",
+        "[2 x ptr] [ptr @vt.adapt.ref.P.tag, ptr @vt.adapt.ref.P.show]",
       )
     }
 
