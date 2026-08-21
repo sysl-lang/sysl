@@ -14,9 +14,9 @@
 
 A modern, ref-counted, general-purpose systems language.
 
-> **Status: design-first, and it runs.** This repository is a clean reimplementation of the sysl
-> language — not a port of the earlier prototype, which survives only as a source of lessons. The
-> compiler is built up deliberately behind a written design, one feature at a time, and it compiles
+> **Status: specified in writing, and it runs.** This repository is a clean reimplementation of the
+> sysl language — not a port of the earlier prototype, which survives only as a source of lessons.
+> Every rule is written down before it is implemented, one feature at a time, and the compiler builds
 > programs to native binaries through LLVM today: see [`guide/`](guide/) for complete ones, and the
 > [tour](https://sysl.sh/tour/) to learn the language.
 
@@ -34,9 +34,9 @@ owns.
 - **[The tour](https://sysl.sh/tour/)** — the language and its standard library in one
   pass, from `print` to a program that reads its input. Every program on those pages is compiled and
   run by a test suite, so a page that has drifted from the compiler fails.
-- **[`design/`](design/)** — the numbered specification. The language is designed in
-  writing before it is implemented, and each chapter carries the argument for its rules along with
-  the alternatives that were rejected.
+- **[The reference](https://sysl.sh/reference/)** — every construct written down once, in its own
+  place, with the rules complete rather than the ones a beginner needs first. This is the
+  specification: where a rule has an edge, the edge is shown as a program that the suite runs.
 - **[`guide/`](guide/)** — complete working programs at the size where the choices start to matter.
 
 The site lives in **[sysl-lang/sysl.sh](https://github.com/sysl-lang/sysl.sh)**, which drives this
@@ -44,8 +44,13 @@ compiler as a published dependency. That is deliberate rather than incidental: a
 the *released* language, so its pages are checked against whatever version is on Central, and a page
 demonstrating something only `dev` can do would be wrong for the person reading it.
 
-What stays here is the specification, which belongs in the same commit as the code implementing it,
-and `guide/` + `examples/`, which are checked against `dev` on every run.
+**There used to be a `design/` directory here as well** — twenty-nine chapters carrying each
+rule's argument and the alternatives that were rejected. It was removed on 2026-08-21, once an audit
+established that the reference documents every language feature and every piece of syntax. Two
+documents saying the same thing is one that goes stale, and the reference is the one with a test
+suite behind it. The chapters are in the history: `git show b12e60c3:design/13-modules.md`.
+
+What stays here is `guide/` and `examples/`, which are checked against `dev` on every run.
 
 ## Building
 
@@ -74,8 +79,8 @@ That needs a `clang` on the PATH: sysl emits textual LLVM IR and links it with c
 [github.com/sysl-lang](https://github.com/sysl-lang). Each is a library rather than a single file:
 its sysl, and the `.c` shims that read whatever only a header knows. `--lib` takes either the tree
 itself or an artifact built from it, and both roads carry the shims, because a `.c` anywhere in a
-tree is compiled with it (`design/15 §7`) — whether that tree is a library, a package a
-`dependencies` block brought in, or the project itself:
+tree is compiled with it ([a library may carry C](https://sysl.sh/reference/ffi/)) — whether that
+tree is a library, a package a `dependencies` block brought in, or the project itself:
 
 ```bash
 sysl run prog.sysl --lib /path/to/some/package     # the source tree
@@ -84,12 +89,12 @@ sysl run prog.sysl --lib /tmp/it.syslib            # or an artifact
 ```
 
 Ordinarily a program names one in `package.hocon` instead and `sysl build` fetches it, which is what
-`design/packages.md` is about.
+[packages](https://sysl.sh/reference/packages/) is about.
 
 **The boundary runs both ways.** `@export` publishes a definition under a plain, unmangled C symbol,
 and `sysl build-c` writes a static archive and a C header for an existing C project to link — so
 sysl can sit underneath a C program as readily as it sits on top of a C library
-(`design/15 §12`):
+([the foreign interface](https://sysl.sh/reference/ffi/)):
 
 ```bash
 sysl build-c mylib -o libmylib.a   # writes libmylib.a and libmylib.a.h
@@ -111,13 +116,13 @@ sysl run prog.sysl --include-path /opt/homebrew/include --link-path /opt/homebre
 library a `link` directive named is; both are repeatable and searched in order. A binding needs both,
 since it has to compile against the headers before there is anything to link. Neither is guessed at
 for you, and neither belongs in a source file — where a prefix lives is a fact about your machine,
-not about the code (`design/15 §8`). `LIBRARY_PATH` and `CPATH` work too, since clang reads them, and
+not about the code. `LIBRARY_PATH` and `CPATH` work too, since clang reads them, and
 are the better answer for a machine where the setting is always the same.
 
 A **package** whose C includes headers it does not carry can name them, and then a build that forgot
 the flag is refused by name rather than by a header you have never heard of — `requires { headers
-{ lwip = "…" } }` in its `package.hocon`, answered with `--include-path lwip=<dir>`
-(`design/packages.md § 8`).
+{ lwip = "…" } }` in its `package.hocon`, answered with `--include-path lwip=<dir>` —
+see [headers a package needs and does not carry](https://sysl.sh/reference/packages/).
 
 **For an ordinary installed library, neither flag is needed at all** — a package names the library and
 this machine is asked where it is:
@@ -137,7 +142,7 @@ rather say it yourself.
 
 **Both bindings that used to live here have repositories of their own now, and `bindings/` is gone.**
 SQLite went first — [sysl-lang/sqlite3](https://github.com/sysl-lang/sqlite3), the first sysl package
-outside this tree (`design/packages.md`) — because a binding to a library nobody is obliged to have
+outside this tree — because a binding to a library nobody is obliged to have
 installed is a *package*, not an example, and keeping it here made the compiler's own suite depend on
 SQLite being present.
 
@@ -147,11 +152,12 @@ everywhere, so the argument was only that a library is not part of the language 
 in the language's repository. It is the organisation's worked example of binding a C library the
 machine already has — a shim for what only a header knows, no `@link` for what the driver already
 passes, and a `requires` clause naming what it needs of the target. What sysl still owns is the
-*mechanism*: `15 §7` and `15 §8` are pinned on fixtures in `LibraryBuildCliTests`, where the inputs
+*mechanism*: carrying the C and resolving the externs are both pinned on fixtures in
+`LibraryBuildCliTests`, where the inputs
 can be chosen to be discriminating rather than being whatever one real library happens to do.
 
 A program's own unit tests are `@test` functions written beside what they test, and `sysl test` is
-what runs them (`design/testing.md`):
+what runs them ([`@test`](https://sysl.sh/reference/attributes/)):
 
 ```bash
 sbt "syslJVM/run test guide/ring"                  # every @test under a directory

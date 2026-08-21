@@ -183,12 +183,14 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
     libraryDependencies ++= Seq(
       "com.github.scopt"         %%% "scopt"                    % "4.1.0",
       "org.scala-lang.modules"   %%% "scala-parser-combinators" % "2.4.0",
-      // Off-side-rule lexer base (see design/front-end.md).
+      // Off-side-rule lexer base — what emits the indent and dedent tokens the layout rules in
+      // `SyslLexical` are built on.
       "io.github.edadma"         %%% "indentation"              % "0.0.6",
-      // Cross-platform I/O boundary (see design/cross-platform.md).
+      // Cross-platform I/O boundary: the compiler cross-publishes to JVM, JS and Native, so every
+      // file and environment read goes through these rather than through `java.io`.
       "io.github.edadma"         %%% "path"                     % "0.0.8",
       "io.github.edadma"         %%% "cross_platform"           % "0.1.9",
-      // The project config's format (see design/packages.md §1).
+      // The project config's format — `package.hocon`, which `PackageConfig` reads.
       "io.github.edadma"         %%% "hocon"                    % "0.1.2",
       // What `weave` renders a literate source with. The prose of a '.lsysl' file is Markdown
       // already, and `indentedCodeLanguage` is what carries the one thing the format gives up: a
