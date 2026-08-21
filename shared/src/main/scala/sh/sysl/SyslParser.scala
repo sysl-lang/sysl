@@ -912,7 +912,7 @@ class SyslParser(val source: Source)
   private lazy val quantifierKind: Parser[Boolean] =
     softWord("all") ^^^ true | softWord("some") ^^^ false
 
-  protected lazy val forExpr: PackratParser[Expr] = constForExpr | cForExpr | forInExpr
+  protected lazy val forExpr: PackratParser[Expr] = constForExpr | cForExpr | forCommaNames | forInExpr
 
   /** `for const i in 0..<A.len` — the loop the compiler unrolls (`10 §10`).
    *
@@ -925,11 +925,82 @@ class SyslParser(val source: Source)
       case n ~ it ~ b ~ _ => ConstFor(n, it, b)
     }
 
+  /** `for x in xs`, and `for (k, v) in pairs` — the walk, whose variable is a **name or a pattern**.
+   *
+   * The pattern is [[destructuring]], which is what a `val` or a `var` binding takes, so there is
+   * one rule rather than two: a `for` binds what a binding binds — a tuple, a struct, either of
+   * those named with `n @`, nested as deep as the value goes, and a variant pattern parsed only so
+   * that it can be refused with a reason. Nothing about the loop had to learn any of that.
+   *
+   * **A pattern is desugared here, into the binding the reader would otherwise have written.** The
+   * loop names a temporary no program can write, and the body opens with the pattern bound to it:
+   *
+   * ```
+   * for (k, v) in walk()            for $elem in walk()
+   *     print(k)             -->        var (k, v) = $elem
+   *                                     print(k)
+   * ```
+   *
+   * That leaves `For` binding a name, which is what every later pass already reads, and it reaches
+   * both kinds of walk at once — a range and an `Iterate` lower differently, and this sits above the
+   * difference.
+   *
+   * **The synthesized binding is stamped with the pattern's own position**, which is what keeps the
+   * desugaring from showing through: `for (a, b) in 0..<n` is answered *"one int is not something to
+   * take apart"* under the `(` in the header, and not against a line the reader did not write.
+   *
+   * The parts are `var` rather than `val` because the loop variable itself is one — a `for` may
+   * assign to what it named, and taking the value apart should not quietly take that away.
+   *
+   * **The two forms cannot be confused for one another**: every alternative of `destructuring`
+   * needs a `(` or a `{` where a plain loop has its `in`, so `for x in xs` never reaches the
+   * pattern path and parses exactly as it always did.
+   */
   protected lazy val forInExpr: PackratParser[Expr] =
-    loopLabel ~ (op("for") ~> ident) ~ (op("in") ~> expression) ~ body("do") ~ opt(elseClause) ~ opt(
+    loopLabel ~ (op("for") ~> here) ~ forBinding ~ (op("in") ~> expression) ~ body("do") ~ opt(elseClause) ~ opt(
       endMarker("for"),
     ) ^^ {
-      case lbl ~ n ~ it ~ b ~ e ~ _ => For(lbl, n, it, b, e)
+      case lbl ~ _ ~ Right(n) ~ it ~ b ~ e ~ _ => For(lbl, n, it, b, e)
+      case lbl ~ p0 ~ Left(p) ~ it ~ b ~ e ~ _ =>
+        val elem = s"${Modules.sep}elem"
+        val bind = PatternDecl(p, mutable = true, Ident(elem).setPos(p0)).setPos(p0)
+
+        For(lbl, elem, it, bind :: b, e)
+    }
+
+  /** What a `for` binds: a pattern, or the plain name that has always stood there.
+   *
+   * The pattern is tried first and costs nothing when there is not one — it commits on a token a
+   * name cannot be.
+   */
+  private lazy val forBinding: Parser[Either[Pattern, String]] =
+    destructuring ^^ (Left(_)) | ident ^^ (Right(_))
+
+  /** `for k, v in pairs` — the comma spelling, parsed so that it can be refused with the form that
+   * works.
+   *
+   * It is not legal, and leaving it out of the grammar does not make it an error a reader can act
+   * on. The three-clause loop's init clause may be a multi-assignment, so `for k, v …` is a
+   * half-written `for i, j = 0, n; i < j; …` until the `in` several tokens later — and what the
+   * reader got was `'>>=' expected`, naming a compound assignment nobody had written and sending
+   * them looking for one.
+   *
+   * The comma form is refused rather than accepted because that ambiguity is the whole of what it
+   * would buy: one header already has three shapes fighting over its first token, and a second
+   * spelling of the pattern form is not worth a fourth.
+   *
+   * **It has to reach the `in` before complaining, and that is a positioning rule rather than a
+   * reading one.** Two candidates that fail at one token are ranked by position and the later one
+   * wins, and the three-clause loop gets as far as the `in` before giving up — so a refusal raised
+   * back at the comma, which is where the mistake actually is, loses the race to the very message it
+   * exists to replace. Written that way it never fired. The `in` is a `guard` so that the complaint
+   * stops level with its rival rather than one token past it.
+   */
+  private lazy val forCommaNames: PackratParser[Expr] =
+    loopLabel ~> op("for") ~> ident ~ (op(",") ~> rep1sep(ident, op(","))) <~ guard(op("in")) >> {
+      case first ~ rest =>
+        err(s"a 'for' names one thing, and a pattern is what takes it apart — write " +
+          s"'for (${(first :: rest).mkString(", ")}) in …'")
     }
 
   /** `for init; cond; step` — the three-clause loop (`00` §10).
