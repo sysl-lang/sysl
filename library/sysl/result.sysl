@@ -45,6 +45,67 @@ enum Result[T, E]
             exit(1)
 end Result
 
+// Two results are equal when they took the same road and agree at the end of it -- which is the only
+// reading that keeps `==` agreeing with `match`. An `Ok` is never equal to an `Err` however the two
+// payloads compare, and they need not even be comparable to each other: the bounds are on the two
+// parameters separately, so a `Result[int, IoError]` compares exactly when both halves do.
+impl[T: Eq, E: Eq] Eq for Result[T, E]
+    eq(self, rhs: Self) -> bool
+        self match
+            Ok(a) ->
+                rhs match
+                    Ok(b) -> a == b
+                    Err(_) -> false
+            Err(a) ->
+                rhs match
+                    Ok(_) -> false
+                    Err(b) -> a == b
+    end eq
+end Result[T, E]
+
+// The variant and its payload, written straight through to wherever they are going. The payload gets
+// a plain specifier, because `14 §2`'s field is the whole result and not what it is carrying.
+private render_result[T: Display, E: Display](x: Result[T, E], out: *Writer)
+    x match
+        Ok(v) ->
+            out.write("Ok(".bytes)
+            v.display(out, FormatSpec(0, -1, false))
+            out.write(")".bytes)
+        Err(e) ->
+            out.write("Err(".bytes)
+            e.display(out, FormatSpec(0, -1, false))
+            out.write(")".bytes)
+end render_result
+
+// A result renders as it is written -- `Ok(3)` or `Err(NotFound)` -- which is what makes a failed
+// `assert_eq` on one readable. `assert_eq` is bounded over `Eq + Display`, so this is not a
+// convenience beside the block above: without it a comparable result is still refused, and the
+// refusal talks about `Display` rather than about the comparison.
+//
+// The width is honoured by rendering twice into a counter first, exactly as a slice does: a field is
+// the whole value, so the padding cannot be decided until the length of the whole is known, and
+// measuring this way costs no allocation.
+impl[T: Display, E: Display] Display for Result[T, E]
+    display(self, out: *Writer, fmt: FormatSpec)
+        var pad = 0
+
+        if fmt.width > 0
+            var count = Counting(0)
+            var sink: *Writer = &count
+
+            render_result(self, sink)
+            pad = fmt.width - int(count.n)
+
+            if pad < 0 then pad = 0
+
+        if !fmt.left then display_fill(out, 32, pad)
+
+        render_result(self, out)
+
+        if fmt.left then display_fill(out, 32, pad)
+    end display
+end Result[T, E]
+
 // What a `main` that answers with a `Result` does with the one it answered.
 //
 // **`main` may result in a `Result[unit, E]`, and this is what makes that mean something.** A program

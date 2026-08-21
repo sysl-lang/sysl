@@ -55,7 +55,7 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
           case ((t, src), (_, pty)) =>
             if src.exists(isLiteral) || src.isDefined && becomesSlice(t.ty, pty) then
               analyzeExpr(src.get, Some(pty))
-            else coerce(t, pty)
+            else reread(coerce(t, pty), src, pty)
         }
       case None => args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
 
@@ -92,6 +92,27 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
 
     ts
   }
+
+  /** A last reading of an argument at the parameter it turned out to have, taken only where the
+   * reading it already has is about to be reported as a mismatch.
+   *
+   * The two cases above cover an argument the solution changes *outright* — a bare literal, an array
+   * standing where a slice was asked for — and they are unconditional because the node they replace
+   * is a stand-in that must not reach the output. This covers the rest of the same shape: anything
+   * whose type came out of a bare analysis and would have come out differently had the parameter
+   * been known. `Some(3)` at a `T` the other arguments solved to `Option[usize]` is that — it reads
+   * as `Option[int]` alone, and `Option[int]` does not coerce to `Option[usize]`, so the call is
+   * refused for a difference the reader never wrote.
+   *
+   * **Conditional on the disagreement, unlike the two above, and deliberately so.** A re-reading
+   * that succeeds can only turn a refusal into the call a non-generic callee would already have
+   * taken; one that fails changes nothing and leaves the original diagnostic to be reported by the
+   * loop below. So this cannot alter a call that resolves today, which is what makes it safe to
+   * apply to every remaining argument rather than to a list of shapes somebody has to keep.
+   */
+  private def reread(t: TExpr, src: Option[Expr], pty: Type): TExpr =
+    if !disagree(t.ty, pty) then t
+    else src.flatMap(a => attempt(analyzeExpr(a, Some(pty)))).filterNot(r => disagree(r.ty, pty)).getOrElse(t)
 
   /** The arguments of a generic call, analyzed once for the inference that follows — each against
    * its parameter's type wherever that type is already known.
@@ -135,12 +156,27 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     val first = at.map { (a, e) =>
       if callableArg(a) || e.isEmpty && nullArg(a) then None
       else
-        Some(e match
-          case Some(_) => analyzeExpr(a, e)
+        e match
+          case Some(_) => Some(analyzeExpr(a, e))
           case None =>
             literalDefault(a) match
-              case Some(ty) => standIn(ty).setPos(a.pos)
-              case None     => analyzeExpr(a))
+              case Some(ty) => Some(standIn(ty).setPos(a.pos))
+              // **A fourth shape with no type of its own, and it is not one a syntax can name**:
+              // anything whose bare analysis cannot get off the ground for want of the context it
+              // was denied. `None` at a parameter of type `Option[T]` is the one that found this —
+              // it is a generic construction whose own type argument nothing here settles, so
+              // analyzing it alone raises where a `null` would merely have waited.
+              //
+              // Held back on the same argument as the three above, and it is the same argument: an
+              // expression that could not be read has unified nothing, so the parameter it stands
+              // at is settled by the others or by nothing at all, and the wait cannot lose the
+              // solution. What it gains is the second pass, where the parameter is a type and the
+              // argument is read against it exactly as a non-generic call reads it.
+              //
+              // `attempt` rather than `probe` because the node is kept where the analysis
+              // succeeded, which is the ordinary case here and must cost one analysis rather than
+              // two.
+              case None => attempt(analyzeExpr(a))
     }
 
     // What the first pass settles. `map[A, B](xs: []A, out: []B, f: A -> B)` gets both from the two
@@ -174,9 +210,13 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
       tps: Set[String],
       bounds: Map[String, List[BoundRef]],
       partial: Map[String, Type],
-  ): Option[Type] = a match
-    case NullLit() => ptype.filterNot(mentions(_, tps -- partial.keySet)).map(resolveType(_, partial))
-    case _         => callBound(ptype, tps, bounds, partial)
+  ): Option[Type] =
+    // Asked of the *callable* rather than of `null`, which is the same question read the other way
+    // round and is what lets a third kind of held-back argument through. A callable is the one that
+    // wants its parameter's **bound**; everything else held back — a `null`, and an argument whose
+    // own analysis could not be made — wants the parameter itself.
+    if callableArg(a) then callBound(ptype, tps, bounds, partial)
+    else ptype.filterNot(mentions(_, tps -- partial.keySet)).map(resolveType(_, partial))
 
   /** `null` written as an argument, which is the one *value* whose type its context supplies. */
   private def nullArg(a: Expr): Boolean = written(a) match
