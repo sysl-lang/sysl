@@ -736,6 +736,71 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
         case Right(m) => fail(s"expected a refusal, got: $m")
     }
 
+    /* The case this exists for: a package whose C shares one configuration says it once. miniz's
+     * implementation and its shim read one header under five options, and two copies of that list
+     * is how the two translation units start to disagree -- which is the silent ABI skew the block
+     * exists to prevent.
+     */
+    "a key names several files with braces, as a shell writes them" in {
+      val c = read(
+        """defines {
+          |  "sh/sysl/miniz/c/{miniz,shim}.c" { MINIZ_NO_MALLOC = true, TDEFL_LESS_MEMORY = 1 }
+          |}
+        """.stripMargin)
+
+      c.definesFor("sh/sysl/miniz/c/miniz.c") shouldBe List("MINIZ_NO_MALLOC", "TDEFL_LESS_MEMORY=1")
+      c.definesFor("sh/sysl/miniz/c/shim.c")  shouldBe List("MINIZ_NO_MALLOC", "TDEFL_LESS_MEMORY=1")
+      c.defines.keySet shouldBe Set("sh/sysl/miniz/c/miniz.c", "sh/sysl/miniz/c/shim.c")
+    }
+
+    "several groups multiply out" in {
+      PackageConfig.expand("{a,b}/{x,y}.c") shouldBe Right(List("a/x.c", "a/y.c", "b/x.c", "b/y.c"))
+    }
+
+    "a key with no group is itself" in {
+      PackageConfig.expand("a/b.c") shouldBe Right(List("a/b.c"))
+    }
+
+    "a group of one is that one" in {
+      PackageConfig.expand("{only}.c") shouldBe Right(List("only.c"))
+    }
+
+    /* Each alternative is still a path, so a brace cannot smuggle past the checks a written-out key
+     * has to pass.
+     */
+    "an alternative that is not a C file is refused like any other key" in {
+      refused("""defines { "c/{miniz.c,shim.h}" { X = true } }""") should
+        include("does not name a '.c' file")
+    }
+
+    "a nested group is refused" in {
+      refused("""defines { "c/{a,{b,c}}.c" { X = true } }""") should include("nests one group")
+    }
+
+    "an empty alternative is refused" in {
+      refused("""defines { "c/{a,}.c" { X = true } }""") should include("empty alternative")
+    }
+
+    "an unbalanced brace is refused" in {
+      refused("""defines { "c/{a,b.c" { X = true } }""") should include("unbalanced brace")
+      refused("""defines { "c/a,b}.c" { X = true } }""") should include("unbalanced brace")
+    }
+
+    /* Two blocks reaching one file has no sensible merge -- the later would silently win, which is
+     * the one outcome nobody could have meant by writing both.
+     */
+    "a file configured from two blocks is refused" in {
+      val e = refused(
+        """defines {
+          |  "c/{a,b}.c" { X = true }
+          |  "c/a.c"     { Y = true }
+          |}
+        """.stripMargin)
+
+      e should include("from more than one block")
+      e should include("c/a.c")
+    }
+
     "a macro name is one the preprocessor would take" in {
       PackageConfig.isMacroName("MINIZ_NO_MALLOC") shouldBe true
       PackageConfig.isMacroName("_X2") shouldBe true

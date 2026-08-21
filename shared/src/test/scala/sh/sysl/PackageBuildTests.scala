@@ -890,6 +890,32 @@ class PackageBuildTests extends PackageCacheSupport {
       e should include("names a file this package does not carry")
     }
 
+    /* Braces are what keep two files that must share a configuration from carrying two copies of
+     * it. Both C files here read the same header and both need the same macro; the key says it once
+     * and the build has to reach both.
+     */
+    "a braced key configures every file it names" in {
+      val second =
+        """#include "sized.h"
+          |#ifdef DOUBLED
+          |int sized_other(void) { return 800; }
+          |#else
+          |int sized_other(void) { return 0; }
+          |#endif
+          |""".stripMargin
+
+      val pkg = packageSaying(
+        """defines { "geom/{shim,other}.c" { DOUBLED = true } }""",
+        "geom-lib", "geom",
+        """extern "sized_value" c() -> int
+          |extern "sized_other" d() -> int
+          |
+          |value() -> int = c() + d()""".stripMargin,
+        "", "geom/shim.c" -> impl, "geom/other.c" -> second, "geom/sized.h" -> header)
+
+      run(app("""print(geom.value())""", s"""g { path = "$pkg" }""")) shouldBe "842\n"
+    }
+
     /* A macro is one package's business. Two packages carrying C compiled with the same option name
      * and different values is not a conflict, because neither one is a build-wide setting.
      */

@@ -497,16 +497,76 @@ object PackageConfig {
     block2(root, "defines") match
       case None => Right(Map.empty)
       case Some(defines) =>
-        collect(defines.fields.toList.sortBy(_._1)) {
-          case (path, sub: ConfigObject) =>
+        val read = collect(defines.fields.toList.sortBy(_._1)) {
+          case (key, sub: ConfigObject) =>
             for
-              _      <- checkCSource(path)
-              macros <- collect(sub.fields.toList.sortBy(_._1))(macroOf(path, _, _))
-            yield path -> macros
-          case (path, _) =>
-            Left(s"$FileName: 'defines.\"$path\"' is not a block of macros — a key is a C file this " +
-              "package carries and what follows it is what that file is compiled with")
-        }.map(_.toMap)
+              paths  <- expand(key)
+              _      <- collect(paths)(checkCSource)
+              macros <- collect(sub.fields.toList.sortBy(_._1))(macroOf(key, _, _))
+            yield paths.map(_ -> macros)
+          case (key, _) =>
+            Left(s"$FileName: 'defines.\"$key\"' is not a block of macros — a key is the C this " +
+              "package carries and what follows it is what that C is compiled with")
+        }
+
+        read.map(_.flatten).flatMap { pairs =>
+          // A file configured from two blocks has no sensible merge: the later would silently win,
+          // which is the one outcome nobody could have intended by writing both.
+          pairs.map(_._1).diff(pairs.map(_._1).distinct).distinct.sorted match
+            case Nil => Right(pairs.toMap)
+            case twice =>
+              Left(s"$FileName: 'defines' configures ${twice.map(p => s"'$p'").mkString(" and ")} " +
+                "from more than one block — a file is compiled once, so it is said in one place")
+        }
+
+  /** A key's alternatives, as a shell writes them: `a/{x,y}.c` is `a/x.c` and `a/y.c`, and several
+   * groups give the cross product.
+   *
+   * ==Why braces and not a glob==
+   *
+   * A `*` would pick up a `.c` added later without anybody deciding, and these are macros that
+   * change a struct's layout — a file joining the set by accident is the exact failure this block
+   * exists to prevent, and it would fail the way the others do, silently. A brace still names every
+   * file it configures; it only says the shared part once, which is the whole difference between
+   * this and repeating the list.
+   *
+   * That matters most where a package's C **must** agree: miniz's implementation and its shim read
+   * one header under five options, and two copies of that list is how they start to drift.
+   *
+   * **Nesting is refused rather than supported.** `{a,{b,c}}` is a second grammar to learn and
+   * expands to what a flat list already says.
+   */
+  private[sysl] def expand(key: String): Either[String, List[String]] = {
+    val open = key.count(_ == '{')
+
+    if open == 0 then (if key.contains('}') then unbalanced(key) else Right(List(key)))
+    else
+      // Left to right, one group at a time, each alternative carried through the rest — so several
+      // groups multiply out and the order is the one a reader scanning the key would predict.
+      val start = key.indexOf('{')
+      val end   = key.indexOf('}', start)
+
+      if end < 0 then unbalanced(key)
+      else
+        val group = key.substring(start + 1, end)
+
+        if group.contains('{') then
+          Left(s"$FileName: 'defines.\"$key\"' nests one group of alternatives inside another, " +
+            "which says nothing a flat list does not")
+        else
+          val parts = group.split(",", -1).toList
+
+          if parts.exists(_.isEmpty) then
+            Left(s"$FileName: 'defines.\"$key\"' has an empty alternative — whichever was meant " +
+              "can be written out, and a group naming nothing configures nothing")
+          else
+            collect(parts)(part => expand(key.substring(0, start) + part + key.substring(end + 1)))
+              .map(_.flatten)
+  }
+
+  private def unbalanced(key: String): Either[String, List[String]] =
+    Left(s"$FileName: 'defines.\"$key\"' has an unbalanced brace — alternatives are written " +
+      "'{one,two}', as a shell writes them")
 
   /** One `NAME = value` line, as clang spells it. */
   private def macroOf(path: String, name: String, value: ConfigValue): Either[String, String] =
