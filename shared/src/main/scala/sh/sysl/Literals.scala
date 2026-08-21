@@ -123,10 +123,10 @@ trait Literals extends TypeResolution {
   /** Whether an expression is one whose type the position it sits in supplies, rather than one it
    * carries itself — the middle tier above.
    *
-   * `xs.load(i)` and the implicit member `.red` are the set, and the first is here for the reason
-   * `MethodCalls`'
-   * `vectorMemory` gives: a slice has whatever length it has, so how many lanes a run of it is read
-   * as is the *receiving* type's to say, and there is nothing in the receiver to read it from.
+   * `xs.load(i)` and the implicit member `.red` are the set. The first is here for the reason
+   * `MethodCalls`' `vectorMemory` gives: a slice has whatever length it has, so how many lanes a
+   * run of it is read as is the *receiving* type's to say, and there is nothing in the receiver to
+   * read it from.
    *
    * **The test is on the spelling, and it is allowed to be**, because the middle tier is not a
    * licence to skip anything — it moves an operand one place later in the order and hands it the

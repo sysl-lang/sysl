@@ -158,14 +158,14 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
   /** What an argument held back from the first pass is analyzed against, once the rest have been
    * read.
    *
-   * A callable asks for the call trait its parameter's bound names. `null` asks for the **parameter
-   * itself**, which is a type by now wherever the other arguments settled what it mentions — so
-   * `two[T](a: *T, b: *T)` gives the `null` in `two(&x, null)` the `*int` that the `&x` said, which
-   * is what the same call to a non-generic `two` has always done.
+   * A callable asks for the call trait its parameter's bound names. `null` and an implicit member
+   * ask for the **parameter itself**, which is a type by now wherever the other arguments settled
+   * what it mentions — so `two[T](a: *T, b: *T)` gives the `null` in `two(&x, null)` the `*int`
+   * that the `&x` said, which is what the same call to a non-generic `two` has always done.
    *
    * `None` in either case where something the parameter names is still unknown, which leaves the
-   * argument to report it: a closure that its parameters have no types, a `null` that its context
-   * gave it none. `one[T](a: *T)` called `one(null)` is that — there is nothing else to read, and
+   * argument to report it: a closure that its parameters have no types, a `null` or a leading dot
+   * that its context gave it none. `one[T](a: *T)` called `one(null)` is that — there is nothing else to read, and
    * the answer is the refusal it always was rather than a guess.
    */
   private def heldWant(
@@ -175,13 +175,11 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
       bounds: Map[String, List[BoundRef]],
       partial: Map[String, Type],
   ): Option[Type] = a match
-    case NullLit() => ptype.filterNot(mentions(_, tps -- partial.keySet)).map(resolveType(_, partial))
-    // An implicit member asks for the parameter for the same reason `null` does, and gets the same
-    // answer: the type is a type by now wherever the other arguments settled what it mentions, so
-    // `same(Colour.red, .green)` reads the second against the `Colour` the first said. Where nothing
-    // settled it, `None` leaves the refusal to the member itself, which is the one that can say the
-    // context supplied no type.
-    case _: ImplicitMember | Call(_: ImplicitMember, _) =>
+    // `null` and an implicit member ask the same thing of the parameter, and for the same reason:
+    // neither carries a type, so what they need is the parameter *itself* once the other arguments
+    // have settled what it mentions. `same(Colour.red, .green)` reads the second argument against
+    // the `Colour` the first said, exactly as `two(&x, null)` reads its second against `*int`.
+    case NullLit() | (_: ImplicitMember) | Call(_: ImplicitMember, _) =>
       ptype.filterNot(mentions(_, tps -- partial.keySet)).map(resolveType(_, partial))
     case _ => callBound(ptype, tps, bounds, partial)
 
