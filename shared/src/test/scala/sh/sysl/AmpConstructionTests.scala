@@ -222,6 +222,38 @@ class AmpConstructionTests extends AnyFreeSpec with RunSupport with CodegenSuppo
     }
   }
 
+  // The rule is about what was **written**, not about what it turned out to be: `&x` asks for *that
+  // thing's* address, and giving it a copy nobody else can see would make two spellings that look
+  // identical mean different things. So a name, a selection, an element and a dereference are
+  // answered as before — and refused as before where what they name has no address.
+  "a name asks for that thing's address, and is not given a copy" - {
+
+    // `t.f` at a property and `t.g` at a field are one spelling. The field yields a pointer into the
+    // object; the property would have yielded a pointer to a copy, and a write through it would go
+    // nowhere.
+    "a property is refused, where a field of the same shape is not" in {
+      val decl =
+        """struct Temp
+          |    c: int
+          |
+          |    f -> int = self.c * 9 / 5 + 32
+          |end Temp
+          |
+          |var t = Temp(0)
+          |""".stripMargin
+
+      err(decl + "var p = &t.f\n\nprint(*p)\n") should include("something with an address")
+      run(decl + "var p = &t.c\n\nprint(*p)\n") shouldBe "0\n"
+    }
+
+    // A constant is folded into each use and occupies nothing, so `&capacity` reads as storage that
+    // is not there. Written as the value it stands for, it is an ordinary materialization.
+    "a constant is refused, where the literal it stands for is not" in {
+      err("const cap: int = 8\n\nvar p = &cap\n\nprint(*p)\n") should include("something with an address")
+      run("var p = &8\n\nprint(*p)\n") shouldBe "8\n"
+    }
+  }
+
   "module storage has no scope to hold one" - {
 
     // The one place the rule has nowhere to put what it makes: an initializer here runs in a

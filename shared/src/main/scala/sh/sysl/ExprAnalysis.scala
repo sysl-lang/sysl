@@ -222,6 +222,18 @@ trait ExprAnalysis
     case Unary("&", _) => true
     case _             => false
 
+  /** Whether an expression **names** something, as written: a name, a selection, an element, or a
+   * dereference. `&` answers one of these about the thing it names, and refuses where that has no
+   * address; anything else it is written in front of is a value, and `&` makes storage for it.
+   *
+   * The question is asked of the *written* form rather than of what it analyzed to, because that is
+   * what a reader wrote and what a diagnostic has to be about. `x.f` is one spelling whether `f` is
+   * a field or a property, and the two must not quietly become an address and a copy.
+   */
+  private def named(e: Expr): Boolean = e match
+    case _: Ident | _: Field | _: Index | Unary("*", _) => true
+    case _                                              => false
+
   /** Wraps a base-typed value in the run-time check for a constrained subtype. */
   private def checkInto(v: TExpr, c: Type.Constrained): TExpr = TConstrainedCheck(v, c).setPos(v.pos)
 
@@ -712,7 +724,13 @@ trait ExprAnalysis
     case Unary("&", e) =>
       val t = analyzeExpr(e)
 
-      if isPlace(t) then
+      // **A name is asking for THAT thing's address, so it is answered rather than given a copy.**
+      // The line is what the reader wrote and not what it turned out to be, which is exactly what a
+      // diagnostic is for: `&t.f` at a property and `&t.g` at a field are one spelling, and handing
+      // the first a pointer into a copy nothing else can see would make the two silently different.
+      // A constant is the same shape — `&capacity` reads as storage and there is none. Everything
+      // below is written as something computed, and asks for storage rather than for an address.
+      if isPlace(t) || named(e) then
         val place = requirePlace(t, e, "'&'", writes = false)
         checkAddressable(place)
         // The address of a register is an address *of a register*, so the qualifier travels with it and
