@@ -228,7 +228,8 @@ object CProbe {
       Toolchain.findClang(target).flatMap { cc =>
         val command = Seq(cc, s"--target=${target.triple}", "-S", "-emit-llvm", "-O0") ++
           Toolchain.machineFlags(target) ++
-          Option.when(target.shortEnums)("-fshort-enums") ++ paths.defineFlags ++
+          Option.when(target.shortEnums)("-fshort-enums") ++
+          paths.probeFlagsFor(unit.source.name) ++
           beside(unit) ++ paths.includeFlags ++ Seq("-o", "-", src)
 
         val result = exec(command)

@@ -621,6 +621,96 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  "defines" - {
+
+    "a carried C file is compiled with the macros the block names" in {
+      val c = read(
+        """defines {
+          |  "sh/sysl/miniz/c/miniz.c" {
+          |    MINIZ_NO_MALLOC   = true
+          |    TDEFL_LESS_MEMORY = 1
+          |    MZ_ASSERT         = "((void)0)"
+          |  }
+          |}
+        """.stripMargin)
+
+      c.definesFor("sh/sysl/miniz/c/miniz.c") shouldBe
+        List("MINIZ_NO_MALLOC", "MZ_ASSERT=((void)0)", "TDEFL_LESS_MEMORY=1")
+    }
+
+    "a file the block does not name is compiled with nothing extra" in {
+      val c = read(
+        """defines {
+          |  "a.c" { X = true }
+          |}
+        """.stripMargin)
+
+      c.definesFor("b.c") shouldBe Nil
+    }
+
+    "true is a bare -DNAME, which is what '#ifdef' reads" in {
+      read("""defines { "a.c" { X = true } }""").definesFor("a.c") shouldBe List("X")
+    }
+
+    /* The one that would otherwise be guessed at. `#ifdef` sees a macro defined as zero, so
+     * "don't define it" and "define it as 0" are different instructions and false could be either.
+     */
+    "false is refused, because it does not say which of two things is meant" in {
+      val e = refused("""defines { "a.c" { X = false } }""")
+
+      e should include("does not say which of two things is meant")
+      e should include("write '0'")
+    }
+
+    "a key that is not a C file is refused" in {
+      refused("""defines { "c/miniz.h" { X = true } }""") should include("does not name a '.c' file")
+    }
+
+    "a key that is absolute or climbs out of the package is refused" in {
+      refused("""defines { "/etc/x.c" { X = true } }""") should include("is an absolute path")
+      refused("""defines { "../other/x.c" { X = true } }""") should include("climbs out of the package")
+    }
+
+    "a name the preprocessor would not take is refused" in {
+      refused("""defines { "a.c" { "2X" = true } }""") should include("not a name a C macro can have")
+    }
+
+    "a value that is not scalar is refused, since a macro is text" in {
+      refused("""defines { "a.c" { X { y = 1 } } }""") should include("must be true or a scalar")
+    }
+
+    "an entry that is not a block says what a key is for" in {
+      refused("""defines { "a.c" = true }""") should include("is not a block of macros")
+    }
+
+    /* A `c const` block is measured from a translation unit the compiler synthesises, so the
+     * manifest has no path to name it by and it inherits from the directory it sits in. The rule
+     * itself lives in `SearchPaths.probeFlagsFor`, which is where both clang call sites can reach
+     * it; what is checked here is the shape this hands it.
+     */
+    "the macros are keyed by the path the file is compiled from" in {
+      val c = read(
+        """defines {
+          |  "sh/sysl/miniz/c/miniz.c" { MINIZ_NO_MALLOC = true }
+          |  "sh/sysl/miniz/c/shim.c"  { MINIZ_NO_MALLOC = true }
+          |}
+        """.stripMargin)
+
+      c.carriedDefines("/cache/miniz") shouldBe Map(
+        "/cache/miniz/sh/sysl/miniz/c/miniz.c" -> List("MINIZ_NO_MALLOC"),
+        "/cache/miniz/sh/sysl/miniz/c/shim.c"  -> List("MINIZ_NO_MALLOC"))
+    }
+
+    "a macro name is one the preprocessor would take" in {
+      PackageConfig.isMacroName("MINIZ_NO_MALLOC") shouldBe true
+      PackageConfig.isMacroName("_X2") shouldBe true
+      PackageConfig.isMacroName("") shouldBe false
+      PackageConfig.isMacroName("2X") shouldBe false
+      PackageConfig.isMacroName("X-Y") shouldBe false
+      PackageConfig.isMacroName("X Y") shouldBe false
+    }
+  }
+
   "a file that is not HOCON at all is one line rather than a stack trace" in {
     val e = refused("package { name = ")
 

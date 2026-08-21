@@ -55,7 +55,8 @@ import io.github.edadma.cross_platform.*
  */
 case class SearchPaths(link: List[String] = Nil, include: List[String] = Nil,
                        defines: List[String] = Nil,
-                       probed: List[String] = Nil, probedLibs: List[String] = Nil) {
+                       probed: List[String] = Nil, probedLibs: List[String] = Nil,
+                       carried: Map[String, List[String]] = Map.empty) {
 
   /** What the linker is told, as clang spells it — `--link-path`'s directories, then any a probe
    * answered with. Joined rather than passed as two arguments, which is how `-L` has been written
@@ -94,6 +95,51 @@ case class SearchPaths(link: List[String] = Nil, include: List[String] = Nil,
    * nobody here can reach.
    */
   def defineFlags: List[String] = defines.map(d => s"-D$d")
+
+  /** The macros one **carried** C file is compiled with: the build's own, then whatever the package
+   * that carries the file declared for it in `defines` (`packages.md § 7`).
+   *
+   * ==Why the package's come second==
+   *
+   * A later `-D` wins, so a `--define` on the command line can be overridden by the package and not
+   * the other way about. That is the right way round for the same reason the block exists at all:
+   * the options are the author's decision and the consumer is not meant to be choosing them, so a
+   * build that happens to define one of a package's own macros must not silently reconfigure it. A
+   * consumer with a real reason to override is editing a vendored copy, which is a decision they
+   * have made rather than one made for them.
+   */
+  def defineFlagsFor(source: String): List[String] =
+    (defines ::: carried.getOrElse(source, Nil)).map(d => s"-D$d")
+
+  /** The macros a `c const` block's probe translation unit is read under: the build's own, then the
+   * union of what the carried C **in the same directory** is compiled with.
+   *
+   * ==A probe has no path of its own, and cannot be left out==
+   *
+   * `CProbe` synthesises the translation unit it measures, so there is nothing in the package for a
+   * `defines` key to have named — and a probe left reading the package's headers under their
+   * defaults while the object beside it was compiled under the options is not a small
+   * inconsistency. Every option worth setting is one that changes a struct's size or deletes a
+   * declaration: measured that way, miniz's `sizeof(tdefl_compressor)` comes back 319,352 where the
+   * object holds 167,800, and the constant is wrong by 151,552 bytes with nothing in the build to
+   * say so. It is the same defect `termbox2`'s `options.h` was written to prevent, arrived at from
+   * the other direction.
+   *
+   * **The directory is the unit because that is how a binding is laid out** — the implementation,
+   * the shim and the `c.sysl` in one `c/` directory, all reading one header. Two C files there
+   * compiled with different macros give their union, which is a shape to avoid rather than to lean
+   * on: a probe cannot be measured under two disagreeing configurations at once, and nothing here
+   * can tell which of them its block meant.
+   */
+  def probeFlagsFor(unit: String): List[String] = {
+    val dir = Project.parentOf(unit)
+
+    val inherited = carried.toList.sortBy(_._1)
+      .collect { case (path, macros) if Project.parentOf(path) == dir => macros }
+      .flatten.distinct
+
+    (defines ::: inherited).map(d => s"-D$d")
+  }
 }
 
 object SearchPaths {
@@ -765,7 +811,7 @@ object Toolchain {
     findClang(target, named).flatMap { cc =>
       val command = Seq(cc, s"--target=${target.triple}", flag(level)) ++ machineFlags(target) ++
         Option.when(target.shortEnums)("-fshort-enums") ++
-        Option.when(target.positionIndependent)("-fPIC") ++ paths.defineFlags ++
+        Option.when(target.positionIndependent)("-fPIC") ++ paths.defineFlagsFor(source) ++
         paths.includeFlags ++
         Seq("-ffunction-sections", "-fdata-sections", "-c", source, "-o", obj)
 

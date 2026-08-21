@@ -94,6 +94,10 @@ case class LibNeed(who: String, module: String, why: String)
  * that package's own C defines — which `packages.md § 7` had already promised would not happen, on
  * the grounds that sysl compiles a package's C declaratively and needs no build script to do it.
  *
+ * `defines` is what each package declared for its **own carried C** (`packages.md § 7`), already
+ * keyed by the path the file will be compiled from: a package's manifest names it relative to the
+ * package root, and where that root is on this machine is known here and nowhere downstream.
+ *
  * `allocators` is carried as the **declarations** rather than as the answer, because the project's
  * own is not here: the root is not a fetched package, and `Allocator.choose` has to see every claim
  * at once to say which wins or that two disagree. That is the same shape as `needs`, which is folded
@@ -102,7 +106,8 @@ case class LibNeed(who: String, module: String, why: String)
 case class PackageSources(sources: List[Source], packages: Packages, roots: List[String],
                           needs: List[HeaderNeed] = Nil,
                           libs: List[LibNeed] = Nil,
-                          allocators: List[(String, Allocator)] = Nil)
+                          allocators: List[(String, Allocator)] = Nil,
+                          defines: Map[String, List[String]] = Map.empty)
 
 object PackageSources {
 

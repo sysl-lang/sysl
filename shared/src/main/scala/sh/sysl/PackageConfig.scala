@@ -1,6 +1,6 @@
 package sh.sysl
 
-import io.github.edadma.hocon.{ConfigBoolean, ConfigObject, ConfigString, Hocon, HoconException}
+import io.github.edadma.hocon.{ConfigBoolean, ConfigNumber, ConfigObject, ConfigString, ConfigValue, Hocon, HoconException}
 
 /** What a target provides, as the project says rather than as the registry knows
  * (`packages.md § 2`).
@@ -97,7 +97,20 @@ case class PackageConfig(
     pkgConfig: Map[String, String] = Map.empty,
     dependencies: List[Dependency] = Nil,
     allocator: Option[Allocator] = None,
+    defines: Map[String, List[String]] = Map.empty,
 ) {
+
+  /** The macros one carried C file is compiled with, as clang spells them, or nothing.
+   *
+   * `path` is relative to the package root and written with `/`, which is how the manifest names it.
+   */
+  def definesFor(path: String): List[String] = defines.getOrElse(path, Nil)
+
+  /** Every macro this package declared, keyed by the path the file is compiled from on this
+   * machine — which is the form the compiler carries them in (`SearchPaths.carried`).
+   */
+  def carriedDefines(root: String): Map[String, List[String]] =
+    defines.map((path, macros) => s"$root/$path" -> macros)
 
   /** The capabilities `target` provides.
    *
@@ -177,6 +190,7 @@ object PackageConfig {
         pkgs    <- readPkgConfig(block2(root, "requires"))
         deps    <- readDependencies(root)
         alloc   <- readAllocator(root)
+        defs    <- readDefines(root)
       yield PackageConfig(
         name = pkg.flatMap(string(_, "name")),
         version = pkg.flatMap(string(_, "version")),
@@ -188,6 +202,7 @@ object PackageConfig {
         pkgConfig = pkgs,
         dependencies = deps,
         allocator = alloc,
+        defines = defs,
       )
     catch
       // Every way HOCON can be wrong arrives as one of these, and the driver wants a line rather
@@ -425,6 +440,100 @@ object PackageConfig {
           _ <- if a == f then Left(s"$FileName: 'allocator' names '$a' for both halves") else Right(())
         yield Some(Allocator(a, f))
     }
+
+  /** The `defines` block: the macros a package's **own carried C** is compiled with
+   * (`packages.md § 7`).
+   *
+   * ==Why a package says this and a consumer does not==
+   *
+   * A vendored C library almost always has compile-time options, and they are the *author's*
+   * decision: which of miniz's four `MINIZ_NO_*` switches are set decides what the package is, and a
+   * consumer of it should no more be typing them than choosing its warning flags. Before this block
+   * the only way to set one was `--define` on the consumer's command line, which put a package's
+   * internal configuration in the hands of everybody who depended on it — or drove the author to
+   * edit the vendored source, which is a fork of upstream carried forever.
+   *
+   * ==Bundled C only==
+   *
+   * A key is the path of a `.c` file **this package carries**, relative to the package root and
+   * written with `/`. It is not a general flags channel: it cannot reach an installed library's
+   * headers, cannot add an include path, and cannot pass anything that is not a macro. `--define`
+   * remains what a *build* says, and applies to every C compilation in it; this is what a *package*
+   * says, and applies to the file it names.
+   *
+   * ==What a value means==
+   *
+   * `true` is a bare `-DNAME`, which is what a C option tested with `#ifdef` wants. Anything else
+   * scalar is `-DNAME=value`, which is what one tested with `#if` wants. **`false` is refused**: a
+   * reader would have to guess between "do not define this" and `-DNAME=0`, and those differ under
+   * `#ifdef`. Whichever was meant can be said exactly — omit the line, or write `0`.
+   */
+  private def readDefines(root: ConfigObject): Either[String, Map[String, List[String]]] =
+    block2(root, "defines") match
+      case None => Right(Map.empty)
+      case Some(defines) =>
+        collect(defines.fields.toList.sortBy(_._1)) {
+          case (path, sub: ConfigObject) =>
+            for
+              _      <- checkCSource(path)
+              macros <- collect(sub.fields.toList.sortBy(_._1))(macroOf(path, _, _))
+            yield path -> macros
+          case (path, _) =>
+            Left(s"$FileName: 'defines.\"$path\"' is not a block of macros — a key is a C file this " +
+              "package carries and what follows it is what that file is compiled with")
+        }.map(_.toMap)
+
+  /** One `NAME = value` line, as clang spells it. */
+  private def macroOf(path: String, name: String, value: ConfigValue): Either[String, String] =
+    if !isMacroName(name) then
+      Left(s"$FileName: 'defines.\"$path\".$name' is not a name a C macro can have — letters, " +
+        "digits and '_', not starting with a digit")
+    else
+      value match
+        case ConfigBoolean(true)  => Right(name)
+        case ConfigBoolean(false) =>
+          Left(s"$FileName: 'defines.\"$path\".$name' is false, which does not say which of two " +
+            "things is meant — leave the line out to not define it, or write '0' to define it as " +
+            "zero, which '#ifdef' still sees")
+        case ConfigString(v) => Right(s"$name=$v")
+        case ConfigNumber(v) => Right(s"$name=$v")
+        case _ =>
+          Left(s"$FileName: 'defines.\"$path\".$name' must be true or a scalar — a macro is " +
+            "text the C preprocessor substitutes, so there is nothing a block or a list could mean")
+
+  /** Whether a `defines` key names a C file this package could be carrying.
+   *
+   * The three refusals are the three ways the path could name something that is not this package's
+   * to configure: an absolute path is a file on the author's machine, a `..` segment climbs out of
+   * the package, and an extension that is not `.c` is either a typo or an attempt to configure a
+   * header — which is not a translation unit and is compiled by nothing.
+   */
+  private def checkCSource(path: String): Either[String, Unit] =
+    if !path.endsWith(".c") then
+      Left(s"$FileName: 'defines.\"$path\"' does not name a '.c' file — a macro is given to a " +
+        "translation unit, and only the C this package carries is one it compiles")
+    else if path.startsWith("/") then
+      Left(s"$FileName: 'defines.\"$path\"' is an absolute path — a key is relative to the " +
+        "package root, since the package is the same tree wherever it was fetched to")
+    else if path.split("/").contains("..") then
+      Left(s"$FileName: 'defines.\"$path\"' climbs out of the package with '..' — a package " +
+        "configures the C it carries and nothing else")
+    else Right(())
+
+  /** The directory part of a manifest path, or `""` for a file at the package root.
+   *
+   * Written here rather than taken from `Project`, because a manifest path is not a path on this
+   * machine: it is always relative, always written with `/`, and means the same thing on every
+   * platform the package is fetched to.
+   */
+  def parentOf(path: String): String =
+    path.lastIndexOf('/') match
+      case -1 => ""
+      case i  => path.substring(0, i)
+
+  /** Whether a name is one the C preprocessor would take. */
+  def isMacroName(name: String): Boolean =
+    name.nonEmpty && !name.head.isDigit && name.forall(c => c.isLetterOrDigit || c == '_')
 
   private def checkHeaderName(name: String): Either[String, Unit] =
     if isHeaderName(name) then Right(())

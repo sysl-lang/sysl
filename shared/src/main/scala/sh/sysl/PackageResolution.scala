@@ -111,6 +111,7 @@ private def collectPackages(graph: Resolve.Graph, os: Os): Either[String, Packag
           fetched.flatMap(p =>
             p.config.pkgConfig.toList.sortBy(_._1).map((mod, why) => LibNeed(p.canonical, mod, why))),
           fetched.flatMap(p => p.config.allocator.map(p.canonical -> _)),
+          fetched.map(p => p.config.carriedDefines(p.root)).foldLeft(Map.empty[String, List[String]])(_ ++ _),
         ))
   // A malformed per-OS directory is a mistake in the package rather than a package that would not
   // read (`13 §5`), and the message names the directory and lists the operating systems there are —

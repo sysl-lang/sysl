@@ -24,11 +24,16 @@ class PackageBuildTests extends PackageCacheSupport {
    * no source, and therefore declaring nothing.
    */
   private def packageOf(name: String, module: String, text: String, deps: String = "",
-                        files: (String, String)*): String = {
+                        files: (String, String)*): String =
+    packageSaying("", name, module, text, deps, files*)
+
+  /** The same, plus whatever else the manifest says — a `defines` block, for the suite below. */
+  private def packageSaying(extra: String, name: String, module: String, text: String,
+                            deps: String = "", files: (String, String)*): String = {
     val root = createTempDirectory("sysl-pkg-")
     val leaf = Project.basename(module)
 
-    writeFile(s"$root/${PackageConfig.FileName}", manifest(name, "1.0.0", deps))
+    writeFile(s"$root/${PackageConfig.FileName}", manifest(name, "1.0.0", deps) + extra)
     createDirectories(s"$root/$module")
     writeFile(s"$root/$module/$leaf.sysl", s"module ${module.replace('/', '.')}\n\n$text\n")
 
@@ -750,4 +755,152 @@ class PackageBuildTests extends PackageCacheSupport {
       withCache(cache)(refused(root)) should include("does not hash to what sysl.sum records")
     }
   }
+
+  /* The header both translation units read, written the way a vendored C library is: an option
+     * with a default, so that a probe measuring it under the defaults gets a *different answer*
+     * rather than failing to compile. That is what makes the probe case below a real test.
+     */
+  private val header =
+    """#ifndef SIZED_H
+      |#define SIZED_H
+      |#ifndef WIDE
+      |#define WIDE 0
+      |#endif
+      |#if WIDE
+      |typedef struct { char bytes[64]; } state;
+      |#else
+      |typedef struct { char bytes[8]; } state;
+      |#endif
+      |int sized_value(void);
+      |#endif
+      |""".stripMargin
+
+  private val impl =
+    """#include "sized.h"
+      |#ifdef DOUBLED
+      |int sized_value(void) { return 42; }
+      |#else
+      |int sized_value(void) { return 1; }
+      |#endif
+      |""".stripMargin
+
+  /** `packages.md § 7`'s `defines` block: the macros a package's own carried C is compiled with.
+   *
+   * Every case here is end to end — the package is built and the program is run — because what the
+   * feature claims is about a clang command line, and the only thing that can check a clang command
+   * line is clang.
+   */
+  "a package's 'defines'" - {
+
+    "reach the C file the block names" in {
+      val pkg = packageSaying(
+        """defines { "geom/shim.c" { DOUBLED = true } }""",
+        "geom-lib", "geom",
+        """extern "sized_value" c() -> int
+          |
+          |value() -> int = c()""".stripMargin,
+        "", "geom/shim.c" -> impl, "geom/sized.h" -> header)
+
+      run(app("""print(geom.value())""", s"""g { path = "$pkg" }""")) shouldBe "42\n"
+    }
+
+    "do not reach a C file the block does not name" in {
+      val pkg = packageSaying(
+        """defines { "geom/other.c" { DOUBLED = true } }""",
+        "geom-lib", "geom",
+        """extern "sized_value" c() -> int
+          |
+          |value() -> int = c()""".stripMargin,
+        "", "geom/shim.c" -> impl, "geom/sized.h" -> header)
+
+      run(app("""print(geom.value())""", s"""g { path = "$pkg" }""")) shouldBe "1\n"
+    }
+
+    "take a value, not only a bare name" in {
+      val pkg = packageSaying(
+        """defines { "geom/shim.c" { DOUBLED = 1 } }""",
+        "geom-lib", "geom",
+        """extern "sized_value" c() -> int
+          |
+          |value() -> int = c()""".stripMargin,
+        "", "geom/shim.c" -> impl, "geom/sized.h" -> header)
+
+      run(app("""print(geom.value())""", s"""g { path = "$pkg" }""")) shouldBe "42\n"
+    }
+
+    /* **The case the feature would be silently wrong without.** A `c const` block is measured from
+     * a translation unit the compiler synthesises, which no `defines` key can name — so it inherits
+     * from the C in its own directory. Measured under the header's defaults `state` is 8 bytes;
+     * under `WIDE` it is 64, and both compile. A probe left out of the block reports 8 for a package
+     * whose object file was built with the 64-byte layout, and nothing anywhere says so.
+     */
+    "reach the probe a 'c const' block is measured from" in {
+      val pkg = packageSaying(
+        """defines { "geom/shim.c" { WIDE = 1 } }""",
+        "geom-lib", "geom",
+        """@include("sized.h")
+          |
+          |c const
+          |    SIZE: usize = "sizeof(state)"
+          |
+          |size() -> usize = SIZE""".stripMargin,
+        "", "geom/shim.c" -> impl, "geom/sized.h" -> header)
+
+      run(app("""print(geom.size())""", s"""g { path = "$pkg" }""")) shouldBe "64\n"
+    }
+
+    /* And the other half of that rule: inheritance is from the probe's **own** directory, so a
+     * package configuring C somewhere else in its tree does not silently reconfigure this one.
+     */
+    "do not reach a probe in a different directory" in {
+      val pkg = packageSaying(
+        """defines { "elsewhere/other.c" { WIDE = 1 } }""",
+        "geom-lib", "geom",
+        """@include("sized.h")
+          |
+          |c const
+          |    SIZE: usize = "sizeof(state)"
+          |
+          |size() -> usize = SIZE""".stripMargin,
+        "", "geom/sized.h" -> header,
+        "elsewhere/other.c" -> "int elsewhere_unused(void) { return 0; }\n")
+
+      run(app("""print(geom.size())""", s"""g { path = "$pkg" }""")) shouldBe "8\n"
+    }
+
+    /* A macro is one package's business. Two packages carrying C compiled with the same option name
+     * and different values is not a conflict, because neither one is a build-wide setting.
+     */
+    "are scoped to the package that declared them" in {
+      val one = packageSaying(
+        """defines { "left/util.c" { DOUBLED = true } }""",
+        "one", "left",
+        """extern "one_util" c() -> int
+          |
+          |value() -> int = c()""".stripMargin,
+        "", "left/util.c" ->
+          """#ifdef DOUBLED
+            |int one_util(void) { return 40; }
+            |#else
+            |int one_util(void) { return 0; }
+            |#endif
+            |""".stripMargin)
+
+      val two = packageOf("two", "left",
+        """extern "two_util" c() -> int
+          |
+          |value() -> int = c()""".stripMargin,
+        "", "left/util.c" ->
+          """#ifdef DOUBLED
+            |int two_util(void) { return 0; }
+            |#else
+            |int two_util(void) { return 2; }
+            |#endif
+            |""".stripMargin)
+
+      run(app("""print(left.value() + other.left.value())""",
+        s"""a { path = "$one" }, b { path = "$two", mount = "other" }""")) shouldBe "42\n"
+    }
+  }
+
 }

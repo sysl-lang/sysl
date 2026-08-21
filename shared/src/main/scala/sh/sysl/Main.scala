@@ -278,7 +278,8 @@ private[sysl] def execute(cfg: Config): Int = {
                         collected.flatMap(_._2), decoded.collect { case Right(r) => r._1 }.flatten,
                         allocator,
                         SearchPaths(cfg.linkPaths, cfg.includePaths, cfg.defines,
-                                    libPaths.probed, libPaths.probedLibs))
+                                    libPaths.probed, libPaths.probedLibs,
+                                    project.carriedDefines(projectRoot(cfg.file))))
 
   val librarySources = collected.flatMap(_._2) ::: fetched.sources
   val packages       = fetched.packages
@@ -324,8 +325,16 @@ private[sysl] def execute(cfg: Config): Int = {
         case Right(answer) => answer
     else SearchPaths()
 
+  // What each package said its **own** carried C is compiled with (`packages.md § 7`), keyed by the
+  // path that C will be compiled from. Three roads reach it and all three are here: the project's
+  // own manifest, each `--lib` source root's, and each fetched package's — the same three the
+  // header requirements are gathered from, for the same reason.
+  val carried = libDefines(roots) match
+    case Left(err)     => return fail(err)
+    case Right(answer) => project.carriedDefines(projectRoot(cfg.file)) ++ answer ++ fetched.defines
+
   val paths = SearchPaths(cfg.linkPaths, cfg.includePaths, cfg.defines,
-                          probed.probed, probed.probedLibs)
+                          probed.probed, probed.probedLibs, carried)
 
   if cfg.verbose then
     for lib <- cfg.libs do trace(s"library: $lib")
@@ -518,6 +527,28 @@ private def libAllocators(roots: List[String]): Either[String, List[(String, All
       seen   <- acc
       config <- readPackageConfig(root)
     yield seen ::: config.allocator.map(root -> _).toList
+  }
+
+/** What the `--lib` **source roots** declare their own carried C is compiled with
+ * (`packages.md § 7`).
+ *
+ * Read off the same manifest as `libHeaderNeeds` and for the same reason: a package handed over as a
+ * directory is the same package it is by coordinate, so what its C is compiled with cannot depend on
+ * how it got here. A binding being developed is reached this way — `sysl test .` in the package's
+ * own tree — so this is the road the author uses before anybody else has the package at all, and a
+ * `defines` block that worked only once fetched would fail exactly where it is being written.
+ *
+ * **Unlike the allocator beside it, this is safe to take from a `--lib` root.** An allocator taken
+ * silently is the mixed heap `packages.md § 13` exists to prevent, because it decides something for
+ * the whole program; a macro here reaches one translation unit in the tree that declared it, and a
+ * root that is not a package has no `defines` block to be read.
+ */
+private def libDefines(roots: List[String]): Either[String, Map[String, List[String]]] =
+  roots.foldLeft[Either[String, Map[String, List[String]]]](Right(Map.empty)) { (acc, root) =>
+    for
+      seen   <- acc
+      config <- readPackageConfig(root)
+    yield seen ++ config.carriedDefines(root)
   }
 
 /** What the `--lib` **source roots** declare they need headers for (`packages.md § 8`).
