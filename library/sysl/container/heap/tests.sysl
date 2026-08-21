@@ -1,0 +1,236 @@
+module sysl.container.heap
+@tests
+
+// What the heap promises. The heap property is invisible from outside -- what a caller can see is
+// that draining the queue answers in order -- so nearly every test here drains and checks the order,
+// which is the only honest way to assert it through the public surface.
+
+@test("a fresh heap is empty and has nothing to look at")
+fresh_is_empty()
+    var h: Heap[int] = heap()
+
+    assert_eq(h.len(), 0)
+    assert(h.is_empty())
+    assert_eq(h.peek(), None)
+    assert_eq(h.pop(), None)
+end fresh_is_empty
+
+@test("the smallest element is the one at the front")
+peek_is_the_minimum()
+    var h: Heap[int] = heap()
+
+    h.push(5)
+    assert_eq(h.peek(), Some(5))
+
+    h.push(9)
+    assert_eq(h.peek(), Some(5))
+
+    h.push(1)
+    assert_eq(h.peek(), Some(1))
+
+    h.push(3)
+    assert_eq(h.peek(), Some(1))
+
+    assert_eq(h.len(), 4)
+end peek_is_the_minimum
+
+@test("peek leaves the element where it is")
+peek_does_not_remove()
+    var h: Heap[int] = heap()
+
+    h.push(2)
+
+    assert_eq(h.peek(), Some(2))
+    assert_eq(h.peek(), Some(2))
+    assert_eq(h.len(), 1)
+end peek_does_not_remove
+
+// The whole promise, and the one that would break if `sift_down` took the larger child.
+@test("draining answers every element in order")
+draining_is_sorted()
+    var h: Heap[int] = heap()
+
+    for v in [5, 3, 9, 1, 7, 8, 2, 6, 4]
+        h.push(v)
+
+    for want in 1..<10
+        assert_eq(h.pop(), Some(want))
+
+    assert(h.is_empty())
+    assert_eq(h.pop(), None)
+end draining_is_sorted
+
+// Equal elements must not be lost or duplicated: a heap is not a set, and the count is what says so.
+@test("duplicates are kept and all come back")
+duplicates_survive()
+    var h: Heap[int] = heap()
+
+    for v in [4, 1, 4, 1, 4]
+        h.push(v)
+
+    assert_eq(h.len(), 5)
+    assert_eq(h.pop(), Some(1))
+    assert_eq(h.pop(), Some(1))
+    assert_eq(h.pop(), Some(4))
+    assert_eq(h.pop(), Some(4))
+    assert_eq(h.pop(), Some(4))
+    assert(h.is_empty())
+end duplicates_survive
+
+@test("elements pushed in ascending order still drain in order")
+ascending_input()
+    var h: Heap[int] = heap()
+
+    for i in 0..<200
+        h.push(i)
+
+    for i in 0..<200
+        assert_eq(h.pop(), Some(i))
+
+    assert(h.is_empty())
+end ascending_input
+
+// The input that makes every push sift all the way to the root, which is the opposite path from the
+// one above and the one a broken `sift_up` termination would get wrong.
+@test("elements pushed in descending order still drain in order")
+descending_input()
+    var h: Heap[int] = heap()
+
+    var i = 200
+
+    while i > 0
+        i -= 1
+        h.push(i)
+
+    for want in 0..<200
+        assert_eq(h.pop(), Some(want))
+
+    assert(h.is_empty())
+end descending_input
+
+@test("pushing and popping interleaved keeps the minimum correct")
+interleaved_push_and_pop()
+    var h: Heap[int] = heap()
+
+    h.push(10)
+    h.push(4)
+    assert_eq(h.pop(), Some(4))
+
+    h.push(7)
+    h.push(2)
+    assert_eq(h.peek(), Some(2))
+    assert_eq(h.pop(), Some(2))
+    assert_eq(h.pop(), Some(7))
+    assert_eq(h.pop(), Some(10))
+    assert_eq(h.pop(), None)
+end interleaved_push_and_pop
+
+@test("a single element goes in and comes back")
+one_element()
+    var h: Heap[int] = heap()
+
+    h.push(42)
+
+    assert_eq(h.len(), 1)
+    assert_eq(h.peek(), Some(42))
+    assert_eq(h.pop(), Some(42))
+    assert(h.is_empty())
+    assert_eq(h.peek(), None)
+end one_element
+
+@test("clear empties the heap")
+clear_empties()
+    var h: Heap[int] = heap()
+
+    for i in 0..<50
+        h.push(i)
+
+    h.clear()
+
+    assert_eq(h.len(), 0)
+    assert(h.is_empty())
+    assert_eq(h.pop(), None)
+
+    h.push(3)
+    assert_eq(h.pop(), Some(3))
+end clear_empties
+
+// -- building in bulk -----------------------------------------------------------------------------
+
+// `heap_of` establishes the heap property by sifting rather than by pushing, which is a different
+// code path reaching the same guarantee -- so it gets the same drain assertion.
+@test("a heap built from a slice drains in order")
+heap_of_drains_sorted()
+    var h = heap_of([9, 2, 8, 3, 7, 4, 6, 5, 1, 0])
+
+    assert_eq(h.len(), 10)
+
+    for want in 0..<10
+        assert_eq(h.pop(), Some(want))
+
+    assert(h.is_empty())
+end heap_of_drains_sorted
+
+@test("a heap built from an empty slice is an empty heap")
+heap_of_nothing()
+    val nothing: []int = []
+    var h = heap_of(nothing)
+
+    assert_eq(h.len(), 0)
+    assert(h.is_empty())
+    assert_eq(h.pop(), None)
+end heap_of_nothing
+
+@test("a heap built from one element holds it")
+heap_of_one()
+    var h = heap_of([7])
+
+    assert_eq(h.len(), 1)
+    assert_eq(h.pop(), Some(7))
+end heap_of_one
+
+@test("a heap built in bulk still takes more elements afterwards")
+heap_of_then_push()
+    var h = heap_of([5, 3, 8])
+
+    h.push(1)
+    h.push(9)
+
+    assert_eq(h.len(), 5)
+    assert_eq(h.pop(), Some(1))
+    assert_eq(h.pop(), Some(3))
+    assert_eq(h.pop(), Some(5))
+    assert_eq(h.pop(), Some(8))
+    assert_eq(h.pop(), Some(9))
+end heap_of_then_push
+
+// -- other orderings ------------------------------------------------------------------------------
+
+// A heap asks only for `Ord`, so anything ordered works -- and a tuple is ordered when its parts are,
+// which is what makes a (priority, payload) queue a thing that needs no wrapper type.
+@test("a tuple orders lexicographically, so a priority queue needs no wrapper")
+tuple_priorities()
+    var h: Heap[(int, int)] = heap()
+
+    h.push((2, 100))
+    h.push((1, 200))
+    h.push((2, 50))
+    h.push((1, 10))
+
+    assert_eq(h.pop(), Some((1, 10)))
+    assert_eq(h.pop(), Some((1, 200)))
+    assert_eq(h.pop(), Some((2, 50)))
+    assert_eq(h.pop(), Some((2, 100)))
+end tuple_priorities
+
+@test("strings order as strings do")
+string_elements()
+    var h: Heap[string] = heap()
+
+    for s in ["pear", "apple", "fig"]
+        h.push(s)
+
+    assert_eq(h.pop(), Some("apple"))
+    assert_eq(h.pop(), Some("fig"))
+    assert_eq(h.pop(), Some("pear"))
+end string_elements

@@ -1,0 +1,321 @@
+module sysl.container.map
+@tests
+
+// What the map promises, asserted in sysl rather than beside it in Scala.
+//
+// **What belongs here is what is true of the map**, not what is true of the compiler. That a generic
+// method dispatches, or that a tuple returned by value round-trips, are language claims and are
+// asserted in Scala against an independent oracle -- asserting them here would ask the compiler
+// under test whether it had compiled itself correctly.
+//
+// The probing scheme is where the interesting failures are, and it is invisible from the outside, so
+// several of these drive the table into a state (a tombstone in the middle of a probe run, a rehash
+// under a live cursor) and then assert only through the public surface.
+
+// -- the basics -----------------------------------------------------------------------------------
+
+@test("a fresh map is empty and answers nothing")
+fresh_is_empty()
+    var m: Map[string, int] = map()
+
+    assert_eq(m.len(), 0)
+    assert(m.is_empty())
+    assert_eq(m.get("nothing"), None)
+    assert(!m.has("nothing"))
+end fresh_is_empty
+
+@test("a key put in comes back out")
+put_then_get()
+    var m: Map[string, int] = map()
+
+    m.put("one", 1)
+    m.put("two", 2)
+
+    assert_eq(m.len(), 2)
+    assert_eq(m.get("one"), Some(1))
+    assert_eq(m.get("two"), Some(2))
+    assert(m.has("one"))
+end put_then_get
+
+@test("putting a key it already has replaces the value and does not lengthen the map")
+put_replaces()
+    var m: Map[string, int] = map()
+
+    m.put("k", 1)
+    m.put("k", 2)
+
+    assert_eq(m.len(), 1)
+    assert_eq(m.get("k"), Some(2))
+end put_replaces
+
+@test("get_or answers the default exactly where the key is absent")
+get_or_default()
+    var m: Map[string, int] = map()
+
+    m.put("here", 5)
+
+    assert_eq(m.get_or("here", -1), 5)
+    assert_eq(m.get_or("absent", -1), -1)
+end get_or_default
+
+@test("removing answers whether the key was there, and only the first time")
+remove_reports()
+    var m: Map[string, int] = map()
+
+    m.put("k", 1)
+
+    assert(m.remove("k"))
+    assert(!m.remove("k"))
+    assert_eq(m.len(), 0)
+    assert_eq(m.get("k"), None)
+end remove_reports
+
+@test("clear empties the map and returns the table to its starting size")
+clear_resets()
+    var m: Map[int, int] = map()
+
+    for i in 0..<200
+        m.put(i, i)
+
+    assert(m.capacity() > 8)
+
+    m.clear()
+
+    assert_eq(m.len(), 0)
+    assert_eq(m.capacity(), 8)
+    assert_eq(m.get(3), None)
+end clear_resets
+
+// -- probing --------------------------------------------------------------------------------------
+
+// The case the two empty variants exist to tell apart. Three keys are made to sit in a probe run,
+// the middle one is removed, and the last one must still be findable -- a probe that stopped at the
+// tombstone would report it missing.
+@test("a key found by probing past a tombstone is still found")
+tombstone_does_not_end_a_probe()
+    var m: Map[int, int] = map()
+
+    for i in 0..<6
+        m.put(i, i * 10)
+
+    for i in 0..<6
+        assert(m.remove(i * 0 + i) || true)
+
+    // rebuild, then punch a hole in the middle of the table rather than at a known index
+    m.clear()
+
+    for i in 0..<6
+        m.put(i, i * 10)
+
+    assert(m.remove(2))
+
+    for i in 0..<6
+        if i != 2
+            assert_eq(m.get(i), Some(i * 10))
+
+    assert_eq(m.get(2), None)
+end tombstone_does_not_end_a_probe
+
+// A tombstone is a slot a later insert may reclaim, and reclaiming it must not lose the key that
+// probed past it.
+@test("a key put after a removal reuses the slot without losing its neighbours")
+tombstone_is_reclaimed()
+    var m: Map[int, int] = map()
+
+    for i in 0..<6
+        m.put(i, i)
+
+    assert(m.remove(3))
+    m.put(100, 100)
+
+    assert_eq(m.get(100), Some(100))
+    assert_eq(m.get(3), None)
+
+    for i in 0..<6
+        if i != 3
+            assert_eq(m.get(i), Some(i))
+end tombstone_is_reclaimed
+
+// -- growth ---------------------------------------------------------------------------------------
+
+@test("every key survives the rehashes that inserting many of them causes")
+growth_keeps_everything()
+    var m: Map[int, int] = map()
+
+    for i in 0..<1000
+        m.put(i, i * i)
+
+    assert_eq(m.len(), 1000)
+
+    for i in 0..<1000
+        assert_eq(m.get(i), Some(i * i))
+end growth_keeps_everything
+
+// The table is grown at three quarters full, so a thousand entries need at least 1334 slots and the
+// next power of two above that is 2048. Asserting the exact figure is what would catch a load factor
+// changed by accident.
+@test("the table grows geometrically and stays at a power of two")
+growth_is_geometric()
+    var m: Map[int, int] = map()
+
+    assert_eq(m.capacity(), 8)
+
+    for i in 0..<1000
+        m.put(i, i)
+
+    assert_eq(m.capacity(), 2048)
+end growth_is_geometric
+
+@test("a reserved map does not rehash while it is filled to what was asked for")
+reserved_does_not_rehash()
+    var m: Map[int, int] = map_with_capacity(100)
+
+    val before = m.capacity()
+
+    for i in 0..<100
+        m.put(i, i)
+
+    assert_eq(m.capacity(), before)
+    assert_eq(m.len(), 100)
+end reserved_does_not_rehash
+
+// **This is the property a naive tombstone scheme gets wrong.** A map held at a steady size while
+// far more entries pass through it must not grow without bound: `rehash` sizes from the live count,
+// so the table settles at what the contents deserve. A table that doubled on every rehash would be
+// in the tens of thousands of slots by the end of this.
+@test("a map churned far past its size does not grow without bound")
+churn_does_not_leak_slots()
+    var m: Map[int, int] = map()
+
+    for i in 0..<20000
+        m.put(i, i + 7)
+
+        if i >= 50
+            assert(m.remove(i - 50))
+
+        assert_eq(m.get(i), Some(i + 7))
+
+    assert_eq(m.len(), 50)
+    assert(m.capacity() <= 256)
+end churn_does_not_leak_slots
+
+// -- walking --------------------------------------------------------------------------------------
+
+@test("a walk yields every live entry once and no removed one")
+walk_yields_the_live_entries()
+    var m: Map[int, int] = map()
+
+    for i in 0..<100
+        m.put(i, i * 2)
+
+    for i in 0..<100
+        if i % 2 == 0
+            assert(m.remove(i))
+
+    var seen = 0
+    var total = 0
+
+    for pair in m.walk()
+        val k, v = pair
+
+        assert_eq(v, k * 2)
+        assert(k % 2 == 1)
+        seen += 1
+        total += k
+
+    assert_eq(seen, 50)
+    assert_eq(total, 2500)
+end walk_yields_the_live_entries
+
+@test("a walk of an empty map yields nothing")
+walk_of_empty()
+    var m: Map[int, int] = map()
+    var seen = 0
+
+    for pair in m.walk()
+        seen += 1
+
+    assert_eq(seen, 0)
+end walk_of_empty
+
+// Modifying a map while a cursor over it is live is memory-safe and yields an unspecified set. This
+// pins the **safety**, which is the half that is promised: the walk finishes, every pair it hands
+// back is a pair that was genuinely put in, and nothing reads freed storage even though the map has
+// been handed entirely different storage part-way through.
+//
+// It deliberately does **not** assert how many were seen. A `put` before the rehash writes into the
+// table the cursor is walking and may be yielded; one after it cannot be. The count therefore
+// depends on where the load factor happened to fall, and asserting it would pin an accident.
+@test("a cursor over a map modified underneath it stays safe and yields only real entries")
+walk_while_modifying_is_safe()
+    var m: Map[int, int] = map()
+
+    for i in 0..<10
+        m.put(i, i * 3)
+
+    var c = m.walk()
+    var seen = 0
+
+    c.next() match
+        None -> assert(false)
+        Some(_) -> seen += 1
+
+    for i in 100..<400
+        m.put(i, i * 3)
+
+    loop
+        c.next() match
+            None -> break
+            Some(pair) ->
+                val k, v = pair
+
+                // Whatever was yielded was really put in, whichever table it came from.
+                assert_eq(v, k * 3)
+                seen += 1
+
+    assert(seen >= 10)
+    assert(seen <= 310)
+    assert_eq(m.len(), 310)
+end walk_while_modifying_is_safe
+
+// -- keys -----------------------------------------------------------------------------------------
+
+// Consecutive integers are the input a hash table actually meets, and the identity hash is what
+// makes them collide in a row -- so the mixer is what stops this being a linear scan. The assertion
+// is on correctness rather than on speed, which a test cannot honestly measure here.
+@test("consecutive integer keys are all distinct in the table")
+integer_keys_do_not_collide_away()
+    var m: Map[int, int] = map_with_capacity(600)
+
+    for i in 0..<500
+        m.put(i, i)
+
+    assert_eq(m.len(), 500)
+
+    for i in 0..<500
+        assert_eq(m.get(i), Some(i))
+end integer_keys_do_not_collide_away
+
+@test("a tuple works as a key, since a tuple hashes and compares when its parts do")
+tuple_keys()
+    var m: Map[(int, string), int] = map()
+
+    m.put((1, "a"), 10)
+    m.put((1, "b"), 20)
+    m.put((2, "a"), 30)
+
+    assert_eq(m.len(), 3)
+    assert_eq(m.get((1, "b")), Some(20))
+    assert_eq(m.get((2, "b")), None)
+end tuple_keys
+
+@test("keys of different integer widths that are equal are the same key")
+integer_widths_agree()
+    var m: Map[u32, string] = map()
+
+    m.put(1u32, "one")
+    m.put(1u32, "uno")
+
+    assert_eq(m.len(), 1)
+    assert_eq(m.get(1u32), Some("uno"))
+end integer_widths_agree

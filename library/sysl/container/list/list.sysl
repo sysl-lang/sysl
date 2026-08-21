@@ -1,0 +1,152 @@
+module sysl.container.list
+
+// A singly linked list that is never modified: every operation answers a **new** list, and the old
+// one is still there and still correct.
+//
+// **The reason this belongs in a reference-counted language specifically is structural sharing.**
+// Putting an element on the front of a list does not copy the list -- it makes one cell holding the
+// new element and a reference to the list that was there, so two lists that differ by one element
+// share every cell but one. That is what makes an immutable list cheap: `prepend` is one allocation
+// whatever the length, where the same operation on an array is a copy of the whole thing.
+//
+// Reference counting is what makes the sharing *safe* without anyone thinking about it. A cell is
+// released when the last list holding it goes, and neither list has to know the other exists. A
+// language without it would need either a garbage collector or an ownership rule saying which of the
+// two lists owns the shared tail, and there is no good answer to that question.
+//
+// **A list cannot form a cycle**, which is the property that makes counting sufficient here rather
+// than merely convenient: a cell's tail is always a list that existed before the cell did, so no
+// chain of tails can arrive back where it started. `guide/lisp` is the program about the case where
+// that is not true and a count cannot reclaim; nothing in this module can reach it.
+//
+// ## What it is for, and what it is not for
+//
+// Reach for this where a value has to be **kept** as well as extended -- a scope chain where an
+// inner scope is the outer one plus a binding, an undo history where each step is the last plus a
+// change, a search where a path is its parent's path plus a step. All three share almost everything
+// and all three would copy almost everything with a `Buf`.
+//
+// Do not reach for it to hold a sequence and walk it. There is no index: getting to the `i`th
+// element walks `i` cells, and those cells are wherever the allocator put them rather than next to
+// each other, so a walk of a long list is a walk of memory in no particular order. `Buf` is what a
+// sequence wants; this is what a *shared history* wants.
+
+// One link: an element, and everything after it.
+//
+// The tail is `Option[&Cell[T]]` rather than a `List[T]` because that is the shape the language
+// gives a chain -- a reference to a cell, or nothing, with the `Option` carrying the end of the list
+// rather than a null. `List` below wraps it so that a program never has to write that type.
+private[sysl] struct Cell[T]
+    head: T
+    tail: Option[&Cell[T]]
+end Cell
+
+// A list, which is a first cell or nothing, and the number of cells after it.
+//
+// **The length is carried rather than counted, and immutability is what makes that free.** A cell's
+// tail never changes, so a length worked out when the list was built stays true forever -- there is
+// no operation that could invalidate it. A mutable list would have to walk to answer `len`, or
+// maintain the count against every mutation; this pays one addition at `prepend` and answers in
+// constant time for the rest of the list's life.
+struct List[T]
+    private cell: Option[&Cell[T]]
+    private count: usize
+
+    len(self) -> usize = self.count
+
+    is_empty(self) -> bool = self.count == 0
+
+    // The first element, or `None`.
+    first(self) -> Option[T]
+        self.cell match
+            None -> None
+            Some(c) -> Some(c.head)
+    end first
+
+    // Everything after the first element, or `None` where there is no first element.
+    //
+    // It answers an `Option[List[T]]` rather than an empty list, because "the rest of nothing" is not
+    // a list -- returning an empty one would make a loop that walks with `rest` unable to tell the
+    // end from another step, which is the bug this shape refuses to allow.
+    rest(self) -> Option[List[T]]
+        self.cell match
+            None -> None
+            Some(c) -> Some(List(c.tail, self.count - 1))
+    end rest
+
+    // The first element and the rest, in one question.
+    //
+    // **This is the member to write loops with.** `first` and `rest` each answer an `Option`, so
+    // using both means asking the same question twice and handling an impossible case in between;
+    // this asks once and hands back both halves, which is what a walk actually wants.
+    uncons(self) -> Option[(T, List[T])]
+        self.cell match
+            None -> None
+            Some(c) -> Some((c.head, List(c.tail, self.count - 1)))
+    end uncons
+
+    // A new list with `v` on the front, sharing the whole of this one.
+    //
+    // One allocation, whatever the length -- the cell -- and this list is untouched and still valid.
+    prepend(self, v: T) -> List[T] = List(Some(Cell(v, self.cell)), self.count + 1)
+
+    // The same elements in the opposite order, which costs a cell each because nothing of the
+    // original can be shared: a reversed list's tails are not tails of the original.
+    reverse(self) -> List[T]
+        var out: List[T] = List(None, 0)
+        var at = self.cell
+
+        loop
+            at match
+                None -> break
+                Some(c) ->
+                    out = out.prepend(c.head)
+                    at = c.tail
+
+        out
+    end reverse
+
+    walk(self) -> ListCursor[T] = ListCursor(self.cell)
+end List
+
+// The empty list.
+list[T]() -> List[T]
+    var l: List[T] = List(None, 0)
+
+    l
+end list
+
+// A list of a slice's elements, in the same order.
+//
+// The slice is walked **backwards**, because a list is built by putting things on the front: walking
+// forwards would produce the reverse and need a second pass to correct.
+list_of[T](xs: []const T) -> List[T]
+    var out: List[T] = List(None, 0)
+    var i = xs.len
+
+    while i > 0
+        i -= 1
+        out = out.prepend(xs[i])
+
+    out
+end list_of
+
+// ------------------------------------------------------------------------------------- walking
+
+// A position in a list, which is just the cell to look at next -- there is nothing else to remember,
+// since a cell knows the whole of the rest of the list.
+//
+// It holds the cell rather than the list, and holding it is what keeps it alive: a cursor part-way
+// through a list that nothing else refers to still owns the cells it has not reached.
+struct ListCursor[T]
+    private at: Option[&Cell[T]]
+end ListCursor
+
+impl[T] Iterate[T] for ListCursor[T]
+    next(*self) -> Option[T]
+        self.at match
+            None -> None
+            Some(c) ->
+                self.at = c.tail
+                Some(c.head)
+    end next

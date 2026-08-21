@@ -1,0 +1,345 @@
+module sysl.container.map
+
+// A hash map, generic in its key and its value.
+//
+// The table is **one flat run of slots** and an entry lives inside it, so a map of a thousand keys
+// is one allocation rather than a thousand and one. That is the whole design decision, and it is
+// worth being exact about what it buys in a reference-counted language: a chained map holds each
+// entry through a `&Entry`, which is a heap cell with a count on it, so an insert allocates, a
+// removal releases, and a table that doubles walks every entry to relink it -- touching a count
+// each time. None of that happens here. `sizeof` says the same thing more plainly: a slot holding
+// two `u64`s is 24 bytes laid down in the table, while the pointer that would have replaced it is
+// 16 bytes *plus* the cell it points at.
+//
+// **A key is found by probing forward from where it hashes**, not by walking a chain: slots are
+// examined in order, wrapping at the end, until the key turns up or an empty slot proves it is not
+// there. Consecutive slots are consecutive memory, so a lookup that misses its first guess reads
+// the next one from the same cache line rather than following a pointer somewhere else.
+//
+// **A removed key leaves a tombstone rather than an empty slot**, because emptying it would break
+// every probe that had run past it on the way to something else. Tombstones accumulate, and the
+// answer is that they count against the table's load exactly as live entries do -- so a map that is
+// inserted into and removed from in equal measure rehashes periodically and stays fast, rather than
+// filling with holes that every lookup has to walk. `rehash` sizes from the **live** count, so that
+// same map settles at the size its contents deserve instead of doubling forever.
+//
+// **The stored hash is the third piece.** A slot keeps the `u64` its key mixed down to, which does
+// two things: a probe compares an integer before it compares a key, so a table of strings rejects a
+// wrong slot without touching either string; and `rehash` re-places every entry without hashing
+// anything, since the number it needs is already sitting beside the key.
+//
+// ## What this replaced, and what that exercise found
+//
+// A chained map lived in `guide/hashmap` until this module existed, and it is gone -- a guide
+// program that teaches someone to write what they should have imported is the failure mode the
+// `guide/` sweep rule exists to catch. Its findings are the reason the language looks as it does
+// here, so they are carried rather than dropped:
+//
+//   * **There was no `Hash` in the core catalog**, so a map had to declare its own trait and an
+//     `impl` for every key type it wanted. Coherence made that permanent rather than untidy: two
+//     libraries each declaring a `Hash` can never share a key type's implementation. `Hash` is a
+//     catalog trait now (`sysl.hash`), which is what lets this module take `K: Hash + Eq` and ask
+//     nothing else of anybody.
+//   * **An enum has no zero value, so an array of them could not be declared without one.** The
+//     repeat form `[None; n]` answered it by filling storage from a value rather than from a zero.
+//     `[Slot.Empty; n]` here is that same form, and it is what makes the flat table *possible*: a
+//     variant carrying no payload needs nothing of `K` or `V`, so it can fill a table of any key and
+//     any value.
+//   * **A generic container cannot make `[K; n]` storage**, because a bound may promise no value to
+//     repeat and no trait sysl ships declares one. That finding is true and is often read wider than
+//     it is -- it rules out a table of bare keys, and it does **not** rule out a flat table, because
+//     the empty variant above sidesteps it entirely. The chained map read it as the wider claim and
+//     paid a heap cell per entry for a limit that was not there.
+//   * **Storage could not be asked for at a size worked out while running**, so the table was a
+//     fixed directory of fixed blocks with a ceiling written into its type. Answered: an array form
+//     written where a `[]T` is expected makes storage of its own, which is what `cell` is.
+//   * **A bound is repeated at every declaration that needs it** -- `[K: Hash + Eq, V]` on the type
+//     and again on each free function over it. There is no `where` clause and no name for a set of
+//     bounds.
+//   * **Two generics cannot solve each other.** `Map([Slot.Empty; n], 0, 0)` asks the constructor to
+//     fix `Map`'s parameters from its arguments while the bare `Slot.Empty` waits to hear what it is
+//     a slot *of*, and neither can go first -- so the binding in `map` below is annotated.
+//     Inference is bidirectional but not simultaneous.
+//   * **A bucket had to be named rather than re-indexed**, and a `ref` standing in `[]T` storage
+//     kept that storage alive, so the table could not be grown while one was live. Nothing here
+//     needs the rule: no reference into the table is ever taken, which is the same property that
+//     makes `get` hand back a value rather than a pointer that a later `put` could strand.
+//
+// ## What it costs, and what was refused
+//
+// **A slot is as wide as a key plus a value plus a tag, whether or not anything is in it**, so an
+// empty table of large entries is bigger than an empty array of pointers would be. That is the
+// trade the flat layout makes and it is the right way round below a load factor of three quarters,
+// which is what `put` holds it to.
+//
+// **Robin Hood probing was refused.** It evens out probe distances and bounds the worst case, at the
+// cost of a displacement number in every slot and a shuffle on every insert and every removal. At
+// three quarters full, linear probing's average is short enough that the bookkeeping costs more
+// than it saves, and the simpler loop is the one a reader can check.
+//
+// **Backward-shift deletion was refused** for the same reason: it removes tombstones outright and
+// needs no periodic rehash, but the wrapping cases are exactly where a subtle bug would live, and
+// counting tombstones against the load gets the same guarantee out of code that is obviously right.
+//
+// **Nothing hands out a reference into the table** -- not `get`, not the cursor. A `&V` into storage
+// that `rehash` replaces would be a pointer at freed memory the moment the map grew, and the
+// chained map's own findings record having to reason about precisely that. The cost is that a value
+// is updated by putting it back rather than by being mutated where it lies.
+
+// How many slots a fresh map has. A power of two, so an index is a mask rather than a division, and
+// doubling keeps every later count a power of two as well.
+private const initial_slots: usize = 8
+
+// The table is grown when three quarters of its slots are spoken for -- live entries and tombstones
+// alike, since a probe has to walk both. Written as a numerator over a denominator because there
+// are no fractions in an index calculation.
+private const load_num: usize = 3
+private const load_den: usize = 4
+
+// ------------------------------------------------------------------------------------- storage
+
+// One slot of the table, which is one of three things: never used, used and vacated, or holding an
+// entry.
+//
+// **`Empty` and `Dead` are different and the difference is the whole probing scheme.** A probe stops
+// at `Empty`, because a key that hashed here would have been placed at the first free slot it found
+// and so cannot be further along. It does **not** stop at `Dead`: something was here when the key it
+// is looking for was inserted, so the chain it belongs to may continue past it.
+//
+// `Live` carries the hash beside the key so that a probe can reject a slot on an integer comparison
+// and `rehash` can re-place an entry without asking the key to mix itself down again.
+enum Slot[K, V]
+    Empty
+    Dead
+    Live(hash: u64, key: K, value: V)
+
+    // What a slot holds, for a caller that has an index and wants the value at it. It answers an
+    // `Option` rather than trapping on the empty cases because that is what its two callers want to
+    // pass straight back out, and because a slot really can be empty -- there is no index into this
+    // table that is guaranteed to hold something.
+    value(self) -> Option[V] = self match
+        Live(_, _, v) -> Some(v)
+        _ -> None
+
+    is_live(self) -> bool = self match
+        Live(_, _, _) -> true
+        _ -> false
+end Slot
+
+// ----------------------------------------------------------------------------------------- map
+
+// A mapping from keys to values, with a key found in constant time on average.
+//
+// `dead` is carried rather than recomputed because it decides when to rehash and is asked for on
+// every insert; counting tombstones would be a walk of the whole table to answer a question about
+// one slot.
+struct Map[K: Hash + Eq, V]
+    cell: []Slot[K, V]
+    count: usize
+    dead: usize
+
+    len(self) -> usize = self.count
+
+    is_empty(self) -> bool = self.count == 0
+
+    // How many slots the table has, which is what the load factor is measured against. It is not a
+    // promise about how many entries fit -- the map rehashes at three quarters of this.
+    capacity(self) -> usize = self.cell.len
+
+    // The index a key's entry sits at, or `None`.
+    //
+    // The walk stops at `Empty` and steps over `Dead`, which is the rule the two variants exist to
+    // express. It terminates because the load factor keeps at least one slot in four empty, so the
+    // `Empty` case is always reachable from anywhere in the table.
+    private find(self, k: K) -> Option[usize]
+        val h = k.hash()
+        val mask = self.cell.len - 1
+        var i = usize(h) & mask
+
+        loop
+            self.cell[i] match
+                Slot.Empty -> break None
+                Slot.Dead -> ()
+                Slot.Live(sh, sk, _) -> if sh == h && sk == k then break Some(i)
+
+            i = (i + 1) & mask
+    end find
+
+    get(self, k: K) -> Option[V]
+        self.find(k) match
+            None -> None
+            Some(i) -> self.cell[i].value()
+    end get
+
+    // The value a key names, or the one the caller supplies where it names none. The common shape
+    // of reading a counter or an accumulator that may not have been started yet.
+    get_or(self, k: K, default: V) -> V = self.get(k).unwrap_or(default)
+
+    has(self, k: K) -> bool = self.find(k).is_some()
+
+    // A key given a value: the entry it already had takes the new one, or a fresh entry is placed.
+    //
+    // **Room is made before the key is placed, not after**, because rehashing moves every entry and
+    // an index worked out beforehand would name a slot in a table that no longer exists. The `+ 1`
+    // is the entry about to be added: the test is whether the table would be over its load *after*
+    // this insert, since discovering it afterwards would leave it over for the whole of the next
+    // lookup.
+    put(*self, k: K, v: V)
+        if (self.count + self.dead + 1) * load_den > self.cell.len * load_num then self.rehash()
+
+        val h = k.hash()
+        val mask = self.cell.len - 1
+        var i = usize(h) & mask
+        var vacant: Option[usize] = None
+
+        loop
+            self.cell[i] match
+                // The end of the probe: the key is not in the table. It goes at the first tombstone
+                // passed on the way here if there was one, which reclaims the slot, and at this
+                // empty slot otherwise.
+                Slot.Empty ->
+                    vacant match
+                        Some(d) ->
+                            self.cell[d] = Slot.Live(h, k, v)
+                            self.dead -= 1
+                        None -> self.cell[i] = Slot.Live(h, k, v)
+
+                    self.count += 1
+                    break
+                Slot.Dead -> if vacant.is_none() then vacant = Some(i)
+                Slot.Live(sh, sk, _) ->
+                    if sh == h && sk == k
+                        self.cell[i] = Slot.Live(h, k, v)
+                        break
+
+            i = (i + 1) & mask
+    end put
+
+    // A key taken out, answering whether it was there.
+    //
+    // The slot becomes a tombstone rather than empty, because a key that probed past it on the way
+    // to its own slot must still be able to. The tombstone is counted, which is what eventually
+    // triggers the rehash that clears it.
+    remove(*self, k: K) -> bool
+        self.find(k) match
+            None -> false
+            Some(i) ->
+                self.cell[i] = Slot.Dead
+                self.count -= 1
+                self.dead += 1
+                true
+    end remove
+
+    // Every entry dropped and the table returned to its starting size, so that a map used as
+    // scratch across a loop does not keep the largest table any pass through it needed.
+    clear(*self)
+        self.cell = [Slot.Empty; initial_slots]
+        self.count = 0
+        self.dead = 0
+    end clear
+
+    // A fresh table holding the same entries, sized from the **live** count.
+    //
+    // Sizing from the live count rather than doubling unconditionally is what makes tombstones a
+    // self-correcting cost instead of a leak: a map that has had as much removed as added is over
+    // its load and rehashes, and lands at the size its contents actually want -- possibly the size
+    // it already was, with every tombstone gone. A map that is genuinely growing doubles, because
+    // its live count is what put it over the line.
+    //
+    // Nothing is hashed here. Every entry carries the `u64` it mixed down to, and a table's index is
+    // that number masked, so re-placing an entry is a mask and a walk.
+    private rehash(*self)
+        var want = initial_slots
+
+        while want < (self.count + 1) * 2
+            want *= 2
+
+        val old = self.cell
+
+        self.cell = [Slot.Empty; want]
+        self.dead = 0
+
+        for i in 0..<old.len
+            old[i] match
+                Slot.Live(h, k, v) -> self.place(h, k, v)
+                _ -> ()
+    end rehash
+
+    // An entry put into a table that is known to have room and known not to hold its key: the two
+    // things `rehash` can promise and `put` cannot. There is no tombstone to consider, because the
+    // table it writes into was made empty a moment ago.
+    private place(*self, h: u64, k: K, v: V)
+        val mask = self.cell.len - 1
+        var i = usize(h) & mask
+
+        while self.cell[i].is_live()
+            i = (i + 1) & mask
+
+        self.cell[i] = Slot.Live(h, k, v)
+    end place
+
+    // A cursor over the entries, in no particular order -- the order is the table's, which changes
+    // when it rehashes and is not something a program may rely on.
+    //
+    // **Do not modify the map while a cursor over it is live.** Doing so is memory-safe and nothing
+    // more: the cursor holds the table as a view, so it keeps that storage alive and can never read
+    // freed memory even when a `put` rehashes and hands the map different storage entirely. What it
+    // *yields* in that case is unspecified. A `put` before the rehash writes into the very table the
+    // cursor is walking and may be yielded; one after it goes somewhere the cursor cannot see and
+    // will not be. Which side of the line a given `put` falls on depends on the load factor, so
+    // there is no rule here worth learning -- collect what is wanted first, then modify.
+    walk(self) -> Cursor[K, V] = Cursor(self.cell, 0)
+end Map
+
+// An empty map, with a table already under it so that every later question can assume one.
+//
+// **The annotation on `m` is required and is not noise.** `Map`'s parameters would have to come from
+// the constructor's arguments while the bare `Slot.Empty` filling the table waits to hear what it is
+// a slot of, and neither can go first.
+map[K: Hash + Eq, V]() -> Map[K, V]
+    var m: Map[K, V] = Map([Slot.Empty; initial_slots], 0, 0)
+
+    m
+end map
+
+// A map whose table is already big enough for `n` entries without rehashing, for a caller that knows
+// roughly how many are coming. The table is sized to twice `n` because the map rehashes at three
+// quarters full, so a table of exactly `n` slots would grow before the `n`th entry arrived.
+map_with_capacity[K: Hash + Eq, V](n: usize) -> Map[K, V]
+    var want = initial_slots
+
+    while want < n * 2
+        want *= 2
+
+    var m: Map[K, V] = Map([Slot.Empty; want], 0, 0)
+
+    m
+end map_with_capacity
+
+// ------------------------------------------------------------------------------------- walking
+
+// A position in a table: which slot to look at next.
+//
+// It takes **no bounds**, which is the point of writing them on the declarations that need them:
+// walking a table hashes nothing and compares nothing, so a cursor asks nothing of a key.
+struct Cursor[K, V]
+    cell: []Slot[K, V]
+    at: usize
+end Cursor
+
+// A pair per entry rather than a reference to one, because there is no entry to refer to -- an entry
+// lives inside the table, and a reference into storage that `rehash` replaces is the one thing this
+// design exists to make impossible.
+impl[K, V] Iterate[(K, V)] for Cursor[K, V]
+    next(*self) -> Option[(K, V)]
+        while self.at < self.cell.len
+            val s = self.cell[self.at]
+
+            self.at += 1
+
+            s match
+                Slot.Live(_, k, v) -> return Some((k, v))
+                _ -> ()
+
+        None
+    end next

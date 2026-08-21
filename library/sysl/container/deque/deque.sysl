@@ -1,0 +1,173 @@
+module sysl.container.deque
+
+// A sequence that grows and that is cheap to take from at **either** end.
+//
+// **The reason this exists beside `Buf` is one line of cost.** A queue written over a growable
+// sequence takes from the front with `remove(0)`, which shifts every remaining element down one --
+// so a loop that pushes n things and pops them all is quadratic, and reads as though it were linear.
+// That is the shape of every breadth-first walk, every work list and every scheduler run queue, and
+// it is the one place the library was quietly teaching an accident.
+//
+// **The elements live in a ring**: `head` says where the first one is, `count` says how many follow,
+// and both ends wrap around the end of the storage rather than moving anything. Taking from the
+// front advances `head` and touches nothing else; adding to the front steps it backwards into the
+// space that leaves. Neither end shifts, which is the whole point.
+//
+// **The storage length is always a power of two**, because it starts at eight and only ever doubles,
+// so wrapping is a mask rather than a division. That invariant is worth stating because it is what
+// every index calculation here assumes -- there is no `%` anywhere below, and a growth path that
+// produced a non-power-of-two length would break all of them at once rather than visibly.
+//
+// The bounds-checked members panic rather than answering an `Option`, which is the bargain `Buf`
+// makes for the same reason: an index past the end is a mistake in the program. `pop_front` and
+// `pop_back` answer an `Option`, because taking from an empty sequence is a question a caller asks
+// on purpose.
+struct Deque[T]
+    elems: []T
+    head: usize
+    count: usize
+
+    len(self) -> usize = self.count
+
+    cap(self) -> usize = self.elems.len
+
+    is_empty(self) -> bool = self.count == 0
+
+    // Where the `i`th element from the front actually lives. Every accessor goes through this, which
+    // is what keeps the wrapping in one place instead of at each end.
+    private seat(self, i: usize) -> usize = (self.head + i) & (self.elems.len - 1)
+
+    at(self, i: usize) -> T
+        if i >= self.count
+            print("panic: index", i, "past the", self.count, "elements of a Deque")
+            exit(1)
+        self.elems[self.seat(i)]
+    end at
+
+    set(*self, i: usize, v: T)
+        if i >= self.count
+            print("panic: index", i, "past the", self.count, "elements of a Deque")
+            exit(1)
+        val s = self.seat(i)
+        self.elems[s] = v
+    end set
+
+    first(self) -> Option[T] = if self.count == 0 then None else Some(self.elems[self.head])
+
+    last(self) -> Option[T] = if self.count == 0 then None else Some(self.elems[self.seat(self.count - 1)])
+
+    // Storage twice the size with the elements laid down **unwrapped**, so the new ring starts at
+    // zero and the head is back at the beginning.
+    //
+    // The fill is the value being pushed, for the same reason `Buf.extend`'s is an element of the
+    // slice it is given: an array is made by repeating a value and a generic `T` has no zero to
+    // repeat. Every slot the caller can reach is written before it can be read -- `count` is what
+    // says which of them are real.
+    private grow(*self, fill: T)
+        var bigger: []T = [fill; if self.elems.len == 0 then 8usize else self.elems.len * 2]
+
+        for i in 0..<self.count
+            bigger[i] = self.elems[self.seat(i)]
+
+        self.elems = bigger
+        self.head = 0
+    end grow
+
+    push_back(*self, v: T)
+        if self.count == self.elems.len then self.grow(v)
+
+        val s = self.seat(self.count)
+
+        self.elems[s] = v
+        self.count += 1
+    end push_back
+
+    // The end `Buf` has no answer for at all. `head` steps backwards by adding the storage length
+    // before subtracting one, so that the arithmetic never goes below zero on the way -- a `usize`
+    // that wraps would name a slot at the far end of memory rather than the far end of the ring.
+    push_front(*self, v: T)
+        if self.count == self.elems.len then self.grow(v)
+
+        self.head = (self.head + self.elems.len - 1) & (self.elems.len - 1)
+        self.elems[self.head] = v
+        self.count += 1
+    end push_front
+
+    pop_front(*self) -> Option[T]
+        if self.count == 0 then return None
+
+        val v = self.elems[self.head]
+
+        self.head = (self.head + 1) & (self.elems.len - 1)
+        self.count -= 1
+        Some(v)
+    end pop_front
+
+    pop_back(*self) -> Option[T]
+        if self.count == 0 then return None
+
+        self.count -= 1
+        Some(self.elems[self.seat(self.count)])
+    end pop_back
+
+    // The elements dropped and the head put back at the start. The storage is kept, which is what
+    // makes a deque reused across passes of a loop allocate once rather than once per pass.
+    clear(*self)
+        self.head = 0
+        self.count = 0
+    end clear
+
+    walk(self) -> DequeCursor[T] = DequeCursor(self.elems, self.head, self.count, 0)
+end Deque
+
+// Subscripting reaches the bounds-checked members rather than the storage, so `d[i]` counts from the
+// **front** of the deque and cannot read a slot the ring is not currently using.
+impl[T] Index[usize, T] for Deque[T]
+    index(self, i: usize) -> T = self.at(i)
+
+impl[T] IndexSet[usize, T] for Deque[T]
+    index_set(*self, i: usize, v: T) = self.set(i, v)
+
+deque[T]() -> Deque[T]
+    var d: Deque[T] = Deque([], 0, 0)
+
+    d
+end deque
+
+// A deque with room for `n` elements already under it. The fill is written rather than inferred for
+// the reason it is on `buf_with_capacity`: nothing about `T` says what an unused slot should hold,
+// and none of these slots is read.
+//
+// The storage is rounded **up** to a power of two, because the mask every index goes through is only
+// correct for those lengths.
+deque_with_capacity[T](n: usize, fill: T) -> Deque[T]
+    var want: usize = 8
+
+    while want < n
+        want *= 2
+
+    var d: Deque[T] = Deque([fill; want], 0, 0)
+
+    d
+end deque_with_capacity
+
+// ------------------------------------------------------------------------------------- walking
+
+// A walk from the front to the back. It holds the storage rather than the deque, so pushing onto the
+// deque while a cursor is live leaves the cursor reading the ring it started on.
+struct DequeCursor[T]
+    elems: []T
+    head: usize
+    count: usize
+    at: usize
+end DequeCursor
+
+impl[T] Iterate[T] for DequeCursor[T]
+    next(*self) -> Option[T]
+        if self.at >= self.count then return None
+
+        val v = self.elems[(self.head + self.at) & (self.elems.len - 1)]
+
+        self.at += 1
+        Some(v)
+    end next

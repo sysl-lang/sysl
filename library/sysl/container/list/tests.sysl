@@ -1,0 +1,259 @@
+module sysl.container.list
+@tests
+
+// What the list promises. The property worth the most here is **structural sharing**: that extending
+// a list leaves the original intact and usable, which is the whole reason to have an immutable one.
+// Several of these therefore keep the original alive and assert on it after the derived list exists.
+
+@test("the empty list is empty at every accessor")
+empty_list()
+    val e: List[int] = list()
+
+    assert_eq(e.len(), 0)
+    assert(e.is_empty())
+    assert_eq(e.first(), None)
+    assert(e.rest().is_none())
+    assert(e.uncons().is_none())
+end empty_list
+
+@test("prepending puts the element on the front and lengthens by one")
+prepend_puts_it_first()
+    val e: List[int] = list()
+    val a = e.prepend(1)
+    val b = a.prepend(2)
+
+    assert_eq(b.len(), 2)
+    assert_eq(b.first(), Some(2))
+    assert_eq(a.len(), 1)
+    assert_eq(a.first(), Some(1))
+end prepend_puts_it_first
+
+// **The point of the whole module.** Two lists derived from one share its cells, and neither is
+// disturbed by the other existing.
+@test("two lists built on one tail leave that tail untouched")
+structural_sharing()
+    val base = list_of([1, 2, 3])
+    val x = base.prepend(10)
+    val y = base.prepend(20)
+
+    assert_eq(base.len(), 3)
+    assert_eq(base.first(), Some(1))
+
+    assert_eq(x.len(), 4)
+    assert_eq(x.first(), Some(10))
+
+    assert_eq(y.len(), 4)
+    assert_eq(y.first(), Some(20))
+
+    // and the shared part really is the same sequence
+    var xs = 0
+    var ys = 0
+
+    for v in x.walk()
+        xs += v
+
+    for v in y.walk()
+        ys += v
+
+    assert_eq(xs, 16)
+    assert_eq(ys, 26)
+    assert_eq(base.len(), 3)
+end structural_sharing
+
+@test("a long chain of prepends keeps every element and the right length")
+deep_sharing()
+    var l: List[int] = list()
+
+    for i in 0..<500
+        l = l.prepend(i)
+
+    assert_eq(l.len(), 500)
+    assert_eq(l.first(), Some(499))
+
+    var seen = 0
+    var expect = 499
+
+    for v in l.walk()
+        assert_eq(v, expect)
+        expect -= 1
+        seen += 1
+
+    assert_eq(seen, 500)
+end deep_sharing
+
+// -- taking apart ---------------------------------------------------------------------------------
+
+@test("rest answers the tail, and nothing where there is no tail")
+rest_answers_the_tail()
+    val l = list_of([1, 2, 3])
+
+    l.rest() match
+        None -> assert(false)
+        Some(t) ->
+            assert_eq(t.len(), 2)
+            assert_eq(t.first(), Some(2))
+
+    val one = list_of([9])
+
+    one.rest() match
+        None -> assert(false)
+        Some(t) -> assert(t.is_empty())
+
+    val e: List[int] = list()
+
+    assert(e.rest().is_none())
+end rest_answers_the_tail
+
+// The member a walk is written with: one question rather than two, and no impossible case in the
+// middle.
+@test("uncons hands back the head and the rest together")
+uncons_walks()
+    val l = list_of([1, 2, 3, 4])
+    var at = l
+    var total = 0
+    var steps = 0
+
+    loop
+        at.uncons() match
+            None -> break
+            Some(pair) ->
+                val head, tail = pair
+
+                total += head
+                steps += 1
+                at = tail
+
+    assert_eq(total, 10)
+    assert_eq(steps, 4)
+    assert_eq(l.len(), 4)
+end uncons_walks
+
+@test("the length falls by exactly one at each step of a walk")
+length_tracks_the_walk()
+    var at = list_of([1, 2, 3, 4, 5])
+    var want: usize = 5
+
+    loop
+        assert_eq(at.len(), want)
+
+        at.rest() match
+            None -> break
+            Some(t) ->
+                at = t
+                want -= 1
+
+    assert_eq(want, 0)
+end length_tracks_the_walk
+
+// -- building -------------------------------------------------------------------------------------
+
+@test("a list built from a slice is in the same order")
+list_of_keeps_order()
+    val l = list_of([1, 2, 3])
+
+    assert_eq(l.len(), 3)
+    assert_eq(l.first(), Some(1))
+
+    var out: []int = [0; 3]
+    var i: usize = 0
+
+    for v in l.walk()
+        out[i] = v
+        i += 1
+
+    assert_eq(out[0], 1)
+    assert_eq(out[1], 2)
+    assert_eq(out[2], 3)
+end list_of_keeps_order
+
+@test("a list built from an empty slice is the empty list")
+list_of_nothing()
+    val nothing: []int = []
+    val l = list_of(nothing)
+
+    assert(l.is_empty())
+    assert_eq(l.len(), 0)
+    assert_eq(l.first(), None)
+end list_of_nothing
+
+// -- reversing ------------------------------------------------------------------------------------
+
+@test("reverse answers the elements backwards and leaves the original alone")
+reverse_does_not_disturb()
+    val l = list_of([1, 2, 3])
+    val r = l.reverse()
+
+    assert_eq(r.len(), 3)
+    assert_eq(r.first(), Some(3))
+
+    assert_eq(l.len(), 3)
+    assert_eq(l.first(), Some(1))
+
+    var out: []int = [0; 3]
+    var i: usize = 0
+
+    for v in r.walk()
+        out[i] = v
+        i += 1
+
+    assert_eq(out[0], 3)
+    assert_eq(out[1], 2)
+    assert_eq(out[2], 1)
+end reverse_does_not_disturb
+
+@test("reversing an empty list and a single-element one changes nothing")
+reverse_of_short_lists()
+    val e: List[int] = list()
+
+    assert(e.reverse().is_empty())
+
+    val one = list_of([5])
+    val r = one.reverse()
+
+    assert_eq(r.len(), 1)
+    assert_eq(r.first(), Some(5))
+end reverse_of_short_lists
+
+@test("reversing twice answers the original order")
+reverse_twice()
+    val l = list_of([1, 2, 3, 4])
+    val back = l.reverse().reverse()
+
+    assert_eq(back.len(), 4)
+
+    var at = back
+    var want = 1
+
+    loop
+        at.uncons() match
+            None -> break
+            Some(pair) ->
+                val head, tail = pair
+
+                assert_eq(head, want)
+                want += 1
+                at = tail
+
+    assert_eq(want, 5)
+end reverse_twice
+
+// -- walking --------------------------------------------------------------------------------------
+
+@test("a walk of the empty list yields nothing")
+walk_of_empty()
+    val e: List[int] = list()
+    var seen = 0
+
+    for v in e.walk()
+        seen += 1
+
+    assert_eq(seen, 0)
+end walk_of_empty
+
+@test("a list holds anything, not only numbers")
+strings_and_tuples()
+    val l = list_of([("a", 1), ("b", 2)])
+
+    assert_eq(l.len(), 2)
+    assert_eq(l.first(), Some(("a", 1)))
+end strings_and_tuples

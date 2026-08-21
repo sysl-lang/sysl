@@ -1,0 +1,138 @@
+module sysl.container.set
+
+import sysl.container.map.{Map, map, map_with_capacity, Cursor}
+
+// A set of keys, with membership answered in constant time on average.
+//
+// **It is a `Map` with nothing in the value column**, and that is a deliberate choice about where the
+// duplication goes rather than laziness. A bespoke table would save the value slot -- for a
+// `Set[int]` that is eight bytes of padding per slot against twenty-four -- and would cost a second
+// copy of the probing, the tombstone rule and the rehash sizing, which is the part of a hash table
+// that is actually hard to get right. Two copies of that is two places for it to be wrong, and only
+// one of them would have the tests.
+//
+// **The representation is behind the API**, which is what makes the choice reversible: `add`, `has`
+// and `remove` say nothing about how the table is laid out, so a bespoke table can replace this one
+// later without moving anything a program can name.
+//
+// The value stored is `true` throughout and is never read. What carries the information is whether
+// the key is in the map at all.
+struct Set[K: Hash + Eq]
+    entries: Map[K, bool]
+
+    len(self) -> usize = self.entries.len()
+
+    is_empty(self) -> bool = self.entries.is_empty()
+
+    capacity(self) -> usize = self.entries.capacity()
+
+    has(self, k: K) -> bool = self.entries.has(k)
+
+    // A key put in, answering whether it was **new**. The answer is what makes a set usable as the
+    // "have I seen this before" test that a graph walk or a deduplication is written around --
+    // `if seen.add(x) then …` visits each thing exactly once, with one lookup rather than a `has`
+    // followed by an `add`.
+    add(*self, k: K) -> bool
+        if self.entries.has(k) then return false
+
+        self.entries.put(k, true)
+        true
+    end add
+
+    // A key taken out, answering whether it was there.
+    remove(*self, k: K) -> bool = self.entries.remove(k)
+
+    clear(*self) = self.entries.clear()
+
+    walk(self) -> SetCursor[K] = SetCursor(self.entries.walk())
+end Set
+
+set[K: Hash + Eq]() -> Set[K]
+    var s: Set[K] = Set(map())
+
+    s
+end set
+
+set_with_capacity[K: Hash + Eq](n: usize) -> Set[K]
+    var s: Set[K] = Set(map_with_capacity(n))
+
+    s
+end set_with_capacity
+
+// Every key of a slice, with duplicates collapsed. The shape that makes a set worth reaching for in
+// one line rather than three.
+set_of[K: Hash + Eq](xs: []const K) -> Set[K]
+    var s: Set[K] = Set(map_with_capacity(xs.len))
+
+    for i in 0..<xs.len
+        s.add(xs[i])
+
+    s
+end set_of
+
+// ------------------------------------------------------------------------------------- walking
+
+// A position in a set, which is a position in the map underneath it with the unread value dropped
+// on the way out.
+struct SetCursor[K]
+    inner: Cursor[K, bool]
+end SetCursor
+
+impl[K] Iterate[K] for SetCursor[K]
+    next(*self) -> Option[K]
+        self.inner.next() match
+            None -> None
+            Some(pair) -> Some(pair.0)
+    end next
+
+// ---------------------------------------------------------------------------------- operations
+
+// The keys in either set. Sized for the larger of the two, since that is the least it can come to.
+union[K: Hash + Eq](a: Set[K], b: Set[K]) -> Set[K]
+    var out: Set[K] = Set(map_with_capacity(if a.len() > b.len() then a.len() else b.len()))
+
+    for k in a.walk()
+        out.add(k)
+
+    for k in b.walk()
+        out.add(k)
+
+    out
+end union
+
+// The keys in both sets. **The smaller set is the one walked**, because every key walked costs a
+// lookup in the other and the result cannot be bigger than the smaller input -- so walking the
+// larger would ask more questions to reach the same answer.
+intersection[K: Hash + Eq](a: Set[K], b: Set[K]) -> Set[K]
+    var out: Set[K] = set()
+
+    if a.len() <= b.len()
+        for k in a.walk()
+            if b.has(k) then out.add(k)
+    else
+        for k in b.walk()
+            if a.has(k) then out.add(k)
+
+    out
+end intersection
+
+// The keys in the first set and not the second. Not symmetric, so it walks `a` whatever the sizes.
+difference[K: Hash + Eq](a: Set[K], b: Set[K]) -> Set[K]
+    var out: Set[K] = set()
+
+    for k in a.walk()
+        if !b.has(k) then out.add(k)
+
+    out
+end difference
+
+// Whether every key of the first set is in the second. A set cannot be a subset of a smaller one, so
+// the count settles most calls before a single lookup is made.
+is_subset[K: Hash + Eq](a: Set[K], b: Set[K]) -> bool
+    if a.len() > b.len() then return false
+
+    for k in a.walk()
+        if !b.has(k) then return false
+
+    true
+end is_subset

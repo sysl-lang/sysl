@@ -1,0 +1,249 @@
+module sysl.container.deque
+@tests
+
+// What the deque promises. The interesting failures are all in the wrapping -- an index that is
+// correct while the ring happens to start at zero and wrong once it does not -- so most of these
+// arrange for the ring to be wrapped before they assert anything.
+
+@test("a fresh deque is empty and has nothing at either end")
+fresh_is_empty()
+    var d: Deque[int] = deque()
+
+    assert_eq(d.len(), 0)
+    assert(d.is_empty())
+    assert_eq(d.first(), None)
+    assert_eq(d.last(), None)
+    assert_eq(d.pop_front(), None)
+    assert_eq(d.pop_back(), None)
+end fresh_is_empty
+
+@test("pushing on the back reads back in order")
+push_back_is_a_queue()
+    var d: Deque[int] = deque()
+
+    d.push_back(1)
+    d.push_back(2)
+    d.push_back(3)
+
+    assert_eq(d.len(), 3)
+    assert_eq(d.first(), Some(1))
+    assert_eq(d.last(), Some(3))
+    assert_eq(d[0], 1)
+    assert_eq(d[2], 3)
+end push_back_is_a_queue
+
+// The end a `Buf` has no answer for at all, and the one that steps `head` backwards past zero.
+@test("pushing on the front reverses the order")
+push_front_prepends()
+    var d: Deque[int] = deque()
+
+    d.push_front(1)
+    d.push_front(2)
+    d.push_front(3)
+
+    assert_eq(d.len(), 3)
+    assert_eq(d[0], 3)
+    assert_eq(d[1], 2)
+    assert_eq(d[2], 1)
+    assert_eq(d.first(), Some(3))
+    assert_eq(d.last(), Some(1))
+end push_front_prepends
+
+@test("both ends can be taken from")
+pops_from_both_ends()
+    var d: Deque[int] = deque()
+
+    for i in 0..<5
+        d.push_back(i)
+
+    assert_eq(d.pop_front(), Some(0))
+    assert_eq(d.pop_back(), Some(4))
+    assert_eq(d.len(), 3)
+    assert_eq(d[0], 1)
+    assert_eq(d[2], 3)
+end pops_from_both_ends
+
+// A ring whose head is not at zero is the state every index calculation has to be right for, so this
+// forces one and then checks every accessor against it.
+@test("indexing counts from the front once the ring has wrapped")
+indexing_when_wrapped()
+    var d: Deque[int] = deque()
+
+    for i in 0..<8
+        d.push_back(i)
+
+    for i in 0..<5
+        assert(d.pop_front().is_some())
+
+    for i in 100..<104
+        d.push_back(i)
+
+    assert_eq(d.len(), 7)
+    assert_eq(d[0], 5)
+    assert_eq(d[1], 6)
+    assert_eq(d[2], 7)
+    assert_eq(d[3], 100)
+    assert_eq(d[6], 103)
+    assert_eq(d.first(), Some(5))
+    assert_eq(d.last(), Some(103))
+end indexing_when_wrapped
+
+@test("set writes through to the element the index names")
+set_writes_at_the_front_relative_index()
+    var d: Deque[int] = deque()
+
+    for i in 0..<6
+        d.push_back(i)
+
+    assert(d.pop_front().is_some())
+    assert(d.pop_front().is_some())
+
+    d[0] = 99
+    d.set(2, 77)
+
+    assert_eq(d[0], 99)
+    assert_eq(d[1], 3)
+    assert_eq(d[2], 77)
+end set_writes_at_the_front_relative_index
+
+// -- growth ---------------------------------------------------------------------------------------
+
+// Growing a ring that is wrapped is the case that gets written wrong: the elements have to be laid
+// down in *logical* order, not copied slot for slot, or the sequence comes back rotated.
+@test("growing a wrapped ring keeps the order")
+growth_unwraps_correctly()
+    var d: Deque[int] = deque()
+
+    for i in 0..<8
+        d.push_back(i)
+
+    for i in 0..<6
+        assert(d.pop_front().is_some())
+
+    // head is now at 6 of 8; these wrap around the end
+    for i in 100..<110
+        d.push_back(i)
+
+    assert_eq(d.len(), 12)
+    assert_eq(d[0], 6)
+    assert_eq(d[1], 7)
+
+    var seat: usize = 2
+
+    for i in 0..<10
+        assert_eq(d[seat], 100 + i)
+        seat += 1
+end growth_unwraps_correctly
+
+@test("the storage doubles from eight and stays a power of two")
+growth_is_geometric()
+    var d: Deque[int] = deque()
+
+    assert_eq(d.cap(), 0)
+
+    d.push_back(1)
+    assert_eq(d.cap(), 8)
+
+    for i in 0..<8
+        d.push_back(i)
+
+    assert_eq(d.len(), 9)
+    assert_eq(d.cap(), 16)
+end growth_is_geometric
+
+@test("a reserved deque rounds its storage up to a power of two")
+reserved_rounds_up()
+    val d = deque_with_capacity(100, 0)
+
+    assert_eq(d.cap(), 128)
+    assert_eq(d.len(), 0)
+end reserved_rounds_up
+
+// **The reason this module exists.** A FIFO run far past its own size must stay correct while the
+// ring wraps many times and the storage grows underneath it.
+@test("a queue driven far past its size stays in order")
+long_fifo_stays_in_order()
+    var d: Deque[int] = deque()
+    var next_out = 0
+
+    for i in 0..<5000
+        d.push_back(i)
+
+        if i % 3 == 0
+            assert_eq(d.pop_front(), Some(next_out))
+            next_out += 1
+
+    assert_eq(d.len(), usize(5000 - next_out))
+    assert_eq(d.first(), Some(next_out))
+    assert_eq(d.last(), Some(4999))
+end long_fifo_stays_in_order
+
+@test("a deque used as a stack at the front is also in order")
+front_stack_stays_in_order()
+    var d: Deque[int] = deque()
+
+    for i in 0..<1000
+        d.push_front(i)
+
+    assert_eq(d.len(), 1000)
+
+    for i in 0..<1000
+        assert_eq(d.pop_front(), Some(999 - i))
+
+    assert(d.is_empty())
+end front_stack_stays_in_order
+
+// -- clearing and walking -------------------------------------------------------------------------
+
+@test("clear empties the deque but keeps its storage")
+clear_keeps_storage()
+    var d: Deque[int] = deque()
+
+    for i in 0..<20
+        d.push_back(i)
+
+    val before = d.cap()
+
+    d.clear()
+
+    assert_eq(d.len(), 0)
+    assert(d.is_empty())
+    assert_eq(d.cap(), before)
+    assert_eq(d.first(), None)
+
+    d.push_back(7)
+    assert_eq(d[0], 7)
+end clear_keeps_storage
+
+@test("a walk yields the elements front to back, wrapped or not")
+walk_matches_indexing()
+    var d: Deque[int] = deque()
+
+    for i in 0..<10
+        d.push_back(i)
+
+    for i in 0..<7
+        assert(d.pop_front().is_some())
+
+    for i in 200..<206
+        d.push_back(i)
+
+    var at: usize = 0
+
+    for v in d.walk()
+        assert_eq(v, d[at])
+        at += 1
+
+    assert_eq(at, d.len())
+end walk_matches_indexing
+
+@test("a walk of an empty deque yields nothing")
+walk_of_empty()
+    var d: Deque[int] = deque()
+    var seen = 0
+
+    for v in d.walk()
+        seen += 1
+
+    assert_eq(seen, 0)
+end walk_of_empty
