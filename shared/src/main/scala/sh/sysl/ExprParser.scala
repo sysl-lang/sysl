@@ -273,10 +273,41 @@ trait ExprParser extends SyslParserBase {
       floatLit | intLit | charLit | interpLit | cStrLit | strLit | boolLit | nullLit | layoutOf | offsetOf |
         selfExpr |
         placeholderExpr |
+        implicitMember |
         identExpr |
         arrayLit |
         op("(") ~> parenTail,
     )
+
+  /** `.red`, `.Circle(3)`, `.make(2)` — a member of the type the context expects, written with
+   * that type's name left off (`reference/expressions.md § Implicit member`).
+   *
+   * **The leading dot is unambiguous wherever an expression may start**, which is what makes this a
+   * `primary` rather than a form needing lookahead. A range's `..` and `..<` are single tokens by
+   * longest match; a number must begin with a digit, so `.5` was never a literal; and a tuple index
+   * is read in the postfix tail, where there is a value to the dot's left. A name follows, for the
+   * reason a field's does — what comes after a dot names something rather than denoting it.
+   *
+   * A **statement** beginning with one parses here and is refused by the analyzer, since a statement
+   * expects no type. That is what leaves the leading-dot continuation style for a call chain
+   * available: the two forms cannot both be meant on one line, because one of them is never legal.
+   */
+  protected lazy val implicitMember: PackratParser[Expr] =
+    op(".") ~> (ident ^^ ImplicitMember.apply | noLeadingPoint)
+
+  /** `.5` — a fraction written the way C allows and sysl does not, refused by name where it would
+   * otherwise be read as this form with the name missing.
+   *
+   * A number begins with a digit here (`reference/lexical.md § Literals`), so `.5` was always two
+   * tokens and always a mistake; what changes is that the dot now belongs to a form, and
+   * "identifier expected" points at the `5` while saying nothing about the fraction the reader
+   * wrote. Nothing else in the grammar puts a number straight after a dot at the start of an
+   * expression — a tuple index is read in the postfix tail, where a value is to its left — so
+   * consuming one commits.
+   */
+  private lazy val noLeadingPoint: Parser[Nothing] =
+    guard(floatLit | intLit) ~> err("a number is written with a digit before the point — '0.5' " +
+      "rather than '.5'")
 
   /** `sizeof(T)` and `alignof(T)` — the two forms whose operand is a type (`03 § Reinterpreting
    * storage`).

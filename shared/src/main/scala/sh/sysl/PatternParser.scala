@@ -72,7 +72,8 @@ trait PatternParser extends ExprParser {
           "program can declare"))
 
   private lazy val unboundPattern: Parser[Pattern] =
-    patternLit ~ (rangeOp ~ patternLit) ^^ { case lo ~ (inc ~ hi) => RangePattern(lo, hi, inc) } |
+    noImplicitMember |
+      patternLit ~ (rangeOp ~ patternLit) ^^ { case lo ~ (inc ~ hi) => RangePattern(lo, hi, inc) } |
       structPattern |
       variantPattern |
       tuplePattern |
@@ -91,6 +92,23 @@ trait PatternParser extends ExprParser {
    */
   private lazy val quotedRef: Parser[String] =
     rep(ident <~ op(".")) ~ quotedIdent ^^ { case ps ~ n => (ps :+ n).mkString(".") }
+
+  /** A leading dot written in a pattern, which the expression form has and a pattern does not need
+   * (`reference/expressions.md § Implicit member`).
+   *
+   * A pattern is already matched *against* a type, and the analyzer reads a bare name against the
+   * scrutinee's enum and drops any qualifier it was written with — so `red` here already means what
+   * `.red` means one line up, and the dot would be a second spelling of the same thing. Refused by
+   * name rather than left to "a pattern expected", which is what a reader arriving from the
+   * expression form would otherwise get for writing the form they had just been taught.
+   *
+   * Nothing else in the grammar begins a pattern with a dot, so consuming one commits.
+   */
+  private lazy val noImplicitMember: Parser[Nothing] =
+    op(".") ~> ident >> (n =>
+      err(s"a pattern is matched against a type it already knows, so the variant is written '$n' " +
+        "with no leading dot — the dot is for an expression, where the type comes from what the " +
+        "context expects"))
 
   protected lazy val variantPattern: Parser[Pattern] =
     qualifiedName ~ (op("(") ~> commaList(pattern) <~ op(")")) ^^ { case n ~ ps => VariantPattern(n, ps) }

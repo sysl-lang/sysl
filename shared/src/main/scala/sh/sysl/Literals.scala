@@ -123,9 +123,10 @@ trait Literals extends TypeResolution {
   /** Whether an expression is one whose type the position it sits in supplies, rather than one it
    * carries itself — the middle tier above.
    *
-   * `xs.load(i)` is the whole of the set today, and it is here for the reason `MethodCalls`'
-   * `vectorMemory` gives: a slice has whatever length it has, so how many lanes a run of it is read
-   * as is the *receiving* type's to say, and there is nothing in the receiver to read it from.
+   * `xs.load(i)` and the implicit member `.red` are the set. The first is here for the reason
+   * `MethodCalls`' `vectorMemory` gives: a slice has whatever length it has, so how many lanes a
+   * run of it is read as is the *receiving* type's to say, and there is nothing in the receiver to
+   * read it from.
    *
    * **The test is on the spelling, and it is allowed to be**, because the middle tier is not a
    * licence to skip anything — it moves an operand one place later in the order and hands it the
@@ -136,6 +137,12 @@ trait Literals extends TypeResolution {
    */
   protected def typedByPosition(e: Expr): Boolean = e match
     case Call(Field(_, "load"), List(_)) => true
+    // `.red` is the other one, and it is the reason the tier is worth having rather than a special
+    // case: `c == .Red` is what a reader writes first, and the form has no type at all until
+    // something says which type is wanted. The neighbour is what says it here, exactly as it says
+    // what width a literal is.
+    case _: ImplicitMember               => true
+    case Call(_: ImplicitMember, _)      => true
     case _                               => false
 
   /** Whether an expression is a literal with no type of its own. A suffixed numeric literal

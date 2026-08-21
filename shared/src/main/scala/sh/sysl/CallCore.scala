@@ -154,7 +154,7 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     // it stands at is settled by the others or by nothing at all. `two(&x, null)` and
     // `two(null, &x)` therefore get one answer, which an ordering rule would not have given.
     val first = at.map { (a, e) =>
-      if callableArg(a) || e.isEmpty && nullArg(a) then None
+      if callableArg(a) || e.isEmpty && (nullArg(a) || implicitArg(a)) then None
       else
         e match
           case Some(_) => Some(analyzeExpr(a, e))
@@ -194,14 +194,14 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
   /** What an argument held back from the first pass is analyzed against, once the rest have been
    * read.
    *
-   * A callable asks for the call trait its parameter's bound names. `null` asks for the **parameter
-   * itself**, which is a type by now wherever the other arguments settled what it mentions — so
-   * `two[T](a: *T, b: *T)` gives the `null` in `two(&x, null)` the `*int` that the `&x` said, which
-   * is what the same call to a non-generic `two` has always done.
+   * A callable asks for the call trait its parameter's bound names. `null` and an implicit member
+   * ask for the **parameter itself**, which is a type by now wherever the other arguments settled
+   * what it mentions — so `two[T](a: *T, b: *T)` gives the `null` in `two(&x, null)` the `*int`
+   * that the `&x` said, which is what the same call to a non-generic `two` has always done.
    *
    * `None` in either case where something the parameter names is still unknown, which leaves the
-   * argument to report it: a closure that its parameters have no types, a `null` that its context
-   * gave it none. `one[T](a: *T)` called `one(null)` is that — there is nothing else to read, and
+   * argument to report it: a closure that its parameters have no types, a `null` or a leading dot
+   * that its context gave it none. `one[T](a: *T)` called `one(null)` is that — there is nothing else to read, and
    * the answer is the refusal it always was rather than a guess.
    */
   private def heldWant(
@@ -211,10 +211,17 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
       bounds: Map[String, List[BoundRef]],
       partial: Map[String, Type],
   ): Option[Type] =
-    // Asked of the *callable* rather than of `null`, which is the same question read the other way
-    // round and is what lets a third kind of held-back argument through. A callable is the one that
-    // wants its parameter's **bound**; everything else held back — a `null`, and an argument whose
-    // own analysis could not be made — wants the parameter itself.
+    // **Asked of the callable rather than of the shapes that are not one**, which is the same
+    // question read the other way round and is what lets a further kind of held-back argument
+    // through without another case. A callable is the one thing here that wants its parameter's
+    // **bound**; everything else held back wants the parameter *itself*, once the other arguments
+    // have settled what it mentions.
+    //
+    // That covers `null`, a leading dot, and an argument whose own analysis could not be made at
+    // all, on one reason: none of them carries a type, so what each needs is what the parameter
+    // turned out to be. `same(Colour.red, .green)` reads its second argument against the `Colour`
+    // the first said, `two(&x, null)` reads its second against `*int`, and `same(n, None)` reads
+    // its second against the `Option[usize]` that `n` said.
     if callableArg(a) then callBound(ptype, tps, bounds, partial)
     else ptype.filterNot(mentions(_, tps -- partial.keySet)).map(resolveType(_, partial))
 
@@ -222,6 +229,14 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
   private def nullArg(a: Expr): Boolean = written(a) match
     case NullLit() => true
     case _         => false
+
+  /** `.red` written as an argument — the other shape with no type of its own, and held back from the
+   * first pass for `null`'s reason: there is nothing in it to unify, and the qualifier it needs is
+   * the parameter type the *other* arguments settle.
+   */
+  private def implicitArg(a: Expr): Boolean = written(a) match
+    case _: ImplicitMember | Call(_: ImplicitMember, _) => true
+    case _                                              => false
 
   /** Whether an expression is one whose type the *context* has to supply (`12 §5`, `§6`).
    *

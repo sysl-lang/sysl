@@ -30,32 +30,13 @@ trait MemberExprAnalysis extends ExprSupport {
       analyzeValueAt(throughModule(f).get, expected)
 
     case Field(Ident(written), f) if lookupOpt(written).isEmpty && typeKey(written).exists(enumDecls.contains) =>
-      val n = typeKey(written).get
-
-      if enumDecls(n).variants.exists(_.name == f) then
-        constructVariant(Modules.qualify(Modules.moduleOf(n), f), Nil, expected, Some(n))
-      else
-        memberDecls.get((n, f)) match
-          case Some(m) if m.isProperty =>
-            err(s"'$f' is a property of '${qn(n)}' — read it on a value, as 'value.$f'")
-          case Some(m) if m.receiver.isDefined =>
-            err(s"'$f' is a method of '${qn(n)}' — call it on a value, as 'value.$f(…)'")
-          case Some(_) => err(s"'$f' is an associated function of '${qn(n)}' — call it with '$written.$f(…)'")
-          case None    => err(s"enum '${qn(n)}' has no variant '$f'")
+      enumMember(typeKey(written).get, written, f, expected)
 
     // A struct name is not a value, so a member selected from it is one of the three that could
     // have been meant rather than a field read — which is what the name would otherwise be reported
     // as, in an undefined-name message naming the type instead of the member.
     case Field(Ident(written), f) if lookupOpt(written).isEmpty && typeKey(written).exists(structDecls.contains) =>
-      val n = typeKey(written).get
-
-      memberDecls.get((n, f)) match
-        case Some(m) if m.isProperty =>
-          err(s"'$f' is a property of '${qn(n)}' — read it on a value, as 'value.$f'")
-        case Some(m) if m.receiver.isDefined =>
-          err(s"'$f' is a method of '${qn(n)}' — call it on a value, as 'value.$f(…)'")
-        case Some(_) => err(s"'$f' is an associated function of '${qn(n)}' — call it with '$written.$f(…)'")
-        case None    => err(s"type '${qn(n)}' has no member '$f' — and '${qn(n)}' is a type, not a value")
+      structMember(typeKey(written).get, written, f)
 
     /** `A.len` — how many types a **pack** stands for (`10 §10`), which is what an unrolled loop
      * counts against. It is a compile-time integer and folds into its use as one, exactly as an
@@ -87,24 +68,7 @@ trait MemberExprAnalysis extends ExprSupport {
     // parentheses are what is missing, and a name that offers nothing is told that it is a type.
     case Field(Ident(written), f)
         if lookupOpt(written).isEmpty && typeKey(written).isEmpty && typeNamed(written).isDefined =>
-      typeNamed(written).get match
-        // Reported rather than raised, because the abstract pass drops an ordinary complaint: this
-        // one is about what a bound licenses, which is exactly what that pass is for.
-        case a: Type.Abstract =>
-          boundAssociated(a, f) match
-            case Some(tr) =>
-              reported(err(s"'$f' is an associated function of '$tr' — call it with '$written.$f()'"))
-            // A property, a method, or nothing a bound licenses at all: the call form's own
-            // complaints, each of which says the right thing about a read as well.
-            case None => callBoundAssociated(a, f, Nil)
-        case concrete =>
-          memberDecls.get((memberKey(concrete, f)._1, f)) match
-            case Some(m) if m.recvMode.isEmpty =>
-              err(s"'$f' is an associated function of '${show(concrete)}' — call it with '$written.$f()'")
-            case Some(_) =>
-              err(s"'$f' is reached on a value of ${show(concrete)}, and '$written' is the type itself")
-            case None =>
-              err(s"'$written' is a type, not a value, and has no associated function '$f'")
+      typeMember(typeNamed(written).get, written, f)
 
     // `T::Attr` — a type attribute read with no argument (`First`, `Last`). `T::Attr(x)` is a
     // `Call` over this node, handled beside the other call forms.
@@ -206,6 +170,140 @@ trait MemberExprAnalysis extends ExprSupport {
             s"so the rest is written: '(*x).$f' reads '$f' off the ${show(tr.ty)} it leaves")
 
         case other => err(s"cannot read field '$f' of ${show(other)}")
+
+  /** `E.name` where `E` is an **enum**: a nullary variant, or the message for whichever member the
+   * name turned out to be.
+   *
+   * It takes the enum's key rather than the name that was written, so the implicit form below —
+   * which has a type in hand and no name at all — resolves through this one rather than through a
+   * copy of it. `written` is only what the message spells the fix with.
+   */
+  protected def enumMember(n: String, written: String, f: String, expected: Option[Type]): TExpr =
+    if enumDecls(n).variants.exists(_.name == f) then
+      constructVariant(Modules.qualify(Modules.moduleOf(n), f), Nil, expected, Some(n))
+    else
+      memberDecls.get((n, f)) match
+        case Some(m) if m.isProperty =>
+          err(s"'$f' is a property of '${qn(n)}' — read it on a value, as 'value.$f'")
+        case Some(m) if m.receiver.isDefined =>
+          err(s"'$f' is a method of '${qn(n)}' — call it on a value, as 'value.$f(…)'")
+        case Some(_) => err(s"'$f' is an associated function of '${qn(n)}' — call it with '$written.$f(…)'")
+        case None    => err(s"enum '${qn(n)}' has no variant '$f'")
+
+  /** `S.name` where `S` is a **struct**. A struct name is not a value, so a member selected from it
+   * is one of the three that could have been meant rather than a field read — which is what the
+   * name would otherwise be reported as, in an undefined-name message naming the type instead of
+   * the member.
+   */
+  protected def structMember(n: String, written: String, f: String): Nothing =
+    memberDecls.get((n, f)) match
+      case Some(m) if m.isProperty =>
+        err(s"'$f' is a property of '${qn(n)}' — read it on a value, as 'value.$f'")
+      case Some(m) if m.receiver.isDefined =>
+        err(s"'$f' is a method of '${qn(n)}' — call it on a value, as 'value.$f(…)'")
+      case Some(_) => err(s"'$f' is an associated function of '${qn(n)}' — call it with '$written.$f(…)'")
+      case None    => err(s"type '${qn(n)}' has no member '$f' — and '${qn(n)}' is a type, not a value")
+
+  /** A type in the position a value would be read from, where the type is not one of the
+   * declaration tables: a type parameter, the `Self` a member's body is analyzed under, or a
+   * built-in an `impl` was written for. What a type offers under its own name is an associated
+   * function and nothing else — a property and a method are read on a value — so the parentheses
+   * are what is missing, and a name that offers nothing is told that it is a type.
+   */
+  protected def typeMember(ty: Type, written: String, f: String): TExpr = ty match
+    // Reported rather than raised, because the abstract pass drops an ordinary complaint: this
+    // one is about what a bound licenses, which is exactly what that pass is for.
+    case a: Type.Abstract =>
+      boundAssociated(a, f) match
+        case Some(tr) =>
+          reported(err(s"'$f' is an associated function of '$tr' — call it with '$written.$f()'"))
+        // A property, a method, or nothing a bound licenses at all: the call form's own
+        // complaints, each of which says the right thing about a read as well.
+        case None => callBoundAssociated(a, f, Nil)
+    case concrete =>
+      memberDecls.get((memberKey(concrete, f)._1, f)) match
+        case Some(m) if m.recvMode.isEmpty =>
+          err(s"'$f' is an associated function of '${show(concrete)}' — call it with '$written.$f()'")
+        case Some(_) =>
+          err(s"'$f' is reached on a value of ${show(concrete)}, and '$written' is the type itself")
+        case None =>
+          err(s"'$written' is a type, not a value, and has no associated function '$f'")
+
+  /** `.red` — a member of the type the context expects, with that type's name left off
+   * (`reference/expressions.md § Implicit member`).
+   *
+   * **The expectation supplies the qualifier and nothing else changes**, which is why this is four
+   * lines rather than a resolution of its own: what `.red` reaches is exactly what `Colour.red`
+   * reaches, so each arm hands the same method the qualified form does the key it read off the
+   * type. A variant, an enum's `try` and an associated function are therefore reached, and a
+   * property and a method stay refused in the words they already had.
+   */
+  protected def implicitMember(f: String, expected: Option[Type]): TExpr =
+    implicitOwner(f, expected) match
+      case e: Type.Enum        => enumMember(e.base, Modules.bare(e.base), f, expected)
+      case s: Type.Struct      => structMember(s.base, Modules.bare(s.base), f)
+      case c: Type.Constrained => constrainedMember(c.name, Modules.bare(c.name), f)
+      case t                   => typeMember(t, show(t), f)
+
+  /** `.make(2)` — the same form with arguments, which is a `Call` over the node the way
+   * `Type.make(2)` is a `Call` over a `Field`.
+   */
+  protected def implicitCall(f: String, args: List[Expr], expected: Option[Type]): TExpr =
+    implicitOwner(f, expected) match
+      case e: Type.Enum =>
+        if f == "try" then enumTry(e.base, args)
+        else if enumDecls(e.base).variants.exists(_.name == f) then
+          constructVariant(Modules.qualify(Modules.moduleOf(e.base), f), args, expected, Some(e.base))
+        else if memberDecls.contains((e.base, f)) then callAssociated(e.base, f, args, expected)
+        else err(s"enum '${qn(e.base)}' has no variant or associated function '$f'")
+
+      case s: Type.Struct => callAssociated(s.base, f, args, expected)
+
+      // A constrained subtype is a name a call reaches, so an `impl` for one may carry an associated
+      // function exactly as a struct's may. Everything else selected from the name is one of the
+      // mistakes `constrainedMember` has words for.
+      case c: Type.Constrained =>
+        if memberDecls.get((c.name, f)).exists(_.recvMode.isEmpty) then callAssociated(c.name, f, args, expected)
+        else constrainedMember(c.name, Modules.bare(c.name), f)
+
+      case t => callTypeAssociated(t, show(t), f, args, expected)
+
+  /** The type an implicit member resolves against: what the context expects, **as written**.
+   *
+   * **Deliberately not `Type.repr`, which is what every other reading of an expectation uses.** A
+   * transparent constrained subtype is interchangeable with its base for every question about the
+   * *value*, and this is not one of those: it is a question about which declaration a name is
+   * looked up in, and stripping to the base throws away the only declaration that has members —
+   * `int` is what an `Age` reduces to, and `int` is not where `Age`'s associated functions are
+   * filed. A qualifier is stripped, since `volatile Colour` and `Colour` name one type.
+   *
+   * **The two refusals are what the form costs, and each says which.** A position expecting nothing
+   * has no qualifier to supply, and that is the ordinary mistake — a discarded statement, an
+   * unannotated `var`, an argument of a generic parameter nothing has solved yet. A **trait object**
+   * reaches here with no expectation at all rather than with its own type, since what may be erased
+   * into one is whatever implements the trait: the message names that case separately, because
+   * "nothing expects a type here" is false where a reader can see one written.
+   */
+  private def implicitOwner(f: String, expected: Option[Type]): Type = expected.map(unqualified) match
+    case Some(t) => t
+    case None =>
+      err(s"'.$f' is a member of whatever type the context expects, and nothing here expects one — " +
+        s"write the type's own name in front of the dot. A trait object expects no single type " +
+        "either, since what may be erased into one is whatever implements the trait")
+
+  /** An expectation with a **mode qualifier** taken off, which is the one thing `repr` strips that
+   * this form wants stripped: how storage is reached says nothing about which type it holds.
+   *
+   * A `weak T` is stripped as well, and that one is about the **message** rather than about
+   * reaching the member. What a weak reference expects is a value something else is keeping alive,
+   * so a freshly built one is refused either way — and the refusal worth getting is the one the
+   * bare spelling gets, which says that nothing here holds the value, rather than a complaint that
+   * `weak Colour` has no associated function of that name.
+   */
+  private def unqualified(t: Type): Type = t match
+    case Type.Volatile(inner) => unqualified(inner)
+    case Type.Weak(inner)     => unqualified(inner)
+    case other                => other
 
   /** `T::Attr` — an attribute of a type rather than of a value (`16`).
    *

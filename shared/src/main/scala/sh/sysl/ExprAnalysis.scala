@@ -984,6 +984,10 @@ trait ExprAnalysis
     case Call(callee, args) if throughModule(callee).isDefined =>
       analyzeValueAt(Call(throughModule(callee).get, args).setPos(expr.pos), expected)
 
+    // `.Circle(5)`, `.make(2)` — the forms below with the type's own name left off, resolved
+    // against what the context expects (`reference/expressions.md § Implicit member`).
+    case Call(ImplicitMember(f), args) => implicitCall(f, args, expected)
+
     // Reached through the enum name: `Color.try(n)` is the fallible constructor; otherwise a
     // data-carrying variant `Shape.Circle(5)`, the qualified form of the bare `Circle(5)`, or an
     // associated function the enum declares, which resolves exactly as a struct's does.
@@ -1143,6 +1147,11 @@ trait ExprAnalysis
 
     case e: Field    => fieldExpr(e, expected)
     case e: TypeAttr => typeAttrExpr(e)
+
+    // `.red` — the same selection with the type's own name left off, taken from what the context
+    // expects (`reference/expressions.md § Implicit member`). The call form is up with the other
+    // call arms, since a call is matched before its callee is looked at.
+    case ImplicitMember(f) => implicitMember(f, expected)
     // Building a sequence and reaching into one, which share the question of how many elements
     // there are and whether this index is one of them. `CollectionExprAnalysis`.
     case e @ (_: ArrayLit | _: ArrayFill | _: Index) => sequenceExpr(e, expected)
