@@ -240,6 +240,27 @@ object Std {
    */
   def fingerprint(os: Os): String = LibraryArtifact.fingerprint(files(os))
 
+  /** The same hash, over a **named** root rather than over the one this object resolved.
+   *
+   * `build-lib --std` compiles the tree it was pointed at, which need not be the tree a compilation
+   * on this machine would resolve — [[candidates]] tries the installed library before the working
+   * directory, so an installed sysl run inside a checkout resolves the installed one while being
+   * handed the checkout's. Naming the artifact with [[fingerprint]] there put the bytes of one
+   * library under the key of another, which is precisely what the key exists to prevent.
+   *
+   * **It agrees with [[fingerprint]] by construction where the root is the same**, and that is a
+   * property of the hash rather than a thing to keep in step:
+   * [[LibraryArtifact.fingerprint]] reduces each file to its `place` and its text and **sorts by
+   * `place` itself**, so neither the order the files arrive in nor the renaming [[named]] applies
+   * can reach it. Nothing here has to reproduce `collect`'s bookkeeping to get the same answer.
+   *
+   * Read off the **directory** rather than off whatever a caller had already collected: `build-lib`
+   * strips a library's `@tests` files before analysis, and the standard module's fingerprint is over
+   * its files including them.
+   */
+  def fingerprintOf(dir: String, os: Os): String =
+    LibraryArtifact.fingerprint(Project.collect(dir, Some(os)) ::: Project.cSources(dir, Some(os)))
+
   /** Every file the library is made of, which is what the fingerprint is over: its sysl and its C.
    *
    * **It has a name of its own so that nobody has to remember the `:::`.** This fingerprint is

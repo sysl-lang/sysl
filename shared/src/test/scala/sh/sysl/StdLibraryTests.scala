@@ -30,7 +30,7 @@ object StdRoot {
  * resolution that goes wrong leaves a compiler that cannot compile anything at all, and has to say
  * so well enough to be fixed.
  */
-class StdLibraryTests extends AnyFreeSpec with Matchers {
+class StdLibraryTests extends AnyFreeSpec with Matchers with TreeSupport {
 
   /** A file's place in the library: the module directories it sits under, then its own name. The
    * one thing that is true of a file wherever the library was found, which is what lets two readings
@@ -256,6 +256,59 @@ class StdLibraryTests extends AnyFreeSpec with Matchers {
       finally discardTree(copy)
     }
 
+    /** `Std.fingerprintOf` is the same hash read off a **named** root, and `build-lib --std` names
+     * the tree it was pointed at with it rather than with `Std.fingerprint` — which is the tree this
+     * machine *resolves*, and need not be the same one at all.
+     *
+     * **That the two agree on one tree is the whole of what makes re-keying safe**, and it is a
+     * property of the hash rather than something two call sites keep in step: `fingerprint` reduces
+     * each file to its `place` and its text and sorts by `place` itself, so neither the order the
+     * files arrive in nor the renaming `Std.collect` applies can reach it.
+     */
+    "and the same hash read off a named root agrees with it" in {
+      assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
+
+      val copy = createTempDirectory("sysl-lib-named-")
+
+      try
+        copyTree(StdRoot.root.get, copy)
+        Std.fingerprintOf(copy, Target.default.os) shouldBe Std.fingerprint(Target.default.os)
+      finally discardTree(copy)
+    }
+
+    /** The other half, and the defect it closes: a tree that is *not* the resolved library must key
+     * an artifact of its own. Before this, `build-lib --std` in a checkout with an installed sysl
+     * wrote the checkout's library under the installed library's key — invisible while the compiled
+     * tree was a superset of the resolved one, an undefined symbol or silently the wrong
+     * implementation the day it was not.
+     */
+    "so a different tree keys a different artifact" in {
+      assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
+
+      val copy = createTempDirectory("sysl-lib-other-")
+
+      try
+        copyTree(StdRoot.root.get, copy)
+        writeFile(s"$copy/sysl/marker.sysl", "module sysl\n\nprivate[sysl] a_marker() -> int = 1\n")
+
+        val theirs = Std.fingerprintOf(copy, Target.default.os)
+
+        theirs should not be Std.fingerprint(Target.default.os)
+
+        LibraryArtifact.stdDefault(Target.default, Allocator.c, Some(theirs)) should not be
+          LibraryArtifact.stdDefault(Target.default, Allocator.c)
+      finally discardTree(copy)
+    }
+
+    // And naming nothing is the compilation's own question, unchanged: it asks about the library it
+    // resolved, which is what every consumer of the artifact does.
+    "while naming no root at all is still the resolved library's key" in {
+      assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
+
+      LibraryArtifact.stdDefault(Target.default, Allocator.c) shouldBe
+        LibraryArtifact.stdDefault(Target.default, Allocator.c, Some(Std.fingerprint(Target.default.os)))
+    }
+
     "while an edit to it does, so a changed library cannot take a stale artifact" in {
       // The other half, and the reason editing the library is now something anybody can do: the
       // artifact's path holds this fingerprint, so a changed file *is* a different path. Nothing has
@@ -303,20 +356,4 @@ class StdLibraryTests extends AnyFreeSpec with Matchers {
       named.mkString(".") should not be p.module.map(_.show).get
   }
 
-  /** A directory copied whole, so that the library can be read from somewhere it was never built. */
-  private def copyTree(from: String, to: String): Unit =
-    for entry <- listFiles(from) do
-      val there = s"$to/${Project.basename(entry)}"
-
-      if isDirectory(entry) then
-        createDirectory(there)
-        copyTree(entry, there)
-      else copyFile(entry, there)
-
-  private def discardTree(path: String): Unit = {
-    for entry <- listFiles(path) do
-      if isDirectory(entry) then discardTree(entry) else Project.discard(entry)
-
-    Project.discard(path)
-  }
 }

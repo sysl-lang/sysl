@@ -630,6 +630,49 @@ class LibraryBuildCliTests extends LibraryCliSupport {
       deleteFile(out)
     }
 
+    /** **Building a tree that is not the one this machine resolves is allowed, and says so.**
+     * `Std.candidates` tries the installed library before the working directory, so an installed
+     * sysl run inside a checkout resolves the installed library while being handed the checkout's —
+     * and the artifact it writes is keyed to the tree it compiled, which nothing here will read.
+     *
+     * Reported rather than refused: the command is mostly run as a type-check of a library being
+     * worked on, and a refusal would stop it doing the one thing it was wanted for.
+     */
+    "says so when the tree given is not the library a compilation here resolves" in {
+      assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
+
+      val copy = createTempDirectory("sysl-cli-other-")
+      val out  = createTempFile("sysl-cli-std-", LibraryArtifact.extension)
+
+      try
+        copyTree(StdRoot.root.get, copy)
+        writeFile(s"$copy/sysl/marker.sysl", "module sysl\n\nprivate[sysl] a_marker() -> int = 1\n")
+
+        val (status, notes) = diagnostics(Config(command = "build-lib", file = copy, output = Some(out), std = true))
+
+        withClue(notes)(status shouldBe 0)
+        notes should include("not the library a compilation here resolves")
+        notes should include(StdRoot.root.get)
+      finally
+        discardTree(copy)
+        deleteFile(out)
+    }
+
+    // And the ordinary case says nothing, which is the half that keeps the note worth reading.
+    "and says nothing when it is" in {
+      assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
+
+      val out = createTempFile("sysl-cli-std-", LibraryArtifact.extension)
+
+      val (status, notes) =
+        diagnostics(Config(command = "build-lib", file = StdRoot.root.get, output = Some(out), std = true))
+
+      withClue(notes)(status shouldBe 0)
+      notes should not include "not the library a compilation here resolves"
+
+      deleteFile(out)
+    }
+
     "refuses to build the standard module against a prebuilt copy of itself" in {
       assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
 

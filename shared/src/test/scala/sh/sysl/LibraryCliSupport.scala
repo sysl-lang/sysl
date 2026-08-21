@@ -14,7 +14,7 @@ import org.scalatest.matchers.should.Matchers
  * and the other about **which one a compilation is given** (`LibraryCliTests`), and neither can be
  * written without being able to build one and read what came out.
  */
-trait LibraryCliSupport extends AnyFreeSpec with Matchers {
+trait LibraryCliSupport extends AnyFreeSpec with Matchers with TreeSupport {
 
   /** The driver, under a name of its own: `Suite` has an `execute` too, and it is the one that wins
    * unqualified.

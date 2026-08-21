@@ -298,10 +298,34 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
       // named after the root it was built from and written inside it, which is the same rule a
       // build's executable follows and for the same reason: the root is the one place that names
       // the library without depending on where the caller happened to be standing.
+      // **The key names the library that was COMPILED, which is not always the one this machine
+      // would resolve.** `Std.candidates` tries the installed library before the working directory,
+      // so an installed sysl run in a checkout resolves the installed one while being handed the
+      // checkout's — and naming the artifact with `Std.fingerprint` put one library's bytes under
+      // the other's key. Invisible while the compiled tree is a superset of the resolved one, which
+      // is what an ordinary afternoon's editing makes it; an undefined symbol, or silently the wrong
+      // implementation, the day it is not.
+      val mine = Option.when(cfg.std)(Std.fingerprintOf(cfg.file, target.os))
+
       val out =
         cfg.output.getOrElse(
-          if cfg.std then cfg.stdSearch.getOrElse(LibraryArtifact.stdDefault(target, allocator))
+          if cfg.std then cfg.stdSearch.getOrElse(LibraryArtifact.stdDefault(target, allocator, mine))
           else defaultOutput(cfg.file, named, LibraryArtifact.extension))
+
+      // **And say so where the two disagree**, because the command still did what it was asked and
+      // the artifact still will not be read. The fast loop in a worktree is exactly this case: the
+      // type-check is the point of the run and it happened, while the file it wrote is keyed to a
+      // library no compilation here resolves. Reported rather than refused — a refusal would stop
+      // the type-check, which is the thing the command is mostly run for.
+      for
+        fp   <- mine
+        root <- Std.root.toOption
+        if fp != Std.fingerprintOf(root, target.os)
+      do
+        Console.err.println(
+          s"note: this is not the library a compilation here resolves — that one is at $root, and " +
+            s"this artifact is keyed to ${cfg.file}, so nothing will read it. Set SYSL_LIB to " +
+            "this tree, or pass -o, if it was meant to be used rather than only checked.")
 
       Project.parentOf(out).foreach(createDirectories)
 

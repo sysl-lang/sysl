@@ -215,11 +215,19 @@ object LibraryArtifact {
    * different artifacts — and `read` refuses the wrong one, which without a key of its own is the
    * rebuild-and-overwrite loop above rather than a diagnostic. It costs nothing to add: the key
    * already names the compiler version, so every entry is new in the release this ships in.
+   *
+   * **`fingerprint` is what the caller COMPILED, and it is not the same question as what the caller
+   * RESOLVED.** A compilation names the library it found and leaves this empty, which asks `Std`;
+   * `build-lib --std` names the tree it was pointed at, which need not be that library at all. They
+   * were one call before, so `build-lib` in a checkout with an installed sysl wrote the checkout's
+   * library under the installed library's key — the one thing a fingerprint in a cache key exists to
+   * stop.
    */
-  def stdDefault(target: Target, allocator: Allocator = Allocator.c): String =
+  def stdDefault(target: Target, allocator: Allocator = Allocator.c,
+                 fingerprint: Option[String] = None): String =
     cacheDirectory
-      .map(c => s"$c/sysl/${BuildInfo.version}-${Std.fingerprint(target.os)}-${target.name}" +
-        s"-${allocator.alloc}-${allocator.free}/std$extension")
+      .map(c => s"$c/sysl/${BuildInfo.version}-${fingerprint.getOrElse(Std.fingerprint(target.os))}" +
+        s"-${target.name}-${allocator.alloc}-${allocator.free}/std$extension")
       .getOrElse(stdLocal)
 
   /** The project-local artifact path, which is what `stdDefault` was before it moved to the cache and
