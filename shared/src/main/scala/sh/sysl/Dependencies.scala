@@ -24,6 +24,20 @@ case class Version(major: Int, minor: Int, patch: Int) extends Ordered[Version] 
 
 object Version {
 
+  /** **The compiler's own version**, which is the one version in the system that may carry a suffix.
+   *
+   * An interim is stamped `0.0.66-fcf4e33a` — the next patch, plus the commit it was built from — so
+   * `parse` refuses it, correctly: nothing may *depend* on an interim, since nobody else can install
+   * one. What a comparison against a package's floor wants is the numbers, and an interim satisfies
+   * whatever they reach: `0.0.66-fcf4e33a` is dev heading for 0.0.66 and has everything 0.0.65
+   * shipped. Cargo makes the same ruling for a nightly toolchain against `rust-version`.
+   *
+   * Nothing is refused here. A version the compiler cannot read is its own, so the answer is to make
+   * no claim about it rather than to fail a build over it — `checkFloor` is then never the thing that
+   * stops anybody.
+   */
+  def ofCompiler(text: String): Option[Version] = parse(text.takeWhile(_ != '-')).toOption
+
   def parse(text: String): Either[String, Version] = {
     val parts = text.split("\\.", -1)
 

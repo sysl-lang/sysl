@@ -107,7 +107,41 @@ object Resolve {
       packages   <- materialize(settled)
       tables     <- collect(packages)(p => tableOf(owner(p), List(p.root), p.config.dependencies, settled)
                       .map(t => p.copy(imports = t)))
+      _          <- checkFloors(tables)
     yield Graph(ResolvedPackage("", root, config, rootTable) :: tables, settled.sums, settled.changed)
+
+  /** Every dependency's stated floor against the compiler in hand (`packages.md § 1`).
+   *
+   * **This is the whole point of the field**, and it is why the check is here rather than left to
+   * whatever fails later: a package using something the language grew fails somewhere *inside*
+   * itself, with a diagnostic pointing at a line in a tree the consumer did not write and nothing to
+   * say the compiler is what is wrong. The manifest is what turns that into one sentence naming the
+   * package, the floor and the compiler.
+   *
+   * The **root** is not checked here — `readPackageConfig` does it, which is the funnel every
+   * command's own config comes through, and checking it twice would report it twice.
+   *
+   * A version this compiler cannot read as three numbers is its own, and the answer to that is to
+   * make no claim rather than to refuse a build over it.
+   */
+  private def checkFloors(packages: List[ResolvedPackage]): Either[String, Unit] =
+    Version.ofCompiler(BuildInfo.version) match
+      case None => Right(())
+      case Some(compiler) =>
+        collect(packages)(p => p.config.checkFloor(named(p), compiler)).map(_ => ())
+
+  /** A package as the person who has to act on the message thinks of it — the name it calls itself
+   * and the tag they wrote, rather than the dotted canonical form the resolver keys on.
+   *
+   * `owner` is the other spelling and stays where it is: it labels a *manifest* being read, where
+   * the coordinate is the thing being quoted back. This labels a package being refused, where what
+   * a reader needs is what to go and look at.
+   */
+  private def named(p: ResolvedPackage): String = {
+    val name = p.config.name.getOrElse(p.canonical)
+
+    p.version.map(v => s"package $name ${v.tag}").getOrElse(s"package $name")
+  }
 
   private def owner(p: ResolvedPackage): String =
     p.version.map(v => s"${p.canonical} ${v.tag}").getOrElse(p.canonical)

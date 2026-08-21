@@ -176,6 +176,15 @@ private def readPackageConfig(file: String): Either[String, PackageConfig] = {
 
   if !isFile(path) then Right(PackageConfig.empty)
   else
-    try PackageConfig.read(readFile(path))
+    try
+      for
+        config <- PackageConfig.read(readFile(path))
+        // Checked here because this is the one funnel every command's root config comes through, so
+        // `build`, `run`, `test`, `build-c` and `build-lib` are all held to the floor by one line. A
+        // dependency's floor is checked where its manifest is read, in `Resolve.graph`.
+        _ <- Version.ofCompiler(BuildInfo.version)
+               .map(config.checkFloor("this project", _))
+               .getOrElse(Right(()))
+      yield config
     catch case e: Exception => Left(s"cannot read $path: ${e.getMessage}")
 }

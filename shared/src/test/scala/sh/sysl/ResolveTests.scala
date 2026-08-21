@@ -351,6 +351,41 @@ class ResolveTests extends PackageCacheSupport {
     graph.sumsChanged shouldBe false
   }
 
+  /** `package.sysl` at a **dependency**, which is the case the field exists for: a package using
+   * something the language grew otherwise fails somewhere inside itself, with a diagnostic pointing
+   * at a line in a tree the consumer did not write.
+   */
+  "a dependency states the oldest compiler it builds with" - {
+
+    "and one too new for the compiler in hand is refused by name" in {
+      val cache = emptyCache()
+
+      published(cache, "github.com/e/future", Version(1, 0, 0),
+        """package { name = "future", version = "1.0.0", sysl = "99.0.0" }
+          |""".stripMargin,
+        "future/future.sysl" -> "module future\n")
+
+      val root = project(manifest("app", "0.1.0", dep("f", "github.com/e/future", "1.0.0")))
+      val e    = resolveRefused(root, cache)
+
+      e should include("package future v1.0.0 cannot be built because it requires sysl 99.0.0")
+      e should include("while the compiler in hand is")
+    }
+
+    "and one this compiler satisfies is nothing at all" in {
+      val cache = emptyCache()
+
+      published(cache, "github.com/e/past", Version(1, 0, 0),
+        """package { name = "past", version = "1.0.0", sysl = "0.0.1" }
+          |""".stripMargin,
+        "past/past.sysl" -> "module past\n")
+
+      val root = project(manifest("app", "0.1.0", dep("p", "github.com/e/past", "1.0.0")))
+
+      selected(resolve(root, cache)) shouldBe Map("github.com.e.past" -> "1.0.0")
+    }
+  }
+
   // The one path that reaches `git`, pointed at a host that cannot exist: `.invalid` is reserved by
   // RFC 2606 precisely so that it never resolves, which makes this a refusal rather than a network
   // round trip — a unit suite should not be able to tell whether the machine is online.

@@ -176,6 +176,27 @@ class PackageConfigCliTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  /** The root project's own floor, at the seam. `ResolveTests` covers a **dependency**'s, which is
+   * the case the field exists for; this is the one that proves the driver asks at all — every
+   * command's config comes through one funnel, and nothing else here would notice if it stopped
+   * looking.
+   */
+  "a project stating a compiler newer than the one in hand is refused" in {
+    project("main()\n    print(1)\n", Some("package { name = \"app\", sysl = \"99.0.0\" }\n")) { dir =>
+      val (code, said) = stderrOf(cli(Config(command = "build", file = dir, output = Some(s"$dir/out"))))
+
+      code should not be 0
+      said should include("this project cannot be built because it requires sysl 99.0.0 or newer")
+      said should include("while the compiler in hand is")
+    }
+  }
+
+  "and one this compiler satisfies says nothing at all" in {
+    project("main()\n    print(1)\n", Some("package { name = \"app\", sysl = \"0.0.1\" }\n")) { dir =>
+      cli(Config(command = "build", file = dir, output = Some(s"$dir/out"))) shouldBe 0
+    }
+  }
+
   "a name that is not a capability is refused rather than ignored" in {
     project(
       "main()\n    print(1)\n",

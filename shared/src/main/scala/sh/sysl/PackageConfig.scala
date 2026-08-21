@@ -98,7 +98,36 @@ case class PackageConfig(
     dependencies: List[Dependency] = Nil,
     allocator: Option[Allocator] = None,
     defines: Map[String, List[String]] = Map.empty,
+    sysl: Option[Version] = None,
 ) {
+
+  /** Refuses to build where the compiler in hand is older than the floor this manifest states
+   * (`packages.md § 1`).
+   *
+   * **The whole of what the field buys is this sentence.** A package that uses something the language
+   * grew builds or does not depending on what the consumer happens to have installed, and when it
+   * does not, the diagnostic points at a line inside somebody else's package with nothing to say the
+   * compiler is the problem. `sdl3` v0.2.6 is the live example: it writes a bare `None` as a method
+   * default, which needs 0.0.62, and a 0.0.61 consumer gets a type-inference error inside
+   * `video.sysl`.
+   *
+   * `who` is what the reader has to act on — a package's name and version, or the project itself —
+   * because the manifest at fault is usually not one they wrote.
+   *
+   * **An interim compiler satisfies the floor its numbers reach**, which is why the comparison is
+   * against `Version.ofCompiler`: `0.0.66-fcf4e33a` is dev heading for 0.0.66 and has everything
+   * 0.0.65 shipped. Cargo makes the same ruling for a nightly toolchain against `rust-version`.
+   *
+   * **An older compiler cannot report this at all**, and nothing here can change that: it does not
+   * know the key, so it reads the manifest, ignores the field, and fails wherever it was going to
+   * fail. The field starts paying from the release that understands it, exactly as `rust-version`
+   * did.
+   */
+  def checkFloor(who: String, compiler: Version): Either[String, Unit] = sysl match
+    case Some(floor) if compiler < floor =>
+      Left(s"$who cannot be built because it requires sysl $floor or newer, while the compiler in " +
+        s"hand is $compiler")
+    case _ => Right(())
 
   /** The macros one carried C file is compiled with, as clang spells them, or nothing.
    *
@@ -207,6 +236,7 @@ object PackageConfig {
       for
         pkg     <- block(root, "package")
         _       <- checkName(pkg.flatMap(string(_, "name")))
+        floor   <- readFloor(pkg)
         targets <- readTargets(root)
         project <- readCapabilityFlags(block2(root, "capabilities"), "capabilities")
         needed  <- readCapabilityFlags(capabilitiesOf(block2(root, "requires")), "requires")
@@ -219,6 +249,7 @@ object PackageConfig {
       yield PackageConfig(
         name = pkg.flatMap(string(_, "name")),
         version = pkg.flatMap(string(_, "version")),
+        sysl = floor,
         defaultTarget = block2(root, "targets").flatMap(string(_, "default")),
         targets = targets,
         capabilities = project.toMap,
@@ -264,6 +295,23 @@ object PackageConfig {
    * for the same reason: each is a legal segment that names a directory rather than a file, so the
    * link would fail at the far end with a message about a path rather than about this line.
    */
+  /** `package.sysl` — the oldest compiler this package is known to build with (`packages.md § 1`).
+   *
+   * It is a **floor** rather than a range, and it is three numbers like every other version here, so
+   * `Version.parse` is what reads it and a pre-release spelling is refused along with everything else
+   * that is not a version. That is the right refusal: what a package states is the release it needs,
+   * and an interim is not something anybody else can install.
+   *
+   * The message names the field, because the version is a string in a file rather than something the
+   * reader can see the shape of from the surrounding line.
+   */
+  private def readFloor(pkg: Option[ConfigObject]): Either[String, Option[Version]] =
+    pkg.flatMap(string(_, "sysl")) match
+      case None => Right(None)
+      case Some(text) =>
+        Version.parse(text).left.map(e => s"$FileName: 'package.sysl' names the oldest compiler " +
+          s"this package builds with, and $e").map(Some(_))
+
   private def checkName(name: Option[String]): Either[String, Unit] = name match
     case None => Right(())
     case Some(n) =>

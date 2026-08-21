@@ -77,6 +77,74 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  /** `package.sysl` — the oldest compiler this package is known to build with.
+   *
+   * The whole of what it buys is one sentence at the top of a build instead of a type error inside
+   * somebody else's package. So the tests are the field's own spelling, and the sentence.
+   */
+  "the compiler floor" - {
+
+    "a package may state one" in {
+      read("package { name = \"sdl3\"\n version = \"0.2.6\"\n sysl = \"0.0.62\" }").sysl shouldBe
+        Some(Version(0, 0, 62))
+    }
+
+    "and saying nothing is the ordinary case" in {
+      read("package { name = \"sdl3\" }").sysl shouldBe None
+    }
+
+    // It is a version like every other version here, so `Version.parse` is what reads it — which
+    // refuses a range, a pre-release and a two-part number for free. The message names the field,
+    // since a string in a file has no shape a reader can see from the line around it.
+    "something that is not a version is refused, and the field is named" in {
+      val e = refused("package { sysl = \">= 0.0.62\" }")
+
+      e should include("'package.sysl'")
+      e should include("is not a version")
+    }
+
+    "an interim spelling is refused too — a package states a release" in {
+      refused("package { sysl = \"0.0.66-fcf4e33a\" }") should include("is not a version")
+    }
+
+    "an older compiler is refused, naming the package, the floor and what is in hand" in {
+      val c = read("package { sysl = \"0.0.62\" }")
+
+      c.checkFloor("github.com/sysl-lang/sdl3 v0.2.6", Version(0, 0, 61)) shouldBe
+        Left("github.com/sysl-lang/sdl3 v0.2.6 cannot be built because it requires sysl 0.0.62 or " +
+          "newer, while the compiler in hand is 0.0.61")
+    }
+
+    "the floor itself is old enough, and so is anything above it" in {
+      val c = read("package { sysl = \"0.0.62\" }")
+
+      c.checkFloor("this project", Version(0, 0, 62)) shouldBe Right(())
+      c.checkFloor("this project", Version(0, 1, 0)) shouldBe Right(())
+      c.checkFloor("this project", Version(1, 0, 0)) shouldBe Right(())
+    }
+
+    "a package that states nothing is never refused" in {
+      PackageConfig.empty.checkFloor("this project", Version(0, 0, 1)) shouldBe Right(())
+    }
+
+    // An interim is stamped `<next patch>-<sha>`, which `Version.parse` refuses and which a
+    // comparison still has to answer. It satisfies whatever its numbers reach, which is Cargo's
+    // ruling for a nightly toolchain against `rust-version`.
+    "an interim compiler is read as the numbers it carries" in {
+      Version.ofCompiler("0.0.66-fcf4e33a") shouldBe Some(Version(0, 0, 66))
+      Version.ofCompiler("0.0.65") shouldBe Some(Version(0, 0, 65))
+
+      read("package { sysl = \"0.0.65\" }")
+        .checkFloor("this project", Version.ofCompiler("0.0.66-fcf4e33a").get) shouldBe Right(())
+    }
+
+    // Nothing here may be the thing that stops a build: a version the compiler cannot read is its
+    // own, and making no claim is the only honest answer to that.
+    "a compiler version that will not read makes no claim" in {
+      Version.ofCompiler("dirty") shouldBe None
+    }
+  }
+
   "targets" - {
 
     "'default' names one rather than being one" in {
