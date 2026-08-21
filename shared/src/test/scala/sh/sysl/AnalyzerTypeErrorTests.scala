@@ -80,9 +80,13 @@ class AnalyzerTypeErrorTests extends AnyFreeSpec with CodegenSupport {
         include("%struct.A = type { %struct.B }")
     }
 
-    "'&' needs something with an address" in {
-      err("print(*(&(1 + 2)))") should include("needs a variable, a field, an element, or a dereference")
-      err("f() -> int = 1\nvar p = &f()") should include("needs a variable, a field, an element, or a dereference")
+    // `&(1 + 2)` and `&f()` were here until `&` in front of something *computed* began making
+    // storage for it; both are `AmpConstructionTests` now. What is left is the half that still needs
+    // an address — a **name**, which asks about that thing rather than for a slot to copy it into.
+    "'&' needs something with an address, where what was written is a name" in {
+      err("const cap: int = 8\nvar p = &cap") should
+        include("needs a variable, a field, an element, or a dereference")
+      err("val v = 3\nvar p = &v") should include("written once")
     }
 
     "'*' needs a pointer or a reference" in {

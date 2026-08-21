@@ -17,7 +17,7 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
           |        self.n += 1
           |var c = C(0)
           |c.bump()""".stripMargin
-      ) should include("'&self' needs a reference")
+      ) should include("'&self' needs a counted reference")
     }
 
     "a property is read without parentheses" in {
@@ -228,7 +228,7 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
           |    code(&self) -> int = 1
           |var c = Red
           |print(c.code())""".stripMargin
-      ) should include("'&self' needs a reference")
+      ) should include("'&self' needs a counted reference")
     }
 
     // Reached through the type name rather than a value: an instance member is not a variant, and
