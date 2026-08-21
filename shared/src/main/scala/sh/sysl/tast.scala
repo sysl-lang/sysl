@@ -251,6 +251,16 @@ case class TDeref(operand: TExpr, ty: Type) extends TExpr
 /** `&place` — the address of a place, as a raw pointer. */
 case class TAddrOf(place: TExpr, ty: Type) extends TExpr
 
+/** `&value` where the value has no address of its own — a construction, a call result, an
+ * arithmetic result, a literal.
+ *
+ * The storage is a **hidden local of the scope the `&` was written in**: a slot is laid down, the
+ * value is written into it with a count taken exactly as a `var`'s initializer takes one, and it is
+ * released where that scope ends. So `&Rect(2)` is `var t = Rect(2)` with the name left out, and the
+ * pointer it yields is as good — and as unchecked (`03`) — as one taken of any local.
+ */
+case class TTempAddr(value: TExpr, ty: Type) extends TExpr
+
 /** `place = value` — stores and yields the assigned value. The place is a `TLoad`, a `TDeref`,
  * or a `TField` chain over one of those; codegen computes its address rather than its value.
  */

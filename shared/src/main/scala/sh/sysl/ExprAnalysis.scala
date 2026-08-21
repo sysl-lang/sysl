@@ -128,6 +128,21 @@ trait ExprAnalysis
     // may already be past being able to supply.
     case Some(want) if converts(want) && branching(expr) => analyzeValue(expr, Some(want))
 
+    // **The `&` in a type and the `&` in front of a value are different things**, and this is the
+    // one place both are written at once. `&T` is a counted box, which owns what is in it; the
+    // operator takes an address, which owns nothing. So an address is not a way of making a box —
+    // and the box needs no operator at all, since the arms below put the value in one wherever it
+    // stands. Said here rather than left to the mismatch, because that reports two spellings of `&`
+    // at somebody who has just written the other one on purpose.
+    //
+    // It sits **above** the trait-object arm because `&Shape` is both — a counted box and erased —
+    // and the arm that catches it first is the one that answers. A `*Shape` is erased and is not a
+    // box, which is why the guard asks for the box rather than for erasure.
+    case Some(r: Type.Ref) if addressOf(expr) =>
+      err(s"'&' in front of a value takes its address, and the '&' in ${show(r)} is a counted box " +
+        "— the two are different things, and an address is not a way of making a box. Drop the " +
+        s"operator: a value read into a ${show(r)} is put in one where it stands")
+
     // A trait object asks the expression for nothing in particular: what may be erased into one is
     // whatever implements the trait, and pushing the object's own type down would be asking for a
     // value of a type that has no layout. `null` is the exception — a raw address is written at
@@ -199,6 +214,13 @@ trait ExprAnalysis
   private def rawCast(e: Expr): Boolean = e match
     case Call(Ident("ptr_cast"), _) => true
     case _                          => false
+
+  /** Whether an expression is the address **operator** — the half of `&`'s two meanings that a
+   * counted-box expectation cannot take.
+   */
+  private def addressOf(e: Expr): Boolean = e match
+    case Unary("&", _) => true
+    case _             => false
 
   /** Wraps a base-typed value in the run-time check for a constrained subtype. */
   private def checkInto(v: TExpr, c: Type.Constrained): TExpr = TConstrainedCheck(v, c).setPos(v.pos)
@@ -688,11 +710,32 @@ trait ExprAnalysis
         "function is what has an address")
 
     case Unary("&", e) =>
-      val place = analyzePlace(e, "'&'", writes = false)
-      checkAddressable(place)
-      // The address of a register is an address *of a register*, so the qualifier travels with it and
-      // every access through the result stays an access to a device (`03 § Device memory`).
-      TAddrOf(place, Type.Ptr(place.placeTy))
+      val t = analyzeExpr(e)
+
+      if isPlace(t) then
+        val place = requirePlace(t, e, "'&'", writes = false)
+        checkAddressable(place)
+        // The address of a register is an address *of a register*, so the qualifier travels with it and
+        // every access through the result stays an access to a device (`03 § Device memory`).
+        TAddrOf(place, Type.Ptr(place.placeTy))
+      // Something computed has no address of its own, so one is made for it: the value is written
+      // into a hidden local of this scope and what comes back is that slot's address (`TTempAddr`).
+      // The pointer is then exactly as good as one taken of a `var` the program wrote itself, which
+      // is what `03` already says about every `*T`.
+      else
+        // A value nothing occupies has no storage to point at, and a pointer to it could only ever
+        // be read through to produce nothing — so the address is refused rather than handed back
+        // aimed at a slot of no bytes.
+        if Type.noValue(t.ty) then
+          err(s"${show(t.ty)} is not a value, so there is nothing to make an address of")
+
+        // An opaque type's shape is the C side's, so there is no slot to lay down for one here —
+        // the same reason `*c` is refused where `c` itself was fine (`15 §9`).
+        Type.underlying(t.ty) match
+          case s: Type.Struct => checkLayoutKnown(s.base, s.name)
+          case _              => ()
+
+        TTempAddr(t, Type.Ptr(t.ty))
 
     case Unary("*", e) =>
       val t = analyzeExpr(e)

@@ -112,10 +112,17 @@ trait ControlFlowEmitter extends PlaceEmitter {
             case _                                             => freshLabel("cond.and")
 
       pushTemps()
+      // **And an ownership region of its own, for the same reason one term further along.** A term
+      // may *materialize* storage — `&Named("x")` writes a hidden local — and that slot is written
+      // only where the chain reached this term, while a release registered with the enclosing scope
+      // is emitted on every path out of it. Closing the region here puts the release on the edges
+      // the store dominates, which is exactly the argument the temp region above is already making.
+      pushOwned()
 
       term match
         case TCondTest(c) =>
           val v = genExpr(c)
+          popOwned()
           popTemps()
           emitTerm(Inst.CondBr(v, nextL, target))
           emitLabel(nextL)
@@ -124,6 +131,10 @@ trait ControlFlowEmitter extends PlaceEmitter {
           val sv   = genExpr(subject)
           val held = pats.map(patternTest(_, sv)).reduce(orI1)
           val ok   = if negated then notI1(held) else held
+
+          // Closed before the branch in every case below, so both edges are clear of it — and
+          // before the bindings open a region of their own, which the arms below manage separately.
+          popOwned()
 
           // A negated test binds nothing, and neither does a list of alternatives — the analyzer
           // refused a pattern that tried in either position — so both close their region here and

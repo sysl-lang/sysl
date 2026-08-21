@@ -298,6 +298,17 @@ trait ExprEmitter extends ArithEmitter {
     case TAddrOf(place, _) =>
       address(place)
 
+    // `&value` — the storage a computed value has no address for. The slot is an ordinary alloca, so
+    // it belongs to the **frame** rather than to the block that wrote it, and the count it takes is
+    // the one a `var`'s slot takes: registered with the scope being emitted, released where that
+    // scope ends. Everything about the pointer afterwards is what a `*T` always is.
+    case TTempAddr(value, _) =>
+      val slot = emitAlloca(freshReg(), value.ty.lty)
+
+      genOwnedInto(slot, value)
+      ownAt(slot, value.ty)
+      slot
+
     case TBox(value, refTy) =>
       genBox(value, refTy)
 
@@ -592,9 +603,18 @@ trait ExprEmitter extends ArithEmitter {
       emitLabel(rhsL)
       // The right side gets its own temp region: anything it allocates is released before the
       // merge, and if the branch is skipped that code never runs at all.
+      //
+      // **And its own ownership region, for the second half of that sentence.** A slot registered
+      // here is written only where the branch is taken, while the region it is registered with is
+      // released on every path out of it — so a `&value` in a short-circuited operand would have
+      // its release emitted where its store never happened. Opening a region of the branch's own
+      // is what keeps the two on one path; where nothing is owned, which is nearly always, the pop
+      // emits nothing at all.
       pushTemps()
+      pushOwned()
       val rv = genExpr(r)
       emit(Inst.Store(i1, rv, slot, Access.Plain))
+      popOwned()
       popTemps()
       emitTerm(Inst.Br(endL))
       emitLabel(endL)
@@ -630,6 +650,10 @@ trait ExprEmitter extends ArithEmitter {
 
       for k <- cmps.indices do
         pushTemps()
+        // An ownership region per block for the same reason and unwound on the same ladder: a
+        // `&value` in an operand the chain short-circuits past must not have its release emitted
+        // where its store never ran.
+        pushOwned()
         if k == 0 then left = genExpr(operands.head)
         val right = genExpr(operands(k + 1))
         val c     = comparison(cmps(k), operands(k).ty, left, right)
@@ -646,6 +670,7 @@ trait ExprEmitter extends ArithEmitter {
 
       for k <- cmps.indices.reverse do
         emitLabel(exits(k))
+        popOwned()
         popTemps()
         emitTerm(Inst.Br(if k == 0 then endL else exits(k - 1)))
 

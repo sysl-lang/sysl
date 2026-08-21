@@ -546,8 +546,14 @@ trait ArcEmitter extends Emitter {
   }
 
   /** Records a slot that holds a count of its own, after it has been written. */
-  protected def ownSlot(name: String, ty: Type): Unit =
-    if containsRef(ty) then owned.head += ((Val.Reg(s"$name.addr"), ty))
+  protected def ownSlot(name: String, ty: Type): Unit = ownAt(Val.Reg(s"$name.addr"), ty)
+
+  /** The same, for a slot with no name in the program — the storage a `&value` materializes. The
+   * scope registered in is the innermost one *at the point the value is written*, which is what
+   * makes the release land on a path the store dominates.
+   */
+  protected def ownAt(slot: Val, ty: Type): Unit =
+    if containsRef(ty) then owned.head += ((slot, ty))
 
   /** Registers the buffer a promoted array lives in, so the scope that declared it gives back its
    * share on the way out. A buffer is what a `&T` points at, so it is registered as one and the

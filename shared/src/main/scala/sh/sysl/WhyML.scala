@@ -533,7 +533,7 @@ object WhyML {
       case _: TStructNew | _: TField       => "a struct"
       case _: TEnumNew                     => "an enum"
       case _: TCast                        => "a conversion between types"
-      case _: TDeref | _: TAddrOf | _: TNullLit => "a pointer"
+      case _: TDeref | _: TAddrOf | _: TTempAddr | _: TNullLit => "a pointer"
       case _: TVCall | _: TCallPtr         => "a call through a value"
       case _: TAsm                         => "an 'asm' block"
       case _: TDefer                       => "a 'defer'"

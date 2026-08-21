@@ -212,9 +212,19 @@ trait CallAnalysis extends OperatorCalls {
     case RecvMode.ByRef(_) =>
       tr.ty match
         case _: Type.Ref => tr
+        // **What is missing is the COUNT, not an address** — and the old wording said "put the
+        // object behind a '&'", which names the `&` in a *type* while the reader reaches for the
+        // `&` *operator*, the one thing that cannot answer this. A `&self` method may keep the
+        // receiver, so it needs a box to keep a share of; a local `var` is refused here for exactly
+        // the same reason a fresh construction is, and neither is a temporary problem.
+        //
+        // So the message names the **binding**, which is where the box is made and where the fix
+        // can be seen from any of the calls that report this.
         case _ =>
-          err(s"'&self' needs a reference; a ${show(tr.ty)} on the stack has none — take '*self' instead, " +
-            "or put the object behind a '&'")
+          err(s"'&self' needs a counted reference, and this receiver is a ${show(tr.ty)} on the " +
+            s"stack — a '&self' method may keep hold of what it is called on, so what it wants is " +
+            s"a share of a box rather than an address. Bind the value into one and call it on " +
+            s"that: 'var r: &${show(tr.ty)} = …'")
 
   protected def constructStruct(name: String, written: List[Expr], expected: Option[Type]): TExpr = {
     val decl = structDecls(name)

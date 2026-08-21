@@ -38,11 +38,34 @@ trait ModuleStorage extends ModuleFiles {
     if disagree(init.ty, ty) then
       err(s"cannot initialize '${qn(key)}': declared ${show(ty)} but the value is ${show(init.ty)}")
 
+    checkNoMaterialized(init)
+
     val static = isStatic(init)
 
     checkVal(ty, key)
     TVal(key, ty, Some(init), !static, align = boundaryOf(key, decl.align), section = decl.section)
   })
+
+  /** Refuses `&value` in a module initializer, which is the one place the form has nowhere to put
+   * what it makes.
+   *
+   * `&Rect(2)` writes the value into a hidden local of the scope it stands in — and an initializer
+   * here belongs to no scope that outlives it: what runs is a prologue, so the slot would be that
+   * prologue's frame and the pointer would be stale by the program's first statement. Storage that
+   * lasts the run is what module storage *is*, so the fix is to give the value a name of its own,
+   * which is a second declaration rather than something the compiler can invent.
+   *
+   * A closure written in an initializer is lowered to a function of its own before this walk sees
+   * anything, so a `&value` inside one is out of reach here and is right where it stands — the slot
+   * is that function's frame, exactly as in any other body.
+   */
+  private def checkNoMaterialized(t: TExpr): Unit = t match
+    case a: TTempAddr =>
+      at(a.pos)(err("'&' in front of a value writes it into a hidden local of the scope the '&' " +
+        "stands in, and module storage has no such scope — the slot would belong to the " +
+        "initializer's own frame, which is gone by the program's first statement. Give the value a " +
+        "name that lasts the run: declare it beside this one, and take the address of that"))
+    case _ => TreeWalk.children(t).foreach(checkNoMaterialized)
 
   /** `@align(n)` above module storage, folded to the boundary it named — the same fold a struct's
    * and a local's go through, reported against the name as a reader wrote it rather than against the
@@ -86,6 +109,8 @@ trait ModuleStorage extends ModuleFiles {
 
       if disagree(t.ty, ty) then
         err(s"cannot initialize '${qn(key)}': declared ${show(ty)} but the value is ${show(t.ty)}")
+
+      checkNoMaterialized(t)
       t
     }
 

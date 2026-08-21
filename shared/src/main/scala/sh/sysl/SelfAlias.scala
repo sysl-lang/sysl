@@ -54,6 +54,9 @@ object SelfAlias {
     def carries(e: TExpr): Boolean = e match
       case TLoad(n, _)          => confined(n)
       case TAddrOf(place, _)    => ownStorage(place)
+      // The slot a `&value` makes is this frame's and is not the receiver's — but what was written
+      // into it may still be a pointer into the receiver, so the question is asked of the value.
+      case TTempAddr(v, _)      => carries(v)
       case TStructNew(_, args)  => args.exists(carries)
       case TEnumNew(_, _, args) => args.exists(carries)
       case TArrayLit(elems, _)  => elems.exists(carries)

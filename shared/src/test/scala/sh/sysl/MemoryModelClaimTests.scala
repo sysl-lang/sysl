@@ -215,17 +215,29 @@ class MemoryModelClaimTests extends AnyFreeSpec with RunSupport with CodegenSupp
       run(src) shouldBe "99\n42\n"
     }
 
-    "and anything computed is not one — a call's result, an arithmetic result, a fresh struct" in {
-      for src <- List(
-          "f() -> int = 3\nvar p = &f()",
-          "var a = 1\nvar b = 2\nvar p = &(a + b)",
-          s"${point}var p = &Point(1, 2)",
-        )
-      do err(src) should include("'&' needs a variable, a field, an element, or a dereference")
+    // Nothing computed is a place — and `&` in front of one no longer asks it to be. It writes the
+    // value into a hidden local of the scope it stands in and hands back that slot's address, so
+    // the three forms below produce a pointer to storage the frame owns rather than a refusal.
+    // `AmpConstructionTests` is where that rule is pinned; here it is the claim about *places* that
+    // is being kept honest, which is that these are not any.
+    "and anything computed is not one — but '&' gives it a slot rather than refusing" in {
+      run("f() -> int = 3\nvar p = &f()\nprint(*p)") shouldBe "3\n"
+      run("var a = 1\nvar b = 2\nvar p = &(a + b)\nprint(*p)") shouldBe "3\n"
+      run(s"${point}var p = &Point(1, 2)\nprint(p.x)") shouldBe "1\n"
     }
 
+    // The enumeration is now the *assignment* target's, which is where a place is still the only
+    // thing that will do — and it still names the element, since leaving it out denied a form the
+    // page's own example writes.
     "the complaint names the element too, since leaving it out denied a form the chapter uses" in {
-      err("f() -> int = 3\nvar p = &f()") should include("a variable, a field, an element, or a dereference")
+      err("var a = 1\nvar b = 2\na + b = 4") should
+        include("a variable, a field, an element, or a dereference")
+    }
+
+    // And a place the program may not *write* through is a different question again, so `&` goes on
+    // refusing a `val` rather than quietly copying it into a slot the program could write.
+    "a 'val' is refused rather than given a slot of its own" in {
+      err("val v = 3\nvar p = &v") should include("written once")
     }
 
     "a string's own subscript is refused for immutability rather than for having no address" in {
