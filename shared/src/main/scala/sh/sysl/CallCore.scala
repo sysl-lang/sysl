@@ -55,7 +55,7 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
           case ((t, src), (_, pty)) =>
             if src.exists(isLiteral) || src.isDefined && becomesSlice(t.ty, pty) then
               analyzeExpr(src.get, Some(pty))
-            else coerce(t, pty)
+            else reread(coerce(t, pty), src, pty)
         }
       case None => args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
 
@@ -135,12 +135,27 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     val first = at.map { (a, e) =>
       if callableArg(a) || e.isEmpty && (nullArg(a) || implicitArg(a)) then None
       else
-        Some(e match
-          case Some(_) => analyzeExpr(a, e)
+        e match
+          case Some(_) => Some(analyzeExpr(a, e))
           case None =>
             literalDefault(a) match
-              case Some(ty) => standIn(ty).setPos(a.pos)
-              case None     => analyzeExpr(a))
+              case Some(ty) => Some(standIn(ty).setPos(a.pos))
+              // **A fourth shape with no type of its own, and it is not one a syntax can name**:
+              // anything whose bare analysis cannot get off the ground for want of the context it
+              // was denied. `None` at a parameter of type `Option[T]` is the one that found this —
+              // it is a generic construction whose own type argument nothing here settles, so
+              // analyzing it alone raises where a `null` would merely have waited.
+              //
+              // Held back on the same argument as the three above, and it is the same argument: an
+              // expression that could not be read has unified nothing, so the parameter it stands
+              // at is settled by the others or by nothing at all, and the wait cannot lose the
+              // solution. What it gains is the second pass, where the parameter is a type and the
+              // argument is read against it exactly as a non-generic call reads it.
+              //
+              // `attempt` rather than `probe` because the node is kept where the analysis
+              // succeeded, which is the ordinary case here and must cost one analysis rather than
+              // two.
+              case None => attempt(analyzeExpr(a))
     }
 
     // What the first pass settles. `map[A, B](xs: []A, out: []B, f: A -> B)` gets both from the two
@@ -174,14 +189,20 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
       tps: Set[String],
       bounds: Map[String, List[BoundRef]],
       partial: Map[String, Type],
-  ): Option[Type] = a match
-    // `null` and an implicit member ask the same thing of the parameter, and for the same reason:
-    // neither carries a type, so what they need is the parameter *itself* once the other arguments
-    // have settled what it mentions. `same(Colour.red, .green)` reads the second argument against
-    // the `Colour` the first said, exactly as `two(&x, null)` reads its second against `*int`.
-    case NullLit() | (_: ImplicitMember) | Call(_: ImplicitMember, _) =>
-      ptype.filterNot(mentions(_, tps -- partial.keySet)).map(resolveType(_, partial))
-    case _ => callBound(ptype, tps, bounds, partial)
+  ): Option[Type] =
+    // **Asked of the callable rather than of the shapes that are not one**, which is the same
+    // question read the other way round and is what lets a further kind of held-back argument
+    // through without another case. A callable is the one thing here that wants its parameter's
+    // **bound**; everything else held back wants the parameter *itself*, once the other arguments
+    // have settled what it mentions.
+    //
+    // That covers `null`, a leading dot, and an argument whose own analysis could not be made at
+    // all, on one reason: none of them carries a type, so what each needs is what the parameter
+    // turned out to be. `same(Colour.red, .green)` reads its second argument against the `Colour`
+    // the first said, `two(&x, null)` reads its second against `*int`, and `same(n, None)` reads
+    // its second against the `Option[usize]` that `n` said.
+    if callableArg(a) then callBound(ptype, tps, bounds, partial)
+    else ptype.filterNot(mentions(_, tps -- partial.keySet)).map(resolveType(_, partial))
 
   /** `null` written as an argument, which is the one *value* whose type its context supplies. */
   private def nullArg(a: Expr): Boolean = written(a) match

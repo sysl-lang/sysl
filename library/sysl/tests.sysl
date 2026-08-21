@@ -87,3 +87,89 @@ chunked_digits_interpolate()
     assert_eq(s"${10000000000000000000000001u128}", "10000000000000000000000001")
     assert_eq(s"n = ${-128}", "n = -128")
 end chunked_digits_interpolate
+
+// **`Option` and `Result` compare and render**, which are the two blocks that make `assert_eq`
+// usable on one -- it is bounded over `Eq + Display`, so either alone would still refuse.
+//
+// These are the assertions the rest of this file is not: the ones above check a rendering the
+// compiler could not have got wrong without getting every number wrong, and these check a rule about
+// two values of a shape a program writes constantly. What a wrong `eq` looks like is an `Ok` equal
+// to an `Err` carrying the same bytes, or a `None` equal to every other `None` *and* to a `Some` --
+// both of which read as working code until something depends on the difference.
+@test("an option compares by variant first and then by payload")
+options_compare()
+    val a: Option[usize] = Some(166)
+    val b: Option[usize] = Some(166)
+    val c: Option[usize] = Some(167)
+    val n: Option[usize] = None
+
+    assert_eq(a, b)
+    assert(a != c)
+
+    // The two directions separately: a wrong `eq` that answers by the left operand's variant alone
+    // passes one of these and fails the other.
+    assert(a != n)
+    assert(n != a)
+    assert_eq(n, n)
+
+    // The literal on the right, which is what a test actually writes -- and which needs the payload
+    // to be read at the parameter's type rather than at its own.
+    assert_eq(a, Some(166))
+    assert_eq(n, None)
+end options_compare
+
+@test("a result compares by variant first and then by payload")
+results_compare()
+    val ok: Result[usize, string] = Ok(3)
+    val same: Result[usize, string] = Ok(3)
+    val other: Result[usize, string] = Ok(4)
+    val err: Result[usize, string] = Err("nope")
+
+    assert_eq(ok, same)
+    assert(ok != other)
+
+    // An `Ok` and an `Err` are never equal, and this is the pair that says so where a comparison
+    // reading the payload alone would have called them equal: both carry a 3.
+    val three: Result[usize, usize] = Ok(3)
+    val failed: Result[usize, usize] = Err(3)
+
+    assert(three != failed)
+    assert(failed != three)
+    assert(ok != err)
+    assert_eq(err, Err("nope"))
+end results_compare
+
+// Rendered as it is written, so that a failed comparison names the value a reader typed.
+@test("an option and a result render as their source spelling")
+options_render()
+    val a: Option[usize] = Some(166)
+    val n: Option[usize] = None
+    val ok: Result[usize, string] = Ok(3)
+    val err: Result[usize, string] = Err("nope")
+
+    assert_eq(str(a), "Some(166)")
+    assert_eq(str(n), "None")
+    assert_eq(str(ok), "Ok(3)")
+    assert_eq(str(err), "Err(nope)")
+
+    // Nested, which is the case that says the payload goes through `Display` rather than through
+    // anything the renderer knows about integers.
+    val nested: Option[Option[usize]] = Some(Some(1))
+
+    assert_eq(str(nested), "Some(Some(1))")
+end options_render
+
+// A specifier describes the field the **whole** value occupies (`14 §2`), which is why the rendering
+// is measured before anything is padded rather than each part being padded as it goes.
+@test("a width pads the whole option rather than its payload")
+options_pad()
+    val a: Option[usize] = Some(166)
+    val n: Option[usize] = None
+
+    assert_eq(f"${a}%12s", "   Some(166)")
+    assert_eq(f"${a}%-12s", "Some(166)   ")
+
+    // A width the rendering already exceeds pads by nothing rather than truncating.
+    assert_eq(f"${a}%3s", "Some(166)")
+    assert_eq(f"${n}%6s", "  None")
+end options_pad

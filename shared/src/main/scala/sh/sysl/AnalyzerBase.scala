@@ -245,23 +245,37 @@ trait AnalyzerBase extends Scoping {
    * type parameter into the emitted module.
    */
   protected def sandboxed[T](body: => T): T = {
-    val structs = structInsts.toList
-    val enums   = enumInsts.toList
-    val funcs   = funcInsts.toList
-    val tables  = vtables.toList
-    val reached = funcsUsed.toList
-    val externs = externsUsed.toList
-    val queued  = pending.toList
+    val saved = registrations
 
     try body
-    finally
-      restore(structInsts, structs)
-      restore(enumInsts, enums)
-      restore(funcInsts, funcs)
-      restore(vtables, tables)
-      funcsUsed.clear();   funcsUsed ++= reached
-      externsUsed.clear(); externsUsed ++= externs
-      pending.clear();     pending ++= queued
+    finally rewind(saved)
+  }
+
+  /** Everything `sandboxed` puts back, taken as one value so that a caller may decide *when* to put
+   * it back rather than only that it will be.
+   */
+  private case class Registrations(
+      structs: List[(String, Type.Struct)],
+      enums: List[(String, Type.Enum)],
+      funcs: List[(String, (List[(String, Type)], Type))],
+      tables: List[(String, TVtable)],
+      reached: List[String],
+      externs: List[String],
+      queued: List[(String, FuncDecl, Map[String, Type])],
+  )
+
+  private def registrations: Registrations =
+    Registrations(structInsts.toList, enumInsts.toList, funcInsts.toList, vtables.toList,
+                  funcsUsed.toList, externsUsed.toList, pending.toList)
+
+  private def rewind(saved: Registrations): Unit = {
+    restore(structInsts, saved.structs)
+    restore(enumInsts, saved.enums)
+    restore(funcInsts, saved.funcs)
+    restore(vtables, saved.tables)
+    funcsUsed.clear();   funcsUsed ++= saved.reached
+    externsUsed.clear(); externsUsed ++= saved.externs
+    pending.clear();     pending ++= saved.queued
   }
 
   private def restore[K, V](table: mutable.LinkedHashMap[K, V], saved: List[(K, V)]): Unit = {
@@ -285,6 +299,37 @@ trait AnalyzerBase extends Scoping {
         case AnalyzerError(_, _, _) => None
         case Poisoned()             => None
     }
+
+  /** An analysis that is **allowed to fail**, and whose registrations are kept when it does not.
+   *
+   * This is `probe`'s other half, and the difference is the whole reason it exists: `probe` always
+   * rewinds, which is right for a question about a type and wrong for anything that keeps the node.
+   * A `TExpr` carried out of a `probe` refers to instantiations that were dropped on the way out —
+   * a generic callee never registered, a vtable never built — so the emitted program names
+   * something nothing emitted.
+   *
+   * Rewinding only on failure is what lets an argument be *tried* at its position for the cost of
+   * one analysis rather than two. A failed attempt is left exactly as `probe` leaves one: nothing
+   * registered, nothing said, since `err` throws rather than recording.
+   */
+  protected def attempt[T](body: => T): Option[T] = {
+    val saved = registrations
+    val said  = complaints
+
+    def undo(): None.type = { rewind(saved); restoreComplaints(said); None }
+
+    try
+      val answer = body
+
+      // **Coming back is not the same as succeeding**, which is the half a `catch` cannot see. A
+      // region that failed inside a `recover` records its complaint and hands back a fallback, so
+      // an attempt reading only the exception would keep a node built out of a mistake *and* leave
+      // the mistake reported — a reading nobody kept, blamed on the reader.
+      if complaints.length > said.length then undo() else Some(answer)
+    catch
+      case AnalyzerError(_, _, _) => undo()
+      case Poisoned()             => undo()
+  }
 
   /** Whether asking that question failed on a mistake **somebody has already been told about**,
    * rather than on its own account.

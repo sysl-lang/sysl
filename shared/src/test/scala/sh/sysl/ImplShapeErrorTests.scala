@@ -206,13 +206,18 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
    * rule would not also accept.
    */
   "an 'impl' with no home" - {
+    // The trait is `Hash` rather than `Eq`, which this used to be written with: the library
+    // implements `Eq` for every `Option` now, so a block naming it is stopped by the overlap check
+    // one step earlier and never reaches coherence. `Hash` is a library trait with no block for
+    // `Option`, which is what leaves coherence the thing being tested — the same substitution the
+    // slice case two tests down already had to make, and for the same reason.
     "a foreign trait for a foreign type is refused" in {
-      err("""impl[T: Eq] Eq for Option[T]
-            |    eq(self, rhs: Option[T]) -> bool = self.is_some() == rhs.is_some()
+      err("""impl[T: Hash] Hash for Option[T]
+            |    hash(self) -> u64 = 1u64
             |print(1)
             |""".stripMargin) should include(
         s"an 'impl' may be written only in the module that declares the trait or in one that " +
-          s"declares a type named in the subject, and '${lib("Eq")}' is the library's while " +
+          s"declares a type named in the subject, and '${lib("Hash")}' is the library's while " +
           s"nothing in '${lib("Option")}' is declared outside the library — so this one has no home")
     }
 

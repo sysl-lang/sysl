@@ -345,6 +345,75 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  /** `null` is not the only argument whose type its context supplies, and the group above is the
+   * narrow case of a wider rule: **an argument that cannot be read on its own waits for the
+   * solution, and one that reads differently once the solution exists is read again.**
+   *
+   * A dataless variant of a generic enum is the shape that found this. `None` says nothing about
+   * what an `Option` holds, so analyzing it alone raises where a `null` merely waits — and
+   * `Some(3)` reads as an `Option[int]` alone, which does not become an `Option[usize]` by any
+   * conversion, so a call whose other argument said `usize` was refused for a difference nobody
+   * wrote.
+   *
+   * Both compile when the callee is written non-generically over the same type, which is the whole
+   * of why these are bugs rather than the inference declining to guess.
+   */
+  "an argument the solution changes" - {
+    "a dataless variant waits for the parameter, as a null does" in {
+      run("""same[T: Eq](a: T, b: T) -> bool = a == b
+            |var n: Option[usize] = None
+            |print(same(n, None))
+            |""".stripMargin) shouldBe "true\n"
+    }
+
+    "and one carrying a literal is read again at the type the others settled" in {
+      run("""same[T: Eq](a: T, b: T) -> bool = a == b
+            |var s: Option[usize] = Some(3)
+            |print(same(s, Some(3)), same(s, Some(4)))
+            |""".stripMargin) shouldBe "true false\n"
+    }
+
+    // The payload is the point: read alone the literal would be an `int`, and what it has to become
+    // is whatever the parameter turned out to be — the same rule a bare literal at a solved
+    // parameter already followed, applied to one standing inside a construction.
+    "the payload takes the width the solution gave it, not its own default" in {
+      run("""first[T](a: T, b: T) -> T = a
+            |var wide: Option[u64] = Some(5000000000)
+            |print(str(first(wide, Some(5000000000)).unwrap()))
+            |""".stripMargin) shouldBe "5000000000\n"
+    }
+
+    // An enum of the program's own, so the rule is pinned about the *shape* rather than about the
+    // two the library happens to ship.
+    "an enum of the program's own is read the same way" in {
+      run("""enum Maybe[T]
+            |    Just(v: T)
+            |    Nothing
+            |same[T](a: T, b: T) -> bool = true
+            |var m: Maybe[u8] = Just(3u8)
+            |print(same(m, Nothing), same(m, Just(4u8)))
+            |""".stripMargin) shouldBe "true true\n"
+    }
+
+    // Waiting is not guessing. With nothing else in the call to read, the refusal is the one it
+    // always was — and it still names the argument that could not be worked out.
+    "nothing else to read is the refusal it always was" in {
+      err("""one[T](a: Option[T]) -> bool = true
+            |print(one(None))
+            |""".stripMargin) should include("cannot infer the type argument")
+    }
+
+    // And a disagreement that re-reading cannot repair is reported as the mismatch it is, in the
+    // parameter's own terms, rather than being quietly accepted.
+    "a re-reading that cannot succeed leaves the original complaint" in {
+      err("""same[T](a: T, b: T) -> bool = true
+            |var s: Option[usize] = Some(3)
+            |var t: string = "no"
+            |print(same(s, t))
+            |""".stripMargin) should include("was given")
+    }
+  }
+
   /** `01` lists the parameter type at a call among the positions that fix an unsuffixed literal,
    * and says nothing about the callee being generic — so a parameter written `usize` fixes one
    * whether or not the declaration beside it also has a `T` to solve. What makes this its own group

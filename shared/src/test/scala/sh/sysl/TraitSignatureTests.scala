@@ -138,6 +138,49 @@ class TraitSignatureTests extends AnyFreeSpec with CodegenSupport with RunSuppor
     }
   }
 
+  /** **What this pass resolves, it must not leave behind**, and a `Type.Abstract` is identified by
+   * its *name* — so a trait's `T` and an unrelated declaration's `T` are one type as far as a cache
+   * key is concerned. Resolving a promise of `Maybe[T]` here registers a `Maybe` instantiated at
+   * *this trait's* stand-in, and every later walk asking for `Maybe[T]` was handed that one.
+   *
+   * What it looked like is the reason it is worth a test rather than a comment: the definition-time
+   * walk of `impl[T: Display] Display for Maybe[T]` was told that its own body assumed what its own
+   * bounds promise, about an `impl` the trait has nothing to do with beyond the letter its parameter
+   * is spelled with. Both blocks below are correct, and the program prints.
+   */
+  "what the pass instantiates does not outlive it" - {
+    "so a trait promising a generic type leaves that type's own 'impl' bounds alone" in {
+      run(
+        """enum Maybe[T]
+          |    Just(v: T)
+          |    Nothing
+          |impl[T: Display] Display for Maybe[T]
+          |    display(self, out: *Writer, fmt: FormatSpec)
+          |        self match
+          |            Just(v) -> v.display(out, fmt)
+          |            Nothing -> out.write("Nothing".bytes)
+          |    end display
+          |end Maybe[T]
+          |trait Sink[T]
+          |    peek(self) -> Maybe[T]
+          |var m: Maybe[int] = Just(3)
+          |print(str(m))""".stripMargin
+      ) shouldBe "3\n"
+    }
+
+    // The same shape against the library's own, which is where it was found: `Option` carries `Eq`
+    // and `Display` blocks of exactly that form, so any trait promising an `Option[T]` used to
+    // report four complaints from inside `library/sysl/option.sysl`.
+    "including the library's, which is where this was found" in {
+      run(
+        """trait Sink[T]
+          |    peek(self) -> Option[T]
+          |var o: Option[int] = Some(3)
+          |print(str(o), o == Some(3))""".stripMargin
+      ) shouldBe "Some(3) true\n"
+    }
+  }
+
   // The conformance check still resolves both sides against a concrete `Self`, so a trait whose
   // signature is fine and an `impl` that disagrees with it is reported exactly as before.
   "the conformance check is untouched" in {

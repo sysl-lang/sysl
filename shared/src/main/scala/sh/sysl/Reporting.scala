@@ -204,6 +204,22 @@ trait Reporting {
    */
   protected def diagnosticCount: Int = found.size
 
+  /** What has been complained about so far, and putting it back — which is what a **speculative**
+   * walk needs and `sandboxed` does not supply.
+   *
+   * A complaint is not always raised: `recorded`, `reported` and `boundErr` put one straight into
+   * the set, and the region carries on with a fallback. So a walk that is allowed to fail cannot
+   * tell whether it failed by catching alone — it has to ask whether anything was said — and a walk
+   * whose answer is thrown away has to take back what it said, or the reader is told about a
+   * reading nobody kept.
+   */
+  protected def complaints: List[(String, Option[Pos])] = found.toList
+
+  protected def restoreComplaints(saved: List[(String, Option[Pos])]): Unit = {
+    found.clear()
+    found ++= saved
+  }
+
   /** The errors, rendered and ordered by where they are, so reading them top to bottom is
    * reading the file top to bottom. A diagnostic with no position sorts last, since there is
    * nowhere to file it.

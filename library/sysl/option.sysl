@@ -32,3 +32,57 @@ enum Option[T]
             print("panic:", msg)
             exit(1)
 end Option
+
+// Two options are equal when they are absent alike, or present with equal payloads -- which is the
+// only reading that keeps `==` agreeing with `match`. The bound is on the payload rather than on the
+// whole, so an `Option` of something incomparable simply is not comparable, and says so at the
+// comparison rather than at the declaration.
+impl[T: Eq] Eq for Option[T]
+    eq(self, rhs: Self) -> bool
+        self match
+            Some(a) ->
+                rhs match
+                    Some(b) -> a == b
+                    None -> false
+            None -> rhs.is_none()
+    end eq
+
+// The variant, and the payload inside it where there is one, written straight through to wherever
+// it is going. The payload gets a plain specifier, because `14 §2`'s field is the whole option and
+// not what it happens to be carrying.
+private render_option[T: Display](x: Option[T], out: *Writer)
+    x match
+        Some(v) ->
+            out.write("Some(".bytes)
+            v.display(out, FormatSpec(0, -1, false))
+            out.write(")".bytes)
+        None -> out.write("None".bytes)
+end render_option
+
+// An option renders as it is written -- `Some(3)` or `None` -- which is what makes a failed
+// `assert_eq` on one readable at all. `Eq` alone would not have been enough: `assert_eq` is bounded
+// over `Eq + Display`, so a comparable option nothing could render would still have been refused.
+//
+// The width is honoured by rendering twice into a counter first, exactly as a slice does: a field is
+// the whole value, so the padding cannot be decided until the length of the whole is known, and
+// measuring this way costs no allocation.
+impl[T: Display] Display for Option[T]
+    display(self, out: *Writer, fmt: FormatSpec)
+        var pad = 0
+
+        if fmt.width > 0
+            var count = Counting(0)
+            var sink: *Writer = &count
+
+            render_option(self, sink)
+            pad = fmt.width - int(count.n)
+
+            if pad < 0 then pad = 0
+
+        if !fmt.left then display_fill(out, 32, pad)
+
+        render_option(self, out)
+
+        if fmt.left then display_fill(out, 32, pad)
+    end display
+end Option[T]
