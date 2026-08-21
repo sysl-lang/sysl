@@ -106,11 +106,36 @@ case class PackageConfig(
    */
   def definesFor(path: String): List[String] = defines.getOrElse(path, Nil)
 
-  /** Every macro this package declared, keyed by the path the file is compiled from on this
-   * machine — which is the form the compiler carries them in (`SearchPaths.carried`).
+  /** Every macro this package declared, keyed by the path its file was **found** at rather than by
+   * the one the manifest wrote (`SearchPaths.carried`).
+   *
+   * ==Why the walk decides the key and the root does not==
+   *
+   * A manifest names `sh/sysl/miniz/c/miniz.c`, and what reaches clang is whatever the source walk
+   * produced — which is absolute and canonical whatever the reader typed, so `sysl test .` inside a
+   * package yields `/private/tmp/…/sh/sysl/miniz/c/miniz.c` for a root of `.`. Joining the root to
+   * the relative path gives `./sh/sysl/miniz/c/miniz.c`, which is the same file and not the same
+   * string, and the macros then reach nothing. Worse, they reach nothing *quietly*: the C compiles
+   * under its defaults and only a `c const` measuring a configured struct notices.
+   *
+   * Absolutizing the root instead would fix the `.` and not the rest of it — a symlinked path is
+   * canonicalised by the walk and not by the working directory, so `/tmp` and `/private/tmp` would
+   * still be two strings for one file on this machine.
+   *
+   * So the declared path is matched against the files the walk actually returned, within this
+   * package's own tree. `found` is that list. A path matching none of them is a mistake in the
+   * manifest rather than something to pass over, and it is the one mistake here that is otherwise
+   * invisible: every other way of getting a `defines` block wrong is refused when the file is read.
    */
-  def carriedDefines(root: String): Map[String, List[String]] =
-    defines.map((path, macros) => s"$root/$path" -> macros)
+  def carriedDefines(found: List[String]): Either[String, Map[String, List[String]]] =
+    PackageConfig.collect(defines.toList.sortBy(_._1)) { (declared, macros) =>
+      found.find(path => path == declared || path.endsWith(s"/$declared")) match
+        case Some(path) => Right(path -> macros)
+        case None =>
+          Left(s"${PackageConfig.FileName}: 'defines.\"$declared\"' names a file this package does " +
+            "not carry — the block configures the C the package itself holds, and there is no such " +
+            "C file in this tree")
+    }.map(_.toMap)
 
   /** The capabilities `target` provides.
    *
@@ -697,7 +722,7 @@ object PackageConfig {
    * One message rather than all of them: a config file is short, its mistakes are usually one
    * mistake, and the alternative is a driver that prints a list before it has read a line of sysl.
    */
-  private def collect[A, B](items: List[A])(f: A => Either[String, B]): Either[String, List[B]] =
+  private[sysl] def collect[A, B](items: List[A])(f: A => Either[String, B]): Either[String, List[B]] =
     items.foldLeft(Right(Nil): Either[String, List[B]]) { (acc, item) =>
       for
         done <- acc

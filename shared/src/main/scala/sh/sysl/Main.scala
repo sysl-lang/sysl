@@ -279,7 +279,9 @@ private[sysl] def execute(cfg: Config): Int = {
                         allocator,
                         SearchPaths(cfg.linkPaths, cfg.includePaths, cfg.defines,
                                     libPaths.probed, libPaths.probedLibs,
-                                    project.carriedDefines(projectRoot(cfg.file))))
+                                    carriedOf(cfg.file, project, target.os) match
+                                      case Left(err)     => return fail(err)
+                                      case Right(answer) => answer))
 
   val librarySources = collected.flatMap(_._2) ::: fetched.sources
   val packages       = fetched.packages
@@ -329,9 +331,12 @@ private[sysl] def execute(cfg: Config): Int = {
   // path that C will be compiled from. Three roads reach it and all three are here: the project's
   // own manifest, each `--lib` source root's, and each fetched package's — the same three the
   // header requirements are gathered from, for the same reason.
-  val carried = libDefines(roots) match
+  val carried = (for
+    own      <- carriedOf(cfg.file, project, target.os)
+    fromLibs <- libDefines(roots, target.os)
+  yield own ++ fromLibs ++ fetched.defines) match
     case Left(err)     => return fail(err)
-    case Right(answer) => project.carriedDefines(projectRoot(cfg.file)) ++ answer ++ fetched.defines
+    case Right(answer) => answer
 
   val paths = SearchPaths(cfg.linkPaths, cfg.includePaths, cfg.defines,
                           probed.probed, probed.probedLibs, carried)
@@ -543,13 +548,25 @@ private def libAllocators(roots: List[String]): Either[String, List[(String, All
  * the whole program; a macro here reaches one translation unit in the tree that declared it, and a
  * root that is not a package has no `defines` block to be read.
  */
-private def libDefines(roots: List[String]): Either[String, Map[String, List[String]]] =
+private def libDefines(roots: List[String], os: Os): Either[String, Map[String, List[String]]] =
   roots.foldLeft[Either[String, Map[String, List[String]]]](Right(Map.empty)) { (acc, root) =>
     for
       seen   <- acc
       config <- readPackageConfig(root)
-    yield seen ++ config.carriedDefines(root)
+      mine   <- carriedOf(root, config, os)
+    yield seen ++ mine
   }
+
+/** One tree's declared macros, keyed by the path its C was found at.
+ *
+ * **The walk is only done for a tree that declared something**, which is why this is a function
+ * rather than a step: reading a package's C to resolve an empty block would be work every build
+ * pays for a feature almost none of them use.
+ */
+private def carriedOf(root: String, config: PackageConfig, os: Os)
+    : Either[String, Map[String, List[String]]] =
+  if config.defines.isEmpty then Right(Map.empty)
+  else config.carriedDefines(Project.cSources(root, Some(os)).map(_.name))
 
 /** What the `--lib` **source roots** declare they need headers for (`packages.md § 8`).
  *
