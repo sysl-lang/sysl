@@ -133,7 +133,7 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     // it stands at is settled by the others or by nothing at all. `two(&x, null)` and
     // `two(null, &x)` therefore get one answer, which an ordering rule would not have given.
     val first = at.map { (a, e) =>
-      if callableArg(a) || e.isEmpty && nullArg(a) then None
+      if callableArg(a) || e.isEmpty && (nullArg(a) || implicitArg(a)) then None
       else
         Some(e match
           case Some(_) => analyzeExpr(a, e)
@@ -176,12 +176,27 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
       partial: Map[String, Type],
   ): Option[Type] = a match
     case NullLit() => ptype.filterNot(mentions(_, tps -- partial.keySet)).map(resolveType(_, partial))
-    case _         => callBound(ptype, tps, bounds, partial)
+    // An implicit member asks for the parameter for the same reason `null` does, and gets the same
+    // answer: the type is a type by now wherever the other arguments settled what it mentions, so
+    // `same(Colour.red, .green)` reads the second against the `Colour` the first said. Where nothing
+    // settled it, `None` leaves the refusal to the member itself, which is the one that can say the
+    // context supplied no type.
+    case _: ImplicitMember | Call(_: ImplicitMember, _) =>
+      ptype.filterNot(mentions(_, tps -- partial.keySet)).map(resolveType(_, partial))
+    case _ => callBound(ptype, tps, bounds, partial)
 
   /** `null` written as an argument, which is the one *value* whose type its context supplies. */
   private def nullArg(a: Expr): Boolean = written(a) match
     case NullLit() => true
     case _         => false
+
+  /** `.red` written as an argument — the other shape with no type of its own, and held back from the
+   * first pass for `null`'s reason: there is nothing in it to unify, and the qualifier it needs is
+   * the parameter type the *other* arguments settle.
+   */
+  private def implicitArg(a: Expr): Boolean = written(a) match
+    case _: ImplicitMember | Call(_: ImplicitMember, _) => true
+    case _                                              => false
 
   /** Whether an expression is one whose type the *context* has to supply (`12 §5`, `§6`).
    *

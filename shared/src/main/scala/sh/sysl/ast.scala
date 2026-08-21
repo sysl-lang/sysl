@@ -117,6 +117,19 @@ case class TypeArgs(receiver: Expr, args: List[Expr]) extends Expr
  */
 case class TypeAttr(receiver: Expr, attr: String) extends Expr
 
+/** `.red`, `.Circle(3)`, `.make(2)` — a member selected from the type the context **expects**,
+ * with the type's own name left off (`reference/expressions.md § Implicit member`).
+ *
+ * It is the qualified form with the qualifier dropped and nothing more: `.red` means what
+ * `Colour.red` means wherever a `Colour` is what is wanted, so it reaches a variant, an enum's
+ * `try`, and an associated function — exactly what the written qualifier reaches. What supplies the
+ * qualifier is the expected type, so a position with no expectation has nothing to resolve against
+ * and the analyzer says so rather than reporting an undefined name.
+ *
+ * `.name(args)` is a `Call` over this node, the way `Type.name(args)` is a `Call` over a `Field`.
+ */
+case class ImplicitMember(name: String) extends Expr
+
 /** `sizeof(T)` / `alignof(T)` — how much storage a type occupies and what it must be aligned to
  * (`03 § Reinterpreting storage`).
  *
