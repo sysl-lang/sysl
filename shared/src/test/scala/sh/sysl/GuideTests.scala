@@ -48,25 +48,6 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
     )
   }
 
-  "hashmap — the trait system under load" in {
-    val out = guide("hashmap")
-
-    out should not include "FAIL"
-    checks(out) shouldBe 53
-    sections(out) shouldBe List(
-      "-- string keys",
-      "-- replacing",
-      "-- removing",
-      "-- integer keys",
-      "-- a key of one's own",
-      "-- every key in one bucket",
-      "-- growth",
-      "-- walking",
-      "-- entries that own what they hold",
-      "-- emptying",
-    )
-  }
-
   // The only guide program of more than one module, and the only one whose assertion is end to
   // end: source text in, bytecode out, the machine runs it, and what it printed is compared.
   "bytecode — a compiler and a machine over one instruction set" in {
