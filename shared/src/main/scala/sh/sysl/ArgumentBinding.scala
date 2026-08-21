@@ -181,10 +181,19 @@ trait ArgumentBinding extends TraitLookup {
       shown: String,
       owner: Option[String],
       params: List[Param],
-      args: List[Expr],
+      all: List[Expr],
       variadic: Boolean,
       names: List[NamedArg],
   ): List[Expr] = {
+    // **A trailing block is a written argument with no position of its own**, so it is taken out of
+    // the list before any of the rules below read one. It is not positional — a name written before
+    // it must not strand it, which is the whole reason for the split, since `column(spacing = 4):`
+    // is exactly what a caller reaches for. And it is not named, having no name to be written by.
+    // What it fills is decided below, once everything that *does* have a position has one.
+    val (args, block) = all match
+      case init :+ (b: BlockArg) => (init, Some(b))
+      case _                     => (all, None)
+
     // A named argument gives up its position, so nothing after one has a position left to mean
     // anything. Reported against the offending positional argument rather than the name that
     // preceded it, since the one to move is the one being pointed at.
@@ -218,15 +227,31 @@ trait ArgumentBinding extends TraitLookup {
     // matched against — which is why a variadic list may declare no default, and so why the tail is
     // whatever positional arguments are left over rather than something this has to reason about.
     if positional.length > params.length && !variadic then
-      err(s"$shown ${arity(params)}, but ${supplied(args.length, "argument")}")
+      err(s"$shown ${arity(params)}, but ${supplied(all.length, "argument")}")
 
     val written = names.map(n => n.name -> n.value).toMap
     val tail    = positional.drop(params.length)
 
-    val filled = params.zipWithIndex.map { (p, i) =>
-      if i < positional.length then Some(positional(i))
-      else written.get(p.name).orElse(p.default.map(scoped(owner, _)))
+    // What the call **wrote**, before a default stands in for anything. The block is placed against
+    // this rather than against the filled list, because a block is a written argument and a default
+    // is not: a parameter that has a default and no argument is still one the block may fill, and
+    // reading the two lists in the other order would hand the block the parameter *after* it.
+    val slots = params.zipWithIndex.map { (p, i) =>
+      if i < positional.length then Some(positional(i)) else written.get(p.name)
     }
+
+    // **A trailing block fills the first parameter no written argument filled**, which is the same
+    // rule as "it is the last argument" wherever the call wrote no names, and is what makes it
+    // still mean something where the call did. Nothing left for it to fill is the reader having
+    // written a value for every parameter and then a block as well.
+    val placed = block.fold(slots) { b =>
+      slots.indexWhere(_.isEmpty) match
+        case -1 => at(b.pos)(err(s"there is no parameter left for this trailing block to stand " +
+          s"at — $shown ${arity(params)}, and the call has already written a value for each of them"))
+        case i  => slots.updated(i, Some(b))
+    }
+
+    val filled = params.zip(placed).map { (p, s) => s.orElse(p.default.map(scoped(owner, _))) }
 
     // Named all at once: a call that left out three parameters has one mistake, not three, and the
     // fix is to look at the signature — which the message puts in front of them.

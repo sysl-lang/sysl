@@ -155,6 +155,66 @@ class TrailingBlockTests extends AnyFreeSpec with ParseSupport with RunSupport w
             |""".stripMargin) shouldBe "13\n"
     }
 
+    // A block has no position of its own, so a name written before it does not strand it — the
+    // block fills whatever nothing else filled. Without this the form and named arguments could not
+    // be used together, and `column(spacing = 4):` is the first thing anybody writes.
+    "a named argument before it does not take its place" in {
+      run("""total(xs: []int, bonus: int) -> int
+            |    var t = bonus
+            |
+            |    for i in 0..<xs.len
+            |        t += xs[i]
+            |
+            |    t
+            |
+            |val n = total(bonus = 100):
+            |    1
+            |    2
+            |
+            |print(n)
+            |""".stripMargin) shouldBe "103\n"
+    }
+
+    // The shape the whole feature exists for (`0168`): a tree of erased views, each line a
+    // different concrete type reaching one `[]&Trait`. If this did not work the form would be of no
+    // use to the thing it was built for.
+    "the lines may be different types reaching one erased element type" in {
+      run("""trait Shape
+            |    area(&self) -> int
+            |end Shape
+            |
+            |struct Square
+            |    w: int
+            |end Square
+            |
+            |impl Shape for Square
+            |    area(&self) -> int = self.w * self.w
+            |
+            |struct Rect
+            |    w: int
+            |    h: int
+            |end Rect
+            |
+            |impl Shape for Rect
+            |    area(&self) -> int = self.w * self.h
+            |
+            |total(shapes: []&Shape) -> int
+            |    var t = 0
+            |
+            |    for i in 0..<shapes.len
+            |        t += shapes[i].area()
+            |
+            |    t
+            |
+            |val n = total:
+            |    Square(3)
+            |    Rect(2, 5)
+            |    Square(1)
+            |
+            |print(n)
+            |""".stripMargin) shouldBe "20\n"
+    }
+
     // The shape the feature exists for: a tree written as indentation rather than as a nest of
     // brackets. Each level is a call whose last argument is the level below it.
     "nested blocks build a tree" in {
