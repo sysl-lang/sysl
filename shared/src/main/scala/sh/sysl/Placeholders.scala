@@ -49,6 +49,11 @@ object Placeholders {
   private def free(x: Any): List[Ident] = x match
     case i @ Ident(n) if isPlaceholder(n) => List(i)
     case _: Lambda                        => Nil
+    // A trailing block is a boundary for the same reason, one step earlier: it may *become* a
+    // [[Lambda]], and which it becomes is not known until the parameter it stands at is. Letting the
+    // enclosing call lift out of it would decide that here, and decide it wrong for every block
+    // filling a callable.
+    case _: BlockArg                      => Nil
     case p: Product                       => p.productIterator.toList.flatMap(free)
     case _                                => Nil
 

@@ -239,12 +239,40 @@ trait ExprParser extends SyslParserBase {
       // the lift happens on the whole call rather than on its parts (`12 §5c`). A call whose
       // arguments were each big enough to lift where they stood has nothing free left in it, and
       // this hands it straight back.
-      here ~ (op("(") ~> commaList(argument) <~ op(")")) ^^ { case p ~ args =>
-        (e: Expr) => Placeholders.lift(Call(e, args).setPos(e.pos).setPos(p))
+      here ~ (op("(") ~> commaList(argument) <~ op(")")) ~ opt(trailingBlock) ^^ { case p ~ args ~ blk =>
+        (e: Expr) => Placeholders.lift(Call(e, args ::: blk.toList).setPos(e.pos).setPos(p))
+      } |
+      // `column:` — the block with no argument list in front of it, which is the whole of what a
+      // container reads like. It is a tail of its own rather than an `opt` on the one above,
+      // because there are no parentheses for that one to have matched.
+      here ~ trailingBlock ^^ { case p ~ blk =>
+        (e: Expr) => Placeholders.lift(Call(e, List(blk)).setPos(e.pos).setPos(p))
       } |
       here <~ op("?") ^^ (p => (e: Expr) => TryExpr(e).setPos(p)) |
       here <~ op("++") ^^ (p => (e: Expr) => PostIncDec("++", e).setPos(p)) |
       here <~ op("--") ^^ (p => (e: Expr) => PostIncDec("--", e).setPos(p))
+
+  /** `f:` and then an indented block — an argument written as layout rather than inside the
+   * parentheses (`reference/expressions.md § A trailing block`).
+   *
+   * **What the block becomes is not decided here**, because the parser does not know the callee's
+   * parameter types: a collection parameter reads it as an array of its lines and a callable
+   * parameter reads it as a closure over them, and argument binding is the first place a parameter
+   * and its argument are known to be a pair. So this builds a [[BlockArg]] and says nothing more.
+   *
+   * **The colon commits to nothing until the indent is there**, which is what keeps this off ground
+   * the language already uses. A contract clause writes its message after one — `requires n > 0:
+   * "…"` — and that is an ordinary expression followed by a colon, so a rule that consumed the colon
+   * and then insisted would refuse it. The lookahead is [[asOneToken]] for the reason [[blockAhead]]
+   * is: a search that crossed a token and found nothing must not leave an expectation behind at the
+   * token it crossed, where it would outrank the real mistake by position.
+   *
+   * A block written on the same line — `f: x` — is therefore not this form and not any other. That
+   * is deliberate rather than an omission: the colon is already spoken for on a line, and the whole
+   * of what the form buys is the layout.
+   */
+  protected lazy val trailingBlock: PackratParser[Expr] =
+    at(asOneToken(op(":") ~ blockAhead) ~> suite ^^ BlockArg.apply)
 
   /** `t.0` — a tuple's part, selected by position. It is a `Field` because it *is* one: a tuple's
    * fields are named for their positions, so nothing downstream needs a second form of selection.

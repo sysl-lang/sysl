@@ -15,6 +15,23 @@ import scala.collection.mutable
  * struct body and a member from a generic `impl` for a composed type differ in every one of those
  * fields and in nothing else, so the lowering reads the home and does not care which it was.
  */
+object MemberLowering {
+
+  /** The name [[MemberLowering.callBounds]] gives the type parameter it adds for a parameter that
+   * wrote a bare arrow — `f: A -> B` becoming `[F: Fn(A) -> B](f: F)`.
+   *
+   * It holds a `$`, which no source name may, so a program can neither collide with one nor be
+   * mistaken for one. The predicate exists because the rewrite is **lossy in the one place that
+   * matters**: after it, a parameter that a reader wrote as a callable is an ordinary named type,
+   * and a rule keyed on the written type — a trailing block's, which has to decide between a
+   * collection and a callable — can no longer see what was written. Asking the name is what gives
+   * it back.
+   */
+  def callBoundName(n: Int): String = s"${Modules.sep}F$n"
+
+  def isCallBound(name: String): Boolean = name.startsWith(s"${Modules.sep}F")
+}
+
 trait MemberLowering extends TypeResolution {
 
   /** Four answers the lowering needs from the traits mixed in after it. Each belongs to a later
@@ -168,7 +185,7 @@ trait MemberLowering extends TypeResolution {
         case a: FnType if a.bare =>
           checkFnArity(a)
 
-          val tp = s"${Modules.sep}F${tparams.length + added.length}"
+          val tp = MemberLowering.callBoundName(tparams.length + added.length)
 
           added += ((tp, List(BoundRef(Type.Fn.base(a.params.length), a.params :+ a.ret).setPos(a.pos))))
           p.copy(typ = NamedType(tp).setPos(a.pos)).setPos(p.pos)

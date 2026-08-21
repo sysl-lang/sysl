@@ -741,6 +741,14 @@ trait ExprAnalysis
       err(s"'$name = …' names an argument, and this is not a call to a declaration that names its " +
         s"parameters — write the value on its own, or '($name = …)' for the assignment")
 
+    // Argument binding replaces every one of these too, and for the same reason it needs a
+    // parameter to replace it against: a block is an array of its lines at a collection parameter
+    // and a closure over them at a callable one, and a callee with no parameters at all — a value
+    // being called through, a variadic's tail — has neither to offer.
+    case _: BlockArg =>
+      err("a trailing block stands at a parameter of the declaration being called, and this call " +
+        "reaches nothing that declares any — write the argument in the parentheses instead")
+
     // `b[i] = v` on a type with no elements of its own is `IndexSet`, and it is a call rather than a
     // store because a trait's method gives back a value and never an address — so there is no place
     // for the ordinary path to write through, and the trait says as much by taking the value.

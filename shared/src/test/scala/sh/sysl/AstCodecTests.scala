@@ -302,6 +302,11 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     // greedy body has to survive the trip as the body rather than as a sibling of it.
     check("both quantifiers, over both range forms",
       "var u = for all i in 0..<3 do i >= 0 && i < 3\n    var e = for some j in 1..4 do j == 2")
+    // A trailing block is the one expression node that is *replaced* rather than analyzed — a call's
+    // argument binding turns it into an array literal or a closure — so a library carrying one
+    // stores it as itself and has to read it back that way. Nothing else would notice if the codec
+    // dropped it: the failure would be a call in the library that had lost an argument.
+    check("a trailing block", "var v = g:\n        1\n        2")
     // A loop's clauses are statements at the head of its body, so what has to survive is their
     // *position* as much as their contents — a message on one and none on the other.
     check("a loop carrying an invariant with a message and a variant",

@@ -169,6 +169,20 @@ case class LambdaParam(name: String, typ: Option[TypeRef]) extends Positioned
  */
 case class Lambda(params: List[LambdaParam], body: List[Stmt]) extends Expr
 
+/** The indented block a call may write after a `:`, standing at one of its parameters.
+ *
+ * It is **neutral about what it is**, and it has to be: the parser reads the block before anything
+ * has resolved the callee, so it does not know whether the parameter the block stands at wants a
+ * collection or a callable. Argument binding is where a parameter and its argument are first known
+ * to be a pair, so that is where this becomes an [[ArrayLit]] of the block's lines or a [[Lambda]]
+ * over them, and nothing downstream ever sees one.
+ *
+ * The body is a statement list for the reason a [[Lambda]]'s is: an indented block is what was
+ * written, and the collection reading is the case that additionally requires every line to be an
+ * expression.
+ */
+case class BlockArg(body: List[Stmt]) extends Expr
+
 /** `[a, b, c]` — an array literal, whose length is how many elements were written. An empty
  * one has no element type of its own and takes it from the context.
  */

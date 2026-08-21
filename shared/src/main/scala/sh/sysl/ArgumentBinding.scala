@@ -1,5 +1,15 @@
 package sh.sysl
 
+/** The two things a trailing block may turn out to be, decided by the parameter it stands at.
+ *
+ * There is no third, and that is the design rather than a stage it has reached: a block is a
+ * sequence of expressions, and either they are the elements of a collection or they are the body of
+ * a closure. Swift needs a result builder here because a Swift block holds *statements*; a sysl
+ * block holds expressions, and `if` is already one whose arms must agree in type.
+ */
+private enum BlockReading:
+  case Collection, Callable
+
 /** Turning what a call wrote into the positional argument list a declaration takes (`12 §2a`).
  *
  * Two things a call may leave to the declaration — an argument's **value**, where the parameter
@@ -37,8 +47,103 @@ trait ArgumentBinding extends TraitLookup {
       if names.isEmpty && !params.exists(_.default.isDefined) then args
       else bind(shown, owner, params, args, variadic, names)
 
-    thunked(params, bound)
+    blocked(params, thunked(params, bound))
   }
+
+  /** Turns each trailing block into what the parameter it stands at asks for (`reference/
+   * expressions.md § A trailing block`).
+   *
+   * **A block is written before anything knows what it is**, and this is the first place that can
+   * be answered: the lists have been made to correspond by now, so the block and its parameter are
+   * a pair. A parameter whose type is a collection reads the block as an array of its lines; one
+   * whose type is a callable reads it as a closure over them. Nothing else takes one, and a
+   * parameter that is neither is told so here rather than left to a complaint about a node the
+   * reader never wrote.
+   *
+   * It runs **after** [[thunked]] and not before, which is what keeps a by-name parameter from
+   * being wrapped twice: a by-name parameter's type is `Fn() -> T`, so a block at one is a closure
+   * by the rule below, and a thunk around that closure would be a second one. [[thunked]] skips a
+   * block for exactly that reason and leaves it to this.
+   */
+  private def blocked(params: List[Param], args: List[Expr]): List[Expr] =
+    if !args.exists(_.isInstanceOf[BlockArg]) then args
+    else
+      args.zipWithIndex.map {
+        case (b: BlockArg, i) => at(b.pos)(fill(params.lift(i), b))
+        case (a, _)           => a
+      }
+
+  private def fill(param: Option[Param], b: BlockArg): Expr =
+    param.map(p => (p, if p.byName then Some(BlockReading.Callable) else blockReading(p.typ))) match
+      // A variadic's tail stands at no parameter, so there is nothing to read the block against —
+      // and past the declared parameters there never will be.
+      case None =>
+        err("there is no parameter for this trailing block to stand at — a block fills the " +
+          "parameter its position gives it, exactly as an argument written in the parentheses does")
+
+      case Some((_, Some(BlockReading.Collection))) => ArrayLit(b.body.map(line)).setPos(b.pos)
+      case Some((_, Some(BlockReading.Callable)))   => Lambda(Nil, b.body).setPos(b.pos)
+
+      case Some((p, None)) =>
+        err(s"a trailing block stands at '${p.name}', which is a '${p.typ.show}' — a block fills a " +
+          "collection parameter as an array of its lines, or a callable parameter as a closure " +
+          "over them, and this is neither")
+
+  /** One line of a block that is being read as an array literal.
+   *
+   * **A block is a list of its lines, so each one has to be a value** — which is where the form
+   * stops short of Swift's result builders, and stops short of them deliberately
+   * (`reference/expressions.md § A trailing block`). A binding declares a name rather than
+   * producing an element, so it has nothing to contribute to a list.
+   *
+   * **A loop is refused by name, and it is the one refusal here that is a choice rather than a
+   * consequence.** A loop in sysl *is* an expression, so one written here would otherwise be an
+   * ordinary line — and would contribute the single `unit` it evaluates to, which is never what
+   * somebody writing `for` inside a list of views meant. What they meant is Swift's `buildArray`,
+   * and refusing the result builder refused that with it. So the sentence says where the loop goes
+   * instead, rather than leaving the reader with a true remark about `unit`.
+   *
+   * A loop carrying an `else` can yield something other than `unit` and is refused with the rest.
+   * One rule with no sub-cases is cheaper to teach than the exception would be worth, and a value
+   * built by a loop has somewhere better to be bound anyway.
+   */
+  private def line(s: Stmt): Expr = s match
+    case ExprStmt(_: For | _: ConstFor | _: While | _: DoWhile | _: Loop | _: CFor) =>
+      at(s.pos)(err("a loop inside a trailing block filling a collection would contribute one " +
+        "element and not one per iteration, so it is refused rather than read that way — build " +
+        "the elements into a 'Buf' before the call and pass a view of it"))
+
+    case ExprStmt(e) => e
+
+    case other =>
+      at(other.pos)(err("every line of a trailing block filling a collection is one of its " +
+        "elements, so it has to be a value — this one declares a name instead. A binding goes " +
+        "outside the block, which is then given what it built"))
+
+  /** Which of the two readings a parameter's written type asks for, or neither.
+   *
+   * It is asked of the type **as written**, which is what makes the answer available before
+   * anything has been analyzed — and what a block needs, since it is the argument the analysis
+   * would otherwise be looking at. A mode reaching the type says nothing about which reading is
+   * meant, so `&Fn() -> unit` and `Fn() -> unit` answer alike.
+   *
+   * **The bare arrow is the one spelling that is no longer written by the time this is asked.**
+   * `f: () -> int` is rewritten into a bounded type parameter before any call is analyzed
+   * (`MemberLowering.callBounds`), so what arrives here is an ordinary named type — and it is the
+   * most likely spelling of a callable parameter there is. `isCallBound` is what recovers it; a
+   * type parameter a *program* bounded by `Fn` is not recognized, and gets the sentence below
+   * naming both readings.
+   */
+  private def blockReading(t: TypeRef): Option[BlockReading] = t match
+    case RefType(inner, _)   => blockReading(inner)
+    case PtrType(inner)      => blockReading(inner)
+    case WeakType(inner)     => blockReading(inner)
+    case VolatileType(inner) => blockReading(inner)
+    case _: ArrayType        => Some(BlockReading.Collection)
+    case _: FnType           => Some(BlockReading.Callable)
+    case _: CFnType          => Some(BlockReading.Callable)
+    case NamedType(n, _) if MemberLowering.isCallBound(n) => Some(BlockReading.Callable)
+    case _                   => None
 
   /** Wraps each argument standing at a by-name parameter in the closure the parameter's type asks
    * for (`12 § A parameter may be passed by name`).
@@ -64,8 +169,12 @@ trait ArgumentBinding extends TraitLookup {
         // A variadic call has arguments past the last declared parameter, and those stand at no
         // parameter at all — `lift` is what says so rather than an index check written out.
         params.lift(i) match
-          case Some(p) if p.byName => Lambda(Nil, List(ExprStmt(a))).setPos(a.pos)
-          case _                   => a
+          // A trailing block at a by-name parameter is already the closure the thunk would build,
+          // since a by-name parameter's type is `Fn() -> T` and [[blocked]] reads a block at a
+          // callable as a closure over its lines. Wrapping here would put a second one around it.
+          case Some(p) if p.byName && !a.isInstanceOf[BlockArg] =>
+            Lambda(Nil, List(ExprStmt(a))).setPos(a.pos)
+          case _ => a
       }
 
   private def bind(

@@ -69,7 +69,7 @@ object AstCodec {
    * conflict**, and that is the case the rule above is written for: read dev's number, take the one
    * after it, and do not assume a clean merge means the versions agree.
    */
-  val Version: Int = 41
+  val Version: Int = 42
 
   private val Magic = "sysl-ast"
 
@@ -309,6 +309,7 @@ object AstCodec {
         case TryExpr(x)              => tok("try"); expr(x)
         case Tuple(es)               => tok("tup"); list(es)(expr)
         case Lambda(ps, b)           => tok("lam"); list(ps)(lambdaParam); list(b)(stmt)
+        case BlockArg(b)             => tok("barg"); list(b)(stmt)
         case ArrayLit(es)            => tok("arr"); list(es)(expr)
         case ArrayFill(v, c)         => tok("afl"); expr(v); expr(c)
         case Block(ss)               => tok("blk"); list(ss)(stmt)
@@ -757,6 +758,7 @@ object AstCodec {
         case "try"  => TryExpr(expr())
         case "tup"  => Tuple(list(expr()))
         case "lam"  => Lambda(list(lambdaParam()), list(stmt()))
+        case "barg" => BlockArg(list(stmt()))
         case "arr"  => ArrayLit(list(expr()))
         case "afl"  => ArrayFill(expr(), expr())
         case "blk"  => Block(list(stmt()))
