@@ -417,6 +417,88 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
     }
   }
 
+  /** The same four readings on a **generic** subject, which is what a vector space over an element
+    * type needs and what was refused until this was fixed.
+    *
+    * The rule the refusal came from is real and is about a written argument coinciding with the
+    * default at *one* instantiation — `impl[T] Mul[Box[int]] for Box[T]` promises at a `Box[int]`
+    * what a defaulted block promises there and promises something else everywhere else. An argument
+    * built out of the block's **own parameters** is not that: it says the same thing at every
+    * instantiation, which is the reading that lets `impl[T] Index[usize, T] for Buf[T]` carry what a
+    * container holds.
+    *
+    * A dot product is the case with no other spelling. Trait arguments are positional, so reaching
+    * `Out` means writing `Rhs`, and `Rhs` on a dot product is `Self` — there is no `Mul[Out = T]`.
+    * Refusing it also split the generic path from the plain one, since `impl Mul[Vector, real] for
+    * Vector` is this same block with the parameter already resolved.
+    */
+  /** The vector space of `space` above, written once over an element type — the same four readings
+    * with `real` replaced by a parameter.
+    */
+  private val generic =
+    """struct Vec2[T]
+      |    a: T
+      |    b: T
+      |end Vec2
+      |struct Mat2[T]
+      |    r0: Vec2[T]
+      |    r1: Vec2[T]
+      |end Mat2
+      |impl[T: Mul + Add] Mul[Vec2[T], T] for Vec2[T]
+      |    mul(self, rhs: Vec2[T]) -> T = self.a * rhs.a + self.b * rhs.b
+      |impl[T: Mul] Mul[T] for Vec2[T]
+      |    mul(self, rhs: T) -> Vec2[T] = Vec2(self.a * rhs, self.b * rhs)
+      |impl[T: Mul + Add] Mul[Vec2[T], Vec2[T]] for Mat2[T]
+      |    mul(self, rhs: Vec2[T]) -> Vec2[T] =
+      |        Vec2(self.r0.a * rhs.a + self.r0.b * rhs.b, self.r1.a * rhs.a + self.r1.b * rhs.b)
+      |""".stripMargin
+
+  "the same readings at a generic element type" - {
+    "a dot product whose operand is the subject and whose result is not" in {
+      run(generic + "print(Vec2(1.0, 2.0) * Vec2(3.0, 4.0))") shouldBe "11\n"
+    }
+
+    // The same body at a second element type, which is the whole point of it being generic: one
+    // block, and the element's own multiplication and addition underneath.
+    "and the same block at another element type" in {
+      run(generic + "print(Vec2(1, 2) * Vec2(3, 4))") shouldBe "11\n"
+    }
+
+    "scaling still gives back the vector" in {
+      run(generic + """var v = Vec2(1.0, 2.0) * 3.0
+                      |print(v.a, v.b)""".stripMargin) shouldBe "3 6\n"
+    }
+
+    "and a matrix applied to a vector still gives back a vector" in {
+      run(generic + """var w = Mat2(Vec2(1.0, 2.0), Vec2(3.0, 4.0)) * Vec2(1.0, 2.0)
+                      |print(w.a, w.b)""".stripMargin) shouldBe "5 11\n"
+    }
+
+    // The refusal the rule exists for, unchanged: an argument naming ONE instantiation of the
+    // subject collides with the defaulted block there and nowhere else.
+    "an argument fixed to one instantiation of the subject is still refused" in {
+      err("""struct Box[T]
+            |    v: T
+            |end Box
+            |impl[T] Mul[Box[int]] for Box[T]
+            |    mul(self, rhs: Box[int]) -> Box[T] = self""".stripMargin) should
+        include("would promise the same thing")
+    }
+
+    // And a real collision on a generic subject is still caught — by the rule that a result is not a
+    // selector, which is where it belonged all along.
+    "two generic blocks agreeing on the operands are still refused" in {
+      err("""struct V[T]
+            |    x: T
+            |end V
+            |impl[T: Mul] Mul[V[T], T] for V[T]
+            |    mul(self, o: V[T]) -> T = self.x * o.x
+            |impl[T: Mul] Mul for V[T]
+            |    mul(self, o: V[T]) -> V[T] = V(self.x * o.x)""".stripMargin) should
+        include("differs only in what it gives back")
+    }
+  }
+
   "a result is not a selector" - {
     // The refusal the design rests on: `a * b` carries the operands and not the result, so two
     // implementations agreeing on the operands leave the use with nothing to choose by. Accepting

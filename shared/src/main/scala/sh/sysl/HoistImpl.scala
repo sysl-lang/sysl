@@ -164,11 +164,25 @@ trait HoistImpl extends ImplConformance {
 
     // On a **generic** subject a defaulted argument list is not one promise but one per
     // instantiation, since the trait's own default names the type being asked about. A written
-    // argument built out of that same type would coincide with it at one instantiation and not at
-    // others, which is a choice between implementations rather than a lookup — so it is refused
-    // here, where the block that would need choosing between is the one being read.
+    // argument built out of that same type at *one* instantiation would coincide with the default
+    // there and nowhere else, which is a choice between implementations rather than a lookup — so
+    // `impl[T] Mul[Box[int]] for Box[T]` is refused here, where the block that would need choosing
+    // between is the one being read.
+    //
+    // **The subject itself is not that case**, and this is the whole of what the comparison below
+    // is for: `impl[T] Mul[Vec[T], T] for Vec[T]` writes the block's own parameters, so it says the
+    // same thing at every instantiation rather than colliding at one. That is the shape a dot
+    // product has — an operand of `Self` with a result that is not — and it has no other spelling,
+    // since trait arguments are positional and reaching `Out` means writing `Rhs`. Refusing it also
+    // refused something the non-generic path allows: `impl Mul[Vector, real] for Vector` is exactly
+    // this block with the parameter resolved.
+    //
+    // What a *duplicate* costs is still charged, by the two checks above rather than by this one —
+    // a second block at the same operands is caught by the argument-list comparison, and one
+    // differing only in its result by the rule that a result is not a selector. Both wait until
+    // there are two blocks, which is what this one now does too.
     if outer.tparams.nonEmpty && tr.tdefaults.values.exists(mentionsSelf) then
-      for a <- written if mentionsKey(a, outer.key) do
+      for a <- written if mentionsKey(a, outer.key) && a != subject do
         err(s"'${show(a)}' is ${aOrAn(outer.label)}, and a '${qn(impl.traitName)}' whose arguments " +
           s"default names the type it is written for — so at one ${outer.label} this block and a " +
           "defaulted one would promise the same thing")
