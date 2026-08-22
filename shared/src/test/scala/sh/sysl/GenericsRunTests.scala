@@ -570,6 +570,48 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "200 5000000000\n"
     }
 
+    /** And it still outranks one when a **closure** stands at a parameter the literal also
+      * mentions, which is where it used to stop.
+      *
+      * A callable argument has no type of its own, so it is held back and read against the partial
+      * solution the other arguments made — and that solution was built from every argument at once,
+      * literals included. So the literal's default settled the parameter before the closure was
+      * read, the closure came out at `int`, and the expected type had nothing left to outrank. The
+      * order here is `solve`'s: what carries a type, then the expected type, then the literals.
+      */
+    "and it still does when a closure stands at the same parameter" in {
+      run("""twice[A](x: A, f: &Fn(A) -> A) -> A = f(f(x))
+            |val n: usize = twice(0, a -> a + 1)
+            |print(n)
+            |""".stripMargin) shouldBe "2\n"
+    }
+
+    /** The same fault, seen through the spelling that lowers to a bound rather than to a box.
+      *
+      * Here the solve *did* seed the parameter from the expected type — and reported that the
+      * closure did not implement what the bound asked for, because the closure had already been
+      * analyzed at the literal's default. One fault, two faces: the boxed form let the wrong answer
+      * win, and the bounded form refused the right one.
+      */
+    "a bare-arrow callable is read at the expected type too" in {
+      run("""twice[A](x: A, f: A -> A) -> A = f(f(x))
+            |val n: usize = twice(0, a -> a + 1)
+            |print(n)
+            |""".stripMargin) shouldBe "2\n"
+    }
+
+    /** An argument that carries a type still beats the expected type, which is the half of the
+      * ordering that must not move: the closure is read at what the *argument* said, and the
+      * mismatch is reported against the binding rather than against the call.
+      */
+    "an argument with a type of its own still outranks the expected type" in {
+      err("""twice[A](x: A, f: &Fn(A) -> A) -> A = f(f(x))
+            |var start: u8 = 1
+            |val n: usize = twice(start, a -> a + 1)
+            |print(n)
+            |""".stripMargin) should include("declared usize")
+    }
+
     "a literal against an argument of a type it cannot be names both" in {
       err("""pair[T](a: T, b: T) -> T = a
             |print(pair("s", 1))

@@ -100,7 +100,7 @@ trait SignatureVisibility extends TypeResolution {
             // declares what a call to it is, and its signature may name either. Resolving under the
             // trait's alone reported the member's as unknown types, which read as a mistake in the
             // trait rather than as a scope this walk had not been given.
-            val here = subst ++ abstractSubst(m.tparams, m.bounds, m.tvalues, m.tpacks)
+            val here = subst ++ abstractSubst(m.tparams, m.bounds, m.tvalues, m.tpacks, subst)
 
             for p <- m.params do resolveType(p.typ, here)
             m.retType.foreach(resolveReturn(_, here))

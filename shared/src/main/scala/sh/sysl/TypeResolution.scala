@@ -229,12 +229,21 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
    * what a short name means is what the *declaring* file imported. Read from anywhere else the bound
    * silently keeps the name as written, and the parameter goes on carrying a promise that no
    * conformance check can match against the same bound resolved properly.
+   *
+   * **`outer` is what the declaration these parameters belong to sits inside**, and a member's
+   * bounds need it: a member declares its own parameters beside its *owner's*, so a bound written on
+   * one of them may name the owner's — which is not an exotic case but the ordinary one, since
+   * `map(self, f: T -> U)` on a `trait Mapping[T]` desugars to exactly that. Resolved without it the
+   * bound reports the owner's parameter as an unknown type, blaming the trait for a scope the walk
+   * had not been given. Empty for a declaration that sits inside nothing, which is every free
+   * function and every type.
    */
   protected def abstractSubst(
       tparams: List[String],
       bounds: Map[String, List[BoundRef]],
       values: Map[String, TypeRef] = Map.empty,
       packs: Set[String] = Set.empty,
+      outer: Map[String, Type] = Map.empty,
   ): Map[String, Type] = {
     def build(tp: String, seen: Set[String]): Type.Abstract = named(tp, tp, seen)
 
@@ -251,7 +260,7 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
           // A bound asks something of the parameter it is written on, so `Self` inside it — written
           // there, or arriving from a default — is that parameter. It is taken from `inner`, whose
           // entry for it is already the bound-free stand-in that breaks the walk back around.
-          val here = inner ++ selfBinding(inner(tp))
+          val here = outer ++ inner ++ selfBinding(inner(tp))
 
           bounds.getOrElse(tp, Nil).map(b => recorded(Type.Bound(b.name, Nil))(resolveBound(b, here))),
       )

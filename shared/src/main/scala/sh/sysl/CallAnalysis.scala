@@ -138,7 +138,9 @@ trait CallAnalysis extends OperatorCalls {
     val (passed, tail) = args.splitAt(fd.params.length)
     val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)((ref, _) => spellSelf(_, ref))
     val ptypes      = fd.params.map(p => spell(p.typ))
-    val provisional = provisionalArgs(fd.name, fd.tparams, ptypes, passed, m.bounds)
+    val provisional =
+      provisionalArgs(fd.name, fd.tparams, ptypes, passed, m.bounds,
+        result = fd.retType.map(spell), expected = expected)
 
     val (ownerTps0, _) = fd.tparams.splitAt(fd.tparams.length - m.tparams.length)
 

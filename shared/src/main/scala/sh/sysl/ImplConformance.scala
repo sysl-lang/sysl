@@ -163,7 +163,10 @@ trait ImplConformance extends MemberLowering {
     //
     // Resolving without them reported the member's own parameters as unknown types — a message
     // about the trait, in a walk the trait had nothing wrong with.
-    val stand    = abstractSubst(tm.tparams, tm.bounds, tm.tvalues, tm.tpacks)
+    // `self` is the outer scope here — the trait's own parameters, and `Self` bound to the
+    // implementing type — because a member's bound may name one of them: a bare-arrow parameter on
+    // `trait Mapping[T]` desugars to a bound of `Fn(T) -> U`, whose `T` is the trait's.
+    val stand    = abstractSubst(tm.tparams, tm.bounds, tm.tvalues, tm.tpacks, self)
     val traitOwn = self ++ stand
     val implOwn  = self ++ im.tparams.zip(tm.tparams.map(stand)).toMap
 

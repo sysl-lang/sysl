@@ -616,7 +616,9 @@ trait MethodCalls extends FuncAddress {
     // function of the same signature has no such gap, because there every parameter is answered by
     // an argument.
     val ownerSeed   = fd.tparams.zip(ownerArgs).toMap
-    val provisional = provisionalArgs(fd.name, fd.tparams, ptypes, passed, m.bounds, ownerSeed)
+    val provisional =
+      provisionalArgs(fd.name, fd.tparams, ptypes, passed, m.bounds, ownerSeed,
+        result = fd.retType.map(spell), expected = expected)
     // **Only the member's own parameters are written**, and they settle the call outright where they
     // are: the owner's arrived with the receiver and were never a question, and the solve below is
     // what the written list replaces rather than something it is checked against.
@@ -820,23 +822,31 @@ trait MethodCalls extends FuncAddress {
           // the provisional pass and as `solve`'s `known`, so a parameter naming any of it is read
           // against the answer rather than waited on. `Self` is named among the ones being held for
           // the same reason the trait's parameters are — it has no resolution outside that map.
-          val ownSolved =
-            if m.tparams.isEmpty then Map.empty[String, Type]
+          val (ownSolved, provisional) =
+            if m.tparams.isEmpty then (Map.empty[String, Type], None)
             else
               val ptypes = m.params.map(_.typ)
               val held   = (selfName :: traitDecls.get(tr.name).fold(List.empty[String])(_.tparams)) ::: m.tparams
               val prov   = provisionalArgs(fname, held, ptypes, declared, m.bounds, self)
 
-              m.tparams
-                .zip(solve(fname, m.tparams, ptypes, prov.map(_.ty), m.retType, None, Nil, m.bounds, self))
-                .toMap
+              (m.tparams
+                 .zip(solve(fname, m.tparams, ptypes, prov.map(_.ty), m.retType, None, Nil, m.bounds, self))
+                 .toMap,
+               Some(prov))
 
           val subst  = self ++ ownSolved
           val params = m.params.map(p => (p.name, resolveType(p.typ, subst)))
 
           if m.tparams.nonEmpty then checkParamBounds(fname, m.tparams, m.bounds, m.tparams.map(ownSolved), self)
 
-          val ts    = declared.zip(params).map { case (arg, (_, pty)) => analyzeExpr(arg, Some(pty)) }
+          // **The provisional reading is kept where there was one**, exactly as a generic free
+          // function's is: it was made against the parameter's *bound*, and re-reading an argument
+          // against the parameter's solved type asks a different question. For a closure standing at
+          // a bare-arrow parameter that question has no answer — the solved type is the closure's own
+          // struct, which says nothing about what the closure takes, so the second reading reported
+          // that its parameters had no types while the first had read them perfectly well.
+          val ts = provisional.getOrElse(
+            declared.zip(params).map { case (arg, (_, pty)) => analyzeExpr(arg, Some(pty)) })
           val rtype = m.retType.map(resolveReturn(_, subst)).getOrElse(Type.Unit)
           TCall(fname, recv :: (checkArgs(fname, params, declared, Some(ts)) ::: tail.map(variadicArg(_))), rtype)
         }

@@ -116,7 +116,13 @@ trait Hoisting extends HoistMembers {
       // A trait asking for a setter is asking about a property it also declares, so the two are put
       // together here — before anything reads the trait's signatures — exactly as a type's own
       // members are paired when they are hoisted.
-      traitDecls(key) = t.copy(name = key, methods = pairSetters(t.methods, t.name)).setPos(t.pos)
+      // A bare-arrow parameter is sugar for a bounded type parameter, and a trait's member gets the
+      // same rewrite a type's does — so `map(self, f: A -> B)` asks for a callable it can call
+      // directly rather than for one in a counted box. What it costs is the member's table slot,
+      // which is the standing rule about a member that declares type parameters of its own rather
+      // than anything new: the function does not exist until a call names them.
+      traitDecls(key) = t.copy(name = key, methods = loweredMembers(pairSetters(t.methods, t.name)))
+        .setPos(t.pos)
       declScope(key) = currentScope
       recordAccess(key, t.vis)
       // A trait's members take no modifier of their own, so each is recorded at the trait's reach —
@@ -270,7 +276,13 @@ trait Hoisting extends HoistMembers {
     // The type an `impl` names may be declared further down the file, so it cannot be resolved here
     // — the duplicate check goes with the resolution, in `hoistImpl`. The module it was written in
     // travels with it, since that is what the trait it names and the type it is for resolve under.
-    case i: ImplDecl =>
+    case original: ImplDecl =>
+      // Lowered here rather than where the block's members are hoisted, because **conformance reads
+      // the block's own declaration**: the trait's side is lowered at registration, so a block whose
+      // members were not would be compared against a signature carrying a type parameter it appears
+      // not to have.
+      val i = original.copy(methods = loweredMembers(original.methods)).setPos(original.pos)
+
       implDecls += ((currentScope, i))
       checkSolvedDefaults("the 'impl' block", s"${i.traitName} for ${i.forType.show}", i.tdefaults)
       for m <- i.methods do

@@ -125,6 +125,8 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
       args: List[Expr],
       bounds: Map[String, List[BoundRef]] = Map.empty,
       seed: Map[String, Type] = Map.empty,
+      result: Option[TypeRef] = None,
+      expected: Option[Type] = None,
   ): List[TExpr] = {
     val tps  = tparams.toSet
     val want = inDecl(decl)(ptypes.map(r => Option.unless(mentions(r, tps))(resolveType(r, Map.empty))))
@@ -152,14 +154,16 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     // agreed about every argument that was not a bare name.
     val callable = at.map((a, _) => callableArg(a))
 
-    val first = at.zip(callable).map { case ((a, e), isCallable) =>
+    // Each entry is the node read, if one was, and whether reading it took a **literal's default**
+    // for want of anything better — which is what the ordering below turns on.
+    val first: List[Option[(TExpr, Boolean)]] = at.zip(callable).map { case ((a, e), isCallable) =>
       if isCallable || e.isEmpty && (nullArg(a) || implicitArg(a)) then None
       else
         e match
-          case Some(_) => Some(analyzeExpr(a, e))
+          case Some(_) => Some(analyzeExpr(a, e) -> false)
           case None =>
             literalDefault(a) match
-              case Some(ty) => Some(standIn(ty).setPos(a.pos))
+              case Some(ty) => Some(standIn(ty).setPos(a.pos) -> true)
               // **A fourth shape with no type of its own, and it is not one a syntax can name**:
               // anything whose bare analysis cannot get off the ground for want of the context it
               // was denied. `None` at a parameter of type `Option[T]` is the one that found this —
@@ -175,7 +179,7 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
               // `attempt` rather than `probe` because the node is kept where the analysis
               // succeeded, which is the ordinary case here and must cost one analysis rather than
               // two.
-              case None => attempt(analyzeExpr(a))
+              case None => attempt(analyzeExpr(a)).map(_ -> false)
     }
 
     // What the first pass settles. `map[A, B](xs: []A, out: []B, f: A -> B)` gets both from the two
@@ -189,10 +193,25 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     // disagrees is a type error `checkArgs` reports against the instantiated signature.
     val partial = scala.collection.mutable.Map.empty[String, Type] ++= seed
 
-    for case (r, Some(t)) <- ptypes.zip(first) do inDecl(decl)(unify(r, t.ty, tps, partial))
+    // **The three tiers are `solve`'s, and they are here because a held-back argument is read
+    // against this map rather than against that one.** What carries a type of its own settles a
+    // parameter first, the expected type next, and a literal's default only where neither reached
+    // it (`10 § Inference is bidirectional`). Reading them in one pass instead let a literal fix the
+    // parameter a closure was about to be analyzed at, so `val n: usize = twice(0, a -> a + 1)` read
+    // its closure at `int` and then reported the result against the binding — with the annotation
+    // that was supposed to answer the question sitting one line above.
+    //
+    // `unify` writes only where the map is silent, so the order is the whole of the precedence.
+    for case (r, Some((t, false))) <- ptypes.zip(first) do inDecl(decl)(unify(r, t.ty, tps, partial))
+
+    if partial.size < tparams.length then
+      for r <- result; e <- expected do inDecl(decl)(unify(r, e, tps, partial))
+
+    if partial.size < tparams.length then
+      for case (r, Some((t, true))) <- ptypes.zip(first) do inDecl(decl)(unify(r, t.ty, tps, partial))
 
     at.zip(first).zipWithIndex.map { case (((a, _), done), i) =>
-      done.getOrElse(
+      done.map(_._1).getOrElse(
         analyzeExpr(a, inDecl(decl)(heldWant(callable(i), ptypes.lift(i), tps, bounds, partial.toMap))))
     }
   }
@@ -702,7 +721,9 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
           err(s"$names $is in neither the parameters of '$shown' nor its result, so nothing in this " +
             s"call says what $it should be — write $it out, as '$shown[…](…)'")
 
-        val provisional = provisionalArgs(f.name, f.tparams, f.params.map(_.typ), args, f.bounds)
+        val provisional =
+          provisionalArgs(f.name, f.tparams, f.params.map(_.typ), args, f.bounds,
+            result = f.retType, expected = expected)
         // The parameter types being matched against are the declaration's, written in the
         // declaration's terms — so a `Pair[T]` there is that module's `Pair` whichever module the
         // call was written in.

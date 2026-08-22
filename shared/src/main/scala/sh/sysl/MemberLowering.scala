@@ -195,6 +195,21 @@ trait MemberLowering extends TypeResolution {
     Option.when(added.nonEmpty)((tparams ::: added.map(_._1).toList, rewritten, added.toMap))
   }
 
+  /** [[callBounds]] applied to each member of a list, which is what a **declaration** wants: a
+   * member's bare-arrow parameters are sugar wherever the member was written, so the rewrite belongs
+   * where the declaration is registered rather than where its members are hoisted.
+   *
+   * **It is idempotent**, which is what lets a list be lowered at registration and hoisted later
+   * without asking whether it has been through here already: a rewritten parameter is a
+   * `NamedType`, and `callBounds` looks only for a bare `FnType`.
+   */
+  protected def loweredMembers(members: List[MethodDecl]): List[MethodDecl] =
+    members.map(m =>
+      callBounds(m.tparams, m.params).fold(m) { (tps, ps, bs) =>
+        m.copy(tparams = tps, params = ps, bounds = m.bounds ++ bs).setPos(m.pos)
+      },
+    )
+
   protected def hoistMemberList(
       home: MemberHome,
       members: List[MethodDecl],
