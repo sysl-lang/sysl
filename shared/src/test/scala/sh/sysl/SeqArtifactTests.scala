@@ -55,6 +55,24 @@ class SeqArtifactTests extends AnyFreeSpec with RunSupport {
           |print(out.len, out[0], out[2])""".stripMargin,
       ) shouldBe "3 4 36\n"
     }
+
+    /** The creator, which is the one thing here with no receiver — so it arrives through the
+      * artifact as a plain generic function rather than through a table, and is worth asking
+      * separately for that reason. What it produces goes straight back into the trait's members,
+      * which is the whole reason it lives in this module.
+      */
+    "generate, and what it makes is an ordinary sequence" in {
+      seq(
+        """import sysl.seq.generate
+          |
+          |val squares = generate(5, i -> int(i * i))
+          |
+          |print(squares.len, squares[0], squares[4])
+          |print(generate(3, i -> s"row ${i}")[2])
+          |print(generate(0, i -> i + 1).len)
+          |print(squares.fold(0, (a, n) -> a + n))""".stripMargin,
+      ) shouldBe "5 0 16\nrow 2\n0\n30\n"
+    }
   }
 
   /** The shape card `0229` is about, asked of this module: a closure that **captures** and returns

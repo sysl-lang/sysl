@@ -35,6 +35,11 @@ import sysl.buf.{Buf, buf, buf_with_capacity}
 //
 // So the only allocation left is the one that is inherent: **three of the ten build a new sequence
 // to hand back**, and the seven that do not now allocate nothing at all.
+//
+// **One thing in this module is not part of the trait**: `generate`, at the foot of the file, which
+// makes a sequence out of a count. It cannot be a member of anything -- a creator has no receiver --
+// and it is here rather than in `sysl.buf` because the shape it has is `map`'s, and because
+// `(0..<n).map(f)`, which is what a caller would otherwise write, is not something sysl can say.
 trait Sequence[T]
 
     // -- these answer without building a sequence ----------------------------------------------
@@ -152,12 +157,21 @@ impl[E] Sequence[E] for []const E
     // The buffer is given the length the answer is known to have, so a map over a long slice grows
     // once instead of at every doubling. `filter` cannot know its own length in advance and does not
     // pretend to.
+    //
+    // **The first result is bound and then pushed, rather than computed twice.** Giving the buffer a
+    // capacity means giving it a value to fill that storage with, and the only value to hand is `f`
+    // of the first element -- so the obvious spelling calls the caller's closure on element zero once
+    // for the fill and again for the element. `f` belongs to the caller: one that counts, logs or
+    // allocates would see it.
     map[U](self, f: E -> U) -> []U
         if self.len == 0 then return []
 
-        var out = buf_with_capacity(self.len, f(self[0]))
+        val first = f(self[0])
+        var out = buf_with_capacity(self.len, first)
 
-        for i in 0..<self.len
+        out.push(first)
+
+        for i in 1..<self.len
             out.push(f(self[i]))
 
         out.view()
@@ -205,3 +219,30 @@ impl[E] Sequence[E] for Buf[E]
     filter(self, p: E -> bool) -> []E = self.view().filter(p)
 
     flat_map[U](self, f: E -> []U) -> []U = self.view().flat_map(f)
+
+// A sequence of `n` elements, each produced from its index.
+//
+// **The one thing here that makes a sequence rather than taking one**, and a free function because a
+// creator has no receiver: there is nothing for `self` to be until the call has already done the
+// work.
+//
+// It is in this module because the shape a caller wants is `map`'s -- an index goes in and an element
+// comes out -- and `(0..<n).map(f)` is what they would write if they could. **A range is not a value
+// in sysl**, so there is no type for `Sequence` to be implemented for and nothing to map over. This
+// stands in for that, and names the count where the range would have stood.
+//
+// `f` is called exactly once for each index, in order, and the buffer is given the length the answer
+// is known to have, so it grows once.
+generate[U](n: usize, f: usize -> U) -> []U
+    if n == 0 then return []
+
+    val first = f(0)
+    var out = buf_with_capacity(n, first)
+
+    out.push(first)
+
+    for i in 1..<n
+        out.push(f(i))
+
+    out.view()
+end generate
