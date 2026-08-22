@@ -263,7 +263,9 @@ class ArgsCliTests extends AnyFreeSpec with RunSupport {
      * two positions right of the row that set the column, and every row disagrees with every other
      * by however many accented characters happen to be above it.
      *
-     * This is `guide/table`'s finding reaching the library that had the same bug (`14 §2`).
+     * This is the byte-versus-column finding reaching the second thing that lays text out: a format
+     * specifier's width counts bytes on purpose, so that it means what `snprintf` means, and
+     * anything laying out a column asks `sysl.text.columns` instead.
      */
     "and the column is screen columns, so a placeholder that is not ASCII still lines up" in {
       val src =

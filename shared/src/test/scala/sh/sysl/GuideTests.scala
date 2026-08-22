@@ -17,7 +17,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * legible next to the documents they are about.
  */
 /** **Each guide is its own test, and they run at the same time.** A guide program is a real compile,
- * link and run of a few hundred lines, and there are fifteen of them; sequentially that was the
+ * link and run of a few hundred lines, and there are fourteen of them; sequentially that was the
  * larger half of this suite's time with one std busy. Nothing is shared between them — each
  * compiles from its own directory into its own temporary files — so the only thing that had made
  * them sequential was the runner taking one test at a time.
@@ -324,31 +324,6 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
   // `Result`, a malformed *program* is a bug in the thing being run and stops the way sysl stops.
   "lisp — what the interpreter refuses, which its own run cannot assert" in {
     guideTests("lisp") should have length 17
-  }
-
-  // The one program in the set that measures text for **display** rather than copying or comparing
-  // it. Its last three sections are the finding: a column is neither bytes nor characters wide, and
-  // the difference is not a constant that could be corrected for afterwards. The measurement itself
-  // is `sysl.text`'s — the finding is what put it there, and `WidthTests` is where it is pinned.
-  "table — text measured for display, where a byte count is the wrong unit" in {
-    val out = guide("table")
-
-    out should not include "FAIL"
-    checks(out) shouldBe 46
-    sections(out) shouldBe List(
-      "-- a column is as wide as its widest cell",
-      "-- a row holds types that differ",
-      "-- alignment puts the slack where it was asked",
-      "-- a column is measured in columns, not bytes and not characters",
-      "-- a cell that is wider than its characters",
-      "-- what a byte count would have done",
-    )
-  }
-
-  // A row is refused for having the wrong number of cells, which traps — so the pair of it and the
-  // row that is taken lives here, where a trap is an observation rather than the end of the run.
-  "table — a row that does not fit its columns" in {
-    guideTests("table") should have length 5
   }
 
   // The one guide program whose subject is the C boundary. Its checks nearly all read the same way
