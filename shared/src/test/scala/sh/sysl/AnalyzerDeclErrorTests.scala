@@ -37,7 +37,8 @@ class AnalyzerDeclErrorTests extends AnyFreeSpec with CodegenSupport {
     }
 
     "a nullary variant cannot take arguments" in {
-      err("enum Shape\n    Circle(r: int)\n    Empty\nvar s = Empty(1)") should include("takes no arguments")
+      err("enum Shape\n    Circle(r: int)\n    Empty\nvar s = Empty(1)") should
+        include("carries nothing, so it is written as a name on its own")
     }
 
     "matching an unknown variant" in {
