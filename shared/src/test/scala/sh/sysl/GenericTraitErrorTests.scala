@@ -309,11 +309,22 @@ class GenericTraitErrorTests extends AnyFreeSpec with RunSupport with CodegenSup
       )
     }
 
-    "a generic method is still refused at the declaration" in {
-      err(
+    // A generic member is the one unslottable shape that does **not** cost the trait its object: it
+    // is left out of the table and the object still forms. Sits here beside the `Self` case above so
+    // the two are read together, since they are the same question answered two different ways.
+    "a generic method does not cost the trait its object — it costs itself a slot" in {
+      run(
         """trait Get[T]
-          |    pick[U](self, u: U) -> T""".stripMargin,
-      ) should include("'Get.pick' declares type parameters of its own, which a trait's member may not")
+          |    tag(self) -> T
+          |    pick[U](self, u: U) -> T
+          |struct A
+          |    n: int
+          |impl Get[int] for A
+          |    tag(self) -> int = self.n
+          |    pick[U](self, u: U) -> int = self.n
+          |val u: &Get[int] = A(7)
+          |print(u.tag())""".stripMargin,
+      ) shouldBe "7\n"
     }
 
     "an implementation still supplies every member the trait declares" in {

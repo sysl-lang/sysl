@@ -802,16 +802,42 @@ trait MethodCalls extends FuncAddress {
           if m.receiver.isEmpty then
             err(s"'$mname' is an associated function of '${tr.show}', so it has no receiver — a value " +
               "cannot be the thing it is called on")
-          val params = m.params.map(p => (p.name, resolveType(p.typ, self)))
           // Checked against the trait's signature, so it is the trait's defaults and the trait's
           // parameter names that a call inside a generic body may reach for — the same ones every
           // instantiation will present, which is what makes one walk stand in for all of them.
           val bound = bindArgs(s"method '$fname'", Some(tr.name), m.params, args, m.variadic)
 
-          checkArity(s"method '$fname'", params.length, m.variadic, bound.length)
-          val (declared, tail) = bound.splitAt(params.length)
+          checkArity(s"method '$fname'", m.params.length, m.variadic, bound.length)
+          val (declared, tail) = bound.splitAt(m.params.length)
+
+          // **A member with type parameters of its own is solved HERE, at the abstract call, and not
+          // left to the instantiation.** They do not depend on the receiver — `apply[U]`'s `U` comes
+          // from the argument and the context exactly as a generic free function's would — so this
+          // walk can settle them, and settling them is what lets the signature be resolved at all.
+          //
+          // What the receiver's own type says is already in `self`: the trait's parameters, and
+          // `Self` standing for the parameter this was reached through. It goes in as the seed for
+          // the provisional pass and as `solve`'s `known`, so a parameter naming any of it is read
+          // against the answer rather than waited on. `Self` is named among the ones being held for
+          // the same reason the trait's parameters are — it has no resolution outside that map.
+          val ownSolved =
+            if m.tparams.isEmpty then Map.empty[String, Type]
+            else
+              val ptypes = m.params.map(_.typ)
+              val held   = (selfName :: traitDecls.get(tr.name).fold(List.empty[String])(_.tparams)) ::: m.tparams
+              val prov   = provisionalArgs(fname, held, ptypes, declared, m.bounds, self)
+
+              m.tparams
+                .zip(solve(fname, m.tparams, ptypes, prov.map(_.ty), m.retType, None, Nil, m.bounds, self))
+                .toMap
+
+          val subst  = self ++ ownSolved
+          val params = m.params.map(p => (p.name, resolveType(p.typ, subst)))
+
+          if m.tparams.nonEmpty then checkParamBounds(fname, m.tparams, m.bounds, m.tparams.map(ownSolved), self)
+
           val ts    = declared.zip(params).map { case (arg, (_, pty)) => analyzeExpr(arg, Some(pty)) }
-          val rtype = m.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
+          val rtype = m.retType.map(resolveReturn(_, subst)).getOrElse(Type.Unit)
           TCall(fname, recv :: (checkArgs(fname, params, declared, Some(ts)) ::: tail.map(variadicArg(_))), rtype)
         }
 
@@ -941,10 +967,17 @@ trait MethodCalls extends FuncAddress {
    */
   protected def callTraitObject(recv: TExpr, t: Type.Trait, mname: String, args: List[Expr]): TExpr = {
     // A trait offers the members of the traits it requires as well as its own, and both kinds are
-    // one slot in one table — so this is the whole list, in the order the table was laid out.
-    val members = traitMembers(Type.Bound(t.name, t.args))
+    // one slot in one table — so this is the table's list, in the order it was laid out.
+    val members = slottedMembers(Type.Bound(t.name, t.args))
 
     members.zipWithIndex.find(_._1._2.name == mname) match
+      // **A member the trait really has, that the table could not hold**, is worth saying so about
+      // rather than reporting as a name the trait does not declare — the reader wrote something
+      // that exists and reached it the one way that cannot work.
+      case None if traitMembers(Type.Bound(t.name, t.args)).exists(_._2.name == mname) =>
+        err(s"'$mname' of '${t.name}' declares type parameters of its own, so it is not a function " +
+          s"until a call names them and no slot of a ${show(recv.ty)}'s table can point at it — " +
+          s"reach it through a bound, where the type is known")
       case None =>
         err(s"trait '${t.name}' declares no method '$mname' — it has " +
           members.map(_._2.name).mkString("'", "', '", "'"))
@@ -988,7 +1021,7 @@ trait MethodCalls extends FuncAddress {
    * one is either a property the trait declares or a mistake, and the second half of this says which.
    */
   protected def readTraitObjectProperty(recv: TExpr, t: Type.Trait, name: String): TExpr = {
-    traitMembers(Type.Bound(t.name, t.args)).zipWithIndex.find(_._1._2.name == name) match
+    slottedMembers(Type.Bound(t.name, t.args)).zipWithIndex.find(_._1._2.name == name) match
       case Some(((from, m), slot)) if m.isProperty =>
         val subst: Map[String, Type] = traitDecls(from.name).tparams.zip(from.args).toMap
 

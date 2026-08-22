@@ -319,7 +319,7 @@ trait SpecialForms extends Closures {
 
   /** Which slot of a trait object's table holds `Display`'s renderer, if the trait requires it. */
   private def displaySlot(o: Type.Trait): Option[Int] =
-    traitMembers(o.bound).zipWithIndex.collectFirst {
+    slottedMembers(o.bound).zipWithIndex.collectFirst {
       case ((from, m), slot) if from.name == displayTrait && m.name == "display" => slot
     }
 

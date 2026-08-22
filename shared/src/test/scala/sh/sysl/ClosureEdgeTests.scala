@@ -401,21 +401,30 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "11 1.75\n"
     }
 
-    // The other half of `12 § Open b` — a closure that is itself generic — needs no decision of its
-    // own, and this is the reason rather than the spelling: a callable's type is the library's `FnN`
-    // trait, and `02` refuses a trait member with type parameters because no vtable slot can hold a
-    // function that does not exist until a call names its types. So there is nothing for an arrow to
-    // declare them for. What the grammar says today is only that it cannot read one.
-    "a closure of its own may not be generic, because its call trait's member may not be" in {
+    // The other half of `12 § Open b` — a closure that is itself generic — is a **grammar** fact and
+    // nothing more. It used to rest on a second one: a callable's type is the library's `FnN` trait,
+    // and a trait member could not declare type parameters at all. That reason is gone — `Fn1.call`
+    // could carry one now — so what is left is that an arrow has nowhere to write them, which is
+    // where the refusal lands.
+    "a closure of its own may not be generic, because an arrow has nowhere to declare one" in {
       // `[T]` reads as an index of `T` and `(x` as a call on the result, so the refusal lands on
       // the `:` that neither of those admits — the grammar has no reading in which the brackets
       // before an arrow declare anything.
       err("""var f = [T](x: T) -> x
             |""".stripMargin) should include("')' expected")
+    }
 
-      err("""trait Maps
+    // The half that was holding it up, kept as its own case so the pair still reads: a trait member
+    // declaring type parameters is ordinary now, and the arrow above is refused on its own account.
+    "a trait member declaring one is no longer what stands in the way" in {
+      run("""trait Maps
             |    over[T](self, x: T) -> T
-            |""".stripMargin) should include("which a trait's member may not")
+            |struct P
+            |    n: int
+            |impl Maps for P
+            |    over[T](self, x: T) -> T = x
+            |print(P(1).over(7), P(1).over("s"))
+            |""".stripMargin) shouldBe "7 s\n"
     }
 
     "'?' inside a body unwraps into the closure's own result" in {

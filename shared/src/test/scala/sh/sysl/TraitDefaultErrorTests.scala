@@ -120,11 +120,21 @@ class TraitDefaultErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("no receiver")
     }
 
-    "a generic trait method is refused at the trait" in {
-      err(
+    // A member declaring type parameters of its own is ordinary now, default body and all — it
+    // gives up its table slot and nothing else. Two calls at two argument types, so the default is
+    // seen to instantiate rather than merely to compile.
+    "a generic trait method is ordinary, and may carry a default body" in {
+      val out = ir(
         """trait Store
-          |    put[T](self, item: T) -> int""".stripMargin
-      ) should include("declares type parameters of its own, which a trait's member may not")
+          |    put[T](self, item: T) -> int = 1
+          |struct Bin
+          |    n: int
+          |impl Store for Bin
+          |print(Bin(0).put("x"), Bin(0).put(2))""".stripMargin
+      )
+
+      out should include("@Bin.put.string(")
+      out should include("@Bin.put.int(")
     }
   }
 
