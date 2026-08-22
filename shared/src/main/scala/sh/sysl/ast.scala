@@ -187,8 +187,17 @@ case class LambdaParam(name: String, typ: Option[TypeRef]) extends Positioned
 /** `x -> x + 1` — a closure literal (`12 §5`). The body is a statement list for the same reason a
  * function's is: an indented block's trailing expression is its value, and the `= expr` short form
  * is that list with one statement in it.
+ *
+ * `implicitParams` is set on the one closure a program does not write the parameters of: the
+ * [[BlockArg]] a trailing block becomes at a callable parameter, whose single parameter is bound as
+ * `it` (`reference/expressions.md § A trailing block`). It says *name the parameters from the arity*
+ * rather than saying how many there are, because the place that builds the closure cannot yet know:
+ * argument binding is asked of the parameter's type **as written**, and a bare arrow has already
+ * been rewritten into a bounded type parameter carrying no arity. `analyzeLambda` is where the
+ * expected signature arrives, and is where the name is given.
  */
-case class Lambda(params: List[LambdaParam], body: List[Stmt]) extends Expr
+case class Lambda(params: List[LambdaParam], body: List[Stmt], implicitParams: Boolean = false)
+    extends Expr
 
 /** The indented block a call may write after a `:`, standing at one of its parameters.
  *

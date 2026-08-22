@@ -75,6 +75,17 @@ object Closures {
    */
   def symbol(name: String): Boolean = name.startsWith(prefix)
 
+  /** The name a trailing block's one parameter is bound as, where the callable it stands at takes
+   * one (`reference/expressions.md § A trailing block`).
+   *
+   * It is an ordinary parameter of the closure and not a keyword: it is not reserved, it shadows an
+   * outer name of its own accord, and a block that has no use for the value simply never writes it.
+   * Kotlin's, and for Kotlin's reason — the block already *is* a closure, so this only names what it
+   * was passed. What it deliberately does not do is extend: two parameters have no positional
+   * spelling here, because `$` is [[Modules.sep]] and no source name may hold one.
+   */
+  val it: String = "it"
+
   /** Whether a function's name is one the **lowering** made up rather than one a reader wrote — a
    * closure's body or a nested function's.
    *
@@ -94,18 +105,30 @@ trait Closures extends CallAnalysis {
   private var environmentCount = 0
 
 
-  /** A closure literal (`12 §5`).
+  /** A closure literal (`12 §5`), and the closure a trailing block became.
    *
    * The parameter types come from the context asking for a callable and the result comes from the
    * body — never the other way round, so a closure is analyzed once and what it yields is what it
    * yields.
+   *
+   * **A block wrote no parameter list, so this is where it gets one.** `implicitParams` turns the
+   * check below inside out for that case: what the context asks for *names* the parameters rather
+   * than being compared against names the reader chose.
    */
   protected def analyzeLambda(l: Lambda, expected: Option[Type]): TExpr = {
     val want = expected.flatMap(callableSignature)
 
-    for (ws, _) <- want if ws.length != l.params.length do
-      err(s"this closure takes ${quantity(l.params.length, "parameter")}, and what it is being " +
-        s"used as takes ${ws.length}")
+    val params = if l.implicitParams then blockParams(l, want.map(_._1)) else l.params
+
+    for (ws, _) <- want if ws.length != params.length do
+      if l.implicitParams then
+        err(s"a trailing block binds the one value it is passed as '${Closures.it}', so it stands " +
+          s"at a callable taking one or none — and what this one is being used as takes " +
+          s"${ws.length}. Write it as a closure literal, which names its parameters: " +
+          s"'(${(1 to ws.length).map(i => ('a' + i - 1).toChar).mkString(", ")}) -> …'")
+      else
+        err(s"this closure takes ${quantity(params.length, "parameter")}, and what it is being " +
+          s"used as takes ${ws.length}")
 
     // An annotation is read where one is written and the context supplies the rest. A parameter with
     // neither is the one shape a closure cannot be analyzed at all, and it is reported against the
@@ -120,7 +143,7 @@ trait Closures extends CallAnalysis {
     // exactly where that bites: a call into a generic member, whose own signature very likely calls
     // something `T`, so a reader copying the advice writes a name that means nothing at the call.
     // `…` cannot be copied and says the same thing.
-    val ptypes = l.params.zipWithIndex.map { (p, i) =>
+    val ptypes = params.zipWithIndex.map { (p, i) =>
       p.typ.map(resolveType(_, tsubst))
         .orElse(want.flatMap((ws, _) => ws.lift(i)))
         .getOrElse(at(p.pos)(err(
@@ -133,8 +156,23 @@ trait Closures extends CallAnalysis {
         )))
     }
 
-    lowerClosure(l.params.map(_.name), ptypes, want.flatMap(_._2), l.body, l.pos)
+    lowerClosure(params.map(_.name), ptypes, want.flatMap(_._2), l.body, l.pos)
   }
+
+  /** What a trailing block's closure calls its parameters, which is the arity it stands at and
+   * nothing the block wrote (`reference/expressions.md § A trailing block`).
+   *
+   * One parameter is [[Closures.it]]. **None is the empty list, and so is anything else** — a block
+   * cannot name two, and handing back nothing is what lets the arity check above say so in the
+   * sentence a reader who wrote no parameters needs, rather than in the one that counts parameters
+   * they did not write.
+   *
+   * Nothing said what the block stands at where `want` is empty, and the empty list is right there
+   * too: the closure is analyzed with no parameters, exactly as one written `() -> …` would be, and
+   * whatever refuses that refuses this.
+   */
+  private def blockParams(l: Lambda, want: Option[List[Type]]): List[LambdaParam] =
+    if want.exists(_.length == 1) then List(LambdaParam(Closures.it, None).setPos(l.pos)) else Nil
 
   /** Builds the struct, the implementation and the body of one closure, and yields the struct value
    * that *is* the closure — its captures, in the order the fields hold them.
@@ -489,7 +527,7 @@ trait Closures extends CallAnalysis {
       case f: FuncDecl => scoped(f.body, bound ++ f.params.map(_.name)); bound
       // A closure inside this one captures from further out through this one, so what it reads is
       // read here too — which is what makes capture reach through a nesting (`12 §5a`).
-      case Lambda(ps, b) => scoped(b, bound ++ ps.map(_.name)); bound
+      case Lambda(ps, b, _) => scoped(b, bound ++ ps.map(_.name)); bound
       case For(_, n, it, b, e) =>
         walk(it, bound)
         scoped(b, bound + n)

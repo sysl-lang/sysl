@@ -146,7 +146,7 @@ object Bodies {
       case MultiDecl(ns, _, vs)  => vs.foreach(walk(_, bound)); bound ++ ns
       case PatternDecl(p, _, v)  => walk(v, bound); bound ++ patternNames(p)
       case g: FuncDecl           => walk(g.body, bound ++ g.params.map(_.name)); bound
-      case Lambda(ps, b)         => walk(b, bound ++ ps.map(_.name)); bound
+      case Lambda(ps, b, _)      => walk(b, bound ++ ps.map(_.name)); bound
       case For(_, n, it, b, e) =>
         walk(it, bound)
         walk(b, bound + n)

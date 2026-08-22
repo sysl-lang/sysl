@@ -311,7 +311,7 @@ object AstCodec {
         case OffsetOf(t, f)          => tok("off"); typ(t); sref(f)
         case TryExpr(x)              => tok("try"); expr(x)
         case Tuple(es)               => tok("tup"); list(es)(expr)
-        case Lambda(ps, b)           => tok("lam"); list(ps)(lambdaParam); list(b)(stmt)
+        case Lambda(ps, b, _)        => tok("lam"); list(ps)(lambdaParam); list(b)(stmt)
         case BlockArg(b)             => tok("barg"); list(b)(stmt)
         case ArrayLit(es)            => tok("arr"); list(es)(expr)
         case ArrayFill(v, c)         => tok("afl"); expr(v); expr(c)
