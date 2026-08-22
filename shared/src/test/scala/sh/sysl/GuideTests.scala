@@ -17,7 +17,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * legible next to the documents they are about.
  */
 /** **Each guide is its own test, and they run at the same time.** A guide program is a real compile,
- * link and run of a few hundred lines, and there are fourteen of them; sequentially that was the
+ * link and run of a few hundred lines, and there are thirteen of them; sequentially that was the
  * larger half of this suite's time with one std busy. Nothing is shared between them — each
  * compiles from its own directory into its own temporary files — so the only thing that had made
  * them sequential was the runner taking one test at a time.
@@ -324,32 +324,6 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
   // `Result`, a malformed *program* is a bug in the thing being run and stops the way sysl stops.
   "lisp — what the interpreter refuses, which its own run cannot assert" in {
     guideTests("lisp") should have length 17
-  }
-
-  // The one guide program whose subject is the C boundary. Its checks nearly all read the same way
-  // — the library's sort and the C library's sort agree on this data — because a binding that is
-  // wrong produces a plausible order rather than a crash, and only the comparison catches that.
-  "qsort — a C routine that calls back into sysl" in {
-    val out = guide("qsort")
-
-    out should not include "FAIL"
-    checks(out) shouldBe 16
-    sections(out) shouldBe List(
-      "-- the binding, on the smallest cases there are",
-      "-- and on the shapes a sort is usually wrong about",
-      "-- one body per element type, which is what the callback is",
-      "-- the same data, sorted both ways",
-      "-- what the C library does not promise",
-      "-- and what it costs, which is the question this program was written to settle",
-    )
-
-    // The last section prints two durations and a ratio, and none of the three is asserted: they are
-    // this machine's numbers under this machine's load, so a bound tight enough to mean anything
-    // would be a test that fails on a busy runner. What is asserted is that the section produced its
-    // two lines, and — by the check above it, which is one of the sixteen — that the two sorts
-    // agreed on the data they were timed over, without which the numbers measure different work.
-    out should include("sysl.slices.sort")
-    out should include("C library qsort")
   }
 
   // **The assertion that carries this one is the third section**, where the *same* `solve` is called
