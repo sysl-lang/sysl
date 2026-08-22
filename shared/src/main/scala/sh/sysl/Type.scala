@@ -610,6 +610,40 @@ object Type {
     case CFn(ps, r)       => ps.exists(mentionsAbstract) || mentionsAbstract(r)
     case _                => false
 
+  /** What a cache key needs beyond the spelling, when the type is built out of stand-ins.
+   *
+   * **An `Abstract` is its name**, so `Buf[T]` under a `[T: Ord]` and `Buf[T]` under a `[T: Display]`
+   * are one string and two types. A map keyed on the spelling hands the second declaration the first
+   * one's instantiation, fields and all — and the diagnostic then lands inside whichever declaration
+   * asked second, saying its own bounds do not promise what its body assumes. Every pass that makes
+   * such an instantiation already sandboxes it, and this is the other half of that rule: while it
+   * lives, it must not be mistaken for a different declaration's.
+   *
+   * Empty for a type with no stand-in in it, which is every type a value is ever laid out at — so a
+   * real instantiation's key is exactly what it always was.
+   *
+   * Two stand-ins that agree on their bounds still share, and should: what a definition-time walk can
+   * do with one is what its bounds promise, so they are interchangeable.
+   */
+  def standInTag(t: Type): String = t match
+    case a: Abstract      => s"{${a.name}:${a.bounds.map(_.key).mkString("+")}}"
+    case n: Named         => n.targs.map(standInTag).mkString
+    case Ptr(inner)       => standInTag(inner)
+    case Ref(inner, _)    => standInTag(inner)
+    case Weak(inner)      => standInTag(inner)
+    case Array(_, elem)   => standInTag(elem)
+    case Vector(_, elem)  => standInTag(elem)
+    case Slice(elem, _)   => standInTag(elem)
+    case Volatile(inner)  => standInTag(inner)
+    case CFn(ps, r)       => ps.map(standInTag).mkString + standInTag(r)
+    case _                => ""
+
+  /** The key an instantiation is cached under: its spelling, plus what tells one stand-in from
+   * another spelled the same way.
+   */
+  def instanceKey(base: String, targs: List[Type]): String =
+    qualified(base, targs) + targs.map(standInTag).mkString
+
   /** Whether a type is built out of one that could not be worked out. `Unknown` is only ever
    * produced where the thing that would have decided the type was already reported, so a check
    * that reaches one is a check whose answer is a consequence of a mistake the reader has already

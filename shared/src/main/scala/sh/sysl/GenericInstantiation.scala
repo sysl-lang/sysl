@@ -128,7 +128,7 @@ trait GenericInstantiation extends ConstFolding {
     val targs = withDefaults(name, decl.tparams, decl.tdefaults, written, Map.empty)
 
     checkTypeBounds(name, decl.tparams, targs)
-    val key = Type.qualified(name, targs)
+    val key = Type.instanceKey(name, targs)
 
     structInsts.get(key) match
       case Some(s) => s
@@ -292,7 +292,7 @@ trait GenericInstantiation extends ConstFolding {
     val targs = withDefaults(name, decl.tparams, decl.tdefaults, written, Map.empty)
 
     checkTypeBounds(name, decl.tparams, targs)
-    val key = Type.qualified(name, targs)
+    val key = Type.instanceKey(name, targs)
 
     enumInsts.get(key) match
       case Some(en) => en
@@ -547,6 +547,11 @@ trait GenericInstantiation extends ConstFolding {
    * the operand rule's, one level up: what is already a type settles the parameter, and the
    * literals take what it settled to. They are still consulted, because with nothing else to go on
    * `id(7)` must remain an `int` rather than an inference failure.
+   *
+   * `known` carries the parameters that are not being inferred at all because something already
+   * says what they are — a type's own arguments, read off the type an associated function was
+   * reached through. Nothing infers over one: `unify` writes only where the map is silent, so a
+   * seeded parameter stands however the arguments and the expected type read.
    */
   protected def solve(
       what: String,
@@ -557,10 +562,13 @@ trait GenericInstantiation extends ConstFolding {
       expected: Option[Type],
       soft: List[Boolean] = Nil,
       bounds: Map[String, List[BoundRef]] = Map.empty,
+      known: Map[String, Type] = Map.empty,
   ): List[Type] = {
     val sub   = mutable.LinkedHashMap.empty[String, Type]
     val tps   = tparams.toSet
     val pairs = paramRefs.zip(argTys).zip(soft.padTo(paramRefs.length, false))
+
+    for (tp, t) <- known if tps(tp) do sub(tp) = t
 
     for ((r, t), adaptable) <- pairs if !adaptable do unify(r, t, tps, sub)
     if sub.size < tparams.length then

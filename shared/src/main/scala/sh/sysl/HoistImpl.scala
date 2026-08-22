@@ -109,7 +109,14 @@ trait HoistImpl extends ImplConformance {
     // already filed under them is read in the names this one wrote: `impl[U] Index[usize, U] for
     // Buf[U]` and an `impl[T] Index[usize, T] for Buf[T]` before it are the one promise they are,
     // rather than two that differ in the letter their author chose.
-    val mine = outer.tparams.map(Type.Abstract(_, Nil))
+    //
+    // **They carry the block's bounds, and it is reading the OTHER block that needs them.** A
+    // comparison re-resolves the already-filed block's arguments under these stand-ins, so an
+    // argument that is a bounded generic type — `impl[T: Scalar] Mul[Vector[T], T] for Vector[T]`,
+    // where `Vector` asks `Scalar` of its own parameter — applies `Vector` to whatever stands here.
+    // A bound-free stand-in makes that application one the type's own declaration refuses, and the
+    // complaint then lands on *this* block, which is neither where it was written nor wrong.
+    val mine = outer.tparams.map(abstractSubst(outer.tparams, outer.bounds, outer.tvalues, outer.tpacks))
 
     for other <- already.find(ti => suppliedBound(ti, impl.traitName, subject, mine).key == bound.key) do
       err(s"'${outer.label}' already implements '${showBound(bound, subject)}'" + secondImplementation(tr, other))
@@ -405,8 +412,20 @@ trait HoistImpl extends ImplConformance {
     // is, rather than reported as an unknown type — which would send the reader looking for a
     // declaration rather than at the argument they meant to fix.
     val declared = abstractSubst(impl.tparams, impl.bounds, impl.tvalues, impl.tpacks)
-    val written  = impl.traitArgs.map(resolveType(_, declared))
-    val subject  = sandboxed(resolveType(impl.forType, declared))
+
+    // **Sandboxed for the same reason the subject below is: an `Abstract` is its name.** A written
+    // argument may be a generic type applied to this block's own parameters — `Mul[Vector[T], T]`,
+    // the shape a dot product has — and resolving it instantiates `Vector` at a stand-in called `T`.
+    // That instantiation keys on the letter, so left registered it is handed to the next declaration
+    // whose parameter is also spelled `T`, along with the *fields* it resolved: a `Vector[T]` holding
+    // a `&Buf[T]` registers `Buf` at this block's `T`, and `sysl.container.Heap[T: Ord]` then reads
+    // its own elements back at a stand-in bounded by something else entirely. The diagnostic lands in
+    // the library, names `Ord`, and has nothing to do with the block that caused it.
+    val written =
+      if impl.tparams.isEmpty then impl.traitArgs.map(resolveType(_, declared))
+      else sandboxed(impl.traitArgs.map(resolveType(_, declared)))
+
+    val subject = sandboxed(resolveType(impl.forType, declared))
 
     // What the block leaves out the trait supplies, and `Self` in one of those defaults is the type
     // this block implements the trait for — which is what makes `impl Mul for Point` the

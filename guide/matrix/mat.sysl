@@ -1,46 +1,48 @@
-// Matrices over the reals — the other half of the vector space, and the two products whose results
+// Matrices over any field — the other half of the vector space, and the two products whose results
 // are different types.
 //
 // `A * v` gives a vector and `A * B` gives a matrix, so one type carries three implementations of one
-// trait: `Mul[Vector, Vector]`, `Mul[Matrix, Matrix]` and `Mul[real, Matrix]`. Each is selected by the
-// type of the right operand, and each declares what it hands back. Nothing here is a method that
-// wanted to be an operator, which is the whole point of the exercise.
+// trait: `Mul[Vector[T], Vector[T]]`, `Mul` and `Mul[T]`. Each is selected by the type of the right
+// operand, and each declares what it hands back. Nothing here is a method that wanted to be an
+// operator, which is the whole point of the exercise.
 //
-// The cells are stored row-major in one `&Buf[real]`, so a matrix is a handle exactly as a vector is:
+// **The matrix product is the defaulted one**, written `impl[T: Scalar] Mul for Matrix[T]`: its
+// operand and its result are both `Self`, which is what the trait's own defaults already say. Writing
+// `Mul[Matrix[T], Matrix[T]]` would say the same thing twice, and a reader would be entitled to look
+// for a difference that is not there.
+//
+// The cells are stored row-major in one `&Buf[T]`, so a matrix is a handle exactly as a vector is:
 // the operators build fresh matrices and `copy` is how a caller stops sharing.
 
 import sysl.buf.{Buf, buf}
-import sysl.math.Float
 
-struct Matrix
+struct Matrix[T: Scalar]
     rows: int
     cols: int
-    cells: &Buf[real]
+    cells: &Buf[T]
 
-    at(self, i: int, j: int) -> real = self.cells.at(usize(i * self.cols + j))
+    at(self, i: int, j: int) -> T = self.cells.at(usize(i * self.cols + j))
 
-    set(*self, i: int, j: int, v: real) = self.cells.set(usize(i * self.cols + j), v)
+    set(*self, i: int, j: int, v: T) = self.cells.set(usize(i * self.cols + j), v)
 
     is_square(self) -> bool = self.rows == self.cols
 
-    row(self, i: int) -> Vector
-        var out = zeros(self.cols)
+    row(self, i: int) -> Vector[T]
+        var out: Vector[T] = zeros(self.cols)
 
         for j in 0..<self.cols do out.set(j, self.at(i, j))
 
         out
-    end row
 
-    col(self, j: int) -> Vector
-        var out = zeros(self.rows)
+    col(self, j: int) -> Vector[T]
+        var out: Vector[T] = zeros(self.rows)
 
         for i in 0..<self.rows do out.set(i, self.at(i, j))
 
         out
-    end col
 
-    copy(self) -> Matrix
-        var out = zero_matrix(self.rows, self.cols)
+    copy(self) -> Matrix[T]
+        var out: Matrix[T] = zero_matrix(self.rows, self.cols)
 
         for i in 0..<self.rows
             for j in 0..<self.cols do out.set(i, j, self.at(i, j))
@@ -48,8 +50,8 @@ struct Matrix
         out
     end copy
 
-    transpose(self) -> Matrix
-        var out = zero_matrix(self.cols, self.rows)
+    transpose(self) -> Matrix[T]
+        var out: Matrix[T] = zero_matrix(self.cols, self.rows)
 
         for i in 0..<self.rows
             for j in 0..<self.cols do out.set(j, i, self.at(i, j))
@@ -69,12 +71,12 @@ struct Matrix
             self.set(b, j, t)
     end swap_rows
 
-    near(self, rhs: Matrix, tol: real) -> bool
+    near(self, rhs: Matrix[T], tol: real) -> bool
         if self.rows != rhs.rows || self.cols != rhs.cols then return false
 
         for i in 0..<self.rows
             for j in 0..<self.cols
-                if (self.at(i, j) - rhs.at(i, j)).abs() > tol then return false
+                if (self.at(i, j) - rhs.at(i, j)).magnitude() > tol then return false
 
         true
     end near
@@ -90,36 +92,38 @@ struct Matrix
     end text
 end Matrix
 
-zero_matrix(rows: int, cols: int) -> Matrix
-    var cells: Buf[real] = buf()
+zero_matrix[T: Scalar](rows: int, cols: int) -> Matrix[T]
+    var cells: Buf[T] = buf()
 
-    for i in 0..<rows * cols do cells.push(0.0)
+    for i in 0..<rows * cols do cells.push(T.zero())
 
     Matrix(rows, cols, cells)
 
 // A matrix from the numbers a program wrote, read row by row.
-matrix(rows: int, cols: int, xs: []real) -> Matrix
+matrix[T: Scalar](rows: int, cols: int, xs: []const T) -> Matrix[T]
     require int(xs.len) == rows * cols, "a matrix needs exactly rows * cols cells"
 
-    var out = zero_matrix(rows, cols)
+    var out: Matrix[T] = zero_matrix(rows, cols)
 
     for i in 0..<rows
         for j in 0..<cols do out.set(i, j, xs[i * cols + j])
 
     out
 
-identity(n: int) -> Matrix
-    var out = zero_matrix(n, n)
+// The identity, which needs both of the element type's identities — a zero everywhere and a one down
+// the diagonal — and is where the pair of core traits earns its second member.
+identity[T: Scalar](n: int) -> Matrix[T]
+    var out: Matrix[T] = zero_matrix(n, n)
 
-    for i in 0..<n do out.set(i, i, 1.0)
+    for i in 0..<n do out.set(i, i, T.one())
 
     out
 
-impl Add for Matrix
-    add(self, rhs: Matrix) -> Matrix
+impl[T: Scalar] Add for Matrix[T]
+    add(self, rhs: Matrix[T]) -> Matrix[T]
         require self.rows == rhs.rows && self.cols == rhs.cols, "matrices added must have the same shape"
 
-        var out = zero_matrix(self.rows, self.cols)
+        var out: Matrix[T] = zero_matrix(self.rows, self.cols)
 
         for i in 0..<self.rows
             for j in 0..<self.cols do out.set(i, j, self.at(i, j) + rhs.at(i, j))
@@ -127,11 +131,11 @@ impl Add for Matrix
         out
     end add
 
-impl Sub for Matrix
-    sub(self, rhs: Matrix) -> Matrix
+impl[T: Scalar] Sub for Matrix[T]
+    sub(self, rhs: Matrix[T]) -> Matrix[T]
         require self.rows == rhs.rows && self.cols == rhs.cols, "matrices subtracted must have the same shape"
 
-        var out = zero_matrix(self.rows, self.cols)
+        var out: Matrix[T] = zero_matrix(self.rows, self.cols)
 
         for i in 0..<self.rows
             for j in 0..<self.cols do out.set(i, j, self.at(i, j) - rhs.at(i, j))
@@ -139,9 +143,9 @@ impl Sub for Matrix
         out
     end sub
 
-impl Neg for Matrix
-    neg(self) -> Matrix
-        var out = zero_matrix(self.rows, self.cols)
+impl[T: Scalar] Neg for Matrix[T]
+    neg(self) -> Matrix[T]
+        var out: Matrix[T] = zero_matrix(self.rows, self.cols)
 
         for i in 0..<self.rows
             for j in 0..<self.cols do out.set(i, j, -self.at(i, j))
@@ -152,22 +156,24 @@ impl Neg for Matrix
 // A matrix applied to a vector: the result is a **vector**, which is neither operand's type. Written
 // as `self.row(i) * rhs`, so the dot product in `vec.sysl` is what actually computes each component —
 // one operator whose result is a scalar, inside one whose result is a vector.
-impl Mul[Vector, Vector] for Matrix
-    mul(self, rhs: Vector) -> Vector
+impl[T: Scalar] Mul[Vector[T], Vector[T]] for Matrix[T]
+    mul(self, rhs: Vector[T]) -> Vector[T]
         require self.cols == rhs.n, "a matrix applied to a vector needs as many columns as it has entries"
 
-        var out = zeros(self.rows)
+        var out: Vector[T] = zeros(self.rows)
 
         for i in 0..<self.rows do out.set(i, self.row(i) * rhs)
 
         out
     end mul
 
-impl Mul[Matrix, Matrix] for Matrix
-    mul(self, rhs: Matrix) -> Matrix
+// The one implementation here that writes no arguments at all, because the trait's defaults already
+// say what it does: a matrix times a matrix is a matrix.
+impl[T: Scalar] Mul for Matrix[T]
+    mul(self, rhs: Matrix[T]) -> Matrix[T]
         require self.cols == rhs.rows, "a product needs the left columns to match the right rows"
 
-        var out = zero_matrix(self.rows, rhs.cols)
+        var out: Matrix[T] = zero_matrix(self.rows, rhs.cols)
 
         for i in 0..<self.rows
             var r = self.row(i)
@@ -177,9 +183,9 @@ impl Mul[Matrix, Matrix] for Matrix
         out
     end mul
 
-impl Mul[real, Matrix] for Matrix
-    mul(self, k: real) -> Matrix
-        var out = zero_matrix(self.rows, self.cols)
+impl[T: Scalar] Mul[T] for Matrix[T]
+    mul(self, k: T) -> Matrix[T]
+        var out: Matrix[T] = zero_matrix(self.rows, self.cols)
 
         for i in 0..<self.rows
             for j in 0..<self.cols do out.set(i, j, self.at(i, j) * k)
@@ -187,10 +193,10 @@ impl Mul[real, Matrix] for Matrix
         out
     end mul
 
-// A pair as the index, which `14 §7` settled with tuples: a subscript takes one argument and a matrix
-// wants two, so the one argument is a pair.
-impl Index[(int, int), real] for Matrix
-    index(self, ij: (int, int)) -> real = self.at(ij.0, ij.1)
+// A pair as the index: a subscript takes one argument and a matrix wants two, so the one argument is
+// a pair.
+impl[T: Scalar] Index[(int, int), T] for Matrix[T]
+    index(self, ij: (int, int)) -> T = self.at(ij.0, ij.1)
 
-impl IndexSet[(int, int), real] for Matrix
-    index_set(*self, ij: (int, int), v: real) = self.set(ij.0, ij.1, v)
+impl[T: Scalar] IndexSet[(int, int), T] for Matrix[T]
+    index_set(*self, ij: (int, int), v: T) = self.set(ij.0, ij.1, v)

@@ -41,13 +41,20 @@ trait CallAnalysis extends OperatorCalls {
   ): TExpr = ty match
     case a: Type.Abstract => callBoundAssociated(a, mname, args)
     case concrete =>
-      val key = memberKey(concrete, mname)._1
+      val (key, targs) = memberKey(concrete, mname)
 
       if !memberDecls.contains((key, mname)) then
         err(s"${show(concrete)} has no associated function '$mname'" +
           (if hasMember(concrete, mname) then s" — '$mname' is reached on a value of one" else ""))
 
-      callAssociated(key, mname, args, expected, boundTraits(written))
+      // **The type's own arguments are known here and are not inferred**, which is what tells this
+      // form apart from `Complex.zero()` written out. A name in this position is a type *parameter*
+      // that has been substituted, so it arrives applied — `T.zero()` at `T = Complex[real]` is
+      // `Complex[real]`, and its `real` is the answer to the question inference would otherwise have
+      // to put to the arguments. A receiverless member has none, so with the arguments discarded a
+      // body bounded by `Zero` could ask a width for its zero and not a generic type, and the
+      // failure landed on the body rather than on the call that chose the type.
+      callAssociated(key, mname, args, expected, boundTraits(written), targs)
 
   /** The traits a **type parameter** was bounded by, as keys, and nothing for a name that is not one.
    *
@@ -61,7 +68,9 @@ trait CallAnalysis extends OperatorCalls {
    *
    * On a **generic** type there is no receiver to read the type arguments off, so they are inferred
    * the way a generic free function's are: from the arguments, and from the type the context expects
-   * where the arguments do not determine them.
+   * where the arguments do not determine them. `owned` is where that question is already answered —
+   * the arguments of the type the call was reached *through*, which a substituted type parameter
+   * brings with it and a bare type name does not.
    */
   protected def callAssociated(
       tname: String,
@@ -69,6 +78,7 @@ trait CallAnalysis extends OperatorCalls {
       written: List[Expr],
       expected: Option[Type],
       via: Set[String] = Set.empty,
+      owned: List[Type] = Nil,
   ): TExpr =
     val chosen = pickAssociated(tname, mname, written, via)
 
@@ -81,7 +91,7 @@ trait CallAnalysis extends OperatorCalls {
           bindArgs(s"associated function '$tname.$chosen'", Some(tname), m.params, written, m.variadic)
 
         genericMembers.get((tname, chosen)) match
-          case Some(fd) => callGenericAssociated(tname, fd, m, args, expected)
+          case Some(fd) => callGenericAssociated(tname, fd, m, args, expected, owned)
           case None =>
             val fname = s"$tname.$chosen"
             // The receiverless third of the same window `MethodCalls` and `MemberExprAnalysis`
@@ -119,6 +129,7 @@ trait CallAnalysis extends OperatorCalls {
       m: MethodDecl,
       args: List[Expr],
       expected: Option[Type],
+      owned: List[Type],
   ): TExpr = {
     val shown = qn(fd.name)
 
@@ -128,6 +139,15 @@ trait CallAnalysis extends OperatorCalls {
     val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)((ref, _) => spellSelf(_, ref))
     val ptypes      = fd.params.map(p => spell(p.typ))
     val provisional = provisionalArgs(fd.name, fd.tparams, ptypes, passed, m.bounds)
+
+    val (ownerTps0, _) = fd.tparams.splitAt(fd.tparams.length - m.tparams.length)
+
+    // The type's arguments answer the type's parameters and nothing else — the member's own are
+    // still inferred beside them. Read only where the two lists agree in length, since the key a
+    // member was found under is not always the type's own: a shape and a blanket file their members
+    // under keys of their own, and a list that does not line up is one saying something else.
+    val known = if ownerTps0.length == owned.length then ownerTps0.zip(owned).toMap else Map.empty
+
     val targs = inDecl(fd.name)(solve(
       shown,
       fd.tparams,
@@ -137,6 +157,7 @@ trait CallAnalysis extends OperatorCalls {
       expected,
       passed.map(isLiteral),
       m.bounds,
+      known,
     ))
 
     val (ownerTps, ownTps)   = fd.tparams.splitAt(fd.tparams.length - m.tparams.length)

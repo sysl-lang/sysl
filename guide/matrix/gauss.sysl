@@ -1,5 +1,5 @@
-// Gaussian elimination with partial pivoting, and the four things it answers: a solution, a
-// determinant, a rank, and an inverse.
+// Gaussian elimination with partial pivoting, over any field, and the four things it answers: a
+// solution, a determinant, a rank, and an inverse.
 //
 // One routine underlies all four. Reducing a matrix to upper-triangular form records everything they
 // need — the pivots, whose product is the determinant; the number of row swaps, whose parity is its
@@ -10,8 +10,12 @@
 // leading cell is zero divides by zero on its first step, and a matrix whose pivot is merely *small*
 // loses most of its significant digits. Choosing the largest available pivot in the column is what
 // makes the arithmetic worth trusting.
-
-import sysl.math.Float
+//
+// **"Largest" is the whole reason `Scalar` has a magnitude.** The complexes carry no `Ord` — there is
+// no order on the plane that respects arithmetic, and the library refuses to invent one — so a
+// comparison between two candidate pivots cannot be `<` on the elements. It is `<` on their
+// magnitudes, which are `real` whatever the elements are, and every comparison below is written that
+// way for that reason.
 
 // How an elimination can fail to answer the question it was asked. Three distinct causes, because a
 // caller can act differently on each: a shape is a programming mistake, and a singular matrix is a
@@ -29,25 +33,28 @@ describe(e: Fail) -> string = e match
 // Which failure this is, for a caller that wants to *act* on one rather than report it — retry with a
 // different method on a singular matrix, fix the call on a shape.
 //
-// A simple enum carries no `==` of its own, by decision rather than omission (`09 §2`): a value is
-// observed by asking for its **position** or its **name**, which is what `::Pos` and `::Image` are
-// for. So the comparison is written on positions, and the type stays a named set rather than an
-// integer that happens to be spelled differently.
+// A simple enum carries no `==` of its own, by decision rather than omission: a value is observed by
+// asking for its **position** or its **name**, which is what `::Pos` and `::Image` are for. So the
+// comparison is written on positions, and the type stays a named set rather than an integer that
+// happens to be spelled differently.
 is_singular(e: Fail) -> bool = Fail::Pos(e) == Fail::Pos(Singular)
 
 is_not_square(e: Fail) -> bool = Fail::Pos(e) == Fail::Pos(NotSquare)
 
 is_shape_mismatch(e: Fail) -> bool = Fail::Pos(e) == Fail::Pos(ShapeMismatch)
 
-// A pivot this small is treated as zero. It has to be a tolerance rather than a test against `0.0`:
-// elimination is subtraction, and a column that cancels exactly in exact arithmetic leaves rounding
-// noise instead of a clean zero.
+// A pivot whose magnitude is this small is treated as zero. It has to be a tolerance rather than a
+// test against the element's own zero: elimination is subtraction, and a column that cancels exactly
+// in exact arithmetic leaves rounding noise instead of a clean zero.
+//
+// **It is a `real` at every element type**, which is the tolerance half of the same decision the
+// magnitude is: what is being measured is size, and size is not the element's type.
 private const tiny: real = 0.000000000001
 
 // What one reduction to upper-triangular form learned. `swaps` is carried rather than folded into a
 // sign so that `rank` — which does not care — reads the same structure as `det`, which does.
-private struct Reduced
-    upper: Matrix
+private struct Reduced[T: Scalar]
+    upper: Matrix[T]
     swaps: int
     pivots: int
 
@@ -57,7 +64,7 @@ private struct Reduced
 // column and reads the answer back by substitution, `inverse` passes the identity, and `det` and
 // `rank` pass a matrix with no columns at all and ignore it. The alternative — an elimination per
 // caller — is the same arithmetic written four times.
-private reduce(m: Matrix, carry: Matrix) -> Reduced
+private reduce[T: Scalar](m: Matrix[T], carry: Matrix[T]) -> Reduced[T]
     var u = m.copy()
     var swaps = 0
     var pivots = 0
@@ -66,12 +73,13 @@ private reduce(m: Matrix, carry: Matrix) -> Reduced
     for col in 0..<u.cols
         if row >= u.rows then break
 
-        // The largest remaining cell in this column, which is the pivot partial pivoting picks.
+        // The largest remaining cell in this column, which is the pivot partial pivoting picks —
+        // largest by magnitude, since that is the only comparison every element type has.
         var best = row
-        var bestMag = u.at(row, col).abs()
+        var bestMag = u.at(row, col).magnitude()
 
         for i in row + 1..<u.rows
-            var mag = u.at(i, col).abs()
+            var mag = u.at(i, col).magnitude()
 
             if mag > bestMag
                 best = i
@@ -91,7 +99,7 @@ private reduce(m: Matrix, carry: Matrix) -> Reduced
         for i in row + 1..<u.rows
             var f = u.at(i, col) / p
 
-            if f != 0.0
+            if f != T.zero()
                 for j in col..<u.cols do u.set(i, j, u.at(i, j) - f * u.at(row, j))
 
                 for j in 0..<carry.cols do carry.set(i, j, carry.at(i, j) - f * carry.at(row, j))
@@ -100,11 +108,12 @@ private reduce(m: Matrix, carry: Matrix) -> Reduced
         row += 1
 
     Reduced(u, swaps, pivots)
+end reduce
 
 // Back-substitution through an upper-triangular matrix, for one column of the carried right-hand side.
-private substitute(u: Matrix, carry: Matrix, col: int) -> Vector
+private substitute[T: Scalar](u: Matrix[T], carry: Matrix[T], col: int) -> Vector[T]
     var n = u.rows
-    var out = zeros(n)
+    var out: Vector[T] = zeros(n)
 
     for step in 0..<n
         var i = n - 1 - step
@@ -115,14 +124,15 @@ private substitute(u: Matrix, carry: Matrix, col: int) -> Vector
         out.set(i, acc / u.at(i, i))
 
     out
+end substitute
 
 // `A x = b`. Square and non-singular or nothing: an underdetermined system has a family of solutions
 // and this returns one vector, so promising an answer for one would be lying about which.
-solve(m: Matrix, b: Vector) -> Result[Vector, Fail]
+solve[T: Scalar](m: Matrix[T], b: Vector[T]) -> Result[Vector[T], Fail]
     if !m.is_square() then return Err(NotSquare)
     if m.rows != b.n then return Err(ShapeMismatch)
 
-    var carry = zero_matrix(m.rows, 1)
+    var carry: Matrix[T] = zero_matrix(m.rows, 1)
 
     for i in 0..<m.rows do carry.set(i, 0, b.at(i))
 
@@ -131,33 +141,36 @@ solve(m: Matrix, b: Vector) -> Result[Vector, Fail]
     if r.pivots < m.rows then return Err(Singular)
 
     Ok(substitute(r.upper, carry, 0))
+end solve
 
-// The product of the pivots, with its sign from the parity of the swaps. Zero for a singular matrix,
-// which falls out rather than being tested for: a column with no pivot leaves a zero on the diagonal.
-det(m: Matrix) -> real
+// The product of the pivots, with its sign from the parity of the swaps. The element type's own zero
+// for a singular matrix, which falls out rather than being tested for: a column with no pivot leaves
+// a zero on the diagonal.
+det[T: Scalar](m: Matrix[T]) -> T
     require m.is_square(), "a determinant needs a square matrix"
 
     var r = reduce(m, zero_matrix(m.rows, 0))
-    var acc = if r.swaps % 2 == 0 then 1.0 else -1.0
+    var acc = if r.swaps % 2 == 0 then T.one() else -T.one()
 
     for i in 0..<m.rows do acc = acc * r.upper.at(i, i)
 
     acc
+end det
 
 // The number of pivots the reduction found, which needs no square matrix and no invertibility.
-rank(m: Matrix) -> int = reduce(m, zero_matrix(m.rows, 0)).pivots
+rank[T: Scalar](m: Matrix[T]) -> int = reduce(m, zero_matrix(m.rows, 0)).pivots
 
 // `A⁻¹`, by carrying the identity through the same elimination and substituting once per column.
-inverse(m: Matrix) -> Result[Matrix, Fail]
+inverse[T: Scalar](m: Matrix[T]) -> Result[Matrix[T], Fail]
     if !m.is_square() then return Err(NotSquare)
 
     var n = m.rows
-    var carry = identity(n)
+    var carry: Matrix[T] = identity(n)
     var r = reduce(m, carry)
 
     if r.pivots < n then return Err(Singular)
 
-    var out = zero_matrix(n, n)
+    var out: Matrix[T] = zero_matrix(n, n)
 
     for col in 0..<n
         var x = substitute(r.upper, carry, col)
@@ -165,3 +178,4 @@ inverse(m: Matrix) -> Result[Matrix, Fail]
         for i in 0..<n do out.set(i, col, x.at(i))
 
     Ok(out)
+end inverse

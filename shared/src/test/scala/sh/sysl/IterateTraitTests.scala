@@ -402,22 +402,26 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
 
     // A `return` from inside the body leaves with the cursor still held, so the release for it has
     // to be on that path too. A cursor holding a reference is what makes the omission visible.
+    //
+    // The cursor is `Once` and not the `One` it was until the standard module declared a trait of
+    // that name: a prelude name is reachable with nothing imported, so a program's own declaration
+    // of one is a collision rather than a shadowing — the same as `Option` or `Add` has always been.
     "a 'return' from inside the loop lets the cursor go" in {
       run("""struct Cell
              |    v: int
              |end Cell
-             |struct One
+             |struct Once
              |    c: &Cell
              |    done: bool
-             |end One
-             |impl Iterate[int] for One
+             |end Once
+             |impl Iterate[int] for Once
              |    next(*self) -> Option[int]
              |        if self.done then return None
              |        self.done = true
              |        Some(self.c.v)
              |    end next
              |first(n: int) -> int
-             |    for v in One(Cell(n), false) do return v
+             |    for v in Once(Cell(n), false) do return v
              |    0
              |var total = 0
              |for i in 0..<5000 do total += first(i)

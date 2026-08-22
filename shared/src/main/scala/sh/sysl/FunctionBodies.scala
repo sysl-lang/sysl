@@ -322,7 +322,13 @@ trait FunctionBodies extends ModuleStorage {
   }
 
   protected def instantiateFunc(f: FuncDecl, targs: List[Type]): String = {
-    val name = Type.mangled(f.name, targs)
+    // The tag is empty for every instantiation a value is ever made at, so an emitted symbol is
+    // exactly what it always was. It is not empty for a **stand-in**, which is its name and nothing
+    // else — so `Buf.at.T` under one declaration's `[T: Ord]` and under another's `[T: Display]`
+    // would be one entry, and the second declaration's body would read the first one's signature
+    // back. The instantiation is definition-time and never emitted, so the name is free to say which
+    // walk it belongs to (`Type.standInTag`).
+    val name = Type.mangled(f.name, targs) + targs.map(Type.standInTag).mkString
 
     // Recorded here because this is the one place a generic becomes a function, and the name it
     // becomes cannot be read back to say so: what tells `lib$twice.Loud` from a member of a type

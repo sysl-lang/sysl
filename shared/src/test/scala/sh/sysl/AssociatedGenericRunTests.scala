@@ -13,6 +13,24 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class AssociatedGenericRunTests extends AnyFreeSpec with RunSupport {
 
+  /** A trait whose one member has no receiver, implemented for a width and for a generic type — the
+   * shape `Zero` has in the library, reduced to what the tests below need.
+   */
+  private val origin =
+    """trait Origin
+      |    origin() -> Self
+      |impl Origin for int
+      |    origin() -> int = 0
+      |struct Pair[T]
+      |    a: T
+      |    b: T
+      |impl[T: Origin] Origin for Pair[T]
+      |    origin() -> Pair[T] = Pair(T.origin(), T.origin())
+      |seed[T: Origin](xs: []const T) -> T
+      |    var s = T.origin()
+      |    s
+      |""".stripMargin
+
   "the arguments come from what the call passes" - {
 
     "one parameter inferred from one argument, at two element types" in {
@@ -278,6 +296,50 @@ class AssociatedGenericRunTests extends AnyFreeSpec with RunSupport {
           |print(n)""".stripMargin
 
       run(src) shouldBe "2000\n"
+    }
+  }
+
+  /** A type parameter is a name for a type that has already been chosen, so where the choice was a
+   * *generic* type the arguments came with it — and a receiverless member is the one place that
+   * matters, since there is no receiver to read them off and no argument to infer them from.
+   *
+   * Read the two tests together: the second is the first with a width in place of the generic type,
+   * and it always worked. What made the difference was the type's arguments being discarded on the
+   * way to the lookup, so a body bounded by a trait could ask an `f32` for its zero and not a
+   * `Complex[real]` — the failure landing in the generic body, which is written once and correct,
+   * rather than at the call that picked the type.
+   */
+  "a parameter substituted to a generic type brings that type's arguments with it" - {
+
+    // Nothing in `seed` says what `T`'s own arguments are, and nothing needs to: the slice does.
+    "with nothing but the call to say what the element type is" in {
+      run(origin + """var ps: []Pair[int] = [Pair(1, 2)]
+                     |print(seed(ps).a, seed(ps).b)""".stripMargin) shouldBe "0 0\n"
+    }
+
+    "and the same body at an element type with no arguments to bring" in {
+      run(origin + """var ns: []int = [1, 2]
+                     |print(seed(ns))""".stripMargin) shouldBe "0\n"
+    }
+
+    // An annotation was the only spelling that worked before, and it still does — what changed is
+    // that it is no longer the only one.
+    "an annotation still says the same thing" in {
+      run(origin + """var p: Pair[int] = Pair.origin()
+                     |print(p.a)""".stripMargin) shouldBe "0\n"
+    }
+
+    /** `Self` is the same rule reached from inside, and it is the one place there was never
+     * anything to infer: it names the type applied to its own parameters, so a member of `Box[T]`
+     * that reaches `Self.count()` in the middle of an expression is asking `Box[T]` and not `Box`.
+     * A bare `Box.count()` still cannot be settled, and `AssociatedGenericErrorTests` keeps that.
+     */
+    "and 'Self' inside the type's own body needs neither" in {
+      run("""struct Box[T]
+            |    v: T
+            |    count() -> int = 0
+            |    twice(self) -> int = Self.count() + Self.count()
+            |print(Box(1).twice(), Box("x").twice())""".stripMargin) shouldBe "0 0\n"
     }
   }
 

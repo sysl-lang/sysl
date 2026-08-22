@@ -1,41 +1,76 @@
-// Matrices and vectors over the reals, and Gaussian elimination on top of them.
+// Matrices and vectors over any field, and Gaussian elimination on top of them.
 //
-// The axis this program owns: **an operator whose result is neither operand's type.** A vector space
-// is the smallest honest example — `v * w` is a number, `A * v` is a vector, `A * B` is a matrix, and
-// `A * 2.0` is a matrix again — and until `14 §7` carried the result as a trait argument only the last
-// two of those four were spellable. The other two became methods, so an expression that is one line
-// of linear algebra read as a mixture of operators and calls.
+// The axis this program owns: **an operator whose result is neither operand's type**, and now also
+// **one algebra written once and run at three element types**. A vector space is the smallest honest
+// example of the first — `v * w` is a scalar, `A * v` is a vector, `A * B` is a matrix, and `A * k` is
+// a matrix again — and until the result became a trait argument only the last two of those four were
+// spellable. The other two became methods, so an expression that is one line of linear algebra read
+// as a mixture of operators and calls.
 //
-// See `vec.sysl` and `mat.sysl` for the algebra and `gauss.sysl` for the elimination.
+// See `scalar.sysl` for what an element has to be, `vec.sysl` and `mat.sysl` for the algebra and
+// `gauss.sysl` for the elimination.
 //
 // WHAT THIS PROGRAM FOUND
 //
 // 1. The feature it was written for went in cleanly, and that is itself the report. Four
-//    implementations of `Mul` across two types — `Vector * Vector -> real`, `Matrix * Vector ->
-//    Vector`, `Matrix * Matrix -> Matrix`, and both scalings — are selected by the right operand and
-//    nothing else, and the line that composes all four reads as arithmetic. The rule that made it
-//    affordable is that **the result does not select**: a use writes the operands, so two
-//    implementations agreeing on them are refused where they are written rather than ranked at the
-//    use.
+//    implementations of `Mul` across two types — `Vector * Vector -> T`, `Matrix * Vector -> Vector`,
+//    `Matrix * Matrix -> Matrix`, and both scalings — are selected by the right operand and nothing
+//    else, and the line that composes all four reads as arithmetic. The rule that made it affordable
+//    is that **the result does not select**: a use writes the operands, so two implementations
+//    agreeing on them are refused where they are written rather than ranked at the use.
 //
-// 2. **A simple enum's `==` is absent by decision, and the replacement was already there.** `e ==
-//    Singular` is refused, and the first thing written here was a two-armed match per question. That
-//    was a workaround for something the language answers: `09 §2` says a simple enum carries no `==`
-//    and no `Display` *on purpose*, because a value is observed by asking for its **position** or its
-//    **name** — so `Fail::Pos(e) == Fail::Pos(Singular)` is the spelling, and each predicate is one
-//    line. The lesson is about method rather than about the language: three functions were written to
-//    work around an absence before the chapter that explains the absence had been read.
+// 2. **Every one of them is generic, and none of them had to be written twice.** A block whose trait
+//    arguments are built out of its own parameter — `impl[T: Scalar] Mul[Vector[T], T] for Vector[T]`
+//    — says the same thing at every instantiation, which is exactly what a dot product needs and has
+//    no other spelling, since trait arguments are positional and reaching the result means writing
+//    the operand. Three element types run the bodies below and there is one of each.
 //
-// 3. **A vector is a handle, and the type cannot say otherwise.** `Vector` and `Matrix` hold a
-//    `&Buf[real]`, so assigning one shares the numbers — see the last section, which pins the
-//    behaviour rather than complaining about it. The alternative is a fixed `[N]real`, which a type
-//    whose size is a runtime value cannot have (`07 § Not yet`, the bound-that-promises-a-value item).
-//    So a numerical type gets ARC sharing plus a named `copy`, which is exactly the bargain `04`
-//    strikes for a string, and the elimination has to copy defensively. Nothing here is wrong; it is
-//    worth recording that the value-semantics matrix a numerical library would want is not writable.
+// 3. **A generic body cannot spell an identity, and that is what `Zero` and `One` are for.** `0.0` is
+//    a `real` and nothing else, so `zeros`, `identity` and the dot product's accumulator have to
+//    *ask* the element type — `T.zero()`, `T.one()`. Both traits are in the standard module, beside
+//    the operators whose identities they are, so nothing here imports them and the concrete version
+//    of this program would not have noticed they exist.
+//
+// 4. **`‖v‖² = v · v` is a fact about the reals, not about vector spaces, and generalising found it.**
+//    Over the complexes `z * z` is a complex number and a sum of them can be zero for a vector that is
+//    nowhere near the origin, so `len` is the root of a sum of squared **magnitudes** and the dot
+//    product is left to be what it is. The concrete program had the two as one function and was right
+//    to; one element type is not enough to tell them apart.
+//
+// 5. **The pivot is where the library stops.** Elimination chooses the largest remaining cell in a
+//    column, and the complexes have no `Ord` at all — there is no order on the plane that respects
+//    arithmetic, and the library refuses to invent one. What pivoting actually wants is a *magnitude*,
+//    which is an ordering on size rather than on values, and no core trait offers one. So `Scalar`
+//    declares it here, with the result fixed to `real`, and the reason it is not a library trait is
+//    that a library one would have to fix it for everybody: there is no associated type, so a
+//    `Magnitude` in the library could not let a rational matrix answer with a rational. **The library
+//    reaches three of the four things a field needs and the fourth is waiting on associated types.**
+//
+// 6. **The integers are outside, and it is the identities that keep them out.** `Zero` and `One` are
+//    written for the floats and for `Complex`, and cannot be written for `int`: the `iN`/`uN` families
+//    are open, so no list of `impl` blocks covers them, and every membership the compiler provides is
+//    a method with a receiver — which a `zero()` has nothing to be called on. A `Matrix[int]` is
+//    therefore not writable today, and a matrix of exact integers is a thing people want.
+//
+// 7. **A simple enum's `==` is absent by decision, and the replacement was already there.**
+//    `e == Singular` is refused, and the first thing written here was a two-armed match per question.
+//    A value is observed by asking for its **position** or its **name**, so
+//    `Fail::Pos(e) == Fail::Pos(Singular)` is the spelling and each predicate is one line.
+//
+// 8. **A vector is a handle, and the type cannot say otherwise.** `Vector[T]` and `Matrix[T]` hold a
+//    `&Buf[T]`, so assigning one shares the numbers — see the last section, which pins the behaviour
+//    rather than complaining about it. The alternative is a fixed `[N]T`, which a type whose size is a
+//    runtime value cannot have. So a numerical type gets ARC sharing plus a named `copy`, and the
+//    elimination has to copy defensively. Nothing here is wrong; it is worth recording that the
+//    value-semantics matrix a numerical library would want is not writable.
+//
+// 9. **A generic constructor needs an annotation where the concrete one did not.** `zeros(self.n)` has
+//    no argument to read `T` off and a bare `var` expects nothing, so every one of them is written
+//    `var out: Vector[T] = zeros(self.n)`. That is the type said once, on the declaration, which is
+//    where it belongs — but it is a line the reader of the concrete program never had to see.
 
-import sysl.buf.Buf
-import sysl.math.{Float, approx_eq}
+import sysl.math.Float
+import sysl.math.complex.Complex
 
 section(name: string)
     print("")
@@ -49,7 +84,10 @@ check(cond: bool, what: string)
 
 const eps: real = 0.000000001
 
-close(a: real, b: real) -> bool = approx_eq(a, b, eps)
+// The comparison every check below is written on, at whatever element type: two values agree when the
+// **size** of their difference is small. That is one function for the reals, the complexes and `f32`,
+// and it is the same reasoning the pivot search runs on.
+same[T: Scalar](a: T, b: T) -> bool = (a - b).magnitude() <= eps
 
 section("the four products of a vector space")
 
@@ -57,9 +95,10 @@ var v = vector([1.0, 2.0, 3.0])
 var w = vector([4.0, 5.0, 6.0])
 
 // 1*4 + 2*5 + 3*6. The result is a `real`, and the expression says so by being usable as one.
-check(close(v * w, 32.0), "a dot product is an operator and yields a scalar")
-check(close(v * v, 14.0), "and a vector against itself is its squared length")
-check(close(v.norm(), 14.0), "which is what 'norm' is written as")
+check(same(v * w, 32.0), "a dot product is an operator and yields a scalar")
+check(same(v * v, 14.0), "and a vector against itself is its quadratic form")
+check(same(v.quadratic_form(), 14.0), "which is what 'quadratic_form' is written as")
+check(same(v.len(), 14.0.sqrt()), "over the reals that form is the squared length")
 
 var scaled = v * 2.0
 
@@ -81,7 +120,7 @@ check(twice.near(matrix(2, 3, [2.0, 4.0, 6.0, 8.0, 10.0, 12.0]), eps), "and a ma
 
 // Four implementations of one trait across two types, and every one of them was selected by the type
 // of the right operand alone. This is the line the program exists to be able to write.
-check(close((a * b * vector([1.0, 1.0])) * vector([1.0, 1.0]), 163.0), "the four compose in one expression")
+check(same((a * b * vector([1.0, 1.0])) * vector([1.0, 1.0]), 163.0), "the four compose in one expression")
 
 section("the algebra holds where the results differ")
 
@@ -89,33 +128,38 @@ check((v + w).near(vector([5.0, 7.0, 9.0]), eps), "addition is componentwise")
 check((w - v).near(vector([3.0, 3.0, 3.0]), eps), "so is subtraction")
 check((-v).near(vector([-1.0, -2.0, -3.0]), eps), "negation has no right operand to select with")
 
-check(close(v * w, w * v), "the dot product is symmetric")
-check(close((v + w) * v, v * v + w * v), "and distributes over addition")
-check(close((v * 2.0) * w, (v * w) * 2.0), "scaling commutes with it")
+check(same(v * w, w * v), "the dot product is symmetric")
+check(same((v + w) * v, v * v + w * v), "and distributes over addition")
+check(same((v * 2.0) * w, (v * w) * 2.0), "scaling commutes with it")
 
-var i3 = identity(3)
+var i3: Matrix[real] = identity(3)
+var i2: Matrix[real] = identity(2)
 
 check((i3 * v).near(v, eps), "the identity fixes every vector")
 check((a * i3).near(a, eps), "and is a right unit for a matrix")
-check((identity(2) * a).near(a, eps), "and a left unit at the other shape")
+check((i2 * a).near(a, eps), "and a left unit at the other shape")
+
+var e0: Vector[real] = basis(3, 0)
+
+check((i3 * e0).near(e0, eps), "a basis vector is a column of the identity")
 
 var t = a.transpose()
 
 check(t.rows == 3 && t.cols == 2, "a transpose swaps the shape")
-check(close((a * v) * vector([1.0, 1.0]), v * (t * vector([1.0, 1.0]))),
+check(same((a * v) * vector([1.0, 1.0]), v * (t * vector([1.0, 1.0]))),
     "and moves across a product, which is two of the four operators agreeing")
 
 section("indexing through a trait")
 
-check(close(v[0], 1.0) && close(v[2], 3.0), "a vector reads by one index")
-check(close(a[(1, 2)], 6.0), "a matrix reads by a pair")
+check(same(v[0], 1.0) && same(v[2], 3.0), "a vector reads by one index")
+check(same(a[(1, 2)], 6.0), "a matrix reads by a pair")
 
 var mutable = v.copy()
 
 mutable[1] = 20.0
 
-check(close(mutable[1], 20.0), "and writes through the same spelling")
-check(close(v[1], 2.0), "the copy is what kept the original out of it")
+check(same(mutable[1], 20.0), "and writes through the same spelling")
+check(same(v[1], 2.0), "the copy is what kept the original out of it")
 
 section("solving a system")
 
@@ -155,20 +199,24 @@ solve(m, vector([1.0, 2.0])) match
 
 section("determinant and rank")
 
-check(close(det(identity(4)), 1.0), "the identity has determinant one")
-check(close(det(m), -1.0), "a determinant comes out of the same elimination")
-check(close(det(singular), 0.0), "a singular matrix has determinant zero")
+var i4: Matrix[real] = identity(4)
+
+check(same(det(i4), 1.0), "the identity has determinant one")
+check(same(det(m), -1.0), "a determinant comes out of the same elimination")
+check(same(det(singular), 0.0), "a singular matrix has determinant zero")
 
 // Swapping two rows negates the determinant, which is the property the pivoting has to preserve — and
 // the one a sign the elimination forgot to track would get wrong.
 var swapped = matrix(3, 3, [-3.0, -1.0, 2.0, 2.0, 1.0, -1.0, -2.0, 1.0, 2.0])
 
-check(close(det(swapped), 1.0), "and a row swap negates it")
-check(close(det(m * swapped), det(m) * det(swapped)), "det is multiplicative, through the operator")
+check(same(det(swapped), 1.0), "and a row swap negates it")
+check(same(det(m * swapped), det(m) * det(swapped)), "det is multiplicative, through the operator")
 
 check(rank(m) == 3, "a full-rank matrix has rank equal to its size")
 check(rank(singular) == 1, "and a dependent row costs exactly one")
-check(rank(zero_matrix(3, 3)) == 0, "the zero matrix has rank zero")
+var z33: Matrix[real] = zero_matrix(3, 3)
+
+check(rank(z33) == 0, "the zero matrix has rank zero")
 check(rank(matrix(2, 3, [1.0, 2.0, 3.0, 2.0, 4.0, 6.0])) == 1, "rank does not need a square matrix")
 
 section("inverse")
@@ -187,20 +235,90 @@ inverse(singular) match
     Ok(_) -> fail("a singular matrix has no inverse")
     Err(e) -> check(is_singular(e), "a singular matrix has no inverse")
 
+section("the same program over the complex numbers")
+
+// Nothing below is a second implementation. Every operator, the elimination and all four of its
+// answers are the bodies the sections above ran, at a different `T`.
+var i = Complex(0.0, 1.0)
+var one: Complex[real] = Complex.one()
+
+var cv = vector([Complex(1.0, 1.0), Complex(2.0, -1.0)])
+var cw = vector([Complex(0.0, 1.0), Complex(1.0, 1.0)])
+
+// (1+i)(i) + (2-i)(1+i) = (-1+i) + (3+i) = 2+2i.
+check(same(cv * cw, Complex(2.0, 2.0)), "a dot product over the complexes yields a complex")
+
+// The check finding 4 is about. `cv * cv` is (1+i)² + (2-i)² = 2i + 3-4i = 3-2i, which is not a
+// length and is not even real — while the length itself is the root of 2 + 5.
+check(same(cv * cv, Complex(3.0, -2.0)), "a vector against itself is a complex number, not a size")
+check(!same(cv * cv, Complex.from_real(cv.len() * cv.len())), "so it is not the squared length")
+check(same(cv.len(), 7.0.sqrt()), "which the magnitudes give and the dot product does not")
+
+check((cv * i).near(vector([Complex(-1.0, 1.0), Complex(1.0, 2.0)]), eps), "scaling by i rotates a vector")
+
+var ci: Matrix[Complex[real]] = identity(2)
+
+check((ci * cv).near(cv, eps), "the identity fixes every complex vector")
+check(same(det(ci), one), "and has determinant one")
+
+// A system whose coefficients are genuinely complex, solved by the same elimination. The pivot search
+// compares magnitudes, which is the only comparison this element type has.
+var cm = matrix(2, 2, [Complex(1.0, 1.0), Complex(2.0, 0.0), Complex(0.0, 1.0), Complex(1.0, -1.0)])
+var cb = cm * cv
+
+solve(cm, cb) match
+    Ok(x) -> check(x.near(cv, 0.000001), "a complex system recovers the vector it was built from")
+    Err(e) -> fail("a complex system recovers the vector it was built from: " + describe(e))
+
+inverse(cm) match
+    Ok(inv) -> check((cm * inv).near(identity(2), 0.000001), "and a complex matrix has a complex inverse")
+    Err(e) -> fail("and a complex matrix has a complex inverse: " + describe(e))
+
+// A complex matrix can be singular for a reason no real matrix could be: the second row is the first
+// multiplied by i, which is a dependence only this field can express.
+var csingular = matrix(2, 2, [Complex(1.0, 0.0), Complex(1.0, 0.0), Complex(0.0, 1.0), Complex(0.0, 1.0)])
+
+check(same(det(csingular), Complex.zero()), "a dependence over i makes the determinant zero")
+
+solve(csingular, cv) match
+    Ok(_) -> fail("and the system is refused")
+    Err(e) -> check(is_singular(e), "and the system is refused")
+
+section("and at a second float width")
+
+// `f32` is the third element type, and it is here to make the point that the bodies are shared rather
+// than to say anything about narrow floats: the same `solve` runs, at a tolerance the width can meet.
+//
+// **The suffixes here are load-bearing, and the annotation on the binding is not enough.** A slice
+// literal settles a generic parameter from its own elements before the declared type is consulted,
+// so `var fm: Matrix[f32] = matrix(2, 2, [2.0, …])` builds a `Matrix[real]` and is then refused for
+// not being what it was annotated as. The element type has to be in the elements — which is the one
+// place in this program where a number is written with its width on it.
+var fm = matrix(2, 2, [2.0f32, 1.0f32, 1.0f32, 3.0f32])
+var fb = vector([5.0f32, 10.0f32])
+
+// Past that point nothing needs saying twice: `near` and `same` read their element type off the
+// value they were given, so the literals below take it from there.
+solve(fm, fb) match
+    Ok(x) -> check(x.near(vector([1.0f32, 3.0f32]), 0.0001), "the same elimination runs at f32")
+    Err(e) -> fail("the same elimination runs at f32: " + describe(e))
+
+check(same(det(fm), 5.0), "and so does the determinant")
+
 section("a system big enough that the walk is the point")
 
 // A 12x12 system whose answer is known by construction: fill a matrix that is diagonally dominant (so
 // it is certainly invertible), pick an `x`, and solve for the `b` it produces.
 var n = 12
-var big = zero_matrix(n, n)
+var big: Matrix[real] = zero_matrix(n, n)
 
-for i in 0..<n
+for r in 0..<n
     for j in 0..<n
-        big.set(i, j, if i == j then real(n) + 1.0 else 1.0 / real(i + j + 1))
+        big.set(r, j, if r == j then real(n) + 1.0 else 1.0 / real(r + j + 1))
 
-var want = zeros(n)
+var want: Vector[real] = zeros(n)
 
-for i in 0..<n do want.set(i, real(i) - 5.5)
+for r in 0..<n do want.set(r, real(r) - 5.5)
 
 var produced = big * want
 
@@ -208,29 +326,29 @@ solve(big, produced) match
     Ok(got) -> check(got.near(want, 0.000001), "a 12x12 system recovers the vector it was built from")
     Err(e) -> fail("a 12x12 system recovers the vector it was built from: " + describe(e))
 
-check(det(big).abs() > 1.0, "and its determinant is nowhere near zero")
+check(det(big).magnitude() > 1.0, "and its determinant is nowhere near zero")
 
 section("sharing, and the copy that ends it")
 
-// A `Vector` is a handle, so this is the hazard `04` documents for a string, in the one place a
-// numerical program would meet it: elimination writes into rows, so it must be given a copy.
+// A `Vector[T]` is a handle, so this is the hazard a string documents, in the one place a numerical
+// program would meet it: elimination writes into rows, so it must be given a copy.
 var original = vector([1.0, 2.0, 3.0])
 var shared = original
 
 shared.set(0, 99.0)
 
-check(close(original.at(0), 99.0), "assigning a vector shares its numbers")
+check(same(original.at(0), 99.0), "assigning a vector shares its numbers")
 
 var separate = original.copy()
 
 separate.set(0, 1.0)
 
-check(close(original.at(0), 99.0), "and 'copy' is what stops the sharing")
+check(same(original.at(0), 99.0), "and 'copy' is what stops the sharing")
 
 // The elimination is the customer: it must not consume the matrix it was asked about, or the residual
 // check above would have been comparing the answer against its own workings.
 var before = m.at(0, 0)
 
 solve(m, rhs) match
-    Ok(_) -> check(close(m.at(0, 0), before), "solving leaves the matrix it was given alone")
+    Ok(_) -> check(same(m.at(0, 0), before), "solving leaves the matrix it was given alone")
     Err(_) -> fail("solving leaves the matrix it was given alone")

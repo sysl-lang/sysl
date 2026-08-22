@@ -14,6 +14,40 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |""".stripMargin) shouldBe "7 2.5 hi\n"
   }
 
+  /** A stand-in for a type parameter is **its name**, so two declarations whose parameters are both
+   * spelled `T` build ones that render the same — and an instantiation cached under the rendering is
+   * handed from whichever declaration asked first to whichever asks next, carrying the first one's
+   * bounds with it.
+   *
+   * The library is the injured party and never the culprit: `sysl.container.Heap[T: Ord]` holds a
+   * `Buf[T]` and compares what it reads back, so a program declaring its own `[T: <anything else>]`
+   * over a `Buf[T]` used to make `Heap`'s elements unordered — and the diagnostic landed on the
+   * *library's* line, naming a bound the library had written correctly. Renaming the program's
+   * parameter to a free letter made it go away, which is what says it is about the letter.
+   *
+   * The `impl` blocks are what made it reachable rather than incidental: they are the third thing to
+   * resolve `Holder[T]`, and the two before them are sandboxed together.
+   */
+  "a program's type parameter does not lend its bounds to a library's of the same name" in {
+    run("""import sysl.buf.{Buf, buf}
+          |trait Tag: Add + Mul
+          |    tag(self) -> int
+          |impl Tag for real
+          |    tag(self) -> int = 1
+          |struct Holder[T: Tag]
+          |    cells: &Buf[T]
+          |    first(self) -> T = self.cells.at(0usize)
+          |impl[T: Tag] Mul[Holder[T], T] for Holder[T]
+          |    mul(self, rhs: Holder[T]) -> T = self.first() * rhs.first()
+          |impl[T: Tag] Mul[T] for Holder[T]
+          |    mul(self, k: T) -> Holder[T] = self
+          |var cells: Buf[real] = buf()
+          |cells.push(2.5)
+          |var h = Holder(cells)
+          |print(h.first(), h * h)
+          |""".stripMargin) shouldBe "2.5 6.25\n"
+  }
+
   "a generic function is instantiated once per type, not once per call" in {
     val out = Compiler.compileToLlvm("""id[T](x: T) -> T = x
                                        |print(id(1), id(2), id(3.5))

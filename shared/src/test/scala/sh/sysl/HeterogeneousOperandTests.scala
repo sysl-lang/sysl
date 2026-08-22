@@ -474,6 +474,34 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
                       |print(w.a, w.b)""".stripMargin) shouldBe "5 11\n"
     }
 
+    /** A **bounded** generic subject, which is what a vector space actually has: `Vector[T: Scalar]`
+     * asks something of its own parameter, and the dot product writes `Vector[T]` as a trait
+     * argument. Every block filed after that one is read against it, under this block's stand-ins
+     * for its parameters — so those stand-ins have to carry the bound, or applying `Vector` to one
+     * is an application the type's own declaration refuses and the complaint lands on the *later*
+     * block, which is neither where it was written nor wrong.
+     *
+     * The scaling block is what fires it, and the third one is here because the guide that found
+     * this had three: each block after the first is read against every block before it.
+     */
+    "a bounded generic subject may be written as a trait argument, with blocks filed after it" in {
+      run("""trait Scalar: Mul + Add
+            |    tag(self) -> int
+            |impl Scalar for real
+            |    tag(self) -> int = 1
+            |struct Vec2[T: Scalar]
+            |    a: T
+            |    b: T
+            |impl[T: Scalar] Mul[Vec2[T], T] for Vec2[T]
+            |    mul(self, rhs: Vec2[T]) -> T = self.a * rhs.a + self.b * rhs.b
+            |impl[T: Scalar] Mul[T] for Vec2[T]
+            |    mul(self, k: T) -> Vec2[T] = Vec2(self.a * k, self.b * k)
+            |impl[T: Scalar] Add for Vec2[T]
+            |    add(self, rhs: Vec2[T]) -> Vec2[T] = Vec2(self.a + rhs.a, self.b + rhs.b)
+            |var v = Vec2(1.0, 2.0)
+            |print(v * v, (v * 3.0).a, (v + v).b)""".stripMargin) shouldBe "5 3 4\n"
+    }
+
     // The refusal the rule exists for, unchanged: an argument naming ONE instantiation of the
     // subject collides with the defaulted block there and nowhere else.
     "an argument fixed to one instantiation of the subject is still refused" in {

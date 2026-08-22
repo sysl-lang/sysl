@@ -95,9 +95,9 @@ class ImplComposedRunTests extends AnyFreeSpec with RunSupport {
       run(
         """trait Total
           |    total(self) -> int
-          |struct One
+          |struct Cell
           |    v: int
-          |impl Total for One
+          |impl Total for Cell
           |    total(self) -> int = self.v
           |impl Total for []int
           |    total(self) -> int
@@ -107,7 +107,7 @@ class ImplComposedRunTests extends AnyFreeSpec with RunSupport {
           |sum_of(t: &Total) -> int = t.total()
           |var a: &[2]int = [10, 20]
           |print(sum_of(a[0..]))
-          |print(sum_of(One(7)))""".stripMargin,
+          |print(sum_of(Cell(7)))""".stripMargin,
       ) shouldBe "30\n7\n"
     }
 

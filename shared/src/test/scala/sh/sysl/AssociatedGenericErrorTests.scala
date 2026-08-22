@@ -43,20 +43,10 @@ class AssociatedGenericErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("cannot infer the type argument 'B' of 'Pair.only'")
     }
 
-    // **`Self` does not settle one either, even inside the type's own body.** It is the same rule
-    // written a second way: what fixes an associated function's arguments is the call and the
-    // expected type, and a member of `Box[T]` reaching `Self.count()` in the middle of an expression
-    // supplies neither. This is why a generic type that wants its own identities builds them from a
-    // value it already holds rather than from an associated function.
-    "and neither does 'Self', reached from inside the type's own body" in {
-      err(
-        """struct Box[T]
-          |    v: T
-          |    count() -> int = 0
-          |    twice(self) -> int = Self.count() + Self.count()
-          |print(Box(1).twice())""".stripMargin,
-      ) should include("cannot infer the type argument 'T' of 'Box.count'")
-    }
+    // **`Self` is the case that is not an inference at all**, and it is asserted where it works
+    // rather than here: it names the type applied to its own parameters, so a member of `Box[T]`
+    // reaching `Self.count()` already has the argument and nothing has to be read off the call. See
+    // `AssociatedGenericRunTests`, which runs it.
   }
 
   "the instantiation the call resolves to is checked" - {
