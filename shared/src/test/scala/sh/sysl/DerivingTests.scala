@@ -376,6 +376,42 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  // Two claims the reference makes that nothing else here runs.
+  "claims the reference makes" - {
+
+    // A compiler-*provided* membership has no method to put in a table, so a value holding one
+    // cannot be erased (`library/sysl/display.sysl` says so of the open integer family). A derived
+    // block is an ordinary block with an ordinary method, so it can — and the page says "found,
+    // checked, dispatched and erased exactly as a written one is", which is this.
+    "a derived implementation can be erased to a trait object" in {
+      run("""struct Size deriving Display
+            |    w: int
+            |    h: int
+            |end Size
+            |
+            |show(d: *Display)
+            |    print(d)
+            |
+            |var s = Size(3, 4)
+            |
+            |show(&s)
+            |""".stripMargin) shouldBe "Size(3, 4)\n"
+    }
+
+    // A value parameter is not a type and has no membership to ask for, so it gains no bound — which
+    // is only observable on a type that has one, since a bound on a `const` would not resolve.
+    "a const value parameter gains no bound" in {
+      run("""struct Buf[const N: usize] deriving Eq, Display
+            |    n: usize
+            |end Buf
+            |
+            |val a: Buf[4] = Buf(1)
+            |
+            |print(a == Buf[4](1), a)
+            |""".stripMargin) shouldBe "true Buf(1)\n"
+    }
+  }
+
   "the clause's own refusals" - {
 
     "a trait the compiler cannot write" in {

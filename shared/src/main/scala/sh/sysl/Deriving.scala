@@ -155,11 +155,6 @@ object Deriving {
   def problem(entry: BoundRef, stmt: Stmt): Option[String] = {
     val simple = entry.name.split('.').last
 
-    // A **simple** enum is already `Eq` by rule: every variant is dataless, so the value is its
-    // discriminant and there is one thing equality could mean (`Type.isEquatable`). An `impl` for
-    // one is refused, and a derived block would be refused by that same rule — with a sentence
-    // telling the reader to delete a block they did not write. Answered here instead, at the word
-    // they did write.
     // An **opaque** struct with no fields is C's incomplete type: the storage belongs to whoever
     // allocated it and nothing here knows its shape. Derived over no fields at all, `Eq` answers
     // `true` for every pair and `Display` renders every value the same — a wrong answer with nothing
@@ -168,6 +163,12 @@ object Deriving {
       Some("this type is opaque and declares no fields, so a derived implementation would have " +
         "nothing to walk — every value would compare equal and render the same. An opaque handle is " +
         "reached as a pointer; write an 'impl' block where one genuinely needs a trait")
+
+    // A **simple** enum is already `Eq` by rule: every variant is dataless, so the value is its
+    // discriminant and there is one thing equality could mean (`Type.isEquatable`). An `impl` for
+    // one is refused, and a derived block would be refused by that same rule — with a sentence
+    // telling the reader to delete a block they did not write. Answered here instead, at the word
+    // they did write.
     else if simple == "Eq" && (stmt match { case e: EnumDecl => Sum(e.variants).simple; case _ => false })
     then
       Some("a simple enum is already 'Eq' — no variant of it carries anything, so its value is its " +
