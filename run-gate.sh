@@ -32,8 +32,25 @@ LOGS=$REPO/target/gate
 SUITES=$REPO/shared/src/test/scala
 
 HEAVY_HEAP=24g;  HEAVY_AGENTS=1     # a suite that builds for every target, on its own
-LIGHT_HEAP=12g;  LIGHT_AGENTS=4     # 4 x 12g = 48 GB ceiling, leaving the machine ~16 GB
+LIGHT_HEAP=16g;  LIGHT_AGENTS=3     # 3 x 16g = the same 48 GB ceiling, redistributed -- see below
 LIMIT=900                           # seconds per group; the groups take 15-75s
+
+# **WHY 3 x 16g RATHER THAN 4 x 12g, measured 2026-08-22 cutting 0.0.66.** A wedged chunk was caught
+# in the act: four agents sat at **4.3 GB** each and the fifth at **exactly 12.0 GB**, which is the
+# cap. The machine was nowhere near full at the time. So the agent that died did not run out of
+# memory -- it ran out of *permission*, while tens of gigabytes sat unused beside it.
+#
+# The ceiling is unchanged at 48 GB, which is what protects the machine. What changed is how it is
+# divided: an agent that balloons now has 16 GB to balloon into rather than 12, and the ordinary
+# agents never wanted more than about 4.3 anyway. Fewer agents also means fewer of them able to
+# balloon at once, which is the case the ceiling exists for.
+#
+# **Neither this nor the grouping is a fix.** Something makes one agent occasionally need three times
+# what its neighbours need, and nobody has explained that -- see the note above about Native wanting
+# twelve times the JVM's memory for the same code. The most promising account is that Scala Native's
+# collector scans the stack conservatively, so garbage that a stack word happens to look like a
+# pointer to cannot be proven dead; a fresh process is then the only thing that reclaims it, which is
+# exactly what this script provides and why it works at all.
 
 mkdir -p "$LOGS"
 SUMMARY=$LOGS/summary.txt
