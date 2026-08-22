@@ -1029,11 +1029,29 @@ trait ExprAnalysis
     case Call(Ident(name), args) if lookupOpt(name).isEmpty && nestedFuncs.contains(name) =>
       callNested(nestedFuncs(name), name, args)
 
-    // One written below the call that names it. Its environment is formed where the first of the
-    // block's nested functions is written, so a call above that point has none to pass.
+    // A nested function of this block whose environment does not exist yet, for one of two reasons —
+    // and they are different mistakes, so they get different sentences (`0224`).
     case Call(Ident(name), _) if lookupOpt(name).isEmpty && pendingNested.exists(_.name == name) =>
-      err(s"'$name' is declared below this call — the nested functions of a block share an " +
-        "environment formed where the first of them is written, so they may be called from there on")
+      // The group is waiting on a binding written below this call. The functions themselves are
+      // above it, so "declared below this call" would be flatly false — what is below is the data.
+      //
+      // **All of them wait, not only the one that reads it**, and that is forced rather than
+      // conservative: a block's nested functions share **one** environment, which is what lets them
+      // call each other in either order, so there is nothing to pass to any of them until it is
+      // built.
+      if awaitingNeeds then
+        val waiting = pendingNeeds.toList.sorted
+        val which   = waiting.map(n => s"'$n'").mkString(", ")
+        val it      = if waiting.length == 1 then "it" else "them"
+
+        err(s"'$name' cannot be called here — the nested functions of this block share one " +
+          s"environment, and it is not built until everything they read is bound. $which " +
+          s"${if waiting.length == 1 then "is" else "are"} bound below this call: move the call " +
+          s"below $it, or move $it above the functions")
+      // The ordinary case: the call is written above the functions themselves.
+      else
+        err(s"'$name' is declared below this call — the nested functions of a block share an " +
+          "environment formed where the first of them is written, so they may be called from there on")
 
     // One belonging to a body this one is written inside. A body reaches its own group and no
     // further, because what it would have to carry to reach further is the frame around it.

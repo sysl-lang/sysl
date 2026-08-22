@@ -128,12 +128,15 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
       ) shouldBe "true false\n"
     }
 
-    "but a binding written below the group is not one it can capture" in {
-      err(
+    // Card `0224`: it is one it can capture. The group's environment is built after the last binding
+    // any of its functions reads, so a helper written above the data it uses — the natural layout for
+    // a script, and the first thing anybody writes in an entry file — is ordinary.
+    "and a binding written below the group is one it can capture too" in {
+      run(
         """show() -> int = later
           |val later = 1
           |print(str(show()))""".stripMargin,
-      ) should include("declared below")
+      ) shouldBe "1\n"
     }
   }
 

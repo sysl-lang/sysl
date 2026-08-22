@@ -62,6 +62,27 @@ trait AnalyzerBase extends Scoping {
    */
   protected var pendingNested: List[FuncDecl] = Nil
 
+  /** The block's own bindings the pending group reads and that are **not bound yet** (`0224`).
+   *
+   * A nested function may read anything its block binds, wherever in the block it is written — so
+   * the group cannot be lowered at the first of them, because the environment it builds holds the
+   * *address* of every capture and a slot whose declaration has not run has no name to point at
+   * yet. The group therefore waits here until the last of these is bound, and is lowered directly
+   * after it.
+   *
+   * **Empty is the ordinary case** — a group reading only what is already above it lowers where it
+   * always did, at the first of its functions.
+   */
+  protected var pendingNeeds: Set[String] = Set.empty
+
+  /** Whether the walk has reached the group's first function and is waiting on `pendingNeeds`.
+   *
+   * It is what keeps the group from being lowered *above* where it is written: a binding that
+   * completes the set before any of the functions has been reached leaves the group pending, to be
+   * lowered at the first of them as usual.
+   */
+  protected var awaitingNeeds: Boolean = false
+
   /** Nested functions of a body this one is written *inside*, kept so that naming one is refused for
    * the reason it is refused rather than as an undefined name.
    *
@@ -270,6 +291,8 @@ trait AnalyzerBase extends Scoping {
     capturedFields = Map.empty
     nestedFuncs = Map.empty
     pendingNested = Nil
+    pendingNeeds = Set.empty
+    awaitingNeeds = false
     outerNested = Set.empty
     blockDeclares = Map.empty
     tbounds = Map.empty
@@ -501,6 +524,9 @@ trait AnalyzerBase extends Scoping {
 
   /** The nested functions of one block, lowered together (`12 §5a`). */
   protected def lowerNestedGroup(group: List[FuncDecl]): List[TStmt]
+
+  /** Which of `candidates` the group's bodies read — what `pendingNeeds` is filled from (`0224`). */
+  protected def groupNeeds(group: List[FuncDecl], candidates: Set[String]): Set[String]
 
   /** `value.name(args)` where `name` is a field holding a callable rather than a method (`12 §6`). */
   protected def callableField(

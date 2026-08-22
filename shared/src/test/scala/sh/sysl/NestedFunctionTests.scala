@@ -430,62 +430,118 @@ class NestedFunctionTests extends AnyFreeSpec with RunSupport with CodegenSuppor
             |""".stripMargin) shouldBe "16\n6\n"
     }
 
-    "a capture written below the group is told which mistake it is" in {
-      err("""bad() -> int
+    // Card `0224`. This used to be refused: the group's environment was built where the *first* of
+    // its functions stood, so a binding written below that point was out of reach of all of them. It
+    // is built after the last binding any of them reads instead, so the ordinary layout — helpers
+    // above the data they use — is simply what it looks like.
+    "a capture written below the group is read, and reads what its initializer left" in {
+      run("""good() -> int
             |    go() -> int = later
             |
             |    var later = 1
             |
             |    go()
-            |""".stripMargin) should include("'later' is declared below this")
+            |
+            |print(good())
+            |""".stripMargin) shouldBe "1\n"
     }
-
-    "and the group is still callable, so one bad body is one message" in {
-      val message = err("""bad() -> int
-                          |    go() -> int = later
-                          |
-                          |    var later = 1
-                          |
-                          |    go()
-                          |""".stripMargin)
-
-      message should not include "undefined function 'go'"
-    }
-
     // Card `0221`. The rule is the one above — what the group may capture is what the block had
     // bound where the **first** of them is written — but the message was measured against the wrong
     // thing, so a use written *below* the declaration was told the declaration was below *it*. That
     // reads as a contradiction, and it cost a session five failed reductions before somebody
     // compared the two line numbers.
-    "a capture bound after the group begins, read from a function written below it" - {
-      val program =
+    // Cards `0221` and `0224` together. `0221` fixed the message, which used to tell a use written
+    // below a declaration that the declaration was below *it*; `0224` removed the restriction it was
+    // reporting, so the program simply runs.
+    "a binding made after the group's first function is still one it can read" in {
+      run("""var counted = 0
+            |
+            |bump(k: int)
+            |    counted += k
+            |end bump
+            |
+            |val data: [3]int = [1, 2, 3]
+            |
+            |read() -> int = data[0]
+            |
+            |bump(1)
+            |print(read())
+            |print(counted)
+            |""".stripMargin) shouldBe "1\n1\n"
+    }
+
+    // A *write* through to a later binding, which is the case that would go wrong quietly if the
+    // environment held anything but the real slot's address: a copy would accumulate and print 0.
+    "and a write reaches the later binding itself, not a copy of it" in {
+      run("""add(k: int)
+            |    total = total + k
+            |
+            |var total = 0
+            |
+            |add(3)
+            |add(4)
+            |print(total)
+            |""".stripMargin) shouldBe "7\n"
+    }
+
+    // Every block is its own group, so a loop body gets a fresh environment per iteration and the
+    // binding it waits on is that iteration's.
+    "a group inside a loop body waits on that iteration's own binding" in {
+      run("""var grand = 0
+            |
+            |for i in 0..<3
+            |    step(k: int)
+            |        acc = acc + k
+            |
+            |    var acc = 0
+            |
+            |    step(i)
+            |    step(i)
+            |    grand = grand + acc
+            |
+            |print(grand)
+            |""".stripMargin) shouldBe "6\n"
+    }
+
+    // The half that keeps the relaxation honest. One environment serves the whole group, so until it
+    // is built there is nothing to pass to *any* of them — and calling one early would otherwise read
+    // a slot whose initializer has not run.
+    "but calling one before that binding is refused, and both ways out are named" - {
+      val early =
         """var counted = 0
           |
           |bump(k: int)
           |    counted += k
           |end bump
           |
-          |val data: [3]int = [1, 2, 3]
-          |
           |read() -> int = data[0]
           |
           |bump(1)
+          |
+          |val data: [3]int = [1, 2, 3]
+          |
           |print(read())
           |""".stripMargin
 
-      "is refused, because the environment was built above the binding" in {
-        err(program) should include("'data' is bound after the nested functions of this block begin")
+      "naming the binding that is not ready" in {
+        err(early) should include("'data' is bound below this call")
       }
 
-      "and is NOT told the declaration is below it, which is where it sits" in {
-        err(program) should not include "'data' is declared below this"
+      "and saying it is the shared environment that is waiting" in {
+        err(early) should include("share one environment")
       }
 
-      "and is told both ways out of it" in {
-        val message = err(program)
+      "and offering the two moves that fix it" in {
+        val message = err(early)
 
-        message should include("Bind 'data' above them")
-        message should include("'static'")
+        message should include("move the call below it")
+        message should include("move it above the functions")
+      }
+
+      // `bump` reads nothing that is waiting and is refused anyway, which is forced rather than
+      // conservative: the environment it would be passed is the one that does not exist yet.
+      "including for a function that does not itself read it" in {
+        err(early) should include("'bump' cannot be called here")
       }
     }
 

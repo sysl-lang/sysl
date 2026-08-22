@@ -31,6 +31,8 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
    */
   protected def inBlock[R](stmts: List[Stmt])(body: => R): R = {
     val savedPending  = pendingNested
+    val savedNeeds    = pendingNeeds
+    val savedAwaiting = awaitingNeeds
     val savedNested   = nestedFuncs
     val savedDeclares = blockDeclares
 
@@ -45,19 +47,57 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
     // alike, since the name was never bound at all.
     // **Where** each is bound travels with it, because `notYetBound` has two mistakes to tell apart
     // and the position is the only thing that separates them (card `0221`).
-    blockDeclares = savedDeclares ++ stmts.collect {
-      case s @ VarDecl(n, _, _, _, _, _) => List(n -> s.pos)
-      case s @ ValDecl(n, _, _, _, _, _) => List(n -> s.pos)
-      case s @ RefDecl(n, _)             => List(n -> s.pos)
-      case s @ MultiDecl(ns, _, _)       => ns.map(_ -> s.pos)
-      case s @ PatternDecl(p, _, _)      => patternNames(p).map(_ -> s.pos)
-    }.flatten
+    val binds = stmts.flatMap(boundBy)
+
+    blockDeclares = savedDeclares ++ binds
+
+    // What the group reads from **this** block, whether or not it is bound yet (`0224`). The group
+    // waits for the last of these and is lowered directly after it, because the environment holds
+    // the address of every capture and a slot whose declaration has not run has no name to point at.
+    // Empty for a group that reads only what is above it, which is the ordinary case and lowers
+    // where it always did.
+    pendingNeeds = groupNeeds(pendingNested, binds.map(_._1).toSet)
+    awaitingNeeds = false
 
     try body
     finally
       pendingNested = savedPending
+      pendingNeeds = savedNeeds
+      awaitingNeeds = savedAwaiting
       nestedFuncs = savedNested
       blockDeclares = savedDeclares
+  }
+
+  /** The names a statement binds, with where it binds them. */
+  private def boundBy(stmt: Stmt): List[(String, Option[Pos])] = stmt match
+    case s @ VarDecl(n, _, _, _, _, _) => List(n -> s.pos)
+    case s @ ValDecl(n, _, _, _, _, _) => List(n -> s.pos)
+    case s @ RefDecl(n, _)             => List(n -> s.pos)
+    case s @ MultiDecl(ns, _, _)       => ns.map(_ -> s.pos)
+    case s @ PatternDecl(p, _, _)      => patternNames(p).map(_ -> s.pos)
+    case _                             => Nil
+
+  /** Strikes off what a statement just bound, and lowers the pending group once it has them all.
+   *
+   * Run after **every** statement, so the environment is built directly after the *last* binding any
+   * of the block's nested functions reads — which is the whole of what lets one read a binding
+   * written below it (`0224`). The lowered environment is returned as statements to sit at that
+   * point, exactly as it used to sit at the first function.
+   *
+   * `awaitingNeeds` is what keeps it from being lowered *above* where the functions are written: a
+   * binding that completes the set before any of them has been reached leaves the group pending, and
+   * the first function lowers it in the ordinary way.
+   */
+  private def settleNeeds(stmt: Stmt): List[TStmt] = {
+    if pendingNeeds.nonEmpty then pendingNeeds = pendingNeeds -- boundBy(stmt).map(_._1)
+
+    if awaitingNeeds && pendingNeeds.isEmpty && pendingNested.nonEmpty then
+      val group = pendingNested
+
+      pendingNested = Nil
+      awaitingNeeds = false
+      lowerNestedGroup(group)
+    else Nil
   }
 
   /** The body of a value block, using whatever scope the caller has established — a match arm
@@ -242,7 +282,7 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
       loops = outer
       bindFailed(stmt)
       List(TExprStmt(TUnitLit()))
-    }(analyzeStmt(stmt))
+    }(analyzeStmt(stmt) ::: settleNeeds(stmt))
   }
 
   /** Keeps what the rest of the block will need from a statement that failed.
@@ -753,6 +793,12 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
     // already been dealt with and contribute nothing further here.
     case _: FuncDecl =>
       if pendingNested.isEmpty then Nil
+      // The group reads something this block binds further down, so its environment cannot be built
+      // here — it holds the *address* of every capture, and a slot whose declaration has not run has
+      // no name to point at. It waits, and `settleNeeds` lowers it after the last of them (`0224`).
+      else if pendingNeeds.nonEmpty then
+        awaitingNeeds = true
+        Nil
       else
         val group = pendingNested
 

@@ -188,6 +188,24 @@ trait Closures extends CallAnalysis {
    * are read. Everything a nested function names from around it must therefore be declared above
    * that point, and the diagnostic for a name declared below says so.
    */
+  /** Which of `candidates` the group's bodies read — the block's own bindings a nested function
+   * needs, whether or not they have been bound yet (`0224`).
+   *
+   * This is what decides **where** the group is lowered. `captures` normally asks the scope whether
+   * a name is an outer one, and a binding written further down the block is not in it yet; asking
+   * about the block's *whole* binding set instead is what lets a nested function read something
+   * written below it. The environment is then built after the last of them, so every address it
+   * holds is of a slot whose declaration has run.
+   *
+   * A name the group's own functions bind, and a parameter of one, is excluded by `captures`
+   * itself, so what comes back is only what the group reaches outward for.
+   */
+  protected def groupNeeds(group: List[FuncDecl], candidates: Set[String]): Set[String] = {
+    val bound = group.map(_.name).toSet
+
+    group.flatMap(f => captures(f.body, bound ++ f.params.map(_.name), candidates)).toSet
+  }
+
   protected def lowerNestedGroup(group: List[FuncDecl]): List[TStmt] = {
     val names = group.map(_.name)
 
@@ -448,12 +466,13 @@ trait Closures extends CallAnalysis {
    * outer name exactly as it would anywhere else, and a name that resolves to a declaration rather
    * than to a local is reached the way any other function reaches it.
    */
-  private def captures(body: List[Stmt], bound: Set[String]): List[String] = {
+  private def captures(body: List[Stmt], bound: Set[String],
+                       outer: String => Boolean = n => lookupOpt(n).isDefined): List[String] = {
     val found = mutable.LinkedHashSet.empty[String]
 
     def walk(node: Any, bound: Set[String]): Set[String] = node match
       case Ident(n) =>
-        if !bound(n) && lookupOpt(n).isDefined then found += n
+        if !bound(n) && outer(n) then found += n
         bound
       // A binding is in scope for what comes *after* it, so the shadow starts at the declaration and
       // the initializer is still read outside it — `var n = n` captures the outer `n`.
@@ -488,7 +507,7 @@ trait Closures extends CallAnalysis {
         // something already declared — so a pattern that both binds `a` and references `` `a` ``
         // reads the outer one.
         for n <- ps.flatMap(patternReads) do
-          if !bound(n) && lookupOpt(n).isDefined then found += n
+          if !bound(n) && outer(n) then found += n
 
         guard.foreach(walk(_, inArm))
         scoped(b, inArm)
