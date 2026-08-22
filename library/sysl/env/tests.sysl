@@ -1,0 +1,47 @@
+module sysl.env
+@requires(os)
+@tests
+
+// What `sysl.env` claims, asserted against whatever environment the suite happens to run in.
+//
+// **Nothing here may assume a particular value**, since this tree is compiled and run on a
+// development machine and again on CI's Linux runner, and the two share almost nothing. So the
+// assertions come in two kinds: a name that cannot be set, where every answer is known exactly, and
+// the relationships between the three functions, which hold whatever the environment holds.
+
+// A name no environment sets. Written with characters a shell cannot export, so this cannot become
+// true by accident on somebody's machine.
+private absent() -> string = "SYSL ENV TEST-NOT/SET"
+
+@test("a name that is not set answers None, false, and the caller's fallback")
+env_absent()
+    assert(get(absent()) == None, "a name nothing sets came back with a value")
+    assert(!is_set(absent()), "a name nothing sets reported as set")
+    assert_eq(get_or(absent(), "fallback"), "fallback")
+end env_absent
+
+@test("get_or answers the value where there is one and the fallback where there is not")
+env_get_or_agrees_with_get()
+    // The relationship rather than either value, which is what makes this true in any environment:
+    // `get_or` is `get` with the `None` filled in, and nothing else.
+    get("PATH") match
+        Some(v) -> assert_eq(get_or("PATH", "fallback"), v)
+        None -> assert_eq(get_or("PATH", "fallback"), "fallback")
+end env_get_or_agrees_with_get
+
+@test("a name that get answers is one is_set agrees is set")
+env_get_implies_is_set()
+    // One direction only, and deliberately: `is_set` is true of a name whose value is not UTF-8,
+    // where `get` answers `None` — so the converse does not hold and asserting it would fail on a
+    // machine whose environment carries a Latin-1 value.
+    if get("PATH") != None then assert(is_set("PATH"), "a name with a value reported as unset")
+    if get("HOME") != None then assert(is_set("HOME"), "a name with a value reported as unset")
+end env_get_implies_is_set
+
+@test("the environment a test runs in has something in it, which is what says the call reaches it")
+env_reaches_the_process()
+    // A shim that always answered null would pass every assertion above, since they are all about
+    // absence. This is the one that fails if `getenv` is never actually reached: `PATH` is set for
+    // every process either of the machines that run this suite can start.
+    assert(is_set("PATH"), "PATH is unset, so either this environment is bare or getenv is not being reached")
+end env_reaches_the_process

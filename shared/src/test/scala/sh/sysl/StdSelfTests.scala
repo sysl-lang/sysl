@@ -57,11 +57,16 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * synthetic zone, needing no host — and `sysl.posix.time`'s four against whatever zone the machine
    * running them is set to. Exactly the new count again, for the reason above.
    *
+   * Raised to **343** when the zone database arrived: `sysl.time.tzif` decodes a TZif file and gets
+   * seven, `sysl.env` four, and `sysl.posix.time` two more for reading a real zone off the host.
+   * `tzif`'s carry their zone as **bytes**, so they assert the format rather than the machine — the
+   * only tests in the library that would pass on a target with no filesystem at all.
+   *
    * **`sysl.fs`'s are the first tests that depend on the library's own C**, so this floor now guards
    * a second thing: a build that stopped compiling or stopped linking the shim under
    * `library/sysl/fs/__<os>__` fails outright rather than quietly collecting fewer tests.
    */
-  private val floor = 330
+  private val floor = 343
 
   /** The library, compiled as a **test build of itself**.
    *

@@ -1,0 +1,289 @@
+module sysl.seq
+@tests
+
+// What `sysl.seq` claims, asserted in sysl.
+//
+// **Every member is asserted twice, once on a slice and once on a `Buf`**, because the second
+// implementation is written as delegation and delegation is exactly the shape that goes wrong
+// silently: a member wired to the neighbouring one answers a plausible number for every input a
+// single test would think to try. The pairs below are what says the two agree.
+//
+// The empty sequence gets a case of its own for every member, since it is the input each of them
+// answers differently and the one a loop-shaped implementation is likeliest to get wrong.
+
+import sysl.buf.{Buf, buf}
+
+// The same five elements as a slice and as a buffer, so a pair of assertions is one line each.
+private five() -> Buf[int]
+    var b: Buf[int] = buf()
+
+    for i in 1..5
+        b.push(i)
+
+    b
+
+// -- fold ------------------------------------------------------------------------------------
+
+@test("fold carries a running value across every element, in order")
+fold_accumulates()
+    val xs = [1, 2, 3, 4, 5]
+
+    assert_eq(xs[..].fold(0, (a, n) -> a + n), 15)
+    assert_eq(five().fold(0, (a, n) -> a + n), 15)
+end fold_accumulates
+
+@test("fold's accumulator is its own type, not the element's")
+fold_changes_type()
+    val xs = ["ab", "c", "def"]
+
+    assert_eq(xs[..].fold(0usize, (a, s) -> a + s.len), 6)
+end fold_changes_type
+
+@test("fold sees the elements in order, which a subtraction is what shows")
+fold_is_ordered()
+    val xs = [1, 2, 3]
+
+    assert_eq(xs[..].fold(0, (a, n) -> a * 10 + n), 123)
+end fold_is_ordered
+
+@test("folding nothing is the initial value")
+fold_of_empty_is_the_seed()
+    val xs = [1, 2, 3]
+
+    assert_eq(xs[0..<0].fold(7, (a, n) -> a + n), 7)
+end fold_of_empty_is_the_seed
+
+// -- any and all -----------------------------------------------------------------------------
+
+@test("any is whether one satisfies the predicate")
+any_finds_one()
+    val xs = [1, 2, 3]
+
+    assert(xs[..].any(n -> n == 2))
+    assert(!xs[..].any(n -> n == 9))
+    assert(five().any(n -> n == 5))
+end any_finds_one
+
+@test("all is whether none fails it")
+all_requires_every_one()
+    val xs = [2, 4, 6]
+
+    assert(xs[..].all(n -> n % 2 == 0))
+    assert(!xs[..].all(n -> n > 2))
+    assert(five().all(n -> n > 0))
+end all_requires_every_one
+
+@test("nothing satisfies a predicate, and nothing fails one")
+any_and_all_of_empty()
+    val xs = [1, 2, 3]
+
+    assert(!xs[0..<0].any(n -> true))
+    assert(xs[0..<0].all(n -> false))
+end any_and_all_of_empty
+
+// -- find, position and count_where -----------------------------------------------------------
+
+@test("find answers the first element satisfying the predicate")
+find_answers_the_element()
+    val xs = [1, 4, 3, 6]
+
+    assert_eq(xs[..].find(n -> n > 2).unwrap(), 4)
+    assert_eq(five().find(n -> n > 2).unwrap(), 3)
+end find_answers_the_element
+
+@test("position answers where the first one is, which is the other question")
+position_answers_the_index()
+    val xs = [1, 4, 3, 6]
+
+    assert_eq(xs[..].position(n -> n > 2).unwrap(), 1)
+    assert_eq(five().position(n -> n > 2).unwrap(), 2)
+end position_answers_the_index
+
+@test("neither invents an answer when nothing satisfies the predicate")
+find_and_position_of_nothing()
+    val xs = [1, 2, 3]
+
+    assert(xs[..].find(n -> n > 9).is_none())
+    assert(xs[..].position(n -> n > 9).is_none())
+    assert(xs[0..<0].find(n -> true).is_none())
+    assert(five().find(n -> n > 9).is_none())
+end find_and_position_of_nothing
+
+@test("count_where is how many satisfy it")
+count_where_counts()
+    val xs = [1, 2, 3, 4, 5]
+
+    assert_eq(xs[..].count_where(n -> n % 2 == 0), 2)
+    assert_eq(xs[..].count_where(n -> n > 9), 0)
+    assert_eq(five().count_where(n -> n % 2 == 0), 2)
+end count_where_counts
+
+// -- each ------------------------------------------------------------------------------------
+
+// **The record is a `&Buf` and not a `Buf`**, because a closure captures by value: pushing into a
+// captured buffer fills a copy, and the original is still empty when the assertion reads it. A
+// counted reference is the storage itself, so what the closure writes is what the test sees.
+@test("each visits every element in order and yields nothing")
+each_visits_all()
+    val xs = [1, 2, 3]
+    var seen: &Buf[int] = buf()
+
+    xs[..].each(n -> seen.push(n))
+
+    assert_eq(seen.len(), 3)
+    assert_eq(seen[0], 1)
+    assert_eq(seen[2], 3)
+end each_visits_all
+
+@test("each of nothing calls nothing, and the same record proves the sequence is what decides")
+each_of_empty()
+    val xs = [1, 2, 3]
+    var seen: &Buf[int] = buf()
+
+    xs[0..<0].each(n -> seen.push(n))
+
+    assert_eq(seen.len(), 0)
+
+    xs[..].each(n -> seen.push(n))
+
+    assert_eq(seen.len(), 3)
+end each_of_empty
+
+// -- map -------------------------------------------------------------------------------------
+
+@test("map is every element transformed, in order")
+map_transforms()
+    val xs = [1, 2, 3]
+    val out = xs[..].map(n -> n * 2)
+
+    assert_eq(out.len, 3)
+    assert_eq(out[0], 2)
+    assert_eq(out[2], 6)
+end map_transforms
+
+@test("map's result type is the closure's, not the sequence's")
+map_changes_type()
+    val xs = [1, 2, 3]
+    val out = xs[..].map(n -> s"<${n}>")
+
+    assert_eq(out[0], "<1>")
+    assert_eq(out[2], "<3>")
+end map_changes_type
+
+@test("a buffer maps to the same answer a slice does")
+map_over_a_buf()
+    val out = five().map(n -> n * n)
+
+    assert_eq(out.len, 5)
+    assert_eq(out[0], 1)
+    assert_eq(out[4], 25)
+end map_over_a_buf
+
+@test("mapping nothing is nothing, and does not reach for a first element")
+map_of_empty()
+    val xs = [1, 2, 3]
+
+    assert_eq(xs[0..<0].map(n -> n * 2).len, 0)
+end map_of_empty
+
+// -- filter ----------------------------------------------------------------------------------
+
+@test("filter keeps the elements satisfying the predicate, in order")
+filter_keeps_matches()
+    val xs = [1, 2, 3, 4, 5]
+    val out = xs[..].filter(n -> n % 2 == 1)
+
+    assert_eq(out.len, 3)
+    assert_eq(out[0], 1)
+    assert_eq(out[2], 5)
+end filter_keeps_matches
+
+@test("filter keeping nothing answers an empty slice rather than trapping")
+filter_keeps_none()
+    val xs = [1, 2, 3]
+
+    assert_eq(xs[..].filter(n -> n > 9).len, 0)
+    assert_eq(xs[0..<0].filter(n -> true).len, 0)
+    assert_eq(five().filter(n -> n > 9).len, 0)
+end filter_keeps_none
+
+// -- flat_map --------------------------------------------------------------------------------
+
+// **A `flat_map` closure hands back storage that outlives the call**, which is what these two
+// helpers are: an array literal is a value in the frame that built it, so a slice of one would name
+// storage that has gone, and the compiler says so. A buffer's `view` is counted and does not.
+
+private pair(n: int) -> []int
+    var b: Buf[int] = buf()
+
+    b.push(n)
+    b.push(n * 10)
+
+    b.view()
+
+private just_odd(n: int) -> []int
+    var b: Buf[int] = buf()
+
+    if n % 2 == 1 then b.push(n)
+
+    b.view()
+
+@test("flat_map lays every answer end to end")
+flat_map_flattens()
+    val xs = [1, 2, 3]
+    val out = xs[..].flat_map(n -> pair(n))
+
+    assert_eq(out.len, 6)
+    assert_eq(out[0], 1)
+    assert_eq(out[1], 10)
+    assert_eq(out[5], 30)
+end flat_map_flattens
+
+@test("an answer of nothing contributes nothing, which is what flattening means")
+flat_map_skips_empties()
+    val xs = [1, 2, 3]
+    val out = xs[..].flat_map(n -> just_odd(n))
+
+    assert_eq(out.len, 2)
+    assert_eq(out[0], 1)
+    assert_eq(out[1], 3)
+end flat_map_skips_empties
+
+// -- what these cost -------------------------------------------------------------------------
+
+// **The seven that build no sequence still allocate**, because a `&Fn` parameter is a counted box
+// and the closure goes into one at the call. That is a language property rather than a fact about
+// this module, so what is asserted here is only that the answers are right; the allocation itself is
+// pinned in `SeqAllocationTests`, where the emitted code can be read.
+@test("the members that build no sequence answer correctly")
+the_non_building_half()
+    val xs = [3, 0, 7]
+
+    assert_eq(xs[..].fold(0, (a, n) -> a + n), 10)
+    assert(xs[..].any(n -> n == 0))
+    assert(!xs[..].all(n -> n > 0))
+    assert_eq(xs[..].count_where(n -> n > 1), 2)
+    assert_eq(xs[..].find(n -> n > 5).unwrap(), 7)
+    assert_eq(xs[..].position(n -> n > 5).unwrap(), 2)
+end the_non_building_half
+
+// -- the whole point -------------------------------------------------------------------------
+
+@test("the stages chain, which is what a sequence surface is for")
+stages_chain()
+    val xs = [1, 2, 3, 4, 5, 6]
+    val out = xs[..].filter(n -> n % 2 == 0).map(n -> n * n)
+
+    assert_eq(out.len, 3)
+    assert_eq(out[0], 4)
+    assert_eq(out[2], 36)
+    assert_eq(xs[..].filter(n -> n > 3).fold(0, (a, n) -> a + n), 15)
+end stages_chain
+
+@test("a mutable slice reaches the members written for a read-only one")
+a_mutable_slice_reaches_them()
+    var xs = [1, 2, 3]
+
+    assert_eq(xs[..].fold(0, (a, n) -> a + n), 6)
+    assert_eq(xs[..].map(n -> n + 1)[0], 2)
+end a_mutable_slice_reaches_them
