@@ -216,8 +216,19 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     // its second against the `Option[usize]` that `n` said.
     // **The answer is the caller's, taken before this pass entered the callee's scope.** Asking
     // `callableArg` here would ask the callee's module whether it declares the name.
-    if isCallable then callBound(ptype, tps, bounds, partial)
-    else ptype.filterNot(mentions(_, tps -- partial.keySet)).map(resolveType(_, partial))
+    //
+    // **A function name at a parameter that is not a callable bound falls through to the parameter
+    // itself**, which is what `spawn(work, &n)` needs: its parameter is a raw `*extern` pointer, so
+    // there is no bound to read and the answer to "what is wanted here" is that C pointer. Without
+    // the fallback the expectation was nothing at all, and the refusal lost the sentence naming the
+    // `&` that would have fixed it — the one thing a reader of that call actually needs. It costs
+    // nothing where a bound *is* found, and where the parameter still mentions something unsolved
+    // the filter below answers `None` exactly as it did before.
+    if isCallable then callBound(ptype, tps, bounds, partial).orElse(plain(ptype, tps, partial))
+    else plain(ptype, tps, partial)
+
+  private def plain(ptype: Option[TypeRef], tps: Set[String], partial: Map[String, Type]): Option[Type] =
+    ptype.filterNot(mentions(_, tps -- partial.keySet)).map(resolveType(_, partial))
 
   /** `null` written as an argument, which is the one *value* whose type its context supplies. */
   private def nullArg(a: Expr): Boolean = written(a) match

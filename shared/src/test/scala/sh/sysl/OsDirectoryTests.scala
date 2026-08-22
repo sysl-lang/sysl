@@ -399,15 +399,15 @@ class OsDirectoryTests extends LibraryCliSupport {
     }
 
     // The same question asked of the tree that ships, which is the one the card was filed about: the
-    // library's four shims are POSIX and must reach a hosted build and no other.
+    // library's shims are POSIX and must reach a hosted build and no other.
     "which is what keeps the library's own shims off a bare machine" in {
       val bare   = Std.cSources(Os.Freestanding).map(s => Project.basename(s.name))
       val hosted = Std.cSources(Os.Linux).map(s => Project.basename(s.name)).sorted
 
       bare shouldBe empty
-      hosted shouldBe List("clock.c", "dirent.c", "stat.c", "termios.c")
+      hosted shouldBe List("clock.c", "dirent.c", "stat.c", "termios.c", "zone.c")
 
-      // And macOS sees the same four files, which is the deduplication itself: before this they were
+      // And macOS sees the same files, which is the deduplication itself: before this they were
       // two directories of identical copies, and a build could only ever have seen one of them.
       Std.cSources(Os.MacOS).map(s => Project.basename(s.name)).sorted shouldBe hosted
     }

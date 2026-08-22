@@ -79,7 +79,12 @@ class GhostTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |print(f(1))
           |""".stripMargin
 
-      ir(src) should not include "big"
+      // **`@big(` rather than `big`**, because the module carries the whole library's type table and
+      // a bare needle matches any symbol that happens to contain these three letters — which
+      // `sysl.time`'s `Resolution.Ambiguous` does, and which cost a gate run to find. The tighter
+      // needle is also the more honest one: what this asserts is that the ghost function was not
+      // emitted, and a function appears as `define … @big(` and is reached as `call … @big(`.
+      ir(src) should not include "@big("
       run(src) shouldBe "1\n"
       // The ordinary `require` still traps, so the neighbouring value is refused.
       exits("""@ghost
