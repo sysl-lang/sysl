@@ -195,6 +195,21 @@ trait DeclParser extends ExprParser {
    */
   protected lazy val opaqueKw: Parser[Unit] = softWord("opaque")
 
+  /** `deriving Eq, Ord, Hash, Display` — the traits the compiler writes a memberwise implementation
+   * of, on the declaration of the type it writes them for.
+   *
+   * A **soft** keyword, for the reason `opaque` and `invariant` are: `deriving` is an ordinary word
+   * and a language that spent one to save itself a lookahead is taking a name away from every
+   * program that had a use for it. There is no ambiguity to trade against here — nothing else may
+   * follow a type's header, so a word in this position can only be this clause.
+   *
+   * Each entry is read as a `boundRef`, which is what a bound is read as everywhere else: it carries
+   * its own position, so a refusal about one trait out of four points at that one. A derived trait
+   * takes no arguments, and `Deriving` is where that is said.
+   */
+  protected lazy val derivingClause: Parser[List[BoundRef]] =
+    opt(softWord("deriving") ~> rep1sep(boundRef, op(","))) ^^ (_.getOrElse(Nil))
+
   /** A **type pack** stands for a list of types and there is one place to write the list out —
    * `(..A)`, the tuple of it (`10 §10`). A declaration whose parameters *are* its shape has nothing
    * to do with one: a struct of a pack would be a tuple with a name, which is the thing a program
@@ -211,7 +226,8 @@ trait DeclParser extends ExprParser {
         "'impl' or a function takes one")
 
   protected lazy val structDecl: PackratParser[Stmt] =
-    opt(opaqueKw) ~ (op("struct") ~> ident) ~ opt(boundedTypeParams) >> { case hidden ~ name ~ tps =>
+    opt(opaqueKw) ~ (op("struct") ~> ident) ~ opt(boundedTypeParams) ~ derivingClause >> {
+      case hidden ~ name ~ tps ~ derives =>
       val tp     = tps.getOrElse(TypeParams.none)
       val opaque = hidden.isDefined
 
@@ -229,7 +245,8 @@ trait DeclParser extends ExprParser {
               val members    = items.collect { case StructPart.Mem(m)  => m }
               val invariants = items.collect { case StructPart.Inv(e)  => e }
               StructDecl(name, tp.names, fields, members, tp.bounds, invariants,
-                         tdefaults = tp.defaults, opaque = opaque, tvalues = tp.values)
+                         tdefaults = tp.defaults, opaque = opaque, tvalues = tp.values,
+                         deriving = derives)
             }
 
         // A struct with **no fields**, whose emptiness is *written* rather than inferred from an
@@ -240,7 +257,8 @@ trait DeclParser extends ExprParser {
         // has always been, and still says so below.
         case None ~ Some(_) =>
           endName(name) ^^^ StructDecl(name, tp.names, Nil, Nil, tp.bounds, Nil,
-                                       tdefaults = tp.defaults, opaque = opaque, tvalues = tp.values)
+                                       tdefaults = tp.defaults, opaque = opaque, tvalues = tp.values,
+                                       deriving = derives)
 
         // A struct with **no body at all**, which only an `opaque` one may be: it is C's incomplete
         // type, `struct sqlite3;`, and it is what a handle from a C library should be declared as.
@@ -248,7 +266,8 @@ trait DeclParser extends ExprParser {
         // declaration exists to give `*sqlite3` a type of its own that a `*u8` cannot be mistaken for.
         case _ if opaque =>
           success(StructDecl(name, tp.names, Nil, Nil, tp.bounds, Nil,
-                             tdefaults = tp.defaults, opaque = true, tvalues = tp.values))
+                             tdefaults = tp.defaults, opaque = true, tvalues = tp.values,
+                             deriving = derives))
 
         case _ =>
           err(s"'struct $name' declares no fields — a struct's body is indented under it, a type " +
@@ -419,7 +438,8 @@ trait DeclParser extends ExprParser {
    * explicit integer value (`Blue = 10`), or a name with a payload (`Circle(radius: int)`).
    */
   protected lazy val enumDecl: PackratParser[Stmt] =
-    op("enum") ~> ident ~ opt(boundedTypeParams) ~ opt(op(":") ~> typeRef) >> { case name ~ tps ~ under =>
+    op("enum") ~> ident ~ opt(boundedTypeParams) ~ opt(op(":") ~> typeRef) ~ derivingClause >> {
+      case name ~ tps ~ under ~ derives =>
       val tp = tps.getOrElse(TypeParams.none)
 
       noPacks(tp, "an enum") ~> (newline ~> indent ~> skipNewlines ~> rep1sep(enumItem, newlines) <~ skipNewlines <~ dedent) <~ endName(name) ^^ {
@@ -427,7 +447,7 @@ trait DeclParser extends ExprParser {
           val variants = items.collect { case Left(v)  => v }
           val members  = items.collect { case Right(m) => m }
           EnumDecl(name, tp.names, under, variants, members, tp.bounds, tdefaults = tp.defaults,
-                   tvalues = tp.values)
+                   tvalues = tp.values, deriving = derives)
       }
     }
 

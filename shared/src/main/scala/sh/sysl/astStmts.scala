@@ -724,6 +724,14 @@ case class StructDecl(
       * the declared name.
       */
     cname: Option[ExportAttr] = None,
+    /** The traits named by a `deriving` clause — `struct Size deriving Eq, Ord`.
+      *
+      * Each is a trait the compiler knows how to write memberwise, and what it writes is an ordinary
+      * `impl` block synthesised before anything is hoisted (`Deriving`). The clause is held as
+      * written, positions and all, because every refusal about it names one trait out of a list and
+      * has to point at that one.
+      */
+    deriving: List[BoundRef] = Nil,
 ) extends Stmt
 
 /** One variant of an `enum`. A variant with `fields` is a data-carrying (tagged-union)
@@ -750,7 +758,9 @@ case class EnumDecl(name: String, tparams: List[String], underlying: Option[Type
                     /** Which of `tparams` stand for **values** rather than types (`10 §9`), and the
                       * type each argument must have.
                       */
-                    tvalues: Map[String, TypeRef] = Map.empty) extends Stmt
+                    tvalues: Map[String, TypeRef] = Map.empty,
+                    /** The traits named by a `deriving` clause, exactly as a struct's are. */
+                    deriving: List[BoundRef] = Nil) extends Stmt
 
 /** The `within lo..hi` clause of a constrained subtype. `exclusiveHi` marks `..<`, which excludes
  * the upper endpoint; a plain `..` includes it. Bounds are literal expressions — an integer, a

@@ -110,7 +110,26 @@ trait ProgramWalk extends AbstractBodies {
             "declares is the module's already"))
         case _ =>
 
-    val body = (library ::: files).flatMap((u, s) => contributed(u).map((s, _)))
+    val written = (library ::: files).flatMap((u, s) => contributed(u).map((s, _)))
+
+    // A `deriving` clause is answered here, before anything is hoisted: what it names becomes an
+    // ordinary `impl` block standing directly after the declaration that asked for it, and every
+    // pass below sees a program in which somebody wrote those blocks out (`Deriving`).
+    //
+    // The clause is checked first and separately, because the two questions are different. What is
+    // wrong with the *clause* — a trait the compiler cannot write, arguments on one, the same trait
+    // twice — is about the words in front of the reader, and each entry is its own recovery region
+    // so a clause with two mistakes in it reports both. What is wrong with a derived *block* is
+    // about the type's fields, and it surfaces exactly where a written block's would.
+    for (_, stmt) <- written; entry <- Deriving.clause(stmt) do
+      currentPos = entry.pos
+      for message <- Deriving.problem(entry, stmt) do recover(())(at(entry.pos)(err(message)))
+
+    for (_, stmt) <- written; entry <- Deriving.duplicates(Deriving.clause(stmt)) do
+      currentPos = entry.pos
+      recover(())(at(entry.pos)(err(s"'${entry.show}' is named twice by one 'deriving' clause")))
+
+    val body = written.flatMap((scope, stmt) => (scope, stmt) :: Deriving.expand(stmt).map((scope, _)))
 
     // What a `@tests` file declares, before anything is hoisted, because hoisting is where a
     // declaration stops remembering which file wrote it (`testing.md`). The library's files go

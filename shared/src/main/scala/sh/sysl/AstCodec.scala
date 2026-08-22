@@ -69,7 +69,7 @@ object AstCodec {
    * conflict**, and that is the case the rule above is written for: read dev's number, take the one
    * after it, and do not assume a clean merge means the versions agree.
    */
-  val Version: Int = 42
+  val Version: Int = 43
 
   private val Magic = "sysl-ast"
 
@@ -411,7 +411,7 @@ object AstCodec {
         case ExternVarDecl(n, t, lk, vs) =>
           tok("extv"); sref(n); typ(t); opt(lk)(sref); vis(vs)
 
-        case StructDecl(n, tps, fs, ms, bs, invs, vs, tds, op, tvs, pk, al, cn) =>
+        case StructDecl(n, tps, fs, ms, bs, invs, vs, tds, op, tvs, pk, al, cn, dv) =>
           tok("sd"); sref(n); list(tps)(sref); list(fs)(param); list(ms)(method)
           bounds(bs); list(invs)(expr); vis(vs); tdefaults(tds); bool(op); tdefaults(tvs)
           // A layout travels with the declaration: an importing module computes an instantiation's
@@ -422,10 +422,14 @@ object AstCodec {
           // consumer generates has to spell a package's type the way the package chose, whether it
           // was compiled from source or read back from an artifact.
           opt(cn)(e => { pos(e); opt(e.symbol)(sref) })
+          // The clause travels rather than the blocks it makes, because expansion happens once, on
+          // the way in to the walk — so an artifact holding the clause and an artifact holding the
+          // source both arrive at the same program.
+          list(dv)(bound)
 
-        case EnumDecl(n, tps, und, vars, ms, bs, vs, tds, tvs) =>
+        case EnumDecl(n, tps, und, vars, ms, bs, vs, tds, tvs, dv) =>
           tok("ed"); sref(n); list(tps)(sref); opt(und)(typ); list(vars)(variant); list(ms)(method)
-          bounds(bs); vis(vs); tdefaults(tds); tdefaults(tvs)
+          bounds(bs); vis(vs); tdefaults(tds); tdefaults(tvs); list(dv)(bound)
 
         case TypeDecl(n, base, der, rng, pred, vs, fromC) =>
           tok("td"); sref(n); typ(base); bool(der); opt(rng)(rangeBound); opt(pred)(expr); vis(vs)
@@ -812,10 +816,10 @@ object AstCodec {
         case "sd" =>
           StructDecl(sref(), list(sref()), list(param()), list(method()),
             bounds(), list(expr()), vis(), tdefaults(), bool(), tdefaults(), bool(), opt(expr()),
-            opt(at(ExportAttr(opt(sref())))))
+            opt(at(ExportAttr(opt(sref())))), list(bound()))
         case "ed" =>
           EnumDecl(sref(), list(sref()), opt(typ()), list(variant()), list(method()),
-            bounds(), vis(), tdefaults(), tdefaults())
+            bounds(), vis(), tdefaults(), tdefaults(), list(bound()))
         case "td" =>
           TypeDecl(sref(), typ(), bool(), opt(rangeBound()), opt(expr()), vis(), bool())
         case "trt" =>
