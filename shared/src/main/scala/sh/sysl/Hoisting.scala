@@ -143,6 +143,12 @@ trait Hoisting extends HoistMembers {
         // This is the one unslottable shape handled that way. A member mentioning `Self` away from
         // its receiver still makes the whole type unformable, which is `checkObjectSafe`'s rule and
         // is left alone deliberately — making the two consistent is a widening of its own.
+        //
+        // A member that may declare parameters may also try to **default** one, which is refused
+        // for the reason every other solved parameter's default is: there is no argument list at
+        // the call for it to fill a gap in. A struct's members, an enum's, an `impl`'s and a
+        // function's were all asked this already; a trait's had nothing to ask about until now.
+        checkSolvedDefaults("the method", s"${t.name}.${m.name}", m.tdefaults)
     // A constrained subtype shares the type namespace, so a name clash is caught here; the base and
     // bounds are resolved and validated lazily, the first time the name is used as a type.
     case t: TypeDecl =>

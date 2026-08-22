@@ -186,21 +186,28 @@ class GenericMethodErrorTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
-  "a trait declares no generic method, so nothing implementing one may either" - {
+  "an 'impl' supplies exactly the type parameters the trait's member declares" - {
 
-    // The refusal is a decision rather than a gap (`02 § Details still to settle`): a member with
-    // type parameters of its own could never occupy a vtable slot, since the function does not exist
-    // until a call names its types. So the message is about the trait, and it names the inherent
-    // member that may declare them.
-    "a trait may not declare one" in {
-      err(
+    // A trait **may** declare one, and the member is left out of the table rather than keeping the
+    // trait out of an object. What is refused is the one thing the table cannot carry: the call on
+    // an erased value. Pinned here beside the arity rules below, since the two are what an `impl`
+    // has to agree with.
+    "the trait may declare one, and the object is what cannot reach it" in {
+      val out = err(
         """trait Mapper
-          |    map[U](self, x: U) -> U""".stripMargin,
-      ) should include(
-        "'Mapper.map' declares type parameters of its own, which a trait's member may not — no table " +
-          "slot can hold a function that does not exist until a call names its types; an inherent " +
-          "member may declare them"
+          |    tag(self) -> int
+          |    map[U](self, x: U) -> U
+          |struct P
+          |    n: int
+          |impl Mapper for P
+          |    tag(self) -> int = self.n
+          |    map[U](self, x: U) -> U = x
+          |val o: &Mapper = P(1)
+          |print(o.map(2))""".stripMargin,
       )
+
+      out should include("'map' of 'Mapper' declares type parameters of its own")
+      out should include("reach it through a bound")
     }
 
     "an 'impl' may not add parameters the trait did not declare" in {

@@ -89,16 +89,22 @@ trait HoistMembers extends HoistImpl {
       m  <- tr.methods if m.body.nonEmpty
     yield defaultAt(tr, FuncDecl(
       s"${tr.name}.${m.name}",
-      selfName :: tr.tparams,
+      // The member's **own** parameters stand beside the trait's, for the reason the trait's stand
+      // beside `Self`: they are as unknown inside the body as either, and a body naming one is
+      // ordinary. Leaving them out reported the member's own parameters as unknown types, in a walk
+      // whose whole job is to check that body once.
+      selfName :: (tr.tparams ::: m.tparams),
       receiverParam(m, NamedType(selfName, Nil)).toList ::: m.params,
       m.retType,
       m.body,
       // A generic trait's default is generic over the trait's parameters too — they are as unknown
       // inside the body as `Self` is — and what `Self` promises is the trait *applied* to them,
       // which is the one promise every implementation of it makes.
-      bounds = tr.bounds +
+      bounds = tr.bounds ++ m.bounds +
         (selfName -> List(BoundRef(tr.name, tr.tparams.map(NamedType(_, Nil))))),
       variadic = m.variadic,
+      tvalues = m.tvalues,
+      tpacks = m.tpacks,
     ).setPos(m.pos))
 
   /** Records that a default is read **in its trait's terms**, and hands it back.

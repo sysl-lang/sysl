@@ -275,17 +275,55 @@ class TypePackTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |print(r.n)""".stripMargin) shouldBe "8\n"
     }
 
-    /** But **not** on a trait's member, and for a reason that has nothing to do with packs: no
-     * member a trait requires may declare parameters of its own, since a table slot cannot hold a
-     * function that does not exist until a call names its types. A pack is one more way to write
-     * that list, so it meets the rule already there — and the message sends the reader to the
-     * inherent member, which is the position that does work.
+    /** And on a **trait's** member too, for a reason that has nothing to do with packs: a member may
+     * declare parameters of its own, and a pack is one more way of writing that list, so it meets
+     * the rule already there rather than one of its own.
+     *
+     * What such a member gives up is its table slot — no slot can hold a function that does not
+     * exist until a call names its types — so it is reached on a value whose type is known, or
+     * through a bound, and not on an object.
      */
-    "but not on a trait's member, which has a table slot to fill" in {
-      err("""trait Take
+    "and on a trait's member, which is the same list written another way" in {
+      run("""trait Take
             |    take[..A: Display](self, t: (..A)) -> usize
-            |print(1)""".stripMargin) should
-        include("an inherent member may declare them")
+            |struct Row
+            |    n: usize
+            |impl Take for Row
+            |    take[..A: Display](self, t: (..A)) -> usize
+            |        var total = self.n
+            |        for const i in 0..<A.len
+            |            total = total + str(t.i).len
+            |        total
+            |print(Row(0).take((1, "abc", true)))""".stripMargin) shouldBe "8\n"
+    }
+
+    "a bound reaches one, and unrolls it at the instantiation" in {
+      run("""trait Take
+            |    take[..A: Display](self, t: (..A)) -> usize
+            |struct Row
+            |    n: usize
+            |impl Take for Row
+            |    take[..A: Display](self, t: (..A)) -> usize
+            |        var total = self.n
+            |        for const i in 0..<A.len
+            |            total = total + str(t.i).len
+            |        total
+            |through[S: Take](s: S) -> usize = s.take((1, "abc", true))
+            |print(through(Row(0)))""".stripMargin) shouldBe "8\n"
+    }
+
+    "an object cannot, and the refusal names the member" in {
+      err("""trait Take
+            |    tag(self) -> usize
+            |    take[..A: Display](self, t: (..A)) -> usize
+            |struct Row
+            |    n: usize
+            |impl Take for Row
+            |    tag(self) -> usize = self.n
+            |    take[..A: Display](self, t: (..A)) -> usize = self.n
+            |val o: &Take = Row(5)
+            |print(o.take((1, "ab")))""".stripMargin) should
+        include("'take' of 'Take' declares type parameters of its own")
     }
 
     "reaches the parts through a reference receiver" in {
