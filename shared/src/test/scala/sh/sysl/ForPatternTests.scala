@@ -154,7 +154,7 @@ class ForPatternTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // yields a pair and every loop over one used to pay a line for it.
     "a map, walked by pattern" in {
       run(
-        """import sysl.container.map.{map}
+        """import sysl.container.{map}
           |
           |show() =
           |    var m = map[string, int]()

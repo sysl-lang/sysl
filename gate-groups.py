@@ -26,7 +26,6 @@ Emits `heavy.json` and `chunks.json` into the output directory.
 """
 
 import json
-import math
 import os
 import re
 import sys
@@ -49,7 +48,26 @@ LIGHT_SWEEPERS = {
 ITERATES = re.compile(r'for\s+\w+\s*<-\s*Target\.all')
 STYLE = re.compile(r'Any(FreeSpec|FunSuite|WordSpec|FlatSpec|FunSpec|PropSpec|FeatureSpec)')
 
-CHUNKS = 14
+# Measured 2026-08-21, cutting 0.0.66. Both numbers moved together and the reason is one fact:
+# **the chunks were contiguous slices of an alphabetically sorted list, and in this tree a shared
+# prefix means a shared kind.** So one chunk held all nine `Codegen*` suites and five `*RunTests`
+# beside them -- every program-compiling suite in the run, in one group of 23, sharing four agents
+# at 12g. It wedged, was killed at the watchdog, and the gate read RED with zero test failures.
+#
+# Dealing round-robin instead of slicing is what fixes it, and raising the count is not: a bigger
+# CHUNKS still puts `Codegen*` next to `Codegen*`, so the next family of twenty similarly-named
+# suites clusters exactly as this one did.
+#
+# **Round-robin alone was measured and was not enough**, which is the second half of the finding: at
+# 18 groups of 17-18 the run cleared five chunks and then wedged again on a group whose suites had
+# nothing in common, so what remained was not lopsidedness but the pile itself. Growth is monotonic
+# per agent within one `sbt`, so the lever that works is fewer suites per invocation and raising the
+# heap cap only postpones it. 36 groups is ~9 suites each, ~2 per agent.
+#
+# The pile got heavier this release for a reason worth recording: `sysl.container` added five
+# modules to `library/sysl`, and every program a suite compiles links the standard library. Nothing
+# here could notice that, which is why the number is measured rather than derived.
+CHUNKS = 36
 
 
 def suites(root):
@@ -96,8 +114,9 @@ def main():
         print('        Not acted on: iterating is not what makes a suite heavy. If a chunk times')
         print('        out, the summary names the suite, and it belongs in HEAVY.')
 
-    size = math.ceil(len(light) / CHUNKS)
-    chunks = [light[i:i + size] for i in range(0, len(light), size)]
+    # Round-robin rather than contiguous slices, so that suites sharing a prefix -- which here means
+    # sharing a kind, and therefore a cost -- are spread across the groups instead of piled into one.
+    chunks = [light[i::CHUNKS] for i in range(min(CHUNKS, len(light)))]
 
     os.makedirs(out, exist_ok=True)
     json.dump(heavy, open(os.path.join(out, 'heavy.json'), 'w'), indent=1)

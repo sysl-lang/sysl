@@ -6,7 +6,7 @@ import org.scalatest.freespec.AnyFreeSpec
  *
  * The form exists for the arrays a container has to make for itself. An `enum` has no zero value, so
  * `var xs: [16]Slot` is refused and the alternative was sixteen elements written out — which is what
- * the chained hash map this form replaced used to write out. `sysl.container.map` is what depends
+ * the chained hash map this form replaced used to write out. `sysl.container` is what depends
  * on it now, and depends on it harder: a variant carrying no payload fills a table of any key and
  * any value, which is what lets its storage be flat. The two properties worth pinning are that the
  * count is a
