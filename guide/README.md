@@ -64,7 +64,6 @@ contract.
 | `shapes` | dynamic dispatch — a heterogeneous collection whose element types are forgotten |
 | `scheduler` | OS shapes — a run queue, blocking and waking, and `&T` graphs mutated through references |
 | `kernel` | the same scheduler with no heap — a fixed table, indices for identity, intrusive lists |
-| `datetime` | a conversion that can succeed twice — wall clocks, timelines, and daylight saving |
 | `matrix` | an operator whose result is neither operand's type — a vector space, then Gaussian elimination |
 | `ring` | the constrained-subtype surface — range types, their `::` attributes, contracts, struct invariants, and a loop's termination measure |
 | `slab` | raw storage — reinterpreting bytes as a typed pointer, `sizeof`/`alignof`, and a free list threaded through the free blocks themselves |
