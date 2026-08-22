@@ -114,16 +114,22 @@ trait Closures extends CallAnalysis {
     // A placeholder's parameter is named by the compiler (`12 §5c`), so the advice that fits a
     // written one — annotate it — names something the program is not able to write. What it is told
     // instead is the form that has somewhere to put the annotation.
+    //
+    // **The type position is an ellipsis and not a `T`.** These two were the only diagnostics in
+    // the tree quoting a spelling with a metavariable in it, and the place this one fires is
+    // exactly where that bites: a call into a generic member, whose own signature very likely calls
+    // something `T`, so a reader copying the advice writes a name that means nothing at the call.
+    // `…` cannot be copied and says the same thing.
     val ptypes = l.params.zipWithIndex.map { (p, i) =>
       p.typ.map(resolveType(_, tsubst))
         .orElse(want.flatMap((ws, _) => ws.lift(i)))
         .getOrElse(at(p.pos)(err(
           if Placeholders.isPlaceholder(p.name) then
             "this '_' has no type here — nothing says what the closure it stands in takes, so " +
-              "write that closure with a named parameter: '(x: T) -> …'"
+              "write that closure with a named parameter: '(x: …) -> …'"
           else
             s"'${p.name}' has no type here — nothing says what this closure takes, so write it: " +
-              s"'(${p.name}: T) -> …'",
+              s"'(${p.name}: …) -> …'",
         )))
     }
 

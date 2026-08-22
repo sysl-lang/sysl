@@ -110,6 +110,13 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
    *
    * The parameter types are the declaration's, so they are resolved where it was written; the
    * arguments are the caller's, and are analyzed where *they* were written.
+   *
+   * **`seed` is what a caller already knows before any argument is read.** A free function knows
+   * nothing — every one of its type parameters is answered by an argument — but a *member* is
+   * reached through a receiver, and a receiver is a type that has its arguments already. Those
+   * belong in the solution from the start rather than being waited for, and nothing in the call can
+   * supply them: `Box[int].apply[U]` has no argument that mentions `T`, so a closure standing at
+   * `&Fn(T) -> U` was held back for a `T` that was never coming.
    */
   protected def provisionalArgs(
       decl: String,
@@ -117,6 +124,7 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
       ptypes: List[TypeRef],
       args: List[Expr],
       bounds: Map[String, List[BoundRef]] = Map.empty,
+      seed: Map[String, Type] = Map.empty,
   ): List[TExpr] = {
     val tps  = tparams.toSet
     val want = inDecl(decl)(ptypes.map(r => Option.unless(mentions(r, tps))(resolveType(r, Map.empty))))
@@ -173,7 +181,13 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     // What the first pass settles. `map[A, B](xs: []A, out: []B, f: A -> B)` gets both from the two
     // slices, and only then is `Fn(A) -> B` a thing a closure can be read against — which is why
     // this is a partial solution rather than the real one, made here and thrown away.
-    val partial = scala.collection.mutable.Map.empty[String, Type]
+    //
+    // It starts at what the caller already knew, so a member's receiver counts as settled before
+    // the first argument is read. `unify` binds only a name it has not got (`GenericInstantiation`),
+    // so a seeded one is never overwritten by an argument that happens to mention it — which is the
+    // right way round: the receiver is the authority on its own arguments, and an argument that
+    // disagrees is a type error `checkArgs` reports against the instantiated signature.
+    val partial = scala.collection.mutable.Map.empty[String, Type] ++= seed
 
     for case (r, Some(t)) <- ptypes.zip(first) do inDecl(decl)(unify(r, t.ty, tps, partial))
 

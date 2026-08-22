@@ -238,14 +238,20 @@ trait TraitLookup extends MemberVisibility {
    * An argument that could not be worked out is passed over. The mistake that produced it has been
    * reported, and a bound it fails to meet is a consequence of that rather than a second mistake.
    */
+  /** `seed` names types the bounds may mention that are **not** among the parameters being checked
+   * — a member's owner, whose arguments the receiver settled. They are resolved against and never
+   * iterated, which is the distinction that matters: the owner's bounds were checked where its type
+   * was made, and checking them again here would report one unmet bound twice.
+   */
   protected def checkParamBounds(
       what: String,
       tparams: List[String],
       bounds: Map[String, List[BoundRef]],
       targs: List[Type],
+      seed: Map[String, Type] = Map.empty,
   ): Unit =
     if bounds.nonEmpty then
-      val subst = tparams.zip(targs).toMap
+      val subst = seed ++ tparams.zip(targs).toMap
 
       for (tp, traits) <- bounds; ref <- traits do
         subst.get(tp) match

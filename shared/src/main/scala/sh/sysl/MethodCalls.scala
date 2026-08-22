@@ -607,7 +607,16 @@ trait MethodCalls extends FuncAddress {
     val (passed, tail) = args.splitAt(fd.params.length - 1)
     val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)((ref, _) => spellSelf(_, ref))
     val ptypes      = fd.params.tail.map(p => spell(p.typ))
-    val provisional = provisionalArgs(fd.name, fd.tparams, ptypes, passed, m.bounds)
+    // The receiver's arguments, handed to the inference as already answered. `synthesize` lays the
+    // owner's parameters ahead of the member's own in one list, which is what makes the `zip` the
+    // whole of the pairing — it stops at the shorter, and the shorter is always the owner's.
+    //
+    // Without this a parameter naming the *type*'s parameter is read as unsolved, and a closure
+    // standing at one is held back for a type no argument was ever going to supply. The free
+    // function of the same signature has no such gap, because there every parameter is answered by
+    // an argument.
+    val ownerSeed   = fd.tparams.zip(ownerArgs).toMap
+    val provisional = provisionalArgs(fd.name, fd.tparams, ptypes, passed, m.bounds, ownerSeed)
     // **Only the member's own parameters are written**, and they settle the call outright where they
     // are: the owner's arrived with the receiver and were never a question, and the solve below is
     // what the written list replaces rather than something it is checked against.
@@ -626,7 +635,13 @@ trait MethodCalls extends FuncAddress {
           fd.bounds,
         ))
 
-    inDecl(fd.name)(checkParamBounds(shown, m.tparams, fd.bounds, own))
+    // The member's own bounds, resolved with the receiver's arguments to hand. A bare arrow is
+    // sugar for a bound (`MemberLowering.callBounds`), so `f: T -> U` on a member of a generic type
+    // writes `Fn(T) -> U` — a bound naming the *owner's* parameter, which nothing in the member's
+    // own list can answer. Reading `fd.bounds` here would sweep the owner's own bounds in as well
+    // and report anything unmet a second time, having already been said where the receiver's type
+    // was made.
+    inDecl(fd.name)(checkParamBounds(shown, m.tparams, m.bounds, own, ownerSeed))
 
     val name            = instantiateFunc(fd, ownerArgs ::: own)
     val (params, rtype) = funcInsts(name)

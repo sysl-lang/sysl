@@ -427,4 +427,143 @@ class GenericMethodRunTests extends AnyFreeSpec with RunSupport with CodegenSupp
       ) shouldBe 2
     }
   }
+
+  /** A closure standing at a parameter written in terms of the **type's** parameter.
+   *
+   * The receiver has already said what that parameter is, so there is nothing left to wait for and
+   * the closure is read against it — which is what the identical free function has always done. The
+   * two are tested side by side below, because the whole of the defect was that they disagreed.
+   *
+   * A bare arrow is the same case reached by another road: it is sugar for a bound
+   * (`MemberLowering.callBounds`), so `f: T -> U` on a member of a generic type writes a bound
+   * naming the owner's `T`, and resolving that bound needs the receiver's arguments too. A member
+   * writing one has type parameters of its own whether or not the source said so, which is why a
+   * member declaring none at all reaches this path.
+   */
+  "a closure at a parameter naming the type's own parameter" - {
+
+    "reads against what the receiver settled" in {
+      run(
+        """struct Box[T]
+          |    v: T
+          |    apply[U](self, f: &Fn(T) -> U) -> U = f(self.v)
+          |val b = Box(3)
+          |print(b.apply(n -> n + 1))""".stripMargin,
+      ) shouldBe "4\n"
+    }
+
+    "the free function of the same signature agrees" in {
+      run(
+        """struct Box[T]
+          |    v: T
+          |    apply[U](self, f: &Fn(T) -> U) -> U = f(self.v)
+          |free_apply[T, U](v: T, f: &Fn(T) -> U) -> U = f(v)
+          |val b = Box(3)
+          |print(free_apply(3, n -> n + 1))
+          |print(b.apply(n -> n + 1))""".stripMargin,
+      ) shouldBe "4\n4\n"
+    }
+
+    "what the closure yields is still read off its body" in {
+      run(
+        """struct Box[T]
+          |    v: T
+          |    apply[U](self, f: &Fn(T) -> U) -> U = f(self.v)
+          |val b = Box(3)
+          |print(b.apply(n -> s"<${n}>"))""".stripMargin,
+      ) shouldBe "<3>\n"
+    }
+
+    "two of the type's parameters, at a closure taking both" in {
+      run(
+        """struct Pair[A, B]
+          |    a: A
+          |    b: B
+          |    fold[R](self, f: &Fn(A, B) -> R) -> R = f(self.a, self.b)
+          |print(Pair(2, "xy").fold((x, y) -> s"${x}${y}"))""".stripMargin,
+      ) shouldBe "2xy\n"
+    }
+
+    "a bare arrow naming the type's parameter, on a member that declares one of its own" in {
+      run(
+        """struct Pair[A, B]
+          |    a: A
+          |    b: B
+          |    arrow[R](self, f: A -> R) -> R = f(self.a)
+          |print(Pair(2, "xy").arrow(x -> x * 10))""".stripMargin,
+      ) shouldBe "20\n"
+    }
+
+    "a bare arrow naming it, on a member that declares none" in {
+      run(
+        """struct Gen[T]
+          |    v: T
+          |    same(self, f: T -> T) -> T = f(self.v)
+          |print(Gen(4).same(n -> n * 2))""".stripMargin,
+      ) shouldBe "8\n"
+    }
+
+    "the map shape it was all for" in {
+      run(
+        """import sysl.buf.{Buf, buf}
+          |struct Seq[T]
+          |    items: Buf[T]
+          |    map[U](self, f: &Fn(T) -> U) -> []U
+          |        var b: Buf[U] = buf()
+          |        for i in 0..<self.items.len()
+          |            b.push(f(self.items[i]))
+          |        b.view()
+          |    end map
+          |end Seq
+          |var names: Buf[string] = buf()
+          |names.push("ab")
+          |names.push("c")
+          |val lens = Seq(names).map(s -> s.len)
+          |print(lens[0], lens[1])""".stripMargin,
+      ) shouldBe "2 1\n"
+    }
+  }
+
+  "and what the receiver cannot settle is still refused" - {
+
+    "a closure at a parameter naming the member's own unsolved parameter" in {
+      err(
+        """struct Box[T]
+          |    v: T
+          |    pick[U](self, f: &Fn(U) -> int) -> int = 0
+          |print(Box(3).pick(n -> 1))""".stripMargin,
+      ) should include("'n' has no type here")
+    }
+
+    /** The advice is an ellipsis and not a `T`. This is the call it fires at, and the receiver's
+      * type parameter here is *called* `T` — so advising the reader to write one would name
+      * something that means nothing where they are standing.
+      */
+    "the refusal advises a type position rather than a name that is not in scope" in {
+      val out = err(
+        """struct Box[T]
+          |    v: T
+          |    pick[U](self, f: &Fn(U) -> int) -> int = 0
+          |print(Box(3).pick(n -> 1))""".stripMargin,
+      )
+
+      out should include("'(n: …) -> …'")
+      out should not include "'(n: T) -> …'"
+    }
+
+    "a bound the member's own parameter does not meet is reported, once" in {
+      val out = err(
+        """struct Box[T]
+          |    v: T
+          |    show[U: Display](self, f: &Fn(T) -> U) -> string = str(f(self.v))
+          |struct Opaque
+          |    n: int
+          |end Opaque
+          |print(Box(3).show(n -> Opaque(n)))""".stripMargin,
+      )
+
+      out should include("requires its type parameter 'U' to implement")
+      out.linesIterator.count(_.contains("requires its type parameter")) shouldBe 1
+    }
+  }
 }
