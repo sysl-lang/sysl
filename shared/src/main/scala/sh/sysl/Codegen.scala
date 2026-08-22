@@ -50,7 +50,15 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
   private def build(): ir.Module = {
     // A function a library already compiled is declared, not defined: its body is in the object file
     // the library shipped, and emitting it again would be a duplicate symbol at the link.
-    val (imported, own) = program.funcs.partition(f => program.precompiled(f.name))
+    //
+    // **An `internal` one is never that, whatever the set says.** Internal linkage is the promise
+    // that the symbol does not leave the object file, so there is nothing for a declaration of one to
+    // resolve to and no duplicate for a definition of one to be. A declaration is therefore not the
+    // careful choice here but the unsound one: it is satisfied by whatever *other* object file
+    // happens to define that name, which for a closure — whose name is a counter in the compilation
+    // that lowered it — is a different closure's body under the same signature (card `0229`).
+    val (imported, own) =
+      program.funcs.partition(f => program.precompiled(f.name) && !f.internal)
     // A `@ghost` function is not emitted at all (`17 §8`). Nothing executable may call one — that is
     // checked in the analyzer — and the clauses that may are the ones skipped below, so there is no
     // call left to resolve.

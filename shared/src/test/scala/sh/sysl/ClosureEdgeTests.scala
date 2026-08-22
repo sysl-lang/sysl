@@ -819,4 +819,94 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         "'T' is in neither the parameters of 'one' nor its result")
     }
   }
+
+  /** What a closure's name is worth outside the compilation that made it, which is nothing —
+   * card `0229`.
+   *
+   * The name is a counter, so two units that each lower a fourth closure both call it
+   * `$closure4.call`, and an instantiation made at one carries that name too. With external linkage
+   * the linker is then free to resolve one unit's call to the other unit's body: the same signature
+   * over a different environment, which is a wrong answer rather than a failure to link. The
+   * standard module shipped in 0.0.70 did exactly that, and `StdArtifactTests` holds its artifact to
+   * the consequence; these pin the property itself, at the one place it is decided.
+   */
+  "a closure's symbol does not leave the object file" - {
+
+    /* Read off the emitted lines rather than written out as a name, because the number in a closure's
+     * name is a counter over the whole compilation — which is the very thing being pinned, and is
+     * not something a test should have to predict. */
+
+    def named(out: String, form: String): List[String] =
+      out.linesIterator.filter(_.startsWith(form)).filter { line =>
+        val at = line.indexOf('@')
+
+        // The symbol alone, cut before the parameter list: a function *taking* a closure names that
+        // struct in its parameters, and this is a question about the name it is called by.
+        at >= 0 && Closures.mentioned(line.drop(at + 1).takeWhile(c => c != '(' && c != ' '))
+      }.toList
+
+    def allInternal(out: String): Unit = {
+      val defined = named(out, "define")
+
+      // Non-vacuous: the program below lowered one, so there is something to have an opinion about.
+      defined should not be empty
+      defined.filterNot(l => l.startsWith("define internal") || l.startsWith("define private")) shouldBe Nil
+
+      // And nothing is left to the linker either. A declaration at one of these names is the shape
+      // card `0229` shipped: a body that resolves to whatever other object file happens to define it.
+      named(out, "declare") shouldBe Nil
+    }
+
+    "the body of a closure literal is internal" in {
+      allInternal(ir("""var n = 2
+                       |var f: &Fn(int) -> int = k -> k * n
+                       |
+                       |print(f(3))
+                       |""".stripMargin))
+    }
+
+    "and so is the body of a nested function, whose name is made the same way" in {
+      allInternal(ir("""outer() -> int
+                       |    var n = 2
+                       |    inner(k: int) -> int = k * n
+                       |    inner(3)
+                       |end outer
+                       |
+                       |print(outer())
+                       |""".stripMargin))
+    }
+
+    "and so is an instantiation made at a closure, which carries the closure's name in its own" in {
+      // The shape the card was found in: a bare-arrow parameter, so the call fixes it at the
+      // caller's closure and monomorphizes a function whose own name carries the closure's.
+      val out = ir("""apply(f: int -> int, x: int) -> int = f(x)
+                     |
+                     |var n = 2
+                     |
+                     |print(apply(k -> k * n, 3))
+                     |""".stripMargin)
+
+      allInternal(out)
+
+      // Discriminating against the closure's own body: the instantiation is a *second* symbol named
+      // after the closure, and it is the one that was being advertised across a link.
+      named(out, "define").filterNot(_.contains("$closure")) shouldBe Nil
+      named(out, "define").count(_.contains("@apply.")) shouldBe 1
+    }
+
+    "while an ordinary instantiation beside it keeps the linkage it always had" in {
+      // Discriminating against all three: without this the rule could be "every instantiation is
+      // internal", which would be a different and much larger change.
+      val out = ir("""twice[T: Add[T]](x: T) -> T = x + x
+                     |
+                     |print(twice(3))
+                     |""".stripMargin)
+
+      val defined = out.linesIterator.filter(l => l.startsWith("define") && l.contains("@twice.int(")).toList
+
+      defined should have length 1
+      defined.head should not startWith "define internal"
+      defined.head should not startWith "define private"
+    }
+  }
 }

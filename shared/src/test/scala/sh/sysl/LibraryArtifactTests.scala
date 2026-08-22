@@ -61,6 +61,43 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
       case Right(r)  => r
       case Left(err) => fail(s"the metadata did not read back: $err")
 
+  /** A library that forms a closure of its own, which is card `0229`'s condition — see the section
+   * at the foot of this file.
+   */
+  private val closing =
+    """module zone
+      |
+      |struct Off
+      |    mins: int
+      |
+      |fixed(t: int) -> Off = Off(0 - 300)
+      |
+      |pick(t: int, at: int -> Off) -> Off = at(t)
+      |
+      |house(t: int) -> Off = pick(t, fixed)
+      |""".stripMargin
+
+  private def zone: (String, String) =
+    LibraryArtifact.build(List(Source("zone/lib.sysl", closing, List("zone")))) match
+      case Right(r)  => r
+      case Left(err) => fail(s"the library did not build: $err")
+
+  /** The emitted lines defining a symbol named after a closure, and the symbols themselves. The name
+   * is cut before the parameter list: a function *taking* a closure names that struct among its
+   * parameters, and the question here is what the function is called by.
+   */
+  private def closureDefinitions(ir: String): List[String] =
+    ir.linesIterator.filter(_.startsWith("define")).filter(l => Closures.mentioned(symbolOn(l))).toList
+
+  private def closureSymbols(ir: String, form: String): List[String] =
+    ir.linesIterator.filter(_.startsWith(s"$form ")).map(symbolOn).filter(Closures.mentioned).toList
+
+  private def symbolOn(line: String): String = {
+    val at = line.indexOf('@')
+
+    if at < 0 then "" else line.drop(at + 1).takeWhile(c => c != '(' && c != ' ')
+  }
+
   "what a library compiles ahead of time" - {
 
     "a declaration with no type parameters is compiled once, by the library" in {
@@ -549,6 +586,56 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
 
       LibraryArtifact.nativeMember(fine) shouldBe "sysl.text.code.o"
       LibraryArtifact.collisions(List(fine)) shouldBe None
+    }
+  }
+
+  /** A library that forms a closure of its own, which is card `0229`'s condition and is easy to miss.
+   *
+   * `pick` takes a bare-arrow parameter, so `house` passing the named `fixed` to it wraps that
+   * function in a closure exactly as an arrow literal would, and monomorphizes a `pick` at it. Both
+   * symbols carry the closure's name, and that name is a **counter** in the compilation that lowered
+   * it — so a consumer that lowered a closure of its own at the same number means something else
+   * entirely by `$closure4`.
+   *
+   * The standard module shipped in 0.0.70 with exactly this pair, and `nm` said the whole of it:
+   *
+   * {{{
+   *                  U _\$closure4.call
+   * 0000000000053cc0 T _sysl.time\$resolve.\$closure4
+   * }}}
+   *
+   * The library **declared** the closure's body — its key begins with the module separator, so
+   * `Modules.moduleOf` read it as the root module's and filed it as something another library
+   * supplies — while advertising the instantiation that calls it. A program then declared the
+   * instantiation rather than building one, and the artifact's body called straight into the
+   * program's own closure: a different environment under a different body.
+   *
+   * **Structural rather than behavioural, because the behaviour is a coincidence of counters.** Two
+   * compilations collide only where they happen to reach the same number, which makes a program that
+   * prints the wrong answer a test of arithmetic nobody controls. What is always true is the rule:
+   * a symbol named after a closure is this compilation's and does not leave its object file.
+   */
+  "a closure the library lowered for itself" - {
+
+    "is compiled into the artifact rather than left for the linker" in {
+      // Non-vacuous by construction: `house` forms one, so there is a body here to be about.
+      closureSymbols(zone._1, "define") should not be empty
+      closureSymbols(zone._1, "declare") shouldBe Nil
+    }
+
+    "and is internal, so a consumer's closure of the same name is a different symbol" in {
+      closureDefinitions(zone._1)
+        .filterNot(l => l.startsWith("define internal") || l.startsWith("define private")) shouldBe Nil
+    }
+
+    "and is not advertised, so a consumer builds its own instantiation" in {
+      LibraryArtifact.read("zone.syslib", zone._2, Target.default) match
+        case Right((_, precompiled, _)) =>
+          // Discriminating: the library does advertise its ordinary functions, so an empty filter
+          // below is the closure rule rather than an empty set.
+          precompiled should contain("zone$house")
+          precompiled.filter(Closures.mentioned) shouldBe empty
+        case Left(err) => fail(err)
     }
   }
 }
