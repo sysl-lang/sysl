@@ -64,12 +64,10 @@ contract.
 | `shapes` | dynamic dispatch — a heterogeneous collection whose element types are forgotten |
 | `scheduler` | OS shapes — a run queue, blocking and waking, and `&T` graphs mutated through references |
 | `kernel` | the same scheduler with no heap — a fixed table, indices for identity, intrusive lists |
-| `datetime` | a conversion that can succeed twice — wall clocks, timelines, and daylight saving |
 | `matrix` | an operator whose result is neither operand's type — a vector space, then Gaussian elimination |
 | `ring` | the constrained-subtype surface — range types, their `::` attributes, contracts, struct invariants, and a loop's termination measure |
 | `slab` | raw storage — reinterpreting bytes as a typed pointer, `sizeof`/`alignof`, and a free list threaded through the free blocks themselves |
 | `lisp` | the reference cycle — the one shape a count cannot reclaim, `weak T` as both the cure and the instrument that measures it |
-| `table` | text measured for **display** — a column is as wide on screen as its widest cell, and both a byte count and a character count are the wrong unit |
 | `qsort` | the C boundary in the direction nothing else goes — a C routine that calls *back*, and the per-instantiation trampoline, slice address and element size it takes |
 | `simd` | one kernel compiled for more than one register width — a lane count as a value parameter, a run of a slice loaded and stored back, and the two places "write it once" stops being true |
 

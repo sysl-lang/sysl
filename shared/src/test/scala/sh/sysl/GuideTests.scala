@@ -216,38 +216,6 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
     )
   }
 
-  // The one program whose expected values all came out of a *different* implementation of the same
-  // subject — the transitions, the offsets and every meeting time were computed with Python's
-  // `zoneinfo` against the real tz database, so the checks are a cross-check and not a recording.
-  // Two of them are the point of the whole program: a week of calendar is 167 hours of timeline in
-  // the spring and 169 in the autumn, and neither of those is a bug.
-  "datetime — wall clocks, timelines, and the conversion between them" in {
-    val out = guide("datetime")
-
-    out should not include "FAIL"
-    checks(out) shouldBe 161
-    sections(out) shouldBe List(
-      "-- instants and durations",
-      "-- days and civil dates",
-      "-- the day of the week",
-      "-- a time of day",
-      "-- when the clocks move",
-      "-- an instant seen from a wall",
-      "-- the offset in force",
-      "-- a reading that happens once",
-      "-- a reading that never happens",
-      "-- a reading that happens twice",
-      "-- next week, and one hundred and sixty-eight hours",
-      "-- six weeks of one meeting",
-      "-- who is awake",
-      "-- every hour of a year",
-      "-- how much of a year is not a moment",
-      "-- the table has ends",
-      "-- a meeting that lands where the clock does not",
-      "-- the edges of the arithmetic",
-    )
-  }
-
   // The one program whose subject is the checking rather than the computing: two implementations of
   // the same buffer, one keeping where the elements end and one computing it, driven through every
   // scenario side by side and required to agree. What this run cannot do is break a contract — a
@@ -356,31 +324,6 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
   // `Result`, a malformed *program* is a bug in the thing being run and stops the way sysl stops.
   "lisp — what the interpreter refuses, which its own run cannot assert" in {
     guideTests("lisp") should have length 17
-  }
-
-  // The one program in the set that measures text for **display** rather than copying or comparing
-  // it. Its last three sections are the finding: a column is neither bytes nor characters wide, and
-  // the difference is not a constant that could be corrected for afterwards. The measurement itself
-  // is `sysl.text`'s — the finding is what put it there, and `WidthTests` is where it is pinned.
-  "table — text measured for display, where a byte count is the wrong unit" in {
-    val out = guide("table")
-
-    out should not include "FAIL"
-    checks(out) shouldBe 46
-    sections(out) shouldBe List(
-      "-- a column is as wide as its widest cell",
-      "-- a row holds types that differ",
-      "-- alignment puts the slack where it was asked",
-      "-- a column is measured in columns, not bytes and not characters",
-      "-- a cell that is wider than its characters",
-      "-- what a byte count would have done",
-    )
-  }
-
-  // A row is refused for having the wrong number of cells, which traps — so the pair of it and the
-  // row that is taken lives here, where a trap is an observation rather than the end of the run.
-  "table — a row that does not fit its columns" in {
-    guideTests("table") should have length 5
   }
 
   // The one guide program whose subject is the C boundary. Its checks nearly all read the same way
