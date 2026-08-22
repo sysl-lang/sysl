@@ -95,7 +95,21 @@ trait TypeParser extends ExprParser {
         // written (`10 §10`). Left to the grammar it would be a stray token, and the reader would
         // be told a newline was expected rather than told about the feature they were reaching for.
         op("..") ~> ident ^^ PackType.apply |
-        qualifiedName ~ opt(typeArgs) ^^ { case n ~ args => NamedType(n, args.getOrElse(Nil)) },
+        // `some Trait` says the type is inferred from a body, which only a result has — so a
+        // reader who wrote one in a field, a parameter or a cast is told where it belongs rather
+        // than told that a type was expected. It is tried before the name alternative and needs a
+        // bound to follow, so a program with a type of its own called `some` still parses.
+        (softSome ~> boundRef >> { b =>
+          err(s"'some ${b.show}' is a result whose type is read off the body that produced it, so " +
+            s"it may stand only as the result of a member of an 'impl' block — everywhere else the " +
+            s"type has to be named")
+        }) |
+        // `T::Body` — an associated type, and a chain of them. The `::` is a suffix on the name
+        // alternative rather than an alternative of its own, so `Buf[int]::Item` reads its arguments
+        // as the arguments they are before the projection is applied to what they made.
+        qualifiedName ~ opt(typeArgs) ~ rep(op("::") ~> ident) ^^ { case n ~ args ~ assoc =>
+          assoc.foldLeft[TypeRef](NamedType(n, args.getOrElse(Nil)))(AssocType.apply)
+        },
     )
 
   /** A vector's lane count: a literal, a name, or any expression **in parentheses**.
@@ -145,10 +159,21 @@ trait TypeParser extends ExprParser {
    * and a field or a parameter apart with no rule of its own.
    */
   protected lazy val resultRef: Parser[TypeRef] =
-    typeRef ~ rep(op(",") ~> typeRef) ^^ {
-      case t ~ Nil  => t
-      case t ~ more => TupleType(t :: more, results = true)
-    }
+    opaqueRef |
+      typeRef ~ rep(op(",") ~> typeRef) ^^ {
+        case t ~ Nil  => t
+        case t ~ more => TupleType(t :: more, results = true)
+      }
+
+  /** `some View` — a result whose concrete type is read off the body, promising only the bound.
+   *
+   * It is written out here rather than allowed among types, because it is not one: it stands in a
+   * result and nowhere else, and `coreType` refuses it everywhere with a message that says so. A
+   * result *list* cannot contain one either — several results are several types, and a type inferred
+   * from the body is the whole of what the body produced.
+   */
+  protected lazy val opaqueRef: Parser[TypeRef] =
+    at(softSome ~> rep1sep(boundRef, op("+")) ^^ SomeType.apply)
 
   /** The `[int, string]` argument list of an applied generic name, whether the name is a type's or
    * a trait's — a trait takes its arguments the same way and in the same place.
@@ -167,6 +192,13 @@ trait TypeParser extends ExprParser {
 
   protected lazy val softSync: Parser[Unit] =
     accept("'sync'", { case t: lexical.Identifier if t.chars == "sync" => () })
+
+  /** `some` stays a soft word for the reason `sync` and `volatile` do: it is special only in front
+   * of a bound in a result position, so a program with a name of its own spelled `some` is
+   * unaffected and the reserved-word table is untouched.
+   */
+  protected lazy val softSome: Parser[Unit] =
+    accept("'some'", { case t: lexical.Identifier if t.chars == "some" => () })
 
   protected lazy val softVolatile: Parser[Unit] =
     accept("'volatile'", { case t: lexical.Identifier if t.chars == "volatile" => () })

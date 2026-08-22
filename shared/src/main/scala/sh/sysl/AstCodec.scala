@@ -69,7 +69,7 @@ object AstCodec {
    * conflict**, and that is the case the rule above is written for: read dev's number, take the one
    * after it, and do not assume a clean merge means the versions agree.
    */
-  val Version: Int = 43
+  val Version: Int = 44
 
   private val Magic = "sysl-ast"
 
@@ -176,6 +176,10 @@ object AstCodec {
 
     private def bound(b: BoundRef): Unit = { pos(b); sref(b.name); list(b.args)(typ) }
 
+    private def assocDecl(a: AssocDecl): Unit = { pos(a); sref(a.name); list(a.bounds)(bound) }
+
+    private def assocBind(a: AssocBind): Unit = { pos(a); sref(a.name); typ(a.typ) }
+
     private def bounds(m: Map[String, List[BoundRef]]): Unit = map(m)(bs => list(bs)(bound))
 
     private def tdefaults(m: Map[String, TypeRef]): Unit = map(m)(typ)
@@ -260,6 +264,8 @@ object AstCodec {
         case FnType(ps, ret, bar) => tok("tf"); list(ps)(typ); typ(ret); bool(bar)
         case CFnType(ps, ret)     => tok("tc"); list(ps)(typ); typ(ret)
         case ValueArgType(v)      => tok("tva"); expr(v)
+        case AssocType(base, m)   => tok("tas"); typ(base); sref(m)
+        case SomeType(bs)         => tok("tsome"); list(bs)(bound)
     }
 
     // ------------------------------------------------------------ patterns
@@ -435,13 +441,14 @@ object AstCodec {
           tok("td"); sref(n); typ(base); bool(der); opt(rng)(rangeBound); opt(pred)(expr); vis(vs)
           bool(fromC)
 
-        case TraitDecl(n, tps, ms, bs, sups, vs, tds) =>
+        case TraitDecl(n, tps, ms, bs, sups, vs, tds, as) =>
           tok("trt"); sref(n); list(tps)(sref); list(ms)(method); bounds(bs); list(sups)(bound)
-          vis(vs); tdefaults(tds)
+          vis(vs); tdefaults(tds); list(as)(assocDecl)
 
-        case ImplDecl(tn, ft, ms, tps, bs, targs, tds, ov, tvs, tpk) =>
+        case ImplDecl(tn, ft, ms, tps, bs, targs, tds, ov, tvs, tpk, as) =>
           tok("impl"); sref(tn); typ(ft); list(ms)(method); list(tps)(sref); bounds(bs)
           list(targs)(typ); tdefaults(tds); bool(ov); tdefaults(tvs); list(tpk.toList)(sref)
+          list(as)(assocBind)
     }
   }
 
@@ -646,6 +653,8 @@ object AstCodec {
 
     private def param(): Param  = at(Param(sref(), typ(), vis(), opt(expr()), bool()))
     private def bound(): BoundRef = at(BoundRef(sref(), list(typ())))
+    private def assocDecl(): AssocDecl = at(AssocDecl(sref(), list(bound())))
+    private def assocBind(): AssocBind = at(AssocBind(sref(), typ()))
     private def bounds(): Map[String, List[BoundRef]] = map(list(bound()))
     private def tdefaults(): Map[String, TypeRef]     = map(typ())
 
@@ -712,6 +721,8 @@ object AstCodec {
         case "tf"  => FnType(list(typ()), typ(), bool())
         case "tc"  => CFnType(list(typ()), typ())
         case "tva" => ValueArgType(expr())
+        case "tas" => AssocType(typ(), sref())
+        case "tsome" => SomeType(list(bound()))
         case other => fail(s"'$other' is not a type tag")
     }
 
@@ -823,10 +834,11 @@ object AstCodec {
         case "td" =>
           TypeDecl(sref(), typ(), bool(), opt(rangeBound()), opt(expr()), vis(), bool())
         case "trt" =>
-          TraitDecl(sref(), list(sref()), list(method()), bounds(), list(bound()), vis(), tdefaults())
+          TraitDecl(sref(), list(sref()), list(method()), bounds(), list(bound()), vis(), tdefaults(),
+            list(assocDecl()))
         case "impl" =>
           ImplDecl(sref(), typ(), list(method()), list(sref()), bounds(), list(typ()), tdefaults(), bool(),
-            tdefaults(), list(sref()).toSet)
+            tdefaults(), list(sref()).toSet, list(assocBind()))
         case other => fail(s"'$other' is not a statement tag")
     }
   }

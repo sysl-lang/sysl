@@ -39,6 +39,12 @@ trait WrittenTypes extends GenericInstantiation {
     case PackType(n)         => tps(n)
     case f: FnType          => mentions(f.asTrait, tps)
     case CFnType(params, ret) => params.exists(mentions(_, tps)) || mentions(ret, tps)
+    // A projection is fixed exactly when its subject is: `T::Item` is no more a type than `T` is
+    // until `T` is one, and once it is, the implementation is what says which type it names.
+    case AssocType(base, _)  => mentions(base, tps)
+    // A `some` result names no type at all — what it promises is a bound — so the parameters it
+    // could mention are the ones a bound's own arguments carry.
+    case SomeType(bs)        => bs.exists(_.args.exists(mentions(_, tps)))
 
   /** Whether an array **length** names one of the parameters being solved — a value parameter
    * standing for the length itself (`10 §9`), or a type parameter reached through a measurement
@@ -156,6 +162,9 @@ trait WrittenTypes extends GenericInstantiation {
           s"a tuple, as '(..$n)'")
       case f: FnType               => f.params.foreach(walk); walk(f.ret)
       case CFnType(params, ret)    => params.foreach(walk); walk(ret)
+      case AssocType(base, _)      => walk(base)
+      // A `some` result declares nothing about a pack or a length; it names a bound.
+      case _: SomeType             => ()
 
     // Walked unconditionally, because a *pack* spelled where none was declared is a mistake in a
     // signature that declares no parameters at all — the two rules above have nothing to say about

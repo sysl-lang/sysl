@@ -365,7 +365,7 @@ trait DeclParser extends ExprParser {
    * the same way it bit an inherent one.
    */
   protected def propertyTail(name: String): Parser[MethodDecl] =
-    (op("->") ~> typeRef) ~ funcBody <~ endName(name) ^^ {
+    (op("->") ~> (opaqueRef | typeRef)) ~ funcBody <~ endName(name) ^^ {
       case ret ~ body => MethodDecl(name, None, isProperty = true, Nil, Nil, Some(ret), body)
     }
 
@@ -533,15 +533,44 @@ trait DeclParser extends ExprParser {
       case name ~ tps ~ supers =>
         val tp = tps.getOrElse(TypeParams.none)
         val body =
-          (newline ~> indent ~> skipNewlines ~> rep1sep(traitMember, newlines) <~ skipNewlines <~ dedent) <~
+          (newline ~> indent ~> skipNewlines ~> rep1sep(traitItem, newlines) <~ skipNewlines <~ dedent) <~
             endName(name)
 
-        def decl(methods: List[MethodDecl]) =
-          TraitDecl(name, tp.names, methods, tp.bounds, supers.getOrElse(Nil), tdefaults = tp.defaults)
+        def decl(items: List[Either[AssocDecl, MethodDecl]]) =
+          TraitDecl(name, tp.names, items.collect { case Right(m) => m }, tp.bounds,
+            supers.getOrElse(Nil), tdefaults = tp.defaults,
+            assocs = items.collect { case Left(a) => a })
 
         noPacks(tp, "a trait") ~>
           (if supers.isEmpty then body ^^ decl else opt(body) ^^ (m => decl(m.getOrElse(Nil))))
     }
+
+  /** One line of a trait body: an associated type, or a member. The associated type is tried first
+   * and cannot be confused with anything — `type` is reserved, so no member declaration can begin
+   * with it.
+   */
+  protected lazy val traitItem: PackratParser[Either[AssocDecl, MethodDecl]] =
+    assocSig ^^ (Left(_)) | traitMember ^^ (Right(_))
+
+  /** `type Body: View` — a trait's **associated type**: a parameter the *implementation* supplies
+   * rather than one written where the trait is applied.
+   *
+   * The bound list is spelled exactly as a type parameter's is, with the same `:` and the same `+`,
+   * because it asks the same thing of the type that fills it. Writing none says the implementation
+   * may supply anything.
+   *
+   * A trait writing `type Body = X` is refused by name: an associated type is what the trait leaves
+   * *open*, so a trait supplying one has written an alias in the one place an alias means nothing.
+   */
+  protected lazy val assocSig: PackratParser[AssocDecl] =
+    at(
+      (op("type") ~> ident) >> { n =>
+        op("=") ~> err(s"a trait's 'type $n' is the associated type an implementation supplies, so " +
+          s"there is nothing for it to equal here — write 'type $n: Trait' to say what the " +
+          s"implementation's must implement, and 'type $n = …' inside the 'impl'") |
+          opt(op(":") ~> rep1sep(boundRef, op("+"))) ^^ (bs => AssocDecl(n, bs.getOrElse(Nil)))
+      },
+    )
 
   /** A line inside a trait body. A **definition** is tried first, since it is a signature with more
    * after it: `member` needs a body to follow the header, so a bare method signature falls through
@@ -567,7 +596,7 @@ trait DeclParser extends ExprParser {
 
   /** A property signature — `name -> type` with neither a parameter list nor a body. */
   protected lazy val propertySig: PackratParser[MethodDecl] =
-    at(ident ~ (op("->") ~> typeRef) ^^ { case name ~ ret =>
+    at(ident ~ (op("->") ~> (opaqueRef | typeRef)) ^^ { case name ~ ret =>
       MethodDecl(name, None, isProperty = true, Nil, Nil, Some(ret), Nil)
     })
 
@@ -597,9 +626,10 @@ trait DeclParser extends ExprParser {
       case ov ~ (tps ~ ((tname, targs)) ~ forType) =>
         val tp = tps.getOrElse(TypeParams.none)
 
-        (implBody | success(Nil)) <~ endTypeRef(forType) ^^ { methods =>
-          ImplDecl(tname, forType, methods, tp.names, tp.bounds, targs, tp.defaults, ov, tp.values,
-                   tp.packs)
+        (implBody | success(Nil)) <~ endTypeRef(forType) ^^ { items =>
+          ImplDecl(tname, forType, items.collect { case Right(m) => m }, tp.names, tp.bounds, targs,
+                   tp.defaults, ov, tp.values, tp.packs,
+                   assocs = items.collect { case Left(a) => a })
         }
     }
 
@@ -620,8 +650,26 @@ trait DeclParser extends ExprParser {
     } |
       qualifiedName ~ opt(typeArgs) ^^ { case n ~ args => (n, args.getOrElse(Nil)) }
 
-  protected lazy val implBody: PackratParser[List[MethodDecl]] =
-    newline ~> indent ~> skipNewlines ~> rep1sep(implMember, newlines) <~ skipNewlines <~ dedent
+  protected lazy val implBody: PackratParser[List[Either[AssocBind, MethodDecl]]] =
+    newline ~> indent ~> skipNewlines ~> rep1sep(implItem, newlines) <~ skipNewlines <~ dedent
+
+  /** One line of an `impl` block: an associated type supplied, or a member. */
+  protected lazy val implItem: PackratParser[Either[AssocBind, MethodDecl]] =
+    assocBind ^^ (Left(_)) | implMember ^^ (Right(_))
+
+  /** `type Body = Column[Text, Button]` — the associated type this block supplies.
+   *
+   * The other spelling is refused by name for the reason the trait's is: a bound here would be the
+   * implementation asking something of a type it is itself choosing.
+   */
+  protected lazy val assocBind: PackratParser[AssocBind] =
+    at(
+      (op("type") ~> ident) ~ (op("=") ~> typeRef |
+        op(":") ~> err("an 'impl' supplies the associated type rather than bounding it — the bound " +
+          "is the trait's, written 'type Name: Trait' there, and what goes here is 'type Name = …'")) ^^ {
+        case n ~ t => AssocBind(n, t)
+      },
+    )
 
   /** A member of an `impl` block, which is the one place a member may say `override` — the trait it
    * implements is the only thing a member of a type can be replacing a body from.
