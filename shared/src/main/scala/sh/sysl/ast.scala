@@ -117,6 +117,27 @@ case class TypeArgs(receiver: Expr, args: List[Expr]) extends Expr
  */
 case class TypeAttr(receiver: Expr, attr: String) extends Expr
 
+/** One field of a `with` clause: `bg = ACCENT`. Positioned at the **name**, so a field the struct
+ * does not have is complained about where it was written rather than at the `with`.
+ */
+case class WithField(name: String, value: Expr) extends Positioned
+
+/** `base with { bg = ACCENT }` — the value `base` again, with the fields named here changed
+ * (`reference/expressions.md § with`).
+ *
+ * It is the two-statement form written as one expression, and that is the whole of the rule: a copy
+ * of `base` is bound, each field is assigned to in the order written, and the copy is the value. So
+ * a struct's invariant is rechecked, a private field is refused, a conversion happens, and a
+ * settable property runs its setter — every one of them because the assignment it desugars to is an
+ * ordinary assignment, and none of them because this form said anything about it.
+ *
+ * **The base must be a struct value**, which is a rule this node has to state rather than inherit:
+ * `p with { … }` where `p` is a `&Style` would bind another reference to the same object and write
+ * through it, changing what every other holder sees. That is the one reading the desugaring gets
+ * wrong, so it is refused by name.
+ */
+case class WithExpr(base: Expr, fields: List[WithField]) extends Expr
+
 /** `.red`, `.Circle(3)`, `.make(2)` — a member selected from the type the context **expects**,
  * with the type's own name left off (`reference/expressions.md § Implicit member`).
  *

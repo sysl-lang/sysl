@@ -248,9 +248,43 @@ trait ExprParser extends SyslParserBase {
       here ~ trailingBlock ^^ { case p ~ blk =>
         (e: Expr) => Placeholders.lift(Call(e, List(blk)).setPos(e.pos).setPos(p))
       } |
+      // `base with { bg = ACCENT }` — a tail rather than a binary operator, so it binds as tightly
+      // as a field selection does and `a + b with { … }` changes `b` rather than the sum. The
+      // position is the `with`, which is what the rule about the base being a struct complains at.
+      here ~ (withWord ~> withFields) ^^ { case p ~ fs => (e: Expr) => WithExpr(e, fs).setPos(p) } |
       here <~ op("?") ^^ (p => (e: Expr) => TryExpr(e).setPos(p)) |
       here <~ op("++") ^^ (p => (e: Expr) => PostIncDec("++", e).setPos(p)) |
       here <~ op("--") ^^ (p => (e: Expr) => PostIncDec("--", e).setPos(p))
+
+  /** `with` is a soft word: it stays a legal identifier everywhere else, and this rule is the only
+   * place it is read as a keyword. Nothing else may follow a value on one line, so consuming it
+   * **commits** — the alternatives below report what was expected instead of backtracking and
+   * leaving the statement to end at a word the reader can see is part of it.
+   */
+  protected lazy val withWord: Parser[Unit] = softWord("with")
+
+  /** The braced field list. Braces rather than parentheses because a parenthesised list of
+   * `name = value` is already a call's argument list, and this is not a call.
+   *
+   * A brace suspends the off-side rule until it closes (`00 §9`), so the fields may be written one
+   * per line with commas, exactly as an array literal's elements are, and the trailing comma is
+   * allowed for the same reason.
+   */
+  protected lazy val withFields: Parser[List[WithField]] =
+    op("{") ~> (commaList1(withField) | emptyWith) <~ op("}") |
+      err("'with' takes the fields to change in braces, as 'base with { bg = ACCENT }'")
+
+  /** `base with { }`. The refusal is written **inside** the braces rather than as an alternative to
+   * the whole form, and the position is why: an alternative is outranked by whichever candidate got
+   * furthest along the line, and a candidate that has consumed the `{` is always further than one
+   * that has not. Written here it stands at the same token the field list failed at, which is what
+   * lets it win — and what leaves `{ bg }` to the sharper `'=' expected` a token later.
+   */
+  private def emptyWith: Parser[Nothing] =
+    err("'with' changes at least one field — with none, 'base with { }' is the value 'base' already is")
+
+  protected lazy val withField: Parser[WithField] =
+    at(ident ~ (op("=") ~> expression) ^^ { case n ~ v => WithField(n, v) })
 
   /** `f:` and then an indented block — an argument written as layout rather than inside the
    * parentheses (`reference/expressions.md § A trailing block`).

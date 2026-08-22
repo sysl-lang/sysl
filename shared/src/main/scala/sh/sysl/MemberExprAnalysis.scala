@@ -758,4 +758,77 @@ trait MemberExprAnalysis extends ExprSupport {
           case _: Type.Struct => err(s"'${show(ty)}' has no field or property '$f'")
           case _              => err(s"'${show(ty)}' has no property '$f'")
   }
+
+  /** `base with { bg = ACCENT }` — the value again, with the fields named here changed
+   * (`reference/expressions.md § with`).
+   *
+   * **It is desugared into source rather than built here**, which is what makes the form cheap and
+   * what decides what it means at every edge nobody thought to ask about. What it becomes is the
+   * two statements a reader writes today:
+   *
+   * {{{
+   * var tmp = base
+   * tmp.bg = ACCENT
+   * tmp
+   * }}}
+   *
+   * so a field that is not there, one that is private, a value that does not convert, a struct
+   * whose invariant the change breaks, and a settable property are each answered by the assignment's
+   * own rule in the assignment's own words — none of them written twice, and none of them able to
+   * disagree with what the same two lines already do.
+   *
+   * **The one thing the desugaring gets wrong on its own is a base that is not a struct**, and it
+   * gets it wrong silently: `var tmp = p` where `p` is a `&Style` binds a second reference to one
+   * object, so the writes reach every other holder rather than a copy. That is the reading this
+   * form exists to avoid, so it is refused before the desugaring is built — with the parenthesised
+   * spelling that does copy, since `*p with { … }` is `*(p with { … })` and would be refused again.
+   */
+  protected def withExpr(w: WithExpr, expected: Option[Type]): TExpr = {
+    // Asked speculatively: a base that does not analyze at all has a complaint of its own, and the
+    // desugaring below reaches it in its own position rather than having it reported here.
+    probe(analyzeExpr(w.base)).map(t => Type.repr(t.ty)).foreach {
+      case _: Type.Tuple =>
+        err("a tuple's parts are named for their positions rather than by a name 'with' could " +
+          "write, so a changed one is spelled by rebuilding it — '(t.0, 9)'")
+      case _: Type.Struct  => ()
+      case Type.Ref(inner, _) => notAStruct(inner, "a counted reference to")
+      case Type.Ptr(inner)    => notAStruct(inner, "a pointer to")
+      case other =>
+        err(s"'with' copies a struct and changes some of its fields, and '${show(other)}' is not a " +
+          "struct")
+    }
+
+    // Written twice, the second write is what the value would carry and the first is dead — which
+    // no reader means, and which the desugaring would carry out in silence.
+    w.fields.groupBy(_.name).collect { case (n, fs) if fs.length > 1 => (n, fs(1)) }.foreach {
+      case (n, second) =>
+        at(second.pos)(err(s"'$n' is changed twice in one 'with', so the first change is thrown " +
+          "away — write the value it should end with, once"))
+    }
+
+    val tmp = s"${Modules.sep}with"
+
+    def posed[T <: Positioned](e: T, p: Option[Pos]): T = e.setPos(p)
+
+    val writes: List[Stmt] = w.fields.map { f =>
+      val place = posed(Field(posed(Ident(tmp), f.pos), f.name), f.pos)
+
+      posed(ExprStmt(posed(Assign("=", place, f.value), f.pos)), f.pos)
+    }
+
+    val body: List[Stmt] =
+      posed(VarDecl(tmp, None, Some(w.base)), w.pos) ::
+        writes :::
+        List(posed(ExprStmt(posed(Ident(tmp), w.pos)), w.pos))
+
+    analyzeExpr(posed(Block(body), w.pos), expected)
+  }
+
+  /** The refusal for a base that reaches a struct without being one. It names the copy, because the
+   * copy is the whole difference between what was written and what it would have meant.
+   */
+  private def notAStruct(inner: Type, what: String): Nothing =
+    err(s"'with' copies a struct, and this is $what one — writing through it would change the " +
+      s"'${show(inner)}' every other holder can see. Copy what it points at first, as " +
+      "'(*base) with { … }'")
 }

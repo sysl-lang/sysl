@@ -439,4 +439,40 @@ class EscapePromotionTests extends AnyFreeSpec with RunSupport with CodegenSuppo
       notes.head should include("is passed to 'stash', which holds on to it")
     }
   }
+
+  /** The case that needs **neither** promotion nor a refusal, and was getting the refusal.
+   *
+   * Promotion is for storage that dies with the frame. Module storage does not: it is laid down once
+   * for the whole run, so a view of it is not a view of any frame and may leave one freely. The
+   * analysis reached that conclusion for a local (promote it) and for a caller's array (refuse), and
+   * fell through to the refusal for a module `val` — with a sentence offering two reasons, "a field
+   * of a value" and "an array a caller passed by value", neither of which is what a `static val` is.
+   *
+   * A table declared once and viewed from a function is the ordinary shape of it, and the one that
+   * found this: `sysl.time.tzif`'s tests carry a zone as a module-level array of bytes and hand a
+   * decoded view of it back out of a helper.
+   */
+  "a view of module storage leaves the frame without promotion or refusal" - {
+    "because the storage outlives every frame there is" in {
+      run("""static val table: [4]u8 = [1, 2, 3, 4]
+            |
+            |head() -> []const u8 = table[0..<2]
+            |
+            |print(head().len, head()[1])
+            |""".stripMargin) shouldBe "2 2\n"
+    }
+
+    // A module `var` is the same storage with writing allowed, so it answers the same way — which is
+    // worth pinning separately, since `TVal.writable` is the only thing that distinguishes the two
+    // and nothing about the lifetime differs.
+    "and a module 'var' is the same storage, so it answers alike" in {
+      run("""static var table: [4]u8 = [1, 2, 3, 4]
+            |
+            |head() -> []const u8 = table[0..<2]
+            |
+            |table[0usize] = 9
+            |print(head()[0], head().len)
+            |""".stripMargin) shouldBe "9 2\n"
+    }
+  }
 }

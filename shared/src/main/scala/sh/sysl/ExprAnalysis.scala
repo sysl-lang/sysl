@@ -1264,6 +1264,10 @@ trait ExprAnalysis
     // expects (`reference/expressions.md § Implicit member`). The call form is up with the other
     // call arms, since a call is matched before its callee is looked at.
     case ImplicitMember(f) => implicitMember(f, expected)
+
+    // `base with { bg = ACCENT }` — the value again with some fields changed, which is a member
+    // form because every rule it obeys is an assignment's. `MemberExprAnalysis`.
+    case w: WithExpr => withExpr(w, expected)
     // Building a sequence and reaching into one, which share the question of how many elements
     // there are and whether this index is one of them. `CollectionExprAnalysis`.
     case e @ (_: ArrayLit | _: ArrayFill | _: Index) => sequenceExpr(e, expected)
