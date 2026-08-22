@@ -451,6 +451,79 @@ class NestedFunctionTests extends AnyFreeSpec with RunSupport with CodegenSuppor
 
       message should not include "undefined function 'go'"
     }
+
+    // Card `0221`. The rule is the one above — what the group may capture is what the block had
+    // bound where the **first** of them is written — but the message was measured against the wrong
+    // thing, so a use written *below* the declaration was told the declaration was below *it*. That
+    // reads as a contradiction, and it cost a session five failed reductions before somebody
+    // compared the two line numbers.
+    "a capture bound after the group begins, read from a function written below it" - {
+      val program =
+        """var counted = 0
+          |
+          |bump(k: int)
+          |    counted += k
+          |end bump
+          |
+          |val data: [3]int = [1, 2, 3]
+          |
+          |read() -> int = data[0]
+          |
+          |bump(1)
+          |print(read())
+          |""".stripMargin
+
+      "is refused, because the environment was built above the binding" in {
+        err(program) should include("'data' is bound after the nested functions of this block begin")
+      }
+
+      "and is NOT told the declaration is below it, which is where it sits" in {
+        err(program) should not include "'data' is declared below this"
+      }
+
+      "and is told both ways out of it" in {
+        val message = err(program)
+
+        message should include("Bind 'data' above them")
+        message should include("'static'")
+      }
+    }
+
+    // The two halves of the discrimination, so that fixing one message cannot silently retire the
+    // other: the same program with the binding moved above the group compiles, and with the *use*
+    // above the binding it gets the original sentence.
+    "moving the binding above the group is one of the two fixes the message names" in {
+      run("""var counted = 0
+            |val data: [3]int = [1, 2, 3]
+            |
+            |bump(k: int)
+            |    counted += k
+            |end bump
+            |
+            |read() -> int = data[0]
+            |
+            |bump(1)
+            |print(read())
+            |print(counted)
+            |""".stripMargin) shouldBe "1\n1\n"
+    }
+
+    "and 'static' is the other, since module storage is bound before any statement runs" in {
+      run("""var counted = 0
+            |
+            |bump(k: int)
+            |    counted += k
+            |end bump
+            |
+            |static val data: [3]int = [1, 2, 3]
+            |
+            |read() -> int = data[0]
+            |
+            |bump(1)
+            |print(read())
+            |print(counted)
+            |""".stripMargin) shouldBe "1\n1\n"
+    }
   }
 
   "a group that captures nothing carries nothing" in {

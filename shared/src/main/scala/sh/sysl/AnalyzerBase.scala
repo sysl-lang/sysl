@@ -72,8 +72,49 @@ trait AnalyzerBase extends Scoping {
 
   /** Every name the block being analyzed binds, reached or not, so that a use written above the
    * declaration is told which of the two mistakes it is.
+   *
+   * **Each name carries where it was bound**, because there are two mistakes rather than one and
+   * the position is what tells them apart: a use genuinely above the binding, and a use inside a
+   * nested function whose group was formed above it. The second reads as a contradiction otherwise
+   * — a name declared six hundred lines higher up reported as "declared below this" (card `0221`).
    */
-  protected var blockDeclares: Set[String] = Set.empty
+  protected var blockDeclares: Map[String, Option[Pos]] = Map.empty
+
+  /** A name the block binds that is not in scope where it is used — **two** mistakes wearing one
+   * shape, told apart by where the binding is (card `0221`).
+   *
+   * The ordinary one is a use written **above** the declaration, and the rule is the one a reader
+   * would state: a name is in scope from where it is bound onward.
+   *
+   * The other reads as a contradiction and is not one. A block's nested functions share **one**
+   * environment, built where the first of them is written (`Closures.lowerNestedGroup`), so what
+   * any of them may capture is what the block had bound by that point — and a use inside one of
+   * them is refused however far below the declaration it is written. Reporting that as "declared
+   * below this" is simply false, and it was: a module `val` bound at line 155 was reported that way
+   * against a use at line 827, which cost a session five failed reductions before the position was
+   * compared rather than assumed.
+   *
+   * **The comparison is guarded on both ends.** A synthesized node has no position and a body
+   * nested through a macro-like path could be reading a different file, so anything that cannot be
+   * ordered falls to the first message — which is the one that was always given and is right
+   * whenever the second cannot be established.
+   */
+  protected def notYetBound(name: String): Nothing = {
+    val below =
+      for
+        d <- blockDeclares(name)
+        u <- currentPos
+        if d.source == u.source
+      yield u.line > d.line || (u.line == d.line && u.col > d.col)
+
+    if below.contains(true) then
+      err(s"'$name' is bound after the nested functions of this block begin, so it is not in this " +
+        s"one's environment — they share a single environment, formed where the first of them is " +
+        s"written, and what it holds is what the block had bound by that point. Bind '$name' above " +
+        s"them, or make it module storage with 'static'")
+    else
+      err(s"'$name' is declared below this, and a name is in scope from where it is bound onward")
+  }
 
   // Per-function state, reset at each function boundary.
   protected var retTy: Type               = Type.Unit
@@ -230,7 +271,7 @@ trait AnalyzerBase extends Scoping {
     nestedFuncs = Map.empty
     pendingNested = Nil
     outerNested = Set.empty
-    blockDeclares = Set.empty
+    blockDeclares = Map.empty
     tbounds = Map.empty
     pbounds = Map.empty
   }

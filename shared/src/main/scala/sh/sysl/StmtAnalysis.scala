@@ -43,12 +43,14 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
     // nothing and a use of its name is genuinely undefined rather than written too early. Listing it
     // here made every such use report that it was "declared below" — from above it and from below it
     // alike, since the name was never bound at all.
+    // **Where** each is bound travels with it, because `notYetBound` has two mistakes to tell apart
+    // and the position is the only thing that separates them (card `0221`).
     blockDeclares = savedDeclares ++ stmts.collect {
-      case VarDecl(n, _, _, _, _, _)  => List(n)
-      case ValDecl(n, _, _, _, _, _)  => List(n)
-      case RefDecl(n, _)        => List(n)
-      case MultiDecl(ns, _, _)  => ns
-      case PatternDecl(p, _, _) => patternNames(p)
+      case s @ VarDecl(n, _, _, _, _, _) => List(n -> s.pos)
+      case s @ ValDecl(n, _, _, _, _, _) => List(n -> s.pos)
+      case s @ RefDecl(n, _)             => List(n -> s.pos)
+      case s @ MultiDecl(ns, _, _)       => ns.map(_ -> s.pos)
+      case s @ PatternDecl(p, _, _)      => patternNames(p).map(_ -> s.pos)
     }.flatten
 
     try body
