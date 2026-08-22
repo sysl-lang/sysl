@@ -157,7 +157,14 @@ trait FunctionBodies extends ModuleStorage {
 
       val (requires, ensures, olds, _) = analyzeContracts(result, contracts)
 
-      (TFunc(name, tparams, result, tbody, variadic, requires, ensures, olds), result)
+      // **Internal, always.** Nothing outside this compilation can name a closure or a function
+      // nested in a body (`12 §6`), so the symbol has no reason to leave the object file — and
+      // leaving it there is what a per-compilation counter for a name makes unsafe. Two units that
+      // each lowered a fourth closure both call it `$closure4.call`, and with external linkage the
+      // linker is free to resolve one unit's call to the other unit's body: a different environment
+      // layout under a different body, which is a wrong answer rather than a failure to link.
+      (TFunc(name, tparams, result, tbody, variadic, requires, ensures, olds, internal = true),
+       result)
     finally
       currentFunctionName = savedFuncName
       currentMemberName = savedMember
@@ -261,8 +268,20 @@ trait FunctionBodies extends ModuleStorage {
     // it came from, which is what `declAccess` was keyed by. They are the same key for an ordinary
     // function, and only the second answers for an instantiation; a symbol is file-private if either
     // says so, since both name the one declaration.
+    //
+    // **And an instantiation whose name carries a closure's is internal on the same ground as the
+    // closure itself.** `sysl.time$resolve.$closure4` is a symbol only the unit that lowered that
+    // closure can mean anything by, since the number in it is that unit's counter. Advertised as a
+    // library's precompiled function it is worse than useless: a program declares it instead of
+    // building its own, and the artifact's copy then calls back into a `$closure4.call` the
+    // *program* defined for a closure of its own (card `0229`).
+    //
+    // Asked of the emitted name rather than of `tsubst`, so that a closure reached through a
+    // composite argument — a `Buf` of them, a pack — is covered by the one rule: whatever the
+    // argument was, the closure's own base is a segment of the name it produced.
     TFunc(name, tparams, rtype, tbody, f.variadic, requires, ensures, olds,
-      fileLocal(name) || fileLocal(f.name), f.conv, f.tailrec, variant, f.pure, f.ghost,
+      fileLocal(name) || fileLocal(f.name) || Closures.mentioned(name),
+      f.conv, f.tailrec, variant, f.pure, f.ghost,
       frameSymbols(f.reads, "reads"), frameSymbols(f.writes, "writes"),
       // `@export` becomes a symbol here, where the declared name is still in hand. An unwritten one
       // is the function's **bare** name: the module path is what mangling adds, and suppressing the

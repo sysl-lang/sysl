@@ -83,6 +83,23 @@ object Closures {
    * reader wrote has nothing to say about it.
    */
   def lowered(name: String): Boolean = name.startsWith(prefix) || name.startsWith(envPrefix)
+
+  /** Whether a symbol's name **carries** a closure's rather than being one: `$closure4.call` is one,
+   * and so is `sysl.time$resolve.$closure4`, the instantiation of a bare-arrow parameter made at it.
+   *
+   * The distinction from `lowered` is where the closure's name sits, and it matters because both are
+   * subject to the same rule: a closure's name is a counter in the compilation that lowered it, so
+   * two units each lowering a fourth closure produce the same name for two different things. Every
+   * symbol answering this is therefore emitted `internal` and may not cross a link — which is what
+   * `StdArtifactTests` holds the standard module's own artifact to.
+   *
+   * **Segment by segment rather than as a substring**, because the prefix begins with the module
+   * separator and a module's own declaration called `closure4` is keyed `foo$closure4`. A mangled
+   * name joins its parts with `.` (`Type.mangled`), and a closure's base is a part in its own right,
+   * so a real one always starts a segment and that one never does.
+   */
+  def mentioned(name: String): Boolean =
+    name.split('.').exists(part => part.startsWith(prefix) || part.startsWith(envPrefix))
 }
 
 trait Closures extends CallAnalysis {
