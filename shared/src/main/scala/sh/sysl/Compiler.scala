@@ -352,8 +352,24 @@ object Compiler {
       promoted <- Escape.check(typed)
       _        <- TailCalls.check(typed)
     yield
-      val mine            = units.map(moduleOf).toSet
-      val (own, supplied) = typed.funcs.partition(f => mine(Modules.moduleOf(f.name)))
+      val mine = units.map(moduleOf).toSet
+
+      // **A closure this compilation lowered is this compilation's, and the module in its key does
+      // not say so.** A closure's name begins with `$`, which is also the module separator, so
+      // `Modules.moduleOf` reads `$closure4.call` as belonging to the *root* module — which is in
+      // nobody's `mine`, so it was filed as something another library supplies. The library then
+      // declared it and never emitted it, while an instantiation made at that closure —
+      // `sysl.time$resolve.$closure4`, whose key does carry a module — was emitted *and* advertised.
+      // A program linking the artifact declared the instantiation instead of building one, and the
+      // artifact's copy called back into a `$closure4.call` the program had defined for a closure of
+      // its own: a different environment under a different body, and a silently wrong answer.
+      //
+      // Emitting it is only half the answer and internal linkage is the other. Both units call their
+      // fourth closure `$closure4.call`, so the two copies have to be two symbols; `TFunc.internal`
+      // is set for every closure body and for every instantiation made at one, which also keeps them
+      // out of `determined` below.
+      val (own, supplied) =
+        typed.funcs.partition(f => mine(Modules.moduleOf(f.name)) || Closures.lowered(f.name))
 
       // A function that reads a module-level `val` is left out of the precompiled half, and this is
       // the honest boundary of what separate compilation reaches today: the storage for a `val` is
