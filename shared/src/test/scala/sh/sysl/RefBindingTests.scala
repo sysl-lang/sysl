@@ -126,7 +126,7 @@ class RefBindingTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     // the binding rather than at each use.
     //
     // It is measured as a **difference between two spellings of one program**, because the count is
-    // over the whole module and the prelude carries checks of its own — an absolute number would be
+    // over the whole module and the library carries checks of its own — an absolute number would be
     // pinning the library rather than the feature. Three writes through paths check three times;
     // three writes through a ref check once; so the ref saves exactly two.
     "an element ref bounds-checks once however often the name is used" in {

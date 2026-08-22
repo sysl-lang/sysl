@@ -404,8 +404,9 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
     // to be on that path too. A cursor holding a reference is what makes the omission visible.
     //
     // The cursor is `Once` and not the `One` it was until the standard module declared a trait of
-    // that name: a prelude name is reachable with nothing imported, so a program's own declaration
-    // of one is a collision rather than a shadowing — the same as `Option` or `Add` has always been.
+    // that name. The standard module is auto-imported, and an auto-import is a wildcard every file
+    // starts with, so a program's own declaration of one of its names is **ambiguous** rather than a
+    // shadowing — the same as `Option` or `Add` has always been.
     "a 'return' from inside the loop lets the cursor go" in {
       run("""struct Cell
              |    v: int

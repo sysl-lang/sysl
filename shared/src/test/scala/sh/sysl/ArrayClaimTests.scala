@@ -421,7 +421,7 @@ class ArrayClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     /* The bit has to survive being *stored*, not merely passed — a container holds its element as a
      * type argument, and a type argument is where a bit on a type gets dropped. Both a generic the
-     * program writes and one the prelude supplies, since they instantiate by different routes. */
+     * program writes and one the library supplies, since they instantiate by different routes. */
     "and survives a round trip through a generic container, written or supplied" in {
       val cell = """struct Cell[T]
                    |    item: T
