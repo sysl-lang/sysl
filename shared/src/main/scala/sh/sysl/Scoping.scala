@@ -446,9 +446,23 @@ trait Scoping extends DeclTables {
 
   // --- the keys the tables are asked with -------------------------------------------------
 
-  /** The key a written **type** name resolves to: a struct's, an enum's, or a constrained subtype's. */
+  /** The key a written **type** name resolves to: a struct's, an enum's, or a constrained subtype's.
+   *
+   * **An alias is followed here, once, for everything downstream.** `type FRect = c.FRect` declares
+   * no type, so every table keyed on a type — the struct decls a constructor call reads, the members
+   * an `impl` registers, the enum a variant is selected from — has to be asked about what the alias
+   * *names* rather than about the alias. Answering that in this one place is what stops every such
+   * table growing a case for aliases; `aliasedKey` is the identity for everything that is not one.
+   */
   protected def typeKey(written: String): Option[String] =
     resolveName(written)(n => structDecls.contains(n) || enumDecls.contains(n) || constrainedDecls.contains(n))
+      .map(followAlias)
+
+  /** What an alias names, overridden where the constrained-type tables are in scope. It is the
+   * identity here because `Scoping` sits below them, and because a compiler pass that has not yet
+   * collected the declarations must not start resolving one.
+   */
+  protected def followAlias(key: String): String = key
 
   /** The key a written **trait** name resolves to. */
   protected def traitKey(written: String): Option[String] = resolveName(written)(traitDecls.contains)

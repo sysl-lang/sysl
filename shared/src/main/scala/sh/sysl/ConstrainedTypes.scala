@@ -9,6 +9,64 @@ package sh.sysl
  */
 trait ConstrainedTypes extends GenericInstantiation {
 
+  /** Whether `key` names a plain **transparent alias** — `type Name = Existing`, with no `new`, no
+   * `within` and no `where` — rather than a constrained subtype.
+   *
+   * An alias declares no type of its own: it is a second spelling for one that already exists, so
+   * everything asked of the name is answered by the type it stands for. That is why the tables are
+   * asked this question at all — a constrained subtype is a type and an alias is a *name*, and the
+   * two want opposite handling from the same declaration form.
+   *
+   * A measured `c type` is written by the compiler in exactly this shape and is **not** an alias in
+   * this sense: it is a distinct scalar whose width came from the C compiler, and the code below
+   * builds it as one.
+   */
+  protected def plainAlias(key: String): Boolean =
+    constrainedDecls.get(key).exists(d => !d.derived && d.range.isEmpty && d.pred.isEmpty && !d.fromC)
+
+  /** The key an alias ultimately stands for, following a chain of them, where what it names is a
+   * declared type. A key that is not an alias, and one whose base is not a bare declared name — a
+   * scalar, a pointer, an array, a callable — is its own answer.
+   *
+   * **The base is resolved in the ALIAS'S OWN SCOPE, which is the whole reason this is not a
+   * substitution on the written name.** `type FRect = c.FRect` names `c` in the file that wrote the
+   * alias; a file that uses `FRect` need not import `c` at all, and may well have its own `c`
+   * meaning something else.
+   *
+   * A cycle — `type A = B` and `type B = A` — is walked at most as many steps as there are
+   * declarations before giving up, so a program that writes one is refused rather than hanging.
+   */
+  override protected def followAlias(key: String): String = aliasedKey(key)
+
+  protected def aliasedKey(key: String): String = {
+    var seen = key
+    var steps = 0
+
+    while plainAlias(seen) && steps <= constrainedDecls.size do
+      val next = inScope(scopeFor(seen)) {
+        constrainedDecls(seen).base match
+          case NamedType(n, Nil) => resolveName(n)(k => structDecls.contains(k) || enumDecls.contains(k) ||
+            constrainedDecls.contains(k))
+          case _                 => None
+      }
+
+      next match
+        case Some(k) if k != seen => seen = k; steps += 1
+        case _                    => return seen
+
+    if steps > constrainedDecls.size then
+      at(constrainedDecls(key).pos)(err(s"'${qn(key)}' is an alias for itself, through a chain of aliases"))
+
+    seen
+  }
+
+  /** What a plain alias stands for, as a type. Only reached where `aliasedKey` could not answer —
+   * the base is a scalar, a pointer, an array or a callable rather than a declared name — since a
+   * declared one is followed at the key and never arrives here.
+   */
+  protected def resolveAlias(key: String): Type =
+    inScope(scopeFor(key))(at(constrainedDecls(key).pos)(resolveType(constrainedDecls(key).base, Map.empty)))
+
   protected def resolveConstrained(key: String): Type.Constrained =
     constrainedInsts.getOrElseUpdate(key, buildConstrained(key))
 

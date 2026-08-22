@@ -210,9 +210,19 @@ trait ProgramWalk extends AbstractBodies {
 
     // Every constrained subtype is resolved now, whether or not anything uses it — so an out-of-range
     // or inverted bound is a mistake reported at the declaration, exactly as a constant's is.
+    //
+    // **A plain alias is resolved here too and by a different road**, since it builds no constrained
+    // type to be checked: what it owes at its declaration is that the name it stands for exists, and
+    // that following it terminates. A cycle is caught by the walk rather than by the resolve, which
+    // would otherwise recurse until the stack ran out.
     for (key, d) <- constrainedDecls do
       currentPos = d.pos
-      inScope(declScope(key))(recover(())(resolveConstrained(key)))
+      inScope(declScope(key))(recover(()) {
+        if plainAlias(key) then
+          aliasedKey(key)
+          resolveAlias(key)
+        else resolveConstrained(key)
+      })
 
     for (scope, stmt) <- body do
       currentPos = stmt.pos

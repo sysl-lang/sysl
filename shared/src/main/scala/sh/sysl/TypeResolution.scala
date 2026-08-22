@@ -550,6 +550,13 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
               case Some(key) if structDecls.contains(key) =>
                 if !behindPointer then checkLayoutKnown(key, n)
                 instantiateStruct(key, targs)
+              // An alias whose base is a declared type was already followed to it by `typeKey`, so
+              // what reaches here is one standing for something with no key of its own — a scalar, a
+              // pointer, an array, a callable. It resolves to that, and to nothing wrapping it: an
+              // alias is a second spelling and not a second type.
+              case Some(key) if plainAlias(key) =>
+                if targs.nonEmpty then err(s"'$n' is an alias and takes no type arguments")
+                resolveAlias(key)
               case Some(key) if constrainedDecls.contains(key) =>
                 if targs.nonEmpty then err(s"'$n' is a constrained subtype and takes no type arguments")
                 resolveConstrained(key)

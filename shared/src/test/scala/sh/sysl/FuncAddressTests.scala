@@ -647,20 +647,38 @@ class FuncAddressTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "42\n"
     }
 
-    /** **A signature cannot be named once**, so every declaration mentioning a callback spells the
-      * whole of it. That is a cost a real binding pays — `signal` alone mentions its handler type
-      * three times — and it is **not this feature's** restriction: `type` declares a constrained
-      * subtype, whose base must be a scalar, so `type Handle = *u8` is refused in exactly the same
-      * words. Both halves are asserted so that a `type` that grows to cover pointers is a test that
-      * fails here and says which one arrived.
+    /** **A signature is named once, with a `type` alias**, which it could not be until the deferral
+      * `16` carried was closed. This test is the tripwire that was left here for the day it arrived:
+      * it used to assert that both spellings were refused, on the grounds that `type` declared a
+      * constrained subtype and a subtype's base must be a scalar. A transparent alias declares no
+      * type at all, so neither restriction reaches it.
+      *
+      * The cost this removes is real and it is what a binding pays: `signal` below mentions its
+      * handler type three times, and every one of them could now be the alias's name.
+      * `TypeAliasTests` is where the feature itself is pinned; both halves stay asserted here so that
+      * a regression in *this* direction — a pointer or a signature alias being refused again —
+      * fails beside the code that wants it.
       */
-    "cannot be named once, for the reason no pointer can" in {
-      val fn = err("type Comparison = *extern(*u8, *u8) -> i32\nprint(1)")
+    "is named once, with an alias" in {
+      ir("""type Comparison = *extern(*u8, *u8) -> i32
+           |
+           |compare(a: *u8, b: *u8) -> i32 = i32(a[0]) - i32(b[0])
+           |
+           |call(f: Comparison, a: *u8, b: *u8) -> i32 = f(a, b)
+           |
+           |var xs = [9u8, 4u8]
+           |
+           |print(str(call(&compare, &xs[0], &xs[1])))
+           |""".stripMargin) should include("@compare")
 
-      fn should include("a constrained subtype's base must be an integer, a float, or 'char'")
-
-      err("type Handle = *u8\nprint(1)") should
-        include("a constrained subtype's base must be an integer, a float, or 'char'")
+      ir("""type Handle = *u8
+           |
+           |first(h: Handle) -> u8 = h[0]
+           |
+           |var bytes = [7u8]
+           |
+           |print(str(first(&bytes[0])))
+           |""".stripMargin) should not be empty
     }
 
     // A slice of them, which is the table shape a dispatch loop reads.

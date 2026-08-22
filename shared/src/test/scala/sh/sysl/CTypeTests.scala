@@ -511,17 +511,19 @@ class CTypeTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pa
             |""".stripMargin) should not be empty
     }
 
-    /** A hand-written `type` with no constraint is still refused. What `c type` lowers to is that
-      * shape, and admitting it there was a decision about **measured typedefs** rather than about
-      * aliases in general — `16` defers that question and this leaves it deferred.
+    /** A hand-written `type` with no constraint is a transparent **alias** and compiles, which it did
+      * not until the deferral `16` carried was closed. The two forms are spelled almost identically
+      * and mean different things, so both are asserted here rather than only the one this file is
+      * about: `c type` declares a scalar whose *width* the C compiler answered for, and `type` with
+      * no constraint declares no type at all.
       */
-    "while a hand-written alias with no constraint is refused exactly as before" in {
-      err("""type Tick = u32
+    "while a hand-written alias with no constraint is now a transparent alias" in {
+      run("""type Tick = u32
             |
             |val x: Tick = 3
             |
             |print(str(x))
-            |""".stripMargin) should include("has no constraint")
+            |""".stripMargin) shouldBe "3\n"
     }
   }
 

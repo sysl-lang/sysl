@@ -47,8 +47,12 @@ class SubtypeErrorTests extends AnyFreeSpec with CodegenSupport {
     err("type Age = int within 0..150\nprint(int(Age(1, 2)))") should include("takes exactly one value")
   }
 
-  "a bare transparent alias with no constraint is rejected" in {
-    err("type T = int\nvar x: T = 1\nprint(int(x))") should include("has no constraint")
+  // A bare `type T = Existing` is a transparent **alias** and declares no subtype at all, so it is
+  // not one of this file's malformed declarations — `TypeAliasTests` is where it lives. What is
+  // asserted here is only that it stopped being an error, since every other case in this file turns
+  // on a `type` line being refused and one of them used to be this.
+  "a bare transparent alias declares no subtype and is not an error" in {
+    Compiler.compileToLlvm("type T = int\nvar x: T = 1\nprint(int(x))") shouldBe a[Right[?, ?]]
   }
 
   "a non-bool where predicate is rejected without leaking the synthesised function's name" in {
