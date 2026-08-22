@@ -768,23 +768,27 @@ case class EnumDecl(name: String, tparams: List[String], underlying: Option[Type
  */
 case class RangeBound(lo: Expr, hi: Expr, exclusiveHi: Boolean) extends Positioned
 
-/** `type Name = [new] Base [within lo..hi] [where predicate]` — a constrained subtype (`16`).
+/** `type Name = [new] Base [within lo..hi] [where predicate]` — one syntax over two things, told
+ * apart by whether anything was added to the base.
  *
- * `Base` is a scalar (an integer, a float, or `char`). Without `new` the subtype is **transparent**:
- * a value flows to and from its base with no cast, and every value produced into it is checked at
- * run time against `range` and `pred`, trapping on violation. With `new` it is a **derived** type:
- * nominally distinct from its base and from other deriveds, mixed only through an explicit cast.
+ * **With nothing added it is a transparent ALIAS**, which declares no type: `Name` and `Base` are
+ * one type under two spellings, and `Base` may be anything a type expression can name — a struct, a
+ * pointer, an array, a callable signature, a generic instantiation. Nothing is emitted and nothing
+ * is checked when a value crosses between the names, because there are not two things for anything
+ * to be emitted between.
  *
- * `range` is the `within` clause and `pred` the `where` predicate; either or both may be present,
- * and at least one must be unless the type is `new` (a bare transparent alias carries no constraint
- * and is not yet a form the language accepts). Inside `pred`, the contextual name `value` binds the
- * value being checked.
+ * **With a constraint it is a subtype**, and there `Base` is a scalar (an integer, a float, or
+ * `char`). Without `new` the subtype is **transparent**: a value flows to and from its base with no
+ * cast, and every value produced into it is checked at run time against `range` and `pred`,
+ * trapping on violation. With `new` it is a **derived** type: nominally distinct from its base and
+ * from other deriveds, mixed only through an explicit cast. `range` is the `within` clause and
+ * `pred` the `where` predicate; either or both may be present, and `new` needs neither. Inside
+ * `pred`, the contextual name `value` binds the value being checked.
  *
  * `fromC` marks the one declaration the compiler writes itself: a `c type` measured against the C
- * compiler lowers to exactly the shape the paragraph above refuses — transparent, no range, no
- * predicate — because that shape *is* what a C typedef means, a second name for one integer with no
- * check of its own. The refusal stays for anything a person wrote; what it is protecting is the
- * decision `16` deferred about aliases in general, and a measured typedef does not reopen it.
+ * compiler. It has an alias's shape — transparent, no range, no predicate — and is deliberately
+ * **not** one: what it declares is a distinct scalar whose width the C compiler answered for, and a
+ * program spells that width nowhere else.
  */
 case class TypeDecl(
     name: String,
