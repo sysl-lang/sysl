@@ -906,8 +906,8 @@ object Toolchain {
    *
    * **It is here because this is the link, and there turned out to be three of them.** The driver
    * adds the library's tree to `NativeSources` (`Main`), `StdSelfTests` compiles it for its own
-   * link, and then `guide/qsort` — which calls `sysl.posix.time.monotonic` — failed to resolve the
-   * clock shim through a *third* path nobody had thought about. Every one of those is "link a
+   * link, and then a guide program calling `sysl.posix.time.monotonic` failed to resolve the clock
+   * shim through a *third* path nobody had thought about. Every one of those is "link a
    * program that was compiled against the library from source", so the knowledge belongs at the link
    * rather than at each caller, where the next harness would have missed it too.
    *
