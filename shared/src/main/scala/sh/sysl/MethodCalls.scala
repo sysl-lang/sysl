@@ -623,6 +623,7 @@ trait MethodCalls extends FuncAddress {
           fd.retType.map(spell),
           expected,
           passed.map(isLiteral),
+          fd.bounds,
         ))
 
     inDecl(fd.name)(checkParamBounds(shown, m.tparams, fd.bounds, own))

@@ -136,6 +136,7 @@ trait CallAnalysis extends OperatorCalls {
       fd.retType.map(spell),
       expected,
       passed.map(isLiteral),
+      m.bounds,
     ))
 
     val (ownerTps, ownTps)   = fd.tparams.splitAt(fd.tparams.length - m.tparams.length)

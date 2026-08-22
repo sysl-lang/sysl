@@ -382,6 +382,15 @@ trait GenericInstantiation extends ConstFolding {
         en
   }
 
+  /** The call trait a value implements, where it implements one — supplied by `Closures`, which is
+   * where a closure's own is registered.
+   *
+   * Declared here because `solve` reads a type argument back off a callable argument and this trait
+   * sits above the one that knows how: the alternative is threading the answer through every call
+   * site, which would put the knowledge of what a callable is into three places that do not need it.
+   */
+  protected def callableOf(t: Type): Option[Type.Bound]
+
   /** Matches a declaration's type reference against an actual type, binding whatever type
    * parameters it determines. Deliberately lenient: a structural mismatch simply leaves the
    * parameter unbound, and the argument is type-checked properly against the instantiated
@@ -482,7 +491,17 @@ trait GenericInstantiation extends ConstFolding {
     // parameter binds `A` and `R` from a `&Fn(int) -> bool` argument exactly as any other applied
     // trait binds its arguments. A closure's own type is a struct that says nothing about either, so
     // what settles a *bare* arrow's parameters is the call's own inference and not this.
-    case f: FnType => unify(f.asTrait, actual, tparams, sub)
+    // **A closure arrives as its own struct, not as the call trait its parameter names**, so the
+    // signature is asked of the implementation rather than matched against the type. That is what
+    // lets `convert[T, U](x: T, f: &Fn(T) -> U)` read `U` off the closure's body — the boxed
+    // spelling's half of what a bound's arguments do for the arrow's, and the only thing in the
+    // call that knows what `U` is.
+    case f: FnType =>
+      callableOf(actual).filter(_.args.length == f.params.length + 1) match
+        case Some(b) =>
+          f.params.zip(b.args).foreach((r, a) => unify(r, a, tparams, sub))
+          unify(f.ret, b.args.last, tparams, sub)
+        case None => unify(f.asTrait, actual, tparams, sub)
     // A function pointer's parts bind exactly as a tuple's do — position by position, and only
     // against another one of the same width, since nothing else has parts to read.
     case CFnType(ps, r) =>
@@ -537,6 +556,7 @@ trait GenericInstantiation extends ConstFolding {
       resultRef: Option[TypeRef],
       expected: Option[Type],
       soft: List[Boolean] = Nil,
+      bounds: Map[String, List[BoundRef]] = Map.empty,
   ): List[Type] = {
     val sub   = mutable.LinkedHashMap.empty[String, Type]
     val tps   = tparams.toSet
@@ -547,6 +567,25 @@ trait GenericInstantiation extends ConstFolding {
       for r <- resultRef; e <- expected do unify(r, e, tps, sub)
     if sub.size < tparams.length then
       for ((r, t), adaptable) <- pairs if adaptable do unify(r, t, tps, sub)
+    // **What a callable argument yields is read back off the closure**, which is the other half of
+    // `callBound` handing one an open result. The parameter itself has by now been solved to the
+    // closure's own struct, and that struct implements the call trait its body determined — so the
+    // bound's arguments, written in the declaration's terms, are matched against the ones the
+    // closure turned out to have. `collect[T, U](xs: []const T, f: T -> U)` reads `U` here and
+    // nowhere else, because nothing but the closure knows it.
+    //
+    // Last, and only while something is still missing, for the reason the literals go last: this
+    // concludes a type parameter from a value that took its own shape from the context, so anything
+    // that knew independently has already spoken.
+    if sub.size < tparams.length then
+      for
+        (tp, bs) <- bounds
+        t        <- sub.get(tp)
+        ref      <- bs.find(b => Type.Fn.isCall(b.name))
+        actual   <- callableOf(t)
+        if ref.args.length == actual.args.length
+        (r, a)   <- ref.args.zip(actual.args)
+      do unify(r, a, tps, sub)
 
     // A parameter left unsolved because what would have solved it could not itself be worked out is
     // a consequence, not a mistake. `f() -> Result[unit, IoError] = Ok(())` with `IoError` never

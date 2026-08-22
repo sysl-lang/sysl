@@ -246,8 +246,21 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
   /** The call trait a callable argument is being asked for, read off the bound of the parameter it
    * stands at, under whatever the other arguments have already settled.
    *
-   * `None` where the bound still names a parameter nothing has determined, which leaves the closure
-   * to report that its parameters have no types — the honest answer, since they have none.
+   * **Only what the closure TAKES has to be settled; what it yields may still be open.** That
+   * asymmetry is the whole of this function and it follows from what a closure is: `analyzeLambda`
+   * takes its parameter types from the context and its result from the body, so a result the
+   * context does not know is not a difficulty — it is the ordinary case, and `Type.Unknown` is how
+   * `fnParts` already says so.
+   *
+   * Requiring the result too made `map`'s shape unreadable, and circularly: in
+   * `collect[T, U](xs: []const T, f: T -> U)` the only thing that can say what `U` is *is* the
+   * closure, so waiting for `U` before reading the closure waits forever. What came out was
+   * "'n' has no type here", which points at the closure and blames the caller for not annotating a
+   * parameter the declaration had already stated. `collect([1, 2, 3], n -> s"<${n}>")` is that call.
+   *
+   * `None` where a **parameter** of the bound still names something nothing has determined, which
+   * leaves the closure to report that its parameters have no types — the honest answer there, since
+   * they have none.
    */
   private def callBound(
       ptype: Option[TypeRef],
@@ -256,11 +269,51 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
       partial: Map[String, Type],
   ): Option[Type] =
     for
-      tp  <- ptype.collect { case NamedType(n, Nil) if tps(n) => n }
-      ref <- bounds.getOrElse(tp, Nil).find(b => Type.Fn.isCall(b.name))
-      if !ref.args.exists(r => mentions(r, tps -- partial.keySet))
-      b = resolveBound(ref, partial)
-    yield Type.Trait(b.name, b.args)
+      (name, taken, yielded) <- callShape(ptype, tps, bounds)
+      unsolved = tps -- partial.keySet
+      if !taken.exists(r => mentions(r, unsolved))
+      result = yielded
+                 .filterNot(mentions(_, unsolved))
+                 .map(r => resolveType(r, partial))
+                 .getOrElse(Type.Unknown)
+    yield Type.Trait(name, taken.map(r => resolveType(r, partial)) :+ result)
+
+  /** The two ways a parameter can ask for a callable, read down to one shape: the trait's name, what
+   * it takes, and what it yields.
+   *
+   * **A bare arrow and a boxed `&Fn` are the same question and were not being asked the same way.**
+   * `12 §6`'s two spellings differ in what they *cost* — the arrow becomes a bounded type parameter
+   * and monomorphizes, the boxed one is a trait object and dispatches — and in nothing else that
+   * matters here, because both state a signature the closure standing at them can be read against.
+   * Only the first was consulted, so `f[T](x: T, f: &Fn(T) -> T)` could not read its closure even
+   * with `T` long since settled, and said the closure's parameters had no types.
+   *
+   * A call trait's arguments are its parameters and then its result, which is why the result is the
+   * last of them in the first case and is written where it stands in the second.
+   */
+  private def callShape(
+      ptype: Option[TypeRef],
+      tps: Set[String],
+      bounds: Map[String, List[BoundRef]],
+  ): Option[(String, List[TypeRef], Option[TypeRef])] = ptype.flatMap {
+    case NamedType(n, Nil) if tps(n) =>
+      bounds.getOrElse(n, Nil).find(b => Type.Fn.isCall(b.name)).map { ref =>
+        (traitKey(ref.name).getOrElse(ref.name), ref.args.dropRight(1), ref.args.lastOption)
+      }
+    case r =>
+      fnWritten(r).map { f =>
+        val base = Type.Fn.base(f.params.length)
+
+        (traitKey(base).getOrElse(base), f.params, Some(f.ret))
+      }
+  }
+
+  /** The callable a parameter's own type names, behind whichever mode it was written with. */
+  private def fnWritten(r: TypeRef): Option[FnType] = r match
+    case f: FnType           => Some(f)
+    case RefType(inner, _)   => fnWritten(inner)
+    case PtrType(inner)      => fnWritten(inner)
+    case _                   => None
 
   /** A node that carries a type and no value, for a literal inference reads before anything has
    * analyzed it. `checkArgs` replaces every one of them.
@@ -615,7 +668,7 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
         // call was written in.
         val solved = inDecl(f.name)(
           solve(shown, f.tparams, f.params.map(_.typ), provisional.map(_.ty), f.retType, expected,
-            args.map(isLiteral)))
+            args.map(isLiteral), f.bounds))
         checkBounds(f, solved)
         (instantiateFunc(f, solved), Some(provisional))
 

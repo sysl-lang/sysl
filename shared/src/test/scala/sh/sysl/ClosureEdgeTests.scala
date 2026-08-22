@@ -699,4 +699,115 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "0 0 0\n"
     }
   }
+
+  /** What a generic call can and cannot tell a closure standing at one of its parameters.
+   *
+   * **The rule is that only what a closure TAKES has to be settled first.** A closure's parameters
+   * come from the context and its result comes from its body, so a result the call is still trying
+   * to work out is the ordinary case rather than an obstacle — and it is often the only thing that
+   * knows: in `collect[T, U](xs: []const T, f: T -> U)` nothing but the closure can say what `U` is.
+   * Waiting for it before reading the closure waits forever, and what came out was the closure being
+   * blamed for parameters the declaration had already stated.
+   *
+   * **Both spellings of `12 §6` are tested against each other throughout**, because they were not
+   * being asked the same question: the bare arrow becomes a bounded type parameter and the boxed
+   * `&Fn` is a trait object, and only the first was ever consulted for a signature.
+   */
+  "a generic call tells a closure what it takes" - {
+    "the arrow spelling, with the result settled by another parameter" in {
+      run("""apply[T](x: T, f: T -> T) -> T = f(x)
+            |
+            |print(apply(3, n -> n + 1))
+            |""".stripMargin) shouldBe "4\n"
+    }
+
+    "the boxed spelling, likewise — and this one could not be read at all" in {
+      run("""apply[T](x: T, f: &Fn(T) -> T) -> T = f(x)
+            |
+            |print(apply(3, n -> n + 1))
+            |""".stripMargin) shouldBe "4\n"
+    }
+
+    "a result nothing else settles comes from the body, arrow spelling" in {
+      run("""convert[T, U](x: T, f: T -> U) -> U = f(x)
+            |
+            |print(convert(3, n -> s"<${n}>"))
+            |""".stripMargin) shouldBe "<3>\n"
+    }
+
+    "and boxed" in {
+      run("""convert[T, U](x: T, f: &Fn(T) -> U) -> U = f(x)
+            |
+            |print(convert(3, n -> s"<${n}>"))
+            |""".stripMargin) shouldBe "<3>\n"
+    }
+
+    // The shape the whole thing was found from: a helper of `map`'s signature, where the element
+    // type comes from the collection and the result type comes from nowhere but the closure.
+    "a map-shaped helper needs neither type argument written" in {
+      run("""import sysl.buf.{Buf, buf}
+            |
+            |collect[T, U](xs: []const T, f: T -> U) -> Buf[U]
+            |    var out: Buf[U] = buf()
+            |
+            |    for x in xs
+            |        out.push(f(x))
+            |
+            |    out
+            |end collect
+            |
+            |print(collect([1, 2, 3], n -> n * 10).view()[2])
+            |""".stripMargin) shouldBe "30\n"
+    }
+
+    // The boxed spelling, because **the arrow's cannot take written type arguments at all**: the
+    // desugaring adds a type parameter for the callable, so `convert[int, string]` on the arrow form
+    // is two arguments where three are declared and is refused naming a `$F2` the reader never
+    // wrote. That is a wart of the sugar rather than anything to do with inference, and it is
+    // recorded here because this is where somebody will meet it.
+    "a written type argument is obeyed rather than re-inferred" in {
+      run("""convert[T, U](x: T, f: &Fn(T) -> U) -> U = f(x)
+            |
+            |print(convert[int, string](9, n -> s"{${n}}"))
+            |""".stripMargin) shouldBe "{9}\n"
+    }
+
+    "an annotated parameter is still read" in {
+      run("""convert[T, U](x: T, f: T -> U) -> U = f(x)
+            |
+            |print(convert(3, (n: int) -> n * 2))
+            |""".stripMargin) shouldBe "6\n"
+    }
+
+    // Settling the result elsewhere was the one arrangement that always worked, and it has to go on
+    // working — it is the case that proved the diagnosis.
+    "a result settled by another argument is unchanged" in {
+      run("""seeded[T, U](xs: []const T, seed: U, f: T -> U) -> U = f(xs[0])
+            |
+            |print(seeded([7, 8], "", n -> s"[${n}]"))
+            |""".stripMargin) shouldBe "[7]\n"
+    }
+
+    // **The refusal has to survive**, or the fix has traded a bad message for a wrong program. A
+    // parameter type nothing determines is still a parameter type nothing determines.
+    "a parameter nothing settles is still refused, and against the closure" in {
+      err("""one[T](f: &Fn(T) -> T) -> int = 0
+            |
+            |print(one(n -> n))
+            |""".stripMargin) should include("'n' has no type here")
+    }
+
+    // The arrow spelling refuses the same program **earlier and better**: `T` is left mentioned only
+    // by the synthesized bound, so nothing in the parameters or the result names it and the call is
+    // told that outright rather than through the closure. Asserted rather than smoothed over,
+    // because the two spellings genuinely differ here and a reader meeting one should not be told
+    // the other's message.
+    "the arrow spelling refuses it earlier, naming the parameter rather than the closure" in {
+      err("""one[T](f: T -> T) -> int = 0
+            |
+            |print(one(n -> n))
+            |""".stripMargin) should include(
+        "'T' is in neither the parameters of 'one' nor its result")
+    }
+  }
 }
