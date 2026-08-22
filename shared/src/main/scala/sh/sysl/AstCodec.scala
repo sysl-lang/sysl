@@ -69,7 +69,7 @@ object AstCodec {
    * conflict**, and that is the case the rule above is written for: read dev's number, take the one
    * after it, and do not assume a clean merge means the versions agree.
    */
-  val Version: Int = 43
+  val Version: Int = 44
 
   private val Magic = "sysl-ast"
 
@@ -237,6 +237,8 @@ object AstCodec {
 
     private def lambdaParam(p: LambdaParam): Unit = { pos(p); sref(p.name); opt(p.typ)(typ) }
 
+    private def withField(f: WithField): Unit = { pos(f); sref(f.name); expr(f.value) }
+
     private def selector(s: ImportSelector): Unit = { pos(s); sref(s.name); opt(s.alias)(sref) }
 
     private def rangeBound(r: RangeBound): Unit = {
@@ -304,6 +306,7 @@ object AstCodec {
         case Field(recv, n)          => tok("fld"); expr(recv); sref(n)
         case TypeAttr(recv, a)       => tok("tat"); expr(recv); sref(a)
         case ImplicitMember(n)       => tok("imem"); sref(n)
+        case WithExpr(b, fs)         => tok("with"); expr(b); list(fs)(withField)
         case LayoutOf(what, t)       => tok("lay"); sref(what); typ(t)
         case OffsetOf(t, f)          => tok("off"); typ(t); sref(f)
         case TryExpr(x)              => tok("try"); expr(x)
@@ -692,6 +695,8 @@ object AstCodec {
 
     private def lambdaParam(): LambdaParam = at(LambdaParam(sref(), opt(typ())))
 
+    private def withField(): WithField = at(WithField(sref(), expr()))
+
     private def selector(): ImportSelector = at(ImportSelector(sref(), opt(sref())))
 
     private def rangeBound(): RangeBound = at(RangeBound(expr(), expr(), bool()))
@@ -757,6 +762,7 @@ object AstCodec {
         case "fld"  => Field(expr(), sref())
         case "tat"  => TypeAttr(expr(), sref())
         case "imem" => ImplicitMember(sref())
+        case "with" => WithExpr(expr(), list(withField()))
         case "lay"  => LayoutOf(sref(), typ())
         case "off"  => OffsetOf(typ(), sref())
         case "try"  => TryExpr(expr())
