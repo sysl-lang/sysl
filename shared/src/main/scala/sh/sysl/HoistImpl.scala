@@ -38,7 +38,8 @@ trait HoistImpl extends ImplConformance {
     // `impl` supplying only the write half is supplying exactly what the trait left open. Paired
     // here, before conformance reads a signature, since an unpaired one resolves to nothing.
     val impl = block
-      .copy(traitName = tr.name, methods = pairSetters(block.methods, block.forType.show, tr.methods))
+      .copy(traitName = tr.name,
+            methods = pairSetters(openedResults(tr, block), block.forType.show, tr.methods))
       .setPos(block.pos)
 
     val (ty, target)     = implTarget(impl)
@@ -269,10 +270,72 @@ trait HoistImpl extends ImplConformance {
     if impl.overrides && ty != Type.Unknown then
       overrideChecks += ((outer.label, bound, ty, impl.pos, currentScope))
 
+    // The associated types the block supplies, in its own terms — the same substitution `subject`
+    // is built under, so an argument built out of the block's parameter means one thing per
+    // instantiation and the subject settles which.
+    val assocSubst = abstractSubst(home.tparams, home.bounds, home.tvalues, home.tpacks) ++
+      selfBinding(subject)
+
+    for a <- impl.assocs do
+      at(a.pos) {
+        if !tr.assocs.exists(_.name == a.name) then
+          err(s"trait '${qn(tr.name)}' declares no associated type '${a.name}', so this 'impl' has " +
+            s"nothing to supply — the trait is where one is declared, as 'type ${a.name}: …'")
+        if impl.assocs.count(_.name == a.name) > 1 then
+          err(s"'${a.name}' is supplied twice by this 'impl', and a type has one associated " +
+            s"'${a.name}' — the trait leaves it open once and the implementation fills it once")
+      }
+
+    // **A type implements at most one trait declaring an associated type of any one name.** The
+    // projection is written without its trait — `Box::Item` and never `Box::Seq.Item` — so a second
+    // trait bringing the same name to one type would make every projection of it a thing that cannot
+    // be said. It is refused here, at the block that creates the collision, because that is where a
+    // reader can do something about it; the alternative is the projection failing wherever anybody
+    // writes one, including inside the traits' own declarations.
+    for
+      a               <- tr.assocs
+      ((other, _), _) <- traitImpls.toList.filter((k, _) => k._2 == home.key && k._1 != impl.traitName)
+      d               <- traitDecls.get(other) if d.assocs.exists(_.name == a.name)
+    do
+      at(impl.pos)(err(s"'${home.label}' already implements '${qn(other)}', which declares an " +
+        s"associated type '${a.name}' — and so does '${qn(tr.name)}'. An associated type is named " +
+        s"without its trait, so one type cannot have two of one name"))
+
+    val writtenAssoc =
+      impl.assocs.map(a => a.name -> at(a.pos)(resolveType(a.typ, assocSubst))).toMap
+
+    // Which associated type each `some` result settles, and the member that settles it.
+    val opaqueMembers = opaqueBindings(tr, block)
+
+    // The lowered function each of those becomes. The name is built here rather than read back,
+    // because it is the same name `synthesize` gives the member and the two must not be able to
+    // disagree.
+    val opaqueBind = opaqueMembers.map((aname, m) => aname -> s"${home.symbol}.${m.name}${home.alt}")
+
+    for a <- tr.assocs do
+      if !writtenAssoc.contains(a.name) && !opaqueBind.contains(a.name) then
+        at(impl.pos)(err(s"'${home.label}' does not implement '${qn(tr.name)}': the associated type " +
+          s"'${a.name}' is missing — supply it with 'type ${a.name} = …', or give the member that " +
+          s"produces it the result 'some ${a.bounds.headOption.fold("Trait")(_.show)}' and let the " +
+          "body say what it is"))
+
+    // What the trait asked of the type supplying it, held to here for a written binding. A `some`
+    // one is held to the same bounds once its body has been analyzed, which is the only moment its
+    // type exists (`settleOpaqueResults`).
+    for
+      a  <- tr.assocs
+      ty <- writtenAssoc.get(a.name)
+      b  <- assocBoundsOf(bound, a, subject)
+      if !satisfies(b, ty)
+    do
+      at(impl.assocs.find(_.name == a.name).flatMap(_.pos).orElse(impl.pos))(
+        err(s"trait '${qn(tr.name)}' asks that its associated type '${a.name}' implement " +
+          s"'${showBound(b, ty)}', and ${show(ty)} does not"))
+
     traitImpls((impl.traitName, home.key)) =
       already :+ TraitImpl(impl, written, wkey, home.alt, home.tparams,
         Option.when(home.tparams.nonEmpty && home.bounds.nonEmpty)((home.tparams, home.bounds)),
-        currentScope)
+        currentScope, writtenAssoc, opaqueBind)
 
     // What the trait **requires** is asked of the implementing type here, at the block that makes
     // the promise, rather than at each bound that relies on it. Two reasons, and the second decides
@@ -311,12 +374,67 @@ trait HoistImpl extends ImplConformance {
     val supplied = impl.methods.map(withTraitDefaults(tr, _))
     val lowered  = hoistMemberList(home, supplied ::: inherited, out)
 
+    // Each `some` result becomes a job for the pass that runs once every declaration is in: a body
+    // cannot be analyzed until then, and the block has to be registered before that for the body to
+    // be able to name anything at all.
+    for
+      (aname, fname) <- opaqueBind
+      decl           <- tr.assocs.find(_.name == aname)
+      fd             <- lowered.find(_.name == fname)
+      m              <- opaqueMembers.get(aname)
+      promised       <- m.retType.collect { case SomeType(bs) => bs }
+    do
+      opaqueJobs += OpaqueJob(fname, fd, promised, assocBoundsOf(bound, decl, subject), home.label,
+        DeclParser.sourceName(m.name), aname, currentScope, m.pos)
+
     // A generic block's members are checkable before anything instantiates them, against the bounds
     // the block wrote on its own parameters — the same walk a generic type's members take. An
     // inherited default is left out: it was checked at the trait, against what the trait promises,
     // which is the whole of what its body may assume wherever it is copied to.
     abstractMembers ++= lowered.filter(_.tparams.nonEmpty).filterNot(f => defaultOrigin.contains(f.name))
   }
+
+  /** The block's members with every `some` result replaced by the projection it stands for —
+   * `Self::Body` — and the two ways of writing one that are not this refused by name.
+   *
+   * The rewrite is the whole of the mechanism. Once the result reads `Self::Body`, the member's
+   * signature is the one the trait declared, so conformance compares two identical things and every
+   * later pass resolves an ordinary projection: what `some` bought was not having to write the type,
+   * and it costs nothing after this line.
+   */
+  protected def openedResults(tr: TraitDecl, block: ImplDecl): List[MethodDecl] =
+    block.methods.map { im =>
+      im.retType match
+        case Some(SomeType(bs)) =>
+          at(im.pos) {
+            val shown = s"some ${bs.map(_.show).mkString(" + ")}"
+
+            tr.methods.find(_.name == im.name).flatMap(_.retType) match
+              case Some(AssocType(NamedType(sn, Nil), a)) if sn == selfName && tr.assocs.exists(_.name == a) =>
+                im.copy(retType = Some(AssocType(NamedType(selfName), a).setPos(im.pos))).setPos(im.pos)
+              case Some(other) =>
+                err(s"'$shown' says the trait left this result open for the implementation to " +
+                  s"settle, and '${qn(tr.name)}' declares '${DeclParser.sourceName(im.name)}' " +
+                  s"returning '${other.show}' — which is already the answer, so write it")
+              case None =>
+                err(s"trait '${qn(tr.name)}' declares no ${kind(im)} " +
+                  s"'${DeclParser.sourceName(im.name)}', so there is no associated type for " +
+                  s"'$shown' to settle")
+          }
+        case _ => im
+    }
+
+  /** Which associated type each `some` member settles, read off the **trait's** declaration of that
+   * member. A member whose trait counterpart is not a projection has already been refused above, so
+   * what reaches here is exactly the members that settle one.
+   */
+  protected def opaqueBindings(tr: TraitDecl, block: ImplDecl): Map[String, MethodDecl] =
+    (for
+      im  <- block.methods
+      _   <- im.retType.collect { case s: SomeType => s }
+      tm  <- tr.methods.find(_.name == im.name)
+      ref <- tm.retType.collect { case AssocType(NamedType(sn, Nil), a) if sn == selfName => a }
+    yield ref -> im).toMap
 
   /** One of an `impl` block's methods, carrying whatever defaults the trait declared for it.
    *
@@ -699,6 +817,11 @@ trait HoistImpl extends ImplConformance {
     case f: FnType           => subjectHomes(f.asTrait)
     // A function pointer belongs to no module — its parts may, so they are what is asked.
     case CFnType(ps, r)      => Set(None) ++ (ps :+ r).flatMap(subjectHomes)
+    // A projection's home is its subject's: `T::Item` is written wherever `T` is, and the type it
+    // names belongs to whoever implemented the trait rather than to whoever wrote this.
+    case AssocType(base, _)  => subjectHomes(base)
+    // A `some` result is never an `impl`'s subject — it stands in a member's result.
+    case _: SomeType         => Set(None)
 
   /** A resolution made only to ask where a name lives, which is not the place a name that resolves
    * to nothing is worth reporting from — a scalar and a block's own type parameter both answer

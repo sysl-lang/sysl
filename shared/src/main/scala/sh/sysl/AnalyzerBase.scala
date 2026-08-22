@@ -420,6 +420,13 @@ trait AnalyzerBase extends Scoping {
   protected def resolveBound(b: BoundRef, subst: Map[String, Type]): Type.Bound
   protected def selfBinding(t: Type): Map[String, Type]
   protected def substParams(t: Type, subst: Map[String, Type]): Type
+
+  /** `T::Item` — the associated type of that name, read off the type that supplies it. Declared here
+    * because the tables that answer it are `TraitLookup`'s and the walks that ask are the type
+    * resolver's and the substitution's, which are not built on it.
+    */
+  protected def assocType(subject: Type, member: String): Type
+  protected def assocTypeOpt(subject: Type, member: String): Option[Type]
   protected def withDefaults(
       key: String,
       tparams: List[String],

@@ -91,7 +91,12 @@ trait SignatureVisibility extends TypeResolution {
         // The parameters are read here rather than outside, because a bound on one of them names a
         // trait in the terms of the file that wrote it: `[T: Scale]` under an `import` means the
         // imported trait, and read from anywhere else means nothing at all.
-        val subst = abstractSubst(t.tparams, t.bounds) + (selfName -> abstractSelf)
+        // `Self` carries **this trait** as its bound, which is what lets a member's result be
+        // `Self::Item`: a projection is read off a bound, and the one thing known about `Self` in a
+        // trait's own declaration is that it implements the trait being declared. Everywhere else
+        // `Self` stands in for itself with nothing promised, which is all those places need.
+        val own   = abstractSubst(t.tparams, t.bounds)
+        val subst = own + (selfName -> Type.Abstract(selfName, List(Type.Bound(key, t.tparams.map(own)))))
 
         for m <- t.methods do
           recover(())(at(m.pos) {
@@ -293,6 +298,13 @@ trait SignatureVisibility extends TypeResolution {
     // A function pointer names no declaration of its own, so what a signature can expose through one
     // is what it is called with — the same walk, for the same reason.
     case CFnType(ps, r)      => (ps :+ r).flatMap(namesIn(_, skip))
+    // A projection exposes its **subject**, which is the name a signature actually spells. What the
+    // projection resolves to is chosen by an implementation rather than written here, and is held to
+    // the same rule where that implementation supplies it.
+    case AssocType(base, _)  => namesIn(base, skip)
+    // A `some` result names no declaration: the bound is the trait, whose own reach is checked where
+    // the bound resolves, and the concrete type is the implementation's.
+    case _: SomeType         => Nil
 
   /** The declaration a name in a type position stands for: a struct, an enum, or — behind a memory
    * mode, where a trait object writes one — a trait.

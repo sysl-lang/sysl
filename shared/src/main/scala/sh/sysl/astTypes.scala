@@ -40,6 +40,8 @@ sealed trait TypeRef extends Positioned {
     case ValueArgType(IntLit(v, _))       => v.toString
     case ValueArgType(Ident(n))           => n
     case ValueArgType(_)                  => "…"
+    case AssocType(base, member)          => s"${base.show}::$member"
+    case SomeType(bounds)                 => s"some ${bounds.map(_.show).mkString(" + ")}"
 }
 
 /** A named type, optionally applied to type arguments: `int`, `Box[int]`,
@@ -186,3 +188,31 @@ case class Param(
       */
     byName: Boolean = false,
 ) extends Positioned
+
+/** `T::Body` — the **associated type** a trait declares, read off the type that implements it.
+ *
+ * It is the same `::` an expression writes in `T::Max`, reaching type position: on either side of it
+ * the left is a type and the right is a name that type's declaration does not itself contain, and
+ * what supplies the name is a trait. Which trait is not written, and does not have to be — a type
+ * implements at most one trait declaring an associated type of any given name, and a program with
+ * two is told so where it asks rather than made to disambiguate everywhere it does not have to.
+ *
+ * `base` is a full `TypeRef` rather than a name because the subject may be anything a type
+ * expression can reach: `Self::Body`, `T::Body`, and `Buf[int]::Body` are all the same question
+ * asked of a different subject.
+ */
+case class AssocType(base: TypeRef, member: String) extends TypeRef
+
+/** `some View` — an `impl` member's result, whose concrete type is **inferred from the body** and
+ * whose declared promise is the bound.
+ *
+ * It is not a type and never resolves to one. What it says is that the trait's associated type is
+ * whatever this member turned out to produce, so it stands in exactly one position — the result of a
+ * member of an `impl` block, where the trait declared an associated type in that position — and
+ * `some` is a soft keyword for the reason `sync` and `volatile` are: it is special in front of a
+ * bound and nowhere else.
+ *
+ * `bounds` is what the member promises about a type it does not name. Every one of them is checked
+ * against the type the body actually produced, so the promise is the reader's *and* the compiler's.
+ */
+case class SomeType(bounds: List[BoundRef]) extends TypeRef

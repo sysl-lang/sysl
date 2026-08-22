@@ -195,6 +195,20 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
         |    show(self) -> string
         |    twice(self) -> int = 2
         |""".stripMargin)
+    check("a trait declaring an associated type, and the projection its member returns",
+      """trait Seq
+        |    type Item: Show + Eq
+        |    head(self) -> Self::Item
+        |""".stripMargin)
+    check("an impl supplying an associated type, and one inferring it from a body",
+      """struct Box
+        |    v: int
+        |impl Seq for Box
+        |    type Item = int
+        |    head(self) -> Self::Item = self.v
+        |impl Other for Box
+        |    tail(self) -> some Show = self.v
+        |""".stripMargin)
     check("an impl with its own parameters and trait arguments",
       """struct Box[T]
         |    v: T

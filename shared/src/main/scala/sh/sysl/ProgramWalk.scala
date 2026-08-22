@@ -22,7 +22,7 @@ import scala.collection.mutable
  * `units` — the files being analyzed together — is supplied by the class and declared alongside the
  * other things a walk is told about its compilation (`DeclTables`).
  */
-trait ProgramWalk extends AbstractBodies {
+trait ProgramWalk extends OpaqueResults {
 
   /** The imports a file starts with, before it has written any of its own (`AutoImport`).
    *
@@ -278,6 +278,12 @@ trait ProgramWalk extends AbstractBodies {
     // And whether each block marked `override` has something to override, which waits for the same
     // moment and for the same reason: the block being replaced may be hoisted after it.
     checkOverrides()
+
+    // Every `some` result is settled here — the one pass that reads a body in order to learn a
+    // *type*. It waits for this moment because such a body may name anything the program declares,
+    // and it runs before the pass below because that one, and every body after it, may ask what an
+    // associated type is (`OpaqueResults`).
+    settleOpaqueResults()
 
     // Every generic body is checked once here, against its bounds alone, before any instantiation
     // is looked at. That is what makes `sum[T](a: T, b: T) = a.plus(b)` fail on its own line

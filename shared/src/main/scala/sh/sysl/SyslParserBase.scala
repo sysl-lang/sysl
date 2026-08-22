@@ -343,6 +343,12 @@ trait SyslParserBase extends PackratParsers {
   /** A function's declared result: one type, or several separated by commas (`12 §5b`). */
   protected def resultRef: Parser[TypeRef]
 
+  /** `some Trait` — a result whose concrete type is read off the body. Declared here because a
+   * **property** takes one and properties are read by the declaration grammar, which is a sibling of
+   * the type grammar rather than built on it.
+   */
+  protected def opaqueRef: Parser[TypeRef]
+
   /** `[T, U: Show, V = int]` — the generic parameter list every declaration form reads the same way,
    * and the one bound within it, which a `trait`'s supertrait list also reads.
    */

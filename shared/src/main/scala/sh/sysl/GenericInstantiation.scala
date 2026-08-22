@@ -262,7 +262,7 @@ trait GenericInstantiation extends ConstFolding {
     if subst.isEmpty then t
     else
       t match
-        case a: Type.Abstract => subst.getOrElse(a.name, a)
+        case a: Type.Abstract => subst.getOrElse(a.name, projected(a, subst))
         case n: Type.Named if n.targs.isEmpty => n
         case t: Type.Tuple    => tupleType(t.targs.map(substParams(_, subst)))
         case n: Type.Struct   => instantiateStruct(n.base, n.targs.map(substParams(_, subst)))
@@ -274,6 +274,32 @@ trait GenericInstantiation extends ConstFolding {
         case Type.Slice(elem, ro) => Type.Slice(substParams(elem, subst), ro)
         case Type.CFn(ps, r)      => Type.CFn(ps.map(substParams(_, subst)), substParams(r, subst))
         case other                => other
+
+  /** A **projection** whose subject the substitution moved: `V::Item` with `V` bound to `Buf[int]`
+   * is `Buf[int]::Item`, which the implementation then says is `int`.
+   *
+   * This is the one place that knows a `Type.Abstract`'s name may have parts, and it is what makes
+   * a projection cost no new type. Everything else — comparing two types, mangling one, refusing a
+   * layout for one, caching an instantiation — sees an opaque parameter with an unusual name and
+   * treats it exactly as it treats `T`.
+   *
+   * A subject the substitution does not move is left alone, which covers the ordinary case of a body
+   * being checked at its own definition. And a projection the tables cannot answer is left abstract
+   * rather than reported: the bound that licensed it was checked where it was written, so an
+   * unanswerable one here means an error has already been raised somewhere with a position worth
+   * printing.
+   */
+  private def projected(a: Type.Abstract, subst: Map[String, Type]): Type = {
+    val cut = a.name.lastIndexOf("::")
+
+    if cut < 0 then a
+    else
+      val base   = Type.Abstract(a.name.substring(0, cut), Nil)
+      val member = a.name.substring(cut + 2)
+      val moved  = substParams(base, subst)
+
+      if moved == base then a else assocTypeOpt(moved, member).getOrElse(a)
+  }
 
   /** Instantiates an enum for one set of type arguments. All-dataless variants make a *simple*
    * enum (integer constants, auto-incrementing from an optional explicit `= value`); any
@@ -510,6 +536,13 @@ trait GenericInstantiation extends ConstFolding {
           ps.zip(as).foreach((pr, a) => unify(pr, a, tparams, sub))
           unify(r, ar, tparams, sub)
         case _ => ()
+    // A projection binds nothing, and that is the same rule a trait gets three lines down rather
+    // than a limitation: solving `T` backwards from `T::Item` would need the implementation table
+    // read in reverse, and more than one type can have the same associated type. The subject is
+    // solved from wherever else it appears, and the projection then follows from it.
+    case _: AssocType => ()
+    // A `some` result stands in an `impl` block's member, which nothing calls generically.
+    case _: SomeType  => ()
     // A trait never binds a type parameter. `f[T](p: *T)` handed a `*Writer` would otherwise
     // instantiate at a type with no layout, and the body could then write `var v: T` for a value
     // that cannot exist; leaving it unsolved reports the inference failure instead.

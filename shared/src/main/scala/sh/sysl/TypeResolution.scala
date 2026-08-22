@@ -119,6 +119,9 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
     case f: FnType =>
       f.copy(params = f.params.map(spellSelf(_, selfRef)), ret = spellSelf(f.ret, selfRef))
     case CFnType(params, ret) => CFnType(params.map(spellSelf(_, selfRef)), spellSelf(ret, selfRef))
+    case AssocType(base, m)   => AssocType(spellSelf(base, selfRef), m)
+    // A `some` result names no type, so there is no `Self` in it to spell.
+    case s: SomeType          => s
 
   protected def resolveBound(b: BoundRef, subst: Map[String, Type]): Type.Bound = at(b.pos) {
     val written = b.args.map(resolveType(_, subst))
@@ -546,6 +549,21 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
       err("a value stands here, and this argument is a type — a value argument belongs where the " +
         "declaration wrote 'const', and nowhere else")
 
+    // `T::Item` — the associated type, read off whatever the subject turned out to be. A subject
+    // still standing in for itself leaves the projection abstract, carrying the bounds the trait
+    // declared for it; a concrete one is answered by the implementation that supplies it.
+    case AssocType(base, member) => assocType(resolveType(base, subst), member)
+
+    // A `some` result that reached resolution is one written where the inference behind it has
+    // nothing to read. `resolveShape` is reached from a *type* position, which `coreType` already
+    // refuses one in — so what arrives here is a **result** in the two places a result is not an
+    // `impl` block's member: a free function, and the trait's own declaration.
+    case SomeType(bounds) =>
+      err(s"'some ${bounds.map(_.show).mkString(" + ")}' says the type is read off the body of a " +
+        s"member that supplies a trait's associated type, so it stands only in an 'impl' block — a " +
+        s"trait writes 'type Name: ${bounds.head.show}' among its members and gives the member the " +
+        s"result 'Self::Name'")
+
     case NamedType(n, argRefs) =>
       if argRefs.isEmpty && subst.contains(n) then subst(n)
       else
@@ -723,6 +741,16 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
   ): Unit = {
     val obj = s"'$sigil${Type.qualified(qn(name), args)}'"
 
+    // **An associated type is what erasure spends**, and it is said here rather than left to the
+    // `Self` rule below because the reader did not write a second `Self` to be told about: the
+    // projection in the member's result is a function of the very type an object has forgotten, so
+    // the slot's signature would differ per implementing type. The trait that declared it is named,
+    // which for a required trait is not the one the object was written as.
+    for b <- traitClosure(Type.Bound(name, args)); d <- traitDecls.get(b.name); a <- d.assocs.headOption do
+      err(s"'${qn(b.name)}' declares the associated type '${a.name}', whose meaning is the " +
+        s"implementing type's — an erased value has forgotten which type that is, so there is no " +
+        s"$obj to form. A bound keeps the type and so keeps the answer: write '[T: ${qn(b.name)}]'")
+
     // A trait offers what it requires as well as what it declares, so a required trait that cannot
     // be erased makes the trait that required it unerasable too — and the diagnostic names the one
     // the member came from, which for a required trait is not the one the object was written as.
@@ -790,6 +818,12 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
     case PackType(n)         => names(n)
     case f: FnType           => mentionsAny(f.asTrait, names)
     case CFnType(ps, r)      => ps.exists(mentionsAny(_, names)) || mentionsAny(r, names)
+    // `Self::Body` mentions `Self`, which is the whole reason a trait declaring an associated type
+    // cannot be erased: the type the projection names is a function of the very type an object has
+    // forgotten. `checkObjectSafe` says so in those words before this answer is reached, so that the
+    // reader is told about the associated type rather than about a `Self` they did not spell twice.
+    case AssocType(base, _)  => mentionsAny(base, names)
+    case _: SomeType         => false
 
   /** Which of a trait's own type parameters were given `Self` at this application — the parameters a
    * member may name and so mention the forgotten type without ever spelling it.

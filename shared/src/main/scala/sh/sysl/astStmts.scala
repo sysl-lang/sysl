@@ -831,7 +831,42 @@ case class TraitDecl(
     supers: List[BoundRef] = Nil,
     vis: Visibility = Visibility.Public,
     tdefaults: Map[String, TypeRef] = Map.empty,
-) extends Stmt
+    /** The `type Body: View` lines — the trait's **associated types**, in the order written.
+      *
+      * They are parameters of the trait exactly as `tparams` are, and are kept in a list of their
+      * own for the one thing that separates them: an ordinary argument is written where the trait is
+      * *used*, so it selects between implementations, while one of these is written by the
+      * implementation and is settled by the subject. So they are absent from every arity check, from
+      * every applied argument list, and from the key an implementation is filed under.
+      */
+    assocs: List[AssocDecl] = Nil,
+) extends Stmt {
+
+  /** Every parameter a member's signature may name: the trait's own, then its associated types. The
+    * order is what `implAssoc` substitutes positionally against, and the two lists never overlap —
+    * `checkTraitAssocs` refuses an associated type sharing a parameter's name.
+    */
+  def allParams: List[String] = tparams ::: assocs.map(_.name)
+}
+
+/** `type Body: View` inside a trait — one associated type, and what the type supplying it must
+ * implement.
+ *
+ * The bounds are the whole of what a generic caller may do with the type: a `[V: View]` body reaching
+ * `V::Body` gets something bounded by exactly these and licensed to do exactly what they promise,
+ * which is the same rule a type parameter's bounds already state. Writing none is legal and says the
+ * implementation may supply anything at all.
+ */
+case class AssocDecl(name: String, bounds: List[BoundRef] = Nil) extends Positioned
+
+/** `type Body = Column[Text, Button]` inside an `impl` — one associated type supplied.
+ *
+ * It has an alias's shape and is deliberately not one: an alias declares a second spelling for a type
+ * and this fills in an argument the trait left for the implementation. The grammar is shared because
+ * the two really do say the same thing in the two places — a name, and the type it stands for — and
+ * a reader arriving at either needs no second form to learn.
+ */
+case class AssocBind(name: String, typ: TypeRef) extends Positioned
 
 /** `impl Trait for Type` with indented method **bodies**. Every method the trait declares without a
  * default must be present with a matching signature, and no method the trait does not declare; the
@@ -882,4 +917,9 @@ case class ImplDecl(
       * syntax says which was meant.
       */
     tpacks: Set[String] = Set.empty,
+    /** The `type Body = …` lines — the **associated types this block supplies**, in the order
+      * written. A block that supplies one through a `some` result writes none of these, and the
+      * binding is filled in from the body instead.
+      */
+    assocs: List[AssocBind] = Nil,
 ) extends Stmt

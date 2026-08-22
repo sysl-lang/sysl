@@ -79,7 +79,8 @@ class GrammarTests extends AnyFreeSpec with Matchers {
     * with the site's copy and turned this half of the reconciliation red on dev; the words are soft
     * keywords in fact, so the list is what was wrong.
     */
-  private val soft = Set("is", "not", "invariant", "new", "within", "where", "opaque", "deriving")
+  private val soft =
+    Set("is", "not", "invariant", "new", "within", "where", "with", "opaque", "deriving")
 
   "the highlighting grammar" - {
 
