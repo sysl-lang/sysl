@@ -138,8 +138,7 @@ trait ImplConformance extends MemberLowering {
       err(s"method '$name' of 'impl $traitName for $forType' takes a different receiver than " +
         "the trait declares")
     // A member of an `impl` is the trait's member supplied, so its shape is the trait's — including
-    // how many types of its own it is generic over. The trait declares none today, which makes this
-    // the diagnostic for writing a generic method in an `impl`.
+    // how many types of its own it is generic over.
     if tm.tparams.length != im.tparams.length then
       err(s"${kind(im)} '$name' of 'impl $traitName for $forType' declares " +
         s"${quantity(im.tparams.length, "type parameter")}, but trait '$traitName' declares " +
@@ -154,19 +153,33 @@ trait ImplConformance extends MemberLowering {
         s"${if im.variadic then "takes" else "does not take"} a '...', but trait '$traitName' " +
         s"declares ${if tm.variadic then "one" else "none"}")
 
+    // **A member's own type parameters stand for one another across the two signatures, by
+    // position.** The trait's `map[U]` and the block's `map[V]` are the same promise — the letters
+    // are each file's own, and what corresponds is the order they were declared in. So one set of
+    // stand-ins is built from the trait's declaration and *both* sides are resolved against it, the
+    // block's under its own spelling. `Type.Abstract` is identified by its name, so a parameter
+    // renamed this way compares equal to the one it stands for, which is exactly what the two
+    // signatures have to agree about.
+    //
+    // Resolving without them reported the member's own parameters as unknown types — a message
+    // about the trait, in a walk the trait had nothing wrong with.
+    val stand    = abstractSubst(tm.tparams, tm.bounds, tm.tvalues, tm.tpacks)
+    val traitOwn = self ++ stand
+    val implOwn  = self ++ im.tparams.zip(tm.tparams.map(stand)).toMap
+
     // The two signatures were written in two files — the trait's and the block's — so each side is
     // resolved where it was written, under that file's module and its imports. A `Point` in the
     // trait's `-> Point` is the trait module's `Point`, whether or not the implementing module has
     // one of its own.
     for (tp, ip) <- tm.params.zip(im.params) do
-      val want = inScope(traitScope)(resolveType(tp.typ, self))
-      val got  = resolveType(ip.typ, self)
+      val want = inScope(traitScope)(resolveType(tp.typ, traitOwn))
+      val got  = resolveType(ip.typ, implOwn)
       if want != got then
         err(s"parameter '${ip.name}' of method '$name' is ${show(got)}, but trait '$traitName' " +
           s"declares ${show(want)}")
 
-    val want = inScope(traitScope)(tm.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit))
-    val got  = im.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
+    val want = inScope(traitScope)(tm.retType.map(resolveReturn(_, traitOwn)).getOrElse(Type.Unit))
+    val got  = im.retType.map(resolveReturn(_, implOwn)).getOrElse(Type.Unit)
     if want != got then
       err(s"method '$name' returns ${show(got)}, but trait '$traitName' declares ${show(want)}")
   }

@@ -566,4 +566,182 @@ class GenericMethodRunTests extends AnyFreeSpec with RunSupport with CodegenSupp
       out.linesIterator.count(_.contains("requires its type parameter")) shouldBe 1
     }
   }
+
+  /** A member that declares type parameters of its own, required by a **trait**.
+   *
+   * No table slot can hold one — it is not a function until a call names its types — but that is a
+   * fact about the member, not about the trait it sits in. So the member is left out of the table,
+   * the object still forms and dispatches everything else, and what is refused is the one call the
+   * table cannot carry. A bound reaches it, because there the type is known.
+   */
+  "a trait may require a member with type parameters of its own" - {
+
+    "an implementation supplies it and a call reaches it" in {
+      run(
+        """trait Applies[T]
+          |    apply[U](self, f: &Fn(T) -> U) -> U
+          |struct Holder
+          |    v: int
+          |impl Applies[int] for Holder
+          |    apply[U](self, f: &Fn(int) -> U) -> U = f(self.v)
+          |print(Holder(3).apply(n -> n + 1))""".stripMargin,
+      ) shouldBe "4\n"
+    }
+
+    "the implementation may spell the parameter with its own letter" in {
+      run(
+        """trait Applies[T]
+          |    apply[U](self, f: &Fn(T) -> U) -> U
+          |struct Holder
+          |    v: int
+          |impl Applies[int] for Holder
+          |    apply[V](self, f: &Fn(int) -> V) -> V = f(self.v)
+          |print(Holder(3).apply(n -> s"<${n}>"))""".stripMargin,
+      ) shouldBe "<3>\n"
+    }
+
+    "a bound reaches it, and solves the member's own parameter at the abstract call" in {
+      run(
+        """trait Applies[T]
+          |    apply[U](self, f: &Fn(T) -> U) -> U
+          |struct Holder
+          |    v: int
+          |impl Applies[int] for Holder
+          |    apply[U](self, f: &Fn(int) -> U) -> U = f(self.v)
+          |twice[S: Applies[int]](s: S) -> int = s.apply(n -> n * 2)
+          |print(twice(Holder(21)))""".stripMargin,
+      ) shouldBe "42\n"
+    }
+
+    "one bound body serves two instantiations of the member" in {
+      run(
+        """trait Applies[T]
+          |    apply[U](self, f: &Fn(T) -> U) -> U
+          |struct Holder
+          |    v: int
+          |impl Applies[int] for Holder
+          |    apply[U](self, f: &Fn(int) -> U) -> U = f(self.v)
+          |shown[S: Applies[int]](s: S) -> string = s.apply(n -> s"<${n}>")
+          |doubled[S: Applies[int]](s: S) -> int = s.apply(n -> n * 2)
+          |print(shown(Holder(3)), doubled(Holder(3)))""".stripMargin,
+      ) shouldBe "<3> 6\n"
+    }
+
+    /** The whole point of the card: a `map` on a built-in slice, which needs a trait because a
+      * slice has no inherent members, and needs this because `map`'s result type is the call's.
+      */
+    "a map on a plain slice, which is what none of this was possible without" in {
+      run(
+        """import sysl.buf.{Buf, buf}
+          |trait Sequence[T]
+          |    map[U](self, f: &Fn(T) -> U) -> []U
+          |impl[A] Sequence[A] for []const A
+          |    map[U](self, f: &Fn(A) -> U) -> []U
+          |        var b: Buf[U] = buf()
+          |        for i in 0..<self.len
+          |            b.push(f(self[i]))
+          |        b.view()
+          |val a = [1, 2, 3]
+          |val doubled = a[..].map(n -> n * 2)
+          |val shown = a[..].map(n -> s"<${n}>")
+          |print(doubled[0], doubled[2])
+          |print(shown[0], shown[2])""".stripMargin,
+      ) shouldBe "2 6\n<1> <3>\n"
+    }
+  }
+
+  "the trait keeps its object, and the member is what is left out of the table" - {
+
+    "the object forms, and its other members dispatch" in {
+      run(
+        """trait Applies[T]
+          |    describe(self) -> string
+          |    apply[U](self, f: &Fn(T) -> U) -> U
+          |struct Holder
+          |    v: int
+          |impl Applies[int] for Holder
+          |    describe(self) -> string = "holder"
+          |    apply[U](self, f: &Fn(int) -> U) -> U = f(self.v)
+          |val o: &Applies[int] = Holder(3)
+          |print(o.describe())""".stripMargin,
+      ) shouldBe "holder\n"
+    }
+
+    "the slot the table did not hold is the one refused, and it says which" in {
+      val out = err(
+        """trait Applies[T]
+          |    describe(self) -> string
+          |    apply[U](self, f: &Fn(T) -> U) -> U
+          |struct Holder
+          |    v: int
+          |impl Applies[int] for Holder
+          |    describe(self) -> string = "holder"
+          |    apply[U](self, f: &Fn(int) -> U) -> U = f(self.v)
+          |val o: &Applies[int] = Holder(3)
+          |print(o.apply(n -> n + 1))""".stripMargin,
+      )
+
+      out should include("'apply' of 'Applies' declares type parameters of its own")
+      out should include("reach it through a bound")
+    }
+
+    /** A bound licenses every member and an object reaches only its table, so the two lists have to
+      * be the same for an object to stand at one. This is the one case where they are not.
+      */
+    "an object does not stand at a bound on a trait with such a member" in {
+      val out = err(
+        """trait Applies[T]
+          |    apply[U](self, f: &Fn(T) -> U) -> U
+          |struct Holder
+          |    v: int
+          |impl Applies[int] for Holder
+          |    apply[U](self, f: &Fn(int) -> U) -> U = f(self.v)
+          |twice[S: Applies[int]](s: S) -> int = s.apply(n -> n * 2)
+          |val o: &Applies[int] = Holder(21)
+          |print(twice(o))""".stripMargin,
+      )
+
+      out should include("a bound promises every member")
+      out should include("'apply' declares type parameters of its own")
+    }
+
+    "a trait with no such member keeps standing at its own bound" in {
+      run(
+        """trait Named
+          |    describe(self) -> string
+          |struct Holder
+          |    v: int
+          |impl Named for Holder
+          |    describe(self) -> string = "holder"
+          |tell[S: Named](s: S) -> string = s.describe()
+          |val o: &Named = Holder(3)
+          |print(tell(o))""".stripMargin,
+      ) shouldBe "holder\n"
+    }
+  }
+
+  "and the shape still has to match the trait's" - {
+
+    "an implementation declaring no parameter of its own where the trait declares one" in {
+      err(
+        """trait Applies[T]
+          |    apply[U](self, f: &Fn(T) -> U) -> U
+          |struct Holder
+          |    v: int
+          |impl Applies[int] for Holder
+          |    apply(self, f: &Fn(int) -> int) -> int = f(self.v)""".stripMargin,
+      ) should include("declares 0 type parameters, but trait 'Applies' declares 1")
+    }
+
+    "an implementation whose signature disagrees once the parameters are lined up" in {
+      err(
+        """trait Applies[T]
+          |    apply[U](self, f: &Fn(T) -> U) -> U
+          |struct Holder
+          |    v: int
+          |impl Applies[int] for Holder
+          |    apply[U](self, f: &Fn(int) -> U) -> int = 0""".stripMargin,
+      ) should include("but trait 'Applies' declares")
+    }
+  }
 }

@@ -95,8 +95,15 @@ trait SignatureVisibility extends TypeResolution {
 
         for m <- t.methods do
           recover(())(at(m.pos) {
-            for p <- m.params do resolveType(p.typ, subst)
-            m.retType.foreach(resolveReturn(_, subst))
+            // A member's **own** parameters stand beside the trait's, exactly as they do on an
+            // inherent member: the trait declares what the type is generic over and the member
+            // declares what a call to it is, and its signature may name either. Resolving under the
+            // trait's alone reported the member's as unknown types, which read as a mistake in the
+            // trait rather than as a scope this walk had not been given.
+            val here = subst ++ abstractSubst(m.tparams, m.bounds, m.tvalues, m.tpacks)
+
+            for p <- m.params do resolveType(p.typ, here)
+            m.retType.foreach(resolveReturn(_, here))
             // And the rules about where a `va_list` may stand, which an implementation would meet
             // when its member is lowered — a promise nothing keeps has no lowering to meet them at.
             // The receiver stands in the list because it is a parameter once the member is lowered,

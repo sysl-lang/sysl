@@ -506,6 +506,27 @@ trait TraitLookup extends MemberVisibility {
   protected def traitMembers(b: Type.Bound, self: Map[String, Type] = Map.empty): List[(Type.Bound, MethodDecl)] =
     traitClosure(b, self).flatMap(sb => traitDecls.get(sb.name).toList.flatMap(_.methods.map((sb, _))))
 
+  /** The members a **table** lays out, which is every member but the ones no slot can hold.
+   *
+   * A member that declares type parameters of its own is not a function until a call names them, so
+   * there is nothing for a slot to point at. That is a fact about the member and not about the
+   * trait: `Sequence`'s `filter` dispatches perfectly well beside a `map` that cannot, so the object
+   * still forms and what is refused is the call (`MethodCalls.callTraitObject`).
+   *
+   * **Everything that builds a table or indexes one reads it from here**, because a slot number is
+   * a position in this list and two callers disagreeing about which members are in it is a call
+   * dispatching to the wrong function. An `impl` still has to supply the member — conformance asks
+   * `traitMembers`, which is the whole list.
+   */
+  protected def slottedMembers(b: Type.Bound, self: Map[String, Type] = Map.empty): List[(Type.Bound, MethodDecl)] =
+    traitMembers(b, self).filter(_._2.tparams.isEmpty)
+
+  /** Whether a trait has a member no table can hold, which is what stops an **object** standing at a
+   * bound on it: the members a bound licenses would then be more than the table can reach.
+   */
+  protected def hasUnslottedMember(b: Type.Bound): Boolean =
+    traitMembers(b).exists(_._2.tparams.nonEmpty)
+
   /** Whether a type implements a trait, which is the one question a bound asks.
    *
    * There are three ways to answer yes and they are not interchangeable. A **user** type opts in
@@ -548,18 +569,24 @@ trait TraitLookup extends MemberVisibility {
    * licenses are exactly the members the table lays out — the two lists are `traitMembers` read
    * twice, which is what makes this an identity rather than a coincidence.
    *
-   * **It is total, and that is a property of sysl's object safety rather than of this rule.** A trait
-   * with a member that cannot be dispatched has no object at all, so a `&Shape` existing is already
-   * the proof that every member of `Shape` is reachable through it. There is no partial case to
-   * exclude here, and none of the "this method is unavailable on the object" apparatus a language
-   * with per-member object safety needs.
+   * **It was total, and it is not any more — a trait may now hold a member no table can.** The rule
+   * this identity rests on is that what a bound licenses and what a table lays out are the same list;
+   * a member declaring type parameters of its own is in the first and not the second, so an object
+   * standing at such a bound would license a call with no slot to dispatch it. The bound is therefore
+   * refused for exactly those traits, which is narrower than it sounds: a trait whose members are all
+   * slottable is unaffected, and that is every trait that could be written before this existed.
+   *
+   * The alternative — letting the object stand at the bound and refusing the call inside the body —
+   * cannot work, because the body is walked once against the *parameter* and never learns that this
+   * instantiation was an object.
    *
    * The required traits come for free from the same closure the table is laid out from, so a bound on
    * a trait the object's own trait requires needs no rule of its own (`02 § Requiring another
    * trait`).
    */
   protected def erasedSatisfies(tr: Type.Bound, t: Type): Boolean =
-    Type.erasedTrait(t).exists(o => traitClosure(Type.Bound(o.name, o.args), selfBinding(t)).exists(_.key == tr.key))
+    !hasUnslottedMember(tr) &&
+      Type.erasedTrait(t).exists(o => traitClosure(Type.Bound(o.name, o.args), selfBinding(t)).exists(_.key == tr.key))
 
   /** The same question about a trait that takes no arguments, which is every trait the compiler
    * knows by name and most of the ones a program declares.
@@ -694,12 +721,26 @@ trait TraitLookup extends MemberVisibility {
           .headOption)
       yield s"the 'impl' that covers it asks '${unmet.show}' of ${show(arg)}, which does not implement it"
 
+    // **An object refused a bound on its own trait**, which without a reason reads as a
+    // contradiction — "'&Applies[int]' does not implement 'Applies[int]'" is a sentence a reader
+    // can only take as a compiler fault. What is true is narrower and is worth spelling: the bound
+    // licenses every member, an object reaches only what its table holds, and one member here is
+    // not in the table. Named first, because when it applies the other two say nothing.
+    val erasedShort =
+      for
+        o <- Type.erasedTrait(t)
+        if traitClosure(Type.Bound(o.name, o.args), selfBinding(t)).exists(_.key == tr.key)
+        m <- traitMembers(tr).find(_._2.tparams.nonEmpty)
+      yield s"a bound promises every member and an erased value reaches only what its table holds, " +
+        s"and '${m._2.name}' declares type parameters of its own, so it has no slot to be reached " +
+        s"through. Call it on the value before erasing it, or take the bound on a type parameter"
+
     // A **tuple** used to get a sentence of its own after these two, saying which arity the library
     // stopped writing rows at and that a product wider than that wants a struct with names. There is
     // no arity to stop at now: the rows are written over a type pack and cover every tuple
     // (`10 §10`), so what is left to say about one is what is said about every other type — which of
     // its parts does not implement the trait, which `unmetCondition` says by name.
-    wrongArgs.headOption.orElse(unmetCondition)
+    erasedShort.orElse(wrongArgs.headOption).orElse(unmetCondition)
 
   /** The same, for a trait that takes no arguments. */
   protected def unmetBound(traitName: String, t: Type): Option[String] =
