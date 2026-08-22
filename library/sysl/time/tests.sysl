@@ -330,3 +330,116 @@ instant_and_duration()
     assert_eq(whole_hours(since(later, t)), 2)
     assert_eq(whole_hours(later - 1.hours - t), 1)
 end instant_and_duration
+
+// -- resolving a wall clock reading against a zone --------------------------------------------------
+//
+// **These need no host and no table, which is the point of `resolve` taking the zone as a function.**
+// The zone below is US Eastern in 2023, written as the two instants at which its clocks moved, and
+// every expected value is a number a reader can check by hand against those two.
+//
+// It is also the axis `guide/datetime` used to own before card 0213 retired it: a reading is usually
+// one instant, sometimes none, and sometimes two. That program spent 8,760 hourly round trips per
+// zone proving it; six transitions' worth of readings prove the same thing, because the answer only
+// ever changes within hours of a transition.
+
+// US Eastern in 2023: `-04:00` between the two moments its clocks moved and `-05:00` outside them.
+// Those moments are 2023-03-12T07:00:00Z and 2023-11-05T06:00:00Z -- the transitions are named in UTC
+// because that is the only reading of them that is not itself ambiguous.
+private eastern_2023(t: Instant) -> Offset
+    val dst_from: long = 1678604400 * us_per_second
+    val dst_until: long = 1699164000 * us_per_second
+
+    if t.us >= dst_from && t.us < dst_until then Offset(-240) else Offset(-300)
+end eastern_2023
+
+// A zone that never moves its clocks, at an offset that is not a whole number of hours.
+private kathmandu(t: Instant) -> Offset = Offset(345)
+
+@test("an ordinary reading resolves to exactly one instant")
+zone_resolves_uniquely()
+    val r = resolve(datetime_at(2023, 6, 15, 12, 0, 0), eastern_2023)
+
+    r match
+        Unique(at) -> assert_eq(at.us, 1686844800 * us_per_second)
+        _ -> assert(false, "a June reading did not resolve to one instant")
+end zone_resolves_uniquely
+
+@test("the hour the clocks go back happens twice, and both instants are answered")
+zone_resolves_ambiguously()
+    val r = resolve(datetime_at(2023, 11, 5, 1, 30, 0), eastern_2023)
+
+    r match
+        Ambiguous(earlier, later) ->
+            // 05:30Z, with the clocks still at -04:00, and 06:30Z with them at -05:00. The host's own
+            // `mktime` answers the second of these and says nothing about the first.
+            assert_eq(earlier.us, 1699162200 * us_per_second)
+            assert_eq(later.us, 1699165800 * us_per_second)
+        _ -> assert(false, "the repeated hour did not resolve to two instants")
+end zone_resolves_ambiguously
+
+@test("the hour the clocks skip never happened, and the offsets either side say so")
+zone_resolves_to_a_gap()
+    val r = resolve(datetime_at(2023, 3, 12, 2, 30, 0), eastern_2023)
+
+    r match
+        Gap(before, after) ->
+            assert_eq(before.minutes, -300)
+            assert_eq(after.minutes, -240)
+        _ -> assert(false, "the skipped hour resolved to an instant")
+end zone_resolves_to_a_gap
+
+@test("a reading either side of a transition is ordinary, however close it is")
+zone_edges_are_unique()
+    // One minute before the clocks go back, and one minute after they finish going back. Both are
+    // inside the day the transition happens and neither is ambiguous.
+    val before = resolve(datetime_at(2023, 11, 5, 0, 59, 0), eastern_2023)
+    val after = resolve(datetime_at(2023, 11, 5, 2, 0, 0), eastern_2023)
+
+    before match
+        Unique(at) -> assert_eq(at.us, (1699164000 - 3660) * us_per_second)
+        _ -> assert(false, "00:59 was not unique")
+
+    after match
+        Unique(at) -> assert_eq(at.us, (1699164000 + 3600) * us_per_second)
+        _ -> assert(false, "02:00 was not unique")
+end zone_edges_are_unique
+
+@test("a zone that never moves its clocks answers every reading exactly once")
+zone_without_transitions()
+    val ldt = datetime_at(2026, 3, 12, 2, 30, 0)
+
+    resolve(ldt, kathmandu) match
+        // Round-tripped rather than compared against a constant, because what is being asserted is
+        // that a fixed zone is total -- the arithmetic of +05:45 is `at_offset`'s business and is
+        // asserted there.
+        Unique(at) -> assert(at_offset(at, Offset(345)) == ldt)
+        _ -> assert(false, "a zone with no transitions did not resolve uniquely")
+end zone_without_transitions
+
+// Every half hour for three hours either side of a transition, which is the only stretch where the
+// answer can be anything but `Unique` -- so a sweep of the whole year would assert the same three
+// facts 17,500 times over.
+private assert_round_trips(x: long)
+    var t = Instant(x - 3 * us_per_hour)
+
+    while t.us <= x + 3 * us_per_hour
+        // The reading a clock in that zone was showing at `t`. Resolving it must find `t` again --
+        // as the only answer, or as one of the two where the clocks had gone back. It can never be a
+        // gap, because a reading taken *from* an instant is one a clock did show.
+        val ldt = at_offset(t, eastern_2023(t))
+
+        val found = resolve(ldt, eastern_2023) match
+            Unique(at) -> at == t
+            Ambiguous(earlier, later) -> earlier == t || later == t
+            Gap(before, after) -> false
+
+        assert(found, "an instant did not survive its own wall clock reading")
+
+        t = t + 30.minutes
+end assert_round_trips
+
+@test("an instant near a transition survives the round trip through its own wall clock reading")
+zone_round_trips()
+    assert_round_trips(1678604400 * us_per_second)
+    assert_round_trips(1699164000 * us_per_second)
+end zone_round_trips

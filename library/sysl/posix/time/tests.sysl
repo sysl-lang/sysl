@@ -2,7 +2,7 @@ module sysl.posix.time
 @requires(posix)
 @tests
 
-import sysl.time.since
+import sysl.time.{Resolution, parse_timestamp, since}
 
 // What `sysl.posix.time` claims, asserted in sysl.
 //
@@ -103,3 +103,57 @@ wall_clock_advances()
     assert(elapsed.us > 0, "the wall clock did not move over two million rounds")
     assert(work != 0)
 end wall_clock_advances
+
+// -- the host's zone --------------------------------------------------------------------------------
+//
+// **Nothing here may assume which zone the machine is set to**, since this tree is compiled and run
+// on the development machine and again on CI's Linux runner, and `TZ` may be anything or unset. So
+// every assertion below is an invariant that holds in every zone -- which is the stronger kind
+// anyway: a test asserting `-05:00` would pass in one place and fail in the next without either
+// being wrong.
+
+@test("the host's offset from UTC is one a zone could actually have")
+local_offset_is_plausible()
+    val m = local_offset(now()).minutes
+
+    // -12:00 to +14:00 is the whole range the database uses. A shim answering seconds rather than
+    // minutes lands far outside it, and so does one reading an uninitialized `struct tm`.
+    assert(m >= -720, "the host is set more than twelve hours behind UTC")
+    assert(m <= 840, "the host is set more than fourteen hours ahead of UTC")
+end local_offset_is_plausible
+
+@test("the host's own wall clock reading resolves back to the instant it came from")
+local_round_trips()
+    val t = now()
+
+    // A reading taken *from* an instant is one the clocks did show, so a gap is unreachable here and
+    // asserting so is what would catch a `resolve` that had the two candidates backwards.
+    from_local(local(t)) match
+        Unique(at) -> assert(at == t, "the host's reading resolved to a different instant")
+        Ambiguous(earlier, later) ->
+            assert(earlier == t || later == t, "neither instant of the repeated hour was the original")
+        Gap(before, after) -> assert(false, "an instant produced a reading no clock ever showed")
+end local_round_trips
+
+@test("a local timestamp is read back as the instant it was written from")
+local_text_round_trips()
+    val t = now()
+
+    // Through the renderer and the parser, which is the pair a program actually uses -- and the one
+    // place the offset this module computes has to agree with the offset `timestamp_text` writes.
+    parse_timestamp(local_text(t)) match
+        Ok(back) -> assert(back == t, "a local timestamp did not read back as itself")
+        Err(e) -> assert(false, f"a local timestamp would not parse: $e%s")
+end local_text_round_trips
+
+@test("the offset is a property of the instant, not of when it was asked")
+local_offset_is_stable()
+    val t = now()
+
+    val a = local_offset(t)
+    val work = churn(100000)
+    val b = local_offset(t)
+
+    assert(a == b, "the same instant gave two different offsets")
+    assert(work != 0)
+end local_offset_is_stable

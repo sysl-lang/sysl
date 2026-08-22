@@ -1,0 +1,59 @@
+module sysl.posix.time
+@requires(posix)
+
+import sysl.time.{Instant, LocalDateTime, Offset, Resolution, at_offset, resolve, timestamp_text}
+
+// The zone the host is set to, which is the one zone a program can ask about without a table.
+//
+// **`sysl.time` deliberately holds no zone database and this file does not give it one.** What it
+// gives is the *host's own* zone, which the operating system already knows and keeps up to date --
+// so a program that wants to print the time where it is running no longer has to write an `Offset`
+// into its source and no longer goes wrong when the clocks move.
+//
+// ## What this can answer and what it cannot
+//
+// It can answer for **the host's zone at any instant**, historically: `tm_gmtoff` reports the offset
+// that was in force then, read out of the host's own data, so a date from a year whose rules differed
+// is answered correctly.
+//
+// It cannot answer for **any other zone**. That is a property of POSIX rather than a decision here:
+// `tzalloc`, `localtime_rz` and `mktime_z` -- the calls that would take a zone as an argument -- are a
+// NetBSD extension that neither macOS nor glibc has, so the only portable way to name a different
+// zone is to set `TZ` in the process environment and call `tzset`, which is global state and not
+// thread-safe. A named zone therefore needs the IANA database read and parsed, which is a different
+// piece of work with a filesystem in it.
+//
+// ## Why the reverse direction has a type and the forward one does not
+//
+// An instant is one wall clock reading, always. A wall clock reading is one instant, *usually* -- and
+// none of them where a zone skipped that hour, and two of them where it repeated it. So `local` is
+// an ordinary function and `from_local` answers a `Resolution`.
+//
+// **The host will not tell you which of the three happened**, which is why the decision is made in
+// sysl out of the offset lookup rather than handed to `mktime`: given the repeated reading `mktime`
+// answers the second occurrence and says nothing, and given the skipped one it rewrites the caller's
+// fields and answers a time that was not asked for.
+
+private[sysl] extern "sysl_posix_time_local_offset_min" c_local_offset_min(us: long) -> int
+
+// How far the host's clocks were set from UTC at that instant.
+//
+// It takes an instant rather than answering "the current offset" because those are different
+// questions wherever a zone moves its clocks, and the one a caller almost always wants is this one:
+// the offset that applied to *the timestamp being rendered*, not the one that applies now.
+local_offset(t: Instant) -> Offset = Offset(c_local_offset_min(t.us))
+
+// An instant as the host's own clocks were showing it.
+local(t: Instant) -> LocalDateTime = at_offset(t, local_offset(t))
+
+// An instant as a timestamp in the host's zone: `2026-08-22T13:26:04-04:00`.
+//
+// The offset is written out rather than an abbreviation like `EDT`, and that is RFC 3339's choice
+// rather than a shortcut: an abbreviation is ambiguous across zones -- `CST` is three different
+// offsets -- so a timestamp carrying one cannot be read back reliably, and `parse_timestamp` reads
+// what this writes.
+local_text(t: Instant) -> string = timestamp_text(t, local_offset(t))
+
+// A wall clock reading in the host's zone, resolved to the instant or instants it names -- or to
+// neither, where the clocks skipped it.
+from_local(ldt: LocalDateTime) -> Resolution = resolve(ldt, t -> local_offset(t))

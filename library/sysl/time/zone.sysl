@@ -1,0 +1,88 @@
+module sysl.time
+
+// Resolving a wall clock reading against a zone whose clocks move, which is the one conversion here
+// that can fail and the one that can succeed twice.
+//
+// **What is still not in this module is the zone itself**, and `quantity.sysl`'s header says why: a
+// table of named zones is a data-distribution problem, either shipped and left to go stale or read
+// from the host and thereby needing a filesystem. Nothing below holds one. What is here is the
+// *arithmetic* of resolution, which needs no table at all -- only something that can be asked what a
+// zone's offset was at a given instant.
+
+// What a wall clock reading turns out to name, once a zone has been asked.
+//
+// **A reading is usually one instant, sometimes none, and sometimes two.** That is a property of
+// zones rather than a shortcoming here: where a zone sets its clocks forward, the hour it skips never
+// happens, and where it sets them back, the hour it repeats happens twice. Every date-time library
+// either says so in a return type or picks one silently, and the host's own answer is the silent
+// kind -- `mktime` given the repeated reading answers the second occurrence and reports nothing, and
+// given the skipped one it rewrites the caller's fields and answers a time nobody asked for.
+//
+// `Gap` carries the offsets either side of the transition rather than an instant, because there is no
+// instant to carry. What to do about it is a policy question -- push the reading forward by the size
+// of the gap, clamp it to the transition, or refuse it -- and `from_offset(ldt, before)` is the first
+// of those, which is the one most libraries choose.
+enum Resolution
+    Unique(at: Instant)
+    Ambiguous(earlier: Instant, later: Instant)
+    Gap(before: Offset, after: Offset)
+
+// The rendering, so that a resolution can be reported without matching on it.
+impl Display for Resolution
+    display(self, out: *Writer, fmt: FormatSpec)
+        var text = self match
+            Unique(at) -> instant_text(at)
+            Ambiguous(earlier, later) ->
+                f"${instant_text(earlier)}%s or ${instant_text(later)}%s"
+            Gap(before, after) ->
+                f"no such time: the clocks went from ${offset_text(before)}%s to ${offset_text(after)}%s"
+
+        display_str(text, out, fmt)
+    end display
+end Resolution
+
+// A wall clock reading resolved against a zone, where a zone is anything able to say what its offset
+// was at a given instant.
+//
+// **The zone arrives as a function rather than as a type**, which is what keeps this file free of a
+// capability. The whole of what resolution needs to know about a zone is that one question, and a
+// host reading `localtime_r`, a package talking to an RTC chip and a table written out by hand can
+// all answer it. `sysl.posix.time.from_local` is the host's answer wired to this.
+//
+// ## How it decides, and the one assumption in it
+//
+// A reading taken as though the offset were zero is within fourteen hours of the instant it names,
+// because that is the widest any zone is ever set from UTC. So the offsets a day either side of that
+// guess bracket every transition that could bear on the answer, and there are at most two of them to
+// try.
+//
+// Each candidate is applied and then **checked against itself**: an offset that is still in force at
+// the instant it produces is a real answer, and one that is not is the reading being read with an
+// offset nobody's clock was showing. One survivor is `Unique`, two is `Ambiguous`, and none is `Gap`
+// -- the reading fell in the hour the clocks skipped, so no offset can produce it.
+//
+// **The assumption is that a zone does not change its offset twice inside forty-eight hours.** No
+// zone in the IANA database ever has. One that did would be resolved against the wrong pair of
+// offsets rather than diagnosed, which is worth writing down because nothing here could detect it.
+resolve(ldt: LocalDateTime, offset_at: Instant -> Offset) -> Resolution
+    val guess = wall_us(ldt)
+    val before = offset_at(Instant(guess - us_per_day))
+    val after = offset_at(Instant(guess + us_per_day))
+
+    // The common case, and it is most of the year: no transition anywhere near the reading, so the
+    // two candidates are one candidate and it cannot fail to reproduce itself.
+    if before == after then return Unique(from_offset(ldt, before))
+
+    val a = from_offset(ldt, before)
+    val b = from_offset(ldt, after)
+    val a_ok = offset_at(a) == before
+    val b_ok = offset_at(b) == after
+
+    if a_ok && b_ok then
+        // Ordered by the timeline rather than by which offset was in force first, so that `earlier`
+        // means what it says whichever way the clocks went.
+        if a < b then Ambiguous(a, b) else Ambiguous(b, a)
+    else if a_ok then Unique(a)
+    else if b_ok then Unique(b)
+    else Gap(before, after)
+end resolve
