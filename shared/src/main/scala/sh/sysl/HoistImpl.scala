@@ -301,15 +301,16 @@ trait HoistImpl extends ImplConformance {
         s"associated type '${a.name}' — and so does '${qn(tr.name)}'. An associated type is named " +
         s"without its trait, so one type cannot have two of one name"))
 
-    val bound_ = bound
     val writtenAssoc =
       impl.assocs.map(a => a.name -> at(a.pos)(resolveType(a.typ, assocSubst))).toMap
 
-    // Which associated type each `some` result settles, and the lowered function whose body settles
-    // it. The name is built here rather than read back, because it is the same name `synthesize`
-    // gives the member and the two must not be able to disagree.
-    val opaqueBind = opaqueBindings(tr, block).map((aname, m) =>
-      aname -> s"${home.symbol}.${m.name}${home.alt}")
+    // Which associated type each `some` result settles, and the member that settles it.
+    val opaqueMembers = opaqueBindings(tr, block)
+
+    // The lowered function each of those becomes. The name is built here rather than read back,
+    // because it is the same name `synthesize` gives the member and the two must not be able to
+    // disagree.
+    val opaqueBind = opaqueMembers.map((aname, m) => aname -> s"${home.symbol}.${m.name}${home.alt}")
 
     for a <- tr.assocs do
       if !writtenAssoc.contains(a.name) && !opaqueBind.contains(a.name) then
@@ -324,7 +325,7 @@ trait HoistImpl extends ImplConformance {
     for
       a  <- tr.assocs
       ty <- writtenAssoc.get(a.name)
-      b  <- assocBoundsOf(bound_, a, subject)
+      b  <- assocBoundsOf(bound, a, subject)
       if !satisfies(b, ty)
     do
       at(impl.assocs.find(_.name == a.name).flatMap(_.pos).orElse(impl.pos))(
@@ -380,10 +381,10 @@ trait HoistImpl extends ImplConformance {
       (aname, fname) <- opaqueBind
       decl           <- tr.assocs.find(_.name == aname)
       fd             <- lowered.find(_.name == fname)
-      m              <- opaqueBindings(tr, block).get(aname)
+      m              <- opaqueMembers.get(aname)
       promised       <- m.retType.collect { case SomeType(bs) => bs }
     do
-      opaqueJobs += OpaqueJob(fname, fd, promised, assocBoundsOf(bound_, decl, subject), home.label,
+      opaqueJobs += OpaqueJob(fname, fd, promised, assocBoundsOf(bound, decl, subject), home.label,
         DeclParser.sourceName(m.name), aname, currentScope, m.pos)
 
     // A generic block's members are checkable before anything instantiates them, against the bounds

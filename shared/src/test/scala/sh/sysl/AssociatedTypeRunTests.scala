@@ -241,6 +241,34 @@ class AssociatedTypeRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
+  "`some` is a contextual word and nothing more" in {
+    val src =
+      """val some = 41
+        |some_thing(some: int) -> int = some + 1
+        |print(some, some_thing(1))""".stripMargin
+
+    run(src) shouldBe "41 2\n"
+  }
+
+  "the type an implementation chooses may be one nobody else can name" in {
+    val src = render +
+      """trait Seq
+        |    type Item: Render
+        |    head(self) -> Self::Item
+        |private struct Hidden
+        |    s: string
+        |impl Render for Hidden
+        |    render(self) -> string = self.s
+        |struct Box
+        |    v: int
+        |impl Seq for Box
+        |    head(self) -> some Render = Hidden("h")
+        |first[S: Seq](s: S) -> string = s.head().render()
+        |print(first(Box(1)))""".stripMargin
+
+    run(src) shouldBe "h\n"
+  }
+
   "the trait may take its own parameters beside an associated one" in {
     val src = render +
       """trait Tagged[K]

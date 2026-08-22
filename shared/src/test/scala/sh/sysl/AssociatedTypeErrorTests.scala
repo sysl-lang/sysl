@@ -151,6 +151,42 @@ class AssociatedTypeErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("promises 'some Render' and its body yields int, which does not implement 'Render'")
     }
 
+    "two paths yielding two types settle nothing, and the ordinary arm rule says so" in {
+      err(
+        render +
+          """trait Seq
+            |    type Item: Render
+            |    head(self) -> Self::Item
+            |struct A
+            |    n: int
+            |struct B
+            |    n: int
+            |impl Render for A
+            |    render(self) -> string = "a"
+            |impl Render for B
+            |    render(self) -> string = "b"
+            |struct Box
+            |    flag: bool
+            |impl Seq for Box
+            |    head(self) -> some Render = if self.flag then A(1) else B(2)
+            |print(1)""".stripMargin,
+      ) should include("if branches have different types: A and B")
+    }
+
+    "a result read off a body that reads it back is a loop, and is named as one" in {
+      err(
+        render +
+          """trait Seq
+            |    type Item: Render
+            |    head(self) -> Self::Item
+            |struct Box
+            |    v: int
+            |impl Seq for Box
+            |    head(self) -> some Render = self.head()
+            |print(1)""".stripMargin,
+      ) should include("a 'some' result cannot depend on itself")
+    }
+
     "and the one the trait asked for, which is a different promise" in {
       err(
         """trait Render
