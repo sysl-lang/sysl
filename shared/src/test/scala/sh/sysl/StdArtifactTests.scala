@@ -441,6 +441,37 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
       precompiled should contain(s"$option.is_some.usize")
     }
 
+    /** **A closure's name is a counter in the compilation that lowered it, so nothing named after
+      * one may cross a link.** `nm` on the standard module shipped in 0.0.70 said the whole of card
+      * `0229` in two lines:
+      *
+      * {{{
+      *                  U _\$closure4.call
+      * 0000000000053cc0 T _sysl.time\$resolve.\$closure4
+      * }}}
+      *
+      * The artifact defined an instantiation of `resolve` made at a closure and left that closure's
+      * own body undefined. A program linking it declared the instantiation instead of building one,
+      * and the artifact's copy then called a `\$closure4.call` the *program* had defined for a
+      * closure of its own — a different environment under a different body, and a wrong answer with
+      * nothing to say so.
+      *
+      * Both halves are asserted because they failed for different reasons. The undefined body is
+      * `Compiler.compileLibrary` filing it by module, where a closure's key begins with the module
+      * separator and reads as the root module's; the advertised instantiation is a symbol whose name
+      * only the unit that lowered the closure can mean anything by.
+      */
+    "and it neither advertises a symbol named after a closure nor leaves one to the linker" in {
+      // Non-vacuous by the last line: the library does lower closures of its own — `from_local` is
+      // `resolve(ldt, local_offset)`, and a named function at a bare-arrow parameter is wrapped in
+      // one like any other — so there is something here for the first two lines to be about.
+      precompiled.filter(Closures.mentioned) shouldBe empty
+      declares(artifact._1).filter(Closures.mentioned) shouldBe empty
+      external(artifact._1).filter(Closures.mentioned) shouldBe empty
+
+      defines(artifact._1).filter(Closures.mentioned) should not be empty
+    }
+
     "and the library carries no entry point of its own to collide with a program's" in {
       artifact._1 should not include "define i32 @main("
     }
@@ -559,6 +590,56 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
       deleteFile(obj)
       deleteFile(exe)
       ran shouldBe Right((0, "1\ntwo\n3.5\ntrue\n"))
+    }
+
+    /** Card `0229`, and it is the behavioural end of the structural claim above.
+      *
+      * `resolve` takes its zone as a bare-arrow parameter, so a call fixes that parameter at the
+      * caller's closure and monomorphizes a `resolve` for it. The library makes one of those for
+      * itself — `sysl.posix.time.from_local` is `resolve(ldt, local_offset)`, and a named function
+      * at a bare-arrow parameter is wrapped in a closure like any other — and used to **advertise**
+      * it. A program with a closure of its own then declared the library's instantiation rather than
+      * building one, and the two closures had the same compiler-made name, so the artifact's body
+      * called the program's. The reading came back a different wrong instant on every run.
+      *
+      * **This is the seam `StdSelfTests` structurally cannot reach**, and that is why it is here
+      * rather than in `library/sysl/time/tests.sysl` — which has a `resolve`-with-a-closure test that
+      * passed throughout, because the library's own tests compile the library from source into the
+      * program and never cross the artifact boundary at all.
+      *
+      * A fixed offset resolves to one instant, so the answer is arithmetic rather than a table:
+      * 01:30 at -05:00 is 06:30 Z.
+      */
+    "and a capturing closure it passes into the library reaches the library's body and not another" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      // The capture is what makes the closure a struct with a field in it, which is what made the
+      // wrong body read something: a closure capturing nothing came out right by having nothing to
+      // get wrong.
+      val program =
+        """import sysl.time.{Instant, Offset, datetime_at, resolve}
+          |
+          |val mins = 0 - 300
+          |
+          |print(resolve(datetime_at(2023, 11, 5, 1, 30, 0), t -> Offset(mins)))
+          |""".stripMargin
+
+      val obj = createTempFile("sysl-std-", ".o")
+      val exe = createTempFile("sysl-std-", "")
+
+      Toolchain.compileObject(artifact._1, obj, Target.default) match
+        case Left(err) => fail(s"the standard module library did not assemble: $err")
+        case Right(_)  => ()
+
+      val ran = Toolchain.build(linked(program), exe, Target.default, List(obj)).map { _ =>
+        val r = exec(List(exe))
+
+        (r.exitCode, r.stdout)
+      }
+
+      deleteFile(obj)
+      deleteFile(exe)
+      ran shouldBe Right((0, "2023-11-05 06:30 Z\n"))
     }
 
     /* A library's object half is one `.o` named on the link line, and a named object is linked
