@@ -60,6 +60,13 @@ trait ArgumentBinding extends TraitLookup {
    * parameter that is neither is told so here rather than left to a complaint about a node the
    * reader never wrote.
    *
+   * **What a callable's closure calls its parameters is NOT decided here**, and cannot be: the
+   * reading is asked of the type as written, and the most likely spelling of a callable parameter —
+   * the bare arrow — has already become a bounded type parameter that carries no arity at all. So
+   * the closure is marked `implicitParams` and `Closures.analyzeLambda` names it from the expected
+   * signature, where the arity has arrived: `it` for the one parameter, nothing for none, and a
+   * refusal naming the closure literal for two or more.
+   *
    * It runs **after** [[thunked]] and not before, which is what keeps a by-name parameter from
    * being wrapped twice: a by-name parameter's type is `Fn() -> T`, so a block at one is a closure
    * by the rule below, and a thunk around that closure would be a second one. [[thunked]] skips a
@@ -82,7 +89,8 @@ trait ArgumentBinding extends TraitLookup {
           "parameter its position gives it, exactly as an argument written in the parentheses does")
 
       case Some((_, Some(BlockReading.Collection))) => ArrayLit(b.body.map(line)).setPos(b.pos)
-      case Some((_, Some(BlockReading.Callable)))   => Lambda(Nil, b.body).setPos(b.pos)
+      case Some((_, Some(BlockReading.Callable)))   =>
+        Lambda(Nil, b.body, implicitParams = true).setPos(b.pos)
 
       case Some((p, None)) =>
         err(s"a trailing block stands at '${p.name}', which is a '${p.typ.show}' — a block fills a " +

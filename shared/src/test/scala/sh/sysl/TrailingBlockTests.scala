@@ -429,4 +429,205 @@ class TrailingBlockTests extends AnyFreeSpec with ParseSupport with RunSupport w
                   |""".stripMargin) should not be empty
     }
   }
+
+  /** The one value a block is passed has a name, and the name is `it` (`0209`).
+    *
+    * A block wrote no parameter list, so the arity it stands at is what names it — which is the
+    * whole of the feature and is why every test here is a *run* rather than a tree: what is being
+    * checked is that the value arrives, not that a parameter appeared.
+    *
+    * **The section is mostly about `it` being ORDINARY.** It is not reserved and it is not magic: it
+    * shadows, it is shadowed, an inner block's hides an outer block's, and a nested closure captures
+    * it as it would capture any parameter. Each of those is a rule that already held for a written
+    * parameter, and each is pinned here because a reader meeting an implicit name has no way to know
+    * which of them it obeys.
+    */
+  "the one value a block is passed is 'it'" - {
+
+    "a block at a one-parameter callable binds it" in {
+      run("""on_change(f: &Fn(int) -> unit) = f(42)
+            |
+            |on_change:
+            |    print(it)
+            |""".stripMargin) shouldBe "42\n"
+    }
+
+    "and the block is still a body, so it is what the lines are written against" in {
+      run("""apply(f: &Fn(int) -> int) -> int = f(6)
+            |
+            |val n = apply:
+            |    val k = it + 1
+            |    k * k
+            |
+            |print(n)
+            |""".stripMargin) shouldBe "49\n"
+    }
+
+    // The bare arrow is the likeliest spelling of a callable parameter and is the one that is no
+    // longer written by the time argument binding reads it: `MemberLowering.callBounds` has already
+    // turned it into a bounded type parameter carrying no arity at all. So the name cannot be given
+    // there, and this is the test that says the arity reaches the place that can.
+    "including a parameter written as a bare arrow, whose arity binding cannot see" in {
+      run("""each(xs: []int, f: int -> unit)
+            |    for i in 0..<xs.len
+            |        f(xs[i])
+            |
+            |each([1, 2, 3]):
+            |    print(it * 10)
+            |""".stripMargin) shouldBe "10\n20\n30\n"
+    }
+
+    "a block that has no use for the value simply never writes it" in {
+      run("""on_change(f: &Fn(int) -> unit) = f(42)
+            |
+            |on_change:
+            |    print("changed")
+            |""".stripMargin) shouldBe "changed\n"
+    }
+
+    "a zero-arity callable binds nothing, so 'it' there is whatever the scope already had" in {
+      run("""later(f: &Fn() -> unit) = f()
+            |
+            |val it = 7
+            |
+            |later:
+            |    print(it)
+            |""".stripMargin) shouldBe "7\n"
+    }
+
+    "the block's own binding shadows it, as it would shadow a written parameter" in {
+      run("""apply(f: &Fn(int) -> int) -> int = f(6)
+            |
+            |val n = apply:
+            |    val it = 100
+            |    it + 1
+            |
+            |print(n)
+            |""".stripMargin) shouldBe "101\n"
+    }
+
+    "and it shadows an outer name of its own" in {
+      run("""apply(f: &Fn(int) -> int) -> int = f(6)
+            |
+            |val it = 100
+            |
+            |val n = apply:
+            |    it + 1
+            |
+            |print(n)
+            |""".stripMargin) shouldBe "7\n"
+    }
+
+    "an inner block's hides an outer block's" in {
+      run("""outer(f: &Fn(int) -> int) -> int = f(1)
+            |inner(f: &Fn(int) -> int) -> int = f(2)
+            |
+            |val n = outer:
+            |    inner:
+            |        it * 10
+            |
+            |print(n)
+            |""".stripMargin) shouldBe "20\n"
+    }
+
+    // The outer block's `it` is a parameter of the outer closure, so the inner one reaches it by
+    // capture — which is the ordinary rule and needs nothing of its own, but is the case a reader
+    // would most reasonably doubt.
+    "and a zero-arity block inside a one-arity block still reads the outer one's" in {
+      run("""outer(f: &Fn(int) -> int) -> int = f(6)
+            |later(f: &Fn() -> unit) = f()
+            |
+            |val n = outer:
+            |    later:
+            |        print(it)
+            |
+            |    it * 2
+            |
+            |print(n)
+            |""".stripMargin) shouldBe "6\n12\n"
+    }
+
+    "a closure literal written inside the block captures it" in {
+      run("""apply(f: &Fn(int) -> int) -> int = f(6)
+            |twice(g: &Fn(int) -> int) -> int = g(1) + g(2)
+            |
+            |val n = apply:
+            |    twice((k) -> k * it)
+            |
+            |print(n)
+            |""".stripMargin) shouldBe "18\n"
+    }
+
+    "it reaches a method's parameter, which is where a widget's handler is" in {
+      run("""struct Field
+            |    tag: int
+            |
+            |    on_change(self, f: &Fn(int) -> unit) = f(self.tag * 2)
+            |end Field
+            |
+            |val fld = Field(21)
+            |
+            |fld.on_change:
+            |    print(it)
+            |""".stripMargin) shouldBe "42\n"
+    }
+
+    // `0171`'s rule is that the reading is decided by the parameter, and the collection reading must
+    // not learn a name from this: a block at `[]T` is a list of its lines and nothing in it is a
+    // parameter of anything.
+    "a collection's block binds nothing, so 'it' there is an undefined name" in {
+      err("""total(xs: []int) -> int = xs[0]
+            |
+            |val n = total:
+            |    it
+            |
+            |print(n)
+            |""".stripMargin) should include("undefined name 'it'")
+    }
+
+    // A block has one name to give and no way to give two, so this is where the form stops. The
+    // sentence has to say that rather than count parameters the reader did not write.
+    "two or more is refused by name, and the closure literal is what it points at" in {
+      val msg = err("""on_drag(f: &Fn(int, int) -> unit) = f(1, 2)
+                      |
+                      |on_drag:
+                      |    print(it)
+                      |""".stripMargin)
+
+      msg should include("binds the one value it is passed as 'it'")
+      msg should include("being used as takes 2")
+      msg should include("'(a, b) -> …'")
+    }
+
+    // The library's own one-parameter callables are trait members taking `&Fn(T) -> U`, which is
+    // the shape a widget's handler has and the shape the card was surveying for. A block reaching
+    // one through a generic member is the case with the most machinery between the written type and
+    // the arity, so it is the one worth a test against the real library rather than a local
+    // declaration.
+    "a block reaches the standard library's own callables" in {
+      run("""import sysl.seq.Sequence
+            |
+            |val xs = [1, 2, 3, 4]
+            |
+            |val evens = xs[..].filter:
+            |    it % 2 == 0
+            |
+            |print(evens)
+            |
+            |val doubled = xs[..].map:
+            |    it * 2
+            |
+            |print(doubled)
+            |""".stripMargin) shouldBe "[2, 4]\n[2, 4, 6, 8]\n"
+    }
+
+    // The other half of that: a closure the reader *did* write parameters for still gets the
+    // message that counts them, because there the count is something they chose.
+    "while a written closure's arity is still refused by counting it" in {
+      err("""on_drag(f: &Fn(int, int) -> unit) = f(1, 2)
+            |
+            |on_drag((a) -> print(a))
+            |""".stripMargin) should include("this closure takes 1 parameter, and what it is being used as takes 2")
+    }
+  }
 }
