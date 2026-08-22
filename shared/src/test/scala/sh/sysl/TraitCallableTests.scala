@@ -144,6 +144,28 @@ class TraitCallableTests extends AnyFreeSpec with RunSupport with CodegenSupport
     }
   }
 
+  /** The shape a library reaches for immediately: one implementation answering by handing its
+    * callable to another's. `sysl.seq`'s `Buf` half is ten lines of exactly this, so whether the
+    * module can drop the boxed spelling at all turns on it.
+    *
+    * What makes it a question is that the parameter's type is by then the *bound* type parameter
+    * rather than a callable type — so passing it on asks whether a value known only by its bound
+    * satisfies the same bound at the next call.
+    */
+  "one implementation may hand its callable to another" in {
+    run("""trait Applies
+          |    apply(self, f: int -> int) -> int
+          |struct N
+          |    v: int
+          |struct M
+          |    inner: N
+          |impl Applies for N
+          |    apply(self, f: int -> int) -> int = f(self.v)
+          |impl Applies for M
+          |    apply(self, f: int -> int) -> int = self.inner.apply(f)
+          |print(M(N(20)).apply(n -> n + 1))""".stripMargin) shouldBe "21\n"
+  }
+
   /** A default body may take one too — it is an ordinary member of the trait, and the lowered
     * function carries the trait's parameters and the member's own together.
     */

@@ -4,17 +4,19 @@ import org.scalatest.freespec.AnyFreeSpec
 
 /** What a call into `sysl.seq` costs, pinned where it can be read: in the emitted code.
  *
- * The trait's members take their callable as `&Fn(…)`, which is a counted box — so the closure a
- * caller writes is allocated at the call, once per call, whichever member it is and before any
- * element is touched. **This suite exists to keep that honest.** The module's own prose said the
- * opposite when it was first written, and nothing would have caught it: every answer is correct
- * either way, and a test that only checks answers cannot tell a boxed callable from an inlined one.
+ * The trait's members take their callable by **bare arrow**, which is a bounded type parameter
+ * (`12 §6`) — so a closure handed to one is a type argument, monomorphized into a copy of the member
+ * and called directly. Nothing is boxed, and the seven members that build no sequence therefore
+ * reach the allocator not at all.
  *
- * A parameter written with a bare arrow monomorphizes instead and is called directly with nothing
- * boxed (`12 §6`), but a trait's member may not write one — the desugaring that turns an arrow into
- * a bound runs for a type's members and an `impl` block's and never for a trait's. **Card `0230` is
- * that gap, and when it closes these assertions are what should flip**, which is why they are
- * written as counts rather than as "at least one".
+ * **This suite exists to keep that honest**, and it has already earned its place twice. The module's
+ * prose first claimed there was no allocation when every call boxed its closure; it then claimed two
+ * allocations for a fold that made one. Nothing else would have caught either: every answer is
+ * correct whichever spelling the parameter uses, and a test that checks answers cannot tell an
+ * inlined callable from a boxed one.
+ *
+ * The counts are written as counts rather than as "at least one" for the same reason — the pair below
+ * is what says the difference is the *spelling* and not the module.
  */
 class SeqAllocationTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
@@ -29,16 +31,13 @@ class SeqAllocationTests extends AnyFreeSpec with RunSupport with CodegenSupport
       |print(xs[..].fold(0, (a, n) -> a + n))
       |""".stripMargin
 
-  "a callable handed to one of these is boxed at the call" - {
+  "a callable handed to one of these is not boxed" - {
 
-    "folding a slice allocates, though it builds no sequence" in {
-      allocations(folding) should be > 0
+    "folding a slice allocates nothing, exactly as the loop it replaces does not" in {
+      allocations(folding) shouldBe 0
     }
 
-    /** The comparison that says it is the **callable** and not the fold: the same walk written as a
-      * loop allocates nothing at all.
-      */
-    "and the same walk written as a loop does not" in {
+    "and the same walk written as a loop is the comparison that says so" in {
       allocations(
         """val xs = [1, 2, 3]
           |var acc = 0
@@ -51,8 +50,41 @@ class SeqAllocationTests extends AnyFreeSpec with RunSupport with CodegenSupport
       ) shouldBe 0
     }
 
+    /** The boxed spelling written out by hand, which is what these members took before a trait's
+      * member could write an arrow — one `malloc` for the closure, before an element is touched.
+      */
+    "while the spelling it replaced allocates once per call" in {
+      allocations(
+        """trait Folding
+          |    folded(self, init: int, f: &Fn(int, int) -> int) -> int
+          |impl Folding for []const int
+          |    folded(self, init: int, f: &Fn(int, int) -> int) -> int
+          |        var acc = init
+          |        for i in 0..<self.len
+          |            acc = f(acc, self[i])
+          |        acc
+          |val xs = [1, 2, 3]
+          |print(xs[..].folded(0, (a, n) -> a + n))
+          |""".stripMargin,
+      ) shouldBe 1
+    }
+
     "the answer is right either way, which is why only the code can say this" in {
       run(folding) shouldBe "6\n"
+    }
+
+    /** `map` allocates because it builds a sequence, which is inherent and is the one cost the
+      * arrow does not remove — so the module's claim is "three of the ten", not "none".
+      */
+    "and a member that builds a sequence still allocates for the sequence" in {
+      allocations(
+        """import sysl.seq.Sequence
+          |
+          |val xs = [1, 2, 3]
+          |
+          |print(xs[..].map(n -> n * 2))
+          |""".stripMargin,
+      ) should be > 0
     }
   }
 }
