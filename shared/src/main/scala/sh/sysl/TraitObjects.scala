@@ -56,7 +56,7 @@ trait TraitObjects extends TypeResolution {
       // and taking one silently would be putting a pointer to a temporary in a program.
       case (Type.Ptr(_), inner) if conforms(tr.bound, inner) =>
         at(t.pos)(err(s"a ${show(want)} points at a value, so it needs an address — write '&' " +
-          s"in front of the ${show(inner)} to take one"))
+          s"in front of the ${Type.showBare(inner)} to take one"))
 
       // A type that implements the trait at *other* arguments looks unrelated to the fall-through
       // below, and what that would report is two type names with nothing said about why they do not
