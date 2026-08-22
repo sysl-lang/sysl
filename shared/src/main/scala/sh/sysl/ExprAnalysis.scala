@@ -250,7 +250,13 @@ trait ExprAnalysis
    * subtype's base and checked; a value whose base does not agree is a mistake the message names.
    */
   private def constrainedCast(key: String, args: List[Expr]): TExpr =
-    castConstrained(resolveConstrained(key), qn(key), args)
+    // An alias's name in call position is the base's name in call position — `Tick(n)` where `Tick`
+    // is a second spelling for `u32` is the `u32(n)` a reader would otherwise write, with nothing
+    // checked on the way in because there is no constraint to check. `convertAt` is the same
+    // dispatch a type in hand goes through, so a base that is an enum or a subtype gets its own
+    // form rather than a scalar conversion.
+    if plainAlias(key) then convertAt(resolveAlias(key), qn(key), args)
+    else castConstrained(resolveConstrained(key), qn(key), args)
 
   /** `T(x)` — a conversion whose target is a type in hand rather than a name that was written out.
    *

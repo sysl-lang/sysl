@@ -176,4 +176,136 @@ class TypeAliasTests extends AnyFreeSpec with CodegenSupport with RunSupport {
             |""".stripMargin) shouldBe "0 150\n"
     }
   }
+
+  /** The paths that reach a declared type by its KEY rather than by resolving a type expression —
+    * a cast, an attribute, a variant selection. Each is a place a constrained subtype answers for
+    * itself, so each is a place an alias has to hand the question on to what it names.
+    */
+  "the edges" - {
+    "a cast through the alias is the base's cast" in {
+      run("""type Tick = u32
+            |
+            |val n = 300
+            |
+            |print(str(Tick(n)))
+            |""".stripMargin) shouldBe "300\n"
+    }
+
+    // An integer answers `Min` and `Max`, and says so about `First`/`Last`, which name the ends of
+    // a declared sequence. Both halves are asserted, because an alias having no attributes of its
+    // own is only useful if the base's refusals arrive as well as the base's answers.
+    "an attribute through the alias is the base's attribute" in {
+      run("""type Tick = u8
+            |
+            |print(str(Tick::Min), str(Tick::Max))
+            |""".stripMargin) shouldBe "0 255\n"
+    }
+
+    "and so is the base's refusal of one it does not have" in {
+      err("""type Tick = u8
+            |
+            |print(str(Tick::First))
+            |""".stripMargin) should include("'Tick' is an integer, not a declared sequence")
+    }
+
+    "an alias over a struct has no attributes, and is told so about the struct" in {
+      err("""struct Point
+            |    x: int
+            |end Point
+            |
+            |type P = Point
+            |
+            |print(str(P::Max))
+            |""".stripMargin) should include("has no type attributes")
+    }
+
+    // A variant is named bare and takes the enum from the expected type, so this asks whether the
+    // alias carries that expectation — and whether the enum's own attributes arrive under it.
+    "an enum's variant is inferred from an alias in the expected position" in {
+      run("""enum Colour
+            |    Red
+            |    Green
+            |    Blue
+            |end Colour
+            |
+            |type C = Colour
+            |
+            |val c: C = Green
+            |
+            |print(C::Image(c), str(C::Pos(C::Last)))
+            |""".stripMargin) shouldBe "Green 2\n"
+    }
+
+    "an alias stands as a type argument" in {
+      run("""type Count = int
+            |
+            |val xs: [3]Count = [1, 2, 3]
+            |val o: Option[Count] = Some(4)
+            |
+            |print(xs[2] + o.unwrap())
+            |""".stripMargin) shouldBe "7\n"
+    }
+
+    "an alias names an array type, which no constrained subtype may" in {
+      run("""type Triple = [3]int
+            |
+            |var t: Triple = [1, 2, 3]
+            |
+            |print(t[0] + t[1] + t[2])
+            |""".stripMargin) shouldBe "6\n"
+    }
+
+    "an alias names a generic instantiation" in {
+      run("""type MaybeInt = Option[int]
+            |
+            |val m: MaybeInt = Some(9)
+            |
+            |print(m.unwrap())
+            |""".stripMargin) shouldBe "9\n"
+    }
+
+    // A method is declared in the struct's own body, and a trait is implemented for the struct. The
+    // alias is a spelling, so a value written at it reaches both with nothing declared twice.
+    "a method and a trait implementation are reached through the alias" in {
+      run("""struct Point
+            |    x: int
+            |    y: int
+            |
+            |    sum(self) -> int = self.x + self.y
+            |end Point
+            |
+            |trait Shown
+            |    shown(self) -> string
+            |end Shown
+            |
+            |impl Shown for Point
+            |    shown(self) -> string = str(self.x) + "," + str(self.y)
+            |end Point
+            |
+            |type P = Point
+            |
+            |val p: P = P(4, 5)
+            |
+            |print(p.sum(), p.shown())
+            |""".stripMargin) shouldBe "9 4,5\n"
+    }
+
+    // `Tick.f` selects a member from a type's NAME, which an alias has and a base scalar does not.
+    // The complaint has to be the base's, not the "add a 'within' range" the shared table would
+    // otherwise produce — that would tell a reader to repair a declaration that is already correct.
+    "a member selected from the alias's name complains as the base does" in {
+      err("""type Tick = u32
+            |
+            |print(str(Tick.nope))
+            |""".stripMargin) should not include "has no constraint"
+    }
+
+    "and a range is not something an alias over an integer has" in {
+      err("""type Tick = u32
+            |
+            |for t in Tick::Range
+            |    print(str(t))
+            |""".stripMargin) should include("no attribute 'Range'")
+    }
+  }
 }

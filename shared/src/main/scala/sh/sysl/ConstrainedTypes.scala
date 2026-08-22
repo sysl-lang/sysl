@@ -96,16 +96,15 @@ trait ConstrainedTypes extends GenericInstantiation {
           (Some(loV), Some(hiV))
         case None => (None, None)
 
-      // A transparent subtype with neither a range nor a predicate would be a plain alias, which is
-      // not a form this cut accepts; `new` alone is enough, since it still changes the type's identity.
-      //
-      // A measured `c type` is that shape and is admitted, because it is not a decision anybody made
-      // about aliases: a C typedef *is* a second name for one integer, and the alternative — a
-      // `within` covering the whole of the base — would be a range nobody wrote and a check nobody
-      // needs. What `16` deferred was whether a person may write one, and this does not reopen it.
+      // A declaration with neither a range nor a predicate nor `new` is a plain alias, and an alias
+      // declares no subtype — so nothing that wants one should have arrived here with its key.
+      // Every caller either resolves the type expression, which branches on `plainAlias` first, or
+      // reaches a key that `typeKey` has already followed past the alias. This is the backstop for
+      // a route that grows later and forgets to: it says what is wrong rather than building a
+      // `Constrained` with no constraint, which would be a subtype whose value set is everything.
       if lo.isEmpty && d.pred.isEmpty && !d.derived && !d.fromC then
-        err(s"'${qn(key)}' has no constraint — add a 'within' range or a 'where' predicate, or 'new' to " +
-          "make it a distinct type")
+        err(s"'${qn(key)}' is a transparent alias and declares no subtype, so there is nothing here " +
+          "to constrain")
 
       val predFn = if d.pred.isDefined then Some(predKey(key)) else None
       Type.Constrained(key, base, d.derived, lo, hi, d.range.exists(_.exclusiveHi), predFn)

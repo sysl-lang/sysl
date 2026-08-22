@@ -172,7 +172,10 @@ trait ControlFlowExprAnalysis extends ExprSupport {
       iter match
         // `for i in T::Range` iterates a constrained integer subtype's range, `First` through `Last`
         // inclusive — the one place `::Range` is meaningful.
-        case TypeAttr(Ident(tn), "Range") if lookupOpt(tn).isEmpty && typeKey(tn).exists(constrainedDecls.contains) =>
+        // An alias is in the same table and is not one of these: it declares no range, so it falls
+        // through to the ordinary attribute path and is refused there in the base's own words.
+        case TypeAttr(Ident(tn), "Range") if lookupOpt(tn).isEmpty &&
+            typeKey(tn).exists(k => constrainedDecls.contains(k) && !plainAlias(k)) =>
           val c = resolveConstrained(typeKey(tn).get)
           val i = c.base match
             case i: Type.Integer => i

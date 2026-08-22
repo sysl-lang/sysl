@@ -433,6 +433,11 @@ trait MemberExprAnalysis extends ExprSupport {
    * does have is spelled with `::`.
    */
   protected def constrainedMember(key: String, written: String, f: String): Nothing = {
+    // An alias reaches this case because it is declared in the same table, and none of what follows
+    // is about it: it has no range to be asked about and no cast to be told to use. What it has is
+    // whatever the base has, so the complaint is the base's, said about the name that was written.
+    if plainAlias(key) then typeMember(resolveAlias(key), written, f)
+
     val c      = resolveConstrained(key)
     val ranged = Type.underlying(c.base).isInstanceOf[Type.Integer] && c.lo.isDefined
 
@@ -477,7 +482,16 @@ trait MemberExprAnalysis extends ExprSupport {
    * (`09 §2`), which are the two that have questions to answer about their own value sets.
    */
   protected def typeAttr(key: String, attr: String, args: List[Expr]): TExpr =
-    if constrainedDecls.contains(key) then constrainedAttr(resolveConstrained(key), key, attr, args)
+    // An alias has no attributes of its own, because it declares no type — the question belongs to
+    // what it names, and is answered in exactly the words the base's own name would have got. Only
+    // an alias over a base with no key of its own arrives here: one naming a declared type was
+    // followed at `typeKey`, so `key` is already the enum's or the subtype's.
+    if plainAlias(key) then
+      resolveAlias(key) match
+        case i: Type.Integer => integerAttr(i, qn(key), attr, args)
+        case other =>
+          err(s"'${qn(key)}' is an alias for ${show(other)}, which has no type attributes")
+    else if constrainedDecls.contains(key) then constrainedAttr(resolveConstrained(key), key, attr, args)
     else if enumDecls.contains(key) then
       if enumDecls(key).tparams.nonEmpty then
         err(s"'${qn(key)}' is generic, so '${qn(key)}::$attr' has no single enum to read")
