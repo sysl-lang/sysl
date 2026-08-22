@@ -429,6 +429,22 @@ class VariantNamespaceTests extends AnyFreeSpec with RunSupport with CodegenSupp
       run("struct Point\n    x: int\n    y: int\nvar p = Point(1, 2)\nprint(p.y)\n") shouldBe "2\n"
     }
 
+    // The shape `box2d` actually has: the colliding name is a **transparent alias** for a struct
+    // declared elsewhere, not a struct declared here. The question is asked through `followAlias`
+    // exactly as `typeKey` asks it, so the two cannot disagree about which arm claims the call.
+    "and the struct may be reached through an alias, which is the case this came from" in {
+      run("""struct RawSeg
+            |    a: int
+            |    b: int
+            |type Segment = RawSeg
+            |enum Kind
+            |    Circle
+            |    Segment
+            |seg(x: int, y: int) -> Segment = Segment(x, y)
+            |print(seg(3, 4).b)
+            |""".stripMargin) shouldBe "4\n"
+    }
+
     // The question "is there a struct of this name?" is the compiler's own, so it is asked
     // quietly: `typeKey` would report the restriction instead of answering, and a variant call
     // would be refused for naming a struct the program cannot see and did not write.
