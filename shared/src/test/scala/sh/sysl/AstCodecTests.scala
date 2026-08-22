@@ -321,6 +321,11 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     // stores it as itself and has to read it back that way. Nothing else would notice if the codec
     // dropped it: the failure would be a call in the library that had lost an argument.
     check("a trailing block", "var v = g:\n        1\n        2")
+    // A `with` clause carries a field list that is neither an expression nor a statement, so it has
+    // a writer and a reader of its own — and the name it carries is the half a structural comparison
+    // of the values alone would not notice going missing.
+    check("a with clause, chained and with several fields",
+      "var w = s with { bg = 9, pad = 8 } with { fg = 7 }")
     // A loop's clauses are statements at the head of its body, so what has to survive is their
     // *position* as much as their contents — a message on one and none on the other.
     check("a loop carrying an invariant with a message and a variant",

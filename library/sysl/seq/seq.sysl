@@ -1,0 +1,207 @@
+module sysl.seq
+
+import sysl.buf.{Buf, buf, buf_with_capacity}
+
+// What a sequence of values can be asked, in one trait, so that a slice and a `Buf` answer the same
+// names.
+//
+// **This is the surface `sysl.slices` deliberately does not have.** That module asks *where is this
+// value* -- `index_of`, `contains`, `min_index` -- and every one of its questions is answered by
+// comparing elements. This one asks *which of these satisfies this predicate*, and every question is
+// answered by calling something the caller wrote. The two never overlap.
+//
+// **It is a trait rather than a family of free functions because a built-in slice has no members of
+// its own**, and a method on one can only arrive through an `impl`. That is also why it could not be
+// written until a trait's member was allowed to declare type parameters of its own: `map` chooses its
+// result type at the call, so `U` belongs to the member and to nothing else.
+//
+// **The operations are EAGER.** `map` returns a new slice rather than a description of one, and a
+// chain allocates once per stage. The lazy alternative -- an adapter over `Iterate`, evaluated by
+// whatever finally walks it -- needs a type a trait can name without spelling, which sysl does not
+// have yet; and a slice is not an `Iterate` to begin with, since a `for` walks one by address. Swift
+// makes the same trade and opts into laziness explicitly, and that is the shape this leaves room for.
+//
+// **Every one of them allocates, and it is the callable rather than the result that does it.** A
+// parameter written `&Fn(...)` is a counted box, so the closure a caller passes is put on the heap
+// at the call -- one allocation per call, whichever member it is, before any element is touched.
+// `fold` over a slice of three is two allocations and not none.
+//
+// **The spelling that would avoid it is not available here.** A parameter written with a bare arrow
+// -- `f: T -> U` -- becomes a bounded type parameter instead, monomorphized and called directly with
+// nothing boxed (`12 §6`), and that is what `sysl.slices`'s sorts take. A trait's member may not
+// write one: the desugaring that turns an arrow into a bound runs for a type's members and for an
+// `impl` block's, and never for a trait's, so a trait can only ask for the boxed form. Card `0230`
+// is that gap, and closing it makes every member here allocation-free without changing a call site.
+//
+// What is still true, and is what the table below is for, is that **three of the ten allocate for a
+// second reason**: they build a new sequence to hand back. That cost is inherent and would remain.
+trait Sequence[T]
+
+    // -- these answer without building a sequence ----------------------------------------------
+
+    // Every element, in order, passed to something that returns a value carried to the next -- which
+    // is the operation the other six here are special cases of.
+    //
+    // The accumulator's type is the member's own, not the sequence's: summing a slice of names into a
+    // length is as ordinary as summing numbers, and a fold that could only produce an element would
+    // not be a fold.
+    fold[A](self, init: A, f: &Fn(A, T) -> A) -> A
+
+    // Whether any element satisfies the predicate. Stops at the first that does.
+    any(self, p: &Fn(T) -> bool) -> bool
+
+    // Whether every element satisfies it. Stops at the first that does not.
+    //
+    // An empty sequence answers `true`, which is the vacuous truth every language with this operation
+    // agrees on: there is no element to be a counterexample.
+    all(self, p: &Fn(T) -> bool) -> bool
+
+    // The first element satisfying the predicate, or `None`.
+    //
+    // **The element rather than its index**, with `position` beside it for the other question. A
+    // caller that wants to look at what it found should not have to subscript to get it, and one that
+    // wants to write through the sequence needs the index and not a copy.
+    find(self, p: &Fn(T) -> bool) -> Option[T]
+
+    // Where the first element satisfying the predicate is, or `None`.
+    position(self, p: &Fn(T) -> bool) -> Option[usize]
+
+    // How many elements satisfy it.
+    //
+    // **`count_where` and not `count`, which is the name a reader reaches for first.** A type's
+    // fields and its members are one namespace, and `count` is the field four of the library's own
+    // containers hold their length in -- `Buf`, `Map`, `List` and `Deque` alike -- so a member of
+    // that name could not be given to any of them. The label is Swift's, and it says which of the
+    // two questions about a length this one is.
+    count_where(self, p: &Fn(T) -> bool) -> usize
+
+    // Every element, in order, handed to something that returns nothing.
+    //
+    // A `for` loop is what a program reaches for here and this does not replace it. What it is for is
+    // the tail of a chain -- `xs.filter(p).each(print)` -- where dropping out of expression position
+    // to write a loop is what breaks the line up.
+    each(self, f: &Fn(T) -> unit)
+
+    // -- these build a new sequence, and allocate for it as well as for the callable ------------
+
+    // Every element, transformed, in a slice of its own.
+    //
+    // The result type is the member's, chosen by what `f` returns and by nothing about the receiver,
+    // which is what makes this the operation a trait could not carry until now.
+    map[U](self, f: &Fn(T) -> U) -> []U
+
+    // The elements satisfying the predicate, in a slice of their own.
+    filter(self, p: &Fn(T) -> bool) -> []T
+
+    // Every element turned into a sequence, and all of those laid end to end.
+    flat_map[U](self, f: &Fn(T) -> []U) -> []U
+end Sequence
+
+// A slice is what everything else in the library hands back, so it is the implementation that
+// matters: `Buf`'s below is this one reached through `view`.
+//
+// **Written for `[]const E` rather than `[]E`**, which is what makes it reachable on both: `07 § Read-only
+// views` says a `[]T` is accepted wherever a `[]const T` is wanted, so a mutable slice finds these
+// members and a read-only one is not given a member that could write through it. Nothing here writes.
+impl[E] Sequence[E] for []const E
+
+    fold[A](self, init: A, f: &Fn(A, E) -> A) -> A
+        var acc = init
+
+        for i in 0..<self.len
+            acc = f(acc, self[i])
+
+        acc
+
+    any(self, p: &Fn(E) -> bool) -> bool
+        for i in 0..<self.len
+            if p(self[i]) then return true
+
+        false
+
+    all(self, p: &Fn(E) -> bool) -> bool
+        for i in 0..<self.len
+            if !p(self[i]) then return false
+
+        true
+
+    find(self, p: &Fn(E) -> bool) -> Option[E]
+        for i in 0..<self.len
+            if p(self[i]) then return Some(self[i])
+
+        None
+
+    position(self, p: &Fn(E) -> bool) -> Option[usize]
+        for i in 0..<self.len
+            if p(self[i]) then return Some(i)
+
+        None
+
+    count_where(self, p: &Fn(E) -> bool) -> usize
+        var n: usize = 0
+
+        for i in 0..<self.len
+            if p(self[i]) then n += 1
+
+        n
+
+    each(self, f: &Fn(E) -> unit)
+        for i in 0..<self.len
+            f(self[i])
+
+    // The buffer is given the length the answer is known to have, so a map over a long slice grows
+    // once instead of at every doubling. `filter` cannot know its own length in advance and does not
+    // pretend to.
+    map[U](self, f: &Fn(E) -> U) -> []U
+        if self.len == 0 then return []
+
+        var out = buf_with_capacity(self.len, f(self[0]))
+
+        for i in 0..<self.len
+            out.push(f(self[i]))
+
+        out.view()
+    end map
+
+    filter(self, p: &Fn(E) -> bool) -> []E
+        var out: Buf[E] = buf()
+
+        for i in 0..<self.len
+            if p(self[i]) then out.push(self[i])
+
+        out.view()
+
+    flat_map[U](self, f: &Fn(E) -> []U) -> []U
+        var out: Buf[U] = buf()
+
+        for i in 0..<self.len
+            out.extend(f(self[i]))
+
+        out.view()
+
+// A buffer answers every one of these by handing its elements over as a slice, which is what `view`
+// is for and costs nothing -- the slice is the storage rather than a copy of it.
+//
+// **It is written out rather than left to the caller** so that a program holding a `Buf` reads the
+// same as one holding a slice. Without it every call site would carry a `.view()` that says nothing
+// about what it is doing.
+impl[E] Sequence[E] for Buf[E]
+    fold[A](self, init: A, f: &Fn(A, E) -> A) -> A = self.view().fold(init, f)
+
+    any(self, p: &Fn(E) -> bool) -> bool = self.view().any(p)
+
+    all(self, p: &Fn(E) -> bool) -> bool = self.view().all(p)
+
+    find(self, p: &Fn(E) -> bool) -> Option[E] = self.view().find(p)
+
+    position(self, p: &Fn(E) -> bool) -> Option[usize] = self.view().position(p)
+
+    count_where(self, p: &Fn(E) -> bool) -> usize = self.view().count_where(p)
+
+    each(self, f: &Fn(E) -> unit) = self.view().each(f)
+
+    map[U](self, f: &Fn(E) -> U) -> []U = self.view().map(f)
+
+    filter(self, p: &Fn(E) -> bool) -> []E = self.view().filter(p)
+
+    flat_map[U](self, f: &Fn(E) -> []U) -> []U = self.view().flat_map(f)

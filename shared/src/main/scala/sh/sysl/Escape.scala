@@ -293,6 +293,18 @@ private class Escape(program: TProgram) {
      */
     private def arrayRoot(base: TExpr): View = base match
       case TLoad(name, _) if locals(name) => View.of(name)
+      // **Module storage is not this frame's and never dies with it**, so a slice of one views
+      // nothing here: it is static for the whole run, and both answers this pass could otherwise
+      // give are wrong for it. `View.of` would promote storage that is already permanent, and
+      // `View.unnamed` — which is what it fell through to — refused the program outright, with a
+      // sentence offering two explanations (a field of a value, an array passed by value) that are
+      // neither of them true of a module `val`.
+      //
+      // A `static val` table of bytes handed out as a slice is the shape that found this, and it is
+      // the ordinary one: a lookup table declared once and viewed from a function that returns the
+      // view. `TGlobal` is the node precisely because the storage is not a local, so matching it
+      // here is the whole of the question.
+      case _: TGlobal => View.none
       // A `ref` declares no storage, so it is never itself a root — the array it names is whatever
       // its place was rooted at. Without this step the name would answer `unnamed`, and an escape
       // through it would be reported as one with nowhere to promote to rather than moving the array
