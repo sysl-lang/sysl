@@ -599,6 +599,19 @@ class TrailingBlockTests extends AnyFreeSpec with ParseSupport with RunSupport w
       msg should include("'(a, b) -> …'")
     }
 
+    // A **raw** trait object is the one callable spelling a block cannot fill, and the reason is not
+    // about blocks: `*Fn` points at a value the caller owns, and a block is a temporary exactly as
+    // the closure literal beside it is. `TraitObjectErrorTests` has the literal's half of this; what
+    // it means here is that the value has to be named before the call, which is what the advice
+    // says. The counted `&Fn` above is the spelling a handler actually takes.
+    "a raw trait object is the one callable spelling a block cannot fill" in {
+      err("""on_change(f: *Fn(int) -> unit) = f(42)
+            |
+            |on_change:
+            |    print(it)
+            |""".stripMargin) should include("points at a value, so it needs an address")
+    }
+
     // The library's own one-parameter callables are trait members taking `&Fn(T) -> U`, which is
     // the shape a widget's handler has and the shape the card was surveying for. A block reaching
     // one through a generic member is the case with the most machinery between the written type and

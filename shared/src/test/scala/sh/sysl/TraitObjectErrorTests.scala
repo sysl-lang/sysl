@@ -113,6 +113,19 @@ class TraitObjectErrorTests extends AnyFreeSpec with CodegenSupport {
       err(shape + "var s: *Shape = Rect(1, 2)") should include("write '&' in front of the Rect")
     }
 
+    // A closure has no name, so it is described as "a closure" rather than by the serial number the
+    // compiler filed it under — and that description carries an article, which the sentence above
+    // supplies for itself. The advice read "in front of the a closure" until `Type.showBare`.
+    "and the advice reads correctly for a closure, which is described rather than named" in {
+      val msg = err("""take(f: *Fn(int) -> unit) = f(1)
+                      |
+                      |take((n) -> print(n))
+                      |""".stripMargin)
+
+      msg should include("write '&' in front of the closure to take one")
+      msg should not include "the a closure"
+    }
+
     /** An object satisfies a bound on the trait it dispatches through, and on nothing else — the
      * table it carries is what answers the bound, so a trait with no slots in it is not answered.
      * `SupertraitTests` has the other side, where the bound is met.

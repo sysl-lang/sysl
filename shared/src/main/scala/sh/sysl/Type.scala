@@ -1105,4 +1105,21 @@ object Type {
     case n: Named       => qualified(Modules.show(n.base), n.targs)
     case c: Constrained => Modules.show(c.name)
     case other          => friendly.getOrElse(other, canonicalName(other))
+
+  /** [[show]] for a sentence that supplies its own article — "the ${showBare(t)}".
+   *
+   * The one description [[show]] gives that is a **phrase rather than a name** is a closure's, and
+   * it carries an article because everywhere else in a message it stands alone: *"the default for
+   * 'f' is a closure"* reads correctly and *"is closure"* does not. After a `the` it reads *"the a
+   * closure"*, which is how this was found — a closure literal at a `*Fn` parameter was advised to
+   * *"write '&' in front of the a closure"*.
+   *
+   * Dropping the article rather than adding a second description is the fix that stays right as
+   * more phrases arrive: what a sentence with its own `the` wants is the noun, and every name
+   * [[show]] returns is already one.
+   */
+  def showBare(t: Type): String = show(t) match
+    case s if s.startsWith("a ")  => s.drop(2)
+    case s if s.startsWith("an ") => s.drop(3)
+    case s                        => s
 }
