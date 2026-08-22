@@ -314,8 +314,13 @@ trait CallAnalysis extends OperatorCalls {
     // for the same reason.
     val args = bindArgs(s"variant '$name'", Some(ename), vdecl.fields, written)
 
+    // The advice says to drop the parentheses rather than repeating the name, which is what it used
+    // to do: *"write it as 'Segment'"* beside a line already reading `Segment(x, y)` names the
+    // spelling it has just refused, and sends a reader looking for a second one that does not exist
+    // (card `0220`).
     if vdecl.fields.isEmpty && args.nonEmpty then
-      err(s"variant '$name' takes no arguments — write it as '$name'")
+      err(s"variant '$name' carries nothing, so it is written as a name on its own — drop the " +
+        s"parentheses and the ${quantity(args.length, "argument")} inside them")
     if vdecl.fields.nonEmpty && args.isEmpty then
       err(s"variant '$name' carries data — construct it with '$name(…)'")
     if args.length != vdecl.fields.length then

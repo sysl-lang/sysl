@@ -173,8 +173,11 @@ trait PatternAnalysis extends TypeResolution {
       ty match
         case en: Type.Enum =>
           en.variant(name) match
+            // The same advice the construction gives, and it is worded the same way for the same
+            // reason: naming the spelling that was just refused is no advice at all (card `0220`).
             case Some(v) if v.fields.isEmpty =>
-              err(s"variant '$name' takes no arguments — match it as '$name'")
+              err(s"variant '$name' carries nothing, so it is matched as a name on its own — drop " +
+                s"the parentheses and the ${quantity(args.length, "sub-pattern")} inside them")
             case Some(v) =>
               if args.length != v.fields.length then
                 err(s"variant '$name' has ${quantity(v.fields.length, "field")}, " +

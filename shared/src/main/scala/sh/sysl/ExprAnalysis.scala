@@ -614,11 +614,9 @@ trait ExprAnalysis
 
                       externVarsUsed += key
                       TGlobal(externVarDecls(key).symbol, externVarType(key), writable = true)
-                    // A name the block binds further down is a different mistake from one that
-                    // stands for nothing, and the difference is what the reader has to fix.
-                    case None if blockDeclares(name) =>
-                      err(s"'$name' is declared below this, and a name is in scope from where it " +
-                        "is bound onward")
+                    // A name the block binds is a different mistake from one that stands for
+                    // nothing, and the difference is what the reader has to fix.
+                    case None if blockDeclares.contains(name) => notYetBound(name)
                     case None => unresolvedErr(s"undefined name '${qn(name)}'")
 
     case Binary(op @ ("&&" | "||"), l, r) =>
@@ -978,7 +976,28 @@ trait ExprAnalysis
     case Call(TypeAttr(Ident(name), attr), args) if lookupOpt(name).isEmpty && builtinInteger(name).isDefined =>
       integerAttr(builtinInteger(name).get, name, attr, args)
 
-    case Call(Ident(name), args) if lookupOpt(name).isEmpty && variantKey(name).isDefined =>
+    // A bare variant name in call position — `Circle(3)` — with the enum taken from the expected
+    // type, exactly as `Ident` above takes it for a nullary one.
+    //
+    // **A struct of the same name is asked about first**, which is what the guard is for. The two
+    // are in different namespaces — a variant is a value name and a struct is a type name — so a
+    // module may declare both, and only the *call* has to choose between them. It chooses the way a
+    // bare variant is resolved everywhere else: the expected type decides where it names the
+    // variant's enum, and the struct wins where it does not.
+    //
+    // **The asymmetry is the argument, rather than a preference for structs.** A variant always has
+    // the qualified `Enum.Variant` spelling, so standing aside costs it nothing it cannot get back;
+    // a struct constructor is named by the struct's own name and has no second spelling at all. The
+    // arm used to come first unguarded, which left such a struct impossible to construct by any
+    // spelling — found from `box2d`, whose `ShapeKind` names five of the shapes it also declares
+    // (card `0220`).
+    // **The struct is asked about with `structInScope` rather than `typeKey`**, because this is the
+    // compiler asking itself a question rather than resolving a name a file wrote — `typeKey` would
+    // raise on a candidate the site may not name, and would file a module dependency for a
+    // declaration the program never reached.
+    case Call(Ident(name), args)
+        if lookupOpt(name).isEmpty && variantKey(name).isDefined &&
+          (!structInScope(name) || variantEnumExpected(variantKey(name).get, expected).isDefined) =>
       constructVariant(variantKey(name).get, args, expected)
 
     case Call(Ident(name), args) if lookupOpt(name).isEmpty && typeKey(name).exists(structDecls.contains) =>

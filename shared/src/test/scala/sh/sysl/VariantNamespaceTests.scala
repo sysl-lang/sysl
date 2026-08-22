@@ -26,6 +26,18 @@ class VariantNamespaceTests extends AnyFreeSpec with RunSupport with CodegenSupp
       |    Slot(len: int)
       |""".stripMargin
 
+  /** A struct and an enum variant of one name, which is what a call in a module declaring both has
+   * to choose between (card `0220`).
+   */
+  private val both =
+    """struct Segment
+      |    a: int
+      |    b: int
+      |enum Kind
+      |    Circle
+      |    Segment
+      |""".stripMargin
+
   "two enums in one module may share a variant name" - {
     "which was refused outright before" in {
       ir(two + "val s: Shape = Circle(1)\nprint(1)") should include("%enum.Shape")
@@ -362,6 +374,134 @@ class VariantNamespaceTests extends AnyFreeSpec with RunSupport with CodegenSupp
           |end Colour
           |""".stripMargin),
       ("", "main.sysl", "print(1)\n")) should include("variant name 'Red' is already used by a module 'var'")
+  }
+
+  // Card `0220`. A variant is a **value** name and a struct is a **type** name, so one module may
+  // declare both — and only a *call* has to choose between them. It used to choose the variant
+  // outright, which left the struct impossible to construct by any spelling at all: found writing
+  // `box2d`, whose `ShapeKind` names five of the shapes the package also declares as structs.
+  //
+  // The struct wins where the expected type does not name the variant's enum, and the asymmetry is
+  // the argument rather than a preference: a variant keeps `Enum.Variant`, and a struct constructor
+  // has no second spelling.
+  "a struct and a variant of one name are told apart in call position" - {
+    "the struct is constructed by its own name, which was refused outright" in {
+      run(both + "seg(x: int, y: int) -> Segment = Segment(x, y)\nprint(seg(3, 4).b)\n") shouldBe "4\n"
+    }
+
+    "with nothing expected at all, since the variant still has a qualified spelling" in {
+      run(both + "var s = Segment(1, 2)\nprint(s.a)\n") shouldBe "1\n"
+    }
+
+    "while the variant wins wherever the expected type names its enum" in {
+      run(both +
+        """name(k: Kind) -> string
+          |    k match
+          |        Circle -> "circle"
+          |        Segment -> "segment"
+          |val k: Kind = Segment
+          |print(name(k))
+          |""".stripMargin) shouldBe "segment\n"
+    }
+
+    "and at an argument, which supplies the expected type without an annotation" in {
+      run(both +
+        """name(k: Kind) -> string
+          |    k match
+          |        Circle -> "circle"
+          |        Segment -> "segment"
+          |print(name(Segment))
+          |""".stripMargin) shouldBe "segment\n"
+    }
+
+    "the qualified spelling reaches the variant from a call position too" in {
+      run(both +
+        """name(k: Kind) -> string
+          |    k match
+          |        Circle -> "circle"
+          |        Segment -> "segment"
+          |var k = Kind.Segment
+          |print(name(k))
+          |""".stripMargin) shouldBe "segment\n"
+    }
+
+    "and a struct with no same-named variant is unaffected" in {
+      run("struct Point\n    x: int\n    y: int\nvar p = Point(1, 2)\nprint(p.y)\n") shouldBe "2\n"
+    }
+
+    // The question "is there a struct of this name?" is the compiler's own, so it is asked
+    // quietly: `typeKey` would report the restriction instead of answering, and a variant call
+    // would be refused for naming a struct the program cannot see and did not write.
+    "a struct of the same name that is out of reach is not a candidate, and does not refuse" in {
+      runIn(
+        ("shapes", "shapes.sysl",
+          """module shapes
+            |private struct Segment
+            |    a: int
+            |    b: int
+            |enum Kind
+            |    Circle
+            |    Segment
+            |name(k: Kind) -> string
+            |    k match
+            |        Circle -> "circle"
+            |        Segment -> "segment"
+            |""".stripMargin),
+        ("", "main.sysl",
+          """import shapes.*
+            |print(name(Segment))
+            |""".stripMargin)) shouldBe "segment\n"
+    }
+
+    // …and the quiet ask still searches the imports, so one that *is* in reach still wins.
+    "while one that is in reach wins, from another module" in {
+      runIn(
+        ("shapes", "shapes.sysl",
+          """module shapes
+            |struct Segment
+            |    a: int
+            |    b: int
+            |enum Kind
+            |    Circle
+            |    Segment
+            |""".stripMargin),
+        ("", "main.sysl",
+          """import shapes.*
+            |var s = Segment(3, 4)
+            |print(s.b)
+            |""".stripMargin)) shouldBe "4\n"
+    }
+  }
+
+  // The advice used to be "write it as 'Segment'", printed under a line already reading
+  // `Segment(x, y)` — the spelling it had just refused. Card `0220`'s second half.
+  "a nullary variant given arguments is told to drop the parentheses" - {
+    "at a construction" in {
+      val message = err("""enum Kind
+                          |    Circle
+                          |    Flat
+                          |val k: Kind = Circle(1)
+                          |print(1)
+                          |""".stripMargin)
+
+      message should include("'Circle' carries nothing, so it is written as a name on its own")
+      message should include("drop the parentheses and the 1 argument inside them")
+    }
+
+    "and at a pattern" in {
+      val message = err("""enum Kind
+                          |    Circle
+                          |    Flat
+                          |val k: Kind = Circle
+                          |
+                          |k match
+                          |    Circle(r) -> print(r)
+                          |    Flat -> print(0)
+                          |""".stripMargin)
+
+      message should include("'Circle' carries nothing, so it is matched as a name on its own")
+      message should include("drop the parentheses and the 1 sub-pattern inside them")
+    }
   }
 
   "the rule crosses a module boundary intact" in {

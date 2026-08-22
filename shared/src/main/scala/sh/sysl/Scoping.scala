@@ -85,15 +85,42 @@ trait Scoping extends DeclTables {
    * **Every step is filtered by what may be named from here**, the library's included, so that the
    * two spellings of one declaration cannot disagree: a member the library keeps to itself is out
    * of reach whether a program writes it bare or by path.
+   *
+   * **`quiet` turns off the two things this does beyond answering**, and it exists for the question
+   * the compiler asks *itself* rather than on behalf of a name a file wrote. Resolving normally
+   * reports a restriction instead of answering (`reachable` raises), and records a module
+   * dependency (`13 §6`) — both right for a written name and both wrong for "could a name of this
+   * spelling have meant that?". A quiet ask answers `None` where the ordinary one would complain,
+   * and files no edge. `traitInScope` sidesteps the same two by asking the imports directly; this
+   * is the same need where the whole search order is wanted.
+   *
+   * **`inReach` is how a candidate's reach is asked, and it is a parameter because `declAccess` is
+   * keyed by the qualified name alone** — so a key is shared by every namespace that spells it the
+   * same way. That is harmless while only one of them records access, and wrong the moment two do:
+   * an **enum variant** records none and takes its reach from its enum (`09 §3`), so `visible`
+   * asked about a variant's key answers about whatever *type* of that spelling recorded one. A
+   * `private struct Segment` beside a public `Kind.Segment` hid the variant from every other file
+   * and every importer, which is card `0220`'s second half. `variantKey` therefore asks with
+   * `variantVisible`; everything else keeps `visible`, which is what its key means.
    */
-  protected def resolveName(written: String)(declared: String => Boolean): Option[String] = {
+  protected def resolveName(written: String, quiet: Boolean = false,
+                            inReach: String => Boolean = visible)(declared: String => Boolean): Option[String] = {
     val dot = written.lastIndexOf('.')
+
+    // A candidate this file may not name is **reported** rather than passed over, so that resolution
+    // does not quietly fall through to an import or the library and answer with something else: the
+    // name was found, and what is wrong is that it is not for this file to write. Where the caller
+    // only wants an answer — a `quiet` ask — it is simply not a candidate.
+    def reach(key: String): Option[String] =
+      if quiet then Option.when(inReach(key) || contestedNames(key))(key)
+      else if !inReach(key) && !contestedNames(key) then err(s"'${qn(key)}' is ${restriction(key)}")
+      else Some(key)
 
     // A name carrying the module separator is one the compiler built rather than one a file wrote
     // — a synthesized `Self` reference, a default's bound on its own trait — and is already the key
     // it names. Nothing in source can be spelled this way, so passing it through is unambiguous.
     val key =
-      if written.indexOf(Modules.sep.toInt) >= 0 then Option.when(declared(written))(written).map(reachable)
+      if written.indexOf(Modules.sep.toInt) >= 0 then Option.when(declared(written))(written).flatMap(reach)
       else if dot < 0 then
         val own     = Modules.qualify(currentModule, written)
         val library = libraryNames.get(written).filter(declared)
@@ -102,13 +129,13 @@ trait Scoping extends DeclTables {
         // library keeps to itself is not an answer to a program's bare name. Nothing enforced it
         // while the library declared nothing private, which is what let the unqualified spelling
         // and the qualified one disagree about the same declaration.
-        val offered = library.filter(visible)
+        val offered = library.filter(inReach)
 
         // Where nothing answered at all, a candidate passed over for being out of reach is the
         // whole story, and saying which restriction it was beats an undefined name. A program's own
         // declaration is reported ahead of the library's for the same reason it is searched for
         // first: it is the likelier thing to have been meant.
-        def restricted = Option.when(declared(own))(own).orElse(library).map(reachable)
+        def restricted = Option.when(declared(own))(own).orElse(library).flatMap(reach)
 
         // A name written in the library takes these same three steps, and used to take a fourth
         // order of its own: the library's names were looked for ahead of the file's own module. That
@@ -118,21 +145,21 @@ trait Scoping extends DeclTables {
         // `own` can only ever be the library's, and the inversion had nothing left to protect — while
         // it did cost the library the ability to import, since the inverted order had no import step
         // in it at all. Which a library of more than one module needs, the same way anyone does.
-        if declared(own) && visible(own) then Some(own)
+        if declared(own) && inReach(own) then Some(own)
         else
           // A declaration this file may not name is not a candidate, so the search goes on rather
           // than stopping at it: a file that imported a `width` said which one it meant, and a
           // sibling file's private helper is not an answer to that. Only where nothing else answers
           // at all is the restriction worth reporting — at which point it is the whole story, and a
           // better one than an undefined name.
-          importedName(written)(declared)
+          importedName(written, inReach)(declared)
             .orElse(offered)
             .orElse(restricted)
       else
         val module = modulePath(written.take(dot))
         val name   = Modules.qualify(module, written.drop(dot + 1))
 
-        Option.when(moduleNames(module) && declared(name))(name).map(reachable)
+        Option.when(moduleNames(module) && declared(name))(name).flatMap(reach)
 
     // Resolution is where a dependency between two modules is *made*, so it is where one is
     // recorded (`13 §6`). Nothing earlier could see it: a qualified path names another module's
@@ -147,7 +174,7 @@ trait Scoping extends DeclTables {
     // The one *source* reference that arrives already spelled this way is a qualified value path,
     // and `Analyzer.throughModule`, which spells it in the terms of the body that wrote it, records
     // that edge itself.
-    if written.indexOf(Modules.sep.toInt) < 0 then key.foreach(k => dependsOn(Modules.moduleOf(k)))
+    if !quiet && written.indexOf(Modules.sep.toInt) < 0 then key.foreach(k => dependsOn(Modules.moduleOf(k)))
     key
   }
 
@@ -283,18 +310,6 @@ trait Scoping extends DeclTables {
         s"here — it may be named as '*$written' and passed to that module's own functions, but not " +
         "built, held by value, laid out inside another type, taken apart, or measured")
 
-  /** A resolved key, or a diagnostic where what it names is not visible here.
-   *
-   * A name the current module declares but may not use is **reported** rather than passed over, so
-   * that resolution does not quietly fall through to an import or the library and answer with
-   * something else. The name was found; what is wrong is that it is not for this file to write, and
-   * that is what a reader needs told.
-   */
-  protected def reachable(key: String): String = {
-    if !visible(key) && !contestedNames(key) then err(s"'${qn(key)}' is ${restriction(key)}")
-    key
-  }
-
   /** Why a declaration cannot be named here, as a diagnostic says it. */
   protected def restriction(key: String): String = declAccess.get(key) match
     case Some(Access(Some(f), None)) => s"private to '${f.name}', the file that declares it"
@@ -427,10 +442,11 @@ trait Scoping extends DeclTables {
    * be reached is the more useful answer than being told nothing is there, so that one is reported
    * at the import itself.
    */
-  protected def importedName(written: String)(declared: String => Boolean): Option[String] =
+  protected def importedName(written: String, inReach: String => Boolean = visible)(
+      declared: String => Boolean): Option[String] =
     searchImports { imports =>
       imports.names.get(written).filter(declared).orElse {
-        imports.wildcards.map(Modules.qualify(_, written)).filter(k => declared(k) && visible(k)).distinct match
+        imports.wildcards.map(Modules.qualify(_, written)).filter(k => declared(k) && inReach(k)).distinct match
           case Nil         => None
           case key :: Nil  => Some(key)
           case keys        =>
@@ -457,6 +473,21 @@ trait Scoping extends DeclTables {
   protected def typeKey(written: String): Option[String] =
     resolveName(written)(n => structDecls.contains(n) || enumDecls.contains(n) || constrainedDecls.contains(n))
       .map(followAlias)
+
+  /** Whether a **struct** answers to this name here, asked without resolving it.
+   *
+   * The one caller is the call-position arm that has to choose between a variant and a same-named
+   * struct (card `0220`), and it cannot use `typeKey`: that raises on a candidate the site may not
+   * name and records a module dependency, neither of which belongs to a question nobody asked. A
+   * variant call in a module where some *other* module happens to keep a private `Segment` would
+   * otherwise be refused for naming that struct, and one that merely shares a spelling with a
+   * struct next door would file an edge the program never wrote.
+   */
+  protected def structInScope(written: String): Boolean =
+    resolveName(written, quiet = true)(n =>
+      structDecls.contains(n) || enumDecls.contains(n) || constrainedDecls.contains(n))
+      .map(followAlias)
+      .exists(structDecls.contains)
 
   /** What an alias names, overridden where the constrained-type tables are in scope. It is the
    * identity here because `Scoping` sits below them, and because a compiler pass that has not yet
@@ -525,8 +556,23 @@ trait Scoping extends DeclTables {
    *
    * The key says which *module*, and not which enum: one module may declare two enums that each
    * name a variant `Circle`, and `variantOwnerOf` is what picks between them at the use site.
+   *
+   * **Reach is asked with `variantVisible`**, because the key a variant shares with a same-named
+   * type is also the key `declAccess` is written under — see `resolveName`'s `inReach`.
    */
-  protected def variantKey(written: String): Option[String] = resolveName(written)(variantOwners.contains)
+  protected def variantKey(written: String): Option[String] =
+    resolveName(written, inReach = variantVisible)(variantOwners.contains)
+
+  /** Whether an **enum variant** may be named from here: whether any enum offering it may be.
+   *
+   * A variant declares no visibility of its own and records none — it follows the enum that
+   * declares it (`09 §3`), which is what makes `variantOwnerOf`'s "widest owner wins" rule work. So
+   * `visible` asked about a variant's key finds no entry and answers yes, *unless* a type or value
+   * of the same spelling recorded one, at which point it answers about that instead: a
+   * `private struct Segment` beside a public `Kind.Segment` made the variant unreachable outside
+   * the file, with `undefined name 'Segment'` and nothing naming the struct (card `0220`).
+   */
+  protected def variantVisible(key: String): Boolean = variantOwners.getOrElse(key, Nil).exists(visible)
 
   /** Which enum a variant name means here, where its module offers more than one answer (`09 §3`).
    *
@@ -545,7 +591,7 @@ trait Scoping extends DeclTables {
   protected def variantOwnerOf(key: String, expected: Option[Type]): Option[String] = {
     val owners = variantOwners.getOrElse(key, Nil)
 
-    def named = expected.map(Type.repr).collect { case e: Type.Enum if owners.contains(e.base) => e.base }
+    def named = variantEnumExpected(key, expected)
 
     def seen = owners.filter(visible) match
       case one :: Nil => Some(one)
@@ -557,6 +603,18 @@ trait Scoping extends DeclTables {
       // more than an ambiguity would.
       case one :: Nil => Some(one)
       case _          => named.orElse(seen)
+  }
+
+  /** The enum the **expected type** names, where it is one this variant belongs to.
+   *
+   * This is the first of `variantOwnerOf`'s two rules on its own, and it is on its own because a
+   * second question needs it: where one name answers as both a variant and a struct, a call has to
+   * decide which of the two it is, and "the site asked for the enum" is what settles it.
+   */
+  protected def variantEnumExpected(key: String, expected: Option[Type]): Option[String] = {
+    val owners = variantOwners.getOrElse(key, Nil)
+
+    expected.map(Type.repr).collect { case e: Type.Enum if owners.contains(e.base) => e.base }
   }
 
   /** Every enum offering a variant of this name, in declaration order — what an ambiguity message
