@@ -132,8 +132,20 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     // merely convenient: an argument with no type of its own has nothing to unify, so the parameter
     // it stands at is settled by the others or by nothing at all. `two(&x, null)` and
     // `two(null, &x)` therefore get one answer, which an ordering rule would not have given.
-    val first = at.map { (a, e) =>
-      if callableArg(a) || e.isEmpty && (nullArg(a) || implicitArg(a)) then None
+    // **Which arguments are callables is decided HERE, in the caller's scope, and carried to the
+    // second pass rather than asked again there.** `callableArg` answers by looking a name up, and
+    // the second pass runs under `inDecl(decl)` — so asked there, it is asking whether the *callee's*
+    // module declares a function of that name. A function passed by name to a bare-arrow parameter
+    // in another module was therefore held back as a callable by this pass and read as though it
+    // were not one by the next, and reported that nothing here wanted a callable while the
+    // parameter's own bound said otherwise.
+    //
+    // A closure literal is what hid it for so long: it is a callable in any scope, so the two passes
+    // agreed about every argument that was not a bare name.
+    val callable = at.map((a, _) => callableArg(a))
+
+    val first = at.zip(callable).map { case ((a, e), isCallable) =>
+      if isCallable || e.isEmpty && (nullArg(a) || implicitArg(a)) then None
       else
         e match
           case Some(_) => Some(analyzeExpr(a, e))
@@ -166,7 +178,8 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     for case (r, Some(t)) <- ptypes.zip(first) do inDecl(decl)(unify(r, t.ty, tps, partial))
 
     at.zip(first).zipWithIndex.map { case (((a, _), done), i) =>
-      done.getOrElse(analyzeExpr(a, inDecl(decl)(heldWant(a, ptypes.lift(i), tps, bounds, partial.toMap))))
+      done.getOrElse(
+        analyzeExpr(a, inDecl(decl)(heldWant(callable(i), ptypes.lift(i), tps, bounds, partial.toMap))))
     }
   }
 
@@ -184,7 +197,7 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
    * the answer is the refusal it always was rather than a guess.
    */
   private def heldWant(
-      a: Expr,
+      isCallable: Boolean,
       ptype: Option[TypeRef],
       tps: Set[String],
       bounds: Map[String, List[BoundRef]],
@@ -201,7 +214,9 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     // turned out to be. `same(Colour.red, .green)` reads its second argument against the `Colour`
     // the first said, `two(&x, null)` reads its second against `*int`, and `same(n, None)` reads
     // its second against the `Option[usize]` that `n` said.
-    if callableArg(a) then callBound(ptype, tps, bounds, partial)
+    // **The answer is the caller's, taken before this pass entered the callee's scope.** Asking
+    // `callableArg` here would ask the callee's module whether it declares the name.
+    if isCallable then callBound(ptype, tps, bounds, partial)
     else ptype.filterNot(mentions(_, tps -- partial.keySet)).map(resolveType(_, partial))
 
   /** `null` written as an argument, which is the one *value* whose type its context supplies. */

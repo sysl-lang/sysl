@@ -53,11 +53,15 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * `deque`, `heap` and `list` — plus the line editor's history cap, which is the first test of a
    * bound that module always had and nothing reached.
    *
+   * Raised to **330** when the zone surface arrived: `sysl.time`'s `resolve` — seven tests against a
+   * synthetic zone, needing no host — and `sysl.posix.time`'s four against whatever zone the machine
+   * running them is set to. Exactly the new count again, for the reason above.
+   *
    * **`sysl.fs`'s are the first tests that depend on the library's own C**, so this floor now guards
    * a second thing: a build that stopped compiling or stopped linking the shim under
    * `library/sysl/fs/__<os>__` fails outright rather than quietly collecting fewer tests.
    */
-  private val floor = 317
+  private val floor = 330
 
   /** The library, compiled as a **test build of itself**.
    *

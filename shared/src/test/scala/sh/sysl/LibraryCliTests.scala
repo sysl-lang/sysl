@@ -770,6 +770,53 @@ class LibraryCliTests extends LibraryCliSupport {
     }
   }
 
+  /** A function passed **by name** to a bare-arrow parameter another module declares (`12 §5`,
+   * `§6`).
+   *
+   * **It lives here rather than beside the other closure tests because two modules is the whole of
+   * what it is about**, and the closure suites compile one file. A bare-arrow parameter is rewritten
+   * into a bounded type parameter at its declaration, and what a call does with a name standing at
+   * one is ask whether that name is a declared function — a question whose answer depends on which
+   * module is doing the asking.
+   *
+   * It was asked in the wrong one. The two passes over a generic call's arguments both ask it: the
+   * first holds callables back, in the caller's scope, and the second reads each held argument
+   * against its parameter's bound, under `inDecl` — the *callee's* scope, where a name the caller
+   * declared is not a function at all. So the argument was held back as a callable and then read as
+   * though it were not one, and the call was refused with a sentence saying nothing here wanted a
+   * callable while the parameter's own bound said otherwise.
+   *
+   * **A closure literal is what hid it**, and it is why both spellings are asserted in one program:
+   * a literal is a callable in any scope, so every test written before this one agreed across the
+   * two passes by accident. Same file and same *module* were fine too — only an import was not,
+   * which is exactly the arrangement a library and its consumer are in.
+   */
+  "a bare-arrow parameter across a module boundary" - {
+    val shape =
+      """module demo
+        |
+        |struct Point
+        |    x: int
+        |
+        |apply(p: Point, f: Point -> Point) -> Point = f(p)
+        |""".stripMargin
+
+    "takes a function by name, exactly as it takes a closure literal" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val lib = artifactOf(rootOf("demo", shape))
+      val prog = program(
+        """import demo.*
+          |
+          |double(p: Point) -> Point = Point(p.x * 2)
+          |
+          |print(apply(Point(3), double).x, apply(Point(4), p -> double(p)).x)
+          |""".stripMargin)
+
+      ran(Config(command = "run", file = prog, libs = List(lib))) shouldBe "6 8\n"
+    }
+  }
+
   /** A library's module-level `val` at a counted type, through the artifact (`13 §7`).
    *
    * A `val` may hold a string whose bytes the object file carries, and the shape that asked for it —
