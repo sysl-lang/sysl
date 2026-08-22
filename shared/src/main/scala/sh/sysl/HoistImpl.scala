@@ -746,7 +746,10 @@ trait HoistImpl extends ImplConformance {
     val args     = impl.forType match
       case NamedType(_, as) => as
       case _                => Nil
-    val spelled = s"impl[${tparams.mkString(", ")}] ${impl.traitName} for $written[${tparams.mkString(", ")}]"
+    // `qn`, because the advice is meant to be typed. A library trait's internal name carries the
+    // module separator it is stored under — `sysl$Mul` — and a reader copying that gets a name the
+    // lexer cannot read, which is worse than no advice at all.
+    val spelled = s"impl[${tparams.mkString(", ")}] ${qn(impl.traitName)} for $written[${tparams.mkString(", ")}]"
 
     if impl.tparams.isEmpty then
       err(s"'$written' is generic, so an 'impl' for it covers every instantiation at once — " +

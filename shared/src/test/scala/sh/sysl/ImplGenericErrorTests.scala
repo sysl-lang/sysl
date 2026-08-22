@@ -28,6 +28,17 @@ class ImplGenericErrorTests extends AnyFreeSpec with CodegenSupport {
       msg should include("write 'impl[T] Show for Box[T]'")
     }
 
+    // The advice is meant to be typed, so the trait it names has to be a name the lexer can read.
+    // A library trait is stored under its module separator — `sysl$Mul` — and every other message
+    // in this file qualifies it before printing; this one interpolated it raw, so the one case that
+    // could show it was a trait the program had not declared itself.
+    "and the trait it tells you to write is spelled the way a program spells it" in {
+      val msg = err(s"${box}impl Mul for Box\n    mul(self, rhs: Box[int]) -> Box[int] = self")
+
+      msg should include("write 'impl[T] sysl.Mul for Box[T]'")
+      msg should not include "sysl$Mul"
+    }
+
     // Fixing the argument is what a second implementation for the one key would be, so it is
     // refused in the same words rather than as a different mistake.
     "and an instantiation fixed to one type is refused the same way" in {
