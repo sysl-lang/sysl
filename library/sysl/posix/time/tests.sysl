@@ -3,6 +3,7 @@ module sysl.posix.time
 @tests
 
 import sysl.time.{Resolution, parse_timestamp, since}
+import sysl.time.tzif.{parse, offset_at, is_dst_at}
 
 // What `sysl.posix.time` claims, asserted in sysl.
 //
@@ -157,3 +158,39 @@ local_offset_is_stable()
     assert(a == b, "the same instant gave two different offsets")
     assert(work != 0)
 end local_offset_is_stable
+
+// -- the zone database ------------------------------------------------------------------------------
+//
+// **A machine may not have one, and that is not a failure of this module.** The database is a
+// package rather than part of the operating system, so a minimal container has none — and the
+// decoder's own tests carry their zone as bytes precisely so they never depend on it. What these add
+// is the half those cannot reach: that the path is built correctly and that a real file, written by
+// somebody else and changing several times a year, decodes.
+
+@test("a zone read off the host decodes, where the host has a database at all")
+zone_database_decodes()
+    // `UTC` is the one name every distribution of the database carries.
+    zone_data("UTC") match
+        Ok(d) ->
+            val z = parse(d[..]).unwrap()
+
+            // Whatever else UTC has done, it has never been set away from zero.
+            assert_eq(offset_at(z, now()).unwrap().minutes, 0)
+            assert(!is_dst_at(z, now()).unwrap(), "UTC reported daylight saving")
+        Err(e) -> ()
+end zone_database_decodes
+
+@test("the host's own zone file decodes, and agrees with the offset libc reports")
+local_zone_agrees_with_libc()
+    // The strongest assertion available here, and the only one that checks the two halves of this
+    // module against each other: `local_offset` asks the C library and `local_zone_data` reads the
+    // file it is reading, so a decoder that mis-parsed the table would disagree with `localtime_r`
+    // about the very same instant.
+    local_zone_data() match
+        Ok(d) ->
+            val z = parse(d[..]).unwrap()
+            val t = now()
+
+            assert_eq(offset_at(z, t).unwrap().minutes, local_offset(t).minutes)
+        Err(e) -> ()
+end local_zone_agrees_with_libc
