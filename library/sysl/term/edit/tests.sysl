@@ -62,60 +62,50 @@ end echo_of
 @test("a bare CR ends a line, which is what a terminal sends")
 cr_ends_a_line()
     assert_slice_eq(lines_of("hi\r").view(), ["hi"])
-end cr_ends_a_line
 
 @test("a bare LF ends a line")
 lf_ends_a_line()
     assert_slice_eq(lines_of("hi\n").view(), ["hi"])
-end lf_ends_a_line
 
 // The case a hand-rolled reader gets wrong: the LF must be swallowed rather than read as an empty
 // line following the CR that already ended one.
 @test("CRLF is one line ending and not two")
 crlf_is_one_ending()
     assert_slice_eq(lines_of("a\r\nb\r\n").view(), ["a", "b"])
-end crlf_is_one_ending
 
 // The same script with the reader handing back one byte at a time, so the CR and the LF arrive in
 // different reads and the debt has to outlive the call that returned the line.
 @test("CRLF is one line ending even when its two bytes arrive in different reads")
 crlf_split_across_reads()
     assert_slice_eq(dribbled_lines_of("a\r\nb\r\n").view(), ["a", "b"])
-end crlf_split_across_reads
 
 @test("an empty line is a line")
 empty_line()
     assert_slice_eq(lines_of("\r\r").view(), ["", ""])
-end empty_line
 
 // Input that stops without a terminator has still been typed, so it is a line -- and the walk ends
 // after it rather than yielding it twice.
 @test("input that ends without a terminator yields what was typed, once")
 unterminated_tail()
     assert_slice_eq(lines_of("a\rbc").view(), ["a", "bc"])
-end unterminated_tail
 
 @test("input that ends cleanly yields nothing more")
 nothing_after_the_end()
     assert_slice_eq(lines_of("a\r").view(), ["a"])
-end nothing_after_the_end
 
 // -- editing --------------------------------------------------------------------------------------
 
 @test("backspace removes the character before the cursor")
 backspace_removes()
     assert_slice_eq(lines_of("abx\u{8}c\r").view(), ["abc"])
-end backspace_removes
 
 @test("delete is backspace's other half and both are accepted")
 del_removes()
     assert_slice_eq(lines_of("abx\u{7f}c\r").view(), ["abc"])
-end del_removes
 
 @test("backspace at the start of the line does nothing")
 backspace_at_start()
     assert_slice_eq(lines_of("\u{8}\u{8}ab\r").view(), ["ab"])
-end backspace_at_start
 
 // -- interrupting and ending ----------------------------------------------------------------------
 //
@@ -131,17 +121,14 @@ end backspace_at_start
 @test("Ctrl-C abandons what was typed and answers an empty line")
 ctrl_c_abandons_the_line()
     assert_slice_eq(lines_of("abc\u{3}").view(), [""])
-end ctrl_c_abandons_the_line
 
 @test("and the line after an interrupted one is unaffected by it")
 ctrl_c_does_not_leak()
     assert_slice_eq(lines_of("abc\u{3}xy\r").view(), ["", "xy"])
-end ctrl_c_does_not_leak
 
 @test("Ctrl-D on an empty line ends the input")
 ctrl_d_ends_input()
     assert_slice_eq(lines_of("ab\rcd\r\u{4}").view(), ["ab", "cd"])
-end ctrl_d_ends_input
 
 // The rule every shell follows, and the reason is that an empty line is the one moment where ending
 // throws nothing away. On a line with text in it a caller could not tell a discarded line from a
@@ -149,17 +136,14 @@ end ctrl_d_ends_input
 @test("but Ctrl-D on a line with text in it is ignored")
 ctrl_d_mid_line_ignored()
     assert_slice_eq(lines_of("ab\u{4}cd\r").view(), ["abcd"])
-end ctrl_d_mid_line_ignored
 
 @test("the left arrow moves the cursor, and typing inserts there")
 left_arrow_inserts()
     assert_slice_eq(lines_of("ac\u{1b}[Db\r").view(), ["abc"])
-end left_arrow_inserts
 
 @test("the right arrow moves back over what the left arrow passed")
 right_arrow_moves()
     assert_slice_eq(lines_of("ac\u{1b}[D\u{1b}[Cb\r").view(), ["acb"])
-end right_arrow_moves
 
 // **The same key, the other spelling.** `ESC [ D` is CSI and `ESC O D` is SS3, and which one a
 // terminal sends depends on whether application cursor key mode is on. Reading only the first is what
@@ -168,74 +152,61 @@ end right_arrow_moves
 @test("an arrow sent as SS3 rather than CSI is the same arrow")
 ss3_arrows()
     assert_slice_eq(lines_of("ac\u{1b}ODb\r").view(), ["abc"])
-end ss3_arrows
 
 @test("and SS3 Home and End are Home and End")
 ss3_home_and_end()
     assert_slice_eq(lines_of("bc\u{1b}OHa\u{1b}OFd\r").view(), ["abcd"])
-end ss3_home_and_end
 
 // A parameterised sequence has to be read to its end whatever is in the middle, or its tail lands in
 // the line. Ctrl-Left is `ESC [ 1 ; 5 D` on an xterm, and a plain left is the honest reading of it.
 @test("a parameterised sequence is read to its final byte")
 parameterised_sequence()
     assert_slice_eq(lines_of("ac\u{1b}[1;5Db\r").view(), ["abc"])
-end parameterised_sequence
 
 // The numbered spellings of Home and End, which some terminals send instead of the lettered ones.
 @test("Home and End also arrive as numbers")
 numbered_home_and_end()
     assert_slice_eq(lines_of("bc\u{1b}[1~a\u{1b}[4~d\r").view(), ["abcd"])
-end numbered_home_and_end
 
 @test("an escape sequence split across two reads is still one sequence")
 escape_split_across_reads()
     assert_slice_eq(dribbled_lines_of("ac\u{1b}[Db\r").view(), ["abc"])
-end escape_split_across_reads
 
 @test("Delete removes the character under the cursor, tilde and all")
 delete_key()
     assert_slice_eq(lines_of("abXc\u{1b}[D\u{1b}[D\u{1b}[3~\r").view(), ["abc"])
-end delete_key
 
 @test("Home and End move to the ends of the line")
 home_and_end()
     assert_slice_eq(lines_of("bc\u{1b}[Ha\u{1b}[Fd\r").view(), ["abcd"])
-end home_and_end
 
 @test("Ctrl-A and Ctrl-E are Home and End")
 ctrl_a_and_ctrl_e()
     assert_slice_eq(lines_of("bc\u{1}a\u{5}d\r").view(), ["abcd"])
-end ctrl_a_and_ctrl_e
 
 @test("Ctrl-B and Ctrl-F are the arrows")
 ctrl_b_and_ctrl_f()
     assert_slice_eq(lines_of("ac\u{2}b\r").view(), ["abc"])
-end ctrl_b_and_ctrl_f
 
 @test("Ctrl-U kills the whole line, wherever the cursor is")
 ctrl_u_kills_the_line()
     assert_slice_eq(lines_of("abc\u{2}\u{15}xy\r").view(), ["xy"])
-end ctrl_u_kills_the_line
 
 @test("Ctrl-K kills from the cursor to the end")
 ctrl_k_kills_the_tail()
     assert_slice_eq(lines_of("abcd\u{2}\u{2}\u{b}\r").view(), ["ab"])
-end ctrl_k_kills_the_tail
 
 // A control character with no meaning here would move the terminal's cursor without being in the
 // line, so it is dropped rather than echoed.
 @test("an unhandled control character is ignored")
 unhandled_control_ignored()
     assert_slice_eq(lines_of("a\u{e}b\r").view(), ["ab"])
-end unhandled_control_ignored
 
 // An arrow with a longer form -- Up is `ESC [ A` -- is swallowed whole, so its final byte does not
 // land in the line as an `A`.
 @test("an unhandled escape sequence does not leak its last byte into the line")
 unhandled_escape_swallowed()
     assert_slice_eq(lines_of("ab\u{1b}[A\r").view(), ["ab"])
-end unhandled_escape_swallowed
 
 // -- history --------------------------------------------------------------------------------------
 //
@@ -245,56 +216,46 @@ end unhandled_escape_swallowed
 @test("the up arrow recalls the line before")
 up_recalls()
     assert_slice_eq(lines_of("one\rtwo\r\u{1b}[A\r").view(), ["one", "two", "two"])
-end up_recalls
 
 @test("and again reaches the one before that")
 up_twice()
     assert_slice_eq(lines_of("one\rtwo\r\u{1b}[A\u{1b}[A\r").view(), ["one", "two", "one"])
-end up_twice
 
 @test("up at the oldest entry stays there rather than wrapping")
 up_stops_at_the_oldest()
     assert_slice_eq(lines_of("one\rtwo\r\u{1b}[A\u{1b}[A\u{1b}[A\u{1b}[A\r").view(),
                     ["one", "two", "one"])
-end up_stops_at_the_oldest
 
 @test("down comes back towards the newest")
 down_returns()
     assert_slice_eq(lines_of("one\rtwo\r\u{1b}[A\u{1b}[A\u{1b}[B\r").view(), ["one", "two", "two"])
-end down_returns
 
 // **The case the whole design is arranged around.** Half a line typed, a change of mind, and it is
 // still there — losing it is what makes a history feel worse than none.
 @test("down past the newest restores what was being typed")
 down_restores_the_draft()
     assert_slice_eq(lines_of("one\rhalf\u{1b}[A\u{1b}[B\r").view(), ["one", "half"])
-end down_restores_the_draft
 
 @test("a recalled line can be edited before it is entered")
 a_recalled_line_is_editable()
     assert_slice_eq(lines_of("ab\r\u{1b}[Ac\r").view(), ["ab", "abc"])
-end a_recalled_line_is_editable
 
 @test("up with nothing behind it does nothing at all")
 up_with_no_history()
     assert_slice_eq(lines_of("\u{1b}[Aab\r").view(), ["ab"])
-end up_with_no_history
 
 @test("down with nothing to come back to does nothing either")
 down_with_no_history()
     assert_slice_eq(lines_of("\u{1b}[Bab\r").view(), ["ab"])
-end down_with_no_history
 
 // Neither is worth reaching back for, and both would push the lines that are further away.
 @test("a blank line is not remembered")
 blank_not_remembered()
     assert_slice_eq(lines_of("one\r\r\u{1b}[A\r").view(), ["one", "", "one"])
-end blank_not_remembered
 
 @test("nor is an immediate repeat")
 repeat_not_remembered()
     assert_slice_eq(lines_of("one\rone\r\u{1b}[A\u{1b}[A\r").view(), ["one", "one", "one"])
-end repeat_not_remembered
 
 // **The cap, which is the one part of the history nothing else here reaches.** A console outlives
 // its session, so the history is bounded and the entry that goes is the *oldest* -- which is the end
@@ -325,12 +286,10 @@ end history_is_capped
 @test("Ctrl-P and Ctrl-N are the arrows")
 ctrl_p_and_ctrl_n()
     assert_slice_eq(lines_of("one\rtwo\r\u{10}\u{10}\u{e}\r").view(), ["one", "two", "two"])
-end ctrl_p_and_ctrl_n
 
 @test("SS3 up and down work too")
 ss3_up_and_down()
     assert_slice_eq(lines_of("one\rtwo\r\u{1b}OA\u{1b}OA\r").view(), ["one", "two", "one"])
-end ss3_up_and_down
 
 // **Recalling a shorter line has to paint over the longer one it replaced**, which is the one piece
 // of arithmetic here that a test looking only at the answer would never see.
@@ -338,28 +297,24 @@ end ss3_up_and_down
 recall_paints_over()
     assert_eq(echo_of("ab\rwxyz\u{1b}[A\r"),
               "ab\r\n" + "wxyz" + "\b\b\b\b" + "ab" + "  " + "\b\b" + "\r\n")
-end recall_paints_over
 
 // -- text -----------------------------------------------------------------------------------------
 
 @test("a multi-byte character is one character in the line")
 multibyte_is_one_character()
     assert_slice_eq(lines_of("café\r").view(), ["café"])
-end multibyte_is_one_character
 
 // The bytes of one character arriving in separate reads is the ordinary case over a serial port, and
 // the decode has to keep asking rather than give up at the end of a read.
 @test("a multi-byte character split across reads is still one character")
 multibyte_split_across_reads()
     assert_slice_eq(dribbled_lines_of("café\r").view(), ["café"])
-end multibyte_split_across_reads
 
 // Backspace removes a whole character rather than a byte, which is what holding the line as
 // characters buys: a half character can never be left behind because one never enters the line.
 @test("backspace removes a whole multi-byte character")
 backspace_removes_a_whole_character()
     assert_slice_eq(lines_of("café\u{8}e\r").view(), ["cafe"])
-end backspace_removes_a_whole_character
 
 // One bad byte answers U+FFFD rather than ending the session, which is what a terminal does. The
 // line is therefore valid text by construction and `getline` has nothing left to validate.
@@ -382,14 +337,12 @@ end malformed_byte_replaced
 @test("an ordinary line is echoed as it is typed, and Enter sends CRLF")
 echo_is_what_was_typed()
     assert_eq(echo_of("ab\r"), "ab\r\n")
-end echo_is_what_was_typed
 
 // Inserting at the end costs the character and nothing else: there is no tail to redraw and no
 // column to walk back over.
 @test("an insertion at the end redraws nothing")
 insert_at_end_redraws_nothing()
     assert_eq(echo_of("a\r"), "a\r\n")
-end insert_at_end_redraws_nothing
 
 // Inserting in the middle writes the character, then the tail that moved, then walks back over the
 // tail. `b` inserted before `c`: `b`, then `c`, then one backspace.
@@ -401,13 +354,11 @@ end insert_at_end_redraws_nothing
 @test("an insertion in the middle rewrites the tail and walks back over it")
 insert_in_middle_redraws_the_tail()
     assert_eq(echo_of("ac\u{2}b\r"), "ac\b" + "b" + "c" + "\b" + "c" + "\r\n")
-end insert_in_middle_redraws_the_tail
 
 // A backspace at the end of the line: back one column, paint the vacated column, back over the paint.
 @test("a backspace at the end paints over the column it vacated")
 backspace_paints_the_column()
     assert_eq(echo_of("ab\u{8}\r"), "ab" + "\b" + " " + "\b" + "\r\n")
-end backspace_paints_the_column
 
 // **The wide-character case, and the reason the editor counts columns rather than characters.** A
 // CJK character is drawn in two columns, so erasing it is two backspaces and two spaces. An editor
@@ -415,16 +366,13 @@ end backspace_paints_the_column
 @test("erasing a wide character clears both of its columns")
 backspace_over_a_wide_character()
     assert_eq(echo_of("世\u{8}\r"), "世" + "\b\b" + "  " + "\b\b" + "\r\n")
-end backspace_over_a_wide_character
 
 // The same arithmetic on the way left: the cursor moves by the character's width, not by one.
 @test("the left arrow steps over a wide character in one move of two columns")
 left_over_a_wide_character()
     assert_eq(echo_of("世\u{1b}[D\r"), "世" + "\b\b" + "世" + "\r\n")
-end left_over_a_wide_character
 
 // Ctrl-U walks back over what is drawn, paints it out, and walks back over the paint.
 @test("Ctrl-U paints out the whole line")
 ctrl_u_paints_out_the_line()
     assert_eq(echo_of("ab\u{15}\r"), "ab" + "\b\b" + "  " + "\b\b" + "\r\n")
-end ctrl_u_paints_out_the_line
