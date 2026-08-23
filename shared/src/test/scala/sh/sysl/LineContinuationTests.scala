@@ -204,4 +204,131 @@ class LineContinuationTests extends AnyFreeSpec with Matchers with RunSupport wi
       run(src) shouldBe "2\n"
     }
   }
+
+  /** The other direction: a line that continues the one above it because of how it **begins**.
+   *
+   * A chain is the one expression people habitually break across lines, and the break they write is
+   * before the dot rather than after it — so the trailing rule above cannot see it, and there is no
+   * operator at the end of `text(label)` for it to see. syslUI is what asked for this: four modifier
+   * links are 92 characters on one line, and a toolkit whose whole surface is chained modifiers
+   * cannot require that.
+   *
+   * A **name** after the dot is what makes it safe. A continued line's own margin is discarded, so a
+   * rule that fired on something which could also begin a statement would pull that line into the
+   * block above and move where the block ends — the hazard pinned at the end of this section.
+   */
+  "a line beginning with a dot continues the one above it" - {
+    "one link lexes as though it had been written on one line" in withLexer { l =>
+      l.all("var a = \"hi\"\n    .len") shouldBe l.all("var a = \"hi\".len")
+    }
+
+    "and so does a chain of them" in withLexer { l =>
+      l.all("var a = x\n    .b\n    .c\n    .d") shouldBe l.all("var a = x.b.c.d")
+    }
+
+    "the continuation line's own indentation carries no meaning" in withLexer { l =>
+      l.all("var a = x\n.b") shouldBe l.all("var a = x.b")
+      l.all("var a = x\n            .b") shouldBe l.all("var a = x.b")
+    }
+
+    "a comment line in the middle of a chain does not end it" in withLexer { l =>
+      l.all("var a = x\n    // why\n    .b") shouldBe l.all("var a = x.b")
+    }
+
+    "nor does a blank line" in withLexer { l =>
+      l.all("var a = x\n\n\n    .b") shouldBe l.all("var a = x.b")
+    }
+
+    "the two continuation rules compose" in withLexer { l =>
+      l.all("var a = x\n    .b +\n    y\n    .c") shouldBe l.all("var a = x.b + y.c")
+    }
+  }
+
+  "what a leading dot must not swallow" - {
+    // `..` is a range and `...` a variadic tail. Neither can begin a statement either, but the
+    // predicate does not have to know that — requiring a letter after the dot means it never sees
+    // them, which is a much smaller thing to be right about.
+    "a range operator at the start of a line is not a chain" in withLexer { l =>
+      l.all("var a = 1\n    ..2") should not be l.all("var a = 1..2")
+    }
+
+    // A tuple index is a digit, not a name.
+    "a tuple index at the start of a line is not a chain" in withLexer { l =>
+      l.all("var a = t\n    .0") should not be l.all("var a = t.0")
+    }
+
+    // The wildcard import is the case that cost the trailing rule an hour, so it is asserted from
+    // this side too.
+    "a wildcard import is untouched" in withLexer { l =>
+      l.all("import isa.*\nvar a = 1") should not be l.all("import isa.* var a = 1")
+    }
+
+    // A trailing dot is deliberately NOT a continuation: two ways to write one chain is a style
+    // argument in every file that has one, so the language admits exactly the one.
+    "a trailing dot is still an error" in {
+      err("var a = \"hi\".\n    len") should include("expected")
+    }
+  }
+
+  "a chain broken before the dot runs" - {
+    "at the top level" in {
+      run("var a = \"hello\"\n    .len\nprint(a)") shouldBe "5\n"
+    }
+
+    "with several links" in {
+      run("import sysl.text.Search\n\nvar a = \"  padded  \"\n    .trim()\n    .len\nprint(a)") shouldBe "6\n"
+    }
+
+    // The block's extent is the thing a suppressed newline could damage, so the chain is put inside
+    // one and the statement after it has to still be inside the block.
+    "inside an indented block, which still ends where it looks like it does" in {
+      val src =
+        """var t = 0
+          |var i = 0
+          |while i < 3
+          |    t = t + int(s"${i}"
+          |        .len)
+          |    i++
+          |print(t)""".stripMargin
+
+      run(src) shouldBe "3\n"
+    }
+
+    "inside a function body" in {
+      val src =
+        """digits(n: int) -> usize
+          |    s"${n}"
+          |        .len
+          |print(digits(12345))""".stripMargin
+
+      run(src) shouldBe "5\n"
+    }
+
+    // Inside brackets newlines were already suppressed, so the two mechanisms have to compose
+    // rather than fight.
+    "inside a bracketed expression" in {
+      run("print(\"hi\"\n    .len, \"abc\"\n    .len)") shouldBe "2 3\n"
+    }
+  }
+
+  "the hazard a leading-token rule shares with a trailing one" - {
+    /** A continued line's margin is discarded, which is the whole point of continuing — so a chain
+      * written at the OUTER margin is still inside the block above it, and that block ends one line
+      * later than it looks like it does.
+      *
+      * This is why the predicate asks for a name after the dot rather than merely a dot: the shapes
+      * that could begin a statement are excluded, and what remains cannot. Pinned so that a future
+      * widening of the rule has to notice what it is taking on.
+      */
+    "a chain written at the outer margin is still inside the block above" in {
+      val src =
+        """var t = 0
+          |if true
+          |    t = t + 1
+          |.to_string()
+          |print(t)""".stripMargin
+
+      err(src) should include("to_string")
+    }
+  }
 }

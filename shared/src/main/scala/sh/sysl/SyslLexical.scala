@@ -204,9 +204,10 @@ class SyslLexical
    * the rule with an arbitrary hole, and not to respell the wildcard: it is to lex `.*` as one
    * token, above. A `.` is only ever followed by a name, so nothing else can produce that pair, and
    * a line then never ends in a bare `*` that was really the end of a statement.
-   *   - **`.`** is left out for a different reason — it would work, but the continuation style
-   *     worth having for a call chain puts the dot at the *start* of the following line, which
-   *     needs the opposite mechanism. Deciding that is not part of this.
+   *   - **`.`** is left out because the continuation style worth having for a call chain puts the
+   *     dot at the *start* of the following line, which needs the opposite mechanism — and now has
+   *     one, in `isLineContinuationStart` below. A trailing `.` remains an error, deliberately: two
+   *     ways to write one chain is a style argument in every file that has one.
    *   - **`,`, `:` and `;`** are separators, and the only one with a real customer (`,`) already
    *     continues wherever it appears, since an argument list is bracketed.
    *
@@ -231,6 +232,43 @@ class SyslLexical
   override protected def isLineContinuationToken(tok: Token): Boolean = tok match
     case Keyword(chars) => continuationOperators(chars)
     case _              => false
+
+  /** A line beginning `.name` continues the line above it.
+   *
+   * This is the other half of the rule above, and it exists because a *chain* is the one expression
+   * people habitually break across lines, and the break they write is before the dot rather than
+   * after it:
+   *
+   * {{{
+   * val face = text(label)
+   *     .foreground(WHITE)
+   *     .padding(8)
+   *     .background(ground, radius)
+   * }}}
+   *
+   * Every language with a fluent surface reads that shape — Scala, Kotlin, Swift, C# — and a
+   * language whose interface toolkit is built out of chained modifiers cannot ask for it on one
+   * line: the four links above are 92 characters together, and there is no operator at the end of
+   * any of them for the trailing rule to see.
+   *
+   * **A name after the dot is required, and that is the whole safety argument.** A continued line's
+   * own margin is discarded, so a rule that fired on something which could also *begin* a statement
+   * would pull the line into the block above and move where that block ends. Nothing in the
+   * expression grammar begins a statement with `.`, and requiring a letter or `_` after it excludes
+   * everything else spelled with one: `..` and `..<` are ranges, `...` is a variadic tail, `.0` is a
+   * tuple index, and `.*` is an import wildcard. None of those can start a line either, but the
+   * predicate does not have to know that — it never sees them.
+   *
+   * The one thing it deliberately does not do is join a line beginning with an *operator*. `+` and
+   * friends already continue from the end of the previous line, and a language that accepted both
+   * ends would be asking every file to pick a side.
+   */
+  override protected def isLineContinuationStart(r: Reader[Char]): Boolean =
+    !r.atEnd && r.first == '.' && {
+      val after = r.rest
+
+      !after.atEnd && (after.first.isLetter || after.first == '_')
+    }
 
   /** Materializes the token stream with each token's source position, so the parser can
    * memoize over a fixed `List` (not the stateful scanner — see design/front-end.md)
