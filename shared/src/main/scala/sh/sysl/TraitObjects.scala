@@ -105,7 +105,21 @@ trait TraitObjects extends TypeResolution {
 
       at(t.pos)(err(s"a ${show(want)} needs a type that implements '${tr.bound.show}', and " +
         s"${show(inner)} does not$why"))
-    else TErase(t, vtableFor(tr, inner, boxed), want).setPos(t.pos)
+    else
+      // **The object wrote down what the implementation chose, so the two have to agree.** This is
+      // the check the binding buys and the reason it is sound: every slot's signature was read under
+      // the object's answer, so a value whose implementation answers differently would be called
+      // through a table promising the wrong types. It is asked here because here is the one place
+      // both are known — the object type at the context, the implementation at the value.
+      for
+        (a, want2) <- tr.assocs
+        got        <- assocTypeOpt(inner, a) if got != want2
+      do
+        at(t.pos)(err(s"a ${show(want)} says '$a' is ${show(want2)}, and ${show(inner)} supplies " +
+          s"${show(got)} for it — an object fixes the associated type, so only a type that chose " +
+          s"the same one goes into it"))
+
+      TErase(t, vtableFor(tr, inner, boxed), want).setPos(t.pos)
   }
 
   /** The method table for one type seen as one trait, registered the first time it is needed.

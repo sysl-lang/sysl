@@ -268,7 +268,7 @@ trait ProgramWalk extends OpaqueResults {
       currentPos = b.pos
       // In the terms the bound was written in, not in whatever the walk was last reading: a bound is
       // a reference like any other, and a short name means what the file that wrote it imported.
-      inScope(b.scope)(recover(())(checkParamBounds(b.what, b.tparams, b.bounds, b.targs)))
+      inScope(b.scope)(recover(())(checkParamBounds(b.what, b.tparams, b.bounds, b.targs, noun = b.noun)))
     boundChecks.clear()
 
     // And whether each `impl` of a trait that requires others supplies those too, which is the same

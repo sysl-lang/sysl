@@ -435,41 +435,44 @@ trait ControlFlowExprAnalysis extends ExprSupport {
     checkedLoop(ctx, TIterate(cursor, seq.ty, seq, step, bind, tb, telse, loopResultType(ctx, telse)))
   }
 
+  /** The name `Iterate` gives the type it yields. It is an **associated** type rather than an
+   * argument, so a type chooses it once and a `for` has nothing to disambiguate.
+   */
+  private val iterateItem = "Item"
+
   /** What a type's `Iterate` implementation yields, or `None` where it has none.
    *
-   * A type may implement one parameterized trait at more than one argument list (`02`), and for
-   * every other trait the call's arguments are what say which — but `next` takes none, so a second
-   * `Iterate` leaves the loop nothing to decide with. That is reported here rather than left to the
-   * call, because the sentence a program needs names the loop.
+   * The element is `Iterate`'s associated type, so it is *determined* by whatever is being walked
+   * rather than selected at the loop: a type supplies one `Item`, and a second implementation of
+   * `Iterate` is the duplicate it looks like rather than an ambiguity a `for` has to resolve. That
+   * is the whole reason the element moved out of the trait's argument list — a signature generic
+   * over what it walks could not name the element otherwise.
+   *
+   * The three subjects a loop can be handed each reach the answer their own way, and all three go
+   * through `assocTypeOpt`: a **trait object** wrote the element into its own type
+   * (`*Iterate[Item = string]`), a **type parameter** has it from the bound that licensed the walk,
+   * and a **concrete type** has it from the implementation. What this adds on top is the membership
+   * question — a type with an `Item` of some *other* trait's is not something a `for` may walk, and
+   * without this it would be.
    */
   protected def iterateElem(ty: Type): Option[Type] = {
-    val (key, targs) = memberOwner(ty)
-    val iterate      = Library.key("Iterate")
+    val iterate = Library.key("Iterate")
 
-    // A **trait object** has no implementations filed for it and needs none: the table it carries
-    // holds `Iterate`'s member, which is the one thing the loop calls. Reaching it here is the same
-    // rule that lets an object satisfy a bound (`10 §5`) — a `for` asks what may be called on the
-    // value, and the answer comes from the same table.
-    //
-    // The several-implementations case below cannot arise for one, which is why this is a lookup
-    // rather than a choice: a trait-object type names one trait at one argument list, so the element
-    // type is whatever the object was erased to. It is read out of the requirement closure so that a
-    // trait *requiring* `Iterate` is walked too, exactly as its members are.
-    def erased =
-      for
-        tr   <- Type.erasedTrait(ty)
-        b    <- traitClosure(tr.bound, selfBinding(ty)).find(_.name == iterate)
-        elem <- b.args.headOption
-      yield elem
+    // Read out of the requirement closure in both cases, so that a trait *requiring* `Iterate` is
+    // walked too — exactly as its members are reached.
+    def declared(b: Type.Bound) = traitClosure(b, selfBinding(ty)).exists(_.name == iterate)
 
-    erased.orElse(
-      implsOf(iterate, key).map(suppliedBound(_, iterate, ty, targs).args) match
-        case Nil               => None
-        case List(elem) :: Nil => Some(elem)
-        case several =>
-          err(s"${show(ty)} implements '${qn(iterate)}' " +
-            s"${conjoin(several.map(a => s"'${Type.Bound(iterate, a).show}'"))}, and a 'for' has " +
-            "nothing to say which of them it means — call 'next' yourself, with the element type written"),
-    )
+    Type.erasedTrait(ty) match
+      // **The object is what holds the answer, not the pointer to it.** A `*Iterate[Item = string]`
+      // has no implementation filed for it and needs none: the element is written into the object
+      // type, which is the whole of what the binding buys, so the projection is asked of the trait
+      // rather than of the mode wrapping it.
+      case Some(tr) => Option.when(declared(tr.bound))(tr).flatMap(_.assoc(iterateItem))
+      case None =>
+        val reaches = ty match
+          case a: Type.Abstract => a.bounds.exists(declared)
+          case _                => implsOf(iterate, ownerKey(ty)).nonEmpty
+
+        if reaches then assocTypeOpt(ty, iterateItem) else None
   }
 }

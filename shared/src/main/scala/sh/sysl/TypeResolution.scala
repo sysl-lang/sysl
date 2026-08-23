@@ -120,6 +120,7 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
       f.copy(params = f.params.map(spellSelf(_, selfRef)), ret = spellSelf(f.ret, selfRef))
     case CFnType(params, ret) => CFnType(params.map(spellSelf(_, selfRef)), spellSelf(ret, selfRef))
     case AssocType(base, m)   => AssocType(spellSelf(base, selfRef), m)
+    case AssocArgType(n, t)   => AssocArgType(n, spellSelf(t, selfRef))
     // A `some` result names no type, so there is no `Self` in it to spell.
     case s: SomeType          => s
 
@@ -554,6 +555,14 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
     // declared for it; a concrete one is answered by the implementation that supplies it.
     case AssocType(base, member) => assocType(resolveType(base, subst), member)
 
+    // `Name = T` reached a position where the brackets belong to something other than a trait behind
+    // a mode. Only a trait object leaves an associated type for a bracket to fix — a generic type's
+    // arguments are all written where it is used, so there is nothing there for a name to pick out.
+    case AssocArgType(a, _) =>
+      err(s"'$a = …' fixes an associated type, which only a trait object has to fix — it belongs " +
+        s"inside the brackets of a '*Trait' or a '&Trait', and a type's arguments are written in " +
+        s"order without names")
+
     // A `some` result that reached resolution is one written where the inference behind it has
     // nothing to read. `resolveShape` is reached from a *type* position, which `coreType` already
     // refuses one in — so what arrives here is a **result** in the two places a result is not an
@@ -693,29 +702,53 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
         checkFnArity(f)
         at(f.pos)(traitObject(f.asTrait, subst, sigil))
       case NamedType(n, argRefs) if traitKey(n).isDefined && !(argRefs.isEmpty && subst.contains(n)) =>
-        val key     = traitKey(n).get
-        val decl    = traitDecls(key)
-        val written = argRefs.map(resolveType(_, subst))
+        val key  = traitKey(n).get
+        val decl = traitDecls(key)
+
+        // The brackets carry two different things now, and they are separated before anything is
+        // resolved: an ordinary argument fills one of the trait's own parameters, and a `Name = T`
+        // fixes an associated type the implementation would otherwise have chosen (`02`).
+        val (bindRefs, posRefs) = argRefs.partition(_.isInstanceOf[AssocArgType])
+        val written             = posRefs.map(resolveType(_, subst))
 
         at(inner.pos) {
-          checkTraitArity(n, decl.tparams, decl.tdefaults, written)
+          val declared = objectAssocs(key)
 
-          val args = withDefaults(key, decl.tparams, decl.tdefaults, written, Map.empty)
+          // **The one unambiguous case is written without the name**, and it is the common one: a
+          // trait with no parameters of its own and exactly one associated type has only one thing a
+          // bare argument could mean, so `*Iterate[string]` is `*Iterate[Item = string]`. Where the
+          // trait has parameters too, a bare argument means one of *those* and the associated type
+          // has to be named — which is what keeps `*Index[usize]` readable once `Index` carries an
+          // element of its own.
+          val sugared =
+            Option.when(decl.tparams.isEmpty && declared.length == 1 && bindRefs.isEmpty && written.length == 1)(
+              (declared.head.name, written.head))
 
+          val positional = if sugared.isDefined then Nil else written
+
+          checkTraitArity(n, decl.tparams, decl.tdefaults, positional)
+
+          val args = withDefaults(key, decl.tparams, decl.tdefaults, positional, Map.empty)
+
+          val assocs = sugared.toList ::: bindRefs.collect { case AssocArgType(a, ref) =>
+            (a, at(ref.pos)(resolveType(ref, subst)))
+          }
+
+          checkAssocArgs(key, declared, assocs, sigil, args)
           deferredBounds(key, decl.tparams, decl.bounds, args)
           // A `Self` that arrived from one of *this* trait's own defaults is left to the check below,
           // because there the fix is a spelling: writing the argument out. That now includes the
           // operator catalog, which it did not when an operator's result was fixed to `Self` and no
           // argument could rescue it — `&Mul[real, real]` is a formable object (`14 §7`).
-          checkObjectSafe(key, args, sigil, decl.tparams.drop(written.length).toSet)
+          checkObjectSafe(key, args, sigil, decl.tparams.drop(positional.length).toSet, assocs.map(_._1).toSet)
 
           // An object has forgotten which type it holds, so a default that names one has nothing to
           // stand for, and writing the argument is the fix.
-          for tp <- decl.tparams.drop(written.length); ref <- decl.tdefaults.get(tp) if mentionsSelf(ref) do
+          for tp <- decl.tparams.drop(positional.length); ref <- decl.tdefaults.get(tp) if mentionsSelf(ref) do
             err(s"'$tp' defaults to '${ref.show}', which names the type implementing '${qn(key)}', " +
               "and an object has forgotten which type it holds — write the argument")
 
-          Some(Type.Trait(key, args))
+          Some(Type.Trait(key, args, assocs))
         }
       case _ => None
 
@@ -733,11 +766,70 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
    * reference-counted box, which only the counted object has: `&Trait` carries one, so it accepts
    * such a method, and `*Trait` points straight at a value and does not.
    */
+  /** Every associated type an object over this trait has to account for: the trait's own, and those
+   * of every trait it requires.
+   *
+   * A required trait's associated type is as much a hole in a slot's signature as the trait's own —
+   * the required members are slots in the same table — so the object binds it in the same brackets
+   * and under the same name. It can be one flat list because a type may implement at most one trait
+   * declaring an associated type of any given name (`02`), which is the rule that lets a projection
+   * be written without naming its trait.
+   */
+  protected def objectAssocs(name: String, args: List[Type] = Nil): List[AssocDecl] =
+    traitClosure(Type.Bound(name, args)).flatMap(b => traitDecls.get(b.name).toList.flatMap(_.assocs)).distinctBy(_.name)
+
+  /** Holds the `Name = T` clauses of a trait object's brackets to the associated types the trait
+   * actually declares: each one named once, each one declared, and each one meeting the bounds the
+   * trait asked of it.
+   *
+   * What it does *not* check is that the value erased into the object agrees — that is the erasure's
+   * question, asked where the concrete type is known, and `TraitObjects.erase` asks it.
+   */
+  protected def checkAssocArgs(
+      name: String,
+      declared: List[AssocDecl],
+      supplied: List[(String, Type)],
+      sigil: String,
+      args: List[Type],
+  ): Unit = {
+    val obj = s"'$sigil${Type.qualified(qn(name), args)}'"
+
+    for (a, _) <- supplied if !declared.exists(_.name == a) do
+      if declared.isEmpty then
+        err(s"'${qn(name)}' declares no associated types, so there is nothing in $obj for '$a' to " +
+          s"fix — a trait declares one with 'type $a: …' among its members")
+      else
+        err(s"'${qn(name)}' declares no associated type '$a' — it declares " +
+          declared.map(_.name).mkString("'", "', '", "'"))
+
+    for (a, _) <- supplied.groupBy(_._1).collect { case (a, more) if more.length > 1 => (a, more) } do
+      err(s"$obj fixes '$a' more than once, and a type has one of each")
+
+    // The bounds are the trait's promise about whatever supplies the type, and an object supplying
+    // one directly is held to them exactly as an `impl` is — otherwise a slot's signature would
+    // typecheck against a type the member's body was never licensed to use.
+    //
+    // **Deferred, for the reason every other applied bound is deferred**: a signature is resolved
+    // while the file is still being hoisted, so the `impl` that makes the supplied type conform may
+    // not be registered yet. Asked here and now, `&Seq[Item = int]` in a program that also writes
+    // `impl Render for int` is refused against a table still being filled.
+    val bound = declared.flatMap(d => supplied.find(_._1 == d.name).map((d, _)))
+
+    deferredBounds(
+      qn(name),
+      bound.map(_._1.name),
+      bound.map((d, _) => d.name -> d.bounds).toMap,
+      bound.map(_._2._2),
+      noun = "associated type",
+    )
+  }
+
   protected def checkObjectSafe(
       name: String,
       args: List[Type],
       sigil: String,
       defaulted: Set[String] = Set.empty,
+      fixed: Set[String] = Set.empty,
   ): Unit = {
     val obj = s"'$sigil${Type.qualified(qn(name), args)}'"
 
@@ -746,10 +838,11 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
     // projection in the member's result is a function of the very type an object has forgotten, so
     // the slot's signature would differ per implementing type. The trait that declared it is named,
     // which for a required trait is not the one the object was written as.
-    for b <- traitClosure(Type.Bound(name, args)); d <- traitDecls.get(b.name); a <- d.assocs.headOption do
+    for b <- traitClosure(Type.Bound(name, args)); d <- traitDecls.get(b.name); a <- d.assocs if !fixed(a.name) do
       err(s"'${qn(b.name)}' declares the associated type '${a.name}', whose meaning is the " +
         s"implementing type's — an erased value has forgotten which type that is, so there is no " +
-        s"$obj to form. A bound keeps the type and so keeps the answer: write '[T: ${qn(b.name)}]'")
+        s"$obj to form. Say which it is and there is: write '$sigil${qn(name)}[${a.name} = …]', or " +
+        s"take a bound instead, which keeps the type and so keeps the answer: '[T: ${qn(b.name)}]'")
 
     // A trait offers what it requires as well as what it declares, so a required trait that cannot
     // be erased makes the trait that required it unerasable too — and the diagnostic names the one
@@ -773,7 +866,7 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
       // those are, and reports them itself in the words that name the fix.
       val viaArg = paramsBoundToSelf(from) -- (if from.name == name then defaulted else Set.empty)
 
-      if (m.params.map(_.typ) ++ m.retType).exists(t => mentionsAny(t, viaArg + selfName)) then
+      if (m.params.map(_.typ) ++ m.retType).exists(t => mentionsAny(t, viaArg + selfName, fixed)) then
         err(s"'${m.name}' of '$shown' mentions 'Self' away from its receiver, and an erased value " +
           s"has forgotten which type that is — so there is no $obj to form")
       // A variadic call names the callee's whole function type, which is how it says where the
@@ -802,27 +895,34 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
   /** Whether a written type names any of `names` anywhere inside it. `Self` is the one that matters
    * for erasure, and a trait *parameter* matters exactly when `Self` is what was passed for it.
    */
-  protected def mentionsAny(t: TypeRef, names: Set[String]): Boolean = t match
-    case NamedType(n, args)  => names(n) || args.exists(mentionsAny(_, names))
-    case PtrType(i)          => mentionsAny(i, names)
-    case RefType(i, _)       => mentionsAny(i, names)
-    case WeakType(i)         => mentionsAny(i, names)
-    case ArrayType(_, e, _)  => mentionsAny(e, names)
-    case VectorType(_, e)    => mentionsAny(e, names)
+  protected def mentionsAny(t: TypeRef, names: Set[String], settled: Set[String] = Set.empty): Boolean = t match
+    case NamedType(n, args)  => names(n) || args.exists(mentionsAny(_, names, settled))
+    case PtrType(i)          => mentionsAny(i, names, settled)
+    case RefType(i, _)       => mentionsAny(i, names, settled)
+    case WeakType(i)         => mentionsAny(i, names, settled)
+    case ArrayType(_, e, _)  => mentionsAny(e, names, settled)
+    case VectorType(_, e)    => mentionsAny(e, names, settled)
     // The question this answers is about erasure — whether a **type** is named — and a value
     // argument names none, so it can hold no forgotten one.
     case _: ValueArgType     => false
-    case VolatileType(i)     => mentionsAny(i, names)
-    case TupleType(parts, _) => parts.exists(mentionsAny(_, names))
+    case VolatileType(i)     => mentionsAny(i, names, settled)
+    case TupleType(parts, _) => parts.exists(mentionsAny(_, names, settled))
     // A pack names one of the block's own parameters, so it is named here exactly as `T` would be.
     case PackType(n)         => names(n)
-    case f: FnType           => mentionsAny(f.asTrait, names)
-    case CFnType(ps, r)      => ps.exists(mentionsAny(_, names)) || mentionsAny(r, names)
-    // `Self::Body` mentions `Self`, which is the whole reason a trait declaring an associated type
-    // cannot be erased: the type the projection names is a function of the very type an object has
-    // forgotten. `checkObjectSafe` says so in those words before this answer is reached, so that the
-    // reader is told about the associated type rather than about a `Self` they did not spell twice.
-    case AssocType(base, _)  => mentionsAny(base, names)
+    case f: FnType           => mentionsAny(f.asTrait, names, settled)
+    case CFnType(ps, r)      => ps.exists(mentionsAny(_, names, settled)) || mentionsAny(r, names, settled)
+    // **`Self::Body` the object fixed mentions nothing it has forgotten.** That is the whole of what
+    // `settled` is for: the projection names a type the object type wrote down, so the slot's
+    // signature is the same for every implementing type and there is a table to point at.
+    case AssocType(NamedType(n, Nil), member) if n == selfName && settled(member) => false
+    // Otherwise `Self::Body` mentions `Self`, which is why a trait declaring an associated type
+    // cannot be erased unless the object says which type it is. `checkObjectSafe` says so in those
+    // words before this answer is reached, so that the reader is told about the associated type
+    // rather than about a `Self` they did not spell twice.
+    case AssocType(base, _)  => mentionsAny(base, names, settled)
+    // What an object fixes an associated type *to* is an ordinary type and is read as one: a
+    // `*Sink[Item = Self]` names the forgotten type as surely as a parameter of that type would.
+    case AssocArgType(_, t)  => mentionsAny(t, names, settled)
     case _: SomeType         => false
 
   /** Which of a trait's own type parameters were given `Self` at this application — the parameters a

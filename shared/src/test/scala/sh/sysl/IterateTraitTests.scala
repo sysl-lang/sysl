@@ -28,7 +28,8 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
       |    at: int
       |    last: int
       |end Upto
-      |impl Iterate[int] for Upto
+      |impl Iterate for Upto
+      |    type Item = int
       |    next(*self) -> Option[int]
       |        if self.at > self.last then return None
       |        self.at += 1
@@ -145,17 +146,24 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
                    |print(it.next().unwrap())""".stripMargin) shouldBe "1\n2\n1\n2\n1\n"
     }
 
-    // Two implementations of one trait on one type is legal (`02`), and every other member picks
-    // between them by its arguments — but `next` takes none, so the loop has nothing to decide
-    // with. Reported at the loop, where the sentence a program needs can name it.
-    "a type implementing 'Iterate' twice leaves a 'for' nothing to choose with" in {
+    // Two implementations of one trait on one type is legal for a trait that takes *arguments*
+    // (`02`), and every member then picks between them by its own — but `Iterate` takes none, and
+    // the element it yields is an associated type the subject chooses. So a second implementation
+    // is not an ambiguity a `for` has to resolve; it is the duplicate it looks like, and it is
+    // refused where it is written rather than at some loop three files away.
+    //
+    // This is the shape the element being a *parameter* used to make legal, and the loop used to be
+    // where it was reported. Nothing reaches the loop now.
+    "a type implementing 'Iterate' twice is a duplicate, not a choice a 'for' has to make" in {
       val two =
         """struct Both
           |    n: int
           |end Both
-          |impl Iterate[int] for Both
+          |impl Iterate for Both
+          |    type Item = int
           |    next(*self) -> Option[int] = None
-          |impl Iterate[bool] for Both
+          |impl Iterate for Both
+          |    type Item = bool
           |    next(*self) -> Option[bool] = None
           |""".stripMargin
 
@@ -226,7 +234,8 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
              |    at: int
              |    n: int
              |end Cells
-             |impl Iterate[&Cell] for Cells
+             |impl Iterate for Cells
+             |    type Item = &Cell
              |    next(*self) -> Option[&Cell]
              |        if self.at >= self.n then return None
              |        self.at += 1
@@ -251,7 +260,8 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
              |    at: int
              |    n: int
              |end Cells
-             |impl Iterate[&Cell] for Cells
+             |impl Iterate for Cells
+             |    type Item = &Cell
              |    next(*self) -> Option[&Cell]
              |        if self.at >= self.n then return None
              |        self.at += 1
@@ -269,35 +279,65 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
     // body may call it. This is the probe that says whether the protocol reaches generic code at
     // all, and it does: `next` is an ordinary bounded method call.
     "a bound promising 'Iterate' licenses the call in a generic body" in {
-      run(upto + """total[T: Iterate[int]](it: T) -> int
-                   |    var sum = 0
+      run(upto + """count_all[T: Iterate](it: T) -> int
+                   |    var seen = 0
                    |    var cur = it
                    |    loop
                    |        var got = cur.next()
                    |        if got.is_none() then break
-                   |        sum += got.unwrap()
-                   |    sum
-                   |print(total(Upto(1, 4)))""".stripMargin) shouldBe "10\n"
+                   |        seen += 1
+                   |    seen
+                   |print(count_all(Upto(1, 4)))""".stripMargin) shouldBe "4\n"
+    }
+
+    /** **The signature the element being an associated type is FOR**, and the one the parameter
+     * form could not express. `[T: Iterate]` names no element, so nothing at the call has to say
+     * what it is; written `[E, T: Iterate[E]]` the same function was refused outright — *"'E' is in
+     * neither the parameters of 'count_all' nor its result"* — because the element appeared only in
+     * a bound, which a call has nothing to solve it from.
+     *
+     * The second half is the other direction: a body that *does* want the element names it as
+     * `T::Item` and gets the type the implementation chose.
+     */
+    "and the element is reachable as 'T::Item', which is what a parameter could not be" in {
+      run(upto + """first[T: Iterate](it: T) -> Option[T::Item]
+                   |    var cur = it
+                   |    cur.next()
+                   |print(first(Upto(3, 9)).unwrap())""".stripMargin) shouldBe "3\n"
     }
 
     // …and so does the loop form, which was worth probing rather than assuming: the loop looks for
     // an implementation filed under the receiver's *type*, and a type parameter has none — but
     // `10 §7`'s per-instantiation lowering means the body is analyzed once `T` is a real type, so
     // by the time the loop asks, there is one. A generic walk over any cursor needs nothing added.
+    // The body counts rather than prints, and that is the associated type showing through: a
+    // `[T: Iterate]` says what `T` can *do* and nothing about what it yields, so `print(x)` is not
+    // licensed — `Iterate` promises nothing of its `Item` and a bound cannot add a promise to a
+    // projection. Naming the element in the bound is what a parameter used to allow and what an
+    // object now does; a *bound* has no spelling for it.
     "a 'for' over a bounded type parameter walks it" in {
-      run(upto + """walk[T: Iterate[int]](it: T)
-                   |    for x in it do print(x)
-                   |walk(Upto(1, 2))""".stripMargin) shouldBe "1\n2\n"
+      run(upto + """walk[T: Iterate](it: T) -> int
+                   |    var n = 0
+                   |    for _ in it do n += 1
+                   |    n
+                   |print(walk(Upto(1, 2)))""".stripMargin) shouldBe "2\n"
     }
 
     /** `02 § An object keeps one trait and what that trait requires` — an erased value reaches its
      * trait's members through a table, and `next` is object-safe (`*self`, no `Self` away from the
      * receiver). So a `for` walks one: the loop asks what may be *called* on the value, which is the
-     * question the table answers, and the element type is whatever the object was erased to.
+     * question the table answers.
+     *
+     * **The element comes out of the object's own type**, which is what makes an object over a trait
+     * with an associated type formable at all: an erased value has forgotten which implementation it
+     * came from, so `*Iterate` alone says nothing about what `next` answers with — and
+     * `*Iterate[Item = int]` says it outright. `*Iterate[int]` is the same type: a trait with no
+     * parameters of its own and exactly one associated type has only one thing a bare argument could
+     * mean, so the short form is what a program writes and both are pinned here.
      *
      * The loop looks for an implementation filed under the receiver's type for every *other* kind of
      * value, and an object has none — it **is** the implementation. Reading the element out of the
-     * object's own trait instead is the same step that lets a bound take one (`10 §5`), and both
+     * object's own type instead is the same step that lets a bound take one (`10 §5`), and both
      * sigils are pinned because the two are separate types.
      */
     "a 'for' walks an erased cursor, and so does a direct 'next'" in {
@@ -314,19 +354,37 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
                    |for x in o do print(x)""".stripMargin) shouldBe "1\n2\n3\n"
     }
 
+    /** The same three, written the long way. `Item = int` is the general spelling and the bare one
+     * is sugar for it, so these are not two types — a value erased at one is the value the other
+     * holds, and a function declared with one takes what the other made.
+     */
+    "and the element may be named outright, which is the same type as the short form" in {
+      run(upto + """var o: &Iterate[Item = int] = Upto(1, 3)
+                   |for x in o do print(x)""".stripMargin) shouldBe "1\n2\n3\n"
+
+      run(upto + """count(o: *Iterate[Item = int]) -> int
+                   |    var n = 0
+                   |    for _ in o do n += 1
+                   |    n
+                   |var c = Upto(1, 4)
+                   |var short: *Iterate[int] = &c
+                   |print(count(short))""".stripMargin) shouldBe "4\n"
+    }
+
     /** An object over a trait that **requires** `Iterate` is walked too, since the element is read
      * out of the requirement closure — the same list the table is laid out from, so the loop cannot
      * disagree with the table about which member it is calling.
      */
     "and one over a trait that requires it, which is the closure being read rather than the name" in {
-      run("""trait Counted: Iterate[int]
+      run("""trait Counted: Iterate
             |    seen(self) -> int
             |
             |struct Upto
             |    at: int
             |    hi: int
             |
-            |impl Iterate[int] for Upto
+            |impl Iterate for Upto
+            |    type Item = int
             |    next(*self) -> Option[int]
             |        if self.at > self.hi then None else
             |            var v = self.at
@@ -337,7 +395,7 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
             |    seen(self) -> int = self.at
             |end Upto
             |
-            |var o: &Counted = Upto(1, 3)
+            |var o: &Counted[int] = Upto(1, 3)
             |
             |for x in o do print(x)
             |
@@ -350,7 +408,8 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
     "an 'Iterate' for a slice does not take over the built-in walk" in {
       run("""struct N
             |    v: int
-            |impl Iterate[N] for []N
+            |impl Iterate for []N
+            |    type Item = N
             |    next(*self) -> Option[N] = Some(N(99))
             |var xs = [N(1), N(2), N(3)]
             |for x in xs[..] do print(x.v)
@@ -365,7 +424,8 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
              |    xs: []int
              |    at: usize
              |end Take
-             |impl Iterate[int] for Take
+             |impl Iterate for Take
+             |    type Item = int
              |    next(*self) -> Option[int]
              |        if self.at >= self.xs.len then return None
              |        self.at += 1usize
@@ -415,7 +475,8 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
              |    c: &Cell
              |    done: bool
              |end Once
-             |impl Iterate[int] for Once
+             |impl Iterate for Once
+             |    type Item = int
              |    next(*self) -> Option[int]
              |        if self.done then return None
              |        self.done = true
@@ -436,7 +497,8 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
       run("""struct Tick
              |    u: unit
              |end Tick
-             |impl Iterate[int] for Tick
+             |impl Iterate for Tick
+             |    type Item = int
              |    next(*self) -> Option[int] = None
              |for x in Tick(()) do print(x)
              |print("through")""".stripMargin) shouldBe "through\n"
@@ -461,7 +523,8 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
       err("""struct Bad
             |    n: int
             |end Bad
-            |impl Iterate[int] for Bad
+            |impl Iterate for Bad
+            |    type Item = int
             |    next(*self) -> int = 0
             |""".stripMargin) should include("next")
     }

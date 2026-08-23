@@ -541,6 +541,9 @@ trait GenericInstantiation extends ConstFolding {
     // read in reverse, and more than one type can have the same associated type. The subject is
     // solved from wherever else it appears, and the projection then follows from it.
     case _: AssocType => ()
+    // An object's binding is written rather than solved: it is part of the object *type*, so a
+    // parameter named there is fixed by whoever wrote it and there is nothing to read backwards.
+    case _: AssocArgType => ()
     // A `some` result stands in an `impl` block's member, which nothing calls generically.
     case _: SomeType  => ()
     // A trait never binds a type parameter. `f[T](p: *T)` handed a `*Writer` would otherwise

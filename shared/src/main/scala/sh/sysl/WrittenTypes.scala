@@ -42,6 +42,8 @@ trait WrittenTypes extends GenericInstantiation {
     // A projection is fixed exactly when its subject is: `T::Item` is no more a type than `T` is
     // until `T` is one, and once it is, the implementation is what says which type it names.
     case AssocType(base, _)  => mentions(base, tps)
+    // An object's binding is a written type, so it mentions a parameter exactly as one does.
+    case AssocArgType(_, t)  => mentions(t, tps)
     // A `some` result names no type at all — what it promises is a bound — so the parameters it
     // could mention are the ones a bound's own arguments carry.
     case SomeType(bs)        => bs.exists(_.args.exists(mentions(_, tps)))
@@ -163,6 +165,10 @@ trait WrittenTypes extends GenericInstantiation {
       case f: FnType               => f.params.foreach(walk); walk(f.ret)
       case CFnType(params, ret)    => params.foreach(walk); walk(ret)
       case AssocType(base, _)      => walk(base)
+      // What an object fixes an associated type to is an ordinary written type, so it is held to
+      // everything the rest of this walk holds one to — a pack or a length written inside it is the
+      // same mistake there as anywhere else.
+      case AssocArgType(_, typ)    => walk(typ)
       // A `some` result declares nothing about a pack or a length; it names a bound.
       case _: SomeType             => ()
 

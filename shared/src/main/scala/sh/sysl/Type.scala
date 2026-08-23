@@ -154,12 +154,19 @@ object Type {
    * and the trait-ness is what makes that pointer fat. Resolving a bare trait name says so rather
    * than producing one of these.
    */
-  case class Trait(name: String, args: List[Type] = Nil) extends Type {
+  case class Trait(name: String, args: List[Type] = Nil, assocs: List[(String, Type)] = Nil) extends Type {
 
     /** The trait as a bound names it, which is what an implementation is filed under: an object over
      * `From[int]` dispatches through the implementation written for exactly that.
+     *
+     * The associated types are deliberately **not** part of it. An argument selects between
+     * implementations and one of these does not — the subject is what supplies it — so a bound
+     * carrying one would be a promise no `impl` is filed under.
      */
     def bound: Bound = Bound(name, args)
+
+    /** What the object fixed the associated type `name` to, where it fixed one. */
+    def assoc(name: String): Option[Type] = assocs.collectFirst { case (n, t) if n == name => t }
 
     def lty(using Word): LType =
       throw new IllegalStateException(s"the trait '$name' reached codegen as a type of its own")
@@ -561,10 +568,15 @@ object Type {
     case Pack(es)                 => es.map(show).mkString(", ")
     // A call trait is spelled the way it is written rather than the way it is filed, so nothing a
     // reader is told names the arity-carrying declaration behind it (`12 §6`).
-    case Trait(n, args) =>
+    case Trait(n, args, assocs) =>
       Fn.parts(n, args) match
         case Some((ps, r)) => s"Fn(${ps.map(show).mkString(", ")}) -> ${show(r)}"
-        case None          => qualified(Modules.show(n), args)
+        // An object's associated types are written back where they were written: inside the same
+        // brackets, after the arguments, since that is the one spelling a reader can copy.
+        case None if assocs.isEmpty => qualified(Modules.show(n), args)
+        case None =>
+          val written = args.map(show) ::: assocs.map((a, t) => s"$a = ${show(t)}")
+          s"${Modules.show(n)}[${written.mkString(", ")}]"
     // Every type a programmer can write is above, and `show` has already taken the named ones, so
     // nothing reaches this. It answers with the case class rather than with an LLVM type because a
     // **diagnostic must not have to know the machine**: a view's LLVM form is the one form that
@@ -1073,7 +1085,10 @@ object Type {
     // and are reached by different instructions, so an instantiation at one must never share a body
     // with an instantiation at the other.
     case Volatile(inner)    => s"volatile.${mangleOne(inner)}"
-    case Trait(n, args)    => mangled(n, args)
+    // The associated types are **not** mangled in, and leaving them out is what keeps one table per
+    // (trait, type): the object fixes them, but a given type supplies exactly one of each, so two
+    // objects over one type could only ever have agreed about them.
+    case Trait(n, args, _) => mangled(n, args)
     // The signature is part of the name for the reason a generic's arguments are: two of these are
     // the same type only where they are called the same way, and a mangled name that dropped the
     // signature would let an instantiation at one share a body with an instantiation at another.

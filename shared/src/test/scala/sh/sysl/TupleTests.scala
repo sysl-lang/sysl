@@ -268,7 +268,8 @@ class TupleTests extends AnyFreeSpec with ParseSupport with RunSupport with Code
     "and is the element a cursor iterates" in {
       run("""struct Cursor
             |    i: int
-            |impl Iterate[(int, string)] for Cursor
+            |impl Iterate for Cursor
+            |    type Item = (int, string)
             |    next(*self) -> Option[(int, string)]
             |        if self.i >= 3 then return None
             |        var n = self.i

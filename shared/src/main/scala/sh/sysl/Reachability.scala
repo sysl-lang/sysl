@@ -241,8 +241,8 @@ object Reachability {
     // with the functions every implementation of that trait put there.
     def dynamic(recvTy: Type, slot: Int): Unit =
       val name = recvTy match
-        case Type.Ptr(Type.Trait(n, _))    => Some(n)
-        case Type.Ref(Type.Trait(n, _), _) => Some(n)
+        case Type.Ptr(Type.Trait(n, _, _))    => Some(n)
+        case Type.Ref(Type.Trait(n, _, _), _) => Some(n)
         case _                             => None
 
       for t <- vtables if name.contains(t.traitName); s <- t.slots.lift(slot) do calls += s.target

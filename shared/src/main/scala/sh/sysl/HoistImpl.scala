@@ -820,6 +820,8 @@ trait HoistImpl extends ImplConformance {
     // A projection's home is its subject's: `T::Item` is written wherever `T` is, and the type it
     // names belongs to whoever implemented the trait rather than to whoever wrote this.
     case AssocType(base, _)  => subjectHomes(base)
+    // An object's binding names a type like any other, and that type is where it lives.
+    case AssocArgType(_, t)  => subjectHomes(t)
     // A `some` result is never an `impl`'s subject — it stands in a member's result.
     case _: SomeType         => Set(None)
 

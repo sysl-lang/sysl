@@ -1033,10 +1033,13 @@ trait MethodCalls extends FuncAddress {
         err(s"'$mname' is a property of '${t.name}' — read it as 'value.$mname', without '()'")
       case Some(((from, m), slot)) =>
         // A signature is read under the parameters of the trait that *declared* it, at the arguments
-        // the object's type fixed for it — an object over `Sink[int]` takes an `int`. `Self` is not
-        // in the substitution at all: object safety already refused any trait that mentions one away
-        // from its receiver, so no signature reaching here contains one.
-        val subst: Map[String, Type] = traitDecls(from.name).tparams.zip(from.args).toMap
+        // the object's type fixed for it — an object over `Sink[int]` takes an `int`.
+        //
+        // **`Self` stands for the object type**, which is the one thing it may stand for here: a
+        // signature that named it anywhere but a projection was refused by object safety, and a
+        // projection is what this is for — `Self::Item` on a `*Iterate[Item = string]` is the
+        // `string` the object wrote down, read back by `assocType`.
+        val subst: Map[String, Type] = traitDecls(from.name).tparams.zip(from.args).toMap + (selfName -> t)
         val params                   = m.params.map(p => (p.name, resolveType(p.typ, subst)))
         // A boxed callable's `call` is the same non-member the inlined one's is, and reads the same
         // way in a message — the arity-carrying trait behind it is the compiler's business.
@@ -1071,7 +1074,9 @@ trait MethodCalls extends FuncAddress {
   protected def readTraitObjectProperty(recv: TExpr, t: Type.Trait, name: String): TExpr = {
     slottedMembers(Type.Bound(t.name, t.args)).zipWithIndex.find(_._1._2.name == name) match
       case Some(((from, m), slot)) if m.isProperty =>
-        val subst: Map[String, Type] = traitDecls(from.name).tparams.zip(from.args).toMap
+        // `Self` stands for the object, exactly as it does at a method call one function up: a
+        // property whose type is a projection reads it back off what the object type fixed.
+        val subst: Map[String, Type] = traitDecls(from.name).tparams.zip(from.args).toMap + (selfName -> t)
 
         TVCall(recv, slot, Nil, m.retType.map(resolveReturn(_, subst)).getOrElse(Type.Unit))
       case Some(_) =>

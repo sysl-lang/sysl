@@ -69,7 +69,7 @@ object AstCodec {
    * conflict**, and that is the case the rule above is written for: read dev's number, take the one
    * after it, and do not assume a clean merge means the versions agree.
    */
-  val Version: Int = 46
+  val Version: Int = 47
 
   private val Magic = "sysl-ast"
 
@@ -278,6 +278,7 @@ object AstCodec {
         case CFnType(ps, ret)     => tok("tc"); list(ps)(typ); typ(ret)
         case ValueArgType(v)      => tok("tva"); expr(v)
         case AssocType(base, m)   => tok("tas"); typ(base); sref(m)
+        case AssocArgType(n, t)   => tok("taa"); sref(n); typ(t)
         case SomeType(bs)         => tok("tsome"); list(bs)(bound)
     }
 
@@ -740,6 +741,7 @@ object AstCodec {
         case "tc"  => CFnType(list(typ()), typ())
         case "tva" => ValueArgType(expr())
         case "tas" => AssocType(typ(), sref())
+        case "taa" => AssocArgType(sref(), typ())
         case "tsome" => SomeType(list(bound()))
         case other => fail(s"'$other' is not a type tag")
     }

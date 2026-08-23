@@ -303,4 +303,123 @@ class AssociatedTypeRunTests extends AnyFreeSpec with RunSupport {
 
     run(src) shouldBe "4\n"
   }
+
+  /** **An object may fix what the implementation would have chosen**, which is the escape from the
+   * rule that a trait declaring an associated type cannot be erased.
+   *
+   * The rule was never arbitrary: a slot's signature is a function of the type the object forgot, so
+   * a table over `Seq` alone would have a `head` whose result differed per implementing type. What
+   * the binding does is put the answer in the *object type* — `&Seq[Item = int]` is a value of some
+   * forgotten type whose `Item` is known to be `int` — so every slot has one signature again and
+   * there is a table to point at. Rust spells it `dyn Iterator<Item = String>` for the same reason.
+   */
+  "an object may fix the associated type, and then it is a table like any other" - {
+
+    "the named form carries the answer through the table" in {
+      val src = render +
+        """trait Seq
+          |    type Item: Render
+          |    head(self) -> Self::Item
+          |struct Box
+          |    v: int
+          |impl Seq for Box
+          |    type Item = int
+          |    head(self) -> Self::Item = self.v
+          |show(s: &Seq[Item = int]) -> unit
+          |    print(s.head(), s.head().render())
+          |show(Box(7))""".stripMargin
+
+      run(src) shouldBe "7 i\n"
+    }
+
+    // The bare form is sugar for the named one where the trait has no parameters of its own and
+    // exactly one associated type, so the two are one type — a function declared with one takes
+    // what the other made, with no conversion between them.
+    "and the bare form is the same type as the named one" in {
+      val src = render +
+        """trait Seq
+          |    type Item: Render
+          |    head(self) -> Self::Item
+          |struct Box
+          |    v: int
+          |impl Seq for Box
+          |    type Item = int
+          |    head(self) -> Self::Item = self.v
+          |named(s: &Seq[Item = int]) -> int = s.head()
+          |bare(s: &Seq[int]) -> int = named(s)
+          |print(bare(Box(4)))""".stripMargin
+
+      run(src) shouldBe "4\n"
+    }
+
+    // A `*Trait` points straight at a value and a `&Trait` carries a counted box, so the two are
+    // separate types and the binding has to reach both.
+    "a raw object binds it too" in {
+      val src = render +
+        """trait Seq
+          |    type Item: Render
+          |    head(self) -> Self::Item
+          |struct Box
+          |    v: int
+          |impl Seq for Box
+          |    type Item = int
+          |    head(self) -> Self::Item = self.v
+          |show(s: *Seq[Item = int]) -> unit
+          |    print(s.head())
+          |var b = Box(9)
+          |show(&b)""".stripMargin
+
+      run(src) shouldBe "9\n"
+    }
+
+    // Two implementations choosing two different types are two object types, and each carries its
+    // own answer — which is the whole claim, since a table shared between them would have to
+    // promise both.
+    "and two types choosing differently are two object types" in {
+      val src = render +
+        """trait Seq
+          |    type Item: Render
+          |    head(self) -> Self::Item
+          |struct Num
+          |    v: int
+          |impl Seq for Num
+          |    type Item = int
+          |    head(self) -> Self::Item = self.v
+          |struct Word
+          |    v: string
+          |impl Seq for Word
+          |    type Item = string
+          |    head(self) -> Self::Item = self.v
+          |ints(s: &Seq[Item = int]) -> string = s.head().render()
+          |words(s: &Seq[Item = string]) -> string = s.head().render()
+          |print(ints(Num(2)), words(Word("w")))""".stripMargin
+
+      run(src) shouldBe "i w\n"
+    }
+
+    // A trait that merely *requires* one is unerasable for the same reason and is rescued the same
+    // way: the required trait's members are slots in this trait's own table, so its associated type
+    // is a hole in a signature here and is bound in these brackets under the name it was declared
+    // with.
+    "a required trait's associated type is bound in the same brackets" in {
+      val src = render +
+        """trait Seq
+          |    type Item: Render
+          |    head(self) -> Self::Item
+          |trait Bigger: Seq
+          |    more(self) -> int
+          |struct Box
+          |    v: int
+          |impl Seq for Box
+          |    type Item = int
+          |    head(self) -> Self::Item = self.v
+          |impl Bigger for Box
+          |    more(self) -> int = self.v + 1
+          |show(s: &Bigger[Item = int]) -> unit
+          |    print(s.head(), s.more())
+          |show(Box(5))""".stripMargin
+
+      run(src) shouldBe "5 6\n"
+    }
+  }
 }

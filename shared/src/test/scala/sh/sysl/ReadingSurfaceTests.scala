@@ -584,7 +584,8 @@ class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
           |    at: int
           |end Count
           |
-          |impl Iterate[int] for Count
+          |impl Iterate for Count
+          |    type Item = int
           |    next(*self) -> Option[int]
           |        if self.at >= 3 then return None
           |

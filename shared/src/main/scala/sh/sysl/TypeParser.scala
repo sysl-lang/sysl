@@ -188,7 +188,18 @@ trait TypeParser extends ExprParser {
    * parameter's name from a value parameter's, and the declaration can.
    */
   protected lazy val typeArg: Parser[TypeRef] =
-    typeRef | (expression ^^ ValueArgType.apply)
+    assocArg | typeRef | (expression ^^ ValueArgType.apply)
+
+  /** `Item = string` — an associated type supplied by a **trait object's** own brackets.
+   *
+   * It is tried before the two alternatives above rather than after, because `Item` on its own is a
+   * perfectly good name: read as a type first, the argument would succeed and leave the `=` to fail
+   * against the closing bracket, and the reader would be told a `]` was expected about a line that
+   * has one. Where the brackets do not belong to a trait behind a mode, the analyzer is what says
+   * so — the grammar cannot tell a trait's name from a struct's.
+   */
+  protected lazy val assocArg: Parser[TypeRef] =
+    at(ident ~ (op("=") ~> typeRef) ^^ { case n ~ t => AssocArgType(n, t) })
 
   protected lazy val softSync: Parser[Unit] =
     accept("'sync'", { case t: lexical.Identifier if t.chars == "sync" => () })

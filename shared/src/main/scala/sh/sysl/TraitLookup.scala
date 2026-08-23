@@ -299,6 +299,14 @@ trait TraitLookup extends MemberVisibility {
         boundErr(s"'${a.name}' is not bounded by a trait declaring an associated type '$member', so " +
           s"there is nothing here to say what '${a.name}::$member' is — a bound is what gives a " +
           s"type parameter one, written '[${a.name}: Trait]' where 'Trait' declares 'type $member'"))
+    // **The subject is a trait object**, which reaches here as the `Self` a slot's signature is read
+    // under: the object forgot its type, and what it wrote down in its place is exactly this. A
+    // projection it did not fix cannot arrive — object safety refused the type before any signature
+    // was read — so the fallback is a compiler fault rather than a program's mistake.
+    case t: Type.Trait =>
+      t.assoc(member).getOrElse(
+        err(s"'${show(t)}' does not say what '$member' is, so a slot naming 'Self::$member' " +
+          s"has no signature — write it as '${show(t)}[$member = …]'"))
     case concrete => concreteAssoc(concrete, member).fold(err, identity)
 
   /** The same, answering `None` where the projection cannot be worked out instead of reporting.
@@ -310,6 +318,7 @@ trait TraitLookup extends MemberVisibility {
   protected def assocTypeOpt(subject: Type, member: String): Option[Type] = subject match
     case Type.Unknown     => Some(Type.Unknown)
     case a: Type.Abstract => abstractAssoc(a, member)
+    case t: Type.Trait    => t.assoc(member)
     case concrete         => concreteAssoc(concrete, member).toOption
 
   /** Which of a type's implementations of a trait supplies exactly the promise `tr` asks for. A
@@ -372,6 +381,12 @@ trait TraitLookup extends MemberVisibility {
       targs: List[Type],
       pos: Option[Pos],
       scope: Scope,
+      /** What the thing being checked is called in the sentence — `type parameter` for the ordinary
+        * case, `associated type` for a trait object's binding. The rule is identical and only the
+        * noun differs, so calling an associated type a parameter would send the reader looking for
+        * a bracket the trait does not have.
+        */
+      noun: String = "type parameter",
   )
 
   /** Type applications whose bounds could not be answered where they were written. Drained once, as
@@ -409,10 +424,11 @@ trait TraitLookup extends MemberVisibility {
       tparams: List[String],
       bounds: Map[String, List[BoundRef]],
       targs: List[Type],
+      noun: String = "type parameter",
   ): Unit =
     if bounds.nonEmpty && tparams.length == targs.length then
-      if implsHoisted then checkParamBounds(what, tparams, bounds, targs)
-      else boundChecks += DeferredBound(what, tparams, bounds, targs, currentPos, currentScope)
+      if implsHoisted then checkParamBounds(what, tparams, bounds, targs, noun = noun)
+      else boundChecks += DeferredBound(what, tparams, bounds, targs, currentPos, currentScope, noun)
 
   /** Whether the type arguments a generic declaration was applied to implement what it asked of its
    * parameters — the one rule, wherever the parameters came from: a function's, an `impl` block's,
@@ -432,6 +448,7 @@ trait TraitLookup extends MemberVisibility {
       bounds: Map[String, List[BoundRef]],
       targs: List[Type],
       seed: Map[String, Type] = Map.empty,
+      noun: String = "type parameter",
   ): Unit =
     if bounds.nonEmpty then
       val subst = seed ++ tparams.zip(targs).toMap
@@ -452,7 +469,7 @@ trait TraitLookup extends MemberVisibility {
               // bound.
               case a: Type.Abstract =>
                 if !satisfies(tr, a) then
-                  boundErr(s"'$what' requires its type parameter '$tp' to implement '${showBound(tr, a)}', " +
+                  boundErr(s"'$what' requires its $noun '$tp' to implement '${showBound(tr, a)}', " +
                     s"but '${a.name}' is not bounded by it")
               case concrete =>
                 if !satisfies(tr, concrete) then
@@ -461,7 +478,7 @@ trait TraitLookup extends MemberVisibility {
                   // block that is already written.
                   val why = unmetBound(tr, concrete).fold("")(reason => s" — $reason")
 
-                  err(s"'$what' requires its type parameter '$tp' to implement '${showBound(tr, concrete)}', " +
+                  err(s"'$what' requires its $noun '$tp' to implement '${showBound(tr, concrete)}', " +
                     s"but ${show(concrete)} does not$why")
           case None =>
 

@@ -41,6 +41,7 @@ sealed trait TypeRef extends Positioned {
     case ValueArgType(Ident(n))           => n
     case ValueArgType(_)                  => "…"
     case AssocType(base, member)          => s"${base.show}::$member"
+    case AssocArgType(n, typ)             => s"$n = ${typ.show}"
     case SomeType(bounds)                 => s"some ${bounds.map(_.show).mkString(" + ")}"
 }
 
@@ -202,6 +203,21 @@ case class Param(
  * asked of a different subject.
  */
 case class AssocType(base: TypeRef, member: String) extends TypeRef
+
+/** `Item = string` inside a trait object's brackets — one associated type the **object** supplies.
+ *
+ * An associated type is the implementation's to choose, which is exactly what an erased value has
+ * forgotten, and that is why a trait declaring one cannot ordinarily be made into an object. What
+ * this says is that the *object type* fixes it: a `*Iterate[Item = string]` is a value of some
+ * forgotten type whose `Item` is known to be `string`, so every slot's signature is settled again
+ * and there is a table to point at. Rust's `dyn Iterator<Item = String>` is the same idea and the
+ * same spelling.
+ *
+ * It stands only inside the brackets of a trait behind a mode. Anywhere else — a struct's arguments,
+ * an ordinary generic type — there is no associated type to bind, and the analyzer says so rather
+ * than resolving it to anything.
+ */
+case class AssocArgType(name: String, typ: TypeRef) extends TypeRef
 
 /** `some View` — an `impl` member's result, whose concrete type is **inferred from the body** and
  * whose declared promise is the bound.

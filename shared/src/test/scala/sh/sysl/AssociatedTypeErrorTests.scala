@@ -219,13 +219,16 @@ class AssociatedTypeErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("'T' is not bounded by a trait declaring an associated type 'Item'")
     }
 
+    // The name is deliberately not `Item`: the standard library's `Iterate` declares one, so
+    // `Box::Item` reaches the *next* refusal down — a trait declares it and this type implements
+    // none of them — which is the case below rather than this one.
     "a name no trait declares at all" in {
       err(
         """struct Box
           |    v: int
-          |val x: Box::Item = 1
+          |val x: Box::Element = 1
           |print(1)""".stripMargin,
-      ) should include("no trait declares an associated type 'Item'")
+      ) should include("no trait declares an associated type 'Element'")
     }
 
     "a concrete type implementing no trait that declares one" in {
@@ -299,6 +302,106 @@ class AssociatedTypeErrorTests extends AnyFreeSpec with CodegenSupport {
             |show(s: &Bigger) -> unit
             |    print(1)
             |print(1)""".stripMargin,
+      ) should include("declares the associated type 'Item'")
+    }
+
+    // What the refusal now *advises*, which is the half a reader acts on. The advice used to be a
+    // bound and only a bound; there is a second answer, and a refusal that did not name it would
+    // send everybody to rewrite a signature they did not have to.
+    "and the refusal names the binding as well as the bound" in {
+      val refused = err(
+        seq +
+          """show(s: *Seq) -> unit
+            |    print(1)
+            |print(1)""".stripMargin,
+      )
+
+      refused should include("Item = …")
+      refused should include("[T: Seq]")
+    }
+  }
+
+  "an object that fixes the associated type has to fix the right one" - {
+
+    "a name the trait does not declare" in {
+      err(
+        seq +
+          """show(s: *Seq[Elem = int]) -> unit
+            |    print(1)
+            |print(1)""".stripMargin,
+      ) should include("declares no associated type 'Elem'")
+    }
+
+    // A trait with none at all gets a different sentence, because the reader's mistake is a
+    // different one: there is nothing here to fix rather than the wrong thing being fixed.
+    "a trait with no associated types has nothing for a binding to name" in {
+      err(
+        """trait Plain
+          |    hi(self) -> string
+          |show(s: *Plain[Item = int]) -> unit
+          |    print(1)
+          |print(1)""".stripMargin,
+      ) should include("declares no associated types")
+    }
+
+    "the same one twice" in {
+      err(
+        seq +
+          """show(s: *Seq[Item = int, Item = string]) -> unit
+            |    print(1)
+            |print(1)""".stripMargin,
+      ) should include("more than once")
+    }
+
+    // The trait's bound on the associated type is a promise about whatever supplies it, and an
+    // object supplies one directly — so it is held to the promise exactly as an `impl` is. Without
+    // this the slot's signature would typecheck against a type the member's body may not use.
+    "a type that does not meet what the trait asked of it" in {
+      err(
+        seq +
+          """impl Render for int
+            |    render(self) -> string = "i"
+            |show(s: *Seq[Item = bool]) -> unit
+            |    print(1)
+            |print(1)""".stripMargin,
+      ) should include("requires its associated type 'Item'")
+    }
+
+    // **The check that makes the binding sound.** Every slot's signature was read under the
+    // object's answer, so a value whose implementation chose a different one would be called
+    // through a table promising the wrong types. Asked at the erasure, which is the one place both
+    // are known — the object type at the context, the implementation at the value.
+    "and a value whose implementation chose otherwise does not go into it" in {
+      err(
+        seq +
+          """impl Render for int
+            |    render(self) -> string = "i"
+            |impl Render for string
+            |    render(self) -> string = self
+            |struct Box
+            |    v: int
+            |impl Seq for Box
+            |    type Item = int
+            |    head(self) -> Self::Item = self.v
+            |show(s: &Seq[Item = string]) -> unit
+            |    print(s.head().render())
+            |show(Box(7))
+            |print(1)""".stripMargin,
+      ) should (include("says 'Item' is string") and include("supplies int"))
+    }
+
+    // The bare form is sugar for the named one and is available only where it cannot be read two
+    // ways: a trait with parameters of its own has a bare argument meaning one of *those*.
+    "and the bare form is refused where the trait has parameters of its own" in {
+      err(
+        """trait Render
+          |    render(self) -> string
+          |trait Keyed[K]
+          |    type Item: Render
+          |    at(self, k: K) -> Self::Item
+          |show(s: *Keyed[int]) -> unit
+          |    print(1)
+          |print(1)""".stripMargin,
       ) should include("declares the associated type 'Item'")
     }
   }

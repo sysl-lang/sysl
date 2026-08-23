@@ -285,7 +285,8 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         """struct Countdown
           |    n: int
           |
-          |impl Iterate[int] for Countdown
+          |impl Iterate for Countdown
+          |    type Item = int
           |    next(*self) -> Option[int]
           |        if self.n <= 0 then None else
           |            self.n -= 1

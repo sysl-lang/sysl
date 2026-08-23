@@ -302,6 +302,9 @@ trait SignatureVisibility extends TypeResolution {
     // projection resolves to is chosen by an implementation rather than written here, and is held to
     // the same rule where that implementation supplies it.
     case AssocType(base, _)  => namesIn(base, skip)
+    // An object's binding is written in the signature, so what it names is exposed by it — unlike a
+    // projection, where the implementation rather than this signature chooses.
+    case AssocArgType(_, t)  => namesIn(t, skip)
     // A `some` result names no declaration: the bound is the trait, whose own reach is checked where
     // the bound resolves, and the concrete type is the implementation's.
     case _: SomeType         => Nil

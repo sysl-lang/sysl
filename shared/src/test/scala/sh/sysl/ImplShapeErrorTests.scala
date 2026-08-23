@@ -224,7 +224,8 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
     // A catalog trait the compiler already provides for a built-in is refused one step earlier
     // (`14 §5`), so the trait here is one it does not — the complaint is then this rule's.
     "a built-in is foreign too, so the library's traits are out of reach for it" in {
-      err("""impl Iterate[int] for int
+      err("""impl Iterate for int
+            |    type Item = int
             |    next(*self) -> Option[int] = None
             |print(1)
             |""".stripMargin) should include("so this one has no home")
@@ -252,7 +253,8 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
     }
 
     "a tuple is the library's, so a foreign trait for one is the ordinary case" in {
-      err("""impl Iterate[int] for (int, string)
+      err("""impl Iterate for (int, string)
+            |    type Item = int
             |    next(*self) -> Option[int] = None
             |print(1)
             |""".stripMargin) should include("so this one has no home")
