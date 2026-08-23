@@ -105,6 +105,35 @@ class ZeroOneTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  // The cases a person reaches that a bound and a bare type name do not cover between them.
+  "the other spellings of the type" - {
+
+    "`Self` inside a member's body" in {
+      run("""trait Counter
+            |    start() -> Self
+            |
+            |impl Counter for u16
+            |    start() -> u16 = Self.zero()
+            |
+            |print(u16.start())
+            |""".stripMargin) shouldBe "0\n"
+    }
+
+    "a transparent alias, which is its base type" in {
+      run("type Word = u32\n\nvar w: Word = Word.one()\nprint(w)\n") shouldBe "1\n"
+    }
+
+    // The literal is a constant, so it reaches the static emitter rather than a function body — a
+    // path a `TCall` could not have taken at all.
+    "module storage, which is initialized before anything runs" in {
+      run("val base: usize = usize.zero()\n\nprint(base, base + 1)\n") shouldBe "0 1\n"
+    }
+
+    "a width past what the mixer and the machine word hold" in {
+      run("var big: u128 = u128.one()\nprint(big == 1, u128.zero() == 0)\n") shouldBe "true true\n"
+    }
+  }
+
   "the refusals" - {
 
     "an argument is refused, the member taking none" in {
@@ -119,6 +148,16 @@ class ZeroOneTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |
             |print(1)
             |""".stripMargin) should include("already implements")
+    }
+
+    // The same complaint a written `impl`'s associated function gets, since the two are the same
+    // mistake: `real.zero` is refused here too and this is not a case the membership invents.
+    "reading it without the parentheses says what a float's read says" in {
+      val provided = err("print(int.zero)\n")
+      val written  = err("print(real.zero)\n")
+
+      provided should include("zero")
+      written should include("zero")
     }
 
     "a name the trait does not declare is still missing" in {

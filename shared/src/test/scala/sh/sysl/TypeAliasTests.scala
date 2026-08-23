@@ -41,6 +41,37 @@ class TypeAliasTests extends AnyFreeSpec with CodegenSupport with RunSupport {
             |print(plain(c))
             |""".stripMargin) shouldBe "9\n"
     }
+
+    // An alias to a **declared** type is followed at the key by `aliasedKey`, so a struct's
+    // associated function is reached through one without anything having to say so. An alias to a
+    // scalar is not a key and had to be sent to its base explicitly: until that was written the call
+    // fell through to the *read* form's complaint, which advised *"call it with 'F.zero()'"* under a
+    // line that already read `F.zero()`.
+    "an associated function of the base is reached through the alias's name" in {
+      run("""type F = real
+            |
+            |print(F.zero() == 0.0, F.one() == 1.0)
+            |""".stripMargin) shouldBe "true true\n"
+    }
+
+    // The same question where the member is the compiler's rather than a written `impl`'s.
+    "including one the compiler provides rather than a block" in {
+      run("""type Word = u32
+            |
+            |var w: Word = Word.one()
+            |
+            |print(w, Word.zero())
+            |""".stripMargin) shouldBe "1 0\n"
+    }
+
+    // The delegation is an alias's alone: a constrained subtype is a type of its own, and what it
+    // offers under its own name is the `::` surface rather than its base's members.
+    "a constrained subtype is NOT delegated, and keeps its own complaint" in {
+      err("""type Age = int within 0..150
+            |
+            |print(Age.zero())
+            |""".stripMargin) should include("written with '::'")
+    }
   }
 
   "a struct base" - {

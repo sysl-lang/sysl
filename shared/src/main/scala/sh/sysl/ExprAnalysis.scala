@@ -1126,7 +1126,16 @@ trait ExprAnalysis
       // A constrained subtype is a name a call reaches, so an `impl` for one may carry an associated
       // function exactly as a struct's may. Everything else selected from the name is one of the
       // mistakes `constrainedMember` has words for.
-      if memberDecls.get((n, mname)).exists(_.recvMode.isEmpty) then callAssociated(n, mname, args, expected)
+      //
+      // **An alias is not one of those and is answered by its base** (`16 §1` — a transparent alias
+      // is the same type as its base), which is what the *read* form already does one line into
+      // `constrainedMember`. Without it here the call fell through to the read's complaint, and for
+      // an alias to a type with a written `impl` that complaint is *"call it with 'F.zero()'"* under
+      // a line already reading `F.zero()`. An alias to a **declared** type never arrives: those are
+      // followed at the key by `aliasedKey`, so only one naming a scalar, a pointer, an array or a
+      // callable reaches this.
+      if plainAlias(n) then callTypeAssociated(resolveAlias(n), written, mname, args, expected)
+      else if memberDecls.get((n, mname)).exists(_.recvMode.isEmpty) then callAssociated(n, mname, args, expected)
       else constrainedMember(n, written, mname)
 
     case Call(Field(Ident(written), mname), _)
