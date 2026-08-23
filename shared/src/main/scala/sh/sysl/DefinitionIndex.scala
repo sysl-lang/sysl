@@ -15,6 +15,13 @@ final case class Reference(at: Pos, declaredAt: Pos, name: String)
  *
  * The two are handed back together because the index is read off the tree and off tables the walk
  * filled, so asking for it later would mean keeping the analyzer alive to ask.
+ *
+ * **A program that does not analyze yields no index**, which is a real limit for the caller this is
+ * for: a file being typed into is a file with errors in it, and that is exactly when an editor is
+ * asked where a name came from. The tables are filled up to the point the walk stopped, so a partial
+ * answer exists and is simply not handed back. Giving one is worth doing **with** parse recovery
+ * rather than before it — until a half-typed file parses at all there is no tree to walk, so the
+ * partial index would cover the cases that already work and none of the ones that do not.
  */
 final case class Indexed(tree: TProgram, references: List[Reference])
 

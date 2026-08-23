@@ -30,6 +30,10 @@ object Locate {
    * is not in it. That is the convention every span in the compiler already keeps, and it is what
    * makes two adjacent tokens unambiguous — a caller that wants an editor's more forgiving reading
    * asks again at `col - 1`.
+   *
+   * **It walks the whole tree per question**, which is right for one file and one cursor and is not
+   * an index: a caller answering a hover per mouse-move over a large file wants to build one from
+   * the same walk rather than call this in a loop.
    */
   def at(program: Program, line: Int, col: Int): List[Positioned] = {
     val covering = walk(program).filter(covers(_, line, col))
