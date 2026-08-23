@@ -15,8 +15,12 @@ package api
  * genuinely wants the tree is a different kind of tool (a formatter, a language server) and reaches
  * past this on purpose.
  *
- * Every method answers `Left` with the **rendered diagnostic**, exactly as the driver would have
- * printed it, so a caller has something to show a reader without knowing what a diagnostic is.
+ * Every method that compiles answers `Left` with the **rendered diagnostic**, exactly as the driver
+ * would have printed it, so a caller has something to show a reader without knowing what a
+ * diagnostic is. `check` is the exception and is here for the other kind of caller: it answers the
+ * mistakes as **data**, each with a range, because an editor cannot underline a paragraph and a
+ * build tool cannot group one by file. It is still plain `String` and `Int` — a `Problem` and a
+ * `Span` and nothing of the compiler's own.
  *
  * It sits in a sub-package rather than beside the compiler for two reasons, and the second is not a
  * matter of taste. The published surface being somewhere of its own is what makes "narrow" checkable
@@ -28,6 +32,7 @@ package api
  * Sysl.run("main()\n    print(1 + 2)")            // Right(Sysl.Run(0, "3\n"))
  * Sysl.runBody("print(1 + 2)")                    // the same, with the `main` supplied
  * Sysl.compile("main()\n    print(x)")            // Left("… undefined name 'x' …")
+ * Sysl.check("main()\n    print(x)")              // List(Problem("undefined name 'x'", Some(…)))
  * ```
  */
 object Sysl {
