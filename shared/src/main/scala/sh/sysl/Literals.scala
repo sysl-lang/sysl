@@ -133,6 +133,22 @@ trait Literals extends TypeResolution {
     if !disagree(t.ty, want) then t
     else src.flatMap(e => attempt(analyzeExpr(e, Some(want)))).filterNot(r => disagree(r.ty, want)).getOrElse(t)
 
+  /** Which of the operands the pair takes its type from: the first that stands on its own, and only
+   * failing that the first that was read at all.
+   *
+   * **An adaptable operand is passed over rather than dropped**, which is the whole of the
+   * difference between this and taking the head. `Some(3)` has a type — it is not a literal, so the
+   * top tier reads it — and that type is worth exactly as much as the `int` inside it, which is to
+   * say nothing when the operand beside it says `Option[usize]`. Taking it anyway settled the pair
+   * on a type nobody wrote and then re-read the operand that was right, so `Some(3) == s` was
+   * refused while `s == Some(3)` compiled.
+   */
+  private def firmest(operands: List[Expr], read: List[Option[TExpr]]): Option[Type] = {
+    val pairs = operands.zip(read).collect { case (e, Some(t)) => (e, t) }
+
+    pairs.find((e, t) => !adaptable(e, t)).orElse(pairs.headOption).map((_, t) => Type.repr(t.ty))
+  }
+
   protected def analyzeOperands(operands: List[Expr], expected: Option[Type]): List[TExpr] = {
     // **The top tier is allowed to come back empty**, which is what lets an operand with no type of
     // its own fall to the tier below rather than raising from the tier that has nothing to offer it.
@@ -142,9 +158,9 @@ trait Literals extends TypeResolution {
     // second side needs and exactly what `12 §5`'s held-back argument already gets at a call.
     val own     = operands.map(e =>
       if isLiteral(e) || typedByPosition(e) then None else attempt(analyzeExpr(e, expected)))
-    val settled = own.flatten.headOption.map(t => Type.repr(t.ty)).orElse(expected)
+    val settled = firmest(operands, own).orElse(expected)
     val told    = operands.zip(own).map((e, t) => t.orElse(Option.when(!isLiteral(e))(analyzeExpr(e, settled))))
-    val ty      = told.flatten.headOption.map(t => Type.repr(t.ty)).orElse(expected)
+    val ty      = firmest(operands, told).orElse(expected)
 
     // And the same last reading the tiers above earn: an operand whose type came out of the top
     // tier, before the other side had said anything, is read again at what the pair settled to.
@@ -187,6 +203,60 @@ trait Literals extends TypeResolution {
     case NullLit()                           => true
     case Unary("-", operand)                 => isLiteral(operand)
     case _                                   => false
+
+  /** Whether an argument or operand is **adaptable**: the tier a bare literal is in, widened to the
+   * things built out of nothing but bare literals.
+   *
+   * `Some(3)` is the case this exists for. It is not a literal — it is a call, and `isLiteral` is
+   * syntactic — so it went in the first round and fixed `T = Option[int]`, a conclusion worth
+   * exactly what the `int` inside it was worth and no more. The operand or argument that actually
+   * knew was then the one re-read, and re-reading an `Option[usize]` at an `Option[int]` cannot
+   * succeed. So `same(s, Some(3))` compiled and `same(Some(3), s)` did not, for a difference the
+   * reader never wrote (card `0200`).
+   *
+   * **Both halves are needed and neither is enough alone**, which is what took the deciding.
+   * `literalShaped` reads the *source*, and is what keeps a suffix load-bearing: `Some(3)` and
+   * `Some(3int)` analyze to the same node at the same type, so only the spelling says that one of
+   * them chose its width. `constructed` reads the *analyzed node*, and is what separates `Some(3)`
+   * from `f(3)`: the two parse identically — `Call(Ident(…), List(IntLit(3)))` — and a function's
+   * result has nothing to do with the literals handed to it, so nothing about an ordinary call
+   * moves.
+   *
+   * **It is deliberately not cleverer than that.** `Some(f(3))` is literal-shaped and is marked
+   * adaptable although its type came from `f`'s return. Consulted last it still settles whatever
+   * nothing else settles, so nothing that compiled before stops compiling; the whole cost is that a
+   * mismatch in a call carrying one is reported at the construction rather than at its neighbour.
+   * Knowing which type arguments really came from `literalDefault` would need the analysis to
+   * report it, which is a great deal of machinery for a caret's position.
+   */
+  protected def adaptable(e: Expr, t: TExpr): Boolean = isLiteral(e) || literalShaped(e) && constructed(t)
+
+  /** Whether an expression is written out of adaptable literals and nothing else — one of them, or a
+   * construction over them, however deeply nested.
+   *
+   * A string, a character and a suffixed number all stop it, because each of those says what it is.
+   */
+  protected def literalShaped(e: Expr): Boolean = e match
+    case _ if isLiteral(e)   => true
+    case NamedArg(_, v)      => literalShaped(v)
+    case Call(_, args)       => args.nonEmpty && args.forall(literalShaped)
+    case ArrayLit(elems)     => elems.nonEmpty && elems.forall(literalShaped)
+    case ArrayFill(v, _)     => literalShaped(v)
+    case _                   => false
+
+  /** Whether an analyzed expression is a **construction**: a value built here out of the parts
+   * written beside it, rather than one something else answered with.
+   *
+   * The distinction is the type's provenance and not the node's kind. A construction's type
+   * arguments are read off what it was handed, so literals inside it reach its type; anything
+   * else — a call, a load, a field — has a type of its own that the literals in the expression
+   * cannot have decided.
+   */
+  protected def constructed(t: TExpr): Boolean = t match
+    case _: TEnumNew | _: TStructNew                            => true
+    case _: TArrayLit | _: TArrayFill | _: TBufLit | _: TBufFill => true
+    case _: TVectorLit                                          => true
+    case _                                                      => false
 
   /** The type an adaptable literal falls back to, worked out from how it is written rather than
    * by analyzing it.

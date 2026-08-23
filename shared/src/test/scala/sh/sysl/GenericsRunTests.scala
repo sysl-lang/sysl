@@ -448,6 +448,126 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  /** The same call written the other way round, which the group above did **not** fix.
+   *
+   * Re-reading repairs the argument that disagrees with what the others settled, and that is no use
+   * when the argument that disagrees is the one which was right. `Some(3)` is not a literal —
+   * `isLiteral` reads the spelling and this is a call — so it went in the first round and fixed
+   * `T = Option[int]`, a conclusion worth exactly what the unsuffixed `int` inside it was worth.
+   * `same(s, Some(3))` therefore compiled and `same(Some(3), s)` was refused, naming two types the
+   * reader never wrote.
+   *
+   * **A construction over adaptable literals is adaptable**, and consulting it last is the whole of
+   * the fix. The predicate is `Literals.adaptable`, and both places a position is settled late ask
+   * it: the ordering `solve` runs its rounds in, and the operand `analyzeOperands` takes the pair's
+   * type from — so the operator half below comes from the same change rather than a second one.
+   */
+  "a construction over literals written first" - {
+    "the argument that knows settles the parameter, whichever end it is written at" in {
+      run("""same[T: Eq](a: T, b: T) -> bool = a == b
+            |var s: Option[usize] = Some(3)
+            |print(same(Some(3), s), same(Some(4), s))
+            |""".stripMargin) shouldBe "true false\n"
+    }
+
+    "and the operator says the same, because it consults the same predicate" in {
+      run("""var s: Option[usize] = Some(3)
+            |print(Some(3) == s, Some(4) == s)
+            |""".stripMargin) shouldBe "true false\n"
+    }
+
+    // The pair of orders in one program, which is the property the card was actually about: a
+    // symmetric call is not supposed to have a good side and a bad one.
+    "the two orders agree" in {
+      run("""same[T: Eq](a: T, b: T) -> bool = a == b
+            |var s: Option[usize] = Some(3)
+            |print(same(s, Some(3)), same(Some(3), s), s == Some(3), Some(3) == s)
+            |""".stripMargin) shouldBe "true true true true\n"
+    }
+
+    "the payload takes the solution's width at this end too" in {
+      run("""first[T](a: T, b: T) -> T = a
+            |var wide: Option[u64] = Some(5000000000)
+            |print(str(first(Some(5000000000), wide).unwrap()))
+            |""".stripMargin) shouldBe "5000000000\n"
+    }
+
+    // A generic struct of the program's own, so the rule is pinned about constructions rather than
+    // about the enum the library happens to ship.
+    "a generic struct of the program's own is read the same way" in {
+      run("""struct Box[T] deriving Eq
+            |    v: T
+            |same[T: Eq](a: T, b: T) -> bool = a == b
+            |var b: Box[usize] = Box(3)
+            |print(same(Box(3), b), Box(4) == b)
+            |""".stripMargin) shouldBe "true false\n"
+    }
+
+    // An array literal reaches this for free, being a construction whose element type the literals
+    // inside it decided. It has no `==`, so the claim is made at a call.
+    "an array literal written first" in {
+      run("""first[T](a: T, b: T) -> T = a
+            |var a: [3]usize = [1, 2, 3]
+            |print(first([4, 5, 6], a)[0])
+            |""".stripMargin) shouldBe "4\n"
+    }
+
+    // The nesting is in the source test, so a construction inside a construction is adaptable for
+    // the same reason the one holding it is.
+    "nested one level deep" in {
+      run("""same[T: Eq](a: T, b: T) -> bool = a == b
+            |var o: Option[Option[usize]] = Some(Some(3))
+            |print(same(Some(Some(3)), o), Some(Some(3)) == o)
+            |""".stripMargin) shouldBe "true true\n"
+    }
+
+    // A width the reader wrote is what stops all of this: the node is the same shape and the same
+    // type, and only the spelling says that this one chose.
+    "a suffix inside the construction is still load-bearing" in {
+      err("""same[T: Eq](a: T, b: T) -> bool = a == b
+            |var s: Option[usize] = Some(3)
+            |print(same(Some(3u8), s))
+            |""".stripMargin) should include("sysl.Option[byte], but sysl.Option[usize] was given")
+    }
+
+    // And a call is not a construction, however it is spelled: `f(3)` parses exactly as `Some(3)`
+    // does, and what comes back has nothing to do with the literal handed over.
+    "an ordinary call over literals is not adaptable" in {
+      err("""same[T: Eq](a: T, b: T) -> bool = a == b
+            |f(n: int) -> Option[int] = Some(n)
+            |var s: Option[usize] = Some(3)
+            |print(same(f(3), s))
+            |""".stripMargin) should include("sysl.Option[int], but sysl.Option[usize] was given")
+    }
+
+    // Nor is a construction over anything that carries a type of its own, which is the other half
+    // of the same test — the string is what fixes the argument, and it disagrees.
+    "a construction over a typed payload keeps its own type" in {
+      err("""var s: Option[usize] = Some(3)
+            |print(Some("x") == s)
+            |""".stripMargin) should include("sysl.Option[string] and sysl.Option[usize]")
+    }
+
+    // Adaptable is a place in the order, not a refusal to conclude — the same thing `id(7)` being
+    // an `int` says about a bare literal. With nothing firmer in the room the first one is still
+    // what the pair settles on, and the payload is still an `int`.
+    "two constructions with nothing else to go on settle as they always did" in {
+      run("""same[T: Eq](a: T, b: T) -> bool = a == b
+            |print(Some(1) == Some(2), same(Some(1), Some(1)), str(Some(7).unwrap()))
+            |""".stripMargin) shouldBe "false true 7\n"
+    }
+
+    // `isLiteral` already reads a negation as part of the literal, so a construction over one is
+    // adaptable for the same reason — which is worth pinning, since the minus is a `Unary` node
+    // and the source test walks the tree rather than the token.
+    "a negated literal inside is still a literal" in {
+      run("""same[T: Eq](a: T, b: T) -> bool = a == b
+            |var s: Option[i16] = Some(-3)
+            |print(same(Some(-3), s), Some(-3) == s)
+            |""".stripMargin) shouldBe "true true\n"
+    }
+  }
+
   /** `01` lists the parameter type at a call among the positions that fix an unsuffixed literal,
    * and says nothing about the callee being generic — so a parameter written `usize` fixes one
    * whether or not the declaration beside it also has a `T` to solve. What makes this its own group
