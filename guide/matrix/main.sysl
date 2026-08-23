@@ -1,14 +1,14 @@
 // Matrices and vectors over any field, and Gaussian elimination on top of them.
 //
 // The axis this program owns: **an operator whose result is neither operand's type**, and now also
-// **one algebra written once and run at three element types**. A vector space is the smallest honest
+// **one algebra written once and run at four element types — one of which it is wrong for**. A vector space is the smallest honest
 // example of the first — `v * w` is a scalar, `A * v` is a vector, `A * B` is a matrix, and `A * k` is
 // a matrix again — and until the result became a trait argument only the last two of those four were
 // spellable. The other two became methods, so an expression that is one line of linear algebra read
 // as a mixture of operators and calls.
 //
-// See `scalar.sysl` for what an element has to be, `vec.sysl` and `mat.sysl` for the algebra and
-// `gauss.sysl` for the elimination.
+// See `scalar.sysl` for what an element has to be, `vec.sysl` and `mat.sysl` for the algebra,
+// `gauss.sysl` for the elimination over a field and `bareiss.sysl` for the fraction-free one.
 //
 // WHAT THIS PROGRAM FOUND
 //
@@ -52,16 +52,30 @@
 //    length and a literal tolerance are reals in this program, so the *view* of a size as a real is
 //    named here and the *ordering* is asked of the library.
 //
-// 6. **The integers are outside, and it is NOT the identities that keep them out — that finding was
-//    wrong and the fix is in.** It said `Zero` and `One` could not be written for `int` because the
-//    `iN`/`uN` families are open and a provided membership had to be a method with a receiver, which
-//    a `zero()` has nothing to be called on. A receiverless membership is reached through the type
-//    instead, so an integer has both identities and, since `Magnitude` covers the family through one
-//    blanket block, a size as well: `int` meets every requirement in `Scalar`'s bound outright, and
-//    `impl Scalar for int` would be one line. What actually keeps a `Matrix[int]` out is the
-//    arithmetic — integer `/` truncates, so elimination over the integers is not the same algorithm
-//    and would answer confidently with the wrong numbers. A matrix of exact integers wants
-//    fraction-free elimination, which is a different program and a good one to write.
+// 6. **A BOUND IS A SIGNATURE, NOT A CONTRACT — and the integers are how this program found out.**
+//    `int` meets every requirement `Scalar` lists, `Div` included, so `impl Scalar for int` is one
+//    line and `Matrix[int]` compiles. `gauss.sysl` then runs on it and is **wrong**: integer `/`
+//    truncates, so every multiplier in the section below becomes zero, no row is ever reduced, and
+//    the determinant comes back 60 for a matrix whose determinant is 40. It does not refuse. It
+//    answers, wrapped in `Ok`, and nothing in the bound, the types or the run says otherwise.
+//
+//    **What the bound cannot say is the whole finding.** It can require that `/` *exists*; it cannot
+//    require that it returns what it was asked for. A field's division is total and exact and a
+//    ring's is neither, and `Scalar` admits both without being able to mention the difference —
+//    which means the type system checked everything it was asked to check and the program is still
+//    wrong. This is not an argument for a stronger bound: **exactness is a property of an operation,
+//    not a type, so there is nothing for a bound to name.**
+//
+//    **The answer was not to exclude the integers but to write the algorithm they deserve.**
+//    `bareiss.sysl` is fraction-free elimination: every entry it computes is a minor of the original
+//    matrix, so every division it performs is exact by construction rather than by hope. It divides
+//    as freely as Gauss does and needs *less* of its element type — no `Magnitude`, no tolerance, no
+//    ordering — because a fraction-free pivot is chosen for being non-zero rather than for being
+//    large. Its import list is empty, and that emptiness is the finding made visible.
+//
+//    This finding said the opposite twice before. First that `Zero` and `One` could not be written
+//    for `int` at all, which a receiverless membership fixed; then that truncation kept a
+//    `Matrix[int]` out, which is why it is *in* — the wrongness is the exhibit.
 //
 // 7. **A simple enum's `==` is absent by decision, and the replacement was already there.**
 //    `e == Singular` is refused, and the first thing written here was a two-armed match per question.
@@ -79,6 +93,24 @@
 //    no argument to read `T` off and a bare `var` expects nothing, so every one of them is written
 //    `var out: Vector[T] = zeros(self.n)`. That is the type said once, on the declaration, which is
 //    where it belongs — but it is a line the reader of the concrete program never had to see.
+//
+// 10. **A tolerance is a property of inexact arithmetic, and the same bound cannot carry one.** The
+//    sibling of finding 6, found by writing the second elimination rather than by reasoning. Every
+//    check in this program but one is written on `same`, which asks whether a difference is *small*,
+//    and `gauss.sysl` rejects a pivot the same way — `norm(...) <= tiny`, because subtraction over
+//    the reals leaves noise where exact arithmetic leaves zero. Over the integers there is no noise,
+//    so a tolerance stops being a safeguard and becomes a way of discarding pivots for being small.
+//    `bareiss.sysl` tests `== T.zero()` instead. **So `Scalar` can no more say which zero test is
+//    right than it can say whether `/` is exact** — and both eliminations satisfy it, while only one
+//    of them is right for any given element type. The integer section is the only place here where a
+//    residual is checked with `==` and no `eps` appears at all.
+//
+// 11. **Exact arithmetic does not make an answer representable, which is the trap in the finding
+//    above.** `solve_exact` over the 3x3 system returns numerators `(-8, 16, 24)` over a denominator
+//    of 40 — the solution is `(-1/5, 2/5, 3/5)` and no `int` holds any of it. Fraction-free
+//    elimination does not turn the integers into a field; it makes the inexactness **explicit**, as
+//    a numerator and a denominator the caller can see, instead of letting `/` apply it silently.
+//    That is why `Exact[T]` has no `value(i)` accessor: the one line it would contain is the bug.
 
 import sysl.math.Float
 import sysl.math.complex.Complex
@@ -316,6 +348,78 @@ solve(fm, fb) match
     Err(e) -> fail("the same elimination runs at f32: " + describe(e))
 
 check(same(det(fm), 5.0), "and so does the determinant")
+
+section("the integers, where the bound is met and the algorithm is not")
+
+// The fourth element type, and the only one that satisfies `Scalar` and is *wrong* for `gauss.sysl`.
+// Integer `/` truncates, so elimination over the integers does not fail — it answers.
+var im = matrix(3, 3, [3, 1, 2, 1, 4, 1, 2, 1, 5])
+var ib = vector([1, 2, 3])
+
+// Every multiplier this system produces is a proper fraction — 1/3, 2/3, 1/4 — and every one of them
+// truncates to zero. `reduce` therefore finds three non-zero pivots, subtracts nothing from any row,
+// and hands back the matrix it was given. The determinant it reports is the product of the untouched
+// diagonal.
+check(det(im) == 60, "Gauss over the integers answers 60 for a determinant that is 40")
+
+// **The failure mode is the bad one.** A refusal would be a result a caller could act on; this is a
+// success, wrapped in `Ok`, carrying a vector of zeros. Nothing in the type system, the bound, or the
+// run says anything is wrong.
+solve(im, ib) match
+    Ok(x) -> check(x.at(0) == 0 && x.at(1) == 0 && x.at(2) == 0, "and 'solve' answers Ok with every component zero")
+    Err(e) -> fail("and 'solve' answers Ok with every component zero: " + describe(e))
+
+// The same system, fraction-free. Every division inside is exact by construction rather than by luck.
+det_exact(im) match
+    Ok(d) -> check(d == 40, "fraction-free elimination answers the determinant exactly")
+    Err(e) -> fail("fraction-free elimination answers the determinant exactly: " + describe(e))
+
+var exact = solve_exact(im, ib)
+
+exact match
+    Ok(x) ->
+        check(x.numerators.at(0) == -8 && x.numerators.at(1) == 16 && x.numerators.at(2) == 24, "and a solution whose numerators are exact")
+        check(x.denominator == 40, "over a single denominator, which is the determinant")
+
+        // The residual check this program could not write at any other element type: `A y = b D`
+        // compared with `==`, no `eps` and no `same`, because there is nothing to be approximately
+        // right about.
+        check(x.verifies(im, ib), "verified by 'A y = b D' with no tolerance anywhere")
+
+        // **Exact arithmetic did not make the answer representable, and that is the second finding.**
+        // The solution is (-1/5, 2/5, 3/5); no `int` holds any of it. What fraction-free elimination
+        // buys is not an integer answer — it is an answer whose inexactness is *stated*, as a
+        // numerator and a denominator, instead of being applied silently by `/`.
+        check(x.numerators.at(0) / x.denominator == 0, "while dividing them is the truncation this avoided")
+    Err(e) -> fail("and a solution whose numerators are exact: " + describe(e))
+
+// A system whose content is entirely the exactness. `det` here is the difference of two 19-digit
+// products, both inside `i64`, and it is -1: the two cancel almost completely, which is the case
+// floating point has nothing left to say about.
+var huge = 1000000000
+var bm = matrix(2, 2, [huge + 1, huge, huge, huge - 1])
+var bb = vector([1, 1])
+
+det_exact(bm) match
+    Ok(d) -> check(d == -1, "a determinant of -1 survives the cancellation of two 19-digit products")
+    Err(e) -> fail("a determinant of -1 survives the cancellation of two 19-digit products: " + describe(e))
+
+solve_exact(bm, bb) match
+    Ok(x) -> check(x.numerators.at(0) == -1 && x.numerators.at(1) == 1 && x.denominator == -1, "and the solution comes back exact")
+    Err(e) -> fail("and the solution comes back exact: " + describe(e))
+
+// The same matrix over the reals, and the only claim about it worth making.
+//
+// **What the reals do here is not portable and must not be asserted.** Whether the subtraction is
+// contracted into a fused multiply-add decides everything downstream: without contraction the pivot
+// cancels to exactly zero and `solve` refuses as singular, and with it the pivot survives as about
+// -1e-9 and `solve` succeeds with a nearly-right answer. Both are correct floating point and this
+// program runs on more than one target. So the check is the one statement true on either path — the
+// determinant is not -1 — and the prose claims nothing more than that.
+var rhuge = real(huge)
+var rm = matrix(2, 2, [rhuge + 1.0, rhuge, rhuge, rhuge - 1.0])
+
+check(!same(det(rm), -1.0), "where the same determinant over the reals is not -1 on any target")
 
 section("a system big enough that the walk is the point")
 

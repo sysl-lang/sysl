@@ -275,15 +275,21 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
     )
   }
 
-  // The vector space is generic over its element type, so the last three sections before the memory
-  // one run the *same* bodies at `Complex[real]` and at `f32` that the first six ran at `real`. That
-  // is the assertion the counts carry here: a section that quietly stopped covering an element type
-  // would leave the algebra above it green.
+  // The vector space is generic over its element type, so the sections before the memory one run the
+  // *same* bodies at `Complex[real]` and at `f32` that the first six ran at `real`. That is the
+  // assertion the counts carry here: a section that quietly stopped covering an element type would
+  // leave the algebra above it green.
+  //
+  // The integer section is the one that does not fit that shape, and it is deliberate: `int`
+  // satisfies `Scalar` outright and `gauss.sysl` is *wrong* for it, so those checks assert the
+  // wrong answers it gives — a determinant of 60 where the true one is 40, and an `Ok` carrying
+  // zeros — before the fraction-free elimination answers the same system exactly. They are exact
+  // integer arithmetic, so they are asserted as equalities rather than as inequalities.
   "matrix — an operator whose result is neither operand's type" in {
     val out = guide("matrix")
 
     out should not include "FAIL"
-    checks(out) shouldBe 62
+    checks(out) shouldBe 72
     sections(out) shouldBe List(
       "-- the four products of a vector space",
       "-- the algebra holds where the results differ",
@@ -293,6 +299,7 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
       "-- inverse",
       "-- the same program over the complex numbers",
       "-- and at a second float width",
+      "-- the integers, where the bound is met and the algorithm is not",
       "-- a system big enough that the walk is the point",
       "-- sharing, and the copy that ends it",
     )
