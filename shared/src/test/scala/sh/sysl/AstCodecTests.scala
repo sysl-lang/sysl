@@ -36,10 +36,13 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
 
   /** Every position in a tree, in the order a walk over the case-class children reaches them. Two
    * trees that agree here agree about what each node points at, which `==` cannot tell us.
+   *
+   * **The end of each span is compared as well as its start**, since a codec that wrote the start
+   * and dropped the rest would read back a tree whose every diagnostic underlines one character.
    */
-  private def positionsOf(node: Any): List[Option[(String, Int, Int)]] = {
+  private def positionsOf(node: Any): List[Option[(String, Int, Int, Int, Int)]] = {
     val here = node match
-      case p: Positioned => List(p.pos.map(x => (x.source.name, x.line, x.col)))
+      case p: Positioned => List(p.pos.map(x => (x.source.name, x.line, x.col, x.endLine, x.endCol)))
       case _             => Nil
 
     // A `List` and a `Some` are themselves `Product`s, so the collections are matched first —
@@ -83,6 +86,14 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
       val stamped = positionsOf(Library.decls).count(_.isDefined)
 
       stamped should be > 1000
+    }
+
+    "and enough of them have an extent for the ends to be worth comparing" in {
+      // The same guard one level in. Every span above compares equal if every span is a point, so
+      // the ends would be carried vacuously by a codec that had quietly stopped writing them.
+      val wide = positionsOf(Library.decls).flatten.count((_, ln, cl, endLn, endCl) => endLn > ln || endCl > cl)
+
+      wide should be > 1000
     }
 
     // **The library uses no vectors, so nothing else encodes a `VectorType`** — the round trip over

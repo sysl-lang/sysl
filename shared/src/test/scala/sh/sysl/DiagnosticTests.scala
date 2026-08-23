@@ -25,8 +25,12 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
   private def at(out: String): List[Int] =
     """--> t\.sysl:(\d+):""".r.findAllMatchIn(out).map(_.group(1).toInt).toList
 
+  /** The underline of the one diagnostic `out` carries, as the reader sees it. */
+  private def underline(out: String): String =
+    out.linesIterator.toList.last.dropWhile(_ != '|').drop(1)
+
   "rendering" - {
-    "names the file, the line, and the column, and points a caret at it" in {
+    "names the file, the line, and the column, and underlines the token" in {
       val src =
         """var x = 1
           |print(nope)
@@ -38,7 +42,7 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
           " --> t.sysl:2:7",
           "  |",
           "2 | print(nope)",
-          "  |       ^",
+          "  |       ^^^^",
         ).mkString("\n")
     }
 
@@ -51,7 +55,7 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
           "  --> t.sysl:10:7",
           "   |",
           "10 | print(nope)",
-          "   |       ^",
+          "   |       ^^^^",
         ).mkString("\n")
     }
 
@@ -76,6 +80,112 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
 
     "survives a column past the end of its line" in {
       Pos(Source("t.sysl", "ab"), 1, 99).render("boom") should include("|   ^")
+    }
+  }
+
+  /** A span is the extent of the **token** a diagnostic points at, so the underline is as wide as
+   * what the reader is being shown and no wider. These are the cases the width is decided by, and
+   * the last three are the ones that would otherwise underline something that is not there.
+   */
+  "how far the underline runs" - {
+    "the whole of an identifier, however long" in {
+      underline(diag("print(a_rather_long_undefined_name)\n")) shouldBe "       " + "^" * 28
+    }
+
+    "the whole of a string literal, its quotes included" in {
+      val src =
+        """add(a: int, b: int) -> int = a + b
+          |print(add(1, "two"))
+          |""".stripMargin
+
+      underline(diag(src)) shouldBe "              ^^^^^"
+    }
+
+    "the whole of a character literal, which is three columns and not one" in {
+      val src =
+        """takes(n: int) -> int = n
+          |print(takes('x'))
+          |""".stripMargin
+
+      underline(diag(src)) shouldBe "             ^^^"
+    }
+
+    "one caret for a one-character token" in {
+      val src =
+        """var a = 1
+          |var = 5
+          |""".stripMargin
+
+      underline(diag(src)) shouldBe "     ^"
+    }
+
+    // The quote shows one line, so an underline longer than it would be pointing past the end of
+    // what the reader can see. A text block's opening delimiter is what is left.
+    "no further than the end of the line a span starts on" in {
+      val src =
+        "takes(n: int) -> int = n\nprint(takes(\"\"\"\nspanning\n\"\"\"))\n"
+
+      underline(diag(src)) shouldBe "             ^^^"
+    }
+
+    // Every position built from a line and a column alone — a literate margin, a conditional
+    // directive, a parse that ran out of input — has no token to measure.
+    "one caret where the position carries no extent at all" in {
+      Pos(Source("t.sysl", "abcdef\n"), 1, 3).render("boom") should endWith("|   ^")
+    }
+
+    "and one caret where a span ends before it begins" in {
+      Pos(Source("t.sysl", "abcdef\n"), 1, 4, 1, 2).render("boom") should endWith("|    ^")
+    }
+  }
+
+  /** The lexer knows where a token ends as an **offset**, and everything that reports a position
+   * speaks in lines and columns, so this conversion sits between the two.
+   */
+  "an offset becomes a line and a column" - {
+    val src = Source("t.sysl", "ab\ncde\n\nf")
+
+    "at the very beginning" in {
+      src.placeOf(0) shouldBe (1, 1)
+    }
+
+    "within the first line" in {
+      src.placeOf(1) shouldBe (1, 2)
+    }
+
+    "at a newline, which belongs to the line it ends" in {
+      src.placeOf(2) shouldBe (1, 3)
+    }
+
+    "at the start of the line after it" in {
+      src.placeOf(3) shouldBe (2, 1)
+    }
+
+    "on an empty line" in {
+      src.placeOf(7) shouldBe (3, 1)
+    }
+
+    "on the last line, which has no newline of its own" in {
+      src.placeOf(8) shouldBe (4, 1)
+    }
+
+    // Where a token runs to the end of input, and where anything asks about a place that is not
+    // in the file at all.
+    "past the end, answering the place just past the last character" in {
+      src.placeOf(9) shouldBe (4, 2)
+      src.placeOf(9999) shouldBe (4, 2)
+    }
+
+    "before the beginning" in {
+      src.placeOf(-1) shouldBe (1, 1)
+    }
+
+    "in a file with no newline in it whatsoever" in {
+      Source("t.sysl", "abc").placeOf(2) shouldBe (1, 3)
+    }
+
+    "in an empty file" in {
+      Source("t.sysl", "").placeOf(0) shouldBe (1, 1)
     }
   }
 
@@ -566,6 +676,51 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
 
       count(out) shouldBe 2
       at(out) shouldBe List(4, 7)
+    }
+  }
+
+  /** What a node's span covers, which is the claim everything above rests on and which the
+   * rendering only shows indirectly. An editor asking "which name is the cursor inside" reads this
+   * rather than a diagnostic.
+   */
+  "a node carries its first token's span" - {
+
+    /** Every span in a parsed program, by the node that carries it. */
+    def spans(src: String): List[(Any, (Int, Int, Int, Int))] = {
+      def walk(node: Any): List[(Any, (Int, Int, Int, Int))] = {
+        val here = node match
+          case p: Positioned => p.pos.toList.map(x => (node, (x.line, x.col, x.endLine, x.endCol)))
+          case _             => Nil
+
+        val below = node match
+          case xs: List[?]  => xs.flatMap(walk)
+          case o: Option[?] => o.toList.flatMap(walk)
+          case p: Product   => p.productIterator.toList.flatMap(walk)
+          case _            => Nil
+
+        here ::: below
+      }
+
+      SyslParser.parse(src, "t.sysl") match
+        case Right(p) => walk(p.body)
+        case Left(e)  => fail(s"the fixture does not parse: $e")
+    }
+
+    "an identifier, from its first character to just past its last" in {
+      spans("var x = 1\nprint(alpha)\n").collectFirst { case (Ident("alpha"), s) => s } shouldBe
+        Some((2, 7, 2, 12))
+    }
+
+    "a string literal, quotes included, so the span is what was written" in {
+      // The token is `"two"` — five columns — though the value it denotes is three characters.
+      spans("""print("two")""" + "\n").collectFirst { case (StrLit("two"), s) => s } shouldBe
+        Some((1, 7, 1, 12))
+    }
+
+    "a text block, whose end is on a later line than its start" in {
+      val src = "var t = \"\"\"\nspanning\n\"\"\"\nprint(t)\n"
+
+      spans(src).collectFirst { case (StrLit("spanning\n"), s) => s } shouldBe Some((1, 9, 3, 4))
     }
   }
 
