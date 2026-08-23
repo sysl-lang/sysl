@@ -157,9 +157,9 @@ trait ExprParser extends SyslParserBase {
    *
    * Rust spells an inclusive range `a..=b`, so a reader arriving from it writes one here once. Left
    * to the ordinary grammar what they get is a message about the open-ended range `a..` that was
-   * parsed — in a `for` header, *"a range is only allowed in a 'for' loop or a 'match' pattern"*,
-   * which is a true sentence about something else and asserts the very thing the reader can see is
-   * already so. The `=` that caused it appears nowhere in it.
+   * parsed — in a `for` header, *"a range is only allowed in a 'for' loop, …"*, which is a true
+   * sentence about something else and asserts the very thing the reader can see is already so. The
+   * `=` that caused it appears nowhere in it.
    *
    * The refusal is an `Error` rather than a `Failure` so it survives the alternations above it: a
    * `Failure` here would be outranked by whichever candidate got furthest, which is how the message

@@ -726,6 +726,44 @@ trait MethodCalls extends FuncAddress {
       TIntOp(mname, recvd, ts.headOption, width, ret)
     }
 
+  /** `int.zero()`, `T.one()` at a solved `T` — a member of a trait the compiler supplies membership
+   * for, reached through the **type** because it has no receiver (`14 §5`, `CoreTraits.constants`).
+   *
+   * This is `builtinNumeric`'s counterpart on the side where there is nothing to lower *from*. A
+   * provided member with a receiver becomes an instruction on that receiver's value; one without
+   * has no value in hand, so what it lowers to is the constant itself — which is why the number is
+   * stated in the table rather than read off anything.
+   *
+   * The type is already solved by the time this is asked. A generic body's `T.zero()` is checked
+   * against the trait's own signature while `T` is abstract (`callBoundAssociated`) and reaches
+   * here only at the instantiation, where `T` is an integer and the literal it wants is `TIntLit`
+   * at that width. So a `[T: Add + Zero]` accumulator lowers to the same `0` a concrete body would
+   * have written, and the membership costs no call and no code.
+   *
+   * **Asked after the member table, exactly as the receiver-bearing ones are**, so a type that
+   * declares a `zero` of its own is not shadowed by this. No integer can, but a written-out block
+   * finding the compiler already there is `HoistImpl`'s complaint to make and not a call's.
+   */
+  protected def builtinAssociated(ty: Type, mname: String, args: List[Expr]): Option[TExpr] =
+    for
+      (trName, value) <- CoreTraits.constants.get(mname)
+      if CoreTraits.builtin(trName, ty)
+      key = Library.key(trName)
+      if traitInScope(key)
+      decl <- traitDecls.get(key)
+      m    <- decl.methods.find(_.name == mname)
+      // The declaration is what says this is a receiverless member taking nothing, and it is read
+      // rather than assumed: a trait that grew a parameter would otherwise be answered here with a
+      // constant that ignored it, which is a wrong program rather than a refused one.
+      if m.receiver.isEmpty && !m.isProperty && m.params.isEmpty
+    yield {
+      if args.nonEmpty then
+        err(s"associated function '$trName.$mname' takes no arguments, but " +
+          s"${supplied(args.length, "argument")}")
+
+      TIntLit(value, ty)
+    }
+
   /** `w.get()` — the one thing a `weak T` can be asked (`03`).
    *
    * It yields an ordinary `Option[&T]`, so everything downstream of it — matching, `unwrap`, `?` —

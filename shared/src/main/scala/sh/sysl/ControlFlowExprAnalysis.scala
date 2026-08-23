@@ -253,8 +253,13 @@ trait ControlFlowExprAnalysis extends ExprSupport {
     case TryExpr(e) =>
       analyzeTry(analyzeExpr(e))
 
+    // A range is a **form** rather than a value: there is no `Range` type, so nothing can be named,
+    // passed or returned. What names the four places it is legal is this sentence and nothing else,
+    // which is why it lists all four — a reader who wrote one in a slice index and got it wrong
+    // somewhere else was being told the index is not allowed either.
     case _: RangeExpr =>
-      err("a range is only allowed in a 'for' loop or a 'match' pattern")
+      err("a range is only allowed in a 'for' loop, in a 'for all' or 'for some' quantifier, in a " +
+        "slice index, or in a 'match' pattern")
 
     // `a, b` where a function's result list is what is being produced. It builds the aggregate the
     // caller takes apart — the same one a tuple builds, since a result list is a tuple's layout

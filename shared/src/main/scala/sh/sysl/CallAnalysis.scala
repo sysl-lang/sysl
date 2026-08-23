@@ -43,18 +43,24 @@ trait CallAnalysis extends OperatorCalls {
     case concrete =>
       val (key, targs) = memberKey(concrete, mname)
 
-      if !memberDecls.contains((key, mname)) then
-        err(s"${show(concrete)} has no associated function '$mname'" +
-          (if hasMember(concrete, mname) then s" — '$mname' is reached on a value of one" else ""))
-
-      // **The type's own arguments are known here and are not inferred**, which is what tells this
-      // form apart from `Complex.zero()` written out. A name in this position is a type *parameter*
-      // that has been substituted, so it arrives applied — `T.zero()` at `T = Complex[real]` is
-      // `Complex[real]`, and its `real` is the answer to the question inference would otherwise have
-      // to put to the arguments. A receiverless member has none, so with the arguments discarded a
-      // body bounded by `Zero` could ask a width for its zero and not a generic type, and the
-      // failure landed on the body rather than on the call that chose the type.
-      callAssociated(key, mname, args, expected, boundTraits(written), targs)
+      if memberDecls.contains((key, mname)) then
+        // **The type's own arguments are known here and are not inferred**, which is what tells this
+        // form apart from `Complex.zero()` written out. A name in this position is a type *parameter*
+        // that has been substituted, so it arrives applied — `T.zero()` at `T = Complex[real]` is
+        // `Complex[real]`, and its `real` is the answer to the question inference would otherwise have
+        // to put to the arguments. A receiverless member has none, so with the arguments discarded a
+        // body bounded by `Zero` could ask a width for its zero and not a generic type, and the
+        // failure landed on the body rather than on the call that chose the type.
+        callAssociated(key, mname, args, expected, boundTraits(written), targs)
+      else
+        // A built-in has no member table to be in, so the compiler's own receiverless members are
+        // asked for here — after the table, which is where the ones with a receiver are asked too.
+        // This is the instantiation end of `T.zero()`: the definition-time walk checked it against
+        // the trait, and `T` is an integer by the time it arrives.
+        builtinAssociated(concrete, mname, args).getOrElse {
+          err(s"${show(concrete)} has no associated function '$mname'" +
+            (if hasMember(concrete, mname) then s" — '$mname' is reached on a value of one" else ""))
+        }
 
   /** The traits a **type parameter** was bounded by, as keys, and nothing for a name that is not one.
    *

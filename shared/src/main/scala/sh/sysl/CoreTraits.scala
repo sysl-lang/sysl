@@ -95,6 +95,23 @@ object CoreTraits {
     "rotate_right"   -> "Bits",
   )
 
+  /** The compiler-provided members that have **no receiver** — a trait, and the whole number its
+   * one member answers with (`14 §5`).
+   *
+   * `numeric`'s members are reached from a value and lower from it; these are reached through the
+   * *type*, because there is no value of `T` to hand a `zero()` before the accumulator that wants
+   * one exists. That is the whole difference, and it is why they are a table of their own: what a
+   * receiverless member lowers to cannot be read off a receiver, so the value is stated here.
+   *
+   * Both are in the standard module, so unlike `Signed` and `Bits` no file has to name the trait to
+   * reach them — but the scope question is still asked at the call, for the reason `builtinNumeric`
+   * asks it: a membership settles which types have the member and never which files may write it.
+   */
+  val constants: Map[String, (String, Int)] = Map(
+    "zero" -> ("Zero", 0),
+    "one"  -> ("One",  1),
+  )
+
   /** Each infix operator token, and the trait its operands must satisfy (`§3`). The four derived
    * comparisons name the trait they are derived *from*, not one of their own — there is no `Gt`.
    */
@@ -230,6 +247,24 @@ object CoreTraits {
     // being the second. `Float` is the counterpart on the closed side, and it is a trait with two
     // written `impl`s for exactly the reason this one cannot be.
     case "Integer" => t.isInstanceOf[Type.Integer]
+
+    // The additive and multiplicative identities. They are the one pair here that is a **value**
+    // rather than an operation, and that is what decides the domain — every other row promises
+    // something a type can *do*, so it is asked at `opSubject` and a subtype inherits it, while
+    // these two promise a particular value exists at the type.
+    //
+    // So they are asked of the type **as written**, and two things fall outside on purpose. A
+    // **constrained subtype** is a claim about which values it holds, and nothing says a range that
+    // was written to exclude zero has one — `16 §3` gives a subtype its base's operations, which
+    // these are not. A **vector** is left out because a splat is not what `zero()` says: `<4>i32`
+    // has four lanes and the member names none of them, where every other row here is the lane's
+    // operation happening four times at once.
+    //
+    // The integers are the whole of what is added, because the floats already have written `impl`
+    // blocks in `sysl.ops` and a membership beside one is what `HoistImpl` refuses. What could not
+    // be written is exactly the open family: a program may name `u256`, so no list of blocks covers
+    // it, which is the argument every membership in this file exists for.
+    case "Zero" | "One" => subject.isInstanceOf[Type.Integer]
 
     case _ => false
     }
