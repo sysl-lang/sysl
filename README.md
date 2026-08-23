@@ -223,6 +223,18 @@ is a declaration, and nothing about the characters separates them.
 Each has a `…Files` form taking several `Sysl.File(name, text, dir)`, where `dir` names the module a
 file belongs to when there is no filesystem to read it from.
 
+`check` is the one that answers the mistakes as **data** rather than as the paragraph the driver would
+have printed — for an editor, which cannot underline a paragraph, and for anything else that wants to
+do something with an error other than show it. Empty means it compiled, and nothing is truncated:
+
+```scala
+Sysl.check("var x = 1\nprint(nope)\n", "t.sysl")
+// List(Problem("undefined name 'nope'", Some(Span("t.sysl", 2, 7, 2, 11))))
+```
+
+A `Span` is 1-based lines and columns with an **exclusive** end, so its width on one line is
+`endCol - col`, and it covers the token the diagnostic points at.
+
 **No signature here mentions a syntax tree.** Everything is `String`, `Int`, `List` and `Either`, so a
 node added to the AST is not a breaking change to anything compiled against this. `Sysl.canRun` says
 whether this machine has the clang that linking needs; compiling to LLVM IR needs nothing installed.
