@@ -109,11 +109,18 @@ private def reportRaised(project: PackageConfig, graph: Resolve.Graph): Unit =
           case Origin.Local(_)  => false)))
       .map(p => p.config.name.getOrElse(p.canonical))
 
-    val because =
-      if who.isEmpty then "" else s", which ${who.distinct.sorted.mkString(" and ")} asks for"
+    // Named as the manifest writes them — `0.2.0` and not `v0.2.0`, since what a reader is being
+    // asked to compare this against is the line they typed, and the tag is the repository's spelling
+    // rather than theirs.
+    val asking = who.distinct.sorted
 
-    Console.err.println(s"sysl: note: '${dep.label}' is named at ${asked.tag} and the build " +
-      s"selected ${resolved.tag}$because")
+    val because = asking match
+      case Nil        => ""
+      case one :: Nil => s", which $one asks for"
+      case many       => s", which ${many.init.mkString(", ")} and ${many.last} ask for"
+
+    Console.err.println(s"sysl: note: '${dep.label}' is named at $asked and the build " +
+      s"selected $resolved$because")
 
 /** What each `--lib` source root says it depends on (`packages.md § 2`).
  *
