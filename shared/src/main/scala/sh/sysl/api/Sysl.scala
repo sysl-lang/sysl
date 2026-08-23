@@ -100,6 +100,12 @@ object Sysl {
    * Nothing is truncated. The compiler's own output stops at five, on the reasoning that a wall of
    * diagnostics is the first few with the signal falling off behind them; an editor marking a file
    * has the opposite need, since the ones it left out are the ones with no underline.
+   *
+   * **A file that will not parse now answers with more than one of them.** It used to answer with
+   * exactly one, because the grammar stops at the first thing it cannot read; such a file is parsed
+   * a second time, recovering, so the lines below the first mistake are marked too. The first
+   * `Problem` is still the one the grammar itself reported, which is the tuned one — what recovery
+   * adds sits below it (`SyslParser.recoveredParse`).
    */
   def check(text: String, name: String = "<input>"): List[Problem] =
     checkFiles(List(File(name, text)))

@@ -16,14 +16,30 @@ final case class Reference(at: Pos, declaredAt: Pos, name: String)
  * The two are handed back together because the index is read off the tree and off tables the walk
  * filled, so asking for it later would mean keeping the analyzer alive to ask.
  *
- * **A program that does not analyze yields no index**, which is a real limit for the caller this is
- * for: a file being typed into is a file with errors in it, and that is exactly when an editor is
- * asked where a name came from. The tables are filled up to the point the walk stopped, so a partial
- * answer exists and is simply not handed back. Giving one is worth doing **with** parse recovery
- * rather than before it — until a half-typed file parses at all there is no tree to walk, so the
- * partial index would cover the cases that already work and none of the ones that do not.
+ * A file being typed into is a file with errors in it, and that is exactly when an editor is asked
+ * where a name came from — so an index is handed back **whenever there is one to hand back**, beside
+ * the diagnostics rather than instead of them (`Indexing`). What has no index is a walk that
+ * escaped before producing a tree; a walk that ran to the end and merely recorded mistakes has a
+ * whole one.
  */
 final case class Indexed(tree: TProgram, references: List[Reference])
+
+/** What `Analyzer.indexed` answers: the index if the walk got far enough to build one, and every
+ * diagnostic it recorded on the way.
+ *
+ * **The two are not alternatives, which is the whole difference between this and `Either`.** The
+ * ordinary compiler entry points are right to be exclusive — a build with a diagnostic in it has no
+ * business having a tree — but an editor's file is *usually* both at once, and the answer it needs
+ * is "here are the mistakes, and here is what everything else means". Answering `Left` for a file
+ * with one error in it threw away an index the analyzer had already finished building.
+ *
+ * `index.isEmpty && problems.isEmpty` cannot happen: a walk either produces a tree or says why not.
+ */
+final case class Indexing(index: Option[Indexed], problems: List[Diagnostic]) {
+
+  /** That the file is clean — an index and nothing to report. */
+  def isClean: Boolean = problems.isEmpty
+}
 
 /** Where the things a program names were declared — go-to-definition, as data.
  *
