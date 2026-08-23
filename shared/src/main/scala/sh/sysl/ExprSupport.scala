@@ -9,7 +9,8 @@ package sh.sysl
  *
  * `analyzeValueAt` is declared and not defined, for the reason `AnalyzerBase` declares `analyzeExpr`
  * that way: a form that rewrites itself into another form — a qualified name folded into the one name
- * its module keys it under — has to re-enter the dispatch, and the dispatch is below this.
+ * its module keys it under — has to re-enter the dispatch, and the dispatch is below this. The same
+ * declaration is what lets `ExprCoercion` sit *above* the dispatch and still reach it.
  */
 trait ExprSupport extends SpecialForms with PatternAnalysis with StmtAnalysis {
 
@@ -18,6 +19,12 @@ trait ExprSupport extends SpecialForms with PatternAnalysis with StmtAnalysis {
    * the parser never saw does not have.
    */
   protected def analyzeValueAt(expr: Expr, expected: Option[Type], discarded: Boolean = false): TExpr
+
+  /** The same, at the expression's own position — the ordinary way in. `analyzeExpr` differs only in
+   * that it consults the expected type first, which is what `ExprCoercion` is for.
+   */
+  protected def analyzeValue(expr: Expr, expected: Option[Type], discarded: Boolean = false): TExpr =
+    at(expr.pos)(analyzeValueAt(expr, expected, discarded)).setPos(expr.pos)
 
   /** What an array form's elements should be analyzed as, given what the form itself is expected to
    * produce. A `string` is not on the list: its elements are bytes, but writing one is a validity
