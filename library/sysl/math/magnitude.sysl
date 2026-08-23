@@ -1,0 +1,59 @@
+module sysl.math
+
+// How large a value is, when that is a different question from which of two values is greater.
+
+// A size, in whatever terms the type measures its own.
+//
+// **The associated type is the whole of why this is a trait rather than a function.** A magnitude has
+// to say what it answers *with*, and there is no one answer: the modulus of a complex number is a
+// real, the magnitude of an integer is an integer of that same width, and a rational's is a rational.
+// Fixing the result to `real` would be a floating-point commitment made on behalf of element types
+// with no floating point in them, and fixing it to `Self` would leave `Complex` out — which is the
+// one type the trait exists for. `type Size` lets each implementation answer in its own terms and a
+// generic body name the answer without knowing it.
+//
+// **`Size` is `Ord` and nothing more**, because comparing two sizes is the whole of what a size is
+// for here. A body wanting arithmetic on one is a body that knows which type it is holding.
+//
+// **It is not `Ord` on the values, and that distinction is the reason it exists.** `Complex` has no
+// `Ord` on purpose — no order on the plane respects the arithmetic — and yet `|z|` orders complex
+// numbers by size perfectly well. Gaussian elimination picking its pivot is the worked example:
+// `guide/matrix` chooses the largest remaining cell in a column, which is a comparison every element
+// type can answer and `<` is not.
+//
+// **It is `sysl.math` rather than the standard module**, which `Zero` and `One` are and this is not.
+// Those are the identities of `+` and `*`, so they sit beside the operator catalog and cost a reader
+// nothing; a magnitude has no operator and its neighbours are `abs` and `Float`, which a program
+// already imports `sysl.math` to reach.
+trait Magnitude
+    type Size: Ord
+    magnitude(self) -> Self::Size
+
+// The floats answer with themselves. `abs` clears the sign bit, so a negative zero and a NaN come
+// back the way `Float` documents them rather than through a comparison of this file's own.
+impl Magnitude for real
+    type Size = real
+    magnitude(self) -> real = self.abs()
+
+// **At the narrower width the size is an `f32`, and deliberately not the `real` it would widen to.**
+// Widening is what an implementation fixing the result to `real` would have forced on every caller;
+// a program working in `f32` compares sizes in `f32` and pays for no conversion.
+impl Magnitude for f32
+    type Size = f32
+    magnitude(self) -> f32 = self.abs()
+
+// Every integer type, at every width and either signedness, in one block: the `iN`/`uN` families are
+// open (`01`), so no list of blocks covers them and a bound over `Integer` is what stands in for the
+// list. It is the same shape `Display` is written in.
+//
+// **Negated as `T.zero() - self` rather than as `-self`, which is what keeps the unsigned widths
+// in**: unary `-` requires `Neg`, which the language gives to the signed integers alone, while `Sub`
+// is every integer's. On an unsigned type the branch is never taken and the subtraction is never
+// performed. `gcd` in `integer.sysl` takes the same route for the same reason.
+//
+// **At the most negative value this answers that value again**, exactly as `Signed.abs` does: the
+// magnitude is one larger than the width can hold, and two's-complement negation wraps. Answering
+// anything else would need a wider type to answer in, which is a promise a size cannot make.
+impl[T: Integer + Zero] Magnitude for T
+    type Size = T
+    magnitude(self) -> T = if self < T.zero() then T.zero() - self else self

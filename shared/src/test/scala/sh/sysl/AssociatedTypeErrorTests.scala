@@ -219,6 +219,22 @@ class AssociatedTypeErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("'T' is not bounded by a trait declaring an associated type 'Item'")
     }
 
+    /** A bound the compiler closes is the one that reaches past the parameter's own bounds: a
+     * blanket block written over that family answers the projection for every member of it. What is
+     * refused is the same question with no such block behind it — the relaxation is a block that
+     * exists, not the family.
+     */
+    "a type parameter over a closed family that no blanket block implements" in {
+      err(
+        """trait Seq
+          |    type Item
+          |    head(self) -> Self::Item
+          |f[T: Integer](x: T) -> unit
+          |    var y: T::Item = x
+          |print(1)""".stripMargin,
+      ) should include("'T' is not bounded by a trait declaring an associated type 'Item'")
+    }
+
     "a name no trait declares at all" in {
       err(
         """struct Box

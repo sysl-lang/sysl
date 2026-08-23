@@ -236,6 +236,50 @@ trait TraitLookup extends MemberVisibility {
       .flatMap(b => traitDecls.get(b.name).toList.flatMap(_.assocs).find(_.name == member).map((b, _)))
       .headOption
       .map((b, ad) => Type.Abstract(s"${a.name}::$member", assocBoundsOf(b, ad, a)))
+      .orElse(blanketAssoc(a, member))
+
+  /** The same question answered by a **blanket** block, for a parameter whose bound is the family
+   * that block was written over.
+   *
+   * `impl[T: Integer] Magnitude for T` says every integer implements the trait, so a `T` bounded by
+   * `Integer` implements it at every instantiation and `T::Size` is exactly what the block supplies
+   * — which is not something the parameter's own bounds can say, since the bound naming the family
+   * is not the trait being implemented. It is the same relaxation `blanketOwners` makes for a
+   * concrete type, asked one step earlier.
+   *
+   * **It is what lets the block's own signature be checked at all.** Conformance resolves the
+   * trait's `Self::Item` with `Self` bound to the subject, and a blanket subject is the parameter —
+   * so without this the block that supplies the associated type is the one place the projection
+   * could not be read, and every blanket implementation of a trait declaring one was refused
+   * against its own declaration.
+   *
+   * Read off the **bound the parameter carries** rather than through `satisfies`, for the reason
+   * `blanketOwners` asks `CoreTraits` directly: this is reached from conformance, and a question
+   * asked back through conformance is the same question one turn later. Silent where two blankets
+   * would answer differently — `concreteAssoc` is what reports that, at an instantiation where the
+   * type has a name worth printing.
+   */
+  private def blanketAssoc(a: Type.Abstract, member: String): Option[Type] = {
+    val hits =
+      for
+        name         <- traitsDeclaring(member)
+        (key, targs) <- blanketOwnersOf(a)
+        ti           <- implsOf(name, key)
+        bound        <- implAssoc(ti, member, key, targs)
+      yield bound
+
+    hits.distinct match
+      case b :: Nil => Some(b)
+      case _        => None
+  }
+
+  /** The blanket keys a **type parameter** is covered by, in the pairing `blanketOwners` gives a
+   * concrete type: a parameter is covered where its own bounds name the family the block was
+   * written over, and the one type argument is the parameter itself.
+   */
+  private def blanketOwnersOf(a: Type.Abstract): List[(String, List[Type])] =
+    if blanketBounds.isEmpty then Nil
+    else blanketBounds.toList.collect { case (key, bound) if a.bounds.exists(_.name == bound) => (key, List(a)) }
 
   /** The same question asked of a **concrete** subject, where the answer is the implementation's.
    *

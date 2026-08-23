@@ -1,53 +1,58 @@
-// What a matrix's cells have to be — and the one thing about them the library cannot say.
+// What a matrix's cells have to be — and the one thing about them that is this program's choice
+// rather than the library's.
 //
 // Linear algebra needs a *field*: a type that adds, subtracts, multiplies, divides, negates, has an
 // additive and a multiplicative identity, and can be compared. Nine of those ten arrive as core
 // traits, and `Zero` and `One` arrive because a generic body cannot spell an identity any other way —
 // `0.0` is a `real` and nothing else, so a body shared by two element types has to *ask*.
 //
-// The tenth is the pivot. Gaussian elimination chooses the largest remaining cell in a column and
-// treats one that is small enough as absent, so it needs a **magnitude**: an ordering on size that is
-// not an ordering on values. The complexes have no `<` at all — the library refuses `Ord` for them on
-// purpose, because there is no order on the plane that respects arithmetic — and yet `|z|` is exactly
-// what pivoting wants. So the requirement is a magnitude and never an `Ord`, and that is why this
-// trait exists rather than a bound written out of core traits alone.
+// The tenth is the pivot. Gaussian elimination chooses the largest remaining cell in a column, so it
+// needs a **magnitude**: an ordering on size that is not an ordering on values. The complexes have no
+// `<` at all — the library refuses `Ord` for them on purpose, because there is no order on the plane
+// that respects arithmetic — and yet `|z|` is exactly what pivoting wants.
 //
-// WHY IT IS THE GUIDE'S AND NOT THE LIBRARY'S — AND WHAT CHANGED. A magnitude has to say what it
-// answers *with*, and the honest answer is "a type the implementation chooses" — `real` here, but a
-// rational matrix would want a rational and an interval matrix an interval. That was unsayable when
-// this was written, so a library trait would have had to fix the result for everybody, and fixing it
-// to `real` is a floating-point commitment made on behalf of element types with no floating point in
-// them.
+// **That tenth requirement is `sysl.math.Magnitude`, and it used to be declared here.** The reason it
+// could not be the library's was that a magnitude has to say what it answers *with*, and a library
+// trait would have had to fix that for everybody — `real`, which is a floating-point commitment made
+// on behalf of element types with no floating point in them. An associated type is what removed the
+// obstacle: `Magnitude` declares `type Size: Ord` and each implementation fills it, so a `Complex[F]`
+// measures in `F` and an integer measures in itself. This program asks for the trait and implements
+// none of it; the three memberships it uses are the library's own.
 //
-// **The language now says it.** A trait may declare an associated type — `type Magnitude: Ord`, a
-// parameter the implementation supplies — so a library `Magnitude` could let each element type answer
-// in its own terms. What is left is a library decision rather than a language one: which module it
-// belongs in, and whether an ordering-on-size deserves a name beside the operator catalogue. Until
-// that is taken, the trait stays here, and everything below answers with `real` because everything
-// below is checked with a tolerance.
+// **What is left here is one member, and it is a choice rather than a gap.** A magnitude is compared
+// against other magnitudes, which is all `gauss.sysl` does with one. Everything *else* this program
+// measures — the length of a vector, how close two results are, the tolerance a check is written
+// against — is reported as a `real`, because a length is a real number and a literal tolerance has to
+// be written at some width. `norm` is that view, and each element type says how to take it.
 
 import sysl.math.Float
+import sysl.math.Magnitude
 import sysl.math.complex.Complex
 
 // The element type of a vector or a matrix. Every requirement is used: `gauss.sysl` divides, negates,
-// compares against a zero and multiplies pivots into a determinant, and `text` renders.
+// compares against a zero and multiplies pivots into a determinant, `Magnitude` is what it pivots on,
+// and `text` renders.
 //
 // `Display` is not algebra and is here anyway, because a numerical type that cannot be printed is a
 // numerical type nobody can debug — and a bound is where a generic body says what it needs, whatever
 // the need is for.
-trait Scalar: Add + Sub + Mul + Div + Neg + Zero + One + Eq + Display
-    magnitude(self) -> real
+trait Scalar: Add + Sub + Mul + Div + Neg + Zero + One + Eq + Display + Magnitude
+
+    // The size of this value as a `real`: the same quantity `magnitude` gives, in the one width this
+    // program prints and writes its tolerances at.
+    norm(self) -> real
 
 impl Scalar for real
-    magnitude(self) -> real = self.abs()
+    norm(self) -> real = self.magnitude()
 
-// The same body at the narrower width, converted at the end rather than at the start: `f32.abs()` is
-// an `f32`, and widening a magnitude that has already been taken loses nothing.
+// The same size at the narrower width, widened at the end rather than at the start: `f32.magnitude()`
+// is an `f32`, and widening a size that has already been taken loses nothing. Note which comparisons
+// this does *not* reach — `gauss.sysl` pivots on the `f32` sizes themselves.
 impl Scalar for f32
-    magnitude(self) -> real = real(self.abs())
+    norm(self) -> real = real(self.magnitude())
 
-// The case the whole exercise is for. `Complex[F].abs()` answers an `F` — the modulus is a *real*
-// number however the parts are stored — so this is one conversion and no arithmetic, and it works at
-// every float width the library has.
+// The case the whole exercise is for. `Complex[F]` measures in `F` — the modulus is a *real* number
+// however the parts are stored — so this is one conversion and no arithmetic, at every float width
+// the library has.
 impl[F: Float + Display] Scalar for Complex[F]
-    magnitude(self) -> real = real(self.abs())
+    norm(self) -> real = real(self.magnitude())
