@@ -243,6 +243,12 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
       targs: List[Type],
       pos: Option[Pos],
       scope: Scope,
+      /** What the thing being checked is called in the sentence — `type parameter` for the ordinary
+        * case, `associated type` for a trait object's binding. The rule is identical and only the
+        * noun differs, so calling an associated type a parameter would send the reader looking for
+        * a bracket the trait does not have.
+        */
+      noun: String = "type parameter",
   )
 
   /** Type applications whose bounds could not be answered where they were written. Drained once, as
@@ -280,10 +286,11 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
       tparams: List[String],
       bounds: Map[String, List[BoundRef]],
       targs: List[Type],
+      noun: String = "type parameter",
   ): Unit =
     if bounds.nonEmpty && tparams.length == targs.length then
-      if implsHoisted then checkParamBounds(what, tparams, bounds, targs)
-      else boundChecks += DeferredBound(what, tparams, bounds, targs, currentPos, currentScope)
+      if implsHoisted then checkParamBounds(what, tparams, bounds, targs, noun = noun)
+      else boundChecks += DeferredBound(what, tparams, bounds, targs, currentPos, currentScope, noun)
 
   /** Whether the type arguments a generic declaration was applied to implement what it asked of its
    * parameters — the one rule, wherever the parameters came from: a function's, an `impl` block's,
@@ -303,6 +310,7 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
       bounds: Map[String, List[BoundRef]],
       targs: List[Type],
       seed: Map[String, Type] = Map.empty,
+      noun: String = "type parameter",
   ): Unit =
     if bounds.nonEmpty then
       val subst = seed ++ tparams.zip(targs).toMap
@@ -323,7 +331,7 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
               // bound.
               case a: Type.Abstract =>
                 if !satisfies(tr, a) then
-                  boundErr(s"'$what' requires its type parameter '$tp' to implement '${showBound(tr, a)}', " +
+                  boundErr(s"'$what' requires its $noun '$tp' to implement '${showBound(tr, a)}', " +
                     s"but '${a.name}' is not bounded by it")
               case concrete =>
                 if !satisfies(tr, concrete) then
@@ -332,7 +340,7 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
                   // block that is already written.
                   val why = unmetBound(tr, concrete).fold("")(reason => s" — $reason")
 
-                  err(s"'$what' requires its type parameter '$tp' to implement '${showBound(tr, concrete)}', " +
+                  err(s"'$what' requires its $noun '$tp' to implement '${showBound(tr, concrete)}', " +
                     s"but ${show(concrete)} does not$why")
           case None =>
 
