@@ -262,13 +262,56 @@ class SyslLexical
    * The one thing it deliberately does not do is join a line beginning with an *operator*. `+` and
    * friends already continue from the end of the previous line, and a language that accepted both
    * ends would be asking every file to pick a side.
+   *
+   * **AND THE LINE ABOVE HAS TO ADMIT IT, WHICH LOOKAHEAD ALONE CANNOT SEE.** sysl has one other
+   * construct spelled with a leading dot — the **implicit member** (`.Red`, whose type comes from
+   * what the context expects) — and a `match` arm's pattern begins a line:
+   *
+   * {{{
+   * val n = c match
+   *     .Red -> 1
+   * }}}
+   *
+   * Joined, that reads as `c match .Red`, and the reader who wrote the form they had just been
+   * taught gets `newline expected` instead of the sentence `PatternParser.noImplicitMember` exists to
+   * give them. So the rule asks both ends, which is the exact dual of the trailing one above: a
+   * trailing operator continues because it **cannot** finish an expression, and a leading dot
+   * continues only where the line above **could** have.
+   *
+   * A reserved word cannot finish one — there is nothing to call a method on — so `match`, `then`,
+   * `else`, `do` and the rest all decline, and no call chain is lost, because none of them can be a
+   * receiver. The four that *are* values are the exception, and `self` is the one that matters:
+   * `self` on its own line with `.field` under it is an ordinary chain.
+   *
+   * **What this does NOT rescue is the second arm**, whose line above ends in whatever the first
+   * arm's value was — an ordinary expression, which admits the join. That is the residual cost, and
+   * it is bounded by the fact that an implicit member in a pattern is *illegal in sysl either way*:
+   * what is lost is the quality of a diagnostic, never the meaning of a legal program.
    */
   override protected def isLineContinuationStart(r: Reader[Char]): Boolean =
     !r.atEnd && r.first == '.' && {
       val after = r.rest
 
       !after.atEnd && (after.first.isLetter || after.first == '_')
-    }
+    } && canEndExpression(previousToken)
+
+  /** The reserved words that are values, and so *can* end an expression.
+   *
+   * Everything else in `reserved` introduces something, so a line ending in one has not finished an
+   * expression and there is nothing under it for a chain to continue.
+   */
+  private val valueWords = Set("self", "true", "false", "null")
+
+  /** Whether the token before a newline could have been the end of an expression.
+   *
+   * A delimiter is admitted rather than enumerated: `)`, `]` and `}` all end one, and the operators
+   * that do not are already handled at the *other* end by `isLineContinuationToken`, which suppresses
+   * the newline before this is ever consulted.
+   */
+  private def canEndExpression(tok: Token): Boolean = tok match
+    case null           => false
+    case Keyword(chars) => !reserved(chars) || valueWords(chars)
+    case _              => true
 
   /** Materializes the token stream with each token's source position, so the parser can
    * memoize over a fixed `List` (not the stateful scanner — see design/front-end.md)

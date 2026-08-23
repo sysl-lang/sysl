@@ -363,12 +363,43 @@ class ImplicitMemberTests extends AnyFreeSpec with RunSupport with CodegenSuppor
     }
   }
 
+  /** A line that begins with a dot, now that the leading-dot continuation style this form left room
+    * for has actually arrived (`LineContinuationTests`).
+    *
+    * The comment here used to say the two readings "can never both be meant", which was the right
+    * call and is why the continuation was available to take. What it did not anticipate is that
+    * taking it makes the *continuation* the reading wherever there is a line above to continue — so
+    * the refusal below is reached only where there is not one.
+    */
   "a statement that begins with one" - {
-    // It parses, and the analyzer refuses it — which is what leaves the leading-dot continuation
-    // style for a call chain available: a line starting with a dot is never a legal statement, so
-    // the two readings can never both be meant.
-    "parses, and is refused for having no expectation" in {
-      err(colour + ".Red\nprint(1)") should include("nothing here expects one")
+    "is read as a continuation of the line above, where there is one to continue" in {
+      err(colour + ".Red\nprint(1)") should include("cannot read field 'Red'")
+    }
+
+    // Nothing precedes it, so nothing is joined and the analyzer gets the statement the parser
+    // always produced.
+    "and where there is nothing above it, parses and is refused for having no expectation" in {
+      err(".Red\n" + colour + "print(1)") should include("nothing here expects one")
+    }
+  }
+
+  /** The one place the two spellings genuinely compete, pinned from this side as well as from
+    * `LineContinuationTests`.
+    *
+    * A `match` arm's pattern begins a line, so an arm written with the expression form's dot looks
+    * exactly like a chain continuing the header. The lexer declines to join after a reserved word —
+    * nothing can be called on `match` — which is what leaves this diagnostic reachable at all.
+    */
+  "the leading-dot continuation does not swallow the first arm of a match" - {
+    "so the pattern form is still refused in the words written for it" in {
+      val e = err(colour + "val c: Colour = .Red\nval n = c match\n    .Red -> 1\n    else -> 2\nprint(n)")
+
+      e should include("a pattern is matched against a type it already knows")
+    }
+
+    // And the ordinary chain, whose line above ends in a name rather than a keyword, is unaffected.
+    "while a chain after an ordinary line still joins" in {
+      run("import sysl.text.Search\n\nval n = \"  hi  \"\n    .trim()\n    .len\nprint(n)") shouldBe "2\n"
     }
   }
 
