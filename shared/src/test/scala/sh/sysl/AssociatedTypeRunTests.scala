@@ -421,5 +421,57 @@ class AssociatedTypeRunTests extends AnyFreeSpec with RunSupport {
 
       run(src) shouldBe "5 6\n"
     }
+
+    // A trait with parameters of its own keeps them where a reader expects them — in order, at the
+    // front — and names the associated type beside them. This is the shape the bare form is refused
+    // for, so it is the one that has to work.
+    "a trait with both takes its arguments in order and its associated type by name" in {
+      val src = render +
+        """trait Keyed[K]
+          |    type Item: Render
+          |    at(self, k: K) -> Self::Item
+          |struct Row
+          |    v: int
+          |impl Keyed[int] for Row
+          |    type Item = int
+          |    at(self, k: int) -> Self::Item = self.v + k
+          |show(s: &Keyed[int, Item = int]) -> unit
+          |    print(s.at(2), s.at(2).render())
+          |show(Row(5))""".stripMargin
+
+      run(src) shouldBe "7 i\n"
+    }
+
+    /** The binding is an ordinary written type, so a generic signature may name one of its own
+     * parameters there — which is what makes an object usable from generic code at all rather than
+     * only at types written out.
+     *
+     * **The argument has to be written**, and that is a limit rather than a decision: `shown(Box(1))`
+     * is refused with *"cannot infer the type argument 'T'"*, because a trait binds no type
+     * parameter during inference (`GenericInstantiation.unify` says so in as many words, for the
+     * reason that `f[T](p: *T)` handed a `*Writer` would otherwise instantiate at a type with no
+     * layout). Solving `T` backwards through an implementation's `type Item` is a separate piece of
+     * machinery and is not built.
+     */
+    "and a generic signature may bind it to one of its own parameters" in {
+      val src = render +
+        """trait Seq
+          |    type Item: Render
+          |    head(self) -> Self::Item
+          |struct Box
+          |    v: int
+          |impl Seq for Box
+          |    type Item = int
+          |    head(self) -> Self::Item = self.v
+          |struct Word
+          |    v: string
+          |impl Seq for Word
+          |    type Item = string
+          |    head(self) -> Self::Item = self.v
+          |shown[T: Render](s: &Seq[Item = T]) -> string = s.head().render()
+          |print(shown[int](Box(1)), shown[string](Word("w")))""".stripMargin
+
+      run(src) shouldBe "i w\n"
+    }
   }
 }
