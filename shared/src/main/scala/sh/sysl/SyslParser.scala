@@ -1075,7 +1075,7 @@ class SyslParser(val source: Source)
    * answer and said so; this is what carries it out.
    */
   def firstLexicalError: Option[(String, Position)] =
-    lexical.scanPositioned(source.text).collectFirst { case (lexical.ErrorToken(msg), at) => (msg, at) }
+    lexical.scanPositioned(source.text).collectFirst { case (lexical.ErrorToken(msg), at, _) => (msg, at) }
 }
 
 object SyslParser {
@@ -1123,12 +1123,17 @@ object SyslParser {
   /** Where a parse failed. Running out of tokens leaves no position at all, and pointing at the
    * end of the last line is more use than pointing at nothing — an unclosed block is exactly the
    * case that reports there.
+   *
+   * A failure that stopped *at* a token carries that token's span, so `identifier expected`
+   * underlines the token that is not one rather than its first character. Running out of input has
+   * no token and so no extent.
    */
-  protected def failedAt(source: Source, at: scala.util.parsing.input.Position): Pos =
-    if at.line > 0 then Pos(source, at.line, at.column)
-    else {
+  protected def failedAt(source: Source, at: scala.util.parsing.input.Position): Pos = at match {
+    case p: TokenPos => p.toPos
+    case p if p.line > 0 => Pos(source, p.line, p.column)
+    case _ =>
       val last = math.max(1, source.lines.length)
 
       Pos(source, last, source.line(last).length + 1)
-    }
+  }
 }

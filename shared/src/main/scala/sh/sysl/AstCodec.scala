@@ -69,7 +69,7 @@ object AstCodec {
    * conflict**, and that is the case the rule above is written for: read dev's number, take the one
    * after it, and do not assume a clean merge means the versions agree.
    */
-  val Version: Int = 45
+  val Version: Int = 46
 
   private val Magic = "sysl-ast"
 
@@ -112,10 +112,11 @@ object AstCodec {
     private def map[A](m: Map[String, A])(f: A => Unit): Unit =
       list(m.toList.sortBy(_._1)) { (k, v) => sref(k); f(v) }
 
-    /** A node's own position, which every `Positioned` carries and a synthesized node may lack. */
+    /** A node's own span, which every `Positioned` carries and a synthesized node may lack. */
     private def pos(p: Positioned): Unit = p.pos match
-      case None                 => tok("0")
-      case Some(Pos(s, ln, cl)) => tok("1"); int(src(s)); int(ln); int(cl)
+      case None                             => tok("0")
+      case Some(Pos(s, ln, cl, endLn, endCl)) =>
+        tok("1"); int(src(s)); int(ln); int(cl); int(endLn); int(endCl)
 
     def write(programs: List[Program]): String = {
       // The tables are filled while the body is written, so the header can only be assembled once
@@ -574,12 +575,14 @@ object AstCodec {
       val s       = if present then int() else 0
       val ln      = if present then int() else 0
       val cl      = if present then int() else 0
+      val endLn   = if present then int() else 0
+      val endCl   = if present then int() else 0
       val node    = build
 
       if present then
         if s < 0 || s >= sources.length then fail(s"source $s is not in the artifact's table")
 
-        node.setPos(Pos(sources(s), ln, cl))
+        node.setPos(Pos(sources(s), ln, cl, endLn, endCl))
       else node
     }
 

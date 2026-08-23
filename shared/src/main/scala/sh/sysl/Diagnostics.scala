@@ -37,6 +37,34 @@ final class Source(val name: String, val text: String, val dir: Option[List[Stri
   def line(n: Int): String =
     if n >= 1 && n <= lines.length then lines(n - 1).stripSuffix("\r") else ""
 
+  /** The offset into `text` at which each line begins, so that an offset can be turned into a line
+   * and a column without walking the text.
+   *
+   * The lexer knows where a token *ends* as an offset and nothing else — it is what the character
+   * reader beneath it counts — while everything that reports a position speaks in lines and
+   * columns. One of the two has to be converted, and this is the cheap direction.
+   */
+  lazy val lineStarts: Vector[Int] =
+    0 +: text.indices.view.filter(text.charAt(_) == '\n').map(_ + 1).toVector
+
+  /** The line and the column, both 1-based, of an offset into `text`.
+   *
+   * An offset past the end answers the place just past the last character, which is where a token
+   * that runs to the end of input ends.
+   */
+  def placeOf(offset: Int): (Int, Int) = {
+    val at = math.max(0, math.min(offset, text.length))
+    var lo = 0
+    var hi = lineStarts.length - 1
+
+    while lo < hi do
+      val mid = (lo + hi + 1) / 2
+
+      if lineStarts(mid) <= at then lo = mid else hi = mid - 1
+
+    (lo + 1, at - lineStarts(lo) + 1)
+  }
+
   override def toString: String = name
 }
 
@@ -47,8 +75,23 @@ object Source {
   def apply(name: String, text: String, dir: List[String]): Source = new Source(name, text, Some(dir))
 }
 
-/** A place in a source file: 1-based line and column, as the lexer counts them. */
-final case class Pos(source: Source, line: Int, col: Int) {
+/** A span of a source file: where something starts, and where it ends.
+ *
+ * `line` and `col` are 1-based, as the lexer counts them, and `endLine`/`endCol` name the place
+ * **just past** the last character — so the width of a span on one line is `endCol - col`, and a
+ * span whose end equals its start has no extent at all. The exclusive end is what an editor
+ * publishes and what makes the arithmetic come out without a `+ 1` at every use.
+ *
+ * **What a span covers is the TOKEN a diagnostic points at, not the whole construct.**
+ * `SyslParserBase.at` stamps a node with the position of the first token the rule consumed, so a
+ * node reports where its first token runs from and to. That is what a reader wants underlined and
+ * what resolves a cursor to an identifier; a span covering a whole expression is a different thing
+ * and nothing here claims to give one.
+ *
+ * A position built from a line and a column alone — a literate file's margin, a conditional
+ * directive, a parse that ran out of input — has no token to measure and carries no extent.
+ */
+final case class Pos(source: Source, line: Int, col: Int, endLine: Int, endCol: Int) {
 
   /** Where this is, as a compiler conventionally spells it: `file.sysl:12:7`.
    *
@@ -58,19 +101,24 @@ final case class Pos(source: Source, line: Int, col: Int) {
    */
   def location: String = s"${source.name}:$line:${col + source.columnOffset}"
 
-  /** The message, the location, and the offending line with a caret under the column:
+  /** The message, the location, and the offending line with the token underlined:
    *
    * {{{
    * error: 'b' of 'add' is int, but string was given
    *  --> hello.sysl:7:14
    *   |
    * 7 | print(add(x, "two"))
-   *   |              ^
+   *   |              ^^^^^
    * }}}
    *
-   * The caret's indent is built from the line's own leading characters with everything but a
-   * tab replaced by a space, so the caret lands under the right column whichever mix of tabs
-   * and spaces the line was written with.
+   * The underline's indent is built from the line's own leading characters with everything but a
+   * tab replaced by a space, so it lands under the right column whichever mix of tabs and spaces
+   * the line was written with.
+   *
+   * A span that runs past the end of its first line — a text block, an unterminated literal — is
+   * underlined to the end of that line and no further: the quote shows one line, so an underline
+   * longer than it would be pointing at nothing. A span with no extent gets a single caret, which
+   * is what every diagnostic looked like before spans existed.
    */
   def render(msg: String): String = {
     val number = line.toString
@@ -78,15 +126,25 @@ final case class Pos(source: Source, line: Int, col: Int) {
     val text   = source.line(line)
     val column = math.max(1, math.min(col, text.length + 1))
     val indent = text.take(column - 1).map(c => if c == '\t' then '\t' else ' ')
+    val past   = if endLine == line then math.min(endCol, text.length + 1) else text.length + 1
+    val width  = math.max(1, past - column)
 
     List(
       s"error: $msg",
       s"$gutter--> $location",
       s"$gutter |",
       s"$number | $text",
-      s"$gutter | $indent^",
+      s"$gutter | $indent${"^" * width}",
     ).mkString("\n")
   }
+}
+
+object Pos {
+
+  /** A place rather than a span, for a caller that knows a line and a column and has no token to
+   * measure. Its end is its start, so it renders with one caret.
+   */
+  def apply(source: Source, line: Int, col: Int): Pos = Pos(source, line, col, line, col)
 }
 
 /** Something that came from a place in a source file.

@@ -316,14 +316,31 @@ class SyslLexical
   /** Materializes the token stream with each token's source position, so the parser can
    * memoize over a fixed `List` (not the stateful scanner — see design/front-end.md)
    * yet still report where a parse error occurred.
+   *
+   * The third element is the offset **just past** the token, which is what lets a diagnostic
+   * underline it rather than point at its first character. It is `rest`'s own offset: a scanner is
+   * built from the character reader positioned immediately after the previous token and reports
+   * that reader's offset as its own, so asking the next scanner where it starts is asking where
+   * this token stopped. Nothing else in the lexer knows a token's width — an integer literal's
+   * `chars` is its value re-spelled rather than what was written, and a string's is what it
+   * denotes — so this is the only honest source of it.
+   *
+   * The two tokens the scanner *synthesizes* at end of input, a closing newline and a dedent, are
+   * built over the reader in front of them and so report an end at or before their own start. They
+   * occupy no characters, which is what a caller clamping the end to the start gets right anyway.
    */
-  def scanPositioned(s: String): List[(Token, Position)] = {
-    val buf = ListBuffer.empty[(Token, Position)]
+  def scanPositioned(s: String): List[(Token, Position, Int)] = {
+    val buf = ListBuffer.empty[(Token, Position, Int)]
     var t   = read(new CharSequenceReader(s))
 
     while (!t.atEnd) {
-      buf += ((t.first, t.pos))
-      t = t.rest
+      // `first` and `pos` are read before `rest`, which is what advances the lexer's own state.
+      val token = t.first
+      val start = t.pos
+      val next  = t.rest
+
+      buf += ((token, start, next.offset))
+      t = next
     }
 
     buf.toList

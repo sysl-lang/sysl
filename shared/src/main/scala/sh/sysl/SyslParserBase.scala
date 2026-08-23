@@ -36,16 +36,35 @@ trait SyslParserBase extends PackratParsers {
     def atEnd: Boolean         = tokens.isEmpty
   }
 
+  /** The token list this parser reads, each token's position widened into the span it occupies.
+   *
+   * `src` is this parser's own `source.text` at both call sites — the end offsets the lexer
+   * reports are offsets into whatever was scanned, and they are turned back into lines and columns
+   * against `source`, so handing it anything else would place the ends in another file.
+   */
   protected def reader(src: String): Reader[lexical.Token] =
-    new PackratReader(new TokenReader(lexical.scanPositioned(src)))
+    new PackratReader(new TokenReader(lexical.scanPositioned(src).map(spanned)))
+
+  /** One scanned token, with the offset just past it resolved into a line and a column.
+   *
+   * The end is clamped forward to the start, for the two tokens the scanner synthesizes at end of
+   * input: they occupy no characters and are reported over the reader in front of them.
+   */
+  private def spanned(scanned: (lexical.Token, Position, Int)): (lexical.Token, Position) = {
+    val (token, start, past)  = scanned
+    val (endLine, endColumn)  = source.placeOf(past)
+    val backwards             = endLine < start.line || (endLine == start.line && endColumn < start.column)
+
+    if backwards then (token, TokenPos(source, start.line, start.column, start.line, start.column))
+    else (token, TokenPos(source, start.line, start.column, endLine, endColumn))
+  }
 
   // --- positions -----------------------------------------------------------------------
 
-  /** Where the next token starts, in this parser's source. */
-  protected def posOf(in: Input): Pos = {
-    val p = in.pos
-
-    Pos(source, p.line, p.column)
+  /** The span of the next token, in this parser's source. */
+  protected def posOf(in: Input): Pos = in.pos match {
+    case p: TokenPos => p.toPos
+    case p           => Pos(source, p.line, p.column)
   }
 
   /** Stamps whatever `p` builds with the position of the first token `p` consumed.
@@ -400,4 +419,33 @@ trait SyslParserBase extends PackratParsers {
    * it is written like an operand rather than like a statement, and it yields a `bool`.
    */
   protected def quantifier: PackratParser[Expr]
+}
+
+/** A token's position, which is a **span**: a token occupies characters rather than sitting at one,
+ * and both a diagnostic that underlines it and an editor that resolves a cursor to it need to know
+ * how far it runs.
+ *
+ * It is a `Position` — rather than something carried beside one — because that is the only channel
+ * a rule can reach it through. `PackratReader` holds its underlying reader as a plain constructor
+ * parameter, so the `TokenReader` beneath it is unreachable from a parser; of the five things it
+ * does forward, only `pos` can carry an extent without meaning something other than what it says.
+ * Widening `offset` to mean the token's end would also have worked and would have left a reader
+ * whose offset is not its own position.
+ *
+ * `SyslParserBase.reader` builds these **once** and stores them in the token list. Rebuilding one
+ * per access would defeat `PackratReader`'s memo cache, which is keyed on `(parser, pos)` and
+ * compares positions by identity.
+ */
+final class TokenPos(val source: Source, val line: Int, val column: Int,
+                     val endLine: Int, val endColumn: Int) extends Position {
+
+  protected def lineContents: String = source.line(line)
+
+  /** This span in the compiler's own terms, which is what a diagnostic is rendered against. */
+  def toPos: Pos = Pos(source, line, column, endLine, endColumn)
+}
+
+object TokenPos {
+  def apply(source: Source, line: Int, column: Int, endLine: Int, endColumn: Int): TokenPos =
+    new TokenPos(source, line, column, endLine, endColumn)
 }
