@@ -156,7 +156,7 @@ trait Reporting {
    * want of a bound to name.
    */
   protected def boundErr(msg: String): Nothing = {
-    found += ((msg, currentPos))
+    found += Diagnostic(msg, currentPos)
     poisoned()
   }
 
@@ -172,7 +172,7 @@ trait Reporting {
     try body
     catch
       case AnalyzerError(msg, pos, _) =>
-        found += ((msg, pos))
+        found += Diagnostic(msg, pos)
         poisoned()
 
   /** `recover`, for a region whose complaint must survive the abstract pass rather than be dropped
@@ -187,7 +187,7 @@ trait Reporting {
     try body
     catch
       case AnalyzerError(msg, pos, _) =>
-        found += ((msg, pos))
+        found += Diagnostic(msg, pos)
         fallback
       case Poisoned() => fallback
 
@@ -197,7 +197,7 @@ trait Reporting {
    * the way in: the same complaint at the same place is one mistake however many times a pass
    * arrives at it — a generic function instantiated three times has one bad line, not three.
    */
-  private val found = mutable.LinkedHashSet.empty[(String, Option[Pos])]
+  private val found = mutable.LinkedHashSet.empty[Diagnostic]
 
   /** How many distinct mistakes have been found, which is what tells a walk that reported something
    * from one that came through clean.
@@ -213,23 +213,21 @@ trait Reporting {
    * whose answer is thrown away has to take back what it said, or the reader is told about a
    * reading nobody kept.
    */
-  protected def complaints: List[(String, Option[Pos])] = found.toList
+  protected def complaints: List[Diagnostic] = found.toList
 
-  protected def restoreComplaints(saved: List[(String, Option[Pos])]): Unit = {
+  protected def restoreComplaints(saved: List[Diagnostic]): Unit = {
     found.clear()
     found ++= saved
   }
 
-  /** The errors, rendered and ordered by where they are, so reading them top to bottom is
-   * reading the file top to bottom. A diagnostic with no position sorts last, since there is
-   * nowhere to file it.
+  /** The errors, ordered by where they are, so reading them top to bottom is reading the file top
+   * to bottom. A diagnostic with no position sorts last, since there is nowhere to file it.
+   *
+   * **They are not rendered here**, which is the difference between this and what it used to be: a
+   * caller wanting them as text asks `Diagnostic.report`, and one wanting them as data — an editor,
+   * `api.Sysl.check` — has them without a paragraph to take apart.
    */
-  protected def diagnostics: List[String] =
-    found.toList
-      .sortBy { case (_, pos) =>
-        (pos.isEmpty, pos.map(_.source.name).getOrElse(""), pos.map(_.line).getOrElse(0), pos.map(_.col).getOrElse(0))
-      }
-      .map { case (msg, pos) => Diagnostic.render(msg, pos) }
+  protected def diagnostics: List[Diagnostic] = Diagnostic.inSourceOrder(found.toList)
 
   /** Runs `body`, and if it abandons its region, records the error and yields `fallback` so the
    * walk carries on to whatever comes after. A `Poisoned` region yields the same fallback and
@@ -242,7 +240,7 @@ trait Reporting {
       // not reach it: it is wrong whatever the parameters turn out to be, so no instantiation will
       // find it again — and a declaration nothing instantiates would otherwise never be told.
       case AnalyzerError(msg, pos, unresolved) =>
-        if !abstractPass || unresolved then found += ((msg, pos))
+        if !abstractPass || unresolved then found += Diagnostic(msg, pos)
         fallback
       case Poisoned() => fallback
 

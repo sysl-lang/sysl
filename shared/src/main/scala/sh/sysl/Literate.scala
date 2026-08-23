@@ -83,7 +83,7 @@ object Literate {
    * implementation would drift, and the drift would be a program that compiles as one thing and
    * renders as another.
    */
-  private[sysl] def classify(source: Source): Either[String, IndexedSeq[Line]] = {
+  private[sysl] def classify(source: Source): Either[Diagnostic, IndexedSeq[Line]] = {
     val lines = source.lines
     val out   = Array.fill[Line](lines.length)(Line.Prose(""))
     var fence = Option.empty[(String, Int)]
@@ -111,10 +111,11 @@ object Literate {
           // silence — the author's function quietly missing a statement. That is the failure the
           // rule exists to prevent, so the rule has to run before the decision it protects.
           if bare.nonEmpty && margin.contains('\t') then
-            return Left(Pos(source, i + 1, margin.indexOf('\t') + 1).render(
+            return Left(Diagnostic(
               "a tab in the indentation of a literate file — what makes a line program text is " +
                 "four columns of indent, and a tab is as wide as whatever happens to be " +
-                "displaying it, so this line is code in one editor and prose in another"))
+                "displaying it, so this line is code in one editor and prose in another",
+              Some(Pos(source, i + 1, margin.indexOf('\t') + 1))))
           else {
             // An open list item ends at the first line with content that is no further in than the
             // marker was. A blank line does not end one — a list may be written with air between
@@ -147,9 +148,10 @@ object Literate {
     // that opened, since that is the line to go and look at.
     fence match
       case Some((_, line)) =>
-        Left(Pos(source, line, 1).render(
+        Left(Diagnostic(
           "this fence is never closed, so everything below it is an illustration and none of it " +
-            "is compiled — close it, or indent the lines that are meant to run"))
+            "is compiled — close it, or indent the lines that are meant to run",
+          Some(Pos(source, line, 1))))
       case None => Right(out.toIndexedSeq)
   }
 
@@ -170,7 +172,12 @@ object Literate {
    * A file that is not literate comes back **unchanged and identical** — the same `Source` object,
    * not a copy of it, since a `Source` compares by identity (`Diagnostics`).
    */
-  def tangle(source: Source): Either[String, Source] =
+  def tangle(source: Source): Either[String, Source] = tangled(source).left.map(_.rendered)
+
+  /** The same, answering the refusal as **data**. A literate file's margin is a mistake in the file
+   * like any other, and an editor showing one has a range to underline.
+   */
+  def tangled(source: Source): Either[Diagnostic, Source] =
     if !named(source.name) then Right(source)
     else
       classify(source).map { lines =>

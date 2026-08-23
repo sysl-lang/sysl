@@ -50,7 +50,7 @@ object Escape {
   /** Analyzes a whole program: either the escapes that are *not* promotable, rendered as one
    * report, or the promotions to make.
    */
-  def check(program: TProgram): Either[String, Promotions] = new Escape(program).run()
+  def check(program: TProgram): Either[List[Diagnostic], Promotions] = new Escape(program).run()
 }
 
 private class Escape(program: TProgram) {
@@ -68,7 +68,7 @@ private class Escape(program: TProgram) {
    */
   private def kept(name: String, i: Int): Boolean = !funcs.contains(name) || keeps((name, i))
 
-  private def run(): Either[String, Escape.Promotions] = {
+  private def run(): Either[List[Diagnostic], Escape.Promotions] = {
     var changed = true
     while changed do
       changed = false
@@ -95,7 +95,7 @@ private class Escape(program: TProgram) {
     val refused = borrowed ::: walks.flatMap((who, _, w) => noAllocPromotion((who, w))) :::
       walks.flatMap((_, stmts, w) => alignedPromotion(stmts, w)) ::: walks.flatMap(_._3.escape)
 
-    if refused.nonEmpty then Left(Diagnostic.report(refused))
+    if refused.nonEmpty then Left(refused)
     else
       Right(
         Escape.Promotions(
@@ -114,7 +114,7 @@ private class Escape(program: TProgram) {
    * implementation that lets those bytes outlive the call is rejected, which is what licenses the
    * call site below to pass a frame-backed slice through a `Writer` at all.
    */
-  private def borrowed: List[String] = {
+  private def borrowed: List[Diagnostic] = {
     // Both flavours of a type's table name the same implementation, so the offender is named once
     // however many ways the program erased it.
     // The writing is **not** the first slot: `Writer: Fallible`, and a trait offers what it requires
@@ -128,7 +128,7 @@ private class Escape(program: TProgram) {
       yield slot.target
 
     offenders.distinct.map { name =>
-      Diagnostic.render(
+      Diagnostic(
         // The trait is named by its key, never spelled: a program with a `Writer` of its own reaches
         // the library's only by path, and a message that spells it plainly names the wrong trait to
         // the one reader who has to tell them apart.
@@ -196,7 +196,7 @@ private class Escape(program: TProgram) {
   ) {
 
     private var confined       = seeds
-    var escape: Option[String] = None
+    var escape: Option[Diagnostic] = None
 
     /** The arrays this body must allocate on the heap. */
     val promoted = mutable.Set.empty[String]
@@ -456,7 +456,7 @@ private class Escape(program: TProgram) {
 
       if v.anonymous && escape.isEmpty then
         escape = Some(
-          Diagnostic.render(
+          Diagnostic(
             s"a slice of an array this frame owns $how, so it would outlive the array, and the " +
               "storage is not this body's to move — it is a field of a value, or an array a caller " +
               "passed by value. Declare it as a '[]T', which makes a buffer of its own and owns it, " +
@@ -478,14 +478,14 @@ private class Escape(program: TProgram) {
    * The body's module is read off the function's key, or is the entry point's for the statements a
    * program runs, which belong to the file that carries them however little they look declared.
    */
-  private def noAllocPromotion(walk: (Option[String], Walk)): List[String] = {
+  private def noAllocPromotion(walk: (Option[String], Walk)): List[Diagnostic] = {
     val (who, w) = walk
     val module   = who.map(Modules.moduleOf).getOrElse(program.mainModule)
 
     if !program.noAllocModules(module) then Nil
     else
       w.sites.toList.map((name, pos, how) =>
-        Diagnostic.render(
+        Diagnostic(
           s"this view of '$name' $how, so the array would move to the heap to outlive the frame — " +
             "and this module declared '@no_alloc', so there is nothing to move it into. Keep the view " +
             "inside the frame, or take the storage from a caller as a '[]T' parameter, which is " +
@@ -508,12 +508,12 @@ private class Escape(program: TProgram) {
    * Reported against the view that leaves the frame, exactly as the `@no_alloc` refusal is: the
    * declaration is fine, and what the reader has to change is where its contents go.
    */
-  private def alignedPromotion(stmts: List[TStmt], w: Walk): List[String] = {
+  private def alignedPromotion(stmts: List[TStmt], w: Walk): List[Diagnostic] = {
     val asked = alignedArrays(stmts)
 
     w.sites.toList.collect {
       case (name, pos, how) if asked.contains(name) =>
-        Diagnostic.render(
+        Diagnostic(
           s"this view of '$name' $how, so the array would move to the heap to outlive the frame — " +
             s"and '$name' asked to begin on a ${asked(name)}-byte boundary, which is the allocator's " +
             "to answer there rather than this declaration's. Keep the view inside the frame, or put " +

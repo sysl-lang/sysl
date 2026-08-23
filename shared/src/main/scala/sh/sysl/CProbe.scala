@@ -115,11 +115,11 @@ object CProbe {
    * bind none.
    */
   def lower(units: List[Program], target: Target, paths: SearchPaths = SearchPaths.none)
-      : Either[String, List[Program]] =
+      : Either[Diagnostic, List[Program]] =
     if !units.exists(_.body.exists(b => b.isInstanceOf[CConstBlock] || b.isInstanceOf[CTypeBlock]))
     then Right(units)
     else
-      units.foldLeft[Either[String, List[Program]]](Right(Nil)) { (soFar, unit) =>
+      units.foldLeft[Either[Diagnostic, List[Program]]](Right(Nil)) { (soFar, unit) =>
         soFar.flatMap(done =>
           if unmeasurable(unit, target) then Right(done :+ emptied(unit))
           else lowerUnit(unit, target, paths).map(done :+ _))
@@ -168,7 +168,7 @@ object CProbe {
   private def emptied(unit: Program): Program = unit.copy(body = Nil)
 
   private def lowerUnit(unit: Program, target: Target, paths: SearchPaths)
-      : Either[String, Program] = {
+      : Either[Diagnostic, Program] = {
     val consts = unit.body.collect { case b: CConstBlock => b }.flatMap(_.consts)
     val types  = unit.body.collect { case b: CTypeBlock => b }.flatMap(_.types)
 
@@ -219,13 +219,16 @@ object CProbe {
    * kind of block was being measured so that a reader knows which lines to look at.
    */
   private def measure(unit: Program, plan: List[(CConstDecl, Declared)], types: List[CTypeDecl],
-                      target: Target, paths: SearchPaths): Either[String, Answers] = {
+                      target: Target, paths: SearchPaths): Either[Diagnostic, Answers] = {
     val src = createTempFile("sysl-cprobe-", ".c")
 
     try
       writeFile(src, probe(unit, plan, types))
 
-      Toolchain.findClang(target).flatMap { cc =>
+      // A missing back end is the *toolchain's* refusal rather than the program's, so it carries no
+      // position — but it arrives on this compilation's error channel and is read beside diagnostics
+      // that do, which is why it is one now rather than a bare sentence among them.
+      Toolchain.findClang(target).left.map(Diagnostic(_, None)).flatMap { cc =>
         val command = Seq(cc, s"--target=${target.triple}", "-S", "-emit-llvm", "-O0") ++
           Toolchain.machineFlags(target) ++
           Option.when(target.shortEnums)("-fshort-enums") ++
@@ -236,7 +239,7 @@ object CProbe {
         val where  = plan.headOption.flatMap(_._1.pos).orElse(types.headOption.flatMap(_.pos))
 
         if result.exitCode != 0 then
-          Left(Diagnostic.render(
+          Left(Diagnostic(
             s"the C compiler refused this file's ${blocks(plan, types)}:\n${result.stderr.trim}",
             where))
         else
@@ -277,8 +280,8 @@ object CProbe {
   /** The C compiled and the probe emitted nothing for a line, which is sysl's bug and not the
    * programmer's — so the message says so rather than sending them back to their own C.
    */
-  private def silent(what: String, pos: Option[Pos]): String =
-    Diagnostic.render(
+  private def silent(what: String, pos: Option[Pos]): Diagnostic =
+    Diagnostic(
       s"the C compiler accepted $what and then emitted nothing for it, so there is no answer to " +
         "read — this is a bug in sysl's probe rather than in what was written",
       pos)
@@ -467,10 +470,10 @@ object CProbe {
    * is where `new` and a `where` predicate are refused.
    */
   private def declaredType(c: CConstDecl, unit: Program, types: List[CTypeDecl], target: Target)
-      : Either[String, Declared] = {
+      : Either[Diagnostic, Declared] = {
     given Word = target.word
 
-    def refuse(message: String) = Left(Diagnostic.render(message, c.pos))
+    def refuse(message: String) = Left(Diagnostic(message, c.pos))
 
     val notNumber = refuse(
       s"'${c.typ.show}' is not a number, and a 'c const' reads a number — the value is read " +
@@ -484,7 +487,7 @@ object CProbe {
         "'float', a 'double' or a 'long double', so the two widths that read back without " +
         "guessing are 'f32' and 'f64'")
 
-    def follow(ref: TypeRef, seen: Set[String]): Either[String, Declared] = ref match
+    def follow(ref: TypeRef, seen: Set[String]): Either[Diagnostic, Declared] = ref match
       case NamedType(name, Nil) =>
         Type.scalars.get(name).orElse(width(name)) match
           case Some(Type.Integer(bits, signed, _)) =>
@@ -517,14 +520,14 @@ object CProbe {
    * the answers are consumed in written order, so a constant reading a `_Bool` typedef is told about
    * the constant rather than about a type declaration that is perfectly good on its own.
    */
-  private def measuredKind(c: CConstDecl, d: Declared, answers: Answers): Either[String, Kind] =
+  private def measuredKind(c: CConstDecl, d: Declared, answers: Answers): Either[Diagnostic, Kind] =
     d match
       case Declared.Now(k) => Right(k)
       case Declared.Later(i, cType, written) =>
         integerKind(answers.types(i), answers.charSigned) match
           case Some((bits, signed)) => Right(Kind.Whole(bits, signed, written))
           case None =>
-            Left(Diagnostic.render(
+            Left(Diagnostic(
               s"'$written' is what the C compiler calls '$cType', which is not an integer here, and " +
                 "a 'c const' reads an integer",
               c.pos))
@@ -568,7 +571,7 @@ object CProbe {
    * number instead of against a remembered one. The message quotes both the C and the value, because
    * neither alone tells the reader which end was wrong.
    */
-  private def literal(c: CConstDecl, k: Kind, raw: Value): Either[String, ConstDecl] =
+  private def literal(c: CConstDecl, k: Kind, raw: Value): Either[Diagnostic, ConstDecl] =
     (k, raw) match
       case (Kind.Whole(bits, signed, name), Value.Whole(v)) => whole(c, bits, signed, name, v)
       case (Kind.Fraction(bits, name), Value.Fraction(v))   => fraction(c, bits, name, v)
@@ -583,7 +586,7 @@ object CProbe {
     ConstDecl(c.name, c.typ, lit.setPos(c.pos), c.vis).setPos(c.pos)
 
   private def whole(c: CConstDecl, bits: Int, signed: Boolean, name: String, raw: BigInt)
-      : Either[String, ConstDecl] = {
+      : Either[Diagnostic, ConstDecl] = {
     // The IR prints an i64 as a signed decimal whatever the C type was, so a `u64` past the signed
     // ceiling comes back negative. Only that case is reinterpreted — a genuinely negative value
     // asked for as unsigned is left as it is, and refused by the range check below.
@@ -594,7 +597,7 @@ object CProbe {
       else (BigInt(0), (BigInt(1) << bits) - 1)
 
     if value < low || value > high then
-      Left(Diagnostic.render(
+      Left(Diagnostic(
         s"'${c.c}' is $value here, which '$name' cannot hold — it holds $low to $high", c.pos))
     else Right(held(c, IntLit(value, None)))
   }
@@ -613,8 +616,8 @@ object CProbe {
    * this feature exists to catch, made against the real number instead of a remembered one.
    */
   private def fraction(c: CConstDecl, bits: Int, name: String, value: Double)
-      : Either[String, ConstDecl] = {
-    def refuse(message: String) = Left(Diagnostic.render(message, c.pos))
+      : Either[Diagnostic, ConstDecl] = {
+    def refuse(message: String) = Left(Diagnostic(message, c.pos))
 
     // Reported the way it will be read back: the shortest decimal that is this exact double, which
     // is also the text the constant is carried as.
@@ -654,7 +657,7 @@ object CProbe {
    * target's convention says. Resolving it to `u8` instead would be a wider claim than the header
    * made.
    */
-  private def alias(t: CTypeDecl, m: Measured, charSigned: Boolean): Either[String, TypeDecl] = {
+  private def alias(t: CTypeDecl, m: Measured, charSigned: Boolean): Either[Diagnostic, TypeDecl] = {
     def named(name: String) =
       Right(TypeDecl(t.name, NamedType(name), derived = false, None, None, t.vis, fromC = true)
         .setPos(t.pos))
@@ -664,7 +667,7 @@ object CProbe {
       integerKind(m, charSigned) match
         case Some((bits, signed)) => named(s"${if signed then "i" else "u"}$bits")
         case None =>
-          Left(Diagnostic.render(
+          Left(Diagnostic(
             s"the C compiler says '${t.c}' is not an integer type, and a 'c type' names an integer " +
               "— what comes back from one is a width and a signedness, which a float, a pointer, a " +
               "struct or an array has not got. An address is written '*T', a float by name, and a " +
@@ -675,7 +678,7 @@ object CProbe {
   /** The first refusal, or every answer — `Either`'s `traverse`, which the standard library has no
    * name for and which this file wants four times.
    */
-  private def traverse[A, B](xs: List[A])(f: A => Either[String, B]): Either[String, List[B]] =
-    xs.foldLeft[Either[String, List[B]]](Right(Nil))((soFar, x) =>
+  private def traverse[A, B](xs: List[A])(f: A => Either[Diagnostic, B]): Either[Diagnostic, List[B]] =
+    xs.foldLeft[Either[Diagnostic, List[B]]](Right(Nil))((soFar, x) =>
       soFar.flatMap(done => f(x).map(done :+ _)))
 }

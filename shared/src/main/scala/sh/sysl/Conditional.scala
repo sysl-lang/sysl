@@ -92,13 +92,20 @@ object Conditional {
    * a copy of it. A `Source` compares by identity (`Diagnostics`), and a compilation that gated
    * nothing should be the compilation it would have been before any of this existed.
    */
-  def gate(source: Source, target: Target): Either[String, Source] = {
+  def gate(source: Source, target: Target): Either[String, Source] =
+    gated(source, target).left.map(_.rendered)
+
+  /** The same, answering the refusal as **data** — what `SyslParser.checked` and through it
+   * `api.Sysl.check` need, since a directive's mistake is a mistake in the file like any other and
+   * an editor has a range to underline for it.
+   */
+  def gated(source: Source, target: Target): Either[Diagnostic, Source] = {
     val lines   = source.lines
     val out     = lines.toArray
     val on      = defined(target)
     var stack   = List.empty[Frame]
     var touched = false
-    var failed  = Option.empty[String]
+    var failed  = Option.empty[Diagnostic]
     var i       = 0
 
     // `stack` holds the open groups, innermost first. A line survives when every one of them is in
@@ -106,7 +113,8 @@ object Conditional {
     // its own condition reads.
     def active: Boolean = stack.forall(_.taken)
 
-    def fail(line: Int, col: Int, msg: String): Unit = failed = Some(Pos(source, line, col).render(msg))
+    def fail(line: Int, col: Int, msg: String): Unit =
+      failed = Some(Diagnostic(msg, Some(Pos(source, line, col))))
 
     while (i < lines.length && failed.isEmpty) {
       val text = lines(i)
@@ -290,13 +298,14 @@ object Conditional {
    * the word quietly discarded, so the spelling most likely to arrive out of muscle memory would be
    * the one thing here that failed silently.
    */
-  private def trailing(source: Source, line: Int, text: String, at: Int): Option[String] = {
+  private def trailing(source: Source, line: Int, text: String, at: Int): Option[Diagnostic] = {
     val rest = argument(text, at)
     val n    = rest.indexWhere(!_.isWhitespace)
 
     Option.when(n >= 0)(
-      Pos(source, line, at + n).render(
-        s"'#${text.drop(1).takeWhile(_.isLetter)}' takes nothing after it, and '${rest.trim}' is here"))
+      Diagnostic(
+        s"'#${text.drop(1).takeWhile(_.isLetter)}' takes nothing after it, and '${rest.trim}' is here",
+        Some(Pos(source, line, at + n))))
   }
 
   /** Whether a directive's condition holds for the symbols given, or what is wrong with it.
@@ -311,11 +320,12 @@ object Conditional {
    * for the sake of a boolean evaluator over a set of strings.
    */
   private def condition(source: Source, line: Int, text: String, at: Int,
-                        on: Set[String]): Either[String, Boolean] = {
+                        on: Set[String]): Either[Diagnostic, Boolean] = {
     val arg  = argument(text, at)
     val word = text.drop(1).takeWhile(_.isLetter)
 
-    def err(col: Int, msg: String): Either[String, Boolean] = Left(Pos(source, line, col).render(msg))
+    def err(col: Int, msg: String): Either[Diagnostic, Boolean] =
+      Left(Diagnostic(msg, Some(Pos(source, line, col))))
 
     // A target's *name* is the thing a reader most plausibly reaches for and the one thing that
     // cannot be a symbol: it has a `-` in it, which no identifier carries. Left to the tokenizer they
@@ -328,7 +338,7 @@ object Conditional {
           "about one fact of the machine at a time, so this is written '" + named.replace("-", " && ") + "'")
 
     val toks   = mutable.ListBuffer.empty[(String, String, Int)]
-    var lexErr = Option.empty[String]
+    var lexErr = Option.empty[Diagnostic]
     var i      = 0
 
     while (i < arg.length && lexErr.isEmpty) {
@@ -345,8 +355,9 @@ object Conditional {
       else if arg.startsWith("||", i) then { toks += (("||", "||", col)); i += 2 }
       else if c == '!' || c == '(' || c == ')' then { toks += ((c.toString, c.toString, col)); i += 1 }
       else
-        lexErr = Some(Pos(source, line, col).render(
-          s"a condition is built from symbols, '!', '&&', '||' and parentheses, and '$c' is none of them"))
+        lexErr = Some(Diagnostic(
+          s"a condition is built from symbols, '!', '&&', '||' and parentheses, and '$c' is none of them",
+          Some(Pos(source, line, col))))
     }
 
     var p = 0
@@ -357,7 +368,7 @@ object Conditional {
     // something written: past the last token there is, or at the argument itself when there are none.
     def endCol: Int = toks.lastOption.map((_, t, c) => c + t.length).getOrElse(at)
 
-    def atom: Either[String, Boolean] = peek match
+    def atom: Either[Diagnostic, Boolean] = peek match
       case Some(("name", s, col)) =>
         p += 1
         if symbols(s) then Right(on(s))
@@ -374,14 +385,14 @@ object Conditional {
       case Some((_, t, col)) => err(col, s"a condition needs a symbol here, and '$t' is what is written")
       case None              => err(endCol, s"'#$word' needs a condition after it")
 
-    def unary: Either[String, Boolean] = peek match
+    def unary: Either[Diagnostic, Boolean] = peek match
       case Some(("!", _, _)) => p += 1; unary.map(!_)
       case _                 => atom
 
     // Both sides are evaluated even where the result is already settled — this is a checker as much
     // as an evaluator, and short-circuiting would let a misspelled symbol through whenever the other
     // half of the condition happened to decide the answer.
-    def and: Either[String, Boolean] = {
+    def and: Either[Diagnostic, Boolean] = {
       var acc = unary
 
       while (peek.exists(_._1 == "&&") && acc.isRight) {
@@ -391,7 +402,7 @@ object Conditional {
       acc
     }
 
-    def or: Either[String, Boolean] = {
+    def or: Either[Diagnostic, Boolean] = {
       var acc = and
 
       while (peek.exists(_._1 == "||") && acc.isRight) {

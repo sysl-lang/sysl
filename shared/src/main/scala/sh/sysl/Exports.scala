@@ -25,12 +25,12 @@ object Exports {
    * definition that build does not contain — which is the `main` collision this card was filed for,
    * reappearing as a diagnostic instead of as a link error.
    */
-  def check(program: TProgram, own: Option[Set[String]] = None): Either[String, Unit] = {
+  def check(program: TProgram, own: Option[Set[String]] = None): Either[List[Diagnostic], Unit] = {
     val exported = Reachability.exports(program, own)
     val refused  = exported.flatMap(signature) ::: duplicates(exported) ::: names(exported) :::
       storage(exported, program)
 
-    if refused.nonEmpty then Left(Diagnostic.report(refused)) else Right(())
+    if refused.nonEmpty then Left(refused) else Right(())
   }
 
   /** A parameter or a result C has no way to spell.
@@ -47,22 +47,22 @@ object Exports {
    * the pointer and length C's own buffer functions already take, an aggregate becomes a pointer to
    * itself. That is what makes the boundary layer writable rather than merely restricted.
    */
-  private def signature(f: TFunc): List[String] = {
+  private def signature(f: TFunc): List[Diagnostic] = {
     val bad = f.params.filterNot((_, t) => ExportCheck.crosses(t))
 
     val params = bad.map { (name, t) =>
-      Diagnostic.render(
+      Diagnostic(
         s"'$name' of the exported '${Modules.show(f.name)}' is ${Type.show(t)}, which C has no way " +
           s"to spell — an exported function takes ${ExportCheck.spellable}. ${ExportCheck.advice(t)}",
-        None)
+        f.pos)
     }
 
     val result =
       Option.when(!Type.noValue(f.retTy) && !ExportCheck.crosses(f.retTy))(
-        Diagnostic.render(
+        Diagnostic(
           s"the exported '${Modules.show(f.name)}' returns ${Type.show(f.retTy)}, which C has no way " +
             s"to spell — an exported function returns that or nothing at all. ${ExportCheck.advice(f.retTy)}",
-          None))
+          f.pos))
 
     params ::: result.toList
   }
@@ -74,16 +74,17 @@ object Exports {
    * costs one grouping and names both declarations, which is the difference between a diagnostic and
    * an archaeology exercise.
    */
-  private def duplicates(exported: List[TFunc]): List[String] =
+  private def duplicates(exported: List[TFunc]): List[Diagnostic] =
     exported
       .groupBy(_.exported.get)
       .toList
       .sortBy(_._1)
       .collect { case (symbol, fs) if fs.length > 1 =>
-        Diagnostic.render(
+        Diagnostic(
           s"'$symbol' is exported by ${fs.map(f => s"'${Modules.show(f.name)}'").sorted.mkString(" and ")} " +
             "— one symbol is one definition, and the linker has no way to tell which was meant",
-          None)
+          // The first of the two, since a diagnostic naming both has to send the reader to one.
+          fs.flatMap(_.pos).minByOption(p => (p.source.name, p.line, p.col)))
       }
 
   /** Two things in one header answering to one name.
@@ -108,7 +109,7 @@ object Exports {
    * A symbol claimed by two *functions* is left to `duplicates`, whose sentence is about the linker
    * and is the better one for that case — hence the group having to hold a type to be reported here.
    */
-  private def names(exported: List[TFunc]): List[String] = {
+  private def names(exported: List[TFunc]): List[Diagnostic] = {
     val types = CHeader.aggregates(exported).map(t => CHeader.cName(t) -> s"the type '${Type.show(t)}'")
     val syms  = exported.map(f => f.exported.get -> s"the function '${Modules.show(f.name)}'")
     val typed = types.map(_._1).toSet
@@ -118,7 +119,7 @@ object Exports {
       .toList
       .sortBy(_._1)
       .collect { case (name, xs) if xs.length > 1 && typed(name) =>
-        Diagnostic.render(
+        Diagnostic(
           s"'$name' is the C name of ${xs.map(_._2).sorted.mkString(" and ")} — a header declares " +
             "both in one namespace, so a C project including it would see the name twice. Give " +
             "each the name it should carry, '@export(\"...\")'",
@@ -143,7 +144,7 @@ object Exports {
    * `val` may be three calls down inside the library, and the function that named it is what the
    * author has to look at.
    */
-  private def storage(exported: List[TFunc], program: TProgram): List[String] = {
+  private def storage(exported: List[TFunc], program: TProgram): List[Diagnostic] = {
     val computed = program.vals.filter(_.computed).map(_.symbol).toSet
 
     if computed.isEmpty || exported.isEmpty then Nil
@@ -152,7 +153,7 @@ object Exports {
         val reached = Reachability.reachedFrom(List(f), program.funcs, program.vtables).vals & computed
 
         Option.when(reached.nonEmpty)(
-          Diagnostic.render(
+          Diagnostic(
             s"'${Modules.show(f.name)}' is exported and reaches " +
               s"${reached.toList.sorted.map(v => s"'${Modules.show(v)}'").mkString(", ")}, which is " +
               "module storage an initializer fills before the program's own statements run. A C " +
@@ -160,7 +161,7 @@ object Exports {
               "would read whatever the loader left. A module 'val' whose initializer is constant " +
               "data is laid straight into the object file and is fine here — it is a computed one " +
               "that has nowhere to be computed",
-            None))
+            f.pos))
       }
   }
 }

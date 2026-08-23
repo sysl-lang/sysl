@@ -177,6 +177,31 @@ trait Positioned {
   }
 }
 
+/** One thing wrong with a program: what is wrong, and where.
+ *
+ * **A diagnostic is carried rather than rendered**, and that is the whole reason this is a type. A
+ * pass that finds a mistake has the message and the position in hand, and until this existed it
+ * turned them into text on that same line — so by the time anything else could look, the only thing
+ * left was a paragraph. Rendering happens once, at the edge, in `render` and `report`.
+ *
+ * What that buys is a caller that wants to do something other than print: an editor wanting a range
+ * to underline, a build tool wanting to group by file, a test wanting to assert on the position
+ * without matching text. `api.Sysl.check` is the published form of it.
+ *
+ * `pos` is absent for a rule that fires away from any one node — a synthesized declaration, a
+ * whole-program check — and that is a reason to say less rather than to say nothing.
+ *
+ * **There is no severity, because every one of these is an error.** The compiler's only two warnings
+ * are the driver's, written straight to standard error and carrying no position; a field with one
+ * inhabitant is a field a reader stops to wonder about, and it goes in when a positioned warning
+ * does.
+ */
+final case class Diagnostic(message: String, pos: Option[Pos]) {
+
+  /** This one on its own, as a reader sees it. */
+  def rendered: String = Diagnostic.render(message, pos)
+}
+
 object Diagnostic {
 
   /** How many errors one compilation reports.
@@ -185,6 +210,10 @@ object Diagnostic {
    * file a diagnostic is, the likelier it is to be a consequence of one further up rather than a
    * mistake of its own. A wall of them is not more information; it is the first five with the
    * signal-to-noise falling off behind them.
+   *
+   * **It is the renderer's rule and not the list's.** A caller reading diagnostics as data wants
+   * all of them — an editor underlines every mistake in the file, and five would leave the rest
+   * unmarked — so nothing truncates until `report` does.
    */
   val limit: Int = 5
 
@@ -205,7 +234,22 @@ object Diagnostic {
    * line, with a closing count when there were more. The ones kept are the *first* — the list
    * arrives in source order, and an error early in a file is the one worth reading.
    */
-  def report(all: List[String]): String =
-    if all.length <= limit then all.mkString("\n\n")
-    else (all.take(limit) :+ s"showing the first $limit of ${all.length} errors").mkString("\n\n")
+  def report(all: List[Diagnostic]): String = {
+    val shown = all.take(limit).map(_.rendered)
+
+    if all.length <= limit then shown.mkString("\n\n")
+    else (shown :+ s"showing the first $limit of ${all.length} errors").mkString("\n\n")
+  }
+
+  /** The order a reader reads a file in: by source, then by line, then by column. A diagnostic with
+   * no position sorts last, since there is nowhere to file it.
+   *
+   * Every pass that collects more than one owes this, so it lives here rather than in whichever
+   * pass happened to need it first.
+   */
+  def inSourceOrder(all: List[Diagnostic]): List[Diagnostic] =
+    all.sortBy(d =>
+      (d.pos.isEmpty, d.pos.map(_.source.name).getOrElse(""), d.pos.map(_.line).getOrElse(0),
+       d.pos.map(_.col).getOrElse(0)),
+    )
 }

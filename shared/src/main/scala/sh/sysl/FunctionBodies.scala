@@ -290,6 +290,13 @@ trait FunctionBodies extends ModuleStorage {
       // `@section` travels as written: the name is the target's spelling, so there is nothing here to
       // resolve it against and nothing downstream that would rather have it in another form.
       f.section)
+      // **The declaration's own position travels with it**, which is what lets the checks that run
+      // on the *typed* tree point somewhere. `Exports.check` and `TailCalls.check` both complain
+      // about a whole function rather than about an expression inside one, and until this they
+      // complained about it from nowhere — no file, no line, and nothing for an editor to
+      // underline. A nested function and a closure are stamped nowhere and need no stamp: neither
+      // can be exported, and `@tailrec` is a declaration's attribute.
+      .setPos(f.pos)
   }
 
   /** Typechecks the leading `require`/`ensure` clauses. Both conditions must be `bool`. `result`

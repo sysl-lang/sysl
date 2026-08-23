@@ -72,8 +72,8 @@ object Compiler {
    */
   def compileTrees(units: List[Program], target: Target = Target.default,
                    allocator: Allocator = Allocator.c): Either[String, String] =
-    analyzed(units, target, Set.empty, Stdlib.fromSource(target), allocator = allocator,
-      own = ownModules(units)).map(_.ir)
+    rendered(analyzed(units, target, Set.empty, Stdlib.fromSource(target), allocator = allocator,
+      own = ownModules(units))).map(_.ir)
 
   /** Compiles a program **against a library**: the library's modules are compiled alongside it, and
    * the program reaches them by the ordinary module rules (`13 §3`) — a full path, or an `import`.
@@ -109,15 +109,15 @@ object Compiler {
                    paths: SearchPaths = SearchPaths.none, allocator: Allocator = Allocator.c,
                    librarySources: List[Source] = Nil)
       : Either[String, Compiled] = {
-    val supplied = librarySources.map(SyslParser.parse(_, target))
-    val parsed   = sources.map(SyslParser.parse(_, target))
+    val supplied = librarySources.map(SyslParser.checked(_, target))
+    val parsed   = sources.map(SyslParser.checked(_, target))
 
-    (supplied ::: parsed).collect { case Left(e) => e } match
+    rendered((supplied ::: parsed).collect { case Left(e) => e } match
       case Nil =>
-        compiledTrees(parsed.collect { case Right(p) => p },
+        treesChecked(parsed.collect { case Right(p) => p },
           libraries ::: supplied.collect { case Right(p) => p }, target, precompiled, std,
           provides, packages, entryPoint, paths, allocator)
-      case errs => Left(errs.mkString("\n"))
+      case errs => Left(errs.flatten))
   }
 
   /** The same compilation from the program's own **already-parsed** units.
@@ -132,6 +132,18 @@ object Compiler {
                     packages: Packages = Packages.none, entryPoint: Boolean = true,
                     paths: SearchPaths = SearchPaths.none, allocator: Allocator = Allocator.c)
       : Either[String, Compiled] =
+    rendered(treesChecked(units, libraries, target, precompiled, std, provides, packages,
+      entryPoint, paths, allocator))
+
+  /** `compiledTrees`, answering its refusal as data. It is the shared body rather than a second
+   * road: `compiledTrees` is this plus `Diagnostic.report`, and `compiledWith` is a parse in front
+   * of it.
+   */
+  private def treesChecked(units: List[Program], libraries: List[Program], target: Target,
+                           precompiled: Set[String], std: Option[Stdlib], provides: Set[String],
+                           packages: Packages, entryPoint: Boolean, paths: SearchPaths,
+                           allocator: Allocator)
+      : Either[List[Diagnostic], Compiled] =
     analyzed(libraries ::: units, target, precompiled, carried(std, target), provides, packages,
       entryPoint, paths, allocator, ownModules(units))
 
@@ -169,8 +181,8 @@ object Compiler {
    */
   def typedWith(sources: List[Source], libraries: List[Program], target: Target = Target.default,
                 std: Option[Stdlib] = None, provides: Set[String] = Capability.core.toSet)
-      : Either[String, (TProgram, Set[String])] = {
-    val parsed = sources.map(SyslParser.parse(_, target))
+      : Either[String, (TProgram, Set[String])] = rendered {
+    val parsed = sources.map(SyslParser.checked(_, target))
 
     parsed.collect { case Left(e) => e } match
       case Nil =>
@@ -185,7 +197,7 @@ object Compiler {
         Analyzer.analyze(libraries ::: mine, std = carried(std, target), target = target,
                          provides = provides, own = ownModules(mine))
           .map((_, mine.map(moduleOf).toSet))
-      case errs => Left(errs.mkString("\n"))
+      case errs => Left(errs.flatten)
   }
 
   /** The standard module a compilation was handed, or the copy the compiler carries **for the target
@@ -204,8 +216,19 @@ object Compiler {
    */
   def compiled(sources: List[Source], target: Target = Target.default,
                allocator: Allocator = Allocator.c)
-      : Either[String, Compiled] = {
-    val parsed = sources.map(SyslParser.parse(_, target))
+      : Either[String, Compiled] = rendered(checked(sources, target, allocator))
+
+  /** The same compilation, answering **every diagnostic as data** rather than as a paragraph.
+   *
+   * This is the compiler's structured entry point, and `api.Sysl.check` is one step on top of it.
+   * A caller here gets the whole list — the five-diagnostic limit is `Diagnostic.report`'s rule and
+   * not the list's, because an editor underlining a file wants every mistake in it and five would
+   * leave the rest unmarked.
+   */
+  def checked(sources: List[Source], target: Target = Target.default,
+              allocator: Allocator = Allocator.c)
+      : Either[List[Diagnostic], Compiled] = {
+    val parsed = sources.map(SyslParser.checked(_, target))
 
     // Every file is parsed before any is rejected, so a syntax error in one does not hide the
     // syntax errors in the rest — the same reason the analyzer reports every mistake it finds.
@@ -215,7 +238,7 @@ object Compiler {
 
         analyzed(mine, target, Set.empty, Stdlib.fromSource(target), allocator = allocator,
           own = ownModules(mine))
-      case errs => Left(errs.mkString("\n"))
+      case errs => Left(errs.flatten)
   }
 
   /** The same compilation as a **test build**: the IR whose entry point dispatches to one `@test`
@@ -245,12 +268,12 @@ object Compiler {
                    precompiled: Set[String] = Set.empty, std: Option[Stdlib] = None,
                    building: Set[String] = Set.empty, paths: SearchPaths = SearchPaths.none,
                    allocator: Allocator = Allocator.c, librarySources: List[Source] = Nil)
-      : Either[String, (Compiled, List[TTest])] = {
-    val supplied = librarySources.map(SyslParser.parse(_, target))
-    val parsed   = sources.map(SyslParser.parse(_, target))
+      : Either[String, (Compiled, List[TTest])] = rendered {
+    val supplied = librarySources.map(SyslParser.checked(_, target))
+    val parsed   = sources.map(SyslParser.checked(_, target))
 
     (supplied ::: parsed).collect { case Left(e) => e } match
-      case errs if errs.nonEmpty => Left(errs.mkString("\n"))
+      case errs if errs.nonEmpty => Left(errs.flatten)
       case _ =>
         val mine   = parsed.collect { case Right(p) => p }
         val handed = libraries ::: supplied.collect { case Right(p) => p }
@@ -330,7 +353,7 @@ object Compiler {
   def compileLibrary(units: List[Program], target: Target = Target.default, building: Set[String] = Set.empty,
                      std: Option[Stdlib] = None, libraries: List[Program] = Nil,
                      allocator: Allocator = Allocator.c)
-      : Either[String, (String, Set[String])] =
+      : Either[String, (String, Set[String])] = rendered {
     for
       // A library ships no tests. They are the library author's, they run against the sources rather
       // than against the artifact, and emitting them would put a function nothing can call into every
@@ -408,6 +431,7 @@ object Compiler {
       val determined = here.filter(f => !f.internal)
 
       (ir, determined.map(_.name).toSet)
+  }
 
   /** The module a file contributes to, as its header says. The directory has to agree, and the
    * analyzer is what holds it to that; before anything is analyzed the header is what there is.
@@ -424,12 +448,22 @@ object Compiler {
    * one of these, and a default of `None` would be the answer that emits an unreached library
    * declaration into the program. Each caller says which modules are its own.
    */
+  /** A structured outcome as the string-returning entry points answer it.
+   *
+   * Every public method here kept its `Either[String, ?]` signature when diagnostics became data,
+   * because a caller wanting text has always wanted exactly this text — and because one of them is
+   * read by `sysl.sh`'s `DocsTests`, in the other repository. `checked` is the one that answers the
+   * list; the rest are this on top of it.
+   */
+  private def rendered[A](outcome: Either[List[Diagnostic], A]): Either[String, A] =
+    outcome.left.map(Diagnostic.report)
+
   private def analyzed(units: List[Program], target: Target, precompiled: Set[String],
                        std: Stdlib, provides: Set[String] = Capability.core.toSet,
                        packages: Packages = Packages.none, entryPoint: Boolean = true,
                        paths: SearchPaths = SearchPaths.none, allocator: Allocator,
                        own: Option[Set[String]])
-      : Either[String, Compiled] =
+      : Either[List[Diagnostic], Compiled] =
     for
       // **`entryPoint` reaches the analyzer and not only the emitter.** It has always decided
       // whether a `main` is written; it also has to decide whether a lone top-level `var` is read as

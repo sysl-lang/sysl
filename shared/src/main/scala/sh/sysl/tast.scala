@@ -906,7 +906,7 @@ case class TFunc(
       * optimizer would otherwise drop a definition nothing calls.
       */
     section: Option[String] = None,
-)
+) extends Positioned
 
 /** A function the linker supplies, which the module declares rather than defines. Only the ones
  * the program actually calls reach here, so an `extern` the library offers and nobody uses costs

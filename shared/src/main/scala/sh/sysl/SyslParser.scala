@@ -1099,7 +1099,22 @@ object SyslParser {
    * receives is ordinary sysl and it behaves exactly as it does for a file that was never literate.
    */
   def parse(source: Source, target: Target): Either[String, Program] =
-    Literate.tangle(source).flatMap(Conditional.gate(_, target)).flatMap(parsed)
+    checked(source, target).left.map(Diagnostic.report)
+
+  /** The same parse, answering its refusal as **data** rather than as a paragraph.
+   *
+   * It is what the compiler itself uses, and `parse` is one line on top of it — a caller that wants
+   * the text has always wanted exactly `Diagnostic.report`'s text, and the two spellings exist so
+   * that adding this broke nothing. `api.Sysl.check` is the published end of this road.
+   *
+   * A parse yields at most **one** diagnostic — the grammar stops at the first thing it cannot
+   * read — so the list is never longer than one. It is a list anyway, because that is the shape of
+   * every other stage and a caller assembling a file's problems should not have two of them.
+   */
+  def checked(source: Source, target: Target = Target.default): Either[List[Diagnostic], Program] =
+    Literate.tangled(source).left.map(List(_))
+      .flatMap(Conditional.gated(_, target).left.map(List(_)))
+      .flatMap(parsed)
 
   /** The same, for the machine a caller that names none would get. Spelled as its own overload
    * rather than as a default argument because only one of these alternatives may carry defaults, and
@@ -1107,15 +1122,15 @@ object SyslParser {
    */
   def parse(source: Source): Either[String, Program] = parse(source, Target.default)
 
-  private def parsed(source: Source): Either[String, Program] = {
+  private def parsed(source: Source): Either[List[Diagnostic], Program] = {
     val p = new SyslParser(source)
 
     p.parseProgram match {
       case p.Success(prog, _) => Right(prog)
       case ns: p.NoSuccess =>
         p.firstLexicalError match {
-          case Some((msg, at)) => Left(Pos(source, at.line, at.column).render(msg))
-          case None            => Left(failedAt(source, ns.next.pos).render(ns.msg))
+          case Some((msg, at)) => Left(List(Diagnostic(msg, Some(Pos(source, at.line, at.column)))))
+          case None            => Left(List(Diagnostic(ns.msg, Some(failedAt(source, ns.next.pos)))))
         }
     }
   }
