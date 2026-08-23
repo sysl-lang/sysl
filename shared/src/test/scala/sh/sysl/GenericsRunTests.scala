@@ -547,6 +547,25 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |print(Some("x") == s)
             |""".stripMargin) should include("sysl.Option[string] and sysl.Option[usize]")
     }
+
+    // Adaptable is a place in the order, not a refusal to conclude — the same thing `id(7)` being
+    // an `int` says about a bare literal. With nothing firmer in the room the first one is still
+    // what the pair settles on, and the payload is still an `int`.
+    "two constructions with nothing else to go on settle as they always did" in {
+      run("""same[T: Eq](a: T, b: T) -> bool = a == b
+            |print(Some(1) == Some(2), same(Some(1), Some(1)), str(Some(7).unwrap()))
+            |""".stripMargin) shouldBe "false true 7\n"
+    }
+
+    // `isLiteral` already reads a negation as part of the literal, so a construction over one is
+    // adaptable for the same reason — which is worth pinning, since the minus is a `Unary` node
+    // and the source test walks the tree rather than the token.
+    "a negated literal inside is still a literal" in {
+      run("""same[T: Eq](a: T, b: T) -> bool = a == b
+            |var s: Option[i16] = Some(-3)
+            |print(same(Some(-3), s), Some(-3) == s)
+            |""".stripMargin) shouldBe "true true\n"
+    }
   }
 
   /** `01` lists the parameter type at a call among the positions that fix an unsuffixed literal,
