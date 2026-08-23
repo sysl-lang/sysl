@@ -504,6 +504,18 @@ trait ControlFlowEmitter extends PlaceEmitter {
     emitTerm(Inst.Br(stepL))
     emitLabel(stepL)
     val cur = freshReg(); emit(Inst.Load(cur, w, Val.Reg(s"$name.addr"), Access.Plain))
+    // **An inclusive loop stops at its bound rather than stepping past it**, and that is not a
+    // nicety: at `250u8..255u8` the increment below wraps to zero and `0 <= 255` starts the walk
+    // again, so the loop never ends. There is no value one greater than the last one to test
+    // against, which is why the test has to happen *here*, before the increment that has nowhere
+    // to go. It costs one compare and one branch, on inclusive loops only — `0..<n` is untouched
+    // and is what nearly every loop in the language is.
+    if inclusive then
+      val done = freshReg()
+      val more = freshLabel("for.more")
+      emit(Inst.IntCmp(done, intPred("==", varTy), w, cur, hiV))
+      emitTerm(Inst.CondBr(done, elseL, more))
+      emitLabel(more)
     val nxt = freshReg(); emit(Inst.Bin(nxt, BinOp.Add, w, cur, Val.Int(1)))
     emit(Inst.Store(w, nxt, Val.Reg(s"$name.addr"), Access.Plain))
     emitTerm(Inst.Br(condL))
@@ -569,6 +581,15 @@ trait ControlFlowEmitter extends PlaceEmitter {
 
     emitLabel(stepL)
     val cur = freshReg(); emit(Inst.Load(cur, w, Val.Reg(s"$name.addr"), Access.Plain))
+    // The same wrap `genFor` guards against, at the same place and for the same reason: without
+    // this, `for all i in 0..255u8 do p` never finishes, and a quantifier that does not finish is
+    // worse than a loop that does not — it is a *question* the program hangs on.
+    if inclusive then
+      val done = freshReg()
+      val more = freshLabel("quant.more")
+      emit(Inst.IntCmp(done, intPred("==", varTy), w, cur, hiV))
+      emitTerm(Inst.CondBr(done, endL, more))
+      emitLabel(more)
     val nxt = freshReg(); emit(Inst.Bin(nxt, BinOp.Add, w, cur, Val.Int(1)))
     emit(Inst.Store(w, nxt, Val.Reg(s"$name.addr"), Access.Plain))
     emitTerm(Inst.Br(condL))

@@ -253,13 +253,36 @@ trait ControlFlowExprAnalysis extends ExprSupport {
     case TryExpr(e) =>
       analyzeTry(analyzeExpr(e))
 
-    // A range is a **form** rather than a value: there is no `Range` type, so nothing can be named,
-    // passed or returned. What names the four places it is legal is this sentence and nothing else,
-    // which is why it lists all four — a reader who wrote one in a slice index and got it wrong
-    // somewhere else was being told the index is not allowed either.
+    // A range **with both ends written** is a value: `sysl.Range[T]`, three fields, built here.
+    //
+    // The four positions that read a range as a *form* — a `for` header, a slice index, a `match`
+    // pattern and a quantifier — never reach this arm, because each matches the `RangeExpr` node
+    // itself and reads the bounds directly. That is what keeps the counted `for` a counter and a
+    // comparison with no struct, no `Option` a step and no call in it; the value is for every other
+    // position, where before there was nothing a range could be.
+    //
+    // **An open end stays a form.** `..`, `lo..` and `..hi` mean something in an index and nothing
+    // on their own — what an absent bound *is* depends on what is being indexed — so they keep the
+    // refusal, which now names the one place they are legal rather than all four.
+    case RangeExpr(Some(lo), Some(hi), inclusive) =>
+      val List(tlo, thi) = analyzeOperands(List(lo, hi), None)
+
+      // The same two questions the `for` header asks of its bounds, in the same order and the same
+      // words: a range value and a counted loop must not come to disagree about what a range is.
+      if tlo.ty != thi.ty then
+        err(s"a range needs matching bounds, got ${show(tlo.ty)} and ${show(thi.ty)}")
+      val vty = tlo.ty match
+        case i: Type.Integer => i
+        case other           => err(s"a range runs between integer bounds, not ${show(other)}")
+
+      val s = instantiateStruct(Library.key("Range"), List(vty))
+
+      TStructNew(s, List(tlo, thi, TBoolLit(inclusive)))
+
     case _: RangeExpr =>
-      err("a range is only allowed in a 'for' loop, in a 'for all' or 'for some' quantifier, in a " +
-        "slice index, or in a 'match' pattern")
+      err("a range with an open end is only allowed in a slice index — as a value it would have to " +
+        "say what the missing bound is, and only the thing being indexed knows that. Write both " +
+        "ends")
 
     // `a, b` where a function's result list is what is being produced. It builds the aggregate the
     // caller takes apart — the same one a tuple builds, since a result list is a tuple's layout

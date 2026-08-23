@@ -1,0 +1,49 @@
+module sysl
+
+// A range with both ends written, as a value.
+//
+// `0..<n` and `0..n` are a **form** first: in a `for` header, a slice index, a `match` pattern and a
+// quantifier the compiler reads the two bounds directly and there is no `Range` anywhere in what it
+// emits. A counted `for` is still a counter and a comparison, which is what keeps the most ordinary
+// loop in the language free of a struct, an `Option` a step, and a call.
+//
+// What this type is for is every *other* position — a range bound to a name, passed to a function,
+// returned from one, or handed to something generic. `sysl.seq` is the reason it exists: a range is
+// the one obvious sequence, and `(0..<n).map(f)` had no receiver to be a method on.
+//
+// **Only a fully-bounded range becomes one.** `..`, `lo..` and `..hi` mean something in a slice
+// index and nothing on their own — a value would have to say what an absent bound *is*, and the
+// answer differs by what it is indexing — so they stay index-only and are refused elsewhere by name.
+struct Range[T]
+
+    // Where the walk starts. It moves: a `Range` walked by `Iterate` is a cursor, so a loop iterates
+    // a **copy** of whatever it was given, exactly as every other `Iterate` does.
+    lo: T
+
+    // Where it stops, and whether stopping is before or at it.
+    hi: T
+    inclusive: bool
+
+// Walking one, which is what makes a range value worth having.
+//
+// **`Integer` does not imply `Add`, which is why the bound reads as long as it does.** The trait is
+// declared `Integer: Div + Rem + Ord + Eq + Sub + Mul` — the list `Display`'s blanket body happens to
+// use — so a body bounded by it may divide an integer and may not add one. `Add` and `One` are named
+// here for that reason rather than for anything about ranges.
+//
+// **The inclusive end is cleared rather than stepped past**, which is the whole subtlety here. The
+// obvious spelling advances `lo` after yielding and tests `lo > hi`; at `0..255u8` that advance
+// wraps to zero and the walk starts again, because there is no `u8` one greater than the last one.
+// So on yielding the element equal to `hi` this clears `inclusive` and leaves `lo` where it is: the
+// half-open test then stops the next call, and nothing is ever incremented past the end.
+impl[T: Integer + Add + One] Iterate[T] for Range[T]
+
+    next(*self) -> Option[T]
+        if self.lo > self.hi || (self.lo == self.hi && !self.inclusive) then return None
+
+        val v = self.lo
+
+        if self.lo == self.hi then self.inclusive = false
+        else self.lo = self.lo + T.one()
+
+        Some(v)

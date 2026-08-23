@@ -200,6 +200,9 @@ object Library {
       // What a subscript on a type with no elements of its own reaches, and what a `for` asks of
       // what it walks — each looked up in the implementation table by name.
       "Index", "IndexSet", "Iterate",
+      // A range with both ends written, in every position but the four that read it as a form —
+      // built by `ControlFlowExprAnalysis` rather than by anything a program writes.
+      "Range",
       // `main(args: []string)`'s argument list, and `s.chars`.
       "args_of", "chars_of",
     ) ++ CoreTraits.required.keySet

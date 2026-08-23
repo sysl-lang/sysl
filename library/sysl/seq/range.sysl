@@ -1,0 +1,94 @@
+module sysl.seq
+
+import sysl.buf.{Buf, buf}
+
+// A range is a sequence, which is the reason `Range` is a value at all.
+//
+// `(0..<n).map(f)` is what a caller reaches for first, and until a range could be named there was no
+// receiver for it to be a method on -- `generate` in the file beside this one stands in for that one
+// spelling, and the other nine members had no stand-in at all.
+//
+// **Every member walks the range and none of them subscripts it**, which is the difference from the
+// slice implementation: there is no storage here, so a range answers a question about a million
+// values without a million values existing. `any`, `all`, `find`, `position` and `count_where` stop
+// as early as they would over a slice, so `(0..<1_000_000).any(p)` costs what the predicate costs
+// and nothing else.
+//
+// **The three that build a sequence grow it as they go.** A range's length is arithmetic rather than
+// a field, but working it out generically means a subtraction into a `usize` at a type the bound
+// says only that it is an integer -- so the buffer doubles the way `filter`'s does everywhere else
+// in this module, and the count a caller already knows is what `generate` is for.
+impl[E: Integer + Add + One] Sequence[E] for Range[E]
+
+    fold[A](self, init: A, f: (A, E) -> A) -> A
+        var acc = init
+
+        for x in self
+            acc = f(acc, x)
+
+        acc
+
+    any(self, p: E -> bool) -> bool
+        for x in self
+            if p(x) then return true
+
+        false
+
+    all(self, p: E -> bool) -> bool
+        for x in self
+            if !p(x) then return false
+
+        true
+
+    find(self, p: E -> bool) -> Option[E]
+        for x in self
+            if p(x) then return Some(x)
+
+        None
+
+    // The **index** of the element, counted from the start of the walk rather than from `lo` -- so
+    // `(10..<20).position(p)` answers `0` for the element `10`, exactly as a slice would.
+    position(self, p: E -> bool) -> Option[usize]
+        var i: usize = 0
+
+        for x in self
+            if p(x) then return Some(i)
+            i += 1
+
+        None
+
+    count_where(self, p: E -> bool) -> usize
+        var n: usize = 0
+
+        for x in self
+            if p(x) then n += 1
+
+        n
+
+    each(self, f: E -> unit)
+        for x in self
+            f(x)
+
+    map[U](self, f: E -> U) -> []U
+        var out: Buf[U] = buf()
+
+        for x in self
+            out.push(f(x))
+
+        out.view()
+
+    filter(self, p: E -> bool) -> []E
+        var out: Buf[E] = buf()
+
+        for x in self
+            if p(x) then out.push(x)
+
+        out.view()
+
+    flat_map[U](self, f: E -> []U) -> []U
+        var out: Buf[U] = buf()
+
+        for x in self
+            out.extend(f(x))
+
+        out.view()
