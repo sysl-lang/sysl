@@ -20,9 +20,15 @@ class DefinitionIndexTests extends AnyFreeSpec with Matchers {
       case Left(e)  => fail(s"the fixture does not parse: $e")
 
     Analyzer.indexed(List(program)) match
-      case Right(i) => i.references.filter(_.at.source.name == "t.sysl")
-      case Left(es) => fail(s"the fixture does not analyze: ${Diagnostic.report(es)}")
+      case Indexing(Some(i), Nil) => i.references.filter(_.at.source.name == "t.sysl")
+      case Indexing(_, es)        => fail(s"the fixture does not analyze: ${Diagnostic.report(es)}")
   }
+
+  /** The walk's whole answer — the index if there is one, and everything it recorded on the way. */
+  private def indexing(src: String): Indexing =
+    SyslParser.parse(src, "t.sysl") match
+      case Right(p) => Analyzer.indexed(List(p))
+      case Left(e)  => fail(s"the fixture does not parse: $e")
 
   /** The reference written at `line`/`col`, which is how each case names the one it is about. */
   private def from(src: String, line: Int, col: Int): Option[Reference] =
@@ -121,5 +127,31 @@ class DefinitionIndexTests extends AnyFreeSpec with Matchers {
     val src = "var x = 1\nprint(x)\nprint(x)\n"
 
     refs(src).filter(_.name == "x").map(r => (r.at.line, r.at.col)) shouldBe List((2, 7), (3, 7))
+  }
+
+  /** A file with a mistake in it is the ordinary state of a file in an editor, and it is exactly when
+   * an editor is asked where a name came from. A walk that ran to the end and recorded the mistake
+   * has a whole tree and whole tables; reporting only the diagnostic threw all of it away.
+   */
+  "a file with a mistake in it still yields the index the walk built" - {
+
+    "the diagnostic is reported" in {
+      indexing("var x = 1\nprint(x)\nprint(nope)\n").problems.isEmpty shouldBe false
+    }
+
+    "and the references around it are still answered" in {
+      val out = indexing("var x = 1\nprint(x)\nprint(nope)\n")
+
+      out.index.map(_.references.filter(r => r.name == "x" && r.at.source.name == "t.sysl")
+        .map(r => (r.at.line, r.at.col))) shouldBe Some(List((2, 7)))
+    }
+
+    "a clean file says so" in {
+      indexing("var x = 1\nprint(x)\n").isClean shouldBe true
+    }
+
+    "and a file with a mistake does not" in {
+      indexing("var x = 1\nprint(nope)\n").isClean shouldBe false
+    }
   }
 }

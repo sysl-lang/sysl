@@ -103,8 +103,15 @@ object Analyzer {
               paths: SearchPaths = SearchPaths.none, own: Option[Set[String]] = None,
               entryPoint: Boolean = true)
       : Either[List[Diagnostic], TProgram] =
-    CProbe.lower(units, target, paths).left.map(List(_)).flatMap(analyzing(_,
-      building, std, target, provides, packages, own, entryPoint, recording = false)).map(_.tree)
+    CProbe.lower(units, target, paths) match
+      case Left(d)       => Left(List(d))
+      case Right(lowered) =>
+        val walked = analyzing(lowered, building, std, target, provides, packages, own, entryPoint,
+          recording = false)
+
+        walked.index match
+          case Some(i) if walked.isClean => Right(i.tree)
+          case _                         => Left(walked.problems)
 
   /** The same walk, answering with the **definition index** beside the tree — what an editor asks
    * for and what nothing in a build has any use for (`DefinitionIndex`).
@@ -112,15 +119,25 @@ object Analyzer {
    * It is a second entry point rather than a wider return type for the same reason `Compiler.checked`
    * is: every existing caller wants a tree and would have to unwrap one, and the index is read off
    * tables the analyzer instance holds, so it cannot be asked for after the fact.
+   *
+   * **It answers an `Indexing` rather than an `Either`, and the difference is the point of it.** A
+   * file with a mistake in it is the ordinary state of a file in an editor, and a walk that ran to
+   * the end and recorded that mistake has a complete tree and complete tables. Reporting only the
+   * diagnostic threw away an index that was already built and paid for — so both come back, and it
+   * is the caller that decides what a partial answer is worth. Only a walk that escaped before
+   * producing a tree has nothing.
    */
   def indexed(units: List[Program], building: Set[String] = Set.empty,
               std: Stdlib = Stdlib.fromSource(Target.default), target: Target = Target.default,
               provides: Set[String] = Capability.core.toSet, packages: Packages = Packages.none,
               paths: SearchPaths = SearchPaths.none, own: Option[Set[String]] = None,
               entryPoint: Boolean = true)
-      : Either[List[Diagnostic], Indexed] =
-    CProbe.lower(units, target, paths).left.map(List(_)).flatMap(analyzing(_,
-      building, std, target, provides, packages, own, entryPoint, recording = true))
+      : Indexing =
+    CProbe.lower(units, target, paths) match
+      case Left(d)        => Indexing(None, List(d))
+      case Right(lowered) =>
+        analyzing(lowered, building, std, target, provides, packages, own, entryPoint,
+          recording = true)
 
   /** The walk itself, over units whose `c const` blocks are already ordinary constants.
    *
@@ -133,7 +150,7 @@ object Analyzer {
   private def analyzing(units: List[Program], building: Set[String], std: Stdlib, target: Target,
                         provides: Set[String], packages: Packages, own: Option[Set[String]],
                         entryPoint: Boolean, recording: Boolean)
-      : Either[List[Diagnostic], Indexed] = {
+      : Indexing = {
     val analyzer = new Analyzer(units, building, std, target, provides, packages, own, entryPoint)
 
     analyzer.recordReferences(recording)
@@ -149,15 +166,18 @@ object Analyzer {
     val found = analyzer.errors
 
     outcome match
-      case Right(tree) if found.isEmpty => Right(Indexed(tree, analyzer.references(tree)))
-      case Right(_)                     => Left(found)
+      // The references are gathered only where they were asked for: `referencesIn` walks the whole
+      // tree, and a build has no use for the answer. A tree with mistakes recorded against it still
+      // yields an index — that is the case an editor is in nearly all the time.
+      case Right(tree) =>
+        Indexing(Some(Indexed(tree, if recording then analyzer.references(tree) else Nil)), found)
       case Left(escaped) =>
         val all = found ::: escaped
 
         // Reaching here with nothing to say would mean the analyzer gave up without recording
         // why, which is a bug in the analyzer rather than in the program it was handed.
-        if all.isEmpty then Left(List(Diagnostic("the analyzer stopped without reporting why", None)))
-        else Left(all)
+        if all.isEmpty then Indexing(None, List(Diagnostic("the analyzer stopped without reporting why", None)))
+        else Indexing(None, all)
   }
 }
 
