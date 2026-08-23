@@ -156,4 +156,56 @@ class ParseRecoveryTests extends AnyFreeSpec with ParseSupport {
   "two statements on one line are still two statements too many" in {
     lines("print(1) print(2)\nprint(3)\n") shouldBe List(1)
   }
+
+  /** The inputs that break a loop like this one, rather than the ones it was written for. Each is
+   * here because the skip could fail to advance, could advance past the end, or could be asked to
+   * recover through something that is not a statement at all.
+   */
+  "the shapes a skipping loop goes wrong on" - {
+
+    "an empty file is not a file with a mistake in it" in {
+      problems("") shouldBe Nil
+      kept("") shouldBe Some(Nil)
+    }
+
+    "nor is a file of blank lines" in {
+      problems("\n\n\n") shouldBe Nil
+      kept("\n\n\n") shouldBe Some(Nil)
+    }
+
+    // Running out of input has no token and so no position of its own; the skip has nowhere to go,
+    // and the loop has to end on that rather than spin.
+    "a mistake at the very last token terminates" in {
+      problems("print(1").length shouldBe 1
+    }
+
+    "a file that is one unreadable token terminates" in {
+      problems(")").length shouldBe 1
+    }
+
+    // Asserted against the same file with the bad line deleted, which is the strongest thing this
+    // can say: the tree is what the reader would have got by removing that line themselves, and a
+    // skip that escaped either block would not produce it.
+    "a mistake two blocks deep is reported where it is, and costs neither block" in {
+      val src = "main()\n    if true\n        print(1 2)\n        print(3)\n    print(4)\n"
+
+      lines(src) shouldBe List(3)
+      kept(src) shouldBe Some(prog("main()\n    if true\n        print(3)\n    print(4)\n"))
+    }
+
+    "a mistake in a match arm does not take the arms below it" in {
+      val src = "val n = 1\nn match\n    1 -> print(1 2)\n    _ -> print(3)\n"
+
+      lines(src) shouldBe List(3)
+    }
+
+    // A literate file's program is indented, and its columns are reported with the margin added
+    // back. Recovery runs on the tangled text, so the second diagnostic has to carry the offset too.
+    "a literate file's second mistake is reported in the reader's own columns" in {
+      val src  = "Some prose.\n\n    print(1 2)\n    print(3)\n    print(4 5)\n"
+      val outs = SyslParser.recovered(Source("t.lsysl", src))._2
+
+      outs.flatMap(_.pos.map(_.line)) shouldBe List(3, 5)
+    }
+  }
 }
