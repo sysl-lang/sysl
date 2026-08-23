@@ -219,6 +219,22 @@ class AssociatedTypeErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("'T' is not bounded by a trait declaring an associated type 'Item'")
     }
 
+    /** A bound the compiler closes is the one that reaches past the parameter's own bounds: a
+     * blanket block written over that family answers the projection for every member of it. What is
+     * refused is the same question with no such block behind it — the relaxation is a block that
+     * exists, not the family.
+     */
+    "a type parameter over a closed family that no blanket block implements" in {
+      err(
+        """trait Seq
+          |    type Item
+          |    head(self) -> Self::Item
+          |f[T: Integer](x: T) -> unit
+          |    var y: T::Item = x
+          |print(1)""".stripMargin,
+      ) should include("'T' is not bounded by a trait declaring an associated type 'Item'")
+    }
+
     // The name is deliberately not `Item`: the standard library's `Iterate` declares one, so
     // `Box::Item` reaches the *next* refusal down — a trait declares it and this type implements
     // none of them — which is the case below rather than this one.
@@ -265,6 +281,23 @@ class AssociatedTypeErrorTests extends AnyFreeSpec with CodegenSupport {
         |    b(self) -> Self::Item = true
         |print(1)""".stripMargin,
     ) should include("one type cannot have two of one name")
+  }
+
+  /** The same rule reaching through a **family**, which is what the standard library's `Magnitude`
+   * costs: it declares `type Size` for every integer, so a program's own trait bringing a second
+   * `Size` to the integers is refused at the block that creates the collision. The name a library
+   * trait picks for an associated type is spent for every type that trait covers.
+   */
+  "and a blanket block collides with the library's own over the same family" in {
+    err(
+      """trait Sized
+        |    type Size
+        |    extent(self) -> Self::Size
+        |impl[T: Integer + Zero] Sized for T
+        |    type Size = T
+        |    extent(self) -> Self::Size = self
+        |print(1)""".stripMargin,
+    ) should include("already implements 'sysl.math.Magnitude', which declares an associated type 'Size'")
   }
 
   "declaring an associated type spends the trait's erasability" - {

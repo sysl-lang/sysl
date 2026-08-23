@@ -317,6 +317,28 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
           |""".stripMargin)
     }
 
+    /** A **blanket** implementation, which is the shape that reaches a program without the program
+     * naming anything: `impl[T: Integer + Zero] Magnitude for T` puts a member on every integer, so
+     * what the artifact has to carry is a block filed under a bound rather than under a type. The
+     * associated type rides with it — `T::Size` is read back off the decoded block — and a body
+     * bounded by the trait is monomorphized here out of trees the artifact supplied.
+     */
+    "for one that reaches a blanket implementation and the associated type it supplies" in {
+      sameBothWays(
+        """import sysl.math.Magnitude
+          |
+          |largest[T: Magnitude](xs: []const T) -> T::Size
+          |    var best = xs[0].magnitude()
+          |
+          |    for x in xs do if best < x.magnitude() then best = x.magnitude()
+          |
+          |    best
+          |end largest
+          |
+          |print(largest([3, -40, 7]), largest([3.0, -40.0, 7.0]))
+          |""".stripMargin)
+    }
+
     "for one that implements a library trait, which builds a table over the library's own members" in {
       sameBothWays(
         """struct P

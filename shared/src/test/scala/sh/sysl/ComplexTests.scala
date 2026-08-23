@@ -436,6 +436,53 @@ class ComplexTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  /** `Magnitude`, which is the one trait a complex number implements that an ordering would have
+   * been. There is no `Ord` here on purpose, and yet `|z|` orders these by size perfectly well — so
+   * the trait carries an associated type saying what a size comes out at, and for a `Complex[F]`
+   * that is `F` rather than the type itself.
+   */
+  "the size, which is an ordering the values do not have" - {
+
+    "the modulus reached through the trait is the type's own abs" in {
+      run("""import sysl.math.Magnitude
+            |
+            |print(Complex(3.0, 4.0).magnitude(), Complex(0.0 - 5.0, 12.0).magnitude())""".stripMargin) shouldBe
+        "5 13\n"
+    }
+
+    /** The width is the claim: a size that had been fixed to `real` would answer here too, and would
+     * answer at binary64 — so the assertion is that the projection is `F`, made by a body that can
+     * only hold what the trait promises.
+     */
+    "and it comes out at the width the value is held in" in {
+      run("""import sysl.math.Magnitude
+            |
+            |size[T: Magnitude](x: T) -> T::Size = x.magnitude()
+            |
+            |var narrow: f32 = size(Complex(3.0f32, 4.0f32))
+            |var wide: real = size(Complex(3.0, 4.0))
+            |
+            |print(narrow, wide)""".stripMargin) shouldBe "5 5\n"
+    }
+
+    /** The point of the trait rather than of the method: one body over element types whose sizes are
+     * not the same type as each other, comparing them without naming either.
+     */
+    "so one routine picks the largest by size over the plane and over the line" in {
+      run("""import sysl.math.Magnitude
+            |
+            |largest[T: Magnitude](xs: []const T) -> T::Size
+            |    var best = xs[0].magnitude()
+            |
+            |    for x in xs do if best < x.magnitude() then best = x.magnitude()
+            |
+            |    best
+            |
+            |print(largest([Complex(3.0, 4.0), Complex(1.0, 1.0)]), largest([3.0, 0.0 - 40.0]))""".stripMargin) shouldBe
+        "5 40\n"
+    }
+  }
+
   "the module is asked for by name" - {
     // The arithmetic is reachable from a module that has given up both the allocator and the
     // operating system, which is what makes the module usable on a freestanding target.
