@@ -709,10 +709,18 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
         // resolved: an ordinary argument fills one of the trait's own parameters, and a `Name = T`
         // fixes an associated type the implementation would otherwise have chosen (`02`).
         val (bindRefs, posRefs) = argRefs.partition(_.isInstanceOf[AssocArgType])
-        val written             = posRefs.map(resolveType(_, subst))
 
         at(inner.pos) {
           val declared = objectAssocs(key)
+
+          // **A bare associated-type name is the mistake to catch before resolution**, because after
+          // it the reader is told there is no type of that name — which is true and is about the
+          // wrong thing. `&Seq[Item]` is somebody one `=` short of the form they meant.
+          for case NamedType(a, Nil) <- posRefs if declared.exists(_.name == a) do
+            err(s"'$a' is an associated type of '${qn(key)}', which an object fixes by name rather " +
+              s"than by position — write '$sigil${qn(key)}[$a = …]'")
+
+          val written = posRefs.map(resolveType(_, subst))
 
           // **The one unambiguous case is written without the name**, and it is the common one: a
           // trait with no parameters of its own and exactly one associated type has only one thing a
@@ -725,6 +733,36 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
               (declared.head.name, written.head))
 
           val positional = if sugared.isDefined then Nil else written
+
+          // **A bare argument too many, on a trait that declares associated types.** The arity
+          // refusal is right about the count and says the wrong thing about the cause — "does not
+          // take type arguments" reads as a trait with nothing open, and this one has something
+          // open that is simply not fixed by position.
+          if sugared.isEmpty && declared.nonEmpty && positional.length > decl.tparams.length then
+            val names   = declared.map(_.name)
+            val fixes   = names.map(a => s"$a = …").mkString(", ")
+            val whole   = (decl.tparams.map(_ => "…") ::: names.map(a => s"$a = …")).mkString(", ")
+            val owns    =
+              if decl.tparams.isEmpty then s"'${qn(key)}' takes no type arguments of its own"
+              else s"'${qn(key)}' takes ${quantity(decl.tparams.length, "type argument")} of its own"
+
+            // The tail says why the short form did not apply, and there are two different reasons:
+            // the trait has more than one thing open, or it has exactly one and was given the wrong
+            // number of arguments. A reader in the second case has the form right and the count
+            // wrong, and telling them about ambiguity would be telling them about somebody else's
+            // mistake.
+            val why =
+              if decl.tparams.isEmpty && names.length == 1 then
+                s"One bare argument is the short form for '$fixes', and ${quantity(positional.length, "argument")} " +
+                  s"${if positional.length == 1 then "is" else "are"} not"
+              else
+                s"A bare argument is the short form only for a trait with no parameters of its own and " +
+                  s"exactly one associated type, so here it would not say which"
+
+            err(s"$owns, and what it leaves for an object to fix is " +
+              s"${if names.length == 1 then "the associated type" else "the associated types"} " +
+              s"${names.mkString("'", "', '", "'")} — an object fixes one by name, so write " +
+              s"'$sigil${qn(key)}[$whole]'. $why")
 
           checkTraitArity(n, decl.tparams, decl.tdefaults, positional)
 

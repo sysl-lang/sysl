@@ -390,6 +390,47 @@ class AssociatedTypeErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should (include("says 'Item' is string") and include("supplies int"))
     }
 
+    // A reader one `=` short of the form they meant. Left to resolution they are told there is no
+    // type called `A`, which is true and is about the wrong thing.
+    "a bare name that is one of the trait's own associated types" in {
+      err(
+        """trait One
+          |    type A
+          |    get(self) -> Self::A
+          |show(s: &One[A]) -> unit
+          |    print(1)
+          |print(1)""".stripMargin,
+      ) should (include("is an associated type of") and include("[A = …]"))
+    }
+
+    // Two things open and one bare argument: the short form cannot say which, and the refusal has
+    // to name both rather than reporting an arity the trait does not have.
+    "a bare argument where the trait leaves more than one thing open" in {
+      err(
+        """trait Two
+          |    type A
+          |    type B
+          |    both(self) -> Self::A
+          |show(s: &Two[int]) -> unit
+          |    print(1)
+          |print(1)""".stripMargin,
+      ) should (include("'A', 'B'") and include("would not say which"))
+    }
+
+    // One thing open and two bare arguments: the reader has the *form* right and the count wrong,
+    // so the sentence is about the count. Telling them about ambiguity here would be telling them
+    // about somebody else's mistake.
+    "and too many bare arguments where the short form would otherwise apply" in {
+      err(
+        """trait One
+          |    type A
+          |    get(self) -> Self::A
+          |show(s: &One[int, string]) -> unit
+          |    print(1)
+          |print(1)""".stripMargin,
+      ) should (include("One bare argument is the short form for 'A = …'") and include("2 arguments are not"))
+    }
+
     // The bare form is sugar for the named one and is available only where it cannot be read two
     // ways: a trait with parameters of its own has a bare argument meaning one of *those*.
     "and the bare form is refused where the trait has parameters of its own" in {
