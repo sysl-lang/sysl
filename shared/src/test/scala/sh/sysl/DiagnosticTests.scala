@@ -679,6 +679,64 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  /** A diagnostic is **carried** now and rendered at the edge, so there are two roads to one text.
+   * These pin them together: the compiler's string entry points are `Diagnostic.report` over the
+   * structured ones, and nothing a reader sees moved when the type arrived.
+   */
+  "carried rather than rendered" - {
+
+    def sources(src: String) = List(Source("t.sysl", src))
+
+    "the rendered report is exactly what the string entry point answers" in {
+      val src = "var a = nope1\nvar b = nope2\nprint(p.zed)\n"
+
+      Compiler.checked(sources(src)).swap.toOption.map(Diagnostic.report) shouldBe
+        Compiler.compile(sources(src)).swap.toOption
+    }
+
+    "and so it is for a parse error, which comes from a different stage entirely" in {
+      val src = "var a = 1\nvar = 5\n"
+
+      Compiler.checked(sources(src)).swap.toOption.map(Diagnostic.report) shouldBe
+        Compiler.compile(sources(src)).swap.toOption
+    }
+
+    // The limit exists so a reader is not handed a wall of text. A caller reading them as data
+    // wants all of them, so the truncation belongs to `report` and to nothing before it.
+    "the five-diagnostic limit is the renderer's rule and not the list's" in {
+      val src = (1 to 8).map(n => s"var v$n = nope$n").mkString("\n")
+
+      Compiler.checked(sources(src)).swap.toOption.map(_.length) shouldBe Some(8)
+      Compiler.compile(sources(src)).swap.toOption.map(count) shouldBe Some(5)
+    }
+
+    "a report of one is that one, with nothing wrapped around it" in {
+      val one = Diagnostic("boom", Some(Pos(Source("t.sysl", "abc\n"), 1, 2, 1, 4)))
+
+      Diagnostic.report(List(one)) shouldBe one.rendered
+    }
+
+    "and a report of none is nothing at all" in {
+      Diagnostic.report(Nil) shouldBe ""
+    }
+
+    "source order is by file, then line, then column, and nowhere sorts last" in {
+      val a = Source("a.sysl", "xx\nxx\n")
+      val b = Source("b.sysl", "xx\n")
+
+      val unordered = List(
+        Diagnostic("nowhere", None),
+        Diagnostic("b:1:1", Some(Pos(b, 1, 1))),
+        Diagnostic("a:2:1", Some(Pos(a, 2, 1))),
+        Diagnostic("a:1:2", Some(Pos(a, 1, 2))),
+        Diagnostic("a:1:1", Some(Pos(a, 1, 1))),
+      )
+
+      Diagnostic.inSourceOrder(unordered).map(_.message) shouldBe
+        List("a:1:1", "a:1:2", "a:2:1", "b:1:1", "nowhere")
+    }
+  }
+
   /** What a node's span covers, which is the claim everything above rests on and which the
    * rendering only shows indirectly. An editor asking "which name is the cursor inside" reads this
    * rather than a diagnostic.

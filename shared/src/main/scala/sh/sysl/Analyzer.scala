@@ -47,8 +47,8 @@ class Analyzer private (
     protected val hasEntryPoint: Boolean,
 ) extends ProgramWalk with ExprAnalysis {
 
-  /** Every error the walk found, rendered and in source order. */
-  def errors: List[String] = diagnostics
+  /** Every error the walk found, in source order and **unrendered** — see `Diagnostic`. */
+  def errors: List[Diagnostic] = diagnostics
 }
 
 object Analyzer {
@@ -61,7 +61,7 @@ object Analyzer {
    * escaping the regions entirely is still caught here, since a diagnostic that reaches the user
    * beats a stack trace.
    */
-  def analyze(program: Program): Either[String, TProgram] = analyze(List(program))
+  def analyze(program: Program): Either[List[Diagnostic], TProgram] = analyze(List(program))
 
   /** Analyzes the files of one module together. They share a single scope, so a declaration in one
    * is visible to all of them with no ordering and no forward declaration (`13 §6`) — which falls
@@ -92,8 +92,9 @@ object Analyzer {
               provides: Set[String] = Capability.core.toSet, packages: Packages = Packages.none,
               paths: SearchPaths = SearchPaths.none, own: Option[Set[String]] = None,
               entryPoint: Boolean = true)
-      : Either[String, TProgram] = CProbe.lower(units, target, paths).flatMap(analyzing(_,
-    building, std, target, provides, packages, own, entryPoint))
+      : Either[List[Diagnostic], TProgram] =
+    CProbe.lower(units, target, paths).left.map(List(_)).flatMap(analyzing(_,
+      building, std, target, provides, packages, own, entryPoint))
 
   /** The walk itself, over units whose `c const` blocks are already ordinary constants.
    *
@@ -106,13 +107,13 @@ object Analyzer {
   private def analyzing(units: List[Program], building: Set[String], std: Stdlib, target: Target,
                         provides: Set[String], packages: Packages, own: Option[Set[String]],
                         entryPoint: Boolean)
-      : Either[String, TProgram] = {
+      : Either[List[Diagnostic], TProgram] = {
     val analyzer = new Analyzer(units, building, std, target, provides, packages, own, entryPoint)
 
     val outcome =
       try Right(analyzer.analyze())
       catch
-        case AnalyzerError(msg, pos, _) => Left(List(Diagnostic.render(msg, pos)))
+        case AnalyzerError(msg, pos, _) => Left(List(Diagnostic(msg, pos)))
         // A poisoned region carries no message of its own: it means an error was already
         // recorded, and those are what the caller is told about.
         case Poisoned() => Left(Nil)
@@ -121,14 +122,14 @@ object Analyzer {
 
     outcome match
       case Right(tree) if found.isEmpty => Right(tree)
-      case Right(_)                     => Left(Diagnostic.report(found))
+      case Right(_)                     => Left(found)
       case Left(escaped) =>
         val all = found ::: escaped
 
         // Reaching here with nothing to say would mean the analyzer gave up without recording
         // why, which is a bug in the analyzer rather than in the program it was handed.
-        if all.isEmpty then Left(Diagnostic.render("the analyzer stopped without reporting why", None))
-        else Left(Diagnostic.report(all))
+        if all.isEmpty then Left(List(Diagnostic("the analyzer stopped without reporting why", None)))
+        else Left(all)
   }
 }
 

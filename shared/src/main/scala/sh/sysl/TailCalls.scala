@@ -159,21 +159,21 @@ object TailCalls {
    * deeply enough to care is one whose author needs to hear that an edit has just cost them the
    * jump, and hear it at the compile rather than at the stack overflow.
    */
-  def check(program: TProgram): Either[String, Unit] = {
+  def check(program: TProgram): Either[List[Diagnostic], Unit] = {
     val refused =
       program.funcs.filter(_.tailrec).flatMap { f =>
         disqualified(f) match
           case Some(why) =>
-            Some(Diagnostic.render(s"'${Modules.show(f.name)}' is marked '@tailrec' but $why", None))
+            Some(Diagnostic(s"'${Modules.show(f.name)}' is marked '@tailrec' but $why", f.pos))
           case None if of(f).isEmpty =>
-            Some(Diagnostic.render(
+            Some(Diagnostic(
               s"'${Modules.show(f.name)}' is marked '@tailrec' but calls itself nowhere the jump " +
                 "can replace — a tail call is the last thing the function does, so nothing may " +
                 "wait on its result and no 'defer' may be in scope where it stands",
-              None))
+              f.pos))
           case None => None
       }
 
-    if refused.nonEmpty then Left(Diagnostic.report(refused)) else Right(())
+    if refused.nonEmpty then Left(refused) else Right(())
   }
 }

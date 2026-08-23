@@ -153,6 +153,97 @@ class SyslLibraryTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  /** `check` is the other kind of caller: one that wants to *do* something with a mistake rather
+   * than print it. Everything above answers with the paragraph the driver would have written, and a
+   * paragraph cannot be taken apart into ranges — which is what an editor needs and what these pin.
+   */
+  "the mistakes in a program come back as data" - {
+
+    "and there are none at all when it compiles" in {
+      Sysl.check("main()\n    print(1)") shouldBe Nil
+    }
+
+    "one per mistake, each with the range of the token that is wrong" in {
+      Sysl.check("var x = 1\nprint(nope)\n", "t.sysl") shouldBe
+        List(Sysl.Problem("undefined name 'nope'", Some(Sysl.Span("t.sysl", 2, 7, 2, 11))))
+    }
+
+    "in source order, so a caller may show them in the order they are read" in {
+      val src = "var a = nope1\nvar b = nope2\nvar c = nope3\n"
+
+      Sysl.check(src, "t.sysl").flatMap(_.at).map(_.line) shouldBe List(1, 2, 3)
+    }
+
+    /* The five-diagnostic limit is the *renderer's* rule: a wall of them is the first few with the
+     * signal falling off behind. A caller marking up a file has the opposite need — the ones left
+     * out are exactly the ones with no underline — so nothing here truncates.
+     */
+    "every one of them, past the five a rendered report stops at" in {
+      val src = (1 to 8).map(n => s"var v$n = nope$n").mkString("\n")
+
+      Sysl.check(src) should have length 8
+      Sysl.compile(src).swap.map(_.contains("showing the first 5 of 8 errors")) shouldBe Right(true)
+    }
+
+    "a parse error among them, pointing at the token that could not be read" in {
+      Sysl.check("var a = 1\nvar = 5\n", "t.sysl") shouldBe
+        List(Sysl.Problem("identifier expected", Some(Sysl.Span("t.sysl", 2, 5, 2, 6))))
+    }
+
+    "and a lexical one, which the grammar never gets to react to" in {
+      Sysl.check("print(\"oops\n", "t.sysl") shouldBe
+        List(Sysl.Problem("unterminated string literal", Some(Sysl.Span("t.sysl", 1, 7, 1, 7))))
+    }
+
+    // Not the analyzer's: escape analysis runs on the typed tree, after it, and its refusals used
+    // to be rendered where they were raised — so a caller reading them as data is reading a stage
+    // that had no data to give.
+    "a refusal from a later pass carries its position too" in {
+      val src = "sum(bytes: []u8) -> int = 0\n\nscratch(s: [4]u8) -> []u8\n    s[..]\n"
+      val List(one) = Sysl.check(src, "t.sysl"): @unchecked
+
+      one.message should include("would outlive the array")
+      one.at.map(a => (a.line, a.col)) shouldBe Some((4, 6))
+    }
+
+    /* These two complain about a whole *function*, and the typed tree carried no position for one
+     * until this surface needed it — so both used to point nowhere at all.
+     *
+     * They land on the **attribute** rather than on the signature under it, which is where the
+     * declaration begins and is also the line the reader has to change: what is refused is the
+     * `@export` and the `@tailrec`, not the function they are written above.
+     */
+    "an export refused for its signature points at the declaration" in {
+      val src =
+        """var first = 1
+          |
+          |@export
+          |f(x: []int) -> int = 1
+          |
+          |print(f([1]))
+          |""".stripMargin
+      val List(one) = Sysl.check(src, "t.sysl"): @unchecked
+
+      one.message should include("which C has no way to spell")
+      one.at.map(_.line) shouldBe Some(3)
+    }
+
+    "and so does a '@tailrec' that is not one" in {
+      val src =
+        """var first = 1
+          |
+          |@tailrec
+          |f(n: int) -> int = if n == 0 then 0 else 1 + f(n - 1)
+          |
+          |print(f(3))
+          |""".stripMargin
+      val List(one) = Sysl.check(src, "t.sysl"): @unchecked
+
+      one.message should include("'@tailrec'")
+      one.at.map(_.line) shouldBe Some(3)
+    }
+  }
+
   "what the library says about itself" - {
     "the version is the one the build stamped, which is what '--version' reports" in {
       Sysl.version shouldBe BuildInfo.version
