@@ -118,7 +118,7 @@ object Fetch {
     val url     = Dependency.cloneUrl(coordinate)
 
     try
-      Project.parentOf(dir).foreach(createDirectories)
+      Project.parentOf(dir).foreach(Project.makeDirectories)
       removeTree(partial)
 
       Console.err.println(s"fetching $coordinate ${version.tag}")

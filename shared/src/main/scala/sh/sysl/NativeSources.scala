@@ -75,6 +75,10 @@ object NativeSources {
       val staged = trees.zipWithIndex.map { (sources, i) =>
         val dir = s"$staging/$i"
 
+        // The plain call rather than `Project.makeDirectories`, which tolerates a directory
+        // something else has made: this one is under a temporary directory of this process's own,
+        // so nothing can be racing it and a name already taken would be a mistake in the index
+        // above rather than a neighbour to make room for.
         createDirectories(dir)
         (dir, sources.map(s => s -> s"$dir/${LibraryArtifact.nativeMember(s)}"))
       }

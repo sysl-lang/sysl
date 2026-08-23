@@ -407,7 +407,7 @@ object Stdlib {
                     val objects = Std.cSources(target.os)
                       .map(s => s -> s"$staging/${LibraryArtifact.nativeMember(s)}")
 
-                    Project.parentOf(out).foreach(createDirectories)
+                    Project.parentOf(out).foreach(Project.makeDirectories)
 
                     // Beside its destination rather than in the staging directory, because a rename
                     // is only a rename within one filesystem and the system's temporary directory

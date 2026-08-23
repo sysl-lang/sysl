@@ -1,5 +1,7 @@
 package sh.sysl
 
+import java.io.IOException
+
 import io.github.edadma.cross_platform.*
 
 /** Reading a project off the filesystem: which files one invocation compiles, and what each one's
@@ -329,6 +331,48 @@ object Project {
 
     Option.when(slash > 0)(path.substring(0, slash))
   }
+
+  /** Makes one directory, tolerating one that something else has just made.
+   *
+   * **`createDirectory` refuses a path that is already there, and no caller here wants that
+   * refusal**: they want the directory to exist, not to have been the one that made it. So the test
+   * after the failure is exactly that test — a failure that leaves no directory behind is still
+   * raised, carrying the filesystem's own message, which is what keeps an unwritable path from
+   * reaching the linker as somewhere to put an executable.
+   *
+   * The refusal is not one exception but two, and the second is the one that matters: a directory
+   * that exists and is *empty* is refused differently from one that exists and has been written
+   * into. A tolerance written against the first alone passes its own test and still fails in the
+   * field, because the field is `makeDirectories` below, where the directory already there is one
+   * another compilation has already put its artifact in.
+   */
+  def makeDirectory(dir: String): Unit =
+    try createDirectory(dir)
+    catch case e: IOException => if !isDirectory(dir) then throw e
+
+  /** Makes a directory and everything above it, tolerating a compilation racing for the same one.
+   *
+   * **`createDirectories` decides what is missing before it makes any of it, so it is not safe to
+   * call twice at once** — and every caller of this is writing somewhere shared, which is to say
+   * somewhere two invocations can be pointed at once. Two compilations starting against a cold
+   * artifact cache both find the cache directory missing, both walk up to make it, and the one that
+   * loses calls `createDirectory` on a directory the winner has made *and already written the
+   * artifact into*.
+   *
+   * What that produces is a complaint that a directory is not empty — which it is not, precisely
+   * because the other compilation got there first. Nothing about it reads as a race, and it lands as
+   * a failed build on whichever invocation was second. The same window is open on a fetched
+   * package's directory and on any output directory two builds are pointed at, which is an ordinary
+   * parallel make.
+   *
+   * **The walk is written out rather than delegated because the tolerance has to be at the leaf.**
+   * The window is between the check that says a directory is missing and the call that makes it, and
+   * only the call that loses it is in a position to know that losing it is not an error.
+   */
+  def makeDirectories(dir: String): Unit =
+    if !isDirectory(dir) then
+      parentOf(dir).foreach(makeDirectories)
+      makeDirectory(dir)
 
   /** Removes a temporary file, whether or not it is there.
    *

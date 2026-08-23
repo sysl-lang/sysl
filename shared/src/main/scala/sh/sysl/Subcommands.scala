@@ -55,7 +55,7 @@ private def weave(cfg: Config, sources: List[Source]): Int =
 
             case (Some(dir), many) =>
               try
-                createDirectories(dir)
+                Project.makeDirectories(dir)
 
                 many.foldLeft(0) { (code, entry) =>
                   val (src, html) = entry
@@ -91,7 +91,7 @@ private def tangle(cfg: Config, sources: List[Source]): Int =
 
 /** A rendered thing written where it was asked for, or the reason it could not be. */
 private def write(path: String, text: String): Int = {
-  Project.parentOf(path).foreach(createDirectories)
+  Project.parentOf(path).foreach(Project.makeDirectories)
 
   try
     writeFile(path, text)
@@ -149,8 +149,8 @@ private def buildForC(cfg: Config, compiled: Compiled, target: Target, named: Op
   val out    = cfg.output.getOrElse(defaultOutput(cfg.file, named, ".a"))
   val header = cfg.header.getOrElse(s"$out.h")
 
-  Project.parentOf(out).foreach(createDirectories)
-  Project.parentOf(header).foreach(createDirectories)
+  Project.parentOf(out).foreach(Project.makeDirectories)
+  Project.parentOf(header).foreach(Project.makeDirectories)
 
   // Named members for `build-lib`'s reason: an archive holds the same names wherever it was built,
   // and `ar t` then shows a reader something they can make sense of.
@@ -327,7 +327,7 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
             s"this artifact is keyed to ${cfg.file}, so nothing will read it. Set SYSL_LIB to " +
             "this tree, or pass -o, if it was meant to be used rather than only checked.")
 
-      Project.parentOf(out).foreach(createDirectories)
+      Project.parentOf(out).foreach(Project.makeDirectories)
 
       // The members are named rather than left as whatever a temporary file was called, so an
       // artifact holds the same names wherever it was built and `ar t` shows a reader something they
