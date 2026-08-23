@@ -41,17 +41,36 @@ permissions:
 # So an in-progress dev run is left to finish, and publishes. That serializes dev's runs and spends
 # the minutes a dropped run saved, which is the cost being accepted.
 #
-# **This does not give every dev commit an interim, and nothing can.** `cancel-in-progress` governs
-# runs that have STARTED; a run still merely *queued* is replaced by the next one pushed, whatever
-# this says, because GitHub keeps one pending run per group. Observed the day this landed: the run
-# for this very commit was superseded while queued -- it has no jobs at all -- while the run ahead of
-# it kept running and published.
+# **`cancel-in-progress` alone did NOT give every dev commit a run, and the group below is what
+# does.** That flag governs runs which have STARTED; a run merely *queued* is replaced by the next
+# push regardless, because GitHub keeps **one pending run per concurrency group**. So while dev's
+# runs all shared the group `ci-refs/heads/dev`, each push evicted its queued predecessor and that
+# commit was never built by anything.
 #
-# What the site's flow actually needs is weaker than per-commit and is what this delivers: **the
-# newest dev commit always eventually publishes**, so a `syslVersion` pin naming it resolves once dev
-# goes quiet. A pin must name a sha whose run really ran, not any sha that happens to be on dev.
+# **Measured 2026-08-23, which is why this changed: seven of twelve dev runs were cancelled.** Three
+# shas -- `52793bbb`, `7a3c7389`, `302a049e` -- got no Linux build at all, on a day when four
+# sessions coordinated their merges correctly every single time. What is lost each time is the only
+# thing this job is for: both local gates are macOS, so a cancelled dev run means nothing ever built
+# that commit on Linux. Card `0120` is a real defect only this runner could see.
+#
+# **Keying dev by SHA is the fix, and it is the whole of it.** Every dev push gets a group of its
+# own, so there is no pending sibling to evict and nothing queues behind anything; branches and pull
+# requests keep the ref, so a new push there still cancels the old run, which is what you want on a
+# branch. `A && B || C` is Actions' ternary: `github.sha` is always non-empty, so the middle term is
+# truthy and the selection is exact.
+#
+# **What it costs is concurrent suites on the runner** when dev pushes land close together -- three
+# or four at today's rate, against runs of 59-112 minutes. This repository is public, so the minutes
+# are free and the cost is queue position rather than money.
+#
+# **The argument for it is not throughput.** A coordination rule is obeyed by people and a
+# concurrency key is obeyed by the runner: on the day this was written the humans followed the rule
+# perfectly and lost the build three times out of three, and the one hour that was NOT lost was
+# saved only because a session noticed that holding a lane it was entitled to hold had stopped being
+# worth it. A rule whose correct operation depends on somebody making that judgement every time will
+# eventually meet a session that does not.
 concurrency:
-  group: "ci-${{ github.ref }}"
+  group: "ci-${{ github.ref == 'refs/heads/dev' && github.sha || github.ref }}"
   cancel-in-progress: ${{ github.ref != 'refs/heads/dev' }}
 
 jobs:
