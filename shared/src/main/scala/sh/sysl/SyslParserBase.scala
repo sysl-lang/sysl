@@ -15,9 +15,15 @@ import scala.util.parsing.input.{Position, Reader}
  * than pretend they do not exist, and naming them here is what lets each area be read on its own —
  * the list below *is* the coupling, in full, and nothing outside it reaches sideways.
  *
- * The traits are mixed in one order (`ExprParser`, then `DeclParser`, then `SyslParser` itself), so
- * a rule needs a declaration here only when it is used by an area that comes **before** the one that
- * defines it. That is why the list is shorter than the number of crossings.
+ * The traits are mixed in one order — `ExprParser`, then `DeclParser` and the areas beside it, then
+ * `StmtParser`, `ControlFlowParser`, and `SyslParser` itself — so a rule needs a declaration here
+ * only when it is used by an area that comes **before** the one that defines it. That is why the
+ * list is shorter than the number of crossings.
+ *
+ * **The order is part of the specification, so a new area goes in at the position whose rules it
+ * took.** `StmtParser` and `ControlFlowParser` were both carved out of `SyslParser`'s own body and
+ * are mixed in exactly where that body sat, which is what makes the split a move rather than a
+ * change: the linearization every rule resolves against is the one it resolved against before.
  */
 trait SyslParserBase extends PackratParsers {
 
