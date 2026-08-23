@@ -71,8 +71,49 @@ private def resolveDependencies(cfg: Config, project: PackageConfig, roots: List
     files <- collectPackages(graph, os)
   yield
     if graph.sumsChanged then writeSums(root, graph.sums)
+    reportRaised(project, graph)
     files
 }
+
+/** Say so when the build is against a **higher** version than this project asked for (`packages.md
+ * § 5`).
+ *
+ * **Selection is silent by design and this is the one case worth breaking that for.** MVS raises
+ * floors constantly — that is what it is — and a line per raise would be a wall of them, every one
+ * about a package nobody typed. What is different here is that the version came from *this
+ * manifest*: somebody wrote `0.2.0`, the build used `0.2.1`, and nothing in the file they are
+ * reading says so.
+ *
+ * It matters more now that a package reached through another is importable (`§ 9`), because the
+ * thing that raised the floor may be a package this project never named at all — so the note names
+ * who asked, found by looking for a manifest in the graph that wanted exactly what was selected.
+ *
+ * **A note rather than a refusal.** The higher version is the right answer and the build is correct;
+ * what a reader wants is to know it happened, so that a manifest saying `0.2.0` while every build
+ * uses `0.2.1` is something they can go and fix rather than something they discover from a bug.
+ */
+private def reportRaised(project: PackageConfig, graph: Resolve.Graph): Unit =
+  for
+    dep      <- project.dependencies
+    asked    <- dep.origin match
+                  case Origin.Git(_, version) => Some(version)
+                  case Origin.Local(_)        => None
+    resolved <- graph.packages.find(p => p.canonical == dep.canonical).flatMap(_.version)
+    if asked < resolved
+  do
+    val who = graph.packages
+      .filterNot(_.isRoot)
+      .filter(_.config.dependencies.exists(d =>
+        d.canonical == dep.canonical && (d.origin match
+          case Origin.Git(_, v) => v == resolved
+          case Origin.Local(_)  => false)))
+      .map(p => p.config.name.getOrElse(p.canonical))
+
+    val because =
+      if who.isEmpty then "" else s", which ${who.distinct.sorted.mkString(" and ")} asks for"
+
+    Console.err.println(s"sysl: note: '${dep.label}' is named at ${asked.tag} and the build " +
+      s"selected ${resolved.tag}$because")
 
 /** What each `--lib` source root says it depends on (`packages.md § 2`).
  *

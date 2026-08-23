@@ -166,6 +166,93 @@ class ResolveTests extends PackageCacheSupport {
         Map("buf" -> "github.com.e.buf.buf")
     }
 
+    // **A dependency's public surface is made of its own dependencies' types**: a driver hands out a
+    // `&Fn() -> &View` and `View` belongs to the toolkit it was built on, so a consumer that could
+    // not name the toolkit could not call the one function the driver exists for. Declaring it
+    // anyway is a line that says nothing the build could not work out.
+    "a package reached through another is importable too" in {
+      val cache = emptyCache()
+
+      publishedModule(cache, "github.com/e/ui", Version(1, 0, 0), "ui")
+      publishedModule(cache, "github.com/e/driver", Version(1, 0, 0), "driver",
+        deps = dep("ui", "github.com/e/ui", "1.0.0"))
+
+      val root = project(manifest("app", "0.1.0", dep("d", "github.com/e/driver", "1.0.0")))
+
+      resolve(root, cache).packages.head.imports shouldBe
+        Map("driver" -> "github.com.e.driver.driver", "ui" -> "github.com.e.ui.ui")
+    }
+
+    // However far down it is: what a program can name is the whole graph, not the first layer of it.
+    "and one reached through two of them" in {
+      val cache = emptyCache()
+
+      publishedModule(cache, "github.com/e/buf", Version(1, 0, 0), "buf")
+      publishedModule(cache, "github.com/e/ui", Version(1, 0, 0), "ui",
+        deps = dep("buf", "github.com/e/buf", "1.0.0"))
+      publishedModule(cache, "github.com/e/driver", Version(1, 0, 0), "driver",
+        deps = dep("ui", "github.com/e/ui", "1.0.0"))
+
+      val root = project(manifest("app", "0.1.0", dep("d", "github.com/e/driver", "1.0.0")))
+
+      resolve(root, cache).packages.head.imports shouldBe Map(
+        "driver" -> "github.com.e.driver.driver",
+        "ui" -> "github.com.e.ui.ui",
+        "buf" -> "github.com.e.buf.buf",
+      )
+    }
+
+    // **A mount is a name its writer chose for itself**, so it is not something a consumer inherits:
+    // what an inherited package offers is what its own documentation shows.
+    "an intermediate's mount does not leak to whoever depends on it" in {
+      val cache = emptyCache()
+
+      publishedModule(cache, "github.com/e/json", Version(1, 0, 0), "json")
+      publishedModule(cache, "github.com/e/driver", Version(1, 0, 0), "driver",
+        deps = dep("j", "github.com/e/json", "1.0.0", mount = "ejson"))
+
+      val root = project(manifest("app", "0.1.0", dep("d", "github.com/e/driver", "1.0.0")))
+
+      val graph = resolve(root, cache)
+
+      graph.packages.head.imports shouldBe
+        Map("driver" -> "github.com.e.driver.driver", "json" -> "github.com.e.json.json")
+      graph.packages.find(_.canonical == "github.com.e.driver").get.imports shouldBe
+        Map("ejson" -> "github.com.e.json")
+    }
+
+    // **What a manifest declared beats what arrived through something else**, which is what makes a
+    // mount worth writing: the nearer name is the one in front of the person reading the file.
+    "a declared name beats an inherited one" in {
+      val cache = emptyCache()
+
+      publishedModule(cache, "github.com/e/json", Version(1, 0, 0), "json")
+      publishedModule(cache, "github.com/e/driver", Version(1, 0, 0), "driver",
+        deps = dep("j", "github.com/e/json", "1.0.0"))
+
+      val root = project(manifest("app", "0.1.0",
+        s"${dep("d", "github.com/e/driver", "1.0.0")}, " +
+          s"${dep("j", "github.com/e/json", "1.0.0", mount = "ejson")}"))
+
+      resolve(root, cache).packages.head.imports shouldBe
+        Map("driver" -> "github.com.e.driver.driver", "ejson" -> "github.com.e.json")
+    }
+
+    // And a name the project wrote itself beats one it never asked for. **Refusing here would mean a
+    // project's own module names could be broken by a package it has never heard of.**
+    "the project's own module beats an inherited one" in {
+      val cache = emptyCache()
+
+      publishedModule(cache, "github.com/e/json", Version(1, 0, 0), "json")
+      publishedModule(cache, "github.com/e/driver", Version(1, 0, 0), "driver",
+        deps = dep("j", "github.com/e/json", "1.0.0"))
+
+      val root = project(manifest("app", "0.1.0", dep("d", "github.com/e/driver", "1.0.0")), "json")
+
+      resolve(root, cache).packages.head.imports shouldBe
+        Map("driver" -> "github.com.e.driver.driver")
+    }
+
     "a package with no modules at all offers nothing to import" in {
       val cache = emptyCache()
 
@@ -192,6 +279,89 @@ class ResolveTests extends PackageCacheSupport {
 
       e should include("claim the same module")
       e should include("mount")
+    }
+
+    // **Two packages that both arrived through something else** are the same collision one layer
+    // further away, and are refused in the same words — with the fix stated as what a consumer can
+    // actually do about it, which is to name one of them.
+    "two inherited packages wanting one name" in {
+      val cache = emptyCache()
+
+      publishedModule(cache, "github.com/e/one", Version(1, 0, 0), "json", name = "one")
+      publishedModule(cache, "github.com/e/two", Version(1, 0, 0), "json", name = "two")
+      publishedModule(cache, "github.com/e/a", Version(1, 0, 0), "a",
+        deps = dep("j", "github.com/e/one", "1.0.0"))
+      publishedModule(cache, "github.com/e/b", Version(1, 0, 0), "b",
+        deps = dep("j", "github.com/e/two", "1.0.0"))
+
+      val root = project(manifest("app", "0.1.0",
+        s"${dep("a", "github.com/e/a", "1.0.0")}, ${dep("b", "github.com/e/b", "1.0.0")}"))
+
+      val e = resolveRefused(root, cache)
+
+      e should include("claim the same module")
+      e should include("mount")
+    }
+
+    // ...and naming one of them is what settles it, because a declared name beats an inherited one.
+    "which naming one of them settles" in {
+      val cache = emptyCache()
+
+      publishedModule(cache, "github.com/e/one", Version(1, 0, 0), "json", name = "one")
+      publishedModule(cache, "github.com/e/two", Version(1, 0, 0), "json", name = "two")
+      publishedModule(cache, "github.com/e/a", Version(1, 0, 0), "a",
+        deps = dep("j", "github.com/e/one", "1.0.0"))
+      publishedModule(cache, "github.com/e/b", Version(1, 0, 0), "b",
+        deps = dep("j", "github.com/e/two", "1.0.0"))
+
+      val root = project(manifest("app", "0.1.0",
+        s"${dep("a", "github.com/e/a", "1.0.0")}, ${dep("b", "github.com/e/b", "1.0.0")}, " +
+          s"${dep("one", "github.com/e/one", "1.0.0")}"))
+
+      resolve(root, cache).packages.head.imports shouldBe Map(
+        "a" -> "github.com.e.a.a",
+        "b" -> "github.com.e.b.b",
+        "json" -> "github.com.e.one.json",
+      )
+    }
+
+    // **Two major versions of one library is the collision worth naming**, and transitive imports
+    // made it likely: `§ 4` puts a major above the first in the coordinate, so selection sees two
+    // different packages and cannot fold them — while their modules have identical names, because a
+    // module's name is its directory. A consumer that named neither otherwise gets a message about
+    // two coordinates it has never typed.
+    "two major versions of one library say so" in {
+      val cache = emptyCache()
+
+      publishedModule(cache, "github.com/e/json", Version(1, 0, 0), "json")
+      publishedModule(cache, "github.com/e/json/v2", Version(2, 0, 0), "json")
+      publishedModule(cache, "github.com/e/a", Version(1, 0, 0), "a",
+        deps = dep("j", "github.com/e/json", "1.0.0"))
+      publishedModule(cache, "github.com/e/b", Version(1, 0, 0), "b",
+        deps = dep("j", "github.com/e/json/v2", "2.0.0"))
+
+      val root = project(manifest("app", "0.1.0",
+        s"${dep("a", "github.com/e/a", "1.0.0")}, ${dep("b", "github.com/e/b", "1.0.0")}"))
+
+      val e = resolveRefused(root, cache)
+
+      e should include("two major versions of one library")
+      e should include("mount")
+    }
+
+    // And two packages that are not one library keep the plainer sentence, because they are not the
+    // same situation and reading them as one would send somebody looking for a version they do not
+    // have.
+    "and two unrelated packages do not" in {
+      val cache = emptyCache()
+
+      publishedModule(cache, "github.com/e/one", Version(1, 0, 0), "json", name = "one")
+      publishedModule(cache, "github.com/e/two", Version(1, 0, 0), "json", name = "two")
+
+      val root = project(manifest("app", "0.1.0",
+        s"${dep("a", "github.com/e/one", "1.0.0")}, ${dep("b", "github.com/e/two", "1.0.0")}"))
+
+      resolveRefused(root, cache) should not include "major versions"
     }
 
     "and a mount settles it" in {

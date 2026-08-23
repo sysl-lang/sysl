@@ -224,12 +224,35 @@ object Resolve {
    */
   private def tableOf(owner: String, ownerRoots: List[String], deps: List[Dependency], state: State)
       : Either[String, Map[String, String]] = {
-    // Which package put each name there, carried beside the name it resolves to and dropped at the
-    // end. The collision test is about *packages* — two of them wanting one name — and the target
-    // alone cannot answer that, since a mount stores the coordinate where an unmounted binding
-    // stores the coordinate and the module both.
-    type Table = Map[String, (String, String)]
+    val declared = deps.map(_.canonical).toSet
 
+    for
+      direct   <- declaredTable(owner, ownerRoots, deps, state)
+      indirect <- inherited(deps, state)
+      whole    <- indirect.foldLeft(Right(direct): Either[String, Table]) { (acc, dep) =>
+                    for
+                      table <- acc
+                      dir   <- theirRoot(dep, state)
+                      added <- bindings(dep.copy(mount = None), dir).left.map(e => s"$owner: $e")
+                      done  <- added.toList.sortBy(_._1).foldLeft(Right(table): Either[String, Table]) {
+                                 (t, binding) =>
+                                   t.flatMap(inherit(owner, ownerRoots, _, binding, dep, declared))
+                               }
+                    yield done
+                  }
+    yield whole.map((k, v) => k -> v._1)
+  }
+
+  /** Which package put each name in a table, carried beside the name it resolves to and dropped at
+   * the end. The collision test is about *packages* — two of them wanting one name — and the target
+   * alone cannot answer that, since a mount stores the coordinate where an unmounted binding stores
+   * the coordinate and the module both.
+   */
+  private type Table = Map[String, (String, String)]
+
+  /** The names a manifest's own `dependencies` block binds, which is what it wrote down. */
+  private def declaredTable(owner: String, ownerRoots: List[String], deps: List[Dependency],
+                            state: State): Either[String, Table] =
     deps.foldLeft(Right(Map.empty): Either[String, Table]) { (acc, dep) =>
       for
         table <- acc
@@ -237,8 +260,89 @@ object Resolve {
         added <- bindings(dep, dir).left.map(e => s"$owner: $e")
         _     <- collect(added.keys.toList.sorted)(local => noCollision(owner, ownerRoots, table, local, dep))
       yield table ++ added.map((k, v) => k -> (v, dep.canonical))
-    }.map(_.map((k, v) => k -> v._1))
+    }
+
+  /** Every package reachable through the ones a manifest named, minus those it named itself
+   * (`packages.md § 9`).
+   *
+   * ==Imports are transitive, and a manifest names what it *takes* rather than what it sees==
+   *
+   * A dependency's public surface is made of its own dependencies' types: `syslui-sdl` hands out a
+   * `&Fn() -> &View` and `View` is syslUI's, so a consumer that could not name syslUI could not call
+   * the one function that package exists for. Requiring it to be declared anyway is asking for a
+   * line that says nothing a build could not work out — and the four-coordinate manifest that came
+   * of it is what made this change: a demo naming a driver had to name the driver's dependencies,
+   * and their dependencies, to compile.
+   *
+   * **The cost is stated rather than hidden**: a program may import through a package that never
+   * promised to keep depending on what it depends on, so a library dropping one of its own
+   * dependencies can break a consumer that never named it. Every language with a class path has this
+   * and it has not been what people complain about; what they complain about is the ceremony.
+   *
+   * **Breadth first, so that nearer packages are offered a name first**, which is what makes the
+   * precedence below decidable at all.
+   */
+  private def inherited(deps: List[Dependency], state: State): Either[String, List[Dependency]] = {
+    val declared = deps.map(_.canonical).toSet
+
+    def walk(queue: List[Dependency], seen: Set[String], out: List[Dependency])
+        : Either[String, List[Dependency]] =
+      queue match
+        case Nil                                => Right(out)
+        case dep :: rest if seen(dep.canonical) => walk(rest, seen, out)
+        case dep :: rest =>
+          for
+            theirs <- theirConfig(dep, state)
+            done   <- walk(rest ::: theirs.dependencies, seen + dep.canonical,
+                        if declared(dep.canonical) then out else out :+ dep)
+          yield done
+
+    walk(deps, Set.empty, Nil)
   }
+
+  /** One name a package further down the graph offers, placed or passed over.
+   *
+   * **Three levels of precedence, and only a tie inside one of them is refused.** The consumer's own
+   * modules win, then what its manifest declared, then what came in through something else — and two
+   * packages at the *same* level wanting one name is the collision `§ 9` refuses rather than resolves.
+   *
+   * **A name nobody asked for never takes one somebody wrote.** A project with its own `json/`, or a
+   * dependency it mounted as `json`, keeps that name however many packages three levels down offer a
+   * `json` of their own: passing over is not the silent winner the section refuses, because the name
+   * that won is the one in front of the person reading the manifest. Refusing here would mean a
+   * project's own module names could be broken by a package it has never heard of.
+   */
+  private def inherit(owner: String, ownerRoots: List[String], table: Table,
+                      binding: (String, String), dep: Dependency,
+                      declared: Set[String]): Either[String, Table] = {
+    val (local, target) = binding
+
+    table.find((name, _) => overlap(name, local)) match
+      case Some((_, (_, other))) if other == dep.canonical => Right(table)
+      case Some((_, (_, other))) if declared(other)        => Right(table)
+
+      case Some((name, (_, other))) =>
+        Left(s"$owner: '$local' and '$name' cannot both be imported — ${sameLibrary(other, dep.canonical)}, " +
+          s"and both arrived through something else this project depends on. Name one of them in " +
+          s"${PackageConfig.FileName} with a 'mount' to say which name it takes here")
+
+      case None =>
+        if ownerRoots.exists(r => Project.modules(r).exists(overlap(_, local))) then Right(table)
+        else Right(table + (local -> (target, dep.canonical)))
+  }
+
+  /** The manifest of the version of `dep` that is being built, read off the selection rather than
+   * off the edge that asked for it — the same rule `theirRoot` follows, for the same reason.
+   */
+  private def theirConfig(dep: Dependency, state: State): Either[String, PackageConfig] =
+    dep.origin match
+      case Origin.Local(_) =>
+        state.locals.get(dep.canonical).map(_._2).toRight(s"'${dep.label}' was never read")
+      case Origin.Git(coordinate, _) =>
+        for
+          version <- state.selected.get(coordinate).toRight(s"'$coordinate' was never selected")
+          entry   <- state.manifests.get((coordinate, version)).toRight(s"'$coordinate' was never read")
+        yield entry._2
 
   /** What a dependency binds in the manifest that named it (`§ 9`).
    *
@@ -313,9 +417,8 @@ object Resolve {
                           local: String, dep: Dependency): Either[String, Unit] =
     table.find((name, _) => overlap(name, local)) match
       case Some((name, (_, other))) if other != dep.canonical =>
-        Left(s"$owner: '$local' and '$name' cannot both be imported — $other and ${dep.canonical} " +
-          s"claim the same module. Give one of them a 'mount' in ${PackageConfig.FileName} to say " +
-          "which name it takes here")
+        Left(s"$owner: '$local' and '$name' cannot both be imported — ${sameLibrary(other, dep.canonical)}. " +
+          s"Give one of them a 'mount' in ${PackageConfig.FileName} to say which name it takes here")
 
       case _ =>
         // The consumer's own modules are in the same name space, and a project with a `json`
@@ -331,6 +434,31 @@ object Resolve {
 
             Left(s"$owner: '$local' is both a module of $whose and one ${dep.canonical} offers — " +
               "give the dependency a 'mount' to say what it is called here")
+
+  /** What to say about two packages claiming one module name, which is not always the same thing.
+   *
+   * **Two major versions of one library is the case worth naming, and transitive imports made it
+   * likely.** `§ 4` copies Go's rule that a major above the first rides in the coordinate, so
+   * `github.com/e/json` and `github.com/e/json/v2` are two *different* packages to selection — MVS
+   * cannot fold them together, and it should not: they are allowed to be incompatible, which is what
+   * the suffix says. What they are not allowed to do is quietly both answer `json`, and their module
+   * names are identical because a module's name is its directory.
+   *
+   * A consumer that named neither of them — which is now possible, since a package reached through
+   * another is importable — otherwise gets a message about a name collision between two coordinates
+   * it has never typed, with no hint that they are one library at two versions.
+   *
+   * The mount is still the answer where somebody genuinely wants both, so the advice does not
+   * change; what changes is that the reader is told what they are looking at.
+   */
+  private def sameLibrary(a: String, b: String): String = {
+    val (one, two) = (a.replace('.', '/'), b.replace('.', '/'))
+
+    if Dependency.withoutMajor(one) == Dependency.withoutMajor(two) && one != two then
+      s"$a and $b are two major versions of one library and both are in this graph, and their " +
+        "modules have the same names"
+    else s"$a and $b claim the same module"
+  }
 
   /** Whether two module paths claim ground the other needs: the same name, or one a path **inside**
    * the other.
