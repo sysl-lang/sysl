@@ -171,7 +171,10 @@ class PackageBuildTests extends PackageCacheSupport {
       "40\n"
   }
 
-  "and the consumer does not thereby reach what its dependency reaches" in {
+  // **And it reaches what its dependency reaches**, which is `§ 9`'s transitivity end to end: the
+  // consumer names `middle` and writes `bottom.double` without ever naming `bottom`. This test
+  // asserted the refusal until 0.0.73, and the sentence it asserted is the one the section retired.
+  "and the consumer reaches what its dependency reaches" in {
     val cache = emptyCache()
     val at    = published(cache, "github.com/e/bottom", Version(1, 0, 0), manifest("bottom", "1.0.0"))
 
@@ -186,8 +189,8 @@ class PackageBuildTests extends PackageCacheSupport {
     writeFile(s"$middle/middle/middle.sysl",
       "module middle\n\nquadruple(n: int) -> int = bottom.double(bottom.double(n))\n")
 
-    withCache(cache)(refused(app("""print(bottom.double(21))""", s"""m { path = "$middle" }"""))) should
-      include("bottom")
+    withCache(cache)(run(app("""print(bottom.double(21))""", s"""m { path = "$middle" }"""))) shouldBe
+      "42\n"
   }
 
   "two packages wanting one name" - {

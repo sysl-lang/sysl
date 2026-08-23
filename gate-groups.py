@@ -71,8 +71,20 @@ CHUNKS = 36
 
 
 def suites(root):
-    """Every concrete ScalaTest suite under `root`, as fully qualified name -> source."""
-    found = {}
+    """Every concrete ScalaTest suite under `root`, as fully qualified name -> source.
+
+    A suite is one whose extends-clause names a ScalaTest style **or a local base that does** --
+    and the second half is not a nicety. `ResolveTests` and `PackageBuildTests` both extend
+    `PackageCacheSupport`, a trait in this tree that extends `AnyFreeSpec` itself, and a pattern
+    matching only the styles missed both of them: the whole package manager, end to end, was outside
+    the gate and nothing said so. Found 2026-08-23 when a change to it made a suite fail that the
+    gate had just called green.
+
+    So the local bases are collected first and the match is closed over them, repeatedly, until it
+    stops growing -- a support trait may extend another one, and one level of following would be the
+    same bug one layer down.
+    """
+    sources = {}
 
     for dirpath, _, files in os.walk(root):
         for f in files:
@@ -82,12 +94,31 @@ def suites(root):
             src = open(os.path.join(dirpath, f), errors='replace').read()
             pkg = re.search(r'^package\s+([\w.]+)', src, re.M)
 
-            if not pkg:
-                continue
+            if pkg:
+                sources[os.path.join(dirpath, f)] = (pkg.group(1), src)
 
-            for m in re.finditer(r'^class\s+(\w+)\s+extends\s+([^\n{]+)', src, re.M):
-                if STYLE.search(m.group(2)):
-                    found[f'{pkg.group(1)}.{m.group(1)}'] = src
+    # Every `trait`/`abstract class`/`class` declared here whose own extends-clause is suite-shaped,
+    # by name, so that a subclass of one is recognised as a suite too.
+    bases = set()
+    decl = re.compile(r'^(?:abstract\s+)?(?:class|trait)\s+(\w+)[^\n]*?\s+extends\s+([^\n{]+)', re.M)
+
+    while True:
+        before = len(bases)
+
+        for _, src in sources.values():
+            for m in decl.finditer(src):
+                if STYLE.search(m.group(2)) or any(re.search(rf'\b{b}\b', m.group(2)) for b in bases):
+                    bases.add(m.group(1))
+
+        if len(bases) == before:
+            break
+
+    found = {}
+
+    for pkg, src in sources.values():
+        for m in re.finditer(r'^class\s+(\w+)\s+extends\s+([^\n{]+)', src, re.M):
+            if STYLE.search(m.group(2)) or any(re.search(rf'\b{b}\b', m.group(2)) for b in bases):
+                found[f'{pkg}.{m.group(1)}'] = src
 
     return found
 
