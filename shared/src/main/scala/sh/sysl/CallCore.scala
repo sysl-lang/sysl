@@ -156,6 +156,10 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
 
     // Each entry is the node read, if one was, and whether reading it took a **literal's default**
     // for want of anything better — which is what the ordering below turns on.
+    //
+    // A **construction over literals** answers that question the same way and is why the flag is
+    // computed rather than written `false`: `Some(3)` read alone is an `Option[int]`, and the only
+    // thing that decided the `int` was a literal with no width on it. See `adaptable`.
     val first: List[Option[(TExpr, Boolean)]] = at.zip(callable).map { case ((a, e), isCallable) =>
       if isCallable || e.isEmpty && (nullArg(a) || implicitArg(a)) then None
       else
@@ -179,7 +183,7 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
               // `attempt` rather than `probe` because the node is kept where the analysis
               // succeeded, which is the ordinary case here and must cost one analysis rather than
               // two.
-              case None => attempt(analyzeExpr(a)).map(_ -> false)
+              case None => attempt(analyzeExpr(a)).map(t => t -> adaptable(a, t))
     }
 
     // What the first pass settles. `map[A, B](xs: []A, out: []B, f: A -> B)` gets both from the two
@@ -729,7 +733,7 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
         // call was written in.
         val solved = inDecl(f.name)(
           solve(shown, f.tparams, f.params.map(_.typ), provisional.map(_.ty), f.retType, expected,
-            args.map(isLiteral), f.bounds))
+            args.zip(provisional).map((a, t) => adaptable(a, t)), f.bounds))
         checkBounds(f, solved)
         (instantiateFunc(f, solved), Some(provisional))
 

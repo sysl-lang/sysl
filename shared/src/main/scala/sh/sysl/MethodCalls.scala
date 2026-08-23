@@ -633,7 +633,7 @@ trait MethodCalls extends FuncAddress {
           provisional.map(_.ty),
           fd.retType.map(spell),
           expected,
-          passed.map(isLiteral),
+          passed.zip(provisional).map((a, t) => adaptable(a, t)),
           fd.bounds,
         ))
 
