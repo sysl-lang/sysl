@@ -266,3 +266,73 @@ walking_leaves_the_range_alone()
     assert_eq(first, 3)
     assert_eq(second, 3)
 end walking_leaves_the_range_alone
+
+// -- the element a cursor yields is the cursor's to choose ---------------------------------------
+
+// `Iterate` names its element with `type Item` rather than taking it as a parameter, and this is
+// what that buys: a function generic over what it walks names no element at all. Written
+// `count_all[E, I: Iterate[E]]` the same signature was refused, because `E` appeared only in a bound
+// and a call has nothing there to solve it from.
+@test("a function may be generic over what it walks, naming no element")
+generic_over_the_cursor()
+    assert_eq(count_all(0..<4), 4)
+    assert_eq(count_all("ab".chars), 2)
+end generic_over_the_cursor
+
+count_all[I: Iterate](it: I) -> usize
+    var n: usize = 0
+    var cur = it
+
+    loop
+        cur.next() match
+            Some(_) -> n += 1
+            None -> break
+
+    n
+end count_all
+
+// And a body that does want the element names it as a projection, which answers with whatever the
+// implementation chose -- an `int` for a range of them, a `char` for a string's characters.
+@test("a body that wants the element reads it off the bound")
+the_element_is_a_projection()
+    assert_eq(first_of(3..<9).unwrap(), 3)
+    assert_eq(first_of("hi".chars).unwrap(), 'h')
+end the_element_is_a_projection
+
+first_of[I: Iterate](it: I) -> Option[I::Item]
+    var cur = it
+    cur.next()
+end first_of
+
+// An object fixes the element the implementation would have chosen, which is what makes one
+// formable at all: an erased value has forgotten which implementation it came from, so the type it
+// yields has to be written down. Both cursors here are the library's own, and neither knows about
+// the other.
+@test("an erased cursor carries the element in its own type")
+an_erased_cursor_says_what_it_yields()
+    var r = 0..<4
+    var chars = "abc".chars
+
+    assert_eq(drain(&r), 4)
+    assert_eq(count_chars(&chars), 3)
+end an_erased_cursor_says_what_it_yields
+
+drain(cur: *Iterate[Item = int]) -> usize
+    var n: usize = 0
+
+    for _ in cur
+        n += 1
+
+    n
+end drain
+
+// The same thing written the short way. A trait with no parameters of its own and exactly one
+// associated type has only one thing a bare argument could mean, so the two spellings are one type.
+count_chars(cur: *Iterate[char]) -> usize
+    var n: usize = 0
+
+    for _ in cur
+        n += 1
+
+    n
+end count_chars
