@@ -245,16 +245,20 @@ class GenericsClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport
    * halves are pinned here rather than left to the prose that now claims them.
    */
   /** A trait declaring an associated type, implemented for the whole integer family by one blanket
-   * block: `Magnitude`'s shape, reduced to what the three cases below need.
+   * block: `sysl.math.Magnitude`'s shape, reduced to what the three cases below need.
+   *
+   * The names are the trait's own rather than the library's, and they have to be: a type has at most
+   * one associated type of any one name, so a second `Size` over the integers is refused where it is
+   * written — which is the rule this fixture would otherwise be testing instead.
    */
   private val mag =
     """trait Mag
-      |    type Size: Ord
-      |    magnitude(self) -> Self::Size
+      |    type Extent: Ord
+      |    extent(self) -> Self::Extent
       |
       |impl[T: Integer + Zero] Mag for T
-      |    type Size = T
-      |    magnitude(self) -> T = if self < T.zero() then T.zero() - self else self
+      |    type Extent = T
+      |    extent(self) -> T = if self < T.zero() then T.zero() - self else self
       |
       |""".stripMargin
 
@@ -291,15 +295,15 @@ class GenericsClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport
      * is what makes such a block writable at all rather than a convenience at the call.
      */
     "supplies an associated type through a subject that is a parameter" in {
-      run(mag + "print((0 - 9).magnitude(), 200u8.magnitude())") shouldBe "9 200\n"
+      run(mag + "print((0 - 9).extent(), 200u8.extent())") shouldBe "9 200\n"
     }
 
     /** A bound over the family reads the projection too, without naming the trait that supplies it:
-     * the block covers every member of the family, so `T::Size` is settled for a `T` in it. Calling
+     * the block covers every member of the family, so `T::Extent` is settled for a `T` in it. Calling
      * the member still asks for the trait, which is the next case.
      */
     "so a bound over the family alone can name the projection" in {
-      run(mag + "same[T: Integer](x: T) -> T::Size = x\nprint(same(4u8))") shouldBe "4\n"
+      run(mag + "same[T: Integer](x: T) -> T::Extent = x\nprint(same(4u8))") shouldBe "4\n"
     }
 
     /** And the whole point of the shape, which is a routine that compares magnitudes without naming
@@ -308,11 +312,11 @@ class GenericsClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport
      */
     "and a routine bounded by the trait compares what it answers with" in {
       run(mag +
-        """biggest[T: Mag](xs: []const T) -> T::Size
-          |    var best = xs[0].magnitude()
+        """biggest[T: Mag](xs: []const T) -> T::Extent
+          |    var best = xs[0].extent()
           |
           |    for i in 1..<xs.len
-          |        if best < xs[i].magnitude() then best = xs[i].magnitude()
+          |        if best < xs[i].extent() then best = xs[i].extent()
           |
           |    best
           |
@@ -332,6 +336,22 @@ class GenericsClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport
             |
             |print(int.identity())""".stripMargin) should
         include("'T' is not a name a call could reach it through")
+    }
+
+    /** What the memberships add up to, which is the claim `guide/matrix` makes about its element
+     * type: an integer meets a *field*-shaped bound — the four operators, both identities, equality,
+     * rendering and a size — with nothing written for it anywhere. The guide's own finding said the
+     * identities were what kept the integers out of a matrix, and they are not; what keeps an
+     * elimination off them is that `/` truncates, which is a fact about the arithmetic rather than
+     * about the bound.
+     */
+    "and meets a field-shaped bound outright, identities, size and all" in {
+      run("""import sysl.math.Magnitude
+            |
+            |field[T: Add + Sub + Mul + Div + Neg + Zero + One + Eq + Display + Magnitude](a: T, b: T) -> T =
+            |    (a - b) * (a + b) / (T.one() + T.one()) + T.zero()
+            |
+            |print(field(7, 3), field(7.0, 3.0))""".stripMargin) shouldBe "20 20\n"
     }
 
     "and nothing may join the family, since the compiler settles who is in it" in {

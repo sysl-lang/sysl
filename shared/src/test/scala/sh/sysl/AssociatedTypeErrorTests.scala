@@ -280,6 +280,23 @@ class AssociatedTypeErrorTests extends AnyFreeSpec with CodegenSupport {
     ) should include("one type cannot have two of one name")
   }
 
+  /** The same rule reaching through a **family**, which is what the standard library's `Magnitude`
+   * costs: it declares `type Size` for every integer, so a program's own trait bringing a second
+   * `Size` to the integers is refused at the block that creates the collision. The name a library
+   * trait picks for an associated type is spent for every type that trait covers.
+   */
+  "and a blanket block collides with the library's own over the same family" in {
+    err(
+      """trait Sized
+        |    type Size
+        |    extent(self) -> Self::Size
+        |impl[T: Integer + Zero] Sized for T
+        |    type Size = T
+        |    extent(self) -> Self::Size = self
+        |print(1)""".stripMargin,
+    ) should include("already implements 'sysl.math.Magnitude', which declares an associated type 'Size'")
+  }
+
   "declaring an associated type spends the trait's erasability" - {
 
     "a `&Trait` cannot be formed over it" in {
