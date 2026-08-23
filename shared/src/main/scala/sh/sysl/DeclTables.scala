@@ -567,6 +567,39 @@ trait DeclTables extends Reporting {
    */
   protected val externVarDecls = mutable.LinkedHashMap.empty[String, ExternVarDecl]
 
+  /** Every reference to a **local** the walk resolved, recorded by `Scoping.lookupOpt`.
+   *
+   * Every other kind of name is recovered afterwards from the typed tree, which names what it
+   * resolved to — see `DefinitionIndex`. A local cannot be: what a typed node carries is the unique
+   * name, and that is unique within a function and reused freely across them, so there is nothing to
+   * look it up in. Resolution is the only moment both halves are in hand at once, so it is where
+   * this is filled.
+   *
+   * Nothing in compilation reads it.
+   */
+  protected val references = mutable.ListBuffer.empty[Reference]
+
+  /** Whether to fill `references` at all — **off unless an editor asked**, which `Analyzer.indexed`
+   * is what does.
+   *
+   * `lookupOpt` is one of the busiest functions in the analyzer, and every name in every file of
+   * the library goes through it. A `Reference` per resolution is a real allocation on a path that
+   * compiles programs nobody is looking at, for an answer nobody is going to read, so an ordinary
+   * build pays a boolean test and nothing else.
+   */
+  protected var recordingReferences = false
+
+  /** What each **instantiation** of a generic function was made from, by the name the instantiation
+   * goes under.
+   *
+   * `instantiateFunc`'s own comment says why this cannot be derived: the mangled name it builds
+   * "cannot be read back to say so". `abstractInsts` beside it records the same thing for the
+   * definition-time pass alone, because that is all that pass needed; this records it for every
+   * instantiation, so that a call to a generic can be traced back to the declaration a reader would
+   * want to open.
+   */
+  protected val funcOrigin = mutable.LinkedHashMap.empty[String, String]
+
   /** The extern variables something in the program actually reads or writes, in the order they were
    * first reached — the same accounting the externs above get, for the same reason.
    */

@@ -15,6 +15,12 @@ package api
  * genuinely wants the tree is a different kind of tool (a formatter, a language server) and reaches
  * past this on purpose.
  *
+ * Where such a caller starts, since there is now somewhere to start: `SyslParser.parse` for the
+ * tree, `sh.sysl.Locate` to resolve a cursor to the constructs it is inside, and
+ * `sh.sysl.Analyzer.indexed` for the typed tree together with a definition index. None of those is
+ * narrow, none of them is stable in the way this is, and that is the trade a tool of that kind
+ * makes knowingly.
+ *
  * Every method that compiles answers `Left` with the **rendered diagnostic**, exactly as the driver
  * would have printed it, so a caller has something to show a reader without knowing what a
  * diagnostic is. `check` is the exception and is here for the other kind of caller: it answers the

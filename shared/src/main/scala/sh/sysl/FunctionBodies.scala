@@ -362,6 +362,10 @@ trait FunctionBodies extends ModuleStorage {
     // the bodies it wrote rather than to the ones a caller's type argument chose for it.
     if f.tparams.nonEmpty then
       genericInsts += name
+      // And what it was made from, for every instantiation rather than only the definition-time
+      // one below — a call reaching an editor as a mangled name has nothing else left pointing at
+      // the declaration a reader would want opened.
+      funcOrigin(name) = f.name
       // And where the *definition-time* pass made one, what it was made from — the instantiation
       // itself is about to be thrown away with the rest of that walk, so its name is the only thing
       // left pointing at the generic that was called.

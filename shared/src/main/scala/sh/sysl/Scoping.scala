@@ -683,7 +683,7 @@ trait Scoping extends DeclTables {
   protected def inDefault[T](name: Option[String])(body: => T): T = {
     val saved = scopes
 
-    scopes = List(mutable.LinkedHashMap.empty[String, (String, Type)])
+    scopes = List(mutable.LinkedHashMap.empty[String, Binding])
     try name.fold(body)(inDecl(_)(body))
     finally scopes = saved
   }
@@ -746,7 +746,18 @@ trait Scoping extends DeclTables {
    * use for it and its type. Reset at every function boundary, since a body sees none of the locals
    * of whatever body reached it.
    */
-  protected var scopes: List[mutable.LinkedHashMap[String, (String, Type)]] = Nil
+  /** What a scope binds a name to: the unique name the frame holds it under, its type, and **where
+   * the binding was written**.
+   *
+   * The third is read by nothing in compilation — `DefinitionIndex` reads it, so that an editor can
+   * answer where a local came from. It lives in the binding rather than in a table of its own for a
+   * reason worth keeping: a unique name is unique *within a function* and no further (`resetFunction`
+   * clears the set), so a table keyed on one collides across functions and answers with whichever
+   * function was compiled last. Carried here it cannot, because the entry is the scope's.
+   */
+  protected type Binding = (String, Type, Option[Pos])
+
+  protected var scopes: List[mutable.LinkedHashMap[String, Binding]] = Nil
 
   /** Every unique name this function has handed out, which is what `freshName` asks to avoid
    * colliding with a name an outer block is still using.
@@ -785,7 +796,7 @@ trait Scoping extends DeclTables {
   // An import inside a block lasts exactly as long as the block's bindings do, so the two stacks
   // are pushed and popped together — including by the unwinding a failed statement does.
   protected def pushScope(): Unit = {
-    scopes = mutable.LinkedHashMap.empty[String, (String, Type)] :: scopes
+    scopes = mutable.LinkedHashMap.empty[String, Binding] :: scopes
     importStack = Imports.empty :: importStack
   }
 
@@ -809,7 +820,7 @@ trait Scoping extends DeclTables {
     readOnlyLocals.clear()
     refPlaces.clear()
     refGuards = Nil
-    scopes = List(mutable.LinkedHashMap.empty[String, (String, Type)])
+    scopes = List(mutable.LinkedHashMap.empty[String, Binding])
     importStack = List(Imports.empty)
   }
 
@@ -867,7 +878,12 @@ trait Scoping extends DeclTables {
       if reservedRefused(name) then poisoned() else refuseReserved(name, "binding")
 
     val unique = freshName(name)
-    scopes.head(name) = (unique, ty)
+
+    // The position is the one a diagnostic raised here would carry — the statement or the function
+    // header being walked, since the binding form itself has been left behind by the time this is
+    // called and there is no node to ask. It is read by `DefinitionIndex` and by nothing else.
+    scopes.head(name) = (unique, ty, currentPos)
+
     unique
   }
 
@@ -891,8 +907,24 @@ trait Scoping extends DeclTables {
     unique
   }
 
+  /** The local a name means here, or `None` where no open block binds it.
+   *
+   * **It is also where a reference to a local is recorded** (`DefinitionIndex`), and this is the one
+   * place it can be: resolution is what decides *which* binding a name means, and after it there is
+   * nothing but a unique name — which is unique within a function and collides across them. What is
+   * recorded is where the name is written, from `currentPos`, against where its binding was.
+   *
+   * A name asked about rather than read — the guards that ask whether a local exists before trying
+   * something else — records one too, and that is right: a hit means the name at that place does
+   * mean that binding, whichever rule went on to use it.
+   */
   protected def lookupOpt(name: String): Option[(String, Type)] =
-    scopes.collectFirst { case s if s.contains(name) => s(name) }
+    scopes.collectFirst { case s if s.contains(name) => s(name) }.map { (unique, ty, bound) =>
+      if recordingReferences then
+        for at <- currentPos; where <- bound do references += Reference(at, where, name)
+
+      (unique, ty)
+    }
 
   protected def lookup(name: String): (String, Type) =
     lookupOpt(name).getOrElse(err(s"undefined name '$name'"))

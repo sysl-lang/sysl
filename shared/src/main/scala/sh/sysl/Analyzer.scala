@@ -45,10 +45,20 @@ class Analyzer private (
     protected val packages: Packages,
     protected val own: Option[Set[String]],
     protected val hasEntryPoint: Boolean,
-) extends ProgramWalk with ExprAnalysis {
+) extends ProgramWalk with ExprAnalysis with DefinitionIndex {
 
   /** Every error the walk found, in source order and **unrendered** — see `Diagnostic`. */
   def errors: List[Diagnostic] = diagnostics
+
+  /** Where the things this program names were declared — see `DefinitionIndex`. It reads the tables
+   * the walk filled, so it is asked after the walk and not before.
+   */
+  def references(tree: TProgram): List[Reference] = referencesIn(tree)
+
+  /** Whether this walk should record where each local reference resolved to. Off by default, since
+   * only an editor wants it and every name in the library goes through the path that fills it.
+   */
+  def recordReferences(on: Boolean): Unit = recordingReferences = on
 }
 
 object Analyzer {
@@ -94,7 +104,23 @@ object Analyzer {
               entryPoint: Boolean = true)
       : Either[List[Diagnostic], TProgram] =
     CProbe.lower(units, target, paths).left.map(List(_)).flatMap(analyzing(_,
-      building, std, target, provides, packages, own, entryPoint))
+      building, std, target, provides, packages, own, entryPoint, recording = false)).map(_.tree)
+
+  /** The same walk, answering with the **definition index** beside the tree — what an editor asks
+   * for and what nothing in a build has any use for (`DefinitionIndex`).
+   *
+   * It is a second entry point rather than a wider return type for the same reason `Compiler.checked`
+   * is: every existing caller wants a tree and would have to unwrap one, and the index is read off
+   * tables the analyzer instance holds, so it cannot be asked for after the fact.
+   */
+  def indexed(units: List[Program], building: Set[String] = Set.empty,
+              std: Stdlib = Stdlib.fromSource(Target.default), target: Target = Target.default,
+              provides: Set[String] = Capability.core.toSet, packages: Packages = Packages.none,
+              paths: SearchPaths = SearchPaths.none, own: Option[Set[String]] = None,
+              entryPoint: Boolean = true)
+      : Either[List[Diagnostic], Indexed] =
+    CProbe.lower(units, target, paths).left.map(List(_)).flatMap(analyzing(_,
+      building, std, target, provides, packages, own, entryPoint, recording = true))
 
   /** The walk itself, over units whose `c const` blocks are already ordinary constants.
    *
@@ -106,9 +132,11 @@ object Analyzer {
    */
   private def analyzing(units: List[Program], building: Set[String], std: Stdlib, target: Target,
                         provides: Set[String], packages: Packages, own: Option[Set[String]],
-                        entryPoint: Boolean)
-      : Either[List[Diagnostic], TProgram] = {
+                        entryPoint: Boolean, recording: Boolean)
+      : Either[List[Diagnostic], Indexed] = {
     val analyzer = new Analyzer(units, building, std, target, provides, packages, own, entryPoint)
+
+    analyzer.recordReferences(recording)
 
     val outcome =
       try Right(analyzer.analyze())
@@ -121,7 +149,7 @@ object Analyzer {
     val found = analyzer.errors
 
     outcome match
-      case Right(tree) if found.isEmpty => Right(tree)
+      case Right(tree) if found.isEmpty => Right(Indexed(tree, analyzer.references(tree)))
       case Right(_)                     => Left(found)
       case Left(escaped) =>
         val all = found ::: escaped
