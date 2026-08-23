@@ -1,7 +1,8 @@
 package sh.sysl
 
+import scala.collection.mutable.ListBuffer
 import scala.util.parsing.combinator.PackratParsers
-import scala.util.parsing.input.{NoPosition, Position, Reader}
+import scala.util.parsing.input.{Position, Reader}
 
 /** What every part of the grammar stands on: the token reader, position stamping, the terminal
  * matchers, and the handful of shapes that recur at every level — a comma list, a soft word, an
@@ -28,12 +29,17 @@ trait SyslParserBase extends PackratParsers {
 
   /** A reader over the pre-scanned, positioned token list. Immutable, so packrat may revisit
    * positions safely — unlike feeding the stateful scanner directly.
+   *
+   * `past` is what it reports once the tokens are exhausted. It is still **no position at all** —
+   * line zero, exactly as `NoPosition` was — and it carries where the last token stopped so that a
+   * rule running to the end of the file has an end. `TokenPos.after` says why both halves matter.
    */
-  protected class TokenReader(tokens: List[(lexical.Token, Position)]) extends Reader[lexical.Token] {
-    def first: lexical.Token   = if (tokens.isEmpty) lexical.EOF else tokens.head._1
-    def rest: Reader[lexical.Token] = if (tokens.isEmpty) this else new TokenReader(tokens.tail)
-    def pos: Position          = if (tokens.isEmpty) NoPosition else tokens.head._2
-    def atEnd: Boolean         = tokens.isEmpty
+  protected class TokenReader(tokens: List[(lexical.Token, Position)], past: Position)
+      extends Reader[lexical.Token] {
+    def first: lexical.Token        = if (tokens.isEmpty) lexical.EOF else tokens.head._1
+    def rest: Reader[lexical.Token] = if (tokens.isEmpty) this else new TokenReader(tokens.tail, past)
+    def pos: Position               = if (tokens.isEmpty) past else tokens.head._2
+    def atEnd: Boolean              = tokens.isEmpty
   }
 
   /** The token list this parser reads, each token's position widened into the span it occupies.
@@ -42,21 +48,46 @@ trait SyslParserBase extends PackratParsers {
    * reports are offsets into whatever was scanned, and they are turned back into lines and columns
    * against `source`, so handing it anything else would place the ends in another file.
    */
-  protected def reader(src: String): Reader[lexical.Token] =
-    new PackratReader(new TokenReader(lexical.scanPositioned(src).map(spanned)))
+  protected def reader(src: String): Reader[lexical.Token] = {
+    val tokens = spanned(lexical.scanPositioned(src))
+    val past   = tokens.lastOption match {
+      case Some((_, p)) => TokenPos.after(source, p.endLine, p.endColumn)
+      case None         => TokenPos.after(source, 0, 0)
+    }
 
-  /** One scanned token, with the offset just past it resolved into a line and a column.
+    new PackratReader(new TokenReader(tokens, past))
+  }
+
+  /** The scanned tokens, each with the offset just past it resolved into a line and a column, and
+   * each told where the token **before** it stopped.
+   *
+   * That second part is how a rule learns its own extent, and it travels this way because there is
+   * nowhere else for it to travel. A parser is handed the reader positioned at the token *after*
+   * everything it consumed, and `PackratReader` forwards nothing of the reader beneath it but that
+   * token's position — so the end of the last token consumed has to arrive in the position of the
+   * one following. `rest.pos` will not do instead: it is the next token's *start*, which is past
+   * whatever whitespace, comment or line break sits between, and would put a node's end wherever
+   * the writer happened to press return.
    *
    * The end is clamped forward to the start, for the two tokens the scanner synthesizes at end of
    * input: they occupy no characters and are reported over the reader in front of them.
    */
-  private def spanned(scanned: (lexical.Token, Position, Int)): (lexical.Token, Position) = {
-    val (token, start, past)  = scanned
-    val (endLine, endColumn)  = source.placeOf(past)
-    val backwards             = endLine < start.line || (endLine == start.line && endColumn < start.column)
+  private def spanned(scanned: List[(lexical.Token, Position, Int)]): List[(lexical.Token, TokenPos)] = {
+    val buf        = ListBuffer.empty[(lexical.Token, TokenPos)]
+    var prevLine   = 1
+    var prevColumn = 1
 
-    if backwards then (token, TokenPos(source, start.line, start.column, start.line, start.column))
-    else (token, TokenPos(source, start.line, start.column, endLine, endColumn))
+    for ((token, start, past) <- scanned) {
+      val (line, column)       = source.placeOf(past)
+      val backwards            = line < start.line || (line == start.line && column < start.column)
+      val (endLine, endColumn) = if backwards then (start.line, start.column) else (line, column)
+
+      buf += ((token, TokenPos(source, start.line, start.column, endLine, endColumn, prevLine, prevColumn)))
+      prevLine = endLine
+      prevColumn = endColumn
+    }
+
+    buf.toList
   }
 
   // --- positions -----------------------------------------------------------------------
@@ -67,12 +98,42 @@ trait SyslParserBase extends PackratParsers {
     case p           => Pos(source, p.line, p.column)
   }
 
-  /** Stamps whatever `p` builds with the position of the first token `p` consumed.
+  /** The extent a rule covered: from the start of the token it began at, to the end of the last
+   * token it consumed.
+   *
+   * The end arrives in the position of the token *after* the rule — `TokenPos` carries where its
+   * predecessor stopped, for the reason `spanned` gives. A rule that consumed nothing, and a reader
+   * carrying no span at all, both leave the first token's own extent standing.
+   */
+  protected def spanOf(from: Input, to: Input): Pos = {
+    val start = posOf(from)
+
+    to.pos match {
+      case p: TokenPos => start.endingAt(p.prevEndLine, p.prevEndColumn)
+      case _           => start
+    }
+  }
+
+  /** Stamps whatever `p` builds with the extent of everything `p` consumed — as the node's `extent`
+   * always, and as the position a diagnostic points at where the rule did not choose one itself.
+   *
+   * **The two come apart on purpose and a single stamp cannot serve both.** A rule may anchor its
+   * node somewhere inside what it read — `postfixTail` puts a field selection on the member name
+   * rather than on the dot, and a call on its callee — because that is where a reader's attention
+   * belongs when the node is wrong. The extent answers a different question, asked by an editor
+   * rather than by a reader: which construct is the cursor inside. `xs.foo(1)` points at `foo` and
+   * covers all of `xs.foo(1)`.
    *
    * Because `setPos` keeps the first position it is given (`Positioned`), wrapping an outer rule
    * never overwrites what an inner one already recorded — so a rule that merely passes its
    * operand through costs nothing, and only the rule that actually built the node decides where
    * it points. `p` is by-name so a rule may wrap a `lazy val` declared later in the file.
+   *
+   * **That is also what keeps an extent honest rather than merely large.** An inner rule finishes
+   * before the rule around it, so it stamps first, and a precedence ladder passing one operand up
+   * through a dozen levels leaves the operand spanning itself rather than spanning the ladder. A
+   * node's span therefore grows to the whole construct exactly when the construct is what was
+   * built — a call, a binding, a binary operation — and no further.
    *
    * **The node is stamped in place and `p`'s own result is handed back**, rather than a fresh
    * `Success` around it. A `Success` carries the furthest failure the parse reached on its way here
@@ -95,7 +156,10 @@ trait SyslParserBase extends PackratParsers {
     Parser { in =>
       p(in) match {
         case s @ Success(t, rest) =>
-          t.setPos(posOf(in))
+          val span = spanOf(in, rest)
+
+          t.setPos(span)
+          t.setExtent(span)
 
           if s.lastFailure.exists(f => !(rest.pos < f.next.pos)) then Success(t, rest) else s
         case other => other
@@ -432,12 +496,18 @@ trait SyslParserBase extends PackratParsers {
  * Widening `offset` to mean the token's end would also have worked and would have left a reader
  * whose offset is not its own position.
  *
+ * It also carries **where the token before it stopped**, which is not about this token at all: it is
+ * the only way the end of a *rule* reaches the rule, since what a rule is handed when it finishes is
+ * the reader at the token after everything it consumed. `SyslParserBase.spanned` says why the
+ * following token's own start will not serve.
+ *
  * `SyslParserBase.reader` builds these **once** and stores them in the token list. Rebuilding one
  * per access would defeat `PackratReader`'s memo cache, which is keyed on `(parser, pos)` and
  * compares positions by identity.
  */
 final class TokenPos(val source: Source, val line: Int, val column: Int,
-                     val endLine: Int, val endColumn: Int) extends Position {
+                     val endLine: Int, val endColumn: Int,
+                     val prevEndLine: Int, val prevEndColumn: Int) extends Position {
 
   protected def lineContents: String = source.line(line)
 
@@ -446,6 +516,23 @@ final class TokenPos(val source: Source, val line: Int, val column: Int,
 }
 
 object TokenPos {
-  def apply(source: Source, line: Int, column: Int, endLine: Int, endColumn: Int): TokenPos =
-    new TokenPos(source, line, column, endLine, endColumn)
+  def apply(source: Source, line: Int, column: Int, endLine: Int, endColumn: Int,
+            prevEndLine: Int, prevEndColumn: Int): TokenPos =
+    new TokenPos(source, line, column, endLine, endColumn, prevEndLine, prevEndColumn)
+
+  /** What a reader reports once its tokens are exhausted: **no position at all**, carrying where
+   * the last token stopped.
+   *
+   * The first half is not a shortcut, it is the contract. Line zero is what `NoPosition` answers,
+   * and the whole of the grammar's error selection is `in.pos < f.next.pos` comparisons that a
+   * position at line zero loses — which is how a failure that merely ran out of input stays out of
+   * the way of one that has something to say. Give the end of the file a real line and it becomes
+   * the furthest failure in every parse that reaches it: `print(,)` reported `end of input` instead
+   * of naming what it wanted, because running out is always further along than the mistake.
+   *
+   * The second half is why this exists at all: a rule that consumed the last token of the file has
+   * nothing after it to carry its end, so the reader answers for it.
+   */
+  def after(source: Source, endLine: Int, endColumn: Int): TokenPos =
+    new TokenPos(source, 0, 0, 0, 0, endLine, endColumn)
 }

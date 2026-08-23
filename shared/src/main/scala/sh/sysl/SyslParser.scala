@@ -15,9 +15,10 @@ import scala.util.parsing.input.Position
  * The `List[Token]` is the reversibility seam: a hand-written parser could later consume the same
  * tokens with no change to the lexer.
  *
- * Every rule that builds a node wraps itself in `at`, which stamps the node with the position of the
- * first token the rule consumed. A parser is bound to one `Source` so that stamp is complete — file,
- * line, and column — the moment the node exists.
+ * Every rule that builds a node wraps itself in `at`, which stamps the node with the extent of
+ * everything the rule consumed — and with where a diagnostic about it should point, which a rule may
+ * choose for itself and which is otherwise the same thing. A parser is bound to one `Source`, so
+ * both stamps are complete — file, line, and column — the moment the node exists.
  */
 class SyslParser(val source: Source)
     extends DeclParser,
@@ -1141,12 +1142,13 @@ object SyslParser {
    *
    * A failure that stopped *at* a token carries that token's span, so `identifier expected`
    * underlines the token that is not one rather than its first character. Running out of input has
-   * no token and so no extent.
+   * no token and so no extent — and the reader answers line zero for it deliberately
+   * (`TokenPos.after`), which is what sends it to the last branch here.
    */
   protected def failedAt(source: Source, at: scala.util.parsing.input.Position): Pos = at match {
-    case p: TokenPos => p.toPos
-    case p if p.line > 0 => Pos(source, p.line, p.column)
-    case _ =>
+    case p: TokenPos if p.line > 0 => p.toPos
+    case p if p.line > 0           => Pos(source, p.line, p.column)
+    case _                         =>
       val last = math.max(1, source.lines.length)
 
       Pos(source, last, source.line(last).length + 1)

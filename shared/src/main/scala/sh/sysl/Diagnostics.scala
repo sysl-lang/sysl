@@ -82,11 +82,11 @@ object Source {
  * span whose end equals its start has no extent at all. The exclusive end is what an editor
  * publishes and what makes the arithmetic come out without a `+ 1` at every use.
  *
- * **What a span covers is the TOKEN a diagnostic points at, not the whole construct.**
- * `SyslParserBase.at` stamps a node with the position of the first token the rule consumed, so a
- * node reports where its first token runs from and to. That is what a reader wants underlined and
- * what resolves a cursor to an identifier; a span covering a whole expression is a different thing
- * and nothing here claims to give one.
+ * **What a span covers depends on which of a node's two it is**, and `Positioned` is where that is
+ * settled: a node's `pos` is where a complaint about it belongs, and its `extent` is the whole of
+ * what it was parsed from. They agree for a node built from one token, which is most of what a
+ * diagnostic points at, and part ways as soon as a rule anchors its node inside itself — `xs.foo(1)`
+ * points at `foo` and covers all of `xs.foo(1)`.
  *
  * A position built from a line and a column alone — a literate file's margin, a conditional
  * directive, a parse that ran out of input — has no token to measure and carries no extent.
@@ -100,6 +100,17 @@ final case class Pos(source: Source, line: Int, col: Int, endLine: Int, endCol: 
    * goes to the file, so the file's column is the one worth giving.
    */
   def location: String = s"${source.name}:$line:${col + source.columnOffset}"
+
+  /** This span carried out to `line`/`col`, or left alone where that would shorten it.
+   *
+   * Widening is the only direction, and the guard is what makes it safe to ask for an end that may
+   * not be one. A rule that consumed nothing ends *before* it began, and one that consumed a single
+   * token ends exactly where that token already does — so both leave the span as it stands rather
+   * than collapse it to no extent at all.
+   */
+  def endingAt(line: Int, col: Int): Pos =
+    if line > endLine || (line == endLine && col >= endCol) then copy(endLine = line, endCol = col)
+    else this
 
   /** The message, the location, and the offending line with the token underlined:
    *
@@ -163,8 +174,26 @@ object Pos {
  */
 trait Positioned {
   private var current: Option[Pos] = None
+  private var parsed: Option[Pos]  = None
 
+  /** Where a diagnostic about this node should point, which is **not** always where the node
+   * begins. A grammar rule may anchor a node somewhere inside itself — a call at its callee, a
+   * field selection at the member name rather than at the dot — because that is where the reader's
+   * attention belongs when something is wrong with it.
+   */
   def pos: Option[Pos] = current
+
+  /** The whole of what this node was parsed from, from its first token to its last.
+   *
+   * This is the question an editor asks — which construct is the cursor inside, what does a
+   * selection expand to, what does hovering cover — and it is a different question from where a
+   * complaint belongs. `xs.foo(1)` points a diagnostic at `foo` and covers `xs.foo(1)`, and both
+   * answers are right for what they are for.
+   *
+   * It falls back to `pos` for a node nothing parsed: the analyzer synthesizes plenty, and a
+   * desugared node's extent is honestly the position it was given.
+   */
+  def extent: Option[Pos] = if parsed.isEmpty then current else parsed
 
   def setPos(p: Pos): this.type = {
     if current.isEmpty then current = Some(p)
@@ -173,6 +202,16 @@ trait Positioned {
 
   def setPos(p: Option[Pos]): this.type = {
     if current.isEmpty then current = p
+    this
+  }
+
+  /** Records what the node was parsed from — the first such claim only, exactly as `setPos` keeps
+   * the first position. An outer rule that merely passed the node through consumed the same tokens
+   * and would say the same thing; one that consumed *more* built a node of its own, and this one is
+   * a part of it rather than the whole.
+   */
+  def setExtent(p: Pos): this.type = {
+    if parsed.isEmpty then parsed = Some(p)
     this
   }
 }

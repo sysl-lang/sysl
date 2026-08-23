@@ -112,7 +112,17 @@ object AstCodec {
     private def map[A](m: Map[String, A])(f: A => Unit): Unit =
       list(m.toList.sortBy(_._1)) { (k, v) => sref(k); f(v) }
 
-    /** A node's own span, which every `Positioned` carries and a synthesized node may lack. */
+    /** Where a diagnostic about the node should point, which every `Positioned` carries and a
+     * synthesized node may lack.
+     *
+     * **A node's `extent` is deliberately not written, and a decoded node falls back to `pos` for
+     * it.** What positions are *in* an artifact for is a diagnostic quoting the library, and that
+     * is `pos`; an extent answers what an editor asks — which construct is the cursor inside — of a
+     * file the editor has open, which is parsed from source rather than read back from here. Adding
+     * it is a version bump and five more integers on every node, and the work that would read them
+     * does not exist yet. The commit that indexes the library for a language server is the one to
+     * reconsider this in.
+     */
     private def pos(p: Positioned): Unit = p.pos match
       case None                             => tok("0")
       case Some(Pos(s, ln, cl, endLn, endCl)) =>

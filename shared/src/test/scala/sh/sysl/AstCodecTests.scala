@@ -450,6 +450,28 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     Pos(back.head.source, at._2, at._3).location shouldBe s"m.lsysl:${at._2}:${at._3 + 4}"
   }
 
+  // What an artifact's positions are for is a diagnostic quoting the library, and that is `pos`. An
+  // extent answers what an editor asks of a file it has open, which is parsed rather than decoded —
+  // so it is not written, and a decoded node says its extent is where it points. The assertion is
+  // here rather than in a comment because the fallback is a decision and not an oversight: a node
+  // that came back claiming a *wider* extent than the artifact carries would be inventing one.
+  "an extent is not carried by the artifact, and falls back to where the node points" in {
+    val src   = "var x = 1\nprint(alpha)\n"
+    val call  = (p: Program) => p.body.collectFirst { case ExprStmt(c: Call) => c }
+    val fresh = call(parsed(src)).getOrElse(fail("the fixture has no call in it"))
+    val back  = call(roundTrip(List(parsed(src))).head).getOrElse(fail("the call did not survive"))
+
+    // A `Source` is compared by identity, so the two trees' positions are never equal as objects
+    // however well they agree — which is the whole reason `positionsOf` walks numbers.
+    val place = (p: Option[Pos]) => p.map(x => (x.line, x.col, x.endLine, x.endCol))
+
+    place(fresh.pos) shouldBe Some((2, 1, 2, 6))
+    place(fresh.extent) shouldBe Some((2, 1, 2, 13))
+
+    place(back.pos) shouldBe place(fresh.pos)
+    place(back.extent) shouldBe place(back.pos)
+  }
+
   // A pattern binding carries a *pattern* rather than a list of names, so the encoder has a nested
   // structure to write where every other binding form has a flat one. Nesting and a wildcard are
   // both here because each is a way the shape can be lost while the names survive.

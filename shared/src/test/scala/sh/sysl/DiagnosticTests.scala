@@ -29,6 +29,32 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
   private def underline(out: String): String =
     out.linesIterator.toList.last.dropWhile(_ != '|').drop(1)
 
+  /** Every span in a parsed program, by the node that carries it, read through `read` — which is
+   * `pos` for what a diagnostic points at and `extent` for what the node was parsed from.
+   */
+  private def spansBy(read: Positioned => Option[Pos])(src: String): List[(Any, (Int, Int, Int, Int))] = {
+    def walk(node: Any): List[(Any, (Int, Int, Int, Int))] = {
+      val here = node match
+        case p: Positioned => read(p).toList.map(x => (node, (x.line, x.col, x.endLine, x.endCol)))
+        case _             => Nil
+
+      val below = node match
+        case xs: List[?]  => xs.flatMap(walk)
+        case o: Option[?] => o.toList.flatMap(walk)
+        case p: Product   => p.productIterator.toList.flatMap(walk)
+        case _            => Nil
+
+      here ::: below
+    }
+
+    SyslParser.parse(src, "t.sysl") match
+      case Right(p) => walk(p.body)
+      case Left(e)  => fail(s"the fixture does not parse: $e")
+  }
+
+  private val spans   = spansBy(_.extent)
+  private val anchors = spansBy(_.pos)
+
   "rendering" - {
     "names the file, the line, and the column, and underlines the token" in {
       val src =
@@ -83,9 +109,10 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
     }
   }
 
-  /** A span is the extent of the **token** a diagnostic points at, so the underline is as wide as
-   * what the reader is being shown and no wider. These are the cases the width is decided by, and
-   * the last three are the ones that would otherwise underline something that is not there.
+  /** The underline is as wide as what is being complained about and no wider — a name, a literal,
+   * or a whole expression where the expression is what is wrong. These are the cases the width is
+   * decided by, and the last three are the ones that would otherwise underline something that is
+   * not there.
    */
   "how far the underline runs" - {
     "the whole of an identifier, however long" in {
@@ -117,6 +144,17 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
           |""".stripMargin
 
       underline(diag(src)) shouldBe "     ^"
+    }
+
+    // Where the mistake is a whole expression rather than a name inside it, the expression is what
+    // the reader is shown. Before a node knew how far it ran this was one caret, under the `1`.
+    "the whole of an expression, where the expression is what is wrong" in {
+      val src =
+        """takes(s: string) -> string = s
+          |print(takes(1 + 2))
+          |""".stripMargin
+
+      underline(diag(src)) shouldBe "             ^^^^^"
     }
 
     // The quote shows one line, so an underline longer than it would be pointing past the end of
@@ -190,6 +228,18 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
   }
 
   "where the caret lands" - {
+    // The grammar picks which of its failures to report by asking which got furthest, and running
+    // out of input is always further along than the mistake that caused it. A reader that gave the
+    // end of the file a real line would therefore win every one of those comparisons and answer
+    // `end of input` to everything — so it answers line zero, which is what `NoPosition` answered
+    // and what the arithmetic was built on. This is the shortest input that shows it.
+    "not on the end of the file, when what ran out of input is the grammar and not the reader" in {
+      val out = diag("print(,)")
+
+      out should include("expected")
+      out should not include "end of input"
+    }
+
     "on the argument that is wrong, not on the call" in {
       // `"two"` starts at column 14 of line 2; the call starts at column 7.
       val src =
@@ -738,31 +788,10 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
   }
 
   /** What a node's span covers, which is the claim everything above rests on and which the
-   * rendering only shows indirectly. An editor asking "which name is the cursor inside" reads this
-   * rather than a diagnostic.
+   * rendering only shows indirectly. An editor asking "which construct is the cursor inside" reads
+   * this rather than a diagnostic.
    */
-  "a node carries its first token's span" - {
-
-    /** Every span in a parsed program, by the node that carries it. */
-    def spans(src: String): List[(Any, (Int, Int, Int, Int))] = {
-      def walk(node: Any): List[(Any, (Int, Int, Int, Int))] = {
-        val here = node match
-          case p: Positioned => p.pos.toList.map(x => (node, (x.line, x.col, x.endLine, x.endCol)))
-          case _             => Nil
-
-        val below = node match
-          case xs: List[?]  => xs.flatMap(walk)
-          case o: Option[?] => o.toList.flatMap(walk)
-          case p: Product   => p.productIterator.toList.flatMap(walk)
-          case _            => Nil
-
-        here ::: below
-      }
-
-      SyslParser.parse(src, "t.sysl") match
-        case Right(p) => walk(p.body)
-        case Left(e)  => fail(s"the fixture does not parse: $e")
-    }
+  "a node carries the extent it was parsed from" - {
 
     "an identifier, from its first character to just past its last" in {
       spans("var x = 1\nprint(alpha)\n").collectFirst { case (Ident("alpha"), s) => s } shouldBe
@@ -779,6 +808,112 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
       val src = "var t = \"\"\"\nspanning\n\"\"\"\nprint(t)\n"
 
       spans(src).collectFirst { case (StrLit("spanning\n"), s) => s } shouldBe Some((1, 9, 3, 4))
+    }
+
+    // Everything above is one token, which is most of what a diagnostic points at and none of what
+    // makes a span worth having. These are the nodes a cursor lands *inside*.
+
+    "a call, from its callee to its closing bracket" in {
+      spans("var x = 1\nprint(alpha)\n").collectFirst { case (Call(Ident("print"), _), s) => s } shouldBe
+        Some((2, 1, 2, 13))
+    }
+
+    "a binary operation, over both its operands and the operator between them" in {
+      spans("var x = 1 + 2\n").collectFirst { case (Binary("+", _, _), s) => s } shouldBe
+        Some((1, 9, 1, 14))
+    }
+
+    // The precedence ladder is a dozen rules deep and hands a lone operand up through every one of
+    // them. `setPos` keeping the first position is what stops the operand inheriting the ladder's
+    // extent — without it every literal in the language would span its whole enclosing expression.
+    "and each operand keeps its own, though a dozen rules passed it through" in {
+      spans("var x = 1 + 2\n").collectFirst { case (IntLit(v, _), s) if v == 1 => s } shouldBe
+        Some((1, 9, 1, 10))
+    }
+
+    "a binding, from its keyword to the end of what it was given" in {
+      spans("var x = 1 + 2\n").collectFirst { case (_: VarDecl, s) => s } shouldBe Some((1, 1, 1, 14))
+    }
+
+    "a construct written over two lines, which ends on the second of them" in {
+      val src = "var x = (1 +\n    2)\n"
+
+      spans(src).collectFirst { case (_: VarDecl, s) => s } shouldBe Some((1, 1, 2, 7))
+    }
+
+    // The last token of the file is the one case with no token after it to carry its end, so the
+    // reader answers for it — and it must answer with where the token stopped rather than with
+    // where the file does.
+    "a node whose last token is the file's last token" in {
+      spans("print(alpha)").collectFirst { case (Call(Ident("print"), _), s) => s } shouldBe
+        Some((1, 1, 1, 13))
+    }
+  }
+
+  /** Where a node was parsed from and where a complaint about it belongs are two questions, and a
+   * node answers each separately. The grammar anchors some nodes inside themselves on purpose —
+   * `postfixTail` says why — and the extent must not disturb that, because the anchor is what every
+   * diagnostic in the compiler is rendered against.
+   */
+  "a node's anchor and its extent are separate" - {
+
+    // What is wrong with `foo(…)` is nearly always `foo` — it does not exist, or it does not take
+    // these arguments — so that is where the caret goes, and it went there before extents existed.
+    "a call still points a diagnostic at its callee" in {
+      anchors("var x = 1\nprint(alpha)\n").collectFirst { case (Call(Ident("print"), _), s) => s } shouldBe
+        Some((2, 1, 2, 6))
+    }
+
+    "while covering the whole of itself" in {
+      spans("var x = 1\nprint(alpha)\n").collectFirst { case (Call(Ident("print"), _), s) => s } shouldBe
+        Some((2, 1, 2, 13))
+    }
+
+    // A caret under the `.` sends the reader looking one column to the left of what was said, so a
+    // field selection is anchored on the member name. Its extent begins at the receiver, which is
+    // the first case where the two do not even start in the same place.
+    "a field selection points at the member and covers the receiver too" in {
+      val src = "var p = 1\nprint(p.missing)\n"
+
+      anchors(src).collectFirst { case (Field(_, "missing"), s) => s } shouldBe Some((2, 9, 2, 16))
+      spans(src).collectFirst { case (Field(_, "missing"), s) => s } shouldBe Some((2, 7, 2, 16))
+    }
+
+    // Nothing parsed a node the analyzer made up, so there is no extent to have — and answering
+    // `pos` is better than answering nothing, since that is honestly where the node came from.
+    "a node with no extent of its own falls back to where it points" in {
+      val node = Ident("x").setPos(Pos(Source("t.sysl", "x\n"), 1, 1, 1, 2))
+
+      node.extent shouldBe node.pos
+    }
+  }
+
+  /** Widening a span is the one operation `at` performs on the extent it computes, and it is a
+   * guard as much as an arithmetic: the end it is offered comes from the token after the rule, and
+   * for a rule that consumed nothing that is a place *before* the span began.
+   */
+  "a span is widened, never shortened" - {
+    val pos = Pos(Source("t.sysl", "abcdef\n"), 1, 2, 1, 4)
+
+    "out to a later column on the same line" in {
+      pos.endingAt(1, 6) shouldBe Pos(pos.source, 1, 2, 1, 6)
+    }
+
+    "out to a later line" in {
+      pos.endingAt(3, 1) shouldBe Pos(pos.source, 1, 2, 3, 1)
+    }
+
+    "and not back to an earlier one, which is what a rule that consumed nothing offers" in {
+      pos.endingAt(1, 2) shouldBe pos
+      pos.endingAt(1, 3) shouldBe pos
+    }
+
+    "nor back to an earlier line" in {
+      pos.endingAt(0, 99) shouldBe pos
+    }
+
+    "an end it already has costs nothing and changes nothing" in {
+      pos.endingAt(1, 4) shouldBe pos
     }
   }
 
