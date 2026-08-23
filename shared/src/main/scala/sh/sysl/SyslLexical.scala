@@ -204,9 +204,10 @@ class SyslLexical
    * the rule with an arbitrary hole, and not to respell the wildcard: it is to lex `.*` as one
    * token, above. A `.` is only ever followed by a name, so nothing else can produce that pair, and
    * a line then never ends in a bare `*` that was really the end of a statement.
-   *   - **`.`** is left out for a different reason — it would work, but the continuation style
-   *     worth having for a call chain puts the dot at the *start* of the following line, which
-   *     needs the opposite mechanism. Deciding that is not part of this.
+   *   - **`.`** is left out because the continuation style worth having for a call chain puts the
+   *     dot at the *start* of the following line, which needs the opposite mechanism — and now has
+   *     one, in `isLineContinuationStart` below. A trailing `.` remains an error, deliberately: two
+   *     ways to write one chain is a style argument in every file that has one.
    *   - **`,`, `:` and `;`** are separators, and the only one with a real customer (`,`) already
    *     continues wherever it appears, since an argument list is bracketed.
    *
@@ -231,6 +232,86 @@ class SyslLexical
   override protected def isLineContinuationToken(tok: Token): Boolean = tok match
     case Keyword(chars) => continuationOperators(chars)
     case _              => false
+
+  /** A line beginning `.name` continues the line above it.
+   *
+   * This is the other half of the rule above, and it exists because a *chain* is the one expression
+   * people habitually break across lines, and the break they write is before the dot rather than
+   * after it:
+   *
+   * {{{
+   * val face = text(label)
+   *     .foreground(WHITE)
+   *     .padding(8)
+   *     .background(ground, radius)
+   * }}}
+   *
+   * Every language with a fluent surface reads that shape — Scala, Kotlin, Swift, C# — and a
+   * language whose interface toolkit is built out of chained modifiers cannot ask for it on one
+   * line: the four links above are 92 characters together, and there is no operator at the end of
+   * any of them for the trailing rule to see.
+   *
+   * **A name after the dot is required, and that is the whole safety argument.** A continued line's
+   * own margin is discarded, so a rule that fired on something which could also *begin* a statement
+   * would pull the line into the block above and move where that block ends. Nothing in the
+   * expression grammar begins a statement with `.`, and requiring a letter or `_` after it excludes
+   * everything else spelled with one: `..` and `..<` are ranges, `...` is a variadic tail, `.0` is a
+   * tuple index, and `.*` is an import wildcard. None of those can start a line either, but the
+   * predicate does not have to know that — it never sees them.
+   *
+   * The one thing it deliberately does not do is join a line beginning with an *operator*. `+` and
+   * friends already continue from the end of the previous line, and a language that accepted both
+   * ends would be asking every file to pick a side.
+   *
+   * **AND THE LINE ABOVE HAS TO ADMIT IT, WHICH LOOKAHEAD ALONE CANNOT SEE.** sysl has one other
+   * construct spelled with a leading dot — the **implicit member** (`.Red`, whose type comes from
+   * what the context expects) — and a `match` arm's pattern begins a line:
+   *
+   * {{{
+   * val n = c match
+   *     .Red -> 1
+   * }}}
+   *
+   * Joined, that reads as `c match .Red`, and the reader who wrote the form they had just been
+   * taught gets `newline expected` instead of the sentence `PatternParser.noImplicitMember` exists to
+   * give them. So the rule asks both ends, which is the exact dual of the trailing one above: a
+   * trailing operator continues because it **cannot** finish an expression, and a leading dot
+   * continues only where the line above **could** have.
+   *
+   * A reserved word cannot finish one — there is nothing to call a method on — so `match`, `then`,
+   * `else`, `do` and the rest all decline, and no call chain is lost, because none of them can be a
+   * receiver. The four that *are* values are the exception, and `self` is the one that matters:
+   * `self` on its own line with `.field` under it is an ordinary chain.
+   *
+   * **What this does NOT rescue is the second arm**, whose line above ends in whatever the first
+   * arm's value was — an ordinary expression, which admits the join. That is the residual cost, and
+   * it is bounded by the fact that an implicit member in a pattern is *illegal in sysl either way*:
+   * what is lost is the quality of a diagnostic, never the meaning of a legal program.
+   */
+  override protected def isLineContinuationStart(r: Reader[Char]): Boolean =
+    !r.atEnd && r.first == '.' && {
+      val after = r.rest
+
+      !after.atEnd && (after.first.isLetter || after.first == '_')
+    } && canEndExpression(previousToken)
+
+  /** The reserved words that are values, and so *can* end an expression.
+   *
+   * Everything else in `reserved` introduces something, so a line ending in one has not finished an
+   * expression and there is nothing under it for a chain to continue.
+   */
+  private val valueWords = Set("self", "true", "false", "null")
+
+  /** Whether the token before a newline could have been the end of an expression.
+   *
+   * A delimiter is admitted rather than enumerated: `)`, `]` and `}` all end one, and the operators
+   * that do not are already handled at the *other* end by `isLineContinuationToken`, which suppresses
+   * the newline before this is ever consulted.
+   */
+  private def canEndExpression(tok: Token): Boolean = tok match
+    case null           => false
+    case Keyword(chars) => !reserved(chars) || valueWords(chars)
+    case _              => true
 
   /** Materializes the token stream with each token's source position, so the parser can
    * memoize over a fixed `List` (not the stateful scanner — see design/front-end.md)
