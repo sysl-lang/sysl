@@ -163,7 +163,7 @@ trait CallAnalysis extends OperatorCalls {
       provisional.map(_.ty),
       fd.retType.map(spell),
       expected,
-      passed.map(isLiteral),
+      passed.zip(provisional).map((a, t) => adaptable(a, t)),
       m.bounds,
       known,
     ))
@@ -288,7 +288,7 @@ trait CallAnalysis extends OperatorCalls {
             val targs =
               inDecl(name)(
                 solve(qn(name), decl.tparams, decl.fields.map(_.typ), provisional.map(_.ty), None, expected,
-                  args.map(isLiteral)))
+                  args.zip(provisional).map((a, t) => adaptable(a, t))))
             (targs, Some(provisional))
 
     val s   = instantiateStruct(name, targs)
@@ -344,7 +344,7 @@ trait CallAnalysis extends OperatorCalls {
             val targs =
               inDecl(ename)(
                 solve(name, decl.tparams, vdecl.fields.map(_.typ), provisional.map(_.ty), None, expected,
-                  args.map(isLiteral)))
+                  args.zip(provisional).map((a, t) => adaptable(a, t))))
             (targs, Some(provisional))
 
     val en = instantiateEnum(ename, targs)
