@@ -23,6 +23,14 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
    */
   protected def buildReceiver(mode: RecvMode, tr: TExpr, member: String = ""): TExpr
 
+  /** The call trait a type turned out to implement, with the arguments it implements it at — which
+   * is how a callable argument that has just been read says what it takes and what it yields.
+   *
+   * Supplied by `Closures`, mixed in after this, for the reason `buildReceiver` is: a closure's own
+   * struct and the four other shapes a callable can arrive as are that layer's to tell apart.
+   */
+  protected def callableOf(t: Type): Option[Type.Bound]
+
 
   /** Type-checks positional arguments against a resolved parameter list. `pre` holds arguments
    * already analyzed during type-argument inference, so they are not analyzed twice.
@@ -214,9 +222,36 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     if partial.size < tparams.length then
       for case (r, Some((t, true))) <- ptypes.zip(first) do inDecl(decl)(unify(r, t.ty, tps, partial))
 
+    // **A held-back argument that turned out to be a callable joins the solution, so the held-back
+    // arguments after it are read against what it settled.** The three tiers above are made of the
+    // arguments that had a type of their own, and a callable never does — so a parameter named only
+    // by an *arrow's* result was still unknown when the next arrow was read, and that next arrow was
+    // told nothing said what it took by a call whose previous argument had just said so.
+    //
+    // `apply(x: int, first: int -> N, again: N -> N)` is the shape: `first` takes an `int`, so it is
+    // readable, and its result is the whole of what `N` is. Reading it and throwing that away left
+    // `again: N -> N` with an unsolved parameter in what it *takes*, which is the one thing
+    // `callBound` requires to be settled.
+    //
+    // `unify` writes only where the map is silent, so this cannot overturn what the tiers decided —
+    // it fills what none of them reached. Left to right, which is both the order a reader expects and
+    // the only order in which an arrow can inform the arrow after it.
     at.zip(first).zipWithIndex.map { case (((a, _), done), i) =>
-      done.map(_._1).getOrElse(
-        analyzeExpr(a, inDecl(decl)(heldWant(callable(i), ptypes.lift(i), tps, bounds, partial.toMap))))
+      done.map(_._1).getOrElse {
+        val t = analyzeExpr(a, inDecl(decl)(heldWant(callable(i), ptypes.lift(i), tps, bounds, partial.toMap)))
+
+        for
+          (_, taken, yielded) <- inDecl(decl)(callShape(ptypes.lift(i), tps, bounds))
+          supplied            <- callableOf(t.ty)
+          if supplied.args.length == taken.length + 1
+        do
+          inDecl(decl) {
+            for (ref, ty) <- taken.zip(supplied.args) do unify(ref, ty, tps, partial)
+            for ref <- yielded do unify(ref, supplied.args.last, tps, partial)
+          }
+
+        t
+      }
     }
   }
 
@@ -550,7 +585,24 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
    */
   protected def unsettleable(f: FuncDecl): List[String] =
     f.tparams.filterNot(tp =>
-      f.params.exists(p => mentions(p.typ, Set(tp))) || f.retType.exists(mentions(_, Set(tp))))
+      f.params.exists(p => mentions(p.typ, Set(tp))) || f.retType.exists(mentions(_, Set(tp))) ||
+        arrowMentions(f, tp))
+
+  /** Whether a parameter is named by an **arrow the sugar moved into a bound**.
+   *
+   * `f: A -> B` is a parameter type as the author wrote it, and `callBounds` rewrites it to a plain
+   * `$F` whose bound carries the `A` and the `B`. So a walk over the written parameter types no
+   * longer sees them, and `chain[A, B](x: int, f: int -> A, g: A -> B, …)` was told `A` appears in
+   * neither its parameters nor its result — on a declaration whose second parameter is `int -> A`.
+   *
+   * Read off the bound rather than by un-rewriting, since the bound is where the types now live and
+   * is what every later stage reads them from.
+   */
+  private def arrowMentions(f: FuncDecl, tp: String): Boolean =
+    f.params.exists(_.typ match
+      case NamedType(n, Nil) if MemberLowering.isCallBound(n) =>
+        f.bounds.getOrElse(n, Nil).exists(_.args.exists(mentions(_, Set(tp))))
+      case _ => false)
 
   /** Which copy of a generic declaration a **written** type-argument list names — `&f[T]` at an
    * address (`12 §6a`) and `f[T](x)` at a call (`10 §2`).

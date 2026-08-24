@@ -797,6 +797,50 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "[7]\n"
     }
 
+    /** The case above settles `U` from an **ordinary** parameter. This settles it from an earlier
+      * *arrow's result*, which is the same answer arriving by a different route — and it did not
+      * arrive: the second closure was told nothing said what it took, on a call whose previous
+      * argument had just said so.
+      *
+      * An argument's contribution to the substitution has to be visible to the arguments after it
+      * whatever spelling produced it, or the order two callables are declared in changes whether a
+      * call compiles.
+      */
+    "an earlier arrow's result settles what a later arrow takes" in {
+      run("""apply_b[N](x: int, first: int -> N, again: N -> N) -> N = again(first(x))
+            |
+            |print(apply_b(3, n -> n * 2, n -> n + 1))
+            |""".stripMargin) shouldBe "7\n"
+    }
+
+    /** The same call with **named functions**, which is the shape that cannot be worked around: a
+      * callable that has to recurse cannot be a closure literal, so it cannot be annotated either.
+      *
+      * Its failure wore a different and worse message — *"'again' is a function, and a function
+      * becomes a value only where a callable is wanted … Nothing here asks for one"* — on a
+      * parameter declared `again: N -> N`, which is the first thing that sentence lists. It also
+      * advised `&again`, the boxed spelling, which is a different program with an allocation in it.
+      */
+    "and a named function is accepted there, not told the position wants no callable" in {
+      run("""apply_b[N](x: int, first: int -> N, again: N -> N) -> N = again(first(x))
+            |
+            |double(n: int) -> int = n * 2
+            |bump(n: int) -> int = n + 1
+            |
+            |print(apply_b(3, double, bump))
+            |""".stripMargin) shouldBe "7\n"
+    }
+
+    /** Three deep, so the fix is carrying the substitution forward rather than special-casing the
+      * argument next door.
+      */
+    "and it carries through a third arrow" in {
+      run("""chain[A, B](x: int, f: int -> A, g: A -> B, h: B -> B) -> B = h(g(f(x)))
+            |
+            |print(chain(3, n -> n * 2, n -> s"<${n}>", s -> s + "!"))
+            |""".stripMargin) shouldBe "<6>!\n"
+    }
+
     // **The refusal has to survive**, or the fix has traded a bad message for a wrong program. A
     // parameter type nothing determines is still a parameter type nothing determines.
     "a parameter nothing settles is still refused, and against the closure" in {
@@ -806,17 +850,31 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) should include("'n' has no type here")
     }
 
-    // The arrow spelling refuses the same program **earlier and better**: `T` is left mentioned only
-    // by the synthesized bound, so nothing in the parameters or the result names it and the call is
-    // told that outright rather than through the closure. Asserted rather than smoothed over,
-    // because the two spellings genuinely differ here and a reader meeting one should not be told
-    // the other's message.
-    "the arrow spelling refuses it earlier, naming the parameter rather than the closure" in {
+    // **The two spellings now refuse it the same way, and that is a correction rather than a
+    // regression.** This asserted the opposite until the arrow's types were made visible to
+    // `unsettleable`: `T` was mentioned only by the synthesized bound, so the call was told `T`
+    // appears in neither the parameters nor the result of a function whose parameter is written
+    // `f: T -> T`.
+    //
+    // What settles which message is better is that only one of them names a fix that exists. The old
+    // one advised `one[…](…)` — and a declaration taking a bare arrow **cannot** be given written
+    // type arguments at all, for the reason recorded above at *"a written type argument is obeyed
+    // rather than re-inferred"*: the sugar's `$F` is counted among them and its argument would be a
+    // closure's unspellable type. The closure's message advises annotating what it takes, and
+    // `one((n: int) -> n)` compiles.
+    "the arrow spelling refuses it against the closure, naming a fix that works" in {
       err("""one[T](f: T -> T) -> int = 0
             |
             |print(one(n -> n))
-            |""".stripMargin) should include(
-        "'T' is in neither the parameters of 'one' nor its result")
+            |""".stripMargin) should include("'n' has no type here")
+    }
+
+    // The advice above, run — so the pair cannot come apart the way advice and program silently do.
+    "and that annotation is what makes it compile" in {
+      run("""one[T](f: T -> T) -> int = 0
+            |
+            |print(one((n: int) -> n))
+            |""".stripMargin) shouldBe "0\n"
     }
   }
 
