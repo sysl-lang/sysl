@@ -279,6 +279,57 @@ class PatternWriteTests extends AnyFreeSpec with CodegenSupport with RunSupport 
     }
   }
 
+  /** The boundary the rule has to stop at, and the one place it would be wrong to cross.
+   *
+   * A binding copies **the payload**, and where the payload is a `&T` the copy is the *reference* —
+   * so a write through it reaches the object the enum is holding rather than an arm-local copy of
+   * it, which is what *Refcounts survive destructuring* is about. Selection dereferences, so
+   * `e.value = 99` is a store through the reference and not a store into the binding, and refusing
+   * it would take a facility away for a reason that does not apply to it.
+   *
+   * The name itself is still written once, which is the pair worth asserting together: the rule is
+   * about the binding, not about everything the binding can reach.
+   */
+  "a '&T' payload still writes through, because the copy is the reference" - {
+
+    val slot =
+      """struct Entry
+        |    value: int
+        |
+        |enum Slot
+        |    Empty
+        |    Filled(e: &Entry)
+        |
+        |""".stripMargin
+
+    "the write reaches the object the enum is holding" in {
+      run(
+        slot +
+          """var s: Slot = Filled(Entry(1))
+            |
+            |s match
+            |    Filled(e) -> e.value = 99
+            |    Empty -> print("empty")
+            |
+            |s match
+            |    Filled(e) -> print(e.value)
+            |    Empty -> print("empty")""".stripMargin
+      ) shouldBe "99\n"
+    }
+
+    "and the name is written once all the same, so it may not be aimed somewhere else" in {
+      err(
+        slot +
+          """var s: Slot = Filled(Entry(1))
+            |var other: &Entry = Entry(5)
+            |
+            |s match
+            |    Filled(e) -> e = other
+            |    Empty -> print("empty")""".stripMargin
+      ) should include("a pattern binding is written once")
+    }
+  }
+
   "what the rule does not reach" - {
 
     "reading the binding, which is everything an arm usually does with one" in {
