@@ -129,7 +129,10 @@ jobs:
           wget -qO llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh "$LLVM_VERSION"
-          sudo apt-get install -y "llvm-$LLVM_VERSION" "lld-$LLVM_VERSION" libunwind-dev libgc-dev
+          # libuv is `sysl-doc`'s, not the compiler's: it links juicer-core, whose server is built
+          # on microserve, and Scala Native puts `-luv` on the link line for it. Without this the
+          # doc binary does not link and the release job fails at the staging step.
+          sudo apt-get install -y "llvm-$LLVM_VERSION" "lld-$LLVM_VERSION" libunwind-dev libgc-dev libuv1-dev
           echo "/usr/lib/llvm-$LLVM_VERSION/bin" >> "$GITHUB_PATH"
 
       - name: Report the toolchain
@@ -142,8 +145,8 @@ jobs:
       # `SYSL_RELEASE=1` is not decoration: it turns on `releaseFast` and thin LTO, so the released
       # binary is not the same lowering as a debug Native build. The macOS tarball is built with it
       # and these must match.
-      - name: Link the compiler
-        run: SYSL_RELEASE=1 sbt -batch syslNative/nativeLink
+      - name: Link the compiler and the doc tool
+        run: SYSL_RELEASE=1 sbt -batch syslNative/nativeLink syslDocNative/nativeLink
 
       # **`-C stage .` is load bearing.** `prefix.install Dir["*"]` is the whole of the formula's
       # `install`, so the tarball *is* a prefix. `tar czf … stage` would put everything under a
@@ -164,8 +167,17 @@ jobs:
             exit 1
           fi
 
+          # `sysl doc` execs `sysl-doc` off the PATH, so a tarball carrying only the compiler
+          # installs a subcommand that cannot work. Both travel or neither is much use.
+          docs=(doc/native/target/scala-*/sysl-doc)
+          if [ "${#docs[@]}" -ne 1 ] || [ ! -x "${docs[0]}" ]; then
+            echo "expected exactly one linked doc binary, found: ${docs[*]}" >&2
+            exit 1
+          fi
+
           mkdir -p stage/bin stage/share/sysl
           cp "${binaries[0]}" stage/bin/sysl
+          cp "${docs[0]}" stage/bin/sysl-doc
           cp -R library stage/share/sysl/library
 
           tarball="sysl-$version-linux-$arch.tar.gz"
@@ -205,9 +217,17 @@ jobs:
           tar -xzf "${{ steps.archive.outputs.tarball }}" -C check/prefix
 
           test -x check/prefix/bin/sysl
+          test -x check/prefix/bin/sysl-doc
           test -d check/prefix/share/sysl/library/sysl
 
           check/prefix/bin/sysl --version | grep -qx "sysl $version"
+
+          # The doc tool is exercised on the library that travelled in the same tarball, which is the
+          # one check that reaches all three at once: the binary runs, the library is where it says,
+          # and the two were built from the same tree.
+          check/prefix/bin/sysl-doc check/prefix/share/sysl/library --out check/api >/dev/null
+          test -f check/api/sysl-text.md
+          grep -q "^module: sysl.text$" check/api/sysl-text.md
 
           cat > check/hello.sysl <<'SYSL'
           print("Hello, sysl!")

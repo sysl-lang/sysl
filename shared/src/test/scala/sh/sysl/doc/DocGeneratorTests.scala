@@ -99,8 +99,10 @@ class DocGeneratorTests extends AnyFreeSpec with Matchers {
       sig("struct Point\n    x: int\n    y: int") shouldBe "struct Point\n    x: int\n    y: int"
     }
 
-    "a struct with no fields renders as a head alone" in {
-      sig("struct Stdout\nend Stdout") shouldBe "struct Stdout"
+    "a struct with no fields keeps its end marker, which is required and not optional" in {
+      // The bare head is not sysl: the compiler refuses it, because `end` is the only thing
+      // distinguishing a deliberately empty body from one whose author forgot to indent it.
+      sig("struct Stdout\nend Stdout") shouldBe "struct Stdout\nend Stdout"
     }
 
     "an enum renders its variants with their named payloads" in {

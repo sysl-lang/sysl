@@ -103,7 +103,12 @@ object DocCli {
    * `weave` serves it, and a thin API page is the honest answer rather than a defect.
    */
   def read(dir: String, includePrivate: Boolean): Either[String, List[ApiModel.Module]] = {
-    val sources = Project.collect(dir, None)
+    // `Project.collect` throws a `NoSuchFileException` on a directory that is not there rather than
+    // answering an empty list, so the sentence below was unreachable for the commonest mistake there
+    // is — a mistyped path. A stack trace is not an answer to that.
+    val sources =
+      try Project.collect(dir, None)
+      catch { case _: Exception => Nil }
 
     if sources.isEmpty then Left(s"sysl-doc: $dir holds no sysl source")
     else
@@ -138,18 +143,28 @@ object DocCli {
           val pages = MarkdownWriter.pages(modules, opts.title, opts.version)
 
           if opts.check then check(opts.out, pages)
-          else write(opts.out, pages, modules.length) match
-            case 0    => opts.site.map(site => render(opts.out, site)).getOrElse(0)
-            case code => code
+          else
+            write(opts.out, pages, modules.length) match
+              case 0    => opts.site.map(site => render(opts.out, site)).getOrElse(0)
+              case code => code
 
   /** Write the pages, and report what was written. */
   private def write(out: String, pages: List[MarkdownWriter.Page], modules: Int): Int =
-    try
+    // **The braces are load bearing and this is where that was learned.** Written as
+    // `catch case e: Exception => println(…); 1`, the `; 1` is NOT the catch body's second statement
+    // — it becomes a second statement of the METHOD body, so the whole method answers 1 whatever the
+    // try produced. This command wrote all 27 modules, printed its success line and exited 1, with no
+    // exception thrown and no error printed; nothing but reading the returned number finds it.
+    try {
       Project.makeDirectories(out)
       pages.foreach(p => writeFile(s"$out/${p.path}", p.text))
       println(s"sysl-doc: $modules module${if modules == 1 then "" else "s"} -> $out")
       0
-    catch case e: Exception => Console.err.println(s"sysl-doc: cannot write $out: ${e.getMessage}"); 1
+    } catch {
+      case e: Exception =>
+        Console.err.println(s"sysl-doc: cannot write $out: ${e.getMessage}")
+        1
+    }
 
   /** Compare what would be written against what is there, and write nothing.
    *
@@ -185,11 +200,15 @@ object DocCli {
    * already exists rather than making one.
    */
   private def render(markdown: String, site: String): Int =
-    try
+    try {
       SiteRenderer.build(markdown, site)
       println(s"sysl-doc: site -> $site")
       0
-    catch case e: Exception => Console.err.println(s"sysl-doc: cannot build the site: ${e.getMessage}"); 1
+    } catch {
+      case e: Exception =>
+        Console.err.println(s"sysl-doc: cannot build the site: ${e.getMessage}")
+        1
+    }
 }
 
 @main def syslDoc(args: String*): Unit = {

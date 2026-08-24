@@ -220,7 +220,16 @@ object Signature {
   def struct(s: StructDecl): String =
     val head = s"struct ${s.name}${tparamsText(s.tparams, s.bounds, s.tvalues, Set.empty, s.tdefaults)}"
 
-    if s.fields.isEmpty then head
+    // A STRUCT WITH NO FIELDS CARRIES ITS `end`, and that marker is required rather than optional —
+    // one of the four cases the org's end-marker rule names. It is the only thing distinguishing a
+    // deliberately empty body from one whose author forgot to indent it, and the compiler refuses
+    // the bare head in as many words: "'struct Full' declares no fields — a struct's body is
+    // indented under it, a type with no fields needs an 'end'".
+    //
+    // So rendering the head alone puts something on the page that is not sysl. Found by compiling
+    // the juicerapi demo's blocks; `Stdout`, `Stderr` and `TtyWriter` are the real cases in the
+    // library.
+    if s.fields.isEmpty then s"$head\nend ${s.name}"
     else s"$head\n${s.fields.map(f => s"    ${paramText(f)}").mkString("\n")}"
 
   /** An enum's head and its variants, payloads included. */
