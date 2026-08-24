@@ -179,4 +179,135 @@ class TraitCallableTests extends AnyFreeSpec with RunSupport with CodegenSupport
           |    value(self) -> int = self.v
           |print(N(20).apply(n -> n + 1))""".stripMargin) shouldBe "21\n"
   }
+
+  /** An arrow's parameter and result may be an **associated-type projection**, which is the shape
+   * the sugar exists for and the one it could not express.
+   *
+   * The rewrite adds a type parameter and moves the arrow's written types into a bound on it, so
+   * those types are resolved one scope further in than they were written. Two things there belonged
+   * to the scope they came from and were taken by the scope they arrived in: `Self`, which a bound
+   * binds to the parameter it constrains, and any other parameter's bounds, which is what says a
+   * projection off it resolves at all. Neither is the arrow's to reinterpret — `f: Self::Item -> N`
+   * is written where `Self` is the receiver, and it means that wherever the desugaring puts it.
+   *
+   * The failure read as a missing bound on a parameter that plainly had one, and on a trait member
+   * it named `$F1` — the synthesized parameter — as the thing lacking the bound, which is the
+   * substitution showing through.
+   */
+  "an arrow may name an associated type" - {
+    "off a bounded parameter" in {
+      run("""trait Walk
+            |    type Item
+            |    step(*self) -> Option[Self::Item]
+            |struct Down
+            |    n: int
+            |impl Walk for Down
+            |    type Item = int
+            |    step(*self) -> Option[int]
+            |        if self.n <= 0 then return None
+            |        self.n -= 1
+            |        Some(self.n)
+            |first_of[S: Walk, N](s: *S, f: S::Item -> N) -> Option[N] =
+            |    s.step() match
+            |        Some(t) -> Some(f(t))
+            |        None -> None
+            |var d = Down(3)
+            |print(first_of(&d, n -> n * 10).expect("a step"))""".stripMargin) shouldBe "20\n"
+    }
+
+    /** The result side of the arrow, which resolves through the same walk and was refused the same
+      * way — so fixing one without the other would leave half the shape unwritable.
+      */
+    "in the arrow's result as well as its parameter" in {
+      run("""trait Walk
+            |    type Item
+            |    step(*self) -> Option[Self::Item]
+            |struct Down
+            |    n: int
+            |impl Walk for Down
+            |    type Item = int
+            |    step(*self) -> Option[int]
+            |        if self.n <= 0 then return None
+            |        self.n -= 1
+            |        Some(self.n)
+            |made[S: Walk, N](s: *S, x: N, f: N -> S::Item) -> S::Item = f(x)
+            |var d = Down(1)
+            |print(made(&d, 4, n -> n + 38))""".stripMargin) shouldBe "42\n"
+    }
+
+    /** The one shape still refused, and it is narrow: a trait's **default body** whose parameter is
+      * an arrow over `Self::Item`. The declaration alone is fine — the case below it declares
+      * exactly this member and an `impl` supplies it — so what is left is the pass that reads a
+      * default's own signature, which resolves the added bound somewhere `Self` is not bound and
+      * reports it as `Self` outside a trait.
+      *
+      * Written with the assertion it should make, since the shape is decided and only the
+      * declaration form is unsupported.
+      */
+    "and 'Self::Item' on a trait's own member" ignore {
+      run("""trait Mapper
+            |    type Item
+            |    first(self) -> Self::Item
+            |    over[N](self, f: Self::Item -> N) -> N = f(self.first())
+            |struct One
+            |    v: int
+            |impl Mapper for One
+            |    type Item = int
+            |    first(self) -> int = self.v
+            |print(One(20).over(n -> n + 1))""".stripMargin) shouldBe "21\n"
+    }
+
+    /** The same on an `impl` block's member rather than a trait's default, since the three
+      * declaration forms reach the rewrite by three different paths.
+      */
+    "and on an implementation's member" in {
+      run("""trait Mapper
+            |    type Item
+            |    over[N](self, f: Self::Item -> N) -> N
+            |struct One
+            |    v: int
+            |impl Mapper for One
+            |    type Item = int
+            |    over[N](self, f: int -> N) -> N = f(self.v)
+            |print(One(20).over(n -> n + 1))""".stripMargin) shouldBe "21\n"
+    }
+
+    /** The boxed spelling always accepted a projection, and it is what a caller had to reach for.
+      * Keeping it here says the fix moved the bare arrow up to it rather than changing what it does.
+      */
+    "which the boxed spelling could already do" in {
+      run("""trait Walk
+            |    type Item
+            |    step(*self) -> Option[Self::Item]
+            |struct Down
+            |    n: int
+            |impl Walk for Down
+            |    type Item = int
+            |    step(*self) -> Option[int]
+            |        if self.n <= 0 then return None
+            |        self.n -= 1
+            |        Some(self.n)
+            |boxed_first[S: Walk](s: *S, f: &Fn(S::Item) -> int) -> int =
+            |    s.step() match
+            |        Some(t) -> f(t)
+            |        None -> 0
+            |var d = Down(3)
+            |print(boxed_first(&d, n -> n * 10))""".stripMargin) shouldBe "20\n"
+    }
+
+    /** The error path the fix must not swallow: a projection naming something the bound's trait does
+      * not declare is still refused, and now says so about the parameter the reader wrote rather
+      * than about the synthesized one.
+      */
+    "while a projection the bound cannot supply is still refused" in {
+      val message = err("""trait Walk
+                          |    type Item
+                          |    step(*self) -> Option[Self::Item]
+                          |first_of[S: Walk, N](s: *S, f: S::Missing -> N) -> int = 0
+                          |print(1)""".stripMargin)
+
+      message should include("'Missing'")
+      message should not include "$F"
+    }
+  }
 }

@@ -260,13 +260,29 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
         as,
         if seen(tp) then Nil
         else
-          val inner: Map[String, Type] = tparams.map(p => p -> build(p, seen + tp)).toMap
+          val refs = bounds.getOrElse(tp, Nil)
+          // **Only the parameters this bound actually names.** Standing up the others is not merely
+          // wasted work: building a sibling's stand-in resolves that sibling's *own* bounds, and it
+          // does so with `tp` in `seen` — which is to say with `tp` stripped of its bounds, since
+          // that is what breaks the walk back around. So a sibling bound naming `tp` was resolved
+          // against a `tp` that promised nothing, and a projection off it (`tp::Item`) was refused
+          // as though the parameter carried no bound at all. The refusal was collateral: it came
+          // from building a stand-in the bound in hand never mentioned.
+          val needed = tparams.filter(p => p == tp || refs.exists(_.args.exists(mentions(_, Set(p)))))
+          val inner: Map[String, Type] = needed.map(p => p -> build(p, seen + tp)).toMap
           // A bound asks something of the parameter it is written on, so `Self` inside it — written
           // there, or arriving from a default — is that parameter. It is taken from `inner`, whose
           // entry for it is already the bound-free stand-in that breaks the walk back around.
-          val here = outer ++ inner ++ selfBinding(inner(tp))
-
-          bounds.getOrElse(tp, Nil).map(b => recorded(Type.Bound(b.name, Nil))(resolveBound(b, here))),
+          //
+          // **A bound the arrow sugar added is the exception, and it is the whole of the exception.**
+          // Its arguments were not written on it: they were written in a *parameter list*, where
+          // `Self` is the receiver's type, and `callBounds` moved them here. Rebinding `Self` to the
+          // synthesized parameter reinterprets what the author wrote — `f: Self::Item -> N` became a
+          // projection off `$F1`, and the diagnostic named `$F1` as the thing lacking a bound.
+          val here =
+            if MemberLowering.isCallBound(tp) then outer ++ inner
+            else outer ++ inner ++ selfBinding(inner(tp))
+          refs.map(b => recorded(Type.Bound(b.name, Nil))(resolveBound(b, here))),
       )
 
     // A **value parameter** stands in as a zero rather than as an `Abstract` (`10 §9`). It is not a
