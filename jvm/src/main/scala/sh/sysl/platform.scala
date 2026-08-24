@@ -24,6 +24,29 @@ def hostMachine: (String, String) =
  */
 def executablePath: Option[String] = None
 
+/** Where `name` sits on the PATH, if it is there and can be run.
+ *
+ * This is what makes an external subcommand possible: `sysl doc` looks for `sysl-doc` and hands it
+ * the rest of the line. `ProcessBuilder` would search the PATH itself, so the reason to ask
+ * separately is the **diagnostic** — a command that is not there and a command that ran and failed
+ * are different things to say to somebody, and going through the process API answers both with one
+ * `IOException`.
+ *
+ * Executability is part of the question rather than an extra check. A directory named like the
+ * command, or a file somebody forgot to `chmod +x`, is not a command — and finding one would stop
+ * the search at something that cannot run while a real one sat further down the PATH.
+ *
+ * The `.exe` spelling is tried second so that Windows works without a separate code path and no
+ * other platform pays for it: a file called `sysl-doc.exe` is not on anybody's Unix PATH.
+ */
+def findOnPath(name: String): Option[String] =
+  Option(System.getenv("PATH")).toList
+    .flatMap(_.split(java.io.File.pathSeparatorChar).toList)
+    .filter(_.nonEmpty)
+    .flatMap(dir => List(new java.io.File(dir, name), new java.io.File(dir, s"$name.exe")))
+    .find(f => f.isFile && f.canExecute)
+    .map(_.getAbsolutePath)
+
 /** A built program run as the driver's own foreground work — `Main`'s `run` command states the
  * contract this answers to.
  *

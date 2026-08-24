@@ -348,6 +348,29 @@ private def splitJoinedLevel(args: Seq[String]): Seq[String] =
 private[sysl] def parseArgs(own: Seq[String]): Option[Config] =
   OParser.parse(parser, splitJoinedLevel(own), Config())
 
+/** The subcommands sysl itself implements, **read off the parser rather than written down twice.**
+ *
+ * `Main` needs this to tell a subcommand it does not have from one it does: an unknown word is
+ * somebody else's `sysl-<word>` and gets exec'd, and a known one must never be, or installing a
+ * binary called `sysl-build` would quietly take over the compiler's own command.
+ *
+ * **A second list would drift**, and it would drift in the direction that breaks a built-in: a
+ * command added to the parser and forgotten here stops being recognized and starts being looked for
+ * on the PATH. So the names come from `OParser.usage`, which renders one `Command: <name> …` line
+ * per command and is the only enumeration scopt exposes — its `OptionDefKind` is `private[scopt]`,
+ * so the structure cannot be walked directly.
+ *
+ * **Reading the usage text is indirect and it fails loudly**, which is what makes it safe: if scopt
+ * ever changes that rendering this answers with nothing, every built-in is looked for on the PATH,
+ * and `SubcommandTests` says so on the first run rather than in somebody's shell a month later.
+ */
+private[sysl] def builtinCommands: Set[String] =
+  OParser
+    .usage(parser)
+    .linesIterator
+    .collect { case line if line.startsWith("Command: ") => line.drop("Command: ".length).takeWhile(!_.isWhitespace) }
+    .toSet
+
 /** Which build of sysl this is.
  *
  * On stdout rather than stderr, and alone on its line, because the first thing anyone does with a

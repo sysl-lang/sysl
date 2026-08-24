@@ -42,6 +42,20 @@ def executablePath: Option[String] = {
   }
 }
 
+/** Where `name` sits on the PATH, if it is there and can be run — **`None` here, deliberately.**
+ *
+ * This answers the external-subcommand question: `sysl doc` looks for `sysl-doc` and hands it the
+ * rest of the line. The other two platforms search the PATH with `java.io`, which Scala.js does not
+ * have; Node could be asked through `fs`, and the reason not to is the one this file already gives
+ * for `runProgram` — **the JS build is not the one that runs programs.** It is the browser and
+ * interpreter build, where there is no PATH to search and no process to start.
+ *
+ * Answering `None` is therefore honest rather than a stub: on this platform there is no external
+ * subcommand to find, and `Main` says so in the same words it uses when a binary is genuinely
+ * missing — which is the truth here.
+ */
+def findOnPath(name: String): Option[String] = None
+
 /** A built program run as the driver's own foreground work — `Main`'s `run` command states the
  * contract this answers to.
  *

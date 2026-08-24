@@ -7,12 +7,57 @@ import io.github.edadma.cross_platform.*
 // and whether this command line answered what the packages asked for.
 
 @main def sysl(args: String*): Unit = {
-  val (own, forwarded) = processArgs(args).span(_ != "--")
+  val all              = processArgs(args)
+  val (own, forwarded) = all.span(_ != "--")
 
-  parseArgs(own) match
-    case Some(cfg) => processExit(execute(cfg.copy(programArgs = forwarded.drop(1).toList)))
-    case None      => processExit(2)
+  // A word sysl has no command for is somebody else's command, if they have installed one. git's
+  // convention: `git foo` runs `git-foo`, which is how every third-party git subcommand has ever
+  // worked, and it is what lets a tool with nothing to do with the compiler read as part of it.
+  //
+  // **A built-in always wins**, because this is only reached for a name `builtinCommands` does not
+  // hold — so a binary called `sysl-build` cannot displace the compiler's own `build`, and adding a
+  // command to the parser takes its name back automatically.
+  //
+  // The test is a leading word rather than a failed parse: reaching for this when scopt refuses
+  // would send `sysl build --nonsense` looking for `sysl-build`, which is a flag mistake in a
+  // command that exists. A leading `-` is not a command either — `sysl --version` is an option on
+  // the program, and there is no `sysl---version`.
+  all.headOption match
+    case Some(name) if !name.startsWith("-") && !builtinCommands(name) =>
+      processExit(subcommand(name, all.tail))
+
+    case _ =>
+      parseArgs(own) match
+        case Some(cfg) => processExit(execute(cfg.copy(programArgs = forwarded.drop(1).toList)))
+        case None      => processExit(2)
 }
+
+/** Run an external subcommand — `sysl <name>` as `sysl-<name>`, with the rest of the line.
+ *
+ * **Everything after the name goes through untouched, `--` included.** sysl does not know what the
+ * other program's arguments mean and has no business splitting them: the `--` that separates the
+ * compiler's own flags from a program's is a convention of *this* command line, and a subcommand is
+ * entitled to its own.
+ *
+ * `runProgram` rather than `exec`, for the reason `run` gives at its own call: `exec` is for a tool
+ * whose output the compiler goes on to read, and closes the child's input at once. A subcommand is
+ * the user's program — its input is theirs and what it writes is for them to read as it is written.
+ * Its exit status becomes sysl's, so a script driving `sysl doc` sees what it would have seen
+ * driving `sysl-doc`.
+ *
+ * **The refusal names what was looked for**, which is the whole reason the PATH is searched here
+ * rather than left to the process API. "There is no `sysl-doc` on your PATH" tells somebody they
+ * have a tool to install; `unknown command 'doc'` tells them they made a typo, and only one of
+ * those is usually true.
+ */
+private def subcommand(name: String, rest: Seq[String]): Int =
+  findOnPath(s"sysl-$name") match
+    case Some(path) => runProgram(path +: rest)
+    case None =>
+      fail(s"'$name' is not a sysl command, and there is no 'sysl-$name' on the PATH — " +
+        s"sysl runs an unknown subcommand as 'sysl-<name>', the way git does, so a tool that " +
+        s"provides one has to be installed and on the PATH. '${builtinCommands.toList.sorted.mkString("', '")}' " +
+        s"are the commands sysl has of its own")
 
 /** What a subcommand does, and the exit status it leaves. Visible to the package so a test can drive
  * the driver rather than re-implementing it — the error paths here are the ones a user meets, and
