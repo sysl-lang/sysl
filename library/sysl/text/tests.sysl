@@ -130,6 +130,62 @@ parse_real_value()
     assert_eq(parse_real("1.5").unwrap(), 1.5)
     assert(parse_real("x").is_err())
 
+// -- parsing off a byte slice ---------------------------------------------------------------------
+//
+// The forms a parser actually reaches for, since what one holds is bytes and a span rather than a
+// string. Each of these would have cost a `string` built from the slice to ask through the `string`
+// forms, and the float one a `cstring` copy on top of that.
+
+@test("an integer parses out of the bytes it is already in")
+parse_int_slice()
+    var text = "  42, -7  ".bytes
+
+    assert_eq(parse_int(text[2..<4]).unwrap(), 42)
+    assert_eq(parse_int(text[6..<8]).unwrap(), -7)
+
+@test("a base is honoured on a slice too")
+parse_int_base_slice()
+    var text = "0xff".bytes
+
+    assert_eq(parse_int_base(text[2..<4], 16).unwrap(), 255)
+
+// The slice forms are where the checking happens and the `string` forms are one line over them, so
+// a refusal has to arrive by the same road rather than only from the wrapper.
+@test("a slice that is not a number is refused the same way")
+parse_slice_refuses()
+    var text = "12x".bytes
+
+    assert(parse_int(text[0..<3]).is_err())
+    assert(parse_int(text[0..<0]).is_err())
+    assert(parse_ulong("-1".bytes).is_err())
+
+@test("the unsigned range reads back off a slice")
+parse_ulong_slice()
+    assert_eq(parse_ulong("18446744073709551615".bytes).unwrap(), 18446744073709551615)
+    assert(parse_ulong("18446744073709551616".bytes).is_err())
+
+@test("a bool parses off a slice from its two spellings")
+parse_bool_slice()
+    var text = "true false".bytes
+
+    assert(parse_bool(text[0..<4]).unwrap())
+    assert(!parse_bool(text[5..<10]).unwrap())
+    assert(parse_bool(text[0..<3]).is_err())
+
+// The stack buffer is what the short case uses and the heap what a long one falls back to, so both
+// roads are walked here: the second literal is longer than the buffer and reads to the same value,
+// which is the point -- the fallback must not be a different parse.
+@test("a real parses off a slice, on both sides of the buffer")
+parse_real_slice()
+    var text = "x1.5y".bytes
+    var long_form = "1.500000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "00000000000000000000000000000000000000000000000000000000"
+
+    assert_eq(parse_real(text[1..<4]).unwrap(), 1.5)
+    assert(long_form.len > 128)
+    assert_eq(parse_real(long_form.bytes).unwrap(), 1.5)
+    assert(parse_real(text[0..<5]).is_err())
+
 // -- display width --------------------------------------------------------------------------------
 //
 // The whole reason `columns` exists: a byte count, a character count and a column count are three
