@@ -75,7 +75,11 @@ print "reconciling the suite list against sbt" | tee -a "$SUMMARY"
 
 sbt -batch --error "print syslNative/Test/definedTestNames" > "$LOGS/defined.log" 2>&1
 
-grep -oE 'sh\.sysl\.[A-Za-z0-9_]+' "$LOGS/defined.log" | sort -u > "$LOGS/defined.txt"
+# The dot is in the class because a package deeper than `sh.sysl` is a matter of time: every test
+# file is `package sh.sysl` today, and a suite under `sh.sysl.foo` would otherwise be captured as
+# `sh.sysl.foo` and reconcile as a mismatch. That fails loudly rather than silently, which is the
+# right way round — and costs nothing to not do at all.
+grep -oE 'sh\.sysl\.[A-Za-z0-9_.]+' "$LOGS/defined.log" | sort -u > "$LOGS/defined.txt"
 
 python3 -c "
 import json, sys
@@ -97,7 +101,13 @@ if [[ -n "$MISSING" || -n "$EXTRA" ]]; then
     print "  fix gate-groups.py rather than this list -- see its self-test"
   } | tee -a "$SUMMARY"
 
-  exit 0
+  # **`exit 1`, unlike every other way this script ends, and the distinction is not a slip.** A RED
+  # *verdict* exits 0 on purpose — the summary is the verdict and a caller reads it, which the header
+  # says at length. This is not a verdict: it is the same class of failure as the grouper dying at
+  # line 60, which exits 1 for the same reason. The suite list being wrong means no verdict was
+  # produced at all, and a check that fires exactly when the gate is not covering what it claims is
+  # the last place to hand back a success status — `./run-gate.sh && <merge>` would sail through it.
+  exit 1
 fi
 
 print "  $(wc -l < "$LOGS/defined.txt" | tr -d ' ') suites, and sbt agrees" | tee -a "$SUMMARY"
