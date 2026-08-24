@@ -18,7 +18,22 @@ package ir
 case class Module(triple: String, declares: List[FuncSig], structs: List[TypeDef],
                   enums: List[TypeDef], boxes: List[TypeDef], imports: List[FuncSig],
                   globals: List[Global], runtime: List[Runtime], funcs: List[Func],
-                  thunks: List[Func], entry: Option[Func], used: Option[Global])
+                  thunks: List[Func], entry: Option[Func], used: Option[Global],
+                  init: Option[Initializer] = None)
+
+/** **What fills a module's computed storage where there is no entry point to fill it in** — the
+ * constructor and the list that gets it called (`13 §7`).
+ *
+ * The two are one value because neither is anything on its own. A function nothing registers is
+ * dead code the linker discards; a registration naming no definition does not link. Carrying them
+ * as a pair is what keeps a back end from being handed half of the mechanism.
+ *
+ * `list` is `@llvm.global_ctors`, whose element is LLVM's own `{ i32, ptr, ptr }` — a priority, the
+ * function, and a global the entry is tied to the liveness of. It is `appending`, so each object
+ * file contributes its own and the linker concatenates them rather than several modules fighting
+ * over one name, exactly as `@llvm.used` does.
+ */
+case class Initializer(func: Func, list: Global)
 
 /** `%struct.Point = type { i32, i32 }` — a name for an aggregate, at module level.
  *

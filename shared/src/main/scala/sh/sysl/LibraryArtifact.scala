@@ -75,6 +75,17 @@ object LibraryArtifact {
    * **5 adds the allocator the object half was built for.** An artifact from 4 records no pair, and a
    * reader that assumed libc's would be assuming the very thing it has to check — so the whole
    * container is refused instead, which is what a version is for.
+   *
+   * **A CHANGE TO `Type.mangleOne` BELONGS IN THAT LIST TOO, and it is the one likeliest to be
+   * forgotten**, because both bumps above were changes to the *shape* of a call while this one is a
+   * change to a **name**. Nothing bounds a mangled symbol today — the mangling is a structural
+   * recursion with no threshold and no hash — so if one is ever added, or the scheme is otherwise
+   * altered, an artifact built before it defines symbols the reader no longer asks for.
+   *
+   * It is worth being honest about how this differs from the two bumps above, so the analogy is not
+   * over-read: those were **silent**, and a naming mismatch is **loud** — the link fails on an
+   * undefined symbol rather than calling the wrong thing. The bump is still owed, for the same
+   * reason and with less at stake.
    */
   val Version: Int = 5
 

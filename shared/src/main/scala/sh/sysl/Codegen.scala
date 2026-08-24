@@ -75,6 +75,16 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       if !program.entryPoint then None
       else if program.tests.nonEmpty then Some(genTestMain(program.vals, program.tests))
       else Some(genMain(program.vals, program.main, program.entry))
+    // What a C archive gets instead of an entry point: a constructor the platform runs before the C
+    // project's own `main`, filling the storage `@main` would have filled (`genModuleInit`). A
+    // program never gets one — its entry point already lays the same `val`s down, and a second
+    // filling would take a second count of every reference among them. **A `.syslib` never gets one
+    // either**, and that is `cArtifact` rather than `!entryPoint`: it is linked by a program that
+    // has an entry point, and `compileLibrary` has already deferred every function reaching computed
+    // storage to it.
+    val init =
+      Option.when(program.cArtifact && target.runsInitializers && program.vals.exists(_.computed))(
+        genModuleInit(program.vals))
     // The tables come after the bodies because a table only exists for a type something erased, and
     // it may ask for an adapter, which the queue below is what emits.
     val vtables = program.vtables.map(genVtable)
@@ -197,7 +207,8 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       // A definition a library already compiled is not in this list: its own module said it was
       // used, and saying so again here would be this module claiming a symbol it does not define.
       genUsed(program.vals.filter(_.section.isDefined).map(v => v.symbol) :::
-                own.filterNot(_.ghost).filter(_.section.isDefined).map(f => symbolOf(f.name))))
+                own.filterNot(_.ghost).filter(_.section.isDefined).map(f => symbolOf(f.name))),
+      init)
   }
 
   /** The intrinsic and libc declarations the module turned out to need.
@@ -424,6 +435,79 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
     finishFunc(entrySig)
   }
+
+  /** **The computed `val`s where there is no entry point to lay them down in** — what `build-c`
+   * gets in place of `@main` (`13 §7`).
+   *
+   * `genMain` above says why a program puts them in its entry point: it is the one place that
+   * certainly runs first and it is already written. An archive has no such place. The C project
+   * linking it supplies its own `main`, so the storage a computed initializer would have written
+   * was whatever the loader left — a silent wrong answer, and until card `0263` it was refused
+   * outright (`Exports.storage`).
+   *
+   * **What answers for it is the platform's own pre-`main` list**, which LLVM spells once and
+   * lowers three ways: `.init_array` on ELF, `__mod_init_func` on Mach-O, `.CRT$XCU` on COFF. So
+   * the objection that a constructor would have to be spelled per target is the back end's problem
+   * and not this compiler's — and the one about the order being invisible to a reader is answered
+   * by the case that matters, since a C `main` runs after every constructor either way.
+   *
+   * **The body is `genMain`'s prologue and nothing else**, region for region: each initializer gets
+   * one of its own, so whatever it allocated on the way to the value is let go of before the next
+   * one starts. There is no runtime to bring up first — a sysl program's entry point calls nothing
+   * before this, so a constructor that does the same is starting from the same place.
+   *
+   * **It is `internal`, so two archives may each carry one.** The list is `appending`, which is
+   * what makes a constructor per object file the ordinary case rather than a name several modules
+   * fight over. Registering it is also what keeps it: nothing here calls it, so a definition the
+   * list did not name would be discarded, and the entry is what makes the linker treat it as a
+   * root.
+   *
+   * **A freestanding target never gets one** — `Target.runsInitializers` — because nothing there
+   * walks the list. That case keeps the refusal.
+   */
+  private def genModuleInit(vals: List[TVal]): ir.Initializer = {
+    startFunction()
+    promoted = promotions(None)
+    pushTemps()
+    pushOwned()
+
+    for v <- vals if v.computed; init <- v.init do
+      pushTemps()
+      genInitStore(v, init)
+      popTemps()
+
+    releaseAll()
+    emitTerm(Inst.Ret(None, None))
+
+    val sig  = ir.FuncSig(initSymbol, ir.FnType(LType.Void, Nil), linkage = ir.Linkage.Internal)
+    // LLVM's own element type for this list: a priority, the function, and the global the entry is
+    // tied to the liveness of. Nothing here is tied to a particular global, so the third is null and
+    // the entry lives as long as the object does.
+    val slot = LType.Struct(List(i32, LType.Ptr, LType.Ptr))
+
+    ir.Initializer(
+      finishFunc(sig),
+      ir.Global("llvm.global_ctors",
+                constant = false,
+                LType.Arr(1, slot),
+                Some(ir.Val.Array(List(ir.Arg(slot,
+                  ir.Val.Agg(List(ir.Arg(i32, ir.Val.Int(initPriority)),
+                                  ir.Arg(LType.Ptr, ir.Val.Global(initSymbol)),
+                                  ir.Arg(LType.Ptr, ir.Val.Null))))))),
+                linkage = ir.Linkage.Appending))
+  }
+
+  /** The constructor's symbol. A runtime helper's spelling — dots — rather than a mangled sysl key,
+   * which separates with `$`, so nothing a module could declare lands on it.
+   */
+  private val initSymbol = "sysl.module_init"
+
+  /** Where the constructor sits among the platform's own. `65535` is the default clang gives a C
+   * `__attribute__((constructor))` with no priority, so sysl's storage is filled alongside the C
+   * the archive carries rather than deliberately before or after it — the two do not depend on each
+   * other, and claiming an earlier slot would be a claim about an ordering nothing needs.
+   */
+  private val initPriority = 65535
 
   /** The platform's own start-up code calls `main` with two arguments whether or not the program
    * asked for them, so this is C's signature and not a sysl one — neither `argc` nor `argv` appears
