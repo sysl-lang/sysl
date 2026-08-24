@@ -12,8 +12,8 @@ import org.scalatest.freespec.AnyFreeSpec
   * **Both limits have tests of their own and they are the point of the last section.** A block
   * filling a collection is a list of its lines, so every line has to be a value — which makes a
   * loop inside one a refusal rather than an oversight, and Swift's `buildArray` is exactly what
-  * would cover it. And a bracket suspends the off-side rule, so a block cannot be written inside
-  * one at all. A test that pins each is what keeps the cost stated rather than rediscovered.
+  * would cover it. And a bracket suspends the off-side rule, so a *trailing* block cannot be written
+  * inside one — `match` and `->` open a block there since card `0248`, and `:` does not. A test that pins each is what keeps the cost stated rather than rediscovered.
   */
 class TrailingBlockTests extends AnyFreeSpec with ParseSupport with RunSupport with CodegenSupport {
 
@@ -419,9 +419,13 @@ class TrailingBlockTests extends AnyFreeSpec with ParseSupport with RunSupport w
     }
 
     // A bracket suspends the off-side rule until it closes (`00 §9`), so there is no indent inside
-    // one for a block to be — which makes this a property of the language rather than of the
-    // feature. It is pinned here because the spelling looks reasonable and the failure is a parse
-    // error about something else.
+    // one for a trailing block to be made of. It is pinned here because the spelling looks
+    // reasonable and the failure is a parse error about something else.
+    //
+    // **`:` is not among the tokens card `0248` gave a block to**, which are `match` and `->`. Each
+    // of those can only ever open a block, so a reader is never left wondering whether the line
+    // ended; `:` appears inside brackets in positions that open nothing, so it stays out and the
+    // name-it-first form remains the way to pass a block.
     "a block written inside parentheses, which the off-side rule leaves no room for" in {
       progError("""print(total:
                   |    1

@@ -83,17 +83,28 @@ class ClosureParserTests extends AnyFreeSpec with ParseSupport {
              |""".stripMargin).head shouldBe a[VarDecl]
     }
 
-    "inside an argument list it does not, because a bracket suspends indentation" in {
-      // `00 §9` — a bracket suspends the off-side rule until it closes, so the lexer emits no
-      // indent inside one and there is no block for the body to be. The fix is a name to bind the
-      // closure to, and the limit is recorded in `12 §5` rather than worked around here.
-      //
-      // The body is therefore the one expression `log(x)`, and the argument list is still open when
-      // the next line starts: what is missing at `print` is the `)` that would have closed it.
-      progError("""xs.each(x ->
-                  |    log(x)
-                  |    print(x))
-                  |""".stripMargin) should include("')' expected")
+    // **This asserted the opposite until card `0248`, and the reversal is the point.** A bracket
+    // suspends the off-side rule until it closes, so the lexer emitted no indent inside one and
+    // there was no block for the body to be — the closure's body was the one expression `log(x)`,
+    // the argument list was still open at the next line, and what was missing at `print` was the
+    // `)` that would have closed it. The recorded fix was a name to bind the closure to.
+    //
+    // An arrow opens a block wherever it is written now, so the body is both statements and the
+    // `)` closes the call. `BlockInBracketsTests` carries the rule and its cost; this one is here
+    // because it is where the old limit was written down, and a limit that has gone should say so
+    // rather than disappear.
+    "inside an argument list it does too, since an arrow opens a block wherever it is written" in {
+      prog("""xs.each(x ->
+             |    log(x)
+             |    print(x))
+             |""".stripMargin) shouldBe
+        List(ExprStmt(Call(
+          Field(Ident("xs"), "each"),
+          List(Lambda(
+            List(p("x")),
+            List(ExprStmt(Call(Ident("log"), List(Ident("x")))), ExprStmt(Call(Ident("print"), List(Ident("x"))))),
+          )),
+        )))
     }
 
     // A body forgotten altogether. The block alternative is *looked for* rather than tried, so its

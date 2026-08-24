@@ -194,8 +194,12 @@ class PlaceholderTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     // The sharpest version: one statement holding both, the scrutinee being a placeholder and an
     // arm being a wildcard. A production that took the other's token breaks here rather than in a
-    // file where the two merely coexist. It is written at statement level because a bracket
-    // suspends the off-side rule (`00 §9`), so the arms cannot be indented inside an argument list.
+    // file where the two merely coexist.
+    //
+    // It is written at statement level because a bracket used to suspend the off-side rule outright,
+    // so the arms could not be indented inside an argument list. Card `0248` gave `match` and `->` a
+    // block wherever they are written, so that reason has gone — the shape is kept because it is the
+    // one this test is about, not because the other is refused.
     "even in one statement, whose scrutinee is a placeholder and whose last arm is a wildcard" in {
       run("""var f: &Fn(int) -> int = _ match
             |    0 -> 100
