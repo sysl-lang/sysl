@@ -400,6 +400,13 @@ object Compiler {
       // program instead, where the initialization it depends on actually happens. Everything else —
       // which is most of a library — is compiled once, here.
       //
+      // **`build-c` took the other road for the same problem and this one stays as it is**, which is
+      // what `TProgram.cArtifact` exists to keep apart (card `0263`). An archive is linked by a C
+      // project that supplies its own `main`, so nothing is ever going to fill its storage and it
+      // registers a constructor that does. A `.syslib` is linked by a sysl program, which has an
+      // entry point and fills the storage there — so deferring is not a workaround here, it is the
+      // cheaper answer, and a constructor emitted alongside would fill a copy nothing reads.
+      //
       // **It has to be left out of what is EMITTED and not only out of what is advertised**, and
       // getting that wrong is a duplicate definition rather than a missing one. The program compiles
       // its own copy because nothing advertised it; if this object file defined it too, both
