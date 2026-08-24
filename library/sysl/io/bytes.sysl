@@ -15,11 +15,12 @@ import sysl.buf.{Buf, buf}
 // measure it before committing, and feeding a function that wants a stream from something that is
 // not one are all the same two types.
 
-// A reader over bytes already in hand.
-//
-// It **borrows** what it reads rather than copying it, so a reader over a large buffer costs three
-// words. What that asks of a caller is that the bytes outlive the reader, which is the ordinary rule
-// for a slice and needs no special mention beyond this one.
+/** A reader over bytes already in hand.
+ *
+ * It **borrows** what it reads rather than copying it, so a reader over a large buffer costs three
+ * words. What that asks of a caller is that the bytes outlive the reader, which is the ordinary rule
+ * for a slice and needs no special mention beyond this one.
+ */
 struct BytesReader
     bytes: []const u8
     at: usize
@@ -30,20 +31,21 @@ struct BytesReader
     remaining(self) -> usize = self.bytes.len - self.at
 end BytesReader
 
-// A reader that hands back as much of what is left as the caller offered room for.
+/** A reader that hands back as much of what is left as the caller offered room for. */
 bytes_reader(b: []const u8) -> BytesReader = BytesReader(b, 0, b.len)
 
-// A reader that hands back **at most `most` bytes per read**, however much room it was offered.
-//
-// **This is how a consumer's refilling is tested, and there is otherwise no way to do it.** Anything
-// reading a stream has cases that only arise when a unit of input straddles two reads -- the two
-// bytes of a CRLF, an escape sequence, the continuation bytes of one character -- and a reader that
-// always empties itself in one go never produces them. Those cases are exactly the ones a
-// hand-rolled reader gets wrong, so being unable to reach them is being unable to test the part that
-// breaks.
-//
-// It is also what a slow source honestly looks like: a serial port hands over what has arrived, not
-// what was asked for.
+/** A reader that hands back **at most `most` bytes per read**, however much room it was offered.
+ *
+ * **This is how a consumer's refilling is tested, and there is otherwise no way to do it.** Anything
+ * reading a stream has cases that only arise when a unit of input straddles two reads -- the two
+ * bytes of a CRLF, an escape sequence, the continuation bytes of one character -- and a reader that
+ * always empties itself in one go never produces them. Those cases are exactly the ones a
+ * hand-rolled reader gets wrong, so being unable to reach them is being unable to test the part that
+ * breaks.
+ *
+ * It is also what a slow source honestly looks like: a serial port hands over what has arrived, not
+ * what was asked for.
+ */
 bytes_reader_at_most(b: []const u8, most: usize) -> BytesReader = BytesReader(b, 0, most)
 
 impl Reader for BytesReader
@@ -60,30 +62,33 @@ impl Reader for BytesReader
     end read
 end BytesReader
 
-// Nothing here can fail: the bytes are already in hand, and running out of them is the end of the
-// input rather than a fault. The block is still written, because a required trait is required
-// whether or not there is anything to say -- `Fallible.failed` has a default answer and no default
-// **membership**.
+/** Nothing here can fail: the bytes are already in hand, and running out of them is the end of the
+ * input rather than a fault. The block is still written, because a required trait is required
+ * whether or not there is anything to say -- `Fallible.failed` has a default answer and no default
+ * **membership**.
+ */
 impl Fallible for BytesReader
 
-// A writer that keeps what it is given.
-//
-// The bytes are a `Buf[u8]`, so the sink grows to fit and `view` hands back everything written so
-// far. A caller wanting text calls `from_utf8` on that view, and gets to decide what an ill-formed
-// sequence means rather than being stopped -- which is right here, because whatever wrote those
-// bytes is the thing under suspicion.
+/** A writer that keeps what it is given.
+ *
+ * The bytes are a `Buf[u8]`, so the sink grows to fit and `view` hands back everything written so
+ * far. A caller wanting text calls `from_utf8` on that view, and gets to decide what an ill-formed
+ * sequence means rather than being stopped -- which is right here, because whatever wrote those
+ * bytes is the thing under suspicion.
+ */
 struct BytesWriter
     bytes: Buf[u8]
 
-    // Everything written so far.
+    /** Everything written so far. */
     view(self) -> []const u8 = self.bytes.view()
 
     len(self) -> usize = self.bytes.len()
 
     is_empty(self) -> bool = self.bytes.is_empty()
 
-    // Forget what was written, keeping the storage -- so a loop that measures one rendering after
-    // another allocates once.
+    /** Forget what was written, keeping the storage -- so a loop that measures one rendering after
+     * another allocates once.
+     */
     clear(*self)
         self.bytes.clear()
 end BytesWriter
@@ -94,6 +99,7 @@ impl Writer for BytesWriter
     write(*self, bytes: []const u8)
         for b in bytes do self.bytes.push(b)
 
-// Memory does not go away, so there is nothing to latch. As above, the block is membership rather
-// than content.
+/** Memory does not go away, so there is nothing to latch. As above, the block is membership rather
+ * than content.
+ */
 impl Fallible for BytesWriter

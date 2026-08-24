@@ -25,26 +25,29 @@ import sysl.slices.swap
 // Taking a seed from the host is `sysl.posix.rand`, a module of its own, so that importing the
 // generator cannot drag an operating system in behind it.
 
-// The multiplier from the reference implementation. Not a number to adjust: the generator's
-// statistical properties are a property of this constant with this state size.
+/** The multiplier from the reference implementation. Not a number to adjust: the generator's
+ * statistical properties are a property of this constant with this state size.
+ */
 private const MULTIPLIER: u64 = 6364136223846793005
 
-// A generator: sixty-four bits of state, and the odd increment that selects one of 2^63 distinct
-// streams.
-//
-// A copy of an `Rng` is an independent generator continuing from the same point, which is a useful
-// thing rather than an accident -- it is how a simulation replays a branch from a saved position.
+/** A generator: sixty-four bits of state, and the odd increment that selects one of 2^63 distinct
+ * streams.
+ *
+ * A copy of an `Rng` is an independent generator continuing from the same point, which is a useful
+ * thing rather than an accident -- it is how a simulation replays a branch from a saved position.
+ */
 struct Rng
     state: u64
     inc: u64
 
-    // The next 32 bits.
-    //
-    // The state advances by an ordinary linear congruential step, and the *output* is a permutation
-    // of the state's high bits rather than the state itself: an xorshift folds the high bits down,
-    // and the result is then rotated by an amount taken from bits the xorshift did not use. That
-    // second step is what a bare congruential generator lacks and is why its low bits are notoriously
-    // poor -- here every bit of the output is the product of the whole state.
+    /** The next 32 bits.
+     *
+     * The state advances by an ordinary linear congruential step, and the *output* is a permutation
+     * of the state's high bits rather than the state itself: an xorshift folds the high bits down,
+     * and the result is then rotated by an amount taken from bits the xorshift did not use. That
+     * second step is what a bare congruential generator lacks and is why its low bits are notoriously
+     * poor -- here every bit of the output is the product of the whole state.
+     */
     next_u32(*self) -> u32
         val old = self.state
 
@@ -58,30 +61,33 @@ struct Rng
         xorshifted >> rot | xorshifted << (0 - rot & 31)
     end next_u32
 
-    // Sixty-four bits, as two draws with the first taken as the high half. Written down because the
-    // order matters to reproducibility: the other order gives a different, equally valid sequence,
-    // and a caller comparing two runs needs to know which this is.
+    /** Sixty-four bits, as two draws with the first taken as the high half. Written down because the
+     * order matters to reproducibility: the other order gives a different, equally valid sequence,
+     * and a caller comparing two runs needs to know which this is.
+     */
     next_u64(*self) -> u64 = u64(self.next_u32()) << 32 | u64(self.next_u32())
 
-    // One bit, taken from the **top** of a draw rather than the bottom. Either is sound here, since
-    // the permutation above makes every bit good, but the high bit is the one that stays good if the
-    // generator is ever changed.
+    /** One bit, taken from the **top** of a draw rather than the bottom. Either is sound here, since
+     * the permutation above makes every bit good, but the high bit is the one that stays good if the
+     * generator is ever changed.
+     */
     boolean(*self) -> bool = self.next_u32() >> 31 == 1
 
-    // A uniform value in `[0, n)`, with **no modulo bias**.
-    //
-    // **This is the function the module exists for.** The obvious `next_u64() % n` is not uniform
-    // whenever `n` does not divide 2^64: the low residues come up more often, by a margin that is
-    // invisible in a handful of draws and is a real defect in a simulation or a shuffle.
-    //
-    // The fix is to reject the unfair part of the range. `threshold` is `2^64 mod n`, computed as
-    // `(0 - n) % n` because unsigned arithmetic wraps (`01`) and `0 - n` is exactly `2^64 - n`.
-    // Draws below it are discarded, leaving a span that `n` divides evenly. It terminates with
-    // probability one and takes under two draws on average -- and for the overwhelmingly common case
-    // of a small `n` the threshold is tiny and the first draw is nearly always taken.
-    //
-    // `below(0)` has no value to answer and gives `0`, which is the one input a caller should not
-    // write.
+    /** A uniform value in `[0, n)`, with **no modulo bias**.
+     *
+     * **This is the function the module exists for.** The obvious `next_u64() % n` is not uniform
+     * whenever `n` does not divide 2^64: the low residues come up more often, by a margin that is
+     * invisible in a handful of draws and is a real defect in a simulation or a shuffle.
+     *
+     * The fix is to reject the unfair part of the range. `threshold` is `2^64 mod n`, computed as
+     * `(0 - n) % n` because unsigned arithmetic wraps (`01`) and `0 - n` is exactly `2^64 - n`.
+     * Draws below it are discarded, leaving a span that `n` divides evenly. It terminates with
+     * probability one and takes under two draws on average -- and for the overwhelmingly common case
+     * of a small `n` the threshold is tiny and the first draw is nearly always taken.
+     *
+     * `below(0)` has no value to answer and gives `0`, which is the one input a caller should not
+     * write.
+     */
     below(*self, n: u64) -> u64
         if n == 0 then return 0
 
@@ -94,27 +100,29 @@ struct Rng
         r % n
     end below
 
-    // A uniform value in `[lo, hi)`, empty when `hi` is not above `lo`.
+    /** A uniform value in `[lo, hi)`, empty when `hi` is not above `lo`. */
     range(*self, lo: i64, hi: i64) -> i64 =
         if hi <= lo then lo else lo + i64(self.below(u64(hi - lo)))
 
-    // A uniform value in `[0, 1)`, from **53** bits.
-    //
-    // Fifty-three because that is the width of a `real`'s mantissa: fewer would leave representable
-    // values that can never come back, and more would be bits thrown away by the division. Half-open
-    // at the top, so `1.0` never appears -- which is the property every caller scaling by a range
-    // depends on, and the one an implementation dividing by `2^53 - 1` quietly breaks.
+    /** A uniform value in `[0, 1)`, from **53** bits.
+     *
+     * Fifty-three because that is the width of a `real`'s mantissa: fewer would leave representable
+     * values that can never come back, and more would be bits thrown away by the division. Half-open
+     * at the top, so `1.0` never appears -- which is the property every caller scaling by a range
+     * depends on, and the one an implementation dividing by `2^53 - 1` quietly breaks.
+     */
     unit(*self) -> real = real(self.next_u64() >> 11) / 9007199254740992.0
 
-    // The elements rearranged, every permutation equally likely.
-    //
-    // **Fisher-Yates, walking down**: each position from the end takes a uniformly chosen element
-    // from those at or below it. The whole difficulty is drawing that index without bias, which is
-    // `below`'s job -- the loop itself is three lines.
-    //
-    // It lives here rather than in `sysl.slices` because it is a fact about a *generator*, and
-    // because `sysl.slices` is the module a C binding reaches into for `as_ptr`: acquiring a
-    // random-number generator by asking for a slice operation would be a poor trade.
+    /** The elements rearranged, every permutation equally likely.
+     *
+     * **Fisher-Yates, walking down**: each position from the end takes a uniformly chosen element
+     * from those at or below it. The whole difficulty is drawing that index without bias, which is
+     * `below`'s job -- the loop itself is three lines.
+     *
+     * It lives here rather than in `sysl.slices` because it is a fact about a *generator*, and
+     * because `sysl.slices` is the module a C binding reaches into for `as_ptr`: acquiring a
+     * random-number generator by asking for a slice operation would be a poor trade.
+     */
     shuffle[T](*self, xs: []T)
         if xs.len < 2 then return
 
@@ -129,16 +137,17 @@ struct Rng
     end shuffle
 end Rng
 
-// A generator from a seed and a stream selector.
-//
-// **Two arguments, because the stream is not the seed.** Two generators with the same seed and
-// different `seq` produce different, equally good sequences -- which is what a program wanting
-// several independent streams from one seed needs, and what seeding several generators from
-// consecutive seeds does *not* reliably give.
-//
-// The initialization is the reference implementation's: the increment is made odd, the state is
-// advanced once, the seed is added, and the state is advanced again. The two steps are what stop a
-// seed of zero from being a special case.
+/** A generator from a seed and a stream selector.
+ *
+ * **Two arguments, because the stream is not the seed.** Two generators with the same seed and
+ * different `seq` produce different, equally good sequences -- which is what a program wanting
+ * several independent streams from one seed needs, and what seeding several generators from
+ * consecutive seeds does *not* reliably give.
+ *
+ * The initialization is the reference implementation's: the increment is made odd, the state is
+ * advanced once, the seed is added, and the state is advanced again. The two steps are what stop a
+ * seed of zero from being a special case.
+ */
 rng(seed: u64, seq: u64) -> Rng
     var g = Rng(0, seq << 1 | 1)
 

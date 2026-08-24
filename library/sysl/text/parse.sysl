@@ -27,20 +27,21 @@ import sysl.sys.sysl_strtod
 // allocations for a value whose text is a dozen bytes, neither of which the digits needed. The
 // digits are ASCII, so nothing is lost by reading them where they already are.
 
-// Why a parse refused, at the granularity a caller can act on.
-//
-// `BadDigit` carries the byte offset for the same reason `Utf8Error` does: a message naming where
-// is worth writing and cannot be reconstructed afterwards. The four are separated by what a caller
-// would *do* about them and not by taxonomy -- an empty field is often a default, a bad digit is a
-// message to a user, an overflow is a wider type or a refusal, and a bad base is the program's own
-// mistake rather than the input's.
+/** Why a parse refused, at the granularity a caller can act on.
+ *
+ * `BadDigit` carries the byte offset for the same reason `Utf8Error` does: a message naming where
+ * is worth writing and cannot be reconstructed afterwards. The four are separated by what a caller
+ * would *do* about them and not by taxonomy -- an empty field is often a default, a bad digit is a
+ * message to a user, an overflow is a wider type or a refusal, and a bad base is the program's own
+ * mistake rather than the input's.
+ */
 enum ParseError
     Empty
     BadDigit(at: usize)
     Overflow
     BadBase(base: int)
 
-// The rendering, so that a refusal can be printed without matching on it.
+/** The rendering, so that a refusal can be printed without matching on it. */
 impl Display for ParseError
     display(self, out: *Writer, fmt: FormatSpec)
         var text = self match
@@ -52,12 +53,13 @@ impl Display for ParseError
         display_str(text, out, fmt)
     end display
 
-// `"true"` or `"false"`, and nothing else.
-//
-// Exactly the two spellings `str(b)` produces, so the pair round-trips and neither direction has an
-// opinion the other lacks. `"True"`, `"yes"` and `"1"` are refused deliberately: each is somebody's
-// convention, none is this library's, and a program wanting one can say so in three lines that read
-// as the policy they are.
+/** `"true"` or `"false"`, and nothing else.
+ *
+ * Exactly the two spellings `str(b)` produces, so the pair round-trips and neither direction has an
+ * opinion the other lacks. `"True"`, `"yes"` and `"1"` are refused deliberately: each is somebody's
+ * convention, none is this library's, and a program wanting one can say so in three lines that read
+ * as the policy they are.
+ */
 parse_bool(b: []const u8) -> Result[bool, ParseError]
     if equal(b, "true".bytes) then
         Ok(true)
@@ -71,20 +73,21 @@ end parse_bool
 
 parse_bool(s: string) -> Result[bool, ParseError] = parse_bool(s.bytes)
 
-// The whole signed range in the given base, `MIN` included.
-//
-// **The accumulation runs negative, and that is the whole trick.** The signed range is asymmetric
-// -- the magnitude of the most negative value is one larger than the largest positive one -- so a
-// parser building the magnitude and negating at the end cannot represent `MIN` at any point and has
-// to special-case it. Building on the negative side covers the entire range with one path, and the
-// only value needing a word of its own is a *positive* result of `MIN`'s magnitude, refused just
-// before the final negation.
-//
-// **The overflow test happens before the arithmetic that would overflow**, because integer
-// arithmetic wraps rather than trapping (`01`): a product that has already wrapped is not a number
-// a later comparison can learn anything from. `limit` is the largest magnitude surviving a multiply
-// by the base, and `cutoff` is the largest digit that may still be subtracted once the accumulator
-// is exactly there.
+/** The whole signed range in the given base, `MIN` included.
+ *
+ * **The accumulation runs negative, and that is the whole trick.** The signed range is asymmetric
+ * -- the magnitude of the most negative value is one larger than the largest positive one -- so a
+ * parser building the magnitude and negating at the end cannot represent `MIN` at any point and has
+ * to special-case it. Building on the negative side covers the entire range with one path, and the
+ * only value needing a word of its own is a *positive* result of `MIN`'s magnitude, refused just
+ * before the final negation.
+ *
+ * **The overflow test happens before the arithmetic that would overflow**, because integer
+ * arithmetic wraps rather than trapping (`01`): a product that has already wrapped is not a number
+ * a later comparison can learn anything from. `limit` is the largest magnitude surviving a multiply
+ * by the base, and `cutoff` is the largest digit that may still be subtracted once the accumulator
+ * is exactly there.
+ */
 parse_long_base(b: []const u8, base: int) -> Result[long, ParseError]
     if base < 2 || base > 36 then return Err(BadBase(base))
 
@@ -127,8 +130,9 @@ parse_long(b: []const u8) -> Result[long, ParseError] = parse_long_base(b, 10)
 
 parse_long(s: string) -> Result[long, ParseError] = parse_long_base(s.bytes, 10)
 
-// The same, narrowed to `int`. A value that is a perfectly good `long` and does not fit here is an
-// `Overflow`, since what the caller asked for is an `int` and there is no honest `int` to hand back.
+/** The same, narrowed to `int`. A value that is a perfectly good `long` and does not fit here is an
+ * `Overflow`, since what the caller asked for is an `int` and there is no honest `int` to hand back.
+ */
 parse_int_base(b: []const u8, base: int) -> Result[int, ParseError]
     var v = parse_long_base(b, base)?
 
@@ -143,12 +147,13 @@ parse_int(b: []const u8) -> Result[int, ParseError] = parse_int_base(b, 10)
 
 parse_int(s: string) -> Result[int, ParseError] = parse_int_base(s.bytes, 10)
 
-// The unsigned range, which is not the signed one with the sign removed: `"ffffffffffffffff"` is a
-// perfectly ordinary 64-bit mask and overflows every signed parse there is. A systems language that
-// could not read one back would be missing the case its own literals are written in.
-//
-// No sign is accepted, not even `+`. A leading `-` on an unsigned value is a question with no good
-// answer -- wrap, clamp or refuse -- and refusing at the first byte is the one that cannot surprise.
+/** The unsigned range, which is not the signed one with the sign removed: `"ffffffffffffffff"` is a
+ * perfectly ordinary 64-bit mask and overflows every signed parse there is. A systems language that
+ * could not read one back would be missing the case its own literals are written in.
+ *
+ * No sign is accepted, not even `+`. A leading `-` on an unsigned value is a question with no good
+ * answer -- wrap, clamp or refuse -- and refusing at the first byte is the one that cannot surprise.
+ */
 parse_ulong_base(b: []const u8, base: int) -> Result[ulong, ParseError]
     if base < 2 || base > 36 then return Err(BadBase(base))
 
@@ -191,24 +196,25 @@ end parse_uint
 
 parse_uint(s: string) -> Result[uint, ParseError] = parse_uint(s.bytes)
 
-// A floating-point value, through the C library.
-//
-// It goes to `strtod` for the reason the float half of `str` goes to `snprintf`: correctly rounded
-// decimal-to-binary conversion is a hard algorithm to get right and an easy one to get subtly
-// wrong, and the two directions must agree or a value will not survive being written and read back.
-// Writing it in sysl waits for a target with no C library, which is the same condition
-// `reference/strings.md § Rendering a value` puts on the rendering half.
-//
-// **It costs a copy and usually not an allocation**, because `strtod` reads a NUL-terminated
-// pointer and neither a slice nor a `string` carries a terminator. The copy goes into a buffer on
-// the stack for any text short enough to fit one, which is every float anybody writes and every
-// float `str` produces; longer input falls back to the heap rather than being refused, since a
-// decimal expansion may legitimately run to hundreds of digits and every one of them can move the
-// last bit of the result.
-//
-// The end pointer is what turns C's lenient parse into this library's strict one: `strtod` stops at
-// the first byte it cannot use and reports where, so anything left over is trailing garbage and
-// `"1.5x"` is refused rather than read as `1.5`.
+/** A floating-point value, through the C library.
+ *
+ * It goes to `strtod` for the reason the float half of `str` goes to `snprintf`: correctly rounded
+ * decimal-to-binary conversion is a hard algorithm to get right and an easy one to get subtly
+ * wrong, and the two directions must agree or a value will not survive being written and read back.
+ * Writing it in sysl waits for a target with no C library, which is the same condition
+ * `reference/strings.md § Rendering a value` puts on the rendering half.
+ *
+ * **It costs a copy and usually not an allocation**, because `strtod` reads a NUL-terminated
+ * pointer and neither a slice nor a `string` carries a terminator. The copy goes into a buffer on
+ * the stack for any text short enough to fit one, which is every float anybody writes and every
+ * float `str` produces; longer input falls back to the heap rather than being refused, since a
+ * decimal expansion may legitimately run to hundreds of digits and every one of them can move the
+ * last bit of the result.
+ *
+ * The end pointer is what turns C's lenient parse into this library's strict one: `strtod` stops at
+ * the first byte it cannot use and reports where, so anything left over is trailing garbage and
+ * `"1.5x"` is refused rather than read as `1.5`.
+ */
 parse_real(b: []const u8) -> Result[real, ParseError]
     if b.len == 0 then return Err(Empty)
 
@@ -228,11 +234,12 @@ end parse_real
 
 parse_real(s: string) -> Result[real, ParseError] = parse_real(s.bytes)
 
-// The call itself and the strictness check, shared by the two copies above.
-//
-// It takes a pointer rather than either buffer because the buffers have different lifetimes and
-// only one of them may exist: a stack array handed to a helper would be a pointer into a frame that
-// has gone, so the copy has to happen in the frame that returns and only the call can be lifted.
+/** The call itself and the strictness check, shared by the two copies above.
+ *
+ * It takes a pointer rather than either buffer because the buffers have different lifetimes and
+ * only one of them may exist: a stack array handed to a helper would be a pointer into a frame that
+ * has gone, so the copy has to happen in the frame that returns and only the call can be lifted.
+ */
 private read_real(p: *u8, n: usize) -> Result[real, ParseError]
     var end: *u8 = null
     var v = sysl_strtod(p, &end)

@@ -59,33 +59,37 @@ private[sysl] extern "mkdir" c_mkdir(path: *u8, mode: u32) -> int
 private made_dir(p: *u8) -> int = c_mkdir(p, u32(dir_mode()))
 #endif
 
-// What `access` is being asked. POSIX fixes all four numbers, and they are named here so that no
-// call below reads as a bare integer.
+/** What `access` is being asked. POSIX fixes all four numbers, and they are named here so that no
+ * call below reads as a bare integer.
+ */
 private f_ok() -> int = 0
 private r_ok() -> int = 4
 private w_ok() -> int = 2
 
-// The permissions a new directory asks for -- 0o777, which the process umask narrows to whatever
-// the environment has decided new directories should be. Asking for less here would override that
-// decision rather than defer to it, which is the wrong way round: a program that wants a private
-// directory says so, and one that does not should get the machine's answer.
+/** The permissions a new directory asks for -- 0o777, which the process umask narrows to whatever
+ * the environment has decided new directories should be. Asking for less here would override that
+ * decision rather than defer to it, which is the wrong way round: a program that wants a private
+ * directory says so, and one that does not should get the machine's answer.
+ */
 private dir_mode() -> int = 511
 
-// Whether there is anything at all at this path.
-//
-// It answers `false` for a path that exists but sits under a directory the program may not search,
-// which is the one way this differs from the question it looks like it is asking. That case cannot
-// be told from absence without a second call whose answer would already be stale, and every caller
-// that matters -- one about to open the file -- gets the truth from the open.
+/** Whether there is anything at all at this path.
+ *
+ * It answers `false` for a path that exists but sits under a directory the program may not search,
+ * which is the one way this differs from the question it looks like it is asking. That case cannot
+ * be told from absence without a second call whose answer would already be stale, and every caller
+ * that matters -- one about to open the file -- gets the truth from the open.
+ */
 exists(path: string) -> bool = c_access(cstring(path).ptr, f_ok()) == 0
 
 readable(path: string) -> bool = c_access(cstring(path).ptr, r_ok()) == 0
 
 writable(path: string) -> bool = c_access(cstring(path).ptr, w_ok()) == 0
 
-// Whether the path names a directory, asked by opening it as one. `DIR *` is opaque, so this needs
-// nothing about the platform beyond the two symbols -- which is what makes it the one question about
-// a path's *kind* the module can answer honestly.
+/** Whether the path names a directory, asked by opening it as one. `DIR *` is opaque, so this needs
+ * nothing about the platform beyond the two symbols -- which is what makes it the one question about
+ * a path's *kind* the module can answer honestly.
+ */
 is_dir(path: string) -> bool
     var d = c_opendir(cstring(path).ptr)
 
@@ -95,21 +99,22 @@ is_dir(path: string) -> bool
     true
 end is_dir
 
-// Every name in a directory, with `.` and `..` left out.
-//
-// The two dots are dropped because every caller drops them: a program listing a directory is asking
-// what is *in* it, and one that genuinely wants to walk upwards has a path to build rather than a
-// name to find. Leaving them in makes the ordinary case a filter written at every call site, and a
-// recursive walk that forgets the filter does not terminate.
-//
-// **The names arrive in whatever order the filesystem keeps them**, which is not sorted and is not
-// stable between two listings of one directory. A program that wants an order applies one; there is
-// no order here to be relied on by accident.
-//
-// **A name that is not UTF-8 stops the program**, exactly as `read_text` does with a file's contents
-// and for the reason written there: answering with an error would put a case in `IoError` that no
-// filesystem ever reports. A POSIX name is bytes, so this is reachable — and a program that would
-// rather inspect than trap is one this module does not serve yet.
+/** Every name in a directory, with `.` and `..` left out.
+ *
+ * The two dots are dropped because every caller drops them: a program listing a directory is asking
+ * what is *in* it, and one that genuinely wants to walk upwards has a path to build rather than a
+ * name to find. Leaving them in makes the ordinary case a filter written at every call site, and a
+ * recursive walk that forgets the filter does not terminate.
+ *
+ * **The names arrive in whatever order the filesystem keeps them**, which is not sorted and is not
+ * stable between two listings of one directory. A program that wants an order applies one; there is
+ * no order here to be relied on by accident.
+ *
+ * **A name that is not UTF-8 stops the program**, exactly as `read_text` does with a file's contents
+ * and for the reason written there: answering with an error would put a case in `IoError` that no
+ * filesystem ever reports. A POSIX name is bytes, so this is reachable — and a program that would
+ * rather inspect than trap is one this module does not serve yet.
+ */
 entries(path: string) -> Result[Buf[string], IoError]
     var d = c_opendir(cstring(path).ptr)
 
@@ -134,14 +139,16 @@ entries(path: string) -> Result[Buf[string], IoError]
     Ok(names)
 end entries
 
-// Whether the path names something that is not a directory. A device or a socket answers `true`
-// here, which is right for what callers use it for: the question is whether opening it as a file
-// could work.
+/** Whether the path names something that is not a directory. A device or a socket answers `true`
+ * here, which is right for what callers use it for: the question is whether opening it as a file
+ * could work.
+ */
 is_file(path: string) -> bool = exists(path) && !is_dir(path)
 
-// How many bytes the file holds. It opens the file to ask, so it reports the same failures an open
-// does -- a missing file answers `NotFound` rather than zero, which is the distinction a caller
-// sizing a buffer needs and the one a bare number could not carry.
+/** How many bytes the file holds. It opens the file to ask, so it reports the same failures an open
+ * does -- a missing file answers `NotFound` rather than zero, which is the distinction a caller
+ * sizing a buffer needs and the one a bare number could not carry.
+ */
 size_of(path: string) -> Result[long, IoError]
     var f = open(path)?
 
@@ -150,36 +157,41 @@ size_of(path: string) -> Result[long, IoError]
     f.size()
 end size_of
 
-// Makes one directory. The parent has to be there already: making a chain is a loop over path
-// separators, and where a separator *is* is a question about paths rather than about the
-// filesystem, which this module does not answer.
+/** Makes one directory. The parent has to be there already: making a chain is a loop over path
+ * separators, and where a separator *is* is a question about paths rather than about the
+ * filesystem, which this module does not answer.
+ */
 make_dir(path: string) -> Result[unit, IoError] = done(made_dir(cstring(path).ptr))
 
-// Removes a file, and refuses a directory rather than removing it: `unlink` is the call that draws
-// that line, where C's own `remove` quietly does either. Two names for two intentions is what lets
-// a program that meant one of them find out it had the other.
+/** Removes a file, and refuses a directory rather than removing it: `unlink` is the call that draws
+ * that line, where C's own `remove` quietly does either. Two names for two intentions is what lets
+ * a program that meant one of them find out it had the other.
+ */
 remove_file(path: string) -> Result[unit, IoError] = done(c_unlink(cstring(path).ptr))
 
-// Removes a directory, which has to be empty. A directory with anything in it reports
-// `DirectoryNotEmpty` -- the one error code in the set whose number the two platforms disagree
-// about, which is why `error.sysl` reads it through a call rather than a literal.
+/** Removes a directory, which has to be empty. A directory with anything in it reports
+ * `DirectoryNotEmpty` -- the one error code in the set whose number the two platforms disagree
+ * about, which is why `error.sysl` reads it through a call rather than a literal.
+ */
 remove_dir(path: string) -> Result[unit, IoError] = done(c_rmdir(cstring(path).ptr))
 
-// Moves a path to another name, replacing whatever was at the destination.
-//
-// It is one operation as far as anything watching is concerned when both paths are on the same
-// filesystem, and it fails rather than copying when they are not -- which is `rename(2)`'s contract
-// and worth knowing, since a program moving a file across devices has to read and write it itself.
-//
-// The two copies are named rather than written into the call, because a `cstring` temporary lives
-// for the statement it appears in and this statement needs both of them alive at once.
+/** Moves a path to another name, replacing whatever was at the destination.
+ *
+ * It is one operation as far as anything watching is concerned when both paths are on the same
+ * filesystem, and it fails rather than copying when they are not -- which is `rename(2)`'s contract
+ * and worth knowing, since a program moving a file across devices has to read and write it itself.
+ *
+ * The two copies are named rather than written into the call, because a `cstring` temporary lives
+ * for the statement it appears in and this statement needs both of them alive at once.
+ */
 rename(from: string, to: string) -> Result[unit, IoError]
     var a = cstring(from)
     var b = cstring(to)
 
     done(c_rename(a.ptr, b.ptr))
 
-// A C call that reports success as zero, as the `Result` the rest of the module speaks in. It reads
-// `errno` here rather than taking a code, so the read happens at the failure -- there is nothing
-// between the two that could overwrite it.
+/** A C call that reports success as zero, as the `Result` the rest of the module speaks in. It reads
+ * `errno` here rather than taking a code, so the read happens at the failure -- there is nothing
+ * between the two that could overwrite it.
+ */
 private done(rc: int) -> Result[unit, IoError] = if rc != 0 then Err(why()) else Ok(())

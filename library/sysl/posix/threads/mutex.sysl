@@ -3,39 +3,40 @@ module sysl.posix.threads
 
 import sysl.sync.*
 
-// Mutual exclusion that **owns what it protects**, which is the difference `library/threads.md §
-// Mutex[T]` draws against `SpinLock`.
-//
-// A spinlock is a flag beside the data and what the data is stays the programmer's to remember. This
-// holds the `T`, and both of its fields are private -- so there is no way to reach the value that
-// does not go through `lock` or `try_lock`, and no way to build one that skips the free state. That
-// is as far as a language with no destructor can take the idea: releasing is still written, and
-// `defer m.unlock()` is how, exactly as `defer f.close()` is in `sysl.fs` and for the same reason.
-//
-// ```
-// var p = m.lock()
-//
-// defer m.unlock()
-// *p = *p + 1
-// ```
-//
-// **It is not built on `pthread_mutex_t`, and the reason is a build property rather than a
-// preference.** A caller-allocated opaque C type is one of the three things `reference/ffi.md § A
-// library may carry C` names as reachable from C and from nothing else: its size is in a header, it
-// differs between the platforms and between two libcs on the *same* platform -- 64 bytes on Darwin,
-// 40 under glibc on x86-64, 48 on aarch64, 40 again under musl -- and `#if` can ask which operating
-// system this is but not which libc. Transcribing a bound would compile everywhere and be checked
-// nowhere, which is precisely the failure that section is about. The way to read a header is C, and
-// the standard library deliberately includes none: it reaches libc by symbol alone, which is what
-// lets it go on building for any target the toolchain can lower for. So the lock is three atomic
-// operations and a yield, and a binding library that carries its own C shim is where a futex-backed
-// one belongs.
-//
-// **What that costs is a waiter's processor for one scheduling quantum at a time.** The spin is not
-// `SpinLock`'s -- a failed exchange gives the processor up rather than turning round again -- so a
-// waiter cannot starve the holder the way a pure spin can on one core, and the hold may be as long as
-// it likes. What it does not do is *sleep*: there is no wait queue, so a contended lock costs a
-// context switch per attempt where a futex would cost none.
+/** Mutual exclusion that **owns what it protects**, which is the difference `library/threads.md §
+ * Mutex[T]` draws against `SpinLock`.
+ *
+ * A spinlock is a flag beside the data and what the data is stays the programmer's to remember. This
+ * holds the `T`, and both of its fields are private -- so there is no way to reach the value that
+ * does not go through `lock` or `try_lock`, and no way to build one that skips the free state. That
+ * is as far as a language with no destructor can take the idea: releasing is still written, and
+ * `defer m.unlock()` is how, exactly as `defer f.close()` is in `sysl.fs` and for the same reason.
+ *
+ * ```
+ * var p = m.lock()
+ *
+ * defer m.unlock()
+ * *p = *p + 1
+ * ```
+ *
+ * **It is not built on `pthread_mutex_t`, and the reason is a build property rather than a
+ * preference.** A caller-allocated opaque C type is one of the three things `reference/ffi.md § A
+ * library may carry C` names as reachable from C and from nothing else: its size is in a header, it
+ * differs between the platforms and between two libcs on the *same* platform -- 64 bytes on Darwin,
+ * 40 under glibc on x86-64, 48 on aarch64, 40 again under musl -- and `#if` can ask which operating
+ * system this is but not which libc. Transcribing a bound would compile everywhere and be checked
+ * nowhere, which is precisely the failure that section is about. The way to read a header is C, and
+ * the standard library deliberately includes none: it reaches libc by symbol alone, which is what
+ * lets it go on building for any target the toolchain can lower for. So the lock is three atomic
+ * operations and a yield, and a binding library that carries its own C shim is where a futex-backed
+ * one belongs.
+ *
+ * **What that costs is a waiter's processor for one scheduling quantum at a time.** The spin is not
+ * `SpinLock`'s -- a failed exchange gives the processor up rather than turning round again -- so a
+ * waiter cannot starve the holder the way a pure spin can on one core, and the hold may be as long as
+ * it likes. What it does not do is *sleep*: there is no wait queue, so a contended lock costs a
+ * context switch per attempt where a futex would cost none.
+ */
 struct Mutex[T]
 
     // Zero when free, one when held. Private, unlike `SpinLock.held`: a spinlock guards something the
@@ -48,18 +49,20 @@ struct Mutex[T]
     // type would be a spinlock with a suggestion attached.
     private value: T
 
-    // Builds a free lock around a value.
-    //
-    // The positional constructor names every field in order (`reference/declarations.md §
-    // Structs`), so a private field is what makes this the only way in from outside -- which is
-    // what keeps `held` starting at zero.
+    /** Builds a free lock around a value.
+     *
+     * The positional constructor names every field in order (`reference/declarations.md §
+     * Structs`), so a private field is what makes this the only way in from outside -- which is
+     * what keeps `held` starting at zero.
+     */
     new(value: T) -> Mutex[T] = Mutex(0, value)
 
-    // Takes the lock, waiting until it is free, and answers the address of what it protects.
-    //
-    // The address is live until `unlock`, and holding on to it past that is the mistake this shape
-    // cannot prevent: a guard whose destruction released the lock is what Rust returns here, and
-    // sysl has no destructor to hang that on.
+    /** Takes the lock, waiting until it is free, and answers the address of what it protects.
+     *
+     * The address is live until `unlock`, and holding on to it past that is the mistake this shape
+     * cannot prevent: a guard whose destruction released the lock is what Rust returns here, and
+     * sysl has no destructor to hang that on.
+     */
     lock(*self) -> *T
         while atomic_swap(&self.held, 1, Acquire) != 0
             // Spin on a plain load until it looks free, then offer the processor away before trying
@@ -72,16 +75,17 @@ struct Mutex[T]
 
         &self.value
 
-    // Takes the lock if it is free, and answers what it protects where it did. Never waits.
+    /** Takes the lock if it is free, and answers what it protects where it did. Never waits. */
     try_lock(*self) -> Option[*T] =
         if atomic_swap(&self.held, 1, Acquire) == 0 then Some(&self.value) else None
 
-    // Releases the lock.
-    //
-    // The `Release` is what publishes everything the holder wrote through the address it was given,
-    // to whichever thread's `Acquire` takes the lock next. That pairing is the whole of what makes
-    // the data safe to touch, and it is why neither of these takes an `Ordering`: a lock's orderings
-    // are fixed by what a lock means.
+    /** Releases the lock.
+     *
+     * The `Release` is what publishes everything the holder wrote through the address it was given,
+     * to whichever thread's `Acquire` takes the lock next. That pairing is the whole of what makes
+     * the data safe to touch, and it is why neither of these takes an `Ordering`: a lock's orderings
+     * are fixed by what a lock means.
+     */
     unlock(*self)
         atomic_store(&self.held, 0, Release)
 

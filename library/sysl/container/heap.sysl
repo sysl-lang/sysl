@@ -2,28 +2,29 @@ module sysl.container
 
 import sysl.buf.{Buf, buf, buf_with_capacity}
 
-// A priority queue: the smallest element is always the next one out.
-//
-// **It is a MIN-heap, and that is a decision rather than a coin toss.** The three things a priority
-// queue is actually reached for -- a scheduler ordered by deadline, a shortest-path search ordered
-// by distance, an event loop ordered by time -- all want the *smallest* first, and all three would
-// otherwise have to negate their keys to get it. A max-heap is a min-heap over a reversed
-// comparison, and reversing `Ord` needs a wrapper type the caller would have to declare, so
-// whichever way round this goes one set of callers pays. It goes the way the common cases want.
-//
-// **The shape is a binary heap laid out in a `Buf`**, with no tree and no pointers: the children of
-// the element at `i` are at `2i + 1` and `2i + 2`, and its parent is at `(i - 1) / 2`. So the whole
-// structure is arithmetic over a growable sequence the library already has, which is why this module
-// is short -- `Buf` does the growing and this does the ordering.
-//
-// The heap property is that no element is smaller than its parent. That is weaker than sorted, which
-// is exactly why `push` and `pop` are logarithmic rather than linear: only one path from a leaf to
-// the root is ever touched.
-//
-// **Walking a heap is deliberately not offered.** The storage order is not the priority order --
-// only the *first* element is guaranteed to be anything in particular -- so a cursor over it would
-// hand back elements in an order that looks meaningful and is not. Draining with `pop` is how a heap
-// is read in order, and it is the only way that answers truthfully.
+/** A priority queue: the smallest element is always the next one out.
+ *
+ * **It is a MIN-heap, and that is a decision rather than a coin toss.** The three things a priority
+ * queue is actually reached for -- a scheduler ordered by deadline, a shortest-path search ordered
+ * by distance, an event loop ordered by time -- all want the *smallest* first, and all three would
+ * otherwise have to negate their keys to get it. A max-heap is a min-heap over a reversed
+ * comparison, and reversing `Ord` needs a wrapper type the caller would have to declare, so
+ * whichever way round this goes one set of callers pays. It goes the way the common cases want.
+ *
+ * **The shape is a binary heap laid out in a `Buf`**, with no tree and no pointers: the children of
+ * the element at `i` are at `2i + 1` and `2i + 2`, and its parent is at `(i - 1) / 2`. So the whole
+ * structure is arithmetic over a growable sequence the library already has, which is why this module
+ * is short -- `Buf` does the growing and this does the ordering.
+ *
+ * The heap property is that no element is smaller than its parent. That is weaker than sorted, which
+ * is exactly why `push` and `pop` are logarithmic rather than linear: only one path from a leaf to
+ * the root is ever touched.
+ *
+ * **Walking a heap is deliberately not offered.** The storage order is not the priority order --
+ * only the *first* element is guaranteed to be anything in particular -- so a cursor over it would
+ * hand back elements in an order that looks meaningful and is not. Draining with `pop` is how a heap
+ * is read in order, and it is the only way that answers truthfully.
+ */
 struct Heap[T: Ord]
     elems: Buf[T]
 
@@ -31,15 +32,17 @@ struct Heap[T: Ord]
 
     is_empty(self) -> bool = self.elems.is_empty()
 
-    // The smallest element, left where it is. `None` where there is nothing to look at, since asking
-    // an empty queue what is next is an ordinary question rather than a mistake.
+    /** The smallest element, left where it is. `None` where there is nothing to look at, since asking
+     * an empty queue what is next is an ordinary question rather than a mistake.
+     */
     peek(self) -> Option[T] = if self.elems.is_empty() then None else Some(self.elems.at(0))
 
-    // An element added, then carried up past every parent it is smaller than.
-    //
-    // The walk stops at the first parent it is **not** smaller than, which is correct rather than an
-    // approximation: everything above that parent is already no bigger than it, so nothing further
-    // up can be bigger than the new element either.
+    /** An element added, then carried up past every parent it is smaller than.
+     *
+     * The walk stops at the first parent it is **not** smaller than, which is correct rather than an
+     * approximation: everything above that parent is already no bigger than it, so nothing further
+     * up can be bigger than the new element either.
+     */
     push(*self, v: T)
         self.elems.push(v)
 
@@ -54,11 +57,12 @@ struct Heap[T: Ord]
             i = parent
     end push
 
-    // The smallest element removed and returned.
-    //
-    // The last element is moved to the root and sifted **down** rather than the tree being rebuilt:
-    // taking the root leaves a hole at the top, and the only element that can be moved without
-    // leaving a second hole is the last one, since it is the only one with no children to orphan.
+    /** The smallest element removed and returned.
+     *
+     * The last element is moved to the root and sifted **down** rather than the tree being rebuilt:
+     * taking the root leaves a hole at the top, and the only element that can be moved without
+     * leaving a second hole is the last one, since it is the only one with no children to orphan.
+     */
     pop(*self) -> Option[T]
         if self.elems.is_empty() then return None
 
@@ -85,12 +89,13 @@ struct Heap[T: Ord]
         self.elems.set(j, a)
     end swap
 
-    // An element carried down past the smaller of its children until neither is smaller than it.
-    //
-    // **The smaller child is the one to swap with, and picking the wrong one silently breaks the
-    // heap** rather than failing: swapping with the larger child leaves it sitting above its own
-    // smaller sibling, so the property holds locally at the step that was taken and is violated one
-    // level down where nothing looks again.
+    /** An element carried down past the smaller of its children until neither is smaller than it.
+     *
+     * **The smaller child is the one to swap with, and picking the wrong one silently breaks the
+     * heap** rather than failing: swapping with the larger child leaves it sitting above its own
+     * smaller sibling, so the property holds locally at the step that was taken and is violated one
+     * level down where nothing looks again.
+     */
     private sift_down(*self, from: usize)
         val n = self.elems.len()
         var i = from
@@ -115,19 +120,21 @@ heap[T: Ord]() -> Heap[T]
 
     h
 
-// A heap whose storage is already big enough for `n` elements. The fill is written for the reason
-// `buf_with_capacity`'s is: a generic `T` has no zero, and none of these slots is read.
+/** A heap whose storage is already big enough for `n` elements. The fill is written for the reason
+ * `buf_with_capacity`'s is: a generic `T` has no zero, and none of these slots is read.
+ */
 heap_with_capacity[T: Ord](n: usize, fill: T) -> Heap[T]
     var h: Heap[T] = Heap(buf_with_capacity(n, fill))
 
     h
 
-// Every element of a slice heaped at once.
-//
-// **This is linear where pushing them one at a time is not**, and the difference is the reason it is
-// worth having rather than a convenience: sifting down from the last parent to the root touches each
-// element once at a depth that halves as it rises, which comes to O(n), while n pushes come to
-// O(n log n). The elements go in unordered and the heap property is established afterwards.
+/** Every element of a slice heaped at once.
+ *
+ * **This is linear where pushing them one at a time is not**, and the difference is the reason it is
+ * worth having rather than a convenience: sifting down from the last parent to the root touches each
+ * element once at a depth that halves as it rises, which comes to O(n), while n pushes come to
+ * O(n log n). The elements go in unordered and the heap property is established afterwards.
+ */
 heap_of[T: Ord](xs: []const T) -> Heap[T]
     if xs.len == 0 then return heap()
 

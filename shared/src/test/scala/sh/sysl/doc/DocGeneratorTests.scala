@@ -332,8 +332,13 @@ class DocGeneratorTests extends AnyFreeSpec with Matchers {
       text.indexOf("[!WARNING]") should be < text.indexOf("Old.")
     }
 
-    "marks an undocumented symbol rather than leaving a reader wondering" in {
-      page("module m\n\nf() -> int = 1") should include("> [!NOTE]\n> Undocumented.")
+    "leaves an undocumented symbol bare, because the empty space already says it" in {
+      // Generating the real library put this callout on 277 of 631 symbols, most of them correctly
+      // undocumented — a run of constants under one shared paragraph does not want a sentence each.
+      val text = page("module m\n\nf() -> int = 1")
+
+      text should include("### `f`")
+      text should not include "Undocumented"
     }
 
     "escapes a pipe in prose, which would otherwise end a table cell" in {

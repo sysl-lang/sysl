@@ -1,85 +1,91 @@
 module sysl.math
 
-// Choosing between two values, and holding one to a range.
-//
-// These are generic over `Ord` rather than being members of `Float`, and that is the whole reason
-// they are in a file of their own. Nothing about picking the smaller of two things is arithmetic:
-// `min` over the integers is the same three words as `min` over the floats, and over a tuple, and
-// over any type a program has written a `lt` for. A version living on `Float` would have been the
-// narrowest useful one and would have left every other type asking why.
-//
-// **What each does at a NaN follows from the comparison and is worth knowing rather than relying
-// on.** A NaN is less than nothing and greater than nothing, so the one comparison each of these
-// makes is false whichever way round the operands go, and both fall through to the arm holding the
-// *first* argument: `min(nan(), x)` answers `nan()` and `min(x, nan())` answers `x`. A program that
-// must reject a NaN should test for one. These will not do it on its behalf, and propagating it
-// from one argument position while dropping it from the other is the behaviour C's `fmin` was
-// criticised for -- said here rather than worked around, because the alternative is a comparison
-// per argument on every call to spare the case a caller can see coming.
+/** Choosing between two values, and holding one to a range.
+ *
+ * These are generic over `Ord` rather than being members of `Float`, and that is the whole reason
+ * they are in a file of their own. Nothing about picking the smaller of two things is arithmetic:
+ * `min` over the integers is the same three words as `min` over the floats, and over a tuple, and
+ * over any type a program has written a `lt` for. A version living on `Float` would have been the
+ * narrowest useful one and would have left every other type asking why.
+ *
+ * **What each does at a NaN follows from the comparison and is worth knowing rather than relying
+ * on.** A NaN is less than nothing and greater than nothing, so the one comparison each of these
+ * makes is false whichever way round the operands go, and both fall through to the arm holding the
+ * *first* argument: `min(nan(), x)` answers `nan()` and `min(x, nan())` answers `x`. A program that
+ * must reject a NaN should test for one. These will not do it on its behalf, and propagating it
+ * from one argument position while dropping it from the other is the behaviour C's `fmin` was
+ * criticised for -- said here rather than worked around, because the alternative is a comparison
+ * per argument on every call to spare the case a caller can see coming.
+ */
 
-// The smaller of two values, and the receiver-side one when they compare equal.
-//
-// Written as `if b < a` rather than `if a < b` so that a tie answers with `a`: for types whose
-// equality does not mean identity -- a record ordered on one field, a pair ordered on its first --
-// which of two indistinguishable values comes back is something a caller can observe, and taking
-// the first is the answer that makes a fold over a sequence stable.
+/** The smaller of two values, and the receiver-side one when they compare equal.
+ *
+ * Written as `if b < a` rather than `if a < b` so that a tie answers with `a`: for types whose
+ * equality does not mean identity -- a record ordered on one field, a pair ordered on its first --
+ * which of two indistinguishable values comes back is something a caller can observe, and taking
+ * the first is the answer that makes a fold over a sequence stable.
+ */
 min[T: Ord](a: T, b: T) -> T = if b < a then b else a
 
-// The larger of two values, and again the first when they tie.
+/** The larger of two values, and again the first when they tie. */
 max[T: Ord](a: T, b: T) -> T = if a < b then b else a
 
-// The receiver held to a range, inclusive at both ends.
-//
-// An inverted range -- `high` below `low` -- answers `low`, which falls out of testing the low end
-// first rather than being decided here. There is no check that the two are the right way round: a
-// bound is nearly always a constant or a length at the call site, and a contract (`16`) is the
-// tool for saying so where it is not.
+/** The receiver held to a range, inclusive at both ends.
+ *
+ * An inverted range -- `high` below `low` -- answers `low`, which falls out of testing the low end
+ * first rather than being decided here. There is no check that the two are the right way round: a
+ * bound is nearly always a constant or a length at the call site, and a contract (`16`) is the
+ * tool for saying so where it is not.
+ */
 clamp[T: Ord](x: T, low: T, high: T) -> T = if x < low then low else if high < x then high else x
 
-// Whether two floats are within `tol` of each other -- an **absolute** tolerance, which is what a
-// delta comparison is.
-//
-// **The equality test in front is not an optimisation.** It is what makes two identical infinities
-// answer `true`: `inf - inf` is a NaN, and every comparison against a NaN is false, so the
-// subtraction alone would call a value unequal to itself. It also makes the exact case exact, which
-// a caller checking a computation against a written-down constant is entitled to.
-//
-// **A NaN is close to nothing, including another NaN**, whatever the tolerance. That falls out of
-// the comparisons rather than being decided here, and it agrees with `==`, which is the property
-// worth having: nothing in this module makes a NaN behave like a number.
-//
-// This is the wrong test for values whose magnitudes differ wildly -- `1e18` and `1e18 + 1` are a
-// long way apart in absolute terms and identical to within one part in a million. `approx_eq_rel`
-// is that test.
+/** Whether two floats are within `tol` of each other -- an **absolute** tolerance, which is what a
+ * delta comparison is.
+ *
+ * **The equality test in front is not an optimisation.** It is what makes two identical infinities
+ * answer `true`: `inf - inf` is a NaN, and every comparison against a NaN is false, so the
+ * subtraction alone would call a value unequal to itself. It also makes the exact case exact, which
+ * a caller checking a computation against a written-down constant is entitled to.
+ *
+ * **A NaN is close to nothing, including another NaN**, whatever the tolerance. That falls out of
+ * the comparisons rather than being decided here, and it agrees with `==`, which is the property
+ * worth having: nothing in this module makes a NaN behave like a number.
+ *
+ * This is the wrong test for values whose magnitudes differ wildly -- `1e18` and `1e18 + 1` are a
+ * long way apart in absolute terms and identical to within one part in a million. `approx_eq_rel`
+ * is that test.
+ */
 approx_eq[F: Float](a: F, b: F, tol: F) -> bool = a == b || (a - b).abs() <= tol
 
-// Whether two floats agree to within `tol` **relative to the larger of them**, which is the test to
-// use when the values could be of any size: `tol` reads as a fraction, so `0.001` means "within a
-// tenth of a percent" at every magnitude.
-//
-// Scaled by the larger magnitude rather than by `a`, so that the answer does not depend on which
-// argument was written first. Near zero it becomes strict -- the scale goes to zero with the
-// operands, so only exact equality passes -- and that is the case `approx_eq` and an absolute
-// tolerance are for. A caller who needs both writes both, which is what Python's `isclose` bundles
-// into one call with two tolerances; here they are two functions because a caller who needed the
-// combined form always knew they did.
+/** Whether two floats agree to within `tol` **relative to the larger of them**, which is the test to
+ * use when the values could be of any size: `tol` reads as a fraction, so `0.001` means "within a
+ * tenth of a percent" at every magnitude.
+ *
+ * Scaled by the larger magnitude rather than by `a`, so that the answer does not depend on which
+ * argument was written first. Near zero it becomes strict -- the scale goes to zero with the
+ * operands, so only exact equality passes -- and that is the case `approx_eq` and an absolute
+ * tolerance are for. A caller who needs both writes both, which is what Python's `isclose` bundles
+ * into one call with two tolerances; here they are two functions because a caller who needed the
+ * combined form always knew they did.
+ */
 approx_eq_rel[F: Float](a: F, b: F, tol: F) -> bool =
     a == b || (a - b).abs() <= tol * max(a.abs(), b.abs())
 
-// The two above, written as assertions -- the float half of `sysl.assert_eq`, which floats cannot
-// use because `==` is the wrong question to ask about them.
-//
-// **They live here rather than beside `assert_eq`**, and the reason is the module graph rather than
-// taste: `Float` is declared in this module and reaches `Eq`, `Ord` and the arithmetic traits in
-// the root, so `sysl.math` depends on `sysl`. A float assertion written in `check.sysl` would put
-// an edge back the other way, and `reference/modules.md § The module graph is acyclic` holds the
-// module graph to being acyclic. Anyone writing float assertions has this module in scope already,
-// since it is where the float functions are. They report the pair and the tolerance for the reason
-// `assert_eq` reports the pair: a float that missed by one part in `1e9` and one that came back NaN
-// are the same failed check until the report says which. `Display` joins the bound because `Float`
-// does not imply it -- the two floats have `impl Display` blocks of their own (`display.sysl`)
-// rather than a membership the compiler hands out, so asking for it costs a caller nothing and lets
-// the report exist.
+/** The two above, written as assertions -- the float half of `sysl.assert_eq`, which floats cannot
+ * use because `==` is the wrong question to ask about them.
+ *
+ * **They live here rather than beside `assert_eq`**, and the reason is the module graph rather than
+ * taste: `Float` is declared in this module and reaches `Eq`, `Ord` and the arithmetic traits in
+ * the root, so `sysl.math` depends on `sysl`. A float assertion written in `check.sysl` would put
+ * an edge back the other way, and `reference/modules.md § The module graph is acyclic` holds the
+ * module graph to being acyclic. Anyone writing float assertions has this module in scope already,
+ * since it is where the float functions are. They report the pair and the tolerance for the reason
+ * `assert_eq` reports the pair: a float that missed by one part in `1e9` and one that came back NaN
+ * are the same failed check until the report says which. `Display` joins the bound because `Float`
+ * does not imply it -- the two floats have `impl Display` blocks of their own (`display.sysl`)
+ * rather than a membership the compiler hands out, so asking for it costs a caller nothing and lets
+ * the report exist.
+ */
 assert_approx_eq[F: Float + Display](got: F, want: F, tol: F, msg: string = "",
                                      file: string = __FILE__, line: long = __LINE__)
     if !approx_eq(got, want, tol) then

@@ -1,48 +1,52 @@
 module sysl.text
 
-// Asking a byte or a character what kind of thing it is, in the ASCII range.
-//
-// **It is named for the range it answers over**, which the module this replaces in the older sysl
-// was not: that one was called `unicode` and classified nothing above 127, so every caller read a
-// promise the code did not keep. Everything here is a comparison against the ASCII table, and a
-// value outside it answers `false` to every question rather than being guessed at. Real Unicode
-// classification needs property tables, and `reference/strings.md § Granularity` puts those in a
-// library above this one rather than underneath it.
-//
-// **A trait rather than two sets of functions, for the reason `Float` is one** (`sysl.math`).
-// Overloading would answer the naming half of it now (`reference/declarations.md § Overloading`) --
-// it did not exist when this was written, so `is_digit` and `is_digit_char` were the alternative --
-// but dispatch on the receiver is what makes `b.is_digit()` the same three words whichever of the
-// two it is, and what lets a member written over the others be written once.
-//
-// The pair is closed, which is what makes an `impl` the right mechanism here and the wrong one for
-// the integers. `sysl.math.Signed` cannot be written this way because `iN` is an open family and
-// five blocks would leave `i128` out; a byte and a character are the only two types this question
-// is ever asked of, so two blocks are the whole of it.
-//
-// **What each implementation supplies is three things, and the rest is written once.** A `code` to
-// compare against, and the two case conversions -- which stay per type only because each has to
-// answer in its own type, not because the arithmetic differs. Every classifier below is a default
-// over `code()`, so adding one is one line here and none in either block.
+/** Asking a byte or a character what kind of thing it is, in the ASCII range.
+ *
+ * **It is named for the range it answers over**, which the module this replaces in the older sysl
+ * was not: that one was called `unicode` and classified nothing above 127, so every caller read a
+ * promise the code did not keep. Everything here is a comparison against the ASCII table, and a
+ * value outside it answers `false` to every question rather than being guessed at. Real Unicode
+ * classification needs property tables, and `reference/strings.md § Granularity` puts those in a
+ * library above this one rather than underneath it.
+ *
+ * **A trait rather than two sets of functions, for the reason `Float` is one** (`sysl.math`).
+ * Overloading would answer the naming half of it now (`reference/declarations.md § Overloading`) --
+ * it did not exist when this was written, so `is_digit` and `is_digit_char` were the alternative --
+ * but dispatch on the receiver is what makes `b.is_digit()` the same three words whichever of the
+ * two it is, and what lets a member written over the others be written once.
+ *
+ * The pair is closed, which is what makes an `impl` the right mechanism here and the wrong one for
+ * the integers. `sysl.math.Signed` cannot be written this way because `iN` is an open family and
+ * five blocks would leave `i128` out; a byte and a character are the only two types this question
+ * is ever asked of, so two blocks are the whole of it.
+ *
+ * **What each implementation supplies is three things, and the rest is written once.** A `code` to
+ * compare against, and the two case conversions -- which stay per type only because each has to
+ * answer in its own type, not because the arithmetic differs. Every classifier below is a default
+ * over `code()`, so adding one is one line here and none in either block.
+ */
 trait Ascii
 
-    // The receiver's value as a code point, which is what every question below is asked of. For a
-    // byte this is the byte; for a character it is the scalar value, which is `>= 128` exactly when
-    // the character is outside the range this trait speaks for.
+    /** The receiver's value as a code point, which is what every question below is asked of. For a
+     * byte this is the byte; for a character it is the scalar value, which is `>= 128` exactly when
+     * the character is outside the range this trait speaks for.
+     */
     code(self) -> u32
 
-    // The case conversions, which answer in the receiver's own type and so cannot be shared. Each
-    // leaves anything that is not a letter of the other case exactly as it found it -- so they are
-    // total, and a caller mapping them over text does not have to ask first.
+    /** The case conversions, which answer in the receiver's own type and so cannot be shared. Each
+     * leaves anything that is not a letter of the other case exactly as it found it -- so they are
+     * total, and a caller mapping them over text does not have to ask first.
+     */
     to_upper(self) -> Self
     to_lower(self) -> Self
 
     // --- What the trait answers for itself. ---
 
-    // Whether the receiver is in the range every other member here speaks for. It is worth a name
-    // because it is the honest guard: a program classifying text that may not be ASCII asks this
-    // first, rather than reading a `false` from `is_alpha` as "not a letter" when it means "not a
-    // letter I can see".
+    /** Whether the receiver is in the range every other member here speaks for. It is worth a name
+     * because it is the honest guard: a program classifying text that may not be ASCII asks this
+     * first, rather than reading a `false` from `is_alpha` as "not a letter" when it means "not a
+     * letter I can see".
+     */
     is_ascii(self) -> bool = self.code() < 128
 
     is_digit(self) -> bool = self.code() >= 48 && self.code() <= 57
@@ -55,47 +59,52 @@ trait Ascii
 
     is_alnum(self) -> bool = self.is_alpha() || self.is_digit()
 
-    // Space, tab, newline, vertical tab, form feed, carriage return -- C's `isspace` set, and the
-    // one a program hand-rolling the test tends to get wrong by stopping after the first two.
+    /** Space, tab, newline, vertical tab, form feed, carriage return -- C's `isspace` set, and the
+     * one a program hand-rolling the test tends to get wrong by stopping after the first two.
+     */
     is_space(self) -> bool = self.code() == 32 || (self.code() >= 9 && self.code() <= 13)
 
-    // The two characters that separate words on a line without ending it. It is a narrower question
-    // than `is_space` and a different one: a program splitting a line into fields wants this, and
-    // reaching for `is_space` instead silently treats a newline as a field separator.
+    /** The two characters that separate words on a line without ending it. It is a narrower question
+     * than `is_space` and a different one: a program splitting a line into fields wants this, and
+     * reaching for `is_space` instead silently treats a newline as a field separator.
+     */
     is_blank(self) -> bool = self.code() == 32 || self.code() == 9
 
     is_hex_digit(self) -> bool =
         self.is_digit() || (self.code() >= 65 && self.code() <= 70) ||
             (self.code() >= 97 && self.code() <= 102)
 
-    // Printable and not a space or alphanumeric: the four runs the ASCII table leaves between its
-    // named groups.
+    /** Printable and not a space or alphanumeric: the four runs the ASCII table leaves between its
+     * named groups.
+     */
     is_punct(self) -> bool =
         (self.code() >= 33 && self.code() <= 47) ||
             (self.code() >= 58 && self.code() <= 64) ||
             (self.code() >= 91 && self.code() <= 96) ||
             (self.code() >= 123 && self.code() <= 126)
 
-    // Something that occupies a column when written, the space included.
+    /** Something that occupies a column when written, the space included. */
     is_print(self) -> bool = self.code() >= 32 && self.code() <= 126
 
-    // Something that leaves a mark, which is `is_print` minus the space -- the distinction C draws
-    // between `isprint` and `isgraph`, and the one a program measuring visible width needs.
+    /** Something that leaves a mark, which is `is_print` minus the space -- the distinction C draws
+     * between `isprint` and `isgraph`, and the one a program measuring visible width needs.
+     */
     is_graph(self) -> bool = self.code() >= 33 && self.code() <= 126
 
-    // The C0 range and the delete, which is the one control character that is not below the space.
+    /** The C0 range and the delete, which is the one control character that is not below the space. */
     is_control(self) -> bool = self.code() < 32 || self.code() == 127
 
-    // The receiver read as a digit in the given base, or `None` when it is not one.
-    //
-    // It is here rather than in `sysl.strconv` because it is a question about a character, and
-    // because the parsing side wants exactly this and nothing else from a digit: the two are the
-    // same test written once. Letters count from ten in either case, so base 16 and base 36 need no
-    // separate spelling.
-    //
-    // A base outside 2..36 answers `None` for every input rather than trapping -- the caller that
-    // passed it is the one that can say what to do, and `sysl.strconv` turns it into an error naming
-    // the base.
+    /** The receiver read as a digit in the given base, or `None` when it is not one.
+     *
+     * It is here rather than in `sysl.strconv` because it is a question about a character, and
+     * because the parsing side wants exactly this and nothing else from a digit: the two are the
+     * same test written once. Letters count from ten in either case, so base 16 and base 36 need no
+     * separate spelling.
+     *
+     * A base outside 2..36 answers `None` for every input rather than trapping -- the caller that
+     * passed it is the one that can say what to do, and `sysl.strconv` turns it into an error naming
+     * the base.
+     */
     digit_value(self, base: int) -> Option[int]
         if base < 2 || base > 36 then return None
 
@@ -114,20 +123,22 @@ trait Ascii
 
 end Ascii
 
-// A byte, which is what a program walking `s.bytes` or a `[]const u8` is holding. The case shift is
-// the single bit ASCII sets between the two alphabets, but it is written as the arithmetic rather
-// than as a mask: a mask would also change eleven punctuation characters, and the guard is what
-// makes these total.
+/** A byte, which is what a program walking `s.bytes` or a `[]const u8` is holding. The case shift is
+ * the single bit ASCII sets between the two alphabets, but it is written as the arithmetic rather
+ * than as a mask: a mask would also change eleven punctuation characters, and the guard is what
+ * makes these total.
+ */
 impl Ascii for u8
     code(self) -> u32 = u32(self)
 
     to_upper(self) -> u8 = if self.is_lower() then self - 32 else self
     to_lower(self) -> u8 = if self.is_upper() then self + 32 else self
 
-// A scalar value, which is what walking `s.chars` yields. Anything outside ASCII passes through
-// both conversions untouched, which is what makes mapping one over arbitrary text safe rather than
-// merely defined: `é` is not a letter this trait knows, so it is left alone instead of being shifted
-// into something else.
+/** A scalar value, which is what walking `s.chars` yields. Anything outside ASCII passes through
+ * both conversions untouched, which is what makes mapping one over arbitrary text safe rather than
+ * merely defined: `é` is not a letter this trait knows, so it is left alone instead of being shifted
+ * into something else.
+ */
 impl Ascii for char
     code(self) -> u32 = u32(self)
 

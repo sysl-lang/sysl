@@ -1,18 +1,19 @@
-// A test framework that runs on the target.
-//
-// `sysl test` is the host's answer and cannot be this one: it starts a process per test, selects one
-// by argv, and reads the verdict out of an exit status. A board has none of those. So the checking a
-// program does about itself has to be written in the language and linked into the image, which is
-// what this is -- the same shape as C's Unity, and for the same reason.
-//
-// **Nothing here allocates, opens anything, or asks the operating system for a service.** Its state
-// is a fixed number of bytes laid into the image, and every value it prints renders itself into a
-// sink rather than into a fresh string.
-//
-// What it deliberately does not do is stop a failing test. Unity aborts with `longjmp`; sysl has
-// none, and an unwind that skipped a scope would skip the releases that scope owes. So a failed check
-// is recorded and the test runs on. Only the first failure in a test is reported, because the ones
-// after it are usually the same failure seen again through worse state.
+/** A test framework that runs on the target.
+ *
+ * `sysl test` is the host's answer and cannot be this one: it starts a process per test, selects one
+ * by argv, and reads the verdict out of an exit status. A board has none of those. So the checking a
+ * program does about itself has to be written in the language and linked into the image, which is
+ * what this is -- the same shape as C's Unity, and for the same reason.
+ *
+ * **Nothing here allocates, opens anything, or asks the operating system for a service.** Its state
+ * is a fixed number of bytes laid into the image, and every value it prints renders itself into a
+ * sink rather than into a fresh string.
+ *
+ * What it deliberately does not do is stop a failing test. Unity aborts with `longjmp`; sysl has
+ * none, and an unwind that skipped a scope would skip the releases that scope owes. So a failed check
+ * is recorded and the test runs on. Only the first failure in a test is reported, because the ones
+ * after it are usually the same failure seen again through worse state.
+ */
 
 module sysl.harness
 
@@ -29,28 +30,30 @@ module sysl.harness
 private var out: *Writer = null
 private var attached: bool = false
 
-// Send the report somewhere other than standard output, which is what a board does before it runs
-// anything:
-//
-//     attach(console())          // a `*Writer` of the board's own
-//
-// A UART is a volatile store through a pointer, which is a language feature, so a board reaches its
-// console with no `asm`, no semihosting, and no C library underneath.
+/** Send the report somewhere other than standard output, which is what a board does before it runs
+ * anything:
+ *
+ * attach(console())          // a `*Writer` of the board's own
+ *
+ * A UART is a volatile store through a pointer, which is a language feature, so a board reaches its
+ * console with no `asm`, no semihosting, and no C library underneath.
+ */
 attach(w: *Writer)
     out = w
     attached = true
 
-// The sink, resolved on **first use** rather than in an initializer, and that is not a nicety -- it
-// is the difference between this module costing every other program something and costing them
-// nothing.
-//
-// A module's storage is initialized in every image the library is linked into, whether or not
-// anything imports the module. An initializer of `stdout()` therefore puts a trait object into
-// storage everywhere, and storing one goes through ARC, whose release path names `free` -- so a
-// bare-board program that never mentions testing acquires a call to an allocator it has not got.
-// **That was measured rather than guessed**: adding this module turned `NoAllocEmissionTests`' first
-// case red, and moving `stdout` in here turned it green again. A null pointer is a stored zero and
-// reaches nothing.
+/** The sink, resolved on **first use** rather than in an initializer, and that is not a nicety -- it
+ * is the difference between this module costing every other program something and costing them
+ * nothing.
+ *
+ * A module's storage is initialized in every image the library is linked into, whether or not
+ * anything imports the module. An initializer of `stdout()` therefore puts a trait object into
+ * storage everywhere, and storing one goes through ARC, whose release path names `free` -- so a
+ * bare-board program that never mentions testing acquires a call to an allocator it has not got.
+ * **That was measured rather than guessed**: adding this module turned `NoAllocEmissionTests`' first
+ * case red, and moving `stdout` in here turned it green again. A null pointer is a stored zero and
+ * reaches nothing.
+ */
 private sink() -> *Writer
     if !attached then attach(stdout())
 
@@ -82,29 +85,32 @@ private var reported: bool = false
 // signals its verdict through something other than a console wants it for the same reason.
 var quiet: bool = false
 
-// A plain rendering: no field width, no precision, no padding (`library/core.md § A specifier is
-// the whole value's field`).
+/** A plain rendering: no field width, no precision, no padding (`library/core.md § A specifier is
+ * the whole value's field`).
+ */
 private plain() -> FormatSpec = FormatSpec(0, -1, false)
 
 private puts(s: string) = sink().write(s.bytes)
 
-// Integers go out through `Display` rather than through `printi`, and the difference matters here:
-// `printi` reaches `snprintf`, which is a C library this framework's target may not have, while the
-// `Display` written for the integers is sysl all the way down to the sink.
-//
-// **It takes an `int` and not a `long`, which is a 32-bit machine's business and not a style.**
-// Rendering divides, and dividing a 64-bit value on a machine with 32-bit registers is a call to
-// `__divdi3` -- a compiler-rt builtin, in an archive a cross toolchain often has no copy of for the
-// target you are building. Every number this framework prints is a line, a count or a length, so
-// none of them ever wanted the other 32 bits. Measured on riscv32 and thumb, where the link failed
-// on exactly that symbol and on nothing else once these were narrowed.
+/** Integers go out through `Display` rather than through `printi`, and the difference matters here:
+ * `printi` reaches `snprintf`, which is a C library this framework's target may not have, while the
+ * `Display` written for the integers is sysl all the way down to the sink.
+ *
+ * **It takes an `int` and not a `long`, which is a 32-bit machine's business and not a style.**
+ * Rendering divides, and dividing a 64-bit value on a machine with 32-bit registers is a call to
+ * `__divdi3` -- a compiler-rt builtin, in an archive a cross toolchain often has no copy of for the
+ * target you are building. Every number this framework prints is a line, a count or a length, so
+ * none of them ever wanted the other 32 bits. Measured on riscv32 and thumb, where the link failed
+ * on exactly that symbol and on nothing else once these were narrowed.
+ */
 private putint(n: int) = n.display(sink(), plain())
 
-// The head of a report line, in Unity's order so that the same editors and CI filters can read it:
-// the file, the line, the test, the verdict.
-//
-// `__LINE__` is a `long`, so the narrowing happens here rather than at each call. A source file with
-// more than two billion lines in it has a different problem.
+/** The head of a report line, in Unity's order so that the same editors and CI filters can read it:
+ * the file, the line, the test, the verdict.
+ *
+ * `__LINE__` is a `long`, so the narrowing happens here rather than at each call. A source file with
+ * more than two billion lines in it has a different problem.
+ */
 private head(file: string, line: long, verdict: string)
     puts(file)
     puts(":")
@@ -114,10 +120,11 @@ private head(file: string, line: long, verdict: string)
     puts(":")
     puts(verdict)
 
-// Take the first failure of a test, or refuse the ones after it.
-//
-// Answers whether the caller should go on to print what went wrong, so that the bookkeeping and the
-// suppression are in one place rather than repeated in every check.
+/** Take the first failure of a test, or refuse the ones after it.
+ *
+ * Answers whether the caller should go on to print what went wrong, so that the bookkeeping and the
+ * suppression are in one place rather than repeated in every check.
+ */
 private failing(file: string, line: long) -> bool
     if reported then return false
 
@@ -129,7 +136,7 @@ private failing(file: string, line: long) -> bool
     head(file, line, "FAIL: ")
     true
 
-// Copy a name into the module's own storage, truncating rather than overflowing.
+/** Copy a name into the module's own storage, truncating rather than overflowing. */
 private remember(name: string)
     val b = name.bytes
 
@@ -137,19 +144,20 @@ private remember(name: string)
 
     for i in 0..<name_len do name_buf[i] = b[i]
 
-// Run one test, under a name to report it by.
-//
-// **The body is a `*extern() -> unit` rather than a bare arrow**, which is one word and one copy of
-// `run` for the whole suite. A bare arrow would be a bound over `Fn` (`reference/types.md §
-// Function types`), monomorphized per test -- thirty tests, thirty copies -- and flash is the thing
-// a target has least of. The cost is the `&` at the call, and the restriction that a test body
-// captures nothing, which is what a test body is anyway:
-//
-//     run("adds_two", &adds_two)
-//
-// `file` and `line` are never passed. They are defaults, and a default is evaluated at the call
-// (`reference/declarations.md § Default parameters and named arguments`), so they hold the line of
-// the `run` that named this test.
+/** Run one test, under a name to report it by.
+ *
+ * **The body is a `*extern() -> unit` rather than a bare arrow**, which is one word and one copy of
+ * `run` for the whole suite. A bare arrow would be a bound over `Fn` (`reference/types.md §
+ * Function types`), monomorphized per test -- thirty tests, thirty copies -- and flash is the thing
+ * a target has least of. The cost is the `&` at the call, and the restriction that a test body
+ * captures nothing, which is what a test body is anyway:
+ *
+ * run("adds_two", &adds_two)
+ *
+ * `file` and `line` are never passed. They are defaults, and a default is evaluated at the call
+ * (`reference/declarations.md § Default parameters and named arguments`), so they hold the line of
+ * the `run` that named this test.
+ */
 run(name: string, body: *extern() -> unit, file: string = __FILE__, line: long = __LINE__)
     remember(name)
 
@@ -162,15 +170,16 @@ run(name: string, body: *extern() -> unit, file: string = __FILE__, line: long =
         head(file, line, "PASS")
         puts("\n")
 
-// A test that was not run, and the reason it was not.
-//
-// **A board is where the third verdict finally earns its place.** On the host a test that cannot run
-// is usually a test that should be deleted; on a target it is routine -- the part is not fitted, the
-// bus is wired for the other variant, the flash is the smaller one. Counting those as passes says
-// something false and counting them as failures says something worse, so they are counted as
-// themselves and named in the tally.
-//
-// It takes the name rather than the body, because the body is exactly what is not going to be called.
+/** A test that was not run, and the reason it was not.
+ *
+ * **A board is where the third verdict finally earns its place.** On the host a test that cannot run
+ * is usually a test that should be deleted; on a target it is routine -- the part is not fitted, the
+ * bus is wired for the other variant, the flash is the smaller one. Counting those as passes says
+ * something false and counting them as failures says something worse, so they are counted as
+ * themselves and named in the tally.
+ *
+ * It takes the name rather than the body, because the body is exactly what is not going to be called.
+ */
 skip(name: string, why: string = "", file: string = __FILE__, line: long = __LINE__)
     remember(name)
 
@@ -186,11 +195,12 @@ skip(name: string, why: string = "", file: string = __FILE__, line: long = __LIN
 
     puts("\n")
 
-// A condition that has to hold, with an optional word about what it was.
-//
-// **`file` and `line` are passed on explicitly** to everything downstream. Letting `failing` fill its
-// own defaults would report a line inside this file for every check in every program, which is the
-// one mistake this shape of API invites (`sysl/check.sysl` says the same thing about `panic`).
+/** A condition that has to hold, with an optional word about what it was.
+ *
+ * **`file` and `line` are passed on explicitly** to everything downstream. Letting `failing` fill its
+ * own defaults would report a line inside this file for every check in every program, which is the
+ * one mistake this shape of API invites (`sysl/check.sysl` says the same thing about `panic`).
+ */
 check(cond: bool, msg: string = "", file: string = __FILE__, line: long = __LINE__)
     if cond then return
     if !failing(file, line) then return
@@ -200,20 +210,21 @@ check(cond: bool, msg: string = "", file: string = __FILE__, line: long = __LINE
 
     puts("\n")
 
-// Two values that have to be equal, reported with both of them when they are not.
-//
-// One generic member stands in for Unity's several hundred assertion macros, and does more than they
-// can: `TEST_ASSERT_EQUAL_*` covers a fixed list of C's own types and falls back to a hex dump of the
-// bytes for anything a program defined, while a bound reaches any type at all that can say whether
-// two of it are equal and write itself down.
-//
-// Rendering costs no allocation: a `Display` writes into a sink rather than returning a fresh string
-// (`sysl/display.sysl`).
-//
-// **`got` and `want`, in that order** -- the computed value first, which is `assert_eq`'s order in
-// the module next door and the order a failure is read in. The package this came from took
-// `(actual, expected)` and said so in its README; one library speaking with one voice is worth more
-// than that sentence was.
+/** Two values that have to be equal, reported with both of them when they are not.
+ *
+ * One generic member stands in for Unity's several hundred assertion macros, and does more than they
+ * can: `TEST_ASSERT_EQUAL_*` covers a fixed list of C's own types and falls back to a hex dump of the
+ * bytes for anything a program defined, while a bound reaches any type at all that can say whether
+ * two of it are equal and write itself down.
+ *
+ * Rendering costs no allocation: a `Display` writes into a sink rather than returning a fresh string
+ * (`sysl/display.sysl`).
+ *
+ * **`got` and `want`, in that order** -- the computed value first, which is `assert_eq`'s order in
+ * the module next door and the order a failure is read in. The package this came from took
+ * `(actual, expected)` and said so in its README; one library speaking with one voice is worth more
+ * than that sentence was.
+ */
 check_eq[T: Eq + Display](got: T, want: T, file: string = __FILE__, line: long = __LINE__)
     if got == want then return
     if !failing(file, line) then return
@@ -224,12 +235,13 @@ check_eq[T: Eq + Display](got: T, want: T, file: string = __FILE__, line: long =
     want.display(sink(), plain())
     puts("\n")
 
-// The same for a slice, which needs more than `==` to be useful.
-//
-// A report saying two slices differ sends its reader to find out *where*, and finding out where is a
-// loop nobody wants to write at each call -- least of all on a board, where the way to look is a
-// debugger and a stopped core. Length first, since a length mismatch explains every index after the
-// shorter one.
+/** The same for a slice, which needs more than `==` to be useful.
+ *
+ * A report saying two slices differ sends its reader to find out *where*, and finding out where is a
+ * loop nobody wants to write at each call -- least of all on a board, where the way to look is a
+ * debugger and a stopped core. Length first, since a length mismatch explains every index after the
+ * shorter one.
+ */
 check_slice_eq[T: Eq + Display](got: []const T, want: []const T, file: string = __FILE__,
                                 line: long = __LINE__)
     if got.len != want.len then
@@ -255,21 +267,23 @@ check_slice_eq[T: Eq + Display](got: []const T, want: []const T, file: string = 
             puts("\n")
             return
 
-// How many tests have run, how many failed, and how many were skipped. A board that reports its
-// verdict through a pin or a register rather than a console reads these.
+/** How many tests have run, how many failed, and how many were skipped. A board that reports its
+ * verdict through a pin or a register rather than a console reads these.
+ */
 tests_run() -> int = ran_count
 
 failures() -> int = fail_count
 
 skipped() -> int = skip_count
 
-// Print the tally and answer with the code a hosted program would exit on: zero when everything
-// passed, one when anything did not. A skipped test is not a failure.
-//
-// **What to do with it is the board's**, which is why this returns rather than exits. A hosted
-// program writes `exit(finish())`; semihosting has `SYS_EXIT`, riscv's `virt` has the `sifive_test`
-// register, and a bare board has whatever pin somebody soldered. None of that belongs in a framework
-// that would then only build for the target it knew about.
+/** Print the tally and answer with the code a hosted program would exit on: zero when everything
+ * passed, one when anything did not. A skipped test is not a failure.
+ *
+ * **What to do with it is the board's**, which is why this returns rather than exits. A hosted
+ * program writes `exit(finish())`; semihosting has `SYS_EXIT`, riscv's `virt` has the `sifive_test`
+ * register, and a bare board has whatever pin somebody soldered. None of that belongs in a framework
+ * that would then only build for the target it knew about.
+ */
 finish() -> i32
     if !quiet then
         putint(ran_count)
@@ -286,11 +300,12 @@ finish() -> i32
 
     if fail_count == 0 then 0 else 1
 
-// Zero the counters, for a suite that runs more than once -- a board looping over its self-test, or
-// this module's own tests, which need each `@test` to start from nothing.
-//
-// The sink is deliberately left alone: a board sets it once at startup, and a `reset` that undid
-// that would send the second pass of a looping self-test to a console the board does not have.
+/** Zero the counters, for a suite that runs more than once -- a board looping over its self-test, or
+ * this module's own tests, which need each `@test` to start from nothing.
+ *
+ * The sink is deliberately left alone: a board sets it once at startup, and a `reset` that undid
+ * that would send the second pass of a looping self-test to a console the board does not have.
+ */
 reset()
     ran_count = 0
     fail_count = 0

@@ -2,30 +2,32 @@ module sysl
 
 import sysl.sys.{sysl_putchar, sysl_snprintf, sysl_write}
 
-// The printing surface, which lives in the library rather than in the compiler. `print(a, b, c)` is
-// a desugaring onto these one-value functions, chosen by each argument's static type, so the
-// compiler knows a handful of *names* and implements no printing of its own.
-//
-// Everything goes out through the single sink `putbytes`, and that is not incidental: two mechanisms
-// means two buffers, and output emerging in the wrong order. It writes a byte at a time because a
-// `string` may hold an interior NUL and every shortcut through C -- `puts`, `%s`, even `%.*s` --
-// stops at one. It is also one of the two functions a freestanding target has to replace: swap its
-// body for a `write` syscall, and `FdReader.read`'s for a `read` one, and the whole surface above
-// both is unchanged.
+/** The printing surface, which lives in the library rather than in the compiler. `print(a, b, c)` is
+ * a desugaring onto these one-value functions, chosen by each argument's static type, so the
+ * compiler knows a handful of *names* and implements no printing of its own.
+ *
+ * Everything goes out through the single sink `putbytes`, and that is not incidental: two mechanisms
+ * means two buffers, and output emerging in the wrong order. It writes a byte at a time because a
+ * `string` may hold an interior NUL and every shortcut through C -- `puts`, `%s`, even `%.*s` --
+ * stops at one. It is also one of the two functions a freestanding target has to replace: swap its
+ * body for a `write` syscall, and `FdReader.read`'s for a `read` one, and the whole surface above
+ * both is unchanged.
+ */
 putbytes(b: []const u8)
     var i: usize = 0
     while i < b.len
         sysl_putchar(int(b[i]))
         i += 1
 
-// Standard output as a `Writer`, which is what a value writes itself into when it renders through
-// its own `Display` rather than through one of the `print*` functions above.
-//
-// It is an ordinary sink written in ordinary sysl, and it is worth saying why that is possible at
-// all: a destination fixed at compile time keeps no state, so the type has no fields -- and a struct
-// may have none. Everything the compiler used to supply here by hand is now three declarations a
-// reader can check, and the byte loop they end in is still `putbytes`, so a freestanding target
-// replaces the same one function it always did.
+/** Standard output as a `Writer`, which is what a value writes itself into when it renders through
+ * its own `Display` rather than through one of the `print*` functions above.
+ *
+ * It is an ordinary sink written in ordinary sysl, and it is worth saying why that is possible at
+ * all: a destination fixed at compile time keeps no state, so the type has no fields -- and a struct
+ * may have none. Everything the compiler used to supply here by hand is now three declarations a
+ * reader can check, and the byte loop they end in is still `putbytes`, so a freestanding target
+ * replaces the same one function it always did.
+ */
 struct Stdout
 end Stdout
 
@@ -43,22 +45,23 @@ stdout() -> *Writer = sink
 
 prints(s: string) = putbytes(s.bytes)
 
-// The other stream, which is where a program's diagnostics belong.
-//
-// **The distinction is not decoration.** A program whose output is being read by another program --
-// piped, redirected, captured in a variable -- writes its answer to one stream and its complaints to
-// the other, so that a complaint never lands in the middle of the answer and a redirect that keeps
-// the answer still lets a person see what went wrong. `sysl.args` puts a usage error here and its
-// `--help` text on standard output for exactly that reason: the help *was* what was asked for.
-//
-// It goes through `write` rather than through `putchar`'s neighbour `fputc`, and directly rather
-// than a byte at a time, because there is no buffer between this and the descriptor: a diagnostic
-// written just before the program stops has to have left, and C's standard error is unbuffered for
-// the same reason. That also makes it the one printing path whose output cannot be lost to a trap,
-// which is worth knowing when a program is being debugged.
-//
-// A short write is looped over rather than ignored, since a signal may cut one anywhere; a write
-// that reports failure ends the loop, because there is nowhere left to report *that* to.
+/** The other stream, which is where a program's diagnostics belong.
+ *
+ * **The distinction is not decoration.** A program whose output is being read by another program --
+ * piped, redirected, captured in a variable -- writes its answer to one stream and its complaints to
+ * the other, so that a complaint never lands in the middle of the answer and a redirect that keeps
+ * the answer still lets a person see what went wrong. `sysl.args` puts a usage error here and its
+ * `--help` text on standard output for exactly that reason: the help *was* what was asked for.
+ *
+ * It goes through `write` rather than through `putchar`'s neighbour `fputc`, and directly rather
+ * than a byte at a time, because there is no buffer between this and the descriptor: a diagnostic
+ * written just before the program stops has to have left, and C's standard error is unbuffered for
+ * the same reason. That also makes it the one printing path whose output cannot be lost to a trap,
+ * which is worth knowing when a program is being debugged.
+ *
+ * A short write is looped over rather than ignored, since a signal may cut one anywhere; a write
+ * that reports failure ends the loop, because there is nowhere left to report *that* to.
+ */
 eputbytes(b: []const u8)
     var at: usize = 0
 
@@ -72,8 +75,9 @@ end eputbytes
 
 eprints(s: string) = eputbytes(s.bytes)
 
-// Standard error as a `Writer`, so a value renders itself onto the diagnostic stream through the
-// same `Display` it uses for standard output. It carries no state for the reason `Stdout` does not.
+/** Standard error as a `Writer`, so a value renders itself onto the diagnostic stream through the
+ * same `Display` it uses for standard output. It carries no state for the reason `Stdout` does not.
+ */
 struct Stderr
 end Stderr
 
@@ -86,9 +90,10 @@ val esink: *Stderr = ptr_cast(0usize)
 
 stderr() -> *Writer = esink
 
-// The integer and float renderings lean on `snprintf`, which is formatting rather than I/O. Doing
-// them in sysl is a small job for the integers and a large one for the floats (correct shortest
-// round-trip), so they wait until there is a reason -- a target without a C library.
+/** The integer and float renderings lean on `snprintf`, which is formatting rather than I/O. Doing
+ * them in sysl is a small job for the integers and a large one for the floats (correct shortest
+ * round-trip), so they wait until there is a reason -- a target without a C library.
+ */
 printi(n: long)
     var buf: [24]u8
     var k = sysl_snprintf(&buf[0], 24, c"%lld", n)
@@ -106,22 +111,23 @@ printr(x: real)
 
 printb(b: bool) = prints(if b then "true" else "false")
 
-// A character's UTF-8 bytes, written into storage the caller owns, answering how many were written.
-// No character needs more than four, so `var b: [4]u8` is always enough and always on the stack --
-// which is what keeps this usable where there is no allocator.
-//
-// The caller supplying the buffer is what makes that true, and it is the same shape every other
-// place in the library takes when a result has a known bound. A slice with fewer than the four bytes
-// is a mistake in the program rather than a truncation, and the bounds check says so: how many bytes
-// are needed is not known until the character has been looked at, so there is no honest way to
-// answer "it did not fit" that is cheaper than having room.
-//
-// **It lives in `sysl` rather than beside `from_utf8` in `sysl.text`, and that is forced.** A
-// submodule may name the standard module freely and `sysl` may not name back (`reference/modules.md
-// § The module graph is acyclic`), so an encoder over in `sysl.text` would be one `printc` below
-// could not call -- and the second encoder that would then have to be written for it is exactly the
-// hand-rolled copy this function exists to prevent. One encoder in an odd place beats two in tidy
-// ones.
+/** A character's UTF-8 bytes, written into storage the caller owns, answering how many were written.
+ * No character needs more than four, so `var b: [4]u8` is always enough and always on the stack --
+ * which is what keeps this usable where there is no allocator.
+ *
+ * The caller supplying the buffer is what makes that true, and it is the same shape every other
+ * place in the library takes when a result has a known bound. A slice with fewer than the four bytes
+ * is a mistake in the program rather than a truncation, and the bounds check says so: how many bytes
+ * are needed is not known until the character has been looked at, so there is no honest way to
+ * answer "it did not fit" that is cheaper than having room.
+ *
+ * **It lives in `sysl` rather than beside `from_utf8` in `sysl.text`, and that is forced.** A
+ * submodule may name the standard module freely and `sysl` may not name back (`reference/modules.md
+ * § The module graph is acyclic`), so an encoder over in `sysl.text` would be one `printc` below
+ * could not call -- and the second encoder that would then have to be written for it is exactly the
+ * hand-rolled copy this function exists to prevent. One encoder in an odd place beats two in tidy
+ * ones.
+ */
 encode_utf8(ch: char, into: []u8) -> usize
     var cp = uint(ch)
 
@@ -147,8 +153,9 @@ encode_utf8(ch: char, into: []u8) -> usize
     4
 end encode_utf8
 
-// A `char` is encoded rather than handed to `snprintf`, which has no conversion that takes a code
-// point.
+/** A `char` is encoded rather than handed to `snprintf`, which has no conversion that takes a code
+ * point.
+ */
 printc(ch: char)
     var buf: [4]u8
 

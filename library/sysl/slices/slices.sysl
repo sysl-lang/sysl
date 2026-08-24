@@ -1,65 +1,70 @@
 module sysl.slices
 
-// Operations over a built-in slice, and the pointer a C binding needs to hand one across.
-//
-// **These are free functions over `[]T` rather than members of anything**, which is the call
-// `math/compare.sysl` already made for `min` and `integer.sysl` made for `gcd`. A slice is indexed by
-// the compiler walking to an address, so none of this goes through `Index` or `Iterate` -- those say
-// what indexing and walking mean for a type *someone wrote*, and a built-in has neither to offer. A
-// bound written on each function is also the specification: `contains` asks for `Eq` because it
-// compares, `max_index` asks for `Ord` because it orders, and a program with a type of its own
-// satisfying the bound gets these for nothing.
-//
-// **Nothing here allocates and nothing here needs a capability.** The module is reachable from a
-// freestanding target, which is deliberate and is what keeps it usable by a C binding: `as_ptr` is
-// the first thing a binding reaches for, and acquiring an allocator by asking for it would be a poor
-// trade. Sorting is in `sort.sysl` beside this file and holds to the same rule.
+/** Operations over a built-in slice, and the pointer a C binding needs to hand one across.
+ *
+ * **These are free functions over `[]T` rather than members of anything**, which is the call
+ * `math/compare.sysl` already made for `min` and `integer.sysl` made for `gcd`. A slice is indexed by
+ * the compiler walking to an address, so none of this goes through `Index` or `Iterate` -- those say
+ * what indexing and walking mean for a type *someone wrote*, and a built-in has neither to offer. A
+ * bound written on each function is also the specification: `contains` asks for `Eq` because it
+ * compares, `max_index` asks for `Ord` because it orders, and a program with a type of its own
+ * satisfying the bound gets these for nothing.
+ *
+ * **Nothing here allocates and nothing here needs a capability.** The module is reachable from a
+ * freestanding target, which is deliberate and is what keeps it usable by a C binding: `as_ptr` is
+ * the first thing a binding reaches for, and acquiring an allocator by asking for it would be a poor
+ * trade. Sorting is in `sort.sysl` beside this file and holds to the same rule.
+ */
 
-// A pointer to the first element, for handing a slice to C as the pointer-and-length pair every C
-// interface takes.
-//
-// **This exists because every binding was writing it.** `qcbor` and `monocypher` each carried a
-// private copy and the QOI survey needed the same one, and each copy had to get the empty case right
-// on its own -- which is the case that is not obvious, and the reason this is a library function.
-// Both copies are gone: the two packages import this one instead, and their two hand-rolled versions
-// had different bugs, which is the argument for a library function in one line.
-//
-// **An empty slice answers `null`.** An empty slice is a real input -- C's convention is a pointer
-// beside a length, and a length of zero is a loop that does not run -- but `&xs[0]` on an empty slice
-// is an out-of-bounds index, so it traps rather than yielding the pointer C would have accepted.
-//
-// The two answers this was chosen over are both worse. A pointer to a **function-local** scratch,
-// which is what the hand-rolled copies return, points into a dead stack frame: safe exactly as long
-// as nobody reads it, and silently wrong if anything ever does. A module-level scratch fixes the
-// lifetime but cannot be generic, so there would have to be one per element type and nowhere to put
-// them.
-//
-// **The cost, said here so a caller can see it:** ISO C leaves passing a null pointer to `memcpy`
-// undefined even at a length of zero, and a small number of libraries assert non-null on entry. Every
-// real interface takes the pair `(null, 0)`, and the length is what says not to look -- but a binding
-// whose C asserts otherwise must pass storage it owns rather than an empty slice.
+/** A pointer to the first element, for handing a slice to C as the pointer-and-length pair every C
+ * interface takes.
+ *
+ * **This exists because every binding was writing it.** `qcbor` and `monocypher` each carried a
+ * private copy and the QOI survey needed the same one, and each copy had to get the empty case right
+ * on its own -- which is the case that is not obvious, and the reason this is a library function.
+ * Both copies are gone: the two packages import this one instead, and their two hand-rolled versions
+ * had different bugs, which is the argument for a library function in one line.
+ *
+ * **An empty slice answers `null`.** An empty slice is a real input -- C's convention is a pointer
+ * beside a length, and a length of zero is a loop that does not run -- but `&xs[0]` on an empty slice
+ * is an out-of-bounds index, so it traps rather than yielding the pointer C would have accepted.
+ *
+ * The two answers this was chosen over are both worse. A pointer to a **function-local** scratch,
+ * which is what the hand-rolled copies return, points into a dead stack frame: safe exactly as long
+ * as nobody reads it, and silently wrong if anything ever does. A module-level scratch fixes the
+ * lifetime but cannot be generic, so there would have to be one per element type and nowhere to put
+ * them.
+ *
+ * **The cost, said here so a caller can see it:** ISO C leaves passing a null pointer to `memcpy`
+ * undefined even at a length of zero, and a small number of libraries assert non-null on entry. Every
+ * real interface takes the pair `(null, 0)`, and the length is what says not to look -- but a binding
+ * whose C asserts otherwise must pass storage it owns rather than an empty slice.
+ */
 as_ptr[T](xs: []const T) -> *T = if xs.len == 0 then null else &xs[0]
 
-// The same, where the caller may write through it.
-//
-// Separate from `as_ptr` because `[]const T` and `[]T` are different types and the const one must not
-// yield a pointer something can write through. The empty case answers `null` for the same reason.
+/** The same, where the caller may write through it.
+ *
+ * Separate from `as_ptr` because `[]const T` and `[]T` are different types and the const one must not
+ * yield a pointer something can write through. The empty case answers `null` for the same reason.
+ */
 as_mut_ptr[T](xs: []T) -> *T = if xs.len == 0 then null else &xs[0]
 
-// Two elements exchanged, in place.
-//
-// Out-of-range indices trap, as any other subscript does: this is an operation on storage the caller
-// named, and inventing an answer for an index that is not there would hide the caller's own mistake.
+/** Two elements exchanged, in place.
+ *
+ * Out-of-range indices trap, as any other subscript does: this is an operation on storage the caller
+ * named, and inventing an answer for an index that is not there would hide the caller's own mistake.
+ */
 swap[T](xs: []T, i: usize, j: usize)
     val t = xs[i]
 
     xs[i] = xs[j]
     xs[j] = t
 
-// The elements in the opposite order, in place.
-//
-// Walks from both ends toward the middle, so each element is written once and an odd middle element
-// is left alone rather than swapped with itself.
+/** The elements in the opposite order, in place.
+ *
+ * Walks from both ends toward the middle, so each element is written once and an odd middle element
+ * is left alone rather than swapped with itself.
+ */
 reverse[T](xs: []T)
     if xs.len > 1
         var i: usize = 0
@@ -70,24 +75,26 @@ reverse[T](xs: []T)
             i += 1
             j -= 1
 
-// Every element set to one value.
+/** Every element set to one value. */
 fill[T](xs: []T, v: T)
     for i in 0..<xs.len
         xs[i] = v
 
-// Where a value first appears, or `None`.
-//
-// **`Option[usize]` rather than a sentinel index.** A library answering `-1` for absence hands back a
-// number that indexes when it should not, and `usize` has no negative to spare in any case. The
-// absence is in the type, where a caller has to look at it.
+/** Where a value first appears, or `None`.
+ *
+ * **`Option[usize]` rather than a sentinel index.** A library answering `-1` for absence hands back a
+ * number that indexes when it should not, and `usize` has no negative to spare in any case. The
+ * absence is in the type, where a caller has to look at it.
+ */
 index_of[T: Eq](xs: []const T, x: T) -> Option[usize]
     for i in 0..<xs.len
         if xs[i] == x then return Some(i)
 
     None
 
-// Where a value last appears, or `None`. Walks down from the end, so it stops at the first match
-// rather than scanning the whole slice to keep the latest one.
+/** Where a value last appears, or `None`. Walks down from the end, so it stops at the first match
+ * rather than scanning the whole slice to keep the latest one.
+ */
 last_index_of[T: Eq](xs: []const T, x: T) -> Option[usize]
     var i = xs.len
 
@@ -98,16 +105,17 @@ last_index_of[T: Eq](xs: []const T, x: T) -> Option[usize]
 
     None
 
-// Whether the value appears at all -- `index_of` where the position is not wanted.
+/** Whether the value appears at all -- `index_of` where the position is not wanted. */
 contains[T: Eq](xs: []const T, x: T) -> bool = index_of(xs, x).is_some()
 
-// Where the smallest element is, or `None` for an empty slice.
-//
-// **The index rather than the value**, because the index answers both questions: an element is one
-// subscript away, and a caller that wanted to *modify* the extreme element could not have got there
-// from a copy. Ties go to the **first**, which is the same choice `min` makes and for the same
-// reason: for a type whose equality does not mean identity, which of two indistinguishable values
-// comes back is something a caller can observe.
+/** Where the smallest element is, or `None` for an empty slice.
+ *
+ * **The index rather than the value**, because the index answers both questions: an element is one
+ * subscript away, and a caller that wanted to *modify* the extreme element could not have got there
+ * from a copy. Ties go to the **first**, which is the same choice `min` makes and for the same
+ * reason: for a type whose equality does not mean identity, which of two indistinguishable values
+ * comes back is something a caller can observe.
+ */
 min_index[T: Ord](xs: []const T) -> Option[usize]
     if xs.len == 0 then return None
 
@@ -118,9 +126,10 @@ min_index[T: Ord](xs: []const T) -> Option[usize]
 
     Some(best)
 
-// Where the largest element is, or `None`. Ties go to the first, as above -- written `xs[best] <
-// xs[i]` rather than `xs[i] > xs[best]` so that an equal element does not displace the one already
-// held.
+/** Where the largest element is, or `None`. Ties go to the first, as above -- written `xs[best] <
+ * xs[i]` rather than `xs[i] > xs[best]` so that an equal element does not displace the one already
+ * held.
+ */
 max_index[T: Ord](xs: []const T) -> Option[usize]
     if xs.len == 0 then return None
 
@@ -131,9 +140,10 @@ max_index[T: Ord](xs: []const T) -> Option[usize]
 
     Some(best)
 
-// Whether two slices have the same length and the same elements in the same order.
-//
-// The length test comes first and is what makes the common refusal cost nothing.
+/** Whether two slices have the same length and the same elements in the same order.
+ *
+ * The length test comes first and is what makes the common refusal cost nothing.
+ */
 equal[T: Eq](a: []const T, b: []const T) -> bool
     if a.len != b.len then return false
 
@@ -142,14 +152,15 @@ equal[T: Eq](a: []const T, b: []const T) -> bool
 
     true
 
-// Whether the slice begins with the given elements. An empty prefix is a prefix of everything, which
-// falls out of the loop rather than being decided here.
+/** Whether the slice begins with the given elements. An empty prefix is a prefix of everything, which
+ * falls out of the loop rather than being decided here.
+ */
 starts_with[T: Eq](xs: []const T, prefix: []const T) -> bool
     if prefix.len > xs.len then return false
 
     equal(xs[0..<prefix.len], prefix)
 
-// Whether the slice ends with the given elements.
+/** Whether the slice ends with the given elements. */
 ends_with[T: Eq](xs: []const T, suffix: []const T) -> bool
     if suffix.len > xs.len then return false
 

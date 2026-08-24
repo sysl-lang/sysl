@@ -51,37 +51,42 @@ import sysl.text.{cstring, from_cstring}
 private[sysl] extern "isatty" c_isatty(fd: int) -> int
 private[sysl] extern "getenv" c_getenv(name: *u8) -> *u8
 
-// The two descriptors POSIX fixes. Named rather than written as 1 and 2 at each call, so no caller
-// has to know which is which.
+/** The two descriptors POSIX fixes. Named rather than written as 1 and 2 at each call, so no caller
+ * has to know which is which.
+ */
 private stdout_fd() -> int = 1
 private stderr_fd() -> int = 2
 
-// Whether a descriptor is attached to a terminal.
-//
-// This is the whole of what C answers, and it is separate from the colour question because a program
-// can want it on its own: a progress bar, a spinner, a prompt, and a full-screen redraw are all worth
-// suppressing when output is a pipe, and none of them is about colour.
+/** Whether a descriptor is attached to a terminal.
+ *
+ * This is the whole of what C answers, and it is separate from the colour question because a program
+ * can want it on its own: a progress bar, a spinner, a prompt, and a full-screen redraw are all worth
+ * suppressing when output is a pipe, and none of them is about colour.
+ */
 is_tty(fd: int) -> bool = c_isatty(fd) != 0
 
-// What the environment says, as the pointer C hands back -- null where the name is unset, which is a
-// different thing from set-and-empty and is why the two callers below check different things.
+/** What the environment says, as the pointer C hands back -- null where the name is unset, which is a
+ * different thing from set-and-empty and is why the two callers below check different things.
+ */
 private env(name: string) -> *u8
     val n = cstring(name)
 
     c_getenv(n.ptr)
 
-// `NO_COLOR` disables colour by being **present and non-empty**, whatever it contains. A program
-// looking for a particular value has misread the convention: `NO_COLOR=0` means no colour.
+/** `NO_COLOR` disables colour by being **present and non-empty**, whatever it contains. A program
+ * looking for a particular value has misread the convention: `NO_COLOR=0` means no colour.
+ */
 private no_color() -> bool
     val p = env("NO_COLOR")
 
     p != null && p[0] != 0
 
-// A terminal that cannot render an escape says so as `TERM=dumb`.
-//
-// Ill-formed bytes are read as *not* dumb rather than as an error: the variable is somebody's
-// environment rather than the program's input, this is a question with only two useful answers, and
-// refusing to colour because a locale wrote a non-UTF-8 `TERM` would be a worse outcome than either.
+/** A terminal that cannot render an escape says so as `TERM=dumb`.
+ *
+ * Ill-formed bytes are read as *not* dumb rather than as an error: the variable is somebody's
+ * environment rather than the program's input, this is a question with only two useful answers, and
+ * refusing to colour because a locale wrote a non-UTF-8 `TERM` would be a worse outcome than either.
+ */
 private dumb_term() -> bool
     val p = env("TERM")
 
@@ -92,21 +97,23 @@ private dumb_term() -> bool
         Err(_) -> false
 end dumb_term
 
-// The environment's half of the answer: whether colour is wanted here at all, said without reference
-// to any descriptor.
-//
-// It is public rather than folded into `color_on` because the two halves are genuinely separate
-// questions and a program can want this one alone -- a `--color=always` flag overrides the
-// descriptor and not the user's `NO_COLOR`, which is exactly this function. It is also the half that
-// can be asked without a terminal, which is what makes it answerable in a test.
+/** The environment's half of the answer: whether colour is wanted here at all, said without reference
+ * to any descriptor.
+ *
+ * It is public rather than folded into `color_on` because the two halves are genuinely separate
+ * questions and a program can want this one alone -- a `--color=always` flag overrides the
+ * descriptor and not the user's `NO_COLOR`, which is exactly this function. It is also the half that
+ * can be asked without a terminal, which is what makes it answerable in a test.
+ */
 color_wanted() -> bool = !no_color() && !dumb_term()
 
-// All three questions, about whichever descriptor is asked about.
+/** All three questions, about whichever descriptor is asked about. */
 color_on(fd: int) -> bool = is_tty(fd) && color_wanted()
 
-// Standard output, which is where a program that prints its results writes them.
+/** Standard output, which is where a program that prints its results writes them. */
 color() -> bool = color_on(stdout_fd())
 
-// Standard error, which is where a program that prints diagnostics writes those -- and the two
-// genuinely differ, since `prog > file` leaves one a file and the other a terminal.
+/** Standard error, which is where a program that prints diagnostics writes those -- and the two
+ * genuinely differ, since `prog > file` leaves one a file and the other a terminal.
+ */
 color_err() -> bool = color_on(stderr_fd())

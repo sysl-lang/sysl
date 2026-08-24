@@ -31,35 +31,40 @@ import sysl.env.get_or
 // glibc carries. The remaining C route is setting `TZ` in the environment and calling `tzset`, which
 // mutates process-wide state and is not thread-safe. Reading the file is what avoids that.
 
-// Where the operating system keeps the database when nothing says otherwise. Every system this
-// module compiles for uses this path -- macOS symlinks it at `/var/db/timezone/zoneinfo` and answers
-// here too.
+/** Where the operating system keeps the database when nothing says otherwise. Every system this
+ * module compiles for uses this path -- macOS symlinks it at `/var/db/timezone/zoneinfo` and answers
+ * here too.
+ */
 const default_zoneinfo_root: string = "/usr/share/zoneinfo"
 
-// The database root this host is using: `TZDIR` where it is set, and the path above where it is not.
-//
-// **`TZDIR` is the convention every other reader of this database follows**, which is what makes it
-// worth consulting rather than a nicety: it is how a distribution relocates the database, how a
-// container image carries its own copy, and how a test points at one it wrote. A reader that ignored
-// it would disagree with `date` and `zdump` on the same machine.
+/** The database root this host is using: `TZDIR` where it is set, and the path above where it is not.
+ *
+ * **`TZDIR` is the convention every other reader of this database follows**, which is what makes it
+ * worth consulting rather than a nicety: it is how a distribution relocates the database, how a
+ * container image carries its own copy, and how a test points at one it wrote. A reader that ignored
+ * it would disagree with `date` and `zdump` on the same machine.
+ */
 zoneinfo_root() -> string = get_or("TZDIR", default_zoneinfo_root)
 
-// The bytes of a named zone -- `"America/Toronto"`, `"Europe/Paris"`, `"UTC"`.
-//
-// The name is a path under the database root, which is why a region-qualified one has a `/` in it and
-// why nothing here parses it: the database's own layout is the naming scheme.
+/** The bytes of a named zone -- `"America/Toronto"`, `"Europe/Paris"`, `"UTC"`.
+ *
+ * The name is a path under the database root, which is why a region-qualified one has a `/` in it and
+ * why nothing here parses it: the database's own layout is the naming scheme.
+ */
 zone_data(name: string) -> Result[[]u8, IoError] = zone_data_in(zoneinfo_root(), name)
 
-// The same, from a database somewhere else -- a copy shipped with an application, a mount, or a
-// directory a test wrote.
+/** The same, from a database somewhere else -- a copy shipped with an application, a mount, or a
+ * directory a test wrote.
+ */
 zone_data_in(root: string, name: string) -> Result[[]u8, IoError] = read_bytes(root + "/" + name)
 
-// The bytes of the zone **this host is set to**, which is what `/etc/localtime` is: a copy of, or a
-// symlink to, one file of the database.
-//
-// It answers what `local_offset` answers and more -- the whole table rather than one instant's
-// offset, so a program can ask this zone for an abbreviation, or hand it to `resolve` without a
-// capability crossing the call. What it cannot answer is the zone's **name**: the file does not carry
-// one, and where `/etc/localtime` is a symlink the name is the link's target rather than anything
-// inside it.
+/** The bytes of the zone **this host is set to**, which is what `/etc/localtime` is: a copy of, or a
+ * symlink to, one file of the database.
+ *
+ * It answers what `local_offset` answers and more -- the whole table rather than one instant's
+ * offset, so a program can ask this zone for an abbreviation, or hand it to `resolve` without a
+ * capability crossing the call. What it cannot answer is the zone's **name**: the file does not carry
+ * one, and where `/etc/localtime` is a symlink the name is the link's target rather than anything
+ * inside it.
+ */
 local_zone_data() -> Result[[]u8, IoError] = read_bytes("/etc/localtime")

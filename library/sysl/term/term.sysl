@@ -1,57 +1,59 @@
 module sysl.term
 @no_alloc
 
-// What a terminal understands: the escape sequences that colour text, emphasise it, and move the
-// cursor about.
-//
-// **Every one of these is a `const string`, and that is the whole design.** A string literal is
-// immortal -- it lives in the program's own image with no owner and no reference count (`04`) -- so
-// naming forty of them costs nothing at run time and nothing in storage, and a module that has
-// declared `@no_alloc` can reach every one. That is why this module declares it too: colouring a
-// line is exactly what a program with no allocator most wants to do, and a facility it could not use
-// would be no facility at all.
-//
-// A sequence is written where the text it affects is written, because that is what it is -- a mark
-// in the stream rather than a property of a string:
-//
-//     print(f"{red}{bold}error{reset}: {msg}")
-//
-// ## What is not here, and why
-//
-// **Nothing that asks whether the terminal is a terminal.** Whether escapes should be emitted at all
-// -- output redirected to a file, `NO_COLOR` set, a dumb terminal -- is a question about the process
-// and its environment, so answering it needs `posix`. This module asks for no capability at all, and
-// putting the answer here would take that away from every program that only wanted to name a colour.
-//
-// So the answer lives in `sysl.posix.tty`, which requires what it needs and leaves this file asking
-// for nothing -- and the namespace is the honest place for it, since `isatty` and `termios` are what
-// it is made of. A hosted program imports both and asks once:
-//
-//     val paint = color()
-//
-//     print(f"${if paint then red else ""}error${if paint then reset else ""}: ${msg}")
-//
-// The split is what serves both audiences instead of choosing between them, and it shows up in the
-// import, which is honest about what the second one costs.
-//
-// **Nothing that takes a number.** Moving the cursor to a row and column means building
-// `ESC [ row ; col H`, and building a string is an allocation -- which is the one thing the whole
-// module is arranged to avoid. The sequences below are the ones whose text is fixed. A program that
-// wants the others has `f"\u{1b}[{row};{col}H"` and knows what it is spending.
-//
-// ## Reading the numbers
-//
-// These are the SGR parameters, and the arithmetic between them is a real specification rather than a
-// coincidence: a background is its foreground plus ten, and a bright colour is its ordinary one plus
-// sixty. `TermTests` asserts both relations across all eight colours, because a table of forty
-// constants transcribed by hand has exactly one interesting failure -- a wrong number -- and it is
-// invisible in review.
+/** What a terminal understands: the escape sequences that colour text, emphasise it, and move the
+ * cursor about.
+ *
+ * **Every one of these is a `const string`, and that is the whole design.** A string literal is
+ * immortal -- it lives in the program's own image with no owner and no reference count (`04`) -- so
+ * naming forty of them costs nothing at run time and nothing in storage, and a module that has
+ * declared `@no_alloc` can reach every one. That is why this module declares it too: colouring a
+ * line is exactly what a program with no allocator most wants to do, and a facility it could not use
+ * would be no facility at all.
+ *
+ * A sequence is written where the text it affects is written, because that is what it is -- a mark
+ * in the stream rather than a property of a string:
+ *
+ * print(f"{red}{bold}error{reset}: {msg}")
+ *
+ * ## What is not here, and why
+ *
+ * **Nothing that asks whether the terminal is a terminal.** Whether escapes should be emitted at all
+ * -- output redirected to a file, `NO_COLOR` set, a dumb terminal -- is a question about the process
+ * and its environment, so answering it needs `posix`. This module asks for no capability at all, and
+ * putting the answer here would take that away from every program that only wanted to name a colour.
+ *
+ * So the answer lives in `sysl.posix.tty`, which requires what it needs and leaves this file asking
+ * for nothing -- and the namespace is the honest place for it, since `isatty` and `termios` are what
+ * it is made of. A hosted program imports both and asks once:
+ *
+ * val paint = color()
+ *
+ * print(f"${if paint then red else ""}error${if paint then reset else ""}: ${msg}")
+ *
+ * The split is what serves both audiences instead of choosing between them, and it shows up in the
+ * import, which is honest about what the second one costs.
+ *
+ * **Nothing that takes a number.** Moving the cursor to a row and column means building
+ * `ESC [ row ; col H`, and building a string is an allocation -- which is the one thing the whole
+ * module is arranged to avoid. The sequences below are the ones whose text is fixed. A program that
+ * wants the others has `f"\u{1b}[{row};{col}H"` and knows what it is spending.
+ *
+ * ## Reading the numbers
+ *
+ * These are the SGR parameters, and the arithmetic between them is a real specification rather than a
+ * coincidence: a background is its foreground plus ten, and a bright colour is its ordinary one plus
+ * sixty. `TermTests` asserts both relations across all eight colours, because a table of forty
+ * constants transcribed by hand has exactly one interesting failure -- a wrong number -- and it is
+ * invisible in review.
+ */
 
 // -- Attributes -----------------------------------------------------------------------------------
 
-// Ends **everything**: colour, background and every attribute at once. ANSI has no way to end one
-// attribute and leave the others, which is why the two below exist for the common case of wanting a
-// colour back without losing an emphasis.
+/** Ends **everything**: colour, background and every attribute at once. ANSI has no way to end one
+ * attribute and leave the others, which is why the two below exist for the common case of wanting a
+ * colour back without losing an emphasis.
+ */
 const reset: string = "\u{1b}[0m"
 
 const bold: string = "\u{1b}[1m"
@@ -74,8 +76,9 @@ const magenta: string = "\u{1b}[35m"
 const cyan: string = "\u{1b}[36m"
 const white: string = "\u{1b}[37m"
 
-// The colour a terminal was already using, which is not the same as `reset`: this ends the colour
-// and leaves the emphasis where it was.
+/** The colour a terminal was already using, which is not the same as `reset`: this ends the colour
+ * and leaves the emphasis where it was.
+ */
 const default_color: string = "\u{1b}[39m"
 
 const bright_black: string = "\u{1b}[90m"
@@ -111,24 +114,27 @@ const on_bright_white: string = "\u{1b}[107m"
 
 // -- The screen and the cursor --------------------------------------------------------------------
 
-// The whole screen, and the whole line the cursor is on. Neither moves the cursor, which is why
-// `clear_screen` is nearly always written with `home` after it.
+/** The whole screen, and the whole line the cursor is on. Neither moves the cursor, which is why
+ * `clear_screen` is nearly always written with `home` after it.
+ */
 const clear_screen: string = "\u{1b}[2J"
 const clear_line: string = "\u{1b}[2K"
 
-// From the cursor onwards, which is what a program redrawing the tail of something wants.
+/** From the cursor onwards, which is what a program redrawing the tail of something wants. */
 const clear_below: string = "\u{1b}[0J"
 const clear_to_line_end: string = "\u{1b}[0K"
 
-// The top left corner.
+/** The top left corner. */
 const home: string = "\u{1b}[H"
 
-// Hiding it is what stops a full-screen redraw from leaving the cursor skittering across the
-// picture. A program that hides it owns showing it again, including on the way out.
+/** Hiding it is what stops a full-screen redraw from leaving the cursor skittering across the
+ * picture. A program that hides it owns showing it again, including on the way out.
+ */
 const hide_cursor: string = "\u{1b}[?25l"
 const show_cursor: string = "\u{1b}[?25h"
 
-// One remembered position -- the terminal's own, so nesting two of these does not work and the
-// second save is the one that is restored.
+/** One remembered position -- the terminal's own, so nesting two of these does not work and the
+ * second save is the one that is restored.
+ */
 const save_cursor: string = "\u{1b}[s"
 const restore_cursor: string = "\u{1b}[u"

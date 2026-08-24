@@ -1,44 +1,46 @@
 module sysl.sync
 
-// A word two threads may touch at once, and the operations that touch it indivisibly.
-//
-// The operations underneath are the language's -- nine forms in the raw tier, each one machine
-// instruction (`library/sync.md`) -- and every one of them takes an **address**. So this is an
-// ordinary struct with a field and methods that take the address of it, which is the whole of what
-// "built on `*T`" means, and it is why the type a program reaches for lives here in the library
-// where a reader can see what it is made of rather than inside the compiler where they cannot.
-//
-// **`T` is an integer of 8, 16, 32 or 64 bits, or a pointer** -- what the machine has an instruction
-// for. Nothing here declares a bound saying so, because there is no trait that means "a width a
-// processor can touch indivisibly": sysl's integers are an open family, so `u12` is a type a program
-// may name and no `impl` list could have covered. What refuses `Atomic[u12]` is the form inside,
-// where the instruction would have had to be chosen, and it names the widths in its message. The
-// arithmetic members are refused on a pointer for the same kind of reason and in the same place.
-//
-// **Reading `a.v` directly is an ordinary non-atomic read.** The field is not hidden, because a
-// thread that knows it is alone with the value -- the one that built it, the one left after every
-// other has been joined -- is entitled to the cheap read, and hiding it would only mean a method
-// that does the same thing less visibly. It is a race everywhere else, and it is greppable, which is
-// the bargain the whole `*T` tier makes.
+/** A word two threads may touch at once, and the operations that touch it indivisibly.
+ *
+ * The operations underneath are the language's -- nine forms in the raw tier, each one machine
+ * instruction (`library/sync.md`) -- and every one of them takes an **address**. So this is an
+ * ordinary struct with a field and methods that take the address of it, which is the whole of what
+ * "built on `*T`" means, and it is why the type a program reaches for lives here in the library
+ * where a reader can see what it is made of rather than inside the compiler where they cannot.
+ *
+ * **`T` is an integer of 8, 16, 32 or 64 bits, or a pointer** -- what the machine has an instruction
+ * for. Nothing here declares a bound saying so, because there is no trait that means "a width a
+ * processor can touch indivisibly": sysl's integers are an open family, so `u12` is a type a program
+ * may name and no `impl` list could have covered. What refuses `Atomic[u12]` is the form inside,
+ * where the instruction would have had to be chosen, and it names the widths in its message. The
+ * arithmetic members are refused on a pointer for the same kind of reason and in the same place.
+ *
+ * **Reading `a.v` directly is an ordinary non-atomic read.** The field is not hidden, because a
+ * thread that knows it is alone with the value -- the one that built it, the one left after every
+ * other has been joined -- is entitled to the cheap read, and hiding it would only mean a method
+ * that does the same thing less visibly. It is a race everywhere else, and it is greppable, which is
+ * the bargain the whole `*T` tier makes.
+ */
 struct Atomic[T]
 
     // The value itself. See the note above on reading it without going through a method.
     v: T
 
-    // Reads the word.
-    //
-    // The receiver is `*self` rather than `self` for a reason worth stating, since a read looks like
-    // it should not need one: a `self` receiver is handed a **copy** of the struct, and the address
-    // of a copy is not the address the other threads are writing to. It would compile, it would be
-    // atomic, and it would read the wrong word.
-    //
-    // **Three of the five orderings apply**, and the contract is what says so. A release publishes
-    // the writes that came before it and a load makes none, so `Release` and the release half of
-    // `AcqRel` describe a load that cannot exist -- the machine has no such instruction and the form
-    // underneath refuses both by name. What the form cannot refuse is a *variable*, which is what
-    // arrives here, so the check is a `require` and lands at run time. It costs nothing where the
-    // ordering was written at the call, which is every ordinary use: the branch is over a constant
-    // and folds away with the dispatch below it.
+    /** Reads the word.
+     *
+     * The receiver is `*self` rather than `self` for a reason worth stating, since a read looks like
+     * it should not need one: a `self` receiver is handed a **copy** of the struct, and the address
+     * of a copy is not the address the other threads are writing to. It would compile, it would be
+     * atomic, and it would read the wrong word.
+     *
+     * **Three of the five orderings apply**, and the contract is what says so. A release publishes
+     * the writes that came before it and a load makes none, so `Release` and the release half of
+     * `AcqRel` describe a load that cannot exist -- the machine has no such instruction and the form
+     * underneath refuses both by name. What the form cannot refuse is a *variable*, which is what
+     * arrives here, so the check is a `require` and lands at run time. It costs nothing where the
+     * ordering was written at the call, which is every ordinary use: the branch is over a constant
+     * and folds away with the dispatch below it.
+     */
     load(*self, ord: Ordering = SeqCst) -> T
         require ord.orders_a_load(), "a load has nothing to release"
 
@@ -48,10 +50,11 @@ struct Atomic[T]
             _       -> atomic_load(&self.v, SeqCst)
     end load
 
-    // Writes the word.
-    //
-    // **Three of the five orderings apply**, for the mirror of the reason on `load`: a store reads
-    // nothing, so there is nothing for it to acquire.
+    /** Writes the word.
+     *
+     * **Three of the five orderings apply**, for the mirror of the reason on `load`: a store reads
+     * nothing, so there is nothing for it to acquire.
+     */
     store(*self, v: T, ord: Ordering = SeqCst)
         require ord.orders_a_store(), "a store has nothing to acquire"
 
@@ -61,7 +64,7 @@ struct Atomic[T]
             _       -> atomic_store(&self.v, v, SeqCst)
     end store
 
-    // Writes the word and answers what was there before.
+    /** Writes the word and answers what was there before. */
     swap(*self, v: T, ord: Ordering = SeqCst) -> T = ord match
         Relaxed -> atomic_swap(&self.v, v, Relaxed)
         Acquire -> atomic_swap(&self.v, v, Acquire)
@@ -69,11 +72,12 @@ struct Atomic[T]
         AcqRel  -> atomic_swap(&self.v, v, AcqRel)
         SeqCst  -> atomic_swap(&self.v, v, SeqCst)
 
-    // Writes `desired` if the word is `expected`, and answers the value it **found** either way.
-    //
-    // A caller learns whether it swapped by comparing the answer against what they expected, which
-    // is one comparison they were going to make anyway -- and on failure the answer is the value to
-    // retry against, so the loop reads `while a.cas(seen, f(seen)) != seen`.
+    /** Writes `desired` if the word is `expected`, and answers the value it **found** either way.
+     *
+     * A caller learns whether it swapped by comparing the answer against what they expected, which
+     * is one comparison they were going to make anyway -- and on failure the answer is the value to
+     * retry against, so the loop reads `while a.cas(seen, f(seen)) != seen`.
+     */
     cas(*self, expected: T, desired: T, ord: Ordering = SeqCst) -> T = ord match
         Relaxed -> atomic_cas(&self.v, expected, desired, Relaxed)
         Acquire -> atomic_cas(&self.v, expected, desired, Acquire)
@@ -81,8 +85,9 @@ struct Atomic[T]
         AcqRel  -> atomic_cas(&self.v, expected, desired, AcqRel)
         SeqCst  -> atomic_cas(&self.v, expected, desired, SeqCst)
 
-    // Adds to the word and answers what was there before, which is what makes an atomic increment
-    // usable as a ticket: every caller gets a different number and none of them is skipped.
+    /** Adds to the word and answers what was there before, which is what makes an atomic increment
+     * usable as a ticket: every caller gets a different number and none of them is skipped.
+     */
     add(*self, n: T, ord: Ordering = SeqCst) -> T = ord match
         Relaxed -> atomic_add(&self.v, n, Relaxed)
         Acquire -> atomic_add(&self.v, n, Acquire)
@@ -90,7 +95,7 @@ struct Atomic[T]
         AcqRel  -> atomic_add(&self.v, n, AcqRel)
         SeqCst  -> atomic_add(&self.v, n, SeqCst)
 
-    // Subtracts from the word and answers what was there before.
+    /** Subtracts from the word and answers what was there before. */
     sub(*self, n: T, ord: Ordering = SeqCst) -> T = ord match
         Relaxed -> atomic_sub(&self.v, n, Relaxed)
         Acquire -> atomic_sub(&self.v, n, Acquire)
@@ -98,7 +103,7 @@ struct Atomic[T]
         AcqRel  -> atomic_sub(&self.v, n, AcqRel)
         SeqCst  -> atomic_sub(&self.v, n, SeqCst)
 
-    // Bitwise-ands into the word and answers what was there before.
+    /** Bitwise-ands into the word and answers what was there before. */
     and(*self, n: T, ord: Ordering = SeqCst) -> T = ord match
         Relaxed -> atomic_and(&self.v, n, Relaxed)
         Acquire -> atomic_and(&self.v, n, Acquire)
@@ -106,8 +111,9 @@ struct Atomic[T]
         AcqRel  -> atomic_and(&self.v, n, AcqRel)
         SeqCst  -> atomic_and(&self.v, n, SeqCst)
 
-    // Bitwise-ors into the word and answers what was there before, which is how a flag is set in a
-    // word other threads are setting their own flags in.
+    /** Bitwise-ors into the word and answers what was there before, which is how a flag is set in a
+     * word other threads are setting their own flags in.
+     */
     or(*self, n: T, ord: Ordering = SeqCst) -> T = ord match
         Relaxed -> atomic_or(&self.v, n, Relaxed)
         Acquire -> atomic_or(&self.v, n, Acquire)
@@ -115,7 +121,7 @@ struct Atomic[T]
         AcqRel  -> atomic_or(&self.v, n, AcqRel)
         SeqCst  -> atomic_or(&self.v, n, SeqCst)
 
-    // Bitwise-xors into the word and answers what was there before.
+    /** Bitwise-xors into the word and answers what was there before. */
     xor(*self, n: T, ord: Ordering = SeqCst) -> T = ord match
         Relaxed -> atomic_xor(&self.v, n, Relaxed)
         Acquire -> atomic_xor(&self.v, n, Acquire)

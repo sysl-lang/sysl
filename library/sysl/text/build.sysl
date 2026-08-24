@@ -3,16 +3,17 @@ module sysl.text
 import sysl.buf.{Buf, buf, buf_with_capacity}
 import sysl.sys.sysl_snprintf
 
-// Text gathered a piece at a time, handed back as one string.
-//
-// It is here rather than in the compiler because only its last line needs to be underneath the
-// language: everything above `finish` is ordinary sysl over the same `Buf[u8]` a `ByteSink` uses,
-// and what no sysl body can write is turning owned bytes into a `string`, which is
-// `from_utf8_unchecked` of bytes this builder has held all along.
-//
-// It exists so that joining does not rebuild what it already has. `a + b` allocates a fresh buffer
-// every time, so gathering n pieces that way costs the sum of every prefix; a builder pays for each
-// piece once and grows geometrically.
+/** Text gathered a piece at a time, handed back as one string.
+ *
+ * It is here rather than in the compiler because only its last line needs to be underneath the
+ * language: everything above `finish` is ordinary sysl over the same `Buf[u8]` a `ByteSink` uses,
+ * and what no sysl body can write is turning owned bytes into a `string`, which is
+ * `from_utf8_unchecked` of bytes this builder has held all along.
+ *
+ * It exists so that joining does not rebuild what it already has. `a + b` allocates a fresh buffer
+ * every time, so gathering n pieces that way costs the sum of every prefix; a builder pays for each
+ * piece once and grows geometrically.
+ */
 struct StrBuilder
     bytes: &Buf[u8]
 
@@ -23,30 +24,32 @@ struct StrBuilder
     push(*self, s: string)
         self.bytes.extend(s.bytes)
 
-    // A character's bytes, through the library's one encoder rather than `string(c)` -- which would
-    // allocate a whole string per character only to copy its bytes back out.
+    /** A character's bytes, through the library's one encoder rather than `string(c)` -- which would
+     * allocate a whole string per character only to copy its bytes back out.
+     */
     push_char(*self, c: char)
         var tmp: [4]u8
 
         self.bytes.extend(tmp[0..<encode_utf8(c, tmp[0..<4])])
 
-    // The numbers, rendered straight into the buffer.
-    //
-    // **These exist so that gathering a number costs no allocation.** The spelling without them is
-    // `push(str(n))`, which builds a whole reference-counted `string` -- a heap object with a
-    // refcount and a deallocation hook -- and then copies its bytes out and drops it, for a value
-    // whose text is never more than a couple of dozen bytes and is wanted only inside this buffer.
-    // A stack array and one `snprintf` is the same rendering with none of that, and it is what
-    // `sysl.render`'s `display_int` already does for the sink path.
-    //
-    // **They take `long` and `ulong` rather than each width**, which is the same bargain the
-    // `print*` family makes: one member per width is the alternative, and the widening a caller
-    // writes is cheaper to read than nine declarations. This used to say "with no overloading",
-    // which `reference/declarations.md § Overloading` has since made false -- the members are
-    // *members*, and a type's are one namespace whatever a module's names may do. The difference is
-    // that `print` has the compiler widening its arguments and a member cannot, so a narrower value
-    // is written `b.push_int(long(n))`. A caller who would rather not is describing `push(str(n))`,
-    // which still works and costs the allocation.
+    /** The numbers, rendered straight into the buffer.
+     *
+     * **These exist so that gathering a number costs no allocation.** The spelling without them is
+     * `push(str(n))`, which builds a whole reference-counted `string` -- a heap object with a
+     * refcount and a deallocation hook -- and then copies its bytes out and drops it, for a value
+     * whose text is never more than a couple of dozen bytes and is wanted only inside this buffer.
+     * A stack array and one `snprintf` is the same rendering with none of that, and it is what
+     * `sysl.render`'s `display_int` already does for the sink path.
+     *
+     * **They take `long` and `ulong` rather than each width**, which is the same bargain the
+     * `print*` family makes: one member per width is the alternative, and the widening a caller
+     * writes is cheaper to read than nine declarations. This used to say "with no overloading",
+     * which `reference/declarations.md § Overloading` has since made false -- the members are
+     * *members*, and a type's are one namespace whatever a module's names may do. The difference is
+     * that `print` has the compiler widening its arguments and a member cannot, so a narrower value
+     * is written `b.push_int(long(n))`. A caller who would rather not is describing `push(str(n))`,
+     * which still works and costs the allocation.
+     */
     push_int(*self, n: long)
         var tmp: [24]u8
         var k = sysl_snprintf(&tmp[0], 24, c"%lld", n)
@@ -57,45 +60,50 @@ struct StrBuilder
         var k = sysl_snprintf(&tmp[0], 24, c"%llu", n)
         self.bytes.extend(tmp[0..<usize(k)])
 
-    // `%g`, so that a float gathered into a builder reads the same as the one `str` and `print`
-    // would have produced. Agreeing with them matters more here than picking a better rendering:
-    // a program that builds half a line with a builder and half with an interpolation should not
-    // be able to tell which half a number came through.
+    /** `%g`, so that a float gathered into a builder reads the same as the one `str` and `print`
+     * would have produced. Agreeing with them matters more here than picking a better rendering:
+     * a program that builds half a line with a builder and half with an interpolation should not
+     * be able to tell which half a number came through.
+     */
     push_real(*self, x: real)
         var tmp: [64]u8
         var k = sysl_snprintf(&tmp[0], 64, c"%g", x)
         self.bytes.extend(tmp[0..<usize(k)])
 
-    // Two immortal literals, so this allocates nothing either -- and it is here rather than left to
-    // the caller so that the set of things a builder takes without a `str` is the set `str` itself
-    // renders directly.
+    /** Two immortal literals, so this allocates nothing either -- and it is here rather than left to
+     * the caller so that the set of things a builder takes without a `str` is the set `str` itself
+     * renders directly.
+     */
     push_bool(*self, b: bool)
         self.push(if b then "true" else "false")
 
     clear(*self)
         self.bytes.clear()
 
-    // Every byte that went in came from a `string` or from `push_char`, so what is held is
-    // well-formed by construction and there is nothing left to validate.
+    /** Every byte that went in came from a `string` or from `push_char`, so what is held is
+     * well-formed by construction and there is nothing left to validate.
+     */
     finish(self) -> string = from_utf8_unchecked(self.bytes.view())
 end StrBuilder
 
 str_builder() -> StrBuilder = StrBuilder(buf())
 
-// A builder that already has room for `n` bytes, for a caller who knows roughly how long the text
-// will be -- a line being assembled from fields, a buffer sized from what it is copying. What it
-// saves is the reallocate-and-copy at each doubling on the way up to `n`.
-//
-// It is a guess and nothing depends on it: too small and the buffer grows the way it always does,
-// too large and the slack is freed with the rest when the builder goes.
+/** A builder that already has room for `n` bytes, for a caller who knows roughly how long the text
+ * will be -- a line being assembled from fields, a buffer sized from what it is copying. What it
+ * saves is the reallocate-and-copy at each doubling on the way up to `n`.
+ *
+ * It is a guess and nothing depends on it: too small and the buffer grows the way it always does,
+ * too large and the slack is freed with the rest when the builder goes.
+ */
 str_builder_with_capacity(n: usize) -> StrBuilder = StrBuilder(buf_with_capacity(n, 0))
 
-// A string copied into the NUL-terminated shape C reads, and the owner of that copy -- a language
-// with no manual free has to say who frees it, so the bytes belong to a value with a lifetime
-// rather than to whoever remembers.
-//
-// `len` is one less than the storage because the terminator is not part of the text, and `ptr` is
-// what an `extern` taking a `char *` is given.
+/** A string copied into the NUL-terminated shape C reads, and the owner of that copy -- a language
+ * with no manual free has to say who frees it, so the bytes belong to a value with a lifetime
+ * rather than to whoever remembers.
+ *
+ * `len` is one less than the storage because the terminator is not part of the text, and `ptr` is
+ * what an `extern` taking a `char *` is given.
+ */
 struct CString
     bytes: []u8
 

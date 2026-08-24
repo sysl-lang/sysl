@@ -183,10 +183,13 @@ object MarkdownWriter {
       if d.body.nonEmpty then out ++= s"${d.body}\n\n"
     }
 
-    // A module whose author explained everything in prose — or has not written any yet — produces a
-    // bare signature. Saying so is the honest answer rather than leaving a reader wondering whether
-    // the page failed to render.
-    if !s.documented then out ++= "> [!NOTE]\n> Undocumented.\n\n"
+    // A SIGNATURE WITH NOTHING UNDER IT ALREADY SAYS IT IS UNDOCUMENTED, so nothing is said.
+    //
+    // There was a `> [!NOTE] Undocumented.` callout here, and generating the real standard library
+    // is what retired it: 277 of 631 symbols got one. Many are right to have no prose of their own —
+    // `us_per_milli` and its four siblings are a run of constants under one shared paragraph, and a
+    // sentence each would be noise — so the callout was not reporting a defect, it was repeating the
+    // absence of one on a third of every page. scaladoc and rustdoc both leave a bare signature bare.
 
     s.doc.foreach { d =>
       val ps = d.params.filter(_.subject.isDefined)

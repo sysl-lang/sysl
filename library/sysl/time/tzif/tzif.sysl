@@ -42,7 +42,7 @@ import sysl.text.from_utf8
 // past the end answers with the last type, which is what the table says and is right until a zone
 // changes its rules again.
 
-// A zone, as a view of the bytes it was decoded from.
+/** A zone, as a view of the bytes it was decoded from. */
 struct Zone
     data: []const u8
     trans_at: usize
@@ -54,13 +54,14 @@ struct Zone
     // Whether a transition time is 8 bytes. False only for a version 1 file.
     wide: bool
 
-// Why a decode refused, at the granularity a caller can act on.
-//
-// The shape is `sysl.encoding.DecodeError`'s and for its reason: the variants are separated by what a
-// caller would **do** about each. `BadMagic` is a file that is not one of these at all -- the usual
-// cause being a path that named something else. `Truncated` carries the length that would have been
-// enough, so a caller reading in pieces knows how much more to get rather than doubling until it
-// fits.
+/** Why a decode refused, at the granularity a caller can act on.
+ *
+ * The shape is `sysl.encoding.DecodeError`'s and for its reason: the variants are separated by what a
+ * caller would **do** about each. `BadMagic` is a file that is not one of these at all -- the usual
+ * cause being a path that named something else. `Truncated` carries the length that would have been
+ * enough, so a caller reading in pieces knows how much more to get rather than doubling until it
+ * fits.
+ */
 enum TzifError
     BadMagic
     BadVersion(saw: u8)
@@ -90,39 +91,43 @@ private u32_at(b: []const u8, at: usize) -> Result[u32, TzifError]
         None -> Err(Truncated(at + 4))
 end u32_at
 
-// A count, as the offset arithmetic wants it. Every count in the header is a `u32` and every use of
-// one is an index, so the conversion happens once here rather than at each of its dozen uses.
+/** A count, as the offset arithmetic wants it. Every count in the header is a `u32` and every use of
+ * one is an index, so the conversion happens once here rather than at each of its dozen uses.
+ */
 private count_at(b: []const u8, at: usize) -> Result[usize, TzifError]
     val v = u32_at(b, at)?
 
     Ok(usize(v))
 
-// A signed 32-bit big-endian integer, which is what an offset from UTC is stored as.
+/** A signed 32-bit big-endian integer, which is what an offset from UTC is stored as. */
 private i32_at(b: []const u8, at: usize) -> Result[int, TzifError]
     val raw = u32_at(b, at)?
 
-    // `int` is 32 bits, so the wide half of the range is the negative half and the subtraction is
-    // done in `long` to reach it. Writing `int(raw)` instead would be a narrowing of a value that
-    // does not fit.
+    /** `int` is 32 bits, so the wide half of the range is the negative half and the subtraction is
+     * done in `long` to reach it. Writing `int(raw)` instead would be a narrowing of a value that
+     * does not fit.
+     */
     Ok(if raw >= 2147483648 then int(long(raw) - 4294967296) else int(raw))
 end i32_at
 
-// A signed 64-bit big-endian integer, composed from its two halves rather than read as a `u64` and
-// reinterpreted -- the high half read *signed* is what carries the sign, so this is exact two's
-// complement with no cast whose behaviour has to be looked up.
+/** A signed 64-bit big-endian integer, composed from its two halves rather than read as a `u64` and
+ * reinterpreted -- the high half read *signed* is what carries the sign, so this is exact two's
+ * complement with no cast whose behaviour has to be looked up.
+ */
 private i64_at(b: []const u8, at: usize) -> Result[long, TzifError]
     val hi = i32_at(b, at)?
     val lo = u32_at(b, at + 4)?
 
     Ok(long(hi) * 4294967296 + long(lo))
 
-// The version byte of the header at `at`, having checked that a header is what is there.
-//
-// **The magic is checked before the length, and the order is the whole of what makes the refusal
-// useful.** Five bytes is enough to know whether these are a TZif file at all, and a caller who
-// named the wrong path has bytes that are plentiful and wrong rather than few and right -- so
-// answering `Truncated` first would tell somebody holding a JPEG that their zone file was too short.
-// Length is what is left to say once the magic has agreed.
+/** The version byte of the header at `at`, having checked that a header is what is there.
+ *
+ * **The magic is checked before the length, and the order is the whole of what makes the refusal
+ * useful.** Five bytes is enough to know whether these are a TZif file at all, and a caller who
+ * named the wrong path has bytes that are plentiful and wrong rather than few and right -- so
+ * answering `Truncated` first would tell somebody holding a JPEG that their zone file was too short.
+ * Length is what is left to say once the magic has agreed.
+ */
 private magic_at(b: []const u8, at: usize) -> Result[u8, TzifError]
     if at + 5 > b.len then return Err(Truncated(at + header_len))
 
@@ -135,7 +140,7 @@ private magic_at(b: []const u8, at: usize) -> Result[u8, TzifError]
     Ok(b[at + 4])
 end magic_at
 
-// How long the data block described by the header at `at` is, at the given time width.
+/** How long the data block described by the header at `at` is, at the given time width. */
 private block_len(b: []const u8, at: usize, time_size: usize) -> Result[usize, TzifError]
     val isutcnt = count_at(b, at + 20)?
     val isstdcnt = count_at(b, at + 24)?
@@ -148,14 +153,15 @@ private block_len(b: []const u8, at: usize, time_size: usize) -> Result[usize, T
         leapcnt * (time_size + 4) + isstdcnt + isutcnt)
 end block_len
 
-// Reads a zone out of the bytes of a TZif file.
-//
-// **The `Zone` borrows `data`** -- see the note above about what that costs.
-//
-// A version 2 or later file carries its table twice: once with 4-byte transition times for a reader
-// that predates the format's second version, and then again with 8-byte ones. The first is stepped
-// over rather than read, which is why the length of it has to be worked out even though nothing in
-// it is wanted.
+/** Reads a zone out of the bytes of a TZif file.
+ *
+ * **The `Zone` borrows `data`** -- see the note above about what that costs.
+ *
+ * A version 2 or later file carries its table twice: once with 4-byte transition times for a reader
+ * that predates the format's second version, and then again with 8-byte ones. The first is stepped
+ * over rather than read, which is why the length of it has to be worked out even though nothing in
+ * it is wanted.
+ */
 parse(data: []const u8) -> Result[Zone, TzifError]
     val version = magic_at(data, 0)?
 
@@ -199,12 +205,13 @@ private transition(z: Zone, i: usize) -> Result[long, TzifError]
     Ok(long(narrow))
 end transition
 
-// Which local time type applies at `secs`, as an index into the type array.
-//
-// **A time before the first transition is the case with a rule of its own.** RFC 8536 says to use the
-// first type that is not daylight saving, and the first type of all where every one of them is -- so
-// a date in 1880, before any zone had a transition to record, reads as that zone's standard time
-// rather than as whatever the first transition happened to leave behind.
+/** Which local time type applies at `secs`, as an index into the type array.
+ *
+ * **A time before the first transition is the case with a rule of its own.** RFC 8536 says to use the
+ * first type that is not daylight saving, and the first type of all where every one of them is -- so
+ * a date in 1880, before any zone had a transition to record, reads as that zone's standard time
+ * rather than as whatever the first transition happened to leave behind.
+ */
 private type_index(z: Zone, secs: long) -> Result[usize, TzifError]
     var lo: usize = 0
     var hi = z.timecnt
@@ -229,28 +236,30 @@ private type_index(z: Zone, secs: long) -> Result[usize, TzifError]
     Ok(0)
 end type_index
 
-// How far this zone's clocks were set from UTC at that instant.
-//
-// **This is the shape `sysl.time.resolve` takes**, which is the whole point of it: a zone read from a
-// file, a zone talking to a chip and a zone written out by hand are one thing to everything above.
+/** How far this zone's clocks were set from UTC at that instant.
+ *
+ * **This is the shape `sysl.time.resolve` takes**, which is the whole point of it: a zone read from a
+ * file, a zone talking to a chip and a zone written out by hand are one thing to everything above.
+ */
 offset_at(z: Zone, t: Instant) -> Result[Offset, TzifError]
     val k = type_index(z, seconds_of(t))?
     val secs = i32_at(z.data, z.ttinfo_at + k * ttinfo_len)?
 
     Ok(Offset(secs / 60))
 
-// Whether daylight saving was in force at that instant, as the file records it.
+/** Whether daylight saving was in force at that instant, as the file records it. */
 is_dst_at(z: Zone, t: Instant) -> Result[bool, TzifError]
     val k = type_index(z, seconds_of(t))?
 
     Ok(z.data[z.ttinfo_at + k * ttinfo_len + 4] != 0)
 
-// The abbreviation the zone used at that instant -- `EST`, `EDT`, `+0545`.
-//
-// **It is here because the file already carries it**, and it is the one thing a host's `tm_gmtoff`
-// route cannot answer without a second call. It is a display string and nothing else: `CST` names
-// three different offsets around the world, so a timestamp that has to be read back carries the
-// number instead, which is what `timestamp_text` writes.
+/** The abbreviation the zone used at that instant -- `EST`, `EDT`, `+0545`.
+ *
+ * **It is here because the file already carries it**, and it is the one thing a host's `tm_gmtoff`
+ * route cannot answer without a second call. It is a display string and nothing else: `CST` names
+ * three different offsets around the world, so a timestamp that has to be read back carries the
+ * number instead, which is what `timestamp_text` writes.
+ */
 abbrev_at(z: Zone, t: Instant) -> Result[string, TzifError]
     val k = type_index(z, seconds_of(t))?
     val start = z.desig_at + usize(z.data[z.ttinfo_at + k * ttinfo_len + 5])
@@ -264,14 +273,16 @@ abbrev_at(z: Zone, t: Instant) -> Result[string, TzifError]
 
     from_utf8(z.data[start..<end]) match
         Ok(s) -> Ok(s)
-        // The designations are ASCII in every file the database ships, so this is a corrupt one
-        // rather than a language question -- and it is reported as the truncation it will look like
-        // to whoever is holding the bytes.
+        /** The designations are ASCII in every file the database ships, so this is a corrupt one
+         * rather than a language question -- and it is reported as the truncation it will look like
+         * to whoever is holding the bytes.
+         */
         Err(e) -> Err(Truncated(z.data.len))
 end abbrev_at
 
-// The instant as a count of whole seconds, rounding toward minus infinity so that a time before 1970
-// lands in the second it belongs to rather than the one after it.
+/** The instant as a count of whole seconds, rounding toward minus infinity so that a time before 1970
+ * lands in the second it belongs to rather than the one after it.
+ */
 private seconds_of(t: Instant) -> long =
     if t.us >= 0 then t.us / us_per_second
     else -((-t.us + us_per_second - 1) / us_per_second)

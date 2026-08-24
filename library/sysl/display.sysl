@@ -1,21 +1,23 @@
 module sysl
 
-// What a format string's flags are carried in (`library/core.md § A specifier is the whole value's
-// field`): the field the whole value occupies, the precision each renderer reads in its own terms,
-// and which side the padding goes on.
-//
-// What honours it is the `display_*` family, whose prose is where the three fields are explained.
+/** What a format string's flags are carried in (`library/core.md § A specifier is the whole value's
+ * field`): the field the whole value occupies, the precision each renderer reads in its own terms,
+ * and which side the padding goes on.
+ *
+ * What honours it is the `display_*` family, whose prose is where the three fields are explained.
+ */
 struct FormatSpec
     width: int
     prec: int
     left: bool
 
-// How a value renders itself.
-//
-// A `Display` writes its value's text into a sink rather than returning a fresh `string`, so
-// rendering costs no allocation and a `no alloc` module can still log. The sink is a `*Writer`,
-// which is the trait object of `02` -- and which this file does not declare: a module's members are
-// one set however many files they came from, so `Writer` is reached here with nothing to import.
+/** How a value renders itself.
+ *
+ * A `Display` writes its value's text into a sink rather than returning a fresh `string`, so
+ * rendering costs no allocation and a `no alloc` module can still log. The sink is a `*Writer`,
+ * which is the trait object of `02` -- and which this file does not declare: a module's members are
+ * one set however many files they came from, so `Writer` is reached here with nothing to import.
+ */
 trait Display
     display(self, out: *Writer, fmt: FormatSpec)
 
@@ -46,24 +48,26 @@ impl Display for string
 impl Display for real
     display(self, out: *Writer, fmt: FormatSpec) = display_real(self, out, fmt)
 
-// The narrower float widens on the way in, which is what the lowering did for it before: one
-// renderer per kind rather than one per type, and `%g` is written against a `double`.
+/** The narrower float widens on the way in, which is what the lowering did for it before: one
+ * renderer per kind rather than one per type, and `%g` is written against a `double`.
+ */
 impl Display for f32
     display(self, out: *Writer, fmt: FormatSpec) = display_real(real(self), out, fmt)
 
-// The integers, which are the family that is **open**: `i5` and `u24` are types a program may
-// name, so there is no finite list of widths to write the blocks above for.
-//
-// What stands in for the list is one block written over the whole family at once, and `Integer` is
-// what names the family. It declares no member of its own -- a type is one of the integers or it is
-// not, which is the compiler's answer and not something a program can join -- so what it carries is
-// the operators the block below needs, exactly as `sysl.math`'s `Float` carries the ones its two
-// widths share.
-// **`Mul` joined this list for rendering**, which is the one member here that is not about taking a
-// number apart. Chunked decimal conversion multiplies in two places -- computing the chunk divisor,
-// and recovering a remainder as `rest - q * chunk` -- and every integer type has `Mul` at every
-// width, so nothing is excluded by asking for it and the compiler supplies the membership either
-// way.
+/** The integers, which are the family that is **open**: `i5` and `u24` are types a program may
+ * name, so there is no finite list of widths to write the blocks above for.
+ *
+ * What stands in for the list is one block written over the whole family at once, and `Integer` is
+ * what names the family. It declares no member of its own -- a type is one of the integers or it is
+ * not, which is the compiler's answer and not something a program can join -- so what it carries is
+ * the operators the block below needs, exactly as `sysl.math`'s `Float` carries the ones its two
+ * widths share.
+ * **`Mul` joined this list for rendering**, which is the one member here that is not about taking a
+ * number apart. Chunked decimal conversion multiplies in two places -- computing the chunk divisor,
+ * and recovering a remainder as `rest - q * chunk` -- and every integer type has `Mul` at every
+ * width, so nothing is excluded by asking for it and the compiler supplies the membership either
+ * way.
+ */
 trait Integer: Div + Rem + Ord + Eq + Sub + Mul
 
 // How every integer renders, at every width, from one body.
@@ -95,22 +99,23 @@ trait Integer: Div + Rem + Ord + Eq + Sub + Mul
 // computing loop folds away, and what is left is the loop that was always there. It was found by a
 // factorial program in which rendering the answer was 98% of the run and the arithmetic 0.075s of it.
 
-// The largest power of ten that fits in both `T` and a `u64`, and how many digits that is.
-//
-// **It is computed rather than written down, and it has to be.** The block below is generic over the
-// whole open integer family, so a literal `10000000000000000000` is refused at every narrow member of
-// it — *"the literal 10000000000000000000 does not fit byte"*. Multiplying up and testing by dividing
-// back is the one form that is total at every width. It lands at 100 for a `u8` and at 10^19 for a
-// `u64` and everything above it.
-//
-// **The loop is a pure function of `T` alone**, so it folds away and an ordinary `int` render pays
-// nothing for it — which is what makes the change below safe rather than a trade.
-//
-// **The cap is a `u64`'s worth of digits and deliberately not a `usize`'s**, and the two differ on a
-// 32-bit target. What the cap has to fit is the type the *low half of each chunk is rendered with*,
-// and that is a `u64` below whatever `usize` happens to be on the machine. Tying it to `usize` would
-// cap at 10^9 there while the arithmetic doing the work stayed 64-bit: slower, for a reason
-// unconnected to the value being printed.
+/** The largest power of ten that fits in both `T` and a `u64`, and how many digits that is.
+ *
+ * **It is computed rather than written down, and it has to be.** The block below is generic over the
+ * whole open integer family, so a literal `10000000000000000000` is refused at every narrow member of
+ * it — *"the literal 10000000000000000000 does not fit byte"*. Multiplying up and testing by dividing
+ * back is the one form that is total at every width. It lands at 100 for a `u8` and at 10^19 for a
+ * `u64` and everything above it.
+ *
+ * **The loop is a pure function of `T` alone**, so it folds away and an ordinary `int` render pays
+ * nothing for it — which is what makes the change below safe rather than a trade.
+ *
+ * **The cap is a `u64`'s worth of digits and deliberately not a `usize`'s**, and the two differ on a
+ * 32-bit target. What the cap has to fit is the type the *low half of each chunk is rendered with*,
+ * and that is a `u64` below whatever `usize` happens to be on the machine. Tying it to `usize` would
+ * cap at 10^9 there while the arithmetic doing the work stayed 64-bit: slower, for a reason
+ * unconnected to the value being printed.
+ */
 private chunk_of[T: Integer]() -> (T, usize)
     val ten: T = 10
     var c: T = 1

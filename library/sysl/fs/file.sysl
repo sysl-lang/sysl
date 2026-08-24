@@ -39,56 +39,61 @@ private[sysl] extern "feof" c_feof(f: *u8) -> int
 // no shim was compiled.
 private[sysl] extern "sysl_fs_file_size" c_file_size(f: *u8) -> long
 
-// Where a seek counts from. C standardises the three names and every platform has agreed on the
-// three values since V7, but the *names* are what the calls below read, so a reader never has to
-// know which is which.
+/** Where a seek counts from. C standardises the three names and every platform has agreed on the
+ * three values since V7, but the *names* are what the calls below read, so a reader never has to
+ * know which is which.
+ */
 private seek_set() -> int = 0
 private seek_end() -> int = 2
 
-// The handle itself, and the two things that are true of it beyond the pointer.
-//
-// It is a struct of its own -- rather than the three fields sitting directly in `File` -- because of
-// what `File` has to survive being copied. A struct is a value here, so a `File` handed to a
-// function is a second `File`, and if it held the pointer directly then closing either would leave
-// the other holding a handle C has freed. Every copy sharing **one** `FileState` is what makes
-// `close` answerable at all: it is written once, and every copy sees it.
+/** The handle itself, and the two things that are true of it beyond the pointer.
+ *
+ * It is a struct of its own -- rather than the three fields sitting directly in `File` -- because of
+ * what `File` has to survive being copied. A struct is a value here, so a `File` handed to a
+ * function is a second `File`, and if it held the pointer directly then closing either would leave
+ * the other holding a handle C has freed. Every copy sharing **one** `FileState` is what makes
+ * `close` answerable at all: it is written once, and every copy sees it.
+ */
 struct FileState
     handle: *u8
     bad: bool
     shut: bool
 
-// A file that is open, or that was.
-//
-// **Closing is the program's to do**, and `defer f.close()` is how it is written -- the language has
-// no destructor, so nothing runs at the end of a scope that the scope did not say. What the shared
-// state above buys is that saying it *twice* is harmless rather than a use-after-free, which is the
-// mistake a value type would otherwise make easy. Dropping a `File` without closing it leaks the
-// handle until the program exits, the same as in C.
+/** A file that is open, or that was.
+ *
+ * **Closing is the program's to do**, and `defer f.close()` is how it is written -- the language has
+ * no destructor, so nothing runs at the end of a scope that the scope did not say. What the shared
+ * state above buys is that saying it *twice* is harmless rather than a use-after-free, which is the
+ * mistake a value type would otherwise make easy. Dropping a `File` without closing it leaks the
+ * handle until the program exits, the same as in C.
+ */
 struct File
     inner: &FileState
 
     closed(*self) -> bool = self.inner.shut
 
-    // **Every member below asks this first, and none of them may be dropped.** `fclose` releases the
-    // handle, so the pointer this struct holds afterwards names storage C has freed, and reaching it
-    // is a use-after-free rather than a call that fails. The flag is what stands between a program
-    // that closed a file too early and undefined behaviour, and the answer it produces instead is
-    // `NotOpen` -- which is `EBADF`, the code the operating system reports for the same mistake made
-    // one layer down.
+    /** **Every member below asks this first, and none of them may be dropped.** `fclose` releases the
+     * handle, so the pointer this struct holds afterwards names storage C has freed, and reaching it
+     * is a use-after-free rather than a call that fails. The flag is what stands between a program
+     * that closed a file too early and undefined behaviour, and the answer it produces instead is
+     * `NotOpen` -- which is `EBADF`, the code the operating system reports for the same mistake made
+     * one layer down.
+     */
     flush(*self) -> Result[unit, IoError]
         if self.inner.shut then return Err(NotOpen)
 
         if c_fflush(self.inner.handle) != 0 then Err(why()) else Ok(())
 
-    // Releases the handle, flushing what is still buffered.
-    //
-    // **It is idempotent**, and the second call is not merely tolerated -- it is the case `defer`
-    // creates. A function that closes on one path and defers the close for the others reaches the
-    // end having done both, and the alternative would be for every such function to carry a flag
-    // this can carry once.
-    //
-    // A failure here is a real one: the flush it performs is where a full disk finally reports, so a
-    // program that cares about its output checks this and not only the writes.
+    /** Releases the handle, flushing what is still buffered.
+     *
+     * **It is idempotent**, and the second call is not merely tolerated -- it is the case `defer`
+     * creates. A function that closes on one path and defers the close for the others reaches the
+     * end having done both, and the alternative would be for every such function to carry a flag
+     * this can carry once.
+     *
+     * A failure here is a real one: the flush it performs is where a full disk finally reports, so a
+     * program that cares about its output checks this and not only the writes.
+     */
     close(*self) -> Result[unit, IoError]
         if self.inner.shut then return Ok(())
 
@@ -99,7 +104,7 @@ struct File
         if c_fclose(self.inner.handle) != 0 then Err(why()) else Ok(())
     end close
 
-    // Where the next read or write will happen, in bytes from the start.
+    /** Where the next read or write will happen, in bytes from the start. */
     tell(*self) -> Result[long, IoError]
         if self.inner.shut then return Err(NotOpen)
 
@@ -108,28 +113,29 @@ struct File
         if at < 0 then Err(why()) else Ok(at)
     end tell
 
-    // Moves to an absolute offset, which also clears the end-of-file mark.
+    /** Moves to an absolute offset, which also clears the end-of-file mark. */
     seek(*self, to: long) -> Result[unit, IoError]
         if self.inner.shut then return Err(NotOpen)
 
         if c_fseek(self.inner.handle, to, seek_set()) != 0 then Err(why()) else Ok(())
 
-    // How many bytes the file holds.
-    //
-    // **It asks, where it used to measure.** This was a seek to the end and back — four calls, and a
-    // position temporarily somewhere the caller did not put it — because the alternative was `fstat`
-    // and `struct stat` is laid out differently by every platform's headers, which is the
-    // transcription this module refuses. A shim reads the header and one field crosses, so the
-    // refusal costs nothing here any more.
-    //
-    // What that fixes beyond the call count: the old shape **moved the position and put it back**,
-    // so a failure between the two left it at the end of the file, and nothing else in the module
-    // could disturb a caller's position at all. It also asks about the **open file** rather than
-    // about a path, so nothing can be renamed or replaced underneath the answer.
-    // **The seek is kept for the systems with no shim**, which is `#if` doing what it is for: one
-    // choice between two implementations, on a target fact. `sysl.fs` requires `os` and not `posix`,
-    // so `x86_64-windows` reaches this module and has no `__windows__` directory to take a shim from
-    // — and `fseek`/`ftell` are ISO C, so the old path goes on working there exactly as it did.
+    /** How many bytes the file holds.
+     *
+     * **It asks, where it used to measure.** This was a seek to the end and back — four calls, and a
+     * position temporarily somewhere the caller did not put it — because the alternative was `fstat`
+     * and `struct stat` is laid out differently by every platform's headers, which is the
+     * transcription this module refuses. A shim reads the header and one field crosses, so the
+     * refusal costs nothing here any more.
+     *
+     * What that fixes beyond the call count: the old shape **moved the position and put it back**,
+     * so a failure between the two left it at the end of the file, and nothing else in the module
+     * could disturb a caller's position at all. It also asks about the **open file** rather than
+     * about a path, so nothing can be renamed or replaced underneath the answer.
+     * **The seek is kept for the systems with no shim**, which is `#if` doing what it is for: one
+     * choice between two implementations, on a target fact. `sysl.fs` requires `os` and not `posix`,
+     * so `x86_64-windows` reaches this module and has no `__windows__` directory to take a shim from
+     * — and `fseek`/`ftell` are ISO C, so the old path goes on working there exactly as it did.
+     */
     size(*self) -> Result[long, IoError]
         if self.inner.shut then return Err(NotOpen)
 
@@ -152,33 +158,36 @@ struct File
 #endif
     end size
 
-    // Whether a read has already run off the end. It answers about reads that **happened**, so it is
-    // false on a file just opened however empty that file is -- which is C's meaning, and the reason
-    // a read loop tests what `read` handed back rather than testing this first.
-    //
-    // A closed file answers `true`, since nothing more will arrive from it and a loop asking this
-    // should stop rather than spin.
+    /** Whether a read has already run off the end. It answers about reads that **happened**, so it is
+     * false on a file just opened however empty that file is -- which is C's meaning, and the reason
+     * a read loop tests what `read` handed back rather than testing this first.
+     *
+     * A closed file answers `true`, since nothing more will arrive from it and a loop asking this
+     * should stop rather than spin.
+     */
     at_end(*self) -> bool = self.inner.shut || c_feof(self.inner.handle) != 0
 end File
 
-// Whether anything has gone wrong on this file since it was opened. It latches, so it is worth
-// asking once after a run of writes rather than after each -- which is the whole reason the surface
-// reports this way (`reference/errors.md § The third shape: a latch`).
-//
-// **It is written once, here, and that is what makes the two `impl` blocks below answerable.** A
-// `failed` declared by `Reader` and another declared by `Writer` would be two members of one name on
-// one type -- allowed, but a call could not say which it meant, since `failed` takes no arguments
-// and a program that reads and writes a file has both traits in scope. Both requiring `Fallible`
-// instead leaves this the single answer each of them reaches.
+/** Whether anything has gone wrong on this file since it was opened. It latches, so it is worth
+ * asking once after a run of writes rather than after each -- which is the whole reason the surface
+ * reports this way (`reference/errors.md § The third shape: a latch`).
+ *
+ * **It is written once, here, and that is what makes the two `impl` blocks below answerable.** A
+ * `failed` declared by `Reader` and another declared by `Writer` would be two members of one name on
+ * one type -- allowed, but a call could not say which it meant, since `failed` takes no arguments
+ * and a program that reads and writes a file has both traits in scope. Both requiring `Fallible`
+ * instead leaves this the single answer each of them reaches.
+ */
 impl Fallible for File
     override failed(*self) -> bool = self.inner.bad
 
-// Reading bytes out of a file is the `Reader` of `sysl.io`, whole and unmodified, which is what lets
-// `lines(&f)` work over a file with nothing here knowing about lines.
-//
-// An empty answer means the end of the input and nothing more. Whether the input ended *badly* is
-// what `failed` reports, and the two are separate questions because a caller that does not care
-// should not have to ask -- the same split `FdReader` makes.
+/** Reading bytes out of a file is the `Reader` of `sysl.io`, whole and unmodified, which is what lets
+ * `lines(&f)` work over a file with nothing here knowing about lines.
+ *
+ * An empty answer means the end of the input and nothing more. Whether the input ended *badly* is
+ * what `failed` reports, and the two are separate questions because a caller that does not care
+ * should not have to ask -- the same split `FdReader` makes.
+ */
 impl Reader for File
     read(*self, into: []u8) -> []const u8
         // Reading a closed file latches rather than answering quietly empty: an empty read means the
@@ -201,9 +210,10 @@ impl Reader for File
     end read
 end File
 
-// And writing them is the `Writer` of `library/core.md § What is in it`, so everything that renders
-// into a sink renders into a file. It latches rather than returning, which is what keeps
-// `f.write(b)` a statement.
+/** And writing them is the `Writer` of `library/core.md § What is in it`, so everything that renders
+ * into a sink renders into a file. It latches rather than returning, which is what keeps
+ * `f.write(b)` a statement.
+ */
 impl Writer for File
     write(*self, bytes: []const u8)
         if self.inner.shut
@@ -215,27 +225,30 @@ impl Writer for File
     end write
 end File
 
-// The three ways a program opens a file, named for what it means rather than for the mode string it
-// becomes. `open` reads an existing file; `create` makes one, or empties one that was there;
-// `append` writes at the end of whatever is there, making the file if it is not.
+/** The three ways a program opens a file, named for what it means rather than for the mode string it
+ * becomes. `open` reads an existing file; `create` makes one, or empties one that was there;
+ * `append` writes at the end of whatever is there, making the file if it is not.
+ */
 open(path: string) -> Result[File, IoError] = opened(path, c"rb")
 
 create(path: string) -> Result[File, IoError] = opened(path, c"wb")
 
 append(path: string) -> Result[File, IoError] = opened(path, c"ab")
 
-// A file opened for reading **and** writing, which the three above cannot express between them: each
-// of C's update modes is a different answer to "and what about what is already there", and naming
-// them apart is what keeps a caller from having to know that `"r+"` fails on a missing file while
-// `"w+"` empties one that exists.
+/** A file opened for reading **and** writing, which the three above cannot express between them: each
+ * of C's update modes is a different answer to "and what about what is already there", and naming
+ * them apart is what keeps a caller from having to know that `"r+"` fails on a missing file while
+ * `"w+"` empties one that exists.
+ */
 open_update(path: string) -> Result[File, IoError] = opened(path, c"r+b")
 
 create_update(path: string) -> Result[File, IoError] = opened(path, c"w+b")
 
-// The mode string is a literal at every call above, so it costs no allocation and there is no
-// direction from a `string` into one -- which is also why this is private. A program wanting a mode
-// the four names do not cover is asking for C's spelling, and that is a good thing to have to say
-// out loud with an `extern` of its own.
+/** The mode string is a literal at every call above, so it costs no allocation and there is no
+ * direction from a `string` into one -- which is also why this is private. A program wanting a mode
+ * the four names do not cover is asking for C's spelling, and that is a good thing to have to say
+ * out loud with an `extern` of its own.
+ */
 private opened(path: string, mode: *u8) -> Result[File, IoError]
     var h = c_fopen(cstring(path).ptr, mode)
 

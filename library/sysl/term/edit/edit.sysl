@@ -41,29 +41,31 @@ import sysl.text.{char_columns, str_builder}
 // allocator is not served here -- and could not be by this API, since building a `string` is where
 // the allocation is. That is a different facility rather than this one with a flag.
 
-// U+FFFD, what a decoder answers for input it cannot make sense of.
+/** U+FFFD, what a decoder answers for input it cannot make sense of. */
 private const replacement: char = '\u{FFFD}'
 
-// How many lines the arrows can reach back through.
-//
-// **A cap rather than none, because a console outlives its session.** A board's REPL runs for as long
-// as the board is powered, and each entry is a `string` of its own — so an uncapped history is a leak
-// whose fuse is measured in days. Sixty-four is past where anybody scrolls and small enough not to
-// matter on a microcontroller.
+/** How many lines the arrows can reach back through.
+ *
+ * **A cap rather than none, because a console outlives its session.** A board's REPL runs for as long
+ * as the board is powered, and each entry is a `string` of its own — so an uncapped history is a leak
+ * whose fuse is measured in days. Sixty-four is past where anybody scrolls and small enough not to
+ * matter on a microcontroller.
+ */
 private const history_limit: usize = 64
 
-// A line editor over a byte source and a place to echo to.
-//
-// **It borrows both rather than owning them**, for the reason `sysl.io.Lines` gives: a `for` loop
-// iterates a *copy* of its iterator, so an owned reader would latch its failure on a copy the caller
-// cannot reach, and `failed` would be decorative. Two parameters rather than one value implementing
-// both traits, because a source and a sink are usually two different things -- a file descriptor each
-// on a host -- and a caller with one value that is both hands it over twice.
-//
-// **Three pieces of state outlive a line, which is why this is a struct rather than a function.** The
-// CRLF debt straddles two lines by construction; the tail of the last read holds bytes that have been
-// taken from the reader and not yet looked at, which an escape sequence arriving in two pieces
-// depends on; and the `Buf[char]` is reused, so a session allocates once rather than once per line.
+/** A line editor over a byte source and a place to echo to.
+ *
+ * **It borrows both rather than owning them**, for the reason `sysl.io.Lines` gives: a `for` loop
+ * iterates a *copy* of its iterator, so an owned reader would latch its failure on a copy the caller
+ * cannot reach, and `failed` would be decorative. Two parameters rather than one value implementing
+ * both traits, because a source and a sink are usually two different things -- a file descriptor each
+ * on a host -- and a caller with one value that is both hands it over twice.
+ *
+ * **Three pieces of state outlive a line, which is why this is a struct rather than a function.** The
+ * CRLF debt straddles two lines by construction; the tail of the last read holds bytes that have been
+ * taken from the reader and not yet looked at, which an escape sequence arriving in two pieces
+ * depends on; and the `Buf[char]` is reused, so a session allocates once rather than once per line.
+ */
 struct Editor
     src: *Reader
     sink: *Writer
@@ -108,11 +110,12 @@ struct Editor
     // thing people remember.
     draft: string
 
-    // The next byte of input, refilling from the reader when what was read is spent.
-    //
-    // An empty read ends the input for good, which is right for the sources `read` serves: zero means
-    // end of input and a failure arrives through `failed` instead, so nothing is being conflated and
-    // a caller reading past the end gets `None` every time rather than a second chance.
+    /** The next byte of input, refilling from the reader when what was read is spent.
+     *
+     * An empty read ends the input for good, which is right for the sources `read` serves: zero means
+     * end of input and a failure arrives through `failed` instead, so nothing is being conflated and
+     * a caller reading past the end gets `None` every time rather than a second chance.
+     */
     next_byte(*self) -> Option[u8]
         loop
             if self.pos < self.have.len
@@ -131,17 +134,18 @@ struct Editor
                 return None
     end next_byte
 
-    // The character a byte begins, read the rest of the way off the source.
-    //
-    // It is a decode with the lead byte already in hand, which is the shape a line editor needs: the
-    // loop has to look at every byte to find the control keys, so by the time it knows a byte is
-    // ordinary text it has already taken it.
-    //
-    // **Malformed input answers U+FFFD rather than failing**, which is what a terminal does and what
-    // keeps one bad byte from ending a session. A continuation byte that is missing or out of range
-    // ends the character there rather than consuming what follows: the next byte is far likelier to
-    // start a fresh character than to be the rest of a broken one. The line is therefore valid text
-    // by construction, and `getline` has nothing left to validate.
+    /** The character a byte begins, read the rest of the way off the source.
+     *
+     * It is a decode with the lead byte already in hand, which is the shape a line editor needs: the
+     * loop has to look at every byte to find the control keys, so by the time it knows a byte is
+     * ordinary text it has already taken it.
+     *
+     * **Malformed input answers U+FFFD rather than failing**, which is what a terminal does and what
+     * keeps one bad byte from ending a session. A continuation byte that is missing or out of range
+     * ends the character there rather than consuming what follows: the next byte is far likelier to
+     * start a fresh character than to be the rest of a broken one. The line is therefore valid text
+     * by construction, and `getline` has nothing left to validate.
+     */
     char_from(*self, b0: u8) -> char
         if b0 < 128 then return char(uint(b0))
 
@@ -171,16 +175,17 @@ struct Editor
         char(cp)
     end char_from
 
-    // One line, without its terminator, echoed as it is typed.
-    //
-    // **`\r`, `\n` and `\r\n` each end a line**, which is `sysl.io.LineEnding.CrOrLf`'s policy and for
-    // the same reason: a terminal sends a bare `\r` when Enter is pressed, so a reader waiting for an
-    // `\n` waits forever and prints nothing. A CR ends the line immediately rather than waiting to see
-    // whether an LF follows, because on a bare-CR terminal it never does and waiting would hang until
-    // the next keystroke -- so the debt is remembered instead, and outlives the call.
-    //
-    // **It cannot fail.** Every character came out of `char_from`, where a malformed byte already
-    // became U+FFFD, so there is nothing left to validate and no `Result` for a caller to unwrap.
+    /** One line, without its terminator, echoed as it is typed.
+     *
+     * **`\r`, `\n` and `\r\n` each end a line**, which is `sysl.io.LineEnding.CrOrLf`'s policy and for
+     * the same reason: a terminal sends a bare `\r` when Enter is pressed, so a reader waiting for an
+     * `\n` waits forever and prints nothing. A CR ends the line immediately rather than waiting to see
+     * whether an LF follows, because on a bare-CR terminal it never does and waiting would hang until
+     * the next keystroke -- so the debt is remembered instead, and outlives the call.
+     *
+     * **It cannot fail.** Every character came out of `char_from`, where a malformed byte already
+     * became U+FFFD, so there is nothing left to validate and no `Result` for a caller to unwrap.
+     */
     getline(*self) -> Option[string]
         self.line.clear()
         self.at = 0
@@ -202,8 +207,9 @@ struct Editor
 
         loop
             self.next_byte() match
-                // The input ended. Whatever was typed before it did is still a line; the next call
-                // finds the line empty and ends the walk.
+                /** The input ended. Whatever was typed before it did is still a line; the next call
+                 * finds the line empty and ends the walk.
+                 */
                 None ->
                     if self.line.is_empty() then return None
 
@@ -255,20 +261,22 @@ struct Editor
                         self.edit(b)
     end getline
 
-    // The characters gathered back into a `string`, which is one `StrBuilder` and no validation —
-    // **and the one place a finished line enters the history**, so that every way of ending a line
-    // records it and no future way can forget to.
+    /** The characters gathered back into a `string`, which is one `StrBuilder` and no validation —
+     * **and the one place a finished line enters the history**, so that every way of ending a line
+     * records it and no future way can forget to.
+     */
     finish(*self) -> string
         val line = self.text_of()
 
         self.remember(line)
         line
 
-    // One keystroke's worth of editing.
-    //
-    // Split from `getline` because that function is about *when a line ends* and this one is about
-    // what the line says -- two questions that were one function in the package this came from, until
-    // arrow keys arrived and it stopped fitting on a screen twice over.
+    /** One keystroke's worth of editing.
+     *
+     * Split from `getline` because that function is about *when a line ends* and this one is about
+     * what the line says -- two questions that were one function in the package this came from, until
+     * arrow keys arrived and it stopped fitting on a screen twice over.
+     */
     edit(*self, b: u8)
         if b == 27 then self.escape()
         elif b == 8 || b == 127 then self.backspace()
@@ -287,19 +295,20 @@ struct Editor
         // Any other control character would move the terminal's cursor without being in the line.
     end edit
 
-    // An escape sequence -- **both of the two forms a terminal sends for the same key**.
-    //
-    // `ESC [ D` is CSI and `ESC O D` is SS3, and a terminal chooses between them by whether the
-    // *application cursor key* mode is on. Nothing here turns it on, so the CSI form is what a fresh
-    // terminal sends -- and reading only that is a bug rather than a simplification, because plenty of
-    // emulators are in the other mode by the time a program is started. Accepting `[` alone means a
-    // left arrow inserts a stray `D` into the line, which is what the absence looks like from a chair.
-    //
-    // **The bytes of a sequence arrive together**, so reading them with the same call the rest of the
-    // loop uses is safe in practice -- and safer here than in a reader taking one byte at a time,
-    // since a sequence split across two reads is held in `have` rather than lost. A lone Escape key is
-    // the exception: it waits for the next keystroke before deciding, which is what every terminal
-    // program does and for the same reason.
+    /** An escape sequence -- **both of the two forms a terminal sends for the same key**.
+     *
+     * `ESC [ D` is CSI and `ESC O D` is SS3, and a terminal chooses between them by whether the
+     * *application cursor key* mode is on. Nothing here turns it on, so the CSI form is what a fresh
+     * terminal sends -- and reading only that is a bug rather than a simplification, because plenty of
+     * emulators are in the other mode by the time a program is started. Accepting `[` alone means a
+     * left arrow inserts a stray `D` into the line, which is what the absence looks like from a chair.
+     *
+     * **The bytes of a sequence arrive together**, so reading them with the same call the rest of the
+     * loop uses is safe in practice -- and safer here than in a reader taking one byte at a time,
+     * since a sequence split across two reads is held in `have` rather than lost. A lone Escape key is
+     * the exception: it waits for the next keystroke before deciding, which is what every terminal
+     * program does and for the same reason.
+     */
     escape(*self)
         self.next_byte() match
             None -> ()
@@ -314,13 +323,14 @@ struct Editor
                         if c >= u8('0') && c <= u8('9') then self.numbered(c) else self.final_key(c)
     end escape
 
-    // A parameterised sequence -- `ESC [ 3 ~` for Delete, and the numbered spellings of Home and End
-    // that some terminals send instead of the lettered ones.
-    //
-    // **It reads to the end of the sequence whatever the parameters are**, which is what keeps a key
-    // it does not act on from leaving its tail in the line. A final byte is anything from `@` to `~`,
-    // so `ESC [ 1 ; 5 D` -- Ctrl-Left on an xterm -- ends at the `D` and is treated as a plain left,
-    // which is a better answer than either ignoring it or inserting a `D`.
+    /** A parameterised sequence -- `ESC [ 3 ~` for Delete, and the numbered spellings of Home and End
+     * that some terminals send instead of the lettered ones.
+     *
+     * **It reads to the end of the sequence whatever the parameters are**, which is what keeps a key
+     * it does not act on from leaving its tail in the line. A final byte is anything from `@` to `~`,
+     * so `ESC [ 1 ; 5 D` -- Ctrl-Left on an xterm -- ends at the `D` and is treated as a plain left,
+     * which is a better answer than either ignoring it or inserting a `D`.
+     */
     numbered(*self, first: u8)
         var n = uint(first - u8('0'))
 
@@ -345,7 +355,7 @@ struct Editor
                         return
     end numbered
 
-    // The last byte of a sequence, where the key is when it is not a number.
+    /** The last byte of a sequence, where the key is when it is not a number. */
     final_key(*self, c: u8)
         if c == u8('D') then self.left()
         elif c == u8('C') then self.right()
@@ -370,7 +380,7 @@ struct Editor
 
         self.sink.write(tmp[0..<encode_utf8(c, tmp[0..<4])])
 
-    // `n` columns back, which is `n` backspaces.
+    /** `n` columns back, which is `n` backspaces. */
     back(*self, n: usize)
         var i = n
 
@@ -379,7 +389,7 @@ struct Editor
             i -= 1
     end back
 
-    // `n` columns painted over.
+    /** `n` columns painted over. */
     blank(*self, n: usize)
         var i = n
 
@@ -388,9 +398,10 @@ struct Editor
             i -= 1
     end blank
 
-    // CRLF, so that whatever the program prints next starts on a line of its own. Both bytes, because
-    // a terminal in raw mode does no translation and a bare `\n` would leave the cursor where the line
-    // ended.
+    /** CRLF, so that whatever the program prints next starts on a line of its own. Both bytes, because
+     * a terminal in raw mode does no translation and a bare `\n` would leave the cursor where the line
+     * ended.
+     */
     new_line(*self)
         self.put("\r\n".bytes)
 
@@ -402,10 +413,10 @@ struct Editor
     // out of the Unicode Character Database, which is exactly the kind of thing no editor should be
     // carrying its own copy of.
 
-    // How wide the character at `i` is drawn.
+    /** How wide the character at `i` is drawn. */
     width_at(self, i: usize) -> usize = char_columns(self.line.view()[i])
 
-    // How many columns the line occupies from `from` to its end.
+    /** How many columns the line occupies from `from` to its end. */
     columns_from(self, from: usize) -> usize
         var n: usize = 0
         var i = from
@@ -419,7 +430,7 @@ struct Editor
 
     // ## Moving
 
-    // The line from `from` to its end, echoed where the cursor stands.
+    /** The line from `from` to its end, echoed where the cursor stands. */
     put_from(*self, from: usize)
         var i = from
 
@@ -450,11 +461,12 @@ struct Editor
         self.put_from(self.at)
         self.at = self.line.len()
 
-    // ## Changing
-    //
-    // After an edit at the cursor, everything to its right has moved, so the tail is written out again
-    // and the cursor walked back to where it belongs. `blanks` is how many columns the line no longer
-    // covers -- the width of what was removed, and none for an insertion.
+    /** ## Changing
+     *
+     * After an edit at the cursor, everything to its right has moved, so the tail is written out again
+     * and the cursor walked back to where it belongs. `blanks` is how many columns the line no longer
+     * covers -- the width of what was removed, and none for an insertion.
+     */
     redraw(*self, blanks: usize)
         self.put_from(self.at)
         self.blank(blanks)
@@ -486,7 +498,7 @@ struct Editor
         self.redraw(w)
     end delete_at
 
-    // Ctrl-U -- everything gone.
+    /** Ctrl-U -- everything gone. */
     kill_line(*self)
         self.to_start()
 
@@ -496,7 +508,7 @@ struct Editor
         self.redraw(w)
     end kill_line
 
-    // Ctrl-K -- everything from the cursor on.
+    /** Ctrl-K -- everything from the cursor on. */
     kill_to_end(*self)
         val w = self.columns_from(self.at)
 
@@ -509,12 +521,13 @@ struct Editor
     // there is nothing: an editor whose history is empty answers an Up by doing nothing at all, which
     // is better than a beep and much better than the sequence's last byte landing in the line.
 
-    // The whole line replaced by `text`, redrawn where it stands.
-    //
-    // **The old line's width is what decides how much to paint over**, not the new one's: replacing
-    // `print something long` with `print 1` leaves twelve columns of the old line on the screen, and
-    // nothing else in this file has to think about that because nothing else shortens a line from the
-    // left. `backspace` and `delete_at` each drop one character and hand `redraw` its width.
+    /** The whole line replaced by `text`, redrawn where it stands.
+     *
+     * **The old line's width is what decides how much to paint over**, not the new one's: replacing
+     * `print something long` with `print 1` leaves twelve columns of the old line on the screen, and
+     * nothing else in this file has to think about that because nothing else shortens a line from the
+     * left. `backspace` and `delete_at` each drop one character and hand `redraw` its width.
+     */
     replace(*self, text: string)
         self.to_start()
 
@@ -534,7 +547,7 @@ struct Editor
         self.back(over)
     end replace
 
-    // The line as text, for putting into the history or keeping as the draft.
+    /** The line as text, for putting into the history or keeping as the draft. */
     text_of(self) -> string
         var out = str_builder()
 
@@ -543,10 +556,11 @@ struct Editor
         out.finish()
     end text_of
 
-    // Up: one step towards the oldest.
-    //
-    // **Leaving the draft is where it gets saved**, which is the only moment it can be: once the line
-    // holds a recalled entry the typed one is gone. Coming back to `hist.len()` is what restores it.
+    /** Up: one step towards the oldest.
+     *
+     * **Leaving the draft is where it gets saved**, which is the only moment it can be: once the line
+     * holds a recalled entry the typed one is gone. Coming back to `hist.len()` is what restores it.
+     */
     earlier(*self)
         if self.browse == 0 then return
 
@@ -556,7 +570,7 @@ struct Editor
         self.replace(self.hist[self.browse])
     end earlier
 
-    // Down: one step towards the line being typed, and then to the draft itself.
+    /** Down: one step towards the line being typed, and then to the draft itself. */
     later(*self)
         if self.browse >= self.hist.len() then return
 
@@ -568,12 +582,13 @@ struct Editor
             self.replace(self.hist[self.browse])
     end later
 
-    // What a finished line leaves behind.
-    //
-    // **A blank line and an immediate repeat are not worth remembering**, which is every shell's rule
-    // and for the same reason: history is for reaching a line that took effort to type, and neither of
-    // those did. A repeat further back is kept — `ls` twice with something in between is two different
-    // moments, and dropping the second would put the arrows somewhere surprising.
+    /** What a finished line leaves behind.
+     *
+     * **A blank line and an immediate repeat are not worth remembering**, which is every shell's rule
+     * and for the same reason: history is for reaching a line that took effort to type, and neither of
+     * those did. A repeat further back is kept — `ls` twice with something in between is two different
+     * moments, and dropping the second would put the arrows somewhere surprising.
+     */
     remember(*self, line: string)
         if line == "" then return
         if !self.hist.is_empty() && self.hist[self.hist.len() - 1] == line then return
@@ -589,18 +604,19 @@ impl Iterate for Editor
     type Item = string
     next(*self) -> Option[string] = self.getline()
 
-// An editor over a byte source and a place to echo to.
-//
-// The two are separate parameters because on a host they are separate things -- a reader on one
-// descriptor and a writer on another. A caller whose console is one value that is both hands it over
-// twice.
-//
-// **It prints no prompt and is not told one.** Every movement here is relative, so the editor never
-// needs to know how far along the row the line starts, and a caller goes on printing its own prompt
-// exactly as it would before `console_lines`. That is what makes a continuation prompt -- a REPL
-// holding an unfinished expression -- a property of the caller rather than a field here.
-// **The history belongs to the editor and so outlives a line but not a session**, which is the right
-// lifetime for it: one console, one history, and nothing to save or load. A program wanting it to
-// survive a restart would have to write it somewhere, and where is a question about that program.
+/** An editor over a byte source and a place to echo to.
+ *
+ * The two are separate parameters because on a host they are separate things -- a reader on one
+ * descriptor and a writer on another. A caller whose console is one value that is both hands it over
+ * twice.
+ *
+ * **It prints no prompt and is not told one.** Every movement here is relative, so the editor never
+ * needs to know how far along the row the line starts, and a caller goes on printing its own prompt
+ * exactly as it would before `console_lines`. That is what makes a continuation prompt -- a REPL
+ * holding an unfinished expression -- a property of the caller rather than a field here.
+ * **The history belongs to the editor and so outlives a line but not a session**, which is the right
+ * lifetime for it: one console, one history, and nothing to save or load. A program wanting it to
+ * survive a restart would have to write it somewhere, and where is a question about that program.
+ */
 editor(r: *Reader, w: *Writer) -> Editor =
     Editor(r, w, buf(), 0, [0; 64], [], 0, false, false, deque(), 0, "")

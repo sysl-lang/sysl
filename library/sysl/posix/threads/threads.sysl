@@ -1,33 +1,34 @@
 module sysl.posix.threads
 @requires(posix)
 
-// Threads of execution, and the two things a program does with one: start it, and wait for it.
-//
-// **This module requires a capability and `sysl.sync` does not**, which is the whole reason the two
-// are apart. `Atomic[T]` and `SpinLock` are reachable from a module that has given up its allocator
-// and its operating system, because a word the processor touches indivisibly is something a bare
-// machine has. A *thread* is not: creating one needs a scheduler underneath, and a module's
-// requirement is module-wide -- one type in here needing an operating system would have taken
-// `Atomic[T]` out of the kernel's reach.
-//
-// **What is here is pthreads, which is why it sits under `sysl.posix`** (`reference/modules.md §
-// Capabilities are a module property`). The capability is `posix` and nothing narrower: whether a
-// scheduler exists is not something the compiler tracks, because nothing in the library is gated on
-// one. A bare-metal target running FreeRTOS has threads of its own and no POSIX, so it does not
-// reach this module and wants a package binding its own kernel instead -- the way `termbox2` sits
-// beside `sysl.term`.
-//
-// A **domain** is a thread (`reference/memory.md § Crossing a concurrency domain`), so everything
-// this module starts is a new one, and what may cross the boundary between two is the subject of
-// that chapter. Nothing here copies anything: `spawn` hands the new thread an **address**, and what
-// is at that address is then shared by two threads and needs a `Mutex[T]` beside this file, or an
-// `Atomic[T]` below it.
-//
-// **`spawn` is marked `@crossing(arg)`**, so every count the state reaches has to be atomic and the
-// compiler says so at the call (`reference/memory.md § @crossing`). A raw pointer is on the
-// crossable list because it carries no refcount to make atomic -- which is a fact about the
-// pointer, not about what it points at, and the annotation is what asks for the second question to
-// be put.
+/** Threads of execution, and the two things a program does with one: start it, and wait for it.
+ *
+ * **This module requires a capability and `sysl.sync` does not**, which is the whole reason the two
+ * are apart. `Atomic[T]` and `SpinLock` are reachable from a module that has given up its allocator
+ * and its operating system, because a word the processor touches indivisibly is something a bare
+ * machine has. A *thread* is not: creating one needs a scheduler underneath, and a module's
+ * requirement is module-wide -- one type in here needing an operating system would have taken
+ * `Atomic[T]` out of the kernel's reach.
+ *
+ * **What is here is pthreads, which is why it sits under `sysl.posix`** (`reference/modules.md §
+ * Capabilities are a module property`). The capability is `posix` and nothing narrower: whether a
+ * scheduler exists is not something the compiler tracks, because nothing in the library is gated on
+ * one. A bare-metal target running FreeRTOS has threads of its own and no POSIX, so it does not
+ * reach this module and wants a package binding its own kernel instead -- the way `termbox2` sits
+ * beside `sysl.term`.
+ *
+ * A **domain** is a thread (`reference/memory.md § Crossing a concurrency domain`), so everything
+ * this module starts is a new one, and what may cross the boundary between two is the subject of
+ * that chapter. Nothing here copies anything: `spawn` hands the new thread an **address**, and what
+ * is at that address is then shared by two threads and needs a `Mutex[T]` beside this file, or an
+ * `Atomic[T]` below it.
+ *
+ * **`spawn` is marked `@crossing(arg)`**, so every count the state reaches has to be atomic and the
+ * compiler says so at the call (`reference/memory.md § @crossing`). A raw pointer is on the
+ * crossable list because it carries no refcount to make atomic -- which is a fact about the
+ * pointer, not about what it points at, and the annotation is what asks for the second question to
+ * be put.
+ */
 
 // pthreads, by symbol.
 //
@@ -48,12 +49,13 @@ private[sysl] extern "pthread_join" c_pthread_join(t: usize, result: **u8) -> in
 private[sysl] extern "pthread_self" c_pthread_self() -> usize
 private[sysl] extern "sched_yield" c_sched_yield() -> int
 
-// A thread that has been started, and may be waited for.
-//
-// It is a handle rather than the thread: copying one copies the handle, and joining either copy
-// joins the one thread. Joining **twice** is undefined in POSIX and is not checked here, for the
-// reason `SpinLock.unlock` gives about the releasing thread -- the word it would take to notice is
-// paid by every correct program.
+/** A thread that has been started, and may be waited for.
+ *
+ * It is a handle rather than the thread: copying one copies the handle, and joining either copy
+ * joins the one thread. Joining **twice** is undefined in POSIX and is not checked here, for the
+ * reason `SpinLock.unlock` gives about the releasing thread -- the word it would take to notice is
+ * paid by every correct program.
+ */
 struct Thread
 
     // The `pthread_t` itself. Not hidden, because a program that wants to hand it to a POSIX call
@@ -61,42 +63,44 @@ struct Thread
     // nothing else to give it, and the alternative is a wrapper per call.
     id: usize
 
-    // Waits for the thread to finish, and answers whether it was waited for.
-    //
-    // The value the body returned is **not** carried back, and the omission is the crossing rule
-    // rather than an oversight: a result coming out of another domain is a value crossing a
-    // boundary (`reference/memory.md § Crossing a concurrency domain`), which is what a channel is
-    // for and what this branch of the library does not have. A body that has something to say
-    // writes it through the address it was given.
+    /** Waits for the thread to finish, and answers whether it was waited for.
+     *
+     * The value the body returned is **not** carried back, and the omission is the crossing rule
+     * rather than an oversight: a result coming out of another domain is a value crossing a
+     * boundary (`reference/memory.md § Crossing a concurrency domain`), which is what a channel is
+     * for and what this branch of the library does not have. A body that has something to say
+     * writes it through the address it was given.
+     */
     join(self) -> bool = c_pthread_join(self.id, null) == 0
 
 end Thread
 
-// Starts `body` on a new thread, with `arg` as the address it is handed.
-//
-// **The body is a `*extern`, not a callable** (`reference/ffi.md § A function's address`). A
-// closure would have to be boxed for the new thread to reach it, which needs an allocator this
-// module could otherwise do without, and its captures would be values crossing a domain boundary
-// with nothing yet checking that they may. The address of a named function is what C's own
-// interface takes, so it is what this takes.
-//
-// **`T` is inferred from the body**, so `spawn(&work, &state)` is the whole of the call. An address
-// is always written, `null` included -- and `null` is the one thing that cannot be, since it takes
-// its type from its context and the context here is the `T` being inferred. A body with nothing of
-// its own to read is handed the address of whatever it reads instead, which every body has.
-//
-// The pointer is the sharing: two threads reading and writing what is at that address is a race
-// unless something orders them, which is what `Mutex[T]` and `Atomic[T]` are for.
-//
-// **`@crossing(arg)` is what holds a caller to `06`'s rule about what may reach another domain.**
-// Without it the pointer would end the question: a `*T` is on the crossable list because *it* carries
-// no count, which says nothing about the object at the far end -- and the object at the far end is
-// what the new thread gets. The annotation is what asks the compiler to look through it, so a state
-// holding a plain `&T` is refused here rather than racing later.
-//
-// A body declared `-> unit` is called by pthreads as though it returned a `void *`, and the value it
-// leaves in the return register is whatever was there. Nothing reads it -- `join` above passes no
-// place to put it -- so the mismatch costs the thread's exit value, which this module does not offer.
+/** Starts `body` on a new thread, with `arg` as the address it is handed.
+ *
+ * **The body is a `*extern`, not a callable** (`reference/ffi.md § A function's address`). A
+ * closure would have to be boxed for the new thread to reach it, which needs an allocator this
+ * module could otherwise do without, and its captures would be values crossing a domain boundary
+ * with nothing yet checking that they may. The address of a named function is what C's own
+ * interface takes, so it is what this takes.
+ *
+ * **`T` is inferred from the body**, so `spawn(&work, &state)` is the whole of the call. An address
+ * is always written, `null` included -- and `null` is the one thing that cannot be, since it takes
+ * its type from its context and the context here is the `T` being inferred. A body with nothing of
+ * its own to read is handed the address of whatever it reads instead, which every body has.
+ *
+ * The pointer is the sharing: two threads reading and writing what is at that address is a race
+ * unless something orders them, which is what `Mutex[T]` and `Atomic[T]` are for.
+ *
+ * **`@crossing(arg)` is what holds a caller to `06`'s rule about what may reach another domain.**
+ * Without it the pointer would end the question: a `*T` is on the crossable list because *it* carries
+ * no count, which says nothing about the object at the far end -- and the object at the far end is
+ * what the new thread gets. The annotation is what asks the compiler to look through it, so a state
+ * holding a plain `&T` is refused here rather than racing later.
+ *
+ * A body declared `-> unit` is called by pthreads as though it returned a `void *`, and the value it
+ * leaves in the return register is whatever was there. Nothing reads it -- `join` above passes no
+ * place to put it -- so the mismatch costs the thread's exit value, which this module does not offer.
+ */
 @crossing(arg)
 spawn[T](body: *extern(*T) -> unit, arg: *T) -> Option[Thread]
     var id: usize = 0
@@ -104,13 +108,15 @@ spawn[T](body: *extern(*T) -> unit, arg: *T) -> Option[Thread]
 
     if started == 0 then Some(Thread(id)) else None
 
-// Offers the processor to whatever else is ready to run, and answers whether the system took it.
-//
-// This is a **hint**, not a wait: a thread that yields is still runnable and may be given the
-// processor straight back. What it is for is the spin in `Mutex.lock`, where the thread holding the
-// lock may not be running at all and nothing else will make it so.
+/** Offers the processor to whatever else is ready to run, and answers whether the system took it.
+ *
+ * This is a **hint**, not a wait: a thread that yields is still runnable and may be given the
+ * processor straight back. What it is for is the spin in `Mutex.lock`, where the thread holding the
+ * lock may not be running at all and nothing else will make it so.
+ */
 yield_now() -> bool = c_sched_yield() == 0
 
-// The calling thread's own handle, which is what a body compares against to learn it is not the
-// thread that spawned it.
+/** The calling thread's own handle, which is what a body compares against to learn it is not the
+ * thread that spawned it.
+ */
 current() -> Thread = Thread(c_pthread_self())

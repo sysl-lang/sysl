@@ -2,34 +2,36 @@ module sysl.math.matrix
 
 import sysl.buf.{Buf, buf}
 
-// Vectors over any `Scalar`, and the half of a vector space whose product yields a *scalar*.
-//
-// **`v * w` is a `T` and `v * k` is a `Vector[T]`, and both are `Mul` on `Vector[T]`.** An operator
-// trait's result is an argument, so the two are told apart by the type of the right operand and by
-// nothing else, and each says what it hands back. Written with the result fixed to `Self` the first
-// of them is unspellable, and a dot product becomes a method while scaling stays an operator -- which
-// is a split a reader of one line of linear algebra should never have to see.
-//
-// **Every operator here is written once, for every element type at once.** A block whose trait
-// arguments are built out of its own parameter says the same thing at every instantiation, so
-// `impl[T: Scalar] Mul[Vector[T], T] for Vector[T]` is one dot product for the reals, the complexes,
-// the integers and whatever else implements `Scalar`.
-//
-// **A `Vector[T]` is a handle.** It is a length and a `&Buf[T]`, so assigning one shares the numbers
-// and costs a retain. Every operator below therefore builds a fresh vector rather than writing into
-// either operand, the one member that does write in place says so in its name (`set`), and `copy` is
-// how a caller stops sharing. That is the bargain a string strikes: the operation that copies is
-// named, and the sharing is documented rather than encoded. A value-semantics vector would need a
-// fixed `[N]T`, which a type whose length is a runtime value cannot have.
+/** Vectors over any `Scalar`, and the half of a vector space whose product yields a *scalar*.
+ *
+ * **`v * w` is a `T` and `v * k` is a `Vector[T]`, and both are `Mul` on `Vector[T]`.** An operator
+ * trait's result is an argument, so the two are told apart by the type of the right operand and by
+ * nothing else, and each says what it hands back. Written with the result fixed to `Self` the first
+ * of them is unspellable, and a dot product becomes a method while scaling stays an operator -- which
+ * is a split a reader of one line of linear algebra should never have to see.
+ *
+ * **Every operator here is written once, for every element type at once.** A block whose trait
+ * arguments are built out of its own parameter says the same thing at every instantiation, so
+ * `impl[T: Scalar] Mul[Vector[T], T] for Vector[T]` is one dot product for the reals, the complexes,
+ * the integers and whatever else implements `Scalar`.
+ *
+ * **A `Vector[T]` is a handle.** It is a length and a `&Buf[T]`, so assigning one shares the numbers
+ * and costs a retain. Every operator below therefore builds a fresh vector rather than writing into
+ * either operand, the one member that does write in place says so in its name (`set`), and `copy` is
+ * how a caller stops sharing. That is the bargain a string strikes: the operation that copies is
+ * named, and the sharing is documented rather than encoded. A value-semantics vector would need a
+ * fixed `[N]T`, which a type whose length is a runtime value cannot have.
+ */
 struct Vector[T: Scalar]
     n: int
     cells: &Buf[T]
 
     // --- The vectors that need no receiver, reached through the type. ---
 
-    // The zero vector, which needs the element type's own zero and has no other way to get one. This
-    // is what `Zero` is for: `T.zero()` is a value of a type this body has never met, and no literal
-    // spells it.
+    /** The zero vector, which needs the element type's own zero and has no other way to get one. This
+     * is what `Zero` is for: `T.zero()` is a value of a type this body has never met, and no literal
+     * spells it.
+     */
     zeros(n: int) -> Vector[T]
         var cells: Buf[T] = buf()
 
@@ -38,8 +40,9 @@ struct Vector[T: Scalar]
         Vector(n, cells)
     end zeros
 
-    // A vector from the numbers a program wrote. The element type comes off the slice, so
-    // `Vector.of([1.0, 2.0])` is a `Vector[real]` and nothing is written twice.
+    /** A vector from the numbers a program wrote. The element type comes off the slice, so
+     * `Vector.of([1.0, 2.0])` is a `Vector[real]` and nothing is written twice.
+     */
     of(xs: []const T) -> Vector[T]
         var out: Vector[T] = Vector.zeros(int(xs.len))
 
@@ -48,8 +51,9 @@ struct Vector[T: Scalar]
         out
     end of
 
-    // The `i`th standard basis vector, which is a column of the identity and the second place an
-    // identity is asked for rather than written.
+    /** The `i`th standard basis vector, which is a column of the identity and the second place an
+     * identity is asked for rather than written.
+     */
     basis(n: int, i: int) -> Vector[T]
         var out: Vector[T] = Vector.zeros(n)
 
@@ -62,19 +66,21 @@ struct Vector[T: Scalar]
 
     set(*self, i: int, v: T) = self.cells.set(usize(i), v)
 
-    // The dot product of a vector with itself, which is `self * self`.
-    //
-    // **Over the reals this is the squared length, and over the complexes it is not.** `z * z` is a
-    // complex number, and a sum of them can be zero for a vector nowhere near the origin. That
-    // identity is a fact about the reals rather than about vector spaces, which is why `len` below is
-    // computed from magnitudes and not from this.
+    /** The dot product of a vector with itself, which is `self * self`.
+     *
+     * **Over the reals this is the squared length, and over the complexes it is not.** `z * z` is a
+     * complex number, and a sum of them can be zero for a vector nowhere near the origin. That
+     * identity is a fact about the reals rather than about vector spaces, which is why `len` below is
+     * computed from magnitudes and not from this.
+     */
     quadratic_form(self) -> T = self * self
 
-    // The Euclidean length: the root of the sum of the squared *magnitudes*, which is the definition
-    // that holds at every element type.
-    //
-    // Taken through `norm` rather than through `magnitude` because a length is arithmetic on sizes
-    // and not a comparison between them -- `Magnitude` promises `Size: Ord` and nothing else.
+    /** The Euclidean length: the root of the sum of the squared *magnitudes*, which is the definition
+     * that holds at every element type.
+     *
+     * Taken through `norm` rather than through `magnitude` because a length is arithmetic on sizes
+     * and not a comparison between them -- `Magnitude` promises `Size: Ord` and nothing else.
+     */
     len(self) -> real
         var total = 0.0
 
@@ -86,8 +92,9 @@ struct Vector[T: Scalar]
         total.sqrt()
     end len
 
-    // A vector that shares nothing with this one. The elimination is the customer: it writes into
-    // rows, so it must be given a copy or it would consume the matrix it was asked about.
+    /** A vector that shares nothing with this one. The elimination is the customer: it writes into
+     * rows, so it must be given a copy or it would consume the matrix it was asked about.
+     */
     copy(self) -> Vector[T]
         var out: Vector[T] = Vector.zeros(self.n)
 
@@ -96,12 +103,13 @@ struct Vector[T: Scalar]
         out
     end copy
 
-    // Agreement to within a tolerance, which is the question floating point makes the right one
-    // almost everywhere. `==` is exact and is what `Eq` below gives; this is what a caller holding
-    // reals actually wants.
-    //
-    // The tolerance is a `real` whatever the elements are, since a literal has to be written at some
-    // width, so the difference is measured with `norm` rather than compared as a size against a size.
+    /** Agreement to within a tolerance, which is the question floating point makes the right one
+     * almost everywhere. `==` is exact and is what `Eq` below gives; this is what a caller holding
+     * reals actually wants.
+     *
+     * The tolerance is a `real` whatever the elements are, since a literal has to be written at some
+     * width, so the difference is measured with `norm` rather than compared as a size against a size.
+     */
     near(self, rhs: Vector[T], eps: real) -> bool
         if self.n != rhs.n then return false
 
@@ -112,9 +120,10 @@ struct Vector[T: Scalar]
     end near
 end Vector
 
-// Exact, componentwise equality. Right for the integers and for a residual that is meant to be zero;
-// **`near` is what a program holding floats should reach for**, and the two are separate so that the
-// choice is made rather than inherited.
+/** Exact, componentwise equality. Right for the integers and for a residual that is meant to be zero;
+ * **`near` is what a program holding floats should reach for**, and the two are separate so that the
+ * choice is made rather than inherited.
+ */
 impl[T: Scalar] Eq for Vector[T]
     eq(self, rhs: Vector[T]) -> bool
         if self.n != rhs.n then return false
@@ -125,10 +134,11 @@ impl[T: Scalar] Eq for Vector[T]
         true
     end eq
 
-// `(a, b, c)`, with each element rendered as its own type renders it -- which is what `Scalar`
-// requiring `Display` buys. The field applies to the whole value rather than to each part
-// (`library/core.md § A specifier is the whole value's field`), so the text is gathered first and
-// padded once.
+/** `(a, b, c)`, with each element rendered as its own type renders it -- which is what `Scalar`
+ * requiring `Display` buys. The field applies to the whole value rather than to each part
+ * (`library/core.md § A specifier is the whole value's field`), so the text is gathered first and
+ * padded once.
+ */
 impl[T: Scalar] Display for Vector[T]
     display(self, out: *Writer, fmt: FormatSpec)
         var text = "("
@@ -171,12 +181,13 @@ impl[T: Scalar] Neg for Vector[T]
         out
     end neg
 
-// The dot product: two vectors in, one **element** out. `Mul[Vector[T], T]` -- the operands select
-// the implementation and the implementation says the result, so this and the scaling below are one
-// operator on one type.
-//
-// The accumulator starts at `T.zero()`, which is also what makes a zero-length vector's dot product
-// the value every other one has rather than a case to special-case.
+/** The dot product: two vectors in, one **element** out. `Mul[Vector[T], T]` -- the operands select
+ * the implementation and the implementation says the result, so this and the scaling below are one
+ * operator on one type.
+ *
+ * The accumulator starts at `T.zero()`, which is also what makes a zero-length vector's dot product
+ * the value every other one has rather than a case to special-case.
+ */
 impl[T: Scalar] Mul[Vector[T], T] for Vector[T]
     mul(self, rhs: Vector[T]) -> T
         require self.n == rhs.n, "vectors multiplied must have the same length"
@@ -188,8 +199,9 @@ impl[T: Scalar] Mul[Vector[T], T] for Vector[T]
         total
     end mul
 
-// Scaling, whose result *is* a vector. Nothing but the right operand's type tells this from the dot
-// product above, and nothing needs to.
+/** Scaling, whose result *is* a vector. Nothing but the right operand's type tells this from the dot
+ * product above, and nothing needs to.
+ */
 impl[T: Scalar] Mul[T] for Vector[T]
     mul(self, k: T) -> Vector[T]
         var out: Vector[T] = Vector.zeros(self.n)
