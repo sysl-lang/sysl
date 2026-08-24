@@ -59,6 +59,49 @@ rm -f "$SUMMARY"
 echo "grouping the suites" | tee -a "$SUMMARY"
 python3 "$REPO/gate-groups.py" "$SUITES" "$LOGS" | tee -a "$SUMMARY" || exit 1
 
+# **RECONCILE WHAT THE GROUPER FOUND AGAINST WHAT sbt SAYS EXISTS.** The grouper reads source text,
+# and a count printed against nothing is not evidence: it said 334 suites for months while there were
+# 350, because a suite extending a base declared in this tree did not match its pattern — the whole
+# package manager among the sixteen it could not see. A fix alone would hold until the next support
+# trait; this is what makes it unable to recur.
+#
+# **Asked of the platform being gated**, not of the JVM. There is one test source root today, so the
+# two sets are identical and `syslJVM` would be a cheaper proxy — but the moment anybody adds
+# `native/src/test/scala` the proxy diverges quietly, in the direction that reads as fine, which is
+# the same failure this check exists to catch.
+#
+# It costs one sbt start; the test classes it needs compiled are ones the first group compiles anyway.
+print "reconciling the suite list against sbt" | tee -a "$SUMMARY"
+
+sbt -batch --error "print syslNative/Test/definedTestNames" > "$LOGS/defined.log" 2>&1
+
+grep -oE 'sh\.sysl\.[A-Za-z0-9_]+' "$LOGS/defined.log" | sort -u > "$LOGS/defined.txt"
+
+python3 -c "
+import json, sys
+chunks = json.load(open('$LOGS/chunks.json'))
+heavy  = json.load(open('$LOGS/heavy.json'))
+found  = sorted({s for g in chunks for s in g} | set(heavy))
+print('\n'.join(found))
+" | sort -u > "$LOGS/grouped.txt"
+
+MISSING=$(comm -23 "$LOGS/defined.txt" "$LOGS/grouped.txt")
+EXTRA=$(comm -13 "$LOGS/defined.txt" "$LOGS/grouped.txt")
+
+if [[ -n "$MISSING" || -n "$EXTRA" ]]; then
+  {
+    print "GATE: RED -- the suite list does not reconcile with sbt"
+    print "  sbt has $(wc -l < "$LOGS/defined.txt" | tr -d ' '), the grouper found $(wc -l < "$LOGS/grouped.txt" | tr -d ' ')"
+    [[ -n "$MISSING" ]] && print "  never run:" && print "$MISSING" | sed 's/^/    /'
+    [[ -n "$EXTRA" ]] && print "  grouped but unknown to sbt:" && print "$EXTRA" | sed 's/^/    /'
+    print "  fix gate-groups.py rather than this list -- see its self-test"
+  } | tee -a "$SUMMARY"
+
+  exit 0
+fi
+
+print "  $(wc -l < "$LOGS/defined.txt" | tr -d ' ') suites, and sbt agrees" | tee -a "$SUMMARY"
+
 run_group () {
   local label=$1 heap=$2 agents=$3 suites=$4
 

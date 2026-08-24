@@ -100,7 +100,11 @@ def suites(root):
     # Every `trait`/`abstract class`/`class` declared here whose own extends-clause is suite-shaped,
     # by name, so that a subclass of one is recognised as a suite too.
     bases = set()
-    decl = re.compile(r'^(?:abstract\s+)?(?:class|trait)\s+(\w+)[^\n]*?\s+extends\s+([^\n{]+)', re.M)
+    # `[^{]*?` rather than `[^\n]*?`, so a declaration whose `extends` is on the next line is seen —
+    # `ArgumentTests` and `ExternVarTests` are written that way, and the class matcher below spans the
+    # newline because `\s+` does. A base collected by a stricter pattern than the thing it feeds would
+    # be the same bug one shape along.
+    decl = re.compile(r'^(?:abstract\s+)?(?:class|trait)\s+(\w+)[^{]*?\bextends\s+([^\n{]+)', re.M)
 
     while True:
         before = len(bases)
@@ -123,9 +127,50 @@ def suites(root):
     return found
 
 
+def self_test():
+    """The matcher, against the shape that defeated it.
+
+    **A suite extending a base declared in this tree was invisible until 2026-08-23**, and sixteen of
+    them were — the whole package manager among them. This asserts the two shapes that matter: a
+    subclass of a local support trait is found, and a subclass of a base that is *not* suite-shaped is
+    not. It runs before every gate because it costs nothing and the bug it pins reads as a smaller
+    number in a line nobody checks.
+    """
+    import tempfile
+
+    tree = tempfile.mkdtemp(prefix='gate-selftest-')
+    write = lambda name, text: open(os.path.join(tree, name), 'w').write(text)
+
+    write('Support.scala', 'package sh.probe\n\ntrait CacheSupport extends AnyFreeSpec with Matchers {\n}\n')
+    write('Wrapped.scala', 'package sh.probe\n\ntrait Deeper extends CacheSupport {\n}\n')
+    write('Plain.scala', 'package sh.probe\n\nclass PlainTests extends AnyFreeSpec with Matchers {\n}\n')
+    write('Local.scala', 'package sh.probe\n\nclass LocalTests extends CacheSupport {\n}\n')
+    write('Nested.scala', 'package sh.probe\n\nclass NestedTests extends Deeper {\n}\n')
+    write('Helper.scala', 'package sh.probe\n\ntrait NotASuite extends AnyRef {\n}\n\nclass NotATest extends NotASuite {\n}\n')
+
+    # A base whose `extends` is on the NEXT line, which is how `ArgumentTests` and `ExternVarTests`
+    # are written — a base collected by a stricter pattern than the class matcher would be the
+    # same bug one shape along.
+    write('Wrapped2.scala', 'package sh.probe\n\ntrait Broken\n    extends AnyFreeSpec\n    with Matchers {\n}\n')
+    write('Late.scala', 'package sh.probe\n\nclass LateTests extends Broken {\n}\n')
+
+    got = set(suites(tree))
+    want = {'sh.probe.PlainTests', 'sh.probe.LocalTests', 'sh.probe.NestedTests', 'sh.probe.LateTests'}
+
+    if got != want:
+        sys.exit(f'gate-groups self-test failed: found {sorted(got)}, wanted {sorted(want)}')
+
+    print('  self-test: a suite extending a local base is found, and a non-suite is not')
+
+
 def main():
+    if len(sys.argv) == 2 and sys.argv[1] == '--self-test':
+        return self_test()
+
     if len(sys.argv) != 3:
         sys.exit('usage: gate-groups.py <test-source-root> <output-dir>')
+
+    self_test()
 
     root, out = sys.argv[1], sys.argv[2]
     found = suites(root)
