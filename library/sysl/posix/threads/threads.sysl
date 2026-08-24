@@ -10,30 +10,34 @@ module sysl.posix.threads
 // requirement is module-wide -- one type in here needing an operating system would have taken
 // `Atomic[T]` out of the kernel's reach.
 //
-// **What is here is pthreads, which is why it sits under `sysl.posix`** (`06 § Threads are a
-// capability`). The capability is `posix` and nothing narrower: whether a scheduler exists is not
-// something the compiler tracks, because nothing in the library is gated on one. A bare-metal target
-// running FreeRTOS has threads of its own and no POSIX, so it does not reach this module and wants a
-// package binding its own kernel instead -- the way `termbox2` sits beside `sysl.term`.
+// **What is here is pthreads, which is why it sits under `sysl.posix`** (`reference/modules.md §
+// Capabilities are a module property`). The capability is `posix` and nothing narrower: whether a
+// scheduler exists is not something the compiler tracks, because nothing in the library is gated on
+// one. A bare-metal target running FreeRTOS has threads of its own and no POSIX, so it does not
+// reach this module and wants a package binding its own kernel instead -- the way `termbox2` sits
+// beside `sysl.term`.
 //
-// A **domain** is a thread (`06 § Domains`), so everything this module starts is a new one, and what
-// may cross the boundary between two is the subject of that chapter. Nothing here copies anything:
-// `spawn` hands the new thread an **address**, and what is at that address is then shared by two
-// threads and needs a `Mutex[T]` beside this file, or an `Atomic[T]` below it.
+// A **domain** is a thread (`reference/memory.md § Crossing a concurrency domain`), so everything
+// this module starts is a new one, and what may cross the boundary between two is the subject of
+// that chapter. Nothing here copies anything: `spawn` hands the new thread an **address**, and what
+// is at that address is then shared by two threads and needs a `Mutex[T]` beside this file, or an
+// `Atomic[T]` below it.
 //
 // **`spawn` is marked `@crossing(arg)`**, so every count the state reaches has to be atomic and the
-// compiler says so at the call (`06 § Marking a domain boundary`). A raw pointer is on the crossable
-// list because it carries no refcount to make atomic -- which is a fact about the pointer, not about
-// what it points at, and the annotation is what asks for the second question to be put.
+// compiler says so at the call (`reference/memory.md § @crossing`). A raw pointer is on the
+// crossable list because it carries no refcount to make atomic -- which is a fact about the
+// pointer, not about what it points at, and the annotation is what asks for the second question to
+// be put.
 
 // pthreads, by symbol.
 //
 // **A `pthread_t` is one word on both platforms this builds for** -- a pointer on Darwin, an
 // `unsigned long` under glibc -- and `usize` is the spelling that is both. That is a transcription,
-// which `15 §7` warns is silently wrong when what is transcribed is a *layout*; a scalar handle is
-// the case where it is not, and it is also the only case here, since nothing below passes an opaque
-// C struct by value or allocates storage for one. The mutex beside this file is built on the atomic
-// tier rather than on `pthread_mutex_t` for exactly that reason.
+// which `reference/ffi.md § A library may carry C` warns is silently wrong when what is transcribed
+// is a *layout*; a scalar handle is the case where it is not, and it is also the only case here,
+// since nothing below passes an opaque C struct by value or allocates storage for one. The mutex
+// beside this file is built on the atomic tier rather than on `pthread_mutex_t` for exactly that
+// reason.
 private[sysl] extern "pthread_create" c_pthread_create(
     t: *usize,
     attr: *u8,
@@ -60,19 +64,21 @@ struct Thread
     // Waits for the thread to finish, and answers whether it was waited for.
     //
     // The value the body returned is **not** carried back, and the omission is the crossing rule
-    // rather than an oversight: a result coming out of another domain is a value crossing a boundary
-    // (`06 § Crossing copies`), which is what a channel is for and what this branch of the library
-    // does not have. A body that has something to say writes it through the address it was given.
+    // rather than an oversight: a result coming out of another domain is a value crossing a
+    // boundary (`reference/memory.md § Crossing a concurrency domain`), which is what a channel is
+    // for and what this branch of the library does not have. A body that has something to say
+    // writes it through the address it was given.
     join(self) -> bool = c_pthread_join(self.id, null) == 0
 
 end Thread
 
 // Starts `body` on a new thread, with `arg` as the address it is handed.
 //
-// **The body is a `*extern`, not a callable** (`12 §6a`). A closure would have to be boxed for the
-// new thread to reach it, which needs an allocator this module could otherwise do without, and its
-// captures would be values crossing a domain boundary with nothing yet checking that they may. The
-// address of a named function is what C's own interface takes, so it is what this takes.
+// **The body is a `*extern`, not a callable** (`reference/ffi.md § A function's address`). A
+// closure would have to be boxed for the new thread to reach it, which needs an allocator this
+// module could otherwise do without, and its captures would be values crossing a domain boundary
+// with nothing yet checking that they may. The address of a named function is what C's own
+// interface takes, so it is what this takes.
 //
 // **`T` is inferred from the body**, so `spawn(&work, &state)` is the whole of the call. An address
 // is always written, `null` included -- and `null` is the one thing that cannot be, since it takes
