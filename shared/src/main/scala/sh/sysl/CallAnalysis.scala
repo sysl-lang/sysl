@@ -144,8 +144,11 @@ trait CallAnalysis extends OperatorCalls {
     val (passed, tail) = args.splitAt(fd.params.length)
     val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)((ref, _) => spellSelf(_, ref))
     val ptypes      = fd.params.map(p => spell(p.typ))
+    // The bounds go through it too, because a bare arrow's shape lives in one rather than in the
+    // parameter — see `spellSelfBounds`.
+    val mbounds     = spellSelfBounds(m.bounds, spell)
     val provisional =
-      provisionalArgs(fd.name, fd.tparams, ptypes, passed, m.bounds,
+      provisionalArgs(fd.name, fd.tparams, ptypes, passed, mbounds,
         result = fd.retType.map(spell), expected = expected)
 
     val (ownerTps0, _) = fd.tparams.splitAt(fd.tparams.length - m.tparams.length)
@@ -164,7 +167,7 @@ trait CallAnalysis extends OperatorCalls {
       fd.retType.map(spell),
       expected,
       passed.zip(provisional).map((a, t) => adaptable(a, t)),
-      m.bounds,
+      mbounds,
       known,
     ))
 
@@ -172,8 +175,10 @@ trait CallAnalysis extends OperatorCalls {
     val (ownerArgs, ownArgs) = targs.splitAt(ownerTps.length)
 
     inDecl(fd.name) {
-      checkParamBounds(qn(owner), ownerTps, fd.bounds, ownerArgs)
-      checkParamBounds(shown, ownTps, fd.bounds, ownArgs)
+      val fbounds = spellSelfBounds(fd.bounds, spell)
+
+      checkParamBounds(qn(owner), ownerTps, fbounds, ownerArgs)
+      checkParamBounds(shown, ownTps, fbounds, ownArgs)
     }
 
     val name            = instantiateFunc(fd, targs)

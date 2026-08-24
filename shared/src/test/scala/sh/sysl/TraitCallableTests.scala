@@ -244,7 +244,7 @@ class TraitCallableTests extends AnyFreeSpec with RunSupport with CodegenSupport
       * Written with the assertion it should make, since the shape is decided and only the
       * declaration form is unsupported.
       */
-    "and 'Self::Item' on a trait's own member" ignore {
+    "and 'Self::Item' on a trait's own member" in {
       run("""trait Mapper
             |    type Item
             |    first(self) -> Self::Item
@@ -305,6 +305,81 @@ class TraitCallableTests extends AnyFreeSpec with RunSupport with CodegenSupport
                           |    step(*self) -> Option[Self::Item]
                           |first_of[S: Walk, N](s: *S, f: S::Missing -> N) -> int = 0
                           |print(1)""".stripMargin)
+
+      message should include("'Missing'")
+      message should not include "$F"
+    }
+
+    /** Two implementing types, so the default is copied twice and each copy has to bind `Self` to
+      * its own subject. One copy binding for both would compile and print the wrong thing, which is
+      * the failure a single-implementation test cannot see.
+      */
+    "with a default body copied to two implementing types" in {
+      run("""trait Mapper
+            |    type Item
+            |    first(self) -> Self::Item
+            |    over[N](self, f: Self::Item -> N) -> N = f(self.first())
+            |struct One
+            |    v: int
+            |impl Mapper for One
+            |    type Item = int
+            |    first(self) -> int = self.v
+            |struct Word
+            |    w: string
+            |impl Mapper for Word
+            |    type Item = string
+            |    first(self) -> string = self.w
+            |print(One(20).over(n -> n + 1))
+            |print(Word("hello").over(s -> s.len))""".stripMargin) shouldBe "21\n5\n"
+    }
+
+    /** A **generic** implementing type, where `Self` spells `Box[T]` rather than a name — so the
+      * projection is read off a subject that is itself still being solved.
+      */
+    "with a default body on a generic implementing type" in {
+      run("""trait Mapper
+            |    type Item
+            |    first(self) -> Self::Item
+            |    over[N](self, f: Self::Item -> N) -> N = f(self.first())
+            |struct Box[T]
+            |    v: T
+            |impl[T] Mapper for Box[T]
+            |    type Item = T
+            |    first(self) -> T = self.v
+            |print(Box(20).over(n -> n + 1))""".stripMargin) shouldBe "21\n"
+    }
+
+    /** The projection on **both** sides of a default's arrow, which is the shape that has nothing
+      * left for the call to read a type off: the closure's parameter and its result are the same
+      * associated type, and only the receiver says what that is.
+      */
+    "with the projection on both sides of a default's arrow" in {
+      run("""trait Mapper
+            |    type Item
+            |    first(self) -> Self::Item
+            |    twice(self, f: Self::Item -> Self::Item) -> Self::Item = f(f(self.first()))
+            |struct One
+            |    v: int
+            |impl Mapper for One
+            |    type Item = int
+            |    first(self) -> int = self.v
+            |print(One(20).twice(n -> n + 1))""".stripMargin) shouldBe "22\n"
+    }
+
+    /** A default body whose arrow names a projection the trait does not declare. The refusal has to
+      * survive the rewrite, and it has to name what the reader wrote.
+      */
+    "while a default's projection the trait cannot supply is still refused" in {
+      val message = err("""trait Mapper
+                          |    type Item
+                          |    first(self) -> Self::Item
+                          |    over[N](self, f: Self::Missing -> N) -> N = f(self.first())
+                          |struct One
+                          |    v: int
+                          |impl Mapper for One
+                          |    type Item = int
+                          |    first(self) -> int = self.v
+                          |print(One(20).over(n -> n + 1))""".stripMargin)
 
       message should include("'Missing'")
       message should not include "$F"
