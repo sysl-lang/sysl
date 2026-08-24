@@ -137,8 +137,50 @@ trait AttrParser extends ExprParser {
    * a run which should not come back, and the text such a run should have printed on its way out.
    */
   protected lazy val testAttr: PackratParser[TestAttr] =
-    at(op("@") ~> attrWord("test") ~> opt(op("(") ~> testArgs <~ op(")"))
+    at(op("@") ~> attrWord("test") ~> opt(emptyTestErr | testArgList)
       ^^ (_.getOrElse(TestAttr(None, false, None))))
+
+  /** The parenthesized part of `@test`, which **commits at the `(`**.
+   *
+   * Everything inside is a rule rather than a parse failure because of where a failure otherwise
+   * lands. `opt` declines without consuming when what is between the parentheses is not a
+   * description, so the `(` is left unread and the statement rule goes on to look for a declaration
+   * there — and refuses the *function below*, with the sentence about an annotation marking a
+   * function and only a function. That sends a reader to a declaration which is perfectly ordinary,
+   * with a caret on a `(` the message never mentions.
+   *
+   * **All four spellings did that, not only the empty one**: `@test(3)`, `@test("x"` and
+   * `@test(should_trap` gave the same unrelated sentence as `@test()`. Having read the `(` there is
+   * nothing else the reader could have been writing, so from here on every road ends in a sentence
+   * about the argument list.
+   */
+  private lazy val testArgList: Parser[TestAttr] =
+    op("(") ~> (testArgs | badTestArgErr) <~ (op(")") | unclosedTestErr)
+
+  /** `@test()` — parentheses with nothing between them.
+   *
+   * **The form stays illegal, which is the decision rather than the easy road.** `@test()` and bare
+   * `@test` would mean the same thing, and accepting the first costs a line — but an empty argument
+   * list is not a shorter way of saying nothing. It reads as a description that *was* going to be
+   * there, and a reader who sees it accepted cannot tell whether the author meant to write one and
+   * lost it. The language already has the spelling for saying nothing, and it is `@test`.
+   *
+   * The lookahead takes in both parentheses so that the refusal is raised at the `(` — the caret
+   * then sits on the pair the reader has to delete, rather than one character past it.
+   */
+  private def emptyTestErr: Parser[TestAttr] =
+    guard(op("(") ~ op(")")) ~> err("'@test' takes a description or nothing at all, and '()' is " +
+      "neither — drop the parentheses, and the function's own name becomes its description")
+
+  private def badTestArgErr: Parser[TestAttr] =
+    err("'@test' takes the description a report shows it under, written as a string — " +
+      "'@test(\"an index past the end is refused\")' — and 'should_trap' for a run that is meant " +
+      "not to come back, optionally with the text such a run must have printed. The two compose, " +
+      "in that order")
+
+  private def unclosedTestErr: Parser[Unit] =
+    err("'@test' closes what it opened — the description and 'should_trap' go between parentheses, " +
+      "and there is no ')' here to end them")
 
   /** `@tailrec` — the assertion that this function's call to itself is the last thing it does
    * (`12 § Tail calls`). It takes no arguments: there is nothing to configure about a jump, and

@@ -71,8 +71,11 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * tree was collecting 390 while the floor still read 343, so a whole module's worth could have
    * stopped being found with nothing said. The number below is the tree's exact count again, which
    * is the only setting that proves a new file is collected rather than silently skipped.
+   *
+   * Raised to **439** when `sysl.text`'s parse family gained its `[]const u8` forms — six tests,
+   * which is what a facility rather than a module costs.
    */
-  private val floor = 433
+  private val floor = 439
 
   /** The library, compiled as a **test build of itself**.
    *

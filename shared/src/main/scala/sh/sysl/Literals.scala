@@ -149,6 +149,36 @@ trait Literals extends TypeResolution {
     pairs.find((e, t) => !adaptable(e, t)).orElse(pairs.headOption).map((_, t) => Type.repr(t.ty))
   }
 
+  /** Whether a value block's value is one of the forms that has **no type of its own** — the two
+   * tiers `analyzeOperands` reads last, applied to a branch of an `if` or an arm of a `match`
+   * instead of to an operand.
+   *
+   * A branch is a block, so what is asked about is the expression it ends in: `then 1` is a `1` and
+   * nothing else, and a `1` is worth what the position it stands in says it is worth. Everything
+   * else — a name, a call, a field, an arithmetic expression over any of them — knows what it is
+   * before anything asks, and is therefore what the pair takes its type *from*.
+   *
+   * **The tiering is the existing one and that is the whole argument for it.** `n + 1` needs no
+   * suffix, `p == null` works for any `*T`, `0..<xs.len` is a `usize` range: in every one of those
+   * a bare literal beside something that knows takes what it is told. A branch is the same shape —
+   * one of two positions that must agree on one type — and the only reason it did not read that way
+   * is that a block is analyzed before anything compares it to its sibling.
+   */
+  protected def guessing(stmts: List[Stmt]): Boolean = stmts.lastOption match
+    case Some(ExprStmt(e)) => isLiteral(e) || typedByPosition(e)
+    case _                 => false
+
+  /** What a branch or an arm **settles** for whichever of its siblings is guessing, or `None` where
+   * it settles nothing.
+   *
+   * The three it declines are the three that are not an answer: `never` is a branch that does not
+   * finish and constrains nothing, `unit` is a branch used for its effect — one of those makes the
+   * whole form a statement — and `unknown` is a mistake already reported, which must not be handed
+   * on to become a second complaint about a consequence.
+   */
+  protected def settles(t: TBlock): Option[Type] =
+    Some(t.ty).filterNot(ty => ty == Type.Never || ty == Type.Unit || ty == Type.Unknown)
+
   protected def analyzeOperands(operands: List[Expr], expected: Option[Type]): List[TExpr] = {
     // **The top tier is allowed to come back empty**, which is what lets an operand with no type of
     // its own fall to the tier below rather than raising from the tier that has nothing to offer it.

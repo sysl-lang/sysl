@@ -31,15 +31,43 @@ trait ControlFlowExprAnalysis extends ExprSupport {
     // An `if` whose own value is unused hands that down: each branch is a block in statement
     // position, so neither is asked what it yields and the two have nothing to disagree about.
     case IfExpr(cond, thenBody, elseOpt) =>
+      // **A branch that has no type of its own takes its sibling's**, which is the tiering
+      // `analyzeOperands` gives a binary operator's two sides and a range's two ends, reaching the
+      // one place two positions have to agree and did not have it. Without it a bare literal falls
+      // to `int` and the pair is refused for a difference the reader never wrote — over a `usize`,
+      // `if n == 0 then 1 else n` needed the width said a second time, and the annotation it asked
+      // for went on the declaration where it said nothing a reader wanted to know.
+      //
+      // **Only a branch that would otherwise be guessing is told anything**, so nothing that
+      // resolves today resolves differently: where both branches know what they are, or where the
+      // position already supplies a type, this is the analysis it always was. Two branches that
+      // genuinely disagree still disagree, in the same words — what has gone is the case where one
+      // of them never had an opinion.
+      val elseGuesses = elseOpt.exists(guessing)
+      val thenGuesses = guessing(thenBody)
+
+      // The `else` leads when it is the branch that knows, which is the one case it is analyzed
+      // before the condition. It reads nothing the condition binds — an `is` binding reaches the
+      // *then* branch and no further, which is what the scope below is for — so it is the same
+      // reading; what moves is only which of two broken branches is complained about first.
+      val early =
+        if expected.isEmpty && thenGuesses && !elseGuesses then
+          elseOpt.map(analyzeValueBlock(_, None, discarded))
+        else None
+
       // The condition's own scope wraps the condition and the *then* branch and nothing else, which
       // is the whole of what an `is` binding's reach has to be said about (`09 §12`). The `else` is
       // analyzed outside it, and so is an `elif` — the parser nests one into the else branch, so it
       // is already on the other side of this `popScope` and cannot read a name the test bound.
       pushScope()
       val tc    = analyzeCond(cond)
-      val tThen = analyzeValueBlock(thenBody, expected, discarded)
+      val tThen = analyzeValueBlock(thenBody, expected.orElse(early.flatMap(settles)), discarded)
       popScope()
-      val tElse = elseOpt.map(analyzeValueBlock(_, expected, discarded))
+      val tElse = early.orElse(elseOpt.map(analyzeValueBlock(
+        _,
+        expected.orElse(if elseGuesses && !thenGuesses then settles(tThen) else None),
+        discarded,
+      )))
       // The branches meet at one type, and a branch that does not finish takes the other's. A
       // branch used only for its effect is a different thing: one `unit` branch makes the whole
       // `if` a statement, whose value is nobody's, exactly as a missing `else` does.
@@ -54,7 +82,7 @@ trait ControlFlowExprAnalysis extends ExprSupport {
 
     case MatchExpr(scrut, arms) =>
       val ts    = analyzeExpr(scrut)
-      val tarms = arms.map(analyzeArm(ts.ty, _, expected, discarded))
+      val tarms = analyzeArms(ts.ty, arms, expected, discarded)
       TMatch(ts, tarms, matchResultType(ts.ty, tarms))
 
     // A loop's `else` is a block like any other, so a loop in statement position discards it too.
@@ -474,5 +502,41 @@ trait ControlFlowExprAnalysis extends ExprSupport {
           case _                => implsOf(iterate, ownerKey(ty)).nonEmpty
 
         if reaches then assocTypeOpt(ty, iterateItem) else None
+  }
+
+  /** A match's arms, with the ones that have **no type of their own** told what the rest settled —
+   * the `if` rule above, over as many alternatives as the form has.
+   *
+   * The arms that know go first and the guessing ones follow, which is the only reordering: each
+   * arm is analyzed in its own scope, so what an arm binds was never visible to another and the
+   * reading of every one of them is the same either way. The list is put back in source order
+   * before it leaves, because exhaustiveness is a question about the arms as written.
+   *
+   * **The whole thing stands aside unless the match is genuinely mixed.** With a type already
+   * expected, with every arm guessing, or with none of them guessing, there is nothing for one arm
+   * to tell another and the arms are analyzed exactly as they were.
+   */
+  private def analyzeArms(
+      scrutTy: Type,
+      arms: List[MatchArm],
+      expected: Option[Type],
+      discarded: Boolean,
+  ): List[TArm] = {
+    val guesses = arms.map(a => guessing(a.body))
+
+    if expected.isDefined || !guesses.contains(true) || !guesses.contains(false) then
+      arms.map(analyzeArm(scrutTy, _, expected, discarded))
+    else
+      val known = arms.zipWithIndex.collect {
+        case (a, i) if !guesses(i) => i -> analyzeArm(scrutTy, a, None, discarded)
+      }
+      // The first arm that settles anything is what the guessing ones are told. Where the arms that
+      // know disagree among themselves this picks one of them, and `matchResultType` then reports
+      // that disagreement — which is the complaint the reader is owed, rather than one about an
+      // arm that only ever repeated what it was handed.
+      val want = known.flatMap((_, t) => settles(t.body)).headOption
+      val told = known.toMap
+
+      arms.zipWithIndex.map((a, i) => told.getOrElse(i, analyzeArm(scrutTy, a, want, discarded)))
   }
 }

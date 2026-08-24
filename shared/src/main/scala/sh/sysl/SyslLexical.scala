@@ -295,6 +295,44 @@ class SyslLexical
       !after.atEnd && (after.first.isLetter || after.first == '_')
     } && canEndExpression(previousToken)
 
+  /** The tokens that open an indented block, so that they open one **inside brackets too**.
+   *
+   * Brackets suspend the off-side rule, which is what lets an argument list be laid out however
+   * reads best. A block opened inside such a list is the one place that is wrong: the body's margin
+   * is the only thing saying where the block ends, so the newline, indent and dedent have to be
+   * emitted after all — and without them a `match` written as an argument was refused with
+   * *newline expected*, pointing at its first arm.
+   *
+   * **The rule is the same shape as `isLineContinuationToken` and answers the opposite question.**
+   * That one says a newline here is not a newline; this says a newline here is one after all. Read
+   * together they are one statement about where a line ends, rather than two lists to remember.
+   *
+   * **Both tokens are here because one of them would be a rule nobody could state.** A `match` opens
+   * its arms and an arrow opens a closure's body or an arm's, and a language admitting the first as
+   * an argument and refusing the second asks a reader to remember which block forms may be written
+   * where. What is worth saying instead is that a block opens wherever it is written:
+   *
+   * {{{
+   * print(n match                    xs.each((x) ->
+   *     0 -> "none"                      val doubled = x * 2
+   *     1 -> "one"                       print(doubled))
+   *     else "many")
+   * }}}
+   *
+   * **Neither can finish an expression**, which is the safety condition — the same one the leading-dot
+   * rule turns on from the other side. A token that could end one would make the *next* line's margin
+   * significant in an argument list, which is exactly what the bracket rule exists to prevent.
+   *
+   * `then`, `else` and `do` are deliberately absent. Each opens a block too, so the rule would admit
+   * them — but an `if` written across lines as an argument puts its `else` back at the outer margin,
+   * which is a dedent the enclosing bracket has to swallow rather than one the block owns, and that
+   * is a different mechanism from this one rather than more of it. A branch as an argument still has
+   * its one-line form, which is what an argument wants anyway.
+   */
+  override protected def isBlockTrigger(tok: Token): Boolean = tok match
+    case Keyword("match") | Keyword("->") => true
+    case _                                => false
+
   /** The reserved words that are values, and so *can* end an expression.
    *
    * Everything else in `reserved` introduces something, so a line ending in one has not finished an
