@@ -1,0 +1,164 @@
+module sysl.process
+@requires(os)
+@tests
+
+import sysl.fs.IoError
+
+// What starting another program promises, asserted in sysl rather than beside it in Scala.
+//
+// **These start real programs**, which is the only honest way to test this module: what it does is
+// fork and exec, and a test that mocked either would be asserting the mock. The programs chosen are
+// ones every hosted system has and whose behaviour is specified rather than conventional --
+// `true`, `false`, `echo`, `printenv`, `pwd`.
+//
+// **They are named without a path wherever the point is not the path**, so that the `PATH` search
+// `execvp` does is itself under test. A tool shelling out to `git` or `adb` depends on that search,
+// and a module that only ever worked with absolute paths would pass every test here and be useless.
+//
+// Like `sysl.fs`'s, these depend on the library's own C: the shim under `__posix__` is what decodes
+// how a child ended, so a build that did not compile or did not link it fails here rather than in
+// whatever program first called it.
+
+// ## Starting one, and how it ended
+
+@test("a program that succeeds exits zero")
+succeeds_exits_zero()
+    assert_eq(run("true").unwrap(), Status.Exited(0))
+
+// **`Ok` carrying a non-zero status, not `Err`.** The distinction is the module's central claim:
+// `Err` is for a child that could not be *started*, and a program that ran and chose to fail has
+// answered the question it was asked.
+@test("a program that fails is still Ok, carrying its status")
+fails_is_still_ok()
+    val r = run("false")
+
+    assert(r.is_ok(), "a program that exits non-zero still started")
+    assert_eq(r.unwrap(), Status.Exited(1))
+
+// **The case the report pipe exists for.** Without it a missing program is indistinguishable from
+// one that ran and exited 127, because that is the status the child would have used to say so.
+@test("a program that is not there is an error rather than a status")
+missing_is_an_error()
+    val r = run("sysl-no-such-program-anywhere-on-this-machine")
+
+    assert(r.is_err(), "a program that cannot be started is an error")
+    assert_eq(r.unwrap_err(), IoError.NotFound)
+
+// A directory is not an executable, and the platform says so with a different number -- which is
+// the evidence that the errno really travels back through the pipe rather than being invented here.
+@test("a path that cannot be executed says why")
+not_executable_says_why()
+    val r = run("/")
+
+    assert(r.is_err(), "a directory is not a program")
+    assert(r.unwrap_err() != IoError.NotFound, "and the reason is not that it is missing")
+
+// **A child that is killed rather than exiting**, which is the other half of `Status` and the only
+// way to reach it: a signal has to come from somewhere, and a shell asked to kill itself is the
+// shortest arrangement that always produces one. The one test here that uses a shell, and it uses
+// it as a way to get a signal rather than as a way to run a command.
+@test("a child that is killed reports the signal")
+killed_reports_the_signal()
+    assert_eq(run("sh", ["-c", "kill -9 $$"]).unwrap(), Status.Signalled(9))
+
+// ## What it wrote
+
+@test("what a program prints comes back")
+prints_come_back()
+    val out = capture("echo", ["hello"]).unwrap()
+
+    assert_eq(out.text, "hello\n")
+    assert(out.status.ok(), "and it exited cleanly")
+
+// **Nothing goes through a shell, and this is what says so.** Under `/bin/sh` this argument would
+// be three words and a second command; `execvp` hands it over exactly as written, so it comes back
+// as one line of text.
+@test("an argument is never read by a shell")
+no_shell_reads_an_argument()
+    val out = capture("echo", ["a b; rm -rf /; $HOME *"]).unwrap()
+
+    assert_eq(out.text, "a b; rm -rf /; $HOME *\n")
+
+@test("a program that prints nothing captures nothing")
+silence_captures_nothing()
+    val out = capture("true").unwrap()
+
+    assert_eq(out.text, "")
+    assert(out.status.ok())
+
+// The temporary file a capture goes through is the module's own business and must not be left
+// behind or reused while it is still held. Two in a row is the cheapest thing that would notice.
+@test("two captures in a row do not collide")
+captures_do_not_collide()
+    assert_eq(capture("echo", ["one"]).unwrap().text, "one\n")
+    assert_eq(capture("echo", ["two"]).unwrap().text, "two\n")
+
+// ## Where it starts
+
+@test("a child starts where it is told")
+starts_where_told()
+    assert_eq(capture("pwd", [], "/").unwrap().text, "/\n")
+
+@test("an empty directory means wherever this program is")
+empty_dir_means_here()
+    val here = capture("pwd").unwrap().text
+
+    assert(here.len > 1, "a path, rather than nothing")
+    assert(here != "/\n", "and not the root, which is what the test above asked for")
+
+// ## The environment
+
+@test("a variable reaches the child")
+a_variable_reaches_the_child()
+    val out = capture("printenv", ["SYSL_PROCESS_TEST"], "",
+                      [Var("SYSL_PROCESS_TEST", "present")]).unwrap()
+
+    assert_eq(out.text, "present\n")
+
+// **Added to the environment rather than replacing it**, which is why these are set in the child
+// instead of being handed to `execve` as a whole `envp`. A child that had lost `PATH` because its
+// parent set one variable could not find the next program it wanted.
+@test("the rest of the environment survives")
+rest_of_environment_survives()
+    val out = capture("printenv", ["PATH"], "", [Var("SYSL_PROCESS_TEST", "present")]).unwrap()
+
+    assert(out.text.len > 1, "PATH is still there alongside what was added")
+
+// Named by an absolute path here, for the reason the next test exists.
+@test("a variable the parent has is overridden for the child")
+a_variable_is_overridden()
+    val out = capture("/usr/bin/printenv", ["PATH"], "", [Var("PATH", "/nowhere")]).unwrap()
+
+    assert_eq(out.text, "/nowhere\n")
+
+// **Setting `PATH` changes where the program itself is looked for**, which is the one variable
+// whose effect starts before the child does. The variables are set between the fork and the exec,
+// so `execvp` searches the child's `PATH` rather than this program's -- consistent, and surprising
+// the first time.
+@test("setting PATH decides where the program is looked for")
+path_decides_the_lookup()
+    val r = capture("printenv", ["PATH"], "", [Var("PATH", "/nowhere")])
+
+    assert(r.is_err(), "there is no printenv under /nowhere")
+    assert_eq(r.unwrap_err(), IoError.NotFound)
+
+// ## Status itself
+
+@test("ok is exited zero and nothing else")
+ok_is_exited_zero()
+    assert(Status.Exited(0).ok())
+    assert(!Status.Exited(1).ok())
+    assert(!Status.Signalled(9).ok(), "a signal is never a success, whatever its number")
+
+// **An exit status and a signal are different answers.** A shell folds them together as `128 + n`,
+// which makes a program killed by `SIGKILL` indistinguishable from one that chose to exit 137.
+@test("a signal is not an exit status")
+signal_is_not_a_status()
+    assert(Status.Exited(9) != Status.Signalled(9))
+    assert(Status.Exited(137) != Status.Signalled(9))
+
+@test("a status says which it is")
+a_status_says_which()
+    assert_eq(s"${Status.Exited(0)}", "exited")
+    assert_eq(s"${Status.Exited(2)}", "exited 2")
+    assert_eq(s"${Status.Signalled(9)}", "killed by signal 9")

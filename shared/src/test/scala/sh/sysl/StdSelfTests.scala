@@ -74,8 +74,14 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    *
    * Raised to **439** when `sysl.text`'s parse family gained its `[]const u8` forms — six tests,
    * which is what a facility rather than a module costs.
+   *
+   * Raised to **457** when `sysl.process` arrived with 18 of its own. Like `sysl.fs`'s, they depend
+   * on the library's own C — the shim under `library/sysl/process/__posix__` is what decodes how a
+   * child ended — so they guard the same second thing that comment names. They also guard something
+   * no other test in the tree does: that `fork` and `execvp` reach a real program and come back,
+   * which cannot be asserted without starting one.
    */
-  private val floor = 439
+  private val floor = 457
 
   /** The library, compiled as a **test build of itself**.
    *
