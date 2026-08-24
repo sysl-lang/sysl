@@ -70,38 +70,40 @@ object MarkdownWriter {
     sb.toString
   }
 
-  /** The anchors on one page, with GitHub's numeric suffix for a repeat.
+  /** The anchors on one page, in heading order, with GitHub's numeric suffix for a repeat.
    *
    * A type and the function that constructs it conventionally share a name in sysl — `buf()` and
    * `Buf`, `map()` and `Map` — and case-folding makes those one slug. GitHub renders the second as
    * `buf-1`, so that is what a link has to say. Computed once for the whole page rather than per
    * link, because the answer depends on everything before it.
+   *
+   * **It answers a LIST rather than a map from heading text, and that is not a stylistic choice.**
+   * sysl has function overloading, so `parse_int` really is two declarations with the same name and
+   * the same heading — and a map keyed by that text holds one entry for both. The first version of
+   * this was such a map, and `sysl.text` came out with `parse_bool` listed twice in its index, both
+   * links pointing at `#parse_bool-1` and neither at the first of the pair. Positions are what
+   * distinguish two identical headings; their text cannot.
    */
-  private def anchors(headings: List[String]): Map[String, String] = {
-    val seen  = scala.collection.mutable.HashMap.empty[String, Int]
-    val built = scala.collection.mutable.LinkedHashMap.empty[String, String]
+  private def anchors(headings: List[String]): List[String] = {
+    val seen = scala.collection.mutable.HashMap.empty[String, Int]
 
-    for h <- headings do
+    headings.map { h =>
       val base = slug(h)
 
-      val id =
-        seen.get(base) match
-          case None => seen(base) = 0; base
-          case Some(n) =>
-            var next = n + 1
-            var cand = s"$base-$next"
+      seen.get(base) match
+        case None => seen(base) = 0; base
+        case Some(n) =>
+          var next = n + 1
+          var cand = s"$base-$next"
 
-            while seen.contains(cand) do
-              next += 1
-              cand = s"$base-$next"
+          while seen.contains(cand) do
+            next += 1
+            cand = s"$base-$next"
 
-            seen(base) = next
-            seen(cand) = 0
-            cand
-
-      built(h) = id
-
-    built.toMap
+          seen(base) = next
+          seen(cand) = 0
+          cand
+    }
   }
 
   /** The heading text for a symbol — the name, in code, so it reads as the thing you type.
@@ -151,20 +153,20 @@ object MarkdownWriter {
     // ----- the symbol index -----
     if headings.nonEmpty then
       out ++= "## Index\n\n"
-      out ++= headings.map(h => s"[$h](#${ids(h)})").mkString(" ")
+      out ++= headings.zip(ids).map((h, id) => s"[$h](#$id)").mkString(" ")
       out ++= "\n\n"
 
     // ----- the groups -----
     for k <- kinds do
       out ++= s"## ${groupTitle(k)}\n\n"
 
-      for s <- m.of(k) do out ++= symbolSection(s, ids)
+      for s <- m.of(k) do out ++= symbolSection(s)
 
     Page(fileNameOf(m.name), out.result().stripTrailing() + "\n")
   }
 
   /** One symbol: heading, signature, prose, and whatever table its shape calls for. */
-  private def symbolSection(s: Symbol, ids: Map[String, String]): String = {
+  private def symbolSection(s: Symbol): String = {
     val out = new StringBuilder
 
     out ++= s"### ${headingOf(s)}\n\n"

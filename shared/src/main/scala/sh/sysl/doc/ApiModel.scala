@@ -91,7 +91,18 @@ object ApiModel {
    * wants the whole of it.
    */
   def build(units: List[Program], includePrivate: Boolean = false): List[Module] = {
-    val byModule = units.filter(_.module.isDefined).groupBy(_.module.get.show)
+    // A `@tests` file is SCAFFOLDING AND NOT API, and dropping it is not a nicety.
+    //
+    // Every build but `sysl test` strips those files before analysis, so their functions are not in
+    // the artifact anybody links and cannot be called by anybody's program. Documenting them puts
+    // `split_cuts` and `lossy_truncated_is_one` on the page beside `split` and `from_utf8_lossy`,
+    // where a reader has no way to tell which of the four they may use.
+    //
+    // Measured before this line existed: `sysl.text` came out with 74 functions, of which 30 were
+    // its own tests — the module's index was 40% noise and its most-repeated entry was a name no
+    // caller can spell.
+    val documented = units.filterNot(_.testOnly)
+    val byModule   = documented.filter(_.module.isDefined).groupBy(_.module.get.show)
 
     byModule.toList.map { (name, us) =>
       // A module's files have no order of their own — they are whatever the directory listing gave —

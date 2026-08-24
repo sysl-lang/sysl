@@ -196,6 +196,18 @@ class DocGeneratorTests extends AnyFreeSpec with Matchers {
       ApiModel.build(List(parse("main() = print(1)"))) shouldBe empty
     }
 
+    "a @tests file contributes nothing, because its functions are not API" in {
+      // Every build but `sysl test` strips those files before analysis, so nothing in one can be
+      // called by anybody's program. Found by generating `sysl.text`: 74 functions came out, 30 of
+      // them its own tests, with no way for a reader to tell which of the two kinds they may use.
+      val lib   = parse("module sysl.text\n\nsplit(s: string) -> int = 1")
+      val tests = parse("module sysl.text\n@tests\n\n@test(\"splits\")\nsplit_cuts()\n    print(1)")
+      val ms    = ApiModel.build(List(lib, tests))
+
+      ms.length shouldBe 1
+      ms.head.symbols.map(_.name) shouldBe List("split")
+    }
+
     "a capability clause is carried, because it is the headline for an embedded reader" in {
       only("module m\n@requires(alloc)\n\nf()\n    print(1)").capabilities shouldBe
         List("requires { alloc }")
@@ -271,6 +283,16 @@ class DocGeneratorTests extends AnyFreeSpec with Matchers {
       MarkdownWriter.slug("starts_with") shouldBe "starts_with"
       MarkdownWriter.slug("Buf[T]") shouldBe "buft"
       MarkdownWriter.slug("Reading These Pages") shouldBe "reading-these-pages"
+    }
+
+    "gives two overloads of one name different anchors" in {
+      // sysl has overloading, so `parse_int` really is two declarations with one heading. The anchor
+      // table was keyed by heading TEXT at first, which holds one entry for both — `sysl.text` came
+      // out with `parse_bool` listed twice, both links pointing at the second of the pair.
+      val text = page("module m\n\nf(s: string) -> int = 1\n\nf(s: []const u8) -> int = 2")
+
+      text should include("[`f`](#f)")
+      text should include("[`f`](#f-1)")
     }
 
     "gives a type and its constructor different anchors, as GitHub does" in {

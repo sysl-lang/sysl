@@ -254,9 +254,64 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
 //    libraryDependencies += "io.github.cquiroz" %%% "scala-java-time" % "2.7.0",
   )
 
+// ===== sysl-doc: the API reference generator, as its own binary =====
+//
+// A separate binary rather than a `doc` subcommand, which is what card 0257's git-style dispatch was
+// built for: `sysl doc` execs `sysl-doc` off the PATH. Every major toolchain ships its doc generator
+// this way — scaladoc beside scalac, rustdoc beside rustc, javadoc beside javac — because the doc
+// tool's dependency profile has nothing to do with the compiler's. This one links a static site
+// generator, a templating engine, an asset pipeline and a web server; putting that inside the
+// compiler is the artifact nobody wants.
+//
+// **So the compiler must NOT grow a `doc` subcommand.** A built-in wins the dispatch and this binary
+// would never be reached. What lives in the compiler is `sh.sysl.doc`, the generator itself, because
+// it needs the AST and carries no dependency of its own; what lives here is the command line and the
+// site build.
+//
+// JVM and Native only. There is no use for a JS build of a command-line tool, and juicer's JS target
+// has not linked since well before 0.3.0 — depending on it would import that problem for nothing.
+lazy val syslDoc = crossProject(JVMPlatform, NativePlatform)
+  .in(file("doc"))
+  .dependsOn(sysl)
+  .settings(
+    name := "sysl-doc",
+    scalacOptions ++= Seq(
+      "-deprecation",
+      "-feature",
+      "-unchecked",
+      "-Wunused:all",
+      "-language:postfixOps",
+      "-language:implicitConversions",
+    ),
+    libraryDependencies ++= Seq(
+      "org.scalatest" %%% "scalatest" % "3.2.20" % "test",
+      // The site generator as a library — the SiteBuild pipeline without juicer's own option parser.
+      // Split out and published for this consumer; see juicer 0.4.0.
+      "io.github.edadma" %%% "juicer-core" % "0.4.0",
+    ),
+    // Not published. It is a binary somebody installs, exactly as the compiler is, and a coordinate
+    // for it would be one nothing should depend on.
+    publish / skip      := true,
+    publishLocal / skip := true,
+  )
+  .jvmSettings(
+    libraryDependencies += "org.scala-js" %% "scalajs-stubs" % "1.1.0" % "provided",
+  )
+  .nativeSettings(
+    libraryDependencies += "org.scala-js" %% "scalajs-stubs" % "1.1.0" % "provided",
+    // Same gate as the compiler's, and for the same reason: the installed binary is built in release
+    // mode and the one built while developing is not.
+    nativeConfig ~= { c =>
+      if (sys.env.get("SYSL_RELEASE").contains("1"))
+        c.withMode(scala.scalanative.build.Mode.releaseFast)
+          .withLTO(scala.scalanative.build.LTO.thin)
+      else c
+    },
+  )
+
 lazy val root = project
   .in(file("."))
-  .aggregate(sysl.js, sysl.jvm, sysl.native)
+  .aggregate(sysl.js, sysl.jvm, sysl.native, syslDoc.jvm, syslDoc.native)
   .settings(
     name                := "sysl",
     publish / skip      := true,
