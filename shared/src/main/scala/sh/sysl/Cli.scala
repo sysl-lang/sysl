@@ -25,6 +25,7 @@ import scopt.OParser
  *   - `sysl emit-llvm <path>`      print the generated LLVM IR
  *   - `sysl weave <path>`          render a literate source as an HTML document
  *   - `sysl tangle <path>`         print the program a literate source holds
+ *   - `sysl deps <path>`           print the resolved dependency graph
  *   - `sysl targets`               list the machines sysl can build for
  *
  * **`--lib` takes either a source tree or an artifact**, and which one is read off the name: a
@@ -241,6 +242,10 @@ private[sysl] val parser = {
             .text("'check' (the default) makes staying in an integer's range a proof obligation; " +
               "'ignore' drops those obligations, for reasoning about the rest of a function first"),
         ),
+      cmd("deps")
+        .action((_, c) => c.copy(command = "deps"))
+        .text("print the dependency graph this project resolves to, and who asked for each version")
+        .children(arg[String]("<path>").required().action((f, c) => c.copy(file = f))),
       cmd("targets")
         .action((_, c) => c.copy(command = "targets"))
         .text("list the machines sysl can build for"),

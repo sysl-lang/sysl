@@ -47,6 +47,17 @@ private[sysl] def execute(cfg: Config): Int = {
     case Left(err) => return fail(err)
     case Right(p)  => p
 
+  // **Above the target, and above every other question a compilation settles.** A graph is a
+  // property of the manifests rather than of the machine, so a project that cannot be built here can
+  // still be inspected — which is the same argument `weave` makes above, and the reason this sits
+  // beside `targets`' early return rather than among the commands that compile. One step lower than
+  // that one only because this command takes a path.
+  //
+  // An artifact named with `--lib` is a compiled library and has no manifest to read, so only the
+  // source roots are handed over; `dependencies` splits them the same way for the same reason.
+  if cfg.command == "deps" then
+    return showDeps(cfg, project, cfg.libs.filterNot(LibraryArtifact.isArtifact))
+
   val target = chooseTarget(cfg.target, project.defaultTarget) match
     case Left(err) => return fail(err)
     case Right(t)  => t
