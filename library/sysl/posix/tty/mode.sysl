@@ -103,6 +103,10 @@ private[sysl] extern "fflush" c_fflush(stream: *u8) -> int
 private[sysl] extern "sysl_tty_raw" c_tty_raw(fd: int) -> int
 private[sysl] extern "sysl_tty_cooked" c_tty_cooked(fd: int) -> int
 
+// The third half of the shim: `fflush(stdout)`, which cannot be written here. See the sink at the
+// foot of this file, and the C beside it for why the stream has to be named on that side.
+private[sysl] extern "sysl_tty_flush_out" c_flush_out() -> unit
+
 // The descriptor a terminal's input arrives on, named beside the two the file already names.
 private stdin_fd() -> int = 0
 
@@ -190,12 +194,19 @@ private restore()
 // A board never shows this, which is why it was found here and not there: its `putchar` is the SDK's
 // and has no buffer in front of it.
 //
-// **The exact fix is `setvbuf(stdout, …)` once, and the gap that stopped it being written is
-// closed.** It needs C's `stdout`, which is a global *variable*; sysl had no `extern` form for one
-// when this was written and has since grown it, and
-// `reference/ffi.md § An extern also declares a variable` names `stdout` as the case it exists for.
-// What is written here is still `fflush(null)`, which flushes every stream and so needs to name
-// none -- the way around a wall that is no longer there.
+// **The obvious fix is `setvbuf(stdout, …)` once, and it is refused for a reason that is ISO C's
+// rather than sysl's.** `setvbuf` may be called only *before any other operation* on the stream, and
+// a library function reached through `raw()` cannot promise that: a program that prints a prompt and
+// then enters cbreak mode has already written to standard output. It happens to work on both libcs
+// here, which is what makes it the dangerous kind of wrong.
+//
+// **So the buffering stays and the flush is what is made cheap.** What was written here was
+// `fflush(null)` -- *every* open stream, on every keystroke, to push the one the terminal reads --
+// and what is written now names the stream. It names it in **C**, one line beside the termios shim,
+// because `stdout` is a `#define` on Darwin (`__stdoutp`) and a symbol under glibc: an `extern`
+// variable reaches it under one spelling and not the other. `reference/ffi.md § An extern also
+// declares a variable` is the form and it is real -- it reaches `environ` and `optind` -- but a
+// macro is one of the three things only C can reach, and on this platform `stdout` is one.
 
 // Push out everything the C library is holding, on every stream.
 //
@@ -220,7 +231,7 @@ impl Fallible for TtyWriter
 impl Writer for TtyWriter
     write(*self, bytes: []const u8)
         putbytes(bytes)
-        c_fflush(null)
+        c_flush_out()
 
 val tty_sink: *TtyWriter = ptr_cast(0usize)
 

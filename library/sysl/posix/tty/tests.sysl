@@ -38,3 +38,27 @@ is_tty_answers_per_descriptor()
     // descriptor nothing has opened is not a terminal, which is the answer that keeps `raw` from
     // configuring something it does not own.
     assert(!is_tty(9999), "an unopened descriptor is not a terminal")
+
+@test("the terminal sink flushes through a shim, which is a symbol that has to link")
+sink_flush_reaches_its_shim()
+    // **Nothing visible is written** -- the slice is empty -- so what this asserts is the half that
+    // used to be `fflush(null)` and is now one line of C beside this file. `sysl_tty_flush_out` is
+    // an ordinary symbol: a binary that could not resolve it does not link, so reaching the
+    // assertion below at all is most of the claim.
+    //
+    // The rest of it is that the sink does not latch. `TtyWriter` implements `Fallible` with an
+    // empty block, taking every default, because a write to a terminal that has already been
+    // checked for is not a thing this layer can fail at -- and a latch that came back true here
+    // would mean the shim had reported something the sink cannot see.
+    //
+    // **What this deliberately does not pin is which stream gets flushed**, that being the change it
+    // was written for. A process cannot observe the difference between `fflush(NULL)` and
+    // `fflush(stdout)` from inside itself: both return zero and both leave the terminal's stream
+    // pushed. The claim available to a test is that the shim is there and reachable, and removing
+    // it fails the whole suite at the link rather than here.
+    val out = tty_writer()
+
+    out.write("".bytes)
+
+    assert(!out.failed(), "the terminal sink should not latch a failure on an empty write")
+end sink_flush_reaches_its_shim
