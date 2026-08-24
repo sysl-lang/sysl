@@ -274,10 +274,35 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with RunSupport
             |""".stripMargin) should not be empty
     }
 
+    // Every one of the four below used to reach the same sentence — that an annotation marks a
+    // function and only a function — which is about the *declaration below* and is true of it. So
+    // the reader was sent to read a function that was never the problem, with a caret on a
+    // parenthesis the message did not mention. Having read the `(` there is nothing else the author
+    // could have been writing, so the argument list answers for itself from there on.
     "an attribute with empty parentheses says nothing, and is not a form" in {
       err("""@test()
             |t() = 0
-            |""".stripMargin) should not be empty
+            |""".stripMargin) should include(
+        "'@test' takes a description or nothing at all, and '()' is neither — drop the parentheses",
+      )
+    }
+
+    "a description is a string, and something else in its place says so" in {
+      err("""@test(3)
+            |t() = 0
+            |""".stripMargin) should include("takes the description a report shows it under, written as a string")
+    }
+
+    "an argument list left open is answered by the annotation rather than by the line below it" in {
+      err("""@test("what holds"
+            |t() = 0
+            |""".stripMargin) should include("there is no ')' here to end them")
+    }
+
+    "'should_trap' left open is the same case" in {
+      err("""@test(should_trap
+            |t() = 0
+            |""".stripMargin) should include("there is no ')' here to end them")
     }
 
     "one attribute to a declaration" in {
