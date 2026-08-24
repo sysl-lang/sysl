@@ -604,6 +604,21 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
         f.bounds.getOrElse(n, Nil).exists(_.args.exists(mentions(_, Set(tp))))
       case _ => false)
 
+  /** The type parameters somebody **wrote**, which are the ones an explicit list fills.
+   *
+   * A bare arrow is sugar for a bounded parameter (`MemberLowering.callBounds`), so a declaration
+   * written `chain[A, B](x: int, f: int -> A, g: A -> B)` carries four parameters and two of them
+   * are the sugar's. Those are named with a character no identifier may hold, precisely so that no
+   * program can write one — and there is nothing to write anyway, the argument being the closure's
+   * own anonymous type.
+   *
+   * **So an explicit list is a list of the ones the author declared**, and the sugar's stay where
+   * they have always come from, which is the arguments. Counting all of them told a reader that a
+   * declaration they wrote as `chain[A, B]` takes four, and named two with a `$`.
+   */
+  protected def authored(tparams: List[String]): List[String] =
+    tparams.filterNot(MemberLowering.isCallBound)
+
   /** Which copy of a generic declaration a **written** type-argument list names — `&f[T]` at an
    * address (`12 §6a`) and `f[T](x)` at a call (`10 §2`).
    *
@@ -624,6 +639,14 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
       targs: List[Expr],
       atCall: Boolean,
   ): String = {
+    // **A bare arrow's parameter has no written form and no argument here to read it off**, which
+    // leaves an address with nothing to instantiate. A call is the other case and does not come
+    // through here: there the arguments answer it, which is where it came from.
+    if authored(decl.tparams).length != decl.tparams.length then
+      err(s"'$written' takes a bare arrow, so it is generic in the callable's own type — and an " +
+        "address has no arguments to read that from, nor any way to write it. Declare the " +
+        "parameter as a counted callable, '&Fn(…) -> …', to give it a type that can be named")
+
     val types = writtenTypeArgs(written, decl.tparams, decl.tvalues, decl.tpacks, targs, atCall)
 
     // The same check a call makes on the arguments it solved (`checkBounds`). Writing them out does
@@ -762,13 +785,25 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
       // (`10 §2`) — not the arguments, and not the expected type. Their whole reason for existing is
       // the call inference cannot reach, so a solve running first would report a failure about a
       // question the reader has already answered.
-      if targs.nonEmpty then (instantiationWritten(shown, f, targs, atCall = true), None)
+      if targs.nonEmpty && authored(f.tparams).length == f.tparams.length then
+        (instantiationWritten(shown, f, targs, atCall = true), None)
       else if f.tparams.isEmpty then (f.name, None)
       else
+        // What a written list says, where the declaration also carries the sugar's own parameters.
+        // The written ones are answered and the rest are solved below exactly as they always were,
+        // which is the whole of what an explicit list is for on such a declaration.
+        val written =
+          if targs.isEmpty then Map.empty[String, Type]
+          else
+            val mine = authored(f.tparams)
+
+            mine.zip(writtenTypeArgs(shown, mine, f.tvalues, f.tpacks, targs, atCall = true)).toMap
+
         // Asked before the solve rather than left to it, because the solve can only report what it
         // failed to find and the answer here is that it was never going to find it — and, since the
-        // list may be written, that there is somewhere to say so.
-        val stuck = unsettleable(f)
+        // list may be written, that there is somewhere to say so. A parameter the reader has just
+        // written out is not stuck, whatever the declaration says about where it appears.
+        val stuck = unsettleable(f).filterNot(written.contains)
 
         if stuck.nonEmpty then
           val names    = stuck.map(t => s"'$t'").mkString(" and ")
@@ -778,14 +813,14 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
             s"call says what $it should be — write $it out, as '$shown[…](…)'")
 
         val provisional =
-          provisionalArgs(f.name, f.tparams, f.params.map(_.typ), args, f.bounds,
+          provisionalArgs(f.name, f.tparams, f.params.map(_.typ), args, f.bounds, written,
             result = f.retType, expected = expected)
         // The parameter types being matched against are the declaration's, written in the
         // declaration's terms — so a `Pair[T]` there is that module's `Pair` whichever module the
         // call was written in.
         val solved = inDecl(f.name)(
           solve(shown, f.tparams, f.params.map(_.typ), provisional.map(_.ty), f.retType, expected,
-            args.zip(provisional).map((a, t) => adaptable(a, t)), f.bounds))
+            args.zip(provisional).map((a, t) => adaptable(a, t)), f.bounds, written))
         checkBounds(f, solved)
         (instantiateFunc(f, solved), Some(provisional))
 

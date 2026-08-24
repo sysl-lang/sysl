@@ -404,15 +404,26 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
     // standing at one is held back for a type no argument was ever going to supply. The free
     // function of the same signature has no such gap, because there every parameter is answered by
     // an argument.
-    val ownerSeed   = fd.tparams.zip(ownerArgs).toMap
-    val provisional =
-      provisionalArgs(fd.name, fd.tparams, ptypes, passed, m.bounds, ownerSeed,
-        result = fd.retType.map(spell), expected = expected)
+    val ownerSeed = fd.tparams.zip(ownerArgs).toMap
+
     // **Only the member's own parameters are written**, and they settle the call outright where they
     // are: the owner's arrived with the receiver and were never a question, and the solve below is
     // what the written list replaces rather than something it is checked against.
+    //
+    // A bare arrow among them is the sugar's rather than the author's (`CallCore.authored`), so a
+    // member declared `map[U](f: T -> U)` is written `map[int]` and the callable's own parameter
+    // goes on being read off the closure, which is where it has always come from.
+    val mine    = authored(m.tparams)
+    val written =
+      if writtenTargs.isEmpty then Map.empty[String, Type]
+      else mine.zip(writtenTypeArgs(m.name, mine, m.tvalues, m.tpacks, writtenTargs, atCall = true)).toMap
+
+    val provisional =
+      provisionalArgs(fd.name, fd.tparams, ptypes, passed, m.bounds, ownerSeed ++ written,
+        result = fd.retType.map(spell), expected = expected)
+
     val own =
-      if writtenTargs.nonEmpty then
+      if writtenTargs.nonEmpty && mine.length == m.tparams.length then
         writtenTypeArgs(m.name, m.tparams, m.tvalues, m.tpacks, writtenTargs, atCall = true)
       else
         inDecl(fd.name)(solve(
@@ -424,6 +435,7 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
           expected,
           passed.zip(provisional).map((a, t) => adaptable(a, t)),
           fd.bounds,
+          written,
         ))
 
     // The member's own bounds, resolved with the receiver's arguments to hand. A bare arrow is

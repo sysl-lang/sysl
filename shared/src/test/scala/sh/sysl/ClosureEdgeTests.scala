@@ -769,16 +769,102 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "30\n"
     }
 
-    // The boxed spelling, because **the arrow's cannot take written type arguments at all**: the
-    // desugaring adds a type parameter for the callable, so `convert[int, string]` on the arrow form
-    // is two arguments where three are declared and is refused naming a `$F2` the reader never
-    // wrote. That is a wart of the sugar rather than anything to do with inference, and it is
-    // recorded here because this is where somebody will meet it.
+    // **The boxed spelling here is now a choice rather than the only one that works.** This comment
+    // used to record a wart: that the arrow's spelling could not take written type arguments at all,
+    // because the desugaring adds a type parameter for the callable and `convert[int, string]` was
+    // then two arguments where three were declared, refused naming a `$F2` the reader never wrote.
+    // An explicit list now fills the parameters the *author* declared and the sugar's go on being
+    // read off the closure, so both spellings take one. The arrow's is the case below.
     "a written type argument is obeyed rather than re-inferred" in {
       run("""convert[T, U](x: T, f: &Fn(T) -> U) -> U = f(x)
             |
             |print(convert[int, string](9, n -> s"{${n}}"))
             |""".stripMargin) shouldBe "{9}\n"
+    }
+
+    "and the arrow's spelling takes one too, naming only what was declared" in {
+      run("""convert[T, U](x: T, f: T -> U) -> U = f(x)
+            |
+            |print(convert[int, string](9, n -> s"{${n}}"))
+            |""".stripMargin) shouldBe "{9}\n"
+    }
+
+    // Two arrows, so two synthesized parameters — and the written list is still the two that were
+    // declared. The count is what a reader miscounts against, so it is the assertion that matters.
+    "several arrows are still two type arguments, not four" in {
+      run("""chain[A, B](x: int, f: int -> A, g: A -> B) -> B = g(f(x))
+            |
+            |print(chain[int, int](3, n -> n * 2, n -> n + 1))
+            |""".stripMargin) shouldBe "7\n"
+    }
+
+    // **The refusal names the author's parameters and their count**, which is the whole of what this
+    // card was about: it used to say four and name two of them with a `$`.
+    "and a wrong count is reported against those two" in {
+      err("""chain[A, B](x: int, f: int -> A, g: A -> B) -> B = g(f(x))
+            |
+            |print(chain[int](3, n -> n * 2, n -> n + 1))
+            |""".stripMargin) should include(
+        "'chain' takes 2 type arguments ('A', 'B'), and 1 was written")
+    }
+
+    // The shape that made this worth fixing rather than documenting: a parameter reachable only
+    // through a **generic** trait bound is not solved from the arguments, so the explicit list is the
+    // only way in — and on a declaration taking an arrow there was no way to write it.
+    "a parameter only a generic bound mentions can now be written out" in {
+      run("""trait Has[T]
+            |    get(self) -> T
+            |
+            |struct Box
+            |    v: int
+            |
+            |impl Has[int] for Box
+            |    get(self) -> int = self.v
+            |
+            |pick[B: Has[T], T, N](b: B, f: T -> N) -> N = f(b.get())
+            |
+            |print(pick[Box, int, int](Box(4), n -> n + 1))
+            |""".stripMargin) shouldBe "5\n"
+    }
+
+    // The same call with nothing written is still refused, which is what says the test above
+    // exercises the written path rather than passing because inference reached it anyway.
+    "and that call is still refused with nothing written" in {
+      err("""trait Has[T]
+            |    get(self) -> T
+            |
+            |struct Box
+            |    v: int
+            |
+            |impl Has[int] for Box
+            |    get(self) -> int = self.v
+            |
+            |pick[B: Has[T], T, N](b: B, f: T -> N) -> N = f(b.get())
+            |
+            |print(pick(Box(4), n -> n + 1))
+            |""".stripMargin) should include("nothing says what this closure takes")
+    }
+
+    "a member's own list names only what the member declared" in {
+      run("""struct Wrap
+            |    v: int
+            |
+            |    mapped[U](self, f: int -> U) -> U = f(self.v)
+            |
+            |print(Wrap(5).mapped[int](n -> n * 3))
+            |""".stripMargin) shouldBe "15\n"
+    }
+
+    // **An address is the one position where the sugar's parameter cannot be answered**, there being
+    // no arguments to read it off and no way to write it. Refused by name rather than by a count
+    // naming a `$`, which is what it did before.
+    "but an address says why it cannot be instantiated" in {
+      err("""chain[A, B](x: int, f: int -> A, g: A -> B) -> B = g(f(x))
+            |
+            |val p = &chain[int, int]
+            |
+            |print(1)
+            |""".stripMargin) should include("generic in the callable's own type")
     }
 
     "an annotated parameter is still read" in {
