@@ -512,6 +512,104 @@ class ResolveTests extends PackageCacheSupport {
     }
   }
 
+  /** The claims the resolver keeps beside its answer, which is what `sysl deps` prints (`§ 5`).
+   *
+   * These are about the question rather than the answer, so every one of them asserts something the
+   * selection itself has thrown away: a floor that lost, who a demand belonged to, and the fact that
+   * the root is an asker like any other rather than a special case above the graph.
+   */
+  "every claim is recorded, whether or not it won" - {
+
+    "the floor that lost is kept, which selection alone cannot say" in {
+      val cache = emptyCache()
+
+      publishedModule(cache, "github.com/e/buf", Version(1, 2, 0), "buf")
+      publishedModule(cache, "github.com/e/buf", Version(1, 4, 0), "buf")
+      publishedModule(cache, "github.com/e/a", Version(1, 0, 0), "a",
+        deps = dep("buf", "github.com/e/buf", "1.2.0"))
+      publishedModule(cache, "github.com/e/b", Version(1, 0, 0), "b",
+        deps = dep("buf", "github.com/e/buf", "1.4.0"))
+
+      val root = project(manifest("app", "0.1.0",
+        s"${dep("a", "github.com/e/a", "1.0.0")}, ${dep("b", "github.com/e/b", "1.0.0")}"))
+
+      claimed(resolve(root, cache))("github.com/e/buf") shouldBe
+        List("github.com/e/a" -> "1.2.0", "github.com/e/b" -> "1.4.0")
+    }
+
+    // The manifest of the version that was passed over is dropped by `materialize`, so nothing in the
+    // finished graph could answer this by being scanned — which is the whole argument for carrying it.
+    "so a losing claim survives its own manifest leaving the graph" in {
+      val cache = emptyCache()
+
+      publishedModule(cache, "github.com/e/buf", Version(1, 2, 0), "early")
+      publishedModule(cache, "github.com/e/buf", Version(1, 4, 0), "later")
+      publishedModule(cache, "github.com/e/a", Version(1, 0, 0), "a",
+        deps = dep("buf", "github.com/e/buf", "1.2.0"))
+
+      val root = project(manifest("app", "0.1.0",
+        s"${dep("a", "github.com/e/a", "1.0.0")}, ${dep("buf", "github.com/e/buf", "1.4.0")}"))
+
+      val graph = resolve(root, cache)
+
+      graph.packages.exists(_.version.contains(Version(1, 2, 0))) shouldBe false
+      claimed(graph)("github.com/e/buf") should contain("github.com/e/a" -> "1.2.0")
+    }
+
+    "the root asks under the name its manifest gives it" in {
+      val cache = emptyCache()
+
+      publishedModule(cache, "github.com/e/buf", Version(1, 4, 0), "buf")
+
+      val root = project(manifest("app", "0.1.0", dep("buf", "github.com/e/buf", "1.4.0")))
+
+      claimed(resolve(root, cache)) shouldBe Map("github.com/e/buf" -> List("app" -> "1.4.0"))
+    }
+
+    // A manifest need not name its package, and a claim attributed to the empty string would read as
+    // though nobody had asked for it.
+    "and under a stand-in where it names none" in {
+      val cache = emptyCache()
+
+      publishedModule(cache, "github.com/e/buf", Version(1, 4, 0), "buf")
+
+      val root = project(s"""dependencies { ${dep("buf", "github.com/e/buf", "1.4.0")} }\n""")
+
+      claimed(resolve(root, cache))("github.com/e/buf").map(_._1) shouldBe List("this project")
+    }
+
+    // A path dependency has no coordinate, so it is attributed by the label its consumer wrote — the
+    // same answer `Dependency.canonical` gives, and the only name it has.
+    "a path dependency's demands are attributed to its label" in {
+      val cache = emptyCache()
+
+      publishedModule(cache, "github.com/e/buf", Version(1, 4, 0), "buf")
+
+      val other = project(manifest("helper", "0.1.0", dep("buf", "github.com/e/buf", "1.4.0")), "helper")
+      val root  = project(s"""package { name = "app", version = "0.1.0" }
+                             |dependencies { h { path = "$other" } }
+                             |""".stripMargin)
+
+      claimed(resolve(root, cache)) shouldBe Map("github.com/e/buf" -> List("h" -> "1.4.0"))
+    }
+
+    // It is keyed as `selected` is, so the two join on one key and no round trip through the dotted
+    // form is needed — which would not survive the trip anyway, a coordinate being full of dots.
+    "and the key is the coordinate as a manifest writes it" in {
+      val cache = emptyCache()
+
+      publishedModule(cache, "github.com/e/buf", Version(1, 4, 0), "buf")
+
+      val root = project(manifest("app", "0.1.0", dep("buf", "github.com/e/buf", "1.4.0")))
+
+      resolve(root, cache).claims.keys should contain only "github.com/e/buf"
+    }
+
+    "a project with no dependencies claims nothing" in {
+      resolve(project(manifest("app", "0.1.0")), emptyCache()).claims shouldBe empty
+    }
+  }
+
   "a project with no dependencies resolves to itself" in {
     val root  = project(manifest("app", "0.1.0"))
     val graph = resolve(root, emptyCache())

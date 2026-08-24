@@ -44,29 +44,55 @@ case class ResolvedPackage(
  */
 object Resolve {
 
-  /** Everything the build needs from the package system: the packages in a stable order, and the
-   * `sysl.sum` that should be on disk afterwards.
+  /** One manifest asking for one coordinate at one floor, kept so that `sysl deps` can say who
+   * wanted what (`packages.md § 5`).
+   *
+   * `asker` is named the way a reader can go and look it up: a fetched package by its coordinate, a
+   * path dependency by its label, and the root by whatever its manifest calls itself. Not the
+   * friendly `package.name` a diagnostic uses — a note about one package can afford that, and a
+   * listing of the whole graph is exactly where two packages both calling themselves `json` stop
+   * being distinguishable.
    */
-  case class Graph(packages: List[ResolvedPackage], sums: Sums, sumsChanged: Boolean)
+  case class Claim(asker: String, version: Version)
 
-  /** What the selecting pass carries: the version floors, the manifests read so far, the packages
-   * that are directories rather than coordinates, and the sums as they stand.
+  /** Everything the build needs from the package system: the packages in a stable order, the claims
+   * that decided their versions, and the `sysl.sum` that should be on disk afterwards.
+   */
+  case class Graph(packages: List[ResolvedPackage], claims: Map[String, List[Claim]], sums: Sums,
+                   sumsChanged: Boolean)
+
+  /** What the selecting pass carries: the version floors, who asked for them, the manifests read so
+   * far, the packages that are directories rather than coordinates, and the sums as they stand.
    */
   private case class State(
       selected: Map[String, Version] = Map.empty,
+      claims: Map[String, List[Claim]] = Map.empty,
       manifests: Map[(String, Version), (String, PackageConfig)] = Map.empty,
       locals: Map[String, (String, PackageConfig)] = Map.empty,
       sums: Sums = Sums.empty,
       changed: Boolean = false,
   ) {
 
-    /** Every requirement raises a floor and nothing ever lowers one, which is the whole of MVS. */
-    def demanding(deps: List[Dependency]): State =
+    /** Every requirement raises a floor and nothing ever lowers one, which is the whole of MVS —
+     * and every one of them is written down on the way past, whether or not it won.
+     *
+     * **This is the only place holding both halves at once.** Downstream has the answer and not the
+     * question: `selected` keeps a version with no memory of where it came from, and a version that
+     * was passed over has its manifest dropped by `materialize` on purpose. So a claim recomputed
+     * from the finished graph can only ever find the one that won, which is the half nobody needed
+     * to be told.
+     *
+     * Keyed on the **slashed** coordinate, as `selected` is, so the two are joined by one key.
+     */
+    def demanding(asker: String, deps: List[Dependency]): State =
       deps.foldLeft(this) {
         case (s, Dependency(_, Origin.Git(coordinate, version), _)) =>
-          if s.selected.get(coordinate).forall(_ < version) then
-            s.copy(selected = s.selected + (coordinate -> version))
-          else s
+          val noted = s.copy(claims = s.claims.updatedWith(coordinate)(was =>
+            Some(was.getOrElse(Nil) :+ Claim(asker, version))))
+
+          if noted.selected.get(coordinate).forall(_ < version) then
+            noted.copy(selected = noted.selected + (coordinate -> version))
+          else noted
         case (s, _) => s
       }
 
@@ -102,13 +128,22 @@ object Resolve {
             sharing: List[String] = Nil): Either[String, Graph] =
     for
       withLocals <- readLocals(config.dependencies, State(sums = sums), cache)
-      settled    <- select(withLocals.demanding(config.dependencies), cache)
+      settled    <- select(withLocals.demanding(rootName(config), config.dependencies), cache)
       rootTable  <- tableOf(PackageConfig.FileName, root :: sharing, config.dependencies, settled)
       packages   <- materialize(settled)
       tables     <- collect(packages)(p => tableOf(owner(p), List(p.root), p.config.dependencies, settled)
                       .map(t => p.copy(imports = t)))
       _          <- checkFloors(tables)
-    yield Graph(ResolvedPackage("", root, config, rootTable) :: tables, settled.sums, settled.changed)
+    yield Graph(ResolvedPackage("", root, config, rootTable) :: tables, settled.claims, settled.sums,
+                settled.changed)
+
+  /** What the root calls itself when it is the one asking, since it has no coordinate to be named by.
+   *
+   * A manifest need not name its package, and a listing that then attributed a claim to the empty
+   * string would read as though nobody had asked for it — which is the opposite of what the claim
+   * says.
+   */
+  private def rootName(config: PackageConfig): String = config.name.getOrElse("this project")
 
   /** Every dependency's stated floor against the compiler in hand (`packages.md § 1`).
    *
@@ -166,7 +201,7 @@ object Resolve {
                         s"'${dep.label}' is a path dependency that itself has a path dependency — a " +
                           "relative path only means something in the project it was written in")
           yield before.copy(locals = before.locals + (dep.canonical -> (got.root, theirs)))
-                      .demanding(theirs.dependencies)
+                      .demanding(dep.label, theirs.dependencies)
     }
 
   private def isGit(dep: Dependency): Boolean = dep.origin match
@@ -192,7 +227,7 @@ object Resolve {
                         "in the project it was written in")
           next    = state.withFetch(dep, got)
                       .copy(manifests = state.manifests + (pair -> (got.root, theirs)))
-                      .demanding(theirs.dependencies)
+                      .demanding(coordinate, theirs.dependencies)
           settled <- select(next, cache)
         yield settled
 

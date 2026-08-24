@@ -130,4 +130,12 @@ trait PackageCacheSupport extends AnyFreeSpec with Matchers {
    */
   protected def selected(g: Resolve.Graph): Map[String, String] =
     g.packages.filterNot(_.isRoot).flatMap(p => p.version.map(v => p.canonical -> v.toString)).toMap
+
+  /** What was *asked* rather than what was settled on — the claims, flattened to pairs so a test can
+   * write the expectation out. Keyed by the coordinate as a manifest writes it, which is how
+   * `Resolve` keys them and is a different spelling from `selected`'s dotted canonical name.
+   */
+  protected def claimed(g: Resolve.Graph): Map[String, List[(String, String)]] =
+    g.claims.map((coordinate, claims) =>
+      coordinate -> claims.map(c => c.asker -> c.version.toString))
 }

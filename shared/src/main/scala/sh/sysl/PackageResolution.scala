@@ -61,18 +61,36 @@ private def dependencies(cfg: Config, project: PackageConfig, roots: List[String
  * (`§ 9`), and nothing in a manifest tells `Resolve` they are there.
  */
 private def resolveDependencies(cfg: Config, project: PackageConfig, roots: List[String], os: Os)
-    : Either[String, PackageSources] = {
+    : Either[String, PackageSources] =
+  for
+    graph <- resolvedGraph(cfg, project, roots)
+    files <- collectPackages(graph, os)
+  yield
+    reportRaised(project, graph)
+    files
+
+/** The graph alone, which is what a build and `sysl deps` have in common.
+ *
+ * Split out so the command reads the same graph the build resolves rather than one composed to look
+ * like it — a listing that disagreed with the compilation standing beside it would be worse than no
+ * listing. `collectPackages` and the note are the build's own half and stay above.
+ *
+ * **Writing the sums back is part of resolving rather than part of building.** A line is recorded
+ * because a package was fetched, and both callers fetch; leaving it to the build would mean the
+ * first `sysl deps` after adding a dependency downloaded a package and recorded nothing about what
+ * it got.
+ */
+private def resolvedGraph(cfg: Config, project: PackageConfig, roots: List[String])
+    : Either[String, Resolve.Graph] = {
   val root = projectRoot(cfg.file)
 
   for
     cache <- Fetch.cacheRoot
     sums  <- readSums(root)
     graph <- Resolve.graph(root, project, sums, cache, roots)
-    files <- collectPackages(graph, os)
   yield
     if graph.sumsChanged then writeSums(root, graph.sums)
-    reportRaised(project, graph)
-    files
+    graph
 }
 
 /** Say so when the build is against a **higher** version than this project asked for (`packages.md
@@ -236,3 +254,101 @@ private def readPackageConfig(file: String): Either[String, PackageConfig] = {
       yield config
     catch case e: Exception => Left(s"cannot read $path: ${e.getMessage}")
 }
+
+/** `sysl deps` — the resolved graph, and who asked for each version (`packages.md § 5`).
+ *
+ * ==What the command is for==
+ *
+ * A package reached through another is importable as of 0.0.73 (`§ 9`), so a program can be built
+ * against packages its own manifest never names — and until this command there was no way to answer
+ * *what am I compiling against* from the files in front of you. Selection is silent by design and is
+ * right to be: MVS raises floors constantly, and a line per raise would be a wall of them. What was
+ * missing is somewhere to go and **ask**.
+ *
+ * It answers with the claims rather than only the outcome, which is the half nothing else can
+ * reconstruct: `reportRaised` above scans the graph for a manifest that wanted what was selected, and
+ * the manifest of a version that was *passed over* is dropped by `materialize` on purpose. So the
+ * claim that lost — the whole reason a version is higher than somebody expected — exists only because
+ * `Resolve.State.demanding` wrote it down on the way past.
+ *
+ * ==What it prints==
+ *
+ * {{{
+ * app 0.1.0
+ *
+ * github.com/e/a    1.0.0
+ *     app asks for 1.0.0
+ * github.com/e/buf  1.4.0  (raised)
+ *     github.com/e/a asks for 1.2.0
+ *     github.com/e/b asks for 1.4.0
+ * }}}
+ *
+ * `(raised)` marks a coordinate some claim on which is **below** what was selected. That is a wider
+ * net than the note `reportRaised` prints, deliberately: the note fires only when the *root's own*
+ * manifest was overtaken, because that is the one line a reader can go and edit, and this catches a
+ * dependency overtaken by its sibling as well.
+ *
+ * A path dependency takes no part in selection and has no version, so it prints its directory
+ * instead — which is the only thing that says which tree it is.
+ */
+private def showDeps(cfg: Config, project: PackageConfig, roots: List[String]): Int = {
+  val listed =
+    for
+      fromRoots <- libDependencies(roots)
+      graph     <- resolvedGraph(cfg, project.copy(dependencies = project.dependencies ::: fromRoots),
+                     roots)
+    yield graph
+
+  listed match
+    case Left(err)    => fail(err)
+    case Right(graph) => printGraph(project, graph)
+}
+
+/** The graph as a reader sees it, once it has resolved. */
+private def printGraph(project: PackageConfig, graph: Resolve.Graph): Int = {
+  val depended = graph.packages.filterNot(_.isRoot)
+  val spelling = coordinates(graph)
+
+  stdout(s"${project.name.getOrElse("this project")}${project.version.fold("")(v => s" $v")}\n")
+
+  if depended.isEmpty then
+    stdout("\nthis project depends on nothing\n")
+    return 0
+
+  def named(p: ResolvedPackage): String = spelling.getOrElse(p.canonical, p.canonical)
+
+  // Padded against the whole listing rather than per line, so the versions form a column a reader can
+  // run an eye down — the same reason `sysl targets` measures its own names first.
+  val width = depended.map(named(_).length).max
+
+  stdout("\n")
+
+  for p <- depended do
+    val claims = graph.claims.getOrElse(named(p), Nil)
+    // A claim below the selection is what makes this coordinate worth stopping at, and it is asked of
+    // the claims rather than of the note above, which only ever sees the root's own manifest.
+    val raised = p.version.exists(v => claims.exists(_.version < v))
+    // A path dependency has no version to print, so it prints the directory instead — which is the
+    // only thing that says which tree it is.
+    val at     = p.version.map(_.toString).getOrElse(p.root)
+
+    stdout(s"${named(p).padTo(width, ' ')}  $at${if raised then "  (raised)" else ""}\n")
+
+    // In the order the walk asked, which is the root's manifest first and then breadth first through
+    // the graph — so the line a reader is most likely to be able to edit is the one at the top.
+    for claim <- claims do stdout(s"    ${claim.asker} asks for ${claim.version}\n")
+
+  0
+}
+
+/** Each package's canonical name back to the coordinate a manifest actually wrote.
+ *
+ * **It cannot be computed from the canonical name, which is the trap worth naming.** `canonical` is
+ * the coordinate with its slashes replaced by dots, and a coordinate is full of dots already, so
+ * `github.com.e.buf` un-replaced is `github/com/e/buf` and names nothing. The claims are keyed on the
+ * real coordinate, and every fetched package has at least one claim — that is how it reached
+ * `selected` at all — so the keys are the whole answer. A path dependency is absent and keeps its
+ * label, which is what `Dependency.canonical` gives it and is the only name it has.
+ */
+private def coordinates(graph: Resolve.Graph): Map[String, String] =
+  graph.claims.keys.map(c => c.replace('/', '.') -> c).toMap
