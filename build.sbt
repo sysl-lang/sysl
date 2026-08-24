@@ -185,7 +185,7 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
       "org.scala-lang.modules"   %%% "scala-parser-combinators" % "2.4.0",
       // Off-side-rule lexer base — what emits the indent and dedent tokens the layout rules in
       // `SyslLexical` are built on.
-      "io.github.edadma"         %%% "indentation"              % "0.0.8",
+      "io.github.edadma"         %%% "indentation"              % "0.0.9",
       // Cross-platform I/O boundary: the compiler cross-publishes to JVM, JS and Native, so every
       // file and environment read goes through these rather than through `java.io`.
       "io.github.edadma"         %%% "path"                     % "0.0.8",
