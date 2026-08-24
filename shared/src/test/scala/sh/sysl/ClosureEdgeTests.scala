@@ -927,6 +927,27 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "<6>!\n"
     }
 
+    /** **And the order the two are declared in is not part of the answer.** These two declarations
+      * differ in nothing but which parameter was written first: one arrow's result is what the
+      * other takes, either way round.
+      *
+      * Reading the held-back arguments left to right settled that by declaration order — the
+      * settling arrow first compiled, the same pair reversed did not — which is the shape
+      * `two(&x, null)` and `two(null, &x)` are documented not to have. Each round now reads the
+      * arguments that *can* be read and lets what they settle reach the rest.
+      */
+    "and neither order of two arrows decides whether the call compiles" in {
+      run("""forward[T](f: int -> T, g: T -> int) -> int = g(f(0))
+            |
+            |print(forward(n -> n + 1, n -> n * 2))
+            |""".stripMargin) shouldBe "2\n"
+
+      run("""backward[T](g: T -> int, f: int -> T) -> int = g(f(0))
+            |
+            |print(backward(n -> n * 2, n -> n + 1))
+            |""".stripMargin) shouldBe "2\n"
+    }
+
     // **The refusal has to survive**, or the fix has traded a bad message for a wrong program. A
     // parameter type nothing determines is still a parameter type nothing determines.
     "a parameter nothing settles is still refused, and against the closure" in {

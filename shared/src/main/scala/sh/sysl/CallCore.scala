@@ -234,25 +234,54 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     // `callBound` requires to be settled.
     //
     // `unify` writes only where the map is silent, so this cannot overturn what the tiers decided —
-    // it fills what none of them reached. Left to right, which is both the order a reader expects and
-    // the only order in which an arrow can inform the arrow after it.
-    at.zip(first).zipWithIndex.map { case (((a, _), done), i) =>
-      done.map(_._1).getOrElse {
-        val t = analyzeExpr(a, inDecl(decl)(heldWant(callable(i), ptypes.lift(i), tps, bounds, partial.toMap)))
+    // it fills what none of them reached.
+    //
+    // **By READINESS rather than left to right, which is what keeps the declaration's order out of
+    // the answer.** `heldWant` says whether an argument can be read at all — for a callable, whether
+    // what it *takes* is settled — so each round reads the ones that can be and lets what they
+    // settle reach the rest. Reading in source order instead makes
+    // `f(g: T -> int, f: int -> T)` refuse a call that `f(f: int -> T, g: T -> int)` accepts, on two
+    // parameters that differ in nothing but which was written first, and the page's own rule about
+    // held-back arguments — *waiting is not queueing* — says that is the wrong shape of answer.
+    //
+    // It terminates because a round that reads nothing stops it, and every round that reads
+    // something reads at least one argument that will not be offered again.
+    val out = scala.collection.mutable.ArrayBuffer.from(first.map(_.map(_._1)))
 
-        for
-          (_, taken, yielded) <- inDecl(decl)(callShape(ptypes.lift(i), tps, bounds))
-          supplied            <- callableOf(t.ty)
-          if supplied.args.length == taken.length + 1
-        do
-          inDecl(decl) {
-            for (ref, ty) <- taken.zip(supplied.args) do unify(ref, ty, tps, partial)
-            for ref <- yielded do unify(ref, supplied.args.last, tps, partial)
-          }
+    def expectedFor(i: Int): Option[Type] =
+      inDecl(decl)(heldWant(callable(i), ptypes.lift(i), tps, bounds, partial.toMap))
 
-        t
-      }
+    def read(i: Int): Unit = {
+      val t = analyzeExpr(at(i)._1, expectedFor(i))
+
+      out(i) = Some(t)
+
+      for
+        (_, taken, yielded) <- inDecl(decl)(callShape(ptypes.lift(i), tps, bounds))
+        supplied            <- callableOf(t.ty)
+        if supplied.args.length == taken.length + 1
+      do
+        inDecl(decl) {
+          for (ref, ty) <- taken.zip(supplied.args) do unify(ref, ty, tps, partial)
+          for ref <- yielded do unify(ref, supplied.args.last, tps, partial)
+        }
     }
+
+    var pending  = out.indices.filter(out(_).isEmpty).toList
+    var progress = true
+
+    while progress && pending.nonEmpty do
+      val (ready, rest) = pending.partition(expectedFor(_).isDefined)
+
+      progress = ready.nonEmpty
+      ready.foreach(read)
+      pending = rest
+
+    // What never became readable is read in source order, so the refusal a reader gets is the
+    // leftmost one rather than whichever round happened to end.
+    pending.foreach(read)
+
+    out.toList.map(_.get)
   }
 
   /** What an argument held back from the first pass is analyzed against, once the rest have been
