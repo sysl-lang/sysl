@@ -296,7 +296,7 @@ object Compiler {
           // `analyzed`. The question is about the emitted program's symbol table, so what to read is
           // whatever *this* compilation emits — and a test build is the one build where a `@test`
           // file's `@export` is a definition rather than something dropped.
-          _        <- Exports.check(Tests.only(typed, ownModules(mine)), ownModules(mine))
+          _        <- Exports.check(Tests.only(typed, ownModules(mine)), target, ownModules(mine))
         yield
           val kept = Tests.only(typed, ownModules(mine))
 
@@ -469,8 +469,22 @@ object Compiler {
       // whether a `main` is written; it also has to decide whether a lone top-level `var` is read as
       // a body's local, because a body nothing emits has no locals for it to be one of — see
       // `ModuleFiles.entryFile`.
-      typed    <- Analyzer.analyze(units, std = std, target = target, provides = provides,
+      walked   <- Analyzer.analyze(units, std = std, target = target, provides = provides,
                     packages = packages, paths = paths, own = own, entryPoint = entryPoint)
+
+      // **The analyzer takes the answer and does not record it, so the tree it hands back says
+      // `true` whatever this build is.** That was invisible for as long as `Codegen` was the only
+      // thing that asked — the `copy` below the `yield` set it on the way past — and it stopped
+      // being invisible the moment a *check* needed it: `Exports.storage` reads it to ask whether
+      // anything will fill this artifact's module storage, and read off the analyzer's default it
+      // is asking about a program that is not being built. Set it once, here, so every pass below
+      // sees the build it is actually part of.
+      //
+      // **`cArtifact` is `!entryPoint` HERE and only here**, because this path is reached with no
+      // entry point by exactly one thing: `build-c` and the `emit-header` beside it (`Main.cLibrary`).
+      // `build-lib` is the other build with no entry point and it does not come through here — see
+      // `compileLibrary`, and `TProgram.cArtifact` for why the two must not share an answer.
+      typed     = walked.copy(entryPoint = entryPoint, cArtifact = !entryPoint)
       promoted <- Escape.check(typed)
       _        <- TailCalls.check(typed)
 
@@ -486,7 +500,7 @@ object Compiler {
       // never have run it — which is the whole of what makes it safe to leave a test beside the code
       // it tests. `Exports` is the odd one out because it asks a question about the emitted
       // program's symbol table rather than about a body.
-      _        <- Exports.check(Tests.strip(typed), own)
+      _        <- Exports.check(Tests.strip(typed), target, own)
     yield
       // Pruning still runs, and still from `main`: a library function this program never calls is
       // dropped from the tree exactly as before. What `precompiled` changes is only what happens to

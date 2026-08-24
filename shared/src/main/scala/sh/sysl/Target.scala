@@ -139,6 +139,27 @@ case class Target(
    */
   def hasThreadLocalStorage: Boolean = os != Os.Freestanding
 
+  /** Whether something on this platform runs a module's initializers **before** the program's own
+   * entry point — which is what decides whether an archive with no entry point of its own can fill
+   * its module storage at all (`13 §7`).
+   *
+   * A program lays its computed `val`s down at the top of `@main`, because the entry point is the
+   * one place that certainly runs first and it is already written. `build-c` has no entry point to
+   * put them in: the artifact is linked into a C project that supplies its own `main`. What answers
+   * for it there is `@llvm.global_ctors`, which LLVM lowers to `.init_array` on ELF,
+   * `__mod_init_func` on Mach-O and `.CRT$XCU` on COFF — so the spelling is the back end's problem
+   * rather than one this compiler has to keep a table of.
+   *
+   * **A freestanding target answers `false`, and the reason is the same one
+   * `hasThreadLocalStorage` gives: there is no loader.** Nothing walks `.init_array` on bare metal
+   * unless the image's own start-up calls `__libc_init_array` — newlib's does and a hand-written
+   * reset vector may not — so a constructor emitted there is a function that is never called, and
+   * the storage it would have filled reads whatever the image left. That is a silent wrong answer,
+   * which is why an export reaching computed storage is still refused for those targets
+   * (`Exports.storage`) instead of being served by a constructor nothing runs.
+   */
+  def runsInitializers: Boolean = os != Os.Freestanding
+
   /** The environment capabilities this machine can have **at all**, which is a different question
    * from what a project says it provides.
    *

@@ -25,10 +25,11 @@ object Exports {
    * definition that build does not contain — which is the `main` collision this card was filed for,
    * reappearing as a diagnostic instead of as a link error.
    */
-  def check(program: TProgram, own: Option[Set[String]] = None): Either[List[Diagnostic], Unit] = {
+  def check(program: TProgram, target: Target, own: Option[Set[String]] = None)
+      : Either[List[Diagnostic], Unit] = {
     val exported = Reachability.exports(program, own)
     val refused  = exported.flatMap(signature) ::: duplicates(exported) ::: names(exported) :::
-      storage(exported, program)
+      storage(exported, program, target)
 
     if refused.nonEmpty then Left(refused) else Right(())
   }
@@ -127,12 +128,26 @@ object Exports {
       }
   }
 
-  /** An exported function that reaches a **computed** module `val`.
+  /** An exported function that reaches a **computed** module `val` **on a build with nowhere to
+   * fill it**.
    *
-   * Module storage is filled by the entry point (`13 §7`), and a C project linking this artifact
-   * supplies its own `main` — so nothing here runs before the C side calls in, and the storage a
-   * computed initializer would have written is whatever the loader left. That is a silent wrong
-   * answer rather than a link error, which is why it is refused.
+   * Module storage is filled before the program's own statements run (`13 §7`), and there are three
+   * builds with three answers. A build with an entry point lays the `val`s down at the top of it
+   * (`Codegen.genMain`). A `.syslib` has none, and defers every function reaching one to the program
+   * that links it (`Compiler.compileLibrary`). A **C** archive has neither road — the project
+   * linking it supplies its own `main` — so it registers a constructor on the platform's pre-`main`
+   * list instead (`Codegen.genModuleInit`).
+   *
+   * **What is left, and all this refuses, is a C archive for a freestanding target.** There is no
+   * loader on bare metal, so nothing walks `.init_array` unless the image's own start-up calls
+   * `__libc_init_array` — and a constructor emitted there would be a function nobody calls, leaving
+   * the storage reading whatever the image left. That is a silent wrong answer rather than a link
+   * error, which is why it is refused rather than emitted hopefully.
+   *
+   * **Until card `0263` this refused every build, whatever the target and whichever of the three it
+   * was.** The rule was written for the archive case and never narrowed to it, so a program whose
+   * own `@main` fills the storage was refused too, and so was `sysl test`, which emits an entry
+   * point of its own (`Codegen.genTestMain`).
    *
    * **A `val` whose initializer is constant data is fine and is not looked at**, because nothing
    * runs to fill it: `TVal.computed` is exactly that distinction, and a constant tree is written
@@ -144,10 +159,10 @@ object Exports {
    * `val` may be three calls down inside the library, and the function that named it is what the
    * author has to look at.
    */
-  private def storage(exported: List[TFunc], program: TProgram): List[Diagnostic] = {
+  private def storage(exported: List[TFunc], program: TProgram, target: Target): List[Diagnostic] = {
     val computed = program.vals.filter(_.computed).map(_.symbol).toSet
 
-    if computed.isEmpty || exported.isEmpty then Nil
+    if !program.cArtifact || target.runsInitializers || computed.isEmpty || exported.isEmpty then Nil
     else
       exported.flatMap { f =>
         val reached = Reachability.reachedFrom(List(f), program.funcs, program.vtables).vals & computed
@@ -156,11 +171,12 @@ object Exports {
           Diagnostic(
             s"'${Modules.show(f.name)}' is exported and reaches " +
               s"${reached.toList.sorted.map(v => s"'${Modules.show(v)}'").mkString(", ")}, which is " +
-              "module storage an initializer fills before the program's own statements run. A C " +
-              "project linking this supplies its own 'main', so nothing fills it and the function " +
-              "would read whatever the loader left. A module 'val' whose initializer is constant " +
-              "data is laid straight into the object file and is fine here — it is a computed one " +
-              "that has nowhere to be computed",
+              "module storage an initializer fills before the program's own statements run. This " +
+              s"artifact has no entry point to fill it in, and '${target.name}' is freestanding — " +
+              "there is no loader to run a constructor either, so the function would read whatever " +
+              "the image left. Build for a hosted target, where the storage is filled before any " +
+              "export can run, or make the initializer constant data, which is laid straight into " +
+              "the object file",
             f.pos))
       }
   }

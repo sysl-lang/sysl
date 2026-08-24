@@ -80,6 +80,14 @@ object Printer {
     m.thunks.foreach(f => sb ++= func(f))
     sb ++= "\n"
     m.entry.foreach(f => sb ++= func(f))
+
+    // The constructor and the list naming it, in that order for `@llvm.used`'s reason: the entry
+    // refers to the function by name, so the definition is written first.
+    for i <- m.init do
+      sb ++= func(i.func)
+      sb ++= i.list.render
+      sb ++= "\n"
+
     // Last, so that every symbol it names has been written above it.
     for g <- m.used do
       sb ++= g.render

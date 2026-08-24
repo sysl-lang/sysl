@@ -281,22 +281,120 @@ class ExportTests extends AnyFreeSpec with CodegenSupport with TestFrameworkSupp
     }
   }
 
+  /** A module compiled the way `build-c` compiles one: **no entry point of its own**, because the
+   * artifact is linked into a C project that supplies the `main`. That is the whole of what
+   * `Main.cLibrary` decides, and it is the shape every assertion about module storage is about.
+   */
+  private def archive(src: String, target: Target = Target.default): Either[String, String] =
+    Compiler.compiledWith(List(Source("<input>", src)), Nil, target, entryPoint = false).map(_.ir)
+
+  /** The IR of such an archive, which must compile. */
+  private def archiveIr(src: String, target: Target = Target.default): String =
+    archive(src, target) match
+      case Right(out) => out
+      case Left(e)    => fail(e)
+
+  /** Why such an archive was refused. */
+  private def archiveErr(src: String, target: Target): String =
+    archive(src, target) match
+      case Right(out) => fail(s"expected an error, got:\n$out")
+      case Left(e)    => e
+
+  /** A freestanding target, which is the one case left that has nowhere to fill module storage. */
+  private def bare: Target = Target.named("thumbv7em-freestanding").getOrElse(cancel("no such target"))
+
   "module storage" - {
 
-    // The ruling: a C project supplies its own `main`, so nothing runs to fill storage a computed
-    // initializer would have written.
-    "a computed 'val' an export reaches is refused" in {
+    /** **A hosted archive fills its storage from a constructor** (card `0263`).
+      *
+      * The ruling this replaces was that a C project supplies its own `main`, so nothing runs to
+      * fill storage a computed initializer would have written — and every build was refused on it,
+      * whatever the target and whether or not it had an entry point of its own. What answers for it
+      * now is `@llvm.global_ctors`, which LLVM lowers to `.init_array` on ELF, `__mod_init_func` on
+      * Mach-O and `.CRT$XCU` on COFF: one spelling here, three where it matters.
+      *
+      * The workaround the refusal forced is what makes this worth pinning: a module reached through
+      * an archive could hold no `Buf`, no closure and no counted value at module scope, so
+      * `sysl-lang/skitter` stored four bare `int`s in place of a callback and `syslui` turned a
+      * write counter into a bare `var`.
+      */
+    "a computed 'val' an export reaches is filled by a constructor on a hosted target" in {
       val src = "module demo\n\ncounter() -> i32 = 7\n\nval start: i32 = counter()\n\n" +
         "@export\nbegin() -> i32 = start\n"
+      val out = archiveIr(src)
 
-      err(src) should include("module storage an initializer fills")
+      out should include("define internal void @sysl.module_init()")
+      out should include(
+        "@llvm.global_ctors = appending global [1 x { i32, ptr, ptr }] " +
+          "[{ i32, ptr, ptr } { i32 65535, ptr @sysl.module_init, ptr null }]")
+      // The storage really is filled there, rather than the constructor being an empty gesture.
+      out should include("call i32 @demo$counter()")
+    }
+
+    /** **The constructor is what `@main` would have been**, so a build that has an entry point
+      * still lays its `val`s down there and gets no second filling — which would take a second
+      * count of every reference among them.
+      */
+    "while a build with an entry point of its own gets no constructor" in {
+      val src = "module demo\n\ncounter() -> i32 = 7\n\nval start: i32 = counter()\n\n" +
+        "@export\nbegin() -> i32 = start\n"
+      val out = ir(src)
+
+      out should not include "@llvm.global_ctors"
+      out should not include "@sysl.module_init"
+    }
+
+    /** **And a freestanding archive is still refused, because nothing there walks the list.** Bare
+      * metal has no loader: `.init_array` runs only if the image's own start-up calls
+      * `__libc_init_array`, which newlib's does and a hand-written reset vector may not — so a
+      * constructor emitted there is a function nobody calls and the storage reads whatever the
+      * image left.
+      */
+    "but a freestanding one is refused, and the diagnostic names the target" in {
+      val src = "module demo\n\ncounter() -> i32 = 7\n\nval start: i32 = counter()\n\n" +
+        "@export\nbegin() -> i32 = start\n"
+      val out = archiveErr(src, bare)
+
+      out should include("module storage an initializer fills")
+      out should include("thumbv7em-freestanding")
     }
 
     "reached transitively, which is what the walk is for" in {
       val src = "module demo\n\ncounter() -> i32 = 7\n\nval start: i32 = counter()\n\n" +
         "inner() -> i32 = start\n\n@export\nbegin() -> i32 = inner()\n"
 
-      err(src) should include("module storage an initializer fills")
+      archiveErr(src, bare) should include("module storage an initializer fills")
+    }
+
+    /** A module with nothing computed at module scope gets no constructor at all — an empty one
+      * would be a symbol on every archive's pre-`main` list doing nothing.
+      */
+    "an archive with nothing computed carries no constructor" in {
+      archiveIr("module demo\n\n@export\nbegin() -> i32 = 7\n") should not include "@llvm.global_ctors"
+    }
+
+    /** **A `.syslib` gets no constructor either, and that is the third answer rather than the
+      * archive's read loosely** (card `0263`).
+      *
+      * A library artifact has no entry point, so `!entryPoint` would have caught it — and it must
+      * not, because the thing that links a `.syslib` is a sysl **program**, which has one.
+      * `Compiler.compileLibrary` already answers for this by leaving every function that reaches a
+      * computed `val` out of the artifact and compiling it in the program instead, where the
+      * initialization actually happens. A constructor here would fill a copy of the storage nothing
+      * reads, and run the initializer a second time to do it.
+      */
+    "and a library artifact gets none, because the program that links it has an entry point" in {
+      val src = SyslParser.parse(Source("lib.sysl",
+        "module demo\n\ncounter() -> i32 = 7\n\nval start: i32 = counter()\n\n" +
+          "@export\nbegin() -> i32 = start\n", List("demo"))) match
+        case Right(p) => p
+        case Left(e)  => fail(e)
+
+      Compiler.compileLibrary(List(src)) match
+        case Right((out, _)) =>
+          out should not include "@llvm.global_ctors"
+          out should not include "@sysl.module_init"
+        case Left(e) => fail(e)
     }
 
     // The other half of the ruling, and the reason it is not simply "no module storage": a constant
@@ -636,12 +734,23 @@ class ExportTests extends AnyFreeSpec with CodegenSupport with TestFrameworkSupp
         "@test\nt() = assert(1 == 1, \"one\")\n") should include("which C has no way to spell")
     }
 
-    // The rule most likely to be written by accident, and a silent wrong answer at run time rather
-    // than a link error — so the loop that never reported it was the worst one to be missing it from.
-    "an export reaching computed module storage" in {
-      testErr("module demo\n\ncounter() -> i32 = 7\n\nval start: i32 = counter()\n\n" +
+    /** **A test build fills its own module storage, so this is one refusal it does NOT inherit**
+      * (card `0263`).
+      *
+      * It used to, and the case was listed here for the reason every other one is: `sysl test` is
+      * the loop a package author actually runs, and a rule it stays silent about is a rule reported
+      * to nobody. What changed is that the rule stopped applying — `Codegen.genTestMain` lays the
+      * computed `val`s down exactly as an ordinary entry point does, so a test binary reads filled
+      * storage and always did. The refusal was over-broad rather than usefully early.
+      *
+      * The refusal that remains is a **freestanding archive**'s, which no test build can be: a test
+      * runs on the machine that built it. `ExportTests`' own "module storage" section is where it
+      * is asserted.
+      */
+    "while an export reaching computed module storage is fine, because a test build fills it" in {
+      testIr("module demo\n\ncounter() -> i32 = 7\n\nval start: i32 = counter()\n\n" +
         "@export\nbegin() -> i32 = start\n\n@test\nt() = assert(1 == 1, \"one\")\n") should
-        include("module storage an initializer fills")
+        include("define i32 @begin(")
     }
 
     // And the export a test build legitimately has stays legitimate: a `@tests` file's `@export` is

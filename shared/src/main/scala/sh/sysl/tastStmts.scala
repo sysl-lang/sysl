@@ -338,6 +338,24 @@ case class TProgram(
      * belonging to whatever links it.
      */
     entryPoint: Boolean = true,
+    /** Whether the artifact this compilation produces is one a **C project** links (`15 §12`) —
+     * `sysl build-c`, and `emit-header` beside it.
+     *
+     * It is a second question rather than `entryPoint` read backwards, because **two** kinds of
+     * build have no entry point and they answer differently about who fills the module storage
+     * (`13 §7`):
+     *
+     *   - a `.syslib` is linked by a sysl **program**, which has an entry point and lays the `val`s
+     *     down at the top of it — so `Compiler.compileLibrary` defers every function reaching one to
+     *     that program rather than emitting it here, and a constructor emitted alongside would fill
+     *     a copy of the storage nothing reads;
+     *   - a **C** archive is linked by a project that supplies its own `main`, so nothing else is
+     *     ever going to fill it and `Codegen.genModuleInit` registers a constructor that does.
+     *
+     * Reading `!entryPoint` as the second of those was card `0263`'s first shape and would have put
+     * a constructor into every `.syslib`.
+     */
+    cArtifact: Boolean = false,
     /** The modules that declared `no alloc` (`13 §4`). The analyzer has already held each of them to
      * making no heap storage of its own; what this carries the answer forward for is the one
      * allocation no expression in the tree spells — the **promotion** of a local array whose slice

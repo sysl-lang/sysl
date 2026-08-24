@@ -275,6 +275,134 @@ class ExportCliTests extends LibraryCliSupport {
     run.stdout.trim shouldBe "hello 7"
   }
 
+  /** **A module that keeps a `Buf` at module scope**, which is the shape card `0263` is about and
+    * the one an archive could not hold at all until it landed.
+    *
+    * `squares` is *computed* storage: nothing about `fill()` is data an object file can carry, so
+    * the value has to be built by something that runs. A program builds it at the top of `@main`;
+    * an archive has no `@main`, and until `0263` the export reaching it was refused outright — so a
+    * boundary layer linked into a C project could hold no `Buf`, no closure and no counted value,
+    * however it was reached.
+    */
+  private val counted =
+    """module mylib
+      |
+      |import sysl.buf.{Buf, buf}
+      |
+      |val squares: Buf[i32] = fill()
+      |
+      |fill() -> Buf[i32]
+      |    var b: Buf[i32] = buf()
+      |
+      |    for i in 1..<4
+      |        b.push(i32(i) * i32(i))
+      |
+      |    b
+      |
+      |@export("mylib_count")
+      |count() -> i32 = i32(squares.len())
+      |
+      |@export("mylib_at")
+      |at(i: i32) -> i32 = squares[usize(i)]
+      |""".stripMargin
+
+  /** **A closure at module scope, which is the shape the card was actually filed from.**
+    *
+    * `sysl-lang/skitter` wanted an application to register what happens when the system bars move —
+    * `var sink: &Fn(int, int, int, int) -> unit` — and could not have one, so it stored four bare
+    * `int`s and offered them to be pulled instead. This is that in miniature: a counted reference in
+    * module storage, written by one export and called through another.
+    *
+    * It is a second module rather than another export on `counted` because it asks a different
+    * question of the constructor. A `Buf` is storage the initializer *builds*; a `&Fn` is a
+    * reference the initializer has to take a **count** of, which is the half of `genInitStore`
+    * that an ordinary assignment does not do.
+    */
+  private val callback =
+    """module mylib
+      |
+      |import sysl.buf.{Buf, buf}
+      |
+      |var seen: Buf[i32] = buf()
+      |
+      |var sink: &Fn(i32) -> unit = (n) -> seen.push(n * 2)
+      |
+      |@export("mylib_fire")
+      |fire(n: i32) = sink(n)
+      |
+      |@export("mylib_last")
+      |last() -> i32 = if seen.len() == 0 then -1 else seen[seen.len() - 1]
+      |""".stripMargin
+
+  "and a closure it holds at module scope, which is what the card was filed from" in {
+    assume(Toolchain.clangAvailable, "clang not available")
+
+    val (archive, header) = built(callback)
+    val dir               = createTempDirectory("sysl-c-callback-")
+    val source            = s"$dir/main.c"
+    val exe               = s"$dir/caller"
+
+    writeFile(source,
+      s"""#include <stdio.h>
+         |#include "$header"
+         |
+         |int main(void) {
+         |    printf("%d ", mylib_last());
+         |    mylib_fire(21);
+         |    printf("%d\\n", mylib_last());
+         |    return 0;
+         |}
+         |""".stripMargin)
+
+    val build = exec(Seq("clang", source, archive, "-o", exe))
+
+    withClue(build.stderr)(build.exitCode shouldBe 0)
+
+    val run = exec(Seq(exe))
+
+    withClue(run.stderr)(run.exitCode shouldBe 0)
+    run.stdout.trim shouldBe "-1 42"
+  }
+
+  /** **The acceptance test for `0263`, and the only thing that can answer it.** Everything the
+    * compiler decides here can be read off the IR — `ExportTests` does exactly that — and none of
+    * it proves that a real loader calls the constructor before a real C `main`. This links the
+    * archive with clang and asks the C side for numbers only a filled `Buf` has.
+    *
+    * `1 4 9` and not zeros: an archive whose constructor never ran answers a length of nothing, so
+    * the count alone would catch it, and the elements say the storage holds what sysl put there
+    * rather than merely something.
+    */
+  "a C program reads module storage a constructor filled, which an archive has no 'main' to fill" in {
+    assume(Toolchain.clangAvailable, "clang not available")
+
+    val (archive, header) = built(counted)
+    val dir               = createTempDirectory("sysl-c-counted-")
+    val source            = s"$dir/main.c"
+    val exe               = s"$dir/caller"
+
+    writeFile(source,
+      s"""#include <stdio.h>
+         |#include "$header"
+         |
+         |int main(void) {
+         |    printf("%d", mylib_count());
+         |    for (int i = 0; i < mylib_count(); i++) printf(" %d", mylib_at(i));
+         |    printf("\\n");
+         |    return 0;
+         |}
+         |""".stripMargin)
+
+    val build = exec(Seq("clang", source, archive, "-o", exe))
+
+    withClue(build.stderr)(build.exitCode shouldBe 0)
+
+    val run = exec(Seq(exe))
+
+    withClue(run.stderr)(run.exitCode shouldBe 0)
+    run.stdout.trim shouldBe "3 1 4 9"
+  }
+
   /** Seven is a number only the C knows and the multiplication is only the sysl's, so an archive that
    * dropped either object cannot answer 42 — and the one it drops is the one this section is about.
    */
