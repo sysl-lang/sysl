@@ -331,6 +331,156 @@ class DocCommentTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  "the check reaches a reader, through a whole compilation" - {
+    /** The rendered diagnostics of a program that must be rejected. */
+    def diag(src: String): String =
+      Compiler.compileToLlvm(src, "t.sysl") match
+        case Left(e)  => e
+        case Right(_) => fail(s"expected an error from:\n$src")
+
+    /** A program that must compile. */
+    def ok(src: String): Unit =
+      Compiler.compileToLlvm(src, "t.sysl") match
+        case Left(e)  => fail(s"expected this to compile, got:\n$e")
+        case Right(_) => ()
+
+    "a `@param` naming nothing in the signature stops the compilation" in {
+      val out = diag(
+        """/** Adds.
+          | * @param z one of them
+          | */
+          |add(a: int, b: int) -> int = a + b
+          |
+          |print(add(1, 2))
+          |""".stripMargin)
+
+      out should include("'z' is not a parameter of this declaration — it has a, b")
+    }
+
+    "and it points at the tag's own line, not at the declaration" in {
+      val out = diag(
+        """/** Adds.
+          | * @param z one of them
+          | */
+          |add(a: int, b: int) -> int = a + b
+          |
+          |print(add(1, 2))
+          |""".stripMargin)
+
+      out should include("t.sysl:2")
+    }
+
+    "a correct doc comment compiles, tags and all" in {
+      ok(
+        """/** Adds two numbers.
+          | *
+          | * @param a the first
+          | * @param b the second
+          | * @return their sum
+          | */
+          |add(a: int, b: int) -> int = a + b
+          |
+          |print(add(1, 2))
+          |""".stripMargin)
+    }
+
+    "an undocumented parameter compiles, which is the property that matters" in {
+      ok(
+        """/** Adds two numbers.
+          | *
+          | * @param a the first
+          | */
+          |add(a: int, b: int) -> int = a + b
+          |
+          |print(add(1, 2))
+          |""".stripMargin)
+    }
+
+    "a `@tparam` on a generic function is checked against its type parameters" in {
+      val out = diag(
+        """/** The first.
+          | * @tparam E the element
+          | */
+          |first[T](xs: []const T) -> T = xs[0]
+          |
+          |print(first([1, 2, 3]))
+          |""".stripMargin)
+
+      out should include("'E' is not a type parameter of this declaration — it has T")
+    }
+
+    "a member inside a struct is checked like any other declaration" in {
+      val out = diag(
+        """struct Point
+          |    x: int
+          |    y: int
+          |
+          |    /** Moves it.
+          |     * @param dz how far
+          |     */
+          |    shift(self, dx: int) -> Point = Point(self.x + dx, self.y)
+          |
+          |print(Point(1, 2).shift(1).x)
+          |""".stripMargin)
+
+      out should include("'dz' is not a parameter of this declaration — it has self, dx")
+    }
+
+    "and its receiver is a parameter it may document, though never one it must" in {
+      // `self` is the receiver rather than an entry in `params`, which is a real distinction to the
+      // analyzer and none at all to somebody writing the prose. Refusing the one tag a reader is
+      // most likely to reach for on a method would be pedantry about a real part of the signature.
+      ok(
+        """struct Point
+          |    x: int
+          |    y: int
+          |
+          |    /** Moves it.
+          |     * @param self the point being moved
+          |     * @param dx how far
+          |     */
+          |    shift(self, dx: int) -> Point = Point(self.x + dx, self.y)
+          |
+          |print(Point(1, 2).shift(1).x)
+          |""".stripMargin)
+    }
+
+    "a doc comment nothing is wrong with does not stop a generic function nobody instantiates" in {
+      // The declaration pass is the point: this is checked whether or not a body is ever walked.
+      ok(
+        """/** Never called.
+          | * @tparam T the element
+          | * @param xs the slice
+          | */
+          |unused[T](xs: []const T) -> usize = xs.len
+          |
+          |print(1)
+          |""".stripMargin)
+    }
+
+    "and a WRONG one on that same uninstantiated function is still refused" in {
+      val out = diag(
+        """/** Never called.
+          | * @param items the slice
+          | */
+          |unused[T](xs: []const T) -> usize = xs.len
+          |
+          |print(1)
+          |""".stripMargin)
+
+      out should include("'items' is not a parameter of this declaration — it has xs")
+    }
+
+    "an ordinary comment above a declaration is not a doc comment, so nothing is checked" in {
+      ok(
+        """// @param z one of them
+          |add(a: int, b: int) -> int = a + b
+          |
+          |print(add(1, 2))
+          |""".stripMargin)
+    }
+  }
+
   "which declaration a comment belongs to" - {
     val source = (src: String) => Source("test.sysl", src)
 

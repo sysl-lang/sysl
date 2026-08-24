@@ -337,6 +337,14 @@ trait ProgramWalk extends OpaqueResults {
     // Read off the declarations for the same reason (`15 §12`).
     checkExports()
 
+    // And a doc comment's tags against the signature it sits above — the same reason a third time,
+    // plus one of its own: a doc comment belongs to the *file* the lexer found it in and is placed
+    // by a line number, and hoisting is where a declaration stops remembering which file wrote it.
+    // So this walks `units` rather than the tables. Only what the tags NAME is checked; a parameter
+    // with no `@param` is not an error and must not become one.
+    for u <- units; (tag, message) <- DocComments.problems(u) do
+      recover(())(at(Some(Pos(u.source, tag.line, 1, tag.line, 1)))(err(message)))
+
     val (fromLibrary, ours) = funcDecls.values.toList
       .filter(f => f.tparams.isEmpty && !externDecls.contains(f.name))
       .partition(suppliedByLibrary)

@@ -227,6 +227,59 @@ object DocComments {
     wrong(doc.params, params, "parameter") ::: wrong(doc.tparams, tparams, "type parameter")
   }
 
+  /** Every doc comment in a file that is wrong about the declaration it sits above.
+   *
+   * **A declaration pass over the file's own statements, not over the hoisted tables**, for the
+   * reason `ConventionCheck` gives and one of its own. The shared reason is that this is a claim
+   * about a *signature*, which exists whether or not a body is ever analyzed — a generic function
+   * nothing instantiates has a doc comment exactly as wrong as one that is called everywhere.
+   *
+   * The reason of its own is that a doc comment belongs to a **file**: it was found by the lexer
+   * that scanned that file, and it is placed by a line number that means nothing anywhere else.
+   * Hoisting is where a declaration stops remembering which file wrote it, so a check that ran off
+   * the hoisted tables would have to reconstruct the association it is standing next to here.
+   *
+   * Members are walked with their type, because a method inside a `struct` is a declaration a reader
+   * documents like any other and the enclosing declaration's own doc comment is a different one.
+   */
+  def problems(program: Program): List[(Tag, String)] = {
+    val source = program.source
+
+    def at(line: Option[Int], params: List[String], tparams: List[String]): List[(Tag, String)] =
+      line.flatMap(l => above(source, program.docs, l)).toList.flatMap(check(_, params, tparams))
+
+    /** A member's receiver counts as a parameter it may document.
+     *
+     * `self` is not in `params` — it is the receiver, which is a different thing to the analyzer and
+     * is why it does not appear there. It is spelled in the declaration all the same, so somebody
+     * writing `@param self` is describing a real part of the signature, and refusing that would be
+     * pedantry about the one tag a reader is most likely to reach for on a method. It is admitted
+     * rather than required, like every other parameter.
+     */
+    def method(m: MethodDecl): List[(Tag, String)] = {
+      val receiver = if m.receiver.isDefined then List("self") else Nil
+
+      at(m.pos.map(_.line), receiver ::: m.params.map(_.name), m.tparams)
+    }
+
+    // A `MethodDecl` is deliberately absent from this match and is not an omission: it is not a
+    // `Stmt`, so it never stands in a file's body. Every member is reached through the declaration
+    // that holds it, which is the four cases below — and an `impl` block is one of them, because a
+    // method written there is documented exactly like a method written in the type.
+    def decl(stmt: Stmt): List[(Tag, String)] = stmt match
+      case f: FuncDecl => at(f.pos.map(_.line), f.params.map(_.name), f.tparams)
+      // A struct's fields are not parameters, so only its type parameters are checkable here. A
+      // `@param` naming a field is therefore refused, which is right: the tag for a field would be
+      // a different tag, and inventing one silently is worse than saying the tag does not fit.
+      case s: StructDecl => at(s.pos.map(_.line), Nil, s.tparams) ::: s.members.flatMap(method)
+      case e: EnumDecl   => at(e.pos.map(_.line), Nil, e.tparams) ::: e.members.flatMap(method)
+      case t: TraitDecl  => at(t.pos.map(_.line), Nil, t.tparams) ::: t.methods.flatMap(method)
+      case i: ImplDecl   => i.methods.flatMap(method)
+      case _             => Nil
+
+    program.body.flatMap(decl)
+  }
+
   /** The doc comment immediately above `line`, if there is one.
    *
    * **Immediately** allows annotations and blank-free whitespace in between, and nothing else. An
