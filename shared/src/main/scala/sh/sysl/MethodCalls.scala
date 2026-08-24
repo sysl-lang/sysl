@@ -396,6 +396,9 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
     val (passed, tail) = args.splitAt(fd.params.length - 1)
     val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)((ref, _) => spellSelf(_, ref))
     val ptypes      = fd.params.tail.map(p => spell(p.typ))
+    // The bounds go through it too, because a bare arrow's shape lives in one rather than in the
+    // parameter — see `spellSelfBounds`.
+    val mbounds     = spellSelfBounds(m.bounds, spell)
     // The receiver's arguments, handed to the inference as already answered. `synthesize` lays the
     // owner's parameters ahead of the member's own in one list, which is what makes the `zip` the
     // whole of the pairing — it stops at the shorter, and the shorter is always the owner's.
@@ -419,7 +422,7 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
       else mine.zip(writtenTypeArgs(m.name, mine, m.tvalues, m.tpacks, writtenTargs, atCall = true)).toMap
 
     val provisional =
-      provisionalArgs(fd.name, fd.tparams, ptypes, passed, m.bounds, ownerSeed ++ written,
+      provisionalArgs(fd.name, fd.tparams, ptypes, passed, mbounds, ownerSeed ++ written,
         result = fd.retType.map(spell), expected = expected)
 
     val own =
@@ -434,7 +437,7 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
           fd.retType.map(spell),
           expected,
           passed.zip(provisional).map((a, t) => adaptable(a, t)),
-          fd.bounds,
+          spellSelfBounds(fd.bounds, spell),
           written,
         ))
 
@@ -444,7 +447,7 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
     // own list can answer. Reading `fd.bounds` here would sweep the owner's own bounds in as well
     // and report anything unmet a second time, having already been said where the receiver's type
     // was made.
-    inDecl(fd.name)(checkParamBounds(shown, m.tparams, m.bounds, own, ownerSeed))
+    inDecl(fd.name)(checkParamBounds(shown, m.tparams, mbounds, own, ownerSeed))
 
     val name            = instantiateFunc(fd, ownerArgs ::: own)
     val (params, rtype) = funcInsts(name)

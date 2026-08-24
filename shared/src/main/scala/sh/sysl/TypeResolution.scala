@@ -124,6 +124,23 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
     // A `some` result names no type, so there is no `Self` in it to spell.
     case s: SomeType          => s
 
+  /** The same rewrite over a declaration's **bounds**, whose arguments are written types exactly as
+   * its parameters are.
+   *
+   * A bound is where the arrow sugar puts what the author wrote in a parameter list
+   * (`MemberLowering.callBounds`), so `f: Self::Item -> N` leaves `Self` in a bound and nowhere
+   * else — and a call reads that bound to say what the closure standing there takes. Spelling the
+   * parameters and leaving the bounds alone therefore looks complete and is not: a member inherited
+   * from a trait's default keeps the word `Self`, deliberately, so that its signature goes on being
+   * read in the trait's own module, and the one place a call could not put the implementing type
+   * back was the half nothing rewrote.
+   */
+  protected def spellSelfBounds(
+      bounds: Map[String, List[BoundRef]],
+      spell: TypeRef => TypeRef,
+  ): Map[String, List[BoundRef]] =
+    bounds.map((tp, refs) => tp -> refs.map(b => BoundRef(b.name, b.args.map(spell)).setPos(b.pos)))
+
   protected def resolveBound(b: BoundRef, subst: Map[String, Type]): Type.Bound = at(b.pos) {
     val written = b.args.map(resolveType(_, subst))
     val key     = traitKey(b.name)
