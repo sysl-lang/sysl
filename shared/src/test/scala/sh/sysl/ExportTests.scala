@@ -285,7 +285,7 @@ class ExportTests extends AnyFreeSpec with CodegenSupport with TestFrameworkSupp
    * artifact is linked into a C project that supplies the `main`. That is the whole of what
    * `Main.cLibrary` decides, and it is the shape every assertion about module storage is about.
    */
-  private def archive(src: String, target: Target = Target.default): Either[String, String] =
+  private def archive(src: String, target: Target): Either[String, String] =
     Compiler.compiledWith(List(Source("<input>", src)), Nil, target, entryPoint = false).map(_.ir)
 
   /** The IR of such an archive, which must compile. */
