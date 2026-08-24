@@ -24,6 +24,13 @@ trait GenericInstantiation extends ConstFolding {
   protected def leastArgs(tparams: List[String], tdefaults: Map[String, TypeRef]): Int
   protected def cycleCheck(key: String): Unit
 
+  /** An instantiation's own fields, resolved outside whatever *type argument* position the
+   * instantiation itself was written in — `TypeResolution` again, and for the same reason as
+   * `cycleCheck`: a cycle among an instantiation's fields is the ordinary kind, whatever the
+   * argument list it was reached through.
+   */
+  protected def outsideTypeArgs[A](resolve: => A): A
+
   /** How an arity is described when it is wrong -- "1 type argument", "between 1 and 3". Shared with
    * the trait-arity check, which asks the same question of a trait's parameter list.
    */
@@ -150,7 +157,8 @@ trait GenericInstantiation extends ConstFolding {
         // here: an entry left in `inProgress` would make the next mention of this type look
         // like a cycle, which is a diagnostic about nothing at all.
         try
-          s.fields = decl.fields.map(f => (f.name, recover(Type.Unknown)(resolveQualified(f.typ, subst))))
+          s.fields = outsideTypeArgs(
+            decl.fields.map(f => (f.name, recover(Type.Unknown)(resolveQualified(f.typ, subst)))))
           s.packed = decl.packed
           s.minAlign = decl.alignment.flatMap(a => recover(Option.empty[Int])(alignBound(decl.name, a)))
           // The declared name where `@export` carried no string, which is the reading it has on a
@@ -346,7 +354,7 @@ trait GenericInstantiation extends ConstFolding {
         val subst    = decl.tparams.zip(targs).toMap
         var nextTag = 0
         try
-          en.variants = decl.variants.map { v =>
+          en.variants = outsideTypeArgs(decl.variants.map { v =>
             if en.simple then
               def fitting(n: BigInt): Int =
                 if !Type.fits(n, en.underlying) then
@@ -368,7 +376,7 @@ trait GenericInstantiation extends ConstFolding {
               val tag    = nextTag; nextTag += 1
               val fields = v.fields.map(f => (f.name, recover(Type.Unknown)(resolveType(f.typ, subst))))
               Type.EnumVariant(v.name, tag, fields, fields.nonEmpty)
-          }
+          })
 
           // A simple enum's value *is* its identity — there is nothing else to tell two variants
           // apart — so two names for one value leave the language unable to keep its own promises:

@@ -531,7 +531,7 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
     // point knows a pack was written.
     case TupleType(List(PackType(n)), _) =>
       subst.get(n) match
-        case Some(Type.Pack(elems)) => tupleType(elems)
+        case Some(Type.Pack(elems)) => tupleType(elems.map(substituted))
         case Some(other) =>
           err(s"'..$n' is written as a type pack, and '$n' stands for ${show(other)} — a pack is " +
             "declared '[..A]' and a single type '[A]'")
@@ -607,7 +607,7 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
         s"result 'Self::Name'")
 
     case NamedType(n, argRefs) =>
-      if argRefs.isEmpty && subst.contains(n) then subst(n)
+      if argRefs.isEmpty && subst.contains(n) then substituted(subst(n))
       else
         val targs = resolveArgs(n, argRefs, subst)
         scalarType(n) match
@@ -660,14 +660,14 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
   private def resolveArgs(n: String, argRefs: List[TypeRef], subst: Map[String, Type]): List[Type] = {
     val values = typeKey(n).fold(Map.empty[String, TypeRef])(nominalValues)
 
-    if values.isEmpty then argRefs.map(resolveType(_, subst))
+    if values.isEmpty then argRefs.map(ref => underTypeArg(resolveType(ref, subst)))
     else
       val tparams = typeKey(n).fold(List.empty[String])(nominalTparams)
 
       argRefs.zipWithIndex.map { (ref, i) =>
         tparams.lift(i).filter(values.contains) match
           case Some(tp) => valueArg(ref, recover(Type.Unknown)(resolveType(values(tp), Map.empty)), subst)
-          case None     => resolveType(ref, subst)
+          case None     => underTypeArg(resolveType(ref, subst))
       }
   }
 
@@ -1029,9 +1029,50 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
   /** Whether reaching an in-progress instantiation again is a legal cycle. It is exactly when
    * at least one indirection was crossed on the way back to it: a `Node` holding a `*Node` is
    * pointer-sized, while a `Node` holding a `Node` by value has no finite size.
+   *
+   * **A type argument is not an answer to this question and is left alone.** `Buf[Node]` reaches
+   * `Node` while `Node` is still being resolved, and whether that is containment depends on how
+   * `Buf` uses its parameter: `Buf` holds a `[]T`, which is an indirection, and a `Wrap` holding a
+   * bare `T` is not. So the argument's own resolution says nothing, and the question is asked again
+   * at every *use* of the substitution inside the instantiation — where the indirection count is the
+   * one that matters. `resolveShape`'s substitution case is the other half of this.
    */
   protected def cycleCheck(key: String): Unit =
-    if indirection <= resolving(key) then err(s"type '${qn(key)}' contains itself, so it has no finite size")
+    if typeArgDepth == 0 && indirection <= resolving(key) then
+      err(s"type '${qn(key)}' contains itself, so it has no finite size")
+
+  /** A type argument's resolution, which reaching an in-progress type inside does not condemn. */
+  protected def underTypeArg[A](resolve: => A): A = {
+    typeArgDepth += 1
+    try resolve
+    finally typeArgDepth -= 1
+  }
+
+  /** An instantiation's own fields, resolved outside whatever type-argument position the
+   * instantiation itself was written in — a cycle among *these* is the ordinary kind again.
+   */
+  protected def outsideTypeArgs[A](resolve: => A): A = {
+    val saved = typeArgDepth
+
+    typeArgDepth = 0
+    try resolve
+    finally typeArgDepth = saved
+  }
+
+  /** What a type parameter stands for, asked the containment question the argument position
+   * deferred: a `T` used **by value** here is the containing type held by value, whatever
+   * indirection the parameter was written behind.
+   */
+  private def substituted(t: Type): Type = {
+    val key = t match
+      case s: Type.Struct => Some(Type.instanceKey(s.base, s.targs))
+      case e: Type.Enum   => Some(Type.instanceKey(e.base, e.targs))
+      case _              => None
+
+    for k <- key if resolving.contains(k) do cycleCheck(k)
+
+    t
+  }
 
   /** The rules a declared signature must satisfy whichever declaration form it came from, checked
    * after the name is registered so a failure reports the mistake without also erasing the

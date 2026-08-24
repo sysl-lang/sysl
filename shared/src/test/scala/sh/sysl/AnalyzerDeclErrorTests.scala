@@ -86,6 +86,23 @@ class AnalyzerDeclErrorTests extends AnyFreeSpec with CodegenSupport {
       err("struct Node\n    next: Node\nvar n = Node(n)") should include("contains itself")
     }
 
+    // **A type argument is not containment, and what decides is how the generic uses it.** Reaching
+    // an in-progress type while resolving `Wrap[Node]`'s argument says nothing on its own — the
+    // question is asked again where the substitution is *used*, which for a bare `T` field is by
+    // value at no indirection at all. So this is still refused, and the caret lands on the field
+    // that holds it rather than on the argument list that mentioned it.
+    "a generic that holds its parameter by value still contains what it is given" in {
+      err("""struct Wrap[T]
+            |    x: T
+            |struct Node
+            |    w: Wrap[Node]
+            |var n: Node
+            |""".stripMargin) should include("type 'Node' contains itself")
+    }
+
+    // The same question the other way round is `StructRunTests`' "a struct whose children are a
+    // growable sequence of itself", which is a run test because compiling it is only half the claim.
+
     // `09 §3` says the same of a variant, and it has to be caught *here* rather than at layout: the
     // model that sizes a data enum's payload region walks its variants, so a type that reached
     // itself would be an unbounded walk in the compiler instead of a diagnostic.

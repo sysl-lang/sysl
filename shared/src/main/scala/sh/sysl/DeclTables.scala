@@ -545,6 +545,16 @@ trait DeclTables extends Reporting {
   /** How many `*T` / `&T` wrappers the resolver is currently inside. */
   protected var indirection = 0
 
+  /** How many **type argument** positions the resolver is currently inside.
+   *
+   * A type argument is not itself containment: `Buf[Node]` holds a `[]Node`, which is an
+   * indirection, and `Wrap[Node]` over `struct Wrap[T] { x: T }` holds a `Node` by value. Which of
+   * those it is is the *instantiated* type's business and cannot be read off the argument, so
+   * reaching an in-progress type here is left alone and the question is asked again where the
+   * substitution is used — see `cycleCheck` and the `subst` case in `resolveShape`.
+   */
+  protected var typeArgDepth = 0
+
   /** Instantiated function signatures, keyed by the name codegen will emit. */
   protected val funcInsts = mutable.LinkedHashMap.empty[String, (List[(String, Type)], Type)]
 
