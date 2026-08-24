@@ -329,9 +329,51 @@ class SyslLexical
    * built over the reader in front of them and so report an end at or before their own start. They
    * occupy no characters, which is what a caller clamping the end to the start gets right anyway.
    */
+  /** The documentation comments the last scan passed over, by the offset each one starts at.
+   *
+   * A comment is trivia and stays trivia: none of these reaches the token stream, no grammar rule
+   * can see one, and nothing in the analyzer reads this. It is here for the things that want a
+   * declaration's prose rather than its meaning — a generator, an editor's hover text — and
+   * `DocComments.attach` is what turns it into an answer about declarations.
+   *
+   * **Keyed by offset because the lexer may report one comment twice**, which
+   * `IndentationLexical.comment` documents: deciding whether a line continues the one above runs
+   * the line-prefix skip over the next line before that line is scanned for real. A map makes the
+   * second report a no-op; a buffer would have made it a duplicate paragraph in somebody's
+   * generated documentation.
+   */
+  private val docs = scala.collection.mutable.LinkedHashMap.empty[Int, (Int, String)]
+
+  /** Only the documentation form, `/** … */`, and never the empty block comment `/**/`.
+   *
+   * The delimiter is what tells a comment written for a reader of the *documentation* from one
+   * written for a reader of the *code*, and it is the whole of the distinction — an ordinary block
+   * comment and every `//` line stay invisible, which is what lets an implementation note sit above
+   * a declaration without being published.
+   *
+   * `/**/` opens with those three characters and is an empty comment rather than a doc comment,
+   * which is worth excluding here rather than discovering as an empty paragraph later.
+   */
+  override protected def comment(from: Reader[Char], to: Reader[Char]): Unit = {
+    val start = from.offset
+    val end   = to.offset
+    val text  = from.source.subSequence(start, end).toString
+
+    if text.startsWith("/**") && text != "/**/" then docs(start) = (end, text)
+  }
+
+  /** The doc comments of the last `scanPositioned`, in source order. */
+  def docComments: List[(Int, Int, String)] =
+    docs.toList.sortBy(_._1).map((start, rest) => (start, rest._1, rest._2))
+
   def scanPositioned(s: String): List[(Token, Position, Int)] = {
     val buf = ListBuffer.empty[(Token, Position, Int)]
-    var t   = read(new CharSequenceReader(s))
+
+    // A lexer instance is reused across scans — `reader` builds one per parse — so the previous
+    // scan's comments have to go, or a second file inherits the first file's prose.
+    docs.clear()
+
+    var t = read(new CharSequenceReader(s))
 
     while (!t.atEnd) {
       // `first` and `pos` are read before `rest`, which is what advances the lexer's own state.

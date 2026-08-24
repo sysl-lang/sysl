@@ -111,6 +111,13 @@ type HeaderClause = CapabilityClause | LinkClause | IncludeClause | TestsClause
  * `sysl test` and dropped by every other build. It is a `Boolean` rather than the clause because
  * nothing downstream has anything to ask of it but whether it was written — the position a
  * diagnostic wants belongs to the declaration it is about, not to the header.
+ *
+ * `docs` is the file's `/** … */` comments, which are **not part of the tree**. They sit beside the
+ * body rather than on the nodes they describe, and that is the design rather than an expedient: a
+ * doc comment changes nothing about what a declaration means, so putting it on the node would mean
+ * every walk, every pattern match and every codec entry carrying a field no analysis reads. What
+ * wants them — a generator, an editor's hover text — asks `DocComments.above` for the prose above a
+ * line, which is the same question a reader asks.
  */
 case class Program(
     body: List[Stmt],
@@ -120,4 +127,5 @@ case class Program(
     source: Source,
     testOnly: Boolean = false,
     includes: List[IncludeClause] = Nil,
+    docs: List[DocComments.Doc] = Nil,
 )

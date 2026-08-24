@@ -215,7 +215,10 @@ class SyslParser(val source: Source, val recovering: Boolean = false) extends Co
                   clauses.collect { case l: LinkClause => l },
                   source,
                   clauses.exists(_.isInstanceOf[TestsClause]),
-                  clauses.collect { case i: IncludeClause => i })
+                  clauses.collect { case i: IncludeClause => i },
+                  // The lexer collected these while scanning, so they are read off it rather than
+                  // parsed: a comment reaches no grammar rule, which is what keeps it trivia.
+                  DocComments.of(source, lexical.docComments))
       }
     }
 
