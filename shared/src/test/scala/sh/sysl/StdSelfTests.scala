@@ -65,8 +65,14 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * **`sysl.fs`'s are the first tests that depend on the library's own C**, so this floor now guards
    * a second thing: a build that stopped compiling or stopped linking the shim under
    * `library/sysl/fs/__<os>__` fails outright rather than quietly collecting fewer tests.
+   *
+   * Raised to **433** when `sysl.math.matrix` arrived with 43 of its own. That raise also closed a
+   * drift of the kind this comment has recorded once before and which had grown larger than it: the
+   * tree was collecting 390 while the floor still read 343, so a whole module's worth could have
+   * stopped being found with nothing said. The number below is the tree's exact count again, which
+   * is the only setting that proves a new file is collected rather than silently skipped.
    */
-  private val floor = 343
+  private val floor = 433
 
   /** The library, compiled as a **test build of itself**.
    *

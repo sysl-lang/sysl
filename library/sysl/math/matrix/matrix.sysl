@@ -1,10 +1,13 @@
-// Matrices over any field — the other half of the vector space, and the two products whose results
-// are different types.
+module sysl.math.matrix
+
+import sysl.buf.{Buf, buf}
+
+// Matrices over any `Scalar`, and the two products whose results are different types.
 //
 // `A * v` gives a vector and `A * B` gives a matrix, so one type carries three implementations of one
 // trait: `Mul[Vector[T], Vector[T]]`, `Mul` and `Mul[T]`. Each is selected by the type of the right
 // operand, and each declares what it hands back. Nothing here is a method that wanted to be an
-// operator, which is the whole point of the exercise.
+// operator.
 //
 // **The matrix product is the defaulted one**, written `impl[T: Scalar] Mul for Matrix[T]`: its
 // operand and its result are both `Self`, which is what the trait's own defaults already say. Writing
@@ -13,13 +16,44 @@
 //
 // The cells are stored row-major in one `&Buf[T]`, so a matrix is a handle exactly as a vector is:
 // the operators build fresh matrices and `copy` is how a caller stops sharing.
-
-import sysl.buf.{Buf, buf}
-
 struct Matrix[T: Scalar]
     rows: int
     cols: int
     cells: &Buf[T]
+
+    // --- The matrices that need no receiver, reached through the type. ---
+
+    zeros(rows: int, cols: int) -> Matrix[T]
+        var cells: Buf[T] = buf()
+
+        for i in 0..<rows * cols do cells.push(T.zero())
+
+        Matrix(rows, cols, cells)
+    end zeros
+
+    // A matrix from the numbers a program wrote, read row by row.
+    of(rows: int, cols: int, xs: []const T) -> Matrix[T]
+        require int(xs.len) == rows * cols, "a matrix needs exactly rows * cols cells"
+
+        var out: Matrix[T] = Matrix.zeros(rows, cols)
+
+        for i in 0..<rows
+            for j in 0..<cols do out.set(i, j, xs[i * cols + j])
+
+        out
+    end of
+
+    // The identity, which needs both of the element type's identities -- a zero everywhere and a one
+    // down the diagonal -- and is where the pair of core traits earns its second member.
+    identity(n: int) -> Matrix[T]
+        var out: Matrix[T] = Matrix.zeros(n, n)
+
+        for i in 0..<n do out.set(i, i, T.one())
+
+        out
+    end identity
+
+    // --- What a matrix is, read off it. ---
 
     at(self, i: int, j: int) -> T = self.cells.at(usize(i * self.cols + j))
 
@@ -28,21 +62,34 @@ struct Matrix[T: Scalar]
     is_square(self) -> bool = self.rows == self.cols
 
     row(self, i: int) -> Vector[T]
-        var out: Vector[T] = zeros(self.cols)
+        var out: Vector[T] = Vector.zeros(self.cols)
 
         for j in 0..<self.cols do out.set(j, self.at(i, j))
 
         out
 
     col(self, j: int) -> Vector[T]
-        var out: Vector[T] = zeros(self.rows)
+        var out: Vector[T] = Vector.zeros(self.rows)
 
         for i in 0..<self.rows do out.set(i, self.at(i, j))
 
         out
 
+    // The sum of the diagonal, which needs no elimination and no invertibility. It is the other
+    // similarity invariant beside the determinant: `trace(AB)` and `trace(BA)` agree even where the
+    // products themselves do not.
+    trace(self) -> T
+        require self.is_square(), "a trace needs a square matrix"
+
+        var total = T.zero()
+
+        for i in 0..<self.rows do total += self.at(i, i)
+
+        total
+    end trace
+
     copy(self) -> Matrix[T]
-        var out: Matrix[T] = zero_matrix(self.rows, self.cols)
+        var out: Matrix[T] = Matrix.zeros(self.rows, self.cols)
 
         for i in 0..<self.rows
             for j in 0..<self.cols do out.set(i, j, self.at(i, j))
@@ -51,7 +98,7 @@ struct Matrix[T: Scalar]
     end copy
 
     transpose(self) -> Matrix[T]
-        var out: Matrix[T] = zero_matrix(self.cols, self.rows)
+        var out: Matrix[T] = Matrix.zeros(self.cols, self.rows)
 
         for i in 0..<self.rows
             for j in 0..<self.cols do out.set(j, i, self.at(i, j))
@@ -59,7 +106,7 @@ struct Matrix[T: Scalar]
         out
     end transpose
 
-    // Exchanging two rows in place — what the pivot search does, and the one operation on a matrix
+    // Exchanging two rows in place -- what a pivot search does, and the one operation on a matrix
     // that is not a fresh value.
     swap_rows(*self, a: int, b: int)
         if a == b then return
@@ -71,6 +118,8 @@ struct Matrix[T: Scalar]
             self.set(b, j, t)
     end swap_rows
 
+    // Agreement to within a tolerance, for the same reason `Vector.near` exists: `==` is exact and
+    // floating point almost never wants it.
     near(self, rhs: Matrix[T], tol: real) -> bool
         if self.rows != rhs.rows || self.cols != rhs.cols then return false
 
@@ -80,50 +129,37 @@ struct Matrix[T: Scalar]
 
         true
     end near
-
-    text(self) -> string
-        var out = ""
-
-        for i in 0..<self.rows
-            if i > 0 then out += "; "
-            out += self.row(i).text()
-
-        out
-    end text
 end Matrix
 
-zero_matrix[T: Scalar](rows: int, cols: int) -> Matrix[T]
-    var cells: Buf[T] = buf()
+impl[T: Scalar] Eq for Matrix[T]
+    eq(self, rhs: Matrix[T]) -> bool
+        if self.rows != rhs.rows || self.cols != rhs.cols then return false
 
-    for i in 0..<rows * cols do cells.push(T.zero())
+        for i in 0..<self.rows
+            for j in 0..<self.cols
+                if self.at(i, j) != rhs.at(i, j) then return false
 
-    Matrix(rows, cols, cells)
+        true
+    end eq
 
-// A matrix from the numbers a program wrote, read row by row.
-matrix[T: Scalar](rows: int, cols: int, xs: []const T) -> Matrix[T]
-    require int(xs.len) == rows * cols, "a matrix needs exactly rows * cols cells"
+// Rows separated by `; `, each rendered as the vector it is -- so a matrix prints as
+// `(1, 2); (3, 4)` and one reading of `Display` covers both types.
+impl[T: Scalar] Display for Matrix[T]
+    display(self, out: *Writer, fmt: FormatSpec)
+        var text = ""
 
-    var out: Matrix[T] = zero_matrix(rows, cols)
+        for i in 0..<self.rows
+            if i > 0 then text += "; "
+            text += str(self.row(i))
 
-    for i in 0..<rows
-        for j in 0..<cols do out.set(i, j, xs[i * cols + j])
-
-    out
-
-// The identity, which needs both of the element type's identities — a zero everywhere and a one down
-// the diagonal — and is where the pair of core traits earns its second member.
-identity[T: Scalar](n: int) -> Matrix[T]
-    var out: Matrix[T] = zero_matrix(n, n)
-
-    for i in 0..<n do out.set(i, i, T.one())
-
-    out
+        display_str(text, out, fmt)
+    end display
 
 impl[T: Scalar] Add for Matrix[T]
     add(self, rhs: Matrix[T]) -> Matrix[T]
         require self.rows == rhs.rows && self.cols == rhs.cols, "matrices added must have the same shape"
 
-        var out: Matrix[T] = zero_matrix(self.rows, self.cols)
+        var out: Matrix[T] = Matrix.zeros(self.rows, self.cols)
 
         for i in 0..<self.rows
             for j in 0..<self.cols do out.set(i, j, self.at(i, j) + rhs.at(i, j))
@@ -135,7 +171,7 @@ impl[T: Scalar] Sub for Matrix[T]
     sub(self, rhs: Matrix[T]) -> Matrix[T]
         require self.rows == rhs.rows && self.cols == rhs.cols, "matrices subtracted must have the same shape"
 
-        var out: Matrix[T] = zero_matrix(self.rows, self.cols)
+        var out: Matrix[T] = Matrix.zeros(self.rows, self.cols)
 
         for i in 0..<self.rows
             for j in 0..<self.cols do out.set(i, j, self.at(i, j) - rhs.at(i, j))
@@ -145,7 +181,7 @@ impl[T: Scalar] Sub for Matrix[T]
 
 impl[T: Scalar] Neg for Matrix[T]
     neg(self) -> Matrix[T]
-        var out: Matrix[T] = zero_matrix(self.rows, self.cols)
+        var out: Matrix[T] = Matrix.zeros(self.rows, self.cols)
 
         for i in 0..<self.rows
             for j in 0..<self.cols do out.set(i, j, -self.at(i, j))
@@ -154,26 +190,26 @@ impl[T: Scalar] Neg for Matrix[T]
     end neg
 
 // A matrix applied to a vector: the result is a **vector**, which is neither operand's type. Written
-// as `self.row(i) * rhs`, so the dot product in `vec.sysl` is what actually computes each component —
-// one operator whose result is a scalar, inside one whose result is a vector.
+// as `self.row(i) * rhs`, so the dot product in `vector.sysl` is what computes each component -- one
+// operator whose result is a scalar, inside one whose result is a vector.
 impl[T: Scalar] Mul[Vector[T], Vector[T]] for Matrix[T]
     mul(self, rhs: Vector[T]) -> Vector[T]
         require self.cols == rhs.n, "a matrix applied to a vector needs as many columns as it has entries"
 
-        var out: Vector[T] = zeros(self.rows)
+        var out: Vector[T] = Vector.zeros(self.rows)
 
         for i in 0..<self.rows do out.set(i, self.row(i) * rhs)
 
         out
     end mul
 
-// The one implementation here that writes no arguments at all, because the trait's defaults already
-// say what it does: a matrix times a matrix is a matrix.
+// The one implementation here that writes no trait arguments at all, because the trait's defaults
+// already say what it does: a matrix times a matrix is a matrix.
 impl[T: Scalar] Mul for Matrix[T]
     mul(self, rhs: Matrix[T]) -> Matrix[T]
         require self.cols == rhs.rows, "a product needs the left columns to match the right rows"
 
-        var out: Matrix[T] = zero_matrix(self.rows, rhs.cols)
+        var out: Matrix[T] = Matrix.zeros(self.rows, rhs.cols)
 
         for i in 0..<self.rows
             var r = self.row(i)
@@ -185,7 +221,7 @@ impl[T: Scalar] Mul for Matrix[T]
 
 impl[T: Scalar] Mul[T] for Matrix[T]
     mul(self, k: T) -> Matrix[T]
-        var out: Matrix[T] = zero_matrix(self.rows, self.cols)
+        var out: Matrix[T] = Matrix.zeros(self.rows, self.cols)
 
         for i in 0..<self.rows
             for j in 0..<self.cols do out.set(i, j, self.at(i, j) * k)

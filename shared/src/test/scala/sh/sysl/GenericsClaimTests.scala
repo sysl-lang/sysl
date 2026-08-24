@@ -307,8 +307,8 @@ class GenericsClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport
     }
 
     /** And the whole point of the shape, which is a routine that compares magnitudes without naming
-     * the type they come out at — `guide/matrix` pivots this way, over element types whose sizes are
-     * not their own values.
+     * the type they come out at — `sysl.math.matrix` pivots this way, over element types whose sizes
+     * are not their own values.
      */
     "and a routine bounded by the trait compares what it answers with" in {
       run(mag +
@@ -338,12 +338,12 @@ class GenericsClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport
         include("'T' is not a name a call could reach it through")
     }
 
-    /** What the memberships add up to, which is the claim `guide/matrix` makes about its element
+    /** What the memberships add up to, which is the claim `sysl.math.matrix` makes about its element
      * type: an integer meets a *field*-shaped bound — the four operators, both identities, equality,
-     * rendering and a size — with nothing written for it anywhere. The guide's own finding said the
-     * identities were what kept the integers out of a matrix, and they are not; what keeps an
-     * elimination off them is that `/` truncates, which is a fact about the arithmetic rather than
-     * about the bound.
+     * rendering and a size — with nothing written for it anywhere. That is exactly why the bound is
+     * not enough: `int` satisfies it and `/` still truncates, so the library carries a separate
+     * `Field` marker that `int` deliberately does not implement, and an elimination that needs exact
+     * division asks for that instead.
      */
     "and meets a field-shaped bound outright, identities, size and all" in {
       run("""import sysl.math.Magnitude

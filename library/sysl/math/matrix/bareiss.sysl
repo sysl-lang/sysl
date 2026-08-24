@@ -1,32 +1,31 @@
-// Fraction-free elimination: the same four answers over a ring that has no division to speak of.
+module sysl.math.matrix
+
+// Fraction-free elimination: the same answers over a ring whose division cannot be trusted.
 //
-// `gauss.sysl` needs a *field*. Every step divides — the multiplier `a[i][k] / p`, the back-substituted
-// `acc / u[i][i]` — and a field is what makes those divisions mean anything. The integers are not a
-// field, and the interesting part is that **`Scalar` cannot tell**: `int` supplies `Div`, so it
-// satisfies the bound outright and `Matrix[int]` compiles. What it does not supply is a division that
-// answers the question asked of it, and elimination over the integers therefore returns confidently
-// wrong numbers rather than refusing. `main.sysl` pins exactly that.
+// `gauss.sysl` requires `Field`, and the integers are not one. What makes that worth a second
+// algorithm rather than a refusal is that the integers are otherwise a perfectly good element type:
+// `Matrix[int]` adds, multiplies, transposes, prints and compares, and the only thing wrong with
+// Gaussian elimination over it is that every multiplier it forms is a proper fraction.
 //
 // Bareiss is the answer, and its shape is worth stating before the code: every entry it computes is a
 // **minor of the original matrix**, so every division it performs comes out exact. It divides, but it
 // only ever divides where the quotient is already whole. That is a promise about *this arithmetic*
-// rather than about the element type, which is why it needs no stronger bound than the one that was
-// already too weak for Gauss.
+// rather than about the element type, which is why `Scalar` is bound enough -- and why this file asks
+// for no `Field`, no `Magnitude`, no tolerance and no ordering.
 //
-// **So this file imports nothing.** `gauss.sysl` imports `sysl.math.Magnitude`, because partial
-// pivoting has to know which candidate is *largest*. A fraction-free pivot is chosen for being
-// **non-zero**, which `Eq` already answers, and `Zero` and `One` come from the standard module. The
-// import list is the difference between the two algorithms made visible: this one asks less of the
-// element type and, over the integers, gets the better answer.
+// **The import list is the difference between the two algorithms made visible.** `gauss.sysl` imports
+// `sysl.math.Magnitude`, because partial pivoting has to know which candidate is *largest*. A
+// fraction-free pivot is chosen for being **non-zero**, which `Eq` already answers, so this file
+// imports nothing at all.
 
-// One reduction's worth of state. The matrix is **augmented** — `n` columns of `A` and one more
-// holding `b` — because a fraction-free step multiplies a whole row by the pivot, and a right-hand
+// One reduction's worth of state. The matrix is **augmented** -- `n` columns of `A` and one more
+// holding `b` -- because a fraction-free step multiplies a whole row by the pivot, and a right-hand
 // side carried separately would have to be scaled in step with it. Carrying it as a column means the
 // loop cannot forget.
+//
 // The last diagonal entry is carried rather than read back off `upper`, because an empty matrix has
 // no last row to read: a 0x0 determinant is `one` by convention, and `gauss.sysl` gets that for free
-// from an accumulator this routine does not have. Two callers want the number and neither should
-// have to know that.
+// from an accumulator this routine does not have.
 private struct Eliminated[T: Scalar]
     upper: Matrix[T]
     swaps: int
@@ -35,20 +34,19 @@ private struct Eliminated[T: Scalar]
 // `A` and `b` side by side, reduced until everything below the diagonal is exactly zero.
 //
 // The division is the whole point. `(u[i][j] * p - u[i][k] * u[k][j]) / prev` divides by the
-// *previous* pivot, and Bareiss's theorem is that the numerator is always a multiple of it — both are
+// *previous* pivot, and Bareiss's theorem is that the numerator is always a multiple of it -- both are
 // minors of the original matrix, and the quotient is the minor one order up. Nothing here tests that
 // or falls back if it fails; if the theorem were false this would silently truncate, which is the
 // failure it exists to prevent.
 //
 // A zero pivot is swapped away rather than tolerated, and the test is `== T.zero()` rather than a
-// comparison against a small number. **That is the second thing the element type decides and the
-// bound cannot say.** `gauss.sysl` rejects a pivot with `norm(...) <= tiny`, because subtraction in
-// floating point leaves noise where exact arithmetic leaves zero. Here there is no noise, so a
-// tolerance would not be a safeguard — it would be a way of discarding pivots that are perfectly
-// good, merely small.
+// comparison against a small number. **That is the second thing the element type decides and no bound
+// can say.** `gauss.sysl` rejects a pivot with `norm(...) <= tiny`, because subtraction in floating
+// point leaves noise where exact arithmetic leaves zero. Here there is no noise, so a tolerance would
+// not be a safeguard -- it would be a way of discarding pivots that are perfectly good, merely small.
 private eliminate[T: Scalar](m: Matrix[T], b: Vector[T]) -> Result[Eliminated[T], Fail]
     var n = m.rows
-    var u: Matrix[T] = zero_matrix(n, n + 1)
+    var u: Matrix[T] = Matrix.zeros(n, n + 1)
 
     for i in 0..<n
         for j in 0..<n do u.set(i, j, m.at(i, j))
@@ -95,31 +93,29 @@ end eliminate
 //
 // **There is deliberately no `value(i)` accessor.** Writing one would put `numerators.at(i) /
 // denominator` behind a name that reads like a component, and over the integers that division
-// truncates — the exact bug the whole exercise is about, reintroduced at the last step by a
+// truncates -- the exact bug the second algorithm exists to avoid, reintroduced at the last step by a
 // convenience. A caller that wants a number has to write the division itself and be looking at it.
+//
+// **Exact arithmetic does not make an answer representable, which is the trap.** A system can have
+// numerators `(-8, 16, 24)` over a denominator of 40, and the solution is then `(-1/5, 2/5, 3/5)`,
+// which no `int` holds. Fraction-free elimination does not turn the integers into a field; it makes
+// the inexactness **explicit**, as a numerator and a denominator the caller can see, instead of
+// letting `/` apply it silently.
 struct Exact[T: Scalar]
     numerators: Vector[T]
     denominator: T
 
-    // `A y = b D`, componentwise, with `==`.
+    // `A y = b D`, with `==`.
     //
-    // **No tolerance appears anywhere in this check**, which no other check in this program can say.
-    // Every other one is written on `same`, which asks whether a difference is *small*, because over
-    // the reals it has to be. Here the claim is equality, and it is either true or the elimination is
-    // wrong.
-    verifies(self, m: Matrix[T], b: Vector[T]) -> bool
-        var lhs = m * self.numerators
-        var rhs = b * self.denominator
-
-        for i in 0..<lhs.n
-            if lhs.at(i) != rhs.at(i) then return false
-
-        true
+    // **No tolerance appears anywhere in this check**, which nothing in `gauss.sysl` can say. Every
+    // check there is written against a difference being *small*, because over the reals it has to be.
+    // Here the claim is equality, and it is either true or the elimination is wrong.
+    verifies(self, m: Matrix[T], b: Vector[T]) -> bool = m * self.numerators == b * self.denominator
 end Exact
 
 // The determinant, exactly, for an element type that has no rounding to hide behind.
 //
-// The last diagonal entry *is* the determinant of the reduced matrix — that is what Bareiss
+// The last diagonal entry *is* the determinant of the reduced matrix -- that is what Bareiss
 // accumulates rather than a running product, so there is no chain of multiplications to lose
 // precision through and nothing to divide at the end. The sign comes from the parity of the swaps,
 // exactly as it does over a field.
@@ -129,7 +125,7 @@ end Exact
 det_exact[T: Scalar](m: Matrix[T]) -> Result[T, Fail]
     if !m.is_square() then return Err(NotSquare)
 
-    var rhs: Vector[T] = zeros(m.rows)
+    var rhs: Vector[T] = Vector.zeros(m.rows)
 
     eliminate(m, rhs) match
         Ok(e) -> Ok(if e.swaps % 2 == 0 then e.det else -e.det)
@@ -141,7 +137,7 @@ end det_exact
 //
 // Back-substitution normally divides by the pivot and lands on a fraction. Solving for `y = D x`
 // instead keeps it whole: `U[i][i] · x_i = c_i − Σ U[i][j] x_j` multiplied through by `D` makes every
-// `x` a `y`, and `y_i = D · x_i` is `det(A_i)` by Cramer's rule — an integer *before* it is a
+// `x` a `y`, and `y_i = D · x_i` is `det(A_i)` by Cramer's rule -- an integer *before* it is a
 // quotient. So `acc / u.at(i, i)` is exact for the same reason the elimination's division was.
 //
 // **The denominator is the reduced matrix's own last entry, with no sign applied**, while `det_exact`
@@ -158,7 +154,7 @@ solve_exact[T: Scalar](m: Matrix[T], b: Vector[T]) -> Result[Exact[T], Fail]
         Ok(e) ->
             var u = e.upper
             var d = e.det
-            var y: Vector[T] = zeros(n)
+            var y: Vector[T] = Vector.zeros(n)
 
             for step in 0..<n
                 var i = n - 1 - step

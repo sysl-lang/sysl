@@ -1,0 +1,552 @@
+module sysl.math.matrix
+@tests
+
+import sysl.math.complex.Complex
+
+// What `sysl.math.matrix` computes, asserted in sysl.
+//
+// **The claim these tests exist to make is that there is one body per operation and not one per
+// element type.** Every section below the first runs the *same* `solve`, the same `det` and the same
+// operators at a different `T`, so a routine that had quietly specialised to the reals would pass the
+// first section and fail the complex one. That is a claim about generic dispatch, and it is worth
+// making here rather than in Scala because the expectation is written in the same language as the
+// code -- a compiler that had widened every `f32` to a `real` would compile a Scala expectation into
+// the widened one and agree with itself.
+//
+// The one thing deliberately *not* here is the refusal that makes `Field` worth having: `solve` on a
+// `Matrix[int]` does not compile, so there is no test to write. `library/matrix.md` carries it as an
+// `error` block, which is where a claim about a diagnostic belongs.
+
+// The comparison nearly every check below is written on: two values agree when the **size** of their
+// difference is small. One function for the reals, the complexes and `f32`, and the same reasoning
+// the pivot search runs on.
+private const eps: real = 0.000000001
+
+private same[T: Scalar](a: T, b: T) -> bool = (a - b).norm() <= eps
+
+// -- the four products of a vector space -------------------------------------------------------------
+
+@test("a dot product is an operator and yields a scalar")
+dot_product_yields_a_scalar()
+    var v = Vector.of([1.0, 2.0, 3.0])
+    var w = Vector.of([4.0, 5.0, 6.0])
+
+    assert(same(v * w, 32.0), "1*4 + 2*5 + 3*6")
+    assert(same(v * v, 14.0), "a vector against itself is its quadratic form")
+    assert(same(v.quadratic_form(), 14.0), "which is what 'quadratic_form' is written as")
+    assert(same(v.len(), 14.0.sqrt()), "over the reals that form is the squared length")
+end dot_product_yields_a_scalar
+
+@test("the same '*' scales, and yields a vector")
+scaling_yields_a_vector()
+    var v = Vector.of([1.0, 2.0, 3.0])
+
+    assert((v * 2.0).near(Vector.of([2.0, 4.0, 6.0]), eps), "every component doubled")
+
+@test("a matrix applied to a vector yields a vector, and to a matrix a matrix")
+the_two_matrix_products()
+    var v = Vector.of([1.0, 2.0, 3.0])
+    var a = Matrix.of(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    var b = Matrix.of(3, 2, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+
+    assert((a * v).near(Vector.of([14.0, 32.0]), eps), "a matrix applied to a vector")
+    assert((a * b).near(Matrix.of(2, 2, [22.0, 28.0, 49.0, 64.0]), eps), "a matrix times a matrix")
+    assert((a * 2.0).near(Matrix.of(2, 3, [2.0, 4.0, 6.0, 8.0, 10.0, 12.0]), eps), "and a matrix scales")
+end the_two_matrix_products
+
+// Four implementations of one trait across two types, every one selected by the type of the right
+// operand alone. This is the line the whole design exists to be able to write.
+@test("the four products compose in one expression")
+the_four_compose()
+    var a = Matrix.of(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    var b = Matrix.of(3, 2, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    var ones = Vector.of([1.0, 1.0])
+
+    assert(same((a * b * ones) * ones, 163.0), "matrix, matrix, vector, then a dot product")
+
+// -- the algebra holds where the results differ ------------------------------------------------------
+
+@test("addition, subtraction and negation are componentwise")
+the_additive_group()
+    var v = Vector.of([1.0, 2.0, 3.0])
+    var w = Vector.of([4.0, 5.0, 6.0])
+
+    assert((v + w).near(Vector.of([5.0, 7.0, 9.0]), eps), "addition")
+    assert((w - v).near(Vector.of([3.0, 3.0, 3.0]), eps), "subtraction")
+    assert((-v).near(Vector.of([-1.0, -2.0, -3.0]), eps), "negation has no right operand to select with")
+end the_additive_group
+
+@test("the dot product is symmetric, distributes, and commutes with scaling")
+dot_product_identities()
+    var v = Vector.of([1.0, 2.0, 3.0])
+    var w = Vector.of([4.0, 5.0, 6.0])
+
+    assert(same(v * w, w * v), "symmetric")
+    assert(same((v + w) * v, v * v + w * v), "distributes over addition")
+    assert(same((v * 2.0) * w, (v * w) * 2.0), "scaling commutes with it")
+end dot_product_identities
+
+@test("the identity fixes every vector and is a unit at both shapes")
+the_identity_is_a_unit()
+    var v = Vector.of([1.0, 2.0, 3.0])
+    var a = Matrix.of(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    var i3: Matrix[real] = Matrix.identity(3)
+    var i2: Matrix[real] = Matrix.identity(2)
+
+    assert((i3 * v).near(v, eps), "fixes a vector")
+    assert((a * i3).near(a, eps), "a right unit")
+    assert((i2 * a).near(a, eps), "and a left unit at the other shape")
+end the_identity_is_a_unit
+
+@test("a basis vector is a column of the identity")
+a_basis_vector()
+    var i3: Matrix[real] = Matrix.identity(3)
+    var e0: Vector[real] = Vector.basis(3, 0)
+
+    assert((i3 * e0).near(e0, eps), "the identity fixes it")
+    assert(i3.col(0) == e0, "and it is what the column reads back")
+
+@test("a transpose swaps the shape and moves across a product")
+transpose_moves_across_a_product()
+    var v = Vector.of([1.0, 2.0, 3.0])
+    var a = Matrix.of(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    var t = a.transpose()
+    var ones = Vector.of([1.0, 1.0])
+
+    assert(t.rows == 3 && t.cols == 2, "the shape is swapped")
+    assert(same((a * v) * ones, v * (t * ones)), "two of the four operators agreeing")
+end transpose_moves_across_a_product
+
+@test("the trace is the sum of the diagonal")
+the_trace()
+    var m = Matrix.of(3, 3, [2.0, 1.0, -1.0, -3.0, -1.0, 2.0, -2.0, 1.0, 2.0])
+    var i4: Matrix[real] = Matrix.identity(4)
+
+    assert(same(m.trace(), 3.0), "2 + -1 + 2")
+    assert(same(i4.trace(), 4.0), "and an identity's trace is its size")
+
+// `trace(AB) = trace(BA)` even where the two products differ, which is the property that makes a
+// trace a similarity invariant rather than an accident of the layout.
+@test("the trace is invariant under the order of a product")
+the_trace_is_invariant()
+    var a = Matrix.of(2, 2, [1.0, 2.0, 3.0, 4.0])
+    var b = Matrix.of(2, 2, [0.0, 1.0, -1.0, 2.0])
+
+    assert(!(a * b).near(b * a, eps), "the products themselves differ")
+    assert(same((a * b).trace(), (b * a).trace()), "and their traces do not")
+
+// -- indexing, equality and rendering ----------------------------------------------------------------
+
+@test("a vector reads by one index and a matrix by a pair")
+indexing_through_a_trait()
+    var v = Vector.of([1.0, 2.0, 3.0])
+    var a = Matrix.of(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+
+    assert(same(v[0], 1.0) && same(v[2], 3.0), "one index")
+    assert(same(a[(1, 2)], 6.0), "a pair, since a subscript takes one argument")
+
+@test("and writes through the same spelling")
+index_set_through_a_trait()
+    var v = Vector.of([1.0, 2.0, 3.0])
+    var mutable = v.copy()
+
+    mutable[1] = 20.0
+
+    assert(same(mutable[1], 20.0), "written through the subscript")
+    assert(same(v[1], 2.0), "and the copy is what kept the original out of it")
+end index_set_through_a_trait
+
+// `Eq` is exact and `near` is not, which is the whole reason both exist. Over the integers the exact
+// one is the right question, and these use it as a caller holding integers would.
+@test("equality is exact and componentwise")
+equality_is_exact()
+    assert_eq(Vector.of([1, 2, 3]), Vector.of([1, 2, 3]), "equal vectors")
+    assert(Vector.of([1, 2, 3]) != Vector.of([1, 2, 4]), "one component is enough")
+    assert(Vector.of([1, 2]) != Vector.of([1, 2, 3]), "and so is a length")
+    assert_eq(Matrix.of(2, 2, [1, 2, 3, 4]), Matrix.of(2, 2, [1, 2, 3, 4]), "equal matrices")
+    assert(Matrix.of(2, 2, [1, 2, 3, 4]) != Matrix.of(2, 2, [1, 2, 3, 5]), "one cell is enough")
+    assert(Matrix.of(2, 2, [1, 2, 3, 4]) != Matrix.of(1, 4, [1, 2, 3, 4]), "and so is a shape")
+end equality_is_exact
+
+// Each element renders as its own type renders it, which is what `Scalar` requiring `Display` buys --
+// including the complexes, whose text no numeric formatter knows how to produce.
+@test("a vector and a matrix render through Display")
+rendering_through_display()
+    assert_eq(str(Vector.of([1, 2, 3])), "(1, 2, 3)", "a vector")
+    assert_eq(str(Matrix.of(2, 2, [1, 2, 3, 4])), "(1, 2); (3, 4)", "a matrix, row by row")
+    assert_eq(str(Vector.of([Complex(1.0, 2.0)])), "(1+2i)", "and the element decides its own text")
+end rendering_through_display
+
+@test("a refusal renders through Display too")
+a_refusal_renders()
+    assert_eq(str(Singular), "the matrix is singular", "the variant's own words")
+    assert(Singular == Singular, "a bare enum compares by discriminant")
+    assert(NotSquare != Singular, "and tells its variants apart")
+
+// -- solving a system --------------------------------------------------------------------------------
+
+// 2x + y - z = 8 ; -3x - y + 2z = -11 ; -2x + y + 2z = -3, whose solution is (2, 3, -1).
+@test("elimination finds the solution, and the residual confirms it")
+elimination_solves()
+    var m = Matrix.of(3, 3, [2.0, 1.0, -1.0, -3.0, -1.0, 2.0, -2.0, 1.0, 2.0])
+    var rhs = Vector.of([8.0, -11.0, -3.0])
+
+    solve(m, rhs) match
+        Ok(x) ->
+            assert(x.near(Vector.of([2.0, 3.0, -1.0]), eps), "the solution")
+            assert((m * x).near(rhs, eps), "and the residual, through the operator")
+        Err(e) -> assert(false, "elimination finds the solution: " + str(e))
+end elimination_solves
+
+// The pivot at (0,0) is zero, so a naive elimination divides by it. Partial pivoting is what makes
+// this an ordinary system rather than a failure.
+@test("a zero pivot is swapped away")
+a_zero_pivot_is_swapped_away()
+    var m = Matrix.of(3, 3, [0.0, 2.0, 1.0, 1.0, -1.0, 3.0, 2.0, 1.0, 1.0])
+    var b = Vector.of([5.0, 4.0, 5.0])
+
+    solve(m, b) match
+        Ok(x) -> assert((m * x).near(b, eps), "the residual confirms it")
+        Err(e) -> assert(false, "a zero pivot is swapped away: " + str(e))
+end a_zero_pivot_is_swapped_away
+
+// The error path, which a library owes as much as it owes the answer: one equation twice, a
+// non-square system, and a right-hand side of the wrong length.
+@test("a singular system is refused")
+a_singular_system_is_refused()
+    var singular = Matrix.of(2, 2, [1.0, 2.0, 2.0, 4.0])
+
+    solve(singular, Vector.of([3.0, 6.0])) match
+        Ok(_) -> assert(false, "a singular system is refused")
+        Err(e) -> assert_eq(e, Singular, "and says which")
+
+@test("a system that is not square is refused")
+a_non_square_system_is_refused()
+    solve(Matrix.of(2, 3, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]), Vector.of([1.0, 1.0])) match
+        Ok(_) -> assert(false, "a system that is not square is refused")
+        Err(e) -> assert_eq(e, NotSquare, "and says which")
+
+@test("a right-hand side of the wrong length is refused")
+a_wrong_length_rhs_is_refused()
+    var m = Matrix.of(3, 3, [2.0, 1.0, -1.0, -3.0, -1.0, 2.0, -2.0, 1.0, 2.0])
+
+    solve(m, Vector.of([1.0, 2.0])) match
+        Ok(_) -> assert(false, "a right-hand side of the wrong length is refused")
+        Err(e) -> assert_eq(e, ShapeMismatch, "and says which")
+
+// -- determinant and rank ----------------------------------------------------------------------------
+
+@test("a determinant comes out of the same elimination")
+the_determinant()
+    var m = Matrix.of(3, 3, [2.0, 1.0, -1.0, -3.0, -1.0, 2.0, -2.0, 1.0, 2.0])
+    var singular = Matrix.of(2, 2, [1.0, 2.0, 2.0, 4.0])
+    var i4: Matrix[real] = Matrix.identity(4)
+
+    assert(same(det(i4), 1.0), "the identity has determinant one")
+    assert(same(det(m), -1.0), "an ordinary system")
+    assert(same(det(singular), 0.0), "and a singular matrix has determinant zero")
+end the_determinant
+
+// Swapping two rows negates the determinant, which is the property the pivoting has to preserve --
+// and the one a sign the elimination forgot to track would get wrong.
+@test("a row swap negates the determinant, and det is multiplicative")
+determinant_identities()
+    var m = Matrix.of(3, 3, [2.0, 1.0, -1.0, -3.0, -1.0, 2.0, -2.0, 1.0, 2.0])
+    var swapped = Matrix.of(3, 3, [-3.0, -1.0, 2.0, 2.0, 1.0, -1.0, -2.0, 1.0, 2.0])
+
+    assert(same(det(swapped), 1.0), "the swap negates it")
+    assert(same(det(m * swapped), det(m) * det(swapped)), "and det is multiplicative, through the operator")
+end determinant_identities
+
+@test("rank counts the pivots and needs no square matrix")
+the_rank()
+    var m = Matrix.of(3, 3, [2.0, 1.0, -1.0, -3.0, -1.0, 2.0, -2.0, 1.0, 2.0])
+    var singular = Matrix.of(2, 2, [1.0, 2.0, 2.0, 4.0])
+    var z33: Matrix[real] = Matrix.zeros(3, 3)
+
+    assert_eq(rank(m), 3, "a full-rank matrix")
+    assert_eq(rank(singular), 1, "a dependent row costs exactly one")
+    assert_eq(rank(z33), 0, "the zero matrix has rank zero")
+    assert_eq(rank(Matrix.of(2, 3, [1.0, 2.0, 3.0, 2.0, 4.0, 6.0])), 1, "and rank needs no square matrix")
+end the_rank
+
+// -- inverse -----------------------------------------------------------------------------------------
+
+@test("an inverse times its matrix is the identity, on both sides")
+the_inverse()
+    var m = Matrix.of(3, 3, [2.0, 1.0, -1.0, -3.0, -1.0, 2.0, -2.0, 1.0, 2.0])
+    var rhs = Vector.of([8.0, -11.0, -3.0])
+
+    inverse(m) match
+        Ok(inv) ->
+            assert((m * inv).near(Matrix.identity(3), eps), "one side")
+            assert((inv * m).near(Matrix.identity(3), eps), "and the other")
+
+            // Solving by inverting must agree with solving by elimination, and they are different
+            // arithmetic -- this is the check that would catch a sign or an index error in either.
+            assert((inv * rhs).near(Vector.of([2.0, 3.0, -1.0]), eps), "and it solves the system it came from")
+        Err(e) -> assert(false, "an inverse times its matrix is the identity: " + str(e))
+end the_inverse
+
+@test("a singular matrix has no inverse")
+a_singular_matrix_has_no_inverse()
+    var singular = Matrix.of(2, 2, [1.0, 2.0, 2.0, 4.0])
+
+    inverse(singular) match
+        Ok(_) -> assert(false, "a singular matrix has no inverse")
+        Err(e) -> assert_eq(e, Singular, "and says which")
+
+// -- the same bodies over the complex numbers --------------------------------------------------------
+//
+// Nothing below is a second implementation. Every operator, the elimination and all four of its
+// answers are the bodies above, at a different `T`.
+
+@test("a dot product over the complexes yields a complex")
+a_complex_dot_product()
+    var cv = Vector.of([Complex(1.0, 1.0), Complex(2.0, -1.0)])
+    var cw = Vector.of([Complex(0.0, 1.0), Complex(1.0, 1.0)])
+
+    // (1+i)(i) + (2-i)(1+i) = (-1+i) + (3+i) = 2+2i.
+    assert(same(cv * cw, Complex(2.0, 2.0)), "the arithmetic of the plane")
+
+// The check that `‖v‖² = v · v` is a fact about the reals rather than about vector spaces.
+// `cv * cv` is (1+i)² + (2-i)² = 2i + 3-4i = 3-2i, which is not a length and is not even real.
+@test("a vector against itself is a complex number, not a size")
+the_quadratic_form_is_not_a_length()
+    var cv = Vector.of([Complex(1.0, 1.0), Complex(2.0, -1.0)])
+
+    assert(same(cv * cv, Complex(3.0, -2.0)), "it is a complex number")
+    assert(!same(cv * cv, Complex.from_real(cv.len() * cv.len())), "so it is not the squared length")
+    assert(same(cv.len(), 7.0.sqrt()), "which the magnitudes give and the dot product does not")
+end the_quadratic_form_is_not_a_length
+
+@test("scaling by i rotates a vector")
+scaling_by_i()
+    var cv = Vector.of([Complex(1.0, 1.0), Complex(2.0, -1.0)])
+    var i = Complex(0.0, 1.0)
+
+    assert((cv * i).near(Vector.of([Complex(-1.0, 1.0), Complex(1.0, 2.0)]), eps), "a quarter turn")
+
+@test("the identity fixes every complex vector and has determinant one")
+the_complex_identity()
+    var cv = Vector.of([Complex(1.0, 1.0), Complex(2.0, -1.0)])
+    var ci: Matrix[Complex[real]] = Matrix.identity(2)
+    var one: Complex[real] = Complex.one()
+
+    assert((ci * cv).near(cv, eps), "it fixes a vector")
+    assert(same(det(ci), one), "and its determinant is the element type's one")
+end the_complex_identity
+
+// A system whose coefficients are genuinely complex, solved by the same elimination. The pivot search
+// compares magnitudes, which is the only comparison this element type has.
+@test("a complex system recovers the vector it was built from")
+a_complex_system()
+    var cv = Vector.of([Complex(1.0, 1.0), Complex(2.0, -1.0)])
+    var cm = Matrix.of(2, 2, [Complex(1.0, 1.0), Complex(2.0, 0.0), Complex(0.0, 1.0), Complex(1.0, -1.0)])
+    var cb = cm * cv
+
+    solve(cm, cb) match
+        Ok(x) -> assert(x.near(cv, 0.000001), "the same solution came back")
+        Err(e) -> assert(false, "a complex system recovers the vector it was built from: " + str(e))
+end a_complex_system
+
+@test("a complex matrix has a complex inverse")
+a_complex_inverse()
+    var cm = Matrix.of(2, 2, [Complex(1.0, 1.0), Complex(2.0, 0.0), Complex(0.0, 1.0), Complex(1.0, -1.0)])
+
+    inverse(cm) match
+        Ok(inv) -> assert((cm * inv).near(Matrix.identity(2), 0.000001), "and it is a two-sided one")
+        Err(e) -> assert(false, "a complex matrix has a complex inverse: " + str(e))
+
+// A complex matrix can be singular for a reason no real matrix could be: the second row is the first
+// multiplied by i, which is a dependence only this field can express.
+@test("a dependence over i makes the determinant zero")
+a_dependence_over_i()
+    var cv = Vector.of([Complex(1.0, 1.0), Complex(2.0, -1.0)])
+    var cs = Matrix.of(2, 2, [Complex(1.0, 0.0), Complex(1.0, 0.0), Complex(0.0, 1.0), Complex(0.0, 1.0)])
+
+    assert(same(det(cs), Complex.zero()), "the determinant is zero")
+
+    solve(cs, cv) match
+        Ok(_) -> assert(false, "and the system is refused")
+        Err(e) -> assert_eq(e, Singular, "and the system is refused")
+end a_dependence_over_i
+
+// -- and at a second float width ---------------------------------------------------------------------
+
+// `f32` is here to make the point that the bodies are shared rather than to say anything about narrow
+// floats: the same `solve` runs, at a tolerance the width can meet.
+//
+// **The suffixes are load-bearing and the annotation on the binding would not be enough.** A slice
+// literal settles a generic parameter from its own elements before a declared type is consulted, so
+// `Matrix.of(2, 2, [2.0, …])` builds a `Matrix[real]` whatever it is assigned to. The element type has
+// to be in the elements.
+@test("the same elimination and determinant run at f32")
+the_same_bodies_at_f32()
+    var fm = Matrix.of(2, 2, [2.0f32, 1.0f32, 1.0f32, 3.0f32])
+    var fb = Vector.of([5.0f32, 10.0f32])
+
+    solve(fm, fb) match
+        Ok(x) -> assert(x.near(Vector.of([1.0f32, 3.0f32]), 0.0001), "the solution, at the narrower width")
+        Err(e) -> assert(false, "the same elimination runs at f32: " + str(e))
+
+    // The rule is about **slice literals** and nothing else: the comparison reads its element type off
+    // the value it was handed, so the bare `5.0` here takes it from `det(fm)`.
+    assert(same(det(fm), 5.0), "and so does the determinant")
+end the_same_bodies_at_f32
+
+// -- the integers, and the elimination they deserve --------------------------------------------------
+
+@test("a matrix over the integers is an ordinary matrix")
+integers_are_an_ordinary_element_type()
+    var im = Matrix.of(3, 3, [3, 1, 2, 1, 4, 1, 2, 1, 5])
+
+    assert_eq((im * Matrix.identity(3)), im, "the identity is still a unit")
+    assert_eq(im.trace(), 12, "the trace is still the diagonal")
+    assert_eq(im.transpose(), im, "and this one is symmetric")
+end integers_are_an_ordinary_element_type
+
+// The same system Gaussian elimination gets wrong, answered exactly. Every division inside is exact by
+// construction rather than by luck.
+@test("fraction-free elimination answers the determinant exactly")
+bareiss_determinant()
+    var im = Matrix.of(3, 3, [3, 1, 2, 1, 4, 1, 2, 1, 5])
+
+    det_exact(im) match
+        Ok(d) -> assert_eq(d, 40, "40, where Gauss over the integers would report 60")
+        Err(e) -> assert(false, "fraction-free elimination answers the determinant exactly: " + str(e))
+
+@test("and a solution whose numerators are exact, over a single denominator")
+bareiss_solution()
+    var im = Matrix.of(3, 3, [3, 1, 2, 1, 4, 1, 2, 1, 5])
+    var ib = Vector.of([1, 2, 3])
+
+    solve_exact(im, ib) match
+        Ok(x) ->
+            assert_eq(x.numerators, Vector.of([-8, 16, 24]), "the numerators")
+            assert_eq(x.denominator, 40, "over the determinant")
+
+            // The residual check no other element type here could write: `A y = b D` with `==`, no
+            // tolerance and nothing to be approximately right about.
+            assert(x.verifies(im, ib), "verified by 'A y = b D' with no tolerance anywhere")
+
+            // **Exact arithmetic did not make the answer representable.** The solution is
+            // (-1/5, 2/5, 3/5) and no `int` holds any of it -- which is why `Exact` has no `value(i)`.
+            assert_eq(x.numerators.at(0) / x.denominator, 0, "dividing them is the truncation this avoided")
+        Err(e) -> assert(false, "and a solution whose numerators are exact: " + str(e))
+end bareiss_solution
+
+// A system whose whole content is the exactness. The determinant is the difference of two 19-digit
+// products, both inside `int`, and it is -1: the two cancel almost completely, which is the case
+// floating point has nothing left to say about.
+@test("a determinant of -1 survives the cancellation of two 19-digit products")
+bareiss_cancellation()
+    var huge = 1000000000
+    var bm = Matrix.of(2, 2, [huge + 1, huge, huge, huge - 1])
+    var bb = Vector.of([1, 1])
+
+    det_exact(bm) match
+        Ok(d) -> assert_eq(d, -1, "exactly minus one")
+        Err(e) -> assert(false, "a determinant of -1 survives the cancellation: " + str(e))
+
+    solve_exact(bm, bb) match
+        Ok(x) ->
+            assert_eq(x.numerators, Vector.of([-1, 1]), "and the solution comes back exact")
+            assert_eq(x.denominator, -1, "over its own determinant")
+        Err(e) -> assert(false, "and the solution comes back exact: " + str(e))
+end bareiss_cancellation
+
+// The same matrix over the reals, and the only claim about it worth making.
+//
+// **What the reals do here is not portable and must not be asserted.** Whether the subtraction is
+// contracted into a fused multiply-add decides everything downstream: without contraction the pivot
+// cancels to exactly zero and `solve` refuses as singular, and with it the pivot survives as about
+// -1e-9 and `solve` succeeds with a nearly-right answer. Both are correct floating point, and this
+// library runs on more than one target. So the check is the one statement true on either path.
+@test("the same determinant over the reals is not -1 on any target")
+the_reals_lose_the_cancellation()
+    var rhuge = real(1000000000)
+    var rm = Matrix.of(2, 2, [rhuge + 1.0, rhuge, rhuge, rhuge - 1.0])
+
+    assert(!same(det(rm), -1.0), "the cancellation is gone whichever way it rounds")
+
+@test("the error path is the same one, whichever elimination is asked")
+bareiss_refuses_the_same_shapes()
+    var im = Matrix.of(3, 3, [3, 1, 2, 1, 4, 1, 2, 1, 5])
+
+    det_exact(Matrix.of(2, 3, [1, 0, 0, 0, 1, 0])) match
+        Ok(_) -> assert(false, "a non-square determinant is refused")
+        Err(e) -> assert_eq(e, NotSquare, "and says which")
+
+    solve_exact(im, Vector.of([1, 2])) match
+        Ok(_) -> assert(false, "a right-hand side of the wrong length is refused")
+        Err(e) -> assert_eq(e, ShapeMismatch, "and says which")
+
+    // A singular matrix has a determinant -- zero -- and no solution, so the two answer differently
+    // and deliberately.
+    var dependent = Matrix.of(2, 2, [1, 2, 2, 4])
+
+    det_exact(dependent) match
+        Ok(d) -> assert_eq(d, 0, "a singular determinant is an answer, not a failure")
+        Err(e) -> assert(false, "a singular determinant is an answer: " + str(e))
+
+    solve_exact(dependent, Vector.of([3, 6])) match
+        Ok(_) -> assert(false, "while the system itself is refused")
+        Err(e) -> assert_eq(e, Singular, "and says which")
+end bareiss_refuses_the_same_shapes
+
+// -- a system big enough that the walk is the point --------------------------------------------------
+
+// A 12x12 system whose answer is known by construction: fill a matrix that is diagonally dominant (so
+// it is certainly invertible), pick an `x`, and solve for the `b` it produces.
+@test("a 12x12 system recovers the vector it was built from")
+a_larger_system()
+    var n = 12
+    var big: Matrix[real] = Matrix.zeros(n, n)
+
+    for r in 0..<n
+        for j in 0..<n
+            big.set(r, j, if r == j then real(n) + 1.0 else 1.0 / real(r + j + 1))
+
+    var want: Vector[real] = Vector.zeros(n)
+
+    for r in 0..<n do want.set(r, real(r) - 5.5)
+
+    solve(big, big * want) match
+        Ok(got) -> assert(got.near(want, 0.000001), "the whole vector came back")
+        Err(e) -> assert(false, "a 12x12 system recovers the vector it was built from: " + str(e))
+
+    assert(det(big).norm() > 1.0, "and its determinant is nowhere near zero")
+end a_larger_system
+
+// -- sharing, and the copy that ends it --------------------------------------------------------------
+
+// A `Vector[T]` is a handle, so this is the hazard a string documents, in the one place a numerical
+// program meets it.
+@test("assigning a vector shares its numbers, and 'copy' is what stops the sharing")
+a_vector_is_a_handle()
+    var original = Vector.of([1.0, 2.0, 3.0])
+    var shared = original
+
+    shared.set(0, 99.0)
+
+    assert(same(original.at(0), 99.0), "the assignment shared them")
+
+    var separate = original.copy()
+
+    separate.set(0, 1.0)
+
+    assert(same(original.at(0), 99.0), "and the copy did not")
+end a_vector_is_a_handle
+
+// The elimination is the customer: it must not consume the matrix it was asked about, or every
+// residual check above would have been comparing an answer against its own workings.
+@test("solving leaves the matrix it was given alone")
+solving_does_not_consume()
+    var m = Matrix.of(3, 3, [2.0, 1.0, -1.0, -3.0, -1.0, 2.0, -2.0, 1.0, 2.0])
+    var before = m.copy()
+
+    solve(m, Vector.of([8.0, -11.0, -3.0])) match
+        Ok(_) -> assert(m == before, "every cell where it was")
+        Err(e) -> assert(false, "solving leaves the matrix it was given alone: " + str(e))
+end solving_does_not_consume
