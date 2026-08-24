@@ -4,8 +4,9 @@
 //
 // **Neither `struct timespec` nor a clock id crosses into sysl**, which is the point of the file.
 // The structure is caller-allocated and the ids are `#define`s -- `CLOCK_MONOTONIC` is 1 on Linux,
-// 6 on macOS and 4 on the BSDs -- and both are exactly what `15 §7` says only C can reach. Answering
-// with the finished number leaves sysl nothing to transcribe and nothing to get wrong.
+// 6 on macOS and 4 on the BSDs -- and both are exactly what `reference/ffi.md § A library may carry
+// C` says only C can reach. Answering with the finished number leaves sysl nothing to transcribe
+// and nothing to get wrong.
 //
 // Microseconds rather than nanoseconds because that is what `Duration` counts. A `long` of
 // nanoseconds runs out in 1678-2262, and `sysl.time` settled that a range which quietly ends is a
