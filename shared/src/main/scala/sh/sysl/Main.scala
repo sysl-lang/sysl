@@ -6,8 +6,15 @@ import io.github.edadma.cross_platform.*
 // and the questions it has to settle before compiling — which target, which standard module,
 // and whether this command line answered what the packages asked for.
 
-@main def sysl(args: String*): Unit = {
-  val all              = processArgs(args)
+@main def sysl(args: String*): Unit = processExit(drive(processArgs(args)))
+
+/** The whole of a command line, from the first word to the status it leaves.
+ *
+ * Held apart from the entry point for the reason `execute` is: a test asks the question a user's
+ * shell asks. `execute` is one step further in and takes a parsed `Config`, so it cannot see the
+ * step this function exists for — **which command word was written**, and whether sysl has one.
+ */
+private[sysl] def drive(all: Seq[String]): Int = {
   val (own, forwarded) = all.span(_ != "--")
 
   // A word sysl has no command for is somebody else's command, if they have installed one. git's
@@ -24,12 +31,12 @@ import io.github.edadma.cross_platform.*
   // the program, and there is no `sysl---version`.
   all.headOption match
     case Some(name) if !name.startsWith("-") && !builtinCommands(name) =>
-      processExit(subcommand(name, all.tail))
+      subcommand(name, all.tail)
 
     case _ =>
       parseArgs(own) match
-        case Some(cfg) => processExit(execute(cfg.copy(programArgs = forwarded.drop(1).toList)))
-        case None      => processExit(2)
+        case Some(cfg) => execute(cfg.copy(programArgs = forwarded.drop(1).toList))
+        case None      => 2
 }
 
 /** Run an external subcommand — `sysl <name>` as `sysl-<name>`, with the rest of the line.
