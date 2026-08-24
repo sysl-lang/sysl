@@ -75,6 +75,25 @@ static int child_setup(const char *const *names, const char *const *values,
 int sysl_proc_run(const char *program, char *const *argv,
                   const char *const *env_names, const char *const *env_values,
                   const char *dir, const char *out_path, int *code, int *sig) {
+    /* **Everything this program has written, written, before anything else can write.**
+     *
+     * A C library buffers standard output, and it buffers it *fully* rather than by line whenever
+     * the destination is not a terminal -- a pipe, a file, a CI log. The child writes to the same
+     * file description directly and is not buffered by anything of ours, so without this its output
+     * lands ahead of text the parent printed first and the log reads in the wrong order. It looks
+     * like the parent forgot to say what it was doing.
+     *
+     * `NULL` flushes every output stream rather than just `stdout`, which is what makes it correct
+     * for a program writing to both channels: they are separately buffered and would otherwise be
+     * separately out of order.
+     *
+     * It is also the reason this belongs to the fork rather than to the caller. Any buffered bytes
+     * still held here are duplicated into the child by `fork`, and a child that did something other
+     * than `exec` immediately would print them a second time -- flushing first is what makes that
+     * unreachable rather than merely unlikely.
+     */
+    fflush(NULL);
+
     int report[2];
 
     if (pipe(report) != 0) return errno;
