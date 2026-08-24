@@ -772,6 +772,16 @@ trait Scoping extends DeclTables {
    */
   protected val readOnlyLocals = mutable.HashSet.empty[String]
 
+  /** The subset of those that a **pattern** bound rather than a `val` — a match arm's capture, an
+   * `is`'s, or the name an `@` puts in front of one.
+   *
+   * It decides nothing: every name in here is in `readOnlyLocals` and is refused a write by that.
+   * What it carries is the **wording**, because "a 'val' is written once" names a keyword the reader
+   * did not write, and the reason a pattern binding may not be written is its own — it holds a copy
+   * of what was matched, so the write would land somewhere the program cannot observe.
+   */
+  protected val patternLocals = mutable.HashSet.empty[String]
+
   /** The place each `ref` name stands for (`03 § ref`), under the unique name codegen uses.
    *
    * This is the compile-time half of the binding, and the half that earns the feature. Codegen needs
@@ -818,6 +828,7 @@ trait Scoping extends DeclTables {
   protected def resetLocals(): Unit = {
     used.clear()
     readOnlyLocals.clear()
+    patternLocals.clear()
     refPlaces.clear()
     refGuards = Nil
     scopes = List(mutable.LinkedHashMap.empty[String, Binding])
@@ -893,6 +904,50 @@ trait Scoping extends DeclTables {
     readOnlyLocals += unique
     unique
   }
+
+  /** Binds a name a **pattern** captured, which is written once for the same reason a `val` is.
+   *
+   * A pattern hands the arm a *copy* of the part it matched, so a write to the name would reach that
+   * copy and be discarded where the arm ends — a statement that reads as though it changed the value
+   * that was matched and cannot have. The keyword-carrying form beside it already says so: `val (a,
+   * b)` is written once and `var (a, b)` is not, and an arm has no keyword, so it takes the rule a
+   * name with no `var` in front of it has everywhere else.
+   *
+   * A copy that is meant to be changed is a `var` taken from the binding, which is what the
+   * diagnostic advises.
+   */
+  protected def declarePattern(name: String, ty: Type): String = {
+    val unique = declareReadOnly(name, ty)
+    patternLocals += unique
+    unique
+  }
+
+  /** The local a place bottoms out in, where it bottoms out in one at all — the same descent
+   * `readOnly` makes, kept apart from it because a diagnostic wants the *name* rather than the
+   * answer. It lives beside `writtenOnce` and for the same reason: both of its callers are
+   * elsewhere, `ExprAnalysis` for assignment and `&` and `CallAnalysis` for a `*self` receiver.
+   */
+  protected def rootLocal(t: TExpr): Option[String] = t match
+    case TLoad(name, _)     => Some(name)
+    case TField(recv, _, _) => rootLocal(recv)
+    case TIndex(recv, _, _) => rootLocal(recv)
+    case _                  => None
+
+  /** Why a write to a read-only place is refused, in the words of the form the program actually
+   * wrote — `what` is the thing being asked for, `"assignment"` or `"'&'"`.
+   *
+   * A pattern binding gets its own sentence rather than the `val` one, because the reader of an arm
+   * wrote no `val` and the reason is a different reason: the name holds a **copy** of the part that
+   * matched, so the write would land where nothing can observe it. Saying "a 'val' is written once"
+   * there names a keyword that is not on the screen and leaves the copy unmentioned, which is the
+   * half that explains why this is refused at all.
+   */
+  protected def writtenOnce(unique: Option[String], what: String): String =
+    if unique.exists(patternLocals) then
+      s"a pattern binding is written once, because it holds a copy of what it matched — so $what " +
+        "would reach that copy rather than the value it came from. Where you mean to change " +
+        "something, take a 'var' from the binding first"
+    else s"a 'val' is written once, so $what has nothing to write through"
 
   /** Binds a name to a **place** rather than to a value — what `ref` declares (`03 § ref`).
    *

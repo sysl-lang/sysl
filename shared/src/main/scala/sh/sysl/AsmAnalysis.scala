@@ -125,8 +125,15 @@ trait AsmAnalysis extends TypeResolution {
 
       case Some((slot, ty)) =>
         if op.dir == AsmDir.Out && readOnlyLocals(slot) then
-          at(op.pos)(err(s"'${op.name}' cannot be written by this assembly, because it is a 'val'. " +
-            "Declare it 'var' if the instructions are meant to set it"))
+          // A pattern binding is written once as well, and its advice cannot be "declare it 'var'":
+          // there is no keyword on an arm's capture to change.
+          at(op.pos)(err(
+            if patternLocals(slot) then
+              s"'${op.name}' cannot be written by this assembly, because a pattern binding holds a " +
+                "copy of what it matched and is written once. Copy it into a 'var' and name that instead"
+            else
+              s"'${op.name}' cannot be written by this assembly, because it is a 'val'. " +
+                "Declare it 'var' if the instructions are meant to set it"))
 
         if !fitsRegister(ty) then
           at(op.pos)(err(registerFitMessage(op.name, ty)))

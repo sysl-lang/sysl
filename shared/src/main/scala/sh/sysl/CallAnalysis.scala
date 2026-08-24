@@ -236,8 +236,15 @@ trait CallAnalysis extends OperatorCalls {
               case TLoad(name, _) => s" — write 'var ${name.takeWhile(_ != '.')}' if it is meant to change"
               case _              => " — write 'var' if it is meant to change"
 
-            err(s"'$member' takes '*self', so it writes through what it is called on, and a 'val' " +
-              s"is written once$fix")
+            // A pattern binding is written once for a reason of its own and has no keyword to
+            // change, so the advice above would name an edit there is nowhere to make.
+            err(if rootLocal(place).exists(patternLocals) then
+                  s"'$member' takes '*self', so it writes through what it is called on — and a " +
+                    "pattern binding holds a copy of what it matched, so the write would reach that " +
+                    "copy rather than the value it came from. Copy it into a 'var' and call this on that"
+                else
+                  s"'$member' takes '*self', so it writes through what it is called on, and a 'val' " +
+                    s"is written once$fix")
           // A `*self` method is handed somewhere to write, so it is the one call that could move
           // storage a live `ref` is standing on (`03 § ref`). It is asked here because this is where
           // the receiver becomes a place the caller can be told about.

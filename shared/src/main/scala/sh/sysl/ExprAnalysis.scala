@@ -758,7 +758,7 @@ trait ExprAnalysis
     // was declared under rather than of the expression it turned into (`12 §7`).
     target match
       case Ident(n) if lookupOpt(n).exists((u, _) => readOnlyLocals(u)) =>
-        err(s"a 'val' is written once, so $what has nothing to write through")
+        err(writtenOnce(lookupOpt(n).map(_._1), what))
       case _ =>
 
     t match
@@ -800,7 +800,7 @@ trait ExprAnalysis
         // does not have is a writable one. `&` is refused along with assignment because a `*T` is a
         // licence to write, and handing one out would make the promise unkeepable one step away
         // from where it was written.
-        if readOnly(t) then err(s"a 'val' is written once, so $what has nothing to write through")
+        if readOnly(t) then err(writtenOnce(rootLocal(t), what))
 
     // A live `ref` stands on storage, and an assignment that would release it leaves the name aimed
     // at freed memory (`03 § ref`). Only a write is asked about: `&` produces a pointer and takes

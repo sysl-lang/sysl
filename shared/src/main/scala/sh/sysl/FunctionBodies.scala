@@ -55,6 +55,7 @@ trait FunctionBodies extends ModuleStorage {
     val savedScopes   = scopes
     val savedUsed     = used.toSet
     val savedReadOnly = readOnlyLocals.toSet
+    val savedPattern  = patternLocals.toSet
     val savedRefs     = refPlaces.toMap
     val savedGuards   = refGuards
     val savedImports  = importStack
@@ -172,6 +173,7 @@ trait FunctionBodies extends ModuleStorage {
       scopes = savedScopes
       used.clear(); used ++= savedUsed
       readOnlyLocals.clear(); readOnlyLocals ++= savedReadOnly
+      patternLocals.clear(); patternLocals ++= savedPattern
       refPlaces.clear(); refPlaces ++= savedRefs
       refGuards = savedGuards
       importStack = savedImports

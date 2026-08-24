@@ -56,12 +56,16 @@ trait PatternAnalysis extends TypeResolution {
       try analyzePatternIn(p, ty)
       finally walkingPattern = false
 
-  /** The name a binding introduces, refused where this pattern has already introduced it. */
+  /** The name a binding introduces, refused where this pattern has already introduced it.
+   *
+   * It is written once, which is `declarePattern`'s subject: a pattern hands over a copy of the part
+   * it matched, so a write to the name would be discarded where the arm ends.
+   */
   private def bindOnce(name: String, ty: Type): String =
     if !boundInPattern.add(name) then
       err(s"'$name' is bound twice in one pattern, and the second would quietly stand for a " +
         "different part of the value — rename it, or compare the two in a guard")
-    else declare(name, ty)
+    else declarePattern(name, ty)
 
   private def analyzePatternIn(p: Pattern, ty: Type): TPattern = p match
     case WildcardPattern => TWildPattern(ty)
