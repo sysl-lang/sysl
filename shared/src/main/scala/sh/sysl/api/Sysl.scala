@@ -40,6 +40,22 @@ package api
  * Sysl.compile("main()\n    print(x)")            // Left("… undefined name 'x' …")
  * Sysl.check("main()\n    print(x)")              // List(Problem("undefined name 'x'", Some(…)))
  * ```
+ *
+ * ## Stability: narrow by design, and not promised before 1.0
+ *
+ * "Narrow" above is a statement about the *shape* of this surface — plain `String`, `Int`, `List`
+ * and `Either`, and no syntax tree — which is what keeps a change to the language's own declarations
+ * from being a breaking change here. It is deliberately not a statement about **when** the surface
+ * stops moving, and the two were easy to read as one thing while no version had been named.
+ *
+ * **Before 1.0 anything here may change in any release.** A consumer pins a compiler version and
+ * moves when it chooses to, exactly as `sh.sysl.ir`'s does.
+ *
+ * **0.1.0 does not change that.** That tag covers the language, the standard library's API and the
+ * package format — the surfaces a *sysl program* is written against — and deliberately not the
+ * compiler's own published artifacts. What this package does offer over `sh.sysl.ir` is that its
+ * narrowness makes a break less likely rather than merely later: a signature written in `String`
+ * has less to break.
  */
 object Sysl {
 

@@ -33,16 +33,21 @@ package sh.sysl
  * every local in a stack slot and reaches it with `load` and `store`, so what a consumer receives is
  * memory form and it may promote or not as it likes.
  *
- * ## Stability: pinned and bumped, with no promise before 0.1.0
+ * ## Stability: pinned and bumped, with no promise before 1.0
  *
  * This package is **published** — it is a sibling of `sh.sysl.api` rather than part of it, because
  * `api`'s own documented claim is that it mentions no tree, and an IR is a tree. A back end can
  * therefore live outside this repository, against the released artifact, off this repository's gate.
  *
  * What it gets in exchange for that is a version to pin rather than a compatibility guarantee.
- * **Before 0.1.0 anything here may change in any release**, including the shape of a case and the
+ * **Before 1.0 anything here may change in any release**, including the shape of a case and the
  * meaning of a field; a consumer pins a compiler version and moves when it chooses to. That is said
  * here rather than assumed, because it is the only thing a downstream can plan around.
+ *
+ * **0.1.0 does not change this, and the version it names was moved so that it cannot.** That tag
+ * covers the language, the standard library's API and the package format — a program's surfaces —
+ * and deliberately not the compiler's own published artifacts. This package is the more volatile of
+ * the two by construction: it is a tree, and lowering is precisely what changes it.
  *
  * The one commitment that does hold, and that the whole model is checked against: **the text this
  * prints is the text the compiler has always printed.** The codegen test tier asserts on emitted IR
