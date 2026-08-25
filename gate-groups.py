@@ -55,19 +55,32 @@ STYLE = re.compile(r'Any(FreeSpec|FunSuite|WordSpec|FlatSpec|FunSpec|PropSpec|Fe
 # at 12g. It wedged, was killed at the watchdog, and the gate read RED with zero test failures.
 #
 # Dealing round-robin instead of slicing is what fixes it, and raising the count is not: a bigger
-# CHUNKS still puts `Codegen*` next to `Codegen*`, so the next family of twenty similarly-named
+# count still puts `Codegen*` next to `Codegen*`, so the next family of twenty similarly-named
 # suites clusters exactly as this one did.
 #
 # **Round-robin alone was measured and was not enough**, which is the second half of the finding: at
 # 18 groups of 17-18 the run cleared five chunks and then wedged again on a group whose suites had
 # nothing in common, so what remained was not lopsidedness but the pile itself. Growth is monotonic
 # per agent within one `sbt`, so the lever that works is fewer suites per invocation and raising the
-# heap cap only postpones it. 36 groups is ~9 suites each, ~2 per agent.
+# heap cap only postpones it.
 #
-# The pile got heavier this release for a reason worth recording: `sysl.container` added five
+# The pile got heavier that release for a reason worth recording: `sysl.container` added five
 # modules to `library/sysl`, and every program a suite compiles links the standard library. Nothing
 # here could notice that, which is why the number is measured rather than derived.
-CHUNKS = 36
+#
+# **THIS WAS A FIXED CHUNK *COUNT* UNTIL 2026-08-25, WHICH MEANT THE MEASURED NUMBER DECAYED.** The
+# comment above it read "36 groups is ~9 suites each", and nine is the figure that was measured; the
+# thirty-six is an artifact of how many suites existed the day it was written. Suites are added
+# steadily, so a fixed count silently grows the chunks: 355 light suites over 36 groups is **~10**,
+# and at 500 it would be 14 -- the gate walking back toward the cliff with nothing to say so.
+#
+# 0.0.79 is where that showed. Two chunks were killed and both passed alone, and the release before
+# it had none. So the size is what is fixed now and the count is derived, which keeps the measured
+# figure true as the tree grows instead of only on the day somebody last looked.
+#
+# User, 2026-08-25, arriving at the same lever from the symptom: *"maybe those chunks just need to
+# be broken up"*.
+SUITES_PER_CHUNK = 9
 
 
 def suites(root):
@@ -127,6 +140,25 @@ def suites(root):
     return found
 
 
+def deal(light):
+    """The light suites dealt round-robin into chunks of at most `SUITES_PER_CHUNK`.
+
+    Round-robin rather than contiguous slices, so that suites sharing a prefix -- which here means
+    sharing a kind, and therefore a cost -- are spread across the groups instead of piled into one.
+
+    **The count is derived from the size rather than the other way round.** A fixed count held the
+    measured suites-per-chunk only on the day it was written; see `SUITES_PER_CHUNK`. `-(-a // b)` is
+    the ceiling, so the last chunk is the short one and no chunk ever exceeds the measured size.
+
+    It is a function rather than four lines in `main` so that the self-test can assert the real
+    thing. Asserting a copy of the arithmetic would pass whatever `main` went on to do, which is the
+    shape of check this file already has one lesson about.
+    """
+    count = max(1, -(-len(light) // SUITES_PER_CHUNK))
+
+    return [light[i::count] for i in range(min(count, len(light)))]
+
+
 def self_test():
     """The matcher, against the shape that defeated it.
 
@@ -162,6 +194,30 @@ def self_test():
 
     print('  self-test: a suite extending a local base is found, and a non-suite is not')
 
+    # **The sizing, which is the half that used to decay silently.** A fixed chunk *count* held the
+    # measured suites-per-chunk only on the day it was written, and 0.0.79 was killed twice on a
+    # tree that had grown into ~10 per chunk against a measured 9. This asserts the property that
+    # replaced it -- no chunk exceeds the target, at any tree size -- which is exactly what a fixed
+    # count cannot promise and what no gate run would report until it wedged.
+    for n in (1, 8, 9, 10, 36, 355, 500, 5000):
+        light = [f'sh.probe.S{i}' for i in range(n)]
+        chunks = deal(light)
+
+        widest = max(len(c) for c in chunks)
+        placed = sorted(s for c in chunks for s in c)
+
+        if widest > SUITES_PER_CHUNK:
+            sys.exit(f'gate-groups self-test failed: {n} suites gave a chunk of {widest}, '
+                     f'over the measured {SUITES_PER_CHUNK}')
+
+        # A round-robin deal that dropped or duplicated a suite would be a hole in the gate of
+        # exactly the kind the reconciliation in `run-gate.sh` exists to catch -- assert it here too,
+        # where it costs nothing and does not need sbt.
+        if placed != sorted(light):
+            sys.exit(f'gate-groups self-test failed: {n} suites in, {len(placed)} out')
+
+    print(f'  self-test: no chunk exceeds {SUITES_PER_CHUNK} suites, and none is lost, at any size')
+
 
 def main():
     if len(sys.argv) == 2 and sys.argv[1] == '--self-test':
@@ -190,15 +246,19 @@ def main():
         print('        Not acted on: iterating is not what makes a suite heavy. If a chunk times')
         print('        out, the summary names the suite, and it belongs in HEAVY.')
 
-    # Round-robin rather than contiguous slices, so that suites sharing a prefix -- which here means
-    # sharing a kind, and therefore a cost -- are spread across the groups instead of piled into one.
-    chunks = [light[i::CHUNKS] for i in range(min(CHUNKS, len(light)))]
+    chunks = deal(light)
 
     os.makedirs(out, exist_ok=True)
     json.dump(heavy, open(os.path.join(out, 'heavy.json'), 'w'), indent=1)
     json.dump(chunks, open(os.path.join(out, 'chunks.json'), 'w'), indent=1)
 
-    print(f'  {len(found)} suites: {len(heavy)} run alone, {len(light)} in {len(chunks)} chunks')
+    # The largest chunk is printed because it is the number that actually bounds a group's peak, and
+    # because it is what silently grew while the count was fixed. A reader who sees it climb past the
+    # measured size has the warning that was missing for four releases.
+    widest = max((len(c) for c in chunks), default=0)
+
+    print(f'  {len(found)} suites: {len(heavy)} run alone, '
+          f'{len(light)} in {len(chunks)} chunks of at most {widest} (target {SUITES_PER_CHUNK})')
 
 
 if __name__ == '__main__':
