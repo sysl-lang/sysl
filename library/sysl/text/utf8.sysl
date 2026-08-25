@@ -71,6 +71,14 @@ private enum Scan
     Invalid(len: usize)
     Truncated(len: usize)
 
+    /** How far this step reaches, whichever of the three it was -- which is what a walk that only
+     * needs to find the next character asks, and it is never zero, so a loop over it terminates.
+     */
+    width(self) -> usize = self match
+        Valid(n) -> n
+        Invalid(n) -> n
+        Truncated(n) -> n
+
 /** The well-formedness table, walked one character at a time.
  *
  * It is Unicode's own table rather than a decode-and-range-check, which is what makes the four ways
@@ -208,6 +216,11 @@ is_char_boundary(b: u8) -> bool = (b & 192) != 128
 
 /** How many bytes the character starting with this lead byte occupies. The width is written into the
  * lead byte, which is the property that makes UTF-8 walkable forwards without decoding anything.
+ *
+ * **It answers for a lead byte that begins a character, and says nothing about one that cannot** --
+ * `0xFF` reads as 4 because that is the row it falls in, and there is no character there at all. So
+ * it is a decoder's helper and never a walk's: what a walk asks is `scan_at`, which distinguishes
+ * the two.
  */
 private char_width(lead: u8) -> usize
     if lead >= 240 then
@@ -222,14 +235,19 @@ end char_width
 
 /** One character read out of a run of bytes.
  *
- * It is a function rather than a body inside `next` because looking without advancing needs the
- * same decode, and a decoder written twice is two chances for the two to disagree. Counting needs
- * neither of them -- `char_width` is enough -- which is why the width is not returned alongside:
- * the caller that has to move already knows how far.
+ * It is a function rather than a body inside `step_at` because it is the half that is only about the
+ * bits: `step_at` decides *whether* there is a character here and how far it reaches, and this says
+ * what it is. Counting needs only the first half, which is why the width is not returned alongside.
  *
- * The decode is a plain shift-and-accumulate with no validation, which is sound only because there
- * is no way to reach it with bytes that were not validated first: a `string` is UTF-8 by
- * construction, so the lead byte's width is the width that is there.
+ * The decode is a plain shift-and-accumulate with no validation, and what makes that sound is the
+ * caller: it is `private`, and the only thing that reaches it is `step_at`, which decodes exactly
+ * where `scan_at` answered `Valid`. So the lead byte's width is the width that is there.
+ *
+ * **It used to say the guarantee came from `string` being UTF-8 by construction, and that was a
+ * whole byte-slice wide of the truth**: `chars_of` is public and takes any `[]const u8`, so
+ * `char_width(0xFF)` answering 4 over a two-byte run read past the end of it and the program
+ * trapped. The precondition is now checked rather than assumed, which is the only version of it a
+ * caller cannot get wrong.
  */
 private decode_at(b: []const u8, i: usize) -> char
     var lead = b[i]
@@ -248,6 +266,24 @@ private decode_at(b: []const u8, i: usize) -> char
 
     char(v)
 end decode_at
+
+/** One step of a walk over bytes that may not be text: the character there, and how many bytes it
+ * took.
+ *
+ * **This is the one place the two halves of this file meet**, and it is why the walk is safe.
+ * `scan_at` is Unicode's own well-formedness table and already reports the **maximal ill-formed
+ * subsequence**, so a step over bytes that are not text yields one U+FFFD and advances past exactly
+ * the run that was wrong -- which is what `from_utf8_lossy` does with the same table, and the two
+ * therefore cannot come to disagree about what a run of bad bytes contains.
+ *
+ * The width is never zero, so a loop driven by this one terminates on any input at all.
+ */
+private step_at(b: []const u8, i: usize) -> (char, usize)
+    val found = scan_at(b, i)
+
+    found match
+        Valid(n) -> (decode_at(b, i), n)
+        _ -> (replacement, found.width())
 
 /** A cursor over the characters of a run of bytes, which is what `s.chars` reaches -- the compiler
  * names `chars_of` for itself, so this is a declaration the language depends on by name rather than
@@ -272,21 +308,23 @@ struct Chars
     peek(self) -> Option[char]
         if self.at >= self.rest.len then return None
 
-        Some(decode_at(self.rest, self.at))
+        Some(step_at(self.rest, self.at).0)
 
     /** How many characters are left, which costs a walk of the remaining bytes -- there is nothing
      * in the representation that knows it, since the whole point of UTF-8 is that the count and the
      * byte length are different numbers. By value again, so counting does not consume.
      *
-     * It reads each lead byte's width and skips, decoding nothing: what a count needs to know is
-     * where the characters start, not what they are.
+     * It reads how far each step reaches and skips, decoding nothing: what a count needs to know is
+     * where the characters start, not what they are. Bytes that are not text count as the one
+     * replacement character the walk would hand back for them, so this agrees with `next` rather
+     * than with the byte length.
      */
     count(self) -> usize
         var n: usize = 0
         var i = self.at
 
         while i < self.rest.len
-            i += char_width(self.rest[i])
+            i += scan_at(self.rest, i).width()
             n += 1
 
         n
@@ -300,16 +338,17 @@ impl Iterate for Chars
     next(*self) -> Option[char]
         if self.at >= self.rest.len then return None
 
-        var c = decode_at(self.rest, self.at)
+        val (c, width) = step_at(self.rest, self.at)
 
-        self.at += char_width(self.rest[self.at])
+        self.at += width
         Some(c)
     end next
 
 /** The same walk, reporting where each character started as well as what it was.
  *
- * This is the cursor a lexer actually wants, and its absence is why the guide's JSON reader and its
- * bytecode lexer both index bytes by hand: a `for` walks a *copy* of a cursor, so `for c in s.chars`
+ * This is the cursor a lexer actually wants, and its absence is why the JSON reader that used to sit
+ * in `guide/` and the bytecode lexer beside it both index bytes by hand: a `for` walks a *copy* of a
+ * cursor, so `for c in s.chars`
  * cannot be asked afterwards where it got to, and a program needing both the character and its
  * offset had no form that gave it both. Rust calls this `char_indices` and it is here for the same
  * reason.

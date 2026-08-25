@@ -504,16 +504,23 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
              |print("through")""".stripMargin) shouldBe "through\n"
     }
 
-    // The decoder trusts `string`'s validity invariant, and a `Chars` a program built itself over
-    // bytes that are not a string has no such invariant behind it — so the property that has to
-    // hold is the safety one rather than the correctness one. A truncated lead byte makes the
-    // decoder ask for a continuation byte that is not there, and the slice's own bounds check is
-    // what stops it: the read traps rather than running off the end.
-    "a hand-built cursor over truncated bytes traps rather than reading past the end" in {
-      exits("""import sysl.text.chars_of
-              |
-              |var b = [0xF0u8]
-              |for c in chars_of(b[..]) do print(c)""".stripMargin)
+    // A `Chars` a program built itself over bytes that are not a string has no validity invariant
+    // behind it, and `chars_of` is public, so the walk has to decide what such bytes *are* rather
+    // than assume they cannot arrive. It answers U+FFFD per ill-formed run, which is what
+    // `from_utf8_lossy` does with the same table — so a lexer over a file somebody else wrote gets
+    // a character it can report rather than a dead process.
+    //
+    // **This used to trap, and the trap was asserted here as the property that held**: `0xF0`
+    // promises three continuation bytes, the decoder asked for one that was not there, and the
+    // slice's bounds check stopped it. Safety was never in question — sysl checks the index — but a
+    // public function that ends the program on ordinary untrusted input is not a thing a caller can
+    // build a reader on, and `sh.sysl.parsing`'s whole scanner tier is built on exactly this.
+    "a hand-built cursor over truncated bytes yields a replacement rather than trapping" in {
+      run("""import sysl.text.chars_of
+            |
+            |var b = [0xF0u8]
+            |for c in chars_of(b[..]) do print(u32(c))
+            |print("through")""".stripMargin) shouldBe "65533\nthrough\n"
     }
 
     // `next` must give back an `Option` of the element type — the trait says so, and an
