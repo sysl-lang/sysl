@@ -307,11 +307,27 @@ class TupleTests extends AnyFreeSpec with ParseSupport with RunSupport with Code
     }
 
     // A specifier describes the field the **whole** value occupies (`library/core.md § A specifier is the whole value's field`), so the padding is
-    // applied once around the finished text rather than handed to each part.
+    // applied once around the whole rendering rather than handed to each part.
+    //
+    // It used to be applied around the *finished text*, which is a different claim and is no longer
+    // true: the parts were gathered into a string so that its length could be read off, and one
+    // string per part plus one per separator was thrown away for every tuple printed. The width is
+    // measured by rendering into a `Counting` sink instead, so nothing is built.
     "and a specifier pads the whole rendering, not each part" in {
       run("""var p = (1, 2)
             |print(f"${p}%10s|", f"${p}%-10s|")
             |""".stripMargin) shouldBe "    (1, 2)| (1, 2)    |\n"
+    }
+
+    // A padded rendering walks the parts twice, so a part the tuple owns is read twice and released
+    // once. A `string` is what makes that visible, and printing the same tuple again afterwards is
+    // what says the first rendering did not consume it.
+    "a part the tuple owns survives being rendered twice" in {
+      run("""var p = (1, "abc")
+            |print(f"${p}%12s|")
+            |print(f"${p}%12s|")
+            |print(p)
+            |""".stripMargin) shouldBe "    (1, abc)|\n    (1, abc)|\n(1, abc)\n"
     }
 
     "a part with no membership takes the trait away from the whole" in {

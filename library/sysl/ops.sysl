@@ -107,20 +107,50 @@ impl[..A: Hash] Hash for (..A)
         hash_u64(h)
     end hash
 
-/** Rendered as one field, which is why the parts are gathered before anything is padded: a specifier
- * describes the field the *whole* value occupies (`library/core.md § A specifier is the whole
- * value's field`), so `%8s` on a pair pads the pair and not its first element.
+/** The elements between brackets, written straight through to wherever they are going. Each element
+ * gets a plain specifier, because the field a specifier describes is the whole tuple and not its
+ * parts (`library/core.md § A specifier is the whole value's field`).
+ */
+private render_tuple[..A: Display](t: (..A), out: *Writer, parts: FormatSpec)
+    out.write("(".bytes)
+
+    for const i in 0..<A.len
+        if i > 0 then out.write(", ".bytes)
+
+        t.i.display(out, parts)
+
+    out.write(")".bytes)
+end render_tuple
+
+/** Rendered as one field: a specifier describes the field the *whole* value occupies
+ * (`library/core.md § A specifier is the whole value's field`), so `%8s` on a pair pads the pair and
+ * not its first element.
+ *
+ * **It is measured rather than gathered**, which is what a compound rendering costs when it is done
+ * the obvious way: building the text first meant one string per element plus one per separator, all
+ * of them thrown away as soon as they were written. Running the same writes into a `Counting` sink
+ * answers the same question and stores nothing, and the sink is built only where a width was asked
+ * for -- so an ordinary print of a tuple costs one pass and allocates nothing at all.
  */
 impl[..A: Display] Display for (..A)
     display(self, out: *Writer, fmt: FormatSpec)
-        var s = "("
+        val parts = FormatSpec(0, -1, false)
+        var pad = 0
 
-        for const i in 0..<A.len
-            if i > 0 then s = s + ", "
+        if fmt.width > 0
+            var count = Counting(0)
+            var sink: *Writer = &count
 
-            s = s + str(self.i)
+            render_tuple(self, sink, parts)
+            pad = fmt.width - int(count.n)
 
-        display_pad((s + ")").bytes, out, fmt)
+            if pad < 0 then pad = 0
+
+        if !fmt.left then display_fill(out, 32, pad)
+
+        render_tuple(self, out, parts)
+
+        if fmt.left then display_fill(out, 32, pad)
     end display
 
 /** A sink that keeps the length of what it was given and drops the bytes, which is how a value made
@@ -132,7 +162,9 @@ impl[..A: Display] Display for (..A)
  * the *whole* value occupies (`library/core.md § A specifier is the whole value's field`), so any
  * `Display` rendering more than one part has to know how wide the whole came out before it can pad
  * once -- and an implementation written outside `sysl` had nowhere to measure into but a buffer.
- * `[]T`, `Option`, `Result` and `Complex[F]` all honour a width this way, from four separate files.
+ * `[]T`, `Option`, `Result`, `Complex[F]` and the tuple above all honour a width this way, from five
+ * separate files -- and so does **every derived `Display`**, which the compiler writes in this shape
+ * (`reference/traits.md § The compiler writes four of them`).
  */
 struct Counting
     n: usize

@@ -216,4 +216,83 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
         s"[2 x ptr] [ptr @C.failed, ptr @C.write]")
     }
   }
+
+  /** What a compound rendering costs, which is the half a run suite cannot see: the output is
+   * identical either way, and only the emitted symbols say whether a string was built to produce it.
+   *
+   * A gathered rendering reaches `sysl.str.concat`, and reaching it at all is the defect — one
+   * string per part plus one per separator, every one of them thrown away as soon as it is written.
+   */
+  "a compound rendering builds no string" - {
+
+    val sized =
+      """struct Size deriving Display
+        |    w: int
+        |    h: int
+        |
+        |""".stripMargin
+
+    /** A writer of the program's own, so that a rendering can be asked for with a specifier the
+      * program spells. What is being measured is what the *rendering* reaches, and this reaches
+      * nothing but a counter of its own.
+      */
+    val sink =
+      """struct C
+        |    n: usize
+        |
+        |impl Fallible for C
+        |
+        |impl Writer for C
+        |    write(*self, bytes: []const u8)
+        |        self.n += bytes.len
+        |
+        |var c: C
+        |var w: *Writer = &c
+        |
+        |""".stripMargin
+
+    "a derived Display writes its parts straight through" in {
+      val out = ir(sized + "print(Size(3, 4))\n")
+
+      out should not include "@sysl.str.concat"
+      out should not include "@sysl.str.int"
+      out should include("@render$20Size")
+    }
+
+    // The width is the case that used to force the buffer, since a field describes the whole value
+    // and the whole value's length has to be known before the first byte goes out. It is measured
+    // into `Counting` instead, which stores nothing.
+    //
+    // The specifier is handed over directly rather than through an f-string, because an f-string
+    // concatenates its own pieces — so `sysl.str.concat` would be in the output whatever the
+    // rendering did, and the seam would stop saying anything.
+    "and a width is measured rather than gathered" in {
+      val out = ir(sized + sink + "Size(3, 4).display(w, FormatSpec(12, -1, false))\n")
+
+      out should not include "@sysl.str.concat"
+      out should include("@sysl$Counting.write")
+    }
+
+    "a tuple builds none either, padded or not" in {
+      val out = ir(sink + """(1, 2).display(w, FormatSpec(0, -1, false))
+                            |(3, 4).display(w, FormatSpec(10, -1, false))
+                            |""".stripMargin)
+
+      out should not include "@sysl.str.concat"
+      out should include("@sysl$Counting.write")
+    }
+
+    // A shape with no parts renders as one string literal, so there was never anything to gather and
+    // the one-call form is kept — no renderer is written for it at all.
+    "and a shape with no parts gets no renderer" in {
+      val out = ir("""struct Unit deriving Display
+                     |end Unit
+                     |
+                     |print(Unit())
+                     |""".stripMargin)
+
+      out should not include "@render"
+      out should include("@sysl$display_pad")
+    }
+  }
 }

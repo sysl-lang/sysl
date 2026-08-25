@@ -83,6 +83,50 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
                    |""".stripMargin) shouldBe "[  Size(3, 4)]\n"
     }
 
+    // Left-justified is the other half of the same padding, and it is the one that would go wrong if
+    // the measuring pass and the writing pass ever disagreed about how wide the value came out.
+    "and a left-justified width pads on the other side" in {
+      run(sized + """val s = Size(3, 4)
+                   |
+                   |print(f"[${s}%-12s]")
+                   |print(f"[${s}%2s]")
+                   |""".stripMargin) shouldBe "[Size(3, 4)  ]\n[Size(3, 4)]\n"
+    }
+
+    // The rendering runs twice under a width — once into the counter and once for real — so a field
+    // the value owns is read twice and released once. A `string` field is what makes that visible:
+    // an owned one released by the measuring pass would leave the second pass reading freed bytes.
+    "a value the rendering owns survives being rendered twice" in {
+      run("""struct Named deriving Display
+            |    name: string
+            |    n: int
+            |end Named
+            |
+            |val v = Named("abc", 1)
+            |
+            |print(f"[${v}%14s]")
+            |print(f"[${v}%14s]")
+            |print(v)
+            |""".stripMargin) shouldBe "[ Named(abc, 1)]\n[ Named(abc, 1)]\nNamed(abc, 1)\n"
+    }
+
+    // The inner value is a part of the outer rendering, so it is written through the same sink the
+    // outer one was pointed at — which is what makes the measuring pass see the whole thing.
+    "a width over a nesting measures the whole nesting" in {
+      run("""struct Point deriving Display
+            |    x: int
+            |    y: int
+            |end Point
+            |
+            |struct Line deriving Display
+            |    a: Point
+            |    b: Point
+            |end Line
+            |
+            |print(f"[${Line(Point(1, 2), Point(3, 4))}%32s]")
+            |""".stripMargin) shouldBe "[  Line(Point(1, 2), Point(3, 4))]\n"
+    }
+
     "one field" in {
       run("""struct Wrap deriving Eq, Ord, Display
             |    v: int
@@ -278,6 +322,15 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
                     |""".stripMargin) shouldBe "Circle(2)\nRect(3, 4)\nEmpty\n"
     }
 
+    // Every arm goes through one renderer, so the width is measured over whichever arm was taken —
+    // including the one that carries nothing, whose rendering is its name and no brackets.
+    "and a width pads whichever variant was taken" in {
+      run(shape + """print(f"[${Circle(2)}%12s]")
+                    |print(f"[${Rect(3, 4)}%-12s]")
+                    |print(f"[${Empty}%8s]")
+                    |""".stripMargin) shouldBe "[   Circle(2)]\n[Rect(3, 4)  ]\n[   Empty]\n"
+    }
+
     "equal values hash equal" in {
       run(shape + """print(Rect(1, 2).hash() == Rect(1, 2).hash())
                     |""".stripMargin) shouldBe "true\n"
@@ -409,6 +462,32 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |
             |print(a == Buf[4](1), a)
             |""".stripMargin) shouldBe "true Buf(1)\n"
+    }
+
+    // The renderer a derived `Display` writes beside the block carries the type's parameters, value
+    // ones included, so it is instantiated at whatever the value was — and a width goes through it
+    // twice at that instantiation.
+    "and a rendering under a width still reaches a value-parameterised type" in {
+      run("""struct Buf[const N: usize] deriving Display
+            |    n: usize
+            |end Buf
+            |
+            |val a: Buf[4] = Buf(1)
+            |val b: Buf[8] = Buf(2)
+            |
+            |print(f"[${a}%10s]", f"[${b}%-10s]")
+            |""".stripMargin) shouldBe "[    Buf(1)] [Buf(2)    ]\n"
+    }
+
+    // And a type parameter, where the renderer is generic over it and the bound the clause added is
+    // what lets the part be written at all.
+    "and a generic one is rendered at each argument it is used at" in {
+      run("""struct Box[T] deriving Display
+            |    v: T
+            |end Box
+            |
+            |print(f"[${Box(1)}%8s]", f"[${Box("ab")}%-8s]")
+            |""".stripMargin) shouldBe "[  Box(1)] [Box(ab) ]\n"
     }
   }
 

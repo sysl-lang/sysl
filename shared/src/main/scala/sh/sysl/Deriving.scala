@@ -54,7 +54,16 @@ object Deriving {
    * about the shape and nothing about it is about a `struct` or an `enum` — and because a *simple*
    * sum is a third case that neither declaration form tells you about on its own.
    */
-  private sealed trait Shape
+  private sealed trait Shape {
+
+    /** Whether anything at all is written between brackets — a fieldless struct and a simple enum
+     * render as one string literal and have nothing to gather, which is what lets a derived
+     * `Display` for either keep the one-call form.
+     */
+    def hasParts: Boolean = this match
+      case Product(fields) => fields.nonEmpty
+      case Sum(variants)   => variants.exists(_.fields.nonEmpty)
+  }
 
   private case class Product(fields: List[String]) extends Shape
 
@@ -128,9 +137,9 @@ object Deriving {
    */
   def expand(stmt: Stmt): List[Stmt] = stmt match
     case s: StructDecl =>
-      usable(s.deriving, s).map(one(_, s.name, s.tparams, s.bounds, s.tvalues, Product(fieldNames(s))))
+      usable(s.deriving, s).flatMap(one(_, s.name, s.tparams, s.bounds, s.tvalues, Product(fieldNames(s))))
     case e: EnumDecl =>
-      usable(e.deriving, e).map(one(_, e.name, e.tparams, e.bounds, e.tvalues, Sum(e.variants)))
+      usable(e.deriving, e).flatMap(one(_, e.name, e.tparams, e.bounds, e.tvalues, Sum(e.variants)))
     case _ => Nil
 
   /** The clause as written, or nothing where the declaration has none — what the check below reads. */
@@ -206,7 +215,7 @@ object Deriving {
       bounds: Map[String, List[BoundRef]],
       tvalues: Map[String, TypeRef],
       shape: Shape,
-  ): Stmt = {
+  ): List[Stmt] = {
     val trait_  = derived.name
     val simple  = trait_.split('.').last
     val subject = NamedType(name, tparams.map(NamedType(_))).setPos(derived.pos)
@@ -221,16 +230,20 @@ object Deriving {
         acc.updated(t, acc.getOrElse(t, Nil) :+ BoundRef(trait_).setPos(derived.pos))
       }
 
-    val method = simple match
-      case "Eq"      => eqMethod(shape)
-      case "Ord"     => ordMethod(shape)
-      case "Hash"    => hashMethod(shape)
-      case "Display" => displayMethod(name, shape)
-      case _         => sys.error(s"unreachable: '$simple' is not a derivable trait")
+    // `Display` is the one that needs a declaration of its own beside the block: the parts are
+    // written straight through a renderer rather than gathered into a string, and a renderer is a
+    // function. Everything else is a body and nothing more.
+    val (extra, method) = simple match
+      case "Eq"   => (Nil, eqMethod(shape))
+      case "Ord"  => (Nil, ordMethod(shape))
+      case "Hash" => (Nil, hashMethod(shape))
+      case "Display" => displayDecls(name, tparams, derivedBounds, tvalues, shape)
+      case _ => sys.error(s"unreachable: '$simple' is not a derivable trait")
 
-    ImplDecl(trait_, subject, List(method.setPos(derived.pos)), tparams, derivedBounds,
-             tvalues = tvalues)
-      .setPos(derived.pos)
+    extra.map(_.setPos(derived.pos)) :+
+      ImplDecl(trait_, subject, List(method.setPos(derived.pos)), tparams, derivedBounds,
+               tvalues = tvalues)
+        .setPos(derived.pos)
   }
 
   private def method(name: String, params: List[Param], ret: Option[TypeRef], body: List[Stmt]) =
@@ -343,46 +356,129 @@ object Deriving {
   /** `Size(3, 4)` — the type's own name and its fields in order, which is the tuple's rendering with
    * the name in front.
    *
-   * Gathered into a string before anything is padded, for the reason the tuple's is: a specifier
-   * describes the field the **whole** value occupies, so `%12s` on a `Size` pads the `Size` and not
-   * its first field. Each field is rendered through `str`, which hands it the neutral specifier.
+   * **Two declarations, because the field belongs to the whole value and the parts do not.** A
+   * specifier describes the field the *whole* value occupies (`library/core.md § A specifier is the
+   * whole value's field`), so `%12s` on a `Size` pads the `Size` and not its first field — and the
+   * only way to pad once is to know how wide the parts came out before writing them. The renderer
+   * below writes the parts straight through to wherever it is pointed, and `display` points it at a
+   * `Counting` sink first when a width was asked for, exactly as `[]T`, `Option`, `Result` and
+   * `Complex[F]` do.
+   *
+   * **What it replaces is a fold of `+` over `str` of each part**, which built one string per field
+   * plus one per separator and threw every one of them away — in every program that derives a
+   * `Display`, which is the ordinary way to give a type a rendering.
+   *
+   * A shape with no parts to write needs none of it: a fieldless struct and a simple enum render as
+   * one string literal, which `display_pad` already pads without gathering anything.
    */
-  private def displayMethod(name: String, shape: Shape): MethodDecl = {
+  private def displayDecls(
+      name: String,
+      tparams: List[String],
+      bounds: Map[String, List[BoundRef]],
+      tvalues: Map[String, TypeRef],
+      shape: Shape,
+  ): (List[Stmt], MethodDecl) = {
     val out = Param("out", PtrType(NamedType("Writer")))
     val fmt = Param("fmt", NamedType("FormatSpec"))
 
-    val text: Expr = shape match
-      case Product(fields) => rendered(name, fields.map(self))
+    if !shape.hasParts then
+      val text: Expr = shape match
+        case Product(_) => StrLit(name)
+        case sum: Sum =>
+          MatchExpr(Ident("self"), sum.variants.map(v => arm(List(anyOf(v)), List(ExprStmt(StrLit(v.name))))))
 
-      // A variant renders under **its own** name rather than the enum's, which is how it is
-      // written: `Circle(2)`, not `Shape(2)`. The enum's name appears nowhere, exactly as it does
-      // not at the construction.
-      case sum: Sum =>
-        MatchExpr(Ident("self"), sum.variants.map { v =>
-          arm(List(variantPattern(v, binder("l", _))),
-              List(ExprStmt(rendered(v.name, v.fields.indices.toList.map(i => Ident(binder("l", i)))))))
-        })
+      (Nil, method("display", List(out, fmt), None,
+                   List(ExprStmt(Call(Ident("display_pad"),
+                                      List(Field(text, "bytes"), Ident("out"), Ident("fmt")))))))
+    else
+      val helper = renderName(name)
 
-    method("display", List(out, fmt), None,
-           List(ExprStmt(Call(Ident("display_pad"),
-                              List(Field(text, "bytes"), Ident("out"), Ident("fmt"))))))
+      val body: List[Stmt] = shape match
+        case Product(fields) => writes(name, fields.map(f => Field(Ident(subjectParam), f)))
+
+        // A variant renders under **its own** name rather than the enum's, which is how it is
+        // written: `Circle(2)`, not `Shape(2)`. The enum's name appears nowhere, exactly as it does
+        // not at the construction.
+        case sum: Sum =>
+          List(ExprStmt(MatchExpr(Ident(subjectParam), sum.variants.map { v =>
+            arm(List(variantPattern(v, binder("l", _))),
+                writes(v.name, v.fields.indices.toList.map(i => Ident(binder("l", i)))))
+          })))
+
+      val subject  = NamedType(name, tparams.map(NamedType(_)))
+      val renderer = FuncDecl(helper, tparams,
+                              List(Param(subjectParam, subject), out, fmt.copy(name = "parts")),
+                              None, body, bounds, vis = Visibility.File, tvalues = tvalues)
+
+      (List(renderer), method("display", List(out, fmt), None, padded(helper)))
   }
 
-  /** `Size(3, 4)` — a name, and its parts between brackets where it has any.
+  /** The name of the renderer a derived `Display` writes its parts through.
    *
-   * The parts are gathered into a string before anything is padded, for the reason the tuple's
-   * rendering gathers its own: a specifier describes the field the **whole** value occupies
-   * (`library/core.md § A specifier is the whole value's field`), so `%12s` on a `Size` pads the `Size` and not its first field. Each part goes through
-   * `str`, which hands it the neutral specifier.
+   * **The space is what makes it unforgeable.** An ordinary identifier is letters, digits and `_`
+   * (`reference/lexical.md § Identifiers`), so no unquoted name can collide with this one, and a
+   * program that wanted to collide would have to write the backticks out itself. A plain
+   * `render_Size` would take a name the program is entitled to.
    */
-  private def rendered(name: String, parts: List[Expr]): Expr =
-    if parts.isEmpty then StrLit(name)
-    else
-      val pieces = parts.zipWithIndex.map { (p, i) =>
-        val piece = Call(Ident("str"), List(p))
+  private def renderName(name: String): String = s"render $name"
 
-        if i == 0 then piece else Binary("+", StrLit(", "), piece)
+  /** What the renderer's receiver is called. Not `self`: it is an ordinary function rather than a
+   * member, and `self` there would read as a receiver it does not have.
+   */
+  private val subjectParam = "v"
+
+  private def write(text: String): Stmt =
+    ExprStmt(Call(Field(Ident("out"), "write"), List(Field(StrLit(text), "bytes"))))
+
+  /** `Size(`, each part, `, ` between them, `)` — the rendering as a sequence of writes rather than
+   * as a string that was built to be written once.
+   *
+   * Each part is handed the **neutral** specifier, which is exactly what `str` handed it before: the
+   * specifier that arrived describes the field the whole value occupies (`library/core.md § A
+   * specifier is the whole value's field`), so applying it to a part would pad inside the rendering.
+   * `[]T`, `Option` and `Result` hand their parts the same thing for the same reason.
+   */
+  private def writes(name: String, parts: List[Expr]): List[Stmt] =
+    if parts.isEmpty then List(write(name))
+    else
+      val pieces = parts.zipWithIndex.flatMap { (p, i) =>
+        val piece = ExprStmt(Call(Field(p, "display"), List(Ident("out"), Ident("parts"))))
+
+        if i == 0 then List(piece) else List(write(", "), piece)
       }
 
-      Binary("+", pieces.foldLeft(StrLit(s"$name("): Expr)(Binary("+", _, _)), StrLit(")"))
+      (write(s"$name(") :: pieces) :+ write(")")
+
+  /** Measure, pad, render, pad — the body of a derived `display`, which is the shape every compound
+   * rendering in the library has.
+   *
+   * The sink is built only where a width was actually asked for, so an ordinary print costs one pass
+   * and allocates nothing at all.
+   */
+  private def padded(helper: String): List[Stmt] = {
+    val width = Field(Ident("fmt"), "width")
+    val fill  = ExprStmt(Call(Ident("display_fill"), List(Ident("out"), IntLit(32, None), Ident("pad"))))
+
+    def render(sink: Expr) = ExprStmt(Call(Ident(helper), List(Ident("self"), sink, Ident("parts"))))
+
+    val measure = List(
+      VarDecl("count", None, Some(Call(Ident("Counting"), List(IntLit(0, None))))),
+      VarDecl("sink", Some(PtrType(NamedType("Writer"))), Some(Unary("&", Ident("count")))),
+      render(Ident("sink")),
+      ExprStmt(Assign("=", Ident("pad"),
+                      Binary("-", width, Call(Ident("int"), List(Field(Ident("count"), "n")))))),
+      ExprStmt(IfExpr(cmp("<", Ident("pad"), IntLit(0, None)),
+                      List(ExprStmt(Assign("=", Ident("pad"), IntLit(0, None)))), None)),
+    )
+
+    List(
+      ValDecl("parts", None, Call(Ident("FormatSpec"),
+                                  List(IntLit(0, None), Unary("-", IntLit(1, None)), BoolLit(false)))),
+      VarDecl("pad", None, Some(IntLit(0, None))),
+      ExprStmt(IfExpr(cmp(">", width, IntLit(0, None)), measure, None)),
+      ExprStmt(IfExpr(Unary("!", Field(Ident("fmt"), "left")), List(fill), None)),
+      render(Ident("out")),
+      ExprStmt(IfExpr(Field(Ident("fmt"), "left"), List(fill), None)),
+    )
+  }
 }
