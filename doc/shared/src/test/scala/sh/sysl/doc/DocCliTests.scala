@@ -41,6 +41,18 @@ class DocCliTests extends AnyFreeSpec with Matchers {
       DocCli.parse(List("--out", "y")).toOption.get.out shouldBe "y"
     }
 
+    "takes -n and --note alike, and has none by default" in {
+      DocCli.parse(List("-n", "hello")).toOption.get.note shouldBe Some("hello")
+      DocCli.parse(List("--note", "hello")).toOption.get.note shouldBe Some("hello")
+      DocCli.parse(Nil).toOption.get.note shouldBe None
+    }
+
+    "names --note when its value is missing, as it does every other valued flag" in {
+      // The missing-value list is written out by hand, so a flag added to the parser and not to
+      // that list fails as "unknown option '--note'" — which reads as a flag that does not exist.
+      DocCli.parse(List("--note")).left.toOption.get should include("'--note' needs a value")
+    }
+
     "reads the flags that take no value" in {
       val opts = DocCli.parse(List("--private", "--check")).toOption.get
 

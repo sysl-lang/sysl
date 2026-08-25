@@ -384,6 +384,28 @@ class DocGeneratorTests extends AnyFreeSpec with Matchers {
       page.text should include("[`sysl.b`](sysl-b/)")
     }
 
+    "puts the site's note under the index title and above the table" in {
+      // Generated reference and hand-written prose are two halves of one set. The module pages link
+      // outward; without this the index has no way back, and the two sections do not know about
+      // each other. The text is the site's because a generator cannot know where the prose lives.
+      val a    = parse("module sysl.a\n\nf() -> int = 1")
+      val note = "The [written pages](/library/#modules) are the argument; this is the list."
+      val page = MarkdownWriter.indexPage(ApiModel.build(List(a)), "Standard library", note = Some(note))
+
+      page.text should include(note)
+      page.text.indexOf(note) should be < page.text.indexOf("## Modules")
+    }
+
+    "leaves the index exactly as it was when no note is given" in {
+      // The note is optional and its absence must cost nothing — a package repo generating for
+      // GitHub alone has no second section to point at.
+      val a       = parse("module sysl.a\n\nf() -> int = 1")
+      val modules = ApiModel.build(List(a))
+
+      MarkdownWriter.indexPage(modules, "T", note = None).text shouldBe
+        MarkdownWriter.indexPage(modules, "T").text
+    }
+
     "gives the index the same per-page settings as a module page" in {
       // The index links to its own `## Modules` heading and sits in the same generated section, so
       // it needs both keys for the same reasons. Asserted separately because it is written by a

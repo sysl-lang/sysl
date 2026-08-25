@@ -251,8 +251,21 @@ object MarkdownWriter {
    */
   private val Carried = Set("see", "note", "example", "since")
 
-  /** The index page listing every module. */
-  def indexPage(modules: List[Module], title: String, version: Option[String] = None): Page = {
+  /** The index page listing every module.
+   *
+   * `note` is a line of Markdown the site asked for, placed under the title and above the table. It
+   * exists because generated reference and hand-written prose are two halves of one documentation
+   * set, and a link in only one direction leaves them two sections that do not know about each
+   * other — the module pages link outward from the declarations they list, and this is where the
+   * index links back. The text is the *site's* to write: where the written pages live, and what
+   * they are for, is not something a generator can know.
+   */
+  def indexPage(
+      modules: List[Module],
+      title:   String,
+      version: Option[String] = None,
+      note:    Option[String] = None,
+  ): Page = {
     val out = new StringBuilder
 
     out ++= "---\n"
@@ -262,6 +275,8 @@ object MarkdownWriter {
     out ++= "slugStyle: github\n"
     version.foreach(v => out ++= s"version: ${yamlScalar(v)}\n")
     out ++= "---\n\n"
+
+    note.foreach(n => out ++= s"${n.trim}\n\n")
 
     out ++= "## Modules\n\n"
     out ++= "| Module | Summary |\n|---|---|\n"
@@ -275,8 +290,13 @@ object MarkdownWriter {
   }
 
   /** Every page for a set of modules. */
-  def pages(modules: List[Module], title: String, version: Option[String] = None): List[Page] =
-    indexPage(modules, title, version) :: modules.map(modulePage(_, version))
+  def pages(
+      modules: List[Module],
+      title:   String,
+      version: Option[String] = None,
+      note:    Option[String] = None,
+  ): List[Page] =
+    indexPage(modules, title, version, note) :: modules.map(modulePage(_, version))
 
   /** A YAML scalar that cannot be misread.
    *
