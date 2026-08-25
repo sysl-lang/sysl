@@ -613,7 +613,7 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
     /** The result of one dispatched operator feeding the next, inside a body whose parameter carries
       * several bounds. This is the position that reads a result off a *bound* rather than off an
       * operand, and a `T` recovered from a bound has had its own promises dropped one level in — so
-      * the second operator is the first thing that could fail to find them. `guide/sha2` is written
+      * the second operator is the first thing that could fail to find them. `sysl.crypto` is written
       * out of exactly this shape.
       */
     "one operator's result is an operand of the next, under several bounds" in {

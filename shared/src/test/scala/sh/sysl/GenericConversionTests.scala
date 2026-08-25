@@ -8,7 +8,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * The form has always worked in one direction. `u8(x)` where `x` is a `T` is ordinary code: the
  * target is a type that exists, and whether the source converts is settled once the instantiation
  * says what `T` is. `T(b)` is the mirror of that and was refused for a reason about the *name*
- * rather than about the conversion, which is what made `guide/sha2`'s `shift_in` a trait member
+ * rather than about the conversion, which is what made `sysl.crypto`'s `shift_in` a trait member
  * written once per width while `top_byte` — its exact opposite — was one generic function.
  *
  * So what these assert is that the two directions are one rule, checked at the same moment and

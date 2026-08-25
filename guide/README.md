@@ -60,7 +60,6 @@ contract.
 | `bytecode` | the module system, and the set's one end-to-end assertion — source in, bytecode out, run it |
 | `png` | the byte level — endianness, bit streams, checksums, a format someone else defined |
 | `fft` | an algorithm checked against its own definition |
-| `sha2` | generic arithmetic — one algorithm at two widths — and static tables |
 | `shapes` | dynamic dispatch — a heterogeneous collection whose element types are forgotten |
 | `scheduler` | OS shapes — a run queue, blocking and waking, and `&T` graphs mutated through references |
 | `kernel` | the same scheduler with no heap — a fixed table, indices for identity, intrusive lists |

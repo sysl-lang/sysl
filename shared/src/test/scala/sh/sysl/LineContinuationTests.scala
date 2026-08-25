@@ -12,7 +12,7 @@ import org.scalatest.matchers.should.Matchers
  * would not be, since a stray `Newline` that the parser happened to tolerate would still pass that.
  *
  * Four guide programs reported the absence before this landed: `guide/bytecode` broke a condition
- * into early returns, `guide/sha2` has a signature with nowhere to break it, and `guide/shapes`
+ * into early returns, `sysl.crypto` has a signature with nowhere to break it, and `guide/shapes`
  * split a conjunction and a cross product into named halves.
  */
 class LineContinuationTests extends AnyFreeSpec with Matchers with RunSupport with CodegenSupport {

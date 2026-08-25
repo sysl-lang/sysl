@@ -101,7 +101,7 @@ class GenericsClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport
   }
 
   "a conversion out of a parameter is NOT refused, which '§ Open f' settles against '§5'" in {
-    // `u8(x)` where `x: T` is called ordinary code by `§ Open f`, and `guide/sha2` is written on it.
+    // `u8(x)` where `x: T` is called ordinary code by `§ Open f`, and `sysl.crypto` is written on it.
     // There is no trait that promises convertibility, so there would be no bound to name — the one
     // capability in the section's list with nothing to license it. Refusing it at the definition
     // breaks a shipped guide program, which is what caught this.

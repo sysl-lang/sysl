@@ -1,3 +1,5 @@
+module sysl.crypto
+
 // The half of SHA-2 that does not care how wide a word is.
 //
 // The message schedule, the eighty-line round, the padding, the streaming buffer and the digest
@@ -6,8 +8,6 @@
 // *digest* rather than per width — the initial values, and how much of the state to publish — is
 // an argument, because SHA-224 and SHA-256 are the same word type and a type may implement a trait
 // once.
-
-import sysl.encoding.hex_string
 
 enum Fault
     NotStarted
@@ -22,15 +22,15 @@ end Fault
 // a type parameter: `T(b)` builds a word out of a byte and `u8(x)` takes one back out, both resolved
 // once the instantiation says what the width is. Bytes arrive most significant first, so a word is
 // built by shifting each one in from the bottom.
-shift_in[T: Word](x: T, b: u8) -> T = (x << 8) | T(b)
+private[crypto] shift_in[T: Word](x: T, b: u8) -> T = (x << 8) | T(b)
 
-top_byte[T: Word](x: T) -> u8 = u8(x >> (T.bits() - 8))
+private[crypto] top_byte[T: Word](x: T) -> u8 = u8(x >> (T.bits() - 8))
 
 // Choose: wherever `x` has a one bit take `y`'s bit, elsewhere take `z`'s.
-ch[T: BitAnd + BitXor + Not](x: T, y: T, z: T) -> T = (x & y) ^ (~x & z)
+private[crypto] ch[T: BitAnd + BitXor + Not](x: T, y: T, z: T) -> T = (x & y) ^ (~x & z)
 
 // Majority: each output bit is whichever value at least two of the three inputs agree on.
-maj[T: BitAnd + BitXor](x: T, y: T, z: T) -> T = (x & y) ^ (x & z) ^ (y & z)
+private[crypto] maj[T: BitAnd + BitXor](x: T, y: T, z: T) -> T = (x & y) ^ (x & z) ^ (y & z)
 
 // A hash in progress. The bound is written once, here, and every member inherits it — which is the
 // answer to the repetition the free functions above show, and the reason a container is a better
@@ -186,24 +186,45 @@ new_sha512() -> Sha[u64]
     s.start(iv512, 64)
     s
 
-// **This program used to carry its own `hex` and its own table of digits**, under a finding that read
-// *"a byte is not a character, so each nibble reaches text through `str(char(…))` — there is still no
-// way to build a string out of bytes a program computed."* That absence has been filled:
-// `sysl.encoding.hex_string` renders bytes as hexadecimal, and the string it builds comes from
-// `from_utf8_unchecked` over the bytes it emitted rather than from concatenating one character at a
-// time. The sixteen-entry table and the loop that indexed it are gone with it.
-digest_of[T: Word](s: Sha[T], data: []const u8) -> string
-    var h = s
-    // Storage the *buffer* owns rather than the frame, because the rendered digest is what leaves: a
-    // slice of a local array cannot outlive it, and `05` has no way to know that `hex_string` copies.
-    var out: []u8 = [0; 64]
+// The four digests, each answering the bytes it is defined to produce.
+//
+// **A digest is bytes, not text.** The guide program this came from ended every one of these in
+// `hex_string(…)`, which is right for something whose job is to print test vectors and wrong for a
+// library twice over: it builds a string, so it allocates and the module could not be used where
+// there is no allocator; and a caller who wants the digest *as a digest* — to compare it, to sign
+// it, to key an HMAC with it — would have to parse the text back. Rendering is one call away and
+// composes, `hex_string(sha256(data))`, which is why this module imports nothing to do it.
+//
+// The length is in the type rather than in a field, so the array a caller receives is exactly the
+// digest and there is no partially-filled buffer to carry a length beside.
+sha224(data: []const u8) -> [28]u8
+    var s = new_sha224()
+    var out: [28]u8
 
-    h.update(data)
-    h.finish(out[0..<h.dlen]).expect("a digest buffer sized from the hasher itself")
-    hex_string(out[0..<h.dlen])
-end digest_of
+    s.update(data)
+    s.finish(out[0..<28]).expect("a digest buffer sized from the hasher itself")
+    out
 
-sha224(data: []const u8) -> string = digest_of(new_sha224(), data)
-sha256(data: []const u8) -> string = digest_of(new_sha256(), data)
-sha384(data: []const u8) -> string = digest_of(new_sha384(), data)
-sha512(data: []const u8) -> string = digest_of(new_sha512(), data)
+sha256(data: []const u8) -> [32]u8
+    var s = new_sha256()
+    var out: [32]u8
+
+    s.update(data)
+    s.finish(out[0..<32]).expect("a digest buffer sized from the hasher itself")
+    out
+
+sha384(data: []const u8) -> [48]u8
+    var s = new_sha384()
+    var out: [48]u8
+
+    s.update(data)
+    s.finish(out[0..<48]).expect("a digest buffer sized from the hasher itself")
+    out
+
+sha512(data: []const u8) -> [64]u8
+    var s = new_sha512()
+    var out: [64]u8
+
+    s.update(data)
+    s.finish(out[0..<64]).expect("a digest buffer sized from the hasher itself")
+    out

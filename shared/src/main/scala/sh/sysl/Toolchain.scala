@@ -252,7 +252,7 @@ object Toolchain {
   /** What optimization a build asks for when nothing named one — the level, as clang spells it after
    * the `-O`.
    *
-   * **Nothing was passed here at all until a program miscompiled.** `guide/sha2` handed a 184-byte
+   * **Nothing was passed here at all until a program miscompiled.** `sysl.crypto`'s SHA-2, then a guide program, handed a 184-byte
    * struct to a function **by value** and the callee received zeros, from correct IR, on a build
    * that differed from a working one by a single `zext` feeding an `llvm.fshr`. `-O0` was where it
    * lived: the same module at `-O1` ran correctly, and the case reduced to a hand-edited `.ll` with

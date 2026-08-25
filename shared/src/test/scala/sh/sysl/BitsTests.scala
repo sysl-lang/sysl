@@ -271,7 +271,7 @@ class BitsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // A literal amount reaches the intrinsic as an **immediate**, with no widening instruction in
     // front of it, which is what makes a constant rotation one machine instruction rather than a
     // funnel shift through a register. Written as a `zext` of a constant it said the same thing and
-    // compiled to more; `guide/sha2` rotates by a constant twenty-four times.
+    // compiled to more; `sysl.crypto`'s mixing functions rotate by a constant twenty-four times.
     "a literal is the constant itself, not a widening of one" in {
       val out = ir(importing + "main()\n    var x: u64 = 255\n    print(x.rotate_right(8))")
 
