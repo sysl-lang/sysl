@@ -57,6 +57,13 @@ object MarkdownWriter {
    * `slugStyle = "github"` for exactly this reason; that setting and this function are two halves of
    * one contract, and `MarkdownWriterTests` pins the cases that differ from the other algorithm.
    *
+   * **The setting is written into each generated page's frontmatter, not into the site.** juicer
+   * made `slugStyle` a per-page key in 0.4.1 for this case: a generated section nearly always lands
+   * on a site that already carries hand-written prose, and turning the site key on rewrites the
+   * anchor of every existing heading with punctuation in it — measured at 115 of 921 on sysl.sh.
+   * Anchors are a per-page property, so saying it per page is both correct and the only form that
+   * does not move somebody else's links.
+   *
    * The rule: lowercase; delete anything that is not a letter, digit, space, hyphen or underscore;
    * turn spaces into hyphens. Nothing is collapsed and nothing is trimmed.
    */
@@ -133,6 +140,10 @@ object MarkdownWriter {
     // generated body's `##` groups are already meant to be <h2>, and have to land at the same level
     // here as when this file is read with no layout at all.
     out ++= "headingShift: 0\n"
+    // The site cannot switch its own `slugStyle` — doing so rewrites the anchor of every existing
+    // heading that carries punctuation, and those are links people have saved. A page says it for
+    // itself instead, which juicer has allowed since 0.4.1. See `slug` above.
+    out ++= "slugStyle: github\n"
     out ++= s"module: ${m.name}\n"
     if m.summary.nonEmpty then out ++= s"summary: ${yamlScalar(m.summary)}\n"
     if m.capabilities.nonEmpty then out ++= s"requires: ${yamlScalar(m.capabilities.mkString(", "))}\n"
@@ -248,6 +259,7 @@ object MarkdownWriter {
     out ++= s"title: ${yamlScalar(title)}\n"
     out ++= "layout: api-index\n"
     out ++= "headingShift: 0\n"
+    out ++= "slugStyle: github\n"
     version.foreach(v => out ++= s"version: ${yamlScalar(v)}\n")
     out ++= "---\n\n"
 

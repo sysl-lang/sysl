@@ -269,6 +269,10 @@ class DocGeneratorTests extends AnyFreeSpec with Matchers {
       text should include("module: sysl.text")
       // A generated body's `##` is already meant to be an <h2>; the site default assumes otherwise.
       text should include("headingShift: 0")
+      // And the page names its own slug algorithm rather than relying on the site's. A site that
+      // already carries hand-written prose cannot switch the site key without rewriting the anchors
+      // its existing headings were published with, so the generated page has to say it for itself.
+      text should include("slugStyle: github")
     }
 
     "opens with an index whose links resolve to its own headings" in {
@@ -378,6 +382,17 @@ class DocGeneratorTests extends AnyFreeSpec with Matchers {
       page.text should include("layout: api-index")
       page.text should include("[`sysl.a`](sysl-a/)")
       page.text should include("[`sysl.b`](sysl-b/)")
+    }
+
+    "gives the index the same per-page settings as a module page" in {
+      // The index links to its own `## Modules` heading and sits in the same generated section, so
+      // it needs both keys for the same reasons. Asserted separately because it is written by a
+      // different method — the two frontmatter blocks have drifted apart before.
+      val a    = parse("module sysl.a\n\nf() -> int = 1")
+      val page = MarkdownWriter.indexPage(ApiModel.build(List(a)), "Standard library")
+
+      page.text should include("headingShift: 0")
+      page.text should include("slugStyle: github")
     }
 
     "emits no HTML and no CSS class, which is what keeps the file readable in a repository" in {
