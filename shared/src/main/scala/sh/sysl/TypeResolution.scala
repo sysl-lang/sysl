@@ -1035,7 +1035,14 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
    * `Buf` uses its parameter: `Buf` holds a `[]T`, which is an indirection, and a `Wrap` holding a
    * bare `T` is not. So the argument's own resolution says nothing, and the question is asked again
    * at every *use* of the substitution inside the instantiation — where the indirection count is the
-   * one that matters. `resolveShape`'s substitution case is the other half of this.
+   * one that matters. `substituted` is the other half of this, and it is the half that carries the
+   * weight: **the deferral is only sound because something asks later**, over what the argument
+   * reaches rather than over the argument itself.
+   *
+   * **A fresh instantiation reached from inside an argument list keeps the raised depth**, which is
+   * what makes the answer independent of which of two mutually recursive types was declared first.
+   * Resolving `Buf[B]` instantiates `B` inside the argument position, so `B`'s own `a: A` is on a
+   * path that came through an argument list and is not containment either.
    */
   protected def cycleCheck(key: String): Unit =
     if typeArgDepth == 0 && indirection <= resolving(key) then
@@ -1048,31 +1055,52 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
     finally typeArgDepth -= 1
   }
 
-  /** An instantiation's own fields, resolved outside whatever type-argument position the
-   * instantiation itself was written in — a cycle among *these* is the ordinary kind again.
-   */
-  protected def outsideTypeArgs[A](resolve: => A): A = {
-    val saved = typeArgDepth
-
-    typeArgDepth = 0
-    try resolve
-    finally typeArgDepth = saved
-  }
-
   /** What a type parameter stands for, asked the containment question the argument position
    * deferred: a `T` used **by value** here is the containing type held by value, whatever
    * indirection the parameter was written behind.
+   *
+   * **The question is about what the argument REACHES, not about what it is.** Asking only whether
+   * the argument is itself in progress answers a mutual cycle wrong, because the other type on the
+   * cycle has usually finished by the time the generic's field substitutes it: `Wrap[B]` over
+   * `struct B { a: A }` holds `B` by value and so holds `A` by value, and `B` is memoized as
+   * complete long before `Wrap`'s `x: T` is reached. So this walks the argument's layout by value
+   * and condemns the first type on it that is still being resolved.
    */
   private def substituted(t: Type): Type = {
-    val key = t match
-      case s: Type.Struct => Some(Type.instanceKey(s.base, s.targs))
-      case e: Type.Enum   => Some(Type.instanceKey(e.base, e.targs))
-      case _              => None
-
-    for k <- key if resolving.contains(k) do cycleCheck(k)
-
+    if resolving.nonEmpty then reachedByValue(t, mutable.Set.empty).foreach(cycleCheck)
     t
   }
+
+  /** The first still-resolving type a layout reaches **without crossing an indirection**, which is
+   * the whole of what makes a cycle infinite.
+   *
+   * A struct's fields, an enum variant's payload, a tuple's parts, a fixed array's elements and a
+   * constrained type's base are all held; a `*T`, a `&T`, a `weak T` and a slice all point, so the
+   * walk stops at them exactly as `underIndirection` counts them.
+   *
+   * It terminates on its own — a type still being resolved has no fields yet, and one that has them
+   * was finite when it got them — and carries `seen` for the same reason `resolving` is a map rather
+   * than a set: a shape reached twice by two fields is walked once.
+   */
+  private def reachedByValue(t: Type, seen: mutable.Set[String]): Option[String] = t match
+    case s: Type.Struct =>
+      val key = Type.instanceKey(s.base, s.targs)
+
+      if resolving.contains(key) then Some(key)
+      else if !seen.add(key) then None
+      else s.fields.iterator.map((_, f) => reachedByValue(f, seen)).collectFirst { case Some(k) => k }
+    case e: Type.Enum =>
+      val key = Type.instanceKey(e.base, e.targs)
+
+      if resolving.contains(key) then Some(key)
+      else if !seen.add(key) then None
+      else
+        e.variants.iterator
+          .flatMap(_.fields.iterator.map((_, f) => reachedByValue(f, seen)))
+          .collectFirst { case Some(k) => k }
+    case Type.Array(_, elem)  => reachedByValue(elem, seen)
+    case c: Type.Constrained  => reachedByValue(c.base, seen)
+    case _                    => None
 
   /** The rules a declared signature must satisfy whichever declaration form it came from, checked
    * after the name is registered so a failure reports the mistake without also erasing the

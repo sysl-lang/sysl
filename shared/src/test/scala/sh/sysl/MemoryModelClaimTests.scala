@@ -377,6 +377,91 @@ class MemoryModelClaimTests extends AnyFreeSpec with RunSupport with CodegenSupp
     }
   }
 
+  /** *"Whether `Wrap[Node]` contains a `Node` is `Wrap`'s business, not something the argument list
+    * can say."* The page says that of one type reaching itself, and the rule above says a cycle is
+    * legal per *cycle* — so the two together say a mutual cycle through a type argument is finite
+    * as well. It was not: the pair was refused, and swapping the two declarations made it compile.
+    *
+    * Every case here is a pair rather than an assertion, because only the comparison says anything.
+    * `Buf` reaches its elements through a `[]T` and `Wrap` holds its parameter by value, so the two
+    * differ in exactly the thing the argument list cannot tell you — and each is written in both
+    * declaration orders, since the order is what used to decide.
+    */
+  "a type argument is not containment, and which type was declared first does not decide it" - {
+
+    /** The generic that holds its parameter **by value**, so that what stands between the cycle and
+      * an infinite type really is the argument position and nothing else.
+      */
+    val wrap =
+      """struct Wrap[T]
+        |    x: T
+        |""".stripMargin
+
+    val bufs = "import sysl.buf.{Buf, buf}\n\n"
+
+    "a type whose children are a growable sequence of itself is finite" in {
+      run(s"${bufs}struct A\n    xs: Buf[A]\nvar n: Buf[A] = buf()\nprint(A(n).xs.len())") shouldBe "0\n"
+    }
+
+    "and so is a mutual cycle through one, whichever of the two is written first" in {
+      run(s"${bufs}struct A\n    xs: Buf[B]\nstruct B\n    a: A\n" +
+        "var n: Buf[B] = buf()\nprint(A(n).xs.len())") shouldBe "0\n"
+      run(s"${bufs}struct B\n    a: A\nstruct A\n    xs: Buf[B]\n" +
+        "var n: Buf[B] = buf()\nprint(A(n).xs.len())") shouldBe "0\n"
+    }
+
+    // The shape a syntax tree has, and the one that has no order to escape through: the enum is the
+    // type holding the `Buf`, so it is the one in progress whichever way round the two are written.
+    "an enum reaching itself through a struct in a Buf is finite, in both orders" in {
+      val json =
+        """enum Json
+          |    Null
+          |    Obj(ms: Buf[Member])
+          |""".stripMargin
+      val member =
+        """struct Member
+          |    key: string
+          |    value: Json
+          |""".stripMargin
+      val use = "var ms: Buf[Member] = buf()\nms.push(Member(\"a\", Null))\nprint(ms.at(0).key)"
+
+      run(s"$bufs$json$member$use") shouldBe "a\n"
+      run(s"$bufs$member$json$use") shouldBe "a\n"
+    }
+
+    "a plain slice was never order-dependent, which is the comparison that made this a defect" in {
+      run("struct A\n    xs: []B\nstruct B\n    a: A\nvar n = A([])\nprint(n.xs.len)") shouldBe "0\n"
+      run("struct B\n    a: A\nstruct A\n    xs: []B\nvar n = A([])\nprint(n.xs.len)") shouldBe "0\n"
+    }
+
+    "while a generic holding its parameter by value is refused" in {
+      err(s"${wrap}struct Node\n    w: Wrap[Node]\nvar n: Node\nprint(1)") should
+        include("type 'Node' contains itself, so it has no finite size")
+    }
+
+    // The deferral has to survive nesting: the inner `Wrap[Node]` is itself an argument, so nothing
+    // may be condemned while it is being resolved and the answer comes at the outer substitution.
+    "including at one remove, where the generic is itself a type argument" in {
+      err(s"${wrap}struct Node\n    w: Wrap[Wrap[Node]]\nvar n: Node\nprint(1)") should
+        include("contains itself")
+    }
+
+    // **The case a deferred question must not lose.** `B` finishes long before `Wrap`'s `x: T`
+    // substitutes it, so asking whether the argument *is* in progress answers no and lets an
+    // unbounded type through; what has to be asked is what the argument reaches.
+    "and around a mutual cycle, in both orders" in {
+      err(s"${wrap}struct A\n    w: Wrap[B]\nstruct B\n    a: A\nvar x: A\nprint(1)") should
+        include("contains itself")
+      err(s"${wrap}struct B\n    a: A\nstruct A\n    w: Wrap[B]\nvar x: A\nprint(1)") should
+        include("contains itself")
+    }
+
+    "a generic holding a Buf of the type is finite again, since the Buf is where the edge is" in {
+      run(s"$bufs${wrap}struct Node\n    w: Wrap[Buf[Node]]\n" +
+        "var n: Buf[Node] = buf()\nprint(Node(Wrap(n)).w.x.len())") shouldBe "0\n"
+    }
+  }
+
   "null exists only for the raw tier" - {
     "so a reference refuses it, and names what an absent one is written as" in {
       err("var r: &int = null\nprint(*r)") should
