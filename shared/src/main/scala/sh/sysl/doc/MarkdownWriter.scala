@@ -57,6 +57,22 @@ object MarkdownWriter {
    * `slugStyle = "github"` for exactly this reason; that setting and this function are two halves of
    * one contract, and `MarkdownWriterTests` pins the cases that differ from the other algorithm.
    *
+   * **"Must stay identical" is the whole of the mechanism: NOTHING RECONCILES THEM.** juicer's copy
+   * is `githubSlugify` in `core/shared/.../package.scala`, a separate implementation in a separate
+   * repository on a separate release cycle, and no test anywhere compares the two. They agree
+   * character for character today, which is what makes this a hazard rather than a defect — and it
+   * is the *renderer* whose answer a reader's link actually lands on, so a divergence makes this
+   * function wrong however carefully it was written.
+   *
+   * **A one-character divergence is silent and total.** Collapse runs of spaces in either loop —
+   * which most slug implementations do and GitHub deliberately does not — and every anchor on every
+   * generated page lands at the top of the right page, with no complaint from juicer, from the
+   * site's `DocsTests`, or from its `AnchorTests`, which calls *this* function and therefore
+   * inherits the blind spot rather than covering it. Card `0286` carries what to do about it.
+   *
+   * The same is true a second time and one layer down: the `-1` numbering for a repeated heading is
+   * implemented here and implemented again by juicer's `dedupeHeadingIds`.
+   *
    * **The setting is written into each generated page's frontmatter, not into the site.** juicer
    * made `slugStyle` a per-page key in 0.4.1 for this case: a generated section nearly always lands
    * on a site that already carries hand-written prose, and turning the site key on rewrites the
