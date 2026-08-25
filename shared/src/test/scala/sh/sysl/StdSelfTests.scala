@@ -94,8 +94,14 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * the floor absurdly high for one run and the failure names it (`482 was not greater than or equal
    * to 99999`), which is one run and settles it. Adding your own tests to a number nobody measured
    * carries the drift forward, which is how it got here twice before.
+   *
+   * Raised to **487** when `Vector[T]` and `Matrix[T]` stopped gathering their renderings: two of
+   * those are the specifier split and the agreement between a matrix and its own rows, and **three
+   * were drift again** -- the tree was at 485 against a floor of 482, from `Complex[F]`'s rendering
+   * tests the day before. That is the fourth time, and it was found by the measurement this comment
+   * prescribes rather than by adding two to the number above it.
    */
-  private val floor = 482
+  private val floor = 487
 
   /** The library, compiled as a **test build of itself**.
    *

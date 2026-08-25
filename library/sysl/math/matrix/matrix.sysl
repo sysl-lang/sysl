@@ -147,18 +147,54 @@ impl[T: Scalar] Eq for Matrix[T]
         true
     end eq
 
-/** Rows separated by `; `, each rendered as the vector it is -- so a matrix prints as
- * `(1, 2); (3, 4)` and one reading of `Display` covers both types.
+/** Rows separated by `; `, each written in the form a vector is written in -- so a matrix prints as
+ * `(1, 2); (3, 4)` and the two types read alike.
+ *
+ * **It walks the cells rather than calling `row`, and that is the point rather than an
+ * optimization.** `row(i)` builds a fresh `Vector[T]` over a fresh `Buf`, so rendering through it
+ * would allocate one vector per row for no reason but to print it -- which is the cost this shape
+ * exists to remove. What it buys instead is a duplicated six lines, and `MatrixTests` pins a matrix
+ * against its own rows so the two spellings cannot drift apart.
+ */
+private render_matrix[T: Scalar](m: Matrix[T], out: *Writer, parts: FormatSpec)
+    for i in 0..<m.rows
+        if i > 0 then out.write("; ".bytes)
+
+        out.write("(".bytes)
+
+        for j in 0..<m.cols
+            if j > 0 then out.write(", ".bytes)
+
+            m.at(i, j).display(out, parts)
+
+        out.write(")".bytes)
+end render_matrix
+
+/** `(1, 2); (3, 4)` -- the rows, each in the form `Vector[T]` renders in.
+ *
+ * The width belongs to the whole matrix and the precision reaches the cells, exactly as it does for a
+ * vector and for `Complex[F]`; and it is measured into a `Counting` sink rather than gathered, so an
+ * ordinary print allocates nothing.
  */
 impl[T: Scalar] Display for Matrix[T]
     display(self, out: *Writer, fmt: FormatSpec)
-        var text = ""
+        val parts = FormatSpec(0, fmt.prec, false)
+        var pad = 0
 
-        for i in 0..<self.rows
-            if i > 0 then text += "; "
-            text += str(self.row(i))
+        if fmt.width > 0
+            var count = Counting(0)
+            var sink: *Writer = &count
 
-        display_str(text, out, fmt)
+            render_matrix(self, sink, parts)
+            pad = fmt.width - int(count.n)
+
+            if pad < 0 then pad = 0
+
+        if !fmt.left then display_fill(out, 32, pad)
+
+        render_matrix(self, out, parts)
+
+        if fmt.left then display_fill(out, 32, pad)
     end display
 
 impl[T: Scalar] Add for Matrix[T]
