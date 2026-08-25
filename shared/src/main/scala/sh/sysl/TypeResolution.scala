@@ -1076,7 +1076,8 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
    * cycle has usually finished by the time the generic's field substitutes it: `Wrap[B]` over
    * `struct B { a: A }` holds `B` by value and so holds `A` by value, and `B` is memoized as
    * complete long before `Wrap`'s `x: T` is reached. So this walks the argument's layout by value
-   * and condemns the first type on it that is still being resolved.
+   * and puts every type on it that is still being resolved to `cycleCheck` — every one and not the
+   * first, for the reason `reachedByValue` gives.
    */
   private def substituted(t: Type): Type = {
     if resolving.nonEmpty then
