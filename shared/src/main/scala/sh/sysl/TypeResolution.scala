@@ -1039,14 +1039,26 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
    * weight: **the deferral is only sound because something asks later**, over what the argument
    * reaches rather than over the argument itself.
    *
-   * **A fresh instantiation reached from inside an argument list keeps the raised depth**, which is
-   * what makes the answer independent of which of two mutually recursive types was declared first.
-   * Resolving `Buf[B]` instantiates `B` inside the argument position, so `B`'s own `a: A` is on a
-   * path that came through an argument list and is not containment either.
+   * **What is excused is an argument list entered AFTER the type in question, not merely being
+   * inside one.** Both counts are therefore compared against where the type was entered rather than
+   * against zero, and each catches what the other cannot:
+   *
+   *   - Resolving `Buf[B]` instantiates `B` inside the argument position, so `B`'s own `a: A` is on
+   *     a path that left `A` through an argument list. `A` was entered outside it, the counts
+   *     differ, and the cycle is left alone — whichever of the two was declared first, which is what
+   *     a mutual cycle through a `Buf` needs and did not get.
+   *   - `B` reaching **itself** is a different matter: it was entered inside that same argument list,
+   *     so the counts agree and it is condemned exactly as it would be anywhere else. An argument
+   *     position is an excuse for the path that came through it and never for what a type does to
+   *     itself — and nothing downstream would catch it, since a generic that does not use its
+   *     parameter in a field never substitutes it.
    */
-  protected def cycleCheck(key: String): Unit =
-    if typeArgDepth == 0 && indirection <= resolving(key) then
+  protected def cycleCheck(key: String): Unit = {
+    val at = resolving(key)
+
+    if indirection <= at.indirection && typeArgDepth <= at.typeArgs then
       err(s"type '${qn(key)}' contains itself, so it has no finite size")
+  }
 
   /** A type argument's resolution, which reaching an in-progress type inside does not condemn. */
   protected def underTypeArg[A](resolve: => A): A = {
@@ -1067,40 +1079,47 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
    * and condemns the first type on it that is still being resolved.
    */
   private def substituted(t: Type): Type = {
-    if resolving.nonEmpty then reachedByValue(t, mutable.Set.empty).foreach(cycleCheck)
+    if resolving.nonEmpty then
+      val found = mutable.LinkedHashSet.empty[String]
+
+      reachedByValue(t, mutable.Set.empty, found)
+      found.foreach(cycleCheck)
+
     t
   }
 
-  /** The first still-resolving type a layout reaches **without crossing an indirection**, which is
-   * the whole of what makes a cycle infinite.
+  /** Every still-resolving type a layout reaches **without crossing an indirection**, which is the
+   * whole of what makes a cycle infinite.
    *
    * A struct's fields, an enum variant's payload, a tuple's parts, a fixed array's elements and a
    * constrained type's base are all held; a `*T`, a `&T`, a `weak T` and a slice all point, so the
    * walk stops at them exactly as `underIndirection` counts them.
    *
+   * **Every one of them, rather than the first**, because they are not interchangeable: `resolving`
+   * records the indirection each type was *entered* at, and a walk can reach two that were entered
+   * at different ones. `cycleCheck` condemns only where the count here has not risen above that
+   * depth, so stopping at the first would let a genuine cycle through whenever a shallower type
+   * happened to sit earlier in the field order — the pointer that excuses one of them says nothing
+   * about the other.
+   *
    * It terminates on its own — a type still being resolved has no fields yet, and one that has them
-   * was finite when it got them — and carries `seen` for the same reason `resolving` is a map rather
-   * than a set: a shape reached twice by two fields is walked once.
+   * was finite when it got them — and carries `seen` so that a shape reached twice by two fields is
+   * walked once.
    */
-  private def reachedByValue(t: Type, seen: mutable.Set[String]): Option[String] = t match
+  private def reachedByValue(t: Type, seen: mutable.Set[String], found: mutable.Set[String]): Unit = t match
     case s: Type.Struct =>
       val key = Type.instanceKey(s.base, s.targs)
 
-      if resolving.contains(key) then Some(key)
-      else if !seen.add(key) then None
-      else s.fields.iterator.map((_, f) => reachedByValue(f, seen)).collectFirst { case Some(k) => k }
+      if resolving.contains(key) then found += key
+      else if seen.add(key) then s.fields.foreach((_, f) => reachedByValue(f, seen, found))
     case e: Type.Enum =>
       val key = Type.instanceKey(e.base, e.targs)
 
-      if resolving.contains(key) then Some(key)
-      else if !seen.add(key) then None
-      else
-        e.variants.iterator
-          .flatMap(_.fields.iterator.map((_, f) => reachedByValue(f, seen)))
-          .collectFirst { case Some(k) => k }
-    case Type.Array(_, elem)  => reachedByValue(elem, seen)
-    case c: Type.Constrained  => reachedByValue(c.base, seen)
-    case _                    => None
+      if resolving.contains(key) then found += key
+      else if seen.add(key) then e.variants.foreach(_.fields.foreach((_, f) => reachedByValue(f, seen, found)))
+    case Type.Array(_, elem) => reachedByValue(elem, seen, found)
+    case c: Type.Constrained => reachedByValue(c.base, seen, found)
+    case _                   => ()
 
   /** The rules a declared signature must satisfy whichever declaration form it came from, checked
    * after the name is registered so a failure reports the mistake without also erasing the

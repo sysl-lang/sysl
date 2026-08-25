@@ -531,11 +531,21 @@ trait DeclTables extends Reporting {
   protected val structInsts = mutable.LinkedHashMap.empty[String, Type.Struct]
   protected val enumInsts   = mutable.LinkedHashMap.empty[String, Type.Enum]
 
-  /** Instantiations whose fields are still being resolved, each recorded with the indirection
-   * depth at which it was entered. A type that reaches itself finds its own entry here; the
-   * depth is what decides whether that is a legal cycle (see `cycleCheck`).
+  /** Where an in-progress instantiation was entered: how many `*T` / `&T` wrappers the resolver was
+   * inside, and how many **type argument** positions it was inside.
+   *
+   * Both are needed and they answer different halves of the same question. The indirection says
+   * whether a cycle back to this type has anything pointing on it. The argument count says whether
+   * the path that got back here left through an argument list *after* this type was entered — which
+   * is not containment and is somebody else's question — as against having been inside one all
+   * along, where it is this type's own business again.
    */
-  protected val resolving = mutable.LinkedHashMap.empty[String, Int]
+  protected case class Entered(indirection: Int, typeArgs: Int)
+
+  /** Instantiations whose fields are still being resolved, each recorded with where it was entered.
+   * A type that reaches itself finds its own entry here, and `cycleCheck` is what reads it.
+   */
+  protected val resolving = mutable.LinkedHashMap.empty[String, Entered]
 
   /** The same instantiations, by display name, so a recursive occurrence resolves to the object
    * whose fields are still being filled in rather than starting a second one.

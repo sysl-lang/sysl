@@ -460,6 +460,41 @@ class MemoryModelClaimTests extends AnyFreeSpec with RunSupport with CodegenSupp
       run(s"$bufs${wrap}struct Node\n    w: Wrap[Buf[Node]]\n" +
         "var n: Buf[Node] = buf()\nprint(Node(Wrap(n)).w.x.len())") shouldBe "0\n"
     }
+
+    // **The indirection on the far side of the loop, which is the placement the two above do not
+    // reach.** Every shape so far puts the pointer between the substituted type and the one still
+    // being resolved; here it is between the two in the other direction — `R` points at `S`, and
+    // everything from `S` back round to `R` is by value. The cycle is finite, and what says so is
+    // not the walk but the depth each type was *entered* at: `R` was entered outside the pointer
+    // and the substitution is inside it, so the comparison does not fire.
+    "and a cycle whose one pointer is on the way DOWN to the generic is finite too" in {
+      run(s"${wrap}struct R\n    s: *S\nstruct S\n    c: Wrap[C]\nstruct C\n    r: R\n" +
+        "var r: R\nprint(r.s == null)") shouldBe "true\n"
+    }
+
+    // **And the same walk reaching two of them at once, which is why it may not stop at the first.**
+    // `R` was entered outside the pointer and `Q` inside it, so `C` reaching `R` is excused and `C`
+    // reaching `Q` is not — `Q` holds a `Wrap[C]` by value and `C` holds a `Q` by value, with
+    // nothing pointing anywhere between them. Field order is the only thing that decides which the
+    // walk sees first, and it must not be the thing that decides whether this compiles.
+    "so a second one further along the same fields is still refused" in {
+      err(s"${wrap}struct R\n    q: *Q\nstruct Q\n    w: Wrap[C]\nstruct C\n    r: R\n    q: Q\n" +
+        "var r: R\nprint(1)") should include("contains itself")
+    }
+
+    // **A type reached first as an argument is still judged on its own account.** The argument
+    // position excuses a path that came *through* it and says nothing about what the argument does
+    // to itself, so `Bad` holding a `Bad` is refused wherever `Bad` was first mentioned. `Phantom`
+    // never uses its parameter in a field, which is what makes this the case nothing downstream
+    // would catch: there is no substitution to ask the question at.
+    "a type that contains itself is refused even where it was first reached as a type argument" in {
+      val phantom = "struct Phantom[T]\n    n: int\n"
+
+      err(s"${phantom}struct Use\n    p: Phantom[Bad]\nstruct Bad\n    b: Bad\nvar u: Use\nprint(1)") should
+        include("type 'Bad' contains itself, so it has no finite size")
+      err(s"${phantom}struct Bad\n    b: Bad\nstruct Use\n    p: Phantom[Bad]\nvar u: Use\nprint(1)") should
+        include("type 'Bad' contains itself, so it has no finite size")
+    }
   }
 
   "null exists only for the raw tier" - {

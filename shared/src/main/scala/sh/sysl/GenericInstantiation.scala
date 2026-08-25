@@ -138,7 +138,7 @@ trait GenericInstantiation extends ConstFolding {
       case None =>
         val s = new Type.Struct(name, targs)
         inProgress(key) = s
-        resolving(key) = indirection
+        resolving(key) = Entered(indirection, typeArgDepth)
         val subst = decl.tparams.zip(targs).toMap
 
         // A field whose type does not resolve is recorded and taken as unknown, so the struct
@@ -329,7 +329,7 @@ trait GenericInstantiation extends ConstFolding {
         val en = new Type.Enum(name, targs)
         en.simple = decl.variants.forall(_.fields.isEmpty)
         inProgress(key) = en
-        resolving(key) = indirection
+        resolving(key) = Entered(indirection, typeArgDepth)
 
         // The `: iN` annotation pins a simple enum's storage; it is meaningless on a generic or
         // data enum, so those reject it rather than silently ignore it. Where present, every
