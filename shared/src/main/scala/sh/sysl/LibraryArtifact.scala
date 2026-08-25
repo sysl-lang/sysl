@@ -57,6 +57,20 @@ object LibraryArtifact {
    *
    * The `.o` on both is not dressing. Each member **is** an object file, the metadata one included,
    * and that is exactly the property that makes the container survive the platform tools.
+   *
+   * **THE TWO MEMBERS DIFFER FOR DIFFERENT REASONS, SO COMPARE THEM SEPARATELY — a whole-container
+   * `cmp` answers the wrong question and answers it confidently.** The metadata half embeds the
+   * **absolute path of every source file**, so two artifacts built from the same sources in
+   * different directories are **not** byte-identical and never were. Measured: one library built
+   * from two worktrees of identical sources gave containers 288 bytes apart, entirely in this member
+   * and in the archive symbol table whose offsets it moved, while the compiled half was identical
+   * byte for byte. 97 embedded paths and a directory name three characters shorter is 291 bytes of
+   * payload, with alignment absorbing the difference.
+   *
+   * So a difference here says where the artifact was built, and a difference in the compiled half
+   * says the emitted code changed. Only the second is evidence about the compiler. To remove the
+   * variable rather than reason about it, point both compilers at **one** source directory: same
+   * paths, and any remaining difference is real.
    */
   val metadataMember: String = s"sysl.$metadataName.o"
 
