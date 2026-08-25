@@ -1,0 +1,50 @@
+module sysl.crypto
+
+// Comparing two tags without telling an attacker how far the comparison got.
+//
+// **`==` on two byte slices is the wrong instrument here, and the reason is not obvious.** A natural
+// comparison walks left to right and stops at the first difference, so a tag whose first byte is
+// wrong is rejected faster than one whose first three bytes are right. That difference is
+// measurable, and it turns forging a tag from a search over every possible value into a search over
+// one byte at a time — from impossible into an afternoon. It is the defect that bit Keyczar in 2009
+// and the reason Java documents `Arrays.equals` as unsuitable for the same job.
+//
+// So this reads **every** byte, accumulates the differences, and asks the question once at the end.
+// There is no arrangement of the inputs that makes it return sooner.
+
+// Whether two byte strings are the same, without revealing where they first differ.
+//
+// **Reach for this wherever one side is a secret a caller supplied** — a message authentication
+// code, a session token, a password digest. For two digests of public data `==` is fine and says so
+// more plainly.
+//
+// The **length** is compared first and that comparison does branch, which costs nothing: how long a
+// SHA-256 tag is was never a secret. What must not leak is *where* two same-length tags diverge.
+//
+// ## WHAT IS PROMISED HERE, AND WHAT IS NOT
+//
+// **Promised**: this reads every byte of both inputs and takes no branch on their contents. That is
+// a property of the code as written, and `CryptoVerifyCodegenTests` pins it against the compiler's
+// own output so that a change which introduced an early exit fails a test rather than shipping.
+//
+// **Not promised**: that the machine executes it in constant time. sysl has no way to *state* that
+// requirement — there is no annotation for it and no check — so nothing here stops a future
+// optimizer, or a processor with a data-dependent instruction, from reintroducing a signal. The
+// emitted code was read at 0.0.79 on aarch64 and the loop is branchless with the verdict taken by a
+// conditional set; anyone wanting to confirm that again on another target can, with
+// `SYSL_RELEASE=1 sysl build` and a disassembler.
+//
+// **Where a hardware-backed guarantee is the requirement** rather than a careful implementation, the
+// instruments are the processor's own — AArch64's `DIT`, x86's `DOITM` — and a vetted C
+// implementation such as Monocypher's `crypto_verify*`, which the org binds as a package.
+verify(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+
+    var diff: u8 = 0
+
+    // `|=` rather than an early exit, and every index visited: the accumulator is what carries the
+    // answer, and it is not looked at until the loop is over.
+    for i in 0..<a.len do diff |= a[i] ^ b[i]
+
+    diff == 0
+end verify

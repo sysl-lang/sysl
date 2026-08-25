@@ -434,3 +434,49 @@ each_hasher_agrees()
     assert_eq(hex_string(ob), hex_string(sha384("abc".bytes)))
     assert_eq(hex_string(oc), hex_string(sha512("abc".bytes)))
 end each_hasher_agrees
+
+// `verify` is the comparison a tag wants, and what it must get right is not only the answer: it must
+// give the same answer `==` would for every input, while reading all of both regardless.
+@test("verify agrees with equality on every shape of input")
+verify_agrees_with_equality()
+    assert(verify(sha256("abc".bytes), sha256("abc".bytes)))
+    assert(!verify(sha256("abc".bytes), sha256("abd".bytes)))
+
+    // Same length, differing in the first byte and in the last — the two the early-exit version
+    // would have told apart by how long it took.
+    var a: [4]u8 = [1, 2, 3, 4]
+    var first: [4]u8 = [9, 2, 3, 4]
+    var last: [4]u8 = [1, 2, 3, 9]
+
+    assert(verify(a[0..<4], a[0..<4]))
+    assert(!verify(a[0..<4], first[0..<4]))
+    assert(!verify(a[0..<4], last[0..<4]))
+
+    // Lengths differ, which is public and answered directly.
+    assert(!verify(a[0..<4], a[0..<3]))
+    assert(!verify(a[0..<3], a[0..<4]))
+
+    // Two empty strings are equal, and nothing is read.
+    assert(verify(a[0..<0], a[0..<0]))
+end verify_agrees_with_equality
+
+@test("verify carries a tag it was given, which is what it is for")
+verify_checks_a_tag()
+    var key = "Jefe".bytes
+    var msg = "what do ya want for nothing?".bytes
+    var tag = hmac256(key, msg)
+
+    assert(verify(tag, hmac256(key, msg)))
+
+    // A tag for a different message, and a tag under a different key: both refused.
+    assert(!verify(tag, hmac256(key, "what do ya want for something?".bytes)))
+    assert(!verify(tag, hmac256("jefe".bytes, msg)))
+
+    // One bit of the tag flipped is still refused — the case an accumulator that stopped early
+    // would have taken longer to reach.
+    var flipped = hmac256(key, msg)
+
+    flipped[31] ^= 1
+
+    assert(!verify(tag, flipped))
+end verify_checks_a_tag
