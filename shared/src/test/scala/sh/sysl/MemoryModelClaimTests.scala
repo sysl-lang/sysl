@@ -477,9 +477,11 @@ class MemoryModelClaimTests extends AnyFreeSpec with RunSupport with CodegenSupp
     // reaching `Q` is not — `Q` holds a `Wrap[C]` by value and `C` holds a `Q` by value, with
     // nothing pointing anywhere between them. Field order is the only thing that decides which the
     // walk sees first, and it must not be the thing that decides whether this compiles.
-    "so a second one further along the same fields is still refused" in {
+    "so a second one further along the same fields is still refused, in either field order" in {
       err(s"${wrap}struct R\n    q: *Q\nstruct Q\n    w: Wrap[C]\nstruct C\n    r: R\n    q: Q\n" +
-        "var r: R\nprint(1)") should include("contains itself")
+        "var r: R\nprint(1)") should include("type 'Q' contains itself, so it has no finite size")
+      err(s"${wrap}struct R\n    q: *Q\nstruct Q\n    w: Wrap[C]\nstruct C\n    q: Q\n    r: R\n" +
+        "var r: R\nprint(1)") should include("type 'Q' contains itself, so it has no finite size")
     }
 
     // **A type reached first as an argument is still judged on its own account.** The argument
