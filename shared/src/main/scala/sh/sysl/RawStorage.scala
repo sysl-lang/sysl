@@ -42,7 +42,8 @@ trait RawStorage extends ExprSupport {
    * all take theirs (`reference/ffi.md § Variadic functions`, `reference/memory.md § null exists,
    * and only here`). It is not written in the call because there is nowhere to write it: square
    * brackets in an expression are indexing, and call-site type arguments are refused language-wide
-   * (`10 § Open a`), so a written target would need a syntax nothing else here has.
+   * (`reference/generics.md § Writing the type arguments`), so a written target would need a syntax
+   * nothing else here has.
    *
    * What comes out is always a `*T` and never a `&T`. A reference is a safe-tier value — non-null,
    * refcounted, and relied on by everything the safe subset promises — and an address invented from

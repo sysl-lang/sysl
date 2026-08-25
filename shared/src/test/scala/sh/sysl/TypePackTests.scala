@@ -478,8 +478,9 @@ class TypePackTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         "12 123 abcd\n"
     }
 
-    /** The third rung of the ladder a tuple's own type and its arity's shape begin — `02 §
-     * override`'s "written-out beats a parameter", applied twice down one chain.
+    /** The third rung of the ladder a tuple's own type and its arity's shape begin —
+     * `reference/traits.md § override — when the overlap is deliberate`'s "written-out beats a
+     * parameter", applied twice down one chain.
      */
     "loses to a block written for one arity" in {
       run("""trait Tag

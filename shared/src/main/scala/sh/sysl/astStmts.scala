@@ -300,7 +300,8 @@ case class MultiDecl(names: List[String], mutable: Boolean, values: List[Expr]) 
  * `reference/statements.md § match`'s refutable forms are refused with that as the reason.
  *
  * **A struct pattern qualifies because a struct has exactly one shape**, which is the same property
- * that makes a tuple pattern irrefutable — `09 §` calls a tuple pattern the positional form of this
+ * that makes a tuple pattern irrefutable — `reference/patterns.md § Struct patterns` calls a tuple
+ * pattern the positional form of this
  * one. A *variant* pattern is the one that does not qualify: an enum has several shapes and naming
  * one of them is a test.
  */

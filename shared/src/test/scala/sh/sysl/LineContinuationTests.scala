@@ -3,7 +3,8 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
-/** An operator at the end of a line carries the expression onto the next one (`00 § Open`).
+/** An operator at the end of a line carries the expression onto the next one
+ * (`reference/lexical.md § An unbracketed line continues after an operator`).
  *
  * The rule is that an operator which cannot finish an expression continues the line, so the tests
  * come in two halves: what continues, and what still ends a statement. The lexical half asserts the

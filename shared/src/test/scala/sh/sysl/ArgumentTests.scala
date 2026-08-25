@@ -250,7 +250,8 @@ class ArgumentTests
   }
 
   "what a default may not be" - {
-    // The suffix rule, worded as `10 §3` words the identical rule about a type parameter's default.
+    // The suffix rule, worded as `reference/generics.md § A parameter may carry a default` words
+    // the identical rule about a type parameter's default.
     "a parameter with no default may not come after one that has" in {
       val e = err("""|f(a: int = 1, b: int) -> int = a + b
                      |print(f(1, 2))
@@ -515,8 +516,9 @@ class ArgumentTests
    */
   "the corners" - {
     // The one that can hang the compiler rather than refuse a program: filling a default calls the
-    // function, which fills the default again. `10 §3` guards the type-level form of this with a
-    // set of what is being filled; the value-level form needs the same guard or none at all.
+    // function, which fills the default again. `reference/generics.md § A parameter may carry a
+    // default` guards the type-level form of this with a set of what is being filled; the
+    // value-level form needs the same guard or none at all.
     "a default that calls its own declaration is refused rather than recursed into" in {
       err("""|loop(n: int = loop()) -> int = n
              |print(loop())

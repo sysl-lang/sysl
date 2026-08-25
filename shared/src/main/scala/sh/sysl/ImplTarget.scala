@@ -31,7 +31,8 @@ trait ImplTarget extends ImplConformance {
    * `impl` for one covers every instantiation, and `impl Index[usize, int] for Buf[int]` is refused
    * outright (`implTarget`). So one block per (trait-at-arguments, generic type) still holds, and a
    * parameter the subject settles is a key that matches one thing per subject rather than many.
-   * `override` (`02 §`) does not reach this: what it relaxes is a *shape* overlapping a type written
+   * `override` (`reference/traits.md § override — when the overlap is deliberate`) does not reach
+   * this: what it relaxes is a *shape* overlapping a type written
    * out in full, which is a second key rather than a second block under this one.
    */
   protected def implBound(impl: ImplDecl, tr: TraitDecl): (Type.Bound, List[Type]) = {

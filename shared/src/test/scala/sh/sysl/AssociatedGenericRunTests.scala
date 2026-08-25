@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Tier-2 runtime behavior of an **associated function** on a generic type (`10 § Open b`).
+/** Tier-2 runtime behavior of an **associated function** on a generic type (`reference/generics.md
+ * § Members and associated functions`).
  *
  * A method reads the type's arguments straight off its receiver. An associated function has no
  * receiver, so it stands where a generic *free* function stands: the arguments are inferred from

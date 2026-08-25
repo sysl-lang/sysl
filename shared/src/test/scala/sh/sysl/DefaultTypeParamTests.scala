@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** A type parameter that carries a default (`10 §3`): `trait Scale[R = Self]`, `struct Pair[A, B = A]`.
+/** A type parameter that carries a default (`reference/generics.md § A parameter may carry a
+ * default`): `trait Scale[R = Self]`, `struct Pair[A, B = A]`.
   *
   * The customer is the operator catalog. `library/core.md § Walking a type of your own` records
   * that a heterogeneous operand — `Complex * f64` — wants `Mul[Rhs]` rather than `Mul`, and that

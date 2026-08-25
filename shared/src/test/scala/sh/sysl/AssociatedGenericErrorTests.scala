@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** What an associated function on a generic type may and may not say (`10 § Open b`).
+/** What an associated function on a generic type may and may not say (`reference/generics.md §
+ * Members and associated functions`).
  *
  * Having no receiver is the whole difference: the type arguments have to be inferred rather than
  * read, so what is refused here is either an inference the call cannot make or a mistake the

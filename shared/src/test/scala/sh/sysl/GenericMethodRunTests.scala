@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** A member that declares type parameters of its own (`10 § Open b`).
+/** A member that declares type parameters of its own (`reference/generics.md § Members and
+ * associated functions`).
  *
  * The type's parameters and the member's are fixed from two different places, and that is the whole
  * of what makes this its own form: the receiver already says what the type's arguments are, while

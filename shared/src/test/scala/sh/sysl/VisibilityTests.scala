@@ -197,7 +197,7 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
     }
   }
 
-  /** What the file level buys the backend (`reference/modules.md § Visibility`, `13 § Open g`).
+  /** What the file level buys the backend (`reference/modules.md § Visibility`).
    *
    * A bare `private` is the one reach that provably never crosses a file boundary, and every file of
    * a compilation is emitted into one LLVM module — so a declaration at that reach has all of its

@@ -4,8 +4,8 @@ import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
 /** Compiling a program **against a library**, with the library crossing as an `AstCodec` artifact
- * and its names arriving by auto-import (`reference/modules.md § Imports`, `13 § Open d`, `13 §
- * Open h`).
+ * and its names arriving by auto-import (`reference/modules.md § Imports`,
+ * `reference/modules.md § Separate compilation`, `library/_index.md`).
  *
  * **This exists to prove the pieces on a library nothing depends on.** It was written before the
  * standard module relied on any of them: a mistake in the artifact, the linking or the auto-import

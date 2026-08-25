@@ -28,7 +28,8 @@ object FormatSpec {
   }
 
   /** The three parts of a specifier a `Display` implementation is handed: the minimum field width,
-   * the precision, and whether the field is left-justified (`14 §8 d`).
+   * the precision, and whether the field is left-justified (`library/core.md § A specifier is the
+   * whole value's field`).
    *
    * A width of `0` and a precision of `-1` mean neither was written, which is the reading `%s` and
    * `%.0s` would otherwise be confused by. Only these three cross the boundary: the numeric flags

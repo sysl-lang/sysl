@@ -404,12 +404,12 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
   /** Where a member of that name is filed for a type: under the type's own key, or — when only a
    * shape-matched block supplies it — under the shape's, with the arguments this type matched at.
    *
-   * **The type's own key is asked first, and that order is what makes an override work** (`02 §
-   * override`). Two blocks may give one name to one type only where the written-out one says
-   * `override` (`hoistMemberList`), and then asking the type's key before the shape's is exactly the
-   * "written-out beats a parameter" half of the ordering — the more specific block answers because it
-   * is the first place looked. Everywhere else nothing is reached both ways, and the order merely
-   * settles which table holds the member.
+   * **The type's own key is asked first, and that order is what makes an override work**
+   * (`reference/traits.md § override — when the overlap is deliberate`). Two blocks may give one
+   * name to one type only where the written-out one says `override` (`hoistMemberList`), and then
+   * asking the type's key before the shape's is exactly the "written-out beats a parameter" half of
+   * the ordering — the more specific block answers because it is the first place looked. Everywhere
+   * else nothing is reached both ways, and the order merely settles which table holds the member.
    */
   protected def memberKey(t: Type, mname: String): (String, List[Type]) = {
     val own = memberOwner(t)
@@ -514,7 +514,7 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
    * above about — the element is still a parameter when the members are hoisted — so the one block
    * that most needs asking is the one it cannot see. `impl[T] Sized for []T` declaring a `len` was
    * accepted and then never found, since `xs.len` is answered ahead of the member table, which is
-   * exactly the outcome `08 § Built-in members` says is refused at the declaration.
+   * exactly the outcome `reference/declarations.md § Structs` says is refused at the declaration.
    *
    * `len` is the whole list: it is the only member the compiler provides for a sequence, and the
    * shapes that have one are the two written with brackets. A tuple's shape is its arity and has
@@ -645,9 +645,9 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
    * cannot work, because the body is walked once against the *parameter* and never learns that this
    * instantiation was an object.
    *
-   * The required traits come for free from the same closure the table is laid out from, so a bound on
-   * a trait the object's own trait requires needs no rule of its own (`02 § Requiring another
-   * trait`).
+   * The required traits come for free from the same closure the table is laid out from, so a bound
+   * on a trait the object's own trait requires needs no rule of its own (`reference/traits.md § A
+   * trait may require another trait`).
    */
   protected def erasedSatisfies(tr: Type.Bound, t: Type): Boolean =
     !hasUnslottedMember(tr) &&
@@ -719,7 +719,8 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
    * The argument list is what selects, and it selects exactly one *per key*. A type may implement a
    * trait more than once, but never twice at one argument list; and a shape and a type written out in
    * full may both implement a trait only where the written-out block says `override` (`hoistImpl`).
-   * That is the one case where two answers exist, and the order below is the ordering `02 §` states:
+   * That is the one case where two answers exist, and the order below is the one
+   * `reference/traits.md § override — when the overlap is deliberate` states:
    * the type's own key before the shape's before a blanket's, which is "written-out beats a
    * parameter" read as a sequence of lookups.
    */

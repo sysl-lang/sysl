@@ -365,11 +365,12 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "1\n"
     }
 
-    // `12 § Open b` asked whether a closure written *inside* a generic body — capturing a value whose
-    // type is the enclosing function's parameter — interacts with monomorphization in a way the
-    // top-level cases do not. It does not: the closure is a struct whose field has that type, so it is
-    // monomorphized with the function that holds it, once per instantiation. Two instantiations here,
-    // and the second is a float, so a struct laid out for the first would be measurably wrong.
+    // `reference/expressions.md § Closures` asked whether a closure written *inside* a generic body
+    // — capturing a value whose type is the enclosing function's parameter — interacts with
+    // monomorphization in a way the top-level cases do not. It does not: the closure is a struct
+    // whose field has that type, so it is monomorphized with the function that holds it, once per
+    // instantiation. Two instantiations here, and the second is a float, so a struct laid out for
+    // the first would be measurably wrong.
     "a closure inside a generic body captures the parameter's own type" in {
       run("""bump[T: Add](x: T, by: T) -> T
             |    var g = (y: T) -> y + by
@@ -402,11 +403,11 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "11 1.75\n"
     }
 
-    // The other half of `12 § Open b` — a closure that is itself generic — is a **grammar** fact and
-    // nothing more. It used to rest on a second one: a callable's type is the library's `FnN` trait,
-    // and a trait member could not declare type parameters at all. That reason is gone — `Fn1.call`
-    // could carry one now — so what is left is that an arrow has nowhere to write them, which is
-    // where the refusal lands.
+    // The other half of `reference/expressions.md § Closures` — a closure that is itself generic —
+    // is a **grammar** fact and nothing more. It used to rest on a second one: a callable's type is
+    // the library's `FnN` trait, and a trait member could not declare type parameters at all. That
+    // reason is gone — `Fn1.call` could carry one now — so what is left is that an arrow has
+    // nowhere to write them, which is where the refusal lands.
     "a closure of its own may not be generic, because an arrow has nowhere to declare one" in {
       // `[T]` reads as an index of `T` and `(x` as a call on the result, so the refusal lands on
       // the `:` that neither of those admits — the grammar has no reading in which the brackets

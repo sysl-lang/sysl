@@ -53,11 +53,11 @@ class SubtypeParserTests extends AnyFreeSpec with ParseSupport {
         )
     }
 
-    /** A bound is a constant *expression*, not a literal (`16 § Open b`), so a name parses here and
-      * whether it denotes a constant is settled later. The level is the one tighter than a range,
-      * which is the whole reason this position could not simply take `expression`: at any looser
-      * level `0..<max_tasks` would parse as a **range expression** and swallow the `..<` that
-      * separates the two bounds.
+    /** A bound is a constant *expression*, not a literal (`reference/errors.md § Ranges`), so a
+      * name parses here and whether it denotes a constant is settled later. The level is the one
+      * tighter than a range, which is the whole reason this position could not simply take
+      * `expression`: at any looser level `0..<max_tasks` would parse as a **range expression** and
+      * swallow the `..<` that separates the two bounds.
       */
     "a name parses as a bound" in {
       typeDecl("type Slot = int within 0..<max_tasks") shouldBe

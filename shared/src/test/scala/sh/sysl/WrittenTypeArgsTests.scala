@@ -78,8 +78,8 @@ class WrittenTypeArgsTests extends AnyFreeSpec with CodegenSupport with RunSuppo
       run(src) shouldBe "11 132 88 0\n"
     }
 
-    // A function whose parameter is used only *inside* the body, which is the shape `10 § Open a`
-    // named as well-formed and uncallable.
+    // A function whose parameter is used only *inside* the body, which is the shape
+    // `reference/generics.md § Writing the type arguments` named as well-formed and uncallable.
     "so is one whose parameter appears only in its body" in {
       run("""trait Width
             |    bits() -> usize

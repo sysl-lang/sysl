@@ -26,7 +26,8 @@ class EscapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
 
     // Moving a field means choosing between moving the field alone and moving the struct that holds
-    // it, which `05 § Deferred` names as unspecified — so it is left refused rather than guessed at.
+    // it, which `reference/memory.md § What happens when a slice escapes` names as unspecified — so
+    // it is left refused rather than guessed at.
     "the array is a field of a local struct" in {
       err("""struct Frame
             |    cells: [4]int
@@ -47,8 +48,9 @@ class EscapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSupport {
   }
 
   /** A fixed array **inside a counted object** is the case that looks like the two above and is not
-   * one of them (`05 § Not yet`, now built). Nothing is moved, because the storage is on the heap
-   * already; what the view needs is the box, and the walk to the field went through it.
+   * one of them (`reference/memory.md § What happens when a slice escapes`, now built). Nothing is
+   * moved, because the storage is on the heap already; what the view needs is the box, and the walk
+   * to the field went through it.
    */
   "a view of a fixed array inside a '&Struct' is not an escape at all" - {
 

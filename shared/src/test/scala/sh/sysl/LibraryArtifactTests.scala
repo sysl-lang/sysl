@@ -8,7 +8,7 @@ import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
 /** Separate compilation: a library built once into a `.syslib`, and a program linked against it
- * (`LibraryArtifact`, `13 § Open d`).
+ * (`LibraryArtifact`, `reference/modules.md § Separate compilation`).
  *
  * **What is worth pinning here is the split**, because it is the whole claim. A declaration with no
  * type parameters is compiled by whoever built the library and *linked* by whoever uses it; a

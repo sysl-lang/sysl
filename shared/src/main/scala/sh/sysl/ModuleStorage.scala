@@ -144,12 +144,12 @@ trait ModuleStorage extends ModuleFiles {
    * of this question either way.
    *
    * Read-only *at every depth* is deliberately **not** what this checks, though it once was. That
-   * promise is about the storage the declaration lays down, and it is kept where it is made: `k[0] =
-   * …` and `&k[0]` are both refused. It was never a promise about what a value *inside* the storage
-   * addresses — a `*T` reached through one is the raw tier, where the language guarantees nothing,
-   * and slicing a `val` and writing `&v[0]` already produces one on purpose (`07 § A view that may
-   * not be written`). Refusing a `val` at pointer type declined one route to what another route
-   * grants.
+   * promise is about the storage the declaration lays down, and it is kept where it is made: `k[0]
+   * = …` and `&k[0]` are both refused. It was never a promise about what a value *inside* the
+   * storage addresses — a `*T` reached through one is the raw tier, where the language guarantees
+   * nothing, and slicing a `val` and writing `&v[0]` already produces one on purpose
+   * (`reference/arrays.md § []const T — a view that may not be written`). Refusing a `val` at
+   * pointer type declined one route to what another route grants.
    */
   private def checkVal(ty: Type, key: String): Unit =
     // The whole difference between a `val` and a `const` is that a `val` has an address (`reference/modules.md § val — a thing`),

@@ -527,8 +527,8 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
       ) should include("written once")
     }
 
-    // `07 § A view that may not be written`: slicing a `val` yields a `[]const T`, and the element
-    // type being a counted one changes nothing about that.
+    // `reference/arrays.md § []const T — a view that may not be written`: slicing a `val` yields a
+    // `[]const T`, and the element type being a counted one changes nothing about that.
     "slicing a table of literals yields a view that may be read and not written" in {
       run(
         """static val names: [3]string = ["alpha", "beta", "gamma"]

@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** The atomic tier — `06 § The kernel tier`, `Atomics`.
+/** The atomic tier — `library/sync.md`, `Atomics`.
  *
  * Three questions, and they need three kinds of test. What instruction comes out is a claim about
  * the *text*, because an ordering is a keyword and a keyword that came out wrong still runs. What
@@ -221,7 +221,7 @@ class AtomicTests extends AnyFreeSpec with CodegenSupport with RunSupport {
   }
 
   /** The tier is the raw one, which means it is what other code is *written on*: a generic wrapper
-   * over `*T`, and a module that has given up the allocator. Both are `06 § The kernel tier`'s own
+   * over `*T`, and a module that has given up the allocator. Both are `library/sync.md § The module is the gate`'s own
    * claims about it, and neither follows from the forms working at a top-level statement.
    */
   "the shapes it is meant to be used from" - {
@@ -255,7 +255,7 @@ class AtomicTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       out should include("Pair is neither")
     }
 
-    /** `06 § The kernel tier` puts these "in a library, available under `no alloc`", which is the
+    /** `library/sync.md § The module is the gate` puts these "in a library, available under `no alloc`", which is the
      * whole reason the ordering enum went into a module that requires nothing. A form that reached
      * the allocator — or that needed a module which did — would make the tier useless in the place
      * it exists for.

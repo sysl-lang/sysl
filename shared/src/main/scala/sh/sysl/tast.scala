@@ -318,7 +318,7 @@ case class TUnary(op: String, operand: TExpr, ty: Type)             extends TExp
  */
 case class TIntOp(op: String, operand: TExpr, amount: Option[TExpr], width: Type, ty: Type) extends TExpr
 
-/** One atomic access, at the address `addr` points at (`06 § The kernel tier`, `Atomics`).
+/** One atomic access, at the address `addr` points at (`library/sync.md § Atomic[T]`, `Atomics`).
  *
  * `ops` are the value operands the form takes — none for a load, one for a store or a
  * read-modify-write, two for a compare-and-swap — and `at` is the type they and the access run at,

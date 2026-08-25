@@ -390,7 +390,7 @@ class SharedObjectTests extends AnyFreeSpec with CodegenSupport with RunSupport 
   "the atomic count itself" - {
 
     // The orderings are the standard sequence and are written down because getting one wrong
-    // produces a bug nobody finds (`06 § The kernel tier`).
+    // produces a bug nobody finds (`library/sync.md § Ordering`).
     "takes a share with no ordering and gives one back with release, acquiring before it frees" in {
       val out = ir(inner + "var a: &sync Inner = Inner(1)\nvar b = a\nprint(b.v)")
 

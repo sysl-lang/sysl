@@ -357,10 +357,10 @@ class EscapePromotionTests extends AnyFreeSpec with RunSupport with CodegenSuppo
     }
   }
 
-  /** `05 § Promotion is silent, not hidden`. Silent promotion earns the obvious objection — an
-   * allocation appears that nothing in the source asked for — and the answer is discoverability
-   * rather than ceremony: the common case costs no reading, and "why did this allocate?" always has
-   * an answer. This is Go's `-m`, reached with `--explain-escapes`.
+  /** `reference/memory.md § Promotion is silent, not hidden`. Silent promotion earns the obvious
+   * objection — an allocation appears that nothing in the source asked for — and the answer is
+   * discoverability rather than ceremony: the common case costs no reading, and "why did this
+   * allocate?" always has an answer. This is Go's `-m`, reached with `--explain-escapes`.
    */
   "every promotion can be asked about" - {
     def explain(src: String): List[String] =

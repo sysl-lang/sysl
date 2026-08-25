@@ -32,8 +32,8 @@ class SubtypeErrorTests extends AnyFreeSpec with CodegenSupport {
   }
 
   // The messages say "integer bounds" rather than "integer-literal bounds", because a bound is a
-  // constant expression and need not be a literal at all (`16 § Open b`) — the kind is what is wrong
-  // here, not the spelling.
+  // constant expression and need not be a literal at all (`reference/errors.md § Ranges`) — the
+  // kind is what is wrong here, not the spelling.
   "bounds of the wrong kind" - {
     "character bounds on an integer base are rejected" in {
       err("type T = int within 'a'..'z'\nvar x: T = 1\nprint(int(x))") should include("needs integer bounds")

@@ -319,10 +319,10 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
-  /** `06 § Refcount ordering` fixes the sequence an atomic reference count moves through, and says
-   * why in one line: getting it wrong produces a bug nobody finds. Nothing a program can run would
-   * notice — a stronger sequence is correct and a weaker one fails on a machine this is not — so it
-   * is asserted where it is written.
+  /** `reference/memory.md § Crossing a concurrency domain` fixes the sequence an atomic reference
+   * count moves through, and says why in one line: getting it wrong produces a bug nobody finds.
+   * Nothing a program can run would notice — a stronger sequence is correct and a weaker one fails
+   * on a machine this is not — so it is asserted where it is written.
    */
   "the atomic refcount moves the way the chapter says" - {
     "a relaxed increment, a releasing decrement, and an acquire fence before the free" in {
@@ -348,10 +348,10 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
    *
    * The reaper drains iteratively through a worklist rather than recursing, and that worklist is
    * `thread_local` so that two threads releasing the last reference to two unrelated objects do not
-   * each overwrite the other's list (`reference/memory.md § Crossing a concurrency domain`, `03 §
-   * Teardown is iterative`). A plain global would put both threads' chains on one list: the visible
-   * failures are a double free, a node freed while the other thread is walking it, or a chain
-   * silently dropped — so the total is what says it did not happen, and it is exact.
+   * each overwrite the other's list (`reference/memory.md § Crossing a concurrency domain`,
+   * `reference/memory.md § A destructor`). A plain global would put both threads' chains on one
+   * list: the visible failures are a double free, a node freed while the other thread is walking
+   * it, or a chain silently dropped — so the total is what says it did not happen, and it is exact.
    */
   "two threads dropping shared structures at the same moment" - {
     "each drain finds its own list" in {
@@ -501,7 +501,8 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   "what is refused" - {
     /** Both fields are private, so the positional constructor is out of reach — which is the whole
      * of what makes `Mutex.new` the only way in, and what keeps a lock from being built already
-     * held. `08 §` puts the constructor in the same list as a selection and a pattern for exactly
+     * held. `reference/modules.md § A restriction is about naming, not about existence` puts the
+     * constructor in the same list as a selection and a pattern for exactly
      * this reason: a private field a caller could still set by position restricts nothing.
      */
     "building one by naming its fields, which would let it start held" in {

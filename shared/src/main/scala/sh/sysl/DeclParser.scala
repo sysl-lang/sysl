@@ -373,7 +373,8 @@ trait DeclParser extends ExprParser {
       case ret ~ body => MethodDecl(name, None, isProperty = true, Nil, Nil, Some(ret), body)
     }
 
-  /** `set count(x)` — the write half of a property (`08 § A property may be settable`).
+  /** `set count(x)` — the write half of a property (`reference/declarations.md § A property may be
+   * settable`).
    *
    * **`set` is a soft keyword**, read only where a member declaration begins, so the word stays an
    * ordinary name everywhere else — a set is a container the library may yet want, and taking the
@@ -488,9 +489,10 @@ trait DeclParser extends ExprParser {
 
   protected lazy val whereClause: Parser[Expr] = whereKw ~> expression
 
-  /** A bound of a `within` range: any **constant expression**, which is the same thing an array bound
-   * accepts — `within 0..<max_tasks` beside `[max_tasks]Task`, so a table's size and the range of the
-   * type indexing it are one fact written once (`reference/modules.md § const — a value`, `16 § Open b`).
+  /** A bound of a `within` range: any **constant expression**, which is the same thing an array
+   * bound accepts — `within 0..<max_tasks` beside `[max_tasks]Task`, so a table's size and the
+   * range of the type indexing it are one fact written once (`reference/modules.md § const — a
+   * value`, `reference/errors.md § Ranges`).
    *
    * The level is `bitOr`, which is deliberately the one *tighter* than a range: `rangeExpr` is built
    * out of `bitOr`, so parsing a bound at any looser level would let `0..<max_tasks` be read as a range

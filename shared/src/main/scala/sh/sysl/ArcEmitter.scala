@@ -647,8 +647,8 @@ trait ArcEmitter extends Emitter {
 
 object ArcEmitter {
 
-  /** The one symbol a freestanding **port** may define to say what the running task's reaper scratch
-   * is (`06 § Letting go of the last one`).
+  /** The one symbol a freestanding **port** may define to say what the running task's reaper
+   * scratch is (`reference/memory.md § A destructor`).
    *
    * It is a C name rather than a sysl one because whoever knows the answer is a scheduler written in
    * C: under FreeRTOS it is `pvTaskGetThreadLocalStoragePointer`, under something else it is

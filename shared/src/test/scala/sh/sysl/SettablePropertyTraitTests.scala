@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** A trait that asks for a settable property (`08 § A property may be settable`, `02`).
+/** A trait that asks for a settable property (`reference/declarations.md § A property may be
+ * settable`, `02`).
  *
  * A setter is an ordinary `*self` method under a name a program cannot spell, so the three ways a
  * member is reached reach it too: a bound, a method table, and the type's own body. What each of

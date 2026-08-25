@@ -28,11 +28,11 @@ trait AttrParser extends ExprParser {
    * the reader is left with nothing to act on — while the reader most likely to write it is the one
    * arriving from a language where `#[test]` on a method is ordinary.
    *
-   * That no annotation marks a member is `06 § What it does not reach`, so this is a sentence rather
-   * than a form the grammar could still have read. `@assert` is told apart and answered separately:
-   * it stands *where* a declaration stands rather than saying anything about one, so the sentence
-   * about what annotations mark is exactly the wrong thing to say about it — the same distinction
-   * `assertDecl` is ordered before `attributedDecl` for.
+   * That no annotation marks a member is `reference/memory.md § Crossing a concurrency domain`, so
+   * this is a sentence rather than a form the grammar could still have read. `@assert` is told
+   * apart and answered separately: it stands *where* a declaration stands rather than saying
+   * anything about one, so the sentence about what annotations mark is exactly the wrong thing to
+   * say about it — the same distinction `assertDecl` is ordered before `attributedDecl` for.
    *
    * **`#` is read here as well**, and it is the spelling the reader this rule is for actually writes:
    * `#[test]` above a method is Rust's, and an indented `#` never reaches the directive pass, which

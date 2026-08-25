@@ -67,12 +67,12 @@ class DropTests extends AnyFreeSpec with RunSupport with CodegenSupport with Tes
     // the slice goes, and its elements go with it.
     //
     // **The elements come apart last-to-first, and that is a consequence rather than a choice.**
-    // Teardown is iterative (`03 § Who frees it`): a count reaching zero pushes the object onto a
-    // worklist threaded through its own dead refcount slot, and the first release to hit zero drains
-    // it. A worklist threaded that way is a stack, so a walk that releases the elements in order
-    // pushes them in order and drains them in reverse. `03` states that no order among siblings is
-    // promised; this pins what it does today, so a change to the drain is noticed rather than
-    // silently altering the order every program sees.
+    // Teardown is iterative (`reference/memory.md § A destructor`): a count reaching zero pushes
+    // the object onto a worklist threaded through its own dead refcount slot, and the first release
+    // to hit zero drains it. A worklist threaded that way is a stack, so a walk that releases the
+    // elements in order pushes them in order and drains them in reverse. `03` states that no order
+    // among siblings is promised; this pins what it does today, so a change to the drain is noticed
+    // rather than silently altering the order every program sees.
     "an element of a container that goes out of scope" in {
       run(s"""$handle
              |hold()

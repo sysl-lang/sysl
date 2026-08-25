@@ -1,6 +1,6 @@
 package sh.sysl
 
-/** The atomic operations, which are the `*T` tier of concurrency — `06 § The kernel tier`.
+/** The atomic operations, which are the `*T` tier of concurrency — `library/sync.md`.
  *
  * These sit beside `sizeof` and `ptr_cast` rather than beside `print`, and for the same reason: each
  * is a machine instruction with no sysl body, at a place where the language's guarantees stop. An

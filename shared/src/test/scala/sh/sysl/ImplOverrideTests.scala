@@ -96,7 +96,8 @@ class ImplOverrideTests extends AnyFreeSpec with CodegenSupport with RunSupport 
 
   "an erasure sees the override, because one type still has one table" - {
 
-    // The soundness argument of `02 §` made concrete: a `&Show` built from a `[]P` reaches the
+    // The soundness argument of `reference/traits.md § override — when the overlap is deliberate`
+    // made concrete: a `&Show` built from a `[]P` reaches the
     // override, not the shape's block, so the two levels of generality do not disagree about what a
     // `[]P` is.
     "so a trait object over the overridden type dispatches to the override" in {
@@ -144,7 +145,8 @@ class ImplOverrideTests extends AnyFreeSpec with CodegenSupport with RunSupport 
 
     // A **conditional** block is one there is something to override: the condition decides which
     // slices conform, not whether the block covers the shape, so overriding it for one element type
-    // is exactly the case `02 §` describes.
+    // is exactly the case `reference/traits.md § override — when the overlap is deliberate`
+    // describes.
     "while a conditional block is something to override" in {
       run(s"""${show}impl[T: Show] Show for []T
              |    show(self) -> string = self[0].show()
@@ -177,8 +179,9 @@ class ImplOverrideTests extends AnyFreeSpec with CodegenSupport with RunSupport 
     }
   }
 
-  /** `02 § What keeps this sound` argues from coherence rather than from the keyword, and these are
-   * the two halves of that argument as the compiler actually enforces them.
+  /** `reference/traits.md § override — when the overlap is deliberate` argues from coherence rather
+   * than from the keyword, and these are the two halves of that argument as the compiler actually
+   * enforces them.
    */
   "coherence is untouched, which is what keeps one type to one table" - {
 

@@ -804,9 +804,10 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) should include("cannot infer the type argument 'T'")
     }
 
-    // Call-site type arguments were deliberately absent (`10 § Open a`) because the list and an
-    // index share a grammar. What settles that is name resolution rather than the parser, and
-    // `WrittenTypeArgsTests` is where the form is covered — this is the reach a reader makes first.
+    // Call-site type arguments were deliberately absent (`reference/generics.md § Writing the type
+    // arguments`) because the list and an index share a grammar. What settles that is name
+    // resolution rather than the parser, and `WrittenTypeArgsTests` is where the form is covered —
+    // this is the reach a reader makes first.
     "type arguments at a call name the instantiation" in {
       run("""id[T](x: T) -> T = x
             |print(id[int](3))

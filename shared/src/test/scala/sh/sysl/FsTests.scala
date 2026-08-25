@@ -697,7 +697,8 @@ class FsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
    */
   "what a file needed from the trait system, asked of an ordinary program" - {
 
-    /* `02 §` — the diamond needs no rule of its own, the walk taking each trait the first time it
+    /* `reference/traits.md § The table carries the required trait's slots` — the diamond needs no
+     * rule of its own, the walk taking each trait the first time it
      * reaches it. `Reader` and `Writer` both require `Fallible`, so a type that is both carries one
      * `failed`, and it is the same answer through either trait object and through the value. Before
      * the latch was shared this program could not be written at all. */
@@ -731,7 +732,8 @@ class FsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       ) shouldBe "2 false false false\n4 true true true\n"
     }
 
-    /* And the reason it is one trait rather than two members of one name, now that `02 §` permits
+    /* And the reason it is one trait rather than two members of one name, now that
+     * `reference/traits.md § Two traits may declare a member of one name` permits
      * the latter: two nullary members differ in no argument a call could write, and a program that
      * uses a file has both traits in scope by definition, so scope cannot tell them apart either.
      * Permitted is not the same as answerable. */
@@ -760,7 +762,8 @@ class FsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       e should include("nothing in the call says which was meant")
     }
 
-    /* `02 §` — a trait whose every method has a default leaves nothing to write, so the block is
+    /* `reference/traits.md § A default may assume exactly what its own trait declares` — a trait
+     * whose every method has a default leaves nothing to write, so the block is
      * optional and the `impl` line alone is a complete implementation. That claim is what keeps the
      * shared latch from costing every sink a body it does not need, so it is worth a program rather
      * than a reading. */

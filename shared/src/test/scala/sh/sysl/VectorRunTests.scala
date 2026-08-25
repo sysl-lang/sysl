@@ -678,9 +678,10 @@ class VectorRunTests extends AnyFreeSpec with RunSupport {
     * which held only for the arithmetic until these two existed.
     *
     * `by` is a vector rather than an `f32` because that is where `W` enters: a written type
-    * argument at a call is still refused (`10 § Open a`), so a kernel whose parameters are all
-    * slices has no way to be told its width. It is not a workaround — a SIMD kernel's constants are
-    * vectors anyway — but it is the reason the signature reads as it does.
+    * argument at a call is still refused (`reference/generics.md § Writing the type arguments`), so
+    * a kernel whose parameters are all slices has no way to be told its width. It is not a
+    * workaround — a SIMD kernel's constants are vectors anyway — but it is the reason the signature
+    * reads as it does.
     */
   "one kernel loads, computes and stores at more than one width" in {
     val src =

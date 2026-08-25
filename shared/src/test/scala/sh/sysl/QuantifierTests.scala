@@ -78,10 +78,12 @@ class QuantifierTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   "both forms short-circuit" - {
 
     // Counting the predicate's evaluations is the only way to see this, and the count is what the
-    // design specifies rather than an accident of the emitter: a `for all` over five elements whose
-    // second fails runs the predicate twice. The counter is a local captured by a nested function,
-    // since the language has no module-level `var` for a function to reach (`13 § Why there is no
-    // module-level var`).
+    // reference specifies rather than an accident of the emitter: a `for all` over five elements
+    // whose second fails runs the predicate twice. The counter is a local captured by a nested
+    // function, which was once the only shape available — the language had no module-level `var` for
+    // a function to reach. It has one now (`reference/modules.md § val — a thing`), so the local is
+    // a choice rather than a workaround, and it is still the better one: the counter belongs to the
+    // one test that reads it.
     "a universal stops at the first counterexample" in {
       run("""probe() -> int
             |    var seen = 0

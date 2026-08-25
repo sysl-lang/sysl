@@ -64,7 +64,7 @@ class MethodRunTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
   // A property is a function with the parameter list left off, so it takes the same body a method
   // takes: an `= expr`, an `=` opening a block, or a block with no `=`. It was the one member whose
-  // body could not be written out, which is what `02 § Details still to settle` recorded.
+  // body could not be written out, which is what `reference/declarations.md § A property` recorded.
   "a property body may be a block" in {
     val src =
       """struct P

@@ -72,8 +72,9 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
 
       // `s.copy()` is the operation that stops a substring holding its parent buffer alive (`04`):
       // the bytes are copied into a string that owns them, so what the result keeps is its own.
-      // Parentheses because it allocates and walks the bytes — `08 § Property or method` puts the
-      // O(1) projections on the other side of that line, and this is the case the line was drawn for.
+      // Parentheses because it allocates and walks the bytes — `reference/declarations.md § A
+      // property` puts the O(1) projections on the other side of that line, and this is the case
+      // the line was drawn for.
       case Type.Str if mname == "copy" =>
         if args.nonEmpty then err("'copy' takes no arguments — it copies the string it is read off")
         TFromBytes(TBytes(tr))
@@ -181,11 +182,11 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
               .orElse(builtinHash(rty, mname, tr, args))
               .orElse(callableField(rty, mname, tr, args, expected))
               .getOrElse {
-                // A call reaches through one level of indirection and only one, exactly as selection
-                // does (`08 § Calling a method`). A receiver still carrying a mode after that has
-                // more than the shorthand walks, and the complaint below would name what is *left*
-                // — a type the reader never wrote — and report a missing method, when the method is
-                // there and what stopped short is the reach.
+                // A call reaches through one level of indirection and only one, exactly as
+                // selection does (`reference/declarations.md § Structs`). A receiver still carrying
+                // a mode after that has more than the shorthand walks, and the complaint below
+                // would name what is *left* — a type the reader never wrote — and report a missing
+                // method, when the method is there and what stopped short is the reach.
                 rty match
                   case _: Type.Ptr | _: Type.Ref =>
                     err(s"a method call reaches through one level of indirection and ${show(tr.ty)} " +
@@ -217,8 +218,8 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
    * argument list in the values it passes — so a call that does not determine one is a call whose
    * arguments name no implementation, which is reported rather than resolved by a preference rule.
    * The arguments are analyzed here with nothing expected of them, and a literal has no type of its
-   * own to be matched by, so `c.mul(2)` where the candidates take a `Complex` and a `real` is one of
-   * the calls that determines nothing (`08 § One name, one member`).
+   * own to be matched by, so `c.mul(2)` where the candidates take a `Complex` and a `real` is one
+   * of the calls that determines nothing (`reference/declarations.md § Structs`).
    */
   protected def pickOverload(
       owner: String,

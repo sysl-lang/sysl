@@ -309,8 +309,9 @@ class TypeLevelTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   }
 
   "a compiler-provided member is still out of reach for an impl" in {
-    // `08 § Built-in members`: `copy` is answered ahead of the member table, so a member of that
-    // name would be registered and never found — and having no receiver does not change that.
+    // `reference/declarations.md § Structs`: `copy` is answered ahead of the member table, so a
+    // member of that name would be registered and never found — and having no receiver does not
+    // change that.
     err(
       """trait Duplicate
         |    copy() -> string
@@ -402,9 +403,10 @@ class TypeLevelTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   }
 
   "a routine entirely about a type is called by writing the type" in {
-    // The gap the mechanism made visible (`10 § Open a`), and the shape that closed it: a function
-    // whose parameter appears nowhere in its signature is reached by neither direction of inference,
-    // so the list written at the call is the only thing that can say which instantiation is meant.
+    // The gap the mechanism made visible (`reference/generics.md § Writing the type arguments`),
+    // and the shape that closed it: a function whose parameter appears nowhere in its signature is
+    // reached by neither direction of inference, so the list written at the call is the only thing
+    // that can say which instantiation is meant.
     run(width +
       """describe[T: Width]() -> usize = T.bits()
         |

@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `parse_*` — reading a value back out of text (`04 § Reading a value`).
+/** `parse_*` — reading a value back out of text (`library/text.md`).
  *
  * The digits are the easy part and are barely tested here. What these are about is the edges, since
  * the edges are what a hand-written loop gets wrong and the reason the parse belongs in the library

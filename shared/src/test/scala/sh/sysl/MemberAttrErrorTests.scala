@@ -5,11 +5,12 @@ import org.scalatest.freespec.AnyFreeSpec
 /** An annotation written above a **member** — a method, a property, an associated function, a field
  * or an enum variant.
  *
- * No annotation in this language marks one (`06 § What it does not reach`), and until this suite the
- * grammar said so by having no alternative that begins with `@`: the block simply ended there, and
- * what the reader was shown was whichever rule was going to complain about the line anyway —
- * `dedent expected` where a member had already been read, `identifier expected` where none had.
- * Both are about indentation and about names, which is the one thing that is not wrong.
+ * No annotation in this language marks one (`reference/memory.md § Crossing a concurrency domain`),
+ * and until this suite the grammar said so by having no alternative that begins with `@`: the block
+ * simply ended there, and what the reader was shown was whichever rule was going to complain about
+ * the line anyway — `dedent expected` where a member had already been read, `identifier expected`
+ * where none had. Both are about indentation and about names, which is the one thing that is not
+ * wrong.
  *
  * So the assertions below are about **what the sentence says and where the caret is**, in every
  * block that reads a member, rather than about the refusal existing. The caret belongs on the `@`

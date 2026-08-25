@@ -61,9 +61,9 @@ trait SpecialForms extends Closures {
    * `ulong`, the floats to `real` — so the library needs one function per *kind* rather than one
    * per type, which sysl has no overloading to hide anyway.
    *
-   * A scalar keeps this direct path rather than going through its `Display` (`14 §8 b`): the two
-   * render identically, and the one that does not build a sink is the one to emit. Everything else
-   * writes itself into standard output through the trait.
+   * A scalar keeps this direct path rather than going through its `Display` (`library/core.md §
+   * Rendering to standard output`): the two render identically, and the one that does not build a
+   * sink is the one to emit. Everything else writes itself into standard output through the trait.
    */
   private def printOne(t: TExpr): TExpr = t.ty match
     // A width past 64 bits has no printf conversion to be widened to, so it renders itself first
@@ -417,8 +417,9 @@ trait SpecialForms extends Closures {
    *
    * There is no `va_arg[T](ap)`: square brackets in an expression are indexing
    * (`reference/generics.md § [] means type application in a type, indexing in an expression`), and
-   * call-site type arguments are refused language-wide (`10 § Open a`). Somebody reaching for that
-   * spelling is told what to write instead rather than that the callee is not a name.
+   * call-site type arguments are refused language-wide (`reference/generics.md § Writing the type
+   * arguments`). Somebody reaching for that spelling is told what to write instead rather than that
+   * the callee is not a name.
    */
   protected def vaArg(args: List[Expr], expected: Option[Type]): TExpr = {
     val ap = vaList("va_arg", args)

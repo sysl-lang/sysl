@@ -3,7 +3,8 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
-/** The AST codec reads back exactly the tree the parser produced (`13 § Open d`).
+/** The AST codec reads back exactly the tree the parser produced, which is what
+ * `reference/modules.md § Separate compilation` rests on.
  *
  * **The shipped library is the load-bearing case**, and deliberately so: it is real sysl using
  * nearly every declaration the language has — generic enums, traits with defaults and supertraits,

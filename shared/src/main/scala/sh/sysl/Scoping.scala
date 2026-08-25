@@ -730,7 +730,8 @@ trait Scoping extends DeclTables {
   }
 
   /** The defaults being filled right now, so one that leads back to itself is caught rather than
-   * recursed into — `10 §3`'s guard, at the other argument list.
+   * recursed into — `reference/generics.md § A parameter may carry a default`'s guard, at the other
+   * argument list.
    *
    * Keyed on **where the default was written** rather than on the declaration it belongs to. The
    * declaration is too coarse: a member's default that calls a sibling member of the same type

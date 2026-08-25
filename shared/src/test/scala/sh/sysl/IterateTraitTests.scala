@@ -103,8 +103,9 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
                    |print(found)""".stripMargin) shouldBe "5\n"
     }
 
-    // `08 § Built-in members` — a compiler-provided member is reached ahead of the member table, so
-    // an `impl` may not declare one of the same name. `chars` joins `len` and `bytes` in that rule.
+    // `reference/declarations.md § Structs` — a compiler-provided member is reached ahead of the
+    // member table, so an `impl` may not declare one of the same name. `chars` joins `len` and
+    // `bytes` in that rule.
     "'chars' is compiler-provided, so an 'impl' may not redeclare it" in {
       err("""trait Mine
             |    chars(self) -> int
@@ -326,10 +327,10 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
                    |print(walk(Upto(1, 2)))""".stripMargin) shouldBe "2\n"
     }
 
-    /** `02 § An object keeps one trait and what that trait requires` — an erased value reaches its
-     * trait's members through a table, and `next` is object-safe (`*self`, no `Self` away from the
-     * receiver). So a `for` walks one: the loop asks what may be *called* on the value, which is the
-     * question the table answers.
+    /** `reference/traits.md § The table carries the required trait's slots` — an erased value
+     * reaches its trait's members through a table, and `next` is object-safe (`*self`, no `Self`
+     * away from the receiver). So a `for` walks one: the loop asks what may be *called* on the
+     * value, which is the question the table answers.
      *
      * **The element comes out of the object's own type**, which is what makes an object over a trait
      * with an associated type formable at all: an erased value has forgotten which implementation it

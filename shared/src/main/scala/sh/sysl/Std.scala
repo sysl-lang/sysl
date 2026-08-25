@@ -3,7 +3,7 @@ package sh.sysl
 import io.github.edadma.cross_platform.*
 
 /** The library the compiler is installed with: the standard module `sysl` that every program is
- * compiled against, and the submodules beneath it (`13 § Open h`).
+ * compiled against, and the submodules beneath it (`library/_index.md`).
  *
  * **`sysl` is the auto-imported part and not the whole of it.** `library/sysl` is a tree, so a
  * directory under it is a submodule by `reference/modules.md`'s ordinary rule, and only the

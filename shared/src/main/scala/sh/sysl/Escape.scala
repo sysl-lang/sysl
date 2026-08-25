@@ -32,10 +32,11 @@ object Escape {
   case class Promotions(
       byFunc: Map[String, Set[String]],
       inMain: Set[String],
-      /** One line per promotion, in source order, for `--explain-escapes` (`05 § Promotion is
-       * silent, not hidden`). Silent promotion earns the objection that an allocation appears which
-       * nothing in the source asked for, and the answer is discoverability rather than ceremony:
-       * the common case costs no reading, and "why did this allocate?" always has an answer.
+      /** One line per promotion, in source order, for `--explain-escapes` (`reference/memory.md §
+       * Promotion is silent, not hidden`). Silent promotion earns the objection that an allocation
+       * appears which nothing in the source asked for, and the answer is discoverability rather
+       * than ceremony: the common case costs no reading, and "why did this allocate?" always has an
+       * answer.
        */
       explanations: List[String] = Nil,
   ) {
@@ -174,9 +175,9 @@ private class Escape(program: TProgram) {
    *
    * The distinction is what decides promotion from diagnostic. A view rooted at a plain local array
    * has somewhere to move the storage to; one rooted at a field of a local struct, or at an array
-   * parameter the caller passed by value, does not — promoting the first would be `05 § Deferred`'s
-   * unspecified "promotion of aggregates", and the second is storage this frame was handed rather
-   * than storage it made.
+   * parameter the caller passed by value, does not — promoting the first would be
+   * `reference/memory.md § What happens when a slice escapes`'s unspecified "promotion of
+   * aggregates", and the second is storage this frame was handed rather than storage it made.
    */
   private case class View(named: Set[String], anonymous: Boolean) {
     def nonEmpty: Boolean  = named.nonEmpty || anonymous
@@ -291,11 +292,12 @@ private class Escape(program: TProgram) {
      *
      * An **index** step is walked through: an element of a local array of arrays is part of that
      * array's storage, so moving the whole thing moves the element with it. A **field** step is
-     * not, because the storage belongs to a struct and moving it would be `05 § Deferred`'s
-     * unspecified "promotion of aggregates" — the choice between moving the field alone and moving
-     * the struct has not been made. An array the caller passed **by value** is storage this frame
-     * was handed rather than storage it made, so it is not this body's to move either. Both of
-     * those come back unnamed and are reported as they always were.
+     * not, because the storage belongs to a struct and moving it would be `reference/memory.md §
+     * What happens when a slice escapes`'s unspecified "promotion of aggregates" — the choice
+     * between moving the field alone and moving the struct has not been made. An array the caller
+     * passed **by value** is storage this frame was handed rather than storage it made, so it is
+     * not this body's to move either. Both of those come back unnamed and are reported as they
+     * always were.
      */
     private def arrayRoot(base: TExpr): View = base match
       case TLoad(name, _) if locals(name) => View.of(name)
@@ -476,11 +478,11 @@ private class Escape(program: TProgram) {
 
   /** A promotion in a module that declared `no alloc`, said as the refusal it is there.
    *
-   * Promotion is deliberately silent everywhere else (`05 § Promotion is silent, not hidden`) — the
-   * program means what it said and the storage quietly moves. A module that gave the allocator up
-   * has nowhere for it to move to, so the same fact has to be reported, and it is reported against
-   * the view that leaves the frame rather than against the array: the array is fine, and what the
-   * reader has to change is where its contents go.
+   * Promotion is deliberately silent everywhere else (`reference/memory.md § Promotion is silent,
+   * not hidden`) — the program means what it said and the storage quietly moves. A module that gave
+   * the allocator up has nowhere for it to move to, so the same fact has to be reported, and it is
+   * reported against the view that leaves the frame rather than against the array: the array is
+   * fine, and what the reader has to change is where its contents go.
    *
    * The body's module is read off the function's key, or is the entry point's for the statements a
    * program runs, which belong to the file that carries them however little they look declared.

@@ -149,8 +149,8 @@ trait MemberExprAnalysis extends ExprSupport {
 
         // `copy` is the one compiler-provided member of a string that is a *method*, so reading it
         // without the parentheses is told what a user type's method is told. The parentheses are
-        // what say it allocates and walks the bytes (`08 § Property or method`), which is exactly
-        // the information this line was missing.
+        // what say it allocates and walks the bytes (`reference/declarations.md § A property`),
+        // which is exactly the information this line was missing.
         case Type.Str if f == "copy" =>
           err("'copy' is a method of 'string' — call it with 'copy()', since it allocates and " +
             "copies the bytes rather than naming what is already there")
@@ -659,7 +659,8 @@ trait MemberExprAnalysis extends ExprSupport {
   private def receiverProbe(receiver: Expr): Option[Type] =
     probe(autoDeref(analyzeExpr(receiver)).ty)
 
-  /** Whether this type has a setter for `name` (`08 § A property may be settable`).
+  /** Whether this type has a setter for `name` (`reference/declarations.md § A property may be
+   * settable`).
    *
    * The three receivers a property can be read off are the three a property can be written through,
    * and each is asked the question the same way its read asks it: a bound consults what it licenses,

@@ -27,8 +27,9 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
       |""".stripMargin
 
   "the scalar path is untouched" - {
-    // `14 §8 b`: the two renderings are identical, so the one that does not build a sink is the one
-    // to emit — and a program that only prints numbers should not carry a method table at all.
+    // `library/core.md § Rendering to standard output`: the two renderings are identical, so the
+    // one that does not build a sink is the one to emit — and a program that only prints numbers
+    // should not carry a method table at all.
     "a printed scalar calls its renderer directly" in {
       val out = irMain("print(5)")
 

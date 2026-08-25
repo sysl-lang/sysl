@@ -69,11 +69,12 @@ object Project {
    *
    * **C belongs to a module or to the tree's own root, so a directory that is neither contributes
    * none of its own.** The walk still descends through such a directory, since a module may sit any
-   * depth below one — what it does not do is take the C sitting *in* it. That is `15 §5` step 1 read
-   * for the other half of the walk: a directory containing sources is a module, and `modules` below
-   * already applies the same rule to the sysl. The two disagreeing is how a project came to compile
-   * C nobody wrote for it — `cmake -B build` puts a build directory *inside* the project, and a
-   * Zephyr build fills it with generated C meant for a different compiler.
+   * depth below one — what it does not do is take the C sitting *in* it. That is
+   * `getting-started/cli.md § The subcommands` step 1 read for the other half of the walk: a
+   * directory containing sources is a module, and `modules` below already applies the same rule to
+   * the sysl. The two disagreeing is how a project came to compile C nobody wrote for it — `cmake
+   * -B build` puts a build directory *inside* the project, and a Zephyr build fills it with
+   * generated C meant for a different compiler.
    *
    * The cost, which is accepted rather than fixed: a vendored C library laid out in sub-directories
    * of its own loses the ones holding no sysl, and the signal is a link error naming the symbols.

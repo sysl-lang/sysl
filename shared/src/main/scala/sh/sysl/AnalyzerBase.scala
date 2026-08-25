@@ -262,10 +262,11 @@ trait AnalyzerBase extends Scoping {
    * split — `Cell.count$set`, not `set`.
    *
    * The two differ for one reason and it is worth stating, because the difference is a trap rather
-   * than a choice: `currentFunctionName` is `Modules.bare` of the name, and `Modules.bare` splits at
-   * the **first** `$`, which is the module separator. A member filed under a name that itself holds
-   * one — a setter, `count$set` (`08 § A property may be settable`) — is therefore cut in the wrong
-   * place in a file with no module prefix to consume the first `$`, and comes back as `set`.
+   * than a choice: `currentFunctionName` is `Modules.bare` of the name, and `Modules.bare` splits
+   * at the **first** `$`, which is the module separator. A member filed under a name that itself
+   * holds one — a setter, `count$set` (`reference/declarations.md § A property may be settable`) —
+   * is therefore cut in the wrong place in a file with no module prefix to consume the first `$`,
+   * and comes back as `set`.
    *
    * `currentFunctionName` stays as it is, because what it is for is `__FUNCTION__` and a name a
    * *reader* wrote never holds a `$`. What needs the whole thing is a question about which member
@@ -454,7 +455,7 @@ trait AnalyzerBase extends Scoping {
   protected def invCheckFor(place: TExpr): List[(TExpr, Type.Struct, String)]
   protected def describe(target: Expr): String
   /** Pairs each setter in a member list with the property it writes, filling in the parameter type
-   * the source deliberately leaves out (`08 § A property may be settable`).
+   * the source deliberately leaves out (`reference/declarations.md § A property may be settable`).
    *
    * The type is the property's result and can be nothing else, so writing it on the setter as well
    * would be one fact kept in two places and a disagreement to diagnose. Doing it here is also what
@@ -497,9 +498,9 @@ trait AnalyzerBase extends Scoping {
 
   protected def indexes(traitName: String, receiver: Expr): Boolean
 
-  /** Whether `recv.name = …` reaches a **setter** rather than storage (`08 § A property may be
-   * settable`), asked here for the reason `indexes` is: a multiple assignment has to know before it
-   * commits to a store, and it is not where the answer lives.
+  /** Whether `recv.name = …` reaches a **setter** rather than storage (`reference/declarations.md §
+   * A property may be settable`), asked here for the reason `indexes` is: a multiple assignment has
+   * to know before it commits to a store, and it is not where the answer lives.
    */
   protected def settable(receiver: Expr, name: String): Boolean
   protected def arithType(op: String, a: Type, b: Type, rhs: Option[Pos]): Type

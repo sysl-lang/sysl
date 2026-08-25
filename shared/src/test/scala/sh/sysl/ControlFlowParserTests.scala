@@ -74,7 +74,7 @@ class ControlFlowParserTests extends AnyFreeSpec with ParseSupport {
       prog("for x in xs\n    print(x)") shouldBe prog("for x in xs do\n    print(x)")
     }
 
-    // The other half of the rule `00 § Open` used to leave undecided: an introducer is *required* for
+    // The other half of the rule (`reference/statements.md § if`): an introducer is *required* for
     // a one-line body, because with nothing between the condition and the body there is nothing to
     // say where one ends and the other begins. The tests above show each keyword may be left out
     // before a block; these show it may not be left out on one line.

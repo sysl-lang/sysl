@@ -38,7 +38,7 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
     }
 
     // A helper that reads nothing is the module's, so declaration order is free exactly as it is
-    // anywhere else (`12 §4`).
+    // anywhere else (`reference/modules.md § The module graph is acyclic`).
     "while one that reads nothing may be called above where it is written" in {
       run(
         """print(str(later()))

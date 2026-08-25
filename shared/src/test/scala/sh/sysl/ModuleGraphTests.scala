@@ -201,7 +201,8 @@ class ModuleGraphTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
 
     // Cycles *within* a module carry no ceremony at all: its files are one scope, so this is the
-    // mutual recursion `12 §4` always allowed, spread across two files.
+    // mutual recursion `reference/modules.md § The module graph is acyclic` always allowed, spread
+    // across two files.
     "mutual recursion across the files of one module" in {
       runIn(
         ("", "main.sysl", "print(m.even(4))"),

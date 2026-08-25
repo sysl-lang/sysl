@@ -96,7 +96,8 @@ class RawStorageRunTests extends AnyFreeSpec with RunSupport with CodegenSupport
 
       run(src) shouldBe "8\n"
     }
-    "`09 § Open a` — an Option of a reference is sixteen bytes, which is the tag width it wants to narrow" in {
+    // A niche is not read out of the reference yet, so the tag costs a word of its own.
+    "an Option of a reference is sixteen bytes, which is the tag width it wants to narrow" in {
       run("struct Node\n    v: int\nprint(sizeof(Option[&Node]))") shouldBe "16\n"
     }
     "`03` — a pointer to a trait is two words, since it carries the table too" in {

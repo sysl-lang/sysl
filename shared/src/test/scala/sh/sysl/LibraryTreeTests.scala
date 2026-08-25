@@ -393,7 +393,8 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
     // there. A `sysl.fmt` holding the renderers compiles and closes no cycle, so nothing mechanical
     // stops the split; what stops it is that a program implementing `Display` is taking part in
     // `print` rather than reaching for a library, and should not have to name part of the language
-    // to do it (`13 § Open h`). Written as a whole program because that is the claim: no import.
+    // to do it (`library/_index.md`). Written as a whole program because that is the claim: no
+    // import.
     "while making a value printable still needs nothing named at all" in {
       irOf(
         "main.sysl" ->

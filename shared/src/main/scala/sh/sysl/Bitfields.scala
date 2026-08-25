@@ -18,12 +18,12 @@ case class BitRange(name: String, ty: Type, offset: Int, width: Int)
  * of it.
  *
  * **The rule is over the integer's value and never over memory bytes.** Phrased the other way —
- * "the low bits of byte 0" — it would be endianness-observable, which `00 §49` forbids. Phrased this
- * way it costs nothing to honour: the container is emitted as an `iM`, so how it reaches memory is
- * the target's ordinary byte order for an integer of that width, and nothing here asks the target
- * anything at all. A wire format's byte order is a property of the protocol rather than of the CPU,
- * so it stays with `sysl.encoding.binary`'s `get_u16_le` and the rest, where it is an operation
- * instead of a layout.
+ * "the low bits of byte 0" — it would be endianness-observable, which `reference/attributes.md §
+ * Bitfields — an iN field in exactly N bits` forbids. Phrased this way it costs nothing to honour:
+ * the container is emitted as an `iM`, so how it reaches memory is the target's ordinary byte order
+ * for an integer of that width, and nothing here asks the target anything at all. A wire format's
+ * byte order is a property of the protocol rather than of the CPU, so it stays with
+ * `sysl.encoding.binary`'s `get_u16_le` and the rest, where it is an operation instead of a layout.
  *
  * **Only an all-integer struct is one of these**, and that is a deliberate floor rather than a
  * simplification to be lifted later. Keeping the container a single integer is what makes the

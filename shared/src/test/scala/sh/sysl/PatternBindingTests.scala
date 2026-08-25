@@ -135,7 +135,8 @@ class PatternBindingTests extends AnyFreeSpec with RunSupport with CodegenSuppor
   }
 
   // A struct has exactly one shape, so naming it cannot fail — the same property that makes a tuple
-  // pattern irrefutable, and `09 §` calls a tuple pattern the positional form of this one.
+  // pattern irrefutable, and `reference/patterns.md § Struct patterns` calls a tuple pattern the
+  // positional form of this one.
   "a struct, taken apart by field name" - {
     "every field" in {
       run(

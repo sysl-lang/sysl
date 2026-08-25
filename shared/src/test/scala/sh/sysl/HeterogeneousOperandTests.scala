@@ -12,8 +12,9 @@ import org.scalatest.freespec.AnyFreeSpec
   * comparison across two types would promise about reflexivity and transitivity is a question nothing
   * has asked.
   *
-  * Both parameters default to `Self` (`10 §3`), so nothing already written had to be respelled:
-  * `impl Mul for Point` is still `Mul[Point, Point]`, and `[T: Mul]` still asks for `Mul[T, T]`.
+  * Both parameters default to `Self` (`reference/generics.md § A parameter may carry a default`),
+  * so nothing already written had to be respelled: `impl Mul for Point` is still `Mul[Point,
+  * Point]`, and `[T: Mul]` still asks for `Mul[T, T]`.
   *
   * **What a use supplies is the operand, never the result** — `a * b` fixes the pair and asks to be
   * told what comes back — so the operands select the implementation and the implementation supplies
@@ -56,9 +57,9 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
             |print((S(10) - 3).v)""".stripMargin) shouldBe "7\n"
     }
 
-    // The place is read once and updated from the value codegen is already holding (`14 §8 e`), and
-    // a dispatched operator must not have changed that — a call rebuilt over the place's own tree
-    // would read it twice.
+    // The place is read once and updated from the value codegen is already holding
+    // (`reference/expressions.md § Assignment`), and a dispatched operator must not have changed
+    // that — a call rebuilt over the place's own tree would read it twice.
     "a compound assignment updates through the same implementation" in {
       run(complex + """var c = C(1.0, 2.0)
                       |c *= 3.0

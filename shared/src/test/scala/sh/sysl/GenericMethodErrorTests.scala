@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** What a member with type parameters of its own may and may not say (`10 § Open b`).
+/** What a member with type parameters of its own may and may not say (`reference/generics.md §
+ * Members and associated functions`).
  *
  * The two lists of parameters are the whole subject. What the *call* has to settle is the member's
  * own, so a parameter nothing at the call mentions is refused there; what the *declaration* has to

@@ -9,9 +9,9 @@ import org.scalatest.freespec.AnyFreeSpec
  *
  * What a `val` promises is that its **own storage** is written once and never again, and holding an
  * address keeps that promise exactly as holding a number does. It is not a promise about what the
- * address reaches, and it could not be: slicing a `val` and writing `&v[0]` already yields a writable
- * `*T` on purpose (`07 § A view that may not be written`), so refusing one here would decline a route
- * to what another route grants.
+ * address reaches, and it could not be: slicing a `val` and writing `&v[0]` already yields a
+ * writable `*T` on purpose (`reference/arrays.md § []const T — a view that may not be written`), so
+ * refusing one here would decline a route to what another route grants.
  */
 class ValPointerTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
@@ -20,8 +20,8 @@ class ValPointerTests extends AnyFreeSpec with CodegenSupport with RunSupport {
    * What a `val` promises is that its **own storage** is written once and never again, and holding
    * an address keeps that promise exactly as holding a number does. It is not a promise about what
    * the address reaches, and it could not be: slicing a `val` and writing `&v[0]` already yields a
-   * writable `*T` on purpose (`07 § A view that may not be written`), so refusing one here declined
-   * a route to what another route grants.
+   * writable `*T` on purpose (`reference/arrays.md § []const T — a view that may not be written`),
+   * so refusing one here declined a route to what another route grants.
    */
   "a module-level 'val' holds a raw pointer" - {
 
@@ -286,9 +286,9 @@ class ValPointerTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
 
     // The promise it never made: read-only at every depth is about the storage the declaration lays
-    // down, not about what a value inside it addresses. `07 § A view that may not be written` says
-    // the same thing from the other side, and the test below is what makes this one a claim rather
-    // than an assertion about an implementation.
+    // down, not about what a value inside it addresses. `reference/arrays.md § []const T — a view
+    // that may not be written` says the same thing from the other side, and the test below is what
+    // makes this one a claim rather than an assertion about an implementation.
     "while the storage it addresses is writable, which is what the raw tier means" in {
       ir(
         """const UART: usize = 0x1000

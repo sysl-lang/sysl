@@ -5,7 +5,7 @@ import io.github.edadma.cross_platform.cacheDirectory
 import java.nio.charset.StandardCharsets.UTF_8
 
 /** A library as one **file**: the half that could be compiled ahead of time as an object file, and
- * the half that could not as a tree (`13 § Open d`, `§ Open h`).
+ * the half that could not as a tree (`reference/modules.md § Separate compilation`).
  *
  * **The split is the whole design, and it is the one Rust's `.rlib` makes.** A declaration with no
  * type parameters is compiled once, by whoever ships the library, and a program that calls it just

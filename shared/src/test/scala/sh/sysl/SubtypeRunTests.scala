@@ -212,10 +212,10 @@ class SubtypeRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |print(Small(3))""".stripMargin) shouldBe "3\n"
   }
 
-  /** A `within` bound may name a `const` too (`16 § Open b`), which is what makes a table's size and
-    * the range of the type indexing it one fact instead of two. The bound folds through the same
-    * `fold` an array bound and an enum discriminant use, so the three positions accept the same
-    * expressions.
+  /** A `within` bound may name a `const` too (`reference/errors.md § Ranges`), which is what makes
+    * a table's size and the range of the type indexing it one fact instead of two. The bound folds
+    * through the same `fold` an array bound and an enum discriminant use, so the three positions
+    * accept the same expressions.
     *
     * The load-bearing assertions are the ones showing the bound really *is* the constant's value: a
     * range that merely compiles proves nothing, since a bound silently read as zero would make every

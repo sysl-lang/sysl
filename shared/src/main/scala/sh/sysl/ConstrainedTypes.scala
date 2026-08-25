@@ -115,12 +115,13 @@ trait ConstrainedTypes extends GenericInstantiation {
    * character, an integer base an integer that fits its width, a float base any number. A bound of the
    * wrong kind, or an integer out of the base's range, is an error.
    *
-   * The bound is **folded first**, so a `const` — or an expression over constants — stands wherever a
-   * literal does, which is what makes `within 0..<max_tasks` and `[max_tasks]Task` one fact rather than
-   * two (`16 § Open b`). Folding is the same `fold` an array bound and an enum discriminant go through,
-   * so the three positions accept exactly the same expressions and cannot drift apart. What does not
-   * fold is reported as not being a constant, at the bound, rather than as a wrong *kind* — a name the
-   * program never declared is a different mistake from a name that is not a number.
+   * The bound is **folded first**, so a `const` — or an expression over constants — stands wherever
+   * a literal does, which is what makes `within 0..<max_tasks` and `[max_tasks]Task` one fact
+   * rather than two (`reference/errors.md § Ranges`). Folding is the same `fold` an array bound and
+   * an enum discriminant go through, so the three positions accept exactly the same expressions and
+   * cannot drift apart. What does not fold is reported as not being a constant, at the bound,
+   * rather than as a wrong *kind* — a name the program never declared is a different mistake from a
+   * name that is not a number.
    */
   private def boundValue(e: Expr, base: Type): BigDecimal =
     fold(e) match

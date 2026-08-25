@@ -193,7 +193,7 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
           s"but ${supplied(targs.length, "type argument")}")
 
   /** The arguments a generic declaration was applied to, with the ones it was not given taken from
-   * the defaults it declares (`10 §3`).
+   * the defaults it declares (`reference/generics.md § A parameter may carry a default`).
    *
    * They are filled left to right, each resolved under the arguments already fixed, so a later
    * default may name an earlier parameter and `[T, U = T]` means what it reads as. `self` carries

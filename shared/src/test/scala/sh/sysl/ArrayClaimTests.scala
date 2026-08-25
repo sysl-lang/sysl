@@ -344,9 +344,10 @@ class ArrayClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
-  /** The claims `07 § A view that may not be written` makes, asked one at a time. Each of these is
-    * a sentence of that section rather than a case the code suggested, which is the point of asking
-    * them separately: a claim written for a category is satisfied by whichever form a test picks.
+  /** The claims `reference/arrays.md § []const T — a view that may not be written` makes, asked one
+    * at a time. Each of these is a sentence of that section rather than a case the code suggested,
+    * which is the point of asking them separately: a claim written for a category is satisfied by
+    * whichever form a test picks.
     */
   "what a view that may not be written promises" - {
 
@@ -603,7 +604,8 @@ class ArrayClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "3 3 3\n"
     }
 
-    // A string indexes in bytes and yields a `u8` (`04 §`), which is why `97` and not `'a'`.
+    // A string indexes in bytes and yields a `u8` (`reference/strings.md § Granularity: bytes and
+    // scalar values`), which is why `97` and not `'a'`.
     "an index" in {
       run("""var a = [1, 2, 3]
             |var s = a[..]

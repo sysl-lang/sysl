@@ -109,7 +109,7 @@ object Sharing {
       head + s"whose count is not. Hold it as a '&sync ${Type.show(i)}' ('06')"
 
     case _: Type.Weak =>
-      head + "and a weak count has no atomic form yet ('06 § Deferred')"
+      head + "and a weak count has no atomic form yet"
 
     case _ =>
       val what = if ty == Type.Str then "bytes" else "elements"

@@ -186,9 +186,10 @@ case class TFunc(
       * The names are resolved symbols rather than what was written, so a frame means the same thing
       * from inside the module and from outside it.
       *
-      * `writes` is included in the readable set rather than being disjoint from it — `count += 1` is
-      * a read and a write of one variable, and a form that common should not have to say so twice.
-      * SPARK's `Output`/`In_Out` split, which this collapses, is `17 § Open b`.
+      * `writes` is included in the readable set rather than being disjoint from it — `count += 1`
+      * is a read and a write of one variable, and a form that common should not have to say so
+      * twice. SPARK's `Output`/`In_Out` split, which this collapses, is `reference/verification.md
+      * § @reads and @writes — what a call may touch`.
       */
     reads: Option[Set[String]] = None,
     writes: Option[Set[String]] = None,

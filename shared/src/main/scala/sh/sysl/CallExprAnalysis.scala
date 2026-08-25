@@ -39,7 +39,7 @@ trait CallExprAnalysis extends ExprCoercion with MemberExprAnalysis with RawStor
     case Call(Ident("ptr_cast"), args)                      => ptrCast(args, expected)
 
     // The atomic tier, which is the raw one — an address, values, and an ordering the call spells
-    // out. The fence is separate because it reaches no address at all (`06 § The kernel tier`).
+    // out. The fence is separate because it reaches no address at all (`library/sync.md § A fence has no wrapper, and the omission is deliberate`).
     // Unlike the forms above, these stand aside for a declaration of the same name — nine names is
     // too much of a program's vocabulary to take outright (`Atomics.unclaimed`).
     case Call(Ident("atomic_fence"), args) if atomicFenceForm => atomicFence(args)

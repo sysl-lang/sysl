@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `sysl.sync` — `Atomic[T]` and `SpinLock`, which are the library half of `06 § The kernel tier`.
+/** `sysl.sync` — `Atomic[T]` and `SpinLock`, which are the library half of `library/sync.md`.
  *
  * The forms underneath have their own suite; what is asserted here is the surface built on them,
  * and the two things that surface adds. The first is the **default**: an ordering is required at
@@ -235,7 +235,7 @@ class SyncTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
-  /** `06 § The kernel tier` puts these "in a library, available under `no alloc`", which is the whole
+  /** `library/sync.md § The module is the gate` puts these "in a library, available under `no alloc`", which is the whole
    * reason `sysl.sync` requires no capability. A type that reached the allocator — or the operating
    * system, through the panic a bounds check would want — would make the module useless in the place
    * it exists for, and nothing but a module that has given up both would notice.

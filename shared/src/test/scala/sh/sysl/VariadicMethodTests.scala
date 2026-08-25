@@ -351,8 +351,8 @@ class VariadicMethodTests extends AnyFreeSpec with CodegenSupport with RunSuppor
         include("a va_list is a parameter as '*va_list'")
     }
 
-    // Two implementations of one trait are told apart by the arguments (`08 § One name, one
-    // member`), and a tail stands at no parameter — so what tells them apart stops where the
+    // Two implementations of one trait are told apart by the arguments (`reference/declarations.md
+    // § Structs`), and a tail stands at no parameter — so what tells them apart stops where the
     // declared parameters do. Comparing the whole list would leave a variadic member unreachable
     // the moment anything was passed to its tail.
     "two implementations of one variadic member are told apart by the declared arguments" in {

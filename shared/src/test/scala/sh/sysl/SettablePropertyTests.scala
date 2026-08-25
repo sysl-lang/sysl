@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** A property that can be written as well as read (`08 § A property may be settable`).
+/** A property that can be written as well as read (`reference/declarations.md § A property may be
+ * settable`).
  *
  * `p.count = v` is a **call** rather than a store, which is what every case here is really about:
  * the value reaches the setter's body, the compound forms read and write through one address, and

@@ -3,7 +3,7 @@ package sh.sysl
 import scala.collection.mutable
 
 /** The AST written out in a form built for reading back quickly, and read back into the tree the
- * parser would have produced (`13 § Open d`).
+ * parser would have produced, which is what `reference/modules.md § Separate compilation` rests on.
  *
  * **Why this exists.** A library's declarations reach a program as an abstract syntax tree, and the
  * only route to one today is the parser — a packrat combinator grammar, which memoizes every rule at

@@ -55,8 +55,9 @@ class MultipleImplementationTests extends AnyFreeSpec with RunSupport with Codeg
             |print((C(3) * false).v)""".stripMargin) shouldBe "12\n7\n0\n"
     }
 
-    // `10 §3`'s default is what keeps every bound already written meaning what it meant: a bare
-    // `Mul` is `Mul[Self]`, so it names the homogeneous implementation and not "whichever".
+    // `reference/generics.md § A parameter may carry a default`'s default is what keeps every bound
+    // already written meaning what it meant: a bare `Mul` is `Mul[Self]`, so it names the
+    // homogeneous implementation and not "whichever".
     "a bound names one of them, and a bare bound still names the homogeneous one" in {
       run("""struct C
             |    v: int
@@ -83,8 +84,8 @@ class MultipleImplementationTests extends AnyFreeSpec with RunSupport with Codeg
             |print(both(C(3)).v)""".stripMargin) shouldBe "10\n"
     }
 
-    // `08 § one name, one member` is what makes this a question at all — and a property has no
-    // arguments, so it is the case where nothing determines the answer.
+    // `reference/declarations.md § Structs` is what makes this a question at all — and a property
+    // has no arguments, so it is the case where nothing determines the answer.
     "a property has no argument to select with, and is told so" in {
       err("""trait Named[T]
             |    tag(self) -> int

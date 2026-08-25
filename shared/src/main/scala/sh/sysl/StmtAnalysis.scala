@@ -546,7 +546,8 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
           Nil
 
     // A struct has exactly one shape, so naming it cannot fail and it belongs at a binding for the
-    // same reason a tuple pattern does — `09 §` calls a tuple pattern the positional form of this
+    // same reason a tuple pattern does — `reference/patterns.md § Struct patterns` calls a tuple
+    // pattern the positional form of this
     // one. What differs from the match path is that an unlisted field binds nothing here rather than
     // being filled with a wildcard: there is no exhaustiveness to discharge at a binding.
     case StructPattern(name, fieldPats) =>
@@ -607,7 +608,8 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
         "and a binding has no other arm to take when the value has another")
       Nil
 
-    // A quoted name is a *reference*, so it tests rather than binds (`09 §`). It earns its own
+    // A quoted name is a *reference*, so it tests rather than binds
+    // (`reference/patterns.md § A backticked name references rather than binds`). It earns its own
     // sentence because the fix is not the one the other refusals want: the name here is almost
     // always the name that was meant, and it is the backticks that are wrong.
     case EqPattern(n) =>

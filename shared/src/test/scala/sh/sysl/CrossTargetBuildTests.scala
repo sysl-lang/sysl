@@ -106,8 +106,8 @@ class CrossTargetBuildTests extends AnyFreeSpec with Matchers {
     }
 
   /** That the reaper slot a freestanding port may define really is **weak in the object**, which is
-   * the claim `06 § Letting go of the last one` rests on and the one thing the emitted text cannot
-   * settle by itself.
+   * the claim `reference/memory.md § A destructor` rests on and the one thing the emitted text
+   * cannot settle by itself.
    *
    * `define weak` is what lets a scheduler's port define `__sysl_arc_reaper` and win the link while
    * a program with no scheduler links against the module's own single slot and defines nothing. Read

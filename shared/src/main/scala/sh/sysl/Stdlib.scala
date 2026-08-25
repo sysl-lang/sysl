@@ -282,8 +282,9 @@ object Stdlib {
    * helper was being monomorphized into every program that compiled against the source std, so the
    * library shipped instantiations no caller had asked for.
    *
-   * `LibraryArtifact` already drops them (`Tests.stripSource`, and `15 §` on why the drop has to come
-   * *before* analysis rather than after), so this was also the one difference between the two ways a
+   * `LibraryArtifact` already drops them (`Tests.stripSource`, and
+   * `reference/attributes.md § What is dropped, and when` on why the drop has to come *before*
+   * analysis rather than after), so this was also the one difference between the two ways a
    * standard module reaches a compilation — which is exactly what `StdArtifactTests` compares. It
    * surfaced as an emitted-type *order* difference rather than a missing type, because the leaked
    * instantiation was one some later library function asks for anyway: it simply arrived earlier on

@@ -139,7 +139,7 @@ trait FunctionBodies extends ModuleStorage {
       // *call*, out of the arguments it supplies (`reference/verification.md § variant on a
       // function`), and neither of these is reached by a call of that shape: a closure goes through
       // `Fn`, and a nested function's calls carry its captured environment as a receiver the check
-      // would have to account for. `17 § Open g`.
+      // would have to account for. `reference/verification.md § variant on a function`.
       body.collectFirst { case v: Variant => v }.foreach { v =>
         at(v.pos)(err("a 'variant' is a top-level function's — the measure is checked where a call " +
           "to the same body is written, and neither a closure, which is reached through 'Fn', nor " +

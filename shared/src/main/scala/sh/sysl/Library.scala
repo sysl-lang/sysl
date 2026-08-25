@@ -178,7 +178,8 @@ object Library {
       // Enums`, `03`).
       "Option", "Some", "None",
       "Result", "Ok", "Err",
-      // What a format string's flags are carried in (`14 §8`).
+      // What a format string's flags are carried in (`library/core.md § A specifier is the whole
+      // value's field`).
       "FormatSpec",
       // The traits whose members a built-in has by rule rather than by an `impl`
       // (`reference/expressions.md § Operator dispatch`).
@@ -193,13 +194,14 @@ object Library {
       // The same, for the members that are not operators and whose trait is in a submodule.
       "Signed", "Bits",
       // The orderings the atomic forms require written at the call, whose variant names become
-      // keywords in the emitted instruction (`06 § The kernel tier`, `Atomics`).
+      // keywords in the emitted instruction (`library/sync.md § Ordering`, `Atomics`).
       "Ordering",
       // The sink every rendering goes through, and the one function its standard-output table ends
       // at — whose *table* codegen lays out by hand, which is why the shape is checked rather than
       // read (`SpecialForms.checkWriterShape`, `WriterEmitter`).
       "Writer", "putbytes",
-      // `print` renders a scalar directly rather than through its `Display` (`14 §8 b`).
+      // `print` renders a scalar directly rather than through its `Display` (`library/core.md §
+      // Rendering to standard output`).
       "printi", "printu", "printr", "printb", "printc", "prints",
       // What a subscript on a type with no elements of its own reaches, and what a `for` asks of
       // what it walks — each looked up in the implementation table by name.

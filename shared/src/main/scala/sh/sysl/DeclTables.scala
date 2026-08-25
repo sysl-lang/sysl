@@ -461,11 +461,11 @@ trait DeclTables extends Reporting {
    * trait gave it one — keyed by (type name, the name as written) and holding the names those
    * members are actually filed under, in source order.
    *
-   * A type with one `mul` has no entry here and is reached by the name it was written with, which is
-   * what keeps the ordinary case a lookup. A `Complex` that is both `Mul[Complex]` and `Mul[real]`
-   * has two, and a call naming `mul` is answered by the one whose parameters accept the arguments —
-   * a resolution the call fully determines, not an overload set to search (`08 § One name, one
-   * member — and what a second implementation does to that`).
+   * A type with one `mul` has no entry here and is reached by the name it was written with, which
+   * is what keeps the ordinary case a lookup. A `Complex` that is both `Mul[Complex]` and
+   * `Mul[real]` has two, and a call naming `mul` is answered by the one whose parameters accept the
+   * arguments — a resolution the call fully determines, not an overload set to search
+   * (`reference/traits.md § Two traits may declare a member of one name`).
    */
   protected val memberAlts = mutable.LinkedHashMap.empty[(String, String), List[String]]
 
