@@ -252,9 +252,16 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   /** `ByteSink` — the one writer the library does supply.
    *
    * It exists because a specifier describes the field the **whole** value occupies (`library/core.md § A specifier is the whole value's field`), so an
-   * implementation rendering more than one part has to gather them before it can pad what they came
-   * to. Every such implementation was writing the same dozen lines. It is ordinary sysl over
-   * `Buf[u8]`, which is why it could not be written until a growable array could.
+   * implementation rendering more than one part has to know what those parts came to before it can
+   * pad once. Every such implementation was writing the same dozen lines to find out.
+   *
+   * **Gathering is one way to answer that and not the cheap one.** `Counting` runs the same writes
+   * and keeps only their length, so a width costs a second pass and no storage — which is what
+   * `[]T`, `Option`, `Result` and `Complex[F]` all do. What a sink is for is the case where the
+   * *bytes* are wanted rather than the width: a rendering handed somewhere that is not a stream.
+   *
+   * It is ordinary sysl over `Buf[u8]`, which is why it could not be written until a growable array
+   * could.
    */
   "the sink the library supplies" - {
     "keeps what is written into it" in {

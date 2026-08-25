@@ -596,10 +596,12 @@ class LibraryMoveTests extends LibrarySeamSupport {
     }
 
     "a sink the library supplies gathers a rendering that pads across the whole value" in {
-      // `ByteSink` is why it sits with `Buf`: it is the writer a multi-part `Display` gathers into
-      // before its specifier can pad what the parts came to, and it is ordinary sysl over the
-      // buffer. Three modules meet in one body here — the sink's, the validator's, and `sysl`'s own
-      // renderers, which arrive with nothing written because `print` is what desugars onto them.
+      // `ByteSink` is why it sits with `Buf`: it is where a rendering goes when the bytes themselves
+      // are wanted rather than a stream, and it is ordinary sysl over the buffer. A multi-part
+      // `Display` that needs only the *width* measures with `Counting` and gathers nothing, which is
+      // what the library's own do. Three modules meet in one body here — the sink's, the
+      // validator's, and `sysl`'s own renderers, which arrive with nothing written because `print`
+      // is what desugars onto them.
       run(
         """import sysl.buf.byte_sink
           |import sysl.text.from_utf8

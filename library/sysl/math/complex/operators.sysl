@@ -84,22 +84,68 @@ impl[F: Float] Neg for Complex[F]
 impl[F: Float] Eq for Complex[F]
     eq(self, rhs: Complex[F]) -> bool = self.re == rhs.re && self.im == rhs.im
 
+/** The four pieces of `a+bi`, written straight through to wherever they are going. The sign of the
+ * imaginary part is always written out, so a negative one reads `3-4i` and never `3+-4i`, and the
+ * magnitude is what follows it.
+ *
+ * The parts take the caller's precision and none of its width: a precision is what each renderer
+ * reads in its own terms, and what `%.3s` on a complex number means is three significant digits in
+ * each half of it. The width belongs to the whole value and is applied by the block below.
+ */
+private render_complex[F: Float + Display](z: Complex[F], out: *Writer, parts: FormatSpec)
+    val negative = z.im < F.zero()
+    val magnitude = if negative then -z.im else z.im
+
+    z.re.display(out, parts)
+    out.write(if negative then "-".bytes else "+".bytes)
+    magnitude.display(out, parts)
+    out.write("i".bytes)
+end render_complex
+
 /** `a+bi`, with the sign of the imaginary part written out and never a `+-`.
  *
  * **The field applies to the whole value and not to each part** (`library/core.md § A specifier is
- * the whole value's field`), so the three pieces are gathered into a string first and padded once.
- * Padding each piece would put spaces inside the number.
+ * the whole value's field`), so the four pieces are padded once between them rather than each in
+ * turn. Padding each piece would put spaces inside the number.
+ *
+ * **It is measured rather than gathered, and that is the whole of why it allocates nothing.** The
+ * obvious way to pad a compound rendering once is to build the text and hand the finished bytes to
+ * `display_pad`, and that is three intermediate strings a `Complex` printed in a loop pays for every
+ * value. Running the same writes into a `Counting` sink answers the same question -- how wide did it
+ * come out -- and stores nothing. A rendering with no width asked for never builds the sink at all,
+ * so the ordinary print costs one pass.
+ *
+ * **It does not follow that this module can declare `@no_alloc`, and it cannot.** A call through
+ * `*Writer` is judged against every `impl Writer` linked into the compilation, and `sysl.buf`'s
+ * `ByteSink` allocates -- so writing into a sink at all is refused under the clause wherever a
+ * growable buffer is in the program. That is a question about the clause rather than about
+ * rendering, and it is open.
  *
  * The bound is `Float + Display` rather than `Float`, because rendering a part means asking `F` for
  * its own rendering and `Float` does not require one. Both widths have it, so nothing a program can
  * reach is excluded -- the compound bound is what says why.
  */
 impl[F: Float + Display] Display for Complex[F]
-    display(self, out: *Writer, fmt: FormatSpec) =
-        val negative = self.im < F.zero()
-        val magnitude = if negative then -self.im else self.im
+    display(self, out: *Writer, fmt: FormatSpec)
+        val parts = FormatSpec(0, fmt.prec, false)
+        var pad = 0
 
-        display_str(str(self.re) + (if negative then "-" else "+") + str(magnitude) + "i", out, fmt)
+        // Measured only when a width was asked for, so the ordinary print costs one pass.
+        if fmt.width > 0
+            var count = Counting(0)
+            var sink: *Writer = &count
+
+            render_complex(self, sink, parts)
+            pad = fmt.width - int(count.n)
+
+            if pad < 0 then pad = 0
+
+        if !fmt.left then display_fill(out, 32, pad)
+
+        render_complex(self, out, parts)
+
+        if fmt.left then display_fill(out, 32, pad)
+    end display
 
 /** The modulus, as the trait that asks every type for its size. `Complex[F]` measures in `F` — the
  * modulus of a complex number is a *real* number however the parts are stored — which is the case

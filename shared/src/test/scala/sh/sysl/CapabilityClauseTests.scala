@@ -322,6 +322,44 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
         "            Singular -> \"singular\"\n\n" +
         "        display_str(text, out, fmt)\n    end display\n\nprint(Fail.Singular)\n") shouldBe "singular\n"
     }
+
+    /** **Both cases above pass because the program links no allocating `Writer`, and neither of them
+     * is a statement about the module.** `sysl.buf`'s `ByteSink` is a `Writer` too, so importing it
+     * puts an allocating implementation into the method table a `*Writer` call is judged against —
+     * and the reachable set over-approximates through method tables on purpose, which is the right
+     * direction to be wrong in.
+     *
+     * So the same `display`, unchanged, is legal or refused according to what the *program* imports.
+     * That is why no `Display` in `library/` can carry the clause — the library build compiles
+     * `sysl.buf` alongside everything else — and it is why `sysl.math.complex` still has none after
+     * its rendering stopped building strings. Card `0282` carries the question, which is one of
+     * granularity and is the user's; this pair is here so that whichever way it goes, the pair moves
+     * together.
+     */
+    "though linking an allocating 'Writer' refuses the same module, since a '*Writer' reaches every one" in {
+      errOf(
+        "mark/a.sysl" ->
+          """module mark
+            |@no_alloc
+            |
+            |struct Mark
+            |    n: int
+            |
+            |impl Display for Mark
+            |    display(self, out: *Writer, fmt: FormatSpec) = display_str("mark", out, fmt)
+            |""".stripMargin,
+        "main.sysl" ->
+          """import mark.Mark
+            |import sysl.buf.byte_sink
+            |
+            |var sink = byte_sink()
+            |var out: *Writer = &sink
+            |
+            |Mark(3).display(out, FormatSpec(0, -1, false))
+            |putbytes(sink.text())
+            |""".stripMargin,
+      ) should include("which makes heap storage, and this module declared '@no_alloc'")
+    }
   }
 
   "'no alloc' refuses every construction that makes heap storage" - {

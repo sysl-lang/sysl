@@ -33,7 +33,11 @@ class ComplexTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       ) shouldBe "3 4 3-4i -3-4i\n"
     }
 
-    // The rendering gathers its pieces and pads once, so the field belongs to the whole value.
+    // The rendering writes its four pieces straight through and pads once between them, so the field
+    // belongs to the whole value without a string being built to measure it. The pieces, the width
+    // and the precision are pinned in `library/sysl/math/complex/tests.sysl`, where a claim about a
+    // library function belongs; this case stays because it is the one expectation written in another
+    // language, and a rendering the library agreed with itself about would still be worth checking.
     "it renders as a+bi, with the sign written out and never a '+-'" in {
       run(
         """print(Complex(3.0, 4.0), Complex(3.0, -4.0), Complex(-3.0, 0.0))
@@ -500,18 +504,25 @@ class ComplexTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       ) shouldBe "5 -7 2 1 3\n"
     }
 
-    // **Rendering one is the exception, and it is `library/core.md § A specifier is the whole value's field`'s rule about the field rather than a
-    // choice this module made.** A specifier describes the field the *whole* value lands in, so the
-    // three pieces have to be gathered before the padding is applied — and gathering means a string.
-    // An allocator-free program computes with `Complex` and prints its parts.
-    "while rendering one is refused there, because a field applies to the whole value" in {
-      err(
+    // **Rendering one used to be refused here, and the rule it was justified by is still true.**
+    // `library/core.md § A specifier is the whole value's field` does say a specifier describes the
+    // field the *whole* value lands in — but "so the pieces have to be gathered before the padding
+    // is applied, and gathering means a string" never followed from it. The width is had by running
+    // the same writes through a `Counting` sink, which keeps the length and drops the bytes, so an
+    // allocator-free program prints a `Complex` instead of printing its parts one at a time.
+    //
+    // **What this does not prove is that the module could carry the clause itself.** This program
+    // links no allocating `Writer`; one that imports `sysl.buf` refuses the very same code, because
+    // a call through `*Writer` is judged against every implementation in the compilation. That is
+    // card `0282`, and `CapabilityClauseTests` pins both halves of it.
+    "and rendering one needs none either, since the width is measured rather than gathered" in {
+      super.run(
         """@no_alloc
           |
           |import sysl.math.complex.Complex
           |
-          |print(Complex(3.0, 4.0))""".stripMargin
-      ) should include("which makes heap storage, and this module declared '@no_alloc'")
+          |print(Complex(3.0, 4.0), Complex(0.5, -0.25))""".stripMargin
+      ) shouldBe "3+4i 0.5-0.25i\n"
     }
 
     "a program that did not import it cannot spell the type" in {
