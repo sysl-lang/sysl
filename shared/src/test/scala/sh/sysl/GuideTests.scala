@@ -17,7 +17,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * legible next to the documents they are about.
  */
 /** **Each guide is its own test, and they run at the same time.** A guide program is a real compile,
- * link and run of a few hundred lines, and there are twelve of them; sequentially that was the
+ * link and run of a few hundred lines, and there are ten of them; sequentially that was the
  * larger half of this suite's time with one std busy. Nothing is shared between them — each
  * compiles from its own directory into its own temporary files — so the only thing that had made
  * them sequential was the runner taking one test at a time.
@@ -32,21 +32,6 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
   private def checks(out: String): Int = out.linesIterator.count(_.startsWith("ok"))
 
   private def sections(out: String): List[String] = out.linesIterator.filter(_.startsWith("--")).toList
-
-  "json — recursive ownership" in {
-    val out = guide("json")
-
-    out should not include "FAIL"
-    checks(out) shouldBe 49
-    sections(out) shouldBe List(
-      "-- scalars",
-      "-- structures",
-      "-- whitespace and escapes are normalized",
-      "-- escapes that survive a round trip",
-      "-- a tree deep enough that the walk is the point",
-      "-- malformed input",
-    )
-  }
 
   // The only guide program of more than one module, and the only one whose assertion is end to
   // end: source text in, bytecode out, the machine runs it, and what it printed is compared.

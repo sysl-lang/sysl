@@ -4,8 +4,9 @@ import org.scalatest.freespec.AnyFreeSpec
 
 /** `from_utf8` and the primitive under it (`04 § Validity`).
  *
- * Two guide programs paid for the absence of this in different currencies — `guide/json` in
- * workarounds, reaching text for a `\uXXXX` only through `str(char(n))`, and `guide/shapes` in
+ * Two guide programs paid for the absence of this in different currencies — the JSON reader that
+ * used to sit in `guide/` in workarounds, reaching text for a `\uXXXX` only through
+ * `str(char(n))`, and `guide/shapes` in
  * design, since the allocation-free way to render is into a `*Writer` and the bytes could not come
  * back out as a `string`.
  *

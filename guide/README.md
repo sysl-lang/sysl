@@ -11,7 +11,7 @@ next compiler change.
 Run one directly:
 
 ```
-sbt "syslJVM/run run guide/json"
+sbt "syslJVM/run run guide/bytecode"
 ```
 
 Each directory is a **project root**, so the files in it are the anonymous root module and any
@@ -56,7 +56,6 @@ contract.
 
 | directory | axis it owns |
 |---|---|
-| `json` | recursive ownership — a value that contains itself through `&T` |
 | `bytecode` | the module system, and the set's one end-to-end assertion — source in, bytecode out, run it |
 | `png` | the byte level — endianness, bit streams, checksums, a format someone else defined |
 | `fft` | an algorithm checked against its own definition |
