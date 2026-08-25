@@ -272,6 +272,58 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
     }
   }
 
+  /** Which of the standard library's modules an allocator-free program may actually reach.
+   *
+   * The clause's worth is that it holds you to the promise while you develop on a machine that has
+   * a heap; a module that is allocation-free and does not say so is one that quietly acquires an
+   * allocation on some future Tuesday. **Seven modules said nothing until the sweep**, and until a
+   * `@tests` file could state its own capabilities they could not: testing an allocation-free
+   * primitive means rendering what it produced, and rendering allocates.
+   *
+   * These are asserted from a program that gave the allocator up, which is the surface a reader
+   * cares about — that the call compiles there, rather than that a header carries a word.
+   */
+  "an allocator-free program reaches the modules that declared themselves so" - {
+
+    "'sysl.math', whose comparisons and integer arithmetic allocate nowhere" in {
+      run("@no_alloc\n\nimport sysl.math.{max, min, gcd}\n\nprint(max(3, 7), min(3, 7), gcd(12, 18))\n") shouldBe
+        "7 3 6\n"
+    }
+
+    "'sysl.slices', which works in storage its caller already owns" in {
+      run("@no_alloc\n\nimport sysl.slices.{reverse, index_of}\n\n" +
+        "var a: [3]int = [1, 2, 3]\nreverse(a[0..<3])\nprint(a[0], index_of(a[0..<3], 1))\n") shouldBe
+        "3 Some(2)\n"
+    }
+
+    "'sysl.rand', whose generator is a value rather than a handle" in {
+      run("@no_alloc\n\nimport sysl.rand.rng\n\nvar g = rng(42, 54)\nprint(g.next_u32() != 0)\n") shouldBe "true\n"
+    }
+
+    "and 'sysl.sync', which a lock-free structure on a board is built out of" in {
+      run("@no_alloc\n\nimport sysl.sync.Atomic\n\nvar a = Atomic(7)\nprint(a.load())\n") shouldBe "7\n"
+    }
+
+    // Probed while sweeping the library, because the sweep's refusals made it look otherwise and the
+    // guess would have shaped the whole result. Rendering *into the sink* allocates nothing — it is
+    // building a string first and handing that over that does — so the constraint is on how a
+    // `display` is written rather than on where it may live.
+    "an 'impl Display' may live in an allocator-free module, since writing into the sink makes nothing" in {
+      run("@no_alloc\n\nstruct Tag\n    n: int\n\nimpl Display for Tag\n" +
+        "    display(self, out: *Writer, fmt: FormatSpec) = display_str(\"tag\", out, fmt)\n\nprint(Tag(1))\n") shouldBe
+        "tag\n"
+    }
+
+    "including one whose text is chosen by a match over literals, which are static rather than made" in {
+      run("@no_alloc\n\nenum Fail\n    NotSquare\n    Singular\n\nimpl Display for Fail\n" +
+        "    display(self, out: *Writer, fmt: FormatSpec)\n" +
+        "        var text = self match\n" +
+        "            NotSquare -> \"not square\"\n" +
+        "            Singular -> \"singular\"\n\n" +
+        "        display_str(text, out, fmt)\n    end display\n\nprint(Fail.Singular)\n") shouldBe "singular\n"
+    }
+  }
+
   "'no alloc' refuses every construction that makes heap storage" - {
 
     "a reference" in {
