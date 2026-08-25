@@ -22,8 +22,18 @@
 # in `-Xmx8g`. Nobody has explained the gap. If it is ever closed, delete this script.
 #
 # EVERY GROUP HAS A HARD TIME LIMIT, because the failure mode above is silence, and silence looks
-# exactly like progress. A group that exceeds it is killed and recorded as TIMEOUT together with the
-# last suite it announced, which is what names the offender.
+# exactly like progress. A group that exceeds it is killed and recorded together with the last suite
+# it announced, which is what names the offender.
+#
+# **A KILLED GROUP IS RE-RUN BEFORE IT IS BELIEVED, AND THAT IS NEW AS OF 2026-08-25 (card 0270).**
+# A kill produces **no verdict** -- which is a reason to run the group again, not a reason to call
+# the gate red. It is retried once, alone, at the heavy settings, and only a second failure is a
+# `TIMEOUT`. A group that ran and *reported failures* is never retried: the empty result is the
+# distinction, and retrying a real failure is how a gate stops meaning anything.
+#
+# Cutting 0.0.79 this read `GATE: RED` with **9926 succeeded, 0 failed** and two killed chunks, both
+# of which passed untouched when re-run by hand. That is a false red, and a false red is worse than a
+# slow gate because it teaches the next one to be discounted.
 
 set -u
 
@@ -34,6 +44,7 @@ SUITES=$REPO/shared/src/test/scala
 HEAVY_HEAP=24g;  HEAVY_AGENTS=1     # a suite that builds for every target, on its own
 LIGHT_HEAP=16g;  LIGHT_AGENTS=3     # 3 x 16g = the same 48 GB ceiling, redistributed -- see below
 LIMIT=900                           # seconds per group; the groups take 15-75s
+OOM_GRACE=60                        # after an agent announces an OOM -- see `attempt_group`
 
 # **WHY 3 x 16g RATHER THAN 4 x 12g, measured 2026-08-22 cutting 0.0.66.** A wedged chunk was caught
 # in the act: four agents sat at **4.3 GB** each and the fifth at **exactly 12.0 GB**, which is the
@@ -55,6 +66,61 @@ LIMIT=900                           # seconds per group; the groups take 15-75s
 mkdir -p "$LOGS"
 SUMMARY=$LOGS/summary.txt
 rm -f "$SUMMARY"
+
+# **THE WATCHDOGS, AGAINST A FAKE `sbt`, BEFORE EVERY GATE.** `gate-groups.py` self-tests its matcher
+# for the same reason and it is the stronger reason here: a watchdog that has quietly stopped working
+# announces itself by the gate taking fifteen minutes longer, which is indistinguishable from a slow
+# machine. Ten seconds, and it pins both directions.
+#
+# `local` is dynamically scoped in zsh, so the shortened limits and the fake PATH are visible to
+# `attempt_group` without it knowing it is being tested -- the real function is what runs.
+# **THE TWO HALVES MUST USE DIFFERENT LIMITS, AND THE FIRST VERSION OF THIS DID NOT — SO IT PASSED
+# AGAINST THE VERY BEHAVIOUR IT WAS WRITTEN TO CATCH.** It ran both halves at `LIMIT=4` and asserted
+# the OOM case finished within it. But the OUTER watchdog also fires at 4s, so a build with the inner
+# one deleted came back at exactly 4s and satisfied `elapsed > LIMIT` being false. Verified by
+# deleting it: the test said PASS.
+#
+# So the OOM half runs with the outer limit set far away, and asserts the cut happened nowhere near
+# it. The silent half keeps a short limit, and asserts the run was NOT cut before it.
+watchdog_self_test () {
+  local tree=$(mktemp -d -t gate-watchdog)
+  local LOGS=$tree/logs PATH=$tree/bin:$PATH
+  local LIMIT OOM_GRACE start elapsed
+
+  mkdir -p "$tree/bin" "$LOGS"
+
+  # Announces an OOM, then spirals: never exits, never prints a result line.
+  print '#!/bin/zsh\nprint "[info] ProbeTests:"\nprint "\tat Heap_exitWithOutOfMemory"\nsleep 600' > "$tree/bin/sbt"
+  chmod +x "$tree/bin/sbt"
+
+  LIMIT=60 OOM_GRACE=2       # the outer limit is a long way off, so only the inner one can explain a fast cut
+  start=$SECONDS
+  attempt_group "oom.log" 16g 3 "sh.probe.Whatever"
+  elapsed=$(( SECONDS - start ))
+
+  (( elapsed > 15 )) && {
+    print "gate watchdog self-test failed: an announced OOM took ${elapsed}s, so it waited for the ${LIMIT}s limit"
+    rm -rf "$tree"; return 1
+  }
+
+  # The control, and it is the half that makes the first one mean something: a group that hangs
+  # SILENTLY must still cost the outer limit. Without this, a watchdog that killed everything on
+  # sight would pass the test above and destroy the gate.
+  print '#!/bin/zsh\nprint "[info] QuietTests:"\nsleep 600' > "$tree/bin/sbt"
+
+  LIMIT=5 OOM_GRACE=2
+  start=$SECONDS
+  attempt_group "quiet.log" 16g 3 "sh.probe.Whatever"
+  elapsed=$(( SECONDS - start ))
+
+  (( elapsed < LIMIT )) && {
+    print "gate watchdog self-test failed: a silent hang was cut after ${elapsed}s, before the ${LIMIT}s limit"
+    rm -rf "$tree"; return 1
+  }
+
+  rm -rf "$tree"
+  print "  self-test: an announced OOM is cut at once, and a silent hang still costs the limit"
+}
 
 echo "grouping the suites" | tee -a "$SUMMARY"
 python3 "$REPO/gate-groups.py" "$SUITES" "$LOGS" | tee -a "$SUMMARY" || exit 1
@@ -112,30 +178,92 @@ fi
 
 print "  $(wc -l < "$LOGS/defined.txt" | tr -d ' ') suites, and sbt agrees" | tee -a "$SUMMARY"
 
+# One attempt at one group, into `$LOGS/$log`. Two watchdogs, and the inner one is why a kill no
+# longer costs the whole limit.
+#
+# **THE OUTER LIMIT IS FOR SILENCE; THE INNER ONE IS FOR AN OOM THAT ANNOUNCED ITSELF.** At the
+# ceiling Immix does not abort, it spirals -- so the 15-minute limit exists for a group that says
+# nothing at all, and it must stay. But an agent that reaches the cap usually *prints* first, and
+# waiting out the limit after that is spending fourteen minutes on an outcome already decided:
+# cutting 0.0.79, chunk-30 announced `Out of heap space grow heap` **1:46 in** and was killed at
+# 15:00, and 26 of the 30 minutes that release's two kills cost were spent after the fact.
+#
+# The grace period is because an OOM in one agent does not always end the group -- sbt can lose that
+# agent and still report on the others -- so a minute is given for a verdict to appear before the
+# group is cut. A minute against fourteen is worth paying for the case where the run recovers.
+attempt_group () {
+  local log=$1 heap=$2 agents=$3 suites=$4
+
+  GC_MAXIMUM_HEAP_SIZE=$heap SYSL_RELEASE=1 sbt -J-XX:-DoEscapeAnalysis -batch \
+    "set Global/concurrentRestrictions += Tags.limit(Tags.Test, $agents)" \
+    "syslNative/testOnly $suites" > "$LOGS/$log" 2>&1 &
+  local sbt_pid=$!
+
+  ( sleep $LIMIT; kill -9 $sbt_pid 2>/dev/null ) &
+  local outer=$!
+
+  ( while kill -0 $sbt_pid 2>/dev/null; do
+      if grep -q "Heap_exitWithOutOfMemory" "$LOGS/$log" 2>/dev/null; then
+        sleep $OOM_GRACE
+        kill -9 $sbt_pid 2>/dev/null
+        break
+      fi
+      sleep 2
+    done ) &
+  local inner=$!
+
+  wait $sbt_pid
+  kill $outer 2>/dev/null
+  kill $inner 2>/dev/null
+}
+
+# Reads one attempt's log. The log is the verdict. Never the exit status: a backgrounded pipeline
+# reports the wrong one, and a killed run reports a plausible one.
+read_result () { grep -E "^\[(info|error)\] Tests: succeeded" "$LOGS/$1" | tail -1 }
+read_last ()   { grep -E "^\[info\] [A-Z][A-Za-z]*Tests:" "$LOGS/$1" | tail -1 }
+
 run_group () {
   local label=$1 heap=$2 agents=$3 suites=$4
 
   print "=== $label start $(date +%H:%M:%S)  heap=$heap agents=$agents" >> "$SUMMARY"
 
-  GC_MAXIMUM_HEAP_SIZE=$heap SYSL_RELEASE=1 sbt -J-XX:-DoEscapeAnalysis -batch \
-    "set Global/concurrentRestrictions += Tags.limit(Tags.Test, $agents)" \
-    "syslNative/testOnly $suites" > "$LOGS/$label.log" 2>&1 &
-  local sbt_pid=$!
+  attempt_group "$label.log" $heap $agents "$suites"
 
-  ( sleep $LIMIT; kill -9 $sbt_pid 2>/dev/null ) &
-  local watchdog=$!
-  wait $sbt_pid
-  kill $watchdog 2>/dev/null
-
-  # The log is the verdict. Never the exit status: a backgrounded pipeline reports the wrong one,
-  # and a killed run reports a plausible one.
-  local result=$(grep -E "^\[(info|error)\] Tests: succeeded" "$LOGS/$label.log" | tail -1)
+  local result=$(read_result "$label.log")
   local failed=$(grep -c "\*\*\* FAILED \*\*\*" "$LOGS/$label.log")
   local oom=$(grep -c "Heap_exitWithOutOfMemory" "$LOGS/$label.log")
 
+  # **A GROUP WITH NO RESULT LINE PRODUCED NO VERDICT, AND NO VERDICT IS A REASON TO RUN IT AGAIN.**
+  # That is the shared rule about a killed run, applied by the script instead of by whoever reads the
+  # summary an hour later. Retried alone at the heavy settings, which is exactly the re-run that was
+  # done by hand after 0.0.79's two kills -- both passed, 229 tests in 2:43 and 372 in 4:02.
+  #
+  # It covers both causes without having to tell them apart: a chunk that piled up more than three
+  # agents could hold, and a cold standard-module cache pushing a per-target artifact build into an
+  # ordinary chunk. One agent with the heavy heap answers each.
+  #
+  # **ONLY WHERE THERE IS NO VERDICT -- a group that RAN and reported failures is never retried.**
+  # Retrying a real failure is how a flake-tolerant gate stops being a gate, and the whole value of
+  # this script is that a red means something. The distinction is the empty `result`, not the count.
   if [[ -z $result ]]; then
-    local last=$(grep -E "^\[info\] [A-Z][A-Za-z]*Tests:" "$LOGS/$label.log" | tail -1)
-    print "$label  TIMEOUT/KILLED $(date +%H:%M:%S)  oom=$oom  last suite: $last" >> "$SUMMARY"
+    print "$label  no verdict $(date +%H:%M:%S)  oom=$oom  last suite: $(read_last "$label.log")" >> "$SUMMARY"
+    print "$label  RETRY alone $(date +%H:%M:%S)  heap=$HEAVY_HEAP agents=$HEAVY_AGENTS" >> "$SUMMARY"
+
+    attempt_group "$label-retry.log" $HEAVY_HEAP $HEAVY_AGENTS "$suites"
+
+    result=$(read_result "$label-retry.log")
+    failed=$(grep -c "\*\*\* FAILED \*\*\*" "$LOGS/$label-retry.log")
+    oom=$(grep -c "Heap_exitWithOutOfMemory" "$LOGS/$label-retry.log")
+
+    if [[ -z $result ]]; then
+      print "$label  TIMEOUT/KILLED $(date +%H:%M:%S)  oom=$oom  last suite: $(read_last "$label-retry.log")" >> "$SUMMARY"
+    else
+      # **A group that only passes alone is a HEAVY candidate, and this is the measurement the
+      # docstring says cannot be computed.** `gate-groups.py` is honest that heaviness cannot be
+      # derived from source text; a group needing the retry across successive runs is the evidence,
+      # and the suite to promote is named in the `no verdict` line above.
+      print "$label  RETRIED-OK $(date +%H:%M:%S)  failed=$failed oom=$oom  $result" >> "$SUMMARY"
+    fi
   else
     print "$label  done $(date +%H:%M:%S)  failed=$failed oom=$oom  $result" >> "$SUMMARY"
   fi
@@ -145,6 +273,15 @@ run_group () {
   local stranded=$(pgrep -x sysl-test | wc -l | tr -d ' ')
   [[ $stranded != 0 ]] && print "  STRANDED AGENTS: $stranded -- kill by PID before continuing" >> "$SUMMARY"
 }
+
+# Runs here rather than at the top because it drives the real `attempt_group`, which is defined
+# above. Captured rather than piped: a function on the left of a `| tee` runs in a subshell, so its
+# failure would be swallowed and the pipeline would report `tee`'s success -- which is the exact
+# shape of the exit-status trap this script's header warns about twice.
+WATCHDOG_OUT=$(watchdog_self_test)
+WATCHDOG_RC=$?
+print "$WATCHDOG_OUT" | tee -a "$SUMMARY"
+(( WATCHDOG_RC == 0 )) || exit 1
 
 run_group heavy $HEAVY_HEAP $HEAVY_AGENTS \
   "$(python3 -c "import json;print(' '.join(json.load(open('$LOGS/heavy.json'))))")"
@@ -163,6 +300,7 @@ import re, sys
 
 total = failed = 0
 stalled = []
+retried = []
 
 for line in open(sys.argv[1]):
     if m := re.search(r'Tests: succeeded (\d+), failed (\d+)', line):
@@ -170,9 +308,17 @@ for line in open(sys.argv[1]):
         failed += int(m.group(2))
     if 'TIMEOUT' in line:
         stalled.append(line.split()[0])
+    if 'RETRIED-OK' in line:
+        retried.append(line.split()[0])
 
 print(f'TOTAL: {total} succeeded, {failed} failed')
 print('TIMED OUT: ' + (', '.join(stalled) if stalled else 'none'))
+
+# **A retry is reported and is NOT a red.** The group produced no verdict, was run again alone, and
+# answered -- which is the mechanism working. It is printed rather than swallowed because a group
+# that needs it repeatedly is the evidence for promoting one of its suites into HEAVY, and that
+# evidence exists nowhere else.
+print('RETRIED (passed alone): ' + (', '.join(retried) if retried else 'none'))
 print('GATE: ' + ('GREEN' if failed == 0 and not stalled else 'RED'))
 PY
 
