@@ -348,7 +348,7 @@ trait ExprParser extends SyslParserBase {
     )
 
   /** `.red`, `.Circle(3)`, `.make(2)` — a member of the type the context expects, written with
-   * that type's name left off (`reference/expressions.md § Implicit member`).
+   * that type's name left off (`reference/expressions.md § A leading dot`).
    *
    * **The leading dot is unambiguous wherever an expression may start**, which is what makes this a
    * `primary` rather than a form needing lookahead. A range's `..` and `..<` are single tokens by

@@ -246,7 +246,7 @@ class TargetCapabilityTests extends AnyFreeSpec with Matchers {
   }
 
   /** A `@tests` file states what a module's tests need, which may be more than the module itself
-   * gave up (`reference/modules.md § A '@tests' file states its own capabilities`). **Only the
+   * gave up (`reference/modules.md § A @tests file states its own capabilities`). **Only the
    * module's half of the two-level rule moves.**
    *
    * The asymmetry is what keeps the exemption honest. A file that ships nowhere may take back a

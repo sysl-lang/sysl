@@ -624,7 +624,7 @@ trait ExprAnalysis
     case e: TypeAttr => typeAttrExpr(e)
 
     // `.red` — the same selection with the type's own name left off, taken from what the context
-    // expects (`reference/expressions.md § Implicit member`). The call form is up with the other
+    // expects (`reference/expressions.md § A leading dot`). The call form is up with the other
     // call arms, since a call is matched before its callee is looked at.
     case ImplicitMember(f) => implicitMember(f, expected)
 

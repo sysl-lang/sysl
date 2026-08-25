@@ -87,7 +87,7 @@ object Capability {
  * is deliberate — you can never open a file of a `no alloc` module and fail to see that it is one.
  *
  * **A `@tests` file is the one exception, and it is an exception to the agreement rather than to the
- * rule** (`reference/modules.md § A '@tests' file states its own capabilities`). The module's clause
+ * rule** (`reference/modules.md § A @tests file states its own capabilities`). The module's clause
  * is a promise about what a program linking this module may do, and a `@tests` file is dropped by
  * every build but `sysl test`, so it was never in that promise. Held to one set, the clause was
  * unavailable to exactly the modules that would want it: testing an allocation-free primitive means

@@ -374,7 +374,7 @@ case class TProgram(
      */
     noAllocModules: Set[String] = Set.empty,
     /** The same, for what each module's **tests** may do
-     * (`reference/modules.md § A '@tests' file states its own capabilities`).
+     * (`reference/modules.md § A @tests file states its own capabilities`).
      *
      * It is a second set rather than a flag because a `@tests` file may take the allocator back — a
      * module can ship allocating nowhere and still be tested by rendering what it produced. A

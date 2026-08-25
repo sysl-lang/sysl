@@ -94,7 +94,7 @@ trait PatternParser extends ExprParser {
     rep(ident <~ op(".")) ~ quotedIdent ^^ { case ps ~ n => (ps :+ n).mkString(".") }
 
   /** A leading dot written in a pattern, which the expression form has and a pattern does not need
-   * (`reference/expressions.md § Implicit member`).
+   * (`reference/expressions.md § A leading dot`).
    *
    * A pattern is already matched *against* a type, and the analyzer reads a bare name against the
    * scrutinee's enum and drops any qualifier it was written with — so `red` here already means what

@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** `.red` — a member of the type the context **expects**, written with that type's own name left
- * off (`reference/expressions.md § Implicit member`).
+ * off (`reference/expressions.md § A leading dot`).
  *
  * The rule is one sentence: `.name` is `T.name` with the `T` dropped, where `T` is what the context
  * asks for. So what it reaches is exactly what the qualified spelling reaches — a variant, a

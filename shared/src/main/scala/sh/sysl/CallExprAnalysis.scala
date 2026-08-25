@@ -215,7 +215,7 @@ trait CallExprAnalysis extends ExprCoercion with MemberExprAnalysis with RawStor
       analyzeValueAt(Call(throughModule(callee).get, args).setPos(expr.pos), expected)
 
     // `.Circle(5)`, `.make(2)` — the forms below with the type's own name left off, resolved
-    // against what the context expects (`reference/expressions.md § Implicit member`).
+    // against what the context expects (`reference/expressions.md § A leading dot`).
     case Call(ImplicitMember(f), args) => implicitCall(f, args, expected)
 
     // Reached through the enum name: `Color.try(n)` is the fallible constructor; otherwise a

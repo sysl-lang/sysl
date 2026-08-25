@@ -143,7 +143,7 @@ case class WithField(name: String, value: Expr) extends Positioned
 case class WithExpr(base: Expr, fields: List[WithField]) extends Expr
 
 /** `.red`, `.Circle(3)`, `.make(2)` — a member selected from the type the context **expects**,
- * with the type's own name left off (`reference/expressions.md § Implicit member`).
+ * with the type's own name left off (`reference/expressions.md § A leading dot`).
  *
  * It is the qualified form with the qualifier dropped and nothing more: `.red` means what
  * `Colour.red` means wherever a `Colour` is what is wanted, so it reaches a variant, an enum's

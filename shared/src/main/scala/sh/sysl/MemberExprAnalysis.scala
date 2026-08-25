@@ -236,7 +236,7 @@ trait MemberExprAnalysis extends ExprSupport {
           err(s"'$written' is a type, not a value, and has no associated function '$f'")
 
   /** `.red` — a member of the type the context expects, with that type's name left off
-   * (`reference/expressions.md § Implicit member`).
+   * (`reference/expressions.md § A leading dot`).
    *
    * **The expectation supplies the qualifier and nothing else changes**, which is why this is four
    * lines rather than a resolution of its own: what `.red` reaches is exactly what `Colour.red`

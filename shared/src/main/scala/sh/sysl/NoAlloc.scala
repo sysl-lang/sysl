@@ -42,7 +42,7 @@ trait NoAlloc extends AnalyzerBase {
       moduleNarrows.get(module).exists(_.contains(Capability.Heap))
 
   /** The same question asked of a module's **tests**, which have an answer of their own
-   * (`reference/modules.md § A '@tests' file states its own capabilities`).
+   * (`reference/modules.md § A @tests file states its own capabilities`).
    *
    * **Only the module's half moves. The target's does not**, and the asymmetry is the honest part of
    * this: a `@tests` file may take back what the module gave up, because the module's clause is a

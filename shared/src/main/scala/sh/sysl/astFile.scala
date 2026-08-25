@@ -77,7 +77,7 @@ case class IncludeClause(header: String) extends Positioned
  *
  * What it does say about the **file** is that its capability clauses are the module's *tests'*
  * rather than the module's, since a file every other build drops was never part of what the module
- * promised a program linking it (`reference/modules.md § A '@tests' file states its own
+ * promised a program linking it (`reference/modules.md § A @tests file states its own
  * capabilities`). A file that writes no clause is held to the module's, which is what all of them
  * did before there was any other answer.
  *

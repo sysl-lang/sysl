@@ -232,7 +232,7 @@ trait Scoping extends DeclTables {
   protected val moduleRequires = mutable.LinkedHashMap.empty[String, Map[String, Option[Pos]]]
 
   /** What each module's **test scaffolding** gave up, which is not always what the module did
-   * (`reference/modules.md § A '@tests' file states its own capabilities`).
+   * (`reference/modules.md § A @tests file states its own capabilities`).
    *
    * A `@tests` file is dropped by every build but `sysl test`, so the module's clause — a promise
    * about what *ships* — is not a promise about it. Testing a module can need what the module gave
