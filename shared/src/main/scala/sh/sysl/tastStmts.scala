@@ -68,7 +68,7 @@ case class TWrite(place: TExpr, op: String, value: TExpr, dispatch: Option[TDisp
                   check: List[(TExpr, Type.Struct, String)],
                   constraint: Option[Type.Constrained] = None)
 
-/** `a, b = b, a` — several places written from several values (`00 §2`).
+/** `a, b = b, a` — several places written from several values (`reference/expressions.md § Several places at once`).
  *
  * The order of events is the whole content of the form, and it is phases rather than one write at a
  * time. Every place's own subexpressions are computed first, and once, so an index that calls
@@ -226,7 +226,7 @@ case class TFunc(
 case class TExtern(name: String, symbol: String, params: List[Type], retTy: Type,
                    variadic: Boolean = false)
 
-/** Storage the linker supplies, which the module declares rather than lays down (`12 §1`).
+/** Storage the linker supplies, which the module declares rather than lays down (`reference/ffi.md § An extern also declares a variable`).
  *
  * The same accounting the externs above get: only the ones something reads or writes reach here, and
  * two declarations may share one symbol, so the module declares each *symbol* once. What it carries
@@ -263,7 +263,7 @@ case class TVSlot(target: String, recv: RecvMode, params: List[Type], retTy: Typ
  *
  * `computed` says which of the two ways it is filled. A constant tree is written straight into the
  * object file and nothing runs; anything else is code, evaluated once before the program's own
- * statements and stored, in an order the initializers' dependencies settle (`13 §7`).
+ * statements and stored, in an order the initializers' dependencies settle (`reference/modules.md § val — a thing`).
  */
 case class TVal(
     symbol: String,
@@ -283,7 +283,7 @@ case class TVal(
     section: Option[String] = None,
 )
 
-/** The `main` a program declared, which runs after its top-level statements (`13 §7`).
+/** The `main` a program declared, which runs after its top-level statements (`reference/modules.md § Where a program starts`).
  *
  * `func` is the key the function is filed under, which is what makes it reachable; `argsFn` names the
  * library function that turns the platform's `argc`/`argv` into the `[]string` it wants, and is
@@ -351,7 +351,7 @@ case class TProgram(
      *
      * It is a second question rather than `entryPoint` read backwards, because **two** kinds of
      * build have no entry point and they answer differently about who fills the module storage
-     * (`13 §7`):
+     * (`reference/modules.md § val — a thing`):
      *
      *   - a `.syslib` is linked by a sysl **program**, which has an entry point and lays the `val`s
      *     down at the top of it — so `Compiler.compileLibrary` defers every function reaching one to
@@ -381,7 +381,7 @@ case class TProgram(
      */
     noAllocTestModules: Set[String] = Set.empty,
     /** The module whose terms the statements in `main` were written in — the file that carries the
-     * program's entry point (`13 §7`). Every other body says which module it belongs to in its own
+     * program's entry point (`reference/modules.md § Where a program starts`). Every other body says which module it belongs to in its own
      * key; these have no key, so the answer is carried here.
      */
     mainModule: String = Modules.root,
@@ -393,7 +393,7 @@ case class TProgram(
      * drops both this and the functions it names: `Tests.strip`.
      */
     tests: List[TTest] = Nil,
-    /** The `extern` variables the program reads or writes (`12 §1`). Declared beside the `val`s
+    /** The `extern` variables the program reads or writes (`reference/ffi.md § An extern also declares a variable`). Declared beside the `val`s
      * rather than up with the `extern` functions, because a named aggregate type has to be defined
      * before anything names it — the same ordering the precompiled declarations need.
      */

@@ -210,7 +210,7 @@ trait SpecialForms extends Closures {
     // base's renderer rather than asking for a `Display` impl of its own. That is what a subtype is
     // for, and it is what keeps `type Percent = int :: 0..100` printing like the integer it is.
     //
-    // **Unless it has said otherwise**, which `02 § override` made writable and nothing had to
+    // **Unless it has said otherwise**, which `reference/traits.md § override — when the overlap is deliberate` made writable and nothing had to
     // before. A derived subtype has its base's memberships (`reference/errors.md § A derivation
     // inherits its base's behaviour and may replace none of it`), so the library's blanket over
     // every integer already covers it and a block of its own is an override — the one case where
@@ -456,7 +456,7 @@ trait SpecialForms extends Closures {
 
   /** Checks that a type is one a variadic tail can be *read* as.
    *
-   * Every argument was widened on the way in (`12 §1`), so asking for a narrower type than the
+   * Every argument was widened on the way in (`reference/ffi.md § The calling side`), so asking for a narrower type than the
    * promotion produced would read the wrong bytes — C's most common varargs mistake, and one worth
    * a diagnostic rather than a wrong answer. Nothing is lost: read it at the promoted width and
    * convert, which is what C's own callee has to do anyway.

@@ -132,7 +132,7 @@ object Exports {
   /** An exported function that reaches a **computed** module `val` **on a build with nowhere to
    * fill it**.
    *
-   * Module storage is filled before the program's own statements run (`13 §7`), and there are three
+   * Module storage is filled before the program's own statements run (`reference/modules.md § val — a thing`), and there are three
    * builds with three answers. A build with an entry point lays the `val`s down at the top of it
    * (`Codegen.genMain`). A `.syslib` has none, and defers every function reaching one to the program
    * that links it (`Compiler.compileLibrary`). A **C** archive has neither road — the project

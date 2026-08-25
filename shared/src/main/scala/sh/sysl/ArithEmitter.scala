@@ -111,7 +111,7 @@ trait ArithEmitter extends CallEmitter {
    * That is the whole distinction from lowering a `TCall`: the forms that reach here — a comparison
    * chain and a compound assignment — each use one operand twice from a single evaluation, and the
    * value is already in a register. `swap` and `negate` carry the derivation of the comparisons the
-   * catalog declares no method for (`14 §2`), so `a > b` calls the one `lt` its `impl` wrote.
+   * catalog declares no method for (`library/core.md § What is in it`), so `a > b` calls the one `lt` its `impl` wrote.
    *
    * The two operands carry their **own** types, which an arithmetic trait no longer requires to be
    * the same one (`library/core.md § Walking a type of your own`): `c *= 2.0` passes a complex

@@ -6,7 +6,7 @@ import org.scalatest.freespec.AnyFreeSpec
  *
  * This is the third measurement a string has, and the two that came before it are the reason it is
  * needed: `s.len` counts bytes and a `Chars` walk counts scalar values, and a program laying out a
- * column needs neither. `14 §2` records the finding that provoked it — a `FormatSpec`'s width
+ * column needs neither. `library/core.md § A specifier is the whole value's field` records the finding that provoked it — a `FormatSpec`'s width
  * counts bytes, so a field padded to it is short by one column per non-ASCII character and two
  * cells of one column come out wrong by different amounts.
  *

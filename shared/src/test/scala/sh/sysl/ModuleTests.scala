@@ -8,7 +8,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * These are that claim from four sides: the header a file writes to say which module it contributes
  * to, the fact that splitting a module across files changes nothing about what its declarations can
  * see, the agreement between a header and the directory the file was found in, and which one file of
- * a program carries the statements it runs (`13 §7`).
+ * a program carries the statements it runs (`reference/modules.md § Where a program starts`).
  */
 class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with RunSupport {
 
@@ -215,7 +215,7 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
 
   "which one file of a program runs" - {
     // A declaration is hoisted and belongs to its module; a statement runs, and running has an
-    // order that neither files nor modules have. So one file carries them (`13 §7`).
+    // order that neither files nor modules have. So one file carries them (`reference/modules.md § Where a program starts`).
     "is a question with one answer" in {
       errOf(
         "a.sysl" -> "print(1)",
@@ -231,7 +231,7 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
     }
 
     // But NOT counting a top-level binding as one of them. A `var` beside a file that really does
-    // carry statements is module storage (`13 §7`), so it is not a second beginning and the two
+    // carry statements is module storage (`reference/modules.md § val — a thing`), so it is not a second beginning and the two
     // files compile together — which is the whole of the mutable-module-storage rule seen from this
     // side.
     "though a binding beside them is module storage rather than a second beginning" in {
@@ -278,7 +278,7 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
     }
   }
 
-  /** Mutable module storage in a file that is not the entry file (`13 §7`).
+  /** Mutable module storage in a file that is not the entry file (`reference/modules.md § val — a thing`).
     *
     * It is the same declaration `static var` is, and the two spellings exist because the entry file
     * is the one place a top-level `var` has a body to be a local of: there the modifier asks for the
@@ -340,7 +340,7 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
     }
 
     // It may hold a counted value. The last one it holds is never released, which is what a static
-    // is — and this pair was refused outright until the rule was read again (`13 §7`).
+    // is — and this pair was refused outright until the rule was read again (`reference/modules.md § val — a thing`).
     "and it may hold a value that owes a release" in {
       runIn(
         ("", "main.sysl", "print(m.greeting)"),
@@ -484,7 +484,7 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
       ) should not be empty
     }
 
-    // `13 §7` gives module storage written with `var` the two things the word already means:
+    // `reference/modules.md § val — a thing` gives module storage written with `var` the two things the word already means:
     // assignment at every depth, and `&`. The second is what a `val` is refused, so it is the
     // discriminating one.
     "and its address may be taken, which a module 'val' is refused" in {

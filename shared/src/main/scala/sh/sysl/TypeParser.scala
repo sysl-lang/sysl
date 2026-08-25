@@ -265,7 +265,7 @@ trait TypeParser extends ExprParser {
    * The type is required and the marker is what makes it readable: without `const` this is
    * `ident ':' name`, which is exactly a bounded type parameter, and only name resolution could say
    * which was meant. Then a trait name misspelled into a type name would quietly change what kind of
-   * parameter it is. The word is not a new one — `13 §7` already spells a compile-time constant
+   * parameter it is. The word is not a new one — `reference/modules.md § const — a value` already spells a compile-time constant
    * `const NAME: Type = expr`, and this is that with the initializer left to the caller.
    *
    * A **default is an expression here**, not a type, which is the second thing the marker buys: one

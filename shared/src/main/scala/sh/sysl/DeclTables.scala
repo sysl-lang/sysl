@@ -294,7 +294,7 @@ trait DeclTables extends Reporting {
    */
   protected def invKey(typeKey: String): String = s"$typeKey$$inv"
 
-  /** Declared constants by key (`13 §7`). A constant is folded into each use and has no storage, so
+  /** Declared constants by key (`reference/modules.md § const — a value`). A constant is folded into each use and has no storage, so
    * this table is read by the analyzer and never by codegen — there is nothing downstream to emit.
    */
   protected val constDecls = mutable.LinkedHashMap.empty[String, ConstDecl]
@@ -314,12 +314,12 @@ trait DeclTables extends Reporting {
    */
   protected val assertDecls = mutable.ListBuffer.empty[(AssertDecl, Scope)]
 
-  /** Declared module-level `val`s by key (`13 §7`). Unlike a constant, this one reaches codegen: it
+  /** Declared module-level `val`s by key (`reference/modules.md § val — a thing`). Unlike a constant, this one reaches codegen: it
    * is storage, and every use of it is a read through an address rather than a copy of a literal.
    */
   protected val valDecls = mutable.LinkedHashMap.empty[String, ValDecl]
 
-  /** Declared module `var`s by key (`13 §7`) — the mutable half of module storage, written
+  /** Declared module `var`s by key (`reference/modules.md § val — a thing`) — the mutable half of module storage, written
    * `static var` in the file the program starts in and plain `var` in any other.
    *
    * A separate table from the `val`s only because the two declarations have different shapes: a
@@ -379,7 +379,7 @@ trait DeclTables extends Reporting {
    * a `[]int`, and by default whichever is written second is refused — this is how the one written
    * first is found however the file ordered them.
    *
-   * The flag is whether the written-out block said **`override`** (`02 § override`), which is what
+   * The flag is whether the written-out block said **`override`** (`reference/traits.md § override — when the overlap is deliberate`), which is what
    * makes the pair deliberate rather than a mistake. It has to be recorded rather than asked at the
    * shape's own declaration, because the shape may be hoisted either before or after the type it
    * covers and the answer must not depend on which.
@@ -586,7 +586,7 @@ trait DeclTables extends Reporting {
    */
   protected val externsUsed = mutable.LinkedHashSet.empty[String]
 
-  /** Every `extern` **variable** the program declares (`12 §1`), by key. Storage the linker supplies
+  /** Every `extern` **variable** the program declares (`reference/ffi.md § An extern also declares a variable`), by key. Storage the linker supplies
    * rather than storage this module lays down, which is the whole of what this table says about it:
    * a reference to one is the same `TGlobal` a module-level `val`'s name becomes, and the only thing
    * downstream reads this for is which symbols to declare and whether the name is one at all.

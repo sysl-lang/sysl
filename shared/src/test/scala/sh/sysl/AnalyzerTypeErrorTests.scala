@@ -146,7 +146,7 @@ class AnalyzerTypeErrorTests extends AnyFreeSpec with CodegenSupport {
   }
 
   "arrays" - {
-    // A `const` may be a bound (`13 §7`); a `var` is a value that exists at run time, and a length
+    // A `const` may be a bound (`reference/modules.md § const — a value`); a `var` is a value that exists at run time, and a length
     // is not.
     "have a length settled before the program runs, not while it does" in {
       err("var n = 4\nvar a: [n]int\nprint(a[0])") should include("must be a constant")

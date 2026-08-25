@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `val` — a binding written once (`07`, `13 §7`).
+/** `val` — a binding written once (`07`, `reference/modules.md § val — a thing`).
  *
  * This suite is about the **module member**: read-only storage laid into the object file, which is
  * what a table of round constants needs and what a `const` can never be, since a constant is folded
@@ -248,7 +248,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     }
   }
 
-  /** A `val` holds a string whose bytes the object file carries (`13 §7`).
+  /** A `val` holds a string whose bytes the object file carries (`reference/modules.md § val — a thing`).
    *
    * The rule it relaxes was never about `string`. It is about a count with nowhere to write the
    * release, and a literal takes none: its bytes are a constant in read-only data and its owner word
@@ -257,7 +257,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
    * the same test that decides whether any `val` is laid into the object file.
    *
    * The shape this exists for is a module with **no allocator** naming its messages once. `const`
-   * could not serve it: a constant has no address (`13 §7`), so it cannot be indexed at a position
+   * could not serve it: a constant has no address (`reference/modules.md § const — a value`), so it cannot be indexed at a position
    * computed while running, which is the whole of what a table is for.
    */
   "a module-level 'val' holds a string literal" - {
@@ -476,7 +476,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
    */
   "what a constant string 'val' does not disturb" - {
 
-    // `13 §7`: a value that has to be checked is code, whatever it looks like. A `val` at a
+    // `reference/modules.md § val — a thing`: a value that has to be checked is code, whatever it looks like. A `val` at a
     // constrained type and a table of them are pinned in `ComputedValTests`; the case the struct arm
     // adds is a constrained field *inside* one, where the check is at the argument. The load-bearing
     // assertion is the out-of-range one, since an in-range value reads back either way.

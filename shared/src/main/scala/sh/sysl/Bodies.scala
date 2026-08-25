@@ -42,7 +42,7 @@ object Bodies {
     case _ => false
 
   /** Whether a top-level statement is a **binding** — the one kind that may be either a body's local
-   * or its module's storage, depending on what the rest of the program looks like (`13 §7`).
+   * or its module's storage, depending on what the rest of the program looks like (`reference/modules.md § Where a program starts`).
    *
    * Everything else settles which file the program starts in on its own: a `print` runs and a
    * `struct` does not, whatever else the program contains. A `var` is the one form that does not,

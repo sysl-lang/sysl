@@ -910,7 +910,7 @@ class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
     }
   }
 
-  /** None of this costs a program that reads nothing, which is the rule `14 §2` states for a library
+  /** None of this costs a program that reads nothing, which is the rule `reference/modules.md § Separate compilation` states for a library
    * member and the reason the surface can live in the library at all.
    */
   "a program that reads nothing carries none of it" - {

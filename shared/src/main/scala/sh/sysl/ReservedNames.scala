@@ -131,7 +131,7 @@ object ReservedNames {
         (if i.wildcard then Nil else named(i.bound, "import", i.pos)) :::
           i.selectors.flatMap(s => named(s.bound, "import", s.pos))
       // `static` says where the storage lives and nothing about the name, so the declaration inside
-      // it is checked exactly as it would have been written on its own (`13 §7`).
+      // it is checked exactly as it would have been written on its own (`reference/modules.md § Where a program starts`).
       case s: StaticDecl => declaredIn(s.inner)
       case _             => Nil
   }

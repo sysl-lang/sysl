@@ -171,7 +171,7 @@ class PointerRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
    * exactly as `03` wants it to. It had no test, and `guide/shapes` is what went looking.
    */
   "a counted reference" - {
-    // `14 §2` puts the pointer modes in `Eq` with **address** equality. Two references to objects
+    // `library/core.md § What is in it` puts the pointer modes in `Eq` with **address** equality. Two references to objects
     // holding the same thing are therefore not equal, which is what makes a reference an identity:
     // a program asking "is this the very object you are holding" — a scheduler asking whether a
     // task owns the lock it is releasing — is asking about the box and never about its contents.
@@ -202,7 +202,8 @@ class PointerRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       run(src) shouldBe "true false\n"
     }
 
-    // Equality reaches further than ordering (`01`, lifted into `14 §2` intact): a reference has
+    // Equality reaches further than ordering
+    // (`reference/expressions.md § Equality reaches further than ordering`): a reference has
     // `==` and no `<`, since one address falling below another is not a fact about the program.
     "has equality and no ordering" in {
       val src =

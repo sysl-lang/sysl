@@ -2,9 +2,9 @@ package sh.sysl
 
 import scala.collection.mutable
 
-/** The order a program's computed module-storage initializers run in (`13 §7`).
+/** The order a program's computed module-storage initializers run in (`reference/modules.md § val — a thing`).
  *
- * **"`val`" below means either declaration**, since `13 §7` makes a `val` and a module `var` one
+ * **"`val`" below means either declaration**, since `reference/modules.md § val — a thing` makes a `val` and a module `var` one
  * kind of thing and an initializer is a place where they are indistinguishable — a cycle may run
  * through both, and a diagnostic that knew about only one of them threw instead of explaining.
  *
@@ -80,7 +80,7 @@ trait InitOrder extends AnalyzerBase {
       val head = cycle.min
 
       if blamed.add(head) then
-        // Both tables, because module storage is one thing under two declarations (`13 §7`) and a
+        // Both tables, because module storage is one thing under two declarations (`reference/modules.md § val — a thing`) and a
         // cycle may run through either. Asking only the `val`s threw where a `var` was on the loop —
         // a crash rather than a diagnostic, and one that stood from the day `static var` landed
         // because nothing had written a cycle through one.
@@ -99,7 +99,7 @@ trait InitOrder extends AnalyzerBase {
 
   /** Where a piece of module storage was declared, whichever of the two declarations wrote it.
    *
-   * `13 §7` makes a `val` and a `var` one kind of thing under two spellings, and everything
+   * `reference/modules.md § val — a thing` makes a `val` and a `var` one kind of thing under two spellings, and everything
    * downstream of hoisting treats them that way — so a lookup that consults one table is a lookup
    * that is right about half its inputs and throws on the rest.
    */

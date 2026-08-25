@@ -207,7 +207,7 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with RunSupport
             |""".stripMargin) should include("returns nothing")
     }
 
-    // `-> unit` and no result at all are the same signature written two ways (`12 §1`), so a test
+    // `-> unit` and no result at all are the same signature written two ways (`reference/declarations.md § Functions`), so a test
     // that says it out loud is as good as one that does not — and a rule checking the *syntax*
     // rather than the resolved type would have refused this one.
     "an explicit '-> unit' is the same as writing none" in {

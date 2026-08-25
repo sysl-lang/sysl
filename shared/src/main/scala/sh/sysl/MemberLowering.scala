@@ -87,7 +87,7 @@ trait MemberLowering extends TypeResolution {
    *   - `fromTrait` is the trait an `impl` block is keeping, and `None` for a type's own body. It is
    *     what a use site's scope is asked about, since a trait's member is reachable only where the
    *     trait can be named.
-   *   - `overrides` is whether the block said `override` (`02 § override`). What it turns off is the
+   *   - `overrides` is whether the block said `override` (`reference/traits.md § override — when the overlap is deliberate`). What it turns off is the
    *     one-name-per-shape rule below: an override gives a written-out type a member the shape it
    *     belongs to also has, and that is what an override *is* rather than a collision — the two are
    *     the same trait's member, and `memberKey` asks the type's own key before the shape's, so one

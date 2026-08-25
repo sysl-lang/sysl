@@ -289,7 +289,7 @@ class CoreTraitRunTests extends AnyFreeSpec with RunSupport with CodegenSupport 
     }
 
     // The other half of the same claim, and the half that has to be checked rather than observed:
-    // `14 §2` says the catalog stays flat and being `Ord` does not imply `Eq`. So a type ordered by
+    // `library/core.md § What is in it` says the catalog stays flat and being `Ord` does not imply `Eq`. So a type ordered by
     // one `lt` gets all four comparisons above and no `==` at all — which is what lets an ordering
     // key be written for a value whose equality would have meant something else entirely.
     "and being ordered does not make a type equatable" in {

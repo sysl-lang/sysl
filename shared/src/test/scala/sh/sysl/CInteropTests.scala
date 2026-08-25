@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** How much of a C library can actually be externed (`12 §1`, `03`).
+/** How much of a C library can actually be externed
+ * (`reference/ffi.md § extern — a declaration with no body`).
  *
  * The question is not whether `extern` works — it plainly does — but whether the *signatures a real
  * header contains* can be spelled, because one that cannot is a library sysl cannot bind. So the bulk
@@ -351,7 +352,7 @@ class CInteropTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       * extern's parameter list compiles, and a trait object is two words where C reads one — so the
       * call would hand over the table and read the value as the callback.
       *
-      * It is not refused because `12 §1` decided the general question the other way: a `string` and
+      * It is not refused because `reference/ffi.md § What crosses the boundary` decided the general question the other way: a `string` and
       * a `&T` are sysl layouts C has no notion of, and handing one over is the programmer's business,
       * the same promise `*T` already is. Singling this one out would be a rule the chapter
       * contradicts. What has changed is that there is now a right answer to reach for, so the cost of

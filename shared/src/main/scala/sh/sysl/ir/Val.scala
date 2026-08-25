@@ -93,7 +93,7 @@ enum Val {
   case Array(elems: List[Arg])
 
   /** A device address written as a number. `inttoptr` is a **constant expression**, so this is a
-   * pointer that sits in the object file rather than one a prologue has to store: `13 §7` admits
+   * pointer that sits in the object file rather than one a prologue has to store: `reference/modules.md § val — a thing` admits
    * exactly the integer case, and a pointer reinterpreted as another pointer is a name rather than
    * a literal and never arrives here.
    */

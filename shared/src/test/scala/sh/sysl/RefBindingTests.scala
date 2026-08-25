@@ -711,7 +711,7 @@ class RefBindingTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       run(src) shouldBe "1\n9\n"
     }
 
-    // `00 §2`: a multi-assignment writes several places at once, and a ref is a place.
+    // `reference/expressions.md § Several places at once`: a multi-assignment writes several places at once, and a ref is a place.
     "a ref may be one place of a multi-assignment" in {
       val src =
         """var xs = [1, 2, 3]

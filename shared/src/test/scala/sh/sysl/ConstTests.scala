@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `const` — the one kind of module-level binding there is (`13 §7`).
+/** `const` — the one kind of module-level binding there is (`reference/modules.md § const — a value`).
  *
  * A constant is folded into every use and has no storage, so nothing here checks what is emitted:
  * what it names is a value, and the assertions are about the value arriving intact at each of the
@@ -333,7 +333,7 @@ class ConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pa
       err("enum Colour\n    Red\nend Colour\nconst Red: int = 1") should include("already used by enum")
     }
 
-    // `13 §7` turns on a constant having no address: it is folded into each use, occupies no
+    // `reference/modules.md § const — a value` turns on a constant having no address: it is folded into each use, occupies no
     // storage, needs no initialization order, and a `no alloc` module may hold one. `&capacity`
     // being unwritable is that property seen from the program's side, and it is what divides a
     // `const` from the `val` that exists to be indexed.

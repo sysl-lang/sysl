@@ -40,7 +40,7 @@ class DeadCodeTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
   "what the documents claim" - {
 
-    // `14 §2`'s note that a library declaration nothing reaches costs the output nothing was only
+    // `reference/modules.md § Separate compilation`'s note that a library declaration nothing reaches costs the output nothing was only
     // ever half the rule: the program's own declarations were emitted whether or not anything
     // called them.
     "a function nothing calls is not emitted" in {
@@ -93,7 +93,7 @@ class DeadCodeTests extends AnyFreeSpec with CodegenSupport with RunSupport {
             |""".stripMargin) should include("is returned")
     }
 
-    // `13 §7`: a computed `val` is filled by a prologue `main` opens with, so its initializer is one
+    // `reference/modules.md § val — a thing`: a computed `val` is filled by a prologue `main` opens with, so its initializer is one
     // of the places the program starts from.
     "a function reached only from a 'val' initializer is emitted" in {
       val out = defined("""build() -> int = 7

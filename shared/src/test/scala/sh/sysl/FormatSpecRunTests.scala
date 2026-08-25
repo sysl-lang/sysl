@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Tier-2 runtime behaviour of a `FormatSpec` once it reaches a renderer (`14 §2`, `§8 d`).
+/** Tier-2 runtime behaviour of a `FormatSpec` once it reaches a renderer
+ * (`library/core.md § A specifier is the whole value's field`).
  *
  * The spec has always been *delivered* — an `f"…"` hole hands its width, precision, and
  * justification to the `Display` it calls. What is under test here is that the library's own

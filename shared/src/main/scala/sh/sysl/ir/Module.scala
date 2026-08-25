@@ -22,7 +22,7 @@ case class Module(triple: String, declares: List[FuncSig], structs: List[TypeDef
                   init: Option[Initializer] = None)
 
 /** **What fills a module's computed storage where there is no entry point to fill it in** — the
- * constructor and the list that gets it called (`13 §7`).
+ * constructor and the list that gets it called (`reference/modules.md § val — a thing`).
  *
  * The two are one value because neither is anything on its own. A function nothing registers is
  * dead code the linker discards; a registration naming no definition does not link. Carrying them

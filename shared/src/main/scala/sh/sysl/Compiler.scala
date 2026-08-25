@@ -86,7 +86,7 @@ object Compiler {
    * worth having — a library is not a second kind of input, it is more modules.
    *
    * A library declares no statements of its own; the one file that carries a program's statements
-   * (`13 §7`) is still the program's, and a library that carried any would be reported by the same
+   * (`reference/modules.md § Where a program starts`) is still the program's, and a library that carried any would be reported by the same
    * rule that reports two of them.
    */
   def compileWith(sources: List[Source], libraries: List[Program],

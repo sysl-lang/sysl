@@ -113,7 +113,7 @@ private class Escape(program: TProgram) {
 
   /** A `Writer` is handed a **borrowed** view of the bytes to write, and that is the whole reason
    * the sink takes bytes rather than a string: a renderer writes into a buffer on its own stack and
-   * passes a slice of it, which is what keeps rendering allocation-free (`14 §2`).
+   * passes a slice of it, which is what keeps rendering allocation-free (`library/core.md § Rendering to a sink`).
    *
    * Nothing in the type says "borrowed", so it is checked here instead of trusted. An
    * implementation that lets those bytes outlive the call is rejected, which is what licenses the
@@ -434,7 +434,7 @@ private class Escape(program: TProgram) {
             if viewsFrame(a) then gets_out(a, "is passed through a trait object, which may hold on to it")
 
         // Nothing is known about what is at the other end of a function pointer — not even which
-        // program compiled it — so the worst is assumed of every argument, exactly as `12 §1` has
+        // program compiled it — so the worst is assumed of every argument, exactly as `reference/ffi.md § extern — a declaration with no body` has
         // this analysis assume it of an `extern`.
         case TCallPtr(_, args, _, _) =>
           for a <- args do

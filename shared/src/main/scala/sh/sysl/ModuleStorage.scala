@@ -10,7 +10,7 @@ package sh.sysl
  * **value**, because a `val` is forever what it was given and a constant tree was never built; a
  * `var`'s is asked of the **type**, because it may be given something else tomorrow; and an
  * `extern`'s is asked of neither, because the storage is somebody else's. `isStatic` is the test
- * all of that turns on, and `13 §7`'s initialization order is the other thing it decides.
+ * all of that turns on, and `reference/modules.md § val — a thing`'s initialization order is the other thing it decides.
  */
 trait ModuleStorage extends ModuleFiles {
   // --- module-level `val`s --------------------------------------------------------------
@@ -74,7 +74,7 @@ trait ModuleStorage extends ModuleFiles {
   private def boundaryOf(key: String, align: Option[Expr]): Option[Int] =
     align.flatMap(a => recover(Option.empty[Int])(alignBound(qn(key), a)))
 
-  /** One module `var`: module storage the program may write (`13 §7`), written `static var` in the
+  /** One module `var`: module storage the program may write (`reference/modules.md § val — a thing`), written `static var` in the
    * file the program starts in and plain `var` in any other.
    *
    * Three things separate it from the `val` above, and each is what the word `var` already means.
@@ -127,7 +127,7 @@ trait ModuleStorage extends ModuleFiles {
       align = boundaryOf(key, decl.align), section = decl.section)
   })
 
-  /** Holds a module-level `val` to something a name can stand for (`13 §7`).
+  /** Holds a module-level `val` to something a name can stand for (`reference/modules.md § val — a thing`).
    *
    * **A counted value is admissible, and is never released.** The rule this replaced refused one
    * unless its initializer was a constant tree, on the ground that a module `val` exists for the
@@ -152,7 +152,7 @@ trait ModuleStorage extends ModuleFiles {
    * grants.
    */
   private def checkVal(ty: Type, key: String): Unit =
-    // The whole difference between a `val` and a `const` is that a `val` has an address (`13 §7`),
+    // The whole difference between a `val` and a `const` is that a `val` has an address (`reference/modules.md § val — a thing`),
     // and a value with no representation has nothing to put one on. The initializer would still run,
     // which is the only thing such a declaration could have been for — and a statement says that
     // without pretending there is storage.
@@ -184,7 +184,7 @@ trait ModuleStorage extends ModuleFiles {
 
   /** Whether an initializer is a value the object file can carry as it stands: numbers, string
    * literals, and the arrays and structs built from them. Everything else is code, which is what
-   * `13 §7`'s initialization order is about — this is the test that decides which of the two a
+   * `reference/modules.md § val — a thing`'s initialization order is about — this is the test that decides which of the two a
    * declaration is. It is also what `checkVal` asks to decide whether a counted type may be held,
    * since a value that was never built owes no release.
    */
@@ -202,7 +202,7 @@ trait ModuleStorage extends ModuleFiles {
     // Fields laid side by side are a constant tree exactly when the fields are — the same rule the
     // array above follows, and the reason a table of `{name, code}` pairs lands in read-only data
     // rather than being filled in by stores. A struct whose `invariant` has to run is wrapped in a
-    // `TStructInvCheck` and never reaches this, which is `13 §7`'s rule that a value having to be
+    // `TStructInvCheck` and never reaches this, which is `reference/modules.md § val — a thing`'s rule that a value having to be
     // checked is code however it looks.
     case TStructNew(_, args) => args.forall(isStatic)
 

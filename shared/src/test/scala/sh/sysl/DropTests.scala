@@ -157,7 +157,7 @@ class DropTests extends AnyFreeSpec with RunSupport with CodegenSupport with Tes
   }
 
   "and module storage never drops, since it is never let go of" in {
-    // `13 §7`'s ruling, seen from this side: storage that lasts the whole run has nothing to write a
+    // `reference/modules.md § val — a thing`'s ruling, seen from this side: storage that lasts the whole run has nothing to write a
     // release on, so the count never reaches zero and the destructor never runs. Stated in the
     // chapter and pinned here, because the alternative — an exit pass — is what this refuses.
     run(s"""$handle

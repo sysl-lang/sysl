@@ -9,7 +9,7 @@ package sh.sysl
  * it cannot read — is there, because that is the only rule the `recovering` flag reaches.
  *
  * A **declaration** is here rather than in `DeclParser` where a declaration's own body is read,
- * because at the top of a file the two are one thing (`13 §7`): `declaration` is an alternative of
+ * because at the top of a file the two are one thing (`reference/modules.md § Where a program starts`): `declaration` is an alternative of
  * `statement`, and which of the two a line turns out to be is the analyzer's question rather than
  * the grammar's. What `DeclParser` holds is the shape *inside* a declaration — a parameter list, a
  * struct's fields, a trait's members.
@@ -43,7 +43,7 @@ trait StmtParser
         breakStmt | continueStmt | deferStmt | requireStmt | ensureStmt | multiAssign | exprStmt,
     )
 
-  /** `a, b = b, a` — a comma list of places, a comma list of values (`00 §2`).
+  /** `a, b = b, a` — a comma list of places, a comma list of values (`reference/expressions.md § Several places at once`).
    *
    * It comes before `exprStmt` and after everything else, and it needs **two or more** targets to
    * commit: with one it would be an ordinary assignment written the long way round, which
@@ -90,7 +90,7 @@ trait StmtParser
     accept("string literal", { case t: lexical.StrLit => t.value })
 
   /** `static val`, `static var` — a binding in the file the program starts in asking to be the
-   * module's rather than that file's body's (`13 §7`).
+   * module's rather than that file's body's (`reference/modules.md § Where a program starts`).
    *
    * The modifier follows the visibility rather than preceding it, so `private static var ticks: u64`
    * reads in the order the two questions are asked: how far it reaches, then whose it is.
@@ -126,7 +126,7 @@ trait StmtParser
    *
    * **`varDecl` is here as well as in `statement`, and that is what lets a module's storage be
    * private.** Outside the file a program starts in, a top-level `var` is the module's storage and is
-   * the same declaration `static var` spells in that file (`13 §7`) — so it takes a visibility for the
+   * the same declaration `static var` spells in that file (`reference/modules.md § Where a program starts`) — so it takes a visibility for the
    * same reason the `val` beside it does. Without this the modifier was a parse error reading
    * "identifier expected", which says the word was not followed by a name rather than that the form
    * takes none; `private static var` parsed all along, and the two spellings are one declaration.
@@ -315,7 +315,7 @@ trait StmtParser
    * `region.bytes[i]` rather than `region[i]` — which is the whole argument for this spelling.
    *
    * All four forms take it, and they must: `static var` and `static val` are the entry file's
-   * spelling of the same declaration a plain `var` and `val` are in every other file (`13 §7`), so an
+   * spelling of the same declaration a plain `var` and `val` are in every other file (`reference/modules.md § Where a program starts`), so an
    * attribute that reached one and not the other would mean different things in different files.
    * `staticDecl` is tried first because it begins the same way and is settled by its own word.
    *
@@ -518,7 +518,7 @@ trait StmtParser
    * than an omission. There is **no type annotation**, because a ref is a local declaration and never
    * a type, so it states nothing to a reader elsewhere and its type is the place's by construction.
    * There is **no multiple form**, because the comma family binds several names to several *values*
-   * (`00 §2`) and a place list is what a multi-assignment already is.
+   * (`reference/expressions.md § Several places at once`) and a place list is what a multi-assignment already is.
    *
    * The initializer is parsed as any expression and held to being a place by the analyzer, which is
    * where the question can be answered at all — `f()[i]` and `xs[i]` are the same shape until
@@ -527,7 +527,7 @@ trait StmtParser
   protected lazy val refDecl: PackratParser[Stmt] =
     op("ref") ~> ident ~ (op("=") ~> expression) ^^ { case n ~ p => RefDecl(n, Placeholders.lift(p)) }
 
-  /** `val a, b = …` / `var a, b = …` — a binding that names several things (`00 §2`).
+  /** `val a, b = …` / `var a, b = …` — a binding that names several things (`reference/expressions.md § Several places at once`).
    *
    * Two or more names, and an initializer, are both required: one name is the ordinary form, and a
    * multiple binding with nothing to take apart names nothing. The parts carry no type annotation,
@@ -539,7 +539,7 @@ trait StmtParser
       case first ~ rest ~ values => MultiDecl(first :: rest, mutable, values)
     }
 
-  /** `const name: type = value` (`13 §7`). Both halves are mandatory, which is what tells it apart
+  /** `const name: type = value` (`reference/modules.md § const — a value`). Both halves are mandatory, which is what tells it apart
    * from a `var` at a glance as well as to the parser: a constant with no value is not a
    * declaration of anything, and a type left off would be the one declaration in the language whose
    * interface could not be read off its syntax.
@@ -664,7 +664,7 @@ trait StmtParser
       "'@assert(sizeof(T) == 16)', with an optional message after a comma. It is the parentheses " +
       "that make it this declaration rather than an annotation about the one under it")
 
-  /** `val name [: type] = value` — a binding that is written once (`07`, `13 §7`).
+  /** `val name [: type] = value` — a binding that is written once (`07`, `reference/modules.md § val — a thing`).
    *
    * The **value is mandatory** and the type is not, which is the opposite arrangement from `const`
    * and for the opposite reason: a `val` with nothing to hold is not a declaration of anything,

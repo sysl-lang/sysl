@@ -117,7 +117,7 @@ class VariadicFunctionTests extends AnyFreeSpec with CodegenSupport with RunSupp
       run(src) shouldBe "44\n"
     }
 
-    // The promotions of `12 §1` are the caller's, so a narrow argument arrives widened and the
+    // The promotions of `reference/ffi.md § The calling side` are the caller's, so a narrow argument arrives widened and the
     // callee reads it at the promoted width — this is the pair of rules meeting.
     "a narrow argument is read at the width it was promoted to" in {
       val src =

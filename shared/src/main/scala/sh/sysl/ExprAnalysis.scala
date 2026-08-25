@@ -298,7 +298,7 @@ trait ExprAnalysis
                     // An `extern` variable is storage too, so it becomes the same node — under the
                     // **symbol** rather than the key, since what it names is what the linker
                     // supplies, and writable, since the storage is not this program's to promise
-                    // anything about (`12 §1`).
+                    // anything about (`reference/ffi.md § An extern also declares a variable`).
                     case None if externVarKey(name).isDefined =>
                       val key = externVarKey(name).get
 
@@ -477,7 +477,7 @@ trait ExprAnalysis
     case PostIncDec(op, target) => incDec(op, target, pre = false)
 
     // Each link of the chain is resolved on its own — an instruction where the operand type has
-    // one, the method its `Eq`/`Ord` supplies otherwise (`14 §2`) — so a chain of user types reads
+    // one, the method its `Eq`/`Ord` supplies otherwise (`reference/expressions.md § Operator dispatch`) — so a chain of user types reads
     // and behaves exactly as a chain of scalars does, sharing each middle operand between the two
     // comparisons that use it.
     case Compare(operands, ops) =>
@@ -522,7 +522,7 @@ trait ExprAnalysis
         s"receiver and the index twice — write it out as 'b[i] = b[i] ${op.dropRight(1)} …'")
 
     // `p.count = v` where `count` is a settable property is a **call**, exactly as `b[i] = v` on a
-    // container is (`library/core.md § Walking a type of your own`, `00 §2`): a property computes
+    // container is (`library/core.md § Walking a type of your own`, `reference/expressions.md § Assignment`): a property computes
     // rather than naming storage, so there is no place for a store to write through, and the setter
     // takes the value instead.
     case Assign("=", Field(receiver, name), value) if settable(receiver, name) =>

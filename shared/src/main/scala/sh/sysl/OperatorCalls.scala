@@ -315,7 +315,7 @@ trait OperatorCalls extends MethodCalls {
 
       checkOperand(op, place.ty, value, resolveType(m.params.head.typ, subst))
 
-      // `a op= b` is `a = a op b` (`14 §2`), so an operator whose result is not the left operand's
+      // `a op= b` is `a = a op b` (`reference/expressions.md § Operator dispatch`), so an operator whose result is not the left operand's
       // type has nothing to assign back. The compound form is refused rather than quietly changing
       // what the place holds, and the reader is pointed at the spelling that says which type it means.
       for want <- m.retType.map(resolveReturn(_, subst)) if disagree(want, place.ty) do

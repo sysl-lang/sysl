@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Statement position — a block written for effect has no value (`00 §2`).
+/** Statement position — a block written for effect has no value (`reference/expressions.md § Statement position discards a block's value`).
  *
  * Assignment yields the value it assigned, which is what makes `while (c = next()) != 0` writable.
  * The cost of that rule is at the *end of a block*: a branch that merely does something ends in an
@@ -212,7 +212,8 @@ class StatementPositionTests extends AnyFreeSpec with CodegenSupport with RunSup
   }
 
   "assignment still yields its value wherever one is wanted" - {
-    "chained, as `00 §2` writes it" in {
+    // `reference/expressions.md § Assignment`
+    "chained, as the reference writes it" in {
       run("""var a = 0
             |var b = 0
             |var c = 0

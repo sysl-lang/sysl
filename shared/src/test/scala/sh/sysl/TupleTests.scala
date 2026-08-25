@@ -306,7 +306,7 @@ class TupleTests extends AnyFreeSpec with ParseSupport with RunSupport with Code
             |""".stripMargin) shouldBe "(1, one)\n(1, 2, 3)\n"
     }
 
-    // A specifier describes the field the **whole** value occupies (`14 §2`), so the padding is
+    // A specifier describes the field the **whole** value occupies (`library/core.md § A specifier is the whole value's field`), so the padding is
     // applied once around the finished text rather than handed to each part.
     "and a specifier pads the whole rendering, not each part" in {
       run("""var p = (1, 2)

@@ -85,7 +85,7 @@ class WeakReferenceTests extends AnyFreeSpec with CodegenSupport with RunSupport
 
     // **A default parameter reaches a `weak T` now, and it did not.** A default is produced afresh
     // at each call that omits it, in a scope holding no locals, so what it names has to outlive every
-    // frame — and the one declaration that does could not hold a reference at all until `13 §7` was
+    // frame — and the one declaration that does could not hold a reference at all until `reference/modules.md § val — a thing` was
     // relaxed. The pair below is what is left of a group that used to be two refusals, and the two
     // halves fail for quite different reasons, which is why both are kept.
     "and a default parameter value reaches one, through storage that outlives every frame" - {
@@ -152,7 +152,7 @@ class WeakReferenceTests extends AnyFreeSpec with CodegenSupport with RunSupport
   }
 
   // A weak edge takes a word in the referent's header and gives it back when the edge goes, so it is
-  // counted in the sense `13 §7` means — and module storage now holds a counted value and simply
+  // counted in the sense `reference/modules.md § val — a thing` means — and module storage now holds a counted value and simply
   // never releases the last one, which is what a static is. What makes a **weak** one worth its own
   // pair of tests is the half that is still true: it keeps nothing alive, so the storage outlives
   // the run and the object it names does not have to.

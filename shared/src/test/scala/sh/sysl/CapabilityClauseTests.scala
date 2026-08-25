@@ -501,7 +501,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
 
     // …while the `val` a driver module actually wants is admitted, which matters because a driver is
     // the module most likely to declare this clause. A constant address is a constant tree
-    // (`13 §7`): it runs nothing at all, so there is nothing here for an allocator to be reached by.
+    // (`reference/modules.md § Where a program starts`): it runs nothing at all, so there is nothing here for an allocator to be reached by.
     "but a register block named at file scope runs nothing, so it is admitted" in {
       irOf(
         "thing/a.sysl" ->

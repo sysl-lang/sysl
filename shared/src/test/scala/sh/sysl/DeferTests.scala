@@ -571,7 +571,7 @@ class DeferTests extends AnyFreeSpec with RunSupport with CodegenSupport with Te
             |""".stripMargin) shouldBe "chose 1 2\nchose 1 2\n3\nother 2\nother 2\n3\n"
     }
 
-    // A multi-assignment is a statement in its own right (`00 §2`), and deferring one reaches the
+    // A multi-assignment is a statement in its own right (`reference/expressions.md § Several places at once`), and deferring one reaches the
     // arm-walking that every pass does through a shape it does not otherwise meet inside a `defer`.
     "a multi-assignment may be the deferred statement" in {
       run("""f()

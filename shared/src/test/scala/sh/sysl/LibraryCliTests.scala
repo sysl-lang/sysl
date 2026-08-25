@@ -820,7 +820,7 @@ class LibraryCliTests extends LibraryCliSupport {
     }
   }
 
-  /** A library's module-level `val` at a counted type, through the artifact (`13 §7`).
+  /** A library's module-level `val` at a counted type, through the artifact (`reference/modules.md § val — a thing`).
    *
    * A `val` may hold a string whose bytes the object file carries, and the shape that asked for it —
    * a table of messages a module with no allocator can index — is exactly the shape a *library*

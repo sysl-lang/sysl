@@ -582,7 +582,7 @@ object CProbe {
       // read from, so the two agree by construction and this is sysl's bug if they ever do not.
       case _ => Left(silent(s"'${c.c}'", c.pos))
 
-  /** The declaration a measured line becomes, which is `13 §7`'s ordinary constant holding an
+  /** The declaration a measured line becomes, which is `reference/modules.md § const — a value`'s ordinary constant holding an
    * ordinary literal — the same shape whichever carrier the value crossed on.
    */
   private def held(c: CConstDecl, lit: Expr): ConstDecl =

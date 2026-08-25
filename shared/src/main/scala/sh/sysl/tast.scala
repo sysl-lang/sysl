@@ -244,7 +244,7 @@ case class TOld(index: Int, ty: Type) extends TExpr
  * so indexing and iterating reach into it without copying the whole thing out.
  *
  * `writable` is what tells the two apart, and it is the only thing that does. A `val` is written
- * once and the analyzer refuses both an assignment to one and a `*T` into it (`13 §7`); an `extern`
+ * once and the analyzer refuses both an assignment to one and a `*T` into it (`reference/modules.md § val — a thing`); an `extern`
  * variable is storage this program did not lay down, so there is no such promise to keep — `optind`
  * and `optarg` are assigned by ordinary C and a declaration that could not would name half of what
  * it was added to reach.
@@ -342,7 +342,7 @@ case class TLogical(op: String, left: TExpr, right: TExpr) extends TExpr { def t
 
 /** An operator that a trait supplies rather than the machine (`reference/expressions.md § Operator
  * dispatch`): the function it lowers to, whether the derivation swaps its operands, and whether it
- * negates the result (`14 §2`).
+ * negates the result (`reference/expressions.md § Operator dispatch`).
  *
  * It rides on the node the operator already lowers to instead of replacing that node with a `TCall`,
  * and the reason is the two forms that use one operand **twice from a single evaluation** — a

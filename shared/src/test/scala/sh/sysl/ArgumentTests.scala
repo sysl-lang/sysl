@@ -588,7 +588,7 @@ class ArgumentTests
              |""".stripMargin) shouldBe "13\n"
     }
 
-    // A zero-sized parameter is dropped from the emitted signature (`12 §1`), so a default for one
+    // A zero-sized parameter is dropped from the emitted signature (`reference/declarations.md § Functions`), so a default for one
     // has to be filled and then have nothing left of it — the case where "fill it in" and "emit
     // nothing" have to agree.
     "a default of a zero-sized type is filled and then emitted as nothing" in {
@@ -699,7 +699,7 @@ class ArgumentTests
              |""".stripMargin) should include("comes after one written by name")
     }
 
-    // `13 §7`: a `val` is laid down before any body runs, in a state belonging to no function. A
+    // `reference/modules.md § val — a thing`: a `val` is laid down before any body runs, in a state belonging to no function. A
     // default filled there is analyzed in the callee's terms and not in that state's.
     "a module-level 'val' may be built by a call that takes a default" in {
       run("""|origin(x: int = 3, y: int = 4) -> int = x * 10 + y

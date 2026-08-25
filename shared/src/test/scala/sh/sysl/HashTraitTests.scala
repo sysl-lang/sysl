@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `Hash` — the catalog trait a keyed container needs (`14 §2`, `§5`).
+/** `Hash` — the catalog trait a keyed container needs (`library/core.md § Hashing`).
  *
  * It is here because its absence was **structural rather than stylistic**. `02`'s coherence rule
  * lets an `impl` live only with its trait or with its type, so two libraries that each declared

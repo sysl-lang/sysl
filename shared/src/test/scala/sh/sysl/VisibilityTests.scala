@@ -69,7 +69,7 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
     }
 
     // A `var` at the top of a file that names a module is that module's storage and is the same
-    // declaration `static var` spells in the entry file (`13 §7`), so it takes a modifier for the
+    // declaration `static var` spells in the entry file (`reference/modules.md § Where a program starts`), so it takes a modifier for the
     // same reason the `val` beside it does. It did not parse at all until the form was added to
     // `declaration`, and what a reader got was "identifier expected" pointing at the `private` —
     // which reads as a missing name rather than as a form that takes no modifier.
@@ -805,7 +805,7 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
       * reached by a shorter route than a function's — a module that may write the name holds a value
       * whose type it cannot write, which is the same hole and not a smaller one.
       *
-      * A `const` is the third of them and cannot reach this rule at all: `13 §7` holds a constant to
+      * A `const` is the third of them and cannot reach this rule at all: `reference/modules.md § const — a value` holds a constant to
       * being a scalar, and every scalar is a builtin nobody may restrict. The test below is what says
       * so, and the check covers `const` anyway so that widening what a constant may hold cannot
       * quietly reopen what these two had.

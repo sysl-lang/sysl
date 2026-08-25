@@ -296,7 +296,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
    * nothing to release: the storage has never held anything, and a `&T`'s zero is not a reference —
    * loading it and letting go of it, which `storeInto` would do, is a decrement through null.
    *
-   * That the count taken here is never given back is `13 §7`'s ruling and the whole of what module
+   * That the count taken here is never given back is `reference/modules.md § val — a thing`'s ruling and the whole of what module
    * storage holding a counted value means.
    */
   private def genInitStore(v: TVal, init: TExpr): Unit = {
@@ -438,7 +438,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
   }
 
   /** **The computed `val`s where there is no entry point to lay them down in** — what `build-c`
-   * gets in place of `@main` (`13 §7`).
+   * gets in place of `@main` (`reference/modules.md § Where a program starts`).
    *
    * `genMain` above says why a program puts them in its entry point: it is the one place that
    * certainly runs first and it is already written. An archive has no such place. The C project

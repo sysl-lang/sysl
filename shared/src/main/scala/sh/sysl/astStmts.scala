@@ -4,7 +4,7 @@ package sh.sysl
  *
  * `Stmt` is sealed and is the one hierarchy that spans both, because at the top of a file the two
  * are the same thing: a declaration is a statement that binds a name rather than doing work, and
- * which of the two a given line is depends on the file it is in (`13 §7`).
+ * which of the two a given line is depends on the file it is in (`reference/modules.md § Where a program starts`).
  */
 
 sealed trait Stmt extends Positioned
@@ -88,7 +88,7 @@ case class VarDecl(name: String, typ: Option[TypeRef], init: Option[Expr],
                    vis: Visibility = Visibility.Public, align: Option[Expr] = None,
                    section: Option[String] = None) extends Stmt
 
-/** `const name: type = value` — a **module member** (`13 §7`). It is what a top-level `var` is not:
+/** `const name: type = value` — a **module member** (`reference/modules.md § const — a value`). It is what a top-level `var` is not:
  * hoisted, order-free, and visible beyond its file under the ordinary rules, where a `var` at the
  * top of a file is a local of the entry point.
  *
@@ -125,7 +125,7 @@ case class ConstDecl(name: String, typ: TypeRef, value: Expr, vis: Visibility = 
  *
  * **It is lowered to an ordinary `ConstDecl` before analysis** (`CProbe`), which is why nothing
  * downstream knows it exists: by the time a name is resolved, a bound is folded or a tree is
- * encoded, the value is a literal and the constant is the one `13 §7` already describes.
+ * encoded, the value is a literal and the constant is the one `reference/modules.md § const — a value` already describes.
  *
  * **It is not a `Stmt`**, which is the same call `Param` and `AsmArm` are: it cannot be written
  * anywhere a statement can go, only inside the block below. Making it one would have bought nothing
@@ -212,7 +212,7 @@ case class CTypeBlock(types: List[CTypeDecl]) extends Stmt
 case class AssertDecl(cond: Expr, message: Option[String]) extends Stmt
 
 /** `static val`, `static var`, `static f() -> …` — a declaration in the file the program starts in
- * that belongs to the **module** rather than to that file's body (`13 §7`).
+ * that belongs to the **module** rather than to that file's body (`reference/modules.md § Where a program starts`).
  *
  * The file carrying a program's statements is a body, so what it declares is local to that body: a
  * `val` is a stack local, a function is a nested function (`reference/declarations.md`). That is
@@ -268,7 +268,7 @@ case class ValDecl(name: String, typ: Option[TypeRef], value: Expr, vis: Visibil
  */
 case class RefDecl(name: String, place: Expr) extends Stmt
 
-/** `a, b = b, a` — several places written from several values in one step (`00 §2`).
+/** `a, b = b, a` — several places written from several values in one step (`reference/expressions.md § Several places at once`).
  *
  * It is a statement rather than an expression, and that is what keeps it small: a single assignment
  * yields the value it stored, so a multiple one would have to yield several, and there is nothing an
@@ -279,7 +279,7 @@ case class RefDecl(name: String, place: Expr) extends Stmt
  */
 case class MultiAssign(op: String, targets: List[Expr], values: List[Expr]) extends Stmt
 
-/** `val a, b = …` / `var a, b = …` — one binding that names several things at once (`00 §2`).
+/** `val a, b = …` / `var a, b = …` — one binding that names several things at once (`reference/expressions.md § Several places at once`).
  *
  * The names are declared only after every value has been produced, so a value on the right may
  * still name whatever the surrounding scope calls one of them.
@@ -428,7 +428,7 @@ enum RecvMode:
  * "said public" — which is why a trait's member and an `impl`'s, neither of which may say anything,
  * carry it too.
  *
- * `overrides` is the `override` keyword written in front of the member (`02 § override`), which says
+ * `overrides` is the `override` keyword written in front of the member (`reference/traits.md § Replacing a default says override`), which says
  * it replaces a body the trait already supplied rather than answering a requirement the trait left
  * open. It is required where that is what the member does and refused where it is not, so a reader of
  * an `impl` block can tell the two apart without going to the trait to find out.
@@ -689,7 +689,7 @@ case class ExternDecl(name: String, params: List[Param], retType: Option[TypeRef
  *
  * The type is written and never inferred — there is no initializer to infer it from, and what the
  * other side laid down is not something this compiler can see. Writing the wrong one is the same
- * kind of promise a wrong parameter list to an `extern` function is (`12 §1`).
+ * kind of promise a wrong parameter list to an `extern` function is (`reference/ffi.md § extern — a declaration with no body`).
  *
  * `link` is the leading string of `extern "environ" env: **u8`, and means what it means for a
  * function: the symbol the linker resolves, when that differs from what the program calls it by.
@@ -908,7 +908,7 @@ case class AssocBind(name: String, typ: TypeRef) extends Positioned
  * `impl From[int] for Celsius`. They are what makes one type able to implement a trait more than
  * once, so they are part of what an implementation is filed under.
  *
- * `overrides` is the `override` keyword written in front of the block (`02 § override`), which says
+ * `overrides` is the `override` keyword written in front of the block (`reference/traits.md § override — when the overlap is deliberate`), which says
  * it deliberately replaces a more general implementation that already covers the same type —
  * `override impl Display for []Point` against the library's `impl[T: Display] Display for []T`.
  * Without it the second implementation is refused, so the accidental duplicate the rule exists to

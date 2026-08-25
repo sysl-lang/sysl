@@ -126,7 +126,7 @@ trait ExprSupport extends SpecialForms with PatternAnalysis with StmtAnalysis {
    */
   protected def readOnly(t: TExpr): Boolean = t match
     // An `extern` variable is the one global that is not one: the storage belongs to whoever laid it
-    // down, and reaching it is the foreign seam rather than a promise this program made (`12 §1`).
+    // down, and reaching it is the foreign seam rather than a promise this program made (`reference/ffi.md § extern — a declaration with no body`).
     case g: TGlobal         => !g.writable
     // A `ref` is read-only exactly when the storage it found is (`reference/memory.md § ref — a
     // name for a place`), which is what lets the property survive being given a shorter name:

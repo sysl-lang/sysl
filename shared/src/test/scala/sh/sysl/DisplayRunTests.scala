@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Tier-2 runtime behaviour of `Display` and its `Writer` sink (`14 §2`, `§6`).
+/** Tier-2 runtime behaviour of `Display` and its `Writer` sink
+ * (`library/core.md § Rendering to a sink`).
  *
  * The claim under test is that rendering is now **one** mechanism: a scalar, a struct, an enum, and
  * a bounded type parameter all reach text the same way, and the difference between `print` and
@@ -250,7 +251,7 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   /** `ByteSink` — the one writer the library does supply.
    *
-   * It exists because a specifier describes the field the **whole** value occupies (`14 §2`), so an
+   * It exists because a specifier describes the field the **whole** value occupies (`library/core.md § A specifier is the whole value's field`), so an
    * implementation rendering more than one part has to gather them before it can pad what they came
    * to. Every such implementation was writing the same dozen lines. It is ordinary sysl over
    * `Buf[u8]`, which is why it could not be written until a growable array could.
@@ -443,7 +444,7 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       run("var a = [1, 2, 3]\nprint(str(a[..]) + \"!\")") shouldBe "[1, 2, 3]!\n"
     }
 
-    /** `14 §2`'s rule — a specifier describes the field the **whole** value occupies — which for a
+    /** `library/core.md § A specifier is the whole value's field`'s rule — a specifier describes the field the **whole** value occupies — which for a
      * slice is the part that cannot be done in one pass. The width is 14 and the rendering is 9
      * bytes, so five spaces land on whichever side the justification says; getting the count wrong
      * in either direction moves them.
@@ -536,7 +537,7 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     /** The block that made this land: a program's own `override` beats the library's block for one
-     * element type, which is the case `02 § override` was written for and the reason this feature
+     * element type, which is the case `reference/traits.md § override — when the overlap is deliberate` was written for and the reason this feature
      * waited on it. Every `impl Display for []N` in the tree became an `override impl` the day the
      * library grew one for every slice.
      */

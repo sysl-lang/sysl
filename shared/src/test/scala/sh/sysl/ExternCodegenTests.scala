@@ -121,7 +121,7 @@ class ExternCodegenTests extends AnyFreeSpec with CodegenSupport {
       err("""extern "" f()""") should include("is not a symbol a linker can resolve")
     }
 
-    /** The accepting half of the same rule (`12 §1`), which is the half that reaches the emitter: a
+    /** The accepting half of the same rule (`reference/ffi.md § extern — a declaration with no body`), which is the half that reaches the emitter: a
       * symbol may hold `_`, `$` and `.` as well as letters and digits, and those are exactly the
       * characters LLVM's own unquoted identifier admits — so the name goes through as written,
       * with no quoting and no mangling. Real symbols look like this: a C++ mangling carries `$`, an

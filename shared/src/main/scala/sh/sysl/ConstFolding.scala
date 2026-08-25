@@ -4,13 +4,13 @@ import scala.collection.mutable
 
 /** Constants, module-level `val`s, and the constant folder that gives a `const` its value.
  *
- * A constant is a scalar and nothing else (`13 §7`), which is not an arbitrary restriction but the
+ * A constant is a scalar and nothing else (`reference/modules.md § const — a value`), which is not an arbitrary restriction but the
  * shape of what a constant expression can produce: there is no aggregate literal to fold to, and a
  * table would be storage rather than a value. That is what lets a constant be answered without any
  * of the type tables — registered in the first hoisting pass and already nameable from an array
  * bound in the second.
  *
- * The folder underneath is small on purpose. It evaluates what `13 §7` says a constant expression is
+ * The folder underneath is small on purpose. It evaluates what `reference/modules.md § const — a value` says a constant expression is
  * and nothing more, and it answers `None` rather than guessing, so the two positions that consume it
  * — an array bound and an enum discriminant — can report "not a constant expression" against the
  * expression the programmer actually wrote.
@@ -45,7 +45,7 @@ trait ConstFolding extends ImportResolution {
 
   // --- constants -------------------------------------------------------------------------
 
-  /** The key a written **constant** name resolves to (`13 §7`). */
+  /** The key a written **constant** name resolves to (`reference/modules.md § const — a value`). */
   protected def constKey(written: String): Option[String] = resolveName(written)(constDecls.contains)
 
   /** A dotted path written as field reads, flattened back into the name it was written as — `c.limit`
@@ -65,7 +65,7 @@ trait ConstFolding extends ImportResolution {
    *
    * A constant is a scalar and nothing else, which is not an arbitrary restriction but the shape of
    * what a constant expression can produce: there is no aggregate literal to fold to, and a table
-   * would be storage rather than a value (`13 §7`). Resolving it needs none of the type tables,
+   * would be storage rather than a value (`reference/modules.md § const — a value`). Resolving it needs none of the type tables,
    * which is what lets a constant be registered in the first hoisting pass and named from an array
    * bound in the second.
    *
@@ -148,7 +148,7 @@ trait ConstFolding extends ImportResolution {
   })
 
   /** Whether a folded value fits the type it was declared at. A constant is written with its type
-   * (`13 §7`), so this is the one place the two meet, and a value that does not fit is the mistake
+   * (`reference/modules.md § const — a value`), so this is the one place the two meet, and a value that does not fit is the mistake
    * a suffix-less literal would otherwise make silently.
    */
   private def checkFits(value: Expr, ty: Type, what: String, pos: Option[Pos]): Unit = (value, ty) match
@@ -231,7 +231,7 @@ trait ConstFolding extends ImportResolution {
     }
 
   /** A compile-time integer, for the two positions where a literal was previously the only thing
-   * accepted: an array bound and an enum discriminant (`13 §7`).
+   * accepted: an array bound and an enum discriminant (`reference/modules.md § const — a value`).
    */
   protected def constInt(e: Expr, subst: Map[String, Type] = Map.empty): Option[BigInt] =
     fold(e, subst).collect { case IntLit(v, _) => v }

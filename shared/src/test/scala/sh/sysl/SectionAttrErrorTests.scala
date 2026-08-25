@@ -43,7 +43,7 @@ class SectionAttrErrorTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
-  /** A local and module storage are the same syntax and differ only in where they stand (`13 §7`),
+  /** A local and module storage are the same syntax and differ only in where they stand (`reference/modules.md § Where a program starts`),
    * so this is refused by the analyzer rather than by the grammar — and the message is about the
    * frame, which is the fact that explains it.
    */

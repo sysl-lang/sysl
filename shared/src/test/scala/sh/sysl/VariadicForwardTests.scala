@@ -158,7 +158,7 @@ class VariadicForwardTests extends AnyFreeSpec with CodegenSupport with RunSuppo
       run(src) shouldBe "15\n"
     }
 
-    // The promotions are the *caller's* (`12 §1`), and lending the walk moves nothing about them —
+    // The promotions are the *caller's* (`reference/ffi.md § The calling side`), and lending the walk moves nothing about them —
     // so the mistake a body makes reading the tail too narrow is the same mistake and the same
     // message wherever the walk came from.
     "reading one too narrow is diagnosed through a lent walk too" in {

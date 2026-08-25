@@ -40,7 +40,7 @@ trait TestScope extends AnalyzerBase {
   /** Reports every reference into a `@tests` file from something that is not itself test-only.
    *
    * `main` is walked with the functions because a program's top-level statements are its entry point
-   * (`13 §7`) and are dropped by no build at all — so a helper named there is the plainest case of
+   * (`reference/modules.md § Where a program starts`) and are dropped by no build at all — so a helper named there is the plainest case of
    * the mistake, and the one a reader is likeliest to make while moving code out of a test.
    */
   protected def checkTestScope(funcs: List[TFunc], main: List[TStmt], testOnly: Set[String],

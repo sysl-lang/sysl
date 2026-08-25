@@ -139,7 +139,7 @@ class FrameTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     // `reference/verification.md § @reads and @writes — what a call may touch` said a frame could
     // reach only the entry file's `static var`, because that was the only mutable module storage
-    // there was when it was written. `13 §7`'s module `var` arrived after, and a frame is resolved
+    // there was when it was written. `reference/modules.md § val — a thing`'s module `var` arrived after, and a frame is resolved
     // through the same lookup a body's own reference is — so it reaches both, and this is the case
     // that says so.
     "a variable declared with 'var' in a module of its own" in {

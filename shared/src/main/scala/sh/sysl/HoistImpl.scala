@@ -208,7 +208,7 @@ trait HoistImpl extends ImplTarget {
     // and a lookup takes one or the other, so a second implementation across that boundary would be
     // one a program could not name however it was written.
     //
-    // **What lifts the refusal is `override` on the written-out side** (`02 § override`), which says
+    // **What lifts the refusal is `override` on the written-out side** (`reference/traits.md § override — when the overlap is deliberate`), which says
     // the overlap is deliberate: `[]Point` beats `[]T` at the position they differ, so the ordering
     // has an answer and the keyword says an answer was wanted. It is asked of the *written-out*
     // block whichever order the two were hoisted in, which is why the flag travels in

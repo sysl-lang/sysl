@@ -318,7 +318,7 @@ trait DeclParser extends ExprParser {
       success(())
 
   /** The refusal a **trait's** member and a **type's own** member share: neither can be replacing
-   * anything, so neither may say `override` (`02 § override`).
+   * anything, so neither may say `override` (`reference/traits.md § Replacing a default says override`).
    *
    * A trait's member is where a default body is *written*, not where one is replaced. A member of a
    * type's own body implements no trait — a name a trait also declares is a collision there and is
@@ -490,7 +490,7 @@ trait DeclParser extends ExprParser {
 
   /** A bound of a `within` range: any **constant expression**, which is the same thing an array bound
    * accepts — `within 0..<max_tasks` beside `[max_tasks]Task`, so a table's size and the range of the
-   * type indexing it are one fact written once (`13 §7`, `16 § Open b`).
+   * type indexing it are one fact written once (`reference/modules.md § const — a value`, `16 § Open b`).
    *
    * The level is `bitOr`, which is deliberately the one *tighter* than a range: `rangeExpr` is built
    * out of `bitOr`, so parsing a bound at any looser level would let `0..<max_tasks` be read as a range
@@ -621,7 +621,7 @@ trait DeclParser extends ExprParser {
    * conforming type nothing to write: `impl Zero for E` on its own line is the whole of that
    * implementation, and the opt-in it states is the point of writing it.
    *
-   * The block may be marked **`override`** (`02 § override`), which says it deliberately replaces a
+   * The block may be marked **`override`** (`reference/traits.md § override — when the overlap is deliberate`), which says it deliberately replaces a
    * more general implementation already covering the same type. The keyword goes in front of `impl`
    * rather than anywhere inside, because what it qualifies is the block as a whole.
    */

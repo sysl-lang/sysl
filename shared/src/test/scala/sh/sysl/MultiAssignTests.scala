@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `a, b = b, a` and `val a, b = …` — the comma forms at a binding and at an assignment (`00 §2`).
+/** `a, b = b, a` and `val a, b = …` — the comma forms at a binding and at an assignment (`reference/expressions.md § Several places at once`).
  *
  * The form's whole promise is an **order**: everything is read before anything is written. So the
  * tests that matter are the ones that can tell a simultaneous write from two sequential ones — a
@@ -112,7 +112,7 @@ class MultiAssignTests extends AnyFreeSpec with ParseSupport with RunSupport wit
     }
   }
 
-  /** `00 §2` — a place's own subexpressions run exactly once, before the values, and the effects
+  /** `reference/expressions.md § Several places at once` — a place's own subexpressions run exactly once, before the values, and the effects
    * happen in written order. Without the rule the form would be a way of accidentally calling
    * something twice, so what is asserted is the *whole* trace and not just the answer.
    */
@@ -396,7 +396,7 @@ class MultiAssignTests extends AnyFreeSpec with ParseSupport with RunSupport wit
                |xs[i], xs[0usize] = 1, 2""".stripMargin))
   }
 
-  /** `00 §2` says the left elements are "the same set a single `=` accepts", and that the form is a
+  /** `reference/expressions.md § Several places at once` says the left elements are "the same set a single `=` accepts", and that the form is a
    * statement rather than an expression. Both are claims about what else is true of it, so they are
    * asked about here rather than assumed.
    */

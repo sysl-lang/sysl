@@ -3,7 +3,7 @@ package sh.sysl
 /** What a *file* contributes to the module, and which file the program starts in.
  *
  * A module is a directory (`reference/modules.md`), so a header and a location are two statements
- * of one fact and have to agree. That is the first thing this answers. The second is `13 §7`'s: a
+ * of one fact and have to agree. That is the first thing this answers. The second is `reference/modules.md § Where a program starts`'s: a
  * declaration is hoisted and belongs to its module, but a statement *runs*, and running happens in
  * an order that neither a set of files nor a graph of modules supplies — so one file carries the
  * statements the program runs, and everything about choosing it is here.
@@ -106,7 +106,7 @@ trait ModuleFiles
    * the functions that read it must not thereby become the file the program starts in.
    *
    * **A top-level `var` is the one form that cannot answer on its own, which is why this is two
-   * passes rather than one filter** (`13 §7`). It is a binding with an initializer, so a file
+   * passes rather than one filter** (`reference/modules.md § Where a program starts`). It is a binding with an initializer, so a file
    * carrying nothing else really is a body and its `var` really is a local — and it is equally
    * readable as storage the module owns, which is what it has to be in a file that names a module.
    * Nothing in the line chooses. What chooses is the rest of the program: **a file carrying a
@@ -116,7 +116,7 @@ trait ModuleFiles
    * what keeps a one-file `var n = 1` meaning what it has always meant.
    *
    * **That fallback reaches only a file with no `module` header**, because a file that names a module
-   * has no body for a binding to belong to instead (`13 §7`). Nothing else here needs the condition:
+   * has no body for a binding to belong to instead (`reference/modules.md § Where a program starts`). Nothing else here needs the condition:
    * the first pass is about what a file *runs*, and a `print` runs whatever the header says.
    *
    * A program with none of either is a complete program that does nothing, which is what a tree of
@@ -151,7 +151,7 @@ trait ModuleFiles
         Some((first, s))
 
       // Nothing runs, so the bindings decide — and only where one file carries them, and only where
-      // that file could have had a body at all. **A file with a `module` header could not**: `13 §7`
+      // that file could have had a body at all. **A file with a `module` header could not**: `reference/modules.md § Where a program starts`
       // says everything it declares is the module's already, so there is nothing there for a `var` to
       // belong to *instead*, and reading one as a local would be reading the header off the file.
       //

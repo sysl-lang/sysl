@@ -55,7 +55,7 @@ trait ImplConformance extends MemberLowering {
     inherited.toList
   }
 
-  /** Whether a member the block wrote says `override` exactly when it is one (`02 § override`).
+  /** Whether a member the block wrote says `override` exactly when it is one (`reference/traits.md § Replacing a default says override`).
    *
    * The trait's side is the whole of the test, and it is one question: does the member the block
    * wrote **replace a body**, or does it **answer a requirement**? A trait member with a body is a

@@ -5,7 +5,7 @@ import scala.collection.mutable
 /** What a program can still arrive at once it has started: the `val`s an expression ends up reading,
  * and the functions it ends up calling.
  *
- * One walk answers both, because they are the same question asked of different roots. `13 §7` asks it
+ * One walk answers both, because they are the same question asked of different roots. `reference/modules.md § val — a thing` asks it
  * of a single `val`'s initializer — which storage has to be filled before this one — and `prune` asks
  * it of the whole program at once, so that a declaration nothing can reach costs the output nothing.
  *

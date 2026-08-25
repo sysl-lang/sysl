@@ -124,7 +124,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       emit(Inst.Store(ty.lty, v, p, acc))
       releaseValue(ty, old)
 
-  /** `a, b = b, a` (`00 §2`), in the phases the form promises.
+  /** `a, b = b, a` (`reference/expressions.md § Several places at once`), in the phases the form promises.
    *
    * Locating every place comes first, so an index that calls something calls it once and the calls
    * happen in written order. Then everything the statement reads is read — what each compound arm

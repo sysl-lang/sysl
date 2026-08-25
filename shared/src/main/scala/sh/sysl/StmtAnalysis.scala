@@ -110,7 +110,7 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
    * expression (`reference/statements.md § return`), but the block around it is one, and its type
    * says control does not arrive.
    *
-   * **A block in statement position has no value, whatever its last expression yields** (`00 §2`).
+   * **A block in statement position has no value, whatever its last expression yields** (`reference/expressions.md § Statement position discards a block's value`).
    * There is no statement terminator to write "and throw this away" with, so a trailing call, an
    * assignment, or an `i++` would otherwise make a block that was plainly written for its effect
    * claim a value nobody asked for — and two such blocks under one `if` or `match` would then be
@@ -325,7 +325,7 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
 
   private def analyzeStmt(stmt: Stmt): List[TStmt] = at(stmt.pos)(analyzeStmtAt(stmt))
 
-  /** `a, b = b, a` and `a, b += 1, 2` (`00 §2`).
+  /** `a, b = b, a` and `a, b += 1, 2` (`reference/expressions.md § Several places at once`).
    *
    * Every place is analyzed before any value, which is what fixes each value's expected type: a
    * literal on the right takes the width of the place it is heading for, exactly as it does after a
@@ -396,7 +396,7 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
             "than a store, so it cannot be one place of a multiple assignment — write that one " +
             "on its own"))
         // A property set through a setter is the second form of the same kind, and refused for the
-        // same reason (`00 §2`): the call both reads and writes, so there is nothing to separate
+        // same reason (`reference/expressions.md § Several places at once`): the call both reads and writes, so there is nothing to separate
         // into the two halves this form's ordering rule is about.
         case Field(receiver, name) if settable(receiver, name) =>
           at(t.pos)(err(s"'$name' is set by a call rather than by a store, so it cannot be one " +
@@ -441,7 +441,7 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
     taken.map(_._1).toList :+ TMultiAssign(writes)
   }
 
-  /** `val a, b = …` / `var a, b = …` (`00 §2`).
+  /** `val a, b = …` / `var a, b = …` (`reference/expressions.md § Several places at once`).
    *
    * The names are declared only once every value has been analyzed, so a value may still name
    * whatever the enclosing scope calls one of them — the binding does not shadow itself half way
@@ -629,7 +629,7 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
    *
    * The two are the same syntax and differ only in where they stand: a top-level `var` is module
    * storage in every file but the one the program starts in, where it is a local of the entry point
-   * (`13 §7`). So the parser cannot tell them apart, and this is the first place that can.
+   * (`reference/modules.md § Where a program starts`). So the parser cannot tell them apart, and this is the first place that can.
    *
    * What it refuses is real rather than unimplemented. A local's storage is the frame, laid down by
    * whichever call is running; a section is a region of the image, decided once at the link. There is
@@ -841,7 +841,7 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
         "iteration to the next, or in a function's contract block, where it is what decreases at " +
         "each recursive call")
 
-    /* `@assert` reaches here in the entry file, whose top level is a body (`13 §7`) rather than a
+    /* `@assert` reaches here in the entry file, whose top level is a body (`reference/modules.md § Where a program starts`) rather than a
      * run of declarations — so this is the same assert a module file hoists, met as a statement.
      *
      * **It is settled here rather than deferred**, and the two paths do not overlap: a module file's

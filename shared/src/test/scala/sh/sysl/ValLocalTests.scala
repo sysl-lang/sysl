@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `val` as a local, what it refuses, and the name it takes (`07`, `13 §7`).
+/** `val` as a local, what it refuses, and the name it takes (`07`, `reference/modules.md § val — a thing`).
  *
  * Split out of `ValTests`, which is about the module member. The three subjects here are the ones
  * that are *not* about laying storage into the object file: a `val` inside a body, where the binding
@@ -167,7 +167,7 @@ class ValLocalTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       err("static val n: usize = 4\nvar bad: [n]int") should include("must be a constant")
     }
 
-    // `13 §7` argues that sysl cannot have Rust's trap where a name in a pattern quietly binds
+    // `reference/modules.md § const — a value` argues that sysl cannot have Rust's trap where a name in a pattern quietly binds
     // instead of matching. A `val` is the one thing that could have reintroduced it, so a **bare**
     // name is refused — and the diagnostic now names the backticked form, which says the test was
     // meant (`09`).

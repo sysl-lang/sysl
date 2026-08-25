@@ -174,7 +174,7 @@ trait Hoisting extends HoistMembers {
 
     // A constant is registered with the types rather than with the functions, because an array
     // bound and an enum discriminant may both name one and both are resolved between the two passes
-    // (`13 §7`). Its *value* is not evaluated here — a constant may be written in terms of one
+    // (`reference/modules.md § const — a value`). Its *value* is not evaluated here — a constant may be written in terms of one
     // declared below it, so folding waits until something asks.
     case c: ConstDecl =>
       val key = Modules.qualify(currentModule, c.name)
@@ -208,7 +208,7 @@ trait Hoisting extends HoistMembers {
 
     // A module `var` is registered beside the `val`s because it is the same kind of thing: storage
     // the module owns, under a name that reaches it. It arrives here by two spellings and they mean
-    // one declaration (`13 §7`): `static var` at the top of the file the program starts in, which
+    // one declaration (`reference/modules.md § Where a program starts`): `static var` at the top of the file the program starts in, which
     // `ProgramWalk` has already unwrapped, and a plain `var` at the top of any other file, where
     // there is no body for it to be a local of and `static` would say nothing.
     //
@@ -460,7 +460,7 @@ trait Hoisting extends HoistMembers {
       checkSignatureRules(e.name, e.params, e.retType, e.variadic, foreign = true)
       for s <- e.link if !s.matches("[A-Za-z0-9_$.]+") do
         err(s"'$s' is not a symbol a linker can resolve")
-      // `main` is where a program starts (`13 §7`), which makes it the one name that means something
+      // `main` is where a program starts (`reference/modules.md § Where a program starts`), which makes it the one name that means something
       // whatever it is attached to. An `extern` may take neither half of it: the **symbol** because
       // this program defines it, so declaring it would be a second definition of one symbol and a
       // link failure rather than anything a reader of this line could act on; and the **name**
@@ -720,7 +720,7 @@ trait Hoisting extends HoistMembers {
     superChecks.clear()
   }
 
-  /** Holds every `override` to there being something for it to override (`02 § override`), once every
+  /** Holds every `override` to there being something for it to override (`reference/traits.md § override — when the overlap is deliberate`), once every
    * `impl` is registered and the question can be answered.
    *
    * This is the check in the other direction from the one the keyword lifts, and it is the one that

@@ -566,7 +566,7 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
   }
 
   "what the result being an argument does not change" - {
-    // A compound assignment is `a = a op b` (`14 §2`), so an operator whose result is not the place's
+    // A compound assignment is `a = a op b` (`reference/expressions.md § Operator dispatch`), so an operator whose result is not the place's
     // type has nothing to assign back. Refused rather than quietly changing what the place holds.
     "a compound assignment through a result that is not the place's type is refused" in {
       val e = err(space + """var v = Vec2(1.0, 2.0)

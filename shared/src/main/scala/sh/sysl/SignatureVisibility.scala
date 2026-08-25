@@ -162,7 +162,7 @@ trait SignatureVisibility extends TypeResolution {
     // here to compare.
     //
     // The `const` line has nothing to catch **today** and is here because the rule is one rule: a
-    // constant is held to being a scalar (`13 §7`), and every scalar is a builtin with no declaration
+    // constant is held to being a scalar (`reference/modules.md § const — a value`), and every scalar is a builtin with no declaration
     // to restrict — so a constant naming a type anyone could make private is refused a step earlier.
     // Stating it here anyway is what keeps widening what a constant may hold from silently reopening
     // the hole that `val` and `extern` had, which is the mistake this whole block is fixing.

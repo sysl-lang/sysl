@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `override` — the one relaxation of "one implementation per type" (`02 § override`), and the
+/** `override` — the one relaxation of "one implementation per type" (`reference/traits.md § override — when the overlap is deliberate`), and the
  * marking it requires of a member that replaces a trait's default body.
  *
  * The keyword goes on the **overriding** side, which is the whole of the design: a library author

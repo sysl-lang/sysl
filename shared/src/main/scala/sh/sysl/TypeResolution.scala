@@ -476,7 +476,7 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
     // array of itself. A slice only points at them, so it breaks a cycle exactly as `*T` does.
     case ArrayType(None, elem, ro) =>
       Type.Slice(addressable(underIndirection(resolveQualified(elem, subst)), "a slice"), readOnly = ro)
-    // A bound is a compile-time constant, which a `const` is and a call is not (`13 §7`).
+    // A bound is a compile-time constant, which a `const` is and a call is not (`reference/modules.md § const — a value`).
     //
     // **The substitution reaches the bound as well as the element**, so a length may measure the
     // block's own type parameter: `[sizeof(T) * 3 + 1]u8` is a buffer sized for whatever `T` turns
@@ -558,7 +558,7 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
     // C's function pointer, which is a type wherever any other is: it is one word, it is copied by
     // being copied, and nothing about it is counted. Its parts are held to exactly what an `extern`
     // holds its own to, which is nothing — what crosses the boundary is the programmer's business
-    // (`12 §1`), and a signature written here is the same kind of promise the `*` already is.
+    // (`reference/ffi.md § extern — a declaration with no body`), and a signature written here is the same kind of promise the `*` already is.
     case CFnType(params, ret) =>
       Type.CFn(params.map(resolveType(_, subst)), resolveReturn(ret, subst))
 

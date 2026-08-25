@@ -100,7 +100,7 @@ trait PatternAnalysis extends TypeResolution {
       TRangePattern(tl, th, inclusive)
 
     // A name in a pattern binds only where nothing answers to it. A variant is asked for first, then
-    // a constant — which is what keeps `13 §7`'s constant patterns off the trap Rust documents,
+    // a constant — which is what keeps `reference/modules.md § const — a value`'s constant patterns off the trap Rust documents,
     // where a `const` in a pattern quietly binds instead of matching. There is no second resolution
     // here to disagree with the first: a constant joins the one a variant already went through.
     // A qualifier is read the same way a variant pattern's is: the scrutinee's type already settled

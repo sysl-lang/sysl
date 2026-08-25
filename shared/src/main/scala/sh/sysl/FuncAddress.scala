@@ -5,7 +5,7 @@ import scala.collection.mutable
 /** A function's address, and a call through one — the two halves of `reference/ffi.md § A
  * function's address`.
  *
- * This is the seam a C library reaches back through. `extern` (`12 §1`) lets sysl call outward, and
+ * This is the seam a C library reaches back through. `extern` (`reference/ffi.md § extern — a declaration with no body`) lets sysl call outward, and
  * that was enough while every foreign interface was one a program calls; it is not enough for the
  * ones that call *back*. `qsort` wants a comparison, `signal` wants a handler, `pthread_create`
  * wants a thread body, and every one of them takes it as an address. Symmetrically, `dlsym` hands an

@@ -190,7 +190,7 @@ trait CallExprAnalysis extends ExprCoercion with MemberExprAnalysis with RawStor
       callThroughAddress(analyzeExpr(Ident(name).setPos(expr.pos)), args)
 
     // The same, for a name holding a **callable** rather than an address. Module storage may hold one
-    // (`13 §7`), which is what a binding keeping a callback does — so `pending(n)` has to mean what
+    // (`reference/modules.md § val — a thing`), which is what a binding keeping a callback does — so `pending(n)` has to mean what
     // it would mean if `pending` were a local, and the general case below is unreachable from here
     // because the complaint about an undefined function comes first.
     case Call(Ident(name), args)

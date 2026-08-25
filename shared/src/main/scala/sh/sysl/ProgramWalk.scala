@@ -550,7 +550,7 @@ trait ProgramWalk extends OpaqueResults {
 
   /** The `main` the program declared, and how its arguments are made.
    *
-   * A program's top-level statements are its entry point (`13 §7`) and go on being that. What a
+   * A program's top-level statements are its entry point (`reference/modules.md § Where a program starts`) and go on being that. What a
    * declared `main` adds is a *named* place to put the work those statements would otherwise do, and
    * the one thing the statements cannot get at: the arguments the program was started with. So it is
    * additive — the statements run first, in the order they were written, and `main` runs after them.
@@ -565,7 +565,7 @@ trait ProgramWalk extends OpaqueResults {
    * `argc`/`argv` is exactly what `args_of` exists so that no program has to write.
    */
   /** A program starts in **one** place, and statements at the top of a file and a `main` are two ways
-   * of writing that place (`13 §7`).
+   * of writing that place (`reference/modules.md § Where a program starts`).
    *
    * A program writing both would have two entry points and an order between them to remember, which
    * is what it reads as to anybody who opens it. Whichever of the two the program means, the other

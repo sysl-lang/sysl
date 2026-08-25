@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `val` at pointer type — the file-scope register block (`07`, `13 §7`).
+/** `val` at pointer type — the file-scope register block (`07`, `reference/modules.md § val — a thing`).
  *
  * Split out of `ValTests`, which is about what a `val` lays down; this is about the one payload that
  * makes people ask whether it should be allowed at all.
@@ -15,7 +15,7 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class ValPointerTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
-  /** A `val` at pointer type — the file-scope register block (`13 §7`).
+  /** A `val` at pointer type — the file-scope register block (`reference/modules.md § val — a thing`).
    *
    * What a `val` promises is that its **own storage** is written once and never again, and holding
    * an address keeps that promise exactly as holding a number does. It is not a promise about what
@@ -187,7 +187,7 @@ class ValPointerTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
   "a constant address costs no initializer" - {
 
-    // `13 §7` puts a constant tree in the object file and orders nothing, and an address written as
+    // `reference/modules.md § val — a thing` puts a constant tree in the object file and orders nothing, and an address written as
     // a number is one. It matters where it is used: a freestanding program reaches its registers
     // before anything has run, and a prologue that had to fill the pointer in first would be no use.
     "'ptr_cast' of a constant is laid straight in as an 'inttoptr'" in {
@@ -263,7 +263,7 @@ class ValPointerTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
     // The ordering rule is over the `val`s themselves, so a pointer one joins the graph like any
     // other — which is worth pinning because a pointer is the type most likely to be reached for in
-    // a cycle (`13 §7`, "what order the initializers run in").
+    // a cycle (`reference/modules.md § val — a thing`, "what order the initializers run in").
     "and a cycle among computed pointer 'val's is still reported" in {
       err(
         """static val a: *u8 = ptr_cast(usize(b))

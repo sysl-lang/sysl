@@ -139,7 +139,7 @@ class SubtypeErrorTests extends AnyFreeSpec with CodegenSupport {
       e should include("'nowhere' is not one")
     }
 
-    // A module-level `val` is read-only *storage* with an address (`13 §7`), which is exactly what a
+    // A module-level `val` is read-only *storage* with an address (`reference/modules.md § val — a thing`), which is exactly what a
     // `const` is not — so it cannot size a type, and the message must not suggest it could.
     "a module-level 'val' is storage, not a constant" in {
       err("""val n: int = 4

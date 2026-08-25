@@ -9,7 +9,7 @@ class CodegenModuleTests extends AnyFreeSpec with CodegenSupport {
 
   "module scaffolding" - {
     // The signature is C's, because this is the function the platform's own start-up code calls and
-    // that code passes a count and a vector (`13 §7`). They are taken whether or not the program
+    // that code passes a count and a vector (`reference/modules.md § Where a program starts`). They are taken whether or not the program
     // asks for them: a `main(args: []string)` is where they turn into a slice.
     "defines main, with the pair the platform passes" in {
       val out = ir("print(1)")

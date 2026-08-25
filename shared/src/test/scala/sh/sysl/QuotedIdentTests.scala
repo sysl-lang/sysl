@@ -265,7 +265,7 @@ class QuotedIdentTests extends AnyFreeSpec with Matchers with CodegenSupport wit
   }
 
   // The refusal is for a *module-level* `val`, so it takes a second file: an entry file's top level
-  // is a body (`13 §7`), and a `val` there is a local, which a bare name may legitimately shadow.
+  // is a body (`reference/modules.md § Where a program starts`), and a `val` there is a local, which a bare name may legitimately shadow.
   "the diagnostic for a module val in a pattern points at the quoted form" in {
     errOf(
       "m.sysl" ->

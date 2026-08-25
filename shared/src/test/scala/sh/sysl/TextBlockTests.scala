@@ -260,7 +260,7 @@ class TextBlockTests extends AnyFreeSpec with Matchers with RunSupport with Code
              |print(s.len)""".stripMargin) shouldBe "34\n"
     }
 
-    // `13 §7` — a `const`'s initializer is a constant expression, and a string literal is one
+    // `reference/modules.md § const — a value` — a `const`'s initializer is a constant expression, and a string literal is one
     // however it was written. A block folds like any other literal, with no storage and no symbol.
     "a block may initialize a const" in {
       run(s"""const S: string = $Q
@@ -270,7 +270,7 @@ class TextBlockTests extends AnyFreeSpec with Matchers with RunSupport with Code
     }
 
     // …and a `val` takes a block exactly as it takes a one-line string, since a block *is* a string
-    // literal by the time the analyzer sees it (`13 §7`). Pinned so the two stay the same case: the
+    // literal by the time the analyzer sees it (`reference/modules.md § const — a value`). Pinned so the two stay the same case: the
     // rule is about a value the object file can carry, not about how the value was written.
     "a val takes a block exactly as it takes a one-line string" in {
       run("""val S: string = "ab"

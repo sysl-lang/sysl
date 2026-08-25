@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `extern name: type` — storage the linker supplies (`12 §1`).
+/** `extern name: type` — storage the linker supplies (`reference/ffi.md § An extern also declares a variable`).
  *
  * The seam had one half for as long as it existed: a program could call out but could not *name*
  * anything the other side had laid down. `stdout`, `stderr`, `stdin`, `environ`, `optarg`, `optind`
@@ -96,7 +96,7 @@ class ExternVarTests
   }
 
   "what the type may be" - {
-    // Every global worth reaching is a pointer. A `val` takes one too (`13 §7`); what it refuses is
+    // Every global worth reaching is a pointer. A `val` takes one too (`reference/modules.md § val — a thing`); what it refuses is
     // a counted value, and an extern variable is refused nothing at all, because the storage is the
     // other side's and so is whatever releasing it would mean.
     "a pointer, which is what nearly every C global is" in {
@@ -172,7 +172,7 @@ class ExternVarTests
   }
 
   /** A `val` is read-only at every depth: the analyzer refuses both an assignment to one and a `&`
-    * that would take the address of its storage (`13 §7`). An `extern` variable is the one global
+    * that would take the address of its storage (`reference/modules.md § val — a thing`). An `extern` variable is the one global
     * those rules do not reach, and the difference is what the storage *is*: `optind` and `optarg`
     * are assigned by ordinary C, and a declaration that could only read them would name half of
     * `getopt`'s interface.
@@ -234,7 +234,7 @@ class ExternVarTests
 
   /** What the neighbouring rules say about storage, asked of the one storage they do not own. */
   "the rules around it, asked rather than assumed" - {
-    // `12 §1`'s declarations are top-level forms, and the message that says so lists them.
+    // `reference/ffi.md § extern — a declaration with no body`'s declarations are top-level forms, and the message that says so lists them.
     "it is a top-level declaration, like every other extern" in {
       err("f() -> int\n    extern optind: i32\n    1\nprint(f())") should
         include("may only be declared at the top level")
@@ -266,7 +266,7 @@ class ExternVarTests
     }
 
     // An array is storage with elements, and an element of it is a place — which is the `val`'s own
-    // rule (`13 §7`) with the one difference this declaration has: the element may be written.
+    // rule (`reference/modules.md § val — a thing`) with the one difference this declaration has: the element may be written.
     "an array one is indexed, and its elements are places" in {
       val out = ir(
         """extern tab: [4]i32
@@ -309,7 +309,7 @@ class ExternVarTests
       run("extern optind: i32\noptind = 1i32\noptind += 4i32\noptind++\nprint(optind)") shouldBe "6\n"
     }
 
-    // `13 §7` slices a `val` to a `[]const T` because the read-only promise has to travel with the
+    // `reference/modules.md § val — a thing` slices a `val` to a `[]const T` because the read-only promise has to travel with the
     // view. There is no such promise here, so the view is the ordinary writable one — asserted by
     // *writing through it*, since that is the whole difference between the two types.
     "slicing yields a view that may be written, where a 'val's yields one that may not" in {
@@ -351,7 +351,7 @@ class ExternVarTests
 
   /** Claims the neighbouring chapters make, asked of the declaration rather than assumed of it. */
   "what the chapters around it claim" - {
-    // `12 §1`: what crosses the boundary is the programmer's business — a `string` or a `&T` is a
+    // `reference/ffi.md § What crosses the boundary`: what crosses the boundary is the programmer's business — a `string` or a `&T` is a
     // sysl layout C has no notion of, and handing one over is the same promise `*T` already is. That
     // sentence is about parameters, and this asks whether it holds for storage: it does, and the
     // consequence is that a nonsense declaration compiles rather than being singled out here.
@@ -383,10 +383,10 @@ class ExternVarTests
       ) should include("store i32 1, ptr @optind")
     }
 
-    /** `13 §7`: a module-level `val` may be *computed*, filled by code that runs before the program's
+    /** `reference/modules.md § val — a thing`: a module-level `val` may be *computed*, filled by code that runs before the program's
       * own statements. One filled from C's storage is the case that asks whether the ordering means
       * anything here — and it does not: what fills `environ` is the loader, which ran before this
-      * program's first instruction, so the read is ordered by the platform rather than by `13 §7`.
+      * program's first instruction, so the read is ordered by the platform rather than by `reference/modules.md § val — a thing`.
       */
     "a computed 'val' may be filled from one, and the loader has already filled it" in {
       run("extern optind: i32\nstatic val start: i32 = optind\nprint(start)") shouldBe "1\n"

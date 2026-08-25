@@ -372,7 +372,7 @@ object Deriving {
    *
    * The parts are gathered into a string before anything is padded, for the reason the tuple's
    * rendering gathers its own: a specifier describes the field the **whole** value occupies
-   * (`14 §2`), so `%12s` on a `Size` pads the `Size` and not its first field. Each part goes through
+   * (`library/core.md § A specifier is the whole value's field`), so `%12s` on a `Size` pads the `Size` and not its first field. Each part goes through
    * `str`, which hands it the neutral specifier.
    */
   private def rendered(name: String, parts: List[Expr]): Expr =

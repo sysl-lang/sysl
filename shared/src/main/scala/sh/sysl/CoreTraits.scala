@@ -1,6 +1,7 @@
 package sh.sysl
 
-/** The traits the compiler knows by name, and which built-in types satisfy them (`14 §2`, `§5`).
+/** The traits the compiler knows by name, and which built-in types satisfy them
+ * (`library/core.md § What is in it`, `reference/expressions.md § Operator dispatch`).
  *
  * The traits themselves are ordinary declarations of the library — a program can read them, and can
  * call their methods directly (`5.add(3)`) exactly as it calls any other. What lives here is the

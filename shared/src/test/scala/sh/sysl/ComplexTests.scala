@@ -105,7 +105,7 @@ class ComplexTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       ) shouldBe "true false true\n"
     }
 
-    // The complex numbers are not ordered, and `14 §2` keeps `Eq` and `Ord` independent so a type
+    // The complex numbers are not ordered, and `library/core.md § What is in it` keeps `Eq` and `Ord` independent so a type
     // can say so. This is that refusal, and it is the point of not deriving one from the other.
     "there is no ordering, which is the mathematics and not an omission" in {
       err(importing + "print(Complex(1.0, 0.0) < Complex(2.0, 0.0))") should include(
@@ -500,7 +500,7 @@ class ComplexTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       ) shouldBe "5 -7 2 1 3\n"
     }
 
-    // **Rendering one is the exception, and it is `14 §2`'s rule about the field rather than a
+    // **Rendering one is the exception, and it is `library/core.md § A specifier is the whole value's field`'s rule about the field rather than a
     // choice this module made.** A specifier describes the field the *whole* value lands in, so the
     // three pieces have to be gathered before the padding is applied — and gathering means a string.
     // An allocator-free program computes with `Complex` and prints its parts.

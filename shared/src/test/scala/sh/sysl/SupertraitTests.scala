@@ -431,7 +431,7 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       run(shape + "var o: &Shape = Rect(3, 4)\nprint(str(o) + \"!\")") shouldBe "a rect!\n"
     }
 
-    // The specifier describes the field the *whole* value occupies (`14 §2`), and it reaches an
+    // The specifier describes the field the *whole* value occupies (`library/core.md § A specifier is the whole value's field`), and it reaches an
     // implementation through the table exactly as it reaches one through a name.
     "an object padded by a format specifier" in {
       run(shape + "var o: &Shape = Rect(3, 4)\nprint(f\"${o}%10s|\")") shouldBe "    a rect|\n"

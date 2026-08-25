@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** What `Display` and `Writer` refuse, and what they say about it (`14 §2`, `§6`).
+/** What `Display` and `Writer` refuse, and what they say about it
+ * (`library/core.md § Rendering to a sink`).
  *
  * The point of routing rendering through a trait is that "this cannot be printed" stops being a
  * special case and becomes a missing implementation or a missing bound, like any other. So each

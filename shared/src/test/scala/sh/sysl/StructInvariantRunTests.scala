@@ -272,7 +272,7 @@ class StructInvariantRunTests extends AnyFreeSpec with RunSupport {
       exits(Outer + "var o = Outer(Inner(1), 5)\no.b = 0")
     }
 
-    // `00 §2` promises every write lands before any invariant is consulted, and that has to survive
+    // `reference/expressions.md § Several places at once` promises every write lands before any invariant is consulted, and that has to survive
     // the walk: each arm alone would be refused, and the pair is what the form is for.
     "and a multi-assignment is judged only once both writes have landed" in {
       run(Outer + "var o = Outer(Inner(1), 5)\no.a.n, o.b = 9, 9\nprint(o.a.n, o.b)") shouldBe "9 9\n"

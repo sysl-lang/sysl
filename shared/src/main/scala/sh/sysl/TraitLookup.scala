@@ -263,7 +263,7 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
   protected val superChecks = mutable.ListBuffer.empty[(String, String, Type.Bound, Type, Option[Pos])]
 
   /** Every block marked `override`, with the type it is for and the promise it makes, waiting to be
-   * asked whether anything more general actually covers that type (`02 § override`).
+   * asked whether anything more general actually covers that type (`reference/traits.md § override — when the overlap is deliberate`).
    *
    * Held for the reason `superChecks` is held: the block being replaced may be written below this one
    * or in a module hoisted after it, and an answer that depended on which would make the keyword mean

@@ -357,7 +357,7 @@ trait GenericInstantiation extends ConstFolding {
               val tag = v.value match
                 // A discriminant is any compile-time integer, so a negative one under a signed
                 // underlying type folds from the unary negation the parser gives, and a `const` may
-                // stand where a literal does (`13 §7`).
+                // stand where a literal does (`reference/modules.md § const — a value`).
                 case Some(e) =>
                   fitting(constInt(e).getOrElse(
                     err(s"the value of variant '${v.name}' must be a constant integer")))

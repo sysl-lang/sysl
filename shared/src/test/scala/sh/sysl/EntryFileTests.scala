@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** What a file's top level means, which depends on where the file sits (`13 §7`).
+/** What a file's top level means, which depends on where the file sits (`reference/modules.md § Where a program starts`).
  *
  * A file carrying statements is the one the program starts in, and its top level is a **body**:
  * what it declares is local to that body, so a `val` there is a stack local initialized where it
@@ -294,7 +294,7 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
       ir("static val n: int = 5\nprint(str(n))") should include("private constant")
     }
 
-    // It holds a counted value like any other module storage (`13 §7`), and the `var` half is where
+    // It holds a counted value like any other module storage (`reference/modules.md § val — a thing`), and the `var` half is where
     // that has to be shown rather than merely allowed: the storage is given a literal and then a
     // built string, so the second store is the one that has a release to write and a line to write it
     // on. Reading it back afterwards is what says the first was let go of without taking the second.
@@ -389,7 +389,7 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
     }
   }
 
-  /** A file that names a module is never the one the program starts in (`13 §7`).
+  /** A file that names a module is never the one the program starts in (`reference/modules.md § Where a program starts`).
     *
     * Which file that is comes down to what a file *runs*, and where nothing runs a lone file of
     * bindings is a body after all — that is what keeps a one-file `var n = 1` meaning what it always

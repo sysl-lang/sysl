@@ -18,7 +18,7 @@ trait StaticEmitter extends StringEmitter {
    * name one, so hiding the symbol costs nothing and lets the optimizer see every read of the table.
    *
    * A **computed** one is a `global` rather than a `constant`, because it *is* written — once, by
-   * the prologue `main` opens with. The zero it starts at is never read: `13 §7`'s ordering is what
+   * the prologue `main` opens with. The zero it starts at is never read: `reference/modules.md § val — a thing`'s ordering is what
    * guarantees that every initializer able to see the storage has already run.
    */
   protected def genVals(vals: List[TVal]): List[ir.Global] =
@@ -71,7 +71,7 @@ trait StaticEmitter extends StringEmitter {
 
     // Three words naming bytes that are never freed. The owner is null, which is what makes the
     // whole value a constant expression rather than something a prologue has to build — and what
-    // lets a `string` sit in storage that is never let go of at all (`13 §7`).
+    // lets a `string` sit in storage that is never let go of at all (`reference/modules.md § val — a thing`).
     case TStrLit(s) => stringValue(s)
 
     // A struct constant lists its fields in the order the type declares them, and skips the ones

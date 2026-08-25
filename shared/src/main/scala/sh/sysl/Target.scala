@@ -141,7 +141,7 @@ case class Target(
 
   /** Whether something on this platform runs a module's initializers **before** the program's own
    * entry point — which is what decides whether an archive with no entry point of its own can fill
-   * its module storage at all (`13 §7`).
+   * its module storage at all (`reference/modules.md § val — a thing`).
    *
    * A program lays its computed `val`s down at the top of `@main`, because the entry point is the
    * one place that certainly runs first and it is already written. `build-c` has no entry point to

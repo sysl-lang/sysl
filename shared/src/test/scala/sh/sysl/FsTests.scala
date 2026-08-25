@@ -217,7 +217,7 @@ class FsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   "a file is a Writer" - {
 
     /** The other half of the payoff: anything that renders into a `*Writer` renders into a file, so
-     * the rendering surface of `14 §2` reaches the disk with nothing written for it here.
+     * the rendering surface of `library/core.md § Rendering to a sink` reaches the disk with nothing written for it here.
      */
     "a value renders itself into a file" in {
       inDir(

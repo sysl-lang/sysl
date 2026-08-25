@@ -74,7 +74,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
                    |""".stripMargin) shouldBe "Size(3, 4)\n"
     }
 
-    // `14 §2`'s rule is that a specifier describes the field the *whole* value occupies, so a width
+    // `library/core.md § A specifier is the whole value's field`'s rule is that a specifier describes the field the *whole* value occupies, so a width
     // pads the rendering rather than its first field.
     "a width pads the whole rendering" in {
       run(sized + """val s = Size(3, 4)

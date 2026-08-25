@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** A module-level `val` whose initializer is **computed** (`13 §7`).
+/** A module-level `val` whose initializer is **computed** (`reference/modules.md § val — a thing`).
  *
  * `val` shipped taking a constant tree only, and the reason it stopped there was an open question
  * rather than an implementation limit: code that runs before `main` has to run in *some* order, and
@@ -112,7 +112,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     // The same cycle through the WRITABLE half of module storage, which every test above spells
     // `val`. It used to throw rather than report: the diagnostic looked its name up in the `val`
     // table alone, and a `var` is in the other one — so the compiler died on a program it was
-    // supposed to be explaining. `13 §7` makes the two one kind of thing, and this is what holds the
+    // supposed to be explaining. `reference/modules.md § val — a thing` makes the two one kind of thing, and this is what holds the
     // reporting to that.
     "including a cycle through a 'var', which is the same storage" in {
       val e = err(
@@ -528,7 +528,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       run(src) shouldBe "6\n"
     }
 
-    // The claim of `13 §7` that this rests on, checked from the far side: a `val` is defined by
+    // The claim of `reference/modules.md § val — a thing` that this rests on, checked from the far side: a `val` is defined by
     // having an address, and a value with no representation has nothing to put one on. Before
     // initializers could be computed this was unreachable, since no constant tree is a `unit`.
     "a 'val' of a type that occupies nothing is refused" in {
@@ -560,7 +560,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       e should include("modules may not depend on each other")
     }
 
-    // `13 §7` says a cycle between *constants* is reported at the declaration, naming the loop. It
+    // `reference/modules.md § const — a value` says a cycle between *constants* is reported at the declaration, naming the loop. It
     // is a different mechanism — a constant folds and never runs — and it says so its own way, one
     // report per declaration rather than one per loop.
     "a cycle between constants is still reported at the declaration" in {
@@ -585,7 +585,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
   }
 
-  /** Where `13 §7`'s constant-tree rule meets `reference/errors.md § Where a constraint is
+  /** Where `reference/modules.md § val — a thing`'s constant-tree rule meets `reference/errors.md § Where a constraint is
     * checked`'s produce-site checking, and which of the two wins. A `val` at a constrained type is
     * written as a plain number, so the constant-tree rule alone would lay it straight into the
     * object file — and would thereby be the one produce site in the language that skipped its
@@ -642,7 +642,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
 
     // The derived case, which carries no check at all and is still filled: a conversion is not one
-    // of the three things `13 §7` calls a constant tree, so it is code by that rule alone.
+    // of the three things `reference/modules.md § val — a thing` calls a constant tree, so it is code by that rule alone.
     "a derivation with nothing to check is code all the same" in {
       val out = ir("type Meters = new int\nstatic val m: Meters = Meters(30)\nprint(int(m))")
 

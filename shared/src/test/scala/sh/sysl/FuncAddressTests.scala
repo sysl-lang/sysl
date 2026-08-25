@@ -558,7 +558,7 @@ class FuncAddressTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       out should not include "*extern"
     }
 
-    // A `unit` parameter is zero-sized and dropped from the emitted signature (`12 §1`), so the
+    // A `unit` parameter is zero-sized and dropped from the emitted signature (`reference/declarations.md § Functions`), so the
     // argument is evaluated for its effect and the ones after it shift up. The positions a
     // function-pointer call checks against must be the written ones, not the emitted ones.
     "a zero-sized parameter is dropped from the call but not from the arity" in {

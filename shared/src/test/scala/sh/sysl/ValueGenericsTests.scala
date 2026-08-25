@@ -93,7 +93,7 @@ class ValueGenericsTests extends AnyFreeSpec with RunSupport with CodegenSupport
     }
 
     // And a declared constant, since a value parameter is a `const` whose value the use supplies
-    // and the two are the same kind of thing (`13 §7`).
+    // and the two are the same kind of thing (`reference/modules.md § const — a value`).
     "and a declared constant" in {
       run("""const SIZE: usize = 3usize
             |struct Buf[const N: usize]
@@ -361,7 +361,7 @@ class ValueGenericsTests extends AnyFreeSpec with RunSupport with CodegenSupport
     }
 
     /** A block written for one length is the more specific of the two and answers first, which is
-     * `shapeOwners`' ordering — the same rule that makes `[]Point` beat `[]T` (`02 § override`),
+     * `shapeOwners`' ordering — the same rule that makes `[]Point` beat `[]T` (`reference/traits.md § override — when the overlap is deliberate`),
      * one level up from where it used to apply.
      *
      * The trait is the program's own because the library's would put this against the orphan rule:

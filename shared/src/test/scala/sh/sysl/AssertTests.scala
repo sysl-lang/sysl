@@ -331,7 +331,7 @@ class AssertTests extends AnyFreeSpec with Matchers with CodegenSupport with Run
 
   // Two paths reach a check, and they must not overlap. In a module file an assert is a
   // declaration, collected by hoisting and settled by the walk; in the entry file it is a statement
-  // (`13 §7`) and is settled where it is met. One assert must produce one message, not two.
+  // (`reference/modules.md § Where a program starts`) and is settled where it is met. One assert must produce one message, not two.
   "in a module file" - {
     "a true one is silent" in {
       runOf(

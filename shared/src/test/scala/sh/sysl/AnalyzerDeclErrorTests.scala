@@ -284,7 +284,7 @@ class AnalyzerDeclErrorTests extends AnyFreeSpec with CodegenSupport {
         ) should include("both stand for 1")
       }
 
-      // A discriminant is any constant expression (`13 §7`), so the collision need not be visible in
+      // A discriminant is any constant expression (`reference/modules.md § const — a value`), so the collision need not be visible in
       // the two lines that collide — it is the folded values that must differ, not their spellings.
       "and where one value reaches its number through a const" in {
         err(

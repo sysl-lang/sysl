@@ -279,7 +279,7 @@ object LibraryArtifact {
    * **The library is analyzed before anything is written.** A library that does not check is broken
    * once, by whoever built it; without this the artifact ships anyway and every program that links
    * against it is handed a diagnostic pointing into somebody else's source. `main` is optional
-   * (`13 §7`), so a library having none is not a complaint.
+   * (`reference/modules.md § Where a program starts`), so a library having none is not a complaint.
    */
   /** **A `c const` is lowered here, before anything else touches the trees**, which is what puts the
    * measured value into the artifact rather than the C expression that produced it. A consumer then

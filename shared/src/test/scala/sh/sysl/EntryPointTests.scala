@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `main` — the named form of the entry point, and the arguments it is handed (`13 §7`).
+/** `main` — the named form of the entry point, and the arguments it is handed (`reference/modules.md § Where a program starts`).
  *
  * A program starts in **one** place. Statements at the top of a file and a `main` are two ways of
  * writing that place, and a program writing both is refused: what a declared `main` adds is a
@@ -39,7 +39,7 @@ class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
 
     // A `val` beside a `main` is a declaration, so the file carries no statements and there is no
-    // second entry point: it is storage filled before anything runs (`13 §7`), which is the one
+    // second entry point: it is storage filled before anything runs (`reference/modules.md § val — a thing`), which is the one
     // ordering left now that there is one place to start.
     "a val beside it is filled before it runs" in {
       run("""val table: [3]int = [1, 2, 3]
@@ -83,7 +83,7 @@ class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       ) shouldBe "app's main 7\n"
     }
 
-    // With no statements anywhere, the file the entry point is *read* in is the root (`13 §7`) while
+    // With no statements anywhere, the file the entry point is *read* in is the root (`reference/modules.md § Where a program starts`) while
     // this `main` is a member of `app` — so a program of one module and no statements is the case a
     // rule about the entry file's own module would have missed.
     "even when nothing in the program carries a statement at all" in {
@@ -301,7 +301,7 @@ class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
             |""".stripMargin) shouldBe "private main ran\n"
     }
 
-    // `13 §7` says a program that must choose its exit status calls `exit`. This is that program, and
+    // `reference/modules.md § Where a program starts` says a program that must choose its exit status calls `exit`. This is that program, and
     // a `-> never` result is accepted because `never` is not a value the wrapper would have to place.
     "it may diverge, which is how a program chooses its status today" in {
       exitsWith("""main() -> never

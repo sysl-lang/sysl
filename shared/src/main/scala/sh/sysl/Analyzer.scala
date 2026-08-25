@@ -143,7 +143,7 @@ object Analyzer {
    *
    * **The lowering is a separate step in front of this rather than a pass inside it**, and that is
    * what keeps the rest of the compiler from knowing the feature exists: by the time a name is
-   * resolved or a bound is folded, a `c const` is the `const` of `13 §7` and nothing else. It is
+   * resolved or a bound is folded, a `c const` is the `const` of `reference/modules.md § const — a value` and nothing else. It is
    * here — at the analyzer's door — rather than in the parser, because `SyslParser.parse` has seven
    * callers and this has one.
    */

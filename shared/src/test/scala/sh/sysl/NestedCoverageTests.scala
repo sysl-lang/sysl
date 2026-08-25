@@ -570,7 +570,7 @@ class NestedCoverageTests extends AnyFreeSpec with Matchers with RunSupport with
           |print(read(h), read(p))""".stripMargin) shouldBe "0 1\n"
     }
 
-    // `13 §7` — a `const` in a pattern compares rather than binds, so nested it behaves as the
+    // `reference/modules.md § const — a value` — a `const` in a pattern compares rather than binds, so nested it behaves as the
     // literal it folds to: it narrows the variant without discharging it, and the report says so
     // the same way `Some(0)` does.
     "a const in a nested pattern narrows without discharging" in {
