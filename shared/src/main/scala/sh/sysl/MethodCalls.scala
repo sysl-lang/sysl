@@ -323,11 +323,21 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
    * them — which is the whole of what an import would have changed, so the message is the import.
    */
   protected def outOfScope(owner: String, mname: String, cands: List[String], subject: String): Nothing = {
-    val traits = cands.flatMap(c => memberTrait.get((owner, c))).distinct.map(qn)
+    val all = cands.flatMap(c => memberTrait.get((owner, c))).distinct
 
-    err(s"$subject has '$mname' from ${conjoin(traits)}, and " +
-      (if traits.length == 1 then s"that trait is not in scope here — import it to reach the member"
-       else "none of those traits is in scope here — import the one that was meant"))
+    // A trait this file may not **name** is not one an import would reach, so advising the import
+    // would send a reader after a line the compiler refuses. Where every candidate is out of reach
+    // for that reason, the member is somebody else's business and saying so is the whole of it —
+    // naming the trait would leak a name that cannot be written here either.
+    val traits = all.filter(visible).map(qn)
+
+    if traits.isEmpty then
+      err(s"$subject has '$mname', but the trait declaring it is private to the module that wrote " +
+        "it — the member is an implementation detail rather than something to import")
+    else
+      err(s"$subject has '$mname' from ${conjoin(traits)}, and " +
+        (if traits.length == 1 then s"that trait is not in scope here — import it to reach the member"
+         else "none of those traits is in scope here — import the one that was meant"))
   }
 
   /** Whether one of a type's members takes a `...`, asked of the member table rather than of the

@@ -131,10 +131,9 @@ trait AbstractMethods extends FuncAddress {
    * what checking at the definition is for.
    */
   private def unlicensedAssociated(a: Type.Abstract, mname: String): Nothing =
-    traitDecls.values
-      .filter(_.methods.exists(m => m.name == mname && m.recvMode.isEmpty))
-      .map(t => qn(t.name))
-      .toList match
+    traitDecls.toList
+      .filter((k, t) => visible(k) && t.methods.exists(m => m.name == mname && m.recvMode.isEmpty))
+      .map((_, t) => qn(t.name)) match
       case Nil =>
         boundErr(s"'${a.name}' is a type parameter, and no trait declares an associated function " +
           s"'$mname' that a bound could promise")
@@ -192,7 +191,8 @@ trait AbstractMethods extends FuncAddress {
    * *does* declare it, the fix is the bound, and naming it is what checking at the definition is for.
    */
   private def unlicensedProperty(a: Type.Abstract, name: String): Nothing =
-    traitDecls.values.filter(_.methods.exists(m => m.name == name && m.isProperty)).map(t => qn(t.name)).toList match
+    traitDecls.toList.filter((k, t) => visible(k) && t.methods.exists(m => m.name == name && m.isProperty))
+      .map((_, t) => qn(t.name)) match
       case Nil =>
         boundErr(s"'${a.name}' is a type parameter, so it has no fields to read — a field is layout, " +
           s"and no trait declares a property '$name' that a bound could promise instead")
@@ -286,7 +286,8 @@ trait AbstractMethods extends FuncAddress {
    * point of checking at the definition instead of at some caller three files away.
    */
   private def unlicensed(a: Type.Abstract, mname: String): Nothing =
-    traitDecls.values.filter(_.methods.exists(_.name == mname)).map(t => qn(t.name)).toList match
+    traitDecls.toList.filter((k, t) => visible(k) && t.methods.exists(_.name == mname))
+      .map((_, t) => qn(t.name)) match
       case Nil =>
         boundErr(s"no trait declares a method '$mname', so no bound on '${a.name}' could license this call")
       case one :: Nil =>

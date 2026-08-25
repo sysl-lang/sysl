@@ -224,24 +224,24 @@ end keyed_hashing
 streaming_agrees_with_one_call()
     var p200 = pattern(200)
 
-    assert_eq(one_at_a_time(new_sha224(), abc()), hex_string(sha224(abc())))
-    assert_eq(one_at_a_time(new_sha256(), abc()), hex_string(sha256(abc())))
-    assert_eq(one_at_a_time(new_sha384(), abc()), hex_string(sha384(abc())))
-    assert_eq(one_at_a_time(new_sha512(), abc()), hex_string(sha512(abc())))
-    assert_eq(one_at_a_time(new_sha224(), p200), hex_string(sha224(p200)))
-    assert_eq(one_at_a_time(new_sha256(), p200), hex_string(sha256(p200)))
-    assert_eq(one_at_a_time(new_sha384(), p200), hex_string(sha384(p200)))
-    assert_eq(one_at_a_time(new_sha512(), p200), hex_string(sha512(p200)))
+    assert_eq(one_at_a_time(new_sha224().inner, abc()), hex_string(sha224(abc())))
+    assert_eq(one_at_a_time(new_sha256().inner, abc()), hex_string(sha256(abc())))
+    assert_eq(one_at_a_time(new_sha384().inner, abc()), hex_string(sha384(abc())))
+    assert_eq(one_at_a_time(new_sha512().inner, abc()), hex_string(sha512(abc())))
+    assert_eq(one_at_a_time(new_sha224().inner, p200), hex_string(sha224(p200)))
+    assert_eq(one_at_a_time(new_sha256().inner, p200), hex_string(sha256(p200)))
+    assert_eq(one_at_a_time(new_sha384().inner, p200), hex_string(sha384(p200)))
+    assert_eq(one_at_a_time(new_sha512().inner, p200), hex_string(sha512(p200)))
 end streaming_agrees_with_one_call
 
 @test("a million bytes in a thousand pieces")
 a_million_bytes()
     var thousand_a = repeated(97, 1000)
 
-    assert_eq(streamed(new_sha224(), thousand_a, 1000), "20794655980c91d8bbb4c1ea97618a4bf03f42581948b2ee4ee7ad67")
-    assert_eq(streamed(new_sha256(), thousand_a, 1000), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0")
-    assert_eq(streamed(new_sha384(), thousand_a, 1000), "9d0e1809716474cb086e834e310a4a1ced149e9c00f248527972cec5704c2a5b07b8b3dc38ecc4ebae97ddd87f3d8985")
-    assert_eq(streamed(new_sha512(), thousand_a, 1000), "e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973ebde0ff244877ea60a4cb0432ce577c31beb009c5c2c49aa2e4eadb217ad8cc09b")
+    assert_eq(streamed(new_sha224().inner, thousand_a, 1000), "20794655980c91d8bbb4c1ea97618a4bf03f42581948b2ee4ee7ad67")
+    assert_eq(streamed(new_sha256().inner, thousand_a, 1000), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0")
+    assert_eq(streamed(new_sha384().inner, thousand_a, 1000), "9d0e1809716474cb086e834e310a4a1ced149e9c00f248527972cec5704c2a5b07b8b3dc38ecc4ebae97ddd87f3d8985")
+    assert_eq(streamed(new_sha512().inner, thousand_a, 1000), "e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973ebde0ff244877ea60a4cb0432ce577c31beb009c5c2c49aa2e4eadb217ad8cc09b")
 end a_million_bytes
 
 @test("the pieces both widths are built from")
@@ -294,14 +294,14 @@ end the_mixing_functions
 // the whole point of their having no receiver.
 @test("what a width answers with no word in hand")
 the_width_answers_for_itself()
-    assert_eq(w32(u32.k(0)), "428a2f98")
-    assert_eq(w32(u32.k(63)), "c67178f2")
-    assert_eq(w64(u64.k(0)), "428a2f98d728ae22")
-    assert_eq(w64(u64.k(79)), "6c44198c4a475817")
-    assert_eq(u32.rounds(), 64)
-    assert_eq(u64.rounds(), 80)
-    assert_eq(u32.bits(), 32)
-    assert_eq(u64.bits(), 64)
+    assert_eq(w32(u32.round_key(0)), "428a2f98")
+    assert_eq(w32(u32.round_key(63)), "c67178f2")
+    assert_eq(w64(u64.round_key(0)), "428a2f98d728ae22")
+    assert_eq(w64(u64.round_key(79)), "6c44198c4a475817")
+    assert_eq(u32.word_rounds(), 64)
+    assert_eq(u64.word_rounds(), 80)
+    assert_eq(u32.word_bits(), 32)
+    assert_eq(u64.word_bits(), 64)
     assert_eq(w32(u32.zero()), "00000000")
     assert_eq(w64(u64.zero()), "0000000000000000")
 end the_width_answers_for_itself
@@ -377,5 +377,60 @@ what_an_hmac_refuses()
     var cramped: []u8 = [0; 31]
 
     assert_eq(why(hmac(unstarted, "k".bytes, abc(), tag)), "this hasher was never given its initial values")
-    assert_eq(why(hmac(new_sha256(), "k".bytes, abc(), cramped)), "the digest does not fit in the space provided")
+    assert_eq(why(hmac(new_sha256().inner, "k".bytes, abc(), cramped)), "the digest does not fit in the space provided")
 end what_an_hmac_refuses
+
+// The four hashers are the public surface, and the generic behind them is not: a program reaches
+// `Sha256`, never `Sha[u32]`, and never names `Word` at all.
+@test("a concrete hasher streams, and copying one copies the hash in progress")
+the_concrete_hashers()
+    var h = new_sha256()
+    var out: [32]u8
+
+    h.update("a".bytes)
+    h.update("b".bytes)
+    h.update("c".bytes)
+    h.finish(out[0..<32]).expect("a digest buffer of the right size")
+
+    assert_eq(hex_string(out), hex_string(sha256("abc".bytes)))
+
+    // A shared prefix hashed once and finished two ways — which is what makes the hasher a value
+    // worth having rather than a detail of the one-shot form.
+    var prefix = new_sha256()
+
+    prefix.update("abc".bytes)
+
+    var left = prefix
+    var right = prefix
+    var lo: [32]u8
+    var ro: [32]u8
+
+    left.update("d".bytes)
+    right.update("e".bytes)
+    left.finish(lo[0..<32]).expect("a digest buffer of the right size")
+    right.finish(ro[0..<32]).expect("a digest buffer of the right size")
+
+    assert_eq(hex_string(lo), hex_string(sha256("abcd".bytes)))
+    assert_eq(hex_string(ro), hex_string(sha256("abce".bytes)))
+end the_concrete_hashers
+
+@test("each width's hasher agrees with its one-shot digest")
+each_hasher_agrees()
+    var a = new_sha224()
+    var b = new_sha384()
+    var c = new_sha512()
+    var oa: [28]u8
+    var ob: [48]u8
+    var oc: [64]u8
+
+    a.update("abc".bytes)
+    b.update("abc".bytes)
+    c.update("abc".bytes)
+    a.finish(oa[0..<28]).expect("a digest buffer of the right size")
+    b.finish(ob[0..<48]).expect("a digest buffer of the right size")
+    c.finish(oc[0..<64]).expect("a digest buffer of the right size")
+
+    assert_eq(hex_string(oa), hex_string(sha224("abc".bytes)))
+    assert_eq(hex_string(ob), hex_string(sha384("abc".bytes)))
+    assert_eq(hex_string(oc), hex_string(sha512("abc".bytes)))
+end each_hasher_agrees

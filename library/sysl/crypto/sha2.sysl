@@ -24,7 +24,7 @@ end Fault
 // built by shifting each one in from the bottom.
 private[crypto] shift_in[T: Word](x: T, b: u8) -> T = (x << 8) | T(b)
 
-private[crypto] top_byte[T: Word](x: T) -> u8 = u8(x >> (T.bits() - 8))
+private[crypto] top_byte[T: Word](x: T) -> u8 = u8(x >> (T.word_bits() - 8))
 
 // Choose: wherever `x` has a one bit take `y`'s bit, elsewhere take `z`'s.
 private[crypto] ch[T: BitAnd + BitXor + Not](x: T, y: T, z: T) -> T = (x & y) ^ (~x & z)
@@ -35,7 +35,7 @@ private[crypto] maj[T: BitAnd + BitXor](x: T, y: T, z: T) -> T = (x & y) ^ (x & 
 // A hash in progress. The bound is written once, here, and every member inherits it — which is the
 // answer to the repetition the free functions above show, and the reason a container is a better
 // place to put a bound than a pile of functions is.
-struct Sha[T: Word]
+private[crypto] struct Sha[T: Word]
     h: [8]T
     block: [128]u8
     used: usize
@@ -45,9 +45,9 @@ struct Sha[T: Word]
     // Three sizes, all of them the width in disguise: sixteen words to a block, a length field of
     // two words, and a digest of eight. The width is a fact about `T`, and asking `T` for it is what
     // these read as — no word has to be in hand for a size to be known.
-    block_len(self) -> usize = 2 * usize(T.bits())
-    word_len(self) -> usize = usize(T.bits()) / 8
-    len_bytes(self) -> usize = usize(T.bits()) / 4
+    block_len(self) -> usize = 2 * usize(T.word_bits())
+    word_len(self) -> usize = usize(T.word_bits()) / 8
+    len_bytes(self) -> usize = usize(T.word_bits()) / 4
 
     start(*self, iv: [8]T, dlen: usize)
         for i in 0..<8 do self.h[i] = iv[i]
@@ -74,7 +74,7 @@ struct Sha[T: Word]
     // the first `rounds` entries are ever read.
     compress(*self)
         var wl = self.word_len()
-        var n = T.rounds()
+        var n = T.word_rounds()
         var w = [T.zero(); 80]
 
         for i in 0..<16usize
@@ -97,7 +97,7 @@ struct Sha[T: Word]
         var t = self.h[7]
 
         for i in 0..<n
-            var t1 = t + e.bsig1() + ch(e, f, g) + T.k(i) + w[i]
+            var t1 = t + e.bsig1() + ch(e, f, g) + T.round_key(i) + w[i]
             var t2 = a.bsig0() + maj(a, b, c)
 
             t = g
@@ -166,25 +166,51 @@ struct Sha[T: Word]
     end finish
 end Sha
 
-new_sha224() -> Sha[u32]
-    var s: Sha[u32]
-    s.start(iv224, 28)
+// A hasher for one of the four digests.
+//
+// **The genericity stops here, deliberately.** `Sha[T]` above is one implementation serving two word
+// widths, and that is worth having — but it is a fact about how SHA-2 is *written*, not something a
+// caller should have to know. A public generic would drag its bound into the public surface with it,
+// and `Word` declares `bits`, `rounds` and `k`: names general enough that the standard library
+// claiming them would collide with the next program that wanted one. So the four widths are four
+// ordinary types, and the trait behind them is the module's own business.
+//
+// Each is `update` as often as you like, then `finish` into storage the caller owns. Copying a
+// hasher copies the hash in progress, so a common prefix can be hashed once and finished several
+// ways.
+struct Sha224
+    private[crypto] inner: Sha[u32]
+
+    update(*self, data: []const u8) = self.inner.update(data)
+    finish(*self, digest: []u8) -> Result[unit, Fault] = self.inner.finish(digest)
+
+struct Sha256
+    private[crypto] inner: Sha[u32]
+
+    update(*self, data: []const u8) = self.inner.update(data)
+    finish(*self, digest: []u8) -> Result[unit, Fault] = self.inner.finish(digest)
+
+struct Sha384
+    private[crypto] inner: Sha[u64]
+
+    update(*self, data: []const u8) = self.inner.update(data)
+    finish(*self, digest: []u8) -> Result[unit, Fault] = self.inner.finish(digest)
+
+struct Sha512
+    private[crypto] inner: Sha[u64]
+
+    update(*self, data: []const u8) = self.inner.update(data)
+    finish(*self, digest: []u8) -> Result[unit, Fault] = self.inner.finish(digest)
+
+private[crypto] started[T: Word](iv: [8]T, dlen: usize) -> Sha[T]
+    var s: Sha[T]
+    s.start(iv, dlen)
     s
 
-new_sha256() -> Sha[u32]
-    var s: Sha[u32]
-    s.start(iv256, 32)
-    s
-
-new_sha384() -> Sha[u64]
-    var s: Sha[u64]
-    s.start(iv384, 48)
-    s
-
-new_sha512() -> Sha[u64]
-    var s: Sha[u64]
-    s.start(iv512, 64)
-    s
+new_sha224() -> Sha224 = Sha224(started(iv224, 28))
+new_sha256() -> Sha256 = Sha256(started(iv256, 32))
+new_sha384() -> Sha384 = Sha384(started(iv384, 48))
+new_sha512() -> Sha512 = Sha512(started(iv512, 64))
 
 // The four digests, each answering the bytes it is defined to produce.
 //
