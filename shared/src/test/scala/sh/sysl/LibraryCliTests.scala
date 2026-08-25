@@ -240,11 +240,12 @@ class LibraryCliTests extends LibraryCliSupport {
       notes should not include "warning"
     }
 
-    // The **second road** for the library's own C (`15 §7`, `13 §5`). Compiled from source, the
-    // library's tree is walked and its shims become objects on the link line; taken from an artifact
-    // they are already archive members, and this is what says the archive really carries them. The
-    // two roads are reached by different code and a warm cache picks this one, so a program that ran
-    // all through development can stop linking the first time somebody builds it on a clean machine.
+    // The **second road** for the library's own C (`reference/ffi.md § A library may carry C`,
+    // `reference/modules.md § Platform selection`). Compiled from source, the library's tree is
+    // walked and its shims become objects on the link line; taken from an artifact they are already
+    // archive members, and this is what says the archive really carries them. The two roads are
+    // reached by different code and a warm cache picks this one, so a program that ran all through
+    // development can stop linking the first time somebody builds it on a clean machine.
     "and one that reaches the library's own C, which travels inside the artifact" in {
       assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
       assume(Toolchain.clangAvailable, "clang not available")
@@ -572,11 +573,12 @@ class LibraryCliTests extends LibraryCliSupport {
       libraryOwn(carried, "define") should not be empty
     }
 
-    // `13 §8` gives the flag a second use beyond the bootstrap: *compiling one program both ways is
-    // how the two paths are held to meaning the same thing.* The test above pins which module was
-    // used, which is the seam; this one is the claim itself. What may differ is the standard module's
-    // own symbols — declared when linked, defined when carried — so what must agree is the code the
-    // **program** lowers to, which the way its library arrived has no business changing.
+    // `reference/modules.md § Separate compilation` gives the flag a second use beyond the
+    // bootstrap: *compiling one program both ways is how the two paths are held to meaning the same
+    // thing.* The test above pins which module was used, which is the seam; this one is the claim
+    // itself. What may differ is the standard module's own symbols — declared when linked, defined
+    // when carried — so what must agree is the code the **program** lowers to, which the way its
+    // library arrived has no business changing.
     "and one program compiled both ways lowers to the same program" in {
       assume(StdRoot.root.isDefined, "the library is not reachable from the test working directory")
 
@@ -615,9 +617,10 @@ class LibraryCliTests extends LibraryCliSupport {
     }
   }
 
-  /** A library written as a document (`15 §11`). The whole path is the point: the walk has to find
-   * the file, the build has to compile it, the artifact has to carry a source whose text is the
-   * program rather than the document, and a program that links it has to run.
+  /** A library written as a document (`reference/lexical.md § Literate source`). The whole path is
+   * the point: the walk has to find the file, the build has to compile it, the artifact has to
+   * carry a source whose text is the program rather than the document, and a program that links it
+   * has to run.
    */
   "a literate library" - {
 
@@ -669,9 +672,9 @@ class LibraryCliTests extends LibraryCliSupport {
     }
   }
 
-  /** What an artifact may advertise is what a linker can resolve, and a `private` declaration is not
-   * that: its symbol is emitted `internal` (`13 §2`), which says every caller is inside the module
-   * that defines it.
+  /** What an artifact may advertise is what a linker can resolve, and a `private` declaration is
+   * not that: its symbol is emitted `internal` (`reference/modules.md § Visibility`), which says
+   * every caller is inside the module that defines it.
    *
    * A library used to advertise one anyway — the precompiled half was every function of the
    * library's own modules, read off the key — and the program that reached it did the reasonable
@@ -770,8 +773,8 @@ class LibraryCliTests extends LibraryCliSupport {
     }
   }
 
-  /** A function passed **by name** to a bare-arrow parameter another module declares (`12 §5`,
-   * `§6`).
+  /** A function passed **by name** to a bare-arrow parameter another module declares
+   * (`reference/expressions.md § Closures`, `§6`).
    *
    * **It lives here rather than beside the other closure tests because two modules is the whole of
    * what it is about**, and the closure suites compile one file. A bare-arrow parameter is rewritten

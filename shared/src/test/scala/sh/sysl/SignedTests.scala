@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** `sysl.math`'s integer half, whose membership is the compiler's rather than a written `impl`
- * (`14 §5`).
+ * (`reference/expressions.md § Operator dispatch`).
  *
  * `Float` could be a library trait because there are two floating-point widths to write blocks for.
  * The integers are an open family — `i5` and `u12` are types a program may name — so `Signed` is
@@ -104,9 +104,9 @@ class SignedTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   }
 
   // The finding this suite exists to pin as much as the members themselves. A compiler-provided
-  // membership says which **types** have a member; it is not a way around `13 §2`, which says which
-  // **files** may write one. `Add` is unaffected because it is in the standard module and every file
-  // auto-imports that.
+  // membership says which **types** have a member; it is not a way around `reference/modules.md §
+  // Visibility`, which says which **files** may write one. `Add` is unaffected because it is in the
+  // standard module and every file auto-imports that.
   "the trait still has to be in scope, membership or not" in {
     val e = err(
       """main()
@@ -121,7 +121,7 @@ class SignedTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   }
 
   // Nothing is emitted for the trait itself: it has no bodies, and a membership is a fact the type
-  // system holds rather than code (`14 §5`).
+  // system holds rather than code (`reference/expressions.md § Operator dispatch`).
   "a membership emits no function" in {
     val out = ir(importing + "main()\n    print((-7).abs())")
 

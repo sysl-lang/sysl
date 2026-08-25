@@ -165,7 +165,7 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
     // implementation covers this value already, and writing a second is exactly what it may not do.
     // So the condition is what the diagnostic names. The covering block is written for a generic
     // type of the program's own rather than for a slice, because `Display` for every slice is a
-    // block only the library has a home for (`02 § Coherence`).
+    // block only the library has a home for (`reference/traits.md § Where an impl may live`).
     "so print names the condition rather than an 'impl' that would be refused" in {
       err(
         s"""struct Row[T]
@@ -199,8 +199,9 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
     }
   }
 
-  /** `02 § Coherence` — an `impl` may be written only where the trait is declared or where a type
-   * named in its subject is, so that resolving a bound inspects two modules rather than every one.
+  /** `reference/traits.md § Where an impl may live` — an `impl` may be written only where the trait
+   * is declared or where a type named in its subject is, so that resolving a bound inspects two
+   * modules rather than every one.
    *
    * The refusals are the whole of it: an accepted block proves nothing that a program without the
    * rule would not also accept.
@@ -222,7 +223,8 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
     }
 
     // A catalog trait the compiler already provides for a built-in is refused one step earlier
-    // (`14 §5`), so the trait here is one it does not — the complaint is then this rule's.
+    // (`reference/expressions.md § Operator dispatch`), so the trait here is one it does not — the
+    // complaint is then this rule's.
     "a built-in is foreign too, so the library's traits are out of reach for it" in {
       err("""impl Iterate for int
             |    type Item = int

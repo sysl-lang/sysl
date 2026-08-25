@@ -101,9 +101,9 @@ trait Emitter {
   private var strId      = 0
 
   /** The emitted name of every struct that asked for a boundary of its own, and the boundary
-   * (`15 §1`). Consulted wherever storage is created, which is the only place an alignment can be
-   * *said* — LLVM's textual form gives a named type no alignment, so `@align` has to be stamped onto
-   * each alloca and global rather than declared once with the type.
+   * (`reference/types.md § Structs`). Consulted wherever storage is created, which is the only
+   * place an alignment can be *said* — LLVM's textual form gives a named type no alignment, so
+   * `@align` has to be stamped onto each alloca and global rather than declared once with the type.
    *
    * Keyed by the **emitted** name rather than by the sysl type, because what a slot has is an
    * `ir.LType` and a declared struct is a `Named` — the sysl type it came from is exactly what
@@ -169,8 +169,9 @@ trait Emitter {
    * pair a `&sync` uses, the null-tolerant pair a slice's owner needs, and the weak trio.
    *
    * The weak *header word* is not on this list, because every box carries it whether or not
-   * anything weakly refers to one (`03 § What it costs`) — what is optional is the three functions
-   * that read it, and only a program holding a `weak T` calls those.
+   * anything weakly refers to one (`reference/memory.md § What a heap object costs`) — what is
+   * optional is the three functions that read it, and only a program holding a `weak T` calls
+   * those.
    */
   protected var heap      = false
   protected var syncHeap  = false
@@ -214,9 +215,10 @@ trait Emitter {
    */
   protected var owned: List[mutable.ListBuffer[(ir.Val, Type)]] = Nil
 
-  /** What each scope has been asked to run on its way out — the `defer` stack (`03 § defer`),
-   * innermost first. It sits beside `owned` because it is pushed, popped and unwound with it and
-   * never on its own, so the two are always the same length and one index reaches both.
+  /** What each scope has been asked to run on its way out — the `defer` stack (`reference/memory.md
+   * § Where defer sits`), innermost first. It sits beside `owned` because it is pushed, popped and
+   * unwound with it and never on its own, so the two are always the same length and one index
+   * reaches both.
    */
   protected var deferrals: List[mutable.ListBuffer[TStmt]] = Nil
 
@@ -461,16 +463,18 @@ trait Emitter {
   protected def genStmt(stmt: TStmt): Unit
 
   /** The value a compound assignment stores: what its operator makes of the place's current value
-   * and the value on the right, whether that is an instruction or a trait method (`14 §3`).
+   * and the value on the right, whether that is an instruction or a trait method
+   * (`reference/expressions.md § Operator dispatch`).
    */
   protected def combine(op: String, ty: Type, valueTy: Type, dispatch: Option[TDispatch],
                         cur: ir.Val, v: ir.Val): ir.Val
 
-  /** Traps unless a struct's `invariant` clauses hold of the value in `v` (`16 §6`). */
+  /** Traps unless a struct's `invariant` clauses hold of the value in `v` (`reference/errors.md § Struct invariants`). */
   protected def emitInvCheck(v: ir.Val, struct: Type.Struct, invFn: String): Unit
 
   /** Traps unless `v` satisfies everything the constrained subtype `c` asks of its values — its
-   * `within` range and its `where` predicate (`16 §4`).
+   * `within` range and its `where` predicate (`reference/errors.md § Where a constraint is
+   * checked`).
    */
   protected def emitConstraintChecks(v: ir.Val, c: Type.Constrained): Unit
 
@@ -498,15 +502,15 @@ trait Emitter {
     refPlaceOf = mutable.HashMap.empty
   }
 
-  /** The **storage** type each `ref` in this body names (`03 § ref`), which is not the same as the
-   * type of the values that come out of it.
+  /** The **storage** type each `ref` in this body names (`reference/memory.md § ref — a name for a
+   * place`), which is not the same as the type of the values that come out of it.
    *
-   * A qualifier lives on storage rather than on a value (`03 § Device memory`), and the ordinary way
-   * to read one is off the place — a field knows its own declaration. A ref's uses are all a plain
-   * name, which has no declaration to consult, so the qualifier it found at the binding is kept here
-   * and put back at each access. Without it a ref to a register would emit an unmarked load and
-   * store: the same access the direct path marks `volatile`, silently free to be reordered or
-   * dropped.
+   * A qualifier lives on storage rather than on a value (`reference/memory.md § Device memory`),
+   * and the ordinary way to read one is off the place — a field knows its own declaration. A ref's
+   * uses are all a plain name, which has no declaration to consult, so the qualifier it found at
+   * the binding is kept here and put back at each access. Without it a ref to a register would emit
+   * an unmarked load and store: the same access the direct path marks `volatile`, silently free to
+   * be reordered or dropped.
    *
    * Per function, like every other name-keyed table here, since a name is unique only within one.
    */

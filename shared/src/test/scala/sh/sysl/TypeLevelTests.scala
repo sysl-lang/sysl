@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** A trait member with **no receiver**, reached through the type rather than through a value of it
- * (`02 § Reaching a trait's members without a value`).
+ * (`reference/traits.md § Reaching a trait's members without a value`).
  *
  * Two things are being pinned, and they are separate. One is that a bound can now promise something
  * about the *type* — a width, a zero, a table of constants — so a generic body no longer has to ask
@@ -284,9 +284,10 @@ class TypeLevelTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   // --- the neighbouring rules, asked rather than assumed -----------------------------------
 
   "a member needs the import too, and it is the trait that is imported" in {
-    // `13 §2`: a member is reachable where its **trait** is, exactly as a name is reachable where
-    // its module was asked for. That was pinned for methods; a member with no receiver is reached
-    // through the type's name rather than through a value, and the rule holds there too.
+    // `reference/modules.md § Visibility`: a member is reachable where its **trait** is, exactly as
+    // a name is reachable where its module was asked for. That was pinned for methods; a member
+    // with no receiver is reached through the type's name rather than through a value, and the rule
+    // holds there too.
     run(
       """import sysl.math.Float
         |
@@ -320,8 +321,9 @@ class TypeLevelTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   }
 
   "one trait at two argument lists is told apart by the argument, with no receiver to help" in {
-    // `02 § One implementation per argument list`. A method has its receiver *and* its arguments to
-    // choose by; an associated function has only the arguments, which is the harder half.
+    // `reference/traits.md § One implementation per argument list`. A method has its receiver *and*
+    // its arguments to choose by; an associated function has only the arguments, which is the
+    // harder half.
     run(
       """trait Of[T]
         |    of(x: T) -> Self
@@ -526,9 +528,10 @@ class TypeLevelTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   }
 
   "a generic container can size storage while running, now that a bound can promise a value" in {
-    // `07 § Not yet` said a repeat needs a value in its value position and no bound promises one,
-    // so `var storage: []K` was the empty slice and nothing widened it. A trait declaring an
-    // associated function is a bound that promises one, and the repeat is ordinary code.
+    // `reference/arrays.md § What is still refused` said a repeat needs a value in its value
+    // position and no bound promises one, so `var storage: []K` was the empty slice and nothing
+    // widened it. A trait declaring an associated function is a bound that promises one, and the
+    // repeat is ordinary code.
     run(
       """trait Blank
         |    blank() -> Self

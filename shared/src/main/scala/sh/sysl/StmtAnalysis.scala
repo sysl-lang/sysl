@@ -22,7 +22,8 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
     tb
   }
 
-  /** Runs a block's statements with that block's own nested functions in view (`12 §5a`).
+  /** Runs a block's statements with that block's own nested functions in view
+   * (`reference/declarations.md`).
    *
    * A block is the unit a nested function is hoisted over, so the group is found here, from the
    * statements themselves, rather than by looking ahead from the one being analyzed. What the block
@@ -106,7 +107,8 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
    * A block that ends in a **jump** — `return`, `break`, `continue` — has no trailing expression to
    * be the value of, and it does not fall out the bottom either, so its type is `never` rather than
    * `unit`. That is what lets `if c then 1 else return 0` be an `int`: the jump is still not an
-   * expression (`12 §3`), but the block around it is one, and its type says control does not arrive.
+   * expression (`reference/statements.md § return`), but the block around it is one, and its type
+   * says control does not arrive.
    *
    * **A block in statement position has no value, whatever its last expression yields** (`00 §2`).
    * There is no statement terminator to write "and throw this away" with, so a trailing call, an
@@ -120,7 +122,8 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
       case ExprStmt(e) :: initRev =>
         val init = initRev.reverse.flatMap(recoverStmt)
         // A block whose value *is* the enclosing function's result is the third place a result list
-        // may stand (`12 §5b`), which is what lets a branch or a nested block forward one.
+        // may stand (`reference/declarations.md § Several results`), which is what lets a branch or
+        // a nested block forward one.
         val tr =
           if wantsResults(expected) then analyzeMulti(e, expected)
           else analyzeExpr(e, expected, discarded)
@@ -138,7 +141,8 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
     r
   }
 
-  /** A loop body: the `invariant` and `variant` clauses at its head (`17 §3`), then the rest.
+  /** A loop body: the `invariant` and `variant` clauses at its head (`reference/verification.md §
+   * invariant and variant on a loop`), then the rest.
    *
    * The clauses are analyzed **in the loop's own scope**, before anything the body declares, which
    * is what lets one read the loop variable and stops one reading a local declared under it. The
@@ -178,7 +182,7 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
       case _ => sys.error("unreachable loop clause")
   }
 
-  /** Wraps a loop that declared a `variant` so its slots are set up once per entry (`17 §3`). */
+  /** Wraps a loop that declared a `variant` so its slots are set up once per entry (`reference/verification.md § invariant and variant on a loop`). */
   protected def checkedLoop(ctx: LoopCtx, loop: TExpr): TExpr =
     ctx.variant match
       case Some((slot, ty)) => TCheckedLoop(slot, ty, loop)
@@ -218,7 +222,8 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
         case -1               => err(s"no enclosing loop is labeled '$l")
         case i                => (loops(i), i)
 
-  /** Why a `for const` body takes neither `break` nor `continue` (`10 §10`).
+  /** Why a `for const` body takes neither `break` nor `continue` (`reference/generics.md § A
+   * parameter may stand for a list of types`).
    *
    * There is no loop at run time for either to act on: the copies are straight-line code in the
    * enclosing function, so a `break` here would leave whatever loop the `for const` happens to sit
@@ -330,7 +335,7 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
    * The ordering it promises is a run-time matter and belongs to codegen.
    */
   /** The values a comma form on the left is given, where the right side is **one** thing carrying
-   * several (`00 §13`) — the third of the three feeds one comma syntax has.
+   * several (`reference/types.md § Tuples`) — the third of the three feeds one comma syntax has.
    *
    * The one thing is evaluated once, into a name no program can write, and each part is read back
    * out of it. That is what keeps `a, b = f()` a single call, and it costs the form nothing else:
@@ -479,7 +484,7 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
     case WildcardPattern        => Nil
     case _                      => Nil
 
-  /** `val (a, b) = …` / `var (a, b) = …` (`00 §13`).
+  /** `val (a, b) = …` / `var (a, b) = …` (`reference/types.md § Tuples`).
    *
    * The value is analyzed once into a temporary and the pattern is then walked against its type,
    * each part reading a field of what is above it. That is `spread`'s mechanism — the comma form
@@ -589,8 +594,9 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
         (for (sub, i) <- args.zipWithIndex
          yield bindPattern(sub, TField(subject, i, s.fields(i)._2), mutable)).flatten
 
-    // Everything `09 §5` admits in an arm and a binding cannot use. Named individually, because the
-    // reason differs: a literal or a range is a *test*, and a variant is a choice among several.
+    // Everything `reference/statements.md § match` admits in an arm and a binding cannot use. Named
+    // individually, because the reason differs: a literal or a range is a *test*, and a variant is
+    // a choice among several.
     case _: LitPattern | _: RangePattern =>
       err("a binding cannot test a value — this pattern matches only some values, and a binding " +
         "has no other arm to take when it does not match")
@@ -676,9 +682,9 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
         err(s"cannot initialize '$name': declared ${show(declTy)} but the value is ${show(ti.ty)}")
       List(TVarDecl(declareReadOnly(name, declTy), declTy, ti, boundary(name, align)))
 
-    // `ref name = place` (`03 § ref`). The place is analyzed once, here, and what the name means
-    // afterwards is the storage it found — so neither the path nor the checks along it are repeated,
-    // and neither is the copy a `var` would have made.
+    // `ref name = place` (`reference/memory.md § ref — a name for a place`). The place is analyzed
+    // once, here, and what the name means afterwards is the storage it found — so neither the path
+    // nor the checks along it are repeated, and neither is the copy a `var` would have made.
     case RefDecl(name, placeExpr) =>
       val tp = analyzeExpr(placeExpr)
 
@@ -725,9 +731,9 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
       val (_, depth) = resolveLoop("continue", label)
       List(TContinue(depth))
 
-    // `defer stmt` (`03 § defer`). The statement is analyzed here, where it is written, so it sees
-    // exactly the names in scope at that point — and it is handed to the block rather than emitted,
-    // so nothing runs until the block is left.
+    // `defer stmt` (`reference/memory.md § Where defer sits`). The statement is analyzed here,
+    // where it is written, so it sees exactly the names in scope at that point — and it is handed
+    // to the block rather than emitted, so nothing runs until the block is left.
     //
     // What may be deferred is bounded by what teardown can mean. A jump would leave the block from
     // inside the code that runs *because* the block is already being left, and there is no second
@@ -788,9 +794,9 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
         "against that file's '@include' headers, and what it declares is a type, which is a module " +
         "member rather than something a body can hold")
 
-    // A function declared inside a body is a **nested function** (`12 §5a`), and the block's are
-    // lowered together the first time one is reached — so the ones after it in the same block have
-    // already been dealt with and contribute nothing further here.
+    // A function declared inside a body is a **nested function** (`reference/declarations.md`), and
+    // the block's are lowered together the first time one is reached — so the ones after it in the
+    // same block have already been dealt with and contribute nothing further here.
     case _: FuncDecl =>
       if pendingNested.isEmpty then Nil
       // The group reads something this block binds further down, so its environment cannot be built
@@ -847,11 +853,11 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
      * It emits nothing either way: a true assertion is not code, and a false one has already
      * stopped the compilation.
      *
-     * **`tsubst` is what makes one inside a generic mean anything** (`10 §7`). A body is analyzed
-     * once per instantiation with its parameters bound to the arguments, so the condition is settled
-     * against the types that were actually chosen — which is the only moment `sizeof(T)` is a number.
-     * Folding against an empty map instead reported `T` as an unknown type, about a parameter
-     * declared a line above.
+     * **`tsubst` is what makes one inside a generic mean anything** (`reference/generics.md §
+     * Monomorphization`). A body is analyzed once per instantiation with its parameters bound to
+     * the arguments, so the condition is settled against the types that were actually chosen —
+     * which is the only moment `sizeof(T)` is a number. Folding against an empty map instead
+     * reported `T` as an unknown type, about a parameter declared a line above.
      */
     case a: AssertDecl =>
       checkAssert(a, tsubst)

@@ -148,8 +148,9 @@ trait LibraryCliSupport extends AnyFreeSpec with Matchers with TreeSupport {
     out.toString
   }
 
-  /** A library tree on disk carrying C source beside its sysl (`15 §7`), which is what a binding to
-   * a real library is: the module in a directory under the root, and the shims beside it.
+  /** A library tree on disk carrying C source beside its sysl (`reference/ffi.md § A library may
+   * carry C`), which is what a binding to a real library is: the module in a directory under the
+   * root, and the shims beside it.
    */
   protected def rootWithC(module: String, sysl: String, cFiles: (String, String)*): String = {
     val root = createTempDirectory("sysl-cli-clib-")

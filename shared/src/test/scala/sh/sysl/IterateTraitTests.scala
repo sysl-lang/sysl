@@ -5,11 +5,12 @@ import org.scalatest.freespec.AnyFreeSpec
 /** Walking a sequence a program has to produce a value at a time — `for x in cursor` through the
   * library's `Iterate`, and `s.chars`, which is what decided the shape.
   *
-  * The deciding question `14 §7` left open was whether iteration is something a *type* implements or
-  * something `for` knows about, and `s.chars` is what settles it: a string cannot hand out a view of
-  * its scalar values the way a container hands out a view of its storage, because the decoding is
-  * what makes them. So there has to be a value that carries a position and answers "the next one",
-  * and once there is, `for` accepting it is a smaller change than teaching `for` about strings.
+  * The deciding question `library/core.md § Walking a type of your own` left open was whether
+  * iteration is something a *type* implements or something `for` knows about, and `s.chars` is what
+  * settles it: a string cannot hand out a view of its scalar values the way a container hands out a
+  * view of its storage, because the decoding is what makes them. So there has to be a value that
+  * carries a position and answers "the next one", and once there is, `for` accepting it is a
+  * smaller change than teaching `for` about strings.
   *
   * A container is deliberately **not** an iterator. `for x in b.view()` reads a `Buf` by index with
   * no call per element, so a protocol for it would be a slower way to do something that already
@@ -38,7 +39,8 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
       |""".stripMargin
 
   "what the documents claim" - {
-    // `14 §7` — the protocol's whole reason to exist is a sequence that is not storage.
+    // `library/core.md § Walking a type of your own` — the protocol's whole reason to exist is a
+    // sequence that is not storage.
     "a type that implements 'Iterate' is what a 'for' walks" in {
       run(upto + """for i in Upto(1, 4) do print(i)""") shouldBe "1\n2\n3\n4\n"
     }
@@ -59,8 +61,8 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
              |print(b, c)""".stripMargin) shouldBe "10 4\n"
     }
 
-    // `07 § Iterating` — the sequence is evaluated once. A `next` with a side effect would show a
-    // second evaluation immediately.
+    // `reference/arrays.md § Iterating` — the sequence is evaluated once. A `next` with a side
+    // effect would show a second evaluation immediately.
     "the sequence expression is evaluated once" in {
       run(upto + """start() -> Upto
                    |    print("built")
@@ -68,8 +70,9 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
                    |for i in start() do print(i)""".stripMargin) shouldBe "built\n1\n2\n3\n"
     }
 
-    // `00 §10` — a loop's `else` runs on normal completion, and running out of elements is normal
-    // completion. This is the claim being checked rather than assumed for a new loop form.
+    // `reference/statements.md` — a loop's `else` runs on normal completion, and running out of
+    // elements is normal completion. This is the claim being checked rather than assumed for a new
+    // loop form.
     "an 'else' runs when the elements run out and not when a 'break' left" in {
       run(upto + """for i in Upto(1, 3)
                    |    print(i)
@@ -90,8 +93,8 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
                    |    print(i)""".stripMargin) shouldBe "2\n4\n6\n"
     }
 
-    // `00 §10` — a loop is an expression, and `break value` carries one out. The `else` supplies
-    // the value on the path where the elements ran out.
+    // `reference/statements.md` — a loop is an expression, and `break value` carries one out. The
+    // `else` supplies the value on the path where the elements ran out.
     "the loop is an expression, and its 'break' carries a value" in {
       run(upto + """var found = for i in Upto(1, 9)
                    |    if i * i > 20 then break i
@@ -275,9 +278,9 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
              |print(total)""".stripMargin) shouldBe "6000\n"
     }
 
-    // `10 §5` — a bound promises behaviour, and `Iterate`'s behaviour is a method, so a generic
-    // body may call it. This is the probe that says whether the protocol reaches generic code at
-    // all, and it does: `next` is an ordinary bounded method call.
+    // `reference/generics.md § Bounds` — a bound promises behaviour, and `Iterate`'s behaviour is a
+    // method, so a generic body may call it. This is the probe that says whether the protocol
+    // reaches generic code at all, and it does: `next` is an ordinary bounded method call.
     "a bound promising 'Iterate' licenses the call in a generic body" in {
       run(upto + """count_all[T: Iterate](it: T) -> int
                    |    var seen = 0
@@ -308,13 +311,13 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
 
     // …and so does the loop form, which was worth probing rather than assuming: the loop looks for
     // an implementation filed under the receiver's *type*, and a type parameter has none — but
-    // `10 §7`'s per-instantiation lowering means the body is analyzed once `T` is a real type, so
-    // by the time the loop asks, there is one. A generic walk over any cursor needs nothing added.
-    // The body counts rather than prints, and that is the associated type showing through: a
-    // `[T: Iterate]` says what `T` can *do* and nothing about what it yields, so `print(x)` is not
-    // licensed — `Iterate` promises nothing of its `Item` and a bound cannot add a promise to a
-    // projection. Naming the element in the bound is what a parameter used to allow and what an
-    // object now does; a *bound* has no spelling for it.
+    // `reference/generics.md § Monomorphization`'s per-instantiation lowering means the body is
+    // analyzed once `T` is a real type, so by the time the loop asks, there is one. A generic walk
+    // over any cursor needs nothing added. The body counts rather than prints, and that is the
+    // associated type showing through: a `[T: Iterate]` says what `T` can *do* and nothing about
+    // what it yields, so `print(x)` is not licensed — `Iterate` promises nothing of its `Item` and
+    // a bound cannot add a promise to a projection. Naming the element in the bound is what a
+    // parameter used to allow and what an object now does; a *bound* has no spelling for it.
     "a 'for' over a bounded type parameter walks it" in {
       run(upto + """walk[T: Iterate](it: T) -> int
                    |    var n = 0
@@ -335,10 +338,11 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
      * parameters of its own and exactly one associated type has only one thing a bare argument could
      * mean, so the short form is what a program writes and both are pinned here.
      *
-     * The loop looks for an implementation filed under the receiver's type for every *other* kind of
-     * value, and an object has none — it **is** the implementation. Reading the element out of the
-     * object's own type instead is the same step that lets a bound take one (`10 §5`), and both
-     * sigils are pinned because the two are separate types.
+     * The loop looks for an implementation filed under the receiver's type for every *other* kind
+     * of value, and an object has none — it **is** the implementation. Reading the element out of
+     * the object's own type instead is the same step that lets a bound take one
+     * (`reference/generics.md § Bounds`), and both sigils are pinned because the two are separate
+     * types.
      */
     "a 'for' walks an erased cursor, and so does a direct 'next'" in {
       run(upto + """var o: &Iterate[int] = Upto(1, 2)
@@ -490,9 +494,10 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
              |print(total)""".stripMargin) shouldBe "12497500\n"
     }
 
-    // The loop gives its cursor a slot, and a zero-sized type has none (`00 §12`) — so the one
-    // shape that could have assumed storage where there is none is a cursor with no state. It has
-    // to be an empty sequence: with nothing to advance, anything else never finishes.
+    // The loop gives its cursor a slot, and a zero-sized type has none (`reference/types.md § unit
+    // and never`) — so the one shape that could have assumed storage where there is none is a
+    // cursor with no state. It has to be an empty sequence: with nothing to advance, anything else
+    // never finishes.
     "a cursor with no state is a slot the loop does not need" in {
       run("""struct Tick
              |    u: unit

@@ -42,9 +42,10 @@ class LibraryMoveTests extends LibrarySeamSupport {
     }
 
     "and a program may now declare one of its own beside it" in {
-      // The other side of the clash pinned above: a moved declaration is a *module's*, so `13 §3`
-      // gives the program's own the unqualified spelling and the library's is still reached by path
-      // — including by the compiler, which is what the format hole in the same program proves.
+      // The other side of the clash pinned above: a moved declaration is a *module's*, so
+      // `reference/modules.md § Imports` gives the program's own the unqualified spelling and the
+      // library's is still reached by path — including by the compiler, which is what the format
+      // hole in the same program proves.
       run(
         """struct FormatSpec
           |    n: int
@@ -136,8 +137,9 @@ class LibraryMoveTests extends LibrarySeamSupport {
     }
 
     "a program may declare a 'Display' of its own, and the library's is still what print asks for" in {
-      // The name clash is gone the moment the trait moves, so `Display` unqualified is the program's
-      // here (`13 §3` — own module first) and has nothing to do with rendering.
+      // The name clash is gone the moment the trait moves, so `Display` unqualified is the
+      // program's here (`reference/modules.md § Imports` — own module first) and has nothing to do
+      // with rendering.
       run(
         """trait Display
           |    describe(self) -> int

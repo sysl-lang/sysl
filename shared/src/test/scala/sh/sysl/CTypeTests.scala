@@ -4,7 +4,8 @@ import io.github.edadma.cross_platform.*
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `c type` — the sysl type a **C typedef** turns out to be (`15 §7`).
+/** `c type` — the sysl type a **C typedef** turns out to be (`reference/ffi.md § A library may
+ * carry C`).
  *
  * Every assertion here that says how wide something is reads that width from the C compiler as well,
  * in the same probe, and asserts the two **agree**. That is deliberate and it is the whole point of
@@ -117,10 +118,10 @@ class CTypeTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pa
     }
 
     /** **Its bounds are the measured integer's**, asked of C in the same program so that the claim
-      * is agreement rather than transcription. A `c type` is the one transparent subtype carrying no
-      * `within` range at all, so this is the case that says `16 §1` holds for the attributes too: a
-      * measured `size_t` *is* the integer it turned out to be, and asking its maximum asks about
-      * that integer.
+      * is agreement rather than transcription. A `c type` is the one transparent subtype carrying
+      * no `within` range at all, so this is the case that says `reference/errors.md § Constrained
+      * types` holds for the attributes too: a measured `size_t` *is* the integer it turned out to
+      * be, and asking its maximum asks about that integer.
       */
     "and its maximum is the maximum of the integer C said it is" in {
       run("""@include("<stddef.h>")

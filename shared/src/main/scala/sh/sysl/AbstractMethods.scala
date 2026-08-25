@@ -6,10 +6,10 @@ package sh.sysl
  * member up under an owner key, because there is no owner to key it under.
  *
  * **A bounded type parameter** is resolved against the traits its bounds name, during the
- * definition-time pass of `14 §4`: the call is checked against the *trait's* signature, which is
- * what lets one walk stand in for every instantiation. **A trait object** is resolved against the
- * table it carries, at run time, so what is checked here is that the trait declares the member and
- * that the arguments fit what it declared.
+ * definition-time pass of `reference/generics.md § Bounds`: the call is checked against the
+ * *trait's* signature, which is what lets one walk stand in for every instantiation. **A trait
+ * object** is resolved against the table it carries, at run time, so what is checked here is that
+ * the trait declares the member and that the arguments fit what it declared.
  *
  * They are together because they fail the same way and it is worth failing identically: a member
  * nothing licenses is reported by naming the bound that would have licensed it, and the three
@@ -17,7 +17,8 @@ package sh.sysl
  */
 trait AbstractMethods extends FuncAddress {
 
-  /** `x.m(…)` where `x` is a type parameter, during the definition-time pass of `14 §4`.
+  /** `x.m(…)` where `x` is a type parameter, during the definition-time pass of
+   * `reference/generics.md § Bounds`.
    *
    * The method is looked up in the traits the parameter's bounds name, and the call checked against
    * the **trait's** signature rather than any implementation's. That is what makes one walk stand in
@@ -145,10 +146,10 @@ trait AbstractMethods extends FuncAddress {
    * signature is read under.
    *
    * That substitution is the whole of what a bound's *arguments* buy. `Self` is the parameter
-   * itself, which is what makes `Add::add` yield a `T` and `Ord::lt` a `bool` inside a body that has
-   * not met a concrete type yet (`14 §4`); the trait's own parameters are the arguments the bound
-   * applied it to, so a `T: From[int]` has a `from` that takes an `int` and one bounded by
-   * `From[U]` has one that takes whatever `U` turns out to be.
+   * itself, which is what makes `Add::add` yield a `T` and `Ord::lt` a `bool` inside a body that
+   * has not met a concrete type yet (`reference/generics.md § Bounds`); the trait's own parameters
+   * are the arguments the bound applied it to, so a `T: From[int]` has a `from` that takes an `int`
+   * and one bounded by `From[U]` has one that takes whatever `U` turns out to be.
    */
   protected def boundMember(a: Type.Abstract, mname: String): Option[(Type.Bound, Map[String, Type], MethodDecl)] =
     a.bounds.iterator
@@ -168,10 +169,10 @@ trait AbstractMethods extends FuncAddress {
   /** `x.p` where `x` is a type parameter and `p` is a property one of its bounds declares — the read
    * `callBoundMethod` is to a call, checked the same way and for the same reason.
    *
-   * A field would be refused here whatever the bounds said, because a field is layout and no promise
-   * about behaviour reaches one (`10 §5`). A property is the opposite case: it is behaviour that
-   * happens to be spelled like a field, so a trait can promise it, and a bounded body may read one
-   * exactly as it may call a method.
+   * A field would be refused here whatever the bounds said, because a field is layout and no
+   * promise about behaviour reaches one (`reference/generics.md § Bounds`). A property is the
+   * opposite case: it is behaviour that happens to be spelled like a field, so a trait can promise
+   * it, and a bounded body may read one exactly as it may call a method.
    */
   protected def readBoundProperty(a: Type.Abstract, recv: TExpr, name: String): TExpr =
     boundMember(a, name) match
@@ -244,10 +245,11 @@ trait AbstractMethods extends FuncAddress {
 
         // The **trait's** declaration is what a call through an object names, so the trait's
         // defaults are what fill it — which is why they are filled here, before the slot is
-        // reached, and mean the same thing as they do at a call to a known type (`12 §2a`). A
-        // boxed callable is the one member here with no names to give: `Fn`'s parameters are the
-        // compiler's, so `bindArgs` is not asked and a name written at one is refused as it is at
-        // an inlined callable.
+        // reached, and mean the same thing as they do at a call to a known type
+        // (`reference/declarations.md § Default parameters and named arguments`). A boxed callable
+        // is the one member here with no names to give: `Fn`'s parameters are the compiler's, so
+        // `bindArgs` is not asked and a name written at one is refused as it is at an inlined
+        // callable.
         val bound =
           if callable then args else bindArgs(fname, Some(from.name), m.params, args)
 

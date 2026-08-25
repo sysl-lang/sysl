@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `ref name = place` (`03 § ref`) — a name for a place rather than for a value.
+/** `ref name = place` (`reference/memory.md § ref — a name for a place`) — a name for a place
+ * rather than for a value.
  *
  * The chapter makes two claims that are the whole of the feature, and each needs its own kind of
  * evidence. **At run time a ref stores an address**, which is a claim about the emitted code and is
@@ -18,7 +19,7 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class RefBindingTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
-  /** The register-block shape `03 § Device memory` is written against, shared by the probes below. */
+  /** The register-block shape `reference/memory.md § Device memory` is written against, shared by the probes below. */
   private val uart =
     """struct Uart
       |    status: volatile u32
@@ -109,9 +110,9 @@ class RefBindingTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       run(src) shouldBe "5 7 6\n"
     }
 
-    // `03 § ref` says a ref is not a fourth mode and introduces no representation. The observable
-    // form of that: the name has an address and no storage of its own, so the whole feature is one
-    // zero-offset `getelementptr` and no `alloca`.
+    // `reference/memory.md § ref — a name for a place` says a ref is not a fourth mode and
+    // introduces no representation. The observable form of that: the name has an address and no
+    // storage of its own, so the whole feature is one zero-offset `getelementptr` and no `alloca`.
     "a ref allocates no slot of its own" in {
       val out = ir("var xs = [1, 2, 3]\nref e = xs[1]\ne = 9\nprint(xs[1])")
 
@@ -164,9 +165,10 @@ class RefBindingTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
   "the place is remembered" - {
 
-    // This is the test the feature exists for. `16 §6` discharges a clause by walking outward
-    // through the place being written; a `*Span` severs that walk and is refused where it is made.
-    // A ref keeps it, so the clause fires — and the program traps rather than storing a bad value.
+    // This is the test the feature exists for. `reference/errors.md § Struct invariants` discharges
+    // a clause by walking outward through the place being written; a `*Span` severs that walk and
+    // is refused where it is made. A ref keeps it, so the clause fires — and the program traps
+    // rather than storing a bad value.
     "a write through a ref re-checks the invariant of the struct it lies inside" in {
       val src =
         """struct Span
@@ -218,7 +220,8 @@ class RefBindingTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
 
     // The counterpart, and the reason the line above is worth anything: the same alias written as a
-    // pointer is refused where it is made, because a `*Inner` names no `Outer` (`16 §6`).
+    // pointer is refused where it is made, because a `*Inner` names no `Outer`
+    // (`reference/errors.md § Struct invariants`).
     "where the same alias as a pointer is refused outright" in {
       val src =
         """struct Inner
@@ -236,8 +239,9 @@ class RefBindingTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       err(src) should include("whose invariant reads")
     }
 
-    // A ref into read-only storage is read-only: `03 § ref` says the property survives being given
-    // a shorter name, which is the same rule that makes an element of a `val` array read-only.
+    // A ref into read-only storage is read-only: `reference/memory.md § ref — a name for a place`
+    // says the property survives being given a shorter name, which is the same rule that makes an
+    // element of a `val` array read-only.
     "a ref into a 'val' may not be written through" in {
       err(
         """val xs: [3]int = [1, 2, 3]
@@ -284,9 +288,10 @@ class RefBindingTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
 
     // The first thing a reader will try, and it is refused for a reason that has nothing to do with
-    // refs: a container's subscript is a call through `Index` (`07`, `14 §7`), so it produces a value
-    // and there is no address anywhere for a name to mean. Pinned because the refusal is the
-    // language being consistent rather than the feature being incomplete.
+    // refs: a container's subscript is a call through `Index` (`07`, `library/core.md § Walking a
+    // type of your own`), so it produces a value and there is no address anywhere for a name to
+    // mean. Pinned because the refusal is the language being consistent rather than the feature
+    // being incomplete.
     "a container's subscript is a call, not a place, so it is refused" in {
       val src =
         """import sysl.buf.{Buf, buf}
@@ -580,9 +585,10 @@ class RefBindingTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       err(src) should include("cannot be captured")
     }
 
-    // …and the place itself is capturable as it always was, which is what the refusal points at. The
-    // borrowing form is written deliberately: an escaping closure copies its captures (`12 §8`), so
-    // an `&Fn` here would read the array as it was and prove nothing about reaching the storage.
+    // …and the place itself is capturable as it always was, which is what the refusal points at.
+    // The borrowing form is written deliberately: an escaping closure copies its captures
+    // (`reference/memory.md § Escape analysis`), so an `&Fn` here would read the array as it was
+    // and prove nothing about reaching the storage.
     "where capturing the place it names is ordinary" in {
       val src =
         """var xs = [1, 2, 3]
@@ -599,8 +605,8 @@ class RefBindingTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     */
   "the neighbouring chapters" - {
 
-    // `03 § Device memory` puts the qualifier on the **storage**, and a ref names storage — so an
-    // access through the name has to be the access the path would have been.
+    // `reference/memory.md § Device memory` puts the qualifier on the **storage**, and a ref names
+    // storage — so an access through the name has to be the access the path would have been.
     //
     // This was a real defect, found by asking the question rather than by a failing program: a ref
     // has no declaration to read a qualifier off, and the emitter read it off the node. A register
@@ -642,9 +648,10 @@ class RefBindingTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       run(src) shouldBe "2\n"
     }
 
-    // `16 §6`'s `SelfAlias`: a `*self` method may not let a pointer into its receiver outlive the
-    // call. A ref is a second name for the receiver's own storage, so taking its address is the same
-    // leak written one line longer — and has to be caught as one.
+    // `reference/errors.md § Struct invariants`'s `SelfAlias`: a `*self` method may not let a
+    // pointer into its receiver outlive the call. A ref is a second name for the receiver's own
+    // storage, so taking its address is the same leak written one line longer — and has to be
+    // caught as one.
     "a '*self' method may not return an address taken through a ref into its receiver" in {
       val src =
         """|struct Inner
@@ -662,10 +669,11 @@ class RefBindingTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       err(src + "var o = Outer(Inner(1), 5)\nvar p = o.a.leak()") should include("outlive the call")
     }
 
-    // `13 §2`: statements at the top of a file are the entry point's, not module members — so a ref
-    // written there is an ordinary local of `main` and needs no rule of its own. Probed because the
-    // opposite was assumed: `ref` is local-only, and the question was whether the top of a file
-    // counts as local. It does, and it does for a reason that predates this feature.
+    // `reference/modules.md § Visibility`: statements at the top of a file are the entry point's,
+    // not module members — so a ref written there is an ordinary local of `main` and needs no rule
+    // of its own. Probed because the opposite was assumed: `ref` is local-only, and the question
+    // was whether the top of a file counts as local. It does, and it does for a reason that
+    // predates this feature.
     "a ref at the top of a file is a local of the entry point" in {
       run("var xs = [1, 2, 3]\nref e = xs[1]\ne = 9\nprint(xs[1])") shouldBe "9\n"
     }
@@ -688,8 +696,9 @@ class RefBindingTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       run(src) shouldBe "green\n"
     }
 
-    // `03 § defer`: a deferred statement runs where the block is left, and a ref is still in scope
-    // there — the binding is a declaration of a name, not of storage that could have been released.
+    // `reference/memory.md § Where defer sits`: a deferred statement runs where the block is left,
+    // and a ref is still in scope there — the binding is a declaration of a name, not of storage
+    // that could have been released.
     "a deferred statement may write through a ref" in {
       val src =
         """var xs = [1, 2, 3]
@@ -715,9 +724,9 @@ class RefBindingTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
   }
 
-  /** How many bounds-check comparisons the emitted module contains. The check `03 § Bounds safety`
-    * describes lowers to one `icmp ult` against the length, so counting them is how "checked once"
-    * is measured rather than asserted.
+  /** How many bounds-check comparisons the emitted module contains. The check `reference/memory.md
+    * § Bounds safety follows length, not pointers` describes lowers to one `icmp ult` against the
+    * length, so counting them is how "checked once" is measured rather than asserted.
     */
   private def checks(out: String): Int = out.linesIterator.count(_.contains("icmp ult i64"))
 }

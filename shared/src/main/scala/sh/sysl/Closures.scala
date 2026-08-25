@@ -2,8 +2,8 @@ package sh.sysl
 
 import scala.collection.mutable
 
-/** A nested function declared in a block (`12 §5a`): the lowered name it is called by, and the
- * environment its call is passed.
+/** A nested function declared in a block (`reference/declarations.md`): the lowered name it is
+ * called by, and the environment its call is passed.
  *
  * The environment is a `*Env` expression rather than a name, because the same nested function is
  * reached two ways — from the block that declared it, where it is the address of the local holding
@@ -12,7 +12,7 @@ import scala.collection.mutable
  */
 case class Nested(fname: String, env: TExpr, variadic: Boolean = false, params: List[Param] = Nil)
 
-/** The environment a body reads its captures out of (`12 §7`, `§5a`).
+/** The environment a body reads its captures out of (`reference/expressions.md § Closures`, `§5a`).
  *
  * `byReference` is the one difference between the two things that have one. A **closure literal**
  * captures by value, because it may outlive the frame it was written in: its fields hold copies and
@@ -27,7 +27,8 @@ case class Environment(
     fixed: Set[String],
 )
 
-/** Closures (`12 §5`–`§8`): the arrow literal, what it captures, and the type it inhabits.
+/** Closures (`reference/expressions.md § Closures`–`§8`): the arrow literal, what it captures, and
+ * the type it inhabits.
  *
  * **A closure is a struct and an `impl`, and that is the whole reduction.** The struct's fields are
  * the variables the body names from the scope it was written in; the `impl` is of the call trait for
@@ -46,12 +47,12 @@ object Closures {
 
   /** What every closure struct's base name begins with. It holds a `$`, which no identifier and no
    * module name may, so nothing a program can write collides with one — the same reason a tuple's
-   * base holds one (`00 §13`).
+   * base holds one (`reference/types.md § Tuples`).
    */
   private val prefix = s"${Modules.sep}closure"
 
   /** And what the environment shared by one block of nested functions begins with, for the same
-   * reason (`12 §5a`).
+   * reason (`reference/declarations.md`).
    */
   private val envPrefix = s"${Modules.sep}env"
 
@@ -63,7 +64,7 @@ object Closures {
 
   /** Whether a type is the struct behind a closure literal — something a program wrote and did not
    * name. What a reader is told about one has to say "closure" and "captures", never the name the
-   * compiler filed it under (`12 §6`).
+   * compiler filed it under (`reference/types.md § Function types`).
    */
   def literal(t: Type): Boolean = t match
     case s: Type.Struct => s.base.startsWith(prefix)
@@ -122,7 +123,8 @@ trait Closures extends CallAnalysis {
   private var environmentCount = 0
 
 
-  /** A closure literal (`12 §5`), and the closure a trailing block became.
+  /** A closure literal (`reference/expressions.md § Closures`), and the closure a trailing block
+   * became.
    *
    * The parameter types come from the context asking for a callable and the result comes from the
    * body — never the other way round, so a closure is analyzed once and what it yields is what it
@@ -151,9 +153,10 @@ trait Closures extends CallAnalysis {
     // neither is the one shape a closure cannot be analyzed at all, and it is reported against the
     // parameter rather than against the literal, since that is where the answer would go.
     //
-    // A placeholder's parameter is named by the compiler (`12 §5c`), so the advice that fits a
-    // written one — annotate it — names something the program is not able to write. What it is told
-    // instead is the form that has somewhere to put the annotation.
+    // A placeholder's parameter is named by the compiler (`reference/expressions.md § _ — a
+    // parameter with the name left out`), so the advice that fits a written one — annotate it —
+    // names something the program is not able to write. What it is told instead is the form that
+    // has somewhere to put the annotation.
     //
     // **The type position is an ellipsis and not a `T`.** These two were the only diagnostics in
     // the tree quoting a spelling with a metavariable in it, and the place this one fires is
@@ -228,13 +231,13 @@ trait Closures extends CallAnalysis {
     funcInsts(name) = (func.params.map((n, t) => (n, t)), ret)
     registerCallTrait(struct, ptypes, ret, pos)
 
-    // Every capture is read where the closure is *formed* (`12 §7`), so a value is copied in and a
-    // `&T` takes a share — which is what the ordinary field-by-field construction of a struct
-    // already does, and the reason capture needed no rule of its own.
+    // Every capture is read where the closure is *formed* (`reference/expressions.md § Closures`),
+    // so a value is copied in and a `&T` takes a share — which is what the ordinary field-by-field
+    // construction of a struct already does, and the reason capture needed no rule of its own.
     TStructNew(struct, captured.map(n => analyzeExpr(Ident(n).setPos(pos)))).setPos(pos)
   }
 
-  /** The nested functions of one block, lowered together (`12 §5a`).
+  /** The nested functions of one block, lowered together (`reference/declarations.md`).
    *
    * **They share one environment**, and that is the whole design. A nested function *is* a closure —
    * capture follows §7 and representation follows §8, both unchanged — but the block's functions are
@@ -279,8 +282,9 @@ trait Closures extends CallAnalysis {
         if f.tparams.nonEmpty then
           err(s"'${f.name}' is declared inside a function body and cannot be generic — the type " +
             "arguments would have nowhere to come from, since nothing outside the body calls it")
-        // A nested function states its own signature (`12 §5a`), so it is held to the same rules as
-        // any other — including where a `va_list` may stand and what a `...` must have before it.
+        // A nested function states its own signature (`reference/declarations.md`), so it is held
+        // to the same rules as any other — including where a `va_list` may stand and what a `...`
+        // must have before it.
         checkSignatureRules(f.name, f.params, f.retType, f.variadic)
       }
 
@@ -305,9 +309,10 @@ trait Closures extends CallAnalysis {
     val here  = TAddrOf(TLoad(local, env), Type.Ptr(env))
     val self  = TLoad("self", Type.Ptr(env))
 
-    // Every signature is registered before any body is analyzed, which is what lets one call another
-    // whichever order they are written in. A nested function states its parameters and its result
-    // (`12 §5a`), so there is nothing here to infer and nothing to wait for.
+    // Every signature is registered before any body is analyzed, which is what lets one call
+    // another whichever order they are written in. A nested function states its parameters and its
+    // result (`reference/declarations.md`), so there is nothing here to infer and nothing to wait
+    // for.
     val lowered = group.map { f =>
       val fname = s"${Type.mangle(env)}.${f.name}"
 
@@ -361,7 +366,7 @@ trait Closures extends CallAnalysis {
     captured.filter(n => lookupOpt(n).exists((u, _) => readOnlyLocals(u))).toSet
 
   /** Refuses a capture of a `ref`, which is the one construct that would carry one out of its block
-   * (`03 § ref`).
+   * (`reference/memory.md § ref — a name for a place`).
    *
    * A ref is a **declaration and never a type**, and the whole of what that buys is that the compiler
    * still holds the place the name stands for, in the body that wrote it. A capture is exactly the
@@ -390,9 +395,10 @@ trait Closures extends CallAnalysis {
     val (params, result) = funcInsts(n.fname)
 
     // A nested function is a declaration with named parameters like any other, so it takes both a
-    // name at the call and a default (`12 §2a`). Its default carries no owning key: every call to
-    // one is inside the body it was written in, so the terms already in force are its own — and
-    // `bindArgs` empties the locals, which is what keeps a default from reading a capture.
+    // name at the call and a default (`reference/declarations.md § Default parameters and named
+    // arguments`). Its default carries no owning key: every call to one is inside the body it was
+    // written in, so the terms already in force are its own — and `bindArgs` empties the locals,
+    // which is what keeps a default from reading a capture.
     val bound = bindArgs(s"'$written'", None, n.params, args, n.variadic)
 
     checkArity(s"'$written'", params.length - 1, n.variadic, bound.length)
@@ -406,7 +412,8 @@ trait Closures extends CallAnalysis {
     TCall(n.fname, checkArgs(written, params, declared, Some(n.env :: supplied2)) ::: tail.map(variadicArg(_)), result)
   }
 
-  /** `xs.map(square)` — a declared function where a callable is wanted (`12 §5`).
+  /** `xs.map(square)` — a declared function where a callable is wanted (`reference/expressions.md §
+   * Closures`).
    *
    * **A named function is the capture-free closure**, so it is one: the same struct with no fields,
    * whose `call` is a call to the function. There is no function-pointer type beside the call trait
@@ -468,7 +475,8 @@ trait Closures extends CallAnalysis {
         .headOption
     case _ => None
 
-  /** `f(args)` where `f` is a value rather than a name the program declared (`12 §6`).
+  /** `f(args)` where `f` is a value rather than a name the program declared (`reference/types.md §
+   * Function types`).
    *
    * It is a call to the call trait's one member, so it is the ordinary method call it looks like —
    * which is what makes the bare-arrow parameter a direct call and the `&Fn` field an indirect one
@@ -497,7 +505,8 @@ trait Closures extends CallAnalysis {
         val field = TField(autoDeref(recv), s.slot(s.fieldIndex(name)), fty)
 
         // A field holding C's function pointer is called through in the same position and by the
-        // same spelling; what differs is only that there is no receiver to hand over (`12 §6a`).
+        // same spelling; what differs is only that there is no receiver to hand over
+        // (`reference/ffi.md § A function's address`).
         if cfnOf(fty).isDefined then callThroughAddress(field, args)
         else callCallable(field, args, expected)
       }
@@ -546,7 +555,8 @@ trait Closures extends CallAnalysis {
       case ConstDecl(n, _, v, _) => walk(v, bound); bound + n
       case f: FuncDecl => scoped(f.body, bound ++ f.params.map(_.name)); bound
       // A closure inside this one captures from further out through this one, so what it reads is
-      // read here too — which is what makes capture reach through a nesting (`12 §5a`).
+      // read here too — which is what makes capture reach through a nesting
+      // (`reference/declarations.md`).
       case Lambda(ps, b, _) => scoped(b, bound ++ ps.map(_.name)); bound
       case For(_, n, it, b, e) =>
         walk(it, bound)
@@ -554,7 +564,8 @@ trait Closures extends CallAnalysis {
         e.foreach(scoped(_, bound))
         bound
       // A quantifier binds its name over the predicate and nowhere else, so an outer name of the
-      // same spelling is not captured by a clause that only shadows it (`17 §2`).
+      // same spelling is not captured by a clause that only shadows it (`reference/verification.md
+      // § for all and for some`).
       case Quantifier(_, n, it, p) =>
         walk(it, bound)
         walk(p, bound + n)

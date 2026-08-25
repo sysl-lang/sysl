@@ -29,7 +29,7 @@ trait ExprParser extends SyslParserBase {
       at(lambda | quantifier | ifExpr | whileExpr | doWhileExpr | loopExpr | forExpr | matchExpr),
     )
 
-  /** `x -> x + 1` — a closure literal (`12 §5`).
+  /** `x -> x + 1` — a closure literal (`reference/expressions.md § Closures`).
    *
    * It sits at the top of the expression grammar because its body extends as far to the right as an
    * expression can: `x -> x + 1` is a closure over the sum, not a closure over `x` added to `1`.
@@ -43,7 +43,8 @@ trait ExprParser extends SyslParserBase {
     lambdaParams ~ (op("->") ~> lambdaBody) ^^ { case ps ~ b => Lambda(ps, b) }
 
   /** One parameter with no parentheses, or a parenthesized list of them — including the empty list,
-   * which is the one arity that has nowhere else to be written (`12 §5`).
+   * which is the one arity that has nowhere else to be written (`reference/expressions.md §
+   * Closures`).
    */
   protected lazy val lambdaParams: Parser[List[LambdaParam]] =
     op("(") ~> commaList(lambdaParam) <~ op(")") |
@@ -59,10 +60,11 @@ trait ExprParser extends SyslParserBase {
         ident ^^ (n => LambdaParam(n, None)),
     )
 
-  /** A closure's parameter declares no default (`12 §2a`). It is matched through the `Fn` trait,
-   * which carries types and no names, so a call through one has nothing to read a default out of —
-   * the same absence that stops a closure being called by name. Said here rather than left to the
-   * "')' expected" a grammar with no place for one would give.
+  /** A closure's parameter declares no default (`reference/declarations.md § Default parameters and
+   * named arguments`). It is matched through the `Fn` trait, which carries types and no names, so a
+   * call through one has nothing to read a default out of — the same absence that stops a closure
+   * being called by name. Said here rather than left to the "')' expected" a grammar with no place
+   * for one would give.
    *
    * Reached only where the parameter wrote a **type**, and that is what makes saying it safe. A
    * parenthesized list is read speculatively — `(x = 1)` is an argument that is a store, and `(a, b)`
@@ -79,10 +81,11 @@ trait ExprParser extends SyslParserBase {
   /** A closure's body, which is a function's body without the `=`: an expression, or an indented
    * block whose trailing expression is the value.
    *
-   * The expression form is a statement-level position and closes a placeholder there (`12 §5c`), so
-   * `x -> _ + 1` is a closure yielding a closure rather than one arrow with two parameters. That is
-   * also what lets [[Placeholders.free]] stop at a [[Lambda]]: one can hold no placeholder that is
-   * still looking for its parameter list.
+   * The expression form is a statement-level position and closes a placeholder there
+   * (`reference/expressions.md § _ — a parameter with the name left out`), so `x -> _ + 1` is a
+   * closure yielding a closure rather than one arrow with two parameters. That is also what lets
+   * [[Placeholders.free]] stop at a [[Lambda]]: one can hold no placeholder that is still looking
+   * for its parameter list.
    *
    * The block is reached through `blockAhead` rather than tried outright, which is what stops a
    * closure whose body was forgotten — `val g = x ->` and then the next statement — being answered
@@ -115,7 +118,8 @@ trait ExprParser extends SyslParserBase {
   lazy val logicalOr: PackratParser[Expr]  = at(chainl1(logicalAnd, binOp("||")))
   lazy val logicalAnd: PackratParser[Expr] = at(chainl1(isTest, binOp("&&")))
 
-  /** `x is Pat`, `x is not Pat` — a pattern where a condition is wanted (`09 §12`).
+  /** `x is Pat`, `x is not Pat` — a pattern where a condition is wanted (`reference/expressions.md
+   * § is — a pattern where a condition is wanted`).
    *
    * It sits **between `&&` and the comparisons**, which is what makes `a is P && b > 0` a chain of
    * two terms rather than an `is` against a conjunction: the subject and the pattern are each held
@@ -219,8 +223,9 @@ trait ExprParser extends SyslParserBase {
   protected lazy val postfixTail: PackratParser[Expr => Expr] =
       // One thing in the brackets is a subscript; more than one never was — `xs[a, b]` was a parse
       // error until this read it, so nothing that compiled before changes meaning here. What the
-      // comma buys is the *multi-argument* type list `&f[A, B]` (`12 §6a`), which the analyzer is
-      // the only thing entitled to accept, and it refuses this node everywhere else.
+      // comma buys is the *multi-argument* type list `&f[A, B]` (`reference/ffi.md § A function's
+      // address`), which the analyzer is the only thing entitled to accept, and it refuses this
+      // node everywhere else.
       here ~ (op("[") ~> expression ~ rep(op(",") ~> expression) <~ op("]")) ^^ {
         case p ~ (idx ~ Nil)  => (e: Expr) => Index(e, idx).setPos(p)
         case p ~ (idx ~ more) => (e: Expr) => TypeArgs(e, idx :: more).setPos(p)
@@ -233,12 +238,12 @@ trait ExprParser extends SyslParserBase {
       (op(".") ~> here ~ (tupleIndex | nestedTupleIndex)) ^^ { case p ~ n => (e: Expr) => Field(e, n).setPos(p) } |
       here ~ (op("::") ~> ident) ^^ { case p ~ n => (e: Expr) => TypeAttr(e, n).setPos(p) } |
       // A call is the exception: what is wrong with `foo(…)` is nearly always `foo` — it does not
-      // exist, or it does not take these arguments — so the callee's own position wins, and the
-      // `(` is only the fallback for a callee that somehow has none.
-      // The call is what absorbs a bare `_` argument, which `argument` deliberately left alone, so
-      // the lift happens on the whole call rather than on its parts (`12 §5c`). A call whose
-      // arguments were each big enough to lift where they stood has nothing free left in it, and
-      // this hands it straight back.
+      // exist, or it does not take these arguments — so the callee's own position wins, and the `(`
+      // is only the fallback for a callee that somehow has none. The call is what absorbs a bare
+      // `_` argument, which `argument` deliberately left alone, so the lift happens on the whole
+      // call rather than on its parts (`reference/expressions.md § _ — a parameter with the name
+      // left out`). A call whose arguments were each big enough to lift where they stood has
+      // nothing free left in it, and this hands it straight back.
       here ~ (op("(") ~> commaList(argument) <~ op(")")) ~ opt(trailingBlock) ^^ { case p ~ args ~ blk =>
         (e: Expr) => Placeholders.lift(Call(e, args ::: blk.toList).setPos(e.pos).setPos(p))
       } |
@@ -266,9 +271,9 @@ trait ExprParser extends SyslParserBase {
   /** The braced field list. Braces rather than parentheses because a parenthesised list of
    * `name = value` is already a call's argument list, and this is not a call.
    *
-   * A brace suspends the off-side rule until it closes (`00 §9`), so the fields may be written one
-   * per line with commas, exactly as an array literal's elements are, and the trailing comma is
-   * allowed for the same reason.
+   * A brace suspends the off-side rule until it closes (`reference/lexical.md § Brackets suspend
+   * the rule`), so the fields may be written one per line with commas, exactly as an array
+   * literal's elements are, and the trailing comma is allowed for the same reason.
    */
   protected lazy val withFields: Parser[List[WithField]] =
     op("{") ~> (commaList1(withField) | emptyWith) <~ op("}") |
@@ -317,8 +322,9 @@ trait ExprParser extends SyslParserBase {
     accept("tuple index", { case t: lexical.IntLit if t.suffix.isEmpty => t.value.toString })
 
   /** `t.0.1` — the nested selection that the lexer reads as one number, since `0.1` is a float
-   * before it is two indices (`00 §13`). Fatal rather than a backtrack: nothing else can be meant
-   * by a float immediately after a `.`, and the fix is worth naming where it happened.
+   * before it is two indices (`reference/types.md § Tuples`). Fatal rather than a backtrack:
+   * nothing else can be meant by a float immediately after a `.`, and the fix is worth naming where
+   * it happened.
    */
   protected lazy val nestedTupleIndex: Parser[Nothing] = Parser { in =>
     in.first match
@@ -371,8 +377,8 @@ trait ExprParser extends SyslParserBase {
     guard(floatLit | intLit) ~> err("a number is written with a digit before the point — '0.5' " +
       "rather than '.5'")
 
-  /** `sizeof(T)` and `alignof(T)` — the two forms whose operand is a type (`03 § Reinterpreting
-   * storage`).
+  /** `sizeof(T)` and `alignof(T)` — the two forms whose operand is a type (`reference/memory.md §
+   * Reinterpreting storage`).
    *
    * They are read here rather than left to look like calls because a call's argument list holds
    * expressions, and `sizeof(*Node)` would parse as a dereference of a name. Both words are reserved,
@@ -410,17 +416,18 @@ trait ExprParser extends SyslParserBase {
   /** A comma-separated list that may end in a comma.
    *
    * Every such list in sysl is bracketed, and a bracket suspends the off-side rule until it closes
-   * (`00 §9`), so a list is free to span lines. That is what makes the trailing comma worth having
-   * rather than a curiosity: with one element per line, the last line stops being different from
-   * the others, so an element can be added, removed or reordered without touching its neighbour,
-   * and a diff shows the line that changed and no other.
+   * (`reference/lexical.md § Brackets suspend the rule`), so a list is free to span lines. That is
+   * what makes the trailing comma worth having rather than a curiosity: with one element per line,
+   * the last line stops being different from the others, so an element can be added, removed or
+   * reordered without touching its neighbour, and a diff shows the line that changed and no other.
    *
    * The comma is optional only *after* an element, never instead of one — `[,]` and `f(,)` stay
    * errors. That is why the empty case is a separate alternative rather than `repsep` with an
    * optional comma hung off it, which would have accepted both.
    */
   /** One argument at a call: an ordinary expression, or `name = value` standing at the parameter it
-   * names rather than at the one its position would give it (`12 §2a`).
+   * names rather than at the one its position would give it (`reference/declarations.md § Default
+   * parameters and named arguments`).
    *
    * `name = value` is also a legal expression — assignment yields the value stored — so the two
    * readings collide and the named argument is the one taken. It is tried first, and only where the
@@ -452,10 +459,10 @@ trait ExprParser extends SyslParserBase {
 
   /** After `(`: `)` is unit, one expression is a grouping, more are a tuple.
    *
-   * The group is one of the three boundaries a placeholder closes at (`12 §5c`), and it is the one
-   * a program reaches for when the other two fall in the wrong place: `(_ + 1) * 2` multiplies the
-   * closure rather than closing over the product. A tuple is lifted whole, since the parentheses
-   * that delimit it are the same ones.
+   * The group is one of the three boundaries a placeholder closes at (`reference/expressions.md § _
+   * — a parameter with the name left out`), and it is the one a program reaches for when the other
+   * two fall in the wrong place: `(_ + 1) * 2` multiplies the closure rather than closing over the
+   * product. A tuple is lifted whole, since the parentheses that delimit it are the same ones.
    */
   protected lazy val parenTail: PackratParser[Expr] =
     op(")") ^^^ UnitLit() |
@@ -535,12 +542,13 @@ trait ExprParser extends SyslParserBase {
    * The embedded text is its own little source, so a position inside a hole points into the hole
    * rather than into an unrelated column of the line the string sits on.
    *
-   * **A hole is therefore a placeholder boundary** (`12 §5c`), and it has to be: the sub-parser
-   * numbers placeholders from zero, so a `_` in a hole and a `_` outside the string would both be
-   * `$ph1` and the lift would build a parameter list naming one thing twice. Closing the hole makes
-   * that unreachable rather than unlikely, since a lifted closure's names never join the outer
-   * tree's free set. What it costs is that a placeholder cannot reach out of a string to close over
-   * the whole of one — the arrow form outside the string is how that is written.
+   * **A hole is therefore a placeholder boundary** (`reference/expressions.md § _ — a parameter
+   * with the name left out`), and it has to be: the sub-parser numbers placeholders from zero, so a
+   * `_` in a hole and a `_` outside the string would both be `$ph1` and the lift would build a
+   * parameter list naming one thing twice. Closing the hole makes that unreachable rather than
+   * unlikely, since a lifted closure's names never join the outer tree's free set. What it costs is
+   * that a placeholder cannot reach out of a string to close over the whole of one — the arrow form
+   * outside the string is how that is written.
    */
   protected def parseEmbedded(src: String): Either[String, Expr] = {
     val sub = new SyslParser(Source(s"${source.name} (interpolation)", src))
@@ -557,7 +565,8 @@ trait ExprParser extends SyslParserBase {
 
   protected lazy val identExpr: Parser[Expr] = ident ^^ Ident.apply
 
-  /** `_` in operand position — a closure's parameter with the name left out (`12 §5c`).
+  /** `_` in operand position — a closure's parameter with the name left out
+   * (`reference/expressions.md § _ — a parameter with the name left out`).
    *
    * It is tried before [[identExpr]] because `_` lexes as an identifier, and it is matched here
    * rather than given a token of its own so that the pattern grammar's `_` is untouched: the two

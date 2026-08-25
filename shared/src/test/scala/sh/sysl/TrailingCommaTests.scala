@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** A comma-separated list may end in a comma (`00 §9`).
+/** A comma-separated list may end in a comma (`reference/lexical.md § Brackets suspend the rule`).
  *
  * Every such list in sysl is bracketed, and a bracket suspends the off-side rule, so a list has
  * always been free to span lines. The trailing comma is what makes that layout worth using: with

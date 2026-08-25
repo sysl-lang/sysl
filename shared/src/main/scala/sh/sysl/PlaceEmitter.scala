@@ -16,7 +16,7 @@ import ir.{Access, Arg, BinOp, CastOp, ICmp, Inst, LType, Val}
 trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
 
   /** The marker that goes on the load or the store reaching a place, which is the whole of what
-   * `volatile` costs (`03 § Device memory`).
+   * `volatile` costs (`reference/memory.md § Device memory`).
    *
    * It is asked of the place rather than of the value, because that is where the qualifier lives:
    * `regs.status` has type `u32` and sits in storage of type `volatile u32`, and the difference
@@ -31,7 +31,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    */
   protected def access(place: TExpr): Access = place match
     // A `ref` name carries no declaration of its own, so the qualifier comes from what the binding
-    // found rather than from the node (`03 § ref`).
+    // found rather than from the node (`reference/memory.md § ref — a name for a place`).
     case TLoad(name, _) if refStorage.contains(name) => accessOf(refStorage(name))
     case _                                           => accessOf(place.placeTy)
 
@@ -78,9 +78,9 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
 
     // A **bitfield** has no address at all, and this says so rather than handing back the
     // container's — which is what a `getelementptr` to slot zero would be, and would be wrong for
-    // every field but the first while looking right for all of them. Nothing reaches here: `15 §1`
-    // refuses `&` on any packed field, and both the read and the write of a bitfield go through its
-    // container by name (`Bitfields`).
+    // every field but the first while looking right for all of them. Nothing reaches here:
+    // `reference/types.md § Structs` refuses `&` on any packed field, and both the read and the
+    // write of a bitfield go through its container by name (`Bitfields`).
     case TField(receiver, _, _) if bitfieldOf(receiver.ty).isDefined =>
       sys.error(s"unreachable address of a bitfield in ${receiver.ty.llvm}")
 
@@ -138,10 +138,11 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * refused for the moment `lo` was `6` and `hi` still `5`.
    */
   protected def genMultiAssign(writes: List[TWrite]): Unit = {
-    // A bitfield has no address of its own — `15 §1` refuses one outright — so what `placeAddr`
-    // locates for one is the **container's**, which is where its read-modify-write happens. Locating
-    // it in this phase rather than at the write is what keeps the form's promise for a bitfield too:
-    // every place's own subexpressions are evaluated once, and before anything is read.
+    // A bitfield has no address of its own — `reference/types.md § Structs` refuses one outright —
+    // so what `placeAddr` locates for one is the **container's**, which is where its
+    // read-modify-write happens. Locating it in this phase rather than at the write is what keeps
+    // the form's promise for a bitfield too: every place's own subexpressions are evaluated once,
+    // and before anything is read.
     val addrs = writes.map(w => if Type.zeroSized(w.place.ty) then Val.Nothing else placeAddr(w.place))
 
     // Every read takes a count for the statement, which is what a form that reads everything before
@@ -199,10 +200,11 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
   /** What is in the place now — one load of the container and a shift for a bitfield.
    *
    * **One load, whatever the field's width**, which is what makes reading a bitfield register a
-   * single bus read of the whole register rather than a sub-word access of part of it. The qualifier
-   * is asked of the **receiver's storage** rather than of the field: every field of a bitfield struct
-   * is bits of one word, so `volatile` on any of them qualifies the container they share, which is
-   * what `Type.volatileIn` already answers by looking through a struct (`15 §1`).
+   * single bus read of the whole register rather than a sub-word access of part of it. The
+   * qualifier is asked of the **receiver's storage** rather than of the field: every field of a
+   * bitfield struct is bits of one word, so `volatile` on any of them qualifies the container they
+   * share, which is what `Type.volatileIn` already answers by looking through a struct
+   * (`reference/types.md § Structs`).
    */
   protected def loadPlace(place: TExpr, p: Val): Val = bitPlace(place) match
     case Some((recv, ranges, r)) => readBits(ranges, r, loadContainer(ranges, recv, p))
@@ -403,8 +405,9 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * A count the program computed is where the arithmetic can go wrong, so the size is built with
    * checked arithmetic: a count that would wrap traps rather than allocating something smaller than
    * the elements that are about to be written into it, and an allocation that fails traps rather
-   * than handing back a null those elements are then stored through. Both are `07 §Indexing`'s trap
-   * for `07 §Indexing`'s reason — the guarantee is that a program with no `*T` in it cannot fault.
+   * than handing back a null those elements are then stored through. Both are `reference/arrays.md
+   * § Indexing`'s trap for `reference/arrays.md § Indexing`'s reason — the guarantee is that a
+   * program with no `*T` in it cannot fault.
    */
   /** The buffer a promoted array lives in, or `null` for one that still lives in the frame.
    *
@@ -415,9 +418,9 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
   protected def promotedOwner(base: TExpr): Val = base match
     case TLoad(name, _) if promotedBoxes.contains(name) => promotedBoxes(name)
     // A `ref` names storage it did not declare, so the box belongs to whatever its place was rooted
-    // at (`03 § ref`). Without this step a view taken through a ref would own nothing, and the buffer
-    // the array was promoted into would be released while the view still pointed into it — a
-    // promotion that silently undid itself.
+    // at (`reference/memory.md § ref — a name for a place`). Without this step a view taken through
+    // a ref would own nothing, and the buffer the array was promoted into would be released while
+    // the view still pointed into it — a promotion that silently undid itself.
     case TLoad(name, _) if refPlaceOf.contains(name)    => promotedOwner(refPlaceOf(name))
     case _: TLoad                                       => Val.Null
     case TIndex(r, _, _)                                => promotedOwner(r)
@@ -570,8 +573,8 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * **Sixteen bits is what made this the ordinary case rather than an exotic one.** Until CRAFT
    * every target's address was as wide as an `int` or wider, so the only index this reached was a
    * `u128`, and refusing those cost nothing. On a machine with a 64 KiB address space `int` is
-   * wider than `usize`, so `for i in 0..<4 do b[i] …` is the case — which `07 § Indexing` names in
-   * as many words as the thing that must not need a conversion.
+   * wider than `usize`, so `for i in 0..<4 do b[i] …` is the case — which `reference/arrays.md §
+   * Indexing` names in as many words as the thing that must not need a conversion.
    */
   protected def widenIndex(index: TExpr): Val = Type.underlying(index.ty) match
     case i: Type.Integer if i.bits <= target.word.bits =>
@@ -643,8 +646,9 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * value at the enum's underlying width, which is the enum's representation.
    */
   protected def genEnumFromInt(value: TExpr, en: Type.Enum): Val = {
-    // Through `repr`, because a transparent subtype *is* its base (`16 §1`) and the analyzer admits
-    // one here on exactly that ground — the value is laid out as the base and converts as it.
+    // Through `repr`, because a transparent subtype *is* its base (`reference/errors.md §
+    // Constrained types`) and the analyzer admits one here on exactly that ground — the value is
+    // laid out as the base and converts as it.
     val vt = Type.repr(value.ty).asInstanceOf[Type.Integer]
     val v  = genExpr(value)
     trapUnless(enumMembership(en, vt, v), "enum")

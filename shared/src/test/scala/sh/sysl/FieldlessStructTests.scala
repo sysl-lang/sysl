@@ -95,8 +95,9 @@ class FieldlessStructTests extends AnyFreeSpec with RunSupport with CodegenSuppo
       err("struct Empty\nend Other\n\nprint(1)\n") should include("'end Other' does not match 'Empty'")
     }
 
-    // `opaque struct Name` with no body at all is C's incomplete type and stays that (`15 §9`);
-    // writing the marker as well says the same thing in the spelling every other block uses.
+    // `opaque struct Name` with no body at all is C's incomplete type and stays that
+    // (`reference/ffi.md § opaque`); writing the marker as well says the same thing in the spelling
+    // every other block uses.
     "an opaque struct may be closed the same way, and is still opaque" in {
       val e = errOf("sq/lib.sysl" -> "module sq\n\nopaque struct Session\nend Session\n",
         "main.sysl" -> "f(p: *u8) -> int = 1\nvar s: *sq.Session = null\nprint(f(s))\n")

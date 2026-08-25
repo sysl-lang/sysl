@@ -70,7 +70,8 @@ trait Reporting {
       finally currentPos = saved
     }
 
-  /** Where the **call** is, while a parameter's default is being filled in at one (`12 §2a`).
+  /** Where the **call** is, while a parameter's default is being filled in at one
+   * (`reference/declarations.md § Default parameters and named arguments`).
    *
    * A default is analyzed in the declaration's terms and evaluated at the call, and those are two
    * different places — which nothing had to tell apart until a built-in could report where it was
@@ -129,8 +130,8 @@ trait Reporting {
   /** Abandons the current region without reporting, because whatever led here already did. */
   protected def poisoned(): Nothing = throw Poisoned()
 
-  /** Whether the analyzer is running the definition-time pass of `14 §4` — a generic body walked
-   * once with its type parameters standing in for themselves.
+  /** Whether the analyzer is running the definition-time pass of `reference/generics.md § Bounds` —
+   * a generic body walked once with its type parameters standing in for themselves.
    *
    * The pass exists to report what a body does that its bounds do not license, and those
    * diagnostics go through `boundErr` — a missing bound on a method call or on an operator alike.

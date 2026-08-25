@@ -178,9 +178,10 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with RunSupport
             |""".stripMargin) should include("takes no parameters")
     }
 
-    // A variadic needs a named parameter in front of the tail (`12 §9`), so it is refused by the
-    // rule above and needs no case of its own — and a tail with *no* named parameter never reaches
-    // this rule at all, being refused where every other signature like it is.
+    // A variadic needs a named parameter in front of the tail (`reference/ffi.md § Variadic
+    // functions`), so it is refused by the rule above and needs no case of its own — and a tail
+    // with *no* named parameter never reaches this rule at all, being refused where every other
+    // signature like it is.
     "a variadic tail is refused for the parameter it has to have" in {
       err("""@test
             |t(n: int, ...) =

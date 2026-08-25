@@ -5,8 +5,8 @@ import io.github.edadma.cross_platform.*
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
-/** `link "z"` — the directive of `15 §8`, by which a module of `extern`s tells the driver which
- * library resolves them.
+/** `link "z"` — the directive of `reference/ffi.md § @link`, by which a module of `extern`s tells
+ * the driver which library resolves them.
  *
  * The suite is in three parts because the feature is: the clause has to *parse* where a header goes
  * and nowhere else, it has to reach the *command line* through every path that links, and it has to
@@ -142,9 +142,9 @@ class LinkDirectiveTests extends AnyFreeSpec with Matchers with RunSupport with 
   }
 
   // The one place this differs from the capability clause it is otherwise shaped like. A capability
-  // describes the whole module, so `13 §4` holds a module's files to agreeing; a link requirement
-  // describes one file's externs, and a module whose externs sit in one file has nothing for the
-  // others to repeat.
+  // describes the whole module, so `reference/modules.md § Capabilities are a module property`
+  // holds a module's files to agreeing; a link requirement describes one file's externs, and a
+  // module whose externs sit in one file has nothing for the others to repeat.
   "the files of a module need not agree, unlike a capability" - {
 
     "one file may name a library the others do not" in {

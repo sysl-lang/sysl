@@ -440,7 +440,7 @@ object Resolve {
    * **What is compared is the module path**, so two packages that both namespace themselves under
    * `sh.sysl` and offer `sh.sysl.sqlite` and `sh.sysl.linenoise` do not collide, because no import
    * line can be read as either. The names they share are `sh` and `sh.sysl`, and neither package
-   * declares those — a directory holding no source is not a module (`13 §1`).
+   * declares those — a directory holding no source is not a module (`reference/modules.md`).
    *
    * **`ownerRoots` is a list because the consumer's name space can be more than one directory.** Its
    * head is the consumer itself; the rest are the `--lib` source roots, whose modules are filed under

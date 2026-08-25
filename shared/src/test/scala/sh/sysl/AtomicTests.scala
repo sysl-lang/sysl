@@ -323,8 +323,9 @@ class AtomicTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
 
     // A constrained subtype is an integer with a promise about the values put into it, and the
-    // instruction runs at the integer — the same resolution `Bits` makes (`14 §5`). The promise is
-    // the writer's, since an atomic write is not a place the compiler can insert a check.
+    // instruction runs at the integer — the same resolution `Bits` makes (`reference/expressions.md
+    // § Operator dispatch`). The promise is the writer's, since an atomic write is not a place the
+    // compiler can insert a check.
     "a constrained subtype runs at the integer underneath it" in {
       val out = ir("""import sysl.sync.*
                      |

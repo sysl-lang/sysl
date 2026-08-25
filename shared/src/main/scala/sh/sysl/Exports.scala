@@ -1,6 +1,7 @@
 package sh.sysl
 
-/** The two things about `@export` that only the whole program can answer (`15 §12`).
+/** The two things about `@export` that only the whole program can answer (`reference/ffi.md §
+ * @export`).
  *
  * `ExportCheck` holds each declaration to a *shape* C can call, which is a question one declaration
  * answers on its own and is asked where the declarations are. These three are not:

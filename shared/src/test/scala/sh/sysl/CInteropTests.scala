@@ -208,11 +208,12 @@ class CInteropTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     /* The caller-allocated opaque type, which is the shape `regcomp` and half of POSIX are written
      * in: the callee fills storage the caller supplies, and the storage's size lives in a header.
      *
-     * Both of these run, and that is the point worth recording — the shape is *reachable*, so what a
-     * binding is missing is never "sysl cannot call this". What both spellings really hold is the
-     * numbers 32 and 8 and the value of `REG_EXTENDED`, transcribed by hand, correct on this machine
-     * and different under glibc, with nothing checking either. That is the argument for a shim
-     * (`15 §7`), and these two are what it is an argument against.
+     * Both of these run, and that is the point worth recording — the shape is *reachable*, so what
+     * a binding is missing is never "sysl cannot call this". What both spellings really hold is the
+     * numbers 32 and 8 and the value of `REG_EXTENDED`, transcribed by hand, correct on this
+     * machine and different under glibc, with nothing checking either. That is the argument for a
+     * shim (`reference/ffi.md § A library may carry C`), and these two are what it is an argument
+     * against.
      *
      * **That paragraph turned out to be literally true, and these two are held to macOS because of
      * it.** Run on glibc they fail, and not by a little: `regex_t` is a different size, and
@@ -277,8 +278,9 @@ class CInteropTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       * here is the *shape of the mistake a reader still makes*, which is reaching for the address
       * with the bare name C would let them use.
       *
-      * A bare `f` is the capture-free closure it has always been (`12 §5`), so what it needs is the
-      * `&` and the message says so rather than reporting a typo.
+      * A bare `f` is the capture-free closure it has always been (`reference/expressions.md §
+      * Closures`), so what it needs is the `&` and the message says so rather than reporting a
+      * typo.
       */
     "a function's address is reached with '&', not with the bare name C allows" in {
       val addr = err("cmp(a: *u8, b: *u8) -> int = 0\nprint(cmp)")

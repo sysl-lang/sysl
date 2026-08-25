@@ -1,7 +1,7 @@
 package sh.sysl
 
-/** How a module's name and the name of a declaration in it make the one key every table is
- * keyed by (`13 §1`, `13 §3`).
+/** How a module's name and the name of a declaration in it make the one key every table is keyed by
+ * (`reference/modules.md`, `reference/modules.md § Imports`).
  *
  * A declaration belongs to a module, and two modules may each declare a `read`, so the name a
  * table holds has to say which module's it is. The alternative — a module dimension on every
@@ -24,9 +24,9 @@ object Modules {
   /** The character between a module's name and the name of a declaration in it. */
   val sep: Char = '$'
 
-  /** The name of the **anonymous root module**, whose name is the empty path (`13 §1`). A
-   * declaration in it is keyed by its own name alone, which is why a program of one headerless
-   * file is keyed exactly as it was before modules existed.
+  /** The name of the **anonymous root module**, whose name is the empty path
+   * (`reference/modules.md`). A declaration in it is keyed by its own name alone, which is why a
+   * program of one headerless file is keyed exactly as it was before modules existed.
    */
   val root: String = ""
 

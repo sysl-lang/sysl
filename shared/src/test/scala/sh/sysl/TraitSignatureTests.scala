@@ -103,9 +103,9 @@ class TraitSignatureTests extends AnyFreeSpec with CodegenSupport with RunSuppor
       ) shouldBe "p\n"
     }
 
-    // A result list is a signature form and not a type (`12 §5b`), so it goes through the return
-    // resolver rather than the type resolver — the one shape that would have been refused if this
-    // pass had reached for `resolveType` on everything.
+    // A result list is a signature form and not a type (`reference/declarations.md § Several
+    // results`), so it goes through the return resolver rather than the type resolver — the one
+    // shape that would have been refused if this pass had reached for `resolveType` on everything.
     "a result list, which is a signature form and not a type" in {
       run(
         """trait Split

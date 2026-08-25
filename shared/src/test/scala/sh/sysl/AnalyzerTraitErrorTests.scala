@@ -11,9 +11,10 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class AnalyzerTraitErrorTests extends AnyFreeSpec with CodegenSupport {
 
-  /** `14 §4` — a generic body is checked once, at its definition, with each type parameter opaque
-   * except for what its bounds promise. What separates this from the template model is that the
-   * body is wrong on its own, so the diagnostic does not wait for a call site to expose it.
+  /** `reference/generics.md § Bounds` — a generic body is checked once, at its definition, with
+   * each type parameter opaque except for what its bounds promise. What separates this from the
+   * template model is that the body is wrong on its own, so the diagnostic does not wait for a call
+   * site to expose it.
    */
   "definition-checked bounds" - {
     val show = "trait Show\n    show(self) -> int\n"
@@ -431,11 +432,11 @@ class AnalyzerTraitErrorTests extends AnyFreeSpec with CodegenSupport {
       err("print(7u32.neg())") should include("type 'uint' has no method 'neg'")
     }
 
-    // A writable view reaches a member written for the read-only one, because `07 § Read-only
-    // views` says a `[]T` goes wherever a `[]const T` is wanted. The sentence ends "and never the
-    // other way round", and this is that half: a member written for a `[]T` may write through its
-    // receiver, so a `[]const T` reaching it would be a read-only view with a writing member —
-    // which is the one thing the bit exists to stop.
+    // A writable view reaches a member written for the read-only one, because `reference/arrays.md
+    // § []const T — a view that may not be written` says a `[]T` goes wherever a `[]const T` is
+    // wanted. The sentence ends "and never the other way round", and this is that half: a member
+    // written for a `[]T` may write through its receiver, so a `[]const T` reaching it would be a
+    // read-only view with a writing member — which is the one thing the bit exists to stop.
     "a read-only view does not reach a member written for a writable one" in {
       err(
         """trait Bump
@@ -503,7 +504,8 @@ class AnalyzerTraitErrorTests extends AnyFreeSpec with CodegenSupport {
 
     // Every other unlicensed use names a bound that would allow it. This one names none — nothing
     // declares a property `v`, and a *field* is layout, which no bound reaches. So it is settled at
-    // the definition outright rather than deferred to whatever types turn up (`10 §5`).
+    // the definition outright rather than deferred to whatever types turn up
+    // (`reference/generics.md § Bounds`).
     "a field read off a type parameter is refused outright, with no bound to suggest" in {
       val out = err("first[T](x: T) -> int = x.v")
 

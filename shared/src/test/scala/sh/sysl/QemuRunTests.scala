@@ -24,7 +24,7 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
 
   /** A UART is a device, so its register is `volatile` — a store to it is an effect and not a value
    * computation, and an optimizer entitled to drop a store nobody reads would drop the program's
-   * whole output. `03 § Device memory` is the chapter.
+   * whole output. `reference/memory.md § Device memory` is the chapter.
    *
    * This is also the answer to how a freestanding program prints at all: **a volatile store through
    * a pointer is a language feature**, so nothing here needs `asm`, semihosting, or a debug host.

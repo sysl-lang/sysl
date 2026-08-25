@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** Every place a value can come to have a constrained subtype, and the check that meets it there
- * (`16 §4`).
+ * (`reference/errors.md § Where a constraint is checked`).
  *
  * The chapter's list of produce sites was written by adding them as they came up, so it was evidence
  * that the ones anybody had tried were covered rather than an argument that there were no others.
@@ -145,9 +145,10 @@ class SubtypeProduceSiteTests extends AnyFreeSpec with RunSupport with CodegenSu
   }
 
   /** The two sites that are the subtype's *own* doing rather than a slot's — an operation whose
-   * result is one, which only a derived subtype has (`16 §3`), and the two forms that compute and
-   * store in one step. `SubtypeOperatorTests` is where these are worked out; they are named here so
-   * that the derivation this file records is complete on its own terms.
+   * result is one, which only a derived subtype has (`reference/errors.md § A derivation inherits
+   * its base's behaviour and may replace none of it`), and the two forms that compute and store in
+   * one step. `SubtypeOperatorTests` is where these are worked out; they are named here so that the
+   * derivation this file records is complete on its own terms.
    */
   "a value the subtype's own operations produce" - {
     "arithmetic on a derived subtype" in {

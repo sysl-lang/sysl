@@ -120,7 +120,7 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
    * multiplies by another complex number and scales by a real, and refusing the second would be
    * refusing the arithmetic rather than resolving an ambiguity. What picks between them is the
    * argument list, which every use — an operator, a bound, a named call — already has in hand
-   * (`02 § A trait may be implemented at more than one argument list`).
+   * (`reference/traits.md § One implementation per argument list`).
    */
   protected val traitImpls = mutable.LinkedHashMap.empty[(String, String), List[TraitImpl]]
 
@@ -191,7 +191,7 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
     implsOf(tr.name, key).find(ti => suppliedBound(ti, tr.name, subject, targs).key == tr.key)
 
   /** The whole argument list an implementation was written at, found from the arguments a *use*
-   * supplies rather than from all of them (`14 §7`).
+   * supplies rather than from all of them (`library/core.md § Walking a type of your own`).
    *
    * An operator is the one use that cannot name every argument: `a * b` fixes the right-hand type and
    * says nothing about the result, because the result is what it is asking to be told. So the
@@ -372,10 +372,10 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
    *
    * There is a **list** of them because an array has two, and the order between them is the whole
    * reason this is not a single answer. Every argument a shape drops is one a block may be generic
-   * over, and value generics (`10 §9`) made an array's length one of those — so `[3]T` and `[N]T`
-   * are both blocks covering a `[3]int`, and the first covers less. Asking the keys in order is how
-   * the more specific one answers, which is the same ordering `memberKey` applies between a type's
-   * own key and its shape.
+   * over, and value generics (`reference/generics.md § A parameter may stand for a value`) made an
+   * array's length one of those — so `[3]T` and `[N]T` are both blocks covering a `[3]int`, and the
+   * first covers less. Asking the keys in order is how the more specific one answers, which is the
+   * same ordering `memberKey` applies between a type's own key and its shape.
    *
    * A `string` is not a slice and has no shape here. It is a view of bytes that are valid UTF-8, and
    * that invariant is the whole difference between it and a `[]u8` — a block written for every slice
@@ -395,7 +395,8 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
     // A tuple has **two** shapes, and the order between them is what makes a block written for one
     // arity beat one written for every arity — the same ladder an array gained one line up, one
     // kind further out. The arity's shape hands the parts back as separate arguments; the pack's
-    // hands them back as one list, which is what `(..A)` binds `A` to (`10 §10`).
+    // hands them back as one list, which is what `(..A)` binds `A` to (`reference/generics.md § A
+    // parameter may stand for a list of types`).
     case t: Type.Tuple =>
       List((Type.Tuple.shape(t.targs.length), t.targs), (Type.Tuple.pack, List(Type.Pack(t.targs))))
     case _ => Nil
@@ -427,12 +428,12 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
 
   /** The key a **writable** view also answers to: the read-only view of the same elements.
    *
-   * `07 § Read-only views` settles this and states it without qualification — "it is one type with a
-   * bit, not two types", and "a `[]T` is accepted wherever a `[]const T` is wanted". A receiver is
-   * such a place, so `impl Search for []const u8` is reachable on a `[]u8`. Without this the lookup
-   * files the two under the names a diagnostic gives them, `[]byte` and `[]const byte`, and denies
-   * the member outright — which is the compiler treating them as the two types that sentence exists
-   * to deny.
+   * `reference/arrays.md § []const T — a view that may not be written` settles this and states it
+   * without qualification — "it is one type with a bit, not two types", and "a `[]T` is accepted
+   * wherever a `[]const T` is wanted". A receiver is such a place, so `impl Search for []const u8`
+   * is reachable on a `[]u8`. Without this the lookup files the two under the names a diagnostic
+   * gives them, `[]byte` and `[]const byte`, and denies the member outright — which is the compiler
+   * treating them as the two types that sentence exists to deny.
    *
    * **It goes one way only, which is the other half of the same sentence: "and never the other way
    * round."** A member written for a `[]T` may write through its receiver, and a `[]const T` that
@@ -523,7 +524,7 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
     name == "len" && head.startsWith("[")
 
   /** Every trait a bound promises: the traits it **requires**, transitively, and then itself
-   * (`02 § A trait may require another trait`).
+   * (`reference/traits.md § A trait may require another trait`).
    *
    * The order is what the rest of this depends on — a required trait comes before the trait that
    * required it — because it is the order a method table is laid out in, and a table and the call
@@ -593,10 +594,11 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
    *
    * There are three ways to answer yes and they are not interchangeable. A **user** type opts in
    * with an explicit `impl`, filed under its owner key — nominal conformance, never structural. A
-   * **built-in** is a member by the compiler's own rule (`14 §5`), because it has no module to write
-   * an `impl` in and the integer family has no finite list of types to write one for. And a **type
-   * parameter** implements exactly what its own bounds promise, which is what lets a bounded body
-   * hand its parameter on to something that asks the same of it.
+   * **built-in** is a member by the compiler's own rule (`reference/expressions.md § Operator
+   * dispatch`), because it has no module to write an `impl` in and the integer family has no finite
+   * list of types to write one for. And a **type parameter** implements exactly what its own bounds
+   * promise, which is what lets a bounded body hand its parameter on to something that asks the
+   * same of it.
    *
    * What a bound promises includes what the traits it names require, which is the whole point of a
    * supertrait: a `[T: Word]` may be handed to something asking `[U: Add]` without writing `Add`
@@ -604,14 +606,15 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
    */
   protected def satisfies(tr: Type.Bound, t: Type): Boolean = t match
     case a: Type.Abstract => a.bounds.exists(b => traitClosure(b, selfBinding(a)).exists(_.key == tr.key))
-    // **A bound on a pack distributes over its members** (`10 §10`), which is the whole of the bound
-    // syntax a pack needs: `[..A: Display]` is the ordinary `[T: Display]` read over a list. It is
-    // what makes the membership answerable before instantiation — a tuple implements `Display` when
-    // every part does, so a call is refused where it is written rather than inside a body that has
-    // already been committed to.
+    // **A bound on a pack distributes over its members** (`reference/generics.md § A parameter may
+    // stand for a list of types`), which is the whole of the bound syntax a pack needs: `[..A:
+    // Display]` is the ordinary `[T: Display]` read over a list. It is what makes the membership
+    // answerable before instantiation — a tuple implements `Display` when every part does, so a
+    // call is refused where it is written rather than inside a body that has already been committed
+    // to.
     //
-    // Empty is vacuously true and cannot arise: there is no zero-tuple (`00 §13`), so a pack bound
-    // by matching one always has parts.
+    // Empty is vacuously true and cannot arise: there is no zero-tuple (`reference/types.md §
+    // Tuples`), so a pack bound by matching one always has parts.
     case Type.Pack(elems) => elems.forall(satisfies(tr, _))
     // A compiler-provided membership is **homogeneous**, and that is `01`'s rule about the scalars
     // rather than a limitation of this one: no operator promotes, so an `int` is `Mul[int]` and is
@@ -798,10 +801,11 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
         s"through. Call it on the value before erasing it, or take the bound on a type parameter"
 
     // A **tuple** used to get a sentence of its own after these two, saying which arity the library
-    // stopped writing rows at and that a product wider than that wants a struct with names. There is
-    // no arity to stop at now: the rows are written over a type pack and cover every tuple
-    // (`10 §10`), so what is left to say about one is what is said about every other type — which of
-    // its parts does not implement the trait, which `unmetCondition` says by name.
+    // stopped writing rows at and that a product wider than that wants a struct with names. There
+    // is no arity to stop at now: the rows are written over a type pack and cover every tuple
+    // (`reference/generics.md § A parameter may stand for a list of types`), so what is left to say
+    // about one is what is said about every other type — which of its parts does not implement the
+    // trait, which `unmetCondition` says by name.
     erasedShort.orElse(wrongArgs.headOption).orElse(unmetCondition)
 
   /** The same, for a trait that takes no arguments. */

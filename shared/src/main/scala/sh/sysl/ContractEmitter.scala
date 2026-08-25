@@ -3,8 +3,10 @@ package sh.sysl
 import ir.{Access, Arg, CastOp, FCmp, Inst, LType, Val}
 
 /** Everything that traps when a value turns out not to be what it was promised to be: a function's
- * `require` and `ensure` clauses (`16 §5`), a constrained subtype's `within` range and `where`
- * predicate (`16 §4`), and a struct's `invariant` (`16 §6`).
+ * `require` and `ensure` clauses (`reference/errors.md § What the type's own name offers: ::
+ * attributes`), a constrained subtype's `within` range and `where` predicate (`reference/errors.md
+ * § Where a constraint is checked`), and a struct's `invariant` (`reference/errors.md § Struct
+ * invariants`).
  *
  * They live together because they are one mechanism wearing four names. Each one evaluates a
  * condition and traps on false, and each one has to leave nothing behind on the checked path — a
@@ -30,7 +32,8 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
   protected var resultSSA: Option[Val]                 = None
 
   /** What the function being emitted is called, what its parameters are, and the `variant` it
-   * declared — the three things a self-call needs to check the measure (`17 §4`).
+   * declared — the three things a self-call needs to check the measure (`reference/verification.md
+   * § variant on a function`).
    */
   protected var selfName: String                 = ""
   protected var selfParams: List[(String, Type)] = Nil
@@ -48,14 +51,16 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
   /** Whether a call to `name` is the self-call a `variant` is checked at. */
   protected def checksVariant(name: String): Boolean = selfVariant.isDefined && name == selfName
 
-  /** The measure check at a direct recursive call (`17 §4`).
+  /** The measure check at a direct recursive call (`reference/verification.md § variant on a
+   * function`).
    *
-   * **It reads no state and threads nothing through the call**, which is what `17 §4`'s restriction
-   * to the parameters buys. The arguments about to be passed are the values the parameters are about
-   * to hold, so the "next" measure is this same expression evaluated with those values in the
-   * parameters' own slots: take the measure as it stands, put the arguments in, take it again, put
-   * the parameters back, and compare. Nothing is retained or released across the swap — the slots end
-   * holding exactly what they held — so the ownership bookkeeping is untouched.
+   * **It reads no state and threads nothing through the call**, which is what
+   * `reference/verification.md § variant on a function`'s restriction to the parameters buys. The
+   * arguments about to be passed are the values the parameters are about to hold, so the "next"
+   * measure is this same expression evaluated with those values in the parameters' own slots: take
+   * the measure as it stands, put the arguments in, take it again, put the parameters back, and
+   * compare. Nothing is retained or released across the swap — the slots end holding exactly what
+   * they held — so the ownership bookkeeping is untouched.
    *
    * `staged` is aligned with `selfParams` and carries what each argument came out as, which is the
    * shape both call paths already produce: an address for a large value, a register for the rest,
@@ -125,7 +130,8 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
       for (cond, _) <- ensures do emitContract(cond, "ensure")
       resultSSA = None
 
-  /** Sets up a `variant`'s two slots at the point the loop is entered (`17 §3`), then emits the loop.
+  /** Sets up a `variant`'s two slots at the point the loop is entered (`reference/verification.md §
+   * invariant and variant on a loop`), then emits the loop.
    *
    * The `armed` flag starts false, which is what lets the first iteration pass with nothing to
    * compare against. It is stored **here** rather than in the function's prologue because a loop

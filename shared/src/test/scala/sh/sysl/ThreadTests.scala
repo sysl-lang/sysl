@@ -348,10 +348,10 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
    *
    * The reaper drains iteratively through a worklist rather than recursing, and that worklist is
    * `thread_local` so that two threads releasing the last reference to two unrelated objects do not
-   * each overwrite the other's list (`06 § &sync T`, `03 § Teardown is iterative`). A plain global
-   * would put both threads' chains on one list: the visible failures are a double free, a node freed
-   * while the other thread is walking it, or a chain silently dropped — so the total is what says it
-   * did not happen, and it is exact.
+   * each overwrite the other's list (`reference/memory.md § Crossing a concurrency domain`, `03 §
+   * Teardown is iterative`). A plain global would put both threads' chains on one list: the visible
+   * failures are a double free, a node freed while the other thread is walking it, or a chain
+   * silently dropped — so the total is what says it did not happen, and it is exact.
    */
   "two threads dropping shared structures at the same moment" - {
     "each drain finds its own list" in {
@@ -447,9 +447,10 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
-  /** `06 § Crossing copies` decides structurally what may cross a domain boundary, and `spawn` is
-   * where a program meets that rule: it is declared `@crossing(arg)`, so the pointer it takes is
-   * looked *through* and every count the state reaches has to be atomic.
+  /** `reference/memory.md § Crossing a concurrency domain` decides structurally what may cross a
+   * domain boundary, and `spawn` is where a program meets that rule: it is declared
+   * `@crossing(arg)`, so the pointer it takes is looked *through* and every count the state reaches
+   * has to be atomic.
    *
    * Until `@crossing` existed this section pinned the opposite — a plain `&T` reaching another
    * thread with nothing said — on the reading that a raw pointer is crossable on purpose. That is
@@ -533,10 +534,10 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       out should include("&sync")
     }
 
-    /** A thread body is C's shape and a callable is not (`12 §6a`): the address is what pthreads
-     * takes, and a closure would need boxing and would carry captures across a boundary nothing
-     * checks. The two differ by one character, so the diagnostic is the whole of what stands between
-     * the reader and the fix, and it names the `&`.
+    /** A thread body is C's shape and a callable is not (`reference/ffi.md § A function's
+     * address`): the address is what pthreads takes, and a closure would need boxing and would
+     * carry captures across a boundary nothing checks. The two differ by one character, so the
+     * diagnostic is the whole of what stands between the reader and the fix, and it names the `&`.
      *
      * **It is the sharp form, and it did not use to be.** The sharp message asks what the context
      * wanted, and `spawn`'s parameter is generic — so while an argument was analyzed before its

@@ -115,9 +115,9 @@ private[sysl] def execute(cfg: Config): Int = {
     case Right(t)  => t
 
   // **Below the target, because which files a tree holds is a question the target answers** — a
-  // module's Linux implementation and its macOS one are different files, and `13 §5` selects between
-  // them by the directory they sit in. This used to sit above everything, which was free while a
-  // tree meant the same thing to every machine.
+  // module's Linux implementation and its macOS one are different files, and `reference/modules.md
+  // § Platform selection` selects between them by the directory they sit in. This used to sit above
+  // everything, which was free while a tree meant the same thing to every machine.
   //
   // A malformed one is reported as itself rather than as a tree that would not read. The two are
   // different mistakes: one is a name somebody typed wrong, which the message can name and explain,
@@ -362,8 +362,9 @@ private[sysl] def execute(cfg: Config): Int = {
   val archives = artifacts ::: coreArchive.toList
 
   // The C beside the sysl, of every tree this compilation walked — the project's own, each `--lib`
-  // source root's, and each package's (`15 §7`, `NativeSources`). An artifact is not among them: a
-  // `.syslib` carries its C already compiled, as archive members.
+  // source root's, and each package's (`reference/ffi.md § A library may carry C`,
+  // `NativeSources`). An artifact is not among them: a `.syslib` carries its C already compiled, as
+  // archive members.
   //
   // Compiled only where something is about to be linked. `emit-llvm` prints IR and `prove` stops at
   // the typed tree, and neither has a use for an object file — running clang for one would be work
@@ -444,15 +445,17 @@ private[sysl] def execute(cfg: Config): Int = {
       case None      => ()
 
   // **The standard library's own tree, and only where it was compiled from source.** The library is
-  // a library (`13 §8`) and may carry C exactly as any other tree may (`15 §7`) — `sysl.fs` reaches
-  // `struct dirent` through a shim under a `__<os>__` directory, which is the only way to reach a
-  // layout that differs by platform and the reason the directories exist (`13 §5`).
+  // a library (`reference/modules.md § Separate compilation`) and may carry C exactly as any other
+  // tree may (`reference/ffi.md § A library may carry C`) — `sysl.fs` reaches `struct dirent`
+  // through a shim under a `__<os>__` directory, which is the only way to reach a layout that
+  // differs by platform and the reason the directories exist (`reference/modules.md § Platform
+  // selection`).
   //
   // **Two compilations have no standard library to add, and both would add it twice.** Where one
   // arrived as an **artifact** its shims are already archive members. And under `--std` the tree
-  // being compiled *is* the standard module (`13 §8`), so `cfg.file` is already this very directory
-  // — `sysl test library --std` is the case, and what it produced was two `sysl.fs.dirent.o` and a
-  // duplicate symbol at the link.
+  // being compiled *is* the standard module (`reference/modules.md § Separate compilation`), so
+  // `cfg.file` is already this very directory — `sysl test library --std` is the case, and what it
+  // produced was two `sysl.fs.dirent.o` and a duplicate symbol at the link.
   val stdTree =
     Option.when(coreArchive.isEmpty && !cfg.std)(Std.root.toOption).flatten.toList
 
@@ -489,8 +492,9 @@ private[sysl] def execute(cfg: Config): Int = {
     return status
 
   // Proving stops at the typed tree and never lowers, so it branches before the compilation below
-  // (`17 §9`). It reads the tree before pruning and before `@ghost` erasure, because the predicates a
-  // specification is written in are exactly what the lowering drops.
+  // (`reference/verification.md § sysl prove`). It reads the tree before pruning and before
+  // `@ghost` erasure, because the predicates a specification is written in are exactly what the
+  // lowering drops.
   if cfg.command == "prove" then
     return prove(cfg, librarySources ::: sources, libraryTrees, target, std, provides)
 
@@ -769,8 +773,8 @@ private def unmetHeaders(project: PackageConfig, fromPackages: List[HeaderNeed],
   }
 }
 
-/** Whether a subcommand is producing something a **C project** links, which is what decides that the
- * module is emitted with no entry point (`15 §12`).
+/** Whether a subcommand is producing something a **C project** links, which is what decides that
+ * the module is emitted with no entry point (`reference/ffi.md § @export`).
  *
  * Both commands here are one compilation with two things read off it, which is why they share this
  * rather than each answering for itself: `emit-header` prints what `build-c` writes beside the

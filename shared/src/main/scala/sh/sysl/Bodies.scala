@@ -55,10 +55,10 @@ object Bodies {
   /** Whether a declaration belongs to the **module** even when it is written in the file the program
    * starts in.
    *
-   * The file that carries the statements is a **body**, so what it declares is local to that body: a
-   * `val` there is a stack local initialized where it is written, a `var` there is an ordinary
-   * mutable local, and a function there is a nested function (`12 §5a`) that captures the locals
-   * above it.
+   * The file that carries the statements is a **body**, so what it declares is local to that body:
+   * a `val` there is a stack local initialized where it is written, a `var` there is an ordinary
+   * mutable local, and a function there is a nested function (`reference/declarations.md`) that
+   * captures the locals above it.
    *
    * What stays behind is everything with **no runtime identity**: a type names a shape, a `const` is
    * folded into its uses before anything runs, an `extern` names storage somebody else owns, an
@@ -79,17 +79,19 @@ object Bodies {
    * that read something the body binds, and the ones that call those.
    *
    * A function written at the top of the entry file is a nested function only if it has an
-   * environment to be nested *in*. `12 §5a` says as much outright: one that captures nothing and does
-   * not escape "is an ordinary static function with a private name". So the three things a nested
-   * function cannot be — generic, addressable, a value — are consequences of holding a frame, not of
-   * where the declaration was written, and charging them to a function that holds no frame would be
-   * charging the common case for the rare one. A comparison handed to `qsort` is the shape that makes
-   * this concrete: it reads nothing, and refusing its address on the ground that "what would have to
-   * travel beside the address is the frame it reads" names a frame that does not exist.
+   * environment to be nested *in*. `reference/declarations.md` says as much outright: one that
+   * captures nothing and does not escape "is an ordinary static function with a private name". So
+   * the three things a nested function cannot be — generic, addressable, a value — are consequences
+   * of holding a frame, not of where the declaration was written, and charging them to a function
+   * that holds no frame would be charging the common case for the rare one. A comparison handed to
+   * `qsort` is the shape that makes this concrete: it reads nothing, and refusing its address on
+   * the ground that "what would have to travel beside the address is the frame it reads" names a
+   * frame that does not exist.
    *
    * **Capture is transitive through a sibling call**, which is what the fixpoint is for: the nested
-   * functions of a block share one environment (`12 §5a`), so a function calling one that captures
-   * needs that environment too and is part of the group whether or not it reads anything itself.
+   * functions of a block share one environment (`reference/declarations.md`), so a function calling
+   * one that captures needs that environment too and is part of the group whether or not it reads
+   * anything itself.
    *
    * This is purely syntactic, and has to be: it decides what the hoisting passes are *given*, so it
    * runs before any scope exists to resolve a name against. Over-approximating is therefore the safe

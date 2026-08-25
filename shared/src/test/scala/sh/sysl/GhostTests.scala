@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** `@ghost` — a declaration that exists for the specification and is erased before codegen
- * (`17 §8`).
+ * (`reference/verification.md § @ghost — what costs nothing to say`).
  *
  * Two halves have to be shown and neither implies the other. That the program still *runs* is the
  * easy half. That the ghost really is **gone** is the half the feature exists for, and a run test
@@ -14,7 +14,8 @@ import org.scalatest.freespec.AnyFreeSpec
 class GhostTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   /** An insertion sort with a ghost `is_sorted` in its postcondition and its outer invariant — the
-   * shape `17 §8` is written about, where checking the clause would turn O(n²) into O(n³).
+   * shape `reference/verification.md § @ghost — what costs nothing to say` is written about, where
+   * checking the clause would turn O(n²) into O(n³).
    */
   private val sort =
     """@ghost

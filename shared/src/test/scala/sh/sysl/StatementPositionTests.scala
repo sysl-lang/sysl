@@ -249,10 +249,10 @@ class StatementPositionTests extends AnyFreeSpec with CodegenSupport with RunSup
   }
 
   "a loop's 'else' is a block too" - {
-    // Python's own idiom, which `00 §10` cites the `else` block for: walk, leave early on a hit,
-    // and record in the `else` that nothing hit. The bare `break` yields `unit` and the `else`
-    // block ended in an assignment, so before the position was taken into account these two were
-    // made to meet and could not.
+    // Python's own idiom, which `reference/statements.md` cites the `else` block for: walk, leave
+    // early on a hit, and record in the `else` that nothing hit. The bare `break` yields `unit` and
+    // the `else` block ended in an assignment, so before the position was taken into account these
+    // two were made to meet and could not.
     "so the 'for'/'else' search idiom needs nothing written round it" in {
       val src =
         """var xs = [3, 5, 8, 9]

@@ -122,9 +122,10 @@ class RecursiveTeardownRunTests extends AnyFreeSpec with RunSupport {
   // waiting for. Built and taken apart a hundred thousand times: the edge that closes the loop is
   // cleared before the objects go, so ARC reclaims them and nothing is freed twice.
   //
-  // Left standing, the same two objects would be a cycle ARC cannot reclaim at all. `03 § weak T`
-  // names the reference that would say so and no such type exists yet, which is why taking the
-  // graph apart is a program's own responsibility rather than the language's.
+  // Left standing, the same two objects would be a cycle ARC cannot reclaim at all.
+  // `reference/memory.md § weak T — breaking cycles` names the reference that would say so and no
+  // such type exists yet, which is why taking the graph apart is a program's own responsibility
+  // rather than the language's.
   "two types that hold each other are reclaimed once the loop is cleared" in {
     val src =
       """import sysl.buf.*

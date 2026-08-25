@@ -65,8 +65,8 @@ trait AttrParser extends ExprParser {
     } | success(())
 
   /** `@packed` — fields at their declared offsets with no interior padding, and an aggregate that
-   * needs no alignment of its own (`15 §1`). It takes no arguments: there is nothing to configure
-   * about the absence of a gap.
+   * needs no alignment of its own (`reference/types.md § Structs`). It takes no arguments: there is
+   * nothing to configure about the absence of a gap.
    */
   protected lazy val packedAttr: PackratParser[Attr] =
     op("@") ~> attrWord("packed") ^^ (_ => Attr.Packed)
@@ -75,7 +75,8 @@ trait AttrParser extends ExprParser {
    *
    * The bound is an expression because it is folded rather than lexed: `@align(CACHE_LINE)` is the
    * form worth writing, and a program that had to repeat the number would be stating the same fact
-   * in two places. What it may be is the constant set of `13 §5`.
+   * in two places. What it may be is the constant set of `reference/modules.md § Platform
+   * selection`.
    */
   protected lazy val alignAttr: PackratParser[Attr] =
     op("@") ~> attrWord("align") ~> (op("(") ~> expression <~ op(")") ^^ Attr.Align.apply | alignErr)
@@ -86,7 +87,7 @@ trait AttrParser extends ExprParser {
       "number is not a weaker claim, it is no claim")
 
   /** `@export` and `@export("mylib_parse")` — the definition is C-callable, under its own name or
-   * under the symbol named (`15 §12`).
+   * under the symbol named (`reference/ffi.md § @export`).
    *
    * The parenthesised form takes a **string** rather than an identifier, exactly as `extern`'s link
    * name does, and for the same reason: it is a symbol the other side chose and it is not required to
@@ -105,7 +106,8 @@ trait AttrParser extends ExprParser {
     err("'@export' names the C symbol as a string — '@export(\"mylib_parse\")' — or takes no " +
       "parentheses at all, which exports the function under its own name")
 
-  /** `@section(".vectors")` — the linker section this object or definition is placed in (`15 §13`).
+  /** `@section(".vectors")` — the linker section this object or definition is placed in
+   * (`reference/attributes.md § @section("...")`).
    *
    * The name is a **string** for the reason `@export`'s symbol is one: it is the target's spelling
    * rather than sysl's, and `.vectors`, `__DATA,__mysection` and `.text.boot` are none of them things
@@ -183,29 +185,32 @@ trait AttrParser extends ExprParser {
       "and there is no ')' here to end them")
 
   /** `@tailrec` — the assertion that this function's call to itself is the last thing it does
-   * (`12 § Tail calls`). It takes no arguments: there is nothing to configure about a jump, and
-   * what the annotation buys is the refusal when there is no jump to make.
+   * (`reference/declarations.md § Tail calls`). It takes no arguments: there is nothing to
+   * configure about a jump, and what the annotation buys is the refusal when there is no jump to
+   * make.
    */
   protected lazy val tailrecAttr: PackratParser[Attr] =
     op("@") ~> attrWord("tailrec") ^^ (_ => Attr.TailRec)
 
   /** `@pure` — the assertion that a caller can observe nothing about this call but its result
-   * (`17 §6`). Like `@tailrec` it takes no arguments: purity is not a thing to configure, and what
-   * the annotation buys is the refusal when the body does something a caller could observe.
+   * (`reference/verification.md § @pure`). Like `@tailrec` it takes no arguments: purity is not a
+   * thing to configure, and what the annotation buys is the refusal when the body does something a
+   * caller could observe.
    */
   protected lazy val pureAttr: PackratParser[Attr] =
     op("@") ~> attrWord("pure") ^^ (_ => Attr.Pure)
 
   /** `@ghost` — the function exists for the specification alone and is erased before codegen
-   * (`17 §8`).
+   * (`reference/verification.md § @ghost — what costs nothing to say`).
    */
   protected lazy val ghostAttr: PackratParser[Attr] =
     op("@") ~> attrWord("ghost") ^^ (_ => Attr.Ghost)
 
   /** `@reads(a, b)` and `@writes(c)` — which module-level variables the function may touch
-   * (`17 §7`). The parentheses are mandatory and may be empty, because `@reads()` is a real and
-   * different claim from writing nothing at all: the first says the function reads no module
-   * storage, the second says nobody has written down what it does.
+   * (`reference/verification.md § @reads and @writes — what a call may touch`). The parentheses are
+   * mandatory and may be empty, because `@reads()` is a real and different claim from writing
+   * nothing at all: the first says the function reads no module storage, the second says nobody has
+   * written down what it does.
    *
    * The argument list is raised **inside** the parentheses rather than after the closing one, per
    * the rule a dead `err` taught: a form that gets further along the line outranks an alternative
@@ -229,7 +234,7 @@ trait AttrParser extends ExprParser {
       "never said")
 
   /** `@crossing(state)` — the parameters through which a value reaches another concurrency domain
-   * (`06 § Marking a domain boundary`).
+   * (`reference/memory.md § @crossing — where the rule is asked`).
    *
    * The parentheses are mandatory and, unlike a frame's, may **not** be empty. `@reads()` is a real
    * claim — the function reads no module storage — while a function that hands nothing to another

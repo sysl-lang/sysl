@@ -208,10 +208,11 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     // **The three tiers are `solve`'s, and they are here because a held-back argument is read
     // against this map rather than against that one.** What carries a type of its own settles a
     // parameter first, the expected type next, and a literal's default only where neither reached
-    // it (`10 § Inference is bidirectional`). Reading them in one pass instead let a literal fix the
-    // parameter a closure was about to be analyzed at, so `val n: usize = twice(0, a -> a + 1)` read
-    // its closure at `int` and then reported the result against the binding — with the annotation
-    // that was supposed to answer the question sitting one line above.
+    // it (`reference/generics.md § Inference is bidirectional`). Reading them in one pass instead
+    // let a literal fix the parameter a closure was about to be analyzed at, so `val n: usize =
+    // twice(0, a -> a + 1)` read its closure at `int` and then reported the result against the
+    // binding — with the annotation that was supposed to answer the question sitting one line
+    // above.
     //
     // `unify` writes only where the map is silent, so the order is the whole of the precedence.
     for case (r, Some((t, false))) <- ptypes.zip(first) do inDecl(decl)(unify(r, t.ty, tps, partial))
@@ -344,7 +345,8 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     case _: ImplicitMember | Call(_: ImplicitMember, _) => true
     case _                                              => false
 
-  /** Whether an expression is one whose type the *context* has to supply (`12 §5`, `§6`).
+  /** Whether an expression is one whose type the *context* has to supply (`reference/expressions.md
+   * § Closures`, `§6`).
    *
    * The two shapes are the two ways of writing a callable that is not already a value: a literal,
    * whose parameters are typed by what asks for it, and the name of a declared function, which is
@@ -358,7 +360,8 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     case _         => false
 
   /** What was actually written at an argument position, which for a **filled default** is inside
-   * the wrapper the binding put around it (`12 §2a`).
+   * the wrapper the binding put around it (`reference/declarations.md § Default parameters and
+   * named arguments`).
    *
    * Both questions above are about the *shape* of an expression, and a wrapper has a shape of its
    * own that answers no to each — so a default of a closure literal was neither held back for the
@@ -409,11 +412,12 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
    * it takes, and what it yields.
    *
    * **A bare arrow and a boxed `&Fn` are the same question and were not being asked the same way.**
-   * `12 §6`'s two spellings differ in what they *cost* — the arrow becomes a bounded type parameter
-   * and monomorphizes, the boxed one is a trait object and dispatches — and in nothing else that
-   * matters here, because both state a signature the closure standing at them can be read against.
-   * Only the first was consulted, so `f[T](x: T, f: &Fn(T) -> T)` could not read its closure even
-   * with `T` long since settled, and said the closure's parameters had no types.
+   * `reference/types.md § Function types`'s two spellings differ in what they *cost* — the arrow
+   * becomes a bounded type parameter and monomorphizes, the boxed one is a trait object and
+   * dispatches — and in nothing else that matters here, because both state a signature the closure
+   * standing at them can be read against. Only the first was consulted, so `f[T](x: T, f: &Fn(T) ->
+   * T)` could not read its closure even with `T` long since settled, and said the closure's
+   * parameters had no types.
    *
    * A call trait's arguments are its parameters and then its result, which is why the result is the
    * last of them in the first case and is written where it stands in the second.
@@ -449,7 +453,8 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     case _: Type.Floating => TFloatLit(0L, ty)
     case _                => TIntLit(0, ty)
 
-  /** A call to a name, which may stand for one function or for several (`12 §1a`).
+  /** A call to a name, which may stand for one function or for several (`reference/declarations.md
+   * § Overloading`).
    *
    * **A name declared once takes the same path it always did**, and that is worth stating as a
    * property rather than as an optimization: `overloadKeys` answers with the one key, the branch
@@ -514,13 +519,13 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
 
   /** The parameter types a candidate would take this call at, or `None` where it does not take it.
    *
-   * It is one `probe` of `callFunction`, which is the same question `12 §1a` says to ask — but the
-   * answer kept is the **signature the fit arrived at** rather than only that there was one. For a
-   * generic candidate that is the signature of the *instantiation*: `callFunction` ends at
-   * `funcInsts(name)` with `name` the instantiated key, so the type arguments the call solved are
-   * already applied. That is what lets `narrow` ask a generic candidate the same exactness question
-   * as an ordinary one, without being handed the substitution or having to read coercion nodes back
-   * out of the tree.
+   * It is one `probe` of `callFunction`, which is the same question `reference/declarations.md §
+   * Overloading` says to ask — but the answer kept is the **signature the fit arrived at** rather
+   * than only that there was one. For a generic candidate that is the signature of the
+   * *instantiation*: `callFunction` ends at `funcInsts(name)` with `name` the instantiated key, so
+   * the type arguments the call solved are already applied. That is what lets `narrow` ask a
+   * generic candidate the same exactness question as an ordinary one, without being handed the
+   * substitution or having to read coercion nodes back out of the tree.
    *
    * The instantiation the probe registered is dropped with everything else it did — `probe` is
    * `sandboxed` — so this reads the table inside the attempt and hands out types, which outlive it.
@@ -537,8 +542,9 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     }
 
   /** The tie-breaks applied to the candidates a call fits, in order, stopping as soon as one leaves
-   * a single answer (`12 §1a`). Each candidate arrives with the signature its fit arrived at, which
-   * for a generic one is the instantiation's — see `fitSignature`.
+   * a single answer (`reference/declarations.md § Overloading`). Each candidate arrives with the
+   * signature its fit arrived at, which for a generic one is the instantiation's — see
+   * `fitSignature`.
    *
    * The first two are about **exactness**, and both exist because a call that fits two declarations
    * usually fits one of them the way it was written and the other by something the language did for
@@ -592,15 +598,16 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     args <= params || (variadic && args >= params)
 
   /** One declaration as a diagnostic lists it: the name a reader wrote and the parameters that tell
-   * it from its siblings. The result is left off — it is not what distinguishes two overloads, since
-   * `12 §1a` refuses a pair that differ only in it.
+   * it from its siblings. The result is left off — it is not what distinguishes two overloads,
+   * since `reference/declarations.md § Overloading` refuses a pair that differ only in it.
    */
   private def signatureOf(f: FuncDecl): String =
     s"${qn(f.name)}(${f.params.map(p => s"${p.name}: ${p.typ.show}").mkString(", ")})"
 
-  /** The type parameters of a declaration that **inference cannot reach from a call**: named by none
-   * of its parameters and by no result, so both of `10 §4`'s directions are empty — the arguments
-   * say nothing about them and neither does the type the value is read into.
+  /** The type parameters of a declaration that **inference cannot reach from a call**: named by
+   * none of its parameters and by no result, so both of `reference/generics.md § Inference is
+   * bidirectional`'s directions are empty — the arguments say nothing about them and neither does
+   * the type the value is read into.
    *
    * It is a property of the *declaration* rather than of any one call, which is what makes it worth
    * asking as its own question: no call of a function shaped like this can be solved, so the reader
@@ -649,13 +656,15 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     tparams.filterNot(MemberLowering.isCallBound)
 
   /** Which copy of a generic declaration a **written** type-argument list names — `&f[T]` at an
-   * address (`12 §6a`) and `f[T](x)` at a call (`10 §2`).
+   * address (`reference/ffi.md § A function's address`) and `f[T](x)` at a call
+   * (`reference/generics.md § [] means type application in a type, indexing in an expression`).
    *
    * The two positions share every rule and differ only in what a refusal points at, which is what
    * `atCall` is for. They were one position for as long as the call head was deferred; what settled
    * that deferral is the shape a *value* parameter makes reachable, where a kernel reading and
-   * writing through slices names its width in no argument and answers `unit`, so neither of `10 §4`'s
-   * directions carries it and there is no binding to annotate.
+   * writing through slices names its width in no argument and answers `unit`, so neither of
+   * `reference/generics.md § Inference is bidirectional`'s directions carries it and there is no
+   * binding to annotate.
    *
    * The expected type is not consulted. Where both are present the written arguments win outright
    * rather than being checked against it, because the result is checked against the expected type
@@ -717,8 +726,9 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
         (if atCall then "the arguments at the call" else "the type its address is wanted at"))
 
     // A declaration's parameters are one list and one argument position whichever kind each of them
-    // is (`10 §9`), so this walks the two lists together: a `const` parameter folds its argument to
-    // a value of the type the declaration wrote, and every other one resolves as a type.
+    // is (`reference/generics.md § A parameter may stand for a value`), so this walks the two lists
+    // together: a `const` parameter folds its argument to a value of the type the declaration
+    // wrote, and every other one resolves as a type.
     tparams.zip(targs).map { (tp, e) =>
       tvalues.get(tp) match
         case Some(vt) => at(e.pos)(valueArg(ValueArgType(e), recover(Type.Unknown)(rt(vt)), tsubst))
@@ -733,7 +743,7 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
    * is. So what arrives is an expression to be read back as the type it was written as, and the
    * shapes that survive the round trip are the ones a type and an expression spell identically: a
    * name, a qualified name, a name applied to arguments, `*T`, `&T`, a tuple, and an integer for a
-   * value parameter (`10 §9`).
+   * value parameter (`reference/generics.md § A parameter may stand for a value`).
    *
    * **The rest are refused by name rather than misread.** A slice, a `weak`, a `volatile`, a vector
    * and a callable have spellings the expression grammar has no production for, so there is nothing
@@ -792,11 +802,12 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
         "every other build leaves it out, so this call would have no definition to reach. " +
         "Work two tests share belongs in an ordinary function they both call")
 
-    // An interrupt handler has one caller and it is the processor (`15 §10`). It is entered on an
-    // asynchronous event with a frame the hardware pushed, and it leaves through a
-    // return-from-interrupt that restores the interrupted context — so a call written here would set
-    // up an ordinary frame and then execute an instruction that unwinds something that never
-    // happened. Its address is still worth taking, which is what a vector table is built from.
+    // An interrupt handler has one caller and it is the processor (`reference/ffi.md § interrupt`).
+    // It is entered on an asynchronous event with a frame the hardware pushed, and it leaves
+    // through a return-from-interrupt that restores the interrupted context — so a call written
+    // here would set up an ordinary frame and then execute an instruction that unwinds something
+    // that never happened. Its address is still worth taking, which is what a vector table is built
+    // from.
     if f.conv.isDefined then
       err(s"'$shown' is an interrupt handler, which the processor enters and no program calls — " +
         "it leaves through a return-from-interrupt, which would unwind a frame this call never " +
@@ -811,9 +822,10 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
 
     val (name, pre) =
       // **Written out, they are what settles the instantiation and nothing else is consulted**
-      // (`10 §2`) — not the arguments, and not the expected type. Their whole reason for existing is
-      // the call inference cannot reach, so a solve running first would report a failure about a
-      // question the reader has already answered.
+      // (`reference/generics.md § [] means type application in a type, indexing in an expression`)
+      // — not the arguments, and not the expected type. Their whole reason for existing is the call
+      // inference cannot reach, so a solve running first would report a failure about a question
+      // the reader has already answered.
       if targs.nonEmpty && authored(f.tparams).length == f.tparams.length then
         (instantiationWritten(shown, f, targs, atCall = true), None)
       else if f.tparams.isEmpty then (f.name, None)
@@ -963,12 +975,13 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
             "integer, a float, a char, or a raw pointer")
   }
 
-  /** Enforces a generic function's trait bounds against the type arguments a call resolved to.
-   * For each bounded parameter, the concrete type must carry an `impl` of every trait the bound
-   * names — checked here at the call, so a caller supplying a type that does not implement the
-   * trait is told exactly that, rather than meeting a missing-method error deep inside the
-   * monomorphized body. A user type conforms by an `impl` written for its owner key, a built-in by
-   * the compiler's own rule (`14 §5`) — which is what lets `sum(3, 4)` instantiate a `[T: Add]`.
+  /** Enforces a generic function's trait bounds against the type arguments a call resolved to. For
+   * each bounded parameter, the concrete type must carry an `impl` of every trait the bound names —
+   * checked here at the call, so a caller supplying a type that does not implement the trait is
+   * told exactly that, rather than meeting a missing-method error deep inside the monomorphized
+   * body. A user type conforms by an `impl` written for its owner key, a built-in by the compiler's
+   * own rule (`reference/expressions.md § Operator dispatch`) — which is what lets `sum(3, 4)`
+   * instantiate a `[T: Add]`.
    *
    * A *type's* parameters are held to their bounds by the same rule, at the point the type is
    * applied, so the two forms of "what this declaration assumes" are one check.

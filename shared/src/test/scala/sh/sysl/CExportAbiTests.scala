@@ -2,7 +2,8 @@ package sh.sysl
 
 import io.github.edadma.cross_platform.*
 
-/** An **aggregate** crossing into an `@export`ed function, run rather than read (`15 §12`, 0137).
+/** An **aggregate** crossing into an `@export`ed function, run rather than read (`reference/ffi.md
+ * § @export`, 0137).
  *
  * `@export` was a rename: the definition took the C symbol and kept sysl's own parameter lowering,
  * so a C caller put its arguments where its convention says and the body read them where sysl's
@@ -324,8 +325,9 @@ class CExportAbiTests extends LibraryCliSupport {
     }
   }
 
-  /** `&f` (`12 §6a`, 0136) — the address, which is the half a callback registration needs and the
-   * half that was refused for every function with an aggregate anywhere in its signature.
+  /** `&f` (`reference/ffi.md § A function's address`, 0136) — the address, which is the half a
+   * callback registration needs and the half that was refused for every function with an aggregate
+   * anywhere in its signature.
    */
   "the address of an exported function is one C can call through" - {
 

@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** `unit` — the type of an expression run only for its effect, and the language's **zero-sized
- * type** (`00 §12`).
+ * type** (`reference/types.md § unit and never`).
  *
  * It has one value, and that value is nothing at all, so it has a layout: the empty one. A field, a
  * parameter, a type argument, or a binding of it is therefore legal and costs nothing — the field is

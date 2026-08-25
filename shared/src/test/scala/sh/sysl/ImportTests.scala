@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** `import` — the Scala forms, and the one thing they all do: shorten a path that already works
- * (`13 §3`).
+ * (`reference/modules.md § Imports`).
  *
  * Because an import grants nothing, every case here has a longhand that compiles without it. What
  * is under test is which shorter spelling means what, and which shorter spellings are refused for
@@ -211,7 +211,8 @@ class ImportTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
   }
 
   "which name wins" - {
-    // The order is `13 §3`'s: this module, then the imports, then the library.
+    // The order is `reference/modules.md § Imports`'s: this module, then the imports, then the
+    // library.
     "a declaration of this module beats an import of the same name" in {
       runIn(("", "main.sysl", "import geom.twice\ntwice(n: int) -> int = n * 10\nprint(twice(4))"), geom) shouldBe
         "40\n"

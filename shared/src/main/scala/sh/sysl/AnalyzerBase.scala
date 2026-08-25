@@ -40,7 +40,7 @@ trait AnalyzerBase extends Scoping {
     case _ => (l, r)
 
   /** Inside a closure's body, the captured names — keyed by the unique name the scope gave each —
-   * paired with the field read that reaches one (`12 §7`).
+   * paired with the field read that reaches one (`reference/expressions.md § Closures`).
    *
    * A capture is declared in the closure's scope like any other name, so shadowing and assignment
    * need no rule of their own; what this adds is where the storage is. Reading a name consults it
@@ -48,7 +48,8 @@ trait AnalyzerBase extends Scoping {
    */
   protected var capturedFields: Map[String, TExpr] = Map.empty
 
-  /** The nested functions in scope, by the name a program calls one by (`12 §5a`).
+  /** The nested functions in scope, by the name a program calls one by
+   * (`reference/declarations.md`).
    *
    * A block's nested functions are lowered as a group, so what is in here is every one of them from
    * the moment the first is written until the block ends — which is the "names are hoisted per
@@ -163,8 +164,8 @@ trait AnalyzerBase extends Scoping {
    */
   protected var pbounds: Map[String, String] = Map.empty
 
-  /** The body's own names standing for a **by-name** parameter (`12 § A parameter may be passed by
-   * name`).
+  /** The body's own names standing for a **by-name** parameter (`reference/declarations.md §
+   * Default parameters and named arguments`).
    *
    * They are the **uniqued** names the scope hands back rather than what was written, which is what
    * makes shadowing need no rule of its own: a local declared over a by-name parameter is a
@@ -178,9 +179,10 @@ trait AnalyzerBase extends Scoping {
   protected def boundTraits(written: String): Set[String] =
     tbounds.getOrElse(written, Nil).flatMap(b => traitKey(b.name)).toSet
 
-  /** Whether the function being analyzed declared its result as a **list** (`12 §5b`) rather than
-   * as one type. `retTy` is the tuple its parts lay out as either way; this is what says whether
-   * the body writes `a, b` or `(a, b)`, and whether a call yielding a list may stand in its result.
+  /** Whether the function being analyzed declared its result as a **list**
+   * (`reference/declarations.md § Several results`) rather than as one type. `retTy` is the tuple
+   * its parts lay out as either way; this is what says whether the body writes `a, b` or `(a, b)`,
+   * and whether a call yielding a list may stand in its result.
    */
   protected var retIsList: Boolean = false
 
@@ -216,14 +218,16 @@ trait AnalyzerBase extends Scoping {
   protected class LoopCtx(val expected: Option[Type], val label: Option[String]):
     val breakTys = mutable.ListBuffer.empty[Type]
 
-    /** The slot name and integer type of this loop's `variant`, where it declared one (`17 §3`).
-     * Filled in once the body has been analyzed, and read by whichever loop form built the context
-     * so it can wrap itself in a `TCheckedLoop`.
+    /** The slot name and integer type of this loop's `variant`, where it declared one
+     * (`reference/verification.md § invariant and variant on a loop`). Filled in once the body has
+     * been analyzed, and read by whichever loop form built the context so it can wrap itself in a
+     * `TCheckedLoop`.
      */
     var variant: Option[(String, Type)] = None
   protected var loops: List[LoopCtx] = Nil
 
-  /** Whether the statement being analyzed sits directly in the body of a `for const` (`10 §10`).
+  /** Whether the statement being analyzed sits directly in the body of a `for const`
+   * (`reference/generics.md § A parameter may stand for a list of types`).
    *
    * The unrolled loop hides the enclosing loops while its copies are analyzed, so `loops` is empty
    * there whatever the loop is written inside — and that is the whole mechanism, since a `break`
@@ -270,10 +274,11 @@ trait AnalyzerBase extends Scoping {
   protected var currentMemberName: String = ""
 
   protected def resetFunction(): Unit = {
-    // Cleared here rather than left to whoever sets it, because "outside any body" has to be a state
-    // the analyzer can actually be in. Left uncleared it held the last name analyzed, so a module
-    // `val`'s `__FUNCTION__` silently reported some unrelated function that a *previous pass* had
-    // walked — the definition-time pass of `14 §4`, which runs before any storage is laid down.
+    // Cleared here rather than left to whoever sets it, because "outside any body" has to be a
+    // state the analyzer can actually be in. Left uncleared it held the last name analyzed, so a
+    // module `val`'s `__FUNCTION__` silently reported some unrelated function that a *previous
+    // pass* had walked — the definition-time pass of `reference/generics.md § Bounds`, which runs
+    // before any storage is laid down.
     currentFunctionName = ""
     currentMemberName = ""
     // Cleared for the same reason, and it matters for the same one: a body left over from the last
@@ -301,12 +306,12 @@ trait AnalyzerBase extends Scoping {
 
   /** Runs `body` and then restores every table the emitted program is built from.
    *
-   * The definition-time pass of `14 §4` walks a generic body exactly as an ordinary one is walked,
-   * so it registers instantiations exactly as an ordinary one does — a `Box[T]`, a call to another
-   * generic function, a library renderer reached by a `print`. None of those is a real
-   * instantiation: `T` is not a type anything can be laid out at, and nothing at run time reaches
-   * them. Dropping what the pass registered is what keeps a diagnostics-only walk from putting a
-   * type parameter into the emitted module.
+   * The definition-time pass of `reference/generics.md § Bounds` walks a generic body exactly as an
+   * ordinary one is walked, so it registers instantiations exactly as an ordinary one does — a
+   * `Box[T]`, a call to another generic function, a library renderer reached by a `print`. None of
+   * those is a real instantiation: `T` is not a type anything can be laid out at, and nothing at
+   * run time reaches them. Dropping what the pass registered is what keeps a diagnostics-only walk
+   * from putting a type parameter into the emitted module.
    */
   protected def sandboxed[T](body: => T): T = {
     val saved = registrations
@@ -353,8 +358,8 @@ trait AnalyzerBase extends Scoping {
    * It sits here, beside `sandboxed`, because two quite different parts of the analyzer ask
    * speculative questions and neither is above the other: a method call asks whether a receiver has
    * a member of some name, and an **overloaded** call asks which of several declarations the
-   * arguments fit (`12 §1a`). It was `MethodCalls`' private helper until the second of those needed
-   * it from `CallCore`, which `MethodCalls` is built on top of.
+   * arguments fit (`reference/declarations.md § Overloading`). It was `MethodCalls`' private helper
+   * until the second of those needed it from `CallCore`, which `MethodCalls` is built on top of.
    */
   protected def probe[T](body: => T): Option[T] =
     sandboxed {
@@ -436,7 +441,7 @@ trait AnalyzerBase extends Scoping {
   ): List[Type]
   protected def analyzeExpr(expr: Expr, expected: Option[Type] = None, discarded: Boolean = false): TExpr
 
-  /** Analyzes one expression in a place a **result list** may stand (`12 §5b`). */
+  /** Analyzes one expression in a place a **result list** may stand (`reference/declarations.md § Several results`). */
   protected def analyzeMulti(expr: Expr, expected: Option[Type] = None): TExpr
 
   /** Whether a value produced *here* is the enclosing function's own result, which is the third
@@ -526,16 +531,16 @@ trait AnalyzerBase extends Scoping {
   protected def readOnly(t: TExpr): Boolean
   protected def instantiateFunc(f: FuncDecl, targs: List[Type]): String
 
-  /** The call trait a value of this type implements, where it implements one (`12 §6`). */
+  /** The call trait a value of this type implements, where it implements one (`reference/types.md § Function types`). */
   protected def callableOf(t: Type): Option[Type.Bound]
 
-  /** The nested functions of one block, lowered together (`12 §5a`). */
+  /** The nested functions of one block, lowered together (`reference/declarations.md`). */
   protected def lowerNestedGroup(group: List[FuncDecl]): List[TStmt]
 
   /** Which of `candidates` the group's bodies read — what `pendingNeeds` is filled from (`0224`). */
   protected def groupNeeds(group: List[FuncDecl], candidates: Set[String]): Set[String]
 
-  /** `value.name(args)` where `name` is a field holding a callable rather than a method (`12 §6`). */
+  /** `value.name(args)` where `name` is a field holding a callable rather than a method (`reference/types.md § Function types`). */
   protected def callableField(
       rty: Type,
       name: String,
@@ -544,7 +549,7 @@ trait AnalyzerBase extends Scoping {
       expected: Option[Type],
   ): Option[TExpr]
 
-  /** Analyzes a body inside the analysis of another one, giving back what it yields (`12 §5`). */
+  /** Analyzes a body inside the analysis of another one, giving back what it yields (`reference/expressions.md § Closures`). */
   protected def analyzeNested(
       name: String,
       params: List[(String, Type)],

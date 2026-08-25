@@ -326,11 +326,12 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
       Target.aarch64Android.triple should fullyMatch regex """.*-android\d+"""
     }
 
-    // Android is the third POSIX system, and it is what turns `13 § 5`'s prediction about
-    // `__posix__` against `__macos,linux__` into a fact: the derived selector covers it and a spelled
-    // list would silently not. Both halves are asserted because `Conditional` reads this one answer
-    // for a `#if` and `Project` reads it for a directory, and a machine that was hosted for one and
-    // bare for the other is the bug `Os.inherentCapabilities` exists to make impossible.
+    // Android is the third POSIX system, and it is what turns `reference/modules.md § Platform
+    // selection`'s prediction about `__posix__` against `__macos,linux__` into a fact: the derived
+    // selector covers it and a spelled list would silently not. Both halves are asserted because
+    // `Conditional` reads this one answer for a `#if` and `Project` reads it for a directory, and a
+    // machine that was hosted for one and bare for the other is the bug `Os.inherentCapabilities`
+    // exists to make impossible.
     "answers hosted and posix for Android, which is what makes it the third POSIX system" in {
       Target.aarch64Android.inherentCapabilities shouldBe Set(Capability.Os, Capability.Posix)
       Target.aarch64Android.inherentCapabilities shouldBe Target.aarch64Linux.inherentCapabilities

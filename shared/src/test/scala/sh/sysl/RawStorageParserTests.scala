@@ -2,8 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `sizeof(T)` and `alignof(T)` parse to a `LayoutOf` over the **type** grammar (`03 § Reinterpreting
- * storage`).
+/** `sizeof(T)` and `alignof(T)` parse to a `LayoutOf` over the **type** grammar
+ * (`reference/memory.md § Reinterpreting storage`).
  *
  * They are parser forms rather than calls the analyzer recognizes by name, and the reason is visible
  * here: an argument list holds expressions, so `sizeof(*Node)` read as a call would be a dereference

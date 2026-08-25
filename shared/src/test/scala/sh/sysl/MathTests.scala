@@ -613,12 +613,13 @@ class MathTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   }
 
   "the error path" - {
-    // What the import gates, which is now one answer for both halves of the module. A *name* — `pi`,
-    // `min`, `nan` — lives in a submodule and has to be asked for, which is `13 §1`'s rule and the
-    // reason `sysl.math` is a submodule at all. A **member** is asked for the same way: it is
-    // reachable where its **trait** is (`13 §2`), so `Float` giving `real` a `sqrt` reaches only the
-    // files that named `Float`. Pinned in both directions because the symmetry is what a reader is
-    // owed — a submodule costs a program nothing it did not ask for, names and members alike.
+    // What the import gates, which is now one answer for both halves of the module. A *name* —
+    // `pi`, `min`, `nan` — lives in a submodule and has to be asked for, which is
+    // `reference/modules.md`'s rule and the reason `sysl.math` is a submodule at all. A **member**
+    // is asked for the same way: it is reachable where its **trait** is (`reference/modules.md §
+    // Visibility`), so `Float` giving `real` a `sqrt` reaches only the files that named `Float`.
+    // Pinned in both directions because the symmetry is what a reader is owed — a submodule costs a
+    // program nothing it did not ask for, names and members alike.
     "a name from the module has to be asked for" in {
       err("print(pi)") should include("pi")
       err("print(min(1, 2))") should include("min")
@@ -670,11 +671,11 @@ class MathTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     // The library claims no names. A trait's members are reachable where the **trait** is in scope
-    // (`13 §2`), so `Float` giving `real` a `sqrt` leaves the name free for anyone else's trait to
-    // give it another — which is what keeps a shipped library implementing a wide trait for a
-    // built-in from spending those names on every program that will ever compile.
-    // `super.run`, because this suite's own `run` prepends the import and the point here is a file
-    // that did not write one.
+    // (`reference/modules.md § Visibility`), so `Float` giving `real` a `sqrt` leaves the name free
+    // for anyone else's trait to give it another — which is what keeps a shipped library
+    // implementing a wide trait for a built-in from spending those names on every program that will
+    // ever compile. `super.run`, because this suite's own `run` prepends the import and the point
+    // here is a file that did not write one.
     "a program may give a float a member the trait already names" in {
       val mine =
         """trait Mine

@@ -1,6 +1,7 @@
 package sh.sysl
 
-/** What a calling convention written on a definition means **on a given processor** (`15 §10`).
+/** What a calling convention written on a definition means **on a given processor**
+ * (`reference/ffi.md § interrupt`).
  *
  * **`interrupt` is one concept with three different answers, and every one of them was read off
  * clang rather than out of a document.** On x86-64 it is an LLVM *calling convention*, `x86_intrcc`,
@@ -13,8 +14,8 @@ package sh.sysl
  * function returns with `ret` where the machine needs `iret` or `mret`, and it does not save the
  * registers an asynchronous entry has to save — so the failure is silent, and it arrives as memory
  * corruption at whatever the interrupted code was doing. Clang's warning is a reasonable answer for
- * C, where the attribute is advisory by tradition; it is not a reasonable answer for a language that
- * refuses the annotated/unannotated split everywhere else (`15 §1`).
+ * C, where the attribute is advisory by tradition; it is not a reasonable answer for a language
+ * that refuses the annotated/unannotated split everywhere else (`reference/types.md § Structs`).
  *
  * Nothing here is portable, and the design does not pretend otherwise. An interrupt handler is the
  * least portable code there is: it is entered by a mechanism the processor defines, and even the
@@ -40,7 +41,8 @@ object Conventions {
     /** An LLVM function attribute, written after the signature — RISC-V's `"interrupt"="mode"`. */
     case Attribute(key: String)
 
-  /** What `interrupt` is on this processor, or **why that processor has none** (`15 §10`).
+  /** What `interrupt` is on this processor, or **why that processor has none** (`reference/ffi.md §
+   * interrupt`).
    *
    * Written out per `Cpu` with no default arm, for the reason `Toolchain.libraryFlags` is: a
    * processor added to the registry has to answer this rather than inherit whichever answer sat at

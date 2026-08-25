@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `x is Pat` in the condition of an `if` or a `while` (`09 §12`).
+/** `x is Pat` in the condition of an `if` or a `while` (`reference/expressions.md § is — a pattern
+ * where a condition is wanted`).
  *
  * The feature is a binding whose reach is stated rather than inferred, so most of what is worth
  * pinning is *where a name is and is not visible* — and a test that only shows the binding working
@@ -84,8 +85,9 @@ class IsPatternTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   "chaining with && is what makes the form worth having" - {
 
-    // Without this the feature covers only the unguarded sliver: `09 §7` already gives a match arm
-    // a guard, so the moment a condition appears the reader is back at `match`.
+    // Without this the feature covers only the unguarded sliver: `reference/patterns.md § Guards`
+    // already gives a match arm a guard, so the moment a condition appears the reader is back at
+    // `match`.
     "a term to the right of the is reads what it bound" in {
       run(fetch + """if fetch(2) is Some(n) && n > 15 then print(n) else print(-1)
                     |if fetch(1) is Some(n) && n > 15 then print(n) else print(-1)
@@ -551,8 +553,9 @@ class IsPatternTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "outside\n"
     }
 
-    // The same rule an arm's alternatives are held to (`09 §6`): the branch cannot know which of
-    // them matched, so there is nothing for a name to hold.
+    // The same rule an arm's alternatives are held to (`reference/patterns.md § The pattern
+    // forms`): the branch cannot know which of them matched, so there is nothing for a name to
+    // hold.
     "and none of them may bind, for the reason an arm's may not" in {
       err("""enum Step
             |    Work(n: int)
@@ -572,10 +575,11 @@ class IsPatternTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   "what the neighbouring rules say, asked of `is`" - {
 
-    // `09 §8`: an enum match is exhaustive-checked in statement position too, so the one-arm match
-    // is *forced* to write a do-nothing catch-all. That refusal is the whole reason this feature
-    // exists, so it is asserted here rather than assumed — if it ever stopped being true, `is`
-    // would have lost its motivation and this test is where that would show.
+    // `reference/patterns.md § Exhaustiveness`: an enum match is exhaustive-checked in statement
+    // position too, so the one-arm match is *forced* to write a do-nothing catch-all. That refusal
+    // is the whole reason this feature exists, so it is asserted here rather than assumed — if it
+    // ever stopped being true, `is` would have lost its motivation and this test is where that
+    // would show.
     "the one-arm statement match `is` replaces really is refused without a catch-all" in {
       err("""var o: Option[int] = Some(1)
             |o match
@@ -589,9 +593,9 @@ class IsPatternTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "1\n"
     }
 
-    // `09 §11`: selection reaches through a memory mode and a pattern does not, so matching a
-    // `&Enum` is written `*e`. A condition is a pattern position, so it inherits the rule and the
-    // hint that goes with it.
+    // `reference/patterns.md § Matching through a reference`: selection reaches through a memory
+    // mode and a pattern does not, so matching a `&Enum` is written `*e`. A condition is a pattern
+    // position, so it inherits the rule and the hint that goes with it.
     "a pattern in a condition does not reach through a reference either" in {
       err("""var o: &Option[int] = Some(1)
             |if o is Some(n) then print(n)
@@ -615,8 +619,9 @@ class IsPatternTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) should include("'is' tests a pattern in the condition of an 'if' or a 'while'")
     }
 
-    // `12 §5` — a closure body is an ordinary body, and the scope an `is` opens is the branch's,
-    // so a closure written inside one may capture what the pattern bound.
+    // `reference/expressions.md § Closures` — a closure body is an ordinary body, and the scope an
+    // `is` opens is the branch's, so a closure written inside one may capture what the pattern
+    // bound.
     "a closure inside the branch captures what the pattern bound" in {
       run("""apply(f: int -> int, x: int) -> int = f(x)
             |
@@ -625,9 +630,10 @@ class IsPatternTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "42\n"
     }
 
-    // `08 § Visibility` — naming every field positionally is reading every field, so the pattern
-    // owes the same check a constructor does. A condition reaches `analyzePattern` by the same route
-    // an arm does, and this is what says so at the seam rather than by inspection.
+    // `reference/modules.md § Visibility` — naming every field positionally is reading every field,
+    // so the pattern owes the same check a constructor does. A condition reaches `analyzePattern`
+    // by the same route an arm does, and this is what says so at the seam rather than by
+    // inspection.
     "a positional pattern in a condition owes the same field visibility an arm's does" in {
       errOf(
         "shape.sysl" ->
@@ -646,9 +652,10 @@ class IsPatternTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       ) should include("y")
     }
 
-    // `16 §5` — a constrained subtype is laid out as its base, so a range pattern over one is a
-    // range over the base's values. Probed rather than assumed: `analyzePattern` asks whether the
-    // scrutinee's type is numeric, and a subtype is a distinct `Type`.
+    // `reference/errors.md § What the type's own name offers: :: attributes` — a constrained
+    // subtype is laid out as its base, so a range pattern over one is a range over the base's
+    // values. Probed rather than assumed: `analyzePattern` asks whether the scrutinee's type is
+    // numeric, and a subtype is a distinct `Type`.
     "a range pattern reaches a constrained subtype" in {
       run("""type Small = int within 1..10
             |

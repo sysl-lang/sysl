@@ -58,9 +58,9 @@ class LinkCommandTests extends AnyFreeSpec with Matchers {
       Toolchain.libraryFlags(List("m"), Target.aarch64Android) shouldBe List("-lm")
     }
 
-    // The directive is what makes it happen at all now. Before `15 §8` the driver appended `-lm` to
-    // every ELF link whether or not anything asked, and this is the assertion that the list is read
-    // rather than remembered.
+    // The directive is what makes it happen at all now. Before `reference/ffi.md § @link` the
+    // driver appended `-lm` to every ELF link whether or not anything asked, and this is the
+    // assertion that the list is read rather than remembered.
     "is not asked for at all when nothing named it" in {
       Toolchain.linkCommand("prog.ll", Nil, "prog", Target.x86_64Linux) should not contain "-lm"
     }
@@ -102,8 +102,8 @@ class LinkCommandTests extends AnyFreeSpec with Matchers {
     }
   }
 
-  // A directive names a library and the target spells the flag, which is the whole of `15 §8`'s
-  // translation. These are the cases that are not `-l` plus the name.
+  // A directive names a library and the target spells the flag, which is the whole of
+  // `reference/ffi.md § @link`'s translation. These are the cases that are not `-l` plus the name.
   "resolving a library name for a target" - {
 
     "passes an unknown library through on every hosted target, since only its placement is guessable" in {
@@ -111,8 +111,8 @@ class LinkCommandTests extends AnyFreeSpec with Matchers {
         withClue(t.name) { Toolchain.libraryFlags(List("z"), t) shouldBe List("-lz") }
     }
 
-    // The C runtime is linked unasked everywhere it exists, so naming it is legal and costs nothing.
-    // `15 §8` opened with "-lc and friends", so it has to be writable.
+    // The C runtime is linked unasked everywhere it exists, so naming it is legal and costs
+    // nothing. `reference/ffi.md § @link` opened with "-lc and friends", so it has to be writable.
     "asks for libc nowhere, because every target that has one links it already" in {
       for t <- Target.all do
         withClue(t.name) { Toolchain.libraryFlags(List("c"), t) shouldBe empty }
@@ -194,7 +194,7 @@ class LinkCommandTests extends AnyFreeSpec with Matchers {
 
   /** Where this machine keeps a library, which is the host's question and not the target's
    * (`SearchPaths`). The target decides what a directive's name becomes; the search path decides
-   * where that name is looked for, and `15 §8` only ever answered the first.
+   * where that name is looked for, and `reference/ffi.md § @link` only ever answered the first.
    */
   "a search path given to the driver" - {
 

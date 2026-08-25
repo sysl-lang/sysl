@@ -3,10 +3,10 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** Tier-2 runtime behavior of the checked conversions between a simple enum and an integer
- * (`09 §2`): enum → integer is total, `Color(n)` is a checked cast that traps on an undeclared
- * discriminant, and `Color.try(n)` is the fallible constructor returning an `Option`. The `: iN`
- * underlying annotation that pins storage and governs each discriminant's range is exercised
- * alongside, since the conversions are defined in terms of it.
+ * (`reference/types.md § Enums`): enum → integer is total, `Color(n)` is a checked cast that traps
+ * on an undeclared discriminant, and `Color.try(n)` is the fallible constructor returning an
+ * `Option`. The `: iN` underlying annotation that pins storage and governs each discriminant's
+ * range is exercised alongside, since the conversions are defined in terms of it.
  */
 class EnumConversionRunTests extends AnyFreeSpec with RunSupport {
 
@@ -18,10 +18,11 @@ class EnumConversionRunTests extends AnyFreeSpec with RunSupport {
       |    Yellow
       |""".stripMargin
 
-  /** `16 §1` makes a **transparent** subtype *the same type as* its base, with values flowing
-   * between them freely, and `§2` makes a `new` derivation a distinct type that does not. The
-   * conversion asked the written type whether it was an integer, so it refused the first along with
-   * the second — found by the audit that follows a merge, not by anything failing.
+  /** `reference/errors.md § Constrained types` makes a **transparent** subtype *the same type as*
+   * its base, with values flowing between them freely, and `§2` makes a `new` derivation a distinct
+   * type that does not. The conversion asked the written type whether it was an integer, so it
+   * refused the first along with the second — found by the audit that follows a merge, not by
+   * anything failing.
    */
   "the integer a checked cast takes may be a transparent subtype, which is its base" in {
     val src = color +

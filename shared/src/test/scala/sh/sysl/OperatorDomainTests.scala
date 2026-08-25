@@ -33,11 +33,12 @@ class OperatorDomainTests extends AnyFreeSpec with CodegenSupport with RunSuppor
     }
   }
 
-  /** `%` is integer-only in `01`'s table, and `14 §5` is explicit about why that matters beyond the
-    * token: `Rem`'s membership is given to the integers rather than to the numeric types, because a
-    * membership wider than the table would promise a bounded generic an operation that fails at the
-    * instantiation the bound was supposed to have proven. So there are two refusals, one at the
-    * operator and one at the bound, and the second is the one the narrower membership buys.
+  /** `%` is integer-only in `01`'s table, and `reference/expressions.md § Operator dispatch` is
+    * explicit about why that matters beyond the token: `Rem`'s membership is given to the integers
+    * rather than to the numeric types, because a membership wider than the table would promise a
+    * bounded generic an operation that fails at the instantiation the bound was supposed to have
+    * proven. So there are two refusals, one at the operator and one at the bound, and the second is
+    * the one the narrower membership buys.
     */
   "remainder is integer-only, at the operator and at the bound" - {
     "a float has no remainder to lower" in {

@@ -3,14 +3,14 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
-/** Coverage computed through nested patterns (`09 §8`).
+/** Coverage computed through nested patterns (`reference/patterns.md § Exhaustiveness`).
   *
   * `guide/bytecode` reported that `Some(Halt)`, `Some(Push)` and `None` cover an `Option[Op]`
   * between them and the analyzer asked for an `else` anyway. The question that had to be answered
-  * before any code was whether that is a bug or a limit, and `09 §8` answers it itself: coverage is
-  * *"about which values are guaranteed handled, not merely which tags appear"*. Those three arms
-  * guarantee every value is handled, so refusing them contradicts the rule rather than approximating
-  * it — a bug.
+  * before any code was whether that is a bug or a limit, and `reference/patterns.md §
+  * Exhaustiveness` answers it itself: coverage is *"about which values are guaranteed handled, not
+  * merely which tags appear"*. Those three arms guarantee every value is handled, so refusing them
+  * contradicts the rule rather than approximating it — a bug.
   *
   * What replaces the old check is the standard matrix algorithm: arms cover a type *together*, so
   * they are read together, one row per unguarded pattern and one column per value still being
@@ -46,9 +46,10 @@ class NestedCoverageTests extends AnyFreeSpec with Matchers with RunSupport with
           |print(read(some), read(halt), read(gone))""".stripMargin) shouldBe "1 0 -1\n"
     }
 
-    // `09 §8`'s own worked example, which the new algorithm has to keep refusing: a `Some` holding
-    // anything but zero slips through, and the complement of one literal has no name to write, so
-    // the report names the variant rather than inventing a pattern for the gap.
+    // `reference/patterns.md § Exhaustiveness`'s own worked example, which the new algorithm has to
+    // keep refusing: a `Some` holding anything but zero slips through, and the complement of one
+    // literal has no name to write, so the report names the variant rather than inventing a pattern
+    // for the gap.
     "a literal sub-pattern still does not discharge its variant" in {
       val e = err(
         """read(o: Option[int]) -> int
@@ -62,7 +63,8 @@ class NestedCoverageTests extends AnyFreeSpec with Matchers with RunSupport with
     }
 
     // The payoff of computing coverage properly: what is missing is named at the depth it is
-    // missing at, so the diagnostic is the to-do list `09 §8` says a closed sum type buys.
+    // missing at, so the diagnostic is the to-do list `reference/patterns.md § Exhaustiveness` says
+    // a closed sum type buys.
     "a gap inside a payload is named at the depth it is missing" in {
       err(OpOption +
         """read(o: Option[Op]) -> int
@@ -84,8 +86,9 @@ class NestedCoverageTests extends AnyFreeSpec with Matchers with RunSupport with
           |        Dot -> 0""".stripMargin) should include("missing Circle, Rect")
     }
 
-    // `09 §7` — a guard is not proof, so a guarded arm discharges nothing. Nesting does not change
-    // that, and the check is worth pinning here because the arms would otherwise cover.
+    // `reference/patterns.md § Guards` — a guard is not proof, so a guarded arm discharges nothing.
+    // Nesting does not change that, and the check is worth pinning here because the arms would
+    // otherwise cover.
     "a guarded arm discharges nothing, nested or not" in {
       err(OpOption +
         """read(o: Option[Op], n: int) -> int
@@ -108,8 +111,9 @@ class NestedCoverageTests extends AnyFreeSpec with Matchers with RunSupport with
           |print(seen(some), seen(gone))""".stripMargin) shouldBe "true false\n"
     }
 
-    // `09 §6` says the two forms compose, and coverage now follows them: a struct has one shape, so
-    // destructuring it inside a variant covers that variant.
+    // `reference/patterns.md § The pattern forms` says the two forms compose, and coverage now
+    // follows them: a struct has one shape, so destructuring it inside a variant covers that
+    // variant.
     "a struct nested in a variant covers it" in {
       run(
         """struct Point
@@ -140,8 +144,9 @@ class NestedCoverageTests extends AnyFreeSpec with Matchers with RunSupport with
           |print(word(t), word(f), word(n))""".stripMargin) shouldBe "yes no ?\n"
     }
 
-    // The other half of `09 §8` is untouched: a type with no set of values to complete is covered
-    // only by a catch-all, and the complaint about one says just that.
+    // The other half of `reference/patterns.md § Exhaustiveness` is untouched: a type with no set
+    // of values to complete is covered only by a catch-all, and the complaint about one says just
+    // that.
     "a scalar match still needs an else" in {
       val e = err("""var x = 1 match
                     |    1 -> 10
@@ -151,8 +156,9 @@ class NestedCoverageTests extends AnyFreeSpec with Matchers with RunSupport with
       e should not include "missing"
     }
 
-    // `09 §8` again — an enum match is checked in both positions, because falling off the end has
-    // no defined result even for effect. So the nested case is accepted for effect too.
+    // `reference/patterns.md § Exhaustiveness` again — an enum match is checked in both positions,
+    // because falling off the end has no defined result even for effect. So the nested case is
+    // accepted for effect too.
     "an enum match for effect is covered by nested arms as well" in {
       run(OpOption +
         """var n = 0
@@ -405,9 +411,9 @@ class NestedCoverageTests extends AnyFreeSpec with Matchers with RunSupport with
           |print(read(s))""".stripMargin) should include("unreachable")
     }
 
-    // `09 §7` — a failed guard falls through to a later overlapping arm. Coverage discounts the
-    // guarded arm, and the unguarded one below it both covers *and* catches the fall, so the two
-    // rules have to hold at once for this to print what it does.
+    // `reference/patterns.md § Guards` — a failed guard falls through to a later overlapping arm.
+    // Coverage discounts the guarded arm, and the unguarded one below it both covers *and* catches
+    // the fall, so the two rules have to hold at once for this to print what it does.
     "a failed guard falls through to the arm that covered for it" in {
       run(OpOption +
         """read(o: Option[Op], n: int) -> int
@@ -420,8 +426,9 @@ class NestedCoverageTests extends AnyFreeSpec with Matchers with RunSupport with
           |print(read(h, 1), read(h, 0))""".stripMargin) shouldBe "100 0\n"
     }
 
-    // `09 §9` — an arm that does not finish constrains nothing about the match's *type*, but it
-    // still covers what its pattern covers. So a diverging nested arm discharges its case.
+    // `reference/patterns.md § What a match is worth` — an arm that does not finish constrains
+    // nothing about the match's *type*, but it still covers what its pattern covers. So a diverging
+    // nested arm discharges its case.
     "a diverging nested arm still covers its case" in {
       run(OpOption +
         """read(o: Option[Op]) -> int
@@ -433,8 +440,9 @@ class NestedCoverageTests extends AnyFreeSpec with Matchers with RunSupport with
           |print(read(p))""".stripMargin) shouldBe "1\n"
     }
 
-    // `09 §10` — refcounts survive destructuring, and dropping the `else` changes which blocks the
-    // releases land in. A list rebuilt and walked in a loop is what a missing release shows up as.
+    // `reference/patterns.md § Refcounts survive destructuring` — refcounts survive destructuring,
+    // and dropping the `else` changes which blocks the releases land in. A list rebuilt and walked
+    // in a loop is what a missing release shows up as.
     "a nested match over a counted payload neither leaks nor frees twice" in {
       run(
         """struct Node
@@ -515,9 +523,9 @@ class NestedCoverageTests extends AnyFreeSpec with Matchers with RunSupport with
         "missing Turn(N, N, E), Turn(N, N, S), Turn(N, E, _), Turn(N, S, _), Turn(E, _, _), Turn(S, _, _)")
     }
 
-    // `09 §4` — a payload is matched at its *instantiated* type, and inside a generic that type is
-    // a parameter, which has no values to list. So a binding covers it and nothing shorter does,
-    // whatever the function is later instantiated at.
+    // `reference/types.md § Enums` — a payload is matched at its *instantiated* type, and inside a
+    // generic that type is a parameter, which has no values to list. So a binding covers it and
+    // nothing shorter does, whatever the function is later instantiated at.
     "a payload of a type parameter is covered by binding it" in {
       run(
         """first[T](o: Option[T], fallback: T) -> T
@@ -529,9 +537,9 @@ class NestedCoverageTests extends AnyFreeSpec with Matchers with RunSupport with
           |print(first(n, 0), first(s, "-"))""".stripMargin) shouldBe "7 -\n"
     }
 
-    // `09 §6`'s own worked example of the two pattern forms composing, which is the direction the
-    // positional tests above do not take: a *named* struct pattern inside a variant, listing one
-    // field and leaving the rest unconstrained.
+    // `reference/patterns.md § The pattern forms`'s own worked example of the two pattern forms
+    // composing, which is the direction the positional tests above do not take: a *named* struct
+    // pattern inside a variant, listing one field and leaving the rest unconstrained.
     "a named struct pattern inside a variant covers it" in {
       run(
         """struct Point
@@ -546,9 +554,10 @@ class NestedCoverageTests extends AnyFreeSpec with Matchers with RunSupport with
           |print(side(here))""".stripMargin) shouldBe "3\n"
     }
 
-    // A variant may be written with its enum's name in front, which `09 §6` says the type makes
-    // redundant rather than wrong. Coverage reads the variant it resolved to, so the two spellings
-    // discharge the same case — and mixing them in one match is the discriminating check.
+    // A variant may be written with its enum's name in front, which `reference/patterns.md § The
+    // pattern forms` says the type makes redundant rather than wrong. Coverage reads the variant it
+    // resolved to, so the two spellings discharge the same case — and mixing them in one match is
+    // the discriminating check.
     "a qualified nested variant pattern covers the same case" in {
       run(OpOption +
         """read(o: Option[Op]) -> int

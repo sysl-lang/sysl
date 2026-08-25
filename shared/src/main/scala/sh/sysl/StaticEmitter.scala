@@ -34,7 +34,8 @@ trait StaticEmitter extends StringEmitter {
                 align = v.align)
     }
 
-  /** `@llvm.used` — the symbols this module places by hand and nothing in it reads (`15 §13`).
+  /** `@llvm.used` — the symbols this module places by hand and nothing in it reads
+   * (`reference/attributes.md § @section("...")`).
    *
    * It is what keeps the feature from compiling, linking and placing nothing. A table gathered by a
    * linker script has no reader inside the program; the globals are emitted `private` and a program

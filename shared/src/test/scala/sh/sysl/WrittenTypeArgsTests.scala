@@ -3,7 +3,8 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** Type arguments written at a **call head** — `f[T](x)`, `Pair[K, V](…)`, `x.m[T](…)`,
- * `va_arg[int](ap)` (`10 §2`).
+ * `va_arg[int](ap)` (`reference/generics.md § [] means type application in a type, indexing in an
+ * expression`).
  *
  * The list and a subscript are one grammar, which is what kept this deferred: `f[T](x)` and
  * `handlers[i](x)` are the same nodes, so the parser cannot tell a type argument from an index. What
@@ -47,9 +48,10 @@ class WrittenTypeArgsTests extends AnyFreeSpec with CodegenSupport with RunSuppo
             |""".stripMargin) shouldBe "4 8\n"
     }
 
-    /** **The class this was built for.** Every parameter is a slice and the result is `unit`, so `W`
-      * is in neither of `10 §4`'s directions and no annotation anywhere could have supplied it. Run
-      * at two widths from one body, which is what says the brackets are read rather than ignored.
+    /** **The class this was built for.** Every parameter is a slice and the result is `unit`, so
+      * `W` is in neither of `reference/generics.md § Inference is bidirectional`'s directions and
+      * no annotation anywhere could have supplied it. Run at two widths from one body, which is
+      * what says the brackets are read rather than ignored.
       */
     "a width-generic kernel with nothing but slices is callable" in {
       val src =
@@ -150,9 +152,10 @@ class WrittenTypeArgsTests extends AnyFreeSpec with CodegenSupport with RunSuppo
   }
 
   "a special form" - {
-    /** `va_arg[int](ap)` is what `12 §9` called the strongest case for this syntax: everywhere else
-      * the annotation standing in is a word on a binding that was going to be written anyway, and a
-      * variadic body reading its tail straight into `print` has no binding at all.
+    /** `va_arg[int](ap)` is what `reference/ffi.md § Variadic functions` called the strongest case
+      * for this syntax: everywhere else the annotation standing in is a word on a binding that was
+      * going to be written anyway, and a variadic body reading its tail straight into `print` has
+      * no binding at all.
       */
     "va_arg reads the type written on it" in {
       val src =

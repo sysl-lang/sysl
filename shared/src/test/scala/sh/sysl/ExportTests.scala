@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `@export` — a definition C can call, and the C header describing it (`15 §12`).
+/** `@export` — a definition C can call, and the C header describing it (`reference/ffi.md §
+ * @export`).
  *
  * **The assertions are on the emitted IR and on the generated header rather than on running
  * anything**, for `CallingConventionTests`' reason: what this feature produces is an artifact for a

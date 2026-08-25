@@ -7,10 +7,10 @@ import org.scalatest.matchers.should.Matchers
  *
  * `require` is a runtime precondition (`17`), so until this there was no way to fail a build on a
  * fact the compiler already knew. What wants one most is a binding: sysl lays a struct out in
- * declaration order and claims C compatibility by construction (`15 §1`), and from inside sysl that
- * claim could not be checked, because `sizeof` reports what sysl laid out rather than what the
- * header says. Paired with a `_Static_assert` in a `.c` beside it, the two pin both sides to one
- * number.
+ * declaration order and claims C compatibility by construction (`reference/types.md § Structs`),
+ * and from inside sysl that claim could not be checked, because `sizeof` reports what sysl laid out
+ * rather than what the header says. Paired with a `_Static_assert` in a `.c` beside it, the two pin
+ * both sides to one number.
  */
 class AssertTests extends AnyFreeSpec with Matchers with CodegenSupport with RunSupport {
 
@@ -276,9 +276,10 @@ class AssertTests extends AnyFreeSpec with Matchers with CodegenSupport with Run
   }
 
   "what it refuses" - {
-    // A call is the line `13 §Constants` draws around a constant expression, and it is the line that
-    // makes this feature necessary rather than redundant: a shim accessor is a call, so a C
-    // library's constants cannot be `const`s, which is why they have to be written down and checked.
+    // A call is the line `reference/modules.md § const — a value` draws around a constant
+    // expression, and it is the line that makes this feature necessary rather than redundant: a
+    // shim accessor is a call, so a C library's constants cannot be `const`s, which is why they
+    // have to be written down and checked.
     "a condition that is not a constant expression" in {
       err(
         """f() -> int = 3

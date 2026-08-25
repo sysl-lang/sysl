@@ -2,8 +2,9 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** The heterogeneous operand of `14 §7`: the catalog's binary arithmetic traits take the right-hand
-  * type as a parameter, so `Complex * f64` is an operator rather than a named method.
+/** The heterogeneous operand of `library/core.md § Walking a type of your own`: the catalog's
+  * binary arithmetic traits take the right-hand type as a parameter, so `Complex * f64` is an
+  * operator rather than a named method.
   *
   * **The result is a second parameter, and the same shape answers it.** `Mul[Rhs = Self, Out = Self]`
   * covers scaling a vector by a real, a dot product, and a matrix applied to a vector, none of which
@@ -149,8 +150,9 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
   }
 
   "what the scalars kept" - {
-    // `14 §5`'s promise is that a membership changes no codegen, and the parameter must not have
-    // changed that: an `int` is `Mul[int]` and reaches the machine's instruction, not a table.
+    // `reference/expressions.md § Operator dispatch`'s promise is that a membership changes no
+    // codegen, and the parameter must not have changed that: an `int` is `Mul[int]` and reaches the
+    // machine's instruction, not a table.
     "a scalar operator is still one instruction" in {
       irMain("var a = 6\nvar b = 7\nprint(a * b)") should include("mul i32")
     }
@@ -335,10 +337,10 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
             |print((Box("a") * Box("b")).v)""".stripMargin) shouldBe "2\nb\n"
     }
 
-    // A shape reaches the fill by a different key than a named type does, so it is asked separately.
-    // The trait is the program's own, because the library's would leave the block with no home:
-    // `02 § Coherence` licenses an `impl` by its trait or by a type named in its subject, and `[]T`
-    // names neither.
+    // A shape reaches the fill by a different key than a named type does, so it is asked
+    // separately. The trait is the program's own, because the library's would leave the block with
+    // no home: `reference/traits.md § Where an impl may live` licenses an `impl` by its trait or by
+    // a type named in its subject, and `[]T` names neither.
     "including one written for a shape" in {
       run("""trait Times[Rhs = Self]
             |    times(self, rhs: Rhs) -> Rhs
@@ -351,7 +353,8 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
   }
 
   /** The two products a vector space is made of, and neither returns both operands' type. These are
-    * what `14 §7` recorded as uncovered for as long as an operator's result was fixed to `Self`.
+    * what `library/core.md § Walking a type of your own` recorded as uncovered for as long as an
+    * operator's result was fixed to `Self`.
     */
   private val space =
     """struct Vec2

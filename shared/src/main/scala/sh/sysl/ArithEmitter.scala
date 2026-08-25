@@ -15,9 +15,10 @@ import ir.{Arg, BinOp, CastOp, Inst, LType, Val}
  * keeps a small counter or an index on the plain path at no cost.
  *
  * Where a type has no instruction for what is being asked, the operator's trait method stands in
- * (`14 §3`). `dispatchValue` is that path, and it applies a method to two **values** rather than
- * two expressions — which is the whole distinction from lowering an ordinary call: the forms that
- * reach it use one operand twice from a single evaluation.
+ * (`reference/expressions.md § Operator dispatch`). `dispatchValue` is that path, and it applies a
+ * method to two **values** rather than two expressions — which is the whole distinction from
+ * lowering an ordinary call: the forms that reach it use one operand twice from a single
+ * evaluation.
  */
 trait ArithEmitter extends CallEmitter {
   /** What a compound assignment stores: a slot that holds a count — a string, or a struct with a
@@ -104,7 +105,8 @@ trait ArithEmitter extends CallEmitter {
       // ordering of its own, it inherits the base's.
       case None    => compareValue(c.op, Type.underlying(ty), av, bv)
 
-  /** Applies an operator's trait method to two **values** rather than two expressions (`14 §3`).
+  /** Applies an operator's trait method to two **values** rather than two expressions
+   * (`reference/expressions.md § Operator dispatch`).
    *
    * That is the whole distinction from lowering a `TCall`: the forms that reach here — a comparison
    * chain and a compound assignment — each use one operand twice from a single evaluation, and the
@@ -112,8 +114,9 @@ trait ArithEmitter extends CallEmitter {
    * catalog declares no method for (`14 §2`), so `a > b` calls the one `lt` its `impl` wrote.
    *
    * The two operands carry their **own** types, which an arithmetic trait no longer requires to be
-   * the same one (`14 §7`): `c *= 2.0` passes a complex number and a `real`. A swap exchanges the
-   * values and their types together, since it is the values that are being reordered.
+   * the same one (`library/core.md § Walking a type of your own`): `c *= 2.0` passes a complex
+   * number and a `real`. A swap exchanges the values and their types together, since it is the
+   * values that are being reordered.
    */
   private def dispatchValue(d: TDispatch, aty: Type, bty: Type, av: Val, bv: Val, resultTy: Type): Val = {
     val (l, lty, r, rty) = if d.swap then (bv, bty, av, aty) else (av, aty, bv, bty)

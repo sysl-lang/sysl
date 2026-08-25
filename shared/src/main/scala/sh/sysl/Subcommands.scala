@@ -100,7 +100,8 @@ private def write(path: String, text: String): Int = {
   catch case e: Exception => fail(s"cannot write $path: ${e.getMessage}")
 }
 
-/** `sysl build-c` — the static archive and the C header a C project is handed (`15 §12`).
+/** `sysl build-c` — the static archive and the C header a C project is handed (`reference/ffi.md §
+ * @export`).
  *
  * **This is `build-lib`'s shape with a different destination.** The compilation is the ordinary one
  * rather than a library build, because what is wanted is a module lowered for *this* target with its
@@ -119,13 +120,14 @@ private def write(path: String, text: String): Int = {
  * link. Those are libraries the author chose and can be given to a linker, which is exactly the
  * distinction the standard module fails.
  *
- * **`roots` is every tree the compilation walked, not the project's own**, and it is a parameter for
- * that reason. `15 §7` gives a source root named with `--lib` and a package a `dependencies` block
- * brought in the same answer as the project itself: their C is compiled and reaches the link. This
- * command reads that table exactly as `NativeSources` does for the commands that link, and the
- * archive is where "the link line" lands when the consumer is a C project — an object the archive
- * left out is one the C author has no way to supply and no way to hear about, since the sysl half
- * compiled cleanly and only the C project's linker ever notices.
+ * **`roots` is every tree the compilation walked, not the project's own**, and it is a parameter
+ * for that reason. `reference/ffi.md § A library may carry C` gives a source root named with
+ * `--lib` and a package a `dependencies` block brought in the same answer as the project itself:
+ * their C is compiled and reaches the link. This command reads that table exactly as
+ * `NativeSources` does for the commands that link, and the archive is where "the link line" lands
+ * when the consumer is a C project — an object the archive left out is one the C author has no way
+ * to supply and no way to hear about, since the sysl half compiled cleanly and only the C project's
+ * linker ever notices.
  */
 private def buildForC(cfg: Config, compiled: Compiled, target: Target, named: Option[String],
                       roots: List[String], paths: SearchPaths): Int = {
@@ -192,11 +194,13 @@ private def buildForC(cfg: Config, compiled: Compiled, target: Target, named: Op
       0
 }
 
-/** `sysl prove` — the module as WhyML, and what Why3 made of it (`17 §9`).
+/** `sysl prove` — the module as WhyML, and what Why3 made of it (`reference/verification.md § sysl
+ * prove`).
  *
  * **A proof is not a build.** Nothing is emitted and nothing about `sysl build` changes, which is
- * `17 §1`: a module that fails to prove still compiles and still runs, with every check `16` and `17`
- * describe. What the prover buys is finding out before the program runs rather than at the trap.
+ * `reference/verification.md`: a module that fails to prove still compiles and still runs, with
+ * every check `16` and `17` describe. What the prover buys is finding out before the program runs
+ * rather than at the trap.
  *
  * The exit status is Why3's, so a proof run is usable in a build script that wants to fail on an
  * undischarged goal.
@@ -279,9 +283,9 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
     case Right(path) => path
 
   // The library's C files, which become members of the archive beside the object its own modules
-  // compiled to (`15 §7`). Checked for a name collision here rather than after the build, for the
-  // same reason the archiver is: the compile is the slow part, and a name that cannot be archived is
-  // known before any of it has run.
+  // compiled to (`reference/ffi.md § A library may carry C`). Checked for a name collision here
+  // rather than after the build, for the same reason the archiver is: the compile is the slow part,
+  // and a name that cannot be archived is known before any of it has run.
   val native = Project.cSources(cfg.file, Some(target.os))
 
   LibraryArtifact.collisions(native) match

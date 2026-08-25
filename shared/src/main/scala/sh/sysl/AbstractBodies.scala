@@ -1,12 +1,12 @@
 package sh.sysl
 
-/** The definition-time pass of `14 §4`: every generic body checked once, with each type parameter
- * opaque except for what its bounds promise.
+/** The definition-time pass of `reference/generics.md § Bounds`: every generic body checked once,
+ * with each type parameter opaque except for what its bounds promise.
  *
- * This is the mechanism `10 §5` committed to, and what tells sysl's generics apart from a C++
- * template. A body that assumes more than it declared is wrong whether or not anything ever
- * instantiates it, so `sum[T](a: T, b: T) = a.plus(b)` fails on its own line rather than at
- * whichever call site first supplied a type without a `plus`.
+ * This is the mechanism `reference/generics.md § Bounds` committed to, and what tells sysl's
+ * generics apart from a C++ template. A body that assumes more than it declared is wrong whether or
+ * not anything ever instantiates it, so `sum[T](a: T, b: T) = a.plus(b)` fails on its own line
+ * rather than at whichever call site first supplied a type without a `plus`.
  *
  * It runs above the bodies it checks because that is what it checks them with: each one is analyzed
  * through `analyzeBodyWith`, against a signature resolved here rather than looked up, since a
@@ -15,9 +15,10 @@ package sh.sysl
 trait AbstractBodies extends FunctionBodies {
 
   /** Checks every generic body once, at its definition, with each type parameter opaque except for
-   * what its bounds promise (`14 §4`). This is the mechanism `10 §5` committed to, and what tells
-   * sysl's generics apart from a C++ template: a body that assumes more than it declared is wrong
-   * whether or not anything ever instantiates it, and this is where it is told so.
+   * what its bounds promise (`reference/generics.md § Bounds`). This is the mechanism
+   * `reference/generics.md § Bounds` committed to, and what tells sysl's generics apart from a C++
+   * template: a body that assumes more than it declared is wrong whether or not anything ever
+   * instantiates it, and this is where it is told so.
    *
    * Every declaration that carries type parameters is walked, and that now includes a generic
    * *type's* own members: `struct SortedList[T: Ord]` is where its bound is written, so a member may

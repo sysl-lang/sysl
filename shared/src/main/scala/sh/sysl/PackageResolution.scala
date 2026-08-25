@@ -10,9 +10,10 @@ import io.github.edadma.cross_platform.*
  * them (`packages.md § 3`, `§ 5`, `§ 9`).
  *
  * A dependency reaches a compilation the way a `--lib` source tree does — as **more modules**, and
- * as a tree whose C is compiled beside the program's (`15 §7`). What is new beside those is the
- * `Packages` table: each fetched package's files are filed under a canonical prefix taken from its
- * coordinate, and the names its import lines write are read back through the manifest that named it.
+ * as a tree whose C is compiled beside the program's (`reference/ffi.md § A library may carry C`).
+ * What is new beside those is the `Packages` table: each fetched package's files are filed under a
+ * canonical prefix taken from its coordinate, and the names its import lines write are read back
+ * through the manifest that named it.
  *
  * ==A `--lib` source root's own `dependencies` are here too, and used not to be==
  *
@@ -192,8 +193,9 @@ private def collectPackages(graph: Resolve.Graph, os: Os): Either[String, Packag
           defines,
         )))
   // A malformed per-OS directory is a mistake in the package rather than a package that would not
-  // read (`13 §5`), and the message names the directory and lists the operating systems there are —
-  // so wrapping it in "cannot read a package" would bury the only part worth having.
+  // read (`reference/modules.md § Platform selection`), and the message names the directory and
+  // lists the operating systems there are — so wrapping it in "cannot read a package" would bury
+  // the only part worth having.
   catch
     case e: SelectionError => Left(e.getMessage)
     case e: Exception      => Left(s"cannot read a package: ${e.getMessage}")
@@ -216,8 +218,9 @@ private def writeSums(root: String, sums: Sums): Unit =
 
 /** The project root: the directory the driver was given, or the one holding the file it was given.
  *
- * `13 § Open a` settles that the driver is *given* a root rather than discovering one, so this never
- * searches upward — a build that walked up would depend on directories above the one named.
+ * `reference/modules.md` settles that the driver is *given* a root rather than discovering one, so
+ * this never searches upward — a build that walked up would depend on directories above the one
+ * named.
  */
 private def projectRoot(file: String): String =
   if isDirectory(file) then file
@@ -229,13 +232,14 @@ private def projectRoot(file: String): String =
 /** The project config, read from the root this invocation was given (`packages.md § 1`).
  *
  * **A missing file is not an error.** A single-file program has no config and wants none, so what
- * comes back is the empty one — the same shape `13 §1` gives the anonymous root module. A file that
- * is *there* and will not read is a different thing entirely and stops the build: somebody wrote it,
- * and building while ignoring it would be building something other than what they asked for.
+ * comes back is the empty one — the same shape `reference/modules.md` gives the anonymous root
+ * module. A file that is *there* and will not read is a different thing entirely and stops the
+ * build: somebody wrote it, and building while ignoring it would be building something other than
+ * what they asked for.
  *
- * The file is looked for beside the sources rather than searched for upwards. `13 § Open a` settles
- * that the driver is *given* a root rather than discovering one, and a search that walked upward
- * would make a build depend on directories above the one named.
+ * The file is looked for beside the sources rather than searched for upwards.
+ * `reference/modules.md` settles that the driver is *given* a root rather than discovering one, and
+ * a search that walked upward would make a build depend on directories above the one named.
  */
 private def readPackageConfig(file: String): Either[String, PackageConfig] = {
   val path = s"${projectRoot(file)}/${PackageConfig.FileName}"

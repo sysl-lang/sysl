@@ -110,7 +110,8 @@ class AtPatternTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
   }
 
-  /** Claims `09 §6` and the reference page make about the form, each run rather than asserted.
+  /** Claims `reference/patterns.md § The pattern forms` and the reference page make about the form,
+   * each run rather than asserted.
    *
    * They are the sentences that would be quietly false if the wrapper were not transparent — the
    * ones saying a binding changes nothing about what a pattern *tests for*.

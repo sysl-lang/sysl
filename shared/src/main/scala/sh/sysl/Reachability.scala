@@ -66,33 +66,35 @@ object Reachability {
    * beside one of those would be a list the other did not have — which is exactly what happened, and
    * cost a test build the ability to link a package that had a destructor or an export.
    *
-   * **An interrupt handler is a root**, and it is the one kind of function that can never be anything
-   * else: no program calls it — `15 §10` refuses that outright — so a walk starting from what the
-   * program *runs* cannot reach it. Dropping one would leave the vector table pointing at nothing,
-   * which is a fault at the worst available moment. It is entered by the processor, and that is
-   * exactly what an entry point is.
+   * **An interrupt handler is a root**, and it is the one kind of function that can never be
+   * anything else: no program calls it — `reference/ffi.md § interrupt` refuses that outright — so
+   * a walk starting from what the program *runs* cannot reach it. Dropping one would leave the
+   * vector table pointing at nothing, which is a fault at the worst available moment. It is entered
+   * by the processor, and that is exactly what an entry point is.
    *
    * Its **body** is walked with the others, so whatever a handler calls survives because the handler
    * does. Only its own name has to be added by hand, since nothing names it.
    *
-   * **An `@export`ed function is a root for the same reason** (`15 §12`). Nothing inside the program
-   * need ever call it — the whole point is that something outside the program will, and this
-   * compilation cannot see that caller any more than it can see the processor. A build with no entry
-   * point at all is the case that makes this load bearing: every root above is absent there, so an
-   * export that were not one would prune the artifact down to nothing.
+   * **An `@export`ed function is a root for the same reason** (`reference/ffi.md § @export`).
+   * Nothing inside the program need ever call it — the whole point is that something outside the
+   * program will, and this compilation cannot see that caller any more than it can see the
+   * processor. A build with no entry point at all is the case that makes this load bearing: every
+   * root above is absent there, so an export that were not one would prune the artifact down to
+   * nothing.
    *
-   * **A `@section` definition is a root for the third version of it** (`15 §13`). What finds it is a
-   * linker script gathering a named section, which is no more visible to this walk than the processor
-   * or the C caller is — a `.ramfunc` copied into RAM by a startup routine, or a boot entry the image
-   * is laid out around. Placing a definition somewhere and then dropping it for want of a caller is
-   * the one outcome the attribute was written to prevent, and keeping it costs a function nobody
-   * calls, which is the trade every other kind here makes.
+   * **A `@section` definition is a root for the third version of it** (`reference/attributes.md §
+   * @section("...")`). What finds it is a linker script gathering a named section, which is no more
+   * visible to this walk than the processor or the C caller is — a `.ramfunc` copied into RAM by a
+   * startup routine, or a boot entry the image is laid out around. Placing a definition somewhere
+   * and then dropping it for want of a caller is the one outcome the attribute was written to
+   * prevent, and keeping it costs a function nobody calls, which is the trade every other kind here
+   * makes.
    *
-   * **A destructor is a root for the fourth version of the same reason** (`03 § A destructor`). What
-   * calls it is the release hook the emitter builds, and that is not a tree this walk can see — it is
-   * generated from a payload type at the moment a box of that type is let go of. No reachable body
-   * names one, so pruning it would leave the hook calling a symbol nothing defined, and the failure
-   * would be at the link, against a name no line of the program contains.
+   * **A destructor is a root for the fourth version of the same reason** (`reference/memory.md § A
+   * destructor`). What calls it is the release hook the emitter builds, and that is not a tree this
+   * walk can see — it is generated from a payload type at the moment a box of that type is let go
+   * of. No reachable body names one, so pruning it would leave the hook calling a symbol nothing
+   * defined, and the failure would be at the link, against a name no line of the program contains.
    *
    * **A root the program did not WRITE counts only where the program reaches its module**, and that
    * is the one qualification on any of the four — the same qualification on each of them, since a
@@ -151,10 +153,10 @@ object Reachability {
    * **The destructor is the kind that could under-prune, and coherence is why it cannot.** Over-
    * pruning the other three costs a symbol nobody asked for; over-pruning a destructor is a *link*
    * error, since the release hook the emitter builds calls a name no line of the program contains.
-   * What makes it safe is `02 § Coherence`: an `impl Drop for T` may live only in the module
-   * declaring `Drop` — the library's — or in one declaring a type named in `T`. So the hook's module
-   * is always one that instantiating `T` had to name, and a reachable instantiation always carries an
-   * edge to it.
+   * What makes it safe is `reference/traits.md § Where an impl may live`: an `impl Drop for T` may
+   * live only in the module declaring `Drop` — the library's — or in one declaring a type named in
+   * `T`. So the hook's module is always one that instantiating `T` had to name, and a reachable
+   * instantiation always carries an edge to it.
    *
    * **That argument was written for a package and holds word for word for the library**, with one
    * residue worth stating rather than legislating against: the library *may* add to `Drop`'s own

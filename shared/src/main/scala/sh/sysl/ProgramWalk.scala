@@ -16,8 +16,8 @@ import scala.collection.mutable
  *
  * What each pass then *does* sits in the traits underneath, in the order the driver reaches them:
  * `ModuleFiles` (what a file contributes), `ModuleStorage` (the `val`s and `var`s it lays down),
- * `AbstractBodies` (`14 §4`'s definition-time check) and `FunctionBodies` (running one, which is
- * what the drain is draining towards).
+ * `AbstractBodies` (`reference/generics.md § Bounds`'s definition-time check) and `FunctionBodies`
+ * (running one, which is what the drain is draining towards).
  *
  * `units` — the files being analyzed together — is supplied by the class and declared alongside the
  * other things a walk is told about its compilation (`DeclTables`).
@@ -52,10 +52,10 @@ trait ProgramWalk extends OpaqueResults {
     // Every declaration is read in the terms its file set up — the module it contributes to and
     // what it imported — so each one is carried alongside those rather than flattened into one
     // list. They are what a name in its signature, its fields, and its body resolves against
-    // (`13 §3`), and the imports can be read now because which module a path names is settled by
-    // the headers alone.
-    // The imports are gathered in the file's own terms, since what an import may reach is a
-    // question about where it was written (`13 §2`) as much as about what it names.
+    // (`reference/modules.md § Imports`), and the imports can be read now because which module a
+    // path names is settled by the headers alone. The imports are gathered in the file's own terms,
+    // since what an import may reach is a question about where it was written
+    // (`reference/modules.md § Visibility`) as much as about what it names.
     def scopeOf(u: Program): Scope = {
       val here = moduleOf(u)
       val base = Scope(here, Imports.empty, Some(u.source))
@@ -85,8 +85,8 @@ trait ProgramWalk extends OpaqueResults {
       case other             => other
 
     // A function at the top of the entry file is the module's unless it reads something the body
-    // binds. `12 §5a`'s limits — no generic, no address, not a value — are what holding a frame
-    // costs, so a function holding none keeps everything an ordinary one has.
+    // binds. `reference/declarations.md`'s limits — no generic, no address, not a value — are what
+    // holding a frame costs, so a function holding none keeps everything an ordinary one has.
     val captures = entry.map((u, _) => Bodies.capturing(u.body)).getOrElse(Set.empty)
 
     def belongsToModule(s: Stmt) = s match
@@ -233,17 +233,20 @@ trait ProgramWalk extends OpaqueResults {
     checkImportTargets()
 
     // How far each declaration reaches is settled too, so a signature can be held to naming nothing
-    // that reaches less far than it does (`13 §2`). It waits until here because the question is
-    // about two declarations at a time, and either may be written below the other.
+    // that reaches less far than it does (`reference/modules.md § Visibility`). It waits until here
+    // because the question is about two declarations at a time, and either may be written below the
+    // other.
     checkExposedTypes()
 
     // And a trait's members are resolved, which nothing else does: they lower to no function, so
-    // this is the only pass that reads them before something implements the trait (`02 § Defaults`).
+    // this is the only pass that reads them before something implements the trait
+    // (`reference/traits.md § A default may assume exactly what its own trait declares`).
     checkTraitSignatures()
 
     // And what each `&sync T` promises about its pointee, which waits for the same reason a bound
     // does: a type that reaches itself through a `&sync` field is resolved while its own field list
-    // is still being filled, so the question is held until every field is in (`06 § &sync T`).
+    // is still being filled, so the question is held until every field is in (`reference/memory.md
+    // § Crossing a concurrency domain`).
     typesHoisted = true
     for (inner, pos) <- sharedChecks.toList do
       currentPos = pos
@@ -317,7 +320,8 @@ trait ProgramWalk extends OpaqueResults {
 
     // And every parameter's default, for the same reason and in the same state: a default is a
     // module member's expression too, filled at a call but written here, so it is checked where it
-    // is written and whether or not any call takes it (`12 §2a`).
+    // is written and whether or not any call takes it (`reference/declarations.md § Default
+    // parameters and named arguments`).
     checkValueDefaults()
 
     val tfuncs = mutable.ListBuffer.empty[TFunc]
@@ -330,11 +334,11 @@ trait ProgramWalk extends OpaqueResults {
     //
     // The hoisted declarations are what is walked, rather than the source statements, because
     // hoisting is where each one was renamed to the key its module gives it — an `extern` is left
-    // out by the table that says which names have no body rather than by its declaration form.
-    // Read off the declarations rather than the bodies, so that a handler nothing instantiates and
-    // nothing reaches is judged exactly as one that does (`15 §10`).
+    // out by the table that says which names have no body rather than by its declaration form. Read
+    // off the declarations rather than the bodies, so that a handler nothing instantiates and
+    // nothing reaches is judged exactly as one that does (`reference/ffi.md § interrupt`).
     checkConventions()
-    // Read off the declarations for the same reason (`15 §12`).
+    // Read off the declarations for the same reason (`reference/ffi.md § @export`).
     checkExports()
 
     // And a doc comment's tags against the signature it sits above — the same reason a third time,
@@ -408,15 +412,18 @@ trait ProgramWalk extends OpaqueResults {
       drain()
 
     // Every reference the program makes has been resolved, so which module depends on which is
-    // finally settled and the graph can be held to being acyclic (`13 §6`).
+    // finally settled and the graph can be held to being acyclic (`reference/modules.md § The
+    // module graph is acyclic`).
     checkModuleGraph()
 
     // And which module a reference lands in is what decides whether a module that gave up an
-    // environment capability was allowed to make it, so this asks the same settled graph (`13 §4`).
+    // environment capability was allowed to make it, so this asks the same settled graph
+    // (`reference/modules.md § Capabilities are a module property`).
     checkGatedModules()
 
     // Which structs can lie inside one that carries invariant clauses is likewise only settled now,
-    // so the rule about what a `*self` method may let out of the call is asked here (`16 §6`).
+    // so the rule about what a `*self` method may let out of the call is asked here
+    // (`reference/errors.md § Struct invariants`).
     checkSelfAliasing((tfuncs ++ closureFuncs).toList)
 
     val externs = externsUsed.toList.map { name =>
@@ -445,16 +452,18 @@ trait ProgramWalk extends OpaqueResults {
     checkNoAlloc(allFuncs, abstractFuncs.toList, tvals.toList, vtables.values.toList, tmain, mainScope.module,
       tests.map(_.func).toSet)
 
-    // And what a `@pure` function promised, asked of the same tree for the same reason (`17 §6`).
+    // And what a `@pure` function promised, asked of the same tree for the same reason
+    // (`reference/verification.md § @pure`).
     checkPurity(allFuncs, externs)
 
-    // And what a `@reads`/`@writes` frame promised (`17 §7`). It runs beside purity rather than
-    // inside it because the two answer different questions about the same nodes: purity asks whether
-    // a caller could observe anything at all, a frame asks which storage in particular.
+    // And what a `@reads`/`@writes` frame promised (`reference/verification.md § @reads and @writes
+    // — what a call may touch`). It runs beside purity rather than inside it because the two answer
+    // different questions about the same nodes: purity asks whether a caller could observe anything
+    // at all, a frame asks which storage in particular.
     checkFrames(allFuncs, externs)
 
-    // And where a `@ghost` function may be called from (`17 §8`), which is the rule that makes
-    // erasing one sound.
+    // And where a `@ghost` function may be called from (`reference/verification.md § @ghost — what
+    // costs nothing to say`), which is the rule that makes erasing one sound.
     checkGhost(allFuncs, tmain)
 
     // And who may name what a `@tests` file declared (`testing.md`), which is the rule that makes
@@ -477,13 +486,14 @@ trait ProgramWalk extends OpaqueResults {
     // graph and could reorder initialization, which is a silent, program-wide behaviour change and
     // exactly what this fix must not be. Analysis sees everything; only the backend sees less.
     //
-    // **It escapes on the library path alone**, which is why it went unnoticed. A program instantiates
-    // the enclosing generic and gets a concrete copy beside the abstract one, so the abstract one is
-    // dead weight the backend never asks about; `build-lib` strips `@tests` *before* analysis
-    // (`Compiler.compileLibrary`), so in a library nothing instantiates the generic at all and the
-    // abstract closure is the only copy there is. `sysl.slices`' `sort[T: Ord](xs) = sort_by(xs, (a,
-    // b) -> a < b)` is the shape that found it, and `12 §6` names a comparator passed to a sort as the
-    // bare arrow's motivating case — so this is a shape the language invites.
+    // **It escapes on the library path alone**, which is why it went unnoticed. A program
+    // instantiates the enclosing generic and gets a concrete copy beside the abstract one, so the
+    // abstract one is dead weight the backend never asks about; `build-lib` strips `@tests`
+    // *before* analysis (`Compiler.compileLibrary`), so in a library nothing instantiates the
+    // generic at all and the abstract closure is the only copy there is. `sysl.slices`' `sort[T:
+    // Ord](xs) = sort_by(xs, (a, b) -> a < b)` is the shape that found it, and `reference/types.md
+    // § Function types` names a comparator passed to a sort as the bare arrow's motivating case —
+    // so this is a shape the language invites.
     val emitted = allFuncs.filterNot(f =>
       f.params.exists((_, t) => Type.mentionsAbstract(t)) || Type.mentionsAbstract(f.retTy))
 
@@ -523,7 +533,7 @@ trait ProgramWalk extends OpaqueResults {
   }
 
   /** Every type this compilation instantiated that has a destructor, paired with the symbol of it
-   * (`03 § A destructor`).
+   * (`reference/memory.md § A destructor`).
    *
    * Asked of the **instantiated** types rather than of the `impl` blocks, because an `impl` for a
    * generic type is one block covering a family and the hook is emitted per concrete payload. A

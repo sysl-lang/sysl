@@ -146,8 +146,9 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   }
 
   "the built-ins render through the same trait" - {
-    // Every scalar `14 §5` calls `Display`, reached as a method rather than through `print` — which
-    // is the call a struct's own `display` makes about its fields.
+    // Every scalar `reference/expressions.md § Operator dispatch` calls `Display`, reached as a
+    // method rather than through `print` — which is the call a struct's own `display` makes about
+    // its fields.
     "every scalar type has a display of its own" in {
       run("""struct All
             |    n: int
@@ -467,10 +468,10 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |print(f"[${r[..]}%12s]")""".stripMargin) shouldBe "[    [a rect]]\n"
     }
 
-    /** A fixed array renders, and it renders **itself** rather than through a view the reader had to
-     * know to take. Value generics (`10 §9`) are what made that writable: a length became an
-     * argument to the array shape instead of part of it, so one
-     * `impl[const N: usize, T: Display] Display for [N]T` covers every length.
+    /** A fixed array renders, and it renders **itself** rather than through a view the reader had
+     * to know to take. Value generics (`reference/generics.md § A parameter may stand for a value`)
+     * are what made that writable: a length became an argument to the array shape instead of part
+     * of it, so one `impl[const N: usize, T: Display] Display for [N]T` covers every length.
      *
      * The two messages this replaces are worth recording because both were true when written and
      * both are gone. First `print(a)` said only that nothing rendered a `[3]int`, which sent a

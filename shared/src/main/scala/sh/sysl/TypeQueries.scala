@@ -38,8 +38,9 @@ trait TypeQueries {
   def zeroSized(t: Type): Boolean = t == Unit
 
   /** Whether a type is built out of something that is not a type — a parameter standing in for
-   * itself, or anything holding one. Such a type is a step in a definition-time walk (`14 §4`)
-   * rather than something a value is ever laid out at, so nothing keyed on it may outlive the walk.
+   * itself, or anything holding one. Such a type is a step in a definition-time walk
+   * (`reference/generics.md § Bounds`) rather than something a value is ever laid out at, so
+   * nothing keyed on it may outlive the walk.
    */
   def mentionsAbstract(t: Type): Boolean = t match
     case _: Abstract      => true

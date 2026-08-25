@@ -21,11 +21,11 @@ object Escape {
 
   /** Which local arrays each body must allocate on the heap rather than in its frame.
    *
-   * An array is in here when a view of it gets out of the frame that declared it, and the answer
-   * to that is promotion rather than a diagnostic (`05 § What happens when a slice escapes`): the
-   * storage becomes an ARC buffer, the slice's owner points at it, and it lives exactly as long as
-   * the last view of it. Only arrays that are **both** sliced and escaped are here; one that is
-   * merely read, or whose views stay in the frame, keeps its stack slot.
+   * An array is in here when a view of it gets out of the frame that declared it, and the answer to
+   * that is promotion rather than a diagnostic (`reference/memory.md § What happens when a slice
+   * escapes`): the storage becomes an ARC buffer, the slice's owner points at it, and it lives
+   * exactly as long as the last view of it. Only arrays that are **both** sliced and escaped are
+   * here; one that is merely read, or whose views stay in the frame, keeps its stack slot.
    *
    * Keyed by function name, with `main`'s statements separate because they are not a function.
    */
@@ -268,8 +268,9 @@ private class Escape(program: TProgram) {
       case TStr(a)              => views(a)
       case TStore(_, v, _)      => views(v)
       case TIf(_, t, e, _)      => blockValue(t) ++ View.any(e.map(blockValue))
-      // One copy of an unrolled `for const` (`10 §10`) — a block, so it views whatever its own
-      // value views, exactly as an `if` branch does.
+      // One copy of an unrolled `for const` (`reference/generics.md § A parameter may stand for a
+      // list of types`) — a block, so it views whatever its own value views, exactly as an `if`
+      // branch does.
       case TBlockExpr(b)        => blockValue(b)
       case TMatch(_, arms, _)   => View.any(arms.map(a => blockValue(a.body)))
       // A loop's value comes from its `break`s and its `else`, so it views the frame when any of
@@ -365,9 +366,10 @@ private class Escape(program: TProgram) {
 
         forEachStmt(stmts) {
           case TVarDecl(name, _, init, _)                  => bind(name, views(init))
-          // A `ref` name reaches the storage its place reached (`03 § ref`), so it views whatever
-          // that place views. Without this the name would view nothing, and a slice taken through it
-          // would look like a view of storage the frame does not own.
+          // A `ref` name reaches the storage its place reached (`reference/memory.md § ref — a name
+          // for a place`), so it views whatever that place views. Without this the name would view
+          // nothing, and a slice taken through it would look like a view of storage the frame does
+          // not own.
           case TRefDecl(name, _, place)                 => bind(name, views(place))
           case TExprStmt(TStore(TLoad(name, _), v, _))  => bind(name, views(v))
           // A multi-assignment's arms are stores, and one landing in a plain local binds that local
@@ -444,10 +446,10 @@ private class Escape(program: TProgram) {
     }
 
     /** A confined view has left the frame. Where it roots at arrays this body declared, they are
-     * promoted — the storage moves to the heap and the program is unchanged otherwise (`05 § What
-     * happens when a slice escapes`). Where it roots at storage that cannot be moved, the escape is
-     * reported against the expression that causes it, so the caret lands on the slice that leaves
-     * the frame rather than on the function as a whole.
+     * promoted — the storage moves to the heap and the program is unchanged otherwise
+     * (`reference/memory.md § What happens when a slice escapes`). Where it roots at storage that
+     * cannot be moved, the escape is reported against the expression that causes it, so the caret
+     * lands on the slice that leaves the frame rather than on the function as a whole.
      */
     private def gets_out(at: TExpr, how: String): Unit = {
       val v = views(at)
@@ -558,8 +560,9 @@ private class Escape(program: TProgram) {
   }
 
   /** The place each `ref` in a body stands for, so a walk that reaches one of those names can carry
-   * on to the storage it really names (`03 § ref`). A ref declares nothing, which is why it is
-   * gathered separately from the arrays above rather than counted among them.
+   * on to the storage it really names (`reference/memory.md § ref — a name for a place`). A ref
+   * declares nothing, which is why it is gathered separately from the arrays above rather than
+   * counted among them.
    */
   private def refBindings(stmts: List[TStmt]): Map[String, TExpr] = {
     val found = mutable.Map.empty[String, TExpr]

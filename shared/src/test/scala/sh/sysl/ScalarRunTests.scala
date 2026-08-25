@@ -176,9 +176,10 @@ class ScalarRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
-  /** `00 §1` gives `u32` → `char` two spellings by how trustworthy the value is. `char(u)` traps;
-   * `char_from_u32(u)` answers. It is a free function because a scalar has no member namespace for
-   * the `char.try` an earlier draft named — the obstacle `string.from_utf8` met.
+  /** `reference/types.md § char` gives `u32` → `char` two spellings by how trustworthy the value
+   * is. `char(u)` traps; `char_from_u32(u)` answers. It is a free function because a scalar has no
+   * member namespace for the `char.try` an earlier draft named — the obstacle `string.from_utf8`
+   * met.
    *
    * The three ways a `u32` fails to be a scalar value are what the tests are built around: past
    * `0x10FFFF`, and either end of the surrogate range, whose interior is easy to get right by

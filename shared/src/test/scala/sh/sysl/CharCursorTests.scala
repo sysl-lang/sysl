@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** What a program can ask a character cursor beyond "give me the next one" (`04 § Granularity`).
+/** What a program can ask a character cursor beyond "give me the next one" (`reference/strings.md §
+ * Granularity: bytes and scalar values`).
  *
  * `for c in s.chars` walks a **copy** of the cursor, so a loop cannot ask afterwards where it got
  * to — which is why the guide's JSON reader and its bytecode lexer both index bytes by hand and

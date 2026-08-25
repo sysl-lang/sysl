@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Tier-1 lowering of rendering (`14 §6`): the two sinks, and which path a value takes to text.
+/** Tier-1 lowering of rendering (`library/core.md § Rendering to a sink`): the two sinks, and which
+ * path a value takes to text.
  *
  * What is worth pinning here rather than leaving to the run suite is the part a working program
  * cannot tell you about — that a scalar still renders with no sink at all, that the sink a `print`

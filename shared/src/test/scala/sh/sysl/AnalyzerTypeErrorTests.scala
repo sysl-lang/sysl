@@ -177,8 +177,9 @@ class AnalyzerTypeErrorTests extends AnyFreeSpec with CodegenSupport {
     }
 
     // An array of a printable element **does** print, through the library's one block over `[N]T`
-    // (`10 §9`). What is refused is an array of something that does not render, and the message
-    // names the element rather than the array, which is the part a reader can act on.
+    // (`reference/generics.md § A parameter may stand for a value`). What is refused is an array of
+    // something that does not render, and the message names the element rather than the array,
+    // which is the part a reader can act on.
     "print an array of anything printable, and name the element when they do not" in {
       err("""struct P
             |    v: int

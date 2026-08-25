@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** A trait's members are reachable where the **trait** can be named, not wherever its implementing
- * type can (`13 §2`).
+ * type can (`reference/modules.md § Visibility`).
  *
  * Before this, a type's members were one flat namespace whatever brought them, so the first trait to
  * claim a name on a type claimed it from every program that would ever compile — `sysl.math`'s
@@ -98,9 +98,9 @@ class TraitScopeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         |""".stripMargin) shouldBe "7\n"
   }
 
-  // What the whole rule rests on: a submodule is reached by naming or importing it (`13 §3`), so a
-  // library trait is out of scope in a file that did not ask for it — which is what leaves its
-  // member names free for that file to use.
+  // What the whole rule rests on: a submodule is reached by naming or importing it
+  // (`reference/modules.md § Imports`), so a library trait is out of scope in a file that did not
+  // ask for it — which is what leaves its member names free for that file to use.
   "a submodule's trait is not nameable without its import" in {
     err(
       """impl Float for f64

@@ -27,10 +27,10 @@ trait HoistMembers extends HoistImpl {
    * does. Members that introduce their own type parameters wait on later work and are rejected with
    * a clear diagnostic rather than silently mishandled.
    *
-   * A generic type's members are handed to the definition-time pass of `14 §4` all the same. What
-   * they may assume of the type's parameters is what the type asks of them — nothing, where it asks
-   * nothing — and that is a rule a body can be held to before anything instantiates it, exactly as
-   * a bounded generic function's body is.
+   * A generic type's members are handed to the definition-time pass of `reference/generics.md §
+   * Bounds` all the same. What they may assume of the type's parameters is what the type asks of
+   * them — nothing, where it asks nothing — and that is a rule a body can be held to before
+   * anything instantiates it, exactly as a bounded generic function's body is.
    */
   protected def hoistMembers(tname: String, members: List[MethodDecl], out: mutable.ListBuffer[FuncDecl]): Unit = {
     val (tparams, taken, noun) = nominal(tname).get
@@ -75,9 +75,9 @@ trait HoistMembers extends HoistImpl {
    *
    * That is what a default body *means* — it may assume of its receiver exactly what the trait
    * promises, and nothing else — so writing it down this way is what lets the definition-time pass
-   * of `14 §4` check it once, at the trait, with the machinery a bounded generic already uses. The
-   * declarations exist only for that walk; the body a program runs is the copy `hoistImpl` makes for
-   * each implementing type.
+   * of `reference/generics.md § Bounds` check it once, at the trait, with the machinery a bounded
+   * generic already uses. The declarations exist only for that walk; the body a program runs is the
+   * copy `hoistImpl` makes for each implementing type.
    *
    * A **property** with a body is a default like any other, and needs nothing said about it here: its
    * declaration form already carries a body, so the only question was whether the trait was allowed
@@ -122,8 +122,9 @@ trait HoistMembers extends HoistImpl {
   }
   /** Checks that every bound a declaration writes names a trait and applies it to as many arguments
    * as it declares, whichever declaration form wrote it — a function, a struct, an enum, a trait. A
-   * bound is a trait and nothing else (`10 §5`), so a name that is a struct, a scalar, or nothing at
-   * all is reported here rather than silently promising something no type could ever be held to.
+   * bound is a trait and nothing else (`reference/generics.md § Bounds`), so a name that is a
+   * struct, a scalar, or nothing at all is reported here rather than silently promising something
+   * no type could ever be held to.
    *
    * It runs in a pass after every type is registered, so a bound may name a trait declared further
    * down the file. What the *arguments* are is left to `resolveBound`, which is reached wherever the

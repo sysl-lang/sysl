@@ -55,8 +55,9 @@ trait GenericInstantiation extends ConstFolding {
    *     and gets one generated at that width, with its buffer sized from the width itself.
    *
    * So the ceiling is the back end's and nothing else's. It is still not a statement about what
-   * `00 §5` permits — the maximum the *language* allows is that chapter's open question, and a
-   * width this large is a thing the machine can hold rather than a thing a program should want.
+   * `reference/types.md § Integers are an open family` permits — the maximum the *language* allows
+   * is that chapter's open question, and a width this large is a thing the machine can hold rather
+   * than a thing a program should want.
    *
    * **Two known costs at the extreme, accepted deliberately rather than guarded against.** A width
    * near the ceiling makes `digitCapacity` evaluate `2^bits` as a `BigInt` and take its decimal
@@ -167,7 +168,7 @@ trait GenericInstantiation extends ConstFolding {
   }
 
   /** The one thing a **bitfield struct** may not hold, refused where the struct is built rather
-   * than where one of its fields is later read (`15 §1`, `Bitfields`).
+   * than where one of its fields is later read (`reference/types.md § Structs`, `Bitfields`).
    *
    * A `@packed` struct with a field narrower than a byte is one integer, and the refusal follows
    * from that sentence rather than from a policy laid over it: a field that does not lower to an
@@ -206,7 +207,8 @@ trait GenericInstantiation extends ConstFolding {
    * A **power of two** is what an alignment is, in the ABI and in LLVM both: an address is aligned
    * by having low bits clear, so a boundary of six is not a weaker claim than eight but an
    * unsatisfiable one. And a **non-constant** is refused because layout is fixed at compile time —
-   * `15 §1` makes it part of the module's interface, which a value computed at run time could not be.
+   * `reference/types.md § Structs` makes it part of the module's interface, which a value computed
+   * at run time could not be.
    *
    * Whether it is *above* the natural alignment is not asked here: the floor is applied by taking
    * the larger of the two, so a struct that asks for less than its fields need simply keeps what
@@ -395,8 +397,8 @@ trait GenericInstantiation extends ConstFolding {
           // from repeating the same complaint at every use.
           //
           // Only a pass that *reports* may mark: the definition-time walk of a generic body raises
-          // errors and drops them (`14 §4`), so marking from there would retire the declaration
-          // before anything had told the reader about it.
+          // errors and drops them (`reference/generics.md § Bounds`), so marking from there would
+          // retire the declaration before anything had told the reader about it.
           case e: AnalyzerError if en.simple && !abstractPass =>
             brokenDecls += name
             throw e
@@ -465,11 +467,12 @@ trait GenericInstantiation extends ConstFolding {
         // the argument is still checked against the instantiated signature afterwards.
         case Type.Array(_, e) => unify(elem, e, tparams, sub)
         case _                => ()
-    // The **length binds a value parameter** the way the element binds a type one (`10 §9`): a
-    // `[N]T` parameter handed a `[3]int` reads 3 off the argument's type, which is where the length
-    // already lives. Only a bare name is read — a length written as arithmetic over a parameter,
-    // `[N + 1]T`, is refused at resolution rather than solved here, since inverting an expression is
-    // the type-level arithmetic that section excludes.
+    // The **length binds a value parameter** the way the element binds a type one
+    // (`reference/generics.md § A parameter may stand for a value`): a `[N]T` parameter handed a
+    // `[3]int` reads 3 off the argument's type, which is where the length already lives. Only a
+    // bare name is read — a length written as arithmetic over a parameter, `[N + 1]T`, is refused
+    // at resolution rather than solved here, since inverting an expression is the type-level
+    // arithmetic that section excludes.
     case ArrayType(Some(len), elem, _) =>
       actual match
         case Type.Array(n, e) =>
@@ -498,9 +501,10 @@ trait GenericInstantiation extends ConstFolding {
     case _: ValueArgType     => ()
     case VolatileType(inner) => unify(inner, Type.unqualified(actual), tparams, sub)
     // `(..A)` binds the pack to **every** part at once, at whatever arity the argument has — which
-    // is the whole of the inference this feature needs (`10 §10`). It is `[N]T` reading a length off
-    // an argument one kind up: nothing is written at the call, and a tuple of three parts and a
-    // tuple of five each solve the one parameter.
+    // is the whole of the inference this feature needs (`reference/generics.md § A parameter may
+    // stand for a list of types`). It is `[N]T` reading a length off an argument one kind up:
+    // nothing is written at the call, and a tuple of three parts and a tuple of five each solve the
+    // one parameter.
     case TupleType(List(PackType(n)), _) =>
       actual match
         case t: Type.Tuple if tparams(n) => sub(n) = Type.Pack(t.targs)
@@ -548,12 +552,12 @@ trait GenericInstantiation extends ConstFolding {
     case _: SomeType  => ()
     // A trait never binds a type parameter. `f[T](p: *T)` handed a `*Writer` would otherwise
     // instantiate at a type with no layout, and the body could then write `var v: T` for a value
-    // that cannot exist; leaving it unsolved reports the inference failure instead.
-    // A qualifier is dropped on the way into a parameter, so `f[T](xs: []T)` handed a
-    // `[]volatile u32` solves `T` as `u32` — and then the argument does not agree with the `[]u32`
-    // that instantiation asks for, which is the message worth reading. Binding `T` to the qualified
-    // type instead would let a generic body promise accesses it cannot promise: the loads and stores
-    // it emits are its own, not the ones the caller wrote (`03 § Device memory`).
+    // that cannot exist; leaving it unsolved reports the inference failure instead. A qualifier is
+    // dropped on the way into a parameter, so `f[T](xs: []T)` handed a `[]volatile u32` solves `T`
+    // as `u32` — and then the argument does not agree with the `[]u32` that instantiation asks for,
+    // which is the message worth reading. Binding `T` to the qualified type instead would let a
+    // generic body promise accesses it cannot promise: the loads and stores it emits are its own,
+    // not the ones the caller wrote (`reference/memory.md § Device memory`).
     case NamedType(n, Nil) if tparams(n) =>
       if !sub.contains(n) && !actual.isInstanceOf[Type.Trait] then sub(n) = Type.unqualified(actual)
     // The reference is the declaration's, written in the declaration's terms, so the name it uses

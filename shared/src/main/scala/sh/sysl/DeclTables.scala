@@ -64,9 +64,10 @@ trait DeclTables extends Reporting {
    */
   protected def std: Stdlib
 
-  /** The machine this compilation is **for**. A handful of rules are the processor's rather than the
-   * language's — `15 §10`'s calling conventions are the case — and asking here is what lets those be
-   * ordinary diagnostics instead of something codegen discovers with nowhere to report it.
+  /** The machine this compilation is **for**. A handful of rules are the processor's rather than
+   * the language's — `reference/ffi.md § interrupt`'s calling conventions are the case — and asking
+   * here is what lets those be ordinary diagnostics instead of something codegen discovers with
+   * nowhere to report it.
    */
   protected def target: Target
 
@@ -105,7 +106,8 @@ trait DeclTables extends Reporting {
     std.owns(d) || building(module)
 
   /** Whether a declaration written in `module` is one the library **offers unqualified** — that is,
-   * one of the names in scope everywhere with no import (`13 §8`, `libraryNames`).
+   * one of the names in scope everywhere with no import (`reference/modules.md § Separate
+   * compilation`, `libraryNames`).
    *
    * Not every library declaration is. Only the standard module's names arrive unasked-for; a
    * submodule's are reached by naming the module or importing it, like any other module's
@@ -155,7 +157,8 @@ trait DeclTables extends Reporting {
   protected val enumDecls   = mutable.LinkedHashMap.empty[String, EnumDecl]
   protected val funcDecls   = mutable.LinkedHashMap.empty[String, FuncDecl]
 
-  /** The keys of an **overload set**, under the key the name resolves to (`12 §1a`).
+  /** The keys of an **overload set**, under the key the name resolves to
+   * (`reference/declarations.md § Overloading`).
    *
    * Overloading is a fact about a *name*, and every table here is keyed by a name that must stand
    * for one declaration — so the second function of a name is filed under a key of its own, and this
@@ -186,7 +189,8 @@ trait DeclTables extends Reporting {
     else key
   }
 
-  /** The **type keys** that were given a destructor by an `impl Drop` (`03 § A destructor`).
+  /** The **type keys** that were given a destructor by an `impl Drop` (`reference/memory.md § A
+   * destructor`).
    *
    * Kept as the keys an `impl` names rather than as instantiated types, because that is what is
    * known when the block is lowered — a generic type's `impl` is one block covering every
@@ -425,7 +429,7 @@ trait DeclTables extends Reporting {
   protected val genericOuter = mutable.LinkedHashMap.empty[String, Map[String, Type]]
 
   /** The members of a generic `impl`, each as the generic function it was lowered to, for the
-   * definition-time pass of `14 §4` to walk.
+   * definition-time pass of `reference/generics.md § Bounds` to walk.
    *
    * A member of a generic *type* is not checked there and cannot be: it inherits the type's
    * parameters, which carry no bounds, so holding it to them would be holding it to nothing. A
@@ -469,11 +473,12 @@ trait DeclTables extends Reporting {
    * members an `impl` block brought. A type's **own** members are absent, which is what tells the
    * two apart at a lookup.
    *
-   * A member is reachable only where the trait that declared it can be named (`13 §2`), so this is
-   * what a call is filtered by: an entry here is a question to ask of the use site's scope, and no
-   * entry is a member that arrives with its type and is reachable wherever the type is. Without it
-   * every trait in a program would share one namespace per type, and the first library to implement
-   * a wide trait for a built-in would claim those names from everybody.
+   * A member is reachable only where the trait that declared it can be named (`reference/modules.md
+   * § Visibility`), so this is what a call is filtered by: an entry here is a question to ask of
+   * the use site's scope, and no entry is a member that arrives with its type and is reachable
+   * wherever the type is. Without it every trait in a program would share one namespace per type,
+   * and the first library to implement a wide trait for a built-in would claim those names from
+   * everybody.
    */
   protected val memberTrait = mutable.LinkedHashMap.empty[(String, String), String]
 
@@ -517,9 +522,10 @@ trait DeclTables extends Reporting {
   /** What `Self` means inside one lowered member, keyed by the name it was lowered to.
    *
    * A member of a concrete type — its own, or one an `impl` gave it — may write `Self` for the type
-   * it belongs to, in its signature and in its body alike (`14 §1`). The binding is recorded at
-   * hoist and folded into the body's substitution, so the body resolves `Self` exactly as it
-   * resolves a type parameter: through the one map that already answers that question.
+   * it belongs to, in its signature and in its body alike (`reference/traits.md § Declaring a
+   * trait`). The binding is recorded at hoist and folded into the body's substitution, so the body
+   * resolves `Self` exactly as it resolves a type parameter: through the one map that already
+   * answers that question.
    */
   protected val memberSelf = mutable.LinkedHashMap.empty[String, Map[String, Type]]
 
@@ -646,9 +652,9 @@ trait DeclTables extends Reporting {
    */
   protected val genericInsts = mutable.HashSet.empty[String]
 
-  /** Every generic body as the definition-time pass of `14 §4` analyzed it: each type parameter
-   * standing for itself, and each call through a bound naming the **trait's** member rather than
-   * whatever an instantiation would substitute.
+  /** Every generic body as the definition-time pass of `reference/generics.md § Bounds` analyzed
+   * it: each type parameter standing for itself, and each call through a bound naming the
+   * **trait's** member rather than whatever an instantiation would substitute.
    *
    * That is the one form in which a generic's own conduct can be read. `s.put(msg)` in it is
    * `Sink.put`, which is no function the program links, while a call the body makes to something
@@ -672,18 +678,20 @@ trait DeclTables extends Reporting {
   /** Every enum variant name maps to the enums declaring one of that name, so a bare `Circle(5)` or
    * `Empty` resolves without qualification.
    *
-   * **It is a list because a variant belongs to its enum rather than to the module** (`09 §3`), so
-   * two enums in one module may each name a variant `Failed` and neither has to be renamed. What
-   * picks between them is `variantOwners.of`: the expected type where there is one, and otherwise
-   * the single visible candidate — a bare name with two answers and nothing to choose by is a
-   * diagnostic pointing at the qualified `Enum.Variant` spelling, never a guess.
+   * **It is a list because a variant belongs to its enum rather than to the module**
+   * (`reference/types.md § Enums`), so two enums in one module may each name a variant `Failed` and
+   * neither has to be renamed. What picks between them is `variantOwners.of`: the expected type
+   * where there is one, and otherwise the single visible candidate — a bare name with two answers
+   * and nothing to choose by is a diagnostic pointing at the qualified `Enum.Variant` spelling,
+   * never a guess.
    *
    * Declaration order is kept, which is what makes an ambiguity message name the candidates in the
    * order the file declares them rather than in whatever order a hash produced.
    */
   protected val variantOwners = mutable.LinkedHashMap.empty[String, List[String]]
 
-  /** The bodies of the closures met so far, lowered where they were written (`12 §5`).
+  /** The bodies of the closures met so far, lowered where they were written
+   * (`reference/expressions.md § Closures`).
    *
    * A closure is analyzed inline rather than queued, because its result type is what its body
    * yields and nothing else can say what that is. So its function is finished at the moment the
@@ -736,9 +744,10 @@ trait DeclTables extends Reporting {
   protected def nominalBounds(base: String): Map[String, List[BoundRef]] =
     structDecls.get(base).map(_.bounds).orElse(enumDecls.get(base).map(_.bounds)).getOrElse(Map.empty)
 
-  /** Which of a nominal type's parameters stand for **values** (`10 §9`), and at what type — the
-   * `N` of `struct Buf[const N: usize]`. Empty for every type that declares none, which is most of
-   * them, and answered without the caller knowing which kind of declaration it is asking about.
+  /** Which of a nominal type's parameters stand for **values** (`reference/generics.md § A
+   * parameter may stand for a value`), and at what type — the `N` of `struct Buf[const N: usize]`.
+   * Empty for every type that declares none, which is most of them, and answered without the caller
+   * knowing which kind of declaration it is asking about.
    */
   protected def nominalValues(base: String): Map[String, TypeRef] =
     structDecls.get(base).map(_.tvalues).orElse(enumDecls.get(base).map(_.tvalues)).getOrElse(Map.empty)

@@ -181,16 +181,16 @@ trait ScalarEmitter extends StringEmitter {
     case _    => sys.error(s"unreachable compare '$op'")
 
   protected def compareValue(op: String, base: Type, av: Val, bv: Val): Val = {
-    // A constrained subtype is laid out as the type it narrows (`16 §1`), so it is compared as that
-    // one — its values are that type's values, and the range it was declared with is checked where
-    // it is *produced* rather than where two of them are ordered. Done here rather than at each
-    // caller because every caller wants it: an ordinary `n < 6` arrives already reduced, and a
-    // pattern's test does not, which is what left `n match 1..6` reaching a signedness question
-    // asked of a type that has no answer to it.
-    // A **simple** enum is its discriminant — `Type.Enum.llvm` delegates to the storage integer, so
-    // the value in hand is already one — and equality on it is that integer's compare. Read here for
-    // the same reason a constrained subtype is: every caller wants it, and the signedness question
-    // has no answer asked of the enum itself.
+    // A constrained subtype is laid out as the type it narrows (`reference/errors.md § Constrained
+    // types`), so it is compared as that one — its values are that type's values, and the range it
+    // was declared with is checked where it is *produced* rather than where two of them are
+    // ordered. Done here rather than at each caller because every caller wants it: an ordinary `n <
+    // 6` arrives already reduced, and a pattern's test does not, which is what left `n match 1..6`
+    // reaching a signedness question asked of a type that has no answer to it. A **simple** enum is
+    // its discriminant — `Type.Enum.llvm` delegates to the storage integer, so the value in hand is
+    // already one — and equality on it is that integer's compare. Read here for the same reason a
+    // constrained subtype is: every caller wants it, and the signedness question has no answer
+    // asked of the enum itself.
     val ty = Type.underlying(base) match
       case e: Type.Enum if e.simple => e.underlying
       case other                    => other
@@ -236,15 +236,16 @@ trait ScalarEmitter extends StringEmitter {
     // integer is just that integer conversion; every enum value is already in range.
     case (e: Type.Enum, b: Type.Integer) => convert(e.underlying, b, v)
 
-    // The raw tier (`03 § Reinterpreting storage`). Two pointee types are the same `ptr` under
-    // opaque pointers, so reading one as the other is nothing at all at this level — which is
-    // exactly the claim the language is making about it.
+    // The raw tier (`reference/memory.md § Reinterpreting storage`). Two pointee types are the same
+    // `ptr` under opaque pointers, so reading one as the other is nothing at all at this level —
+    // which is exactly the claim the language is making about it.
     case (_: Type.Ptr, _: Type.Ptr)      => v
     case (a: Type.Ptr, b: Type.Integer)  => castOp(CastOp.PtrToInt, a, b, v)
     case (a: Type.Integer, b: Type.Ptr)  => castOp(CastOp.IntToPtr, a, b, v)
 
     // An address of code and an address of bytes are the same word, which is what makes `dlsym`
-    // usable in one direction and a `*u8` callback table usable in the other (`12 §6a`).
+    // usable in one direction and a `*u8` callback table usable in the other (`reference/ffi.md § A
+    // function's address`).
     case (_: Type.Ptr, _: Type.CFn)      => v
     case (_: Type.CFn, _: Type.Ptr)      => v
     case (_: Type.CFn, _: Type.CFn)      => v

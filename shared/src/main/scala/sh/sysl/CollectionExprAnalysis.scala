@@ -48,10 +48,10 @@ trait CollectionExprAnalysis extends ExprSupport {
     // wanted starting value. The value is evaluated **once** and copied into every element, which
     // is what makes `[f(); 8]` mean one call rather than eight.
     //
-    // What is being asked for decides which of the two things this is (`07 §Storage sized while
-    // running`). Under a `[N]T` the count is part of the type and so a compile-time constant; under
-    // a `[]T` the length is not in the type at all, so the count is an ordinary expression and the
-    // elements are storage of their own that the view owns.
+    // What is being asked for decides which of the two things this is (`reference/arrays.md §
+    // Storage sized while running`). Under a `[N]T` the count is part of the type and so a
+    // compile-time constant; under a `[]T` the length is not in the type at all, so the count is an
+    // ordinary expression and the elements are storage of their own that the view owns.
     case ArrayFill(value, count) =>
       val elemExp = expected.flatMap(elementWanted)
       val tv      = analyzeExpr(value, elemExp)
@@ -135,12 +135,12 @@ trait CollectionExprAnalysis extends ExprSupport {
               "'p[0..<n]' with the number of elements that are really there")
           e
 
-        // A type read by a subscript through `Index` cannot be *sliced* through it, and `14 §7`
-        // says why: the index would have to be a range, and a range is not yet a type a program can
-        // name, so there is nothing for the trait's argument to be. Somebody who has written an
-        // `Index` and is reaching for the neighbouring form is owed that rather than "cannot
-        // slice", which reads as though their type were the wrong shape for an operation that
-        // exists.
+        // A type read by a subscript through `Index` cannot be *sliced* through it, and
+        // `library/core.md § Walking a type of your own` says why: the index would have to be a
+        // range, and a range is not yet a type a program can name, so there is nothing for the
+        // trait's argument to be. Somebody who has written an `Index` and is reaching for the
+        // neighbouring form is owed that rather than "cannot slice", which reads as though their
+        // type were the wrong shape for an operation that exists.
         case other if indexes(Library.key("Index"), other) =>
           err(s"${show(other)} is read by a subscript through '${qn(Library.key("Index"))}', but slicing " +
             "through the trait is not built: the index would have to be a range, and a range is not yet " +
@@ -158,8 +158,9 @@ trait CollectionExprAnalysis extends ExprSupport {
         if tr.ty == Type.Str then Type.Str
         else Type.Slice(elem, readOnly = viewIsConst || Type.readOnlyView(tr.ty))
 
-      // A view that may be written is an alias like any other, so it is refused where a `&` would be:
-      // over storage inside a struct whose invariant reads it (`16 §6`).
+      // A view that may be written is an alias like any other, so it is refused where a `&` would
+      // be: over storage inside a struct whose invariant reads it (`reference/errors.md § Struct
+      // invariants`).
       checkSliceable(tr, viewTy)
       TSlice(tr, lo.map(bound), hi.map(bound), inclusive, viewTy)
 
@@ -214,7 +215,7 @@ trait CollectionExprAnalysis extends ExprSupport {
           // is exactly what a written conversion is for.
           Type.repr(ti.ty) match
             // The element's qualifier stays on the receiver's type and comes off the value read out
-            // of it, exactly as a field's does (`03 § Device memory`).
+            // of it, exactly as a field's does (`reference/memory.md § Device memory`).
             case _: Type.Integer => TIndex(tr, ti, Type.unqualified(elem))
             // At the index's own position rather than the subscript's: the message is about what
             // was written between the brackets, and a caret on the `[` points one character to the
@@ -222,9 +223,10 @@ trait CollectionExprAnalysis extends ExprSupport {
             case other           => at(index.pos)(err(s"an index must be an integer, not ${show(other)}"))
 
         // A type with no elements of its own is indexed through `Index`, whose one method the
-        // subscript *is* (`14 §3`). The index is not held to being an integer here: what a
-        // container is read by is the trait's own argument, and a type that indexes by something
-        // else is implementing a different `Index` rather than misusing this one.
+        // subscript *is* (`reference/expressions.md § Operator dispatch`). The index is not held to
+        // being an integer here: what a container is read by is the trait's own argument, and a
+        // type that indexes by something else is implementing a different `Index` rather than
+        // misusing this one.
         case None if indexes(Library.key("Index"), tr.ty) => callMethodOn(raw, "index", List(index), expected)
 
         case None =>
@@ -232,11 +234,12 @@ trait CollectionExprAnalysis extends ExprSupport {
             // A parameter has no implementation to find — `indexes` asks after one, and a bound is
             // not that — so the subscript goes the way every other use of a parameter goes: to the
             // member machinery, which answers from the bounds and complains through `boundErr` when
-            // they license nothing. A subscript **is** `Index`'s one method (`14 §3`), so this is
-            // the same question the dot form asks, and `10 §5` puts indexing among what an unbounded
-            // parameter may not do. Without this the definition-time pass dropped the complaint and
-            // the reader met it at whatever first instantiated the body, against a type the
-            // definition never named — which is the outcome §5 exists to prevent.
+            // they license nothing. A subscript **is** `Index`'s one method
+            // (`reference/expressions.md § Operator dispatch`), so this is the same question the
+            // dot form asks, and `reference/generics.md § Bounds` puts indexing among what an
+            // unbounded parameter may not do. Without this the definition-time pass dropped the
+            // complaint and the reader met it at whatever first instantiated the body, against a
+            // type the definition never named — which is the outcome §5 exists to prevent.
             case _: Type.Abstract => callMethodOn(raw, "index", List(index), expected)
             case other            => err(s"cannot index ${show(other)}")
 

@@ -1,7 +1,8 @@
 package sh.sysl
 
-/** How far a declaration may be named from, and — the part this file exists for — how far a **field**
- * or a **member** of a type may be (`08 § Visibility`, `13 §2`).
+/** How far a declaration may be named from, and — the part this file exists for — how far a
+ * **field** or a **member** of a type may be (`reference/modules.md § Visibility`,
+ * `reference/modules.md § Visibility`).
  *
  * The machinery is `AnalyzerBase`'s `declAccess`, which is keyed by a string and holds an entry only
  * for a declaration that restricted itself. A field and a member join it under `owner.name`, which
@@ -22,7 +23,8 @@ trait MemberVisibility extends AnalyzerBase {
    */
   protected def memberAccessKey(owner: String, name: String): String = s"$owner.$name"
 
-  /** Records how far a declaration is visible, for the modifier it was written with (`13 §2`).
+  /** Records how far a declaration is visible, for the modifier it was written with
+   * (`reference/modules.md § Visibility`).
    *
    * A public declaration records nothing: the unmarked default is the common case, and a table that
    * held an entry for it would be a table with an entry per declaration in every program. What is
@@ -38,7 +40,7 @@ trait MemberVisibility extends AnalyzerBase {
     case Visibility.Scoped(m) => recover(())(declAccess(key) = Access(currentFile, Some(enclosing(m))))
 
   /** Which module a `private[M]` names: the **innermost** enclosing one whose last segment is `M`,
-   * counting the declaring module itself (`13 §2`).
+   * counting the declaring module itself (`reference/modules.md § Visibility`).
    *
    * Reading outward from the declaration is what disambiguates a repeated segment — `private[geom]`
    * inside `geom.mesh.geom.tri` is the nearer `geom` — and taking the answer from where the
@@ -93,7 +95,7 @@ trait MemberVisibility extends AnalyzerBase {
     err(s"'$label' is $claim, but '${qn(owner)}' is ${restriction(owner)} — a member cannot be more " +
       "visible than the type it belongs to")
 
-  /** Reports a member of `owner` that may not be named here (`08 § Visibility`). */
+  /** Reports a member of `owner` that may not be named here (`reference/modules.md § Visibility`). */
   protected def checkMemberVisible(owner: String, name: String, what: String): Unit = {
     val key = memberAccessKey(owner, name)
 
@@ -114,9 +116,9 @@ trait MemberVisibility extends AnalyzerBase {
    */
   protected def checkFieldVisible(owner: String, name: String): Unit = {
     // Selecting a field is reading an offset, so an `opaque` type's fields are out of reach from
-    // outside however each one is marked (`15 §9`). Asked here rather than at the three call sites
-    // for the reason the visibility question is: reading and writing a field are one question, and
-    // every way of naming one arrives through this.
+    // outside however each one is marked (`reference/ffi.md § opaque`). Asked here rather than at
+    // the three call sites for the reason the visibility question is: reading and writing a field
+    // are one question, and every way of naming one arrives through this.
     checkLayoutKnown(owner, qn(owner))
     checkMemberVisible(owner, name, "field")
   }

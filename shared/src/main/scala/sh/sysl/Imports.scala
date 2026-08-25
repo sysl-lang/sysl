@@ -1,6 +1,7 @@
 package sh.sysl
 
-/** What a file's — or a block's — `import` statements make reachable by a shorter name (`13 §3`).
+/** What a file's — or a block's — `import` statements make reachable by a shorter name
+ * (`reference/modules.md § Imports`).
  *
  * An import never grants access to anything: a public member is reachable fully-qualified with no
  * import at all, so every binding here is a second, shorter spelling of a path that already works.
@@ -24,8 +25,8 @@ case class Imports(
   def isEmpty: Boolean = names.isEmpty && modules.isEmpty && wildcards.isEmpty
 
   /** Whether `name` is already bound here, by either of the two explicit forms. A wildcard is not
-   * asked: it offers a name rather than binding one, and `13 §3` gives it to the more specific
-   * import.
+   * asked: it offers a name rather than binding one, and `reference/modules.md § Imports` gives it
+   * to the more specific import.
    */
   def binds(name: String): Boolean = names.contains(name) || modules.contains(name)
 
@@ -44,7 +45,8 @@ object Imports {
 /** The modules whose public names every file may write **unqualified without importing them**.
  *
  * An auto-imported module is exactly a **wildcard import every file starts with**, and that is the
- * whole mechanism — `13 §3`'s rules then say everything else, with nothing written twice:
+ * whole mechanism — `reference/modules.md § Imports`'s rules then say everything else, with nothing
+ * written twice:
  *
  *   - **a file's own declaration wins**, because `resolveName` asks the current module before it
  *     asks the imports at all, so a program declaring its own `Pair` shadows the library's;
@@ -57,10 +59,10 @@ object Imports {
  * A module is auto-imported only where it is actually present, so a program compiled without the
  * library is unaffected rather than carrying a wildcard over a module that does not exist.
  *
- * **The dependency graph is not told.** `13 §6` puts the standard module outside the graph on the grounds
- * that it is the language rather than a module, and a library every file gets for free is in the
- * same position: an edge from every file to it would say nothing, and would make the library's own
- * files depend on themselves.
+ * **The dependency graph is not told.** `reference/modules.md § The module graph is acyclic` puts
+ * the standard module outside the graph on the grounds that it is the language rather than a
+ * module, and a library every file gets for free is in the same position: an edge from every file
+ * to it would say nothing, and would make the library's own files depend on themselves.
  *
  * **`sysl` is the one a shipped compiler auto-imports** — the standard module every program is
  * compiled against, which is why every unqualified name in every program goes through this. Nothing
@@ -108,11 +110,12 @@ object AutoImport {
 /** The terms a name is read in: the module it is written in, what that file (or block) has
  * imported, and which file it is. All three travel together everywhere a declaration's signature,
  * fields, or body is resolved, because each is a property of *where it was written* rather than of
- * where the walk arrived from (`13 §3`).
+ * where the walk arrived from (`reference/modules.md § Imports`).
  *
- * The file is what a bare `private` is measured against (`13 §2`), and it is the `Source` itself
- * rather than its name because sources compare by identity — two files of one project may be
- * called the same thing, and a name they share must not make one visible to the other.
+ * The file is what a bare `private` is measured against (`reference/modules.md § Visibility`), and
+ * it is the `Source` itself rather than its name because sources compare by identity — two files of
+ * one project may be called the same thing, and a name they share must not make one visible to the
+ * other.
  */
 case class Scope(module: String, imports: Imports, file: Option[Source] = None)
 

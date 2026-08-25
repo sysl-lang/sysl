@@ -142,8 +142,8 @@ class TypeNameMemberTests extends AnyFreeSpec with CodegenSupport with RunSuppor
     }
 
     // The module-qualified form folds the module into the name it qualifies before anything else
-    // looks at it (`13 §3`), so the answer has to be the same one, and it has to name the type by
-    // its qualified name rather than by the bare word that was written.
+    // looks at it (`reference/modules.md § Imports`), so the answer has to be the same one, and it
+    // has to name the type by its qualified name rather than by the bare word that was written.
     "a subtype reached through its module gets the same answer" in {
       val e = errIn(
         ("geom", "g.sysl", "module geom\ntype Age = int within 0..150\n"),
@@ -163,9 +163,10 @@ class TypeNameMemberTests extends AnyFreeSpec with CodegenSupport with RunSuppor
       e should include("is a member of the trait")
     }
 
-    // `12 §6` keeps the arity-carrying name out of diagnostics by rendering every `FnN[…]` *type*
-    // as its arrow. This is the one position where the name is legitimately printed: a call trait
-    // is an ordinary trait of the library's, and here the reader is the one who wrote it.
+    // `reference/types.md § Function types` keeps the arity-carrying name out of diagnostics by
+    // rendering every `FnN[…]` *type* as its arrow. This is the one position where the name is
+    // legitimately printed: a call trait is an ordinary trait of the library's, and here the reader
+    // is the one who wrote it.
     "a call trait is answered as the ordinary trait it is" in {
       err("print(Fn1.call())") should include(s"is a member of the trait '${lib("Fn1")}'")
     }

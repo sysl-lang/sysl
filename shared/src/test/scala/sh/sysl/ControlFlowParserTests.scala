@@ -273,12 +273,13 @@ class ControlFlowParserTests extends AnyFreeSpec with ParseSupport {
       )
     }
 
-    // A binding's `=` *does* introduce a block now, which is what `00 § Continuing a line` had
-    // always given as the reason for excluding `=` from the continuation set. This test asserted
-    // the opposite — that the initializer had to stay on the line that names it — and what it was
-    // pinning was the gap between that reason and the grammar. `BlockInitializerTests` owns the
-    // form; what is kept here is that the branch it collapses to is the same tree the inline
-    // spelling parses to, since a block of one expression is that expression.
+    // A binding's `=` *does* introduce a block now, which is what `reference/lexical.md § An
+    // unbracketed line continues after an operator` had always given as the reason for excluding
+    // `=` from the continuation set. This test asserted the opposite — that the initializer had to
+    // stay on the line that names it — and what it was pinning was the gap between that reason and
+    // the grammar. `BlockInitializerTests` owns the form; what is kept here is that the branch it
+    // collapses to is the same tree the inline spelling parses to, since a block of one expression
+    // is that expression.
     "an initializer may start on the next line, and a lone branch collapses out of the block" in {
       prog("val x =\n    if c then 1 else 2") shouldBe
         prog("val x = if c then 1 else 2")

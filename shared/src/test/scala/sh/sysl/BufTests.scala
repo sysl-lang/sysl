@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `Buf[T]` — a growable array (`07 §Growing one`).
+/** `Buf[T]` — a growable array (`reference/arrays.md § Growing one`).
  *
  * It is **ordinary sysl in the library**, not a type the compiler knows, and that is the finding
  * rather than an implementation note. Storage sized while running gave a library the one thing it
@@ -100,12 +100,12 @@ class BufTests extends AnyFreeSpec with RunSupport {
   }
 
   // A list somebody *leaves*: taking an element out of the middle, and cutting a length down to a
-  // number. `remove` is written in terms of `truncate`, which is what `07 § Not yet` said it should
-  // be, and `clear` is `truncate(0)` — so all three shorten a buffer the one way.
-  // What `truncate` does to the *length* — cutting to a number, and a number past the end being a
-  // no-op rather than a panic — is asserted in `library/sysl/buf/tests.sysl`, where the buffer is. What
-  // stays here is what the length cannot show: the storage that survives a truncation, and the
-  // counted elements it lets go of.
+  // number. `remove` is written in terms of `truncate`, which is what `reference/arrays.md § What
+  // is still refused` said it should be, and `clear` is `truncate(0)` — so all three shorten a
+  // buffer the one way. What `truncate` does to the *length* — cutting to a number, and a number
+  // past the end being a no-op rather than a panic — is asserted in `library/sysl/buf/tests.sysl`,
+  // where the buffer is. What stays here is what the length cannot show: the storage that survives
+  // a truncation, and the counted elements it lets go of.
   "shortening one" - {
     "truncating to nothing is what clear does" in {
       run(

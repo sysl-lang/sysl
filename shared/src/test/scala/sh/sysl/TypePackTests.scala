@@ -2,8 +2,9 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Type packs and the unrolled loop that walks one (`10 §10`) — a parameter standing for a **list**
- * of types, written `[..A]`, which is what lets one declaration cover every tuple.
+/** Type packs and the unrolled loop that walks one (`reference/generics.md § A parameter may stand
+ * for a list of types`) — a parameter standing for a **list** of types, written `[..A]`, which is
+ * what lets one declaration cover every tuple.
  */
 class TypePackTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
@@ -186,8 +187,8 @@ class TypePackTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   "the edges" - {
     /** Zero copies, which is what an empty range unrolls to. There is no zero-tuple to reach this
-     * from a pack (`00 §13`), so it takes a written range — and it is worth pinning that the answer
-     * is nothing rather than a copy at some default.
+     * from a pack (`reference/types.md § Tuples`), so it takes a written range — and it is worth
+     * pinning that the answer is nothing rather than a copy at some default.
      */
     "an empty range unrolls to nothing" in {
       run("""f()
@@ -548,8 +549,9 @@ class TypePackTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |print((1, Q(2)))""".stripMargin) should include("cannot print")
     }
 
-    /** An array of tuples: the array block covers every length (`10 §9`) and the tuple block every
-     * arity, so the two compose with nothing written for the pair of them.
+    /** An array of tuples: the array block covers every length (`reference/generics.md § A
+     * parameter may stand for a value`) and the tuple block every arity, so the two compose with
+     * nothing written for the pair of them.
      */
     "prints an array of tuples" in {
       run("""var a: [2](int, int) = [(1, 2), (3, 4)]

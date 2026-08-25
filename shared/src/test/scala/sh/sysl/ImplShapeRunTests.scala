@@ -131,8 +131,9 @@ class ImplShapeRunTests extends AnyFreeSpec with RunSupport {
     }
 
     // The trait is the program's own: `Display` is the library's and so is every slice, so a shape
-    // block for it has no home (`02 § Coherence`) and only the library may write one. What the shape
-    // still buys a program is exactly this — one block covering every slice whose element conforms.
+    // block for it has no home (`reference/traits.md § Where an impl may live`) and only the
+    // library may write one. What the shape still buys a program is exactly this — one block
+    // covering every slice whose element conforms.
     "a conditional shape's member reaches its element through the bound" in {
       run(
         """trait Render
@@ -200,9 +201,10 @@ class ImplShapeRunTests extends AnyFreeSpec with RunSupport {
   "an array of any element" - {
 
     // A length written out is a shape of its own: `[2]T` and `[3]T` are two, each covering every
-    // element type at its own length. Value generics (`10 §9`) added a second shape *below* these
-    // rather than replacing them — `[N]T` covers every length, and is asked second, so a block
-    // naming a length still answers first for the arrays of that length.
+    // element type at its own length. Value generics (`reference/generics.md § A parameter may
+    // stand for a value`) added a second shape *below* these rather than replacing them — `[N]T`
+    // covers every length, and is asked second, so a block naming a length still answers first for
+    // the arrays of that length.
     "is a shape per length" in {
       run(
         """trait Tag

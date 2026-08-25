@@ -343,10 +343,10 @@ class ConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pa
     }
   }
 
-  /** A constrained subtype is a scalar for this purpose, which `16 §1` settles rather than this
-    * file: without `new` such a type *is* its base. What it adds is the `within` range, checked here
-    * against a value that is already known — the run-time check a `val` would have had, made one
-    * step earlier because a constant has no run time of its own.
+  /** A constrained subtype is a scalar for this purpose, which `reference/errors.md § Constrained
+    * types` settles rather than this file: without `new` such a type *is* its base. What it adds is
+    * the `within` range, checked here against a value that is already known — the run-time check a
+    * `val` would have had, made one step earlier because a constant has no run time of its own.
     */
   "a constant may be declared at a constrained subtype" - {
     "and holds a value the range admits" in {
@@ -374,9 +374,9 @@ class ConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pa
         include("does not fit")
     }
 
-    /** `16 §2`: a derived type is reached only through a written conversion, in both directions and
-      * with no position excused — and a constant is the value it was written as, so there is nowhere
-      * on the line to write one.
+    /** `reference/errors.md § new is what makes it a type`: a derived type is reached only through
+      * a written conversion, in both directions and with no position excused — and a constant is
+      * the value it was written as, so there is nowhere on the line to write one.
       */
     "a 'new' type is refused, since a constant has nowhere to write the conversion" in {
       err("type Meters = new int\n\nconst m: Meters = 3\n\nprint(str(m))\n") should

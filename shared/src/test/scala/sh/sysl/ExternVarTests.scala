@@ -286,8 +286,9 @@ class ExternVarTests
       run("extern optind: i32\nvar optind = 5\nprint(optind)") shouldBe "5\n"
     }
 
-    // Two files of one module are one unordered set of members (`13 §6`), so a second declaration of
-    // the same name is a duplicate wherever it was written.
+    // Two files of one module are one unordered set of members (`reference/modules.md § The module
+    // graph is acyclic`), so a second declaration of the same name is a duplicate wherever it was
+    // written.
     "and two files of one module may not both declare it" in {
       errOf(
         "a.sysl"    -> "module os\n\nextern environ: **u8",
@@ -359,9 +360,10 @@ class ExternVarTests
         include("@s = external global { ptr, ptr, i64 }")
     }
 
-    // `15 §2`: a sysl definition is mangled with its module path and an `extern` is the exception,
-    // emitting the raw C symbol. Asked of a *library* module, which is where a key most differs from
-    // a symbol — `sysl.io$lines` against a bare `environ`.
+    // `reference/modules.md § Separate compilation`: a sysl definition is mangled with its module
+    // path and an `extern` is the exception, emitting the raw C symbol. Asked of a *library*
+    // module, which is where a key most differs from a symbol — `sysl.io$lines` against a bare
+    // `environ`.
     "a symbol carries no module even where the key is a library one" in {
       val out = irAgainstTree(
         ("sysl", "std.sysl", "module sysl\nextern environ: **u8\nmark(n: int) -> int = n + 1"),
@@ -407,9 +409,10 @@ class ExternVarTests
       allPass(src)
     }
 
-    /** `13 §2`: a declaration may not be more visible than the types it names. It reaches this one
-      * exactly as it reaches a function — a module that may write `os.there` would hold a `Hidden` it
-      * cannot write, which is the hole the rule exists to close and not a smaller one.
+    /** `reference/modules.md § Visibility`: a declaration may not be more visible than the types it
+      * names. It reaches this one exactly as it reaches a function — a module that may write
+      * `os.there` would hold a `Hidden` it cannot write, which is the hole the rule exists to close
+      * and not a smaller one.
       *
       * `VisibilityTests` is where the rule itself lives, over every form a declaration takes. What is
       * asked here is only that this declaration is among them.

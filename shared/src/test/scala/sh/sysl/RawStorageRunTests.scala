@@ -2,8 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** The raw tier at run time (`03 § Reinterpreting storage`): what a type's storage costs, and
- * reading an address as a pointer to something else.
+/** The raw tier at run time (`reference/memory.md § Reinterpreting storage`): what a type's storage
+ * costs, and reading an address as a pointer to something else.
  *
  * The three operations exist for one customer between them — an allocator carves bytes, hands back a
  * typed pointer, and has to know how wide the thing it is pointing at is — so the suite ends with
@@ -73,8 +73,9 @@ class RawStorageRunTests extends AnyFreeSpec with RunSupport with CodegenSupport
    * compiler believes, and these are what a *program* is told. They agree here because `sizeof` is
    * that same measurement surfaced, and pinning them at this seam is what keeps the prose honest.
    */
-  "what other chapters claim about storage, now that a program can ask" - {
-    "`15 §1` — fields are laid out in declaration order and never reordered" in {
+  "what the reference claims about storage, now that a program can ask" - {
+    // `reference/types.md § Structs`
+    "fields are laid out in declaration order and never reordered" in {
       val src =
         """struct Ordered
           |    a: u8
@@ -109,10 +110,12 @@ class RawStorageRunTests extends AnyFreeSpec with RunSupport with CodegenSupport
     "`03` — a weak reference is an address like the other two, and the same width" in {
       run("struct Node\n    v: int\nprint(sizeof(weak Node), alignof(weak Node))") shouldBe "8 8\n"
     }
-    "`00 §5` — an odd width costs what LLVM makes it cost, not its bit count over eight" in {
+    // `reference/types.md § Integers are an open family`
+    "an odd width costs what LLVM makes it cost, not its bit count over eight" in {
       run("print(sizeof(u12), alignof(u12), sizeof(u96), alignof(u96))") shouldBe "2 2 16 16\n"
     }
-    "`16 §5` — a constrained subtype is laid out as the type it constrains" in {
+    // `reference/errors.md § What the type's own name offers: :: attributes`
+    "a constrained subtype is laid out as the type it constrains" in {
       val src =
         """type Age = int within 0..150
           |print(sizeof(Age) == sizeof(int), alignof(Age) == alignof(int))""".stripMargin
@@ -122,7 +125,8 @@ class RawStorageRunTests extends AnyFreeSpec with RunSupport with CodegenSupport
     /** An array of them is a different question and the language refuses one outright, which is why
      * this asks only about the type itself — see the companion in the error suite.
      */
-    "`00 §13` — a zero-sized type occupies nothing, and is still aligned to something" in {
+    // `reference/types.md § Tuples`
+    "a zero-sized type occupies nothing, and is still aligned to something" in {
       run("print(sizeof(unit), alignof(unit))") shouldBe "0 1\n"
     }
     "a struct field that occupies nothing changes neither measurement" in {

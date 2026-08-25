@@ -7,9 +7,9 @@ import org.scalatest.matchers.should.Matchers
 
 /** Where the standard module library sits, as seen from wherever the suite was started.
  *
- * `library/` is a **library project root** holding the single module `sysl`, so a module's name is the
- * path below it exactly as it is for a program (`13 §1`) — which is why the root is what is found
- * here and `library/sysl` is not.
+ * `library/` is a **library project root** holding the single module `sysl`, so a module's name is
+ * the path below it exactly as it is for a program (`reference/modules.md`) — which is why the root
+ * is what is found here and `library/sysl` is not.
  */
 object StdRoot {
 
@@ -337,9 +337,10 @@ class StdLibraryTests extends AnyFreeSpec with Matchers with TreeSupport {
   }
 
   "two files of one module reach each other with nothing imported" in {
-    // `Display.display` names `Writer`, which the *other* file declares, and `13 §6` is why that
-    // needs no import: a module's members are one set however many files they came from. It is
-    // also what a one-file standard module would never have said.
+    // `Display.display` names `Writer`, which the *other* file declares, and `reference/modules.md
+    // § The module graph is acyclic` is why that needs no import: a module's members are one set
+    // however many files they came from. It is also what a one-file standard module would never
+    // have said.
     val declared = Std.parsed(Target.default).map(p => place(p.source) -> p.body).toMap
 
     declared("sysl/write.sysl").collect { case t: TraitDecl => t.name } shouldBe List("Writer")

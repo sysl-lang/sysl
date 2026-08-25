@@ -6,8 +6,8 @@ import scala.collection.mutable
  *
  * Running a body is what the driver is draining towards, so this is where the drain arrives. Three
  * entries reach it and they differ only in where the signature comes from: an instantiation's is
- * registered in `funcInsts`, the definition-time pass of `14 §4` resolves its own, and a closure's
- * comes from the context that asked for a callable.
+ * registered in `funcInsts`, the definition-time pass of `reference/generics.md § Bounds` resolves
+ * its own, and a closure's comes from the context that asked for a callable.
  *
  * That last one is why `analyzeNested` saves and restores the whole of the per-function state. A
  * closure's body is written in the middle of its enclosing function and has to be analyzed there —
@@ -40,8 +40,9 @@ trait FunctionBodies extends ModuleStorage {
    * the whole of what makes a body nested inside another body possible.
    *
    * **The result type comes from the body**, not from a signature, which is what lets a closure be
-   * written with nothing to infer a result from (`12 §5`): the parameters come from the context
-   * asking for a callable and the result comes from what the body does.
+   * written with nothing to infer a result from (`reference/expressions.md § Closures`): the
+   * parameters come from the context asking for a callable and the result comes from what the body
+   * does.
    */
   protected def analyzeNested(
       name: String,
@@ -92,7 +93,8 @@ trait FunctionBodies extends ModuleStorage {
       retTy = declaredResult.getOrElse(Type.Unknown)
       retIsList = false
       // A nested function states its own signature, so a `...` on one is its own tail to walk; a
-      // closure literal has no way to write one, and is handed `false` (`12 §5a`, §9).
+      // closure literal has no way to write one, and is handed `false`
+      // (`reference/declarations.md`, §9).
       variadicFn = variadic
 
       // The receiver comes first, so the closure's own environment is the argument every call
@@ -117,9 +119,9 @@ trait FunctionBodies extends ModuleStorage {
           (if e.fixed(n) then declareReadOnly(n, ty) else declare(n, ty)) -> read
         }.toMap
       // A sibling is in scope throughout the group, so a body may call one written below it — which
-      // is the half of `12 §5a` that makes mutual recursion work. What a body does *not* reach is a
-      // nested function of the frame around it, and remembering their names is what lets that be
-      // said rather than reported as a name that stands for nothing.
+      // is the half of `reference/declarations.md` that makes mutual recursion work. What a body
+      // does *not* reach is a nested function of the frame around it, and remembering their names
+      // is what lets that be said rather than reported as a name that stands for nothing.
       nestedFuncs = siblings
       outerNested = (savedNested.keySet ++ savedOuter) -- siblings.keySet
       // The block around this body is where a name it could not capture would have been bound, so
@@ -134,9 +136,10 @@ trait FunctionBodies extends ModuleStorage {
 
       // Neither a closure nor a nested function takes a `variant` yet, and the two are refused
       // together because this is the one path both are analyzed on. The measure is checked at the
-      // *call*, out of the arguments it supplies (`17 §4`), and neither of these is reached by a
-      // call of that shape: a closure goes through `Fn`, and a nested function's calls carry its
-      // captured environment as a receiver the check would have to account for. `17 § Open g`.
+      // *call*, out of the arguments it supplies (`reference/verification.md § variant on a
+      // function`), and neither of these is reached by a call of that shape: a closure goes through
+      // `Fn`, and a nested function's calls carry its captured environment as a receiver the check
+      // would have to account for. `17 § Open g`.
       body.collectFirst { case v: Variant => v }.foreach { v =>
         at(v.pos)(err("a 'variant' is a top-level function's — the measure is checked where a call " +
           "to the same body is written, and neither a closure, which is reached through 'Fn', nor " +
@@ -159,11 +162,12 @@ trait FunctionBodies extends ModuleStorage {
       val (requires, ensures, olds, _) = analyzeContracts(result, contracts)
 
       // **Internal, always.** Nothing outside this compilation can name a closure or a function
-      // nested in a body (`12 §6`), so the symbol has no reason to leave the object file — and
-      // leaving it there is what a per-compilation counter for a name makes unsafe. Two units that
-      // each lowered a fourth closure both call it `$closure4.call`, and with external linkage the
-      // linker is free to resolve one unit's call to the other unit's body: a different environment
-      // layout under a different body, which is a wrong answer rather than a failure to link.
+      // nested in a body (`reference/types.md § Function types`), so the symbol has no reason to
+      // leave the object file — and leaving it there is what a per-compilation counter for a name
+      // makes unsafe. Two units that each lowered a fourth closure both call it `$closure4.call`,
+      // and with external linkage the linker is free to resolve one unit's call to the other unit's
+      // body: a different environment layout under a different body, which is a wrong answer rather
+      // than a failure to link.
       (TFunc(name, tparams, result, tbody, variadic, requires, ensures, olds, internal = true),
        result)
     finally
@@ -192,8 +196,9 @@ trait FunctionBodies extends ModuleStorage {
   }
 
   /** Analyzes one body against a signature it is handed, rather than one looked up in `funcInsts`.
-   * An instantiation's signature is registered there; the definition-time pass of `14 §4` resolves
-   * its own, since a generic declaration has no entry until something instantiates it.
+   * An instantiation's signature is registered there; the definition-time pass of
+   * `reference/generics.md § Bounds` resolves its own, since a generic declaration has no entry
+   * until something instantiates it.
    */
   protected def analyzeBodyWith(
       name: String,
@@ -237,8 +242,9 @@ trait FunctionBodies extends ModuleStorage {
     variadicFn = f.variadic
     val tparams = params.map { case (n, t) => (declare(n, t), t) }
     // Which of those uniqued names came from a by-name parameter, so a read of one becomes the call
-    // the sugar promises (`12 § A parameter may be passed by name`). Matched by written name rather
-    // than by position, since what `params` holds is not always the declaration's list unchanged.
+    // the sugar promises (`reference/declarations.md § Default parameters and named arguments`).
+    // Matched by written name rather than by position, since what `params` holds is not always the
+    // declaration's list unchanged.
     val byNameWritten = f.params.filter(_.byName).map(_.name).toSet
     byNameLocals =
       if byNameWritten.isEmpty then Set.empty
@@ -337,12 +343,13 @@ trait FunctionBodies extends ModuleStorage {
               case _: Type.Integer =>
               case other           => err(s"a 'variant' is an integer measure, not ${show(other)}")
 
-            // `17 §4` says the measure reads the parameters and nothing else, and **scoping is what
-            // enforces it** rather than a rule of this pass: the clause is analyzed before the body,
-            // in a scope holding the parameters alone, so a name from the body is undefined here and
-            // says so. That is what makes the check local — the arguments at a self-call are what
-            // the parameters are about to become, so the "next" measure is this expression over
-            // them and nothing has to travel with the call.
+            // `reference/verification.md § variant on a function` says the measure reads the
+            // parameters and nothing else, and **scoping is what enforces it** rather than a rule
+            // of this pass: the clause is analyzed before the body, in a scope holding the
+            // parameters alone, so a name from the body is undefined here and says so. That is what
+            // makes the check local — the arguments at a self-call are what the parameters are
+            // about to become, so the "next" measure is this expression over them and nothing has
+            // to travel with the call.
             variant = Some(te)
           }
         case _ => // span guarantees only Require/Ensure/Variant reach here

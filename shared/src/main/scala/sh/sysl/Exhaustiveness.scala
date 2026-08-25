@@ -3,10 +3,11 @@ package sh.sysl
 /** Whether a set of match arms leaves any value unhandled, and if so what one of those values
  * looks like.
  *
- * `09 §8` states the rule as a question about **values**: a match is exhaustive when every value
- * of the scrutinee's type is guaranteed handled. Reading a single arm at a time cannot answer
- * that, because arms cover a type *together* — `Some(Halt)`, `Some(Push)` and `None` leave nothing
- * of an `Option[Op]` behind even though not one of them covers a variant on its own.
+ * `reference/patterns.md § Exhaustiveness` states the rule as a question about **values**: a match
+ * is exhaustive when every value of the scrutinee's type is guaranteed handled. Reading a single
+ * arm at a time cannot answer that, because arms cover a type *together* — `Some(Halt)`,
+ * `Some(Push)` and `None` leave nothing of an `Option[Op]` behind even though not one of them
+ * covers a variant on its own.
  *
  * So coverage is computed over all the arms at once, as a matrix: one row per unguarded pattern
  * (an arm's alternatives are separate rows, since either may match), one column per value still
@@ -65,8 +66,8 @@ object Exhaustiveness {
 
     /** A literal or a range, which stands for one value of a type with no finite constructor set.
      * It never equals a constructor a split enumerates, so a row headed by one is dropped from
-     * every split — which is the conservative direction, and the one `09 §8` already takes when it
-     * says `Some(0)` does not discharge `Some`.
+     * every split — which is the conservative direction, and the one `reference/patterns.md §
+     * Exhaustiveness` already takes when it says `Some(0)` does not discharge `Some`.
      */
     case Opaque
   }
@@ -154,8 +155,8 @@ object Exhaustiveness {
   case class Gap(names: List[String], exact: Boolean)
 
   /** The gap in a match's coverage, or `None` when the arms cover the type between them. A guarded
-   * arm is left out: `09 §7` does not let one discharge anything, since the compiler cannot prove
-   * the guard holds.
+   * arm is left out: `reference/patterns.md § Guards` does not let one discharge anything, since
+   * the compiler cannot prove the guard holds.
    */
   def gap(scrutTy: Type, arms: List[TArm]): Option[Gap] = {
     val ws = witnesses(arms.filter(_.guard.isEmpty).flatMap(_.patterns.map(List(_))), List(scrutTy), 0)

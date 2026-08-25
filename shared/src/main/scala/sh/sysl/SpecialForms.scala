@@ -192,14 +192,15 @@ trait SpecialForms extends Closures {
 
   /** The `display` a value renders through, and the value in whatever width that renderer takes.
    *
-   * The answers are `14 §3`'s one dispatch rule, applied to rendering: a **built-in** reaches the
-   * library renderer its membership provides (`§5`), a **user type** the member its `impl` produced,
-   * and a **bounded type parameter** the trait's own method, since which implementation runs is
-   * monomorphization's to decide once a concrete type is known. A **trait object** answers with a
-   * slot rather than a name, since which `display` runs is a word in its table — and it has one
-   * exactly when the trait it was erased to **requires** `Display` (`02`). That is what a supertrait
-   * buys the ordinary way of printing: without one, a value stops being printable at the moment it
-   * is erased, which is the moment a program most wants to describe what it is holding.
+   * The answers are `reference/expressions.md § Operator dispatch`'s one dispatch rule, applied to
+   * rendering: a **built-in** reaches the library renderer its membership provides (`§5`), a **user
+   * type** the member its `impl` produced, and a **bounded type parameter** the trait's own method,
+   * since which implementation runs is monomorphization's to decide once a concrete type is known.
+   * A **trait object** answers with a slot rather than a name, since which `display` runs is a word
+   * in its table — and it has one exactly when the trait it was erased to **requires** `Display`
+   * (`02`). That is what a supertrait buys the ordinary way of printing: without one, a value stops
+   * being printable at the moment it is erased, which is the moment a program most wants to
+   * describe what it is holding.
    *
    * `op` is the form that asked, so a type that renders no way at all is complained about in the
    * words the programmer wrote rather than in the machinery underneath them.
@@ -210,7 +211,8 @@ trait SpecialForms extends Closures {
     // for, and it is what keeps `type Percent = int :: 0..100` printing like the integer it is.
     //
     // **Unless it has said otherwise**, which `02 § override` made writable and nothing had to
-    // before. A derived subtype has its base's memberships (`16 §3`), so the library's blanket over
+    // before. A derived subtype has its base's memberships (`reference/errors.md § A derivation
+    // inherits its base's behaviour and may replace none of it`), so the library's blanket over
     // every integer already covers it and a block of its own is an override — the one case where
     // the type has a renderer the base does not. Collapsing first would find the base's, which
     // would make that block compile and do nothing.
@@ -254,13 +256,14 @@ trait SpecialForms extends Closures {
           // and names the element that fails that block's condition — the same answer a slice gets,
           // and the part a reader can act on. What used to stand here was advice to take the
           // whole-array view, written when a length was part of an array's shape and no block could
-          // be generic over it (`10 §9`).
+          // be generic over it (`reference/generics.md § A parameter may stand for a value`).
 
-          // A composed type is the module's when anything named in it is (`02 § Coherence`), so
-          // the advice holds for a `[]Point` and is impossible for a `[]int`: `Display` is the
-          // library's and nothing in `[]int` is this module's, so the block named here is one
-          // `checkCoherence` refuses. Both diagnostics used to arrive in the same run — the
-          // rule saying the `impl` has no home, and this line telling the reader to write it.
+          // A composed type is the module's when anything named in it is (`reference/traits.md §
+          // Where an impl may live`), so the advice holds for a `[]Point` and is impossible for a
+          // `[]int`: `Display` is the library's and nothing in `[]int` is this module's, so the
+          // block named here is one `checkCoherence` refuses. Both diagnostics used to arrive in
+          // the same run — the rule saying the `impl` has no home, and this line telling the reader
+          // to write it.
           case _: Type.Array | _: Type.Slice if implementableHere(ty) =>
             s"write an 'impl $tr for ${show(ty)}' to say how it renders"
 
@@ -278,7 +281,8 @@ trait SpecialForms extends Closures {
       (fname, t, None)
 
   /** Whether an `impl` for this type could be written **here** — the coherence question
-   * (`02 § Coherence`), asked of a resolved type rather than of a written subject.
+   * (`reference/traits.md § Where an impl may live`), asked of a resolved type rather than of a
+   * written subject.
    *
    * `Display` belongs to the library, so the only thing that can give the block a home is a type of
    * this module's named somewhere in the subject. The walk goes through the composed shapes for that
@@ -411,7 +415,8 @@ trait SpecialForms extends Closures {
    * it comes from the context the value is read into — the same place `None` and `Ok(5)` get
    * theirs. Nothing in the tail can confirm it, which is the unsafety C has here too.
    *
-   * There is no `va_arg[T](ap)`: square brackets in an expression are indexing (`10 §2`), and
+   * There is no `va_arg[T](ap)`: square brackets in an expression are indexing
+   * (`reference/generics.md § [] means type application in a type, indexing in an expression`), and
    * call-site type arguments are refused language-wide (`10 § Open a`). Somebody reaching for that
    * spelling is told what to write instead rather than that the callee is not a name.
    */
@@ -435,9 +440,10 @@ trait SpecialForms extends Closures {
    *
    * Two spellings reach that, and they are the same thing seen from the two sides of a call. A
    * `va_list` is a body's own walk, and its address is taken here exactly as `&ap` would take it. A
-   * **`*va_list`** is a walk some other function lent (`12 §9`, *Handing a walk on*): it is already
-   * the address, so it is passed along as it stands, and it need not be a place — a pointer
-   * arriving as a parameter, out of a struct, or straight from a call all say the same thing.
+   * **`*va_list`** is a walk some other function lent (`reference/ffi.md § Variadic functions`,
+   * *Handing a walk on*): it is already the address, so it is passed along as it stands, and it
+   * need not be a place — a pointer arriving as a parameter, out of a struct, or straight from a
+   * call all say the same thing.
    */
   private def vaListArg(what: String, arg: Expr): TExpr = {
     val t = analyzeExpr(arg)

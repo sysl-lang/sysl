@@ -71,8 +71,9 @@ trait ControlFlowEmitter extends PlaceEmitter {
         emitTerm(Inst.Br(next))
   }
 
-  /** Emits an `if`'s or a `while`'s condition as the chain of `&&`-joined terms it is (`09 §12`),
-   * landing on `successL` — open, with every binding established — where all of them held.
+  /** Emits an `if`'s or a `while`'s condition as the chain of `&&`-joined terms it is
+   * (`reference/expressions.md § is — a pattern where a condition is wanted`), landing on
+   * `successL` — open, with every binding established — where all of them held.
    *
    * Each term branches to the next on success and to `failL` on failure, the last one branching to
    * `successL`; so a condition with no `is` in it is the one test and the one `br` it always was,
@@ -525,7 +526,8 @@ trait ControlFlowEmitter extends PlaceEmitter {
   }
 
   /** `for all i in lo..hi do pred` and `for some …` — a counted loop over an accumulator slot,
-   * yielding the `i1` the slot holds when it stops (`17 §2`).
+   * yielding the `i1` the slot holds when it stops (`reference/verification.md § for all and for
+   * some`).
    *
    * **The slot starts at the quantifier's identity and is written exactly once, by the iteration
    * that decides the answer.** A conjunction over nothing is true and a disjunction over nothing is

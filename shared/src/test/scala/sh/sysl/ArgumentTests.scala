@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** A parameter's default value, and an argument written at the parameter it names (`12 §2a`).
+/** A parameter's default value, and an argument written at the parameter it names
+ * (`reference/declarations.md § Default parameters and named arguments`).
  *
  * The two are one feature because they are one question — what a call may leave to the declaration
  * — and one implementation: both are resolved by `bindArgs` before any call form looks at its
@@ -47,8 +48,9 @@ class ArgumentTests
              |""".stripMargin) shouldBe "321\n303\n6\n"
     }
 
-    // `12 §2a`: "a fresh call per call site rather than one value computed once and shared". Asserted
-    // by defaulting to something with a side effect and counting how often it happened.
+    // `reference/declarations.md § Default parameters and named arguments`: "a fresh call per call
+    // site rather than one value computed once and shared". Asserted by defaulting to something
+    // with a side effect and counting how often it happened.
     "is an expression evaluated at each call, not one value shared between them" in {
       run("""|import sysl.buf.{Buf, buf}
              |
@@ -93,10 +95,11 @@ class ArgumentTests
              |""".stripMargin) shouldBe "15\n6\n"
     }
 
-    // `12 §2a`: a default "is written in the declaration's terms", and the parameter's own type is
-    // the first of those terms. `None` alone says what it is `None` *of* only if something tells
-    // it, and the parameter is what tells it — so a member whose default was read against nothing
-    // could not take a `None` at all, while the identical free function could.
+    // `reference/declarations.md § Default parameters and named arguments`: a default "is written
+    // in the declaration's terms", and the parameter's own type is the first of those terms. `None`
+    // alone says what it is `None` *of* only if something tells it, and the parameter is what tells
+    // it — so a member whose default was read against nothing could not take a `None` at all, while
+    // the identical free function could.
     "is read at the parameter's type on a method, so a nullary variant needs no annotation" in {
       run("""|struct Box
              |    n: int
@@ -164,11 +167,12 @@ class ArgumentTests
              |""".stripMargin) shouldBe "2\nx\n"
     }
 
-    // `12 §2a`: a default stands exactly where the argument would have been written, and at that
-    // position a closure literal takes its parameter types from what is asking for it. The bare
-    // arrow is a **bounded type parameter** (`12 §6`), so what says what `y` is here is the bound —
-    // which is what makes this the one spelling meant for taking a closure that could not default
-    // to one.
+    // `reference/declarations.md § Default parameters and named arguments`: a default stands
+    // exactly where the argument would have been written, and at that position a closure literal
+    // takes its parameter types from what is asking for it. The bare arrow is a **bounded type
+    // parameter** (`reference/types.md § Function types`), so what says what `y` is here is the
+    // bound — which is what makes this the one spelling meant for taking a closure that could not
+    // default to one.
     "may be a closure literal at a parameter written with the bare arrow" in {
       run("""|apply(g: int -> int = y -> y * 2) -> int = g(21)
              |print(apply())
@@ -186,8 +190,9 @@ class ArgumentTests
              |""".stripMargin) shouldBe "42\n22\n"
     }
 
-    // `12 §5c`'s placeholder is the same expression with the parameter unwritten, so it is fixed by
-    // the same thing and would be a separate hole if it were not.
+    // `reference/expressions.md § _ — a parameter with the name left out`'s placeholder is the same
+    // expression with the parameter unwritten, so it is fixed by the same thing and would be a
+    // separate hole if it were not.
     "and may be written with the placeholder, which needs the same thing to say what it stands for" in {
       run("""|apply(g: int -> int = _ * 2) -> int = g(21)
              |print(apply())
@@ -204,9 +209,10 @@ class ArgumentTests
   }
 
   "a trait's default" - {
-    // `12 §2a`: the trait's declaration is what a call names, so the default is filled before the
-    // dispatch and means the same thing either way. Both halves asserted, because a fill that
-    // happened after the slot lookup would work through a known type and fail through an object.
+    // `reference/declarations.md § Default parameters and named arguments`: the trait's declaration
+    // is what a call names, so the default is filled before the dispatch and means the same thing
+    // either way. Both halves asserted, because a fill that happened after the slot lookup would
+    // work through a known type and fail through an object.
     "is the same value through a trait object as through a known type" in {
       run("""|trait Volume
              |    loud(self, times: int = 3) -> int
@@ -254,8 +260,9 @@ class ArgumentTests
       e should include("nothing could leave out 'a' and still supply 'b'")
     }
 
-    // `12 §9`: C reads the tail relative to the last named argument, so an argument that might be
-    // the last parameter or might be the first of the tail leaves nowhere for the tail to begin.
+    // `reference/ffi.md § Variadic functions`: C reads the tail relative to the last named
+    // argument, so an argument that might be the last parameter or might be the first of the tail
+    // leaves nowhere for the tail to begin.
     "a variadic parameter list declares none" in {
       err("""|f(a: int, b: int = 2, ...) -> int = a
              |print(f(1))
@@ -304,8 +311,9 @@ class ArgumentTests
              |""".stripMargin) should include("the default for 'by'")
     }
 
-    // `13 §2`, applied to the one part of a signature a call does not write. Without this a caller
-    // in another module would have had `secret()` called on their behalf.
+    // `reference/modules.md § Visibility`, applied to the one part of a signature a call does not
+    // write. Without this a caller in another module would have had `secret()` called on their
+    // behalf.
     "a public declaration's default may not name something that reaches less far" in {
       errOf(
         "lib.sysl"  -> """|module lib
@@ -444,8 +452,9 @@ class ArgumentTests
              |""".stripMargin) should include("already given by position")
     }
 
-    // A call through a `&Fn` carries types and no names (`12 §6`), so there is nothing to match a
-    // name against and the message says that rather than "no such parameter".
+    // A call through a `&Fn` carries types and no names (`reference/types.md § Function types`), so
+    // there is nothing to match a name against and the message says that rather than "no such
+    // parameter".
     "or be written at a call through a callable, which carries no names" in {
       err("""|apply(f: &Fn(int) -> int) -> int = f(n = 1)
              |
@@ -454,8 +463,9 @@ class ArgumentTests
              |""".stripMargin) should include("names an argument")
     }
 
-    // `*extern(A) -> R` is one machine word (`12 §6a`), so it carries even less than a trait object
-    // does — there is no declaration anywhere behind it to have named anything.
+    // `*extern(A) -> R` is one machine word (`reference/ffi.md § A function's address`), so it
+    // carries even less than a trait object does — there is no declaration anywhere behind it to
+    // have named anything.
     "or at a call through a function's address" in {
       err("""|double(n: int) -> int = n * 2
              |
@@ -608,7 +618,8 @@ class ArgumentTests
              |""".stripMargin) should include("a parameter list with a tail declares no default")
     }
 
-    // `13 §2` through a member rather than a free function: the same leak, one declaration form in.
+    // `reference/modules.md § Visibility` through a member rather than a free function: the same
+    // leak, one declaration form in.
     "a member's default is held to the same reach its type is" in {
       errOf(
         "lib.sysl"  -> """|module lib
@@ -633,8 +644,9 @@ class ArgumentTests
    * other rules already had something to say about.
    */
   "what the neighbouring rules say once a name reaches a constructor" - {
-    // `08 § Visibility`: the positional constructor writes every field, so a restricted one puts it
-    // out of reach. A name is a second way in, and the rule has to hold at both.
+    // `reference/modules.md § Visibility`: the positional constructor writes every field, so a
+    // restricted one puts it out of reach. A name is a second way in, and the rule has to hold at
+    // both.
     "a private field still puts the constructor out of reach" in {
       errOf(
         "lib.sysl"  -> """|module lib
@@ -674,8 +686,9 @@ class ArgumentTests
              |""".stripMargin) shouldBe "8\n"
     }
 
-    // `12 §9`: a variadic's tail stands at no parameter, so nothing in it has a name — and since a
-    // positional argument may not follow a named one, a call that names anything has no tail left.
+    // `reference/ffi.md § Variadic functions`: a variadic's tail stands at no parameter, so nothing
+    // in it has a name — and since a positional argument may not follow a named one, a call that
+    // names anything has no tail left.
     "a variadic call may name its declared parameters only while it writes no tail" in {
       run("""|first(a: int, ...) -> int = a
              |print(first(a = 5))
@@ -696,8 +709,9 @@ class ArgumentTests
              |""".stripMargin) shouldBe "39\n"
     }
 
-    // `02 § Defaults`: a trait's default *body* is copied to each implementing type. A parameter
-    // default on that same member is a second thing being copied, and the two travel together.
+    // `reference/traits.md § A default may assume exactly what its own trait declares`: a trait's
+    // default *body* is copied to each implementing type. A parameter default on that same member
+    // is a second thing being copied, and the two travel together.
     "a trait's default body and its parameter default are copied together" in {
       run("""|trait Step
              |    size(self) -> int

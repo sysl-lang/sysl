@@ -2,8 +2,9 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `volatile` (`03 § Device memory`): storage whose reads and writes are effects rather than value
- * computations, so the compiler emits exactly the accesses the source wrote and no others.
+/** `volatile` (`reference/memory.md § Device memory`): storage whose reads and writes are effects
+ * rather than value computations, so the compiler emits exactly the accesses the source wrote and
+ * no others.
  *
  * The suite is arranged around the one distinction the whole feature rests on. `volatile` qualifies
  * **storage**, and a value read out of it is an ordinary value — so the qualifier lives in the
@@ -636,9 +637,10 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       case Left(e)           => fail(s"decode failed: $e")
   }
 
-  // `16 §6`'s rule and this one meet at a struct that holds registers, and the answer is that such a
-  // struct carries no invariant. A check is a call taking every field, so it reads the whole block
-  // however few fields the clause names — which at a device is not a redundant read.
+  // `reference/errors.md § Struct invariants`'s rule and this one meet at a struct that holds
+  // registers, and the answer is that such a struct carries no invariant. A check is a call taking
+  // every field, so it reads the whole block however few fields the clause names — which at a
+  // device is not a redundant read.
   "a struct that holds a register carries no invariant" - {
     "even where the clause reads only the ordinary fields beside it" in {
       val src =
@@ -753,7 +755,7 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     // A driver is exactly the code that runs where there is no allocator, so the capability clause
-    // has to admit one (`13 §4`).
+    // has to admit one (`reference/modules.md § Capabilities are a module property`).
     "a driver module compiles under 'no alloc'" in {
       irOf(
         "dev.sysl" ->

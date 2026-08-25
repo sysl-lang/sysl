@@ -7,15 +7,16 @@ package sh.sysl
  */
 
 /** The `module a.b.c` header a file carries, naming the module the file contributes to. The name is
- * a directory path with the separators read as dots (`13 §1`), so it is kept as its segments rather
- * than as one string — the segments are what a visibility scope and a platform layout are written
- * against, and the dotted spelling is recovered by `show`.
+ * a directory path with the separators read as dots (`reference/modules.md`), so it is kept as its
+ * segments rather than as one string — the segments are what a visibility scope and a platform
+ * layout are written against, and the dotted spelling is recovered by `show`.
  */
 case class ModuleName(parts: List[String]) extends Positioned {
   def show: String = parts.mkString(".")
 }
 
-/** Which way a capability clause points (`capabilities.md`, `13 §4`).
+/** Which way a capability clause points (`capabilities.md`, `reference/modules.md § Capabilities
+ * are a module property`).
  *
  * The two are not opposites of one degree: `Narrows` *removes* a capability the target offers and
  * is enforced at every use inside the module, while `Requires` states a dependency the module
@@ -29,7 +30,8 @@ enum CapabilityDirection:
   /** `requires alloc` — the module cannot be built where the capability is missing. */
   case Requires
 
-/** One capability clause of a file's header: `no alloc`, `requires alloc` (`13 §4`).
+/** One capability clause of a file's header: `no alloc`, `requires alloc` (`reference/modules.md §
+ * Capabilities are a module property`).
  *
  * The name is kept as written rather than resolved to a member of the core set, because which names
  * are capabilities is a property of the project's configuration and not of the grammar
@@ -38,7 +40,8 @@ enum CapabilityDirection:
  */
 case class CapabilityClause(direction: CapabilityDirection, name: String) extends Positioned
 
-/** `link "z"` — a library the linker must be given for this file's `extern`s to resolve (`15 §8`).
+/** `link "z"` — a library the linker must be given for this file's `extern`s to resolve
+ * (`reference/ffi.md § @link`).
  *
  * The name is the library's, not a flag: `m` rather than `-lm`. What that becomes on a command line
  * is the target's answer and not the author's, because where a library lives is a property of the
@@ -48,7 +51,8 @@ case class CapabilityClause(direction: CapabilityDirection, name: String) extend
  */
 case class LinkClause(name: String) extends Positioned
 
-/** `@include("FreeRTOS.h")` — a C header the file's `c const` block is evaluated against (`15 §7`).
+/** `@include("FreeRTOS.h")` — a C header the file's `c const` block is evaluated against
+ * (`reference/ffi.md § A library may carry C`).
  *
  * It is written the way C writes it, quotes and extension and all, because it is handed to the C
  * compiler unchanged: what a header is called, and whether it is found by `"…"` or by `<…>`, are
@@ -59,7 +63,7 @@ case class LinkClause(name: String) extends Positioned
  * **It says nothing to the rest of the compilation.** No name from the header becomes visible in
  * sysl, and no declaration is read out of it: what it buys is that a `c const`'s expression
  * compiles. A type a program wants from the header is still declared with `opaque struct` and a
- * function with `extern`, which is `15 §9`'s arrangement and is unchanged.
+ * function with `extern`, which is `reference/ffi.md § opaque`'s arrangement and is unchanged.
  */
 case class IncludeClause(header: String) extends Positioned
 
@@ -82,7 +86,8 @@ case class IncludeClause(header: String) extends Positioned
  */
 case class TestsClause() extends Positioned
 
-/** What one `@` line of a file's header may turn out to be (`13 §4`, `15 §8`, `testing.md`).
+/** What one `@` line of a file's header may turn out to be (`reference/modules.md § Capabilities
+ * are a module property`, `reference/ffi.md § @link`, `testing.md`).
  *
  * They are gathered as one list because they are read as one run of lines, and separated by what
  * each means once the file is parsed rather than by which rule matched — `@requires` alone yields
@@ -98,13 +103,13 @@ type HeaderClause = CapabilityClause | LinkClause | IncludeClause | TestsClause
  * which is why one needs no header to compile.
  *
  * `capabilities` is a property of the *module* written on each of its files, so it is read per file
- * and held to agreeing across them (`13 §4`).
+ * and held to agreeing across them (`reference/modules.md § Capabilities are a module property`).
  *
  * `links` is **not** held to agreeing, and that is the one place these two headers differ. A
  * capability describes what the whole module may do, so files that disagree describe different
  * modules; a link requirement describes what one file's `extern`s need, so a module whose externs
- * all sit in one file has nothing to say in the other four. The module's requirement is the union of
- * its files' (`15 §8`).
+ * all sit in one file has nothing to say in the other four. The module's requirement is the union
+ * of its files' (`reference/ffi.md § @link`).
  *
  * `includes` is per file for the same reason `links` is, and more sharply: two files of one module
  * may include headers that contradict each other, and each is compiled on its own, so a header

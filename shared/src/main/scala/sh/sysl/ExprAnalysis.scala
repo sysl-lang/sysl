@@ -52,9 +52,10 @@ trait ExprAnalysis
    * that is already a `&T` passes through untouched.
    */
   protected def analyzeExpr(expr: Expr, expected: Option[Type], discarded: Boolean): TExpr = {
-    // Whether *this* expression is one of the three places a result list may stand (`12 §5b`).
-    // Taking the flag before anything below runs is what confines it to one expression: every
-    // subexpression is analyzed through this same funnel and sees it already spent.
+    // Whether *this* expression is one of the three places a result list may stand
+    // (`reference/declarations.md § Several results`). Taking the flag before anything below runs
+    // is what confines it to one expression: every subexpression is analyzed through this same
+    // funnel and sees it already spent.
     val allowed = multiOk
     multiOk = false
 
@@ -85,9 +86,10 @@ trait ExprAnalysis
     t
   }
 
-  /** Analyzes one expression in a place a **result list** may stand (`12 §5b`): the right side of
-   * a binding, the right side of a multiple assignment, and the result of a function whose own
-   * declared result is a list. The permission covers this expression and nothing inside it.
+  /** Analyzes one expression in a place a **result list** may stand (`reference/declarations.md §
+   * Several results`): the right side of a binding, the right side of a multiple assignment, and
+   * the result of a function whose own declared result is a list. The permission covers this
+   * expression and nothing inside it.
    */
   protected def analyzeMulti(expr: Expr, expected: Option[Type] = None): TExpr = {
     multiOk = true
@@ -109,10 +111,11 @@ trait ExprAnalysis
    *
    * The location three of them report is `reportedPos`, which is the node's own place everywhere
    * except while a parameter's default is being filled in — there it is the **call**, because a
-   * default stands exactly where the argument would have been written (`12 §2a`). That one
-   * substitution is the whole mechanism behind a checking function that names its caller's line
-   * without any caller having written one down, and it is why sysl needs no `#[track_caller]`: the
-   * call-site behaviour falls out of what a default already was.
+   * default stands exactly where the argument would have been written (`reference/declarations.md §
+   * Default parameters and named arguments`). That one substitution is the whole mechanism behind a
+   * checking function that names its caller's line without any caller having written one down, and
+   * it is why sysl needs no `#[track_caller]`: the call-site behaviour falls out of what a default
+   * already was.
    *
    * `__LINE__` and `__COLUMN__` go through `intLiteral`, so each takes the integer type its context
    * asks for and is range-checked like any other literal — a parameter declared `i32` gets an `i32`,
@@ -191,8 +194,8 @@ trait ExprAnalysis
       TZero(expected.get)
 
     // A declared function standing where a callable is wanted is one, with nothing captured
-    // (`12 §5`). It is asked for only where the context says a callable, so a bare function name
-    // anywhere else is still the mistake it was.
+    // (`reference/expressions.md § Closures`). It is asked for only where the context says a
+    // callable, so a bare function name anywhere else is still the mistake it was.
     case Ident(name)
         if lookupOpt(name).isEmpty && !ownValueName(name) && funcKey(name).isDefined &&
           expected.flatMap(callableSignature).isDefined =>
@@ -200,9 +203,10 @@ trait ExprAnalysis
 
       functionAsCallable(name, ptypes, result, expr.pos)
 
-    // A nested function is **called** where it is written and is not a value (`12 §5a`). Its
-    // environment is a row of addresses into the frame it was declared in, which is sound exactly
-    // because nothing can carry it out of that frame — and a callable value is a way of carrying it.
+    // A nested function is **called** where it is written and is not a value
+    // (`reference/declarations.md`). Its environment is a row of addresses into the frame it was
+    // declared in, which is sound exactly because nothing can carry it out of that frame — and a
+    // callable value is a way of carrying it.
     case Ident(name)
         if lookupOpt(name).isEmpty && (nestedFuncs.contains(name) || outerNested(name)) =>
       err(s"'$name' is a nested function, so it is called where it is written rather than passed — " +
@@ -237,12 +241,13 @@ trait ExprAnalysis
             s"for one; where the address of code is what is wanted, that is written '&$shown'",
       )
 
-    /** A **value parameter** (`10 §9`), folded into its use exactly as a declared constant is —
-     * which is what it is, a `const` whose value the instantiation supplied. The substitution holds
-     * a `ConstArg` for it wherever the body is walked: the real argument at an instantiation, and a
-     * zero placeholder during the walk that checks the generic body, where there is no argument yet
-     * and the tree built is discarded. An array length written `[sizeof(T)]u8` already stands at
-     * zero for that same walk and for the same reason.
+    /** A **value parameter** (`reference/generics.md § A parameter may stand for a value`), folded
+     * into its use exactly as a declared constant is — which is what it is, a `const` whose value
+     * the instantiation supplied. The substitution holds a `ConstArg` for it wherever the body is
+     * walked: the real argument at an instantiation, and a zero placeholder during the walk that
+     * checks the generic body, where there is no argument yet and the tree built is discarded. An
+     * array length written `[sizeof(T)]u8` already stands at zero for that same walk and for the
+     * same reason.
      *
      * **A local of the same name still wins**, which is why the scope is asked first: a parameter is
      * the outermost binding of its name, not the only one.
@@ -272,7 +277,8 @@ trait ExprAnalysis
         case Some((u, ty)) if byNameLocals(u) =>
           callCallable(capturedFields.getOrElse(u, TLoad(u, ty)), Nil, expected)
         // A captured name is a name the scope knows and the frame does not hold: what it reaches is
-        // the field of the closure the body is now a member of (`12 §7`).
+        // the field of the closure the body is now a member of (`reference/expressions.md §
+        // Closures`).
         case Some((u, ty)) => capturedFields.getOrElse(u, TLoad(u, ty))
         case None =>
           variantKey(name) match
@@ -336,21 +342,21 @@ trait ExprAnalysis
     // there is no refcount to take a share of. Reaching a `&T` means being handed one.
     //
     // The one place it is refused is a place inside a struct whose invariant reads it: the pointer
-    // would be typed below the promise, and `16 §6` is discharged by naming the struct.
-    // A function is not a place — nothing holds it, and there is no slot to point at — so its
-    // address is taken here rather than by the walk below, which asks for one (`12 §6a`). A local
-    // shadowing the name is an ordinary value and keeps the ordinary reading.
-    // The expected type is handed on because it is what settles a *generic* function's arguments:
-    // there is no written form for them here, and a `*extern` being asked for already fixes the
-    // signature (`12 §6a`).
+    // would be typed below the promise, and `reference/errors.md § Struct invariants` is discharged
+    // by naming the struct. A function is not a place — nothing holds it, and there is no slot to
+    // point at — so its address is taken here rather than by the walk below, which asks for one
+    // (`reference/ffi.md § A function's address`). A local shadowing the name is an ordinary value
+    // and keeps the ordinary reading. The expected type is handed on because it is what settles a
+    // *generic* function's arguments: there is no written form for them here, and a `*extern` being
+    // asked for already fixes the signature (`reference/ffi.md § A function's address`).
     case Unary("&", Ident(name)) if lookupOpt(name).isEmpty && !ownValueName(name) && funcKey(name).isDefined =>
       functionAddress(name, funcKey(name).get, expected)
 
     // `&f[T]` and `&f[A, B]` — the address of an *instantiation*, with the arguments written out
-    // (`12 §6a`). This is the one position in the language where type arguments are written rather
-    // than inferred, and what earns it is the shape every C callback has: the interface fixes the
-    // signature to untyped pointers, so a trampoline mentions its own type parameter nowhere and
-    // there is nothing for the expected type to solve.
+    // (`reference/ffi.md § A function's address`). This is the one position in the language where
+    // type arguments are written rather than inferred, and what earns it is the shape every C
+    // callback has: the interface fixes the signature to untyped pointers, so a trampoline mentions
+    // its own type parameter nowhere and there is nothing for the expected type to solve.
     //
     // **The grammar gives this the same shape as `&xs[i]`, and the discrimination is here rather
     // than there.** The name has to be a generic declaration and nothing nearer: a local shadowing
@@ -394,16 +400,17 @@ trait ExprAnalysis
       functionAddress(written, key, expected, targs)
 
     // The same node anywhere else. A subscript takes one index, so what was written is a
-    // type-argument list — and `12 §6a` is the only place one may be written, which is what this
-    // says rather than complaining that a comma was unexpected.
+    // type-argument list — and `reference/ffi.md § A function's address` is the only place one may
+    // be written, which is what this says rather than complaining that a comma was unexpected.
     case TypeArgs(_, args) =>
       err(s"a subscript takes one index, and ${args.length} were written — a list of types in " +
         "brackets is a type-argument list, and the only place one is written is at an address, as " +
         "'&f[A, B]'. Everywhere else a generic's arguments are inferred, from the arguments at a " +
         "call or from the type the result is read into")
 
-    // A nested function's environment is the frame it was declared in (`12 §5a`), and an address is
-    // a way of carrying it out of that frame — the same reason the name is not a value either.
+    // A nested function's environment is the frame it was declared in
+    // (`reference/declarations.md`), and an address is a way of carrying it out of that frame — the
+    // same reason the name is not a value either.
     case Unary("&", Ident(name)) if lookupOpt(name).isEmpty && (nestedFuncs.contains(name) || outerNested(name)) =>
       err(s"'$name' is a nested function, so it has no address to take — what would have to travel " +
         "beside the address is the frame it reads, and a '*extern' is one word. A top-level " +
@@ -421,8 +428,9 @@ trait ExprAnalysis
       if isPlace(t) || named(e) then
         val place = requirePlace(t, e, "'&'", writes = false)
         checkAddressable(place)
-        // The address of a register is an address *of a register*, so the qualifier travels with it and
-        // every access through the result stays an access to a device (`03 § Device memory`).
+        // The address of a register is an address *of a register*, so the qualifier travels with it
+        // and every access through the result stays an access to a device (`reference/memory.md §
+        // Device memory`).
         TAddrOf(place, Type.Ptr(place.placeTy))
       // Something computed has no address of its own, so one is made for it: the value is written
       // into a hidden local of this scope and what comes back is that slot's address (`TTempAddr`).
@@ -436,7 +444,7 @@ trait ExprAnalysis
           err(s"${show(t.ty)} is not a value, so there is nothing to make an address of")
 
         // An opaque type's shape is the C side's, so there is no slot to lay down for one here —
-        // the same reason `*c` is refused where `c` itself was fine (`15 §9`).
+        // the same reason `*c` is refused where `c` itself was fine (`reference/ffi.md § opaque`).
         Type.underlying(t.ty) match
           case s: Type.Struct => checkLayoutKnown(s.base, s.name)
           case _              => ()
@@ -448,7 +456,8 @@ trait ExprAnalysis
       Type.pointee(t.ty) match
         case Some(inner) =>
           // Reading through the pointer produces the **value**, which is the one thing an opaque
-          // type has no shape for out here — so `*c` is refused where `c` itself was fine (`15 §9`).
+          // type has no shape for out here — so `*c` is refused where `c` itself was fine
+          // (`reference/ffi.md § opaque`).
           Type.underlying(inner) match
             case s: Type.Struct => checkLayoutKnown(s.base, s.name)
             case _              => ()
@@ -477,9 +486,10 @@ trait ExprAnalysis
       if ts.exists(t => Type.repr(t.ty).isInstanceOf[Type.Vector]) then vecCompare(ts, ops)
       else compareChain(ts, ops.indices.map(i => compareLink(ops(i), ts(i), ts(i + 1))).toList)
 
-    // A parameter's default, spliced in where the argument was not written (`12 §2a`). It is
-    // analyzed in the declaration's own terms and with nothing local in scope, which is what makes
-    // it mean the same thing from every module that calls the function.
+    // A parameter's default, spliced in where the argument was not written
+    // (`reference/declarations.md § Default parameters and named arguments`). It is analyzed in the
+    // declaration's own terms and with nothing local in scope, which is what makes it mean the same
+    // thing from every module that calls the function.
     case d @ DefaultArg(owner, e) =>
       atCallSite(d.pos)(at(e.pos)(filling(e.pos)(inDefault(owner)(analyzeExpr(e, expected)))))
 
@@ -512,16 +522,18 @@ trait ExprAnalysis
         s"receiver and the index twice — write it out as 'b[i] = b[i] ${op.dropRight(1)} …'")
 
     // `p.count = v` where `count` is a settable property is a **call**, exactly as `b[i] = v` on a
-    // container is (`14 §7`, `00 §2`): a property computes rather than naming storage, so there is
-    // no place for a store to write through, and the setter takes the value instead.
+    // container is (`library/core.md § Walking a type of your own`, `00 §2`): a property computes
+    // rather than naming storage, so there is no place for a store to write through, and the setter
+    // takes the value instead.
     case Assign("=", Field(receiver, name), value) if settable(receiver, name) =>
       checkNotOwnSetter(receiver, name)
       callMethod(receiver, DeclParser.setterName(name), List(value), None)
 
-    // The compound forms, which is where a property parts company with `IndexSet`. `14 §7` refuses
-    // `b[i] += v` because the receiver *and the index* would each be evaluated twice; a property has
-    // no index, so taking the receiver's address once is the whole of what the form needs — and it
-    // is the line the feature exists for, `count += 1` rather than the two calls written out.
+    // The compound forms, which is where a property parts company with `IndexSet`. `library/core.md
+    // § Walking a type of your own` refuses `b[i] += v` because the receiver *and the index* would
+    // each be evaluated twice; a property has no index, so taking the receiver's address once is
+    // the whole of what the form needs — and it is the line the feature exists for, `count += 1`
+    // rather than the two calls written out.
     //
     // It is desugared into source rather than built here, so every rule arrives through its ordinary
     // spelling: `&` refuses a receiver with no address, the setter's own `*self` refuses a `val`,
@@ -622,17 +634,18 @@ trait ExprAnalysis
     // Building a sequence and reaching into one, which share the question of how many elements
     // there are and whether this index is one of them. `CollectionExprAnalysis`.
     case e @ (_: ArrayLit | _: ArrayFill | _: Index) => sequenceExpr(e, expected)
-    // Control flow that yields a value (`00 §10`), and the forms that carry several at once.
-    // `ControlFlowExprAnalysis`.
+    // Control flow that yields a value (`reference/statements.md`), and the forms that carry
+    // several at once. `ControlFlowExprAnalysis`.
     case e @ (_: IfExpr | _: MatchExpr | _: While | _: DoWhile | _: Loop | _: CFor | _: For |
         _: ConstFor | _: Quantifier | _: TryExpr | _: RangeExpr | _: ResultList | _: Lambda |
         _: Tuple | _: Block) =>
       controlExpr(e, expected, discarded)
 
     // Reached only where an `is` was written somewhere a condition's terms are not read one by one:
-    // under `||` or `!`, in a `match` guard, in a `require`, on the right of an `=`, as an argument.
-    // The rule is about the binding rather than the test — a `bool` would be harmless, but a name
-    // bound where the reader cannot see which paths reach it is not (`09 §12`).
+    // under `||` or `!`, in a `match` guard, in a `require`, on the right of an `=`, as an
+    // argument. The rule is about the binding rather than the test — a `bool` would be harmless,
+    // but a name bound where the reader cannot see which paths reach it is not
+    // (`reference/expressions.md § is — a pattern where a condition is wanted`).
     case _: IsPattern =>
       err("'is' tests a pattern in the condition of an 'if' or a 'while', and nowhere else — its " +
         "binding is live from here to the end of the condition and through the branch that " +
@@ -702,9 +715,9 @@ trait ExprAnalysis
       val (a, b)   = (ts(i), ts(i + 1))
       val equality = op == "==" || op == "!="
       // Operands agree on their *representation*, which is the reading `arithType` takes: a
-      // transparent subtype is the same type as its base (`16 §1`), so `a < n` between an `Age` and
-      // an `int` is one comparison of two integers, while a derived subtype is its own
-      // representation and so still compares only with itself.
+      // transparent subtype is the same type as its base (`reference/errors.md § Constrained
+      // types`), so `a < n` between an `Age` and an `int` is one comparison of two integers, while
+      // a derived subtype is its own representation and so still compares only with itself.
       if Type.repr(a.ty) != Type.repr(b.ty) then err(s"cannot compare ${show(a.ty)} with ${show(b.ty)}")
       if !(if equality then Type.isEquatable(a.ty) else Type.isOrdered(a.ty)) then
         err(s"'$op' is not defined for ${show(a.ty)}")
@@ -755,7 +768,8 @@ trait ExprAnalysis
   protected def requirePlace(t: TExpr, target: Expr, what: String, writes: Boolean = true): TExpr = {
     // A **captured** name reaches storage the walk below cannot see the binding of — a field of the
     // environment, or the frame slot one points at — so being written once is asked of the name it
-    // was declared under rather than of the expression it turned into (`12 §7`).
+    // was declared under rather than of the expression it turned into (`reference/expressions.md §
+    // Closures`).
     target match
       case Ident(n) if lookupOpt(n).exists((u, _) => readOnlyLocals(u)) =>
         err(writtenOnce(lookupOpt(n).map(_._1), what))
@@ -803,8 +817,9 @@ trait ExprAnalysis
         if readOnly(t) then err(writtenOnce(rootLocal(t), what))
 
     // A live `ref` stands on storage, and an assignment that would release it leaves the name aimed
-    // at freed memory (`03 § ref`). Only a write is asked about: `&` produces a pointer and takes
-    // nothing away, so the storage a ref found is exactly where it was.
+    // at freed memory (`reference/memory.md § ref — a name for a place`). Only a write is asked
+    // about: `&` produces a pointer and takes nothing away, so the storage a ref found is exactly
+    // where it was.
     if writes then checkRefGuards(t)
 
     t

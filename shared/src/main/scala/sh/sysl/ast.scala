@@ -74,7 +74,8 @@ case class Assign(op: String, target: Expr, value: Expr) extends Expr
 case class Call(callee: Expr, args: List[Expr]) extends Expr
 
 /** `name = value` at a call — the argument stands at the parameter it names rather than at the one
- * its position would have given it (`12 §2a`).
+ * its position would have given it (`reference/declarations.md § Default parameters and named
+ * arguments`).
  *
  * It is an `Expr` so that it travels in `Call.args` beside the positional arguments it is mixed
  * with, and every call form binds its arguments before looking at any of them. Reaching
@@ -83,7 +84,8 @@ case class Call(callee: Expr, args: List[Expr]) extends Expr
  */
 case class NamedArg(name: String, value: Expr) extends Expr
 
-/** A parameter's default, spliced in at a call that left the argument out (`12 §2a`).
+/** A parameter's default, spliced in at a call that left the argument out
+ * (`reference/declarations.md § Default parameters and named arguments`).
  *
  * Synthesized by argument binding and never parsed, so it carries the position of the default as
  * written rather than one of its own.
@@ -100,8 +102,9 @@ case class Field(receiver: Expr, name: String)  extends Expr
 /** `f[A, B]` — brackets holding *more than one* thing, which is never an index.
  *
  * A subscript takes one index, so a comma inside the brackets is what tells the two readings apart
- * without asking what the name is. It exists for the one place a list of types is written —
- * `&f[A, B]`, the address of an instantiation (`12 §6a`) — and every other position refuses it.
+ * without asking what the name is. It exists for the one place a list of types is written — `&f[A,
+ * B]`, the address of an instantiation (`reference/ffi.md § A function's address`) — and every
+ * other position refuses it.
  *
  * The single-argument form `&f[T]` has no comma to distinguish it and arrives as an `Index`, which
  * the analyzer re-reads where the name is a generic function. That asymmetry is deliberate: it is
@@ -110,7 +113,8 @@ case class Field(receiver: Expr, name: String)  extends Expr
  */
 case class TypeArgs(receiver: Expr, args: List[Expr]) extends Expr
 
-/** `T::Attr` — a type attribute (`16 §5`, `09 §2`): metadata a type exposes under a name, with `::`
+/** `T::Attr` — a type attribute (`reference/errors.md § What the type's own name offers: ::
+ * attributes`, `reference/types.md § Enums`): metadata a type exposes under a name, with `::`
  * rather than `.` because it belongs to the type itself, not to a value of it. `Age::First`,
  * `Day::Succ(d)`. The receiver is a type name; a bare `Attr` reads a value, and `Attr(args)` is a
  * `Call` over this node, exactly as an enum's associated function is a `Call` over a `Field`.
@@ -152,7 +156,7 @@ case class WithExpr(base: Expr, fields: List[WithField]) extends Expr
 case class ImplicitMember(name: String) extends Expr
 
 /** `sizeof(T)` / `alignof(T)` — how much storage a type occupies and what it must be aligned to
- * (`03 § Reinterpreting storage`).
+ * (`reference/memory.md § Reinterpreting storage`).
  *
  * The operand is a **type**, which is why this is a node of its own rather than a `Call` the analyzer
  * recognizes by name: an argument list holds values, and the whole type grammar is written here —
@@ -162,12 +166,13 @@ case class ImplicitMember(name: String) extends Expr
 case class LayoutOf(op: String, typ: TypeRef) extends Expr
 
 /** `offsetof(T, field)` — where a field starts inside the struct it is written in, in bytes
- * (`03 § Reinterpreting storage`).
+ * (`reference/memory.md § Reinterpreting storage`).
  *
- * The other half of what `@assert` needs to hold a mirrored C struct to its original (`13 §@assert`).
- * `sizeof` pins the total, which catches a field that changed width or one that was added; it says
- * nothing about **order**, so two same-width fields transposed in the mirror leave the size right and
- * every read wrong. This is what turns that into a refusal.
+ * The other half of what `@assert` needs to hold a mirrored C struct to its original
+ * (`reference/attributes.md § @assert — a condition settled while compiling`). `sizeof` pins the
+ * total, which catches a field that changed width or one that was added; it says nothing about
+ * **order**, so two same-width fields transposed in the mirror leave the size right and every read
+ * wrong. This is what turns that into a refusal.
  *
  * It is not a `LayoutOf` with a third field because its operands are of two kinds — a type and then a
  * name — and folding it asks a different question of `Layout`.
@@ -180,13 +185,14 @@ case class TryExpr(expr: Expr) extends Expr
 case class Tuple(elements: List[Expr]) extends Expr
 
 /** One of a closure literal's parameters. Its type is written only where nothing else can supply
- * one (`12 §5`), so the annotation is optional here in a way a declared function's never is.
+ * one (`reference/expressions.md § Closures`), so the annotation is optional here in a way a
+ * declared function's never is.
  */
 case class LambdaParam(name: String, typ: Option[TypeRef]) extends Positioned
 
-/** `x -> x + 1` — a closure literal (`12 §5`). The body is a statement list for the same reason a
- * function's is: an indented block's trailing expression is its value, and the `= expr` short form
- * is that list with one statement in it.
+/** `x -> x + 1` — a closure literal (`reference/expressions.md § Closures`). The body is a
+ * statement list for the same reason a function's is: an indented block's trailing expression is
+ * its value, and the `= expr` short form is that list with one statement in it.
  *
  * `implicitParams` is set on the one closure a program does not write the parameters of: the
  * [[BlockArg]] a trailing block becomes at a callable parameter, whose single parameter is bound as
@@ -220,7 +226,7 @@ case class ArrayLit(elements: List[Expr]) extends Expr
 case class ArrayFill(value: Expr, count: Expr) extends Expr
 
 /** An indented block standing where a value is wanted — the block a binding's `=` introduces
- * (`00 § Continuing a line`).
+ * (`reference/lexical.md § An unbracketed line continues after an operator`).
  *
  * It is the same thing a function body and a branch already are: a statement list whose trailing
  * expression is its value, `never` where it ends in a jump, and `unit` where it ends in neither. What
@@ -246,8 +252,9 @@ case class IfExpr(cond: Expr, thenBody: List[Stmt], elseBody: Option[List[Stmt]]
 case class MatchExpr(scrutinee: Expr, arms: List[MatchArm]) extends Expr
 
 /** `subject is Pat` / `subject is not Pat` — a pattern tested where a condition is wanted
- * (`09 §12`). It yields a `bool` and, in the un-negated form, binds whatever the pattern names for
- * the rest of the condition and the branch the condition guards.
+ * (`reference/expressions.md § is — a pattern where a condition is wanted`). It yields a `bool`
+ * and, in the un-negated form, binds whatever the pattern names for the rest of the condition and
+ * the branch the condition guards.
  *
  * `patterns` holds the `|`-alternatives an arm's left side may hold, and under the same rule: they
  * share one answer, so none of them may bind.
@@ -259,9 +266,10 @@ case class MatchExpr(scrutinee: Expr, arms: List[MatchArm]) extends Expr
  */
 case class IsPattern(subject: Expr, patterns: List[Pattern], negated: Boolean) extends Expr
 
-/** `a, b` where a function's own result list is what is being produced (`12 §5b`) — the callee's
- * side of the form. It is never a value: the analyzer accepts it only where the enclosing
- * function's declared result is a list, and builds the aggregate the caller takes apart.
+/** `a, b` where a function's own result list is what is being produced (`reference/declarations.md
+ * § Several results`) — the callee's side of the form. It is never a value: the analyzer accepts it
+ * only where the enclosing function's declared result is a list, and builds the aggregate the
+ * caller takes apart.
  */
 case class ResultList(values: List[Expr]) extends Expr
 
@@ -306,7 +314,8 @@ case class Loop(label: Option[String], body: List[Stmt]) extends Expr
 case class For(label: Option[String], name: String, iter: Expr, body: List[Stmt], elseBody: Option[List[Stmt]])
     extends Expr
 
-/** `for const name in iter body` — the loop the compiler **unrolls** (`10 §10`).
+/** `for const name in iter body` — the loop the compiler **unrolls** (`reference/generics.md § A
+ * parameter may stand for a list of types`).
  *
  * `iter` is a range whose ends are compile-time constants, and the body is repeated once per value
  * with `name` folded in as that value. The copies are type-checked *separately*, which is the whole
@@ -322,11 +331,12 @@ object ConstFor {
 
   /** How many copies one `for const` may be unrolled into.
    *
-   * A bound rather than no bound, because the cost is in the *emitted program* and not in a number a
-   * reader can see: `for const i in 0..<100000` is one line and a hundred thousand copies of
+   * A bound rather than no bound, because the cost is in the *emitted program* and not in a number
+   * a reader can see: `for const i in 0..<100000` is one line and a hundred thousand copies of
    * whatever is under it. The limit is generous against what the feature is for — a tuple wide
-   * enough to reach it is one nobody should be writing (`00 §13`) — and a loop that genuinely counts
-   * that high is the ordinary `for`, which costs one copy however far it goes.
+   * enough to reach it is one nobody should be writing (`reference/types.md § Tuples`) — and a loop
+   * that genuinely counts that high is the ordinary `for`, which costs one copy however far it
+   * goes.
    */
   val maxCopies: Int = 64
 }
@@ -350,7 +360,7 @@ case class CFor(
 ) extends Expr
 
 /** `for all i in 0..<n do P(i)` / `for some i in 0..<n do P(i)` — a quantifier over an integer
- * range, yielding a `bool` (`17 §2`).
+ * range, yielding a `bool` (`reference/verification.md § for all and for some`).
  *
  * `universal` tells the two apart. The bound name is visible only inside `pred`, and `iter` is a
  * range expression — the same `RangeExpr` a counted `for` takes, so the two forms cannot drift

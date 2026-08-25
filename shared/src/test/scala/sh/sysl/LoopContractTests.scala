@@ -3,7 +3,8 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** `invariant` and `variant` at the head of a loop body, and `variant` in a function's contract
- * block (`17 §3`, `17 §4`).
+ * block (`reference/verification.md § invariant and variant on a loop`, `reference/verification.md
+ * § variant on a function`).
  *
  * Both clauses really run, which is what separates them from a specification-only reading, so most
  * of what is here is a pair: a program the clause lets through and the neighbouring one it stops.
@@ -328,10 +329,11 @@ class LoopContractTests extends AnyFreeSpec with RunSupport with CodegenSupport 
               |""".stripMargin)
     }
 
-    // `16 §7` explains that a function with an `ensure` is not tail-call transformed, because a
-    // postcondition is checked when a call returns and a tail call never returns. A `variant` is
-    // checked *before* the call, so it survives the jump — and this is the test that says so, since
-    // a check emitted only on the ordinary call path would be skipped here entirely.
+    // `reference/errors.md § Contracts on a function` explains that a function with an `ensure` is
+    // not tail-call transformed, because a postcondition is checked when a call returns and a tail
+    // call never returns. A `variant` is checked *before* the call, so it survives the jump — and
+    // this is the test that says so, since a check emitted only on the ordinary call path would be
+    // skipped here entirely.
     "survives the tail-call transform" in {
       run("""@tailrec
             |walk(n: int, acc: int) -> int

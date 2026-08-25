@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `from_utf8` and the primitive under it (`04 § Validity`).
+/** `from_utf8` and the primitive under it (`reference/strings.md § Validity`).
  *
  * Two guide programs paid for the absence of this in different currencies — the JSON reader that
  * used to sit in `guide/` in workarounds, reaching text for a `\uXXXX` only through

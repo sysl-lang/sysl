@@ -21,8 +21,9 @@ sealed trait TExpr extends Positioned {
   def ty: Type
 
   /** The type of the **storage** this node names, as against `ty`, which is the type of the value
-   * read out of it. The two differ only by a `volatile` qualifier (`03 § Device memory`), which the
-   * projection that built the node stripped: a read of a `volatile u32` hands back a `u32`.
+   * read out of it. The two differ only by a `volatile` qualifier (`reference/memory.md § Device
+   * memory`), which the projection that built the node stripped: a read of a `volatile u32` hands
+   * back a `u32`.
    *
    * It is recovered from the receiver rather than kept on the node, because the receiver is where
    * the declaration that wrote the qualifier still is — a struct's field list, an array's element
@@ -164,7 +165,7 @@ case class TVecStore(receiver: TExpr, index: TExpr, value: TExpr) extends TExpr 
 /** The same two forms written where a `[]T` was expected: storage of the program's own, and a view
  * of all of it. The count of a `TBufFill` is an ordinary expression rather than part of a type,
  * which is the whole reason these exist — an array's length is fixed when it is compiled, and a
- * length read out of a file is not (`07 §Storage sized while running`).
+ * length read out of a file is not (`reference/arrays.md § Storage sized while running`).
  */
 case class TBufLit(elems: List[TExpr], sliceTy: Type.Slice) extends TExpr { def ty: Type = sliceTy }
 case class TBufFill(value: TExpr, count: TExpr, sliceTy: Type.Slice) extends TExpr { def ty: Type = sliceTy }
@@ -281,12 +282,14 @@ case class TTempAddr(value: TExpr, ty: Type) extends TExpr
 case class TStore(place: TExpr, value: TExpr, ty: Type) extends TExpr
 
 /** A compound assignment `place op= value`, yielding the updated value. `dispatch` is present when
- * the operator is a trait method rather than an instruction (`14 §3`).
+ * the operator is a trait method rather than an instruction (`reference/expressions.md § Operator
+ * dispatch`).
  *
  * `check` is present when the place holds a constrained subtype: the operation computes a value the
- * place cannot be given unexamined, so the constraint is tested between the arithmetic and the store
- * (`16 §4`). It is the same test a `TConstrainedCheck` makes; it lives here rather than in a
- * wrapping node because the store is inside this one, and a value has to be refused before it lands.
+ * place cannot be given unexamined, so the constraint is tested between the arithmetic and the
+ * store (`reference/errors.md § Where a constraint is checked`). It is the same test a
+ * `TConstrainedCheck` makes; it lives here rather than in a wrapping node because the store is
+ * inside this one, and a value has to be refused before it lands.
  */
 case class TUpdate(place: TExpr, op: String, value: TExpr, ty: Type, dispatch: Option[TDispatch] = None,
                    check: Option[Type.Constrained] = None)
@@ -301,8 +304,8 @@ case class TIncDec(place: TExpr, op: String, pre: Boolean, ty: Type, check: Opti
 case class TBinary(op: String, left: TExpr, right: TExpr, ty: Type) extends TExpr
 case class TUnary(op: String, operand: TExpr, ty: Type)             extends TExpr
 
-/** A member a built-in has by rule rather than by an `impl`, and which lowers to instructions rather
- * than to a call (`14 §5`, `CoreTraits.numeric`).
+/** A member a built-in has by rule rather than by an `impl`, and which lowers to instructions
+ * rather than to a call (`reference/expressions.md § Operator dispatch`, `CoreTraits.numeric`).
  *
  * A node of its own rather than a tree of the operators it is equivalent to, because every one of
  * these reads its operand more than once — a magnitude compares it and negates it — and a tree would
@@ -337,8 +340,9 @@ case class TFence(ordering: String) extends TExpr { def ty: Type = Type.Unit }
 /** `&&` / `||` — short-circuit, always boolean. */
 case class TLogical(op: String, left: TExpr, right: TExpr) extends TExpr { def ty: Type = Type.Bool }
 
-/** An operator that a trait supplies rather than the machine (`14 §3`): the function it lowers to,
- * whether the derivation swaps its operands, and whether it negates the result (`14 §2`).
+/** An operator that a trait supplies rather than the machine (`reference/expressions.md § Operator
+ * dispatch`): the function it lowers to, whether the derivation swaps its operands, and whether it
+ * negates the result (`14 §2`).
  *
  * It rides on the node the operator already lowers to instead of replacing that node with a `TCall`,
  * and the reason is the two forms that use one operand **twice from a single evaluation** — a
@@ -371,7 +375,7 @@ case class TSeq(exprs: List[TExpr]) extends TExpr { def ty: Type = Type.Unit }
 case class TStr(arg: TExpr) extends TExpr { def ty: Type = Type.Str }
 
 /** The built-in `from_utf8_unchecked(b)` — the bytes of a `[]u8` as a `string`, with nothing
- * checked (`04 § Validity`).
+ * checked (`reference/strings.md § Validity`).
  *
  * It is here rather than in the library for the reason the `va_*` forms are: no sysl body can build
  * a `string`, since every safe route to one already has the UTF-8 guarantee behind it. The bytes are
@@ -423,9 +427,9 @@ case class TCStrLit(value: String) extends TExpr { def ty: Type = Type.Ptr(Type.
 case class TCall(name: String, args: List[TExpr], ty: Type, results: Boolean = false) extends TExpr
 
 /** `&f` — the address of a declared function, as the C convention would have somebody call it
- * (`12 §6a`). `name` is the function this addresses; `entry` is the symbol the address is *of*,
- * which is the function itself where sysl's own convention already agrees with C's and a generated
- * adapter where it does not.
+ * (`reference/ffi.md § A function's address`). `name` is the function this addresses; `entry` is
+ * the symbol the address is *of*, which is the function itself where sysl's own convention already
+ * agrees with C's and a generated adapter where it does not.
  *
  * The two are separate because the choice is the emitter's and the reachability walk's question is
  * about the first: what keeps the definition in the program is that something took its address, and
@@ -433,7 +437,8 @@ case class TCall(name: String, args: List[TExpr], ty: Type, results: Boolean = f
  */
 case class TFuncAddr(name: String, entry: String, ty: Type) extends TExpr
 
-/** A call through a `*extern` — a function pointer with no definition in sight (`12 §6a`).
+/** A call through a `*extern` — a function pointer with no definition in sight (`reference/ffi.md §
+ * A function's address`).
  *
  * It carries the whole signature rather than looking one up, because there is nothing to look up:
  * the callee is a value, and what is known about it is exactly what its type said. That is also why
@@ -458,10 +463,10 @@ case class TErase(operand: TExpr, vtable: String, ty: Type) extends TExpr
 case class TVCall(receiver: TExpr, slot: Int, args: List[TExpr], ty: Type, results: Boolean = false)
     extends TExpr
 
-/** The ABI primitives of a variadic body (`12 §9`), each holding the *address* of the `va_list` it
- * works on — they advance it rather than reading a copy of it, so what the analyzer hands over is
- * the place, exactly as `&ap` would. A `*va_list` a caller lent is already that address and is
- * handed over as it stands.
+/** The ABI primitives of a variadic body (`reference/ffi.md § Variadic functions`), each holding
+ * the *address* of the `va_list` it works on — they advance it rather than reading a copy of it, so
+ * what the analyzer hands over is the place, exactly as `&ap` would. A `*va_list` a caller lent is
+ * already that address and is handed over as it stands.
  *
  * `TVaArg` carries the type it reads, which the analyzer took from the context the value is used
  * in; there is nothing in the tail to check that against, which is what makes it as unsafe as C's.
@@ -475,7 +480,7 @@ case class TVaArg(ap: TExpr, ty: Type) extends TExpr
 case class TVaCopy(dst: TExpr, src: TExpr) extends TExpr { def ty: Type = Type.Unit }
 
 /** A walk handed to a **foreign** function whose C parameter is a `va_list` — `vprintf` and its
- * family (`12 §9`).
+ * family (`reference/ffi.md § Variadic functions`).
  *
  * It holds the address of the walk, like the four forms above, and differs from passing that
  * address in what the callee is given: C's `va_list` is a different type on every target and is
@@ -488,17 +493,18 @@ case class TVaPass(ap: TExpr) extends TExpr { def ty: Type = Type.Ptr(Type.VaLis
 /** Positional construction of a value struct. */
 case class TStructNew(struct: Type.Struct, args: List[TExpr]) extends TExpr { def ty: Type = struct }
 
-/** A struct value checked against its `invariant` clauses (`16 §6`): `value` builds the struct, `invFn`
- * is the synthesised `<Struct>$inv` that takes the fields and returns a `bool`. Codegen emits
- * `value`, calls `invFn` with its field values, traps on a false result, and yields the same value —
- * the struct is unchanged, so the only run-time effect is a trap when an invariant is violated.
+/** A struct value checked against its `invariant` clauses (`reference/errors.md § Struct
+ * invariants`): `value` builds the struct, `invFn` is the synthesised `<Struct>$inv` that takes the
+ * fields and returns a `bool`. Codegen emits `value`, calls `invFn` with its field values, traps on
+ * a false result, and yields the same value — the struct is unchanged, so the only run-time effect
+ * is a trap when an invariant is violated.
  */
 case class TStructInvCheck(value: TExpr, struct: Type.Struct, invFn: String) extends TExpr { def ty: Type = struct }
 
-/** Something that may have changed a struct carrying `invariant` clauses (`16 §6`): `after` runs,
- * then `recv` — the struct that could have been mutated — is re-read and passed to `invFn`, trapping
- * on a false result. Yields what `after` yields, so `s.f = v` remains an expression of the field's
- * type.
+/** Something that may have changed a struct carrying `invariant` clauses (`reference/errors.md §
+ * Struct invariants`): `after` runs, then `recv` — the struct that could have been mutated — is
+ * re-read and passed to `invFn`, trapping on a false result. Yields what `after` yields, so `s.f =
+ * v` remains an expression of the field's type.
  *
  * Two things wear this. A **write** into the struct: a direct `s.f = v`, a compound `s.f op= v`, a
  * through-pointer `(*p).f = v`, or one nested inside — `o.a.n = 9`. And a **`*self` method call on a
@@ -530,11 +536,11 @@ case class TEnumFromInt(value: TExpr, en: Type.Enum) extends TExpr { def ty: Typ
 case class TEnumTry(value: TExpr, en: Type.Enum, optTy: Type.Enum,
                     some: Type.EnumVariant, none: Type.EnumVariant) extends TExpr { def ty: Type = optTy }
 
-/** A simple enum's type attribute with a runtime argument (`09 §2`): `kind` names which one —
- * `Pos` (a value's 0-based position), `Val` (the value at a position, trapping out of range),
- * `Succ`/`Pred` (the neighbouring value, trapping at the end), `Image` (a value's name as a
- * string), or `Value` (the value named by a string, trapping on no match). `arg` is the one
- * operand. The bare `First`/`Last` are compile-time constants and need no node of their own.
+/** A simple enum's type attribute with a runtime argument (`reference/types.md § Enums`): `kind`
+ * names which one — `Pos` (a value's 0-based position), `Val` (the value at a position, trapping
+ * out of range), `Succ`/`Pred` (the neighbouring value, trapping at the end), `Image` (a value's
+ * name as a string), or `Value` (the value named by a string, trapping on no match). `arg` is the
+ * one operand. The bare `First`/`Last` are compile-time constants and need no node of their own.
  */
 case class TEnumAttr(kind: String, en: Type.Enum, arg: TExpr, ty: Type) extends TExpr
 
@@ -560,7 +566,8 @@ case class TTry(
  */
 case class TField(receiver: TExpr, index: Int, ty: Type) extends TExpr
 
-/** One term of an `if`'s or a `while`'s condition — the `&&`-joined chain written out (`09 §12`).
+/** One term of an `if`'s or a `while`'s condition — the `&&`-joined chain written out
+ * (`reference/expressions.md § is — a pattern where a condition is wanted`).
  *
  * A condition is a **list** of these rather than one expression because a term may bind: an `is`
  * that matched leaves names the terms to its right and the guarded branch can read, and that is a
@@ -595,7 +602,7 @@ case class TArm(patterns: List[TPattern], guard: Option[TExpr], body: TBlock)
 case class TBlock(stmts: List[TStmt], result: Option[TExpr], ty: Type)
 
 /** A block standing where an expression does, which is what one copy of an unrolled `for const`
- * becomes (`10 §10`).
+ * becomes (`reference/generics.md § A parameter may stand for a list of types`).
  *
  * `if` and `match` carry their blocks in their own nodes because the branch is part of what they
  * are; an unrolled loop has no node of its own by the time this exists — it has become its copies —
@@ -634,9 +641,10 @@ case class TFor(name: String, varTy: Type, lo: TExpr, hi: TExpr, inclusive: Bool
 case class TCFor(init: List[TStmt], cond: Option[TExpr], step: List[TStmt], body: List[TStmt],
                  elseBlock: Option[TBlock], ty: Type) extends TExpr
 
-/** `for all name in lo..hi do pred` / `for some …` — a quantifier over an integer range (`17 §2`),
- * which is an **expression** yielding a `bool` and not a loop: it carries no `break`, no `else`, and
- * no label, so its type is settled rather than met.
+/** `for all name in lo..hi do pred` / `for some …` — a quantifier over an integer range
+ * (`reference/verification.md § for all and for some`), which is an **expression** yielding a
+ * `bool` and not a loop: it carries no `break`, no `else`, and no label, so its type is settled
+ * rather than met.
  *
  * The bounds share `TFor`'s shape because they are the same range. What differs is the body: a
  * single `TExpr` rather than a statement list, since a predicate is a condition and not a block.
@@ -645,7 +653,8 @@ case class TQuantifier(universal: Boolean, name: String, varTy: Type, lo: TExpr,
                        inclusive: Boolean, pred: TExpr) extends TExpr { def ty: Type = Type.Bool }
 
 /** A loop whose body carries a `variant`, wrapped so the measure's slots are set up **once per
- * entry** to the loop rather than once per call to the function (`17 §3`).
+ * entry** to the loop rather than once per call to the function (`reference/verification.md §
+ * invariant and variant on a loop`).
  *
  * It wraps rather than adding a field to each of the seven loop nodes, and what it holds is only
  * what has to happen outside the body: the two allocas and the store that disarms the comparison.
@@ -661,7 +670,8 @@ case class TCheckedLoop(slot: String, varTy: Type, loop: TExpr) extends TExpr { 
 case class TForEach(name: String, elemTy: Type, seq: TExpr, body: List[TStmt],
                     elseBlock: Option[TBlock], ty: Type) extends TExpr
 
-/** `for name in cursor [else …]` over a type that implements `Iterate` (`14 §7`).
+/** `for name in cursor [else …]` over a type that implements `Iterate` (`library/core.md § Walking
+ * a type of your own`).
  *
  * `cursor` is the name of the loop's own slot holding the iterator: the sequence expression is
  * evaluated once into it, and `next` is the already-built call that reads it and advances it, so

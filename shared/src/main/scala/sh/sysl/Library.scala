@@ -5,10 +5,10 @@ package sh.sysl
  * Two questions run through the analyzer and both are about the same thing. **Is this declaration
  * the library's rather than the program's** — which decides whether it is in scope everywhere with
  * no import, whether it may be left unanalyzed until something reaches it, and whose `impl` rows
- * those are (`13 §8`, `02 § Coherence`). And **which key is the library's `Option` filed under** —
- * asked wherever the compiler names a library declaration itself rather than reading a name out of
- * source: `?` needs `Option`'s variants, `print` needs the renderers, a format string needs
- * `FormatSpec`.
+ * those are (`reference/modules.md § Separate compilation`, `reference/traits.md § Where an impl
+ * may live`). And **which key is the library's `Option` filed under** — asked wherever the compiler
+ * names a library declaration itself rather than reading a name out of source: `?` needs `Option`'s
+ * variants, `print` needs the renderers, a format string needs `FormatSpec`.
  *
  * Both were once answered in place, by asking the declarations directly and by spelling library keys
  * as bare names. That worked only while the library was a string inside the compiler keyed under the
@@ -47,12 +47,12 @@ object Library {
   lazy val modules: List[String] = carried.modules
 
   /** The library modules every file may write the names of without importing them (`AutoImport`,
-   * `13 §8`).
+   * `reference/modules.md § Separate compilation`).
    *
    * **Only the standard module**, which is the whole of what auto-importing is for: a program
    * cannot avoid needing what the language desugars onto, so those names arriving unasked-for is
    * honest. A submodule is an offer rather than part of the language, and is reached by naming it
-   * or importing it exactly as any other module is (`13 §3`).
+   * or importing it exactly as any other module is (`reference/modules.md § Imports`).
    */
   val autoImported: List[String] = List(Std.module)
 
@@ -124,7 +124,8 @@ object Library {
   def spelling(k: String): Option[String] =
     Option.when(modules.contains(Modules.moduleOf(k)))(Modules.bare(k))
 
-  /** The enum `?` unwraps, paired with its success and failure variant names (`09 §4`).
+  /** The enum `?` unwraps, paired with its success and failure variant names (`reference/types.md §
+   * Enums`).
    *
    * The base is a key and the variants are spellings, which is not an inconsistency: a variant is
    * named within its enum's own layout — `Type.Enum.variant` finds it by what was written — while the
@@ -173,16 +174,19 @@ object Library {
    */
   lazy val known: Set[String] =
     Set(
-      // `?`, `for ... in`, and a weak reference's `get` all build one (`09 §4`, `03`).
+      // `?`, `for ... in`, and a weak reference's `get` all build one (`reference/types.md §
+      // Enums`, `03`).
       "Option", "Some", "None",
       "Result", "Ok", "Err",
       // What a format string's flags are carried in (`14 §8`).
       "FormatSpec",
-      // The traits whose members a built-in has by rule rather than by an `impl` (`14 §5`).
+      // The traits whose members a built-in has by rule rather than by an `impl`
+      // (`reference/expressions.md § Operator dispatch`).
       "Display", "Hash",
-      // What a type does when the last reference to one of its values goes (`03 § A destructor`).
-      // The compiler spells it because the *hook* is what calls it: a release site has a payload
-      // type and no source anywhere near it, so the member is found by name rather than by a call.
+      // What a type does when the last reference to one of its values goes (`reference/memory.md §
+      // A destructor`). The compiler spells it because the *hook* is what calls it: a release site
+      // has a payload type and no source anywhere near it, so the member is found by name rather
+      // than by a call.
       "Drop",
       // The family every integer belongs to, which the blanket `impl` of `Display` is written over.
       "Integer",

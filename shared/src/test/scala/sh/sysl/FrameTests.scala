@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `@reads` and `@writes` — which module storage a function may touch (`17 §7`).
+/** `@reads` and `@writes` — which module storage a function may touch (`reference/verification.md §
+ * @reads and @writes — what a call may touch`).
   *
   * The feature is three rules, so the tests are the three plus the neighbouring case for each: what
   * each refuses, and the thing one step away from it that it must not. Two of those neighbours carry
@@ -45,8 +46,9 @@ class FrameTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "2\n"
     }
 
-    // `W` is inside the readable set on purpose (`17 §7`), which is what makes this one annotation
-    // rather than two saying the same thing.
+    // `W` is inside the readable set on purpose (`reference/verification.md § @reads and @writes —
+    // what a call may touch`), which is what makes this one annotation rather than two saying the
+    // same thing.
     "reading a variable that only its '@writes' names" in {
       run("""static var count: int = 0
             |
@@ -105,8 +107,9 @@ class FrameTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "2\n"
     }
 
-    // Adoption runs from the leaves up (`17 §7`), so a function that never said anything is held to
-    // nothing and may still call and be called by anything.
+    // Adoption runs from the leaves up (`reference/verification.md § @reads and @writes — what a
+    // call may touch`), so a function that never said anything is held to nothing and may still
+    // call and be called by anything.
     "an unannotated function doing whatever it likes" in {
       run("""static var count: int = 0
             |
@@ -134,10 +137,11 @@ class FrameTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "1\n"
     }
 
-    // `17 §7` said a frame could reach only the entry file's `static var`, because that was the only
-    // mutable module storage there was when it was written. `13 §7`'s module `var` arrived after,
-    // and a frame is resolved through the same lookup a body's own reference is — so it reaches
-    // both, and this is the case that says so.
+    // `reference/verification.md § @reads and @writes — what a call may touch` said a frame could
+    // reach only the entry file's `static var`, because that was the only mutable module storage
+    // there was when it was written. `13 §7`'s module `var` arrived after, and a frame is resolved
+    // through the same lookup a body's own reference is — so it reaches both, and this is the case
+    // that says so.
     "a variable declared with 'var' in a module of its own" in {
       runOf(
         "counter.sysl" ->

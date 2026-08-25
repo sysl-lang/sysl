@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** A trait's member may take a **bare-arrow** callable — `f: T -> U` — which is sugar for a bounded
- * type parameter (`12 §6`) exactly as it is on a type's own member.
+ * type parameter (`reference/types.md § Function types`) exactly as it is on a type's own member.
  *
  * **What it buys is that nothing is boxed.** The other spelling, `&Fn(T) -> U`, is a counted
  * reference: the closure a caller writes goes on the heap at the call, once per call, before an

@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** A function's address, and a call through one — `12 §6a`.
+/** A function's address, and a call through one — `reference/ffi.md § A function's address`.
  *
  * The claim this file exists to hold is that **both directions of the C callback seam work**, and
  * both are checked by running a real libc interface rather than by reading IR: `qsort` calls a sysl
@@ -361,8 +361,8 @@ class FuncAddressTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     /** So is a function carrying `@export`, whose address is its **thunk's** — a definition that
-      * genuinely has the convention this rule is written about (`ExportThunk`). `15 §12` said that
-      * all along; what changed with 0137 is that it became true.
+      * genuinely has the convention this rule is written about (`ExportThunk`). `reference/ffi.md §
+      * @export` said that all along; what changed with 0137 is that it became true.
       */
     "and so is an exported function, whose address is the C-convention entry" in {
       val out = ir("""struct Point
@@ -436,7 +436,7 @@ class FuncAddressTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
-  /** The claims `12 §6a` makes in prose, each run rather than read. */
+  /** The claims `reference/ffi.md § A function's address` makes in prose, each run rather than read. */
   "what the chapter claims" - {
     /** §6a: *"A call through one goes out under C's convention … the same lowering an `extern` call
       * gets (§1), aggregates and all."* That is the asymmetry the section turns on — **taking** the
@@ -682,10 +682,11 @@ class FuncAddressTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     // A slice of them, which is the table shape a dispatch loop reads.
-    /** An allocator-free module (`13 §4`, `capabilities.md`) is held to what its calls **reach**, and
-      * taking an address is a way of reaching. Refusing it is conservative in the right direction:
-      * the address is handed to something this compiler cannot see, so if it were not a use here it
-      * would be no use anywhere.
+    /** An allocator-free module (`reference/modules.md § Capabilities are a module property`,
+      * `capabilities.md`) is held to what its calls **reach**, and taking an address is a way of
+      * reaching. Refusing it is conservative in the right direction: the address is handed to
+      * something this compiler cannot see, so if it were not a use here it would be no use
+      * anywhere.
       *
       * The allocator-free half is what makes the test discriminating — a rule that refused every
       * address would pass the second half of this and mean nothing.
@@ -747,8 +748,9 @@ class FuncAddressTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) should not be empty
     }
 
-    // A bare function name still means the capture-free closure it always meant (`12 §5`), so the
-    // `&` is what tells the two readings apart and nothing was quietly rerouted.
+    // A bare function name still means the capture-free closure it always meant
+    // (`reference/expressions.md § Closures`), so the `&` is what tells the two readings apart and
+    // nothing was quietly rerouted.
     "and a bare name is still the capture-free closure it was" in {
       run("""square(n: int) -> int = n * n
             |
@@ -843,9 +845,9 @@ class FuncAddressTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     /** The other half, and the rule this shares with every other qualified form: **a local binding
-      * shadows a module name** (`13 §3`). A head bound to a value makes the chain a field read and
-      * nothing else, so reading it as a module path would take an address of the wrong thing
-      * entirely — and silently, since both readings produce a pointer.
+      * shadows a module name** (`reference/modules.md § Imports`). A head bound to a value makes
+      * the chain a field read and nothing else, so reading it as a module path would take an
+      * address of the wrong thing entirely — and silently, since both readings produce a pointer.
       */
     "while a local of the module's name is still a field read" in {
       runIn(

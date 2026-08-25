@@ -61,12 +61,12 @@ object Conditional {
 
   /** The symbols an **operating system alone** settles, true for it and false for every other.
    *
-   * This is the half a directory selects on (`13 §5`), and the reason it is a function of `Os`
-   * rather than of a whole target: the walk that reads a tree has an operating system and no
-   * processor, so a selector may name anything answerable from one and nothing that is not. Every
-   * one of these is also a `#if` symbol, because [[defined]] is this plus the processor — the two
-   * places a source file can name a machine share a vocabulary, and here is where that stops being
-   * a claim and becomes an equation.
+   * This is the half a directory selects on (`reference/modules.md § Platform selection`), and the
+   * reason it is a function of `Os` rather than of a whole target: the walk that reads a tree has
+   * an operating system and no processor, so a selector may name anything answerable from one and
+   * nothing that is not. Every one of these is also a `#if` symbol, because [[defined]] is this
+   * plus the processor — the two places a source file can name a machine share a vocabulary, and
+   * here is where that stops being a claim and becomes an equation.
    */
   def osDefined(os: Os): Set[String] =
     val machine = os.inherentCapabilities
@@ -206,8 +206,9 @@ object Conditional {
   /** What an operating system is called where a *source file* names one.
    *
    * Visible to the package because `Project`'s `__<os>__` directories select on the same vocabulary
-   * (`13 §5`), and they have to be the same words: `#if linux` and `__linux__/` are one reader's one
-   * idea, and two spellings of it would be a thing to look up rather than a thing to know.
+   * (`reference/modules.md § Platform selection`), and they have to be the same words: `#if linux`
+   * and `__linux__/` are one reader's one idea, and two spellings of it would be a thing to look up
+   * rather than a thing to know.
    */
   private[sysl] def osSymbol(os: Os): String = os match
     case Os.MacOS        => "macos"

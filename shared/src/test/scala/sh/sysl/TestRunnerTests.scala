@@ -259,9 +259,10 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
   }
 
   "a test is a member of its module like any other" - {
-    // The claim this settles is about *order*: tests are dropped after the whole-program checks have
-    // run, so a module's capability clause reaches them (`13 §4`). A test invisible to that check
-    // would let a `no alloc` module hold an allocation that its own tests exercised every day.
+    // The claim this settles is about *order*: tests are dropped after the whole-program checks
+    // have run, so a module's capability clause reaches them (`reference/modules.md § Capabilities
+    // are a module property`). A test invisible to that check would let a `no alloc` module hold an
+    // allocation that its own tests exercised every day.
     "a module's 'no alloc' clause reaches its tests" in {
       errIn(("m", "m.sysl", """module m
                               |@no_alloc

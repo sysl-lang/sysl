@@ -65,16 +65,18 @@ trait StmtParser
   protected lazy val ensureStmt: PackratParser[Stmt] =
     op("ensure") ~> expression ~ opt(op(",") ~> contractMsg) ^^ { case c ~ m => Ensure(c, m) }
 
-  /** `invariant <cond> [, "message"]` and `variant <expr>` — the loop clauses of `17 §3`, and, for
-   * `variant`, the recursion measure a function's contract block carries (`17 §4`).
+  /** `invariant <cond> [, "message"]` and `variant <expr>` — the loop clauses of
+   * `reference/verification.md § invariant and variant on a loop`, and, for `variant`, the
+   * recursion measure a function's contract block carries (`reference/verification.md § variant on
+   * a function`).
    *
    * **Both words are contextual**, matched as soft words exactly as the struct `invariant` of
-   * `16 §6` is — which is also where `invariant` was already being read this way, so this spends no
-   * new word. The cost of that is the cost `is` and `not` already pay: a *bare statement* that calls
-   * a function of the same name, `invariant(x)`, reads as a clause over `(x)`. Anywhere that is not
-   * a bare statement — `val v = invariant(x)`, an argument, a condition — the call is unambiguous,
-   * and a value named `invariant` is untouched. That trade buys the clause its natural spelling in
-   * the position a reader writes it.
+   * `reference/errors.md § Struct invariants` is — which is also where `invariant` was already
+   * being read this way, so this spends no new word. The cost of that is the cost `is` and `not`
+   * already pay: a *bare statement* that calls a function of the same name, `invariant(x)`, reads
+   * as a clause over `(x)`. Anywhere that is not a bare statement — `val v = invariant(x)`, an
+   * argument, a condition — the call is unambiguous, and a value named `invariant` is untouched.
+   * That trade buys the clause its natural spelling in the position a reader writes it.
    */
   protected lazy val invariantStmt: PackratParser[Stmt] =
     invariantKw ~> expression ~ opt(op(",") ~> contractMsg) ^^ { case c ~ m => Invariant(c, m) }
@@ -116,7 +118,7 @@ trait StmtParser
         "a module member cannot have",
     )
 
-  /** A declaration that may carry a visibility modifier (`13 §2`).
+  /** A declaration that may carry a visibility modifier (`reference/modules.md § Visibility`).
    *
    * The forms are grouped so the modifier is written once, before whichever of them follows, rather
    * than threaded through rules that would each have to remember it. An `impl` is not among them and
@@ -167,9 +169,10 @@ trait StmtParser
       duplicated(as) match
         case Some(dup) =>
           err(s"'@$dup' is written twice above one declaration, and it says nothing the once does not")
-        // `@pure` *is* `@reads() @writes()` plus the further bans of `17 §6`, so the two together say
-        // one thing twice — and worse, they could be made to disagree, which would leave nothing to
-        // say which of the two claims the function was held to.
+        // `@pure` *is* `@reads() @writes()` plus the further bans of `reference/verification.md §
+        // @pure`, so the two together say one thing twice — and worse, they could be made to
+        // disagree, which would leave nothing to say which of the two claims the function was held
+        // to.
         case None if as.exists(_ == Attr.Pure) && as.exists(frame) =>
           err("'@pure' already says '@reads()' and '@writes()', so a frame beside it says one thing " +
             "twice — write the frame alone if the function touches module storage, and '@pure' alone " +
@@ -408,8 +411,9 @@ trait StmtParser
         "replaces nothing",
     )
 
-  /** `private`, `private[M]`, or nothing at all — which is public (`13 §2`). There is no `pub`
-   * keyword; its absence *is* public, so the unmarked case is the one that writes nothing.
+  /** `private`, `private[M]`, or nothing at all — which is public (`reference/modules.md §
+   * Visibility`). There is no `pub` keyword; its absence *is* public, so the unmarked case is the
+   * one that writes nothing.
    */
   protected lazy val visibility: Parser[Visibility] =
     op("private") ~> opt(op("[") ~> ident <~ op("]")) ^^ {
@@ -443,7 +447,7 @@ trait StmtParser
       }
 
   /** What a binding's `=` takes: one expression, or an indented block whose trailing expression is
-   * the value (`00 § Continuing a line`).
+   * the value (`reference/lexical.md § An unbracketed line continues after an operator`).
    *
    * The block is tried first and costs nothing when there is not one — it opens on `Newline`+`Indent`,
    * which no expression can begin with, so a value written on the same line as the `=` reaches
@@ -468,7 +472,8 @@ trait StmtParser
       case Nil               => UnitLit()
     }
 
-  /** `val (a, b) = …` / `var (a, b) = …` — a binding written as a **pattern** (`00 §13`).
+  /** `val (a, b) = …` / `var (a, b) = …` — a binding written as a **pattern** (`reference/types.md
+   * § Tuples`).
    *
    * Two patterns may stand here, and they are the two that cannot fail to match: a **tuple**
    * pattern, and a **struct** pattern, which names a type that has exactly one shape.
@@ -485,8 +490,9 @@ trait StmtParser
    * still reads a bare name, so nothing that parsed before this existed parses differently now.
    *
    * **The pattern is the whole of the left side, with no type annotation beside it.** That is
-   * `12 §5b`'s open question again rather than an oversight — the parts of a destructuring have
-   * nowhere to carry a type, and inference covers what the form is for.
+   * `reference/declarations.md § Several results`'s open question again rather than an oversight —
+   * the parts of a destructuring have nowhere to carry a type, and inference covers what the form
+   * is for.
    */
   protected def patternDecl(keyword: String, mutable: Boolean): PackratParser[Stmt] =
     (op(keyword) ~> destructuring) ~ (op("=") ~> initializer) ^^ {
@@ -506,7 +512,7 @@ trait StmtParser
       case None ~ p    => p
     }
 
-  /** `ref name = place` (`03 § ref`).
+  /** `ref name = place` (`reference/memory.md § ref — a name for a place`).
    *
    * Neither half of what `var` and `val` accept is offered here, and each absence is a rule rather
    * than an omission. There is **no type annotation**, because a ref is a local declaration and never
@@ -525,8 +531,8 @@ trait StmtParser
    *
    * Two or more names, and an initializer, are both required: one name is the ordinary form, and a
    * multiple binding with nothing to take apart names nothing. The parts carry no type annotation,
-   * which is `12 §5b`'s open question rather than an oversight — inference covers what the form is
-   * for, and there is no spelling yet for the case it does not.
+   * which is `reference/declarations.md § Several results`'s open question rather than an oversight
+   * — inference covers what the form is for, and there is no spelling yet for the case it does not.
    */
   protected def multiDecl(keyword: String, mutable: Boolean): PackratParser[Stmt] =
     (op(keyword) ~> ident <~ op(",")) ~ rep1sep(ident, op(",")) ~ (op("=") ~> rep1sep(expression, op(","))) ^^ {
@@ -548,7 +554,8 @@ trait StmtParser
       case n ~ t ~ v => ConstDecl(n, t, v)
     }
 
-  /** `c const` and its constants, each of whose values is a C expression in quotes (`15 §7`).
+  /** `c const` and its constants, each of whose values is a C expression in quotes
+   * (`reference/ffi.md § A library may carry C`).
    *
    * ```
    * c const
@@ -556,11 +563,12 @@ trait StmtParser
    *     MAX_DELAY: u32          = "portMAX_DELAY"
    * ```
    *
-   * **`c` is contextual and stays an ordinary identifier**, which the `const` after it is what makes
-   * safe: nothing else in the language may follow a name with a keyword, so the two words together
-   * cannot be anything but this, and a program is free to call a variable `c` — which one counting
-   * characters certainly will. It is a cheaper disambiguation than `interrupt`'s (`15 §10`), which
-   * needs a lookahead past an optional parenthesized argument to find the name it qualifies.
+   * **`c` is contextual and stays an ordinary identifier**, which the `const` after it is what
+   * makes safe: nothing else in the language may follow a name with a keyword, so the two words
+   * together cannot be anything but this, and a program is free to call a variable `c` — which one
+   * counting characters certainly will. It is a cheaper disambiguation than `interrupt`'s
+   * (`reference/ffi.md § interrupt`), which needs a lookahead past an optional parenthesized
+   * argument to find the name it qualifies.
    *
    * **The C is quoted with a plain string and carries no prefix.** A `c"…"` form would be a second
    * literal kind bought to say what the header already said: inside this block a string can mean
@@ -586,7 +594,8 @@ trait StmtParser
   protected lazy val cConstItem: Parser[CConstDecl] =
     at(ident ~ (op(":") ~> typeRef) ~ (op("=") ~> linkName) ^^ { case n ~ t ~ c => CConstDecl(n, t, c) })
 
-  /** `c type` — the sysl types a file's C typedefs turn out to be (`15 §7`):
+  /** `c type` — the sysl types a file's C typedefs turn out to be (`reference/ffi.md § A library
+   * may carry C`):
    *
    * ```
    * c type
@@ -672,7 +681,8 @@ trait StmtParser
       }
 
   /** A statement-level expression is the last of the three places a placeholder closes at
-   * (`12 §5c`) — it is what stops one from reaching past the statement it was written in.
+   * (`reference/expressions.md § _ — a parameter with the name left out`) — it is what stops one
+   * from reaching past the statement it was written in.
    */
   protected lazy val exprStmt: PackratParser[Stmt] =
     expression ^^ (e => ExprStmt(Placeholders.lift(e)).setPos(e.pos))
@@ -712,7 +722,8 @@ trait StmtParser
   protected lazy val continueStmt: PackratParser[Stmt] =
     op("continue") ~> opt(labelRef) ^^ (lbl => Continue(lbl))
 
-  /** `defer stmt` — what to run on the way out of this block (`03 § defer`).
+  /** `defer stmt` — what to run on the way out of this block (`reference/memory.md § Where defer
+   * sits`).
    *
    * What follows is an inline statement, so the whole form is one line: the deferred thing is a
    * release, and a release that needs a block of its own is a function worth naming. Reading it as

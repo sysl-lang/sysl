@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `for all i in r do P(i)` and `for some i in r do P(i)` — the quantifiers of `17 §2`.
+/** `for all i in r do P(i)` and `for some i in r do P(i)` — the quantifiers of
+ * `reference/verification.md § for all and for some`.
  *
  * The form is small and almost all of its design is in the edges, so the tests are weighted the same
  * way: the identities at an empty range, the short circuit, the boundary between the quantifier and

@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `@pure` — a function a caller can observe nothing about but its result (`17 §6`).
+/** `@pure` — a function a caller can observe nothing about but its result
+ * (`reference/verification.md § @pure`).
  *
  * The whole feature is a list of exclusions, so the tests are the list plus the neighbouring case for
  * each: what is banned, and the thing one step away from it that is not. The two exclusions this
@@ -63,9 +64,9 @@ class PurityTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "108\n"
     }
 
-    // `17 §6` departs from old sysl here and argues it out: a caller cannot observe an object that
-    // did not exist when the call began. A check that banned allocation would refuse this, and every
-    // string operation with it.
+    // `reference/verification.md § @pure` departs from old sysl here and argues it out: a caller
+    // cannot observe an object that did not exist when the call began. A check that banned
+    // allocation would refuse this, and every string operation with it.
     "allocate, which is the departure from old sysl" in {
       run("""@pure
             |shout(s: string) -> string = s + "!"

@@ -114,10 +114,11 @@ class SubtypeErrorTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
-  /** A constrained cast traps rather than reporting, and `16 §4` says why: a value outside the range
-   * is a bug in the code that made it, not a condition to handle. So there is no `T.try(x)` — but a
-   * simple enum has one, which makes it the first thing anyone writes here. The whole of what the
-   * name answers instead is pinned in `TypeNameMemberTests`; here is only that the absence is real.
+  /** A constrained cast traps rather than reporting, and `reference/errors.md § Where a constraint
+   * is checked` says why: a value outside the range is a bug in the code that made it, not a
+   * condition to handle. So there is no `T.try(x)` — but a simple enum has one, which makes it the
+   * first thing anyone writes here. The whole of what the name answers instead is pinned in
+   * `TypeNameMemberTests`; here is only that the absence is real.
    */
   "a subtype has no fallible cast" in {
     err("type Age = int within 0..150\nprint(Age.try(200).is_some())") should

@@ -15,7 +15,8 @@ class IntegerAttrErrorTests extends AnyFreeSpec with CodegenSupport {
   "First and Last are refused, and say what they are for" - {
     // The whole reason these are `Min`/`Max` and not `First`/`Last`: the latter name the ends of a
     // declared sequence, and on an enum with explicit discriminants the first-declared variant need
-    // not carry the smallest one. A reader arriving from `16 §5` writes `First` and is redirected.
+    // not carry the smallest one. A reader arriving from `reference/errors.md § What the type's own
+    // name offers: :: attributes` writes `First` and is redirected.
     "First points at Min" in {
       err("print(u8::First)") should include("'u8::Min'")
       err("print(u8::First)") should include("not a declared sequence")

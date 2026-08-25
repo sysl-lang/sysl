@@ -2,8 +2,9 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** What a closure *does* (`12 §5`–`§8`): the two representations, what a body captures, and the
- * cases where the answer would be the same under a weaker rule and is not.
+/** What a closure *does* (`reference/expressions.md § Closures`–`§8`): the two representations,
+ * what a body captures, and the cases where the answer would be the same under a weaker rule and is
+ * not.
  */
 class ClosureRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
@@ -276,7 +277,8 @@ class ClosureRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     /** The address is the **other** thing a bare name may have been reaching for, and where the
       * context asks for one outright the missing `&` is the whole of the mistake — so the message
-      * drops the two callable forms the reader did not want and names it (`12 §6a`).
+      * drops the two callable forms the reader did not want and names it (`reference/ffi.md § A
+      * function's address`).
       */
     "while a context that wants C's function pointer names the '&' rather than the callable forms" in {
       val e = err(

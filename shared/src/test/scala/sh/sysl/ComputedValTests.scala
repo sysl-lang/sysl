@@ -6,14 +6,16 @@ import org.scalatest.freespec.AnyFreeSpec
  *
  * `val` shipped taking a constant tree only, and the reason it stopped there was an open question
  * rather than an implementation limit: code that runs before `main` has to run in *some* order, and
- * `13 §6` gives a module's own files none at all. The answer taken here is that the order is the one
- * the initializers' own dependencies describe — a `val` is filled after everything it reads, where
- * "reads" follows through whatever its initializer calls.
+ * `reference/modules.md § The module graph is acyclic` gives a module's own files none at all. The
+ * answer taken here is that the order is the one the initializers' own dependencies describe — a
+ * `val` is filled after everything it reads, where "reads" follows through whatever its initializer
+ * calls.
  *
- * Two properties fall out of `13 §6` rather than being decided, and both are pinned below: a cycle
- * can only ever be *inside* one module, since a cross-module edge would need the module graph to
- * cycle; and a call through a method table can be followed without knowing what it lands in, because
- * every table for the trait is in the same object file.
+ * Two properties fall out of `reference/modules.md § The module graph is acyclic` rather than being
+ * decided, and both are pinned below: a cycle can only ever be *inside* one module, since a
+ * cross-module edge would need the module graph to cycle; and a call through a method table can be
+ * followed without knowing what it lands in, because every table for the trait is in the same
+ * object file.
  */
 class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
@@ -274,10 +276,11 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       ir(src) should include("@seed = private constant")
     }
 
-    // The claim `13 §6` makes this rest on: a table in one module built out of a table in another
-    // is ordered without anyone having said what order the modules run in, because the graph over
-    // the `val`s already answers it. The importing module's table is declared first here, so a walk
-    // that took the modules in the order it read them would get this wrong.
+    // The claim `reference/modules.md § The module graph is acyclic` makes this rest on: a table in
+    // one module built out of a table in another is ordered without anyone having said what order
+    // the modules run in, because the graph over the `val`s already answers it. The importing
+    // module's table is declared first here, so a walk that took the modules in the order it read
+    // them would get this wrong.
     "a table built out of another module's table is ordered across the seam" in {
       val out = runIn(
         ("", "main.sysl", "print(scaled[0], scaled[3])"),
@@ -535,9 +538,10 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       e should include("no storage")
     }
 
-    // `13 §6`'s claim, which is what makes cross-module ordering need no rule of its own: the edge a
-    // `val` reference makes is an ordinary module edge, so two modules reading each other's tables
-    // is refused as a module cycle rather than reaching the `val` sort at all.
+    // `reference/modules.md § The module graph is acyclic`'s claim, which is what makes
+    // cross-module ordering need no rule of its own: the edge a `val` reference makes is an
+    // ordinary module edge, so two modules reading each other's tables is refused as a module cycle
+    // rather than reaching the `val` sort at all.
     "two modules reading each other's tables is a module cycle" in {
       val e = errIn(
         ("", "main.sysl", "print(up.a)"),
@@ -581,10 +585,11 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
   }
 
-  /** Where `13 §7`'s constant-tree rule meets `16 §4`'s produce-site checking, and which of the two
-    * wins. A `val` at a constrained type is written as a plain number, so the constant-tree rule
-    * alone would lay it straight into the object file — and would thereby be the one produce site in
-    * the language that skipped its check, because a check is code and a global has nowhere to run it.
+  /** Where `13 §7`'s constant-tree rule meets `reference/errors.md § Where a constraint is
+    * checked`'s produce-site checking, and which of the two wins. A `val` at a constrained type is
+    * written as a plain number, so the constant-tree rule alone would lay it straight into the
+    * object file — and would thereby be the one produce site in the language that skipped its
+    * check, because a check is code and a global has nowhere to run it.
     *
     * It does not: the value goes into storage the program fills, and the check runs there. The
     * load-bearing assertions are the *out-of-range* ones. An in-range `val` reads correctly whichever

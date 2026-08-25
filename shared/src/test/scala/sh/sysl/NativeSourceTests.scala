@@ -2,8 +2,8 @@ package sh.sysl
 
 import io.github.edadma.cross_platform.*
 
-/** `15 §7` for the trees a compilation walks that are not a `build-lib`'s: the project's own, and a
- * source tree named with `--lib`.
+/** `reference/ffi.md § A library may carry C` for the trees a compilation walks that are not a
+ * `build-lib`'s: the project's own, and a source tree named with `--lib`.
  *
  * **The rule is about a source tree, not about a library.** A `.c` dropped anywhere in a tree is
  * compiled with it, and the walk that finds the sysl already visits every directory — so which tree
@@ -92,9 +92,9 @@ class NativeSourceTests extends LibraryCliSupport {
       ran(Config(command = "test", file = root)) should include("1 passed")
     }
 
-    // Naming a file compiles that file alone (`13 §1`), so there is no tree for C to have travelled
-    // with — and the link says so by naming the symbol nothing defined, rather than by quietly
-    // building something that works only when the directory was named.
+    // Naming a file compiles that file alone (`reference/modules.md`), so there is no tree for C to
+    // have travelled with — and the link says so by naming the symbol nothing defined, rather than
+    // by quietly building something that works only when the directory was named.
     "is not gathered when a single file was named rather than a tree" in {
       assume(Toolchain.clangAvailable, "clang not available")
 
@@ -107,7 +107,8 @@ class NativeSourceTests extends LibraryCliSupport {
     }
   }
 
-  /** `15 §7`: C belongs to a **module**, so a directory holding no sysl contributes none of its own.
+  /** `reference/ffi.md § A library may carry C`: C belongs to a **module**, so a directory holding
+   * no sysl contributes none of its own.
    *
    * The case this is for is not hypothetical and not a tidy-up. `cmake -B build -S .` — CMake's
    * default and what `sysl-lang/zephyr-demo` documents — puts the build directory *inside* the

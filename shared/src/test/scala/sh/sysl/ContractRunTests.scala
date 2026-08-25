@@ -158,10 +158,10 @@ class ContractRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     ) shouldBe "5\n"
   }
 
-  /** `16 §6`. A contract is a block at the **top** of the body, both kinds together — an `ensure`
-   * is written with the preconditions and checked before every return, and neither kind may come
-   * after ordinary work. A method is where the pair earns its keep, because `old` on a `*self`
-   * receiver is how a mutating method says what it changed.
+  /** `reference/errors.md § Struct invariants`. A contract is a block at the **top** of the body,
+   * both kinds together — an `ensure` is written with the preconditions and checked before every
+   * return, and neither kind may come after ordinary work. A method is where the pair earns its
+   * keep, because `old` on a `*self` receiver is how a mutating method says what it changed.
    */
   "a method carries contracts, and old reads through its receiver" - {
     val counter =

@@ -136,8 +136,9 @@ enum Linkage {
   /** Visible nowhere, and renameable — what a runtime helper and a string constant take. */
   case Private
 
-  /** Visible inside this module only. A file-private function's (`13 §2`): every caller is in the
-   * module that defines it, so nothing outside may resolve it and the linker may discard it.
+  /** Visible inside this module only. A file-private function's (`reference/modules.md §
+   * Visibility`): every caller is in the module that defines it, so nothing outside may resolve it
+   * and the linker may discard it.
    */
   case Internal
 
@@ -145,7 +146,8 @@ enum Linkage {
   case External
 
   /** Each module contributes its own and the linker concatenates them, which is what makes
-   * `@llvm.used` a list rather than a name several modules fight over (`15 §13`).
+   * `@llvm.used` a list rather than a name several modules fight over (`reference/attributes.md §
+   * @section("...")`).
    */
   case Appending
 
@@ -171,9 +173,10 @@ case class FuncSig(name: String, ty: FnType, linkage: Linkage = Linkage.Default,
                    cconv: Option[String] = None, attrs: List[(String, String)] = Nil,
                    section: Option[String] = None) {
   // `cconv` and `attrs` are the two fields here that are still LLVM's own spelling, and knowingly:
-  // both carry an interrupt handler's declaration (`15 §10`), which LLVM writes two different ways
-  // — x86-64's is a calling convention and RISC-V's a function attribute — and neither is a set the
-  // compiler closes, since a new target may bring its own. `Conventions` is where they come from.
+  // both carry an interrupt handler's declaration (`reference/ffi.md § interrupt`), which LLVM
+  // writes two different ways — x86-64's is a calling convention and RISC-V's a function attribute
+  // — and neither is a set the compiler closes, since a new target may bring its own. `Conventions`
+  // is where they come from.
 
 
   /** The `define` line, without the brace the printer adds. */

@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `val (a, b) = …` — a binding that takes a tuple apart by pattern (`00 §13`).
+/** `val (a, b) = …` — a binding that takes a tuple apart by pattern (`reference/types.md §
+ * Tuples`).
  *
  * The comma form beside it, `val a, b = …`, already took a tuple apart at one level, and the two are
  * not redundant: a list of names says how *many* things to bind and a pattern says the **shape**, so

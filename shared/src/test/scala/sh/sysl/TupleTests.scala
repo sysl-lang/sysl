@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `(a, b)` — a positional product with no name (`00 §13`).
+/** `(a, b)` — a positional product with no name (`reference/types.md § Tuples`).
  *
  * A tuple **is** a struct with its fields named for their positions, so most of what is worth
  * testing is that the reuse is real rather than approximate: the same layout, the same counting,
@@ -326,9 +326,10 @@ class TupleTests extends AnyFreeSpec with ParseSupport with RunSupport with Code
     // where it stopped is the only useful thing to say, since the fix is a struct rather than a
     // fourth implementation.
     /** There is no widest arity, and there used to be. The rows are written over a type pack
-     * (`10 §10`) and cover every tuple, so what a wide one is told is what any other type is told:
-     * which of its parts does not implement the trait. The sentence that named the ceiling and sent
-     * the reader to write a struct went with the ceiling.
+     * (`reference/generics.md § A parameter may stand for a list of types`) and cover every tuple,
+     * so what a wide one is told is what any other type is told: which of its parts does not
+     * implement the trait. The sentence that named the ceiling and sent the reader to write a
+     * struct went with the ceiling.
      */
     "and a tuple wider than three implements the catalog like any other" in {
       run("print((1, 2, 3, 4) == (1, 2, 3, 4))") shouldBe "true\n"
@@ -424,8 +425,8 @@ class TupleTests extends AnyFreeSpec with ParseSupport with RunSupport with Code
      *
      * It used to be answered by the *duplicate* check instead, because the library's row was filed
      * under this arity's shape and the lookup found it there. The row is under the pack's key now
-     * (`10 §10`), so the arity's shape holds nothing and coherence is reached first — which is the
-     * rule §13 names.
+     * (`reference/generics.md § A parameter may stand for a list of types`), so the arity's shape
+     * holds nothing and coherence is reached first — which is the rule §13 names.
      */
     "and the library's own rows may not be given a second implementation" in {
       err("""impl Eq for (int, int)

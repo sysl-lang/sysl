@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `weak T` — the reference that does not keep its referent alive (`03 § weak T`).
+/** `weak T` — the reference that does not keep its referent alive (`reference/memory.md § weak T —
+ * breaking cycles`).
  *
  * The feature is two conversions and one call. A `&T` becomes a `weak T` wherever one is asked
  * for, `get()` asks the box whether the object is still there and hands back `Option[&T]`, and
@@ -143,7 +144,7 @@ class WeakReferenceTests extends AnyFreeSpec with CodegenSupport with RunSupport
     }
 
     // `&sync` is a distinct type from `&`, so weakening one is a distinct question, and the answer
-    // is a chapter that is not built (`03 § weak sync T`).
+    // is a chapter that is not built (`reference/memory.md § Crossing a concurrency domain`).
     "and an atomic reference has no weak form yet" in {
       err(node + "var w: weak sync Node = None") should include(
         "wants the concurrency model of '06'")
@@ -458,8 +459,8 @@ class WeakReferenceTests extends AnyFreeSpec with CodegenSupport with RunSupport
         "cannot print a weak Node value — it does not implement 'sysl.Display'")
     }
 
-    // `13 §2` — a declaration may not be more visible than the types it names, and the mode in
-    // front of a name changes nothing about which names it holds.
+    // `reference/modules.md § Visibility` — a declaration may not be more visible than the types it
+    // names, and the mode in front of a name changes nothing about which names it holds.
     "a public field may not name a private type through one" in {
       err("""private struct Hidden
             |    v: int
@@ -513,7 +514,7 @@ class WeakReferenceTests extends AnyFreeSpec with CodegenSupport with RunSupport
 
     // The third word is in every box whether or not the program holds a weak reference, because
     // releasing one is type-erased and two layouts would need a word to tell them apart
-    // (`03 § What it costs`).
+    // (`reference/memory.md § What a heap object costs`).
     "every box carries the weak count, weak reference or not" in {
       ir(node + "var r: &Node = Node(1)\nprint(r.value)") should
         include("%arc.Node = type { i64, ptr, i64, %struct.Node }")

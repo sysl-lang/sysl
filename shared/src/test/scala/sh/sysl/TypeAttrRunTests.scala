@@ -53,9 +53,10 @@ class TypeAttrRunTests extends AnyFreeSpec with RunSupport {
 
   /** What the attributes are typed *as*. Every test above uses a **transparent** subtype, where the
    * subtype and its base agree and the question cannot be asked — so these use a `new` one, which
-   * is the only place the answer is observable. `16 §5` rules that all of them but `Valid` speak the
-   * subtype: a bound of `T` is a `T`, and the step from one `T` is another. `Valid` takes the base,
-   * because asking whether a value is a `T` is only a question about something that is not one yet.
+   * is the only place the answer is observable. `reference/errors.md § What the type's own name
+   * offers: :: attributes` rules that all of them but `Valid` speak the subtype: a bound of `T` is
+   * a `T`, and the step from one `T` is another. `Valid` takes the base, because asking whether a
+   * value is a `T` is only a question about something that is not one yet.
    */
   private val Slot = "type Slot = new u8 within 0..<8\nonly(s: Slot) -> int = int(s)\n"
 
@@ -87,9 +88,10 @@ class TypeAttrRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
-  // `16 §5` says `::` is what keeps these out of the member namespace. A member of the same name is
-  // the discriminating case: if the two shared a namespace one would have to win, and the chapter's
-  // claim is that the question never arises.
+  // `reference/errors.md § What the type's own name offers: :: attributes` says `::` is what keeps
+  // these out of the member namespace. A member of the same name is the discriminating case: if the
+  // two shared a namespace one would have to win, and the chapter's claim is that the question
+  // never arises.
   "an attribute is not a member, so a member of the same name does not shadow it" in {
     run(
       Age +

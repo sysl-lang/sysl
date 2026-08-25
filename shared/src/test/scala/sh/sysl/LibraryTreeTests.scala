@@ -3,7 +3,8 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
-/** The library as a **tree of modules** rather than one flat module (`13 §1`, `13 §3`).
+/** The library as a **tree of modules** rather than one flat module (`reference/modules.md`,
+ * `reference/modules.md § Imports`).
  *
  * A module is a directory, so a submodule of the standard one is a directory under `library/sysl` and
  * needs nothing new from the compiler to exist. What it does need is for the standard module's
@@ -175,8 +176,8 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
     }
 
     // `private[sysl]` names an ancestor of `sysl.sys`, so the rest of the library is inside it
-    // (`13 §2`) — which is what makes a submodule a place to put the library's own workings rather
-    // than a second public surface.
+    // (`reference/modules.md § Visibility`) — which is what makes a submodule a place to put the
+    // library's own workings rather than a second public surface.
     "and reachable from the rest of the library, which is what the modifier says" in {
       irAgainstTree(kept*)(
         "main.sysl" -> "mark(21)",
@@ -207,8 +208,9 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
       ) should include(s"call i32 @${sysKey("flag")}")
     }
 
-    // The wildcard offers only what is visible from where it was written (`13 §3`), and a submodule
-    // is where a library keeps what it does not offer — so the two meet here rather than in theory.
+    // The wildcard offers only what is visible from where it was written (`reference/modules.md §
+    // Imports`), and a submodule is where a library keeps what it does not offer — so the two meet
+    // here rather than in theory.
     //
     // "Undefined" and not the restriction, which is what an ordinary module's wildcard says too: a
     // wildcard passes over what it cannot see rather than offering it and refusing. The standard
@@ -227,10 +229,10 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
       ) should include("'sysl.sys.hold' is private to module 'sysl'")
     }
 
-    // A scope argument is one segment, resolved outward from the declaration (`13 §2`), so a
-    // submodule names itself by its own last segment — `private[sys]` inside `sysl.sys`. That makes
-    // `sysl` *outside* it: the ancestor direction does not run both ways, and a submodule can keep
-    // something from the standard module as well as the other way round.
+    // A scope argument is one segment, resolved outward from the declaration (`reference/modules.md
+    // § Visibility`), so a submodule names itself by its own last segment — `private[sys]` inside
+    // `sysl.sys`. That makes `sysl` *outside* it: the ancestor direction does not run both ways,
+    // and a submodule can keep something from the standard module as well as the other way round.
     "a submodule may keep something from the standard module too" in {
       errAgainstTree(
         ("sysl", "std.sysl", "module sysl\nmark(n: int) -> int = sysl.sys.hold(n)"),
@@ -348,7 +350,8 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
       e should include("undefined function 'cstring'")
     }
 
-    // One import reaches a whole file of them, `sysl.text` being two files and one module (`13 §1`).
+    // One import reaches a whole file of them, `sysl.text` being two files and one module
+    // (`reference/modules.md`).
     "which one import over the module reaches, however many files declared them" in {
       irOf(
         "main.sysl" -> "import sysl.text.*\n\nvar b = str_builder()\nb.push(\"x\")\nprint(b.finish(), cstring(\"y\").len)",
@@ -419,10 +422,10 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
       ) should include(s"@${Library.key("from_utf8")}({ ptr, ptr, i64 }")
     }
 
-    // Two wildcards over two of the library's own modules. `13 §3` makes a name offered by two
-    // wildcards ambiguous, so this passing is the claim that the library's spellings do not
-    // collide across its modules — which `LibraryTests` holds them to, and this is that held at
-    // the seam a program actually writes.
+    // Two wildcards over two of the library's own modules. `reference/modules.md § Imports` makes a
+    // name offered by two wildcards ambiguous, so this passing is the claim that the library's
+    // spellings do not collide across its modules — which `LibraryTests` holds them to, and this is
+    // that held at the seam a program actually writes.
     "two wildcards over two of them offer no name twice" in {
       irOf(
         "main.sysl" -> "import sysl.buf.*\nimport sysl.text.*\n\nvar b = str_builder()\nb.push(\"x\")\nprint(b.finish(), byte_sink().text().len)",

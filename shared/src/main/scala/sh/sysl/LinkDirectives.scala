@@ -1,6 +1,7 @@
 package sh.sysl
 
-/** `link "z"` — what a module of `extern`s tells the driver its symbols are resolved by (`15 §8`).
+/** `link "z"` — what a module of `extern`s tells the driver its symbols are resolved by
+ * (`reference/ffi.md § @link`).
  *
  * **The directive names a library, and the flag is the target's business.** `link "m"` says the file
  * needs the mathematics; whether that is `-lm`, or nothing because the host already links what holds
@@ -9,13 +10,13 @@ package sh.sysl
  * everything else, and the file that wrote it could not be told so by any compiler on the machine
  * that wrote it.
  *
- * **A requirement is a property of the file, not of the module.** That is the one place this differs
- * from the capability clause it is otherwise shaped like: `13 §4` holds the files of a module to
- * declaring the *same* capabilities, because a capability describes what the whole module may do and
- * files that disagreed would describe different modules. A link requirement describes what one
- * file's `extern`s need, and a module whose externs all sit in one file has nothing for the other
- * four to repeat. So the module's requirement is the union of its files', and no agreement is asked
- * for.
+ * **A requirement is a property of the file, not of the module.** That is the one place this
+ * differs from the capability clause it is otherwise shaped like: `reference/modules.md §
+ * Capabilities are a module property` holds the files of a module to declaring the *same*
+ * capabilities, because a capability describes what the whole module may do and files that
+ * disagreed would describe different modules. A link requirement describes what one file's
+ * `extern`s need, and a module whose externs all sit in one file has nothing for the other four to
+ * repeat. So the module's requirement is the union of its files', and no agreement is asked for.
  *
  * **Nothing is pruned.** Every unit of the compilation contributes, whether or not the program
  * reaches it — so a Linux program is handed `-lm` because `sysl.math` is in the standard module it

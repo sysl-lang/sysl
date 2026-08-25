@@ -45,17 +45,17 @@ trait HoistImpl extends ImplTarget {
     val (bound, written) = implBound(impl, tr)
     val outer            = target.copy(outer = tr.tparams.zip(bound.args).toMap)
 
-    // A built-in's memberships come from the compiler (`14 §5`), so an `impl` for one is not adding
-    // a capability but competing with the one that is already there — and the operator would keep
-    // lowering to its native instruction whatever this block said. What the block *wrote* is what
-    // decides: a catalog trait's arguments default to the implementing type, so an `impl Mul for
-    // int` that wrote none of them is the one the compiler already provides, while one that wrote
-    // an argument is asking for something else entirely.
-    // **The one type reaching this that a program declared is a simple enum**, whose `Eq` the
-    // compiler supplies for the reason it supplies the open integer family's: the value *is* its
-    // discriminant, so there is one thing equality could mean. The rule is the same and the reader
-    // is different — somebody who wrote the enum four lines up is owed why their own type is on the
-    // compiler's side of this line, not only that it is.
+    // A built-in's memberships come from the compiler (`reference/expressions.md § Operator
+    // dispatch`), so an `impl` for one is not adding a capability but competing with the one that
+    // is already there — and the operator would keep lowering to its native instruction whatever
+    // this block said. What the block *wrote* is what decides: a catalog trait's arguments default
+    // to the implementing type, so an `impl Mul for int` that wrote none of them is the one the
+    // compiler already provides, while one that wrote an argument is asking for something else
+    // entirely. **The one type reaching this that a program declared is a simple enum**, whose `Eq`
+    // the compiler supplies for the reason it supplies the open integer family's: the value *is*
+    // its discriminant, so there is one thing equality could mean. The rule is the same and the
+    // reader is different — somebody who wrote the enum four lines up is owed why their own type is
+    // on the compiler's side of this line, not only that it is.
     if written.isEmpty && Library.spelling(impl.traitName).exists(CoreTraits.builtin(_, ty)) then
       val because = ty match
         case e: Type.Enum if e.simple =>
@@ -125,20 +125,23 @@ trait HoistImpl extends ImplTarget {
     // list above cannot see it: a blanket is filed under its bound's key rather than under any type's,
     // which is what lets one block stand for a whole family.
     //
-    // The case is a derived subtype of a built-in — `type Stamp = new int` is the program's own type,
-    // so coherence gives an `impl` here a home, and `16 §3` gives it its base's memberships, so the
-    // library's blanket covers it too. Two blocks would then cover one type with nothing to pick
-    // between them, and the one that answered would be whichever key the lookup tried first.
+    // The case is a derived subtype of a built-in — `type Stamp = new int` is the program's own
+    // type, so coherence gives an `impl` here a home, and `reference/errors.md § A derivation
+    // inherits its base's behaviour and may replace none of it` gives it its base's memberships, so
+    // the library's blanket covers it too. Two blocks would then cover one type with nothing to
+    // pick between them, and the one that answered would be whichever key the lookup tried first.
     for
       (key, targs) <- blanketOwners(ty)
       _            <- implAt(bound, key, ty, targs)
       if !impl.overrides
     do
       // The subtype half is said only where there is one, and it says "subtype" rather than
-      // "derived" because both kinds reach here: a transparent one *is* its base (`16 §1`) and a
-      // derived one has the base's catalogue (`16 §3`), so either way the block covering it was
-      // written for a type the reader did not name. On a built-in written out in full there is no
-      // such type, and the clause would be a sentence about something that is not there.
+      // "derived" because both kinds reach here: a transparent one *is* its base
+      // (`reference/errors.md § Constrained types`) and a derived one has the base's catalogue
+      // (`reference/errors.md § A derivation inherits its base's behaviour and may replace none of
+      // it`), so either way the block covering it was written for a type the reader did not name.
+      // On a built-in written out in full there is no such type, and the clause would be a sentence
+      // about something that is not there.
       val inherited =
         if Type.underlying(ty) == ty then ""
         else ", and a subtype has its base's memberships"
@@ -147,10 +150,10 @@ trait HoistImpl extends ImplTarget {
         s"${everyShape(key)} does, through one block written over the family$inherited")
 
     // **A result is not a selector.** An operator trait's last argument is what the operator gives
-    // back (`14 §7`), and `a * b` supplies the operands and nothing else — so two implementations that
-    // agree on the operands and differ only in the result leave a use with nothing to choose by.
-    // Refused here rather than at the use, because the use is where it would be too late to say which
-    // of the two the program meant.
+    // back (`library/core.md § Walking a type of your own`), and `a * b` supplies the operands and
+    // nothing else — so two implementations that agree on the operands and differ only in the
+    // result leave a use with nothing to choose by. Refused here rather than at the use, because
+    // the use is where it would be too late to say which of the two the program meant.
     val catalog = Library.spelling(impl.traitName).filter(CoreTraits.required.contains)
 
     if catalog.exists(CoreTraits.selectsByOperand) && bound.args.length > 1 then
@@ -237,11 +240,12 @@ trait HoistImpl extends ImplTarget {
     // different traits.
     //
     // A **different trait** holding one of these names takes a suffix too, rather than the refusal
-    // it used to take. A trait's member is reachable only where the trait can be named (`13 §2`), so
-    // two traits declaring one name for a type are two members a use site tells apart — which is
-    // what lets a program declare its own `Zero` for a float width the library has already given a
-    // `zero`. A name held by the type's **own** body is a real collision and is reported per member,
-    // so the search stops at one rather than stepping over it.
+    // it used to take. A trait's member is reachable only where the trait can be named
+    // (`reference/modules.md § Visibility`), so two traits declaring one name for a type are two
+    // members a use site tells apart — which is what lets a program declare its own `Zero` for a
+    // float width the library has already given a `zero`. A name held by the type's **own** body is
+    // a real collision and is reported per member, so the search stops at one rather than stepping
+    // over it.
     //
     // A **call** trait's member is the other thing that has no scope to be told apart by, and for
     // the same reason an inherent member has none: `t(1)` reaches it through the call syntax, which
@@ -360,16 +364,18 @@ trait HoistImpl extends ImplTarget {
     //
     // Conformance is checked with the block's parameters standing in for themselves, which resolves
     // a signature mentioning one — and `Self`, which for a generic `impl` is the type applied to
-    // them. Those instantiations are diagnostic only, so the walk is sandboxed the way `14 §4`'s is.
+    // them. Those instantiations are diagnostic only, so the walk is sandboxed the way
+    // `reference/generics.md § Bounds`'s is.
     val inherited = sandboxed(checkConformance(tr, impl, home, signatures(home)))
 
     for m <- inherited do
       defaultOrigin(s"${home.symbol}.${m.name}${home.alt}") = s"${impl.traitName}.${m.name}"
 
-    // The trait's defaults travel onto the block's own methods, so that a call to a known type fills
-    // them from the same place a call through an object does (`12 §2a`). Doing it here rather than
-    // at the call is what keeps every downstream path — the concrete call, the vtable slot, the
-    // generic body checked against a bound — from having to know a member came from an `impl`.
+    // The trait's defaults travel onto the block's own methods, so that a call to a known type
+    // fills them from the same place a call through an object does (`reference/declarations.md §
+    // Default parameters and named arguments`). Doing it here rather than at the call is what keeps
+    // every downstream path — the concrete call, the vtable slot, the generic body checked against
+    // a bound — from having to know a member came from an `impl`.
     val supplied = impl.methods.map(withTraitDefaults(tr, _))
     val lowered  = hoistMemberList(home, supplied ::: inherited, out)
 

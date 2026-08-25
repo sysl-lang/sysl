@@ -4,10 +4,11 @@ import org.scalatest.freespec.AnyFreeSpec
 
 /** What a file's top level means, which depends on where the file sits (`13 §7`).
  *
- * A file carrying statements is the one the program starts in, and its top level is a **body**: what
- * it declares is local to that body, so a `val` there is a stack local initialized where it stands
- * and a function there is a nested function (`12 §5a`) capturing the locals above it. A file carrying
- * no statements declares module members, as does one with a `module` header.
+ * A file carrying statements is the one the program starts in, and its top level is a **body**:
+ * what it declares is local to that body, so a `val` there is a stack local initialized where it
+ * stands and a function there is a nested function (`reference/declarations.md`) capturing the
+ * locals above it. A file carrying no statements declares module members, as does one with a
+ * `module` header.
  *
  * `static` is how a declaration in the body opts back into the module — the escape hatch for the
  * three things a nested function cannot be and the one thing a local cannot be.
@@ -47,7 +48,8 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
 
     // The cost of being a nested function, and it is worth stating rather than discovering: a
     // group's environment is formed where the first of them is written, so a call above that point
-    // has no environment to make (`12 §5a`). It is paid only by a helper that has an environment.
+    // has no environment to make (`reference/declarations.md`). It is paid only by a helper that
+    // has an environment.
     "but one that reads a binding may not, since its environment is formed where it is" in {
       err(
         """print(str(later()))
@@ -78,9 +80,10 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
     }
   }
 
-  /** A function written at the top of the entry file is a nested function, so `12 §5a` applies to it
-    * whole — including the half that is the reason anybody wants this: it may read and write the
-    * bindings above it, because the environment holds their addresses rather than copies.
+  /** A function written at the top of the entry file is a nested function, so
+    * `reference/declarations.md` applies to it whole — including the half that is the reason
+    * anybody wants this: it may read and write the bindings above it, because the environment holds
+    * their addresses rather than copies.
     */
   "a function declared there is a nested function" - {
     "so it reads the bindings above it, with nothing passed in" in {
@@ -117,8 +120,8 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
             |print(str(count))""".stripMargin) shouldBe "2\n"
     }
 
-    // Names hoist, captures do not (`12 §5a`). Two helpers may call each other whichever order they
-    // are written in, which is what makes the group a group.
+    // Names hoist, captures do not (`reference/declarations.md`). Two helpers may call each other
+    // whichever order they are written in, which is what makes the group a group.
     "while two of them call each other, whichever order they are written in" in {
       run(
         """even(n: int) -> bool = if n == 0 then true else odd(n - 1)
@@ -140,11 +143,11 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
     }
   }
 
-  /** `12 §5a`'s three limits — no generic, no address, not a value — are what holding a frame costs,
-    * not what being written in the entry file costs. So a helper reading nothing keeps all three, and
-    * only one that reads a binding pays them. A comparison handed to `qsort` is the shape that makes
-    * this matter: it reads nothing, and refusing its address for the frame it reads would be naming a
-    * frame that does not exist.
+  /** `reference/declarations.md`'s three limits — no generic, no address, not a value — are what
+    * holding a frame costs, not what being written in the entry file costs. So a helper reading
+    * nothing keeps all three, and only one that reads a binding pays them. A comparison handed to
+    * `qsort` is the shape that makes this matter: it reads nothing, and refusing its address for
+    * the frame it reads would be naming a frame that does not exist.
     */
   "what a helper may be depends on whether it reads anything, not on where it is written" - {
     "so a generic one is ordinary" in {
@@ -187,10 +190,10 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
     }
 
     // Capture reaches through a sibling call: the nested functions of a block share one environment
-    // (`12 §5a`), so calling one that reads a binding needs that environment too.
-    // `main` is the platform's symbol, not a name the program calls, so it can never be one of the
-    // body's — and a `main` reading a binding used to become one silently, leaving the program with
-    // no entry point at all and no complaint about it.
+    // (`reference/declarations.md`), so calling one that reads a binding needs that environment
+    // too. `main` is the platform's symbol, not a name the program calls, so it can never be one of
+    // the body's — and a `main` reading a binding used to become one silently, leaving the program
+    // with no entry point at all and no complaint about it.
     "while 'main' is never one of them, however it is written" in {
       err(
         """var count = 0

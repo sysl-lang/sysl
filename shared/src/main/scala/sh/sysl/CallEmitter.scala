@@ -47,8 +47,9 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    * once, in memory, instead of as a multi-kilobyte value crossing the call.
    *
    * The value is kept beside its type rather than formatted straight away because a self-call needs
-   * the values themselves: `17 §4`'s measure is evaluated over the arguments, and reaching them by
-   * evaluating the arguments a second time would run whatever they do twice.
+   * the values themselves: `reference/verification.md § variant on a function`'s measure is
+   * evaluated over the arguments, and reaching them by evaluating the arguments a second time would
+   * run whatever they do twice.
    */
   protected def argValue(a: TExpr): Option[(Type, Either[ir.Val, ir.Val])] =
     if layout.indirect(a.ty) then Some((a.ty, Left(address(a))))
@@ -99,8 +100,8 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
 
     // The measure is checked while the frame is still whole, since it reads the parameters and the
     // jump below is about to overwrite them. A tail call survives this where an `ensure` does not
-    // (`16 §7`): the check happens *before* the call, and a tail call's problem is that it never
-    // returns.
+    // (`reference/errors.md § Contracts on a function`): the check happens *before* the call, and a
+    // tail call's problem is that it never returns.
     if checksVariant(selfName) then
       genVariantAtCall(tailParams.zip(staged).map {
         case ((_, ty), Some(Left(slot))) => Some((ty, Left(slot)))
@@ -195,7 +196,8 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
   protected def symbolOf(name: String): String = symbols.getOrElse(name, name)
 
   /** The symbol an **address** of this function names — the one entry point that is callable under
-   * the machine's C convention, since that is the only thing a `*extern` may hold (`12 §6a`).
+   * the machine's C convention, since that is the only thing a `*extern` may hold
+   * (`reference/ffi.md § A function's address`).
    *
    * For an ordinary sysl function the two are the same and this is `symbolOf`: its signature is all
    * scalars, or the address would have been refused (`FuncAddress`), and a scalar crosses as itself.

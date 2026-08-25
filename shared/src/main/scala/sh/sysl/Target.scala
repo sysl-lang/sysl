@@ -180,7 +180,7 @@ case class Target(
    * **It is the operating system's answer and not the whole machine's**, which is why the work is
    * `Os`'s. A directory selects on what the walk that finds it knows, and that is an `Os` — so a
    * selector naming `posix` has to be answerable without a processor, and this is where that is
-   * settled for both askers at once (`13 §5`).
+   * settled for both askers at once (`reference/modules.md § Platform selection`).
    */
   def inherentCapabilities: Set[String] = os.inherentCapabilities
 
@@ -396,7 +396,8 @@ enum Os {
       Option.when(this == Os.MacOS || this == Os.Linux || this == Os.Android)(Capability.Posix)
 }
 
-/** What a call hands a C function whose parameter is a `va_list` (`12 §9`).
+/** What a call hands a C function whose parameter is a `va_list` (`reference/ffi.md § Variadic
+ * functions`).
  *
  * C's `va_list` is a different type on every target and is passed differently on each, so the one
  * thing sysl has — the address of the walk's storage — reaches a foreign callee three ways. Each

@@ -4,7 +4,8 @@ import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
 /** Compiling a program **against a library**, with the library crossing as an `AstCodec` artifact
- * and its names arriving by auto-import (`13 §3`, `13 § Open d`, `13 § Open h`).
+ * and its names arriving by auto-import (`reference/modules.md § Imports`, `13 § Open d`, `13 §
+ * Open h`).
  *
  * **This exists to prove the pieces on a library nothing depends on.** It was written before the
  * standard module relied on any of them: a mistake in the artifact, the linking or the auto-import
@@ -200,8 +201,9 @@ class DevLibraryTests extends AnyFreeSpec with Matchers with RunSupport {
   "the auto-import loses to anything more specific" - {
 
     "a declaration the program makes itself" in {
-      // `13 §3`: a local declaration beats a wildcard, so a program may name its own `Pair` without
-      // the library's becoming unreachable — it is still there under its full path.
+      // `reference/modules.md § Imports`: a local declaration beats a wildcard, so a program may
+      // name its own `Pair` without the library's becoming unreachable — it is still there under
+      // its full path.
       ran(
         """struct Pair
           |    n: int

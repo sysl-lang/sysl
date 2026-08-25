@@ -46,9 +46,9 @@ class AnalyzerDeclErrorTests extends AnyFreeSpec with CodegenSupport {
       err(src) should include("no variant 'Square'")
     }
 
-    // Two enums sharing a variant name is legal as of `09 §3`'s namespacing rule — what is refused
-    // is a *use* of the shared name with nothing to say which was meant. `VariantNamespaceTests`
-    // covers the rest of it.
+    // Two enums sharing a variant name is legal as of `reference/types.md § Enums`'s namespacing
+    // rule — what is refused is a *use* of the shared name with nothing to say which was meant.
+    // `VariantNamespaceTests` covers the rest of it.
     "a variant name shared by two enums is ambiguous where nothing settles it" in {
       err("enum A\n    X\n    Y\nenum B\n    X\n    Z\nvar v = X\nprint(1)") should
         include("'X' is a variant of 'A' and 'B'")
@@ -103,9 +103,10 @@ class AnalyzerDeclErrorTests extends AnyFreeSpec with CodegenSupport {
     // The same question the other way round is `StructRunTests`' "a struct whose children are a
     // growable sequence of itself", which is a run test because compiling it is only half the claim.
 
-    // `09 §3` says the same of a variant, and it has to be caught *here* rather than at layout: the
-    // model that sizes a data enum's payload region walks its variants, so a type that reached
-    // itself would be an unbounded walk in the compiler instead of a diagnostic.
+    // `reference/types.md § Enums` says the same of a variant, and it has to be caught *here*
+    // rather than at layout: the model that sizes a data enum's payload region walks its variants,
+    // so a type that reached itself would be an unbounded walk in the compiler instead of a
+    // diagnostic.
     "nor does a variant that holds its own enum" in {
       err("""enum List
             |    Cons(head: int, tail: List)

@@ -32,8 +32,9 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
         "cannot make a string of a Q value — write an 'impl sysl.Display for Q'")
     }
 
-    // A pointer is deliberately not `Display` (`14 §5`): an address renders differently on every
-    // run. There is no `impl` to suggest either, since a composed type cannot carry one yet.
+    // A pointer is deliberately not `Display` (`reference/expressions.md § Operator dispatch`): an
+    // address renders differently on every run. There is no `impl` to suggest either, since a
+    // composed type cannot carry one yet.
     "offers no impl for a type that could not carry one" in {
       err("var n = 1\nprint(&n)") should include("cannot print a *int value — it does not implement 'sysl.Display'")
     }
@@ -45,8 +46,9 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
             |print(p)""".stripMargin) should include("cannot print a &P value")
     }
 
-    // An array renders at every length, through one library block over `[N]T` (`10 §9`) — so what
-    // it refuses is an array whose *element* does not render, and it says which element.
+    // An array renders at every length, through one library block over `[N]T`
+    // (`reference/generics.md § A parameter may stand for a value`) — so what it refuses is an
+    // array whose *element* does not render, and it says which element.
     "refuses an array only when its element does not render" in {
       err("""struct P
             |    v: int
@@ -68,8 +70,9 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
   }
 
   "a type parameter" - {
-    // The whole payoff of `14 §4`: the complaint lands on the definition, naming the bound that
-    // would license it, whether or not anything ever instantiates the function.
+    // The whole payoff of `reference/generics.md § Bounds`: the complaint lands on the definition,
+    // naming the bound that would license it, whether or not anything ever instantiates the
+    // function.
     "is told which bound would let it be printed" in {
       err("f[T](x: T) = print(x)\nf(1)") should include(s"'print' needs 'T: ${lib("Display")}'")
     }
@@ -127,7 +130,8 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
     }
 
     // **The one type that can reach a blanket and still have a home of its own.** A derived subtype
-    // is the program's, so coherence lets an `impl` be written here; `16 §3` gives it the base's
+    // is the program's, so coherence lets an `impl` be written here; `reference/errors.md § A
+    // derivation inherits its base's behaviour and may replace none of it` gives it the base's
     // memberships, so the library's blanket covers it as well. Two blocks would then cover one type
     // and the answer would be whichever key the lookup happened to try first.
     //
@@ -144,8 +148,10 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
       e should include("a subtype has its base's memberships")
     }
 
-    // A transparent subtype reaches the same refusal, and the message is the same one: `16 §1` makes
-    // it its base and `16 §3` gives a derived one the base's catalogue, so the blanket covers both.
+    // A transparent subtype reaches the same refusal, and the message is the same one:
+    // `reference/errors.md § Constrained types` makes it its base and `reference/errors.md § A
+    // derivation inherits its base's behaviour and may replace none of it` gives a derived one the
+    // base's catalogue, so the blanket covers both.
     "nor for a transparent one, which is its base" in {
       val e = err("""type Count = int within 0..100
                     |impl Display for Count

@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** A bound on a **type's own** type parameters (`10 §5`).
+/** A bound on a **type's own** type parameters (`reference/generics.md § Bounds`).
  *
  * `struct SortedList[T: Ord]` is the same list a generic function writes, in the same place, meaning
  * the same thing: it is what the declaration assumes of the parameter, and what every application of
@@ -84,8 +84,8 @@ class TypeBoundsRunTests extends AnyFreeSpec with RunSupport {
       ) shouldBe "p2\n"
     }
 
-    // `Display` is the bound the rendering surface asks for (`14 §6`), so a type whose element it
-    // bounds may print one.
+    // `Display` is the bound the rendering surface asks for (`library/core.md § Rendering to a
+    // sink`), so a type whose element it bounds may print one.
     "licenses rendering the element" in {
       run(
         """struct Wrap[T: Display]
@@ -176,8 +176,8 @@ class TypeBoundsRunTests extends AnyFreeSpec with RunSupport {
 
   "an unbounded parameter is unchanged" - {
 
-    // Holding and handing along any `T` is the free baseline (`10 §5`), so the type that asks
-    // nothing is exactly the type that could be written before bounds existed.
+    // Holding and handing along any `T` is the free baseline (`reference/generics.md § Bounds`), so
+    // the type that asks nothing is exactly the type that could be written before bounds existed.
     "so a container that only moves values around needs no bound" in {
       run(
         """struct Box[T]

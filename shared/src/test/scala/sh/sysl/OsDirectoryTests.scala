@@ -2,7 +2,8 @@ package sh.sysl
 
 import io.github.edadma.cross_platform.*
 
-/** `13 §5`: a directory named `__<os>__` selects source for an operating system and names nothing.
+/** `reference/modules.md § Platform selection`: a directory named `__<os>__` selects source for an
+ * operating system and names nothing.
  *
  * **Every test here is written against the machine it runs on**, which is what lets one suite cover
  * a mechanism whose whole subject is that two machines see different files: the folder for
@@ -95,9 +96,9 @@ class OsDirectoryTests extends LibraryCliSupport {
       ran(Config(command = "run", file = root)) shouldBe "selected\n"
     }
 
-    // The claim `13 §5` makes and the one that costs something: an unselected tree is not compiled,
-    // not analyzed and not *parsed*. Source that could never lex proves the last of those, which
-    // nothing about a duplicate definition can.
+    // The claim `reference/modules.md § Platform selection` makes and the one that costs something:
+    // an unselected tree is not compiled, not analyzed and not *parsed*. Source that could never
+    // lex proves the last of those, which nothing about a duplicate definition can.
     "is not parsed at all when it is not the one selected" in {
       val root = projectOf(
         "main.sysl"               -> "print(demo.tag())\n",
@@ -109,9 +110,9 @@ class OsDirectoryTests extends LibraryCliSupport {
     }
   }
 
-  /** The case the whole mechanism exists for (`15 §7`): a `.c` cannot carry a sysl attribute, so the
-   * path is the only place a selector could go — and a shim written against one system's header must
-   * not reach the other's compiler.
+  /** The case the whole mechanism exists for (`reference/ffi.md § A library may carry C`): a `.c`
+   * cannot carry a sysl attribute, so the path is the only place a selector could go — and a shim
+   * written against one system's header must not reach the other's compiler.
    */
   "the C under a per-OS directory" - {
 
@@ -135,8 +136,9 @@ class OsDirectoryTests extends LibraryCliSupport {
       ran(Config(command = "run", file = root)) shouldBe "42\n"
     }
 
-    // `15 §7`'s rule is that C belongs to a **module**, and a folder is not one — so the module it
-    // belongs to is the directory holding the folder, exactly as the sysl inside one does.
+    // `reference/ffi.md § A library may carry C`'s rule is that C belongs to a **module**, and a
+    // folder is not one — so the module it belongs to is the directory holding the folder, exactly
+    // as the sysl inside one does.
     "belongs to the module holding the folder, not to the folder" in {
       assume(Toolchain.clangAvailable, "clang not available")
 
@@ -156,9 +158,10 @@ class OsDirectoryTests extends LibraryCliSupport {
       ran(Config(command = "run", file = root)) shouldBe "42\n"
     }
 
-    // `15 §7`'s root exemption meets the folder. The root is the tree rather than a directory in it,
-    // so its C is taken whether or not it holds sysl — and a folder at the root has to inherit that,
-    // or a package namespaced by reverse DNS could not put a per-OS shim where its other C goes.
+    // `reference/ffi.md § A library may carry C`'s root exemption meets the folder. The root is the
+    // tree rather than a directory in it, so its C is taken whether or not it holds sysl — and a
+    // folder at the root has to inherit that, or a package namespaced by reverse DNS could not put
+    // a per-OS shim where its other C goes.
     "is taken at the tree's own root, where no module is declared" in {
       assume(Toolchain.clangAvailable, "clang not available")
 
@@ -178,10 +181,11 @@ class OsDirectoryTests extends LibraryCliSupport {
     }
   }
 
-  /** `13 §4`: a capability is a property of the **module**, so every file of one states it. A file
-   * inside a folder is a file of the module holding the folder, so the clause reaches in there too —
-   * which is a consequence of §5 rather than a rule of its own, and is exactly what
-   * `library/sysl/fs/tests.sysl` tripped over on the way to being written.
+  /** `reference/modules.md § Capabilities are a module property`: a capability is a property of the
+   * **module**, so every file of one states it. A file inside a folder is a file of the module
+   * holding the folder, so the clause reaches in there too — which is a consequence of §5 rather
+   * than a rule of its own, and is exactly what `library/sysl/fs/tests.sysl` tripped over on the
+   * way to being written.
    */
   "a capability clause" - {
 
@@ -359,12 +363,13 @@ class OsDirectoryTests extends LibraryCliSupport {
         List("hosted.c", "posix.c")
     }
 
-    // **`13 § 5`'s claim, now that there is a third POSIX system to test it with.** The chapter says
-    // to prefer the name that says why over the list that says which, and predicts exactly this: a
-    // `__posix__` folder covers a new POSIX machine untouched while a `__macos,linux__` folder
-    // silently does not. Both halves are asserted, because the failure is an **absence** — a folder
-    // that selects nothing is not an error, so the list form would have produced a module missing its
-    // shim with no diagnostic anywhere, surfacing much later as a function that is not there.
+    // **`reference/modules.md § Platform selection`'s claim, now that there is a third POSIX system
+    // to test it with.** The chapter says to prefer the name that says why over the list that says
+    // which, and predicts exactly this: a `__posix__` folder covers a new POSIX machine untouched
+    // while a `__macos,linux__` folder silently does not. Both halves are asserted, because the
+    // failure is an **absence** — a folder that selects nothing is not an error, so the list form
+    // would have produced a module missing its shim with no diagnostic anywhere, surfacing much
+    // later as a function that is not there.
     //
     // The library follows its own advice: all three of its selector directories are `__posix__`, so
     // adding this machine to the registry cost them nothing.

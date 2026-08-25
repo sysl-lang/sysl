@@ -2,10 +2,10 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Integer widths above 64 bits. `00 §5` states that `iN` / `uN` is an open family over any
- * positive width and names `i128` among its examples, on the grounds that a width is "a capability
- * of the target, not something sysl emulates" — so the semantics here are not new rules, they are
- * the existing ones at a width that needs two registers.
+/** Integer widths above 64 bits. `reference/types.md § Integers are an open family` states that
+ * `iN` / `uN` is an open family over any positive width and names `i128` among its examples, on the
+ * grounds that a width is "a capability of the target, not something sysl emulates" — so the
+ * semantics here are not new rules, they are the existing ones at a width that needs two registers.
  *
  * The load-bearing tests are the ones whose value does not fit in 64 bits. A width that merely
  * *parses* proves nothing: every operation on the way to the screen used to narrow to 64 bits, so a
@@ -14,7 +14,8 @@ import org.scalatest.freespec.AnyFreeSpec
 class WideIntegerTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
   "a width above 64 is a type" - {
-    "the width `00 §5` names as its example resolves" in {
+    // `reference/types.md § Integers are an open family`
+    "the width the reference names as its example resolves" in {
       run("var x: i128 = 1\nprint(x)") shouldBe "1\n"
     }
 
@@ -455,11 +456,11 @@ class WideIntegerTests extends AnyFreeSpec with CodegenSupport with RunSupport {
    * program to decline — and asking whether it fits *before* narrowing costs one comparison and
    * keeps every word of the value while the question is asked.
    *
-   * `07 § Indexing` had said so all along: the index may be any integer type, because requiring
-   * `usize` would make `for i in 0..<10 do a[i] …` need a conversion for no benefit. On a 64-bit
-   * machine the only index that reached the refusal was a `u128`, so it cost nothing and nobody
-   * noticed; on a 16-bit one an `int` is wider than an address, and the standard library stopped
-   * compiling in twelve places.
+   * `reference/arrays.md § Indexing` had said so all along: the index may be any integer type,
+   * because requiring `usize` would make `for i in 0..<10 do a[i] …` need a conversion for no
+   * benefit. On a 64-bit machine the only index that reached the refusal was a `u128`, so it cost
+   * nothing and nobody noticed; on a 16-bit one an `int` is wider than an address, and the standard
+   * library stopped compiling in twelve places.
    */
   "a width past 64 bits is an index like any other" - {
     "reading an element with one lands where it says" in {

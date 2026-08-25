@@ -4,7 +4,7 @@ import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
 /** `opaque struct` — a type whose **layout** is withheld from every module but the one declaring it
- * (`15 §9`).
+ * (`reference/ffi.md § opaque`).
  *
  * Two things want it and they meet in the middle. A sysl library stabilizing its own surface wants
  * to add and reorder fields without anything downstream noticing; a binding to a C library wants

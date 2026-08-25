@@ -5,9 +5,9 @@ import org.scalatest.freespec.AnyFreeSpec
 /** What a call into `sysl.seq` costs, pinned where it can be read: in the emitted code.
  *
  * The trait's members take their callable by **bare arrow**, which is a bounded type parameter
- * (`12 §6`) — so a closure handed to one is a type argument, monomorphized into a copy of the member
- * and called directly. Nothing is boxed, and the seven members that build no sequence therefore
- * reach the allocator not at all.
+ * (`reference/types.md § Function types`) — so a closure handed to one is a type argument,
+ * monomorphized into a copy of the member and called directly. Nothing is boxed, and the seven
+ * members that build no sequence therefore reach the allocator not at all.
  *
  * **This suite exists to keep that honest**, and it has already earned its place twice. The module's
  * prose first claimed there was no allocation when every call boxed its closure; it then claimed two

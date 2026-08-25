@@ -35,10 +35,10 @@ trait TraitObjects extends TypeResolution {
       // object asks what may be *assembled* from the value's type, and an object has no
       // implementations to assemble from.
       //
-      // It is the upcast that flattening gives up (`02 § A trait may require another trait`), stated
-      // where someone meets it: `Named`'s members really are slots in a `&Greet`'s table, laid out
-      // there so that a required trait's method stays one indirect call — but a run of slots inside
-      // another table is not a table anything can point at.
+      // It is the upcast that flattening gives up (`reference/traits.md § A trait may require
+      // another trait`), stated where someone meets it: `Named`'s members really are slots in a
+      // `&Greet`'s table, laid out there so that a required trait's method stays one indirect call
+      // — but a run of slots inside another table is not a table anything can point at.
       case (_, from) if Type.erasedTrait(from).exists(_.bound.key != tr.bound.key) =>
         at(t.pos)(err(s"a ${show(from)} has forgotten which type it holds, so there is nothing for a " +
           s"${show(want)} to be built from — '${tr.bound.show}' is reachable *through* the value, and " +
@@ -133,9 +133,9 @@ trait TraitObjects extends TypeResolution {
    *
    * A trait that **requires** another carries the required trait's slots too, rather than a pointer
    * to a table of its own. That keeps a required trait's method the single indirect call the
-   * trait's own methods are, which is what makes a supertrait worth having on an object at all; what
-   * it gives up is an upcast from a `&Sub` to a `&Super`, since the slots are there but no word
-   * names them as a table (`02 § A trait may require another trait`).
+   * trait's own methods are, which is what makes a supertrait worth having on an object at all;
+   * what it gives up is an upcast from a `&Sub` to a `&Super`, since the slots are there but no
+   * word names them as a table (`reference/traits.md § A trait may require another trait`).
    */
   private def vtableFor(tr: Type.Trait, ty: Type, boxed: Boolean): String = {
     // The **member** prefix rather than the plain mangling, for the reason the members themselves
@@ -147,10 +147,10 @@ trait TraitObjects extends TypeResolution {
       val slots = slottedMembers(tr.bound, selfBinding(ty)).map { (from, m) =>
         // The trait's own membership was checked before this was reached; a **required** one is
         // checked here, where the table is being built, and the two ways it can fail want different
-        // things said. A built-in satisfies by the compiler's rule (`14 §5`) and has no function to
-        // name, because its operator is an instruction. Anything else simply has no implementation,
-        // which the `impl` was already told — so this says what the erasure cannot do and leaves the
-        // advice to the report that has it.
+        // things said. A built-in satisfies by the compiler's rule (`reference/expressions.md §
+        // Operator dispatch`) and has no function to name, because its operator is an instruction.
+        // Anything else simply has no implementation, which the `impl` was already told — so this
+        // says what the erasure cannot do and leaves the advice to the report that has it.
         if !conforms(from, ty) then
           if satisfies(from, ty) then
             err(s"${show(ty)} implements '${qn(from.name)}' by the compiler's own rule rather than " +

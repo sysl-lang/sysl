@@ -21,9 +21,10 @@ class TraitObjectErrorTests extends AnyFreeSpec with CodegenSupport {
 
   "object safety" - {
     // A bare `*Add` is `*Add[Self, Self]`, and both arguments would have to be the type the object
-    // forgot. The advice is a spelling rather than "this trait cannot be erased", because writing the
-    // arguments out really does rescue it now that an operator's result is an argument (`14 §7`) —
-    // `&Mul[real, real]` is a formable object, which `TraitObjectRunTests` dispatches through.
+    // forgot. The advice is a spelling rather than "this trait cannot be erased", because writing
+    // the arguments out really does rescue it now that an operator's result is an argument
+    // (`library/core.md § Walking a type of your own`) — `&Mul[real, real]` is a formable object,
+    // which `TraitObjectRunTests` dispatches through.
     "an operator trait is refused bare, because its arguments default to 'Self'" in {
       val e = err("var s: *Add = 1")
 
@@ -61,10 +62,11 @@ class TraitObjectErrorTests extends AnyFreeSpec with CodegenSupport {
      * dispatchable `use` beside the associated function, and the answer is that there is no `*Make`
      * rather than a `*Make` without `build`.
      *
-     * A good deal rests on it. A trait object satisfying a bound (`10 §5`) is total *because* of
-     * this: a `&Shape` existing is already the proof that every member of `Shape` is reachable
-     * through it, so nothing has to say what a bound does when it reaches a member the object cannot
-     * offer. A language deciding safety per member owes that rule; sysl owes none.
+     * A good deal rests on it. A trait object satisfying a bound (`reference/generics.md § Bounds`)
+     * is total *because* of this: a `&Shape` existing is already the proof that every member of
+     * `Shape` is reachable through it, so nothing has to say what a bound does when it reaches a
+     * member the object cannot offer. A language deciding safety per member owes that rule; sysl
+     * owes none.
      */
     "an associated function has no receiver to dispatch on, and takes the whole trait with it" in {
       err(

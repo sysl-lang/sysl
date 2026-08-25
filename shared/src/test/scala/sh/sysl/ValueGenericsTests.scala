@@ -2,8 +2,9 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Value generics (`10 §9`) — a parameter standing for a **value** rather than a type, written
- * `[const N: usize]`, which is what lets one declaration cover every array length.
+/** Value generics (`reference/generics.md § A parameter may stand for a value`) — a parameter
+ * standing for a **value** rather than a type, written `[const N: usize]`, which is what lets one
+ * declaration cover every array length.
  */
 class ValueGenericsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
@@ -120,10 +121,11 @@ class ValueGenericsTests extends AnyFreeSpec with RunSupport with CodegenSupport
     }
   }
 
-  /** `10 §9` admits **integers, `bool`, `char` and enum values** on day one, for one reason: a value
-   * in a type's identity must compare and must mangle, and each of those does. The argument travels
-   * as a number whichever it is, and the parameter's declared type is what reads it back — which is
-   * why a `bool` parameter is a `bool` in a body rather than the `0` it is stored as.
+  /** `reference/generics.md § A parameter may stand for a value` admits **integers, `bool`, `char`
+   * and enum values** on day one, for one reason: a value in a type's identity must compare and
+   * must mangle, and each of those does. The argument travels as a number whichever it is, and the
+   * parameter's declared type is what reads it back — which is why a `bool` parameter is a `bool`
+   * in a body rather than the `0` it is stored as.
    *
    * Floats and strings are excluded by that same rule, and §9 says why: `NaN != NaN` would make a
    * type unequal to itself, and two spellings of one text are not one value until strings intern.
@@ -381,9 +383,10 @@ class ValueGenericsTests extends AnyFreeSpec with RunSupport with CodegenSupport
   }
 
   "what is refused" - {
-    /** `[N + 1]T` needs the compiler to decide when two *expressions* denote one length — that
-     * `N + 1` and `1 + N` are one type — which is type-level arithmetic and a separate feature
-     * (`10 §9`). Rust keeps it unstable for the same reason long after const generics shipped.
+    /** `[N + 1]T` needs the compiler to decide when two *expressions* denote one length — that `N +
+     * 1` and `1 + N` are one type — which is type-level arithmetic and a separate feature
+     * (`reference/generics.md § A parameter may stand for a value`). Rust keeps it unstable for the
+     * same reason long after const generics shipped.
      *
      * Refusing is not a limitation admitted reluctantly: left alone the length resolves to whatever
      * the placeholder made it, so the array is silently the wrong size.

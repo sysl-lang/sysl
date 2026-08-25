@@ -16,10 +16,10 @@ import org.scalatest.freespec.AnyFreeSpec
  * and contrasts with C++.
  *
  * The cause was structural: the definition-time pass keeps only what is raised through `boundErr`
- * and drops the rest, and the subscript's complaint went through the ordinary `err`. It now asks the
- * bounds the way a dot call does, since a subscript **is** `Index`'s one method (`14 §3`) — which
- * also fixed a case that had only ever worked by accident, a subscript on a parameter that really
- * was bounded by `Index`.
+ * and drops the rest, and the subscript's complaint went through the ordinary `err`. It now asks
+ * the bounds the way a dot call does, since a subscript **is** `Index`'s one method
+ * (`reference/expressions.md § Operator dispatch`) — which also fixed a case that had only ever
+ * worked by accident, a subscript on a parameter that really was bounded by `Index`.
  */
 class GenericsClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 

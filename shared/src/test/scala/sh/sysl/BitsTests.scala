@@ -3,8 +3,8 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** `sysl.math`'s bit surface, whose membership is the compiler's over the open integer family the
- * way `Signed`'s is (`14 §5`), and whose members lower to LLVM's bit intrinsics rather than to the
- * shift-and-mask loops a program would otherwise write.
+ * way `Signed`'s is (`reference/expressions.md § Operator dispatch`), and whose members lower to
+ * LLVM's bit intrinsics rather than to the shift-and-mask loops a program would otherwise write.
  */
 class BitsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
@@ -234,7 +234,7 @@ class BitsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   "what is refused" - {
 
     // Same rule as `Signed`: a compiler-provided membership says which types have the member, never
-    // which files may write it (`13 §2`).
+    // which files may write it (`reference/modules.md § Visibility`).
     "the trait has to be in scope, membership or not" in {
       err("main()\n    print((1u8).count_ones())") should include("count_ones")
     }
@@ -308,8 +308,10 @@ class BitsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     run(importing + "main()\n    print((1u8).rotate_left(n = 1))") shouldBe "2\n"
   }
 
-  // A subtype narrows which values a type has and never which operations it has (`16 §3`), so the
-  // members reach one — at the base's bit pattern, which is the only thing a count could mean.
+  // A subtype narrows which values a type has and never which operations it has
+  // (`reference/errors.md § A derivation inherits its base's behaviour and may replace none of
+  // it`), so the members reach one — at the base's bit pattern, which is the only thing a count
+  // could mean.
   "a constrained subtype has them, at its base's bits" in {
     run(
       """import sysl.math.{Bits, Signed}

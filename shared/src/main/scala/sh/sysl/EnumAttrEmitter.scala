@@ -3,7 +3,7 @@ package sh.sysl
 import ir.{Access, ICmp, Inst, LType, Val}
 
 /** The seven type attributes of a simple enum — `Pos`, `Val`, `Succ`, `Pred`, `Image`, `Value`, and
- * the `Range` the analyzer folds away before it gets here (`09 §5`).
+ * the `Range` the analyzer folds away before it gets here (`reference/statements.md § match`).
  *
  * They are one family and they lower one way: the variant list is known and small, so every attribute
  * is a **chain over it** rather than arithmetic. That is not a shortcut, it is forced — a simple

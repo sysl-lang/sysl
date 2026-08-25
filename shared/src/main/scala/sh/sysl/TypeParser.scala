@@ -36,19 +36,19 @@ trait TypeParser extends ExprParser {
    */
   protected lazy val coreType: Parser[TypeRef] =
     at(
-      // `Fn(A) -> R`, the callable's type written out (`12 §6`). It comes first because `Fn` is an
-      // ordinary identifier: without this the name alternative below would take it and leave the
-      // parameter list stranded.
+      // `Fn(A) -> R`, the callable's type written out (`reference/types.md § Function types`). It
+      // comes first because `Fn` is an ordinary identifier: without this the name alternative below
+      // would take it and leave the parameter list stranded.
       (fnWord ~> op("(") ~> commaList(typeRef) <~ op(")")) ~ (op("->") ~> typeRef) ^^ {
         case ps ~ r => FnType(ps, r, bare = false)
       } |
         // `() -> R` — a callable of no arguments. Empty parentheses are not a type, so this is the
         // one place they may be written, and the arrow is what says so.
         (op("(") ~> op(")") ~> op("->") ~> typeRef) ^^ (r => FnType(Nil, r, bare = true)) |
-        // `*extern(A) -> R`, C's function pointer (`12 §6a`). It comes before the general `*` so the
-        // `extern` is read as part of this spelling rather than as a type named `extern` — which it
-        // could not be anyway, the word being reserved, but the alternative below would reach the
-        // name production and complain about the wrong thing.
+        // `*extern(A) -> R`, C's function pointer (`reference/ffi.md § A function's address`). It
+        // comes before the general `*` so the `extern` is read as part of this spelling rather than
+        // as a type named `extern` — which it could not be anyway, the word being reserved, but the
+        // alternative below would reach the name production and complain about the wrong thing.
         ((op("*") ~> op("extern") ~> op("(") ~> commaList(typeRef) <~ op(")")) ~ (op("->") ~> typeRef) ^^ {
           case ps ~ r => CFnType(ps, r)
         }) |
@@ -71,9 +71,9 @@ trait TypeParser extends ExprParser {
               s"one — read-only storage is declared with 'val', as 'val name: [N]${t.show}'")
           case n ~ ro ~ t => success(ArrayType(n, t, readOnly = ro.isDefined))
         }) |
-        // `<N>T`, a vector (`01 § Vectors`). The angle brackets are free in type position: type
-        // arguments are spelled `[...]`, and nothing reaches `coreType` except after a `:`, a `->`
-        // or another type constructor, where a comparison cannot appear.
+        // `<N>T`, a vector (`reference/types.md § Vectors`). The angle brackets are free in type
+        // position: type arguments are spelled `[...]`, and nothing reaches `coreType` except after
+        // a `:`, a `->` or another type constructor, where a comparison cannot appear.
         //
         // The empty spelling is caught here rather than left to fail as a stray `>`, because
         // somebody writing it has read `[]T` and is owed the reason the two are not parallel.
@@ -85,15 +85,16 @@ trait TypeParser extends ExprParser {
         ((op("<") ~> laneCount <~ op(">")) ~ coreType ^^ {
           case n ~ t => VectorType(n, t)
         }) |
-        // `volatile T` (`03 § Device memory`). It stays a soft word like `sync`, so it is special
-        // only in front of another type — a program with a type of its own named `volatile` still
-        // parses, since this alternative needs a second type after the word and the name
-        // alternative below picks up what is left.
+        // `volatile T` (`reference/memory.md § Device memory`). It stays a soft word like `sync`,
+        // so it is special only in front of another type — a program with a type of its own named
+        // `volatile` still parses, since this alternative needs a second type after the word and
+        // the name alternative below picks up what is left.
         softVolatile ~> coreType ^^ VolatileType.apply |
         tupleType |
         // A bare `..A` parses so that the analyzer can say what a pack is and where one may be
-        // written (`10 §10`). Left to the grammar it would be a stray token, and the reader would
-        // be told a newline was expected rather than told about the feature they were reaching for.
+        // written (`reference/generics.md § A parameter may stand for a list of types`). Left to
+        // the grammar it would be a stray token, and the reader would be told a newline was
+        // expected rather than told about the feature they were reaching for.
         op("..") ~> ident ^^ PackType.apply |
         // `some Trait` says the type is inferred from a body, which only a result has — so a
         // reader who wrote one in a field, a parameter or a cast is told where it belongs rather
@@ -130,7 +131,8 @@ trait TypeParser extends ExprParser {
 
   /** `(A, B)` — a tuple type. A single part is refused rather than read as a grouping, because the
    * two spellings would then differ by a comma and mean different things; `(T)` is the shape
-   * somebody writes when they mean a one-tuple, and there is no such type (`00 §13`).
+   * somebody writes when they mean a one-tuple, and there is no such type (`reference/types.md §
+   * Tuples`).
    */
   protected lazy val tupleType: Parser[TypeRef] =
     packTuple | (op("(") ~> commaList1(typeRef) <~ op(")")) >> {
@@ -140,7 +142,8 @@ trait TypeParser extends ExprParser {
       case parts => success(TupleType(parts))
     }
 
-  /** `(..A)` — the tuple of a type pack (`10 §10`), which matches a tuple of any arity.
+  /** `(..A)` — the tuple of a type pack (`reference/generics.md § A parameter may stand for a list
+   * of types`), which matches a tuple of any arity.
    *
    * Tried before the ordinary tuple, and the two cannot both parse: a pack is the whole of what is
    * between the parentheses. Mixing one with written-out parts — `(..A, int)` — is pack *expansion*
@@ -152,7 +155,8 @@ trait TypeParser extends ExprParser {
         "is not built; write '(..A)' and reach the parts with 'for const'",
     ))) ^^ { n => TupleType(List(PackType(n))) }
 
-  /** A function's declared result: one type, or several separated by commas (`12 §5b`).
+  /** A function's declared result: one type, or several separated by commas
+   * (`reference/declarations.md § Several results`).
    *
    * A result list is a property of the signature and not a type, so it is spelled here rather than
    * in `typeRef` — nothing that asks for a *type* can reach one, which is what keeps `-> int, int`
@@ -181,7 +185,8 @@ trait TypeParser extends ExprParser {
   protected lazy val typeArgs: Parser[List[TypeRef]] =
     op("[") ~> commaList1(typeArg) <~ op("]")
 
-  /** One argument of that list, which may stand for a **value** (`10 §9`) — `Buf[4]`.
+  /** One argument of that list, which may stand for a **value** (`reference/generics.md § A
+   * parameter may stand for a value`) — `Buf[4]`.
    *
    * A type is tried first and an expression only where nothing could be a type, so a bare `N` is
    * read as a name and left for the declaration to interpret: the grammar cannot tell a type
@@ -254,7 +259,8 @@ trait TypeParser extends ExprParser {
       )
     }
 
-  /** `[const N: usize]` — a parameter standing for a **value** (`10 §9`).
+  /** `[const N: usize]` — a parameter standing for a **value** (`reference/generics.md § A
+   * parameter may stand for a value`).
    *
    * The type is required and the marker is what makes it readable: without `const` this is
    * `ident ':' name`, which is exactly a bounded type parameter, and only name resolution could say
@@ -279,7 +285,8 @@ trait TypeParser extends ExprParser {
       case n ~ t ~ d => ValueParamSpec(n, t, d)
     }
 
-  /** `..A: Display` — a **type pack** (`10 §10`), whose bound distributes over its members.
+  /** `..A: Display` — a **type pack** (`reference/generics.md § A parameter may stand for a list of
+   * types`), whose bound distributes over its members.
    *
    * The `..` is the marker, and it is in front for the same reason `const` is: without it `A: Display`
    * is an ordinary bounded type parameter and nothing in the grammar could say which was meant. It

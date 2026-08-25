@@ -1,7 +1,7 @@
 package sh.sysl
 
-/** The growable buffer a rendering can end in (`14 §6`): the sink whose bytes `str` and an `f"…"`
- * hole turn into a fresh `string`.
+/** The growable buffer a rendering can end in (`library/core.md § Rendering to a sink`): the sink
+ * whose bytes `str` and an `f"…"` hole turn into a fresh `string`.
  *
  * It is a `*Writer` trait object, and it is the compiler's rather than the library's — not because
  * it does anything a sysl body could not, but because it has no *type* sysl can give it: a growable

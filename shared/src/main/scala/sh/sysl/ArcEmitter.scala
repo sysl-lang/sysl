@@ -15,8 +15,8 @@ import scala.collection.mutable
 trait ArcEmitter extends Emitter {
 
   /** The typed program being lowered. Declared here as well as in `CallEmitter` because the release
-   * hook has to ask it which payload types carry a destructor (`03 § A destructor`), and a hook is
-   * built from a type with no call site anywhere near it.
+   * hook has to ask it which payload types carry a destructor (`reference/memory.md § A
+   * destructor`), and a hook is built from a type with no call site anywhere near it.
    */
   protected val program: TProgram
 
@@ -34,8 +34,8 @@ trait ArcEmitter extends Emitter {
     case _                   => false
 
   /** Where a box's own contents begin, once the three header words — the strong count, the
-   * destruction hook, and the weak count (`03 § What it costs`) — are behind them. A buffer's
-   * element count sits here and its elements one further on.
+   * destruction hook, and the weak count (`reference/memory.md § What a heap object costs`) — are
+   * behind them. A buffer's element count sits here and its elements one further on.
    */
   protected val headerFields = 3
 
@@ -221,8 +221,9 @@ trait ArcEmitter extends Emitter {
    */
   protected def dropFn(payload: Type): Val.Global = {
     // A type with a destructor needs a hook of its own even when nothing in it is counted
-    // (`03 § A destructor`): the walk has nothing to do and the `drop` still has to be called, so
-    // the plain hook — which is shared by every payload that holds nothing — cannot serve.
+    // (`reference/memory.md § A destructor`): the walk has nothing to do and the `drop` still has
+    // to be called, so the plain hook — which is shared by every payload that holds nothing —
+    // cannot serve.
     val destructor = program.destructors.get(Type.mangle(payload))
 
     if !containsRef(payload) && destructor.isEmpty then plainDropFn
@@ -518,7 +519,8 @@ trait ArcEmitter extends Emitter {
 
   /** What the innermost temp region holds, for an edge that has to give those counts back somewhere
    * other than where the region is closed — a condition term that branches before it can release,
-   * because the branch it guards retains out of the very value being held (`09 §12`).
+   * because the branch it guards retains out of the very value being held
+   * (`reference/expressions.md § is — a pattern where a condition is wanted`).
    */
   protected def tempsHere: List[(Val, Type)] = tempStack.head.toList
 
@@ -535,8 +537,8 @@ trait ArcEmitter extends Emitter {
    *
    * They go **before** that scope's releases, so every local the statement names is still alive
    * while it runs — including the one holding the resource it is closing, which is the whole point
-   * of the form. Registration order is written order, so `reverse` is the LIFO `03 § defer`
-   * promises.
+   * of the form. Registration order is written order, so `reverse` is the LIFO `reference/memory.md
+   * § Where defer sits` promises.
    */
   private def runDeferrals(scope: mutable.ListBuffer[TStmt]): Unit = scope.reverse.foreach(genStmt)
 
@@ -578,10 +580,11 @@ trait ArcEmitter extends Emitter {
   /** What the innermost scope holds, for a path that has to give those counts back somewhere other
    * than where the scope ends.
    *
-   * A condition's `is` bindings are the case (`09 §12`): the scope is popped at the end of the
-   * branch the condition guards, but a later term of the same condition may fail, and *that* edge
-   * leaves without ever reaching the branch. Its releases are emitted after the success path has
-   * already popped, so the slots have to be read out while the scope is still there.
+   * A condition's `is` bindings are the case (`reference/expressions.md § is — a pattern where a
+   * condition is wanted`): the scope is popped at the end of the branch the condition guards, but a
+   * later term of the same condition may fail, and *that* edge leaves without ever reaching the
+   * branch. Its releases are emitted after the success path has already popped, so the slots have
+   * to be read out while the scope is still there.
    */
   protected def ownedHere: List[(Val, Type)] = owned.head.toList
 
@@ -706,8 +709,9 @@ object ArcEmitter {
    * **The storage outlives the object when something weak still asks about it.** The strong count
    * reaching zero destroys the object — the payload's references are given back — but the bytes
    * come back only when the weak count follows, and the weak count holds one share on behalf of
-   * every strong reference together (`03 § What it costs`). So a `get()` on a dead object reads
-   * storage that is still there and finds a strong count of zero in it.
+   * every strong reference together (`reference/memory.md § What a heap object costs`). So a
+   * `get()` on a dead object reads storage that is still there and finds a strong count of zero in
+   * it.
    *
    * That share is also what makes the worklist safe. A queued object has its strong slot on loan
    * as the list's link, and a weak release arriving in that window cannot free it, because the

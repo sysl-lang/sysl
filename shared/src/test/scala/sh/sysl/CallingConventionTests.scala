@@ -3,8 +3,8 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
-/** `interrupt` — the calling convention of `15 §10`, and the one annotation whose meaning is the
- * **processor's** rather than the language's.
+/** `interrupt` — the calling convention of `reference/ffi.md § interrupt`, and the one annotation
+ * whose meaning is the **processor's** rather than the language's.
  *
  * Everything asserted here was read off clang first, because the three processors sysl lowers for
  * answer `__attribute__((interrupt))` three different ways and no document says so in one place:

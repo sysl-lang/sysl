@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Searching, trimming, splitting and joining (`04 § Operations`).
+/** Searching, trimming, splitting and joining (`reference/strings.md § What lives in the library`).
  *
  * Two properties are under test throughout and are worth naming, because most of the individual
  * cases are checking one of them.
@@ -142,9 +142,10 @@ class StringOpsTests extends AnyFreeSpec with RunSupport {
     // `s.bytes` is already read-only, which is why every case above resolved without anything being
     // widened. A buffer a program is still filling is a *writable* `[]u8`, and that is the receiver
     // the second implementation exists for — bytes off a socket or a file, before anyone knows
-    // whether they are UTF-8. `07 § Read-only views` says a `[]T` is accepted wherever a
-    // `[]const T` is wanted, and a receiver is such a place; the lookup used to file the two under
-    // the names a diagnostic gives them and deny the member outright.
+    // whether they are UTF-8. `reference/arrays.md § []const T — a view that may not be written`
+    // says a `[]T` is accepted wherever a `[]const T` is wanted, and a receiver is such a place;
+    // the lookup used to file the two under the names a diagnostic gives them and deny the member
+    // outright.
     "a writable byte view reaches them too, since it is the same type with a bit" in {
       run("""var raw = [104u8, 105u8, 33u8]
             |var needle = [105u8, 33u8]

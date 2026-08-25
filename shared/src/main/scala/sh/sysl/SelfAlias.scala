@@ -33,7 +33,7 @@ object SelfAlias {
     /** The locals that may hold such a pointer. `self` seeds it: the receiver is one. */
     var confined = Set("self")
 
-    /** The place each `ref` in this body names (`03 § ref`).
+    /** The place each `ref` in this body names (`reference/memory.md § ref — a name for a place`).
      *
      * A ref is a second name for storage, so `&r` is `&<the place r names>` — and the question this
      * pass asks of an address is *structural*, "is this a chain of steps from `*self`", which a bare
@@ -69,7 +69,8 @@ object SelfAlias {
       case TRecheck(a, _, _, _) => carries(a)
       case TSeq(exprs)          => exprs.lastOption.exists(carries)
       case TIf(_, t, el, _)     => t.result.exists(carries) || el.flatMap(_.result).exists(carries)
-      // One copy of an unrolled `for const` carries whatever its own value carries (`10 §10`).
+      // One copy of an unrolled `for const` carries whatever its own value carries
+      // (`reference/generics.md § A parameter may stand for a list of types`).
       case TBlockExpr(b)        => b.result.exists(carries)
       case TMatch(_, arms, _)   => arms.exists(_.body.result.exists(carries))
       // A loop's value comes from its `break`s and its `else`, so a pointer carried out of the loop

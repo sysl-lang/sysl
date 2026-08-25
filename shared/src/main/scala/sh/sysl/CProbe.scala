@@ -2,17 +2,19 @@ package sh.sysl
 
 import io.github.edadma.cross_platform.*
 
-/** `c const` and `c type` — the values and the widths only the C compiler can work out (`15 §7`).
+/** `c const` and `c type` — the values and the widths only the C compiler can work out
+ * (`reference/ffi.md § A library may carry C`).
  *
  * ==Why the language needs them at all==
  *
- * `15 §7` already says how a binding reaches something that has no symbol: put it behind three lines
- * of C and declare the wrapper `extern`. That answer is complete for a *function* and for anything a
- * program is content to learn at run time, and it is no answer at all for a **value**, because a
- * value reached through a call is not a constant. It cannot size an array, cannot stand in a `match`
- * arm, cannot be folded into a bound, and cannot be checked by `@assert`. FreeRTOS is the case that
- * made this unavoidable: a statically allocated task is a `[sizeof(StaticTask_t)]u8` the caller
- * supplies, and there is no such thing as an array whose length is decided by a function.
+ * `reference/ffi.md § A library may carry C` already says how a binding reaches something that has
+ * no symbol: put it behind three lines of C and declare the wrapper `extern`. That answer is
+ * complete for a *function* and for anything a program is content to learn at run time, and it is
+ * no answer at all for a **value**, because a value reached through a call is not a constant. It
+ * cannot size an array, cannot stand in a `match` arm, cannot be folded into a bound, and cannot be
+ * checked by `@assert`. FreeRTOS is the case that made this unavoidable: a statically allocated
+ * task is a `[sizeof(StaticTask_t)]u8` the caller supplies, and there is no such thing as an array
+ * whose length is decided by a function.
  *
  * It is no answer for a **type** either, and that is the second half. A typedef whose width the
  * target or a `#define` decides — `TickType_t`, `time_t`, `off_t`, `wchar_t` — appears in
@@ -67,10 +69,10 @@ import io.github.edadma.cross_platform.*
  *
  * ==What it is not==
  *
- * It reads no declarations out of the header. A `c type` names a typedef and gets an integer back; it
- * does not import the typedef, and a struct still arrives by `opaque struct` and a function by
- * `extern`, which is `15 §9`'s arrangement and is deliberately untouched — a directive that imported
- * C declarations wholesale is a different feature with a different cost.
+ * It reads no declarations out of the header. A `c type` names a typedef and gets an integer back;
+ * it does not import the typedef, and a struct still arrives by `opaque struct` and a function by
+ * `extern`, which is `reference/ffi.md § opaque`'s arrangement and is deliberately untouched — a
+ * directive that imported C declarations wholesale is a different feature with a different cost.
  */
 object CProbe {
 
@@ -126,7 +128,7 @@ object CProbe {
       }
 
   /** Whether this file's blocks must not be measured, because the machine being built for cannot
-   * have what the file says it needs (`capabilities.md`, `15 § c type`).
+   * have what the file says it needs (`capabilities.md`, `reference/ffi.md § c type`).
    *
    * **A probe is a C compilation, so a file carrying one asks for headers.** A file that also
    * declares `@requires(posix)` has said which machines it is for, and a freestanding target is not
@@ -454,11 +456,12 @@ object CProbe {
    * an integer can. Both carriers go through the one probe and differ only in what the global is
    * declared as.
    *
-   * **A name is followed rather than refused**, because `16 §1` says a transparent subtype *is* its
-   * base and this pass was the one place in the language where that was not true — which left the
-   * two blocks unable to describe the case they were both built for, a typedef whose width the
-   * config decides and the constants that have to be that width. What is followed is this file's own
-   * declarations: a `c type` the same probe measures, or a `type` whose base reaches an integer.
+   * **A name is followed rather than refused**, because `reference/errors.md § Constrained types`
+   * says a transparent subtype *is* its base and this pass was the one place in the language where
+   * that was not true — which left the two blocks unable to describe the case they were both built
+   * for, a typedef whose width the config decides and the constants that have to be that width.
+   * What is followed is this file's own declarations: a `c type` the same probe measures, or a
+   * `type` whose base reaches an integer.
    *
    * **A name from another module is refused by name.** A block is one question put to one file's
    * headers, and both halves of it are asked in the same probe; a type measured against some other

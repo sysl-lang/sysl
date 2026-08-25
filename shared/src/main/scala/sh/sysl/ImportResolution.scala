@@ -3,7 +3,7 @@ package sh.sysl
 import scala.collection.mutable
 
 /** Turns a file's — or a block's — `import` statements into the bindings `resolveName` consults
- * (`13 §3`).
+ * (`reference/modules.md § Imports`).
  *
  * An import never grants access: everything it names is already reachable by its full path, so
  * nothing here can make a program legal that was not. What it does is decide, once per file,
@@ -41,9 +41,9 @@ trait ImportResolution extends TraitLookup {
       case (acc, _)             => acc
     }
 
-  /** One `import` written **inside a block**, which binds for the rest of that block and no
-   * further (`13 §3`). It is added to the innermost open scope, so it is unwound with the block's
-   * local bindings and shadows whatever the file imported under the same name.
+  /** One `import` written **inside a block**, which binds for the rest of that block and no further
+   * (`reference/modules.md § Imports`). It is added to the innermost open scope, so it is unwound
+   * with the block's local bindings and shadows whatever the file imported under the same name.
    */
   protected def importInBlock(decl: ImportDecl): Unit =
     importHere(gatherImports(List(decl), importStack.head))
@@ -81,8 +81,9 @@ trait ImportResolution extends TraitLookup {
       decl.selectors.foldLeft(acc)((a, s) => at(s.pos.orElse(decl.pos))(recover(a)(select(path, s, a))))
     else
       // The longest prefix that names a module wins, exactly as a qualified reference is read by
-      // (`13 §3`): `import a.b` is the module `a.b` where there is one, and `a`'s member `b`
-      // otherwise. That is what makes the module form and the member form one piece of syntax.
+      // (`reference/modules.md § Imports`): `import a.b` is the module `a.b` where there is one,
+      // and `a`'s member `b` otherwise. That is what makes the module form and the member form one
+      // piece of syntax.
       if moduleNames(path) then
         bindModule(decl.bound, path, acc)
       else
@@ -117,9 +118,9 @@ trait ImportResolution extends TraitLookup {
   }
 
   /** One name brought in from a module. Importing it is already a dependency on that module
-   * (`13 §6`), whether or not the file goes on to write the shorter spelling it bought — a file's
-   * imports are meant to be readable as what it needs, and a dependency that came and went with a
-   * use would not be.
+   * (`reference/modules.md § The module graph is acyclic`), whether or not the file goes on to
+   * write the shorter spelling it bought — a file's imports are meant to be readable as what it
+   * needs, and a dependency that came and went with a use would not be.
    */
   private def bindName(bound: String, module: String, name: String, acc: Imports): Imports = {
     val key = Modules.qualify(module, name)
@@ -152,9 +153,9 @@ trait ImportResolution extends TraitLookup {
   }
 
   /** Whether the module named declares what the selector asked for, and whether the importing file
-   * may name it (`13 §2`). Naming something deliberately is reported where it was named: being told
-   * a helper is private is a more useful answer at the import than an undefined name at every use
-   * of the shorter spelling it would have bound.
+   * may name it (`reference/modules.md § Visibility`). Naming something deliberately is reported
+   * where it was named: being told a helper is private is a more useful answer at the import than
+   * an undefined name at every use of the shorter spelling it would have bound.
    */
   private def checkDeclared(key: String, written: String): Unit =
     if !declaresAnything(key) then

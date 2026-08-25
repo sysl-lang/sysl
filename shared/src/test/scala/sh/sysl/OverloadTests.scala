@@ -2,7 +2,8 @@ package sh.sysl
 
 import io.github.edadma.cross_platform.*
 
-/** Two declarations of one name, and which of them a use means — `12 §1a`.
+/** Two declarations of one name, and which of them a use means — `reference/declarations.md §
+ * Overloading`.
  *
  * The claim this file holds is that **a name may stand for several functions and every use of it
  * still names exactly one**. That is checked by running rather than by reading IR wherever it can

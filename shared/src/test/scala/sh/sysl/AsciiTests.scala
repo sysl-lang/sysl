@@ -14,8 +14,8 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class AsciiTests extends AnyFreeSpec with RunSupport {
 
-  /** The trait has to be in scope for its members to be reached (`13 §2`), so every program here
-   * asks for it by name.
+  /** The trait has to be in scope for its members to be reached (`reference/modules.md §
+   * Visibility`), so every program here asks for it by name.
    */
   private def ascii(src: String): String = run("import sysl.text.Ascii\n\n" + src)
 

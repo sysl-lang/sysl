@@ -1,6 +1,7 @@
 package sh.sysl
 
-/** What a parameter's default has to satisfy at the **declaration** (`12 §2a`).
+/** What a parameter's default has to satisfy at the **declaration** (`reference/declarations.md §
+ * Default parameters and named arguments`).
  *
  * A default is filled at the call, so without this pass everything wrong with one would be reported
  * at whichever call first left the argument out — a mistake in a signature, reported in somebody
@@ -51,9 +52,9 @@ trait DefaultParams extends StmtAnalysis with SignatureVisibility {
       expectedAt: Int => Option[Type],
   ): Unit = {
     if params.exists(_.default.isDefined) then
-      // C reads a variadic call's tail relative to the last named argument (`12 §9`), so an argument
-      // that might be the last declared parameter or might be the first of the tail leaves nowhere
-      // for the tail to begin.
+      // C reads a variadic call's tail relative to the last named argument (`reference/ffi.md §
+      // Variadic functions`), so an argument that might be the last declared parameter or might be
+      // the first of the tail leaves nowhere for the tail to begin.
       if variadic then
         for p <- params.find(_.default.isDefined) do
           recover(())(at(p.default.get.pos)(err(
@@ -92,8 +93,9 @@ trait DefaultParams extends StmtAnalysis with SignatureVisibility {
   }
 
   /** A default is the one part of a signature a call does not write, so what it names has to reach
-   * as far as the declaration does (`13 §2`) — otherwise a caller who leaves the argument out has
-   * had a call made on their behalf that they could neither have written nor can see.
+   * as far as the declaration does (`reference/modules.md § Visibility`) — otherwise a caller who
+   * leaves the argument out has had a call made on their behalf that they could neither have
+   * written nor can see.
    *
    * The names are the ones the default reaches **directly**: what a function it calls does inside
    * itself is that function's business and restricts nothing here. Passing no functions to the walk
@@ -101,7 +103,8 @@ trait DefaultParams extends StmtAnalysis with SignatureVisibility {
    *
    * A member is held to its **type's** reach. A member may restrict itself further than its type
    * does, so this is the weaker of the two questions — but it is the one that matches how the rest
-   * of `13 §2` reads a member, and the stricter half belongs with it rather than here.
+   * of `reference/modules.md § Visibility` reads a member, and the stricter half belongs with it
+   * rather than here.
    */
   private def exposed(shown: String, key: String, param: String, t: TExpr): Unit = {
     val refs = Reachability.reachedFrom(List(t), Nil, Nil)
@@ -141,14 +144,15 @@ trait DefaultParams extends StmtAnalysis with SignatureVisibility {
    * `funcInsts`, which is the very list the call will check the argument against. A **generic** one
    * has no resolved signature — its parameters are written in terms nothing has fixed yet — so the
    * written type is resolved with each type parameter standing for **itself**, which is the
-   * substitution `14 §4`'s definition-time pass walks a generic body under, and for the same
-   * reason: it is what a declaration can be held to before any call exists.
+   * substitution `reference/generics.md § Bounds`'s definition-time pass walks a generic body
+   * under, and for the same reason: it is what a declaration can be held to before any call exists.
    *
    * **The second road is what lets a closure literal be a default at all.** A parameter written
-   * with a bare arrow *is* a bounded type parameter (`12 §6`), so the only thing that says what the
-   * closure takes is that bound — and a stand-in carries its bounds, which is exactly what a call
-   * reads a held-back callable argument against. Without it the arrow, the one spelling made for
-   * taking a closure, was the one spelling whose default could not be one.
+   * with a bare arrow *is* a bounded type parameter (`reference/types.md § Function types`), so the
+   * only thing that says what the closure takes is that bound — and a stand-in carries its bounds,
+   * which is exactly what a call reads a held-back callable argument against. Without it the arrow,
+   * the one spelling made for taking a closure, was the one spelling whose default could not be
+   * one.
    */
   private def expectedAt(lowered: String, f: FuncDecl, skip: Int)(i: Int): Option[Type] =
     typed(lowered)(i + skip).orElse(

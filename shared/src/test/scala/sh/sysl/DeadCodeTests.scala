@@ -58,9 +58,10 @@ class DeadCodeTests extends AnyFreeSpec with CodegenSupport with RunSupport {
                 |""".stripMargin) should contain("used")
     }
 
-    // Visibility decides what a program may *name* (`15 §3`); reachability decides what is written
-    // out. They are different questions, so an unmarked declaration is dropped exactly as a private
-    // one is — nothing outside the program can name either, since the whole of it is compiled at once.
+    // Visibility decides what a program may *name* (`reference/modules.md § Separate compilation`);
+    // reachability decides what is written out. They are different questions, so an unmarked
+    // declaration is dropped exactly as a private one is — nothing outside the program can name
+    // either, since the whole of it is compiled at once.
     "a private declaration is dropped the same way an unmarked one is" in {
       val out = defined("""private hidden() -> int = 1
                           |open() -> int = 2
@@ -464,9 +465,10 @@ class DeadCodeTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
   }
 
-  /** The four unconditional roots of `15 §12` — an export, an interrupt handler, a `@section`
-   * definition and a destructor — asked of the **library**, which is handed to every compilation
-   * there is and was the last of the handed roots to be qualified by where it came from.
+  /** The four unconditional roots of `reference/ffi.md § @export` — an export, an interrupt
+   * handler, a `@section` definition and a destructor — asked of the **library**, which is handed
+   * to every compilation there is and was the last of the handed roots to be qualified by where it
+   * came from.
    *
    * A stand-in library is what makes these askable at all: the real `library/` carries none of the
    * four, which is the only reason nobody has paid for this. `sysl.res` below stands for a submodule
@@ -538,12 +540,13 @@ class DeadCodeTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       irAgainstTree(res*)("main.sysl" -> "sysl.res.tick(1)\n") should include("res_tick")
     }
 
-    // The under-prune direction, and the one whose failure is a *link* error rather than a test: the
-    // program names `sysl.hand` and never `sysl.res`, so only the transitive closure of the module
-    // graph puts the destructor's module in reach. What guarantees there is such an edge is
-    // `02 § Coherence` — an `impl Drop for T` sits in `Drop`'s module or in one declaring a type
-    // named in `T`, so whatever hands the value out had to name that module to spell its own return
-    // type. Pinned for the library because it is the tree every program links.
+    // The under-prune direction, and the one whose failure is a *link* error rather than a test:
+    // the program names `sysl.hand` and never `sysl.res`, so only the transitive closure of the
+    // module graph puts the destructor's module in reach. What guarantees there is such an edge is
+    // `reference/traits.md § Where an impl may live` — an `impl Drop for T` sits in `Drop`'s module
+    // or in one declaring a type named in `T`, so whatever hands the value out had to name that
+    // module to spell its own return type. Pinned for the library because it is the tree every
+    // program links.
     "through a module that reaches it, where the program names neither" in {
       val out = irAgainstTree(res :+ ("sysl.hand", "hand.sysl",
         """module sysl.hand

@@ -20,13 +20,14 @@ sealed trait TStmt
 case class TVarDecl(name: String, ty: Type, init: TExpr, align: Option[Int] = None) extends TStmt
 case class TExprStmt(expr: TExpr)                         extends TStmt
 
-/** A loop's `invariant`, at the head of its body (`17 §3`) — a condition that traps on false, which
- * is what every other clause in `16` already is. It carries no machinery of its own for that reason.
+/** A loop's `invariant`, at the head of its body (`reference/verification.md § invariant and
+ * variant on a loop`) — a condition that traps on false, which is what every other clause in `16`
+ * already is. It carries no machinery of its own for that reason.
  */
 case class TInvariant(cond: TExpr, msg: Option[String]) extends TStmt
 
-/** A loop's `variant`, at the head of its body (`17 §3`): the measure is evaluated, compared against
- * the previous iteration's, and stored.
+/** A loop's `variant`, at the head of its body (`reference/verification.md § invariant and variant
+ * on a loop`): the measure is evaluated, compared against the previous iteration's, and stored.
  *
  * `slot` names the pair of allocas the enclosing `TCheckedLoop` set up — `%<slot>.prev` holding the
  * last value and `%<slot>.armed` saying whether there has been one. The armed flag is what makes the
@@ -37,8 +38,8 @@ case class TInvariant(cond: TExpr, msg: Option[String]) extends TStmt
  */
 case class TVariantCheck(slot: String, varTy: Type, expr: TExpr) extends TStmt
 
-/** `ref name = place` (`03 § ref`) — a name bound to the storage `place` found, rather than to a
- * copy of what was in it.
+/** `ref name = place` (`reference/memory.md § ref — a name for a place`) — a name bound to the
+ * storage `place` found, rather than to a copy of what was in it.
  *
  * It declares **no slot**. Where a `TVarDecl` allocates storage and stores into it, this binds the
  * name's address to the address the place already has, so the walk that reaches an element is made
@@ -53,15 +54,15 @@ case class TVariantCheck(slot: String, varTy: Type, expr: TExpr) extends TStmt
 case class TRefDecl(name: String, ty: Type, place: TExpr) extends TStmt
 
 /** One write of a multi-assignment: the place, the operator that was written, the value, the trait
- * method a compound operator lowers to when it is not an instruction (`14 §3`), and the `invariant`
- * re-check the receiver needs once the write lands (`05`).
+ * method a compound operator lowers to when it is not an instruction (`reference/expressions.md §
+ * Operator dispatch`), and the `invariant` re-check the receiver needs once the write lands (`05`).
  *
  * The check is carried here rather than wrapped around a store node, as `TRecheck` wraps one,
  * because these writes are not expressions and there is nothing for a node to wrap.
  *
  * `constraint` is the compound arm's counterpart of `TUpdate.check` — a plain arm's value carries
  * its own check, having been analyzed against the place's type, while a compound arm computes one
- * here and so is checked here (`16 §4`).
+ * here and so is checked here (`reference/errors.md § Where a constraint is checked`).
  */
 case class TWrite(place: TExpr, op: String, value: TExpr, dispatch: Option[TDispatch],
                   check: List[(TExpr, Type.Struct, String)],
@@ -87,7 +88,8 @@ case class TReturn(value: Option[TExpr])                  extends TStmt
 case class TBreak(value: Option[TExpr], depth: Int) extends TStmt
 case class TContinue(depth: Int)                    extends TStmt
 
-/** `defer stmt` — the statements to run on the way out of the block this sits in (`03 § defer`).
+/** `defer stmt` — the statements to run on the way out of the block this sits in
+ * (`reference/memory.md § Where defer sits`).
  *
  * It is a list because one written statement can analyze to several, the way a binding that names
  * more than one thing does. Reaching this node emits nothing at the point it stands: it hands the
@@ -121,8 +123,8 @@ case class TAsmOperand(dir: AsmDir, name: String, slot: String, ty: Type, reg: O
  * every return, with a `TResult` in an `ensure` standing for the returned value.
  *
  * `internal` says every caller of this function is in the module that defines it, so its symbol
- * needs no external linkage (`13 §2`). It is set for a declaration whose reach is the file that
- * wrote it, and it is the only thing the emitted linkage depends on.
+ * needs no external linkage (`reference/modules.md § Visibility`). It is set for a declaration
+ * whose reach is the file that wrote it, and it is the only thing the emitted linkage depends on.
  */
 case class TFunc(
     name: String,
@@ -137,12 +139,14 @@ case class TFunc(
     conv: Option[CallConv] = None,
     /** `@tailrec` was written above it: an assertion that its self-call is the last thing it does,
      * and a demand to be told at the compile rather than at the stack overflow when an edit stops
-     * that being true (`12 § Tail calls`). The jump itself does not wait on this — it applies
-     * wherever it applies — so what the flag reaches is `TailCalls.check` and nothing in codegen.
+     * that being true (`reference/declarations.md § Tail calls`). The jump itself does not wait on
+     * this — it applies wherever it applies — so what the flag reaches is `TailCalls.check` and
+     * nothing in codegen.
      */
     tailrec: Boolean = false,
     /** The `variant` its contract block declared: an integer measure over the **parameters** that
-     * must strictly decrease at every direct recursive call (`17 §4`).
+     * must strictly decrease at every direct recursive call (`reference/verification.md § variant
+     * on a function`).
      *
      * That it reads only parameters is what makes the check local, and it is what this field is
      * enough for on its own. At a self-call the emitter has both the current parameter values and
@@ -152,15 +156,15 @@ case class TFunc(
      */
     variant: Option[TExpr] = None,
     /** `@pure` was written above it: an assertion that a caller can observe nothing about this call
-     * but its result (`17 §6`).
+     * but its result (`reference/verification.md § @pure`).
      *
      * It is checked rather than believed, and what it excludes is written out in `Purity`. It is not
      * inferred: a function is pure because it says so, which is what keeps an edit to a leaf from
      * breaking a caller three levels up with no annotation anywhere naming the promise it broke.
      */
     pure: Boolean = false,
-    /** `@ghost` was written above it: the function exists for the specification and is erased before
-     * codegen (`17 §8`).
+    /** `@ghost` was written above it: the function exists for the specification and is erased
+     * before codegen (`reference/verification.md § @ghost — what costs nothing to say`).
      *
      * Its body is ordinary code and may read real state freely — that is the whole point of an
      * `is_sorted` — and what the mark buys is the pair of rules that make erasing it sound: nothing
@@ -169,7 +173,8 @@ case class TFunc(
      * give one program two meanings.
      */
     ghost: Boolean = false,
-    /** `@reads(…)` and `@writes(…)`: the module-level storage this function may touch (`17 §7`).
+    /** `@reads(…)` and `@writes(…)`: the module-level storage this function may touch
+     * (`reference/verification.md § @reads and @writes — what a call may touch`).
       *
       * **`None` and `Some(Nil)` are different claims and the distinction carries the whole design.**
       * A function with no annotation has effects nobody has written down — it may call and be called
@@ -187,7 +192,8 @@ case class TFunc(
       */
     reads: Option[Set[String]] = None,
     writes: Option[Set[String]] = None,
-    /** `@export` — the symbol this definition is C-callable under, mangling suppressed (`15 §12`).
+    /** `@export` — the symbol this definition is C-callable under, mangling suppressed
+     * (`reference/ffi.md § @export`).
       *
       * It carries the **resolved** symbol rather than what was written, so `@export` and
       * `@export("mylib_parse")` are one thing by the time anything downstream looks: the first
@@ -198,7 +204,8 @@ case class TFunc(
       * the program calls it, and the whole point is that something outside will (`Reachability`).
       */
     exported: Option[String] = None,
-    /** `@section("…")` — the linker section this definition is placed in (`15 §13`).
+    /** `@section("…")` — the linker section this definition is placed in (`reference/attributes.md
+     * § @section("...")`).
       *
       * It makes the function a **root** for the third version of the export's reason: what finds a
       * definition by its placement is a linker script, and no call in this program need name it. The
@@ -268,9 +275,10 @@ case class TVal(
       * what LLVM gives a global that asked for nothing.
       */
     align: Option[Int] = None,
-    /** `@section("…")` — the linker section this storage is placed in (`15 §13`). Present also means
-      * the symbol is kept: nothing in the program reads a table the linker script gathers, so the
-      * object joins `llvm.used` rather than being dropped by the optimizer that finds no reader.
+    /** `@section("…")` — the linker section this storage is placed in (`reference/attributes.md §
+      * @section("...")`). Present also means the symbol is kept: nothing in the program reads a
+      * table the linker script gathers, so the object joins `llvm.used` rather than being dropped
+      * by the optimizer that finds no reader.
       */
     section: Option[String] = None,
 )
@@ -338,8 +346,8 @@ case class TProgram(
      * belonging to whatever links it.
      */
     entryPoint: Boolean = true,
-    /** Whether the artifact this compilation produces is one a **C project** links (`15 §12`) —
-     * `sysl build-c`, and `emit-header` beside it.
+    /** Whether the artifact this compilation produces is one a **C project** links
+     * (`reference/ffi.md § @export`) — `sysl build-c`, and `emit-header` beside it.
      *
      * It is a second question rather than `entryPoint` read backwards, because **two** kinds of
      * build have no entry point and they answer differently about who fills the module storage
@@ -356,10 +364,11 @@ case class TProgram(
      * a constructor into every `.syslib`.
      */
     cArtifact: Boolean = false,
-    /** The modules that declared `no alloc` (`13 §4`). The analyzer has already held each of them to
-     * making no heap storage of its own; what this carries the answer forward for is the one
-     * allocation no expression in the tree spells — the **promotion** of a local array whose slice
-     * outlives its frame, which escape analysis decides after the walk has finished (`05`).
+    /** The modules that declared `no alloc` (`reference/modules.md § Capabilities are a module
+     * property`). The analyzer has already held each of them to making no heap storage of its own;
+     * what this carries the answer forward for is the one allocation no expression in the tree
+     * spells — the **promotion** of a local array whose slice outlives its frame, which escape
+     * analysis decides after the walk has finished (`05`).
      */
     noAllocModules: Set[String] = Set.empty,
     /** The same, for what each module's **tests** may do
@@ -402,7 +411,8 @@ case class TProgram(
      */
     testOnly: Set[String] = Set.empty,
     /** The **destructor** each type that has one is reached by, keyed by the type as `Type.mangle`
-     * spells it — which is exactly how the release hook names itself (`03 § A destructor`).
+     * spells it — which is exactly how the release hook names itself (`reference/memory.md § A
+     * destructor`).
      *
      * It is carried rather than looked up because the two ends are in different phases and neither
      * can ask the other. The analyzer knows which types an `impl Drop` covered and what the lowered
@@ -410,9 +420,9 @@ case class TProgram(
      * A map from one to the other is the whole of what has to cross.
      */
     destructors: Map[String, String] = Map.empty,
-    /** Which module refers to which, as name resolution settled it (`13 §6`) — the same edges
-     * `ModuleGraph` holds to being acyclic, kept for the one question that is asked after the
-     * analyzer has finished.
+    /** Which module refers to which, as name resolution settled it (`reference/modules.md § The
+     * module graph is acyclic`) — the same edges `ModuleGraph` holds to being acyclic, kept for the
+     * one question that is asked after the analyzer has finished.
      *
      * That question is `Reachability.prune`'s: whether an `@export` in a module a **dependency**
      * supplied is a root. Nothing in the typed tree answers it, because the whole point of an export

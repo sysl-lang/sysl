@@ -28,8 +28,8 @@ package sh.sysl
  *
  * Equal ids mean the same type, within a compilation. **Nothing else.** It is not stable across
  * releases — the mangling is free to change — it is not a number to persist, and it is not a way
- * back to the type: there is no map from an id to anything, which is what keeps `02 § There is no
- * way back to the type` true.
+ * back to the type: there is no map from an id to anything, which is what keeps
+ * `reference/traits.md § There is no way back to the type` true.
  */
 object TypeId {
 

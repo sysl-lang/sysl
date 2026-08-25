@@ -161,9 +161,10 @@ class VariadicMethodTests extends AnyFreeSpec with CodegenSupport with RunSuppor
     }
   }
 
-  // `12 §9` names a nested function alongside a member: its environment holds the first parameter
-  // slot the way a receiver does, so the tail anchors after what the program wrote. That makes it
-  // the one variadic whose fixed parameters are not all written at the declaration.
+  // `reference/ffi.md § Variadic functions` names a nested function alongside a member: its
+  // environment holds the first parameter slot the way a receiver does, so the tail anchors after
+  // what the program wrote. That makes it the one variadic whose fixed parameters are not all
+  // written at the declaration.
   "a nested function" - {
     "walks its own tail, and reaches the frame it was declared in" in {
       val src =

@@ -13,11 +13,12 @@ import scala.collection.mutable
  * soon as two of them exist the question is which goes first — which is the question that kept
  * computed initializers out of `val`'s first cut.
  *
- * **The answer falls out of `13 §6` rather than being invented for this.** The rule is that an
- * initializer runs after every `val` it needs, and it needs whichever ones its initializer reads,
- * directly or through anything that initializer calls. That is a graph over the `val`s themselves,
- * and it is finer than the module graph in the one direction that matters: a module's own files have
- * no order at all (§7), so ordering by module could not have settled two tables in one directory.
+ * **The answer falls out of `reference/modules.md § The module graph is acyclic` rather than being
+ * invented for this.** The rule is that an initializer runs after every `val` it needs, and it
+ * needs whichever ones its initializer reads, directly or through anything that initializer calls.
+ * That is a graph over the `val`s themselves, and it is finer than the module graph in the one
+ * direction that matters: a module's own files have no order at all (§7), so ordering by module
+ * could not have settled two tables in one directory.
  *
  * The module DAG is still what makes the rule usable, and in a way worth saying out loud: a
  * cross-module reference follows a module edge, and those may not cycle, so **a cycle among `val`s

@@ -4,7 +4,8 @@ import io.github.edadma.cross_platform.*
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `c const` — a constant whose value the **C compiler** works out (`15 §7`).
+/** `c const` — a constant whose value the **C compiler** works out (`reference/ffi.md § A library
+ * may carry C`).
  *
  * Every assertion here that reads a number reads one this file does not name. That is deliberate and
  * it is the whole point of the feature: a test asserting `sizeof(long long) == 8` against a literal
@@ -186,8 +187,9 @@ class CConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
             |""".stripMargin) shouldBe "4\n"
     }
 
-    /** `16 §1` again, on the other carrier: a transparent subtype *is* its base, so a float constant
-      * may be declared at one and the `within` bound is checked against the measured number.
+    /** `reference/errors.md § Constrained types` again, on the other carrier: a transparent subtype
+      * *is* its base, so a float constant may be declared at one and the `within` bound is checked
+      * against the measured number.
       */
     "the type may be a transparent subtype of a float, bound and all" in {
       run("""type Fraction = f32 within 0.0..1.0
@@ -413,13 +415,15 @@ class CConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
     }
   }
 
-  /** **The two blocks used as the pair they are** (`15 §7`): a typedef whose width the target or a
-    * `#define` decides, and the constants that have to be that width. Neither half is any use to a
-    * binding without the other — `TickType_t` spelled exactly in a signature and `portMAX_DELAY`
-    * spelled `usize` beside it is a package that does not compile on a port where the two disagree.
+  /** **The two blocks used as the pair they are** (`reference/ffi.md § A library may carry C`): a
+    * typedef whose width the target or a `#define` decides, and the constants that have to be that
+    * width. Neither half is any use to a binding without the other — `TickType_t` spelled exactly
+    * in a signature and `portMAX_DELAY` spelled `usize` beside it is a package that does not
+    * compile on a port where the two disagree.
     *
-    * `16 §1` is what makes this a rule holding rather than an exception: without `new` a constrained
-    * type *is* its base, so a constant declared at one is a constant declared at an integer.
+    * `reference/errors.md § Constrained types` is what makes this a rule holding rather than an
+    * exception: without `new` a constrained type *is* its base, so a constant declared at one is a
+    * constant declared at an integer.
     */
   "the type may be a transparent subtype of an integer" - {
     "a 'c type' measured beside it, which is what the pair is for" in {

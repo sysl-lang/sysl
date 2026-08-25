@@ -53,10 +53,11 @@ trait ExprSupport extends SpecialForms with PatternAnalysis with StmtAnalysis {
    * `Point(…)`, `Shape.Circle(…)` — the ordinary forms, resolved by the cases that already handle
    * them, against tables that were keyed this way to begin with.
    *
-   * Two rules decide it, and both are `13 §3`'s. **A local binding shadows a module name**, so a
-   * chain whose head is bound to a value is a field read and nothing else — which is why this
-   * cannot be a pre-pass over the tree and has to be asked where the scopes are. And the
-   * **longest** module prefix wins, so a module `a.b` is reached as one rather than as `a`'s `b`.
+   * Two rules decide it, and both are `reference/modules.md § Imports`'s. **A local binding shadows
+   * a module name**, so a chain whose head is bound to a value is a field read and nothing else —
+   * which is why this cannot be a pre-pass over the tree and has to be asked where the scopes are.
+   * And the **longest** module prefix wins, so a module `a.b` is reached as one rather than as
+   * `a`'s `b`.
    *
    * A head bound by an import is read as that import, which is what makes the `fs` of `import std.fs`
    * a prefix everywhere a written path is. Everything after that is `inPackage`'s to decide — the
@@ -67,9 +68,9 @@ trait ExprSupport extends SpecialForms with PatternAnalysis with StmtAnalysis {
    * **The package layer is asked with the whole chain and the import layer with its head**, and the
    * asymmetry is the two layers' own. An import binds one name, so only a head can answer to it. A
    * package binds a module *path* — `sh.sysl.table` for one namespaced by reverse DNS, since a
-   * directory holding no source is no module (`13 §1`) — so a head is not enough to find it, and
-   * offering only the head is what made `sh.sysl.table.of(…)` read as a field of an undefined `sh`
-   * while `import sh.sysl.table` beside it resolved.
+   * directory holding no source is no module (`reference/modules.md`) — so a head is not enough to
+   * find it, and offering only the head is what made `sh.sysl.table.of(…)` read as a field of an
+   * undefined `sh` while `import sh.sysl.table` beside it resolved.
    *
    * This used to hold a **second** copy of `inPackage`'s ordering, deciding on the head alone before
    * the package layer was reached at all. That is the shape the ordering fixed, and having it written
@@ -88,7 +89,8 @@ trait ExprSupport extends SpecialForms with PatternAnalysis with StmtAnalysis {
 
       // The key this builds is spelled the way the compiler spells its own references, so resolving
       // it says nothing about which module wrote it — but *this* is a path a file wrote, in the
-      // terms of the body being read, so the dependency it makes is recorded here (`13 §6`).
+      // terms of the body being read, so the dependency it makes is recorded here
+      // (`reference/modules.md § The module graph is acyclic`).
       dependsOn(module)
       rest.tail.foldLeft[Expr](Ident(Modules.qualify(module, rest.head)))((acc, n) => Field(acc, n))
         .setPos(e.pos)
@@ -97,17 +99,19 @@ trait ExprSupport extends SpecialForms with PatternAnalysis with StmtAnalysis {
    * paired with the key it resolves to — `("c.less", "c$less")` from `Field(Ident("c"), "less")`.
    *
    * A function is not a place, so its address is taken from the name rather than by the walk that
-   * looks for storage (`12 §6a`) — and that walk is the only thing `throughModule` sits in front of.
-   * A qualified name therefore has to be recognised here instead, which is the whole of why the
-   * unqualified spelling reached an address and the qualified one did not.
+   * looks for storage (`reference/ffi.md § A function's address`) — and that walk is the only thing
+   * `throughModule` sits in front of. A qualified name therefore has to be recognised here instead,
+   * which is the whole of why the unqualified spelling reached an address and the qualified one did
+   * not.
    *
    * **The written spelling is kept beside the key because a diagnostic has to quote it.** A key
    * carries the module separator, which nothing in source may contain, so a message built from one
    * tells the reader to type something that is not sysl.
    *
-   * `funcKey` is asked the whole dotted path, which it has always accepted: `13 §3`'s last step is a
-   * qualified one, and this is the same resolution an unqualified name takes. **A local binding
-   * shadows a module name**, so the head is tested exactly as `throughModule` tests it.
+   * `funcKey` is asked the whole dotted path, which it has always accepted: `reference/modules.md §
+   * Imports`'s last step is a qualified one, and this is the same resolution an unqualified name
+   * takes. **A local binding shadows a module name**, so the head is tested exactly as
+   * `throughModule` tests it.
    */
   protected def qualifiedFunc(e: Expr): Option[(String, String)] =
     for
@@ -124,9 +128,9 @@ trait ExprSupport extends SpecialForms with PatternAnalysis with StmtAnalysis {
     // An `extern` variable is the one global that is not one: the storage belongs to whoever laid it
     // down, and reaching it is the foreign seam rather than a promise this program made (`12 §1`).
     case g: TGlobal         => !g.writable
-    // A `ref` is read-only exactly when the storage it found is (`03 § ref`), which is what lets the
-    // property survive being given a shorter name: reaching into a `val` keeps it, and a ref is a
-    // way of reaching in.
+    // A `ref` is read-only exactly when the storage it found is (`reference/memory.md § ref — a
+    // name for a place`), which is what lets the property survive being given a shorter name:
+    // reaching into a `val` keeps it, and a ref is a way of reaching in.
     case TLoad(name, _)     => readOnlyLocals(name) || refPlaces.get(name).exists(readOnly)
     case TField(recv, _, _) => readOnly(recv)
     // Only where the elements are the receiver's own storage. A slice's are somebody else's, and

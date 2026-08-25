@@ -11,10 +11,10 @@ class EscapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSupport {
   /** What promotion does **not** reach, and why each is a different question rather than the same
    * one unfinished.
    *
-   * `05 § What happens when a slice escapes` moves a local array to the heap when a view of it gets
-   * out. Both shapes below get a view out and neither has anywhere to move it to: the storage
-   * belongs to something the body did not declare. So the diagnostic that used to cover every
-   * escape now covers exactly these, and says which of the two it is.
+   * `reference/memory.md § What happens when a slice escapes` moves a local array to the heap when
+   * a view of it gets out. Both shapes below get a view out and neither has anywhere to move it to:
+   * the storage belongs to something the body did not declare. So the diagnostic that used to cover
+   * every escape now covers exactly these, and says which of the two it is.
    */
   "a view that gets out is still refused when the storage is not this body's to move" - {
     // The caller laid the array out and passed a copy of it; moving it would mean copying it into a

@@ -295,8 +295,8 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
       run("static val xs: [3]string = [\"x\"; 3]\nvar i = 1\nprint(xs[i])") shouldBe "x\n"
     }
 
-    // A text block is joined by the lexer into one constant (`04 § Text blocks`), so it arrives here
-    // as a literal and needs no rule of its own.
+    // A text block is joined by the lexer into one constant (`reference/lexical.md § Strings`), so
+    // it arrives here as a literal and needs no rule of its own.
     "a text block, which is one literal by the time the analyzer sees it" in {
       run(
         "val banner: string = \"\"\"\n    one\n    two\n    \"\"\"\nprint(banner)",

@@ -1,7 +1,7 @@
 package sh.sysl
 
-/** Control flow **as an expression** (`00 §10`), plus the three forms that carry several values at
- * once.
+/** Control flow **as an expression** (`reference/statements.md`), plus the three forms that carry
+ * several values at once.
  *
  * Every one of these yields a value, which is the whole reason they are analyzed here rather than in
  * `StmtAnalysis`: an `if` in statement position and an `if` on the right of a `var` are the same
@@ -56,7 +56,8 @@ trait ControlFlowExprAnalysis extends ExprSupport {
         else None
 
       // The condition's own scope wraps the condition and the *then* branch and nothing else, which
-      // is the whole of what an `is` binding's reach has to be said about (`09 §12`). The `else` is
+      // is the whole of what an `is` binding's reach has to be said about
+      // (`reference/expressions.md § is — a pattern where a condition is wanted`). The `else` is
       // analyzed outside it, and so is an `elif` — the parser nests one into the else branch, so it
       // is already on the other side of this `popScope` and cannot read a name the test bound.
       pushScope()
@@ -135,12 +136,14 @@ trait ControlFlowExprAnalysis extends ExprSupport {
                   TCFor(tinit, tcond, tstep, tbody, telse,
                         if tcond.isEmpty then endlessResultType(ctx) else loopResultType(ctx, telse)))
 
-    /** `for const i in 0..<A.len` — the loop the compiler **unrolls** (`10 §10`).
+    /** `for const i in 0..<A.len` — the loop the compiler **unrolls** (`reference/generics.md § A
+     * parameter may stand for a list of types`).
      *
-     * The body is analyzed once per value of the range, each copy on its own, with the name standing
-     * at a `ConstArg` for the length of that copy — which is exactly what a value parameter stands
-     * at (`10 §9`), so the name folds into its uses through the machinery that already exists and
-     * `self.i` selects a part through the same constant.
+     * The body is analyzed once per value of the range, each copy on its own, with the name
+     * standing at a `ConstArg` for the length of that copy — which is exactly what a value
+     * parameter stands at (`reference/generics.md § A parameter may stand for a value`), so the
+     * name folds into its uses through the machinery that already exists and `self.i` selects a
+     * part through the same constant.
      *
      * **Analyzing each copy separately is the whole feature**, and it is why this cannot be a
      * desugaring into an ordinary `for`: the parts of a tuple have different types, so one written
@@ -254,10 +257,10 @@ trait ControlFlowExprAnalysis extends ExprSupport {
               err(s"'for' iterates an integer range, an array, a slice, or a type that implements " +
                 s"'${qn(Library.key("Iterate"))}', and ${show(other)} is none of those")
 
-    // `for all i in lo..hi do pred` (`17 §2`). The range is read exactly as a counted `for`'s is —
-    // same node, same two diagnostics — so the two forms cannot come to disagree about what a range
-    // is. What it does not share is the loop machinery: a quantifier has no `break` to meet a type
-    // at, so nothing here consults the loop context.
+    // `for all i in lo..hi do pred` (`reference/verification.md § for all and for some`). The range
+    // is read exactly as a counted `for`'s is — same node, same two diagnostics — so the two forms
+    // cannot come to disagree about what a range is. What it does not share is the loop machinery:
+    // a quantifier has no `break` to meet a type at, so nothing here consults the loop context.
     case Quantifier(universal, name, iter, pred) =>
       val word = if universal then "for all" else "for some"
 
@@ -340,8 +343,9 @@ trait ControlFlowExprAnalysis extends ExprSupport {
     // were written. What each part is *wanted* at comes from the tuple being asked for, which is
     // what lets `var p: (i8, i8) = (1, 2)` narrow its literals the way a struct's fields do.
     case Tuple(elems) =>
-      // A function declaring a result list yields several things and not one tuple (`12 §5b`), so
-      // the parentheses are refused where they would build the carrier the form says never exists.
+      // A function declaring a result list yields several things and not one tuple
+      // (`reference/declarations.md § Several results`), so the parentheses are refused where they
+      // would build the carrier the form says never exists.
       if wantsResults(expected) then
         err(s"this function yields ${quantity(elems.length, "result")} rather than a tuple — " +
           s"write the values without the parentheses")
@@ -352,16 +356,18 @@ trait ControlFlowExprAnalysis extends ExprSupport {
 
       val ts = elems.zip(wanted).map((e, w) => analyzeExpr(e, w))
 
-      // A `unit` part is let through for the reason a `unit` field is (`00 §12`): the layout skips
-      // it. `never` is refused for the reason it is refused everywhere but a result — a part that
-      // is never produced is a part nothing can give the tuple.
+      // A `unit` part is let through for the reason a `unit` field is (`reference/types.md § unit
+      // and never`): the layout skips it. `never` is refused for the reason it is refused
+      // everywhere but a result — a part that is never produced is a part nothing can give the
+      // tuple.
       for t <- ts do
         if t.ty == Type.Never then
           at(t.pos)(err("a tuple part has to be a value, and this expression never produces one"))
 
       TStructNew(tupleType(ts.map(_.ty)), ts)
 
-  /** An `if`'s or a `while`'s condition, as the `&&`-joined chain of terms it is (`09 §12`).
+  /** An `if`'s or a `while`'s condition, as the `&&`-joined chain of terms it is
+   * (`reference/expressions.md § is — a pattern where a condition is wanted`).
    *
    * The chain is flattened here rather than left as nested `Binary("&&", …)` because a term may
    * **bind**, and a binding's reach is "from its own `is` rightward" — which is a statement about
@@ -406,8 +412,9 @@ trait ControlFlowExprAnalysis extends ExprSupport {
             s"this pattern matches every ${show(subject.ty)}, so the test is always true — " +
               s"take the value apart with 'match', or bind it with 'var'")
 
-    // Alternatives share one answer, so the branch cannot know which of them matched — the same rule
-    // an arm's alternatives are held to (`09 §6`), said in the words this position needs.
+    // Alternatives share one answer, so the branch cannot know which of them matched — the same
+    // rule an arm's alternatives are held to (`reference/patterns.md § The pattern forms`), said in
+    // the words this position needs.
     if tpats.length > 1 && tpats.exists(binds) then
       err("alternative patterns joined by '|' cannot bind a name — the branch cannot know which of " +
         "them matched. Write '_' for the parts you are not naming")
@@ -435,7 +442,8 @@ trait ControlFlowExprAnalysis extends ExprSupport {
     checkedLoop(ctx, TForEach(u, elem, seq, tb, telse, loopResultType(ctx, telse)))
   }
 
-  /** `for name in cursor` over a sequence that has to be produced a value at a time (`14 §7`).
+  /** `for name in cursor` over a sequence that has to be produced a value at a time
+   * (`library/core.md § Walking a type of your own`).
    *
    * The cursor is the loop's own: the expression is evaluated once into a slot nothing outside the
    * loop can name, and `next` takes that slot's address, so a `Chars` or any other iterator advances

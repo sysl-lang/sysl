@@ -152,9 +152,10 @@ class TypeIdTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   "what it does not offer" - {
 
-    // `02 § There is no way back to the type` is untouched: the id compares and nothing more. The
-    // refusal below is the other half of keeping that true — a value whose type is known asks for it
-    // by name, so `::Id` on a value never reads as "the runtime type of anything".
+    // `reference/traits.md § There is no way back to the type` is untouched: the id compares and
+    // nothing more. The refusal below is the other half of keeping that true — a value whose type
+    // is known asks for it by name, so `::Id` on a value never reads as "the runtime type of
+    // anything".
     "a value whose type is known here is told to ask for it by name" in {
       val e = err(shapes + """var r = Rect(2)
                              |

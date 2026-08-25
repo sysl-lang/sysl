@@ -1,6 +1,7 @@
 package sh.sysl
 
-/** Holds a definition marked `@export` to what a C caller can actually name and call (`15 §12`).
+/** Holds a definition marked `@export` to what a C caller can actually name and call
+ * (`reference/ffi.md § @export`).
  *
  * **`@export` is `extern` read the other way**, and that symmetry is what decides every rule here.
  * An `extern` names a symbol the linker has and states the signature the other side published; an
@@ -103,9 +104,9 @@ trait ExportCheck extends TypeResolution {
     // **An overload exported under its own name is refused here**, and it is worth catching by name
     // rather than leaving to the rule below. An overload's key carries a numbered segment, which is
     // not a C identifier — so the check below already refuses it, with a message quoting a spelling
-    // the source does not contain (`12 §1a`). C has no overloading at all: two exports of one name
-    // are two definitions of one symbol, which is a link error rather than anything a reader of
-    // either line could act on.
+    // the source does not contain (`reference/declarations.md § Overloading`). C has no overloading
+    // at all: two exports of one name are two definitions of one symbol, which is a link error
+    // rather than anything a reader of either line could act on.
     if e.symbol.isEmpty && overloadKeys(overloadPlain(f.name)).length > 1 then
       err(s"'${qn(f.name)}' is declared more than once, and C has no overloading — two exports of " +
         "one name would be two definitions of one symbol. Give each export a symbol of its own, " +
@@ -127,15 +128,16 @@ trait ExportCheck extends TypeResolution {
         "there would be no way to say which instantiation the linker holds. Export a wrapper per " +
         "instantiation, each naming its own symbol")
 
-    // `private` emits the symbol `internal` (`13 §2`), which is the promise that every caller is
-    // inside this module. An export is the opposite promise, and a definition cannot make both.
+    // `private` emits the symbol `internal` (`reference/modules.md § Visibility`), which is the
+    // promise that every caller is inside this module. An export is the opposite promise, and a
+    // definition cannot make both.
     if f.vis != Visibility.Public then
       err(s"'${Modules.show(f.name)}' is private, which promises every caller is inside its own " +
         "module — and an export promises the opposite. A definition cannot make both claims")
 
     if f.ghost then
       err(s"'${Modules.show(f.name)}' is '@ghost', so it is erased before codegen and there is no " +
-        "symbol for C to link against (`17 §8`)")
+        "symbol for C to link against")
 
     if f.test.isDefined then
       err(s"'${Modules.show(f.name)}' is a '@test', which only 'sysl test' builds — an exported " +

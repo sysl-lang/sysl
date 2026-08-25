@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** A module is a directory, so its files are one scope (`13 §1`, `13 §6`).
+/** A module is a directory, so its files are one scope (`reference/modules.md`,
+ * `reference/modules.md § The module graph is acyclic`).
  *
  * These are that claim from four sides: the header a file writes to say which module it contributes
  * to, the fact that splitting a module across files changes nothing about what its declarations can
@@ -32,8 +33,9 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
       progError("module a\nprint(1)\nmodule b") should include("module")
     }
 
-    // A capability annotation is a line of the header rather than part of this one (`13 §4`), and
-    // the refusal says so rather than reporting a token it did not expect (`CapabilityClauseTests`).
+    // A capability annotation is a line of the header rather than part of this one
+    // (`reference/modules.md § Capabilities are a module property`), and the refusal says so rather
+    // than reporting a token it did not expect (`CapabilityClauseTests`).
     "does not carry the capability annotation on its own line" in {
       progError("module m @no_alloc\nprint(1)") should include("belongs in the file's header")
     }
@@ -180,8 +182,8 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
     }
 
     // Requiring the header rather than inferring it from the path is what keeps a file
-    // self-describing (`13 §1`), and a file with nothing in it has not written one. There is
-    // nothing to point at, so the diagnostic names the file and carries no caret.
+    // self-describing (`reference/modules.md`), and a file with nothing in it has not written one.
+    // There is nothing to point at, so the diagnostic names the file and carries no caret.
     "and a file with nothing in it has not said which module it is" in {
       errIn(
         ("m", "a.sysl", "module m\nf() -> int = 1"),
@@ -292,8 +294,9 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
       ) shouldBe "7\n"
     }
 
-    // Two files of one module share one set of declarations (`13 §1`), so the storage is reachable
-    // from a sibling exactly as a `val` would be — which a local of the entry point never was.
+    // Two files of one module share one set of declarations (`reference/modules.md`), so the
+    // storage is reachable from a sibling exactly as a `val` would be — which a local of the entry
+    // point never was.
     "and a sibling file of the same module writes it" in {
       runIn(
         ("", "main.sysl", "m.bump()\nm.bump()\nm.bump()\nprint(str(m.n))"),
@@ -453,7 +456,7 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
 
     // It reaches the rest of the machinery through the same table `static var` does, so the checks
     // stated over module storage answer for it without being restated. A `@pure` function reading
-    // one (`17 §6`) is the cheapest proof of that.
+    // one (`reference/verification.md § @pure`) is the cheapest proof of that.
     "and a '@pure' function may not read one, as of any module storage" in {
       errIn(
         ("", "main.sysl", "print(str(m.peek()))"),
@@ -500,8 +503,9 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
       ) should not be empty
     }
 
-    // The value namespace is shared (`13 §2`), so a `var` and a `val` of one name in one module are
-    // the collision they are — reported at whichever was written second.
+    // The value namespace is shared (`reference/modules.md § Visibility`), so a `var` and a `val`
+    // of one name in one module are the collision they are — reported at whichever was written
+    // second.
     "and it shares the value namespace with a 'val' of the same name" in {
       errIn(
         ("", "main.sysl", "print(str(m.n))"),

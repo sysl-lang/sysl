@@ -45,7 +45,8 @@ class TypeAttrErrorTests extends AnyFreeSpec with CodegenSupport {
     err(Age + "print(Age::Range)") should include("only meaningful as the iterable of a 'for' loop")
   }
 
-  /** A **derived** subtype is nominally distinct from its base (`16 §1`), and `16 §5` types its
+  /** A **derived** subtype is nominally distinct from its base (`reference/errors.md § Constrained
+   * types`), and `reference/errors.md § What the type's own name offers: :: attributes` types its
    * attributes as the subtype — so the base is what a step now refuses, which is the reverse of
    * what it refused before. `Valid` keeps the base, and so keeps refusing the subtype: a value that
    * is already a `Slot` is not something to ask about.
@@ -65,8 +66,9 @@ class TypeAttrErrorTests extends AnyFreeSpec with CodegenSupport {
   }
 
   // Every one of these is a question about integer bounds, so a subtype over another scalar has
-  // none of them (`16 §5`). The message names the *base*, which is the part that would have to
-  // change — naming the attribute would suggest a different one might work.
+  // none of them (`reference/errors.md § What the type's own name offers: :: attributes`). The
+  // message names the *base*, which is the part that would have to change — naming the attribute
+  // would suggest a different one might work.
   "a subtype over a non-integer base has no attributes, and the message names the base" in {
     val e = err("type Meters = new f64\nprint(Meters::First)")
 

@@ -51,7 +51,8 @@ sealed trait TypeRef extends Positioned {
  */
 case class NamedType(name: String, args: List[TypeRef] = Nil) extends TypeRef
 
-/** A **value** argument as it was written — the `4` in `Buf[4]` (`10 §9`).
+/** A **value** argument as it was written — the `4` in `Buf[4]` (`reference/generics.md § A
+ * parameter may stand for a value`).
  *
  * It is a `TypeRef` because it stands in an argument list of them, which is the same reason
  * `Type.ConstArg` is a `Type`: a declaration's parameters are one list and one argument position,
@@ -94,7 +95,7 @@ case class ArrayType(length: Option[Expr], elem: TypeRef, readOnly: Boolean = fa
 case class VectorType(lanes: Expr, elem: TypeRef) extends TypeRef
 
 /** `volatile T` — storage a device may change and a read of which may itself do something
- * (`03 § Device memory`).
+ * (`reference/memory.md § Device memory`).
  *
  * It goes *before* the type rather than after a sigil, the way C's qualifier does and the way
  * `[]const T`'s does not, because it qualifies the type it is written on rather than the mode
@@ -104,12 +105,13 @@ case class VectorType(lanes: Expr, elem: TypeRef) extends TypeRef
  */
 case class VolatileType(inner: TypeRef) extends TypeRef
 
-/** `(A, B)` — a tuple of two or more parts (`00 §13`). One part is never written here: `(T)` is a
- * type in parentheses, and a product of one thing is the thing.
+/** `(A, B)` — a tuple of two or more parts (`reference/types.md § Tuples`). One part is never
+ * written here: `(T)` is a type in parentheses, and a product of one thing is the thing.
  */
 case class TupleType(parts: List[TypeRef], results: Boolean = false) extends TypeRef
 
-/** `..A` — a **type pack**, one name standing for a list of types (`10 §10`).
+/** `..A` — a **type pack**, one name standing for a list of types (`reference/generics.md § A
+ * parameter may stand for a list of types`).
  *
  * It is a `TypeRef` for the reason `ValueArgType` is one: a declaration's parameters are one list
  * whichever kind each of them is, and a pack stands in that list. It is never a type on its own —
@@ -118,7 +120,8 @@ case class TupleType(parts: List[TypeRef], results: Boolean = false) extends Typ
  */
 case class PackType(name: String) extends TypeRef
 
-/** The type of a callable (`12 §6`) — the parameters it is called with and the result it yields.
+/** The type of a callable (`reference/types.md § Function types`) — the parameters it is called
+ * with and the result it yields.
  *
  * One node covers both spellings because they name the same thing. `Fn(int) -> int` writes the
  * trait out; `int -> int` is the sugar a *parameter* may use, and `bare` records which was written
@@ -166,13 +169,14 @@ case class BoundRef(name: String, args: List[TypeRef] = Nil) extends Positioned 
 
 /** One `name: type` binding, shared by function parameters and struct fields.
  *
- * `vis` is a **field's** — how far the field may be read from (`08 § Visibility`). A function
- * parameter is named by nobody outside the signature it is written in, so it carries the unmarked
- * default and the grammar gives it no place to write anything else.
+ * `vis` is a **field's** — how far the field may be read from (`reference/modules.md §
+ * Visibility`). A function parameter is named by nobody outside the signature it is written in, so
+ * it carries the unmarked default and the grammar gives it no place to write anything else.
  *
  * `default` is a **parameter's** — the value a call that leaves the argument out stands there
- * instead (`12 §2a`). It is the mirror image of `vis`: a field declares none, and the grammar gives
- * a field no place to write one, because what a field falls back to is a different question (`07`).
+ * instead (`reference/declarations.md § Default parameters and named arguments`). It is the mirror
+ * image of `vis`: a field declares none, and the grammar gives a field no place to write one,
+ * because what a field falls back to is a different question (`07`).
  */
 case class Param(
     name: String,
@@ -180,7 +184,8 @@ case class Param(
     vis: Visibility = Visibility.Public,
     default: Option[Expr] = None,
     /** Written `x: -> T`: the argument is an expression the *call* does not evaluate, and the body
-      * evaluates at each use (`12 § A parameter may be passed by name`).
+      * evaluates at each use (`reference/declarations.md § Default parameters and named
+      * arguments`).
       *
       * It is a property of the **parameter** rather than of its type, and that is the whole of why
       * this is cheap. The type is `Fn() -> T` exactly as `x: () -> T` is, so nothing downstream —

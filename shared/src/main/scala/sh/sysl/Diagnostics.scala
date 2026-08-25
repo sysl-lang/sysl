@@ -13,10 +13,10 @@ package sh.sysl
  * diagnostic against a library declaration quotes the library's own file rather than the wrong one.
  *
  * `dir` is where the file sits, as the directory segments between the project root and it — so a
- * file at `std/fs/read.sysl` carries `["std", "fs"]` and one at the root carries `Nil`. A module
- * is a directory (`13 §1`), which makes this the module the file's header has to agree with, and
- * it is the driver that knows it: `None` says the file was handed over with no project around it,
- * and the header is then the whole of what says which module the file is in.
+ * file at `std/fs/read.sysl` carries `["std", "fs"]` and one at the root carries `Nil`. A module is
+ * a directory (`reference/modules.md`), which makes this the module the file's header has to agree
+ * with, and it is the driver that knows it: `None` says the file was handed over with no project
+ * around it, and the header is then the whole of what says which module the file is in.
  *
  * `columnOffset` is how many columns were taken off the front of every line to make this text, which
  * is zero for a file the compiler was handed as it was written and four for the program inside a

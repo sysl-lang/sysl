@@ -9,10 +9,10 @@ package sh.sysl
  * the machine the compiler is running on reaches this only as the default `Target.default` picks,
  * and a caller that names one is building for it whether or not it could run the result.
  *
- * A compilation also allocates from **one** pair of C functions (`15 §10`), and that pair is a
- * parameter for the same reason: it is settled by the packages a program depends on, which is a fact
- * the driver holds and no pass here could work out. `Allocator.c` is libc's, which is what a program
- * depending on nothing that says otherwise gets.
+ * A compilation also allocates from **one** pair of C functions (`reference/ffi.md § interrupt`),
+ * and that pair is a parameter for the same reason: it is settled by the packages a program depends
+ * on, which is a fact the driver holds and no pass here could work out. `Allocator.c` is libc's,
+ * which is what a program depending on nothing that says otherwise gets.
  */
 /** What one compilation produced: the module, whatever the driver may want to tell the user about
  * it, and what the result has to be linked against.
@@ -21,12 +21,13 @@ package sh.sysl
  * property of the *build*, and the only pass that can answer it is the one holding every unit that
  * went in, the standard module and any decoded library included. A driver that had the IR alone
  * could not work it out by reading it: an `extern` says which symbol it wants and never which
- * library has it, which is the whole reason `15 §8` exists.
+ * library has it, which is the whole reason `reference/ffi.md § @link` exists.
  */
 /** `exports` is the lowered tree's exported functions, which is what a C header is written from
- * (`15 §12`). It is carried here rather than recomputed because the two would then be two answers to
- * one question: a header naming a function the object does not define, or missing one it does, is
- * exactly the failure a C project cannot diagnose — it links, and calls something that is not there.
+ * (`reference/ffi.md § @export`). It is carried here rather than recomputed because the two would
+ * then be two answers to one question: a header naming a function the object does not define, or
+ * missing one it does, is exactly the failure a C project cannot diagnose — it links, and calls
+ * something that is not there.
  */
 /** `module` is the compilation's result **as data** (`ir.Module`) and `ir` is that written down.
  *
@@ -56,9 +57,10 @@ object Compiler {
     compile(List(Source(name, source)), target, allocator)
 
   /** Compiles the files of one program, however many modules they make up. Each file says which
-   * module it contributes to, the files of one module share a single scope (`13 §1`), and a module
-   * reaches another's members by naming them in full (`13 §3`) — so the order the files are handed
-   * over in decides nothing but which one a diagnostic is reported against first.
+   * module it contributes to, the files of one module share a single scope
+   * (`reference/modules.md`), and a module reaches another's members by naming them in full
+   * (`reference/modules.md § Imports`) — so the order the files are handed over in decides nothing
+   * but which one a diagnostic is reported against first.
    */
   def compile(sources: List[Source], target: Target = Target.default,
               allocator: Allocator = Allocator.c): Either[String, String] =
@@ -76,7 +78,8 @@ object Compiler {
       own = ownModules(units))).map(_.ir)
 
   /** Compiles a program **against a library**: the library's modules are compiled alongside it, and
-   * the program reaches them by the ordinary module rules (`13 §3`) — a full path, or an `import`.
+   * the program reaches them by the ordinary module rules (`reference/modules.md § Imports`) — a
+   * full path, or an `import`.
    *
    * The library arrives as trees rather than as source because that is what it will be: an
    * `AstCodec` artifact, decoded. Nothing downstream distinguishes the two, which is the property
@@ -172,12 +175,14 @@ object Compiler {
   private def ownModules(units: List[Program]): Option[Set[String]] =
     Some(units.map(moduleOf).toSet)
 
-  /** The same compilation stopped at the **typed tree**, which is what `sysl prove` reads (`17 §9`).
+  /** The same compilation stopped at the **typed tree**, which is what `sysl prove` reads
+   * (`reference/verification.md § sysl prove`).
    *
    * It stops before pruning and before lowering, and both matter. A function nothing calls is still
    * one the program declared and still one somebody may want proved; and a `@ghost` declaration is
-   * dropped from the emitted module by design (`17 §8`), so a proof run reading the lowered tree
-   * would have lost exactly the predicates the specification is written in.
+   * dropped from the emitted module by design (`reference/verification.md § @ghost — what costs
+   * nothing to say`), so a proof run reading the lowered tree would have lost exactly the
+   * predicates the specification is written in.
    */
   def typedWith(sources: List[Source], libraries: List[Program], target: Target = Target.default,
                 std: Option[Stdlib] = None, provides: Set[String] = Capability.core.toSet)
@@ -340,9 +345,10 @@ object Compiler {
    * them, so that the compiler does not supply the files it is being asked to compile.
    *
    * `libraries` is every **other** library this one is built on — the `--lib` roots and `.syslib`s
-   * of `15 §7`, already parsed. They join the compilation the way the shipped library does and are
-   * governed by the paragraph above with nothing added: their modules are not this tree's, so what
-   * they declare is declared here and defined in whatever program links them both.
+   * of `reference/ffi.md § A library may carry C`, already parsed. They join the compilation the
+   * way the shipped library does and are governed by the paragraph above with nothing added: their
+   * modules are not this tree's, so what they declare is declared here and defined in whatever
+   * program links them both.
    */
   /** **The object half is built for one allocator**, exactly as it is built for one target: an
    * allocating function compiled here calls the pair by name, and a program that frees through a
@@ -427,10 +433,11 @@ object Compiler {
           promoted, target, allocator)
 
       // **What is advertised is what the linker can reach**, so a file-private declaration is left
-      // out however ordinary it looks here. Its symbol is emitted `internal` (`13 §2`), which is a
-      // promise that every caller is in this module — and a program told the artifact holds it would
-      // declare it, call it, and find nothing at the link. Left out, the program compiles a copy of
-      // its own from the tree the artifact carries, which is what it does with a generic.
+      // out however ordinary it looks here. Its symbol is emitted `internal` (`reference/modules.md
+      // § Visibility`), which is a promise that every caller is in this module — and a program told
+      // the artifact holds it would declare it, call it, and find nothing at the link. Left out,
+      // the program compiles a copy of its own from the tree the artifact carries, which is what it
+      // does with a generic.
       //
       // An `internal` function is still *emitted* above, unlike a deferred one: internal linkage is
       // what keeps the program's copy and this one from being one symbol, so there is no collision
@@ -520,12 +527,13 @@ object Compiler {
       val pruned = Reachability.prune(Tests.strip(typed), own)
 
       // The std's units are asked as well as the program's, and this is what makes an artifact's
-      // directives mean anything: the standard module arrives as `Stdlib` rather than in `units`, so a
-      // collection that read only the latter would drop every directive the library ships with.
-      // `entryPoint = false` is what makes a C-callable artifact possible at all (`15 §12`): the
-      // module is emitted with no `main`, so the C project supplies its own and this object is
-      // something its linker takes rather than something that wanted to be a program. It is the same
-      // switch a library build has always used, reached from a second command.
+      // directives mean anything: the standard module arrives as `Stdlib` rather than in `units`,
+      // so a collection that read only the latter would drop every directive the library ships
+      // with. `entryPoint = false` is what makes a C-callable artifact possible at all
+      // (`reference/ffi.md § @export`): the module is emitted with no `main`, so the C project
+      // supplies its own and this object is something its linker takes rather than something that
+      // wanted to be a program. It is the same switch a library build has always used, reached from
+      // a second command.
       Compiled(Codegen.module(pruned.copy(precompiled = precompiled, entryPoint = entryPoint),
                               promoted, target, allocator),
                promoted.explanations,

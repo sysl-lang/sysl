@@ -1,7 +1,7 @@
 package sh.sysl
 
 /** The rule that a declaration may not name, in what it declares to whoever can reach it, a type
- * that does not reach as far (`13 §2`).
+ * that does not reach as far (`reference/modules.md § Visibility`).
  *
  * A `private struct Point` beside a public `make() -> Point` would hand every module a value of a
  * type none of them may name: they could hold it, pass it on, and read its fields, and the one
@@ -44,9 +44,9 @@ trait SignatureVisibility extends TypeResolution {
    * which is the whole of the question a leak asks.
    *
    * A module-scoped declaration covers another exactly when its subtree contains the other's, and
-   * `private[M]` may only name an enclosing module (`13 §2`), so every reach is a contiguous region
-   * and containment settles it. A file covers only itself, compared by identity rather than by name
-   * because two files of one project may be called the same thing.
+   * `private[M]` may only name an enclosing module (`reference/modules.md § Visibility`), so every
+   * reach is a contiguous region and containment settles it. A file covers only itself, compared by
+   * identity rather than by name because two files of one project may be called the same thing.
    */
   protected def covers(outer: Reach, inner: Reach): Boolean = (outer, inner) match
     case (Reach.Everywhere, _)                      => true
@@ -194,7 +194,8 @@ trait SignatureVisibility extends TypeResolution {
       supers: List[BoundRef] = Nil,
   ): Unit = exposeIn(key, Modules.split(key)._2, reachOf(key), tparams, bounds, parts, supers)
 
-  /** One member of a type or of a trait, asked at **its own** reach (`08 § Visibility`).
+  /** One member of a type or of a trait, asked at **its own** reach (`reference/modules.md §
+   * Visibility`).
    *
    * That is the type's where the member said nothing, since an unmarked member inherits it, and
    * narrower where it restricted itself — so a `private` helper method may name a `private` type

@@ -3,7 +3,7 @@ package sh.sysl
 import io.github.edadma.cross_platform.*
 
 /** `sysl build-c` and `sysl emit-header` — the archive and the header a C project is handed
- * (`15 §12`).
+ * (`reference/ffi.md § @export`).
  *
  * **The last test is the one that matters and the rest are its scaffolding.** Everything else in
  * this feature can be asserted by reading text sysl produced, which proves only that sysl agrees
@@ -423,9 +423,9 @@ class ExportCliTests extends LibraryCliSupport {
       |answer() -> i32 = demo.seven_times(6)
       |""".stripMargin
 
-  /** `15 §7`'s table gives a source root named with `--lib` the same answer as the project's own
-   * tree: its C is compiled and reaches the link. For this command the link line is the archive, so
-   * "reaches the link" means "is a member".
+  /** `reference/ffi.md § A library may carry C`'s table gives a source root named with `--lib` the
+   * same answer as the project's own tree: its C is compiled and reaches the link. For this command
+   * the link line is the archive, so "reaches the link" means "is a member".
    *
    * **The failure this pins was silent in both directions.** `build-c` walked the project's tree
    * alone, so a package carrying a shim built cleanly, wrote an archive, said nothing, and handed a
@@ -507,8 +507,9 @@ class ExportCliTests extends LibraryCliSupport {
    * project's is, and it fails in the same silent way: the sysl compiles, the archive is written, and
    * a C project's linker reports a symbol nobody in that project has ever heard of.
    *
-   * The C only exists because it is under a per-OS directory (`13 §5`), so this is also what says
-   * the selection reaches this command and not only the ones that link.
+   * The C only exists because it is under a per-OS directory (`reference/modules.md § Platform
+   * selection`), so this is also what says the selection reaches this command and not only the ones
+   * that link.
    */
   "the standard library's own C" - {
 

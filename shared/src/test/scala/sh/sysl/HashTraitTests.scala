@@ -95,8 +95,9 @@ class HashTraitTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       run(src) shouldBe "true\nfalse\n"
     }
 
-    // `10 §5`'s definition-time check: the missing bound is reported at the line that writes the
-    // call, not at whichever instantiation first supplied a type without one.
+    // `reference/generics.md § Bounds`'s definition-time check: the missing bound is reported at
+    // the line that writes the call, not at whichever instantiation first supplied a type without
+    // one.
     "and without the bound the call is refused where it is written" in {
       err("keyed[K](k: K) -> u64 = k.hash()\nprint(1)") should include("hash")
     }
@@ -131,10 +132,11 @@ class HashTraitTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
   }
 
-  // **What the written blocks buy, and the reason they replaced the rule.** A method table points at
-  // functions, and a membership the compiler hands out has none — so before these blocks a built-in
-  // could satisfy a `Hash` bound and still not be erasable to a `&Hash`. This is the capability
-  // `Display` gained when it made the same move (`14 §5`).
+  // **What the written blocks buy, and the reason they replaced the rule.** A method table points
+  // at functions, and a membership the compiler hands out has none — so before these blocks a
+  // built-in could satisfy a `Hash` bound and still not be erasable to a `&Hash`. This is the
+  // capability `Display` gained when it made the same move (`reference/expressions.md § Operator
+  // dispatch`).
   "a built-in erases to a trait object, its membership being a real function now" - {
     "and a heterogeneous collection of them each hashes through its own impl" in {
       val src =

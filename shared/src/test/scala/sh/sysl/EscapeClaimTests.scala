@@ -8,11 +8,12 @@ import org.scalatest.freespec.AnyFreeSpec
  * cover the five escape routes, the call-crossing summaries, recursion, erasure, the `Reader`
  * non-exception, the `&Struct` owner walk and the `--explain-escapes` report. All of it held.
  *
- * What the sweep found is an **enumeration short by two**, with the implementation on the right side
- * of it: `§ What escapes` names a returned "struct, enum, or `Option`" as the carriers a view can
- * ride out in, and the language has two more — a tuple (`00 §13`) and a slot of a multi-result list
- * (`12 §5`). Both are caught; only the prose was behind. The rest of this file is the claims no
- * suite happened to reach, all of which held.
+ * What the sweep found is an **enumeration short by two**, with the implementation on the right
+ * side of it: `§ What escapes` names a returned "struct, enum, or `Option`" as the carriers a view
+ * can ride out in, and the language has two more — a tuple (`reference/types.md § Tuples`) and a
+ * slot of a multi-result list (`reference/expressions.md § Closures`). Both are caught; only the
+ * prose was behind. The rest of this file is the claims no suite happened to reach, all of which
+ * held.
  */
 class EscapeClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 

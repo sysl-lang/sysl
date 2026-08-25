@@ -183,8 +183,9 @@ class ImplComposedErrorTests extends AnyFreeSpec with CodegenSupport with RunSup
   "two impls for one composed type share its member table" - {
 
     // A composed type's members are one namespace like any other type's, and like any other type's
-    // that namespace is **per trait** (`13 §2`): both blocks are accepted, because which `go` a use
-    // means is a question about what the file can name rather than about the slice.
+    // that namespace is **per trait** (`reference/modules.md § Visibility`): both blocks are
+    // accepted, because which `go` a use means is a question about what the file can name rather
+    // than about the slice.
     "so both are filed, and the declarations stand" in {
       run(twoTraits +
         """main()

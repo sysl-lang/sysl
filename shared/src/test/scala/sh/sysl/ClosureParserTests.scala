@@ -2,8 +2,9 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Parsing of the closure surface (`12 §5`, `§5a`, `§6`): the arrow literal, the callable's type in
- * both its spellings, and what each of them may not be confused with.
+/** Parsing of the closure surface (`reference/expressions.md § Closures`, `§5a`, `§6`): the arrow
+ * literal, the callable's type in both its spellings, and what each of them may not be confused
+ * with.
  */
 class ClosureParserTests extends AnyFreeSpec with ParseSupport {
 

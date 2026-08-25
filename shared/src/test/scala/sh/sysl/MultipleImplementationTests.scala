@@ -32,15 +32,15 @@ class MultipleImplementationTests extends AnyFreeSpec with RunSupport with Codeg
       |""".stripMargin
 
   "what the documents claim" - {
-    // `02 § A trait's members become the type's` — and both implementations' members do, under the
-    // one name the trait declared.
+    // `reference/traits.md § Reaching a member through its trait` — and both implementations'
+    // members do, under the one name the trait declared.
     "both implementations' members are reachable by the name the trait wrote" in {
       run(sink + """print(A(10).put(1))
                    |print(A(10).put(1.0))""".stripMargin) shouldBe "11\n9\n"
     }
 
-    // `14 §3` — the operator is dispatched at the type of its right operand, however many
-    // implementations there are to dispatch among.
+    // `reference/expressions.md § Operator dispatch` — the operator is dispatched at the type of
+    // its right operand, however many implementations there are to dispatch among.
     "an operator dispatches on the pair, at three argument lists" in {
       run("""struct C
             |    v: int
@@ -100,7 +100,7 @@ class MultipleImplementationTests extends AnyFreeSpec with RunSupport with Codeg
       )
     }
 
-    // `02 § A type that implements the trait at other arguments` — the diagnostic now names every
+    // `reference/traits.md § One implementation per argument list` — the diagnostic now names every
     // implementation there is, because writing one more is the thing to do about it.
     "a bound that names neither is told what the type does implement" in {
       err(sink + """f[X: Sink[bool]](x: X) -> int = 1
@@ -312,7 +312,8 @@ class MultipleImplementationTests extends AnyFreeSpec with RunSupport with Codeg
             |print(A(0).twice(1.0))""".stripMargin) shouldBe "2\n202\n"
     }
 
-    // The scalars are `Mul` at themselves and at nothing else (`14 §5`, `01`'s no-promotion rule).
+    // The scalars are `Mul` at themselves and at nothing else (`reference/expressions.md § Operator
+    // dispatch`, `01`'s no-promotion rule).
     "a built-in still cannot be given an operator implementation" in {
       err("""impl Mul for int
             |    mul(self, k: int) -> int = self""".stripMargin) should include("the compiler provides")

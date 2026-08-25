@@ -45,8 +45,9 @@ object Tests {
    * for, and a type parameter leaves nothing to call at all, since a generic has no compiled form
    * until a caller fixes its arguments.
    *
-   * A variadic tail needs no case of its own: `12 §9` already requires a named parameter in front of
-   * one, so a function that could take a tail has taken a parameter and is refused by that.
+   * A variadic tail needs no case of its own: `reference/ffi.md § Variadic functions` already
+   * requires a named parameter in front of one, so a function that could take a tail has taken a
+   * parameter and is refused by that.
    *
    * Each is reported where the attribute is rather than where the signature is, because the attribute
    * is the part that is wrong: the function is a perfectly good function, and it is `@test` that made
@@ -88,9 +89,9 @@ object Tests {
    * absence here and its refusal there are the same fact said twice.
    *
    * A binding that names several things, written either as a list or as a pattern, is absent for a
-   * different reason: neither can be a module member at all, since its parts have nowhere to write a
-   * type (`12 §5b`), and `Hoisting` reports one at a file's top level rather than registering it. So
-   * there is no key for this to answer with.
+   * different reason: neither can be a module member at all, since its parts have nowhere to write
+   * a type (`reference/declarations.md § Several results`), and `Hoisting` reports one at a file's
+   * top level rather than registering it. So there is no key for this to answer with.
    */
   def declaredNames(stmt: Stmt): List[String] = stmt match
     case d: FuncDecl      => List(d.name)

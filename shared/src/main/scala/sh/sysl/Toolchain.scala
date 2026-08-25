@@ -17,17 +17,18 @@ import io.github.edadma.cross_platform.*
 /** Where on **this machine** the toolchain should look for things it was not told the location of:
  * libraries a `@link` directive named, and headers a carried `.c` includes.
  *
- * ==This is the host's question, and `15 §8` answered the target's==
+ * ==This is the host's question, and `reference/ffi.md § @link` answered the target's==
  *
- * `15 §8` is emphatic that a directive names a library and never a flag, because *what a name becomes
- * on a command line* is a property of the machine being built **for** — `-lm` is right on ELF and
- * wrong on Darwin. That decision stands and nothing here touches it. What it never addressed is
- * *where the library sits on the machine being built* **on**, which is a different question with a
- * different owner: the target decides the name-to-flag mapping, the host decides the search path.
+ * `reference/ffi.md § @link` is emphatic that a directive names a library and never a flag, because
+ * *what a name becomes on a command line* is a property of the machine being built **for** — `-lm`
+ * is right on ELF and wrong on Darwin. That decision stands and nothing here touches it. What it
+ * never addressed is *where the library sits on the machine being built* **on**, which is a
+ * different question with a different owner: the target decides the name-to-flag mapping, the host
+ * decides the search path.
  *
  * So this belongs to the driver and must not become an attribute. A path written into a module's
- * header would be one machine's directory layout hard-coded into portable source, which is the exact
- * failure `15 §8` refuses `-l` spellings to avoid.
+ * header would be one machine's directory layout hard-coded into portable source, which is the
+ * exact failure `reference/ffi.md § @link` refuses `-l` spellings to avoid.
  *
  * ==Why it is a flag when clang already reads the environment==
  *
@@ -184,8 +185,8 @@ object Toolchain {
   lazy val clangAvailable: Boolean =
     exec(Seq("clang", "--version")).exitCode == 0
 
-  /** Whether a Why3 is on the PATH, for `sysl prove` (`17 §9`). The proof tests gate on it so they
-   * skip cleanly on a machine without one.
+  /** Whether a Why3 is on the PATH, for `sysl prove` (`reference/verification.md § sysl prove`).
+   * The proof tests gate on it so they skip cleanly on a machine without one.
    *
    * Looked for by name only. Why3 installs through opam and has no Homebrew formula, so on a machine
    * that has one it is opam's switch that puts it on the PATH — which is the thing to say in the
@@ -224,7 +225,8 @@ object Toolchain {
    */
   lazy val why3HasProver: Boolean = prover.isDefined
 
-  /** Runs Why3 over a WhyML module, answering what it said (`17 §9`).
+  /** Runs Why3 over a WhyML module, answering what it said (`reference/verification.md § sysl
+   * prove`).
    *
    * `prove` is the batch subcommand: it splits each verification condition into goals, runs the
    * configured provers on them, and reports one line per goal. The exit status is what says whether
@@ -647,7 +649,8 @@ object Toolchain {
       target.fpu.toList.flatMap: unit =>
         List(if target.softFloat then "-mfloat-abi=softfp" else "-mfloat-abi=hard", s"-mfpu=$unit")
 
-  /** What a build's link directives (`15 §8`) become on **this** target's command line.
+  /** What a build's link directives (`reference/ffi.md § @link`) become on **this** target's
+   * command line.
    *
    * A directive names a library and never a flag, so this is the whole of the translation, and it is
    * a decision per operating system written out per case rather than a default that some target
@@ -667,11 +670,11 @@ object Toolchain {
    * apart: it is the C runtime's own family that a freestanding target is missing, and a directive
    * naming anything else — a driver's own archive, say — is passed through on every target.
    *
-   * **This replaced a list the driver carried.** Until `15 §8` existed, `-lm` was appended to every
-   * ELF link whether or not the program touched mathematics, because the compiler had no way to be
-   * told and `sysl.math` had no way to say. It says so itself now, in `library/sysl/sys/math.sysl`, and
-   * the decision left here is the only part that was ever the driver's: where a named library lives
-   * on the machine being built for.
+   * **This replaced a list the driver carried.** Until `reference/ffi.md § @link` existed, `-lm`
+   * was appended to every ELF link whether or not the program touched mathematics, because the
+   * compiler had no way to be told and `sysl.math` had no way to say. It says so itself now, in
+   * `library/sysl/sys/math.sysl`, and the decision left here is the only part that was ever the
+   * driver's: where a named library lives on the machine being built for.
    */
   private[sysl] def libraryFlags(links: List[String], target: Target): List[String] =
     links.filter(name => !provided(target.os).contains(name)).map(name => s"-l$name")
@@ -755,7 +758,7 @@ object Toolchain {
   }
 
   /** Compiles one of a library's C files into a relocatable object, to be archived beside the
-   * object the library's own sysl compiled to (`15 §7`).
+   * object the library's own sysl compiled to (`reference/ffi.md § A library may carry C`).
    *
    * **This is what makes a binding to a C library writable at all.** A caller-allocated type like
    * `regex_t` has a size and an alignment that only the target's own headers know, and a macro like
@@ -872,8 +875,8 @@ object Toolchain {
    * platform passes and not something this could withhold.
    *
    * The whole `Compiled` is taken rather than the IR alone because what a program links against
-   * comes back beside its module and nowhere else (`15 §8`). Taking the IR was enough only while the
-   * driver carried one hardcoded library for every build.
+   * comes back beside its module and nowhere else (`reference/ffi.md § @link`). Taking the IR was
+   * enough only while the driver carried one hardcoded library for every build.
    */
   private[sysl] def runIr(compiled: Either[String, Compiled], args: List[String],
                           archives: List[String] = Nil): Either[String, (Int, String)] =

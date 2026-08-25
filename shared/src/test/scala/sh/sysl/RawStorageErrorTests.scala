@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** What the raw tier refuses (`03 § Reinterpreting storage`).
+/** What the raw tier refuses (`reference/memory.md § Reinterpreting storage`).
  *
  * The shape of the whole section is here: reading an address *out of* a pointer is an ordinary
  * conversion and reading one *into* a pointer is not, so the refusals cluster on the second

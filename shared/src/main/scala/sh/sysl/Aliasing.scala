@@ -2,7 +2,8 @@ package sh.sysl
 
 import scala.collection.mutable
 
-/** What a struct's `invariant` clauses (`16 §6`) demand of the aliases a program makes.
+/** What a struct's `invariant` clauses (`reference/errors.md § Struct invariants`) demand of the
+ * aliases a program makes.
  *
  * A clause is discharged by re-checking it at the write, and the write is found by walking outward
  * through the **place** being written — so the whole obligation rests on the place still naming the
@@ -44,9 +45,10 @@ trait Aliasing extends RefBindings {
     place match
       case TField(recv, _, _) => owed(recv) ++ invCheckFor(recv)
       case TIndex(recv, _, _) => invCheckFor(recv)
-      // A `ref` name is a place written shorter (`03 § ref`), so the walk carries on through what it
-      // stands for. This is the whole of why a ref keeps the checking a `*T` would have severed:
-      // there is still a place here to walk outward through, and it is the one the program wrote.
+      // A `ref` name is a place written shorter (`reference/memory.md § ref — a name for a place`),
+      // so the walk carries on through what it stands for. This is the whole of why a ref keeps the
+      // checking a `*T` would have severed: there is still a place here to walk outward through,
+      // and it is the one the program wrote.
       case TLoad(n, _) if refPlaces.contains(n) => invCheckFor(refPlaces(n))
       case _                                    => Nil
 
@@ -145,7 +147,8 @@ trait Aliasing extends RefBindings {
       case _               => Nil
     }
 
-  /** Holds a clause to reading storage the struct **owns** (`16 §6`).
+  /** Holds a clause to reading storage the struct **owns** (`reference/errors.md § Struct
+   * invariants`).
    *
    * Everything else here restricts the aliases a program may make, and that only works while the
    * clause is a claim about the struct's own bytes. A clause that reads through a pointer, a
@@ -157,13 +160,14 @@ trait Aliasing extends RefBindings {
    * A view's `len` is the exception, and it is not really one: the three words are stored in the
    * struct, so the length is the struct's own and the elements are not.
    *
-   * A struct holding a **register** carries no invariant at all (`03 § Device memory`), and the rule
-   * is about the struct rather than about the clause for a reason worth stating: a check is a call
-   * taking *every* field, so it reads the whole block however few fields the clause names. On real
-   * hardware that is not a redundant read — reading a data register pops a FIFO — so a clause over
-   * the shadow field beside the registers would make writing that field an access to every one of
-   * them. There is nothing to keep the clause true either: a device changes a register between the
-   * check and the instruction after it, with no alias anywhere for `16 §6` to restrict.
+   * A struct holding a **register** carries no invariant at all (`reference/memory.md § Device
+   * memory`), and the rule is about the struct rather than about the clause for a reason worth
+   * stating: a check is a call taking *every* field, so it reads the whole block however few fields
+   * the clause names. On real hardware that is not a redundant read — reading a data register pops
+   * a FIFO — so a clause over the shadow field beside the registers would make writing that field
+   * an access to every one of them. There is nothing to keep the clause true either: a device
+   * changes a register between the check and the instruction after it, with no alias anywhere for
+   * `reference/errors.md § Struct invariants` to restrict.
    */
   protected def checkInvariantReads(decl: StructDecl, ftypes: Map[String, Type]): Unit = {
     val fields = decl.fields.map(_.name).toSet
@@ -241,7 +245,7 @@ trait Aliasing extends RefBindings {
         s"it would break the clause with nothing left to re-check it against. Take the address of the " +
         s"${show(s)} itself, which keeps the invariant in its type, or make the change through a method")
 
-  /** `&` of a field inside a `@packed` struct, refused (`15 §1`).
+  /** `&` of a field inside a `@packed` struct, refused (`reference/types.md § Structs`).
    *
    * A packed field sits at its declared offset, which is very often not a multiple of its own
    * alignment — the whole point of the attribute. A `*u32` is a `*u32` wherever it came from, and
@@ -279,14 +283,15 @@ trait Aliasing extends RefBindings {
           s"${show(Type.element(view).getOrElse(Type.Unknown))}', which may not write, or make the " +
           s"change through a method")
 
-  /** Re-checks, after a call, every invariant the receiver's place lies below (`16 §6`).
+  /** Re-checks, after a call, every invariant the receiver's place lies below (`reference/errors.md
+   * § Struct invariants`).
    *
    * A `*self` method reached through a field — `o.a.bump()` — is the one severed place the language
-   * still has, since there are no parameter modes (`12 §2`) and so no other way to hand a callee
-   * somewhere to write without writing `&`. What makes it recoverable is that the **call site** still
-   * knows the whole place: the receiver is `o.a`, `o` is right there, and the clause can be re-run
-   * the moment the call returns. So the alias is allowed and the promise is kept at the boundary
-   * instead of inside.
+   * still has, since there are no parameter modes (`reference/declarations.md § Functions`) and so
+   * no other way to hand a callee somewhere to write without writing `&`. What makes it recoverable
+   * is that the **call site** still knows the whole place: the receiver is `o.a`, `o` is right
+   * there, and the clause can be re-run the moment the call returns. So the alias is allowed and
+   * the promise is kept at the boundary instead of inside.
    *
    * Wrapping is by the same fold a write uses, so where a place lies below more than one struct the
    * innermost clause is the one that fires first.

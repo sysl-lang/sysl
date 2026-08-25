@@ -1,6 +1,7 @@
 package sh.sysl
 
-/** What a `ref` binding is, and the one thing it asks of the code around it (`03 § ref`).
+/** What a `ref` binding is, and the one thing it asks of the code around it (`reference/memory.md §
+ * ref — a name for a place`).
  *
  * A ref binds a name to a **place**. At run time that is an address, taken once where the binding is
  * written; at compile time it is the place expression itself, kept so that every walk which
@@ -89,10 +90,10 @@ trait RefBindings extends AnalyzerBase {
    * the inside.
    *
    * A `*self` receiver is the one place a callee is handed somewhere to write without an `&` in the
-   * caller's own source (`16 §6`), so it is the one call that has to be asked about. It is refused
-   * whether or not that particular method reassigns anything, because deciding otherwise means
-   * reading the body, and a module compiles against its imports' signatures and never their bodies
-   * (`15`).
+   * caller's own source (`reference/errors.md § Struct invariants`), so it is the one call that has
+   * to be asked about. It is refused whether or not that particular method reassigns anything,
+   * because deciding otherwise means reading the body, and a module compiles against its imports'
+   * signatures and never their bodies (`15`).
    */
   protected def checkRefCall(place: TExpr): Unit =
     for

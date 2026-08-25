@@ -8,7 +8,8 @@ package sh.sysl
  */
 case class BitRange(name: String, ty: Type, offset: Int, width: Int)
 
-/** A `@packed` struct in which an `iN` field occupies exactly N bits (`15 §1`).
+/** A `@packed` struct in which an `iN` field occupies exactly N bits (`reference/types.md §
+ * Structs`).
  *
  * **Such a struct *is* one unsigned integer**, `bits` wide, and its fields are bit ranges of that
  * integer filled from the least significant bit upward in declaration order, straddling byte

@@ -199,10 +199,11 @@ class SyslParser(val source: Source, val recovering: Boolean = false) extends Co
    */
   protected lazy val program: PackratParser[Program] =
     skipNewlines ~> maybe(moduleHeader) >> { m =>
-      // An attribute goes on a line of its own, which is what both `13 §4` and `capabilities.md`
-      // show and what keeps `module m @no_alloc @requires(os)` from being a line anyone has to read.
-      // The exception is a file that declares no module: the root module is a module like any other,
-      // and there is no header for its attributes to sit below, so there they may open the file.
+      // An attribute goes on a line of its own, which is what both `reference/modules.md §
+      // Capabilities are a module property` and `capabilities.md` show and what keeps `module m
+      // @no_alloc @requires(os)` from being a line anyone has to read. The exception is a file that
+      // declares no module: the root module is a module like any other, and there is no header for
+      // its attributes to sit below, so there they may open the file.
       val lead = if m.isDefined then success(List.empty[HeaderClause])
                  else maybe(headerAttr) ^^ (_.toList.flatten)
 

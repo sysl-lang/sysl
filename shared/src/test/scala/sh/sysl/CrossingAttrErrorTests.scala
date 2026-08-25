@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** `@crossing(p)` — the annotation that says a parameter hands a value to another concurrency
- * domain, and what it refuses (`06 § Marking a domain boundary`).
+ * domain, and what it refuses (`reference/memory.md § @crossing — where the rule is asked`).
  *
  * The point of the annotation is that the rule reaches a scheduler sysl did not write: the check is
  * made at the call, off the signature, so a package binding an RTOS gets it by writing one line

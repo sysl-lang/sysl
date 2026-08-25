@@ -59,8 +59,9 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
       args: List[Expr],
       expected: Option[Type],
       via: Set[String] = Set.empty,
-      // Written at the call — `x.m[T](…)` (`10 §2`). Only the last branch below can be reached with
-      // a list in hand, because what routes a call here with one is a guard that has already found a
+      // Written at the call — `x.m[T](…)` (`reference/generics.md § [] means type application in a
+      // type, indexing in an expression`). Only the last branch below can be reached with a list in
+      // hand, because what routes a call here with one is a guard that has already found a
       // **declared method** of that name on the receiver's own type.
       writtenTargs: List[Expr] = Nil,
   ): TExpr = {
@@ -146,7 +147,8 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
             // written *above* its callee reached here before the signature failed to be recorded.
             val (params, rtype) = funcInsts.getOrElse(fname, poisoned())
             // A closure's `call` is not a method a program wrote, so a complaint about one names
-            // the callable and the argument's position rather than the member behind it (`12 §6`).
+            // the callable and the argument's position rather than the member behind it
+            // (`reference/types.md § Function types`).
             val callable = mname == "call" && callableOf(rty).isDefined
             // Named by the **receiver**, not by the symbol the member is emitted under. The two
             // agree for a type with a name of its own and part company for everything reached
@@ -248,11 +250,11 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
 
         // **Scope decides before the arguments do**, because the two axes answer different
         // questions and only this one can answer its own. Two implementations of one trait differ
-        // in their argument lists and are told apart by a call's values; two *different traits*
-        // may declare the same name with the same parameters — `zero()` and `zero()` — and nothing
-        // in the call could ever tell those apart. What tells them apart is that a trait's member
-        // is reachable only where the trait can be named (`13 §2`), so a file reaching one of them
-        // has said which by what it imported.
+        // in their argument lists and are told apart by a call's values; two *different traits* may
+        // declare the same name with the same parameters — `zero()` and `zero()` — and nothing in
+        // the call could ever tell those apart. What tells them apart is that a trait's member is
+        // reachable only where the trait can be named (`reference/modules.md § Visibility`), so a
+        // file reaching one of them has said which by what it imported.
         val cands = all.filter(reachable(owner, _, via))
 
         if cands.isEmpty then outOfScope(owner, mname, all, subject)
@@ -274,9 +276,10 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
             "argument given by name leaves nothing to tell them apart. Write them in declared order"))
 
         // A candidate that takes a `...` is answered for by its declared parameters alone: the tail
-        // stands at none, so what it may be told apart by stops where they do (`12 §9`). A default
-        // widens the same count downwards, and for the same reason — a call may stop where the
-        // defaults begin, so what is compared is the prefix the two lists share.
+        // stands at none, so what it may be told apart by stops where they do (`reference/ffi.md §
+        // Variadic functions`). A default widens the same count downwards, and for the same reason
+        // — a call may stop where the defaults begin, so what is compared is the prefix the two
+        // lists share.
         val fits = cands.filter { c =>
           params(c).exists { ps =>
             val counted =
@@ -308,7 +311,7 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
 
         err(s"$from, and the arguments do not say which was meant")
 
-  /** Whether a use site here can reach this member at all (`13 §2`).
+  /** Whether a use site here can reach this member at all (`reference/modules.md § Visibility`).
    *
    * Three ways it can, and the first is why the table records provenance at all. A member the type's
    * **own** body declared has no trait to be gated by and is reachable wherever the type is. One an
@@ -467,7 +470,8 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
       TCall(name, checkArgs(shown, params, passed, Some(recvArg :: provisional)) ::: tail.map(variadicArg(_)), rtype))
   }
 
-  /** `k.hash()` — the mixing a built-in's `Hash` membership provides (`14 §5`).
+  /** `k.hash()` — the mixing a built-in's `Hash` membership provides (`reference/expressions.md §
+   * Operator dispatch`).
    *
    * `5.add(3)`'s sibling, and built the same way for the same reason: a built-in has no
    * `impl` block, so the lowering is a library function named here. Where `Display` writes into a
@@ -492,14 +496,15 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
     }
 
   /** A member of a trait the compiler supplies membership for, but which is not an operator —
-   * `n.abs()`, `n.count_ones()`, `n.rotate_left(3)` (`14 §5`, `CoreTraits.numeric`).
+   * `n.abs()`, `n.count_ones()`, `n.rotate_left(3)` (`reference/expressions.md § Operator
+   * dispatch`, `CoreTraits.numeric`).
    *
    * **Gated on the trait being in scope**, which is what keeps a compiler-provided membership from
-   * being a way around `13 §2`. The two questions are different and both have to be answered: a
-   * membership settles which *types* have the member, and scope settles which *files* may write it.
-   * `Add` and `Display` are unaffected because they are in the standard module, which every file
-   * auto-imports; `Signed` and `Bits` are in `sysl.math`, so a program asks for one exactly as it
-   * asks for `Float`.
+   * being a way around `reference/modules.md § Visibility`. The two questions are different and
+   * both have to be answered: a membership settles which *types* have the member, and scope settles
+   * which *files* may write it. `Add` and `Display` are unaffected because they are in the standard
+   * module, which every file auto-imports; `Signed` and `Bits` are in `sysl.math`, so a program
+   * asks for one exactly as it asks for `Float`.
    *
    * **Every signature is read off the trait's own declaration**, the way `builtinMethod` reads
    * `Add`'s, rather than being restated here. That is what makes `rotate_left`'s amount, and the
@@ -541,7 +546,8 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
     }
 
   /** `int.zero()`, `T.one()` at a solved `T` — a member of a trait the compiler supplies membership
-   * for, reached through the **type** because it has no receiver (`14 §5`, `CoreTraits.constants`).
+   * for, reached through the **type** because it has no receiver (`reference/expressions.md §
+   * Operator dispatch`, `CoreTraits.constants`).
    *
    * This is `builtinNumeric`'s counterpart on the side where there is nothing to lower *from*. A
    * provided member with a receiver becomes an instruction on that receiver's value; one without
@@ -597,9 +603,10 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
   /** `5.add(3)`, `x.lt(y)` — a core-trait method on a type whose membership the compiler provides.
    *
    * A built-in has no `impl` block and so no lowered `int.add` to call; what it has is the operator
-   * the trait method *means*, and that is what this builds. The result is the same tree the operator
-   * itself would have produced, which is `14 §5`'s promise that a membership changes no codegen —
-   * and it is what a monomorphized `[T: Add]` body lands on once `T` is known to be a scalar.
+   * the trait method *means*, and that is what this builds. The result is the same tree the
+   * operator itself would have produced, which is `reference/expressions.md § Operator dispatch`'s
+   * promise that a membership changes no codegen — and it is what a monomorphized `[T: Add]` body
+   * lands on once `T` is known to be a scalar.
    */
   private def builtinMethod(rty: Type, mname: String, recv: TExpr, args: List[Expr]): Option[TExpr] =
     for
@@ -608,8 +615,9 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
       decl   <- traitDecls.get(Library.key(trName))
       m      <- decl.methods.find(_.name == mname)
     yield {
-      // A built-in's membership is homogeneous (`14 §5`), so the trait's own parameter is the
-      // receiver's own type: `5.add(3)` is the `Add[int]` an `int` has, and it has no other.
+      // A built-in's membership is homogeneous (`reference/expressions.md § Operator dispatch`), so
+      // the trait's own parameter is the receiver's own type: `5.add(3)` is the `Add[int]` an `int`
+      // has, and it has no other.
       //
       // The signature is the **trait's**, so it is resolved in the trait's terms however far from it
       // the call was written — the same rule an instantiated function's signature follows. Reading

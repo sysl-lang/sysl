@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
-/** The multi-line literal — `"""` … `"""` (`04 § Text blocks`).
+/** The multi-line literal — `"""` … `"""` (`reference/lexical.md § Strings`).
   *
   * The backlog entry called this "no multi-line or raw string literal", and the shape it had to
   * serve was named at the same time: **embedded data**. That turns out to want two things a plain

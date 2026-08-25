@@ -7,8 +7,9 @@ import org.scalatest.freespec.AnyFreeSpec
  * The load-bearing group is *the caller's location*, near the bottom. Everything above it is a
  * constant folded into its use and would be hard to get wrong; the thing worth pinning is that a
  * built-in written in a **default argument** reports the call rather than the declaration, because
- * that behaviour is not written anywhere in this feature — it falls out of `12 §2a`, and a change to
- * how defaults are spliced would take it away silently.
+ * that behaviour is not written anywhere in this feature — it falls out of
+ * `reference/declarations.md § Default parameters and named arguments`, and a change to how
+ * defaults are spliced would take it away silently.
  */
 class SourceLocationTests extends AnyFreeSpec with RunSupport {
 

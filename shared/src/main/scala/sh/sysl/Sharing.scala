@@ -1,6 +1,7 @@
 package sh.sysl
 
-/** `06 § &sync T` — what an object reached through an atomic reference may contain.
+/** `reference/memory.md § Crossing a concurrency domain` — what an object reached through an atomic
+ * reference may contain.
  *
  * `&sync T` makes the **reference** safe to hold in two concurrency domains at once. That is a
  * promise about the count in `T`'s own box and about nothing else, so it is sound only when every
@@ -9,8 +10,8 @@ package sh.sysl
  *
  * The walk stops at two things. A `&sync U` is a leaf, because whatever *that* type reaches was
  * settled where it was written — the same argument that makes `&T` a leaf for ARC. A `*U` is a leaf
- * because it carries no count at all: it is the unsafe tier, and `06 § How strong this is` names it
- * as one of the two greppable ways to share on purpose.
+ * because it carries no count at all: it is the unsafe tier, and `library/threads.md § How strong
+ * this is` names it as one of the two greppable ways to share on purpose.
  *
  * This is the strict half of the chapter's structural rule, and it is asked in **two** places. The
  * first is where a `&sync T` is written. The second is a `@crossing` parameter, where a facility
@@ -81,7 +82,7 @@ object Sharing {
     }
 
   /** Why a value may not be handed to a `@crossing` parameter, or `None` when it may
-   * (`06 § Marking a domain boundary`).
+   * (`reference/memory.md § @crossing — where the rule is asked`).
    *
    * `subject` is the caller's words for what is crossing — the argument, or what the argument points
    * at — because the two shapes a boundary takes are worth telling apart at the call and are not

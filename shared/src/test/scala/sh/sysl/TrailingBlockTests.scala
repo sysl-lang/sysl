@@ -418,9 +418,10 @@ class TrailingBlockTests extends AnyFreeSpec with ParseSupport with RunSupport w
       msg should include("'Buf'")
     }
 
-    // A bracket suspends the off-side rule until it closes (`00 §9`), so there is no indent inside
-    // one for a trailing block to be made of. It is pinned here because the spelling looks
-    // reasonable and the failure is a parse error about something else.
+    // A bracket suspends the off-side rule until it closes (`reference/lexical.md § Brackets
+    // suspend the rule`), so there is no indent inside one for a trailing block to be made of. It
+    // is pinned here because the spelling looks reasonable and the failure is a parse error about
+    // something else.
     //
     // **`:` is not among the tokens card `0248` gave a block to**, which are `match` and `->`. Each
     // of those can only ever open a block, so a reader is never left wondering whether the line

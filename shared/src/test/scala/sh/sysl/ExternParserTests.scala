@@ -130,8 +130,9 @@ class ExternParserTests extends AnyFreeSpec with ParseSupport {
         List(ExternDecl("log", List(Param("fmt", PtrType(NamedType("u8")))), None, variadic = true))
     }
 
-    // The ellipsis is not the foreign seam's alone — a sysl function takes it too (`12 §9`), from
-    // the same production, so the two cannot drift apart.
+    // The ellipsis is not the foreign seam's alone — a sysl function takes it too
+    // (`reference/ffi.md § Variadic functions`), from the same production, so the two cannot drift
+    // apart.
     "a sysl function takes the same ellipsis" in {
       prog("f(n: int, ...) -> int = n") shouldBe
         List(

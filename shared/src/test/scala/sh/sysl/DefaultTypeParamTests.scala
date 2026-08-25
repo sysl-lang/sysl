@@ -4,16 +4,18 @@ import org.scalatest.freespec.AnyFreeSpec
 
 /** A type parameter that carries a default (`10 §3`): `trait Scale[R = Self]`, `struct Pair[A, B = A]`.
   *
-  * The customer is the operator catalog. `14 §7` records that a heterogeneous operand — `Complex * f64`
-  * — wants `Mul[Rhs]` rather than `Mul`, and that the change cannot be made without defaults: every
-  * `impl Mul for Point` already written would become `impl Mul[Point] for Point`, and `[T: Mul]` would
-  * stop saying what it says now. So the case that matters most here is `Self` as the default, which is
-  * what makes those two spellings mean the same thing.
+  * The customer is the operator catalog. `library/core.md § Walking a type of your own` records
+  * that a heterogeneous operand — `Complex * f64` — wants `Mul[Rhs]` rather than `Mul`, and that
+  * the change cannot be made without defaults: every `impl Mul for Point` already written would
+  * become `impl Mul[Point] for Point`, and `[T: Mul]` would stop saying what it says now. So the
+  * case that matters most here is `Self` as the default, which is what makes those two spellings
+  * mean the same thing.
   *
-  * A default belongs only where arguments are **written**. sysl offers no call-site type arguments at
-  * all (`10 §2`), so a function's, a method's, and an `impl` block's parameters are solved rather than
-  * supplied, and a default there is refused — the thing that would be useful in those three is a
-  * fallback for an inference that found nothing, which is a different feature.
+  * A default belongs only where arguments are **written**. sysl offers no call-site type arguments
+  * at all (`reference/generics.md § [] means type application in a type, indexing in an
+  * expression`), so a function's, a method's, and an `impl` block's parameters are solved rather
+  * than supplied, and a default there is refused — the thing that would be useful in those three is
+  * a fallback for an inference that found nothing, which is a different feature.
   */
 class DefaultTypeParamTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
@@ -251,8 +253,9 @@ class DefaultTypeParamTests extends AnyFreeSpec with RunSupport with CodegenSupp
   }
 
   "where a parameter is solved rather than written" - {
-    /** The three refusals are one rule: sysl has no call-site type arguments (`10 §2`), so in none of
-      * these is there an argument list with a gap for a default to fill.
+    /** The three refusals are one rule: sysl has no call-site type arguments
+      * (`reference/generics.md § [] means type application in a type, indexing in an expression`),
+      * so in none of these is there an argument list with a gap for a default to fill.
       */
     "a function may not default a type parameter" in {
       err("f[T = int](x: T) -> T = x\nprint(f(1))") should include(
@@ -356,10 +359,10 @@ class DefaultTypeParamTests extends AnyFreeSpec with RunSupport with CodegenSupp
     }
   }
 
-  /** `13 §2` says a declaration may not be more visible than the types it names. A default is one of
-    * those: it is not written at the use, so a caller that leaves the argument out ends up holding a
-    * type the default named — and if that type does not reach them, they are holding something they
-    * could not have written and cannot name.
+  /** `reference/modules.md § Visibility` says a declaration may not be more visible than the types
+    * it names. A default is one of those: it is not written at the use, so a caller that leaves the
+    * argument out ends up holding a type the default named — and if that type does not reach them,
+    * they are holding something they could not have written and cannot name.
     */
   "how far a default reaches" - {
     "a struct may not default to a type that reaches less far than it does" in {

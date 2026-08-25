@@ -2,20 +2,21 @@ package sh.sysl
 
 import scala.collection.mutable
 
-/** The rule that no two modules may depend on each other, directly or through a chain (`13 §6`).
+/** The rule that no two modules may depend on each other, directly or through a chain
+ * (`reference/modules.md § The module graph is acyclic`).
  *
  * The graph the rule is about is the **reference** graph, not the import graph, and the difference
  * is not a nicety: a qualified path reaches another module's declaration with no import at all
- * (`13 §3`), so a file can depend on a module its header never mentions. The edges come from
- * resolution instead — `AnalyzerBase.dependsOn` records one wherever a name turns out to belong
- * somewhere else — and an import contributes one of its own, since a file that imports a module
- * depends on it whether or not it goes on to name anything from it.
+ * (`reference/modules.md § Imports`), so a file can depend on a module its header never mentions.
+ * The edges come from resolution instead — `AnalyzerBase.dependsOn` records one wherever a name
+ * turns out to belong somewhere else — and an import contributes one of its own, since a file that
+ * imports a module depends on it whether or not it goes on to name anything from it.
  *
- * Being acyclic is what makes a module's dependencies *finished* before the module itself is
- * looked at, which is what capability propagation is a single reverse-topological sweep over rather
- * than a fixpoint (`13 §4`), and what would let modules compile in dependency order. Cycles
- * **within** a module stay free: sibling files share one scope, so mutual recursion across them
- * needs no ceremony at all.
+ * Being acyclic is what makes a module's dependencies *finished* before the module itself is looked
+ * at, which is what capability propagation is a single reverse-topological sweep over rather than a
+ * fixpoint (`reference/modules.md § Capabilities are a module property`), and what would let
+ * modules compile in dependency order. Cycles **within** a module stay free: sibling files share
+ * one scope, so mutual recursion across them needs no ceremony at all.
  */
 trait ModuleGraph extends AnalyzerBase {
 

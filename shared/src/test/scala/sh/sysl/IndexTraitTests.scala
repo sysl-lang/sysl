@@ -4,13 +4,14 @@ import org.scalatest.freespec.AnyFreeSpec
 
 /** Indexing a type the compiler has no elements for — `b[i]` through the library's `Index`.
  *
- * `14 §7` filed this under associated types, on the reading that a subscript wants the element type
- * *and* the index type and neither is `Self`. That reading turned out to be wrong in one place, and
- * the place is worth stating because it is what this feature rests on. The element type does not
- * have to be inferred from anything: it can be an ordinary trait argument, written where the block
- * is written, **because the subject binds it** — `impl[T] Index[usize, T] for Buf[T]` says a `Buf`
- * of anything is indexed by a `usize` and gives back whatever it holds, and every particular `Buf`
- * settles what that is. What made this impossible before was one refusal, not a missing feature.
+ * `library/core.md § Walking a type of your own` filed this under associated types, on the reading
+ * that a subscript wants the element type *and* the index type and neither is `Self`. That reading
+ * turned out to be wrong in one place, and the place is worth stating because it is what this
+ * feature rests on. The element type does not have to be inferred from anything: it can be an
+ * ordinary trait argument, written where the block is written, **because the subject binds it** —
+ * `impl[T] Index[usize, T] for Buf[T]` says a `Buf` of anything is indexed by a `usize` and gives
+ * back whatever it holds, and every particular `Buf` settles what that is. What made this
+ * impossible before was one refusal, not a missing feature.
  *
  * That refusal was right about its own case and wrong about this one, and both cases are pinned
  * here. `impl[T] From[T] for Wrapper` leaves the argument genuinely open — nothing decides which
@@ -52,8 +53,8 @@ class IndexTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       |""".stripMargin
 
   "what the documents claim" - {
-    // `02 § A trait may be implemented at more than one argument list` — and a two-parameter trait
-    // is no different from a one-parameter one, which is the claim being checked rather than assumed.
+    // `reference/traits.md § One implementation per argument list` — and a two-parameter trait is
+    // no different from a one-parameter one, which is the claim being checked rather than assumed.
     "a trait taking two arguments is implemented at two argument lists" in {
       run(get + """print(Row(3).get(1usize))
                   |print(Row(3).get(true))""".stripMargin) shouldBe "4\nyes\n"
@@ -67,9 +68,9 @@ class IndexTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
                   |print(s, n)""".stripMargin) shouldBe "no 3\n"
     }
 
-    // `02 § An implementation covers every instantiation` — the fact the relaxation rests on. If a
-    // block for one instantiation were allowed, a parameter in an argument list would be a key
-    // matching many things, which is the matching problem sysl does not have.
+    // `reference/traits.md § An impl covers a generic type as a whole` — the fact the relaxation
+    // rests on. If a block for one instantiation were allowed, a parameter in an argument list
+    // would be a key matching many things, which is the matching problem sysl does not have.
     "a block for one instantiation of a generic type is refused, so there is no overlap to resolve" in {
       err("""trait Named
             |    name(self) -> string
@@ -125,8 +126,8 @@ class IndexTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |print(firstOf(a))""".stripMargin) shouldBe "5\n"
     }
 
-    // `14 §3` — an operator is the trait's one method. `[]` is `Index`'s, and the library implements
-    // it for the one growable container it ships.
+    // `reference/expressions.md § Operator dispatch` — an operator is the trait's one method. `[]`
+    // is `Index`'s, and the library implements it for the one growable container it ships.
     "a Buf is read with a subscript" in {
       run("""var b: Buf[int] = buf()
             |b.push(7)
@@ -142,9 +143,9 @@ class IndexTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |print(b[0usize], b[1usize])""".stripMargin) shouldBe "7 42\n"
     }
 
-    // `02 § Conditional conformance` — the condition is answered against the arguments the subject
-    // was made with, and the block's parameters are matched to the subject's positions rather than
-    // to the order the block declared them in.
+    // `reference/traits.md § Conditional conformance` — the condition is answered against the
+    // arguments the subject was made with, and the block's parameters are matched to the subject's
+    // positions rather than to the order the block declared them in.
     "a conditional block's bound follows the subject's positions, not the order the block wrote" in {
       val src =
         """trait Show2
@@ -308,10 +309,11 @@ class IndexTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |print(b[0usize])""".stripMargin) shouldBe "3\n"
     }
 
-    // `14 §7` defers slicing through the trait and gives the reason — the index would have to be a
-    // range, and a range is not a type a program can name. A type that has an `Index` is exactly
-    // who reaches for the neighbouring form, and the bare "cannot slice" reads as though its shape
-    // were wrong for an operation that exists rather than as a feature that is not built.
+    // `library/core.md § Walking a type of your own` defers slicing through the trait and gives the
+    // reason — the index would have to be a range, and a range is not a type a program can name. A
+    // type that has an `Index` is exactly who reaches for the neighbouring form, and the bare
+    // "cannot slice" reads as though its shape were wrong for an operation that exists rather than
+    // as a feature that is not built.
     "slicing through Index is not built, and says so rather than that the type is the wrong shape" in {
       val src =
         """struct Row

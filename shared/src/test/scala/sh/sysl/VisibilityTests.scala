@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `private` and `private[M]` — how far a declaration may be named from (`13 §2`).
+/** `private` and `private[M]` — how far a declaration may be named from (`reference/modules.md §
+ * Visibility`).
  *
  * Public is the unmarked default, so every case here is about what a modifier takes away. The two
  * levels are one keyword and its argument: a bare `private` is the **file**, and `private[M]`
@@ -87,7 +88,7 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
     }
 
     // The argument is a simple name, not a path: a visibility scope is always an enclosing module,
-    // and there is no way to name an unrelated one (`13 §2`).
+    // and there is no way to name an unrelated one (`reference/modules.md § Visibility`).
     "but the scope argument is one segment, not a path" in {
       progError("private[a.b] f() -> int = 1") should include("']'")
     }
@@ -138,8 +139,9 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
   }
 
   "a file is not a namespace, only a visibility level" - {
-    // `13 §8`: the file is a contribution to its module, not a unit of its own. So a private
-    // declaration still spends its name in the module it belongs to.
+    // `reference/modules.md § Separate compilation`: the file is a contribution to its module, not
+    // a unit of its own. So a private declaration still spends its name in the module it belongs
+    // to.
     "a private declaration still collides with a sibling file's public one" in {
       errIn(
         ("", "main.sysl", "print(1)"),
@@ -165,8 +167,9 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
     }
 
     // The two of them land in one LLVM module, so what keeps them apart is the module segment in
-    // the symbol and nothing else. This is the case that decides `13 §2`'s claim about mangling:
-    // drop the segment for a file-private name and these two definitions collide.
+    // the symbol and nothing else. This is the case that decides `reference/modules.md §
+    // Visibility`'s claim about mangling: drop the segment for a file-private name and these two
+    // definitions collide.
     "which they can only do because the symbol still carries the module" in {
       val out = irIn(
         ("", "main.sysl", "print(geom.twice(10) + text.twice(10))"),
@@ -194,7 +197,7 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
     }
   }
 
-  /** What the file level buys the backend (`13 §2`, `13 § Open g`).
+  /** What the file level buys the backend (`reference/modules.md § Visibility`, `13 § Open g`).
    *
    * A bare `private` is the one reach that provably never crosses a file boundary, and every file of
    * a compilation is emitted into one LLVM module — so a declaration at that reach has all of its
@@ -229,8 +232,8 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
       out should not include "define internal i32 @geom$scale("
     }
 
-    // `08 § Visibility`: an unmarked member sits at its type's reach, so a member of a file-private
-    // type is file-private without saying so.
+    // `reference/modules.md § Visibility`: an unmarked member sits at its type's reach, so a member
+    // of a file-private type is file-private without saying so.
     "an unmarked member of a file-private type" in {
       ir("""private struct Hidden
            |    n: int
@@ -419,9 +422,9 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
       errIn(("", "main.sysl", "print(geom.scale(21))"), hidden) should include("'geom.scale' is private")
     }
 
-    // `13 §2` gives the exception a reason of its own, so the refusal has to carry the reason
-    // rather than the grammar's complaint that the modifier was not followed by a name. This is
-    // the same refusal the members *inside* an `impl` already get.
+    // `reference/modules.md § Visibility` gives the exception a reason of its own, so the refusal
+    // has to carry the reason rather than the grammar's complaint that the modifier was not
+    // followed by a name. This is the same refusal the members *inside* an `impl` already get.
     "and an 'impl' does not, having no name for one to restrict" in {
       val src =
         """trait Show
@@ -826,10 +829,11 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
     }
 
     // A `const` used not to get far enough to be asked: every user-declared type was refused as a
-    // constant's type before visibility was looked at. That stopped being true when a **transparent**
-    // subtype became one (`16 §1`, `15 §7`), which is what the last case below is for — and it is
-    // exactly what the line in `checkExposedTypes` was written in advance for, so that widening what
-    // a constant may hold could not quietly reopen the hole `val` and `extern` had.
+    // constant's type before visibility was looked at. That stopped being true when a
+    // **transparent** subtype became one (`reference/errors.md § Constrained types`,
+    // `reference/ffi.md § A library may carry C`), which is what the last case below is for — and
+    // it is exactly what the line in `checkExposedTypes` was written in advance for, so that
+    // widening what a constant may hold could not quietly reopen the hole `val` and `extern` had.
     //
     // The other three are still refused a step earlier, and are asserted here rather than only where
     // the refusals live so that the next form to become constant-able shows up in this block too.

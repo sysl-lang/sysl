@@ -1,7 +1,7 @@
 package sh.sysl
 
 /** Which of a function's calls to itself are the last thing it does, and so can be a jump back to
- * its own entry instead of a second frame (`12 § Tail calls`).
+ * its own entry instead of a second frame (`reference/declarations.md § Tail calls`).
  *
  * The whole of the transformation is here and in `Codegen.genFunction`, and the division is the
  * usual one: this pass decides, codegen emits. A call named here is one where replacing the frame
@@ -35,10 +35,10 @@ object TailCalls {
    * only what it costs.
    */
   def disqualified(f: TFunc): Option[String] = f match
-    // A variadic function's tail is read relative to its last named argument (`12 §9`), and the
-    // arguments a jump rebinds are the named ones — so the second iteration would walk the first
-    // call's tail. Nothing here can rebind it, and a `va_list` into a frame that is being reused is
-    // worse than a missed optimization.
+    // A variadic function's tail is read relative to its last named argument (`reference/ffi.md §
+    // Variadic functions`), and the arguments a jump rebinds are the named ones — so the second
+    // iteration would walk the first call's tail. Nothing here can rebind it, and a `va_list` into
+    // a frame that is being reused is worse than a missed optimization.
     case _ if f.variadic =>
       Some("it is variadic, and a jump back to the entry cannot rebind the tail the first call was " +
         "passed")
@@ -100,7 +100,8 @@ object TailCalls {
     case TMatch(_, arms, _) => arms.flatMap(a => stmts(f, a.body.stmts, deferred)._1)
     // A copy of an unrolled `for const` may `return`, and its own value is not in tail position:
     // the copies are a sequence, so only the last of them could be, and `TSeq` is not followed here
-    // for the same reason a loop's body is not (`10 §10`).
+    // for the same reason a loop's body is not (`reference/generics.md § A parameter may stand for
+    // a list of types`).
     case TBlockExpr(b)      => stmts(f, b.stmts, deferred)._1
 
     // A loop's body may return, and none of it is in tail position however the loop ends: the value

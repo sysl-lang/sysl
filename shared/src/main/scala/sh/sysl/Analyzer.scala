@@ -15,8 +15,8 @@ package sh.sysl
  * `ProgramWalk` has four of its own underneath it, in the order the driver reaches them:
  * `ModuleFiles` (what a file contributes to its module, and which file the program starts in),
  * `ModuleStorage` (the `val`s, `var`s and `extern` variables a module lays down), `AbstractBodies`
- * (`14 §4`'s definition-time check of every generic body) and `FunctionBodies` (what a body is
- * checked against, and analyzing one inside another).
+ * (`reference/generics.md § Bounds`'s definition-time check of every generic body) and
+ * `FunctionBodies` (what a body is checked against, and analyzing one inside another).
  *
  * What stays in this file is the class that mixes them together and the entry point that runs it.
  * The recursive entry points the traits call back into — `analyzeExpr`, `analyzePlace`,
@@ -74,14 +74,14 @@ object Analyzer {
   def analyze(program: Program): Either[List[Diagnostic], TProgram] = analyze(List(program))
 
   /** Analyzes the files of one module together. They share a single scope, so a declaration in one
-   * is visible to all of them with no ordering and no forward declaration (`13 §6`) — which falls
-   * out of hoisting, since the pass that registers every signature already runs over the whole set
-   * before any body is checked.
+   * is visible to all of them with no ordering and no forward declaration (`reference/modules.md §
+   * The module graph is acyclic`) — which falls out of hoisting, since the pass that registers
+   * every signature already runs over the whole set before any body is checked.
    */
   /** `target` is here for the reason it is a parameter everywhere else: a few rules are the
    * *machine's* rather than the language's, and a diagnostic about one has to be raised where
-   * diagnostics are raised. `15 §10`'s calling conventions are the case — whether `interrupt` exists
-   * at all, and what signature it demands, differ per processor.
+   * diagnostics are raised. `reference/ffi.md § interrupt`'s calling conventions are the case —
+   * whether `interrupt` exists at all, and what signature it demands, differ per processor.
    */
   /** `paths` is here for `target`'s reason one step further out: a `c const` is evaluated by the C
    * compiler, and a C compiler that has not been told where the headers are cannot evaluate one

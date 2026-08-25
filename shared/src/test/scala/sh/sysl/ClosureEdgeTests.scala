@@ -2,9 +2,9 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** The exhaustive pass over closures (`12 §5`–`§8`): every kind of thing that can be captured, every
- * place a captured name can have come from, every position a callable can stand in, and the way each
- * of those goes wrong.
+/** The exhaustive pass over closures (`reference/expressions.md § Closures`–`§8`): every kind of
+ * thing that can be captured, every place a captured name can have come from, every position a
+ * callable can stand in, and the way each of those goes wrong.
  *
  * What earns a test here is a case where the answer could plausibly differ from the one beside it —
  * a type whose capture costs a retain rather than a copy, a binding form the free-variable walk has
@@ -301,8 +301,9 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "21\n"
     }
 
-    // `12 §6` lists the result of another call among these, which is the one that never passes
-    // through a name at all: the head of the outer call is the inner call itself.
+    // `reference/types.md § Function types` lists the result of another call among these, which is
+    // the one that never passes through a name at all: the head of the outer call is the inner call
+    // itself.
     "the result of another call, called straight away" in {
       run("""pick(which: bool) -> &Fn(int) -> int
             |    if which then x -> x + 1 else x -> x * 2
@@ -520,8 +521,9 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     /** A closure standing where a bare function address is asked for, which is the case a program
-     * meets at every C callback: `*extern(A) -> R` is one machine word (`12 §6a`) and a closure is a
-     * struct with an environment, so there is nothing to convert.
+     * meets at every C callback: `*extern(A) -> R` is one machine word (`reference/ffi.md § A
+     * function's address`) and a closure is a struct with an environment, so there is nothing to
+     * convert.
      *
      * **What the reader is told it gave has to be "a closure".** The struct is filed under a serial
      * number that runs over the whole compilation with `library/` lowered first, so the message used to
@@ -615,10 +617,10 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     "a type is callable at one arity, since its members are one namespace" in {
       // `Fn(int) -> int` and `Fn(int, int) -> int` are two traits, and each would give the type a
       // member named `call`. Two traits naming one member is ordinarily allowed, told apart by
-      // which of them a file can name (`13 §2`) — but `call` is reached through the **call syntax**,
-      // which names no trait, so nothing a program could write would say which arity it meant.
-      // `callableOf` answers with the first it finds, which makes the second one silent rather than
-      // ambiguous, and that is what is refused here.
+      // which of them a file can name (`reference/modules.md § Visibility`) — but `call` is reached
+      // through the **call syntax**, which names no trait, so nothing a program could write would
+      // say which arity it meant. `callableOf` answers with the first it finds, which makes the
+      // second one silent rather than ambiguous, and that is what is refused here.
       err("""struct Twin
             |    k: int
             |
@@ -718,9 +720,10 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
    * Waiting for it before reading the closure waits forever, and what came out was the closure being
    * blamed for parameters the declaration had already stated.
    *
-   * **Both spellings of `12 §6` are tested against each other throughout**, because they were not
-   * being asked the same question: the bare arrow becomes a bounded type parameter and the boxed
-   * `&Fn` is a trait object, and only the first was ever consulted for a signature.
+   * **Both spellings of `reference/types.md § Function types` are tested against each other
+   * throughout**, because they were not being asked the same question: the bare arrow becomes a
+   * bounded type parameter and the boxed `&Fn` is a trait object, and only the first was ever
+   * consulted for a signature.
    */
   "a generic call tells a closure what it takes" - {
     "the arrow spelling, with the result settled by another parameter" in {

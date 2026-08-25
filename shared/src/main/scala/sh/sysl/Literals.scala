@@ -43,11 +43,12 @@ trait Literals extends TypeResolution {
       case None =>
         expected.map(scalarWanted) match
           case Some(i: Type.Integer) => i
-          // A type **parameter**, during the definition-time pass of `14 §4`. It is opaque, so there
-          // is no width to check against and no representation to pick — but it is still the type
-          // the literal has, since what the instantiation makes of `T` is what the literal is read
-          // as when the body is lowered. Taking `int` instead would make the `1` in a `[T: Sub]`
-          // body's `x - 1` ask for `Sub[int]` where what the body means is `T`'s own subtraction.
+          // A type **parameter**, during the definition-time pass of `reference/generics.md §
+          // Bounds`. It is opaque, so there is no width to check against and no representation to
+          // pick — but it is still the type the literal has, since what the instantiation makes of
+          // `T` is what the literal is read as when the body is lowered. Taking `int` instead would
+          // make the `1` in a `[T: Sub]` body's `x - 1` ask for `Sub[int]` where what the body
+          // means is `T`'s own subtraction.
           case Some(a: Type.Abstract) => a
           case _                      => Type.Int
 
@@ -85,12 +86,12 @@ trait Literals extends TypeResolution {
    * any width without the literal needing a suffix, and `p == null` work for any `*T`. The operands
    * that have a type are analyzed first precisely so it is available to the ones that do not.
    *
-   * What it takes is the neighbour's **representation**, which for a transparent subtype is its base:
-   * the operator it is about to be an operand of is the base's, so the literal is a base value and
-   * has no range to satisfy. Reading `120` in `t + 120` as a `Temp` would refuse it for not being a
-   * temperature when what has to be one is the sum — and the sum is checked where it is stored. A
-   * derived subtype is its own representation, so a literal still may not stand beside one without
-   * the cast `16 §2` asks for.
+   * What it takes is the neighbour's **representation**, which for a transparent subtype is its
+   * base: the operator it is about to be an operand of is the base's, so the literal is a base
+   * value and has no range to satisfy. Reading `120` in `t + 120` as a `Temp` would refuse it for
+   * not being a temperature when what has to be one is the sum — and the sum is checked where it is
+   * stored. A derived subtype is its own representation, so a literal still may not stand beside
+   * one without the cast `reference/errors.md § new is what makes it a type` asks for.
    *
    * **There are three tiers rather than two, and the middle one is `typedByPosition`.** A form whose
    * type the position supplies is not a literal — it may be a whole expression, and what it is owed
@@ -181,11 +182,12 @@ trait Literals extends TypeResolution {
 
   protected def analyzeOperands(operands: List[Expr], expected: Option[Type]): List[TExpr] = {
     // **The top tier is allowed to come back empty**, which is what lets an operand with no type of
-    // its own fall to the tier below rather than raising from the tier that has nothing to offer it.
-    // `n == None` is the case: `None` is not a literal and not a load, so it is asked first — and
-    // asking it alone is asking what an `Option` of nothing in particular holds. Held over, it is
-    // read against what the *other* operand settled, which is the whole of what a comparison's
-    // second side needs and exactly what `12 §5`'s held-back argument already gets at a call.
+    // its own fall to the tier below rather than raising from the tier that has nothing to offer
+    // it. `n == None` is the case: `None` is not a literal and not a load, so it is asked first —
+    // and asking it alone is asking what an `Option` of nothing in particular holds. Held over, it
+    // is read against what the *other* operand settled, which is the whole of what a comparison's
+    // second side needs and exactly what `reference/expressions.md § Closures`'s held-back argument
+    // already gets at a call.
     val own     = operands.map(e =>
       if isLiteral(e) || typedByPosition(e) then None else attempt(analyzeExpr(e, expected)))
     val settled = firmest(operands, own).orElse(expected)
@@ -332,9 +334,10 @@ trait Literals extends TypeResolution {
             err(s"only a simple enum converts to an integer — ${show(e)} carries data")
           true
         // A pointer → integer is total: an address *is* a number of `usize`'s width, so reading one
-        // as that number loses nothing and yields a value nothing can dereference. It goes only this
-        // way; making a pointer out of an integer is `ptr_cast` in the raw tier (`03 § Reinterpreting
-        // storage`). A pointer to a trait is two words rather than an address, so it has no number.
+        // as that number loses nothing and yields a value nothing can dereference. It goes only
+        // this way; making a pointer out of an integer is `ptr_cast` in the raw tier
+        // (`reference/memory.md § Reinterpreting storage`). A pointer to a trait is two words
+        // rather than an address, so it has no number.
         case (Type.Ptr(_: Type.Trait), _: Type.Integer) =>
           err("a pointer to a trait is two words — the address and the table of the type it was " +
             "erased from — so it is not a number")
@@ -441,7 +444,8 @@ trait Literals extends TypeResolution {
 
   /** The type a unary operator yields at `a`, by the rule `arithType` uses for a binary one: a
    * transparent subtype's arithmetic happens at its base and yields the base, while a derived one's
-   * happens at itself and yields itself (`16 §3`).
+   * happens at itself and yields itself (`reference/errors.md § A derivation inherits its base's
+   * behaviour and may replace none of it`).
    */
   protected def unaryType(a: Type): Type = a match
     case c: Type.Constrained if c.derived => a
@@ -451,9 +455,10 @@ trait Literals extends TypeResolution {
    * asks anything of its values. A subtype with neither a range nor a predicate — `type Stamp = new
    * i64`, which exists to be a distinct name — asks nothing, so producing one costs no instruction.
    *
-   * This is the question `16 §4` is about, asked of a type rather than of a syntactic form: every
-   * site that gives a value this type consults it, so the set of checked sites is the set of sites
-   * that produce one, by construction rather than by a list somebody kept up to date.
+   * This is the question `reference/errors.md § Where a constraint is checked` is about, asked of a
+   * type rather than of a syntactic form: every site that gives a value this type consults it, so
+   * the set of checked sites is the set of sites that produce one, by construction rather than by a
+   * list somebody kept up to date.
    */
   protected def constraintOf(t: Type): Option[Type.Constrained] = t match
     case c: Type.Constrained if c.lo.nonEmpty || c.hi.nonEmpty || c.predFn.nonEmpty => Some(c)
@@ -463,8 +468,10 @@ trait Literals extends TypeResolution {
    * subtype's own arithmetic produces one — a transparent subtype computes at its base, so its
    * results are base values and the check waits for the store that gives one the subtype again.
    *
-   * Without this, `16 §3` (a derivation's operators produce itself) and `16 §4` (every produce site
-   * is checked) could not both be true: `Slot(199) + Slot(1)` would be a `Slot` holding 200.
+   * Without this, `reference/errors.md § A derivation inherits its base's behaviour and may replace
+   * none of it` (a derivation's operators produce itself) and `reference/errors.md § Where a
+   * constraint is checked` (every produce site is checked) could not both be true: `Slot(199) +
+   * Slot(1)` would be a `Slot` holding 200.
    */
   protected def produced(t: TExpr): TExpr = constraintOf(t.ty) match
     case Some(c) => TConstrainedCheck(t, c).setPos(t.pos)

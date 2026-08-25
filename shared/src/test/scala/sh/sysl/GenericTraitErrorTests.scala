@@ -172,8 +172,8 @@ class GenericTraitErrorTests extends AnyFreeSpec with RunSupport with CodegenSup
 
   "an 'impl' fixes the trait's arguments and its own parameters separately" - {
     // A block's parameter is an argument the *subject* settles, so the promise is one per
-    // instantiation exactly as a defaulted list on a generic subject is (`02 § One implementation
-    // per argument list`). This is what carries the element type of a container.
+    // instantiation exactly as a defaulted list on a generic subject is (`reference/traits.md § One
+    // implementation per argument list`). This is what carries the element type of a container.
     "the trait's argument may be one of the block's own parameters" in {
       run(
         """trait Get[T]

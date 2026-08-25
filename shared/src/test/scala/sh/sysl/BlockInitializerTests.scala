@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** An indented block under a binding's `=`, whose trailing expression is the value
- * (`00 § Continuing a line`).
+ * (`reference/lexical.md § An unbracketed line continues after an operator`).
  *
  * The form was missing for a reason that was itself the argument for building it: `=` is excluded
  * from the set of operators that carry a line onto the next one, and the reason `00` gives for the
@@ -264,8 +264,9 @@ class BlockInitializerTests extends AnyFreeSpec with CodegenSupport with RunSupp
       run(src) shouldBe "dropped 2\ndropped 1\nafter 3\n3\n"
     }
 
-    // `03 § defer` puts a deferred statement at the end of its *block*, and this is a block — so it
-    // runs before the value is bound rather than at the end of the function.
+    // `reference/memory.md § Where defer sits` puts a deferred statement at the end of its *block*,
+    // and this is a block — so it runs before the value is bound rather than at the end of the
+    // function.
     "a 'defer' inside it runs at the end of it" in {
       val src =
         """f() -> int

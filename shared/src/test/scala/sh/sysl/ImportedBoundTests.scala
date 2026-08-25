@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** A type parameter bounded by a trait that came from **another module**, however the bound spells
- * it (`13 §3`, `14 §4`).
+ * it (`reference/modules.md § Imports`, `reference/generics.md § Bounds`).
  *
  * An `import` shortens a reference and changes nothing else, so a bound written with the short name
  * has to ask what the qualified one asks. The two spellings meeting at different keys is invisible

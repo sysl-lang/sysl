@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** A function that calls itself as the last thing it does reuses its own frame (`12 § Tail calls`).
+/** A function that calls itself as the last thing it does reuses its own frame
+ * (`reference/declarations.md § Tail calls`).
  *
  * The runtime cases are all deep enough that a second frame per call would exhaust the stack, which
  * is the only assertion that distinguishes the jump from a call the machine happens to survive: a
@@ -211,9 +212,10 @@ class TailCallTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       out should not include "tailrec"
     }
 
-    // `12 §3` says the jump is self-recursion only, and gives the reason: a large argument crosses as
-    // the address of the caller's storage, and a frame being replaced cannot be the frame an argument
-    // still points into. So `even` ending in `odd` emits an ordinary call.
+    // `reference/statements.md § return` says the jump is self-recursion only, and gives the
+    // reason: a large argument crosses as the address of the caller's storage, and a frame being
+    // replaced cannot be the frame an argument still points into. So `even` ending in `odd` emits
+    // an ordinary call.
     //
     // **The assertion is on the IR and not on the depth, deliberately.** A run would be measuring the
     // *back end*: at the default `-O1` LLVM's sibling-call pass turns exactly this pair into jumps

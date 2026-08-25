@@ -680,7 +680,7 @@ class SyslLexical
   }
 
   /** The body of a text block, `"""` … `"""`, which is the one-quote scan with a line discipline
-   * over it (`04 § Text blocks`).
+   * over it (`reference/lexical.md § Strings`).
    *
    * Three things happen to a line that do not happen inside `"…"`. Its incidental indentation is
    * dropped, so the block may be indented with the code around it. Its trailing blanks are dropped,

@@ -2,16 +2,17 @@ package sh.sysl
 
 import io.github.edadma.cross_platform.*
 
-/** The C a compilation carries, compiled for the same target and put on the link line (`15 §7`).
+/** The C a compilation carries, compiled for the same target and put on the link line
+ * (`reference/ffi.md § A library may carry C`).
  *
  * ==C travels with a source tree, whatever that tree is to the compilation==
  *
- * `15 §7` settles that a `.c` dropped anywhere in a tree is compiled with it and nothing declares
- * it, and the walk that finds the sysl already visits every directory. What that leaves open is
- * *which* trees a compilation walks, and the answer is all of them: the project's own, a source tree
- * named with `--lib`, and every package a `dependencies` block brought in. Each is a directory of
- * sysl files that reached this compilation as modules, and a C file beside them is as much a part of
- * one as of another.
+ * `reference/ffi.md § A library may carry C` settles that a `.c` dropped anywhere in a tree is
+ * compiled with it and nothing declares it, and the walk that finds the sysl already visits every
+ * directory. What that leaves open is *which* trees a compilation walks, and the answer is all of
+ * them: the project's own, a source tree named with `--lib`, and every package a `dependencies`
+ * block brought in. Each is a directory of sysl files that reached this compilation as modules, and
+ * a C file beside them is as much a part of one as of another.
  *
  * **A dependency's C is the case this exists for.** `packages.md § 7` refuses build scripts on the
  * grounds that sysl already compiles a package's C declaratively — which was true of a package built
@@ -49,8 +50,8 @@ object NativeSources {
    * dropped.
    *
    * A root that names a **file** rather than a directory contributes nothing, which is
-   * `Project.cSources`'s own rule and the right one here too: naming a file compiles that file alone
-   * (`13 §1`), so there is no tree for C to have travelled with.
+   * `Project.cSources`'s own rule and the right one here too: naming a file compiles that file
+   * alone (`reference/modules.md`), so there is no tree for C to have travelled with.
    *
    * **A tree may be named once.** Nothing deduplicates here and nothing needs to: a tree named twice
    * declares its sysl twice, which the analyzer refuses long before a link — so a repeat that reached

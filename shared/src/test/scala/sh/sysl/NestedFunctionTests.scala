@@ -2,9 +2,9 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Nested functions (`12 §5a`) — a closure with a name, and the two halves of its rule: every name
- * in a block is in scope throughout it, and what may be captured is settled where the group is
- * written.
+/** Nested functions (`reference/declarations.md`) — a closure with a name, and the two halves of
+ * its rule: every name in a block is in scope throughout it, and what may be captured is settled
+ * where the group is written.
  */
 class NestedFunctionTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 

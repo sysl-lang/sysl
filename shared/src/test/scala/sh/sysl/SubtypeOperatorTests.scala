@@ -2,8 +2,9 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** A constrained subtype has its base's whole operator catalog, and every value the catalog makes of
- * one is held to what the type says its values are (`16 §1`, `§3`, `§4`).
+/** A constrained subtype has its base's whole operator catalog, and every value the catalog makes
+ * of one is held to what the type says its values are (`reference/errors.md § Constrained types`,
+ * `§3`, `§4`).
  *
  * The two flavours part company over *where* the check lands, and every test here is written so
  * that the two cannot be confused. A **transparent** subtype computes at its base, so `-a` and
@@ -21,8 +22,9 @@ class SubtypeOperatorTests extends AnyFreeSpec with RunSupport with CodegenSuppo
   private val Slot  = "type Slot = new u8 within 0..<200\n"
   private val Stamp = "type Stamp = new i64\n"
 
-  /** `16 §1` — a transparent subtype is *the same type as* its base, so an operator on one is the
-   * base's operator on base values, and its result is a base value with no range of its own.
+  /** `reference/errors.md § Constrained types` — a transparent subtype is *the same type as* its
+   * base, so an operator on one is the base's operator on base values, and its result is a base
+   * value with no range of its own.
    */
   "a transparent subtype computes at its base" - {
     "unary minus yields a base value, so a result outside the range is not a violation" in {
@@ -83,8 +85,9 @@ class SubtypeOperatorTests extends AnyFreeSpec with RunSupport with CodegenSuppo
     }
   }
 
-  /** `16 §4` lists an assignment as a produce site; a compound assignment is one, and it is the same
-   * one — `a += e` gives the place what `a = a + e` gives it, so the two must agree exactly.
+  /** `reference/errors.md § Where a constraint is checked` lists an assignment as a produce site; a
+   * compound assignment is one, and it is the same one — `a += e` gives the place what `a = a + e`
+   * gives it, so the two must agree exactly.
    */
   "a compound assignment is the produce site its written-out form is" - {
     "an in-range result holds" in {
@@ -165,8 +168,9 @@ class SubtypeOperatorTests extends AnyFreeSpec with RunSupport with CodegenSuppo
     }
   }
 
-  /** `16 §3` — a derivation arrives with everything the scalar could do, *working at itself and
-   * producing itself*. Producing itself is what makes each operation a produce site of `§4`.
+  /** `reference/errors.md § A derivation inherits its base's behaviour and may replace none of it`
+   * — a derivation arrives with everything the scalar could do, *working at itself and producing
+   * itself*. Producing itself is what makes each operation a produce site of `§4`.
    */
   "a derived subtype computes at itself, so the operation is the produce site" - {
     "an in-range sum is the derived type" in {
@@ -206,8 +210,9 @@ class SubtypeOperatorTests extends AnyFreeSpec with RunSupport with CodegenSuppo
     }
   }
 
-  /** A derivation exists to be a distinct name as often as to be a narrowing (`16 §2`), and one that
-   * narrows nothing must cost nothing — otherwise every `new i64` pays for a range it does not have.
+  /** A derivation exists to be a distinct name as often as to be a narrowing (`reference/errors.md
+   * § new is what makes it a type`), and one that narrows nothing must cost nothing — otherwise
+   * every `new i64` pays for a range it does not have.
    */
   "a derived subtype with no range asks nothing of its values" - {
     "its arithmetic runs unchecked" in {
@@ -337,17 +342,19 @@ class SubtypeOperatorTests extends AnyFreeSpec with RunSupport with CodegenSuppo
       err("type Letter = char within 'a'..'z'\nvar c: Letter = 'q'\nc++") should
         include("'++' is not defined for Letter")
     }
-    // The two flavours do not mix without a cast (`16 §2`), and a compound form is not a way around
-    // that: what it would change is the type of the place, which is the thing the message names.
+    // The two flavours do not mix without a cast (`reference/errors.md § new is what makes it a
+    // type`), and a compound form is not a way around that: what it would change is the type of the
+    // place, which is the thing the message names.
     "a compound assignment may still not change the type of its place" in {
       err(Slot + "var k: Slot = Slot(1)\nk += 1") should include("needs matching types")
     }
   }
 
-  /** The catalog being the base's is what `16 §3` calls inheriting it, and the other half of that
-   * ruling is that no `impl` may replace a row of it. Both halves turn on one predicate — whether the
-   * compiler provides the operator for this type — so a change that widens the catalog is a change to
-   * what may be written over it, and these say which way.
+  /** The catalog being the base's is what `reference/errors.md § A derivation inherits its base's
+   * behaviour and may replace none of it` calls inheriting it, and the other half of that ruling is
+   * that no `impl` may replace a row of it. Both halves turn on one predicate — whether the
+   * compiler provides the operator for this type — so a change that widens the catalog is a change
+   * to what may be written over it, and these say which way.
    */
   "the catalog is inherited and cannot be replaced" - {
     "an operator trait the compiler provides may not be implemented for a derived subtype" in {
@@ -370,10 +377,11 @@ class SubtypeOperatorTests extends AnyFreeSpec with RunSupport with CodegenSuppo
     }
   }
 
-  /** The other side of inheriting the catalog (`14 §5`): a membership is what a **bound** is
-    * satisfied by, so a subtype reaches a generic written over the base's traits. The tests above
-    * pin that the *operators* reach a subtype; a bound is a different question, since it asks
-    * whether the type system agrees the subtype is a member rather than whether a token lowers.
+  /** The other side of inheriting the catalog (`reference/expressions.md § Operator dispatch`): a
+    * membership is what a **bound** is satisfied by, so a subtype reaches a generic written over
+    * the base's traits. The tests above pin that the *operators* reach a subtype; a bound is a
+    * different question, since it asks whether the type system agrees the subtype is a member
+    * rather than whether a token lowers.
     */
   "a subtype satisfies the bounds its base satisfies" - {
     "a transparent one reaches an operator bound, computing at its base" in {

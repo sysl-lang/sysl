@@ -208,10 +208,11 @@ class ImplOverrideTests extends AnyFreeSpec with CodegenSupport with RunSupport 
     }
   }
 
-  /** The third kind of general block, and the one with the most obvious use: the library's
-   * `impl[T: Integer] Display for T` covers every integer, and `16 §3` gives a derived subtype its
-   * base's memberships — so a named unit type printed the way its base prints was a documented
-   * refusal with no way round it. Now it says `override`.
+  /** The third kind of general block, and the one with the most obvious use: the library's `impl[T:
+   * Integer] Display for T` covers every integer, and `reference/errors.md § A derivation inherits
+   * its base's behaviour and may replace none of it` gives a derived subtype its base's memberships
+   * — so a named unit type printed the way its base prints was a documented refusal with no way
+   * round it. Now it says `override`.
    */
   "a derived subtype overrides the blanket its base is covered by" in {
     run("""type Stamp = new int

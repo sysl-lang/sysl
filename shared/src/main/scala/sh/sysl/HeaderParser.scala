@@ -15,12 +15,12 @@ trait HeaderParser extends AttrParser {
 
   /** A **module path**, whose segments may not be quoted.
    *
-   * Two reasons, and the second is the load-bearing one. A module names a *directory* (`13 §1`), so
-   * a path is the one name that is not purely the programmer's to choose. And `Modules.split`
-   * recovers a module from a key by finding its **first** `$` — an invariant that survives quoting
-   * only because the escape `Modules.qualify` applies can introduce a `$` after the separator and
-   * never before it. A quoted module segment would put one before it, and the key would be read as
-   * belonging to a module nobody declared.
+   * Two reasons, and the second is the load-bearing one. A module names a *directory*
+   * (`reference/modules.md`), so a path is the one name that is not purely the programmer's to
+   * choose. And `Modules.split` recovers a module from a key by finding its **first** `$` — an
+   * invariant that survives quoting only because the escape `Modules.qualify` applies can introduce
+   * a `$` after the separator and never before it. A quoted module segment would put one before it,
+   * and the key would be read as belonging to a module nobody declared.
    */
   protected lazy val modulePath: Parser[List[String]] =
     rep1sep(
@@ -32,10 +32,11 @@ trait HeaderParser extends AttrParser {
 
   /** A name that may be reached through the module it belongs to: `File`, `std.fs.File`.
    *
-   * A public member is always reachable fully-qualified, with no import (`13 §3`), so every
-   * position that names a declaration takes this rather than a bare identifier. The dots are kept
-   * in the name as written — which module the prefix is and which part of it is the declaration's
-   * own name is a question only the analyzer, holding the program's module names, can answer.
+   * A public member is always reachable fully-qualified, with no import (`reference/modules.md §
+   * Imports`), so every position that names a declaration takes this rather than a bare identifier.
+   * The dots are kept in the name as written — which module the prefix is and which part of it is
+   * the declaration's own name is a question only the analyzer, holding the program's module names,
+   * can answer.
    */
   protected lazy val qualifiedName: Parser[String] = dottedName ^^ (_.mkString("."))
 
@@ -46,8 +47,9 @@ trait HeaderParser extends AttrParser {
   protected lazy val moduleHeader: Parser[ModuleName] =
     at(op("module") ~> modulePath ^^ ModuleName.apply)
 
-  /** A file-header attribute: `@no_alloc`, `@requires(os, posix)`, `@link("z")`, `@tests` (`13 §4`,
-   * `15 §8`, `capabilities.md`, `testing.md`).
+  /** A file-header attribute: `@no_alloc`, `@requires(os, posix)`, `@link("z")`, `@tests`
+   * (`reference/modules.md § Capabilities are a module property`, `reference/ffi.md § @link`,
+   * `capabilities.md`, `testing.md`).
    *
    * **These are attributes rather than grammar, and that is the point of the spelling.** A capability
    * and a library name are things said *about* a module, not constructs the language executes, so
@@ -82,8 +84,9 @@ trait HeaderParser extends AttrParser {
    *
    * It is one list because two would drift, and both readers of it are about the boundary rather
    * than about any one attribute: the commit point below, and the refusal of one written where a
-   * statement goes. `13 §4` and `capabilities.md` are where the vocabulary is documented; this is
-   * the grammar's single copy of it.
+   * statement goes. `reference/modules.md § Capabilities are a module property` and
+   * `capabilities.md` are where the vocabulary is documented; this is the grammar's single copy of
+   * it.
    *
    * **`@test` and `@tailrec` are deliberately not here.** The header's repetition runs before the
    * statements, so it also sees the attributes written above the first declaration — a list that
@@ -164,7 +167,8 @@ trait HeaderParser extends AttrParser {
       "this attribute belongs in the file's header, on the lines directly after 'module' and before " +
         "everything else — it is a property of the whole module, not of the statements below it")
 
-  /** `import a.b.c`, `import a.b.{c, d as e}`, `import a.b.*` — the Scala forms (`13 §3`).
+  /** `import a.b.c`, `import a.b.{c, d as e}`, `import a.b.*` — the Scala forms
+   * (`reference/modules.md § Imports`).
    *
    * The path is the greedy dotted name, so the tail forms are read off what is left after it: a
    * `.` followed by something that is not an identifier is not part of the path, which is what

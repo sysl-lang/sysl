@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `defer` — scope exit for what the language does not own (`03 § defer`).
+/** `defer` — scope exit for what the language does not own (`reference/memory.md § Where defer
+ * sits`).
  *
  * Almost everything here is a **run** test that prints in the order things happened, because that
  * order is the whole content of the feature and it is not visible in the IR: a deferred statement
@@ -10,9 +11,9 @@ import org.scalatest.freespec.AnyFreeSpec
  * others. A test that only checked the statement was emitted would pass for a compiler that ran it
  * at the wrong time, at the wrong edge, or twice.
  *
- * The claims being pinned are the ones `03 § defer` makes: it runs at the end of its **block**, on
- * every ordinary exit including `?`, last-registered-first, only if control reached it, and never
- * on a trap.
+ * The claims being pinned are the ones `reference/memory.md § Where defer sits` makes: it runs at
+ * the end of its **block**, on every ordinary exit including `?`, last-registered-first, only if
+ * control reached it, and never on a trap.
  */
 class DeferTests extends AnyFreeSpec with RunSupport with CodegenSupport with TestFrameworkSupport {
 
@@ -43,8 +44,8 @@ class DeferTests extends AnyFreeSpec with RunSupport with CodegenSupport with Te
             |""".stripMargin) shouldBe "cleanup\n1\ncleanup\n2\n"
     }
 
-    // `11 §5` makes `?` the normal way to leave a function, so a form that did not fire on it would
-    // miss the exit that matters most.
+    // `reference/errors.md § ? and the memory model` makes `?` the normal way to leave a function,
+    // so a form that did not fire on it would miss the exit that matters most.
     "on the failure arm of a '?'" in {
       run("""parse(ok: bool) -> Result[int, string] =
             |    if ok then Ok(7) else Err("bad")
@@ -64,8 +65,9 @@ class DeferTests extends AnyFreeSpec with RunSupport with CodegenSupport with Te
             |""".stripMargin) shouldBe "released\nok 8\nreleased\nerr bad\n"
     }
 
-    // The trailing expression is the function's result, and `03 § defer` says the deferred statement
-    // runs after it is computed — so a defer that mutates what was already returned cannot change it.
+    // The trailing expression is the function's result, and `reference/memory.md § Where defer
+    // sits` says the deferred statement runs after it is computed — so a defer that mutates what
+    // was already returned cannot change it.
     "after the returned value has been computed" in {
       run("""f() -> int
             |    var n = 1
@@ -205,8 +207,9 @@ class DeferTests extends AnyFreeSpec with RunSupport with CodegenSupport with Te
   }
 
   "what it costs" - {
-    // `03 § defer` claims it allocates nothing and takes no count, which is what keeps it usable
-    // under `no alloc`. Asserted at the capability, which is the surface that would refuse it.
+    // `reference/memory.md § Where defer sits` claims it allocates nothing and takes no count,
+    // which is what keeps it usable under `no alloc`. Asserted at the capability, which is the
+    // surface that would refuse it.
     "nothing that 'no alloc' forbids" in {
       run("""@no_alloc
             |
@@ -343,10 +346,11 @@ class DeferTests extends AnyFreeSpec with RunSupport with CodegenSupport with Te
   }
 
   "what the chapters claim" - {
-    // `11 §6` settles that a trap aborts without stack cleanup, and `03 § defer` does not qualify it.
-    // Asserted through the exit status rather than through output, because a trap does not flush
-    // stdio — so a program whose deferred statement is `exit(0)` exits zero if defers ran on the
-    // trap path and non-zero if they did not. Nothing about buffering can fake that.
+    // `reference/errors.md § Traps` settles that a trap aborts without stack cleanup, and
+    // `reference/memory.md § Where defer sits` does not qualify it. Asserted through the exit
+    // status rather than through output, because a trap does not flush stdio — so a program whose
+    // deferred statement is `exit(0)` exits zero if defers ran on the trap path and non-zero if
+    // they did not. Nothing about buffering can fake that.
     "a trap runs no deferred statement" in {
       exits("""f()
               |    var xs = [1, 2, 3]
@@ -371,8 +375,8 @@ class DeferTests extends AnyFreeSpec with RunSupport with CodegenSupport with Te
                   |""".stripMargin, 3)
     }
 
-    // `03 § defer` names the loop body as a block without saying which loop, so each form is asked.
-    // Both read `i` at its exit-time value, per the rule pinned below.
+    // `reference/memory.md § Where defer sits` names the loop body as a block without saying which
+    // loop, so each form is asked. Both read `i` at its exit-time value, per the rule pinned below.
     "a 'while' body is a block like any other" in {
       run("""var i = 0
             |while i < 2
@@ -423,8 +427,8 @@ class DeferTests extends AnyFreeSpec with RunSupport with CodegenSupport with Te
             |""".stripMargin) shouldBe "zero in\nzero out\nafter\nother in\nother out\nafter\n"
     }
 
-    // `12 §5a` — a nested function is a function, so its body is a block and its defers are its own
-    // rather than the enclosing body's.
+    // `reference/declarations.md` — a nested function is a function, so its body is a block and its
+    // defers are its own rather than the enclosing body's.
     "a nested function's defers belong to the nested function" in {
       run("""outer()
             |    inner()

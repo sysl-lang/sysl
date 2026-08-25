@@ -55,7 +55,7 @@ trait ControlFlowParser extends StmtParser {
       case lbl ~ c ~ b ~ e ~ _ => While(lbl, c, b, e)
     }
 
-  /** `do body while cond [else …]` — the post-test loop (`00 §10`).
+  /** `do body while cond [else …]` — the post-test loop (`reference/statements.md`).
    *
    * **`do` is unambiguous by position, which is what lets the same word do both jobs.** Everywhere
    * else it is a body *introducer*, and it only ever appears there after a loop header on the same
@@ -87,7 +87,7 @@ trait ControlFlowParser extends StmtParser {
     loopLabel ~ (op("loop") ~> body("do")) ~ opt(endMarker("loop")) ^^ { case lbl ~ b ~ _ => Loop(lbl, b) }
 
   /** `for all i in 0..<n do a[i] > 0`, `for some k in 0..n do a[k] == t` — a quantifier over an
-   * integer range (`17 §2`).
+   * integer range (`reference/verification.md § for all and for some`).
    *
    * **`all` and `some` stay ordinary identifiers**, matched here as soft words, so nothing a program
    * already names is spent on this. Telling the form from a counted loop takes one token: a
@@ -111,7 +111,8 @@ trait ControlFlowParser extends StmtParser {
 
   protected lazy val forExpr: PackratParser[Expr] = constForExpr | cForExpr | forCommaNames | forInExpr
 
-  /** `for const i in 0..<A.len` — the loop the compiler unrolls (`10 §10`).
+  /** `for const i in 0..<A.len` — the loop the compiler unrolls (`reference/generics.md § A
+   * parameter may stand for a list of types`).
    *
    * Tried first, and unambiguous against the other two: neither of them may have `const` after the
    * `for`. There is no label and no `else` clause, because there is no loop at run time for a

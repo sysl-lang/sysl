@@ -39,8 +39,8 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
   }
 
   // The weak count starts at one because the strong references hold one share between them
-  // (`03 § What it costs`), so the storage lives exactly until the object and every weak reference
-  // to it are both gone.
+  // (`reference/memory.md § What a heap object costs`), so the storage lives exactly until the
+  // object and every weak reference to it are both gone.
   "and its weak count starts at the one share the strong references hold together" in {
     val out = ir(point + "var p: &Point = Point(1, 2)")
 
@@ -101,7 +101,7 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
 
   // The tag is read straight off the value, since it is the aggregate's own first member; the
   // payload is not, because it shares one region with every other variant — so reaching it is a
-  // store and a load back at this variant's type (`09 §3`).
+  // store and a load back at this variant's type (`reference/types.md § Enums`).
   "a data enum walks only the variants that carry a reference, behind a tag test" in {
     val src = "struct Node\n    value: int\n    next: Option[&Node]\nvar n: &Node = Node(1, None)"
     val out = ir(src)

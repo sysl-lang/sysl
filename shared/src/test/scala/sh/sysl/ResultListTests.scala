@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `-> int, int` — several results as a property of the signature (`12 §5b`).
+/** `-> int, int` — several results as a property of the signature (`reference/declarations.md §
+ * Several results`).
  *
  * The whole design is that **there is no carrier**: the several things travel from callee to caller
  * and are taken apart there, so a result list may stand in exactly three places and nowhere else.
@@ -130,7 +131,8 @@ class ResultListTests extends AnyFreeSpec with ParseSupport with RunSupport with
   }
 
   /** The rule the whole section exists for: a multi-result call may appear in exactly three places
-   * (`12 §5b`). Each of these is a place it may not, and each is refused in the same words.
+   * (`reference/declarations.md § Several results`). Each of these is a place it may not, and each
+   * is refused in the same words.
    */
   "nothing may hold one" - {
     "not an argument" in {
@@ -199,8 +201,9 @@ class ResultListTests extends AnyFreeSpec with ParseSupport with RunSupport with
     }
   }
 
-  /** `00 §13`'s claim that the caller usually cannot tell the two apart — the point being that a
-   * callee may change its mind between the two forms without touching a call site that destructures.
+  /** `reference/types.md § Tuples`'s claim that the caller usually cannot tell the two apart — the
+   * point being that a callee may change its mind between the two forms without touching a call
+   * site that destructures.
    */
   "beside a tuple, at the same binding" - {
     "the same spelling takes a result list and a tuple apart" in {

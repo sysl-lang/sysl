@@ -282,8 +282,9 @@ trait SyslParserBase extends PackratParsers {
   /** `_`, which the lexer hands over as an ordinary identifier.
    *
    * Two productions read it and they never read the same position: a pattern's wildcard (`09`) and
-   * an expression's placeholder (`12 §5c`). Both go through this one matcher so there is a single
-   * answer to what the token is, rather than two spellings of the test that could drift apart.
+   * an expression's placeholder (`reference/expressions.md § _ — a parameter with the name left
+   * out`). Both go through this one matcher so there is a single answer to what the token is,
+   * rather than two spellings of the test that could drift apart.
    */
   protected lazy val wildcard: Parser[Unit] =
     accept("'_'", { case t: lexical.Identifier if t.chars == "_" => () })
@@ -410,12 +411,13 @@ trait SyslParserBase extends PackratParsers {
   protected def inlineBody: PackratParser[List[Stmt]]
 
   /** The quoted symbol an `extern` or a `@link` names, where that differs from the word the program
-   * calls it by (`15 §8`).
+   * calls it by (`reference/ffi.md § @link`).
    */
   protected def linkName: Parser[String]
 
   /** One pattern, as a `match` arm writes it. Declared here because a condition may test one too
-   * (`09 §12`), and the two spellings must be the same grammar rather than two that drift.
+   * (`reference/expressions.md § is — a pattern where a condition is wanted`), and the two
+   * spellings must be the same grammar rather than two that drift.
    */
   protected def pattern: Parser[Pattern]
 
@@ -429,7 +431,7 @@ trait SyslParserBase extends PackratParsers {
   protected def softEnd: Parser[Unit]
   protected def fnWord: Parser[Unit]
 
-  /** A function's declared result: one type, or several separated by commas (`12 §5b`). */
+  /** A function's declared result: one type, or several separated by commas (`reference/declarations.md § Several results`). */
   protected def resultRef: Parser[TypeRef]
 
   /** `some Trait` — a result whose concrete type is read off the body. Declared here because a
@@ -450,7 +452,7 @@ trait SyslParserBase extends PackratParsers {
   protected def qualifiedName: Parser[String]
   protected def typeArgs: Parser[List[TypeRef]]
 
-  /** `private`, `private[M]`, or nothing at all — which is public (`13 §2`). */
+  /** `private`, `private[M]`, or nothing at all — which is public (`reference/modules.md § Visibility`). */
   protected def visibility: Parser[Visibility]
 
   /** The string a contract clause or a `@test` carries — the sentence a reader is shown when the
@@ -485,8 +487,9 @@ trait SyslParserBase extends PackratParsers {
   protected def forExpr: PackratParser[Expr]
   protected def matchExpr: PackratParser[Expr]
 
-  /** `for all i in r do P` / `for some i in r do P` (`17 §2`), which is not one of the six above:
-   * it is written like an operand rather than like a statement, and it yields a `bool`.
+  /** `for all i in r do P` / `for some i in r do P` (`reference/verification.md § for all and for
+   * some`), which is not one of the six above: it is written like an operand rather than like a
+   * statement, and it yields a `bool`.
    */
   protected def quantifier: PackratParser[Expr]
 }

@@ -308,8 +308,9 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
    * name a consumer answers with `--include-path <name>=<dir>` (`packages.md § 8`).
    *
    * It sits under `requires` because that is already *what this package needs of its environment*,
-   * and the only thing separating it from the capabilities beside it is that satisfying it is a path
-   * — which `15 §8` settles is the driver's and may never be written in this file.
+   * and the only thing separating it from the capabilities beside it is that satisfying it is a
+   * path — which `reference/ffi.md § @link` settles is the driver's and may never be written in
+   * this file.
    */
   "the headers a package requires" - {
 

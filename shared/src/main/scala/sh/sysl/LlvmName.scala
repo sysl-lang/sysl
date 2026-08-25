@@ -38,9 +38,9 @@ object LlvmName {
    * name, and never to the result.
    *
    * **An ordinary identifier passes through untouched**, which is the property that matters most:
-   * every symbol this compiler has ever emitted keeps the spelling it had, so `15 §2`'s requirement
-   * that two modules instantiating one generic produce byte-identical symbols is undisturbed by
-   * this existing at all.
+   * every symbol this compiler has ever emitted keeps the spelling it had, so `reference/modules.md
+   * § Separate compilation`'s requirement that two modules instantiating one generic produce
+   * byte-identical symbols is undisturbed by this existing at all.
    *
    * A literal `$` is written `$24`, without which the encoding would not be injective — `` `a b` ``
    * and `` `a$20b` `` would be one symbol, and a silent collision between two names is the one

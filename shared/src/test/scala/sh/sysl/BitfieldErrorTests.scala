@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** What a bitfield struct may not hold, and what may not be asked of one (`15 §1`).
+/** What a bitfield struct may not hold, and what may not be asked of one (`reference/types.md §
+ * Structs`).
  *
  * Every refusal here follows from the one sentence that a `@packed` struct with a field narrower
  * than a byte **is** an integer, rather than from a policy laid over the feature — which is why each

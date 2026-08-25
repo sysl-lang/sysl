@@ -71,8 +71,8 @@ object CoreTraits {
    * declaration like any other, and the lowering is `TIntOp`'s.
    *
    * Unlike `required`'s, these traits are **not** in the standard module, so a file reaches their
-   * members only where it has named the trait (`13 §2`). A compiler-provided membership settles
-   * which types have a member, never which files may write it.
+   * members only where it has named the trait (`reference/modules.md § Visibility`). A
+   * compiler-provided membership settles which types have a member, never which files may write it.
    */
   val numeric: Map[String, String] = Map(
     "abs"    -> "Signed",
@@ -96,7 +96,7 @@ object CoreTraits {
   )
 
   /** The compiler-provided members that have **no receiver** — a trait, and the whole number its
-   * one member answers with (`14 §5`).
+   * one member answers with (`reference/expressions.md § Operator dispatch`).
    *
    * `numeric`'s members are reached from a value and lower from it; these are reached through the
    * *type*, because there is no value of `T` to hand a `zero()` before the accumulator that wants
@@ -123,8 +123,9 @@ object CoreTraits {
   val prefix: Map[String, String] =
     required.collect { case (name, (_, op, Kind.Prefix)) => op -> name }
 
-  /** Whether a trait's implementations are told apart by an operand rather than by the whole argument
-   * list — which is to say, whether its last argument is the operator's **result** (`14 §7`).
+  /** Whether a trait's implementations are told apart by an operand rather than by the whole
+   * argument list — which is to say, whether its last argument is the operator's **result**
+   * (`library/core.md § Walking a type of your own`).
    *
    * The ten binary arithmetic and bitwise traits are declared `[Rhs = Self, Out = Self]`, and a use
    * writes neither: `a * b` fixes the operands and asks to be told the result. So the operands select
@@ -169,16 +170,18 @@ object CoreTraits {
    * equality and no ordering, a pointer compares by address and nothing else.
    */
   def builtin(traitName: String, subject: Type): Boolean = {
-    // A constrained subtype is asked about at its **base**: `16 §1` makes a transparent one the same
-    // type as its base, and `16 §3` gives a derived one the base's whole catalog, so a subtype
-    // narrows which values a type has and never which operations it has. `Eq` and `Ord` already read
-    // it this way through `isOrdered`; the rows below used to match the type as written, which left
-    // `%`, the bitwise operators, the shifts and unary `-` off a subtype that plainly has them.
-    // **A vector is asked about at its lane**, for the reason the sentence above gives about a
-    // subtype: a register does not decide which operations a type has, only how many of them happen
-    // at once. What this settles is that the *compiler* owns `+` on a `<4>f32` and it is not looked
-    // for among the `impl` blocks — which pair is actually defined is `arithType`'s answer, and it
-    // refuses integer `/` there with a reason rather than by falling through to a missing `impl`.
+    // A constrained subtype is asked about at its **base**: `reference/errors.md § Constrained
+    // types` makes a transparent one the same type as its base, and `reference/errors.md § A
+    // derivation inherits its base's behaviour and may replace none of it` gives a derived one the
+    // base's whole catalog, so a subtype narrows which values a type has and never which operations
+    // it has. `Eq` and `Ord` already read it this way through `isOrdered`; the rows below used to
+    // match the type as written, which left `%`, the bitwise operators, the shifts and unary `-`
+    // off a subtype that plainly has them. **A vector is asked about at its lane**, for the reason
+    // the sentence above gives about a subtype: a register does not decide which operations a type
+    // has, only how many of them happen at once. What this settles is that the *compiler* owns `+`
+    // on a `<4>f32` and it is not looked for among the `impl` blocks — which pair is actually
+    // defined is `arithType`'s answer, and it refuses integer `/` there with a reason rather than
+    // by falling through to a missing `impl`.
     val t = Type.opSubject(subject)
 
     traitName match {
@@ -241,11 +244,12 @@ object CoreTraits {
     // own; what it promises is that `T` is one of the integers, and the operations come from the
     // traits it requires.
     //
-    // It is deliberately **not** `Bits` under another name (`14 §5`). `Bits` is named for what it
-    // provides — a population count, a rotation — and `Integer` for what it ranges over; they extend
-    // alike today and would part company the moment a bitset or a lane mask wanted the first without
-    // being the second. `Float` is the counterpart on the closed side, and it is a trait with two
-    // written `impl`s for exactly the reason this one cannot be.
+    // It is deliberately **not** `Bits` under another name (`reference/expressions.md § Operator
+    // dispatch`). `Bits` is named for what it provides — a population count, a rotation — and
+    // `Integer` for what it ranges over; they extend alike today and would part company the moment
+    // a bitset or a lane mask wanted the first without being the second. `Float` is the counterpart
+    // on the closed side, and it is a trait with two written `impl`s for exactly the reason this
+    // one cannot be.
     case "Integer" => t.isInstanceOf[Type.Integer]
 
     // The additive and multiplicative identities. They are the one pair here that is a **value**
@@ -255,10 +259,11 @@ object CoreTraits {
     //
     // So they are asked of the type **as written**, and two things fall outside on purpose. A
     // **constrained subtype** is a claim about which values it holds, and nothing says a range that
-    // was written to exclude zero has one — `16 §3` gives a subtype its base's operations, which
-    // these are not. A **vector** is left out because a splat is not what `zero()` says: `<4>i32`
-    // has four lanes and the member names none of them, where every other row here is the lane's
-    // operation happening four times at once.
+    // was written to exclude zero has one — `reference/errors.md § A derivation inherits its base's
+    // behaviour and may replace none of it` gives a subtype its base's operations, which these are
+    // not. A **vector** is left out because a splat is not what `zero()` says: `<4>i32` has four
+    // lanes and the member names none of them, where every other row here is the lane's operation
+    // happening four times at once.
     //
     // The integers are the whole of what is added, because the floats already have written `impl`
     // blocks in `sysl.ops` and a membership beside one is what `HoistImpl` refuses. What could not

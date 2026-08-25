@@ -409,9 +409,10 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("requires its type parameter 'T' to implement 'Show', but Color does not")
     }
 
-    // The definition-time check of `14 §4`: the body is walked once with `T` opaque, so a method
-    // it did not declare a bound for is reported against the definition that assumed it rather
-    // than against whichever caller happened to supply a type without that method.
+    // The definition-time check of `reference/generics.md § Bounds`: the body is walked once with
+    // `T` opaque, so a method it did not declare a bound for is reported against the definition
+    // that assumed it rather than against whichever caller happened to supply a type without that
+    // method.
     "an unbounded generic may not call a method its parameter does not promise" in {
       err(
         """trait Show

@@ -396,11 +396,12 @@ class TraitObjectRunTests extends AnyFreeSpec with RunSupport with CodegenSuppor
     }
   }
 
-  /** An **operator trait** erased into an object, which the catalog could not be while an operator's
-    * result was fixed to `Self` (`14 §7`). Writing both arguments out leaves `mul(self, rhs: real) ->
-    * real` with no `Self` in it anywhere, so there is nothing about the signature a forgotten type
-    * would have been needed for — and two types with quite different multiplications then dispatch
-    * dynamically through one slot.
+  /** An **operator trait** erased into an object, which the catalog could not be while an
+    * operator's result was fixed to `Self` (`library/core.md § Walking a type of your own`).
+    * Writing both arguments out leaves `mul(self, rhs: real) -> real` with no `Self` in it
+    * anywhere, so there is nothing about the signature a forgotten type would have been needed for
+    * — and two types with quite different multiplications then dispatch dynamically through one
+    * slot.
     *
     * The operator **token** does not reach through an object: `f * x` on a `&Mul[real, real]` is
     * refused, because the catalog's dispatch is on a pair of *types* and an object has forgotten the

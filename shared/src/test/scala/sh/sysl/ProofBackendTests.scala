@@ -3,7 +3,8 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
-/** The proof backend: sysl to WhyML, and Why3's verdict on the result (`17 §9`).
+/** The proof backend: sysl to WhyML, and Why3's verdict on the result (`reference/verification.md §
+ * sysl prove`).
  *
  * **The tests that matter run the prover.** A translation test can only say the output looks like
  * what was expected, and what was expected is exactly what might be wrong — a module that typechecks
@@ -108,8 +109,9 @@ class ProofBackendTests extends AnyFreeSpec with Matchers {
 
   "integer overflow is a proof obligation" - {
 
-    // `17 §9`'s decision, and the sharpest thing about the translation. `n * 2` for an `n` that is
-    // only known non-negative can leave the range, and the mathematical model would have hidden it.
+    // `reference/verification.md § sysl prove`'s decision, and the sharpest thing about the
+    // translation. `n * 2` for an `n` that is only known non-negative can leave the range, and the
+    // mathematical model would have hidden it.
     "so a multiplication that can leave the range is not discharged" in {
       proves("""double_it(n: int) -> int
                |    require n >= 0
@@ -186,8 +188,8 @@ class ProofBackendTests extends AnyFreeSpec with Matchers {
     }
 
     // The rule that keeps the two worlds apart: a contract is mathematics, and an ordinary function
-    // is a program. `@ghost` is what moves one across, which is the same thing `17 §8` says it is
-    // for at runtime.
+    // is a program. `@ghost` is what moves one across, which is the same thing
+    // `reference/verification.md § @ghost — what costs nothing to say` says it is for at runtime.
     "an ordinary function called from a contract is refused, and told to mark it" in {
       refusal("""ok(n: int) -> bool = n > 0
                 |

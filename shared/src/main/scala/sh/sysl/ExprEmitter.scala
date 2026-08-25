@@ -266,9 +266,9 @@ trait ExprEmitter extends ArithEmitter {
     // Nothing is stored for a zero-sized binding, so there is nothing to read back.
     case TLoad(_, ty) if Type.zeroSized(ty) => Val.Nothing
 
-    // The qualifier comes off the value's type for an ordinary local, whose slot is its own, and off
-    // the recorded storage for a `ref`, whose slot is somebody else's and may be a register
-    // (`03 § ref`, `03 § Device memory`).
+    // The qualifier comes off the value's type for an ordinary local, whose slot is its own, and
+    // off the recorded storage for a `ref`, whose slot is somebody else's and may be a register
+    // (`reference/memory.md § ref — a name for a place`, `reference/memory.md § Device memory`).
     case TLoad(name, ty) =>
       val acc = accessOf(if refStorage.contains(name) then refStorage(name) else ty)
       val r   = freshReg()
@@ -538,7 +538,8 @@ trait ExprEmitter extends ArithEmitter {
           r
 
     // The operand is read into a register once and the comparisons index off that, which is the
-    // whole reason these are a node rather than a tree of the operators they mean (`14 §5`).
+    // whole reason these are a node rather than a tree of the operators they mean
+    // (`reference/expressions.md § Operator dispatch`).
     case TIntOp(op, operand, amount, width, ty) =>
       val v    = genExpr(operand)
       val n    = amount.map(genExpr)
@@ -690,8 +691,9 @@ trait ExprEmitter extends ArithEmitter {
     case TSeq(exprs) =>
       exprs.foreach(genExpr); Val.Nothing
 
-    // One copy of an unrolled `for const` (`10 §10`), which is a block wherever it stands. A copy
-    // that yields nothing is emitted for its effects, which is what every copy of a loop body does.
+    // One copy of an unrolled `for const` (`reference/generics.md § A parameter may stand for a
+    // list of types`), which is a block wherever it stands. A copy that yields nothing is emitted
+    // for its effects, which is what every copy of a loop body does.
     case TBlockExpr(b) =>
       if Type.zeroSized(b.ty) then { genBlockVoid(b); Val.Nothing }
       else genBlockValue(b)
@@ -725,9 +727,9 @@ trait ExprEmitter extends ArithEmitter {
     case TCall(name, args, ty, _) =>
       val staged = args.map(argValue)
 
-      // `17 §4`: a call the compiler can see is a call to the same body checks that the measure has
-      // gone down. It sits before the call rather than inside the callee, which is what lets it be
-      // made out of values already in hand.
+      // `reference/verification.md § variant on a function`: a call the compiler can see is a call
+      // to the same body checks that the measure has gone down. It sits before the call rather than
+      // inside the callee, which is what lets it be made out of values already in hand.
       if checksVariant(name) then genVariantAtCall(staged)
       val (what, callee) = calleeParts(name, ty)
 
@@ -853,9 +855,9 @@ trait ExprEmitter extends ArithEmitter {
 
     // A bitfield is read out of its container, and the container is reached the way the *receiver*
     // is: at its address where it has one, so that a field of a `volatile` register block is one
-    // volatile load of the whole register — and out of the value otherwise. Which of those it is has
-    // to be settled here rather than by the two cases below, because both of those take the address
-    // of the **field**, and a bitfield has none (`15 §1`).
+    // volatile load of the whole register — and out of the value otherwise. Which of those it is
+    // has to be settled here rather than by the two cases below, because both of those take the
+    // address of the **field**, and a bitfield has none (`reference/types.md § Structs`).
     case TField(receiver, index, _) if bitfieldOf(receiver.ty).isDefined =>
       val ranges = bitfieldOf(receiver.ty).get
       val ct     = containerLty(ranges)
@@ -867,9 +869,10 @@ trait ExprEmitter extends ArithEmitter {
       //
       // **A container holding any `volatile` field is read at its address whatever its size**, so
       // that reading a bitfield register is one volatile load of the register and not a load of the
-      // struct followed by an `extractvalue` (`15 §1`). `volatile` is a property of the container
-      // rather than of one range of it — every field of a bitfield struct is bits of the same word —
-      // which is why the qualifier is asked of the receiver's storage and not of the field.
+      // struct followed by an `extractvalue` (`reference/types.md § Structs`). `volatile` is a
+      // property of the container rather than of one range of it — every field of a bitfield struct
+      // is bits of the same word — which is why the qualifier is asked of the receiver's storage
+      // and not of the field.
       val acc = accessOf(receiver.placeTy)
       val c =
         if hasAddress(receiver) && (layout.indirect(receiver.ty) || acc != Access.Plain) then
@@ -883,7 +886,7 @@ trait ExprEmitter extends ArithEmitter {
 
     // A register is reached at its own address, because the ordinary lowering below would read the
     // whole block to get at one field of it — and reading a register block is not a way of reading
-    // one register (`03 § Device memory`).
+    // one register (`reference/memory.md § Device memory`).
     case e @ TField(receiver, _, ty) if Type.volatileIn(e.placeTy) && hasAddress(receiver) =>
       val p = address(e)
       val r = freshReg(); emit(Inst.Load(r, ty.lty, p, Access.Volatile)); r

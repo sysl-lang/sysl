@@ -30,7 +30,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
                        override protected val allocator: Allocator)
     extends ExprEmitter with ExportThunk {
 
-  /** The ghost functions of this program, which nothing emitted may name (`17 §8`). */
+  /** The ghost functions of this program, which nothing emitted may name (`reference/verification.md § @ghost — what costs nothing to say`). */
   private val ghostFuncs: Set[String] = program.funcs.filter(_.ghost).map(_.name).toSet
 
   /** Whether a clause is a proof obligation rather than something to lay down: it names a ghost
@@ -59,9 +59,9 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // that lowered it — is a different closure's body under the same signature (card `0229`).
     val (imported, own) =
       program.funcs.partition(f => program.precompiled(f.name) && !f.internal)
-    // A `@ghost` function is not emitted at all (`17 §8`). Nothing executable may call one — that is
-    // checked in the analyzer — and the clauses that may are the ones skipped below, so there is no
-    // call left to resolve.
+    // A `@ghost` function is not emitted at all (`reference/verification.md § @ghost — what costs
+    // nothing to say`). Nothing executable may call one — that is checked in the analyzer — and the
+    // clauses that may are the ones skipped below, so there is no call left to resolve.
     val funcs           = own.filterNot(_.ghost).map(genFunction)
     // The C-callable entry each `@export` publishes, in front of the definition it calls
     // (`ExportThunk`). Only this compilation's own functions get one: a precompiled function's thunk
@@ -137,11 +137,12 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     }
 
     // A data enum is the tag and **one** payload region, wide enough and aligned for whichever
-    // variant needs the most (`09 §3`). Each variant's own payload keeps its named aggregate type,
-    // which is what a construction stores into that region and what a match reads back out of it.
-    // Deduplicated for the reason the structs above are, and it is the same rule reaching two more
-    // definitions apiece: a variant's payload aggregate is named from the enum's mangling too, so
-    // `Option[Age]` beside `Option[int]` would define `%…Option.int.Some` twice as well.
+    // variant needs the most (`reference/types.md § Enums`). Each variant's own payload keeps its
+    // named aggregate type, which is what a construction stores into that region and what a match
+    // reads back out of it. Deduplicated for the reason the structs above are, and it is the same
+    // rule reaching two more definitions apiece: a variant's payload aggregate is named from the
+    // enum's mangling too, so `Option[Age]` beside `Option[int]` would define `%…Option.int.Some`
+    // twice as well.
     val enums = program.enums.distinctBy(_.llvm).flatMap { e =>
       val (unit, count) = layout.payloadArea(e)
 
@@ -601,10 +602,10 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       case None =>
         releaseAll(); emitTerm(Inst.Ret(Some(f.retTy.lty), Some(zero(f.retTy))))
 
-    // A file-private declaration has every caller in the module that defines it (`13 §2`), so its
-    // symbol is `internal`: nothing outside may resolve it, and the linker is free to discard it
-    // when nothing inside calls it either — which is what an exported helper in a library artifact
-    // costs today.
+    // A file-private declaration has every caller in the module that defines it
+    // (`reference/modules.md § Visibility`), so its symbol is `internal`: nothing outside may
+    // resolve it, and the linker is free to discard it when nothing inside calls it either — which
+    // is what an exported helper in a library artifact costs today.
     finishFunc(
       ir.FuncSig(symbolOf(f.name),
                  syslFnType(f.retTy, f.params, f.variadic, Some(f)),
@@ -654,7 +655,8 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     emitTerm(Inst.Ret(None, None))
   }
 
-  /** What a calling convention becomes on the `define` line for **this** machine (`15 §10`).
+  /** What a calling convention becomes on the `define` line for **this** machine (`reference/ffi.md
+   * § interrupt`).
    *
    * Two of these because LLVM spells the one concept two ways: x86-64's interrupt handler is a
    * *calling convention* written before the result type, and RISC-V's is a *function attribute*
@@ -726,9 +728,10 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       genOwnedInto(Val.Reg(s"$name.addr"), init)
       ownSlot(name, ty)
 
-    // `ref name = place` (`03 § ref`). The walk to the place is made **once**, here, and its result
-    // becomes the name's address — so every later read and write is the one instruction it would
-    // have been, and the bounds check an element owed is paid at this line rather than at each use.
+    // `ref name = place` (`reference/memory.md § ref — a name for a place`). The walk to the place
+    // is made **once**, here, and its result becomes the name's address — so every later read and
+    // write is the one instruction it would have been, and the bounds check an element owed is paid
+    // at this line rather than at each use.
     //
     // The zero-offset `getelementptr` is there to give the address a name of its own: `address` may
     // hand back an existing slot or a global, and a register cannot simply be renamed.
@@ -794,9 +797,11 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     case TAsm(lines, operands, clobbers) =>
       if lines.nonEmpty then genAsm(lines, operands, clobbers)
 
-    // A loop's `invariant` (`17 §3`) is a condition that traps on false, which is every other clause
-    // in `16` — so it is the shared check and nothing more, unless it mentions ghost state, in which
-    // case it is a proof obligation and nothing runs (`17 §8`).
+    // A loop's `invariant` (`reference/verification.md § invariant and variant on a loop`) is a
+    // condition that traps on false, which is every other clause in `16` — so it is the shared
+    // check and nothing more, unless it mentions ghost state, in which case it is a proof
+    // obligation and nothing runs (`reference/verification.md § @ghost — what costs nothing to
+    // say`).
     case TInvariant(cond, _) =>
       if !ghostly(cond) then emitContract(cond, "invariant")
 

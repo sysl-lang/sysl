@@ -79,9 +79,9 @@ trait ImplTarget extends ImplConformance {
   /** What a signature written inside these members resolves under.
    *
    * A concrete `impl` binds only `Self`, to the one type it is for. A generic one binds its own
-   * parameters to themselves — the opaque stand-in of `14 §4` — and `Self` to the type applied to
-   * them, so `-> Self` and `-> Box[T]` are the one signature conformance compares, exactly as
-   * `-> Self` and `-> Point` are on a concrete implementation.
+   * parameters to themselves — the opaque stand-in of `reference/generics.md § Bounds` — and `Self`
+   * to the type applied to them, so `-> Self` and `-> Box[T]` are the one signature conformance
+   * compares, exactly as `-> Self` and `-> Point` are on a concrete implementation.
    *
    * The trait's own parameters are bound either way, since the block fixed them: a method written in
    * the trait's `T` and one written in the type that `T` is are the same signature.
@@ -268,8 +268,8 @@ trait ImplTarget extends ImplConformance {
     impl.tparams
   }
 
-  /** Where an `impl` may be written (`02 § Coherence`): **the module that declares the trait, or one
-   * that declares a type named in the subject**, and nowhere else.
+  /** Where an `impl` may be written (`reference/traits.md § Where an impl may live`): **the module
+   * that declares the trait, or one that declares a type named in the subject**, and nowhere else.
    *
    * An `impl` is unnamed, so resolving a bound means *searching* for one — and this is the rule that
    * bounds the search to two modules, both of which anything naming the trait and the type already
@@ -298,7 +298,8 @@ trait ImplTarget extends ImplConformance {
     else s"'$label' names only what ${homes.toList.map(whose).sorted.mkString(" and ")}"
 
   /** Every module the **subject** of an `impl` belongs to: its own where it is a declared type, and
-   * every one its parts belong to where it is composed (`02 § Coherence`).
+   * every one its parts belong to where it is composed (`reference/traits.md § Where an impl may
+   * live`).
    *
    * A composed type is the module's when anything named in it is — `[]Point` belongs where `Point`
    * does, `[]int` to nobody. Without that a module could not so much as print a slice of its own
@@ -323,7 +324,8 @@ trait ImplTarget extends ImplConformance {
     case VolatileType(inner) => subjectHomes(inner)
     case TupleType(parts, _) => Set(None) ++ parts.flatMap(subjectHomes)
     // A pack is the block's own parameter, which is not a local type and so is no home — the same
-    // answer `impl[T: Display] Display for []T` gets for its `T` (`02 § coherence`).
+    // answer `impl[T: Display] Display for []T` gets for its `T` (`reference/traits.md § Where an
+    // impl may live`).
     case _: PackType         => Set(None)
     case f: FnType           => subjectHomes(f.asTrait)
     // A function pointer belongs to no module — its parts may, so they are what is asked.
@@ -366,7 +368,8 @@ trait ImplTarget extends ImplConformance {
     // knows it by — there is no shape to describe, so the bound is the description.
     else if head.startsWith("@bound:") then s"every '${qn(head.drop("@bound:".length))}'"
     // Every tuple at *any* arity, which is the block whose parts are a pack — as against `(,)`,
-    // every pair, which the branch after this reads off the key (`10 §10`).
+    // every pair, which the branch after this reads off the key (`reference/generics.md § A
+    // parameter may stand for a list of types`).
     else if head == Type.Tuple.pack then "every tuple"
     else if head.startsWith("(") then s"every tuple of ${head.count(_ == ',') + 1} parts"
     else s"every array of ${head.drop(1).dropRight(1)}"
@@ -449,15 +452,17 @@ trait ImplTarget extends ImplConformance {
    *
    * The two part company for exactly one subject, and that is the whole reason this is not simply
    * `shapeOwners(ty).head`: a value parameter stands at zero for the walk that checks the block's
-   * body (`10 §9`), so `[N]T` and `[0]T` resolve to the same array and only the syntax says which
-   * was written. A length that is one of the block's own value parameters covers every array; every
-   * other length covers the arrays of that one length, under the per-length key it has always had.
+   * body (`reference/generics.md § A parameter may stand for a value`), so `[N]T` and `[0]T`
+   * resolve to the same array and only the syntax says which was written. A length that is one of
+   * the block's own value parameters covers every array; every other length covers the arrays of
+   * that one length, under the per-length key it has always had.
    */
   protected def implShape(impl: ImplDecl, ty: Type): Option[String] =
     if lengthParam(impl).isDefined then Some(Type.Array.shape)
     // `(..A)` covers every tuple at every arity, and the subject it resolved to is an ordinary pair
-    // — a pack stands at two types for the walk that checks the body (`10 §10`) — so only the syntax
-    // says which was written. Exactly the reason a length gets the branch above.
+    // — a pack stands at two types for the walk that checks the body (`reference/generics.md § A
+    // parameter may stand for a list of types`) — so only the syntax says which was written.
+    // Exactly the reason a length gets the branch above.
     else if packParam(impl).isDefined then Some(Type.Tuple.pack)
     else shapeOwners(ty).headOption.map(_._1)
 
@@ -496,7 +501,8 @@ trait ImplTarget extends ImplConformance {
     val declared = impl.tparams.toSet
     // A block covering every tuple applies **one** argument, the pack, and reads it off what was
     // written for the reason a length is read that way: the pack stands at two types for this walk,
-    // so the subject is a pair and no longer knows which parameter made it one (`10 §10`).
+    // so the subject is a pair and no longer knows which parameter made it one
+    // (`reference/generics.md § A parameter may stand for a list of types`).
     val matched  =
       if packParam(impl).isDefined then Nil
       else

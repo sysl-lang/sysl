@@ -10,7 +10,8 @@ package sh.sysl
 private enum BlockReading:
   case Collection, Callable
 
-/** Turning what a call wrote into the positional argument list a declaration takes (`12 §2a`).
+/** Turning what a call wrote into the positional argument list a declaration takes
+ * (`reference/declarations.md § Default parameters and named arguments`).
  *
  * Two things a call may leave to the declaration — an argument's **value**, where the parameter
  * declares a default, and an argument's **position**, where the call names the parameter instead —
@@ -154,7 +155,7 @@ trait ArgumentBinding extends TraitLookup {
     case _                   => None
 
   /** Wraps each argument standing at a by-name parameter in the closure the parameter's type asks
-   * for (`12 § A parameter may be passed by name`).
+   * for (`reference/declarations.md § Default parameters and named arguments`).
    *
    * **This is the whole of the feature, and it is deliberately a desugar over the untyped tree.**
    * `x: -> T` is typed `Fn() -> T`, so an argument that arrives as a closure is a thing the analyzer
@@ -282,10 +283,11 @@ trait ArgumentBinding extends TraitLookup {
    * to be filled inside itself, which is precisely what the cycle guard exists to refuse.
    *
    * **The wrapper's own position is the call's, and the expression inside it keeps the
-   * declaration's.** Those are the two places a default belongs to (`12 §2a`) and both are wanted:
-   * the inner one is where a complaint about the default goes, since that is where it was written,
-   * and the outer one is what `__FILE__` and `__LINE__` report, since a default stands where the
-   * argument would have. Nothing needed to tell them apart until a built-in could ask.
+   * declaration's.** Those are the two places a default belongs to (`reference/declarations.md §
+   * Default parameters and named arguments`) and both are wanted: the inner one is where a
+   * complaint about the default goes, since that is where it was written, and the outer one is what
+   * `__FILE__` and `__LINE__` report, since a default stands where the argument would have. Nothing
+   * needed to tell them apart until a built-in could ask.
    *
    * A trait's copy is re-wrapped by `copy()` rather than assigned to, because `setPos` keeps the
    * first position a node is given and that node is shared by every call to the method — the copy is

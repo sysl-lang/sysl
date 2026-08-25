@@ -74,9 +74,9 @@ trait NoAlloc extends AnalyzerBase {
    * **A generic is answered for by the body it was written as, and an instantiation of one by
    * nobody** (`capabilities.md § A generic`). The clause is a promise about a module's own conduct,
    * and a generic has no conduct until a type is chosen — by somebody else, in a module of their
-   * own. So `abstracts` carries what the definition-time pass of `14 §4` analyzed, where the
-   * declaring module's own calls still have their names and a call through a bound is the trait's,
-   * and the instantiations are passed over.
+   * own. So `abstracts` carries what the definition-time pass of `reference/generics.md § Bounds`
+   * analyzed, where the declaring module's own calls still have their names and a call through a
+   * bound is the trait's, and the instantiations are passed over.
    *
    * They are passed over rather than dropped: an instance is still part of the program every other
    * walk goes through, so a module calling a generic that allocates is reported at *its* call, which
@@ -169,8 +169,8 @@ trait NoAlloc extends AnalyzerBase {
     else if (if scaffolding then ours else theirs).isDefined then "this module declared '@no_alloc'"
     else s"'${target.name}' provides no allocator"
 
-  /** Which functions make heap storage, and which trees reach one (`13 §4` — *propagation is over
-   * the module graph*).
+  /** Which functions make heap storage, and which trees reach one (`reference/modules.md §
+   * Capabilities are a module property` — *propagation is over the module graph*).
    *
    * **The diagnostic lands at the call rather than at the import**, and the reason is the standard
    * library: `sysl` is one module and is half allocator-free, so a rule stated over modules would
@@ -250,9 +250,9 @@ trait NoAlloc extends AnalyzerBase {
   /** What a node allocates, said the way a reader would say it, or nothing for a node that does not.
    *
    * `TDowngrade` is deliberately absent: a weak reference is a count inside the box the strong one
-   * already made (`03 § What it costs`), so weakening allocates nothing. Making a `weak T` is gated
-   * all the same, one step earlier — the `&T` it has to come from is `TBox`, and there is no other
-   * route to one.
+   * already made (`reference/memory.md § What a heap object costs`), so weakening allocates
+   * nothing. Making a `weak T` is gated all the same, one step earlier — the `&T` it has to come
+   * from is `TBox`, and there is no other route to one.
    */
   private def allocates(e: TExpr): Option[String] = e match
     case _: TBox                       => Some("a reference")

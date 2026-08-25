@@ -8,10 +8,11 @@ import org.scalatest.matchers.should.Matchers
 /** The standard module handed to a compilation as an **artifact** rather than as source, and the one
  * claim that has to hold before anything is moved onto that path: that the two mean the same thing.
  *
- * A program is compiled against the library (`13 §8`), and every compilation so far has been handed
- * it the same way — `library/sysl` as the compiler embeds it, parsed. The artifact exists to end that
- * source dependence: the same trees arrive already decoded, and the half with nothing left to
- * monomorphize arrives as object code to link against rather than emit again.
+ * A program is compiled against the library (`reference/modules.md § Separate compilation`), and
+ * every compilation so far has been handed it the same way — `library/sysl` as the compiler embeds
+ * it, parsed. The artifact exists to end that source dependence: the same trees arrive already
+ * decoded, and the half with nothing left to monomorphize arrives as object code to link against
+ * rather than emit again.
  *
  * **"It links" would prove nothing on its own.** A compilation that reached a *different* library
  * and still produced a program that linked would be exactly as green. So what is pinned here is the

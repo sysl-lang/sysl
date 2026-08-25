@@ -25,9 +25,9 @@ class StringSurfaceTests extends AnyFreeSpec with CodegenSupport with RunSupport
 
   override protected def err(src: String): String = super.err(importing + src)
 
-  /** `s.copy()` exists for one reason (`04 § Ownership and lifetime`): a substring shares its
-   * parent's buffer, so a short-lived slice of a long-lived string would otherwise pin the whole
-   * thing. Copying is the named operation that breaks that hold.
+  /** `s.copy()` exists for one reason (`reference/strings.md § Immortal bytes`): a substring shares
+   * its parent's buffer, so a short-lived slice of a long-lived string would otherwise pin the
+   * whole thing. Copying is the named operation that breaks that hold.
    */
   "a string copies out of the buffer it was sharing" - {
     "the copy reads the same bytes" in {
@@ -68,9 +68,9 @@ class StringSurfaceTests extends AnyFreeSpec with CodegenSupport with RunSupport
     }
   }
 
-  /** `04 § Granularity` puts `copy` on the method side of `08`'s line and `len` on the property
-   * side, because one walks the bytes and the other reads a word that is already there. Both
-   * mistakes name the fix.
+  /** `reference/strings.md § Granularity: bytes and scalar values` puts `copy` on the method side
+   * of `08`'s line and `len` on the property side, because one walks the bytes and the other reads
+   * a word that is already there. Both mistakes name the fix.
    */
   "and it is a method, because it costs something" - {
     "read without parentheses it says so" in {
@@ -93,8 +93,8 @@ class StringSurfaceTests extends AnyFreeSpec with CodegenSupport with RunSupport
             |""".stripMargin) should not be empty
     }
 
-    // `10 §5`: an unbounded parameter permits only what every type supports, and no trait declares
-    // `copy`, so there is no bound to suggest.
+    // `reference/generics.md § Bounds`: an unbounded parameter permits only what every type
+    // supports, and no trait declares `copy`, so there is no bound to suggest.
     "a type parameter cannot reach it, and no bound would help" in {
       err("""f[T](x: T) = x.copy()
             |print(1)
@@ -102,8 +102,8 @@ class StringSurfaceTests extends AnyFreeSpec with CodegenSupport with RunSupport
     }
   }
 
-  /** `string(c)` is the fourth row of `04 § Validity`'s construction table, and the only conversion
-   * whose result is not a scalar.
+  /** `string(c)` is the fourth row of `reference/strings.md § Validity`'s construction table, and
+   * the only conversion whose result is not a scalar.
    */
   "a char converts to the string that spells it" - {
     "one scalar value becomes its UTF-8" in {
@@ -124,8 +124,8 @@ class StringSurfaceTests extends AnyFreeSpec with CodegenSupport with RunSupport
       run("""print(string('\u{0}').len)""") shouldBe "1\n"
     }
 
-    // `04 § Rendering a value` gives `char` the same row, so the two must agree to the byte —
-    // which is why `string(c)` needs nothing of its own underneath.
+    // `reference/strings.md § Rendering a value` gives `char` the same row, so the two must agree
+    // to the byte — which is why `string(c)` needs nothing of its own underneath.
     "and it agrees with 'str' of the same char" in {
       run("""print(string('\u{10ffff}') == str('\u{10ffff}'), string('q') == str('q'))""") shouldBe
         "true true\n"
@@ -154,9 +154,10 @@ class StringSurfaceTests extends AnyFreeSpec with CodegenSupport with RunSupport
     }
   }
 
-  /** `StrBuilder` is `04 § Granularity`'s "repeated append, amortized" row. Its two ways in — a
-   * string and a char — are the two that carry the UTF-8 guarantee with them, which is what lets
-   * `finish` hand back a `string` rather than something that has to be validated.
+  /** `StrBuilder` is `reference/strings.md § Granularity: bytes and scalar values`'s "repeated
+   * append, amortized" row. Its two ways in — a string and a char — are the two that carry the
+   * UTF-8 guarantee with them, which is what lets `finish` hand back a `string` rather than
+   * something that has to be validated.
    */
   "a builder appends without rebuilding what it already has" - {
     "strings and chars go in, one string comes out" in {
@@ -335,8 +336,9 @@ class StringSurfaceTests extends AnyFreeSpec with CodegenSupport with RunSupport
     }
   }
 
-  /** `cstring(s)` is `04 § C interop`'s general direction — the one for a string that is not a
-   * literal, where `c"…"` cannot apply because there is no constant to take the address of.
+  /** `cstring(s)` is `reference/strings.md § C interop`'s general direction — the one for a string
+   * that is not a literal, where `c"…"` cannot apply because there is no constant to take the
+   * address of.
    */
   "a string copies into the shape C reads" - {
     "the copy is NUL-terminated, and C finds the same length sysl does" in {

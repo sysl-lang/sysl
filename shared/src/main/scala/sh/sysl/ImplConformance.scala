@@ -101,11 +101,12 @@ trait ImplConformance extends MemberLowering {
    *
    * Both sides are resolved with `Self` bound to the implementing type, which is what makes a
    * signature written with `Self` and one written with the concrete name the same signature
-   * (`14 §1`) — the comparison is between *resolved* types, so it does not matter which spelling
-   * either side chose.
+   * (`reference/traits.md § Declaring a trait`) — the comparison is between *resolved* types, so it
+   * does not matter which spelling either side chose.
    */
   /** The trait an `impl` is for, as a message spells it — which for a call trait is the arrow the
-   * block was written with, not the arity-carrying declaration behind it (`12 §6`).
+   * block was written with, not the arity-carrying declaration behind it (`reference/types.md §
+   * Function types`).
    */
   protected def traitShown(impl: ImplDecl): String =
     if Type.Fn.isCall(impl.traitName) && impl.traitArgs.nonEmpty then

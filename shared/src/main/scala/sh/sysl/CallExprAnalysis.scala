@@ -128,19 +128,20 @@ trait CallExprAnalysis extends ExprCoercion with MemberExprAnalysis with RawStor
     // reason the nearest binding always does. It is asked whether it is callable rather than merely
     // whether it is a local, so a name that shadows a function with something uncallable still
     // reaches the function — which is what it did before there were closures, and no program that
-    // relied on it is silently rerouted.
-    // A local holding C's function pointer, called through it. It comes before the callable one
-    // because a `*extern` implements no call trait: there is no receiver to pass and no table to
-    // read, only an address and the signature its type carried (`12 §6a`).
+    // relied on it is silently rerouted. A local holding C's function pointer, called through it.
+    // It comes before the callable one because a `*extern` implements no call trait: there is no
+    // receiver to pass and no table to read, only an address and the signature its type carried
+    // (`reference/ffi.md § A function's address`).
     case Call(Ident(name), args) if lookupOpt(name).exists((_, t) => cfnOf(t).isDefined) =>
       callThroughAddress(analyzeExpr(Ident(name).setPos(expr.pos)), args)
 
     case Call(Ident(name), args) if lookupOpt(name).exists((_, t) => callableOf(t).isDefined) =>
       callCallable(analyzeExpr(Ident(name).setPos(expr.pos)), args, expected)
 
-    // A nested function of an enclosing block (`12 §5a`), which shadows a top-level one of the same
-    // name for the reason the nearest binding always wins. The environment travels as the receiver,
-    // so a sibling call and a recursive call are the same call.
+    // A nested function of an enclosing block (`reference/declarations.md`), which shadows a
+    // top-level one of the same name for the reason the nearest binding always wins. The
+    // environment travels as the receiver, so a sibling call and a recursive call are the same
+    // call.
     case Call(Ident(name), args) if lookupOpt(name).isEmpty && nestedFuncs.contains(name) =>
       callNested(nestedFuncs(name), name, args)
 
@@ -181,7 +182,8 @@ trait CallExprAnalysis extends ExprCoercion with MemberExprAnalysis with RawStor
     // A name that is neither a local nor a function, holding a function pointer — a module-level
     // `val` is the one that reaches here, since it is resolved by neither of the two lookups above.
     // The general case further down would have taken it, but the complaint about an undefined
-    // function comes first: a call head that is a *name* never gets that far (`12 §6a`).
+    // function comes first: a call head that is a *name* never gets that far (`reference/ffi.md § A
+    // function's address`).
     case Call(Ident(name), args)
         if lookupOpt(name).isEmpty && probe(analyzeExpr(Ident(name).setPos(expr.pos)))
           .exists(t => cfnOf(t.ty).isDefined) =>
@@ -205,9 +207,10 @@ trait CallExprAnalysis extends ExprCoercion with MemberExprAnalysis with RawStor
     case Call(Ident(name), _) =>
       err(s"undefined function '$name'")
 
-    // A member reached through the module it belongs to (`13 §3`): the chain is rewritten with the
-    // module folded into the name it qualifies, and what is left is the ordinary form — a call, a
-    // construction, an associated function — resolved exactly as one written unqualified is.
+    // A member reached through the module it belongs to (`reference/modules.md § Imports`): the
+    // chain is rewritten with the module folded into the name it qualifies, and what is left is the
+    // ordinary form — a call, a construction, an associated function — resolved exactly as one
+    // written unqualified is.
     case Call(callee, args) if throughModule(callee).isDefined =>
       analyzeValueAt(Call(throughModule(callee).get, args).setPos(expr.pos), expected)
 
@@ -242,13 +245,13 @@ trait CallExprAnalysis extends ExprCoercion with MemberExprAnalysis with RawStor
       // function exactly as a struct's may. Everything else selected from the name is one of the
       // mistakes `constrainedMember` has words for.
       //
-      // **An alias is not one of those and is answered by its base** (`16 §1` — a transparent alias
-      // is the same type as its base), which is what the *read* form already does one line into
-      // `constrainedMember`. Without it here the call fell through to the read's complaint, and for
-      // an alias to a type with a written `impl` that complaint is *"call it with 'F.zero()'"* under
-      // a line already reading `F.zero()`. An alias to a **declared** type never arrives: those are
-      // followed at the key by `aliasedKey`, so only one naming a scalar, a pointer, an array or a
-      // callable reaches this.
+      // **An alias is not one of those and is answered by its base** (`reference/errors.md §
+      // Constrained types` — a transparent alias is the same type as its base), which is what the
+      // *read* form already does one line into `constrainedMember`. Without it here the call fell
+      // through to the read's complaint, and for an alias to a type with a written `impl` that
+      // complaint is *"call it with 'F.zero()'"* under a line already reading `F.zero()`. An alias
+      // to a **declared** type never arrives: those are followed at the key by `aliasedKey`, so
+      // only one naming a scalar, a pointer, an array or a callable reaches this.
       if plainAlias(n) then callTypeAssociated(resolveAlias(n), written, mname, args, expected)
       else if memberDecls.get((n, mname)).exists(_.recvMode.isEmpty) then callAssociated(n, mname, args, expected)
       else constrainedMember(n, written, mname)
@@ -260,7 +263,8 @@ trait CallExprAnalysis extends ExprCoercion with MemberExprAnalysis with RawStor
     // `T.f(…)` and `real.f(…)` — an associated function reached through a type that is not one of
     // the declaration tables above: a type parameter, the `Self` a member's body is analyzed under,
     // or a built-in an `impl` was written for. It is the only way a bound says anything about the
-    // type rather than about a value of it (`02 § Reaching a trait's members without a value`).
+    // type rather than about a value of it (`reference/traits.md § Reaching a trait's members
+    // without a value`).
     case Call(Field(Ident(written), mname), args)
         if lookupOpt(written).isEmpty && typeKey(written).isEmpty && traitKey(written).isEmpty &&
           typeNamed(written).isDefined =>
@@ -281,10 +285,11 @@ trait CallExprAnalysis extends ExprCoercion with MemberExprAnalysis with RawStor
     case Call(Field(recv, mname), args) =>
       callMethod(recv, mname, args, expected)
 
-    // `f[T](…)` — type arguments written at a call (`10 §2`). The list and a subscript are one
-    // grammar, so what tells them apart is not the parser: the name is resolved, and a **function**
-    // is not a thing that can be indexed, so there is no second reading of the brackets to protect.
-    // That is the discrimination `&f[T]` already made in order to refuse this by name, turned from a
+    // `f[T](…)` — type arguments written at a call (`reference/generics.md § [] means type
+    // application in a type, indexing in an expression`). The list and a subscript are one grammar,
+    // so what tells them apart is not the parser: the name is resolved, and a **function** is not a
+    // thing that can be indexed, so there is no second reading of the brackets to protect. That is
+    // the discrimination `&f[T]` already made in order to refuse this by name, turned from a
     // refusal into a solve.
     //
     // The name has to be a declaration and nothing nearer: a local shadowing one is an ordinary
@@ -340,11 +345,11 @@ trait CallExprAnalysis extends ExprCoercion with MemberExprAnalysis with RawStor
       constructWritten(written, targs, args)
 
     // A special form written with type arguments. **`va_arg[int](ap)` is the one this is for**, and
-    // `12 §9` named it as the strongest case for the syntax: everywhere else the annotation that
-    // stands in is a word on a binding that was going to be written anyway, and a variadic body
-    // reading its tail straight into `print` has no binding at all. `ptr_cast[T](p)` is the same
-    // shape from the raw tier — both take their type from what receives the value, so writing it
-    // here is writing it where the value is made.
+    // `reference/ffi.md § Variadic functions` named it as the strongest case for the syntax:
+    // everywhere else the annotation that stands in is a word on a binding that was going to be
+    // written anyway, and a variadic body reading its tail straight into `print` has no binding at
+    // all. `ptr_cast[T](p)` is the same shape from the raw tier — both take their type from what
+    // receives the value, so writing it here is writing it where the value is made.
     //
     // The rest take none, for the reason a non-generic function takes none: there is nothing for an
     // argument to be an argument *of*.
@@ -357,10 +362,11 @@ trait CallExprAnalysis extends ExprCoercion with MemberExprAnalysis with RawStor
         case _          => err(s"'$name' takes no type arguments")
 
     // Anything that *is* a callable may be called, wherever it was read from — an element of an
-    // array of them, a part of a tuple, a container's item (`12 §6`). The head of a call is looked
-    // at rather than required to be a name, and only what turns out not to be callable is refused.
-    // A function pointer read from wherever one was kept — a struct's field, an element of a table
-    // of handlers, what another call handed back (`12 §6a`).
+    // array of them, a part of a tuple, a container's item (`reference/types.md § Function types`).
+    // The head of a call is looked at rather than required to be a name, and only what turns out
+    // not to be callable is refused. A function pointer read from wherever one was kept — a
+    // struct's field, an element of a table of handlers, what another call handed back
+    // (`reference/ffi.md § A function's address`).
     case Call(callee, args) if probe(analyzeExpr(callee)).exists(t => cfnOf(t.ty).isDefined) =>
       callThroughAddress(analyzeExpr(callee), args)
 
@@ -431,11 +437,12 @@ trait CallExprAnalysis extends ExprCoercion with MemberExprAnalysis with RawStor
    * they mean at a constructor: the instantiation is fixed and the payload is checked against it.
    *
    * **An associated function is not that**, and keeps the refusal. Its instantiation is solved from
-   * the call — the type's parameters and its own arrive in one list and are read together (`10 §4`)
-   * — so honouring the brackets would mean settling half of that list and solving the rest, which is
-   * a different question from the one this form asks. The annotation on the binding reaches it, and
-   * unlike the corner a call head could not reach, it is always there: an associated function has a
-   * result, and the result is what its type arguments are read off.
+   * the call — the type's parameters and its own arrive in one list and are read together
+   * (`reference/generics.md § Inference is bidirectional`) — so honouring the brackets would mean
+   * settling half of that list and solving the rest, which is a different question from the one
+   * this form asks. The annotation on the binding reaches it, and unlike the corner a call head
+   * could not reach, it is always there: an associated function has a result, and the result is
+   * what its type arguments are read off.
    */
   protected def typeArgsAtSelection(
       written: String,

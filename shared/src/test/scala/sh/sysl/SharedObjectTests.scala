@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** `&sync T` — the reference whose count is atomic, and so the one that may be held in two
- * concurrency domains at once (`06 § &sync T`).
+ * concurrency domains at once (`reference/memory.md § Crossing a concurrency domain`).
  *
  * The type has always parsed and always lowered to the atomic pair. What is checked here is the
  * condition the chapter attaches to it: an atomic count on the object promises nothing about the
@@ -289,9 +289,9 @@ class SharedObjectTests extends AnyFreeSpec with CodegenSupport with RunSupport 
                     |""".stripMargin) should include("'&sync Box[&Inner]' may be reached from two domains at once")
     }
 
-    // A trait's own signature is resolved where the trait is written (`02 § Defaults`), so a
-    // promise nothing can keep is refused there — with nothing implementing it, and again when
-    // something does.
+    // A trait's own signature is resolved where the trait is written (`reference/traits.md § A
+    // default may assume exactly what its own trait declares`), so a promise nothing can keep is
+    // refused there — with nothing implementing it, and again when something does.
     "a trait's signature is asked at the trait, implemented or not" in {
       val declared = inner + "struct H\n    kid: &Inner\ntrait Registry\n    put(self, h: &sync H) -> int\n"
 
@@ -359,7 +359,7 @@ class SharedObjectTests extends AnyFreeSpec with CodegenSupport with RunSupport 
     }
 
     // A closure is a struct a program wrote and did not name, so nothing it is told may repeat the
-    // name the compiler filed it under (`12 §6`).
+    // name the compiler filed it under (`reference/types.md § Function types`).
     "one capturing a reference is refused, and the message says 'closure'" in {
       val e = err(inner + "var k: &Inner = Inner(3)\nvar f: &sync Fn(int) -> int = x -> x + k.v")
 
@@ -419,7 +419,7 @@ class SharedObjectTests extends AnyFreeSpec with CodegenSupport with RunSupport 
   "what the chapter says the language does not have" - {
 
     // No `async`, no `await`, and no task runtime — so none of the three is a reserved word, and a
-    // program may use all of them as names (`06 § No async/await`).
+    // program may use all of them as names (`library/threads.md § There is no async`).
     "no async, await, or actor, so all three are ordinary names" in {
       run("var async = 1\nvar await = 2\nvar actor = 3\nprint(async + await + actor)") shouldBe "6\n"
     }

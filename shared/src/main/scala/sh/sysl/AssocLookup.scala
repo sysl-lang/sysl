@@ -129,9 +129,10 @@ trait AssocLookup { this: TraitLookup =>
   private def concreteAssoc(t: Type, member: String): Either[String, Type] = {
     val names = traitsDeclaring(member)
     // The same ladder `memberKey` climbs, and for the same reason: a `[]T` also answers to the
-    // read-only view of its elements (`07 § Read-only views`), so an `impl` written for a
-    // `[]const u8` supplies the projection of a `[]u8` exactly as it supplies its members. Leaving
-    // the widened key out made a member reachable whose associated type was not.
+    // read-only view of its elements (`reference/arrays.md § []const T — a view that may not be
+    // written`), so an `impl` written for a `[]const u8` supplies the projection of a `[]u8`
+    // exactly as it supplies its members. Leaving the widened key out made a member reachable whose
+    // associated type was not.
     val keys  = memberOwner(t) :: widened(t).toList ::: shapeOwners(t) ::: blanketOwners(t)
     val hits =
       for

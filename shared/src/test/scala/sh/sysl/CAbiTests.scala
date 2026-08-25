@@ -764,8 +764,9 @@ class CAbiTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |div(1, 1)""".stripMargin) shouldBe "3 1\n"
     }
 
-    // A zero-sized parameter is dropped from the signature (`00 §12`), which has to happen *before*
-    // the rest are classified or every argument after it lands one register early.
+    // A zero-sized parameter is dropped from the signature (`reference/types.md § unit and never`),
+    // which has to happen *before* the rest are classified or every argument after it lands one
+    // register early.
     "a parameter that occupies nothing is dropped from in front of a coerced one" in {
       run("""struct div_t
             |    quot: i32

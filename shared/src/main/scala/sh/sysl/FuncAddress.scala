@@ -2,7 +2,8 @@ package sh.sysl
 
 import scala.collection.mutable
 
-/** A function's address, and a call through one — the two halves of `12 §6a`.
+/** A function's address, and a call through one — the two halves of `reference/ffi.md § A
+ * function's address`.
  *
  * This is the seam a C library reaches back through. `extern` (`12 §1`) lets sysl call outward, and
  * that was enough while every foreign interface was one a program calls; it is not enough for the
@@ -12,20 +13,21 @@ import scala.collection.mutable
  * and unusable.
  *
  * Both directions are the same value — one word holding the address of code compiled to the
- * machine's C convention — so both are `Type.CFn`, and neither is a sysl callable. A `Fn` is a trait
- * (`12 §6`): a bound at a parameter, a two-word object where a concrete type is required, and in
- * both cases something with an environment beside it. C has no notion of an environment, which is
- * why this is a separate type rather than a third mode of that one, and it is why nothing here can
- * take the address of a closure.
+ * machine's C convention — so both are `Type.CFn`, and neither is a sysl callable. A `Fn` is a
+ * trait (`reference/types.md § Function types`): a bound at a parameter, a two-word object where a
+ * concrete type is required, and in both cases something with an environment beside it. C has no
+ * notion of an environment, which is why this is a separate type rather than a third mode of that
+ * one, and it is why nothing here can take the address of a closure.
  */
 trait FuncAddress extends CallCore {
 
   /** `&f` — the address of a declared function.
    *
    * The `&` is the same one `03` gives every other address, and it is deliberate that no bare `f`
-   * reaches here: a bare function name already means the capture-free closure (`12 §5`), and a
-   * spelling that meant a sysl callable in one slot and a C address in another would be a silent
-   * choice between two representations that share nothing.
+   * reaches here: a bare function name already means the capture-free closure
+   * (`reference/expressions.md § Closures`), and a spelling that meant a sysl callable in one slot
+   * and a C address in another would be a silent choice between two representations that share
+   * nothing.
    */
   protected def functionAddress(
       written: String,
@@ -36,12 +38,13 @@ trait FuncAddress extends CallCore {
     val key  = overloadAddressed(written, plain, expected)
     val decl = funcDecls(key)
 
-    // Which copy of it? A generic function is not code until its arguments are settled (`10 §7`), so
-    // there is no single body to name until they are — but the *expected type* settles them wherever
-    // there is one, exactly as a call's arguments do, and an instantiation is one body like any
-    // other. Refusing outright was too broad: it is what stopped a library offering a callback
-    // helper at all, since a trampoline's state type belongs to the application rather than to the
-    // binding, so every application had to hand-roll one and cast the userdata itself.
+    // Which copy of it? A generic function is not code until its arguments are settled
+    // (`reference/generics.md § Monomorphization`), so there is no single body to name until they
+    // are — but the *expected type* settles them wherever there is one, exactly as a call's
+    // arguments do, and an instantiation is one body like any other. Refusing outright was too
+    // broad: it is what stopped a library offering a callback helper at all, since a trampoline's
+    // state type belongs to the application rather than to the binding, so every application had to
+    // hand-roll one and cast the userdata itself.
     //
     // Where the arguments are *written*, they are what settles it, and the expected type is not
     // consulted at all: `&f[T]` exists precisely for the signatures the expected type cannot solve.
@@ -92,8 +95,8 @@ trait FuncAddress extends CallCore {
     //     callback a binding wanted to register unnameable, which is most of what a callback-shaped
     //     library is;
     //   - a function carrying **`@export`**, whose address is its thunk's (`ExportThunk`) — a
-    //     definition that genuinely has the convention this rule is written about. `15 §12` said
-    //     that all along; what changed is that it is now true.
+    // definition that genuinely has the convention this rule is written about. `reference/ffi.md §
+    // @export` said that all along; what changed is that it is now true.
     val hasCConvention = externDecls.contains(instKey) || decl.exported.isDefined
 
     if !hasCConvention then
@@ -112,16 +115,17 @@ trait FuncAddress extends CallCore {
     TFuncAddr(instKey, instKey, Type.CFn(ptypes, ret))
   }
 
-  /** Which declaration of an overloaded name an address is of (`12 §1a`).
+  /** Which declaration of an overloaded name an address is of (`reference/declarations.md §
+   * Overloading`).
    *
    * **The expected type decides, and it is the same mechanism a generic function's arguments are
    * read off** — an address is handed to something whose signature is already fixed, so the
    * signature is there to be matched. What is compared is the parameter list: a `*extern` states
    * exactly what a call through it passes, and that is what tells two overloads apart.
    *
-   * The result is deliberately not compared. `12 §1a` refuses a pair differing only in it, so it
-   * carries no information here — and comparing it would refuse an address whose expected type is
-   * spelled with a result the declaration converts to.
+   * The result is deliberately not compared. `reference/declarations.md § Overloading` refuses a
+   * pair differing only in it, so it carries no information here — and comparing it would refuse an
+   * address whose expected type is spelled with a result the declaration converts to.
    *
    * **With no expected type there is nothing to read**, and this reports rather than guessing. An
    * address is one word with no context of its own; taking the first declaration would be choosing

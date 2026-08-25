@@ -32,10 +32,10 @@ trait Hoisting extends HoistMembers {
   /** The same question with the variants left out — what a *variant* registration asks, because a
    * second enum naming a variant the first one also names is legal and everything else is not.
    *
-   * The asymmetry is the whole of `09 §3`'s namespacing rule in one line. Two variants of that name
-   * are told apart by the enum they belong to, and a use site that cannot tell them apart says so at
-   * the use site; a variant and a constant of one name have nothing to be told apart *by*, so the
-   * clash is real and is reported where it is written.
+   * The asymmetry is the whole of `reference/types.md § Enums`'s namespacing rule in one line. Two
+   * variants of that name are told apart by the enum they belong to, and a use site that cannot
+   * tell them apart says so at the use site; a variant and a constant of one name have nothing to
+   * be told apart *by*, so the clash is real and is reported where it is written.
    */
   private def storageNameHolder(key: String): Option[String] =
     if constDecls.contains(key) then Some("a constant")
@@ -84,10 +84,11 @@ trait Hoisting extends HoistMembers {
       recordAccess(key, e.vis)
       for m <- e.members do at(m.pos)(recordMemberAccess(key, m.name, m.vis, s"${e.name}.${m.name}"))
       if libraryOffers(e, currentModule) then libraryNames(e.name) = key
-      // **A variant belongs to its enum, not to the module** (`09 §3`), so two enums here may each
-      // name a variant `Failed` and the module-level name simply has two answers. What a bare use of
-      // it means is settled at the use site, by the type expected there; the qualified
-      // `Enum.Variant` spelling is what a site with nothing to go on writes instead.
+      // **A variant belongs to its enum, not to the module** (`reference/types.md § Enums`), so two
+      // enums here may each name a variant `Failed` and the module-level name simply has two
+      // answers. What a bare use of it means is settled at the use site, by the type expected
+      // there; the qualified `Enum.Variant` spelling is what a site with nothing to go on writes
+      // instead.
       //
       // The key is still the module's, because that is what a bare name resolves through — the list
       // under it is what makes two answers representable at all.
@@ -196,8 +197,9 @@ trait Hoisting extends HoistMembers {
 
       if valDecls.contains(key) then duplicate(key, s"'${v.name}' is already declared")
       else for what <- valueNameHolder(key) do duplicate(key, s"'${v.name}' is already used by $what")
-      // `13 §2` — what is visible outside its file states its types, and a module member always
-      // could be. A local `val` states nothing to anyone and infers like a `var`.
+      // `reference/modules.md § Visibility` — what is visible outside its file states its types,
+      // and a module member always could be. A local `val` states nothing to anyone and infers like
+      // a `var`.
       if v.typ.isEmpty then
         err(s"a module-level 'val' states its type, so '${v.name}' needs one — 'val ${v.name}: T = …'")
       valDecls(key) = v.copy(name = key).setPos(v.pos)
@@ -219,12 +221,12 @@ trait Hoisting extends HoistMembers {
 
       if staticVarDecls.contains(key) then duplicate(key, s"'${v.name}' is already declared")
       else for what <- valueNameHolder(key) do duplicate(key, s"'${v.name}' is already used by $what")
-      // The same rule a `val` meets, and for the same reason (`13 §2`): a module member may be
-      // visible outside its file, and what is has to say what it is. It bites harder here, because
-      // module storage written with `var` may have no initializer at all for a type to be inferred
-      // from.
+      // The same rule a `val` meets, and for the same reason (`reference/modules.md § Visibility`):
+      // a module member may be visible outside its file, and what is has to say what it is. It
+      // bites harder here, because module storage written with `var` may have no initializer at all
+      // for a type to be inferred from.
       if v.typ.isEmpty then
-        err(s"'${v.name}' is module storage, and module storage states its type (`13 §2`) — write " +
+        err(s"'${v.name}' is module storage, and module storage states its type — write " +
           s"'${v.name}: T'")
       staticVarDecls(key) = v.copy(name = key).setPos(v.pos)
       declScope(key) = currentScope
@@ -259,9 +261,10 @@ trait Hoisting extends HoistMembers {
           "code rather than storage — an 'extern' variable names a symbol the linker resolves")
 
     // The same rule, meeting a form that cannot satisfy it: a binding that names several things has
-    // nowhere to write a type for any of them (`12 §5b`), so it can only ever be a local. Saying so
-    // here is what stops one at the top of a file from quietly becoming a local of the entry point,
-    // where every other `val` written there is a module member.
+    // nowhere to write a type for any of them (`reference/declarations.md § Several results`), so
+    // it can only ever be a local. Saying so here is what stops one at the top of a file from
+    // quietly becoming a local of the entry point, where every other `val` written there is a
+    // module member.
     case m: MultiDecl if !m.mutable =>
       at(m.pos)(err("a module-level 'val' states its type, and a binding that names several things " +
         s"has nowhere to write one — declare ${m.names.map(n => s"'$n'").mkString(" and ")} separately"))
@@ -374,11 +377,12 @@ trait Hoisting extends HoistMembers {
       val plain = Modules.qualify(currentModule, e.name)
       val key   = if funcDecls.contains(plain) then overloadSlot(plain) else plain
 
-      // **An `extern` overloads, and the C symbol is what keeps the overloads apart** (`12 §1a`).
-      // Two sysl declarations sharing a name are two functions; two sharing a *symbol* are one C
-      // function claimed at two signatures, and nothing downstream could tell which was meant — the
-      // symbol is what is emitted, so both calls would reach the same code with different arguments.
-      // That is what `ptr_cast` over a `*extern` is for, written where a reader can see it.
+      // **An `extern` overloads, and the C symbol is what keeps the overloads apart**
+      // (`reference/declarations.md § Overloading`). Two sysl declarations sharing a name are two
+      // functions; two sharing a *symbol* are one C function claimed at two signatures, and nothing
+      // downstream could tell which was meant — the symbol is what is emitted, so both calls would
+      // reach the same code with different arguments. That is what `ptr_cast` over a `*extern` is
+      // for, written where a reader can see it.
       val externClash =
         Option.when(key != plain) {
           if overloadKeys(plain).flatMap(externDecls.get).exists(_.symbol == e.symbol) then
@@ -507,13 +511,14 @@ trait Hoisting extends HoistMembers {
         funcInsts(ikey) = (ftypes.map((n, t) => (n, Type.unqualified(t))), Type.Bool)
 
         // What the clauses may read is settled here, where the field types have just been resolved
-        // and the whole aliasing rule that rests on them is still ahead (`16 §6`).
+        // and the whole aliasing rule that rests on them is still ahead (`reference/errors.md §
+        // Struct invariants`).
         checkInvariantReads(s, ftypes.toMap)
 
     case _ =>
 
   /** What `@crossing` may name: parameters of the function it is written above, each once
-   * (`06 § Marking a domain boundary`).
+   * (`reference/memory.md § @crossing — where the rule is asked`).
    *
    * It is the whole of what can be settled at the declaration — whether an *argument* may cross is a
    * question about the argument, and is asked at each call. Checked here, with the rest of what a
@@ -618,9 +623,10 @@ trait Hoisting extends HoistMembers {
    *
    * A function's parameters are fixed by what the call passes, a method's by that and its receiver,
    * an `impl` block's by the type it is for — and sysl offers no call-site type arguments at all
-   * (`10 §2`), so in none of the three is there an argument list a default could fill a gap in. The
-   * thing that would be useful there is a fallback for an inference that found nothing, which is a
-   * different feature and not this one; saying so at the declaration is what keeps the two apart.
+   * (`reference/generics.md § [] means type application in a type, indexing in an expression`), so
+   * in none of the three is there an argument list a default could fill a gap in. The thing that
+   * would be useful there is a fallback for an inference that found nothing, which is a different
+   * feature and not this one; saying so at the declaration is what keeps the two apart.
    */
   protected def checkSolvedDefaults(noun: String, label: String, tdefaults: Map[String, TypeRef]): Unit =
     for (tp, ref) <- tdefaults.toList.sortBy(_._1) do
@@ -750,10 +756,10 @@ trait Hoisting extends HoistMembers {
   /** Refuses a struct or an enum whose module and name spell a module the program also has.
    *
    * `geom.Point.dist` would then name both `geom`'s `Point.dist` and `geom.Point`'s `dist`, and a
-   * dotted reference takes the **longest** prefix that names a module (`13 §3`) — so the module
-   * would win and the type's member would have no spelling left at all. The keys stay distinct
-   * either way (`Modules`); what collides is the path a program writes, which is exactly the thing
-   * a diagnostic can fix and a silent choice cannot.
+   * dotted reference takes the **longest** prefix that names a module (`reference/modules.md §
+   * Imports`) — so the module would win and the type's member would have no spelling left at all.
+   * The keys stay distinct either way (`Modules`); what collides is the path a program writes,
+   * which is exactly the thing a diagnostic can fix and a silent choice cannot.
    *
    * Only a struct and an enum are asked, because they are what a dotted chain reaches *into*. A
    * trait is named in a bound or behind a sigil and never has a member selected off its name, so a
@@ -769,8 +775,9 @@ trait Hoisting extends HoistMembers {
       constrainedDecls.contains(key) || scalarType(written).isDefined ||
       written == neverName || written == selfName
 
-  /** The key the **second and later** declarations of one function name are filed under (`12 §1a`),
-   * recording as it goes that the name now stands for a set.
+  /** The key the **second and later** declarations of one function name are filed under
+   * (`reference/declarations.md § Overloading`), recording as it goes that the name now stands for
+   * a set.
    *
    * Every table in the analyzer is keyed by a name that stands for one declaration, and overloading
    * is precisely a name that does not — so the first declaration keeps the plain key and each one
@@ -785,7 +792,8 @@ trait Hoisting extends HoistMembers {
     key
   }
 
-  /** Refuses a declaration that some call could not be told apart from one already made (`12 §1a`).
+  /** Refuses a declaration that some call could not be told apart from one already made
+   * (`reference/declarations.md § Overloading`).
    *
    * **The question is whether a call exists that both would take**, which is the only thing that
    * makes two declarations of a name a problem. Each declaration takes a *range* of argument counts
@@ -796,9 +804,10 @@ trait Hoisting extends HoistMembers {
    * That one rule covers the two cases worth naming separately:
    *
    * - **A pair differing only in the result.** `h(x: int) -> string` and `h(x: int) -> int` collide
-   *   at one argument. Resolution never looks at the result (`12 §1a`), so the pair has no call that
-   *   distinguishes them and every use would report an ambiguity — one mistake, made once, reported
-   *   at every call site instead of at the line that has it.
+   * at one argument. Resolution never looks at the result (`reference/declarations.md §
+   * Overloading`), so the pair has no call that distinguishes them and every use would report an
+   * ambiguity — one mistake, made once, reported at every call site instead of at the line that has
+   * it.
    * - **A pair whose difference is behind a default.** `g(x: int)` and `g(x: int, y: int = 0)`
    *   collide at one argument, and the second's default is unreachable: no call can ever supply one
    *   argument to it, because the first takes that call. A default nothing can use is worth saying

@@ -2,8 +2,8 @@ package sh.sysl
 
 import scala.collection.mutable
 
-/** What a module that gave up an environment capability may not reach (`capabilities.md
- * § Propagation through imports`, `13 §4`).
+/** What a module that gave up an environment capability may not reach (`capabilities.md §
+ * Propagation through imports`, `reference/modules.md § Capabilities are a module property`).
  *
  * **The question is asked of the module graph, and that is what makes it a different pass from
  * `NoAlloc`.** `alloc` changes what the *language* allows, so it is checked at each construction

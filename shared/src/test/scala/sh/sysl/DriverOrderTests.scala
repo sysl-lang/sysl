@@ -13,12 +13,13 @@ import org.scalatest.matchers.should.Matchers
  * answer whenever every step succeeds. It stops being invisible exactly when one of them **fails**,
  * because then the reader gets the first failure rather than the relevant one.
  *
- * **The library carrying C is what made that reachable** (`13 §5`, card 0135). A shim under a
- * `__<os>__` directory is selected by the *target's* system and compiled by the host's clang, so a
- * cross-system build asks this machine to compile another system's C against headers it has not got.
- * That is a real limitation and not the bug: cross-compiling C needs a sysroot, and none of these
- * commands could have produced a working binary anyway. The bug is that the complaint arrived
- * *first*, in place of the one the reader needed.
+ * **The library carrying C is what made that reachable** (`reference/modules.md § Platform
+ * selection`, card 0135). A shim under a `__<os>__` directory is selected by the *target's* system
+ * and compiled by the host's clang, so a cross-system build asks this machine to compile another
+ * system's C against headers it has not got. That is a real limitation and not the bug:
+ * cross-compiling C needs a sysroot, and none of these commands could have produced a working
+ * binary anyway. The bug is that the complaint arrived *first*, in place of the one the reader
+ * needed.
  *
  * **CI is where it showed, and it showed as two unrelated-looking failures.** On Linux the first
  * cross target in the registry is `aarch64-macos`, so a `sysl test` refusal and a capability

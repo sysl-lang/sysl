@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** A trait that **requires** another (`02 § A trait may require another trait`).
+/** A trait that **requires** another (`reference/traits.md § A trait may require another trait`).
  *
  * There are two customers and they ask for different things. A **bound** wants economy: `[T: Word]`
  * rather than `[T: Word + Add + BitXor + …]` at every declaration. A **trait object** wants
@@ -224,8 +224,8 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |show(o)""".stripMargin) shouldBe "a rect\n"
     }
 
-    // A bound is also what a *type* asks of its parameters (`10 §5`), and it is the one check, so an
-    // object is a legal argument there as well.
+    // A bound is also what a *type* asks of its parameters (`reference/generics.md § Bounds`), and
+    // it is the one check, so an object is a legal argument there as well.
     "a type's own bound takes an object" in {
       run(
         shape +
@@ -930,10 +930,10 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         include("declares no method 'volume'")
     }
 
-    /** `13 §2`'s rule, and a requirement is the sharpest case of it: implementing the trait means
-     * implementing the required one too, so a requirement the implementer cannot name leaves the
-     * trait unimplementable from outside. Reported at the declaration that made the promise, not at
-     * the `impl` that cannot keep it.
+    /** `reference/modules.md § Visibility`'s rule, and a requirement is the sharpest case of it:
+     * implementing the trait means implementing the required one too, so a requirement the
+     * implementer cannot name leaves the trait unimplementable from outside. Reported at the
+     * declaration that made the promise, not at the `impl` that cannot keep it.
      */
     "a trait may not require one that reaches less far than it does" in {
       errIn(

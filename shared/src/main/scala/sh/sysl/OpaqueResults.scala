@@ -52,12 +52,12 @@ trait OpaqueResults extends AbstractBodies {
 
   /** Analyzes one body and records what it produced.
    *
-   * The signature it is analyzed against is the block's own, with the block's parameters standing in
-   * for themselves — the same setup the definition-time pass of `14 §4` uses, and for the same
-   * reason: a generic block's `some` result is one type per instantiation, and the type it is
-   * recorded as has to be written in the block's terms so that a particular subject's arguments
-   * substitute into it. `impl[T] Sequence for Buf[T]` whose body builds a `Cursor[T]` records
-   * exactly that, and a `Buf[int]` then has `Cursor[int]`.
+   * The signature it is analyzed against is the block's own, with the block's parameters standing
+   * in for themselves — the same setup the definition-time pass of `reference/generics.md § Bounds`
+   * uses, and for the same reason: a generic block's `some` result is one type per instantiation,
+   * and the type it is recorded as has to be written in the block's terms so that a particular
+   * subject's arguments substitute into it. `impl[T] Sequence for Buf[T]` whose body builds a
+   * `Cursor[T]` records exactly that, and a `Buf[int]` then has `Cursor[int]`.
    *
    * The declared result handed to the walk is `Type.Unknown`, which is the honest answer: it is what
    * this pass is trying to find out. Nothing is checked against it — a result the analyzer could not

@@ -292,9 +292,10 @@ class MultiAssignTests extends AnyFreeSpec with ParseSupport with RunSupport wit
     }
   }
 
-  /** A module member states its type (`13 §2`), and this form has nowhere to write one for any of its
-    * parts (`12 §5b`) — so it is a local form, and the one place that could be in doubt is a file the
-    * program starts in, where `static` is what asks for the member.
+  /** A module member states its type (`reference/modules.md § Visibility`), and this form has
+    * nowhere to write one for any of its parts (`reference/declarations.md § Several results`) — so
+    * it is a local form, and the one place that could be in doubt is a file the program starts in,
+    * where `static` is what asks for the member.
     *
     * Written plain it needs no rule at all now: everything a body declares is local, so a multiple
     * `val` there is exactly what it looks like. The refusal is what `static` gets.
@@ -449,9 +450,10 @@ class MultiAssignTests extends AnyFreeSpec with ParseSupport with RunSupport wit
     // and not a multiple assignment. That is the reason the form commits only at statement level:
     // below one, the comma always means something else.
     //
-    // What the middle argument *is* changed with `12 §2a`: `b = 1` at a call is now the named
-    // argument it reads as, not the assignment it used to be. That is a decision about the call and
-    // not about this form, which is why the count is what matters here — three arguments either way.
+    // What the middle argument *is* changed with `reference/declarations.md § Default parameters
+    // and named arguments`: `b = 1` at a call is now the named argument it reads as, not the
+    // assignment it used to be. That is a decision about the call and not about this form, which is
+    // why the count is what matters here — three arguments either way.
     "a comma below statement level goes on meaning what it meant" in {
       prog("print(a, b = 1, 2)") shouldBe
         List(printStmt(Ident("a"), NamedArg("b", i(1)), i(2)))

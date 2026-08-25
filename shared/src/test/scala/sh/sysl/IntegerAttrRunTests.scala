@@ -3,7 +3,8 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** `T::Min` and `T::Max` on a built-in integer type — the bounds a `within` subtype has answered
- * since `16 §5` while the integer it is declared over answered nothing.
+ * since `reference/errors.md § What the type's own name offers: :: attributes` while the integer it
+ * is declared over answered nothing.
  *
  * The wide cases carry the point of the feature. A program can write `4294967295` for a `u32` and
  * cannot write the largest `u10000` at all, so for a wide member of the open family the attribute is
@@ -69,15 +70,16 @@ class IntegerAttrRunTests extends AnyFreeSpec with RunSupport with CodegenSuppor
   }
 
   /** A subtype that narrows **nothing** answers its base's extremes, because that is what it can
-   * hold. `16 §1` makes a transparent one *be* its base, so the alternative — refusing for want of a
-   * `within` range — was the subtype claiming to be a different type than its own chapter says. It
-   * is not a corner: a `c type` (`15 §7`) lowers to exactly this, so every measured typedef in the
-   * kernel and Pico packages is one.
+   * hold. `reference/errors.md § Constrained types` makes a transparent one *be* its base, so the
+   * alternative — refusing for want of a `within` range — was the subtype claiming to be a
+   * different type than its own chapter says. It is not a corner: a `c type` (`reference/ffi.md § A
+   * library may carry C`) lowers to exactly this, so every measured typedef in the kernel and Pico
+   * packages is one.
    */
   "a subtype that narrows nothing answers the integer it is" - {
-    /** A bare transparent alias is refused at the declaration (`16 §1`), so a **derived** one is the
-      * shape a person can write. The attribute answers in the subtype, as every one but `Valid`
-      * does, which is why the value needs a cast to print.
+    /** A bare transparent alias is refused at the declaration (`reference/errors.md § Constrained
+      * types`), so a **derived** one is the shape a person can write. The attribute answers in the
+      * subtype, as every one but `Valid` does, which is why the value needs a cast to print.
       */
     "a derived subtype with no constraint has its base's maximum" in {
       run("type Handle = new u16\nwidest() -> u16 = u16(Handle::Max)\nprint(widest())") shouldBe "65535\n"
@@ -95,8 +97,9 @@ class IntegerAttrRunTests extends AnyFreeSpec with RunSupport with CodegenSuppor
   }
 
   "the bounds are constants, not calls" - {
-    // `13 §5` admits no call in a `const` initializer, so an attribute that resolved as one would be
-    // unusable in the two places bounds are most wanted. This is the test that pins that.
+    // `reference/modules.md § Platform selection` admits no call in a `const` initializer, so an
+    // attribute that resolved as one would be unusable in the two places bounds are most wanted.
+    // This is the test that pins that.
     "a const initializer folds one" in {
       run("const LIMIT: u16 = u16::Max\nprint(LIMIT)") shouldBe "65535\n"
     }
@@ -191,9 +194,9 @@ class IntegerAttrRunTests extends AnyFreeSpec with RunSupport with CodegenSuppor
     }
 
     /** The subtype reaching the parameter does not put it outside its base's traffic, which is the
-      * half worth pinning: a transparent subtype *is* its base for every value that flows (`16 §1`),
-      * so a bound written over the base is satisfied and the arithmetic inside the body is the
-      * base's. Only the bound answers differently.
+      * half worth pinning: a transparent subtype *is* its base for every value that flows
+      * (`reference/errors.md § Constrained types`), so a bound written over the base is satisfied
+      * and the arithmetic inside the body is the base's. Only the bound answers differently.
       */
     "a bound written over the base is still satisfied by the subtype" in {
       run("""type Age = int within 0..150

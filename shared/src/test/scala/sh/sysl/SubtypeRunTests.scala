@@ -85,11 +85,12 @@ class SubtypeRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
-  /** A transparent subtype **is** its base (`16 §2`), so its name converts what the base's name
-    * converts: `Age(n)` on a `usize` is the `int(n)` a reader would otherwise have to write. Before
-    * this the operand had to arrive already at the base, which left no way into a subtype whose base
-    * cannot be *named* — a `c type` measures a width the program is not supposed to know, so
-    * `Tick(xs.len)` had no longhand to fall back on. `CTypeTests` carries that case.
+  /** A transparent subtype **is** its base (`reference/errors.md § new is what makes it a type`),
+    * so its name converts what the base's name converts: `Age(n)` on a `usize` is the `int(n)` a
+    * reader would otherwise have to write. Before this the operand had to arrive already at the
+    * base, which left no way into a subtype whose base cannot be *named* — a `c type` measures a
+    * width the program is not supposed to know, so `Tick(xs.len)` had no longhand to fall back on.
+    * `CTypeTests` carries that case.
     *
     * The range is still checked on the way in, which is what the trapping half of each pair pins:
     * the conversion is a conversion, not a way past the constraint.
@@ -134,11 +135,12 @@ class SubtypeRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     run(Age + "var a: Age = 12\nvar n: int = a\nprint(n + 1)") shouldBe "13\n"
   }
 
-  /** `16 §1` — a subtype is laid out as the type it narrows, so a pattern matches its values as that
-   * type's values. Both forms are here because both reach the same comparison and it had no answer
-   * for a subtype: the compiler **crashed** on either, with a Scala stack trace rather than a
-   * diagnostic, so a program that matched on a constrained value could not be compiled at all.
-   * Found by probing `09 §12`'s claim that a condition takes every pattern an arm does.
+  /** `reference/errors.md § Constrained types` — a subtype is laid out as the type it narrows, so a
+   * pattern matches its values as that type's values. Both forms are here because both reach the
+   * same comparison and it had no answer for a subtype: the compiler **crashed** on either, with a
+   * Scala stack trace rather than a diagnostic, so a program that matched on a constrained value
+   * could not be compiled at all. Found by probing `reference/expressions.md § is — a pattern where
+   * a condition is wanted`'s claim that a condition takes every pattern an arm does.
    */
   "a pattern matches a constrained subtype as the base it narrows" - {
     val Small = "type Small = int within 1..10\n"
@@ -172,15 +174,17 @@ class SubtypeRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "high\n"
     }
 
-    "which a condition's pattern reaches by the same route (`09 §12`)" in {
+    // `reference/expressions.md § is — a pattern where a condition is wanted`
+    "which a condition's pattern reaches by the same route" in {
       run(Small + """var n: Small = 5
                     |if n is 1..6 then print("low") else print("high")
                     |""".stripMargin) shouldBe "low\n"
     }
   }
 
-  /** `16 §4` lists the places a constrained value is produced, and a struct field is one of them —
-   * at construction *and* at every later write, since a field is not read-only.
+  /** `reference/errors.md § Where a constraint is checked` lists the places a constrained value is
+   * produced, and a struct field is one of them — at construction *and* at every later write, since
+   * a field is not read-only.
    */
   "a constrained struct field is checked wherever it is written" - {
     val Person = "type Age = int within 0..150\nstruct Person\n    age: Age\n"
@@ -199,8 +203,9 @@ class SubtypeRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
-  // `16 §1`. A struct invariant may read one and is tested for it; a subtype predicate is the same
-  // question one declaration over, and it is what lets a table's ceiling be written down once.
+  // `reference/errors.md § Constrained types`. A struct invariant may read one and is tested for
+  // it; a subtype predicate is the same question one declaration over, and it is what lets a
+  // table's ceiling be written down once.
   "a where predicate may read a module constant" in {
     run("""const ceiling: int = 150
           |type Small = int where value < ceiling

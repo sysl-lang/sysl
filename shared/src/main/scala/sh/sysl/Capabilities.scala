@@ -77,7 +77,7 @@ object Capability {
 }
 
 /** Reading the capability clauses of a program's files into the module property they describe
- * (`13 §4`, `capabilities.md`).
+ * (`reference/modules.md § Capabilities are a module property`, `capabilities.md`).
  *
  * A clause is written per **file** and means something about the **module**, which is the whole of
  * why there is a pass here rather than a field: the files of one module have to be held to saying
@@ -267,7 +267,7 @@ trait Capabilities extends AnalyzerBase {
         else err(s"'${cs.head.name}' is declared twice, and the second says nothing the first did not")
       })
 
-  /** The module a file contributes to — its header, or the anonymous root module (`13 §1`). */
+  /** The module a file contributes to — its header, or the anonymous root module (`reference/modules.md`). */
   private def declaredModule(u: Program): String = u.module.map(_.show).getOrElse(Modules.root)
 
   /** A set of clauses as the capabilities they cover, with each one's implications folded in: a
@@ -342,7 +342,8 @@ trait Capabilities extends AnalyzerBase {
     err(s"no capability is called '${c.name}' — the set is " +
       Capability.core.map(n => s"'$n'").mkString(", "))
 
-  /** Holds the files of one module to declaring the same clauses (`13 §4`).
+  /** Holds the files of one module to declaring the same clauses (`reference/modules.md §
+   * Capabilities are a module property`).
    *
    * The comparison is of the **set** of clauses rather than of the text: order between two clauses
    * says nothing, and a file that wrote the same one twice is a separate mistake reported on its

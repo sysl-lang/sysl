@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** A type-bound destructor — `03 § A destructor`.
+/** A type-bound destructor — `reference/memory.md § A destructor`.
  *
  * **The claim is that a value's `drop` runs wherever the last reference to it goes, including where
  * no program could have written a call.** That is the whole argument for the feature over `defer`,
@@ -143,9 +143,10 @@ class DropTests extends AnyFreeSpec with RunSupport with CodegenSupport with Tes
   }
 
   "a value that never reaches the heap has no single death, so nothing runs" in {
-    // `03 § A destructor` states this limit outright rather than leaving it to be discovered: a value
-    // type is copied, and a copy is not a second resource. The test pins the *documented* behaviour,
-    // which is what makes widening it later a deliberate change rather than a surprise.
+    // `reference/memory.md § A destructor` states this limit outright rather than leaving it to be
+    // discovered: a value type is copied, and a copy is not a second resource. The test pins the
+    // *documented* behaviour, which is what makes widening it later a deliberate change rather than
+    // a surprise.
     run(s"""$handle
            |hold()
            |    var h = Handle(1)

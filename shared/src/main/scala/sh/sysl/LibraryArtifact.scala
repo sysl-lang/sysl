@@ -287,13 +287,13 @@ object LibraryArtifact {
    * given the expression anyway, since an artifact is built for one target and re-evaluating it
    * somewhere else would be answering a different question under the same name.
    */
-  /** **`libraries` and `libraryTrees` are what this library is built ON** — the `--lib` source roots
-   * and `.syslib`s of `15 §7`, which reach a library exactly as they reach a program. They are kept
-   * apart from `sources` for one reason and it decides the artifact's correctness: what the object
-   * half **defines** is the modules this tree declares, and everything else is declared. Folded in
-   * with the library's own files they would be *its* modules, so the artifact would carry a second
-   * copy of its dependency's compiled half — which builds, archives, and fails as a duplicate symbol
-   * at whatever program later links both.
+  /** **`libraries` and `libraryTrees` are what this library is built ON** — the `--lib` source
+   * roots and `.syslib`s of `reference/ffi.md § A library may carry C`, which reach a library
+   * exactly as they reach a program. They are kept apart from `sources` for one reason and it
+   * decides the artifact's correctness: what the object half **defines** is the modules this tree
+   * declares, and everything else is declared. Folded in with the library's own files they would be
+   * *its* modules, so the artifact would carry a second copy of its dependency's compiled half —
+   * which builds, archives, and fails as a duplicate symbol at whatever program later links both.
    */
   def build(sources: List[Source], target: Target = Target.default, building: Set[String] = Set.empty,
             std: Option[Stdlib] = None, native: List[Source] = Nil,
@@ -387,10 +387,11 @@ object LibraryArtifact {
   /** Why a library may not sit in the anonymous root module.
    *
    * Two reasons, and either alone would be enough. A library is reached by **naming** its module
-   * (`13 §3`), and the root module has no name — so a declaration there is one no program that
-   * depends on the library could write. And the root module is where a headerless *program's*
-   * declarations go, so the two would share a key space: the library's `double` and the program's
-   * would be one name, and which of them a call meant would depend on what else was linked.
+   * (`reference/modules.md § Imports`), and the root module has no name — so a declaration there is
+   * one no program that depends on the library could write. And the root module is where a
+   * headerless *program's* declarations go, so the two would share a key space: the library's
+   * `double` and the program's would be one name, and which of them a call meant would depend on
+   * what else was linked.
    *
    * It is also what makes the split above exact. Everything the compiler supplied is keyed outside
    * the library's own modules, and that stops being true the moment a library is allowed to declare

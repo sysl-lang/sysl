@@ -42,9 +42,9 @@ trait PackageCacheSupport extends AnyFreeSpec with Matchers {
 
   /** The usual case: a package in the cache holding one module, in a directory of its own.
    *
-   * A package's modules are the directories of it that **hold source** (`13 §1`) and are therefore
-   * the names it offers a consumer, so a package with none offers nothing — which makes this, rather
-   * than `published`, what almost every test wants.
+   * A package's modules are the directories of it that **hold source** (`reference/modules.md`) and
+   * are therefore the names it offers a consumer, so a package with none offers nothing — which
+   * makes this, rather than `published`, what almost every test wants.
    *
    * `module` may be a path, which is how a package that namespaces itself by reverse DNS is laid
    * out: `sh/sysl/table` puts the source three directories down, so `sh` and `sh/sysl` hold none and
@@ -72,9 +72,9 @@ trait PackageCacheSupport extends AnyFreeSpec with Matchers {
 
   /** A project on disk: a `package.hocon` and whatever **modules** it has of its own.
    *
-   * Each name gets a source file in it, because a directory holding none is not a module (`13 §1`)
-   * and so is not a name anything can collide with — which is a case worth testing deliberately
-   * (`bare`) rather than one every caller should get by accident.
+   * Each name gets a source file in it, because a directory holding none is not a module
+   * (`reference/modules.md`) and so is not a name anything can collide with — which is a case worth
+   * testing deliberately (`bare`) rather than one every caller should get by accident.
    */
   protected def project(config: String, dirs: String*): String = {
     val root = createTempDirectory("sysl-pkg-project-")

@@ -2,11 +2,11 @@ package sh.sysl
 
 /** What a *file* contributes to the module, and which file the program starts in.
  *
- * A module is a directory (`13 §1`), so a header and a location are two statements of one fact and
- * have to agree. That is the first thing this answers. The second is `13 §7`'s: a declaration is
- * hoisted and belongs to its module, but a statement *runs*, and running happens in an order that
- * neither a set of files nor a graph of modules supplies — so one file carries the statements the
- * program runs, and everything about choosing it is here.
+ * A module is a directory (`reference/modules.md`), so a header and a location are two statements
+ * of one fact and have to agree. That is the first thing this answers. The second is `13 §7`'s: a
+ * declaration is hoisted and belongs to its module, but a statement *runs*, and running happens in
+ * an order that neither a set of files nor a graph of modules supplies — so one file carries the
+ * statements the program runs, and everything about choosing it is here.
  *
  * Both are settled before a single name is resolved, which is why they sit below the driver rather
  * than inside it: what a file contributes decides what there is to hoist.
@@ -30,8 +30,8 @@ trait ModuleFiles
     with DefaultParams {
 
   /** The module a file contributes to: what its header says, or the **anonymous root module** when
-   * it declares none (`13 §1`) — under the canonical prefix of the package it came from
-   * (`packages.md § 9`).
+   * it declares none (`reference/modules.md`) — under the canonical prefix of the package it came
+   * from (`packages.md § 9`).
    *
    * The prefix is what keeps a dependency's `json` and this project's `json` apart, and it is added
    * *here* rather than being written in the file so that a package's source is the same source
@@ -42,7 +42,7 @@ trait ModuleFiles
     Packages.qualify(packages.prefixOf(u.source), u.module.map(_.show).getOrElse(Modules.root))
 
   /** A module is a directory, and its name is that directory's path relative to the project root
-   * (`13 §1`), so a file's header has to agree with where the file sits.
+   * (`reference/modules.md`), so a file's header has to agree with where the file sits.
    *
    * The location is the driver's to know, and it hands it over on the `Source`. A file handed to
    * the compiler with no project around it carries none, and its header is then the whole of what
@@ -59,8 +59,9 @@ trait ModuleFiles
       // Both sides are read **relative to the package's own root**, which is what lets a fetched
       // package be checked by the rule it was written under: its files say `module json` and sit in
       // `json/`, and the canonical prefix that keeps it apart from this project's `json` is added
-      // above both of them rather than to one. `13 §1` is a rule about a package, not about a
-      // machine's directory layout, and a dependency would fail it for the wrong reason otherwise.
+      // above both of them rather than to one. `reference/modules.md` is a rule about a package,
+      // not about a machine's directory layout, and a dependency would fail it for the wrong reason
+      // otherwise.
       val expected = dir.mkString(".")
       val declared = u.module.map(_.show).getOrElse(Modules.root)
 
@@ -74,11 +75,11 @@ trait ModuleFiles
 
   /** Refuses a file claiming a module the library already carries.
    *
-   * A module's declarations are one set however many files they came from (`13 §1`), so a program
-   * with a `sysl` directory of its own would not be writing a module beside the standard one — it
-   * would be adding to it, sharing its key space, and shadowing whatever name it happened to reuse.
-   * There is nothing in the file that distinguishes that from a mistake, and the mistake is the far
-   * likelier reading, so it is a diagnostic rather than a silent merge.
+   * A module's declarations are one set however many files they came from (`reference/modules.md`),
+   * so a program with a `sysl` directory of its own would not be writing a module beside the
+   * standard one — it would be adding to it, sharing its key space, and shadowing whatever name it
+   * happened to reuse. There is nothing in the file that distinguishes that from a mistake, and the
+   * mistake is the far likelier reading, so it is a diagnostic rather than a silent merge.
    *
    * Unless the compilation is what **produces** that module, which is the one reading under which
    * the files are not adding to the library but are the library. Nothing infers it: a build says so,
@@ -95,9 +96,9 @@ trait ModuleFiles
    *
    * A declaration is hoisted and belongs to the module it was written in, but an executable
    * statement runs, and running happens in an order. Files have none — a module's members are one
-   * unordered set (`13 §6`) — and neither do modules, which are a graph rather than a sequence. So
-   * **one file of the program carries the statements it runs**, and a second that carries any is a
-   * mistake rather than an ordering to be guessed at.
+   * unordered set (`reference/modules.md § The module graph is acyclic`) — and neither do modules,
+   * which are a graph rather than a sequence. So **one file of the program carries the statements
+   * it runs**, and a second that carries any is a mistake rather than an ordering to be guessed at.
    *
    * An `import` is not executable: it binds a name for the file that wrote it and runs nothing, so a
    * file may import whatever it likes without becoming the file the program starts in. Neither is a

@@ -369,8 +369,8 @@ class PackageBuildTests extends PackageCacheSupport {
     refused(app("""print(geom.triple(21))""", s"""g { path = "$geom" }""")) should include("triple")
   }
 
-  /** `15 §7` from the consuming side: a package carries C, and a build against it compiles that C
-   * and links it.
+  /** `reference/ffi.md § A library may carry C` from the consuming side: a package carries C, and a
+   * build against it compiles that C and links it.
    *
    * **This is the seam a whole release shipped without.** A package's `.sysl` compiled, its `.c` was
    * dropped with nothing said, and the build ended at the linker naming symbols the package's own C
@@ -399,8 +399,9 @@ class PackageBuildTests extends PackageCacheSupport {
       run(app("""print(geom.seven_times(6))""", s"""g { path = "$geom" }""")) shouldBe "42\n"
     }
 
-    // `15 §7` says *anywhere* in the tree, and the package root is the one place that declares no
-    // module — so a walk gathering C only where it found sysl would skip it.
+    // `reference/ffi.md § A library may carry C` says *anywhere* in the tree, and the package root
+    // is the one place that declares no module — so a walk gathering C only where it found sysl
+    // would skip it.
     "is found at the package root as well as beside a module" in {
       val geom = packageOf("geom-lib", "geom", calling, "", "shim.c" -> shim)
 
@@ -452,7 +453,7 @@ class PackageBuildTests extends PackageCacheSupport {
     // The other half of a binding: the C reaches its own library through a `@link` directive, and
     // the directive is written in the package's header where nothing but the package could know it.
     // Named after a library no machine has, so the observation is the same on every platform — the
-    // name reached a command line, which is all `15 §8` claims.
+    // name reached a command line, which is all `reference/ffi.md § @link` claims.
     "carries its module's link directive to the command line" in {
       val geom = packageOf("geom-lib", "geom",
         "@link(\"sysl-no-such-library\")\n\nvalue() -> int = 42")

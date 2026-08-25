@@ -3,7 +3,8 @@ package sh.sysl
 import io.github.edadma.cross_platform.*
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `@section("…")` — where the linker puts one object or one definition (`15 §13`).
+/** `@section("…")` — where the linker puts one object or one definition (`reference/attributes.md §
+ * @section("...")`).
  *
  * It is asserted from the **IR**, because there is nothing at run time to ask: a program cannot read
  * back which section its own storage landed in, and the section name is a string the back end passes

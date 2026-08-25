@@ -87,9 +87,9 @@ enum Ordering {
 /** How an access is reached: ordinarily, as a device effect, or indivisibly.
  *
  * `Volatile` is not an optimization barrier and does not order anything — it says the access is an
- * effect, so it happens exactly once and exactly where it was written (`03 § Device memory`).
- * `Atomic` carries the ordering LLVM needs spelled at the instruction, which is why an ordering is
- * refused as a runtime value at the call that asks for one.
+ * effect, so it happens exactly once and exactly where it was written (`reference/memory.md §
+ * Device memory`). `Atomic` carries the ordering LLVM needs spelled at the instruction, which is
+ * why an ordering is refused as a runtime value at the call that asks for one.
  */
 enum Access {
   case Plain

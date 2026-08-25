@@ -436,8 +436,9 @@ object AstCodec {
           tok("sd"); sref(n); list(tps)(sref); list(fs)(param); list(ms)(method)
           bounds(bs); list(invs)(expr); vis(vs); tdefaults(tds); bool(op); tdefaults(tvs)
           // A layout travels with the declaration: an importing module computes an instantiation's
-          // layout for itself (`15 §4`), so a struct whose padding or alignment an attribute decided
-          // would otherwise be laid out two different ways either side of an artifact.
+          // layout for itself (`reference/generics.md § Monomorphization`), so a struct whose
+          // padding or alignment an attribute decided would otherwise be laid out two different
+          // ways either side of an artifact.
           bool(pk); opt(al)(expr)
           // And the C name travels for the reason a function's exported symbol does: the header a
           // consumer generates has to spell a package's type the way the package chose, whether it

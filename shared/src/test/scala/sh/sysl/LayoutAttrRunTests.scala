@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `@packed` and `@align(n)` — the two layout attributes a struct takes (`15 §1`).
+/** `@packed` and `@align(n)` — the two layout attributes a struct takes (`reference/types.md §
+ * Structs`).
  *
  * They are separate axes and compose: `@packed` removes the padding *between* fields, `@align`
  * raises where the aggregate must *begin*. `sizeof` and `alignof` are how a program observes both,

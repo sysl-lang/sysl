@@ -6,15 +6,15 @@ import io.github.edadma.cross_platform.*
  * C side, pinned to the same number.
  *
  * This is what `@assert` was built for, and it is the pair that matters rather than either half.
- * `15 §7` refuses transcribing a C struct into sysl on the grounds that nothing verifies the
- * result — *"sysl's own `sizeof` would report what sysl laid out, not what C did, so even that
- * comparison is a tautology."* It stops being a tautology when both sides name the same literal: the
- * `.c` pins what the header says, the `@assert` pins what sysl laid out, and a build survives only
- * while the two agree.
+ * `reference/ffi.md § A library may carry C` refuses transcribing a C struct into sysl on the
+ * grounds that nothing verifies the result — *"sysl's own `sizeof` would report what sysl laid out,
+ * not what C did, so even that comparison is a tautology."* It stops being a tautology when both
+ * sides name the same literal: the `.c` pins what the header says, the `@assert` pins what sysl
+ * laid out, and a build survives only while the two agree.
  *
- * A project rather than a string, because the C has to be a **file in the tree** for `15 §7` to
- * compile it — which is also the half that carries `--target=`, so the check reads the headers of
- * the machine being built for.
+ * A project rather than a string, because the C has to be a **file in the tree** for
+ * `reference/ffi.md § A library may carry C` to compile it — which is also the half that carries
+ * `--target=`, so the check reads the headers of the machine being built for.
  */
 class LayoutCheckTests extends LibraryCliSupport {
 

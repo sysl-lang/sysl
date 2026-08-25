@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** A bitfield struct: inside `@packed`, an `iN` field occupies exactly N bits (`15 §1`).
+/** A bitfield struct: inside `@packed`, an `iN` field occupies exactly N bits (`reference/types.md
+ * § Structs`).
  *
  * The struct **is** one unsigned integer, and its fields are ranges of that integer filled from the
  * least significant bit upward in declaration order, straddling byte boundaries freely. C leaves
@@ -10,8 +11,9 @@ import org.scalatest.freespec.AnyFreeSpec
  * tests that pin the *order* matter as much as the ones that pin the widths.
  *
  * Where a claim is about where a field physically sits, the storage is read back through a `*u8`
- * (`03 § Reinterpreting storage`) rather than through the struct: reading a field through the struct
- * would use the same offsets the write used, and agree with itself whatever they were.
+ * (`reference/memory.md § Reinterpreting storage`) rather than through the struct: reading a field
+ * through the struct would use the same offsets the write used, and agree with itself whatever they
+ * were.
  */
 class BitfieldRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 

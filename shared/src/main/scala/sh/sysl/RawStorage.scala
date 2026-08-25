@@ -1,6 +1,7 @@
 package sh.sysl
 
-/** Reinterpreting storage, and asking what a type's storage costs — `03 § Reinterpreting storage`.
+/** Reinterpreting storage, and asking what a type's storage costs — `reference/memory.md §
+ * Reinterpreting storage`.
  *
  * Three operations that only look unrelated. An allocator carves bytes and hands back a typed
  * pointer, a driver takes an address the datasheet gives as a number and reaches the registers at
@@ -38,9 +39,10 @@ trait RawStorage extends ExprSupport {
   /** `ptr_cast(x)` — an address read as a pointer to something else.
    *
    * The target is the type the context asks for, the way `va_arg`, a bare `None` and a bare `null`
-   * all take theirs (`12 §9`, `03 § Null`). It is not written in the call because there is nowhere to
-   * write it: square brackets in an expression are indexing, and call-site type arguments are refused
-   * language-wide (`10 § Open a`), so a written target would need a syntax nothing else here has.
+   * all take theirs (`reference/ffi.md § Variadic functions`, `reference/memory.md § null exists,
+   * and only here`). It is not written in the call because there is nowhere to write it: square
+   * brackets in an expression are indexing, and call-site type arguments are refused language-wide
+   * (`10 § Open a`), so a written target would need a syntax nothing else here has.
    *
    * What comes out is always a `*T` and never a `&T`. A reference is a safe-tier value — non-null,
    * refcounted, and relied on by everything the safe subset promises — and an address invented from
@@ -75,7 +77,7 @@ trait RawStorage extends ExprSupport {
 
     // A function pointer is an address like any other, and this is how the one `dlsym` hands back
     // becomes something callable — the direction that would otherwise stay shut, since nothing else
-    // produces a `*extern` out of a value C computed (`12 §6a`).
+    // produces a `*extern` out of a value C computed (`reference/ffi.md § A function's address`).
     case _: Type.CFn => ()
 
     case _: Type.Ref =>

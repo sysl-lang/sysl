@@ -5,37 +5,39 @@ import scala.collection.mutable
 /** What a name written at a given place means.
  *
  * One question with two halves, and they meet in the middle. Outward, a name is read against the
- * **module** the file contributes to, what that file **imported**, and the library — `13 §3`'s
- * order, filtered at every step by what the writing file is allowed to reach (`13 §2`). Inward, a
- * name may be one of the **locals** an open block bound, which is nearer than any of that and is
- * why the two live together: a lookup asks the scopes first and the modules afterwards.
+ * **module** the file contributes to, what that file **imported**, and the library —
+ * `reference/modules.md § Imports`'s order, filtered at every step by what the writing file is
+ * allowed to reach (`reference/modules.md § Visibility`). Inward, a name may be one of the
+ * **locals** an open block bound, which is nearer than any of that and is why the two live
+ * together: a lookup asks the scopes first and the modules afterwards.
  *
  * The terms travel with the walk rather than with the tree. A declaration's signature and body mean
  * what they meant **where they were written**, whatever module a call arrived from, which is what
  * `inScope` and the `declScope` table are for — and it is why the module, the imports and the file
  * are three variables restored on the way out rather than three fields on a node.
  *
- * Recording a module's dependency on another (`13 §6`) happens here for the same reason: resolution
- * is where the dependency is *made*, and nothing earlier could have seen it.
+ * Recording a module's dependency on another (`reference/modules.md § The module graph is acyclic`)
+ * happens here for the same reason: resolution is where the dependency is *made*, and nothing
+ * earlier could have seen it.
  */
 trait Scoping extends DeclTables {
 
   /** Every module the program is made of, by name, including the anonymous root one when a file
-   * declared no header. It is what tells a dotted reference that names a module from one that
-   * reads a field off a value (`13 §3`), and it is known before any name is resolved because a
-   * file's header is the whole of what says which module it is in.
+   * declared no header. It is what tells a dotted reference that names a module from one that reads
+   * a field off a value (`reference/modules.md § Imports`), and it is known before any name is
+   * resolved because a file's header is the whole of what says which module it is in.
    */
   protected val moduleNames = mutable.LinkedHashSet.empty[String]
 
-  /** The module whose terms a name is currently being read in: the module of the declaration
-   * being hoisted, of the body being analyzed, or of the file that carries the statements the
-   * program runs. An unqualified name is looked for here first (`13 §3`).
+  /** The module whose terms a name is currently being read in: the module of the declaration being
+   * hoisted, of the body being analyzed, or of the file that carries the statements the program
+   * runs. An unqualified name is looked for here first (`reference/modules.md § Imports`).
    */
   protected var currentModule: String = Modules.root
 
   /** What the file being read has imported. It travels with `currentModule` because both are
    * properties of where a declaration was *written*: a body means what it meant there, and its
-   * file's imports are half of what that sentence says (`13 §3`).
+   * file's imports are half of what that sentence says (`reference/modules.md § Imports`).
    */
   protected var currentImports: Imports = Imports.empty
 
@@ -47,7 +49,8 @@ trait Scoping extends DeclTables {
 
   /** The file whose text is currently being read. It travels with the module and the imports for
    * the same reason they travel together, and it is what a bare `private` is measured against
-   * (`13 §2`) — the one visibility level that never crosses a file boundary.
+   * (`reference/modules.md § Visibility`) — the one visibility level that never crosses a file
+   * boundary.
    */
   protected var currentFile: Option[Source] = None
 
@@ -55,7 +58,7 @@ trait Scoping extends DeclTables {
   protected def currentScope: Scope = Scope(currentModule, currentImports, currentFile)
 
   /** What the library declares, **as written** against the key it is filed under — the names that
-   * are in scope everywhere with no import (`13 §8`).
+   * are in scope everywhere with no import (`reference/modules.md § Separate compilation`).
    *
    * It is a lookup rather than a set of keys because the two differ: a declaration the standard
    * module carries is keyed `sysl$FormatSpec` and is still written `FormatSpec`, and what a use site
@@ -76,11 +79,11 @@ trait Scoping extends DeclTables {
    * spelling may name a type in one module and a function in another, and which one is in scope is
    * a question that can only be answered against the table the use site is looking in.
    *
-   * The order is `13 §3`'s: **this module**, then what the file (or the block) has **imported**,
-   * then the **library**, and a **fully-qualified path** reaches anything at all. A sibling
-   * module's names are deliberately not in it — a module earns visibility by being named or
-   * imported (`13 §8`), and the root module has no name, so its declarations are its own files' to
-   * use.
+   * The order is `reference/modules.md § Imports`'s: **this module**, then what the file (or the
+   * block) has **imported**, then the **library**, and a **fully-qualified path** reaches anything
+   * at all. A sibling module's names are deliberately not in it — a module earns visibility by
+   * being named or imported (`reference/modules.md § Separate compilation`), and the root module
+   * has no name, so its declarations are its own files' to use.
    *
    * **Every step is filtered by what may be named from here**, the library's included, so that the
    * two spellings of one declaration cannot disagree: a member the library keeps to itself is out
@@ -89,19 +92,21 @@ trait Scoping extends DeclTables {
    * **`quiet` turns off the two things this does beyond answering**, and it exists for the question
    * the compiler asks *itself* rather than on behalf of a name a file wrote. Resolving normally
    * reports a restriction instead of answering (`reachable` raises), and records a module
-   * dependency (`13 §6`) — both right for a written name and both wrong for "could a name of this
-   * spelling have meant that?". A quiet ask answers `None` where the ordinary one would complain,
-   * and files no edge. `traitInScope` sidesteps the same two by asking the imports directly; this
-   * is the same need where the whole search order is wanted.
+   * dependency (`reference/modules.md § The module graph is acyclic`) — both right for a written
+   * name and both wrong for "could a name of this spelling have meant that?". A quiet ask answers
+   * `None` where the ordinary one would complain, and files no edge. `traitInScope` sidesteps the
+   * same two by asking the imports directly; this is the same need where the whole search order is
+   * wanted.
    *
    * **`inReach` is how a candidate's reach is asked, and it is a parameter because `declAccess` is
    * keyed by the qualified name alone** — so a key is shared by every namespace that spells it the
    * same way. That is harmless while only one of them records access, and wrong the moment two do:
-   * an **enum variant** records none and takes its reach from its enum (`09 §3`), so `visible`
-   * asked about a variant's key answers about whatever *type* of that spelling recorded one. A
-   * `private struct Segment` beside a public `Kind.Segment` hid the variant from every other file
-   * and every importer, which is card `0220`'s second half. `variantKey` therefore asks with
-   * `variantVisible`; everything else keeps `visible`, which is what its key means.
+   * an **enum variant** records none and takes its reach from its enum (`reference/types.md §
+   * Enums`), so `visible` asked about a variant's key answers about whatever *type* of that
+   * spelling recorded one. A `private struct Segment` beside a public `Kind.Segment` hid the
+   * variant from every other file and every importer, which is card `0220`'s second half.
+   * `variantKey` therefore asks with `variantVisible`; everything else keeps `visible`, which is
+   * what its key means.
    */
   protected def resolveName(written: String, quiet: Boolean = false,
                             inReach: String => Boolean = visible)(declared: String => Boolean): Option[String] = {
@@ -162,9 +167,9 @@ trait Scoping extends DeclTables {
         Option.when(moduleNames(module) && declared(name))(name).flatMap(reach)
 
     // Resolution is where a dependency between two modules is *made*, so it is where one is
-    // recorded (`13 §6`). Nothing earlier could see it: a qualified path names another module's
-    // declaration with no import to scan for, and which module an unqualified name reaches is the
-    // whole question this answered.
+    // recorded (`reference/modules.md § The module graph is acyclic`). Nothing earlier could see
+    // it: a qualified path names another module's declaration with no import to scan for, and which
+    // module an unqualified name reaches is the whole question this answered.
     //
     // A name carrying the separator is exempt, because a dependency is something a **file** wrote
     // and one of these was written by the compiler. Each is a re-spelling of a reference already
@@ -181,7 +186,7 @@ trait Scoping extends DeclTables {
   // --- the module graph -------------------------------------------------------------------
 
   /** Which module depends on which, and where the reference that first said so was written
-   * (`13 §6`).
+   * (`reference/modules.md § The module graph is acyclic`).
    *
    * The **first** reference is the one kept, because a cycle is reported against one line and the
    * earliest of them is the one a reader can follow the rest of the chain from.
@@ -191,9 +196,10 @@ trait Scoping extends DeclTables {
   /** Records that whatever is being read now depends on `to`.
    *
    * A module does not depend on itself, and nothing depends on the **root** module: the library
-   * lives there and is the language rather than a module (`13 §8`), and a program's own root-module
-   * declarations are its files' alone, since the root module has no name for anything else to
-   * write. So the root is a module that only ever depends, and can never be depended on.
+   * lives there and is the language rather than a module (`reference/modules.md § Separate
+   * compilation`), and a program's own root-module declarations are its files' alone, since the
+   * root module has no name for anything else to write. So the root is a module that only ever
+   * depends, and can never be depended on.
    *
    * A path that names no module is not one either: an import may be written for one that does not
    * exist, and the diagnostic for that says so far better than a graph built around it could.
@@ -204,7 +210,8 @@ trait Scoping extends DeclTables {
 
   // --- capabilities ---------------------------------------------------------------------
 
-  /** What each module gave up, and where the clause that said so was written (`13 §4`).
+  /** What each module gave up, and where the clause that said so was written (`reference/modules.md
+   * § Capabilities are a module property`).
    *
    * It is keyed by module rather than by file because a capability is a property of the module —
    * which is why every file of one has to state the same clause, and why the position kept is
@@ -254,8 +261,9 @@ trait Scoping extends DeclTables {
 
   // --- visibility -----------------------------------------------------------------------
 
-  /** Where a **restricted** declaration may be named from (`13 §2`): the file that wrote it, and —
-   * for a scoped-private one — the module subtree its `private[M]` widened to.
+  /** Where a **restricted** declaration may be named from (`reference/modules.md § Visibility`):
+   * the file that wrote it, and — for a scoped-private one — the module subtree its `private[M]`
+   * widened to.
    *
    * A public declaration has no entry at all, which is what makes the unmarked default cost a
    * lookup that finds nothing rather than an entry per declaration in every program.
@@ -288,15 +296,17 @@ trait Scoping extends DeclTables {
    * A **file**-private one is compared by source identity rather than by name, since two files of
    * one project may be called the same thing. A **scoped** one is visible across the named module
    * and everything beneath it, which is a contiguous subtree because `private[M]` can only name an
-   * enclosing module (`13 §2`) — so containment is the whole of the test.
+   * enclosing module (`reference/modules.md § Visibility`) — so containment is the whole of the
+   * test.
    */
   protected def visible(key: String): Boolean = declAccess.get(key).forall {
     case Access(file, None)    => file.isEmpty || file.exists(f => currentFile.exists(_ eq f))
     case Access(_, Some(m))    => currentModule == m || currentModule.startsWith(s"$m.")
   }
 
-  /** Whether a declaration may be named only from inside the file that wrote it — `13 §2`'s bare
-   * `private`, as opposed to a `private[M]` that widened to a module subtree.
+  /** Whether a declaration may be named only from inside the file that wrote it —
+   * `reference/modules.md § Visibility`'s bare `private`, as opposed to a `private[M]` that widened
+   * to a module subtree.
    *
    * This is the one reach that provably never crosses a file boundary, and every file of a
    * compilation lands in the same LLVM module, so a symbol at this reach has all of its callers in
@@ -309,12 +319,12 @@ trait Scoping extends DeclTables {
   }
 
   /** Whether a struct's **layout** is hidden from where the analyzer currently is — `opaque`, and
-   * declared somewhere other than here (`15 §9`).
+   * declared somewhere other than here (`reference/ffi.md § opaque`).
    *
    * The reach is the **declaring module exactly**, not a subtree the way `private[M]` widens. What
    * `opaque` buys is that a field may be added or reordered with nothing downstream recompiled, and
    * the set of files that must be recompiled together is the module: its files share one scope
-   * (`13 §1`), so they are already one unit for this and a submodule is already not.
+   * (`reference/modules.md`), so they are already one unit for this and a submodule is already not.
    *
    * This sits beside `visible` because the two are the same *kind* of question asked about different
    * things — who may say the name, and who may know the shape — and are deliberately independent. A
@@ -443,7 +453,7 @@ trait Scoping extends DeclTables {
    * **The whole path is offered and not its leading segment**, which is the other half of `§ 9`
    * reading a written path differently: what a dependency binds is a module path rather than a
    * segment — `sh.sysl.table` and not `sh`, since a directory holding no source is no module
-   * (`13 §1`).
+   * (`reference/modules.md`).
    *
    * This one is asked *after* the global question rather than before it, and the asymmetry with
    * `ownPackage` is deliberate. A package's own modules are what its source is written in terms of
@@ -459,16 +469,16 @@ trait Scoping extends DeclTables {
   /** The key an **imported** name stands for, or `None` where nothing imported answers to it in the
    * table being asked.
    *
-   * The two forms are asked in `13 §3`'s order. A name brought in by a selector is a deliberate
-   * act and wins outright; a name merely *offered* by a wildcard is taken only if nothing more
-   * specific claimed it, and two wildcards offering the same name make an unqualified use of it
-   * ambiguous rather than silently picking one.
+   * The two forms are asked in `reference/modules.md § Imports`'s order. A name brought in by a
+   * selector is a deliberate act and wins outright; a name merely *offered* by a wildcard is taken
+   * only if nothing more specific claimed it, and two wildcards offering the same name make an
+   * unqualified use of it ambiguous rather than silently picking one.
    *
-   * A **wildcard offers only what is visible here** (`13 §2`), which is what keeps a module's
-   * private helper from either answering to its name or making a name from elsewhere ambiguous. A
-   * selector is not filtered the same way: naming something deliberately and being told it cannot
-   * be reached is the more useful answer than being told nothing is there, so that one is reported
-   * at the import itself.
+   * A **wildcard offers only what is visible here** (`reference/modules.md § Visibility`), which is
+   * what keeps a module's private helper from either answering to its name or making a name from
+   * elsewhere ambiguous. A selector is not filtered the same way: naming something deliberately and
+   * being told it cannot be reached is the more useful answer than being told nothing is there, so
+   * that one is reported at the import itself.
    */
   protected def importedName(written: String, inReach: String => Boolean = visible)(
       declared: String => Boolean): Option[String] =
@@ -527,7 +537,7 @@ trait Scoping extends DeclTables {
   protected def traitKey(written: String): Option[String] = resolveName(written)(traitDecls.contains)
 
   /** Whether a trait can be **named** from where the walk currently is, which is what its members'
-   * reachability is measured by (`13 §2`).
+   * reachability is measured by (`reference/modules.md § Visibility`).
    *
    * A trait declared in this module, one this file or an open block imported by name, one a
    * wildcard offers, and one an auto-imported module carries are in scope; a sibling module's and a
@@ -594,15 +604,17 @@ trait Scoping extends DeclTables {
   /** Whether an **enum variant** may be named from here: whether any enum offering it may be.
    *
    * A variant declares no visibility of its own and records none — it follows the enum that
-   * declares it (`09 §3`), which is what makes `variantOwnerOf`'s "widest owner wins" rule work. So
-   * `visible` asked about a variant's key finds no entry and answers yes, *unless* a type or value
-   * of the same spelling recorded one, at which point it answers about that instead: a
-   * `private struct Segment` beside a public `Kind.Segment` made the variant unreachable outside
-   * the file, with `undefined name 'Segment'` and nothing naming the struct (card `0220`).
+   * declares it (`reference/types.md § Enums`), which is what makes `variantOwnerOf`'s "widest
+   * owner wins" rule work. So `visible` asked about a variant's key finds no entry and answers yes,
+   * *unless* a type or value of the same spelling recorded one, at which point it answers about
+   * that instead: a `private struct Segment` beside a public `Kind.Segment` made the variant
+   * unreachable outside the file, with `undefined name 'Segment'` and nothing naming the struct
+   * (card `0220`).
    */
   protected def variantVisible(key: String): Boolean = variantOwners.getOrElse(key, Nil).exists(visible)
 
-  /** Which enum a variant name means here, where its module offers more than one answer (`09 §3`).
+  /** Which enum a variant name means here, where its module offers more than one answer
+   * (`reference/types.md § Enums`).
    *
    * **The expected type decides wherever there is one**, which is nearly always: an argument, a
    * declared `val`, a `return` and an annotated field all supply it, so `val e: Link = Fault(rc)` is
@@ -701,7 +713,8 @@ trait Scoping extends DeclTables {
   protected def inDecl[T](name: String)(body: => T): T = inScope(scopeFor(name))(body)
 
   /** Runs `body` in `name`'s terms **and with nothing local in scope** — how a parameter's default
-   * is analyzed at a call that left the argument out (`12 §2a`).
+   * is analyzed at a call that left the argument out (`reference/declarations.md § Default
+   * parameters and named arguments`).
    *
    * `inDecl` alone would put the default in the declaration's module while leaving it looking at
    * the *caller's* locals, so a default of `n` would quietly find whatever the call site happened
@@ -810,7 +823,8 @@ trait Scoping extends DeclTables {
    */
   protected val patternLocals = mutable.HashSet.empty[String]
 
-  /** The place each `ref` name stands for (`03 § ref`), under the unique name codegen uses.
+  /** The place each `ref` name stands for (`reference/memory.md § ref — a name for a place`), under
+   * the unique name codegen uses.
    *
    * This is the compile-time half of the binding, and the half that earns the feature. Codegen needs
    * only an address, which it takes once; every *check* needs the place, because a promise is
@@ -823,9 +837,10 @@ trait Scoping extends DeclTables {
    */
   protected val refPlaces = mutable.HashMap.empty[String, TExpr]
 
-  /** What a live `ref` forbids while it is in scope (`03 § ref`): the places whose reassignment could
-   * free the storage the ref found. `depth` is the scope nesting it was declared at, which is what
-   * takes it out of consideration again when that block closes.
+  /** What a live `ref` forbids while it is in scope (`reference/memory.md § ref — a name for a
+   * place`): the places whose reassignment could free the storage the ref found. `depth` is the
+   * scope nesting it was declared at, which is what takes it out of consideration again when that
+   * block closes.
    */
   protected case class RefGuard(name: String, hazards: Set[String], depth: Int)
 
@@ -977,7 +992,8 @@ trait Scoping extends DeclTables {
         "something, take a 'var' from the binding first"
     else s"a 'val' is written once, so $what has nothing to write through"
 
-  /** Binds a name to a **place** rather than to a value — what `ref` declares (`03 § ref`).
+  /** Binds a name to a **place** rather than to a value — what `ref` declares (`reference/memory.md
+   * § ref — a name for a place`).
    *
    * The type is the place's, since a ref states nothing of its own, and the guard is what holds the
    * storage still for as long as the name can reach it.

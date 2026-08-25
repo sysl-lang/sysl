@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** `Zero` and `One` at the integers — the first compiler-provided membership whose member has **no
- * receiver** (`14 §5`).
+ * receiver** (`reference/expressions.md § Operator dispatch`).
  *
  * `Signed` and `Bits` are provided over the same open family and are reached from a value, so what
  * they lower to is read off that value. An identity has no value in hand: the whole situation is
@@ -74,9 +74,9 @@ class ZeroOneTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "24\n"
     }
 
-    // `14 §5`'s promise, at the one membership that could most easily have broken it: an identity is
-    // a literal at the instantiation, so the accumulator costs no call and nothing is emitted for
-    // the trait.
+    // `reference/expressions.md § Operator dispatch`'s promise, at the one membership that could
+    // most easily have broken it: an identity is a literal at the instantiation, so the accumulator
+    // costs no call and nothing is emitted for the trait.
     "lowers to the literal, not to a call" in {
       ir(sum + "\nprint(sum([1, 2, 3]))\n") should not include "Zero.zero"
     }
@@ -84,7 +84,8 @@ class ZeroOneTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   "what is deliberately not a member" - {
 
-    // Every other row of the table promises an operation, and `16 §3` gives a subtype its base's
+    // Every other row of the table promises an operation, and `reference/errors.md § A derivation
+    // inherits its base's behaviour and may replace none of it` gives a subtype its base's
     // operations. These promise a value, and a range written to exclude zero has not got one.
     "a constrained subtype, whose range need not hold the value" in {
       err("""type Small = int within 1..10

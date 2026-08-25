@@ -125,11 +125,11 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
         case Left(err)     => fail(s"the standard library did not compile as a test build:\n$err")
       }
 
-    // **The library's own C** (`15 §7`), which it may carry exactly as any other tree may — the shim
-    // under `library/sysl/fs/__<os>__` is what answers `entries`, and `sysl.fs`'s own `@test`s call
-    // it. The driver does this for a real compilation off `Stdlib.Resolved`'s answer about whether an
-    // artifact supplied the standard module; here the tree is being compiled from source by
-    // construction, so it is unconditional.
+    // **The library's own C** (`reference/ffi.md § A library may carry C`), which it may carry
+    // exactly as any other tree may — the shim under `library/sysl/fs/__<os>__` is what answers
+    // `entries`, and `sysl.fs`'s own `@test`s call it. The driver does this for a real compilation
+    // off `Stdlib.Resolved`'s answer about whether an artifact supplied the standard module; here
+    // the tree is being compiled from source by construction, so it is unconditional.
     val native =
       NativeSources.build(NativeSources.of(List(root.get), target.os), target) match {
         case Left(err)    => fail(s"the standard library's C did not compile:\n$err")

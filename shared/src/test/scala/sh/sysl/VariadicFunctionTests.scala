@@ -240,9 +240,9 @@ class VariadicFunctionTests extends AnyFreeSpec with CodegenSupport with RunSupp
       run(src) shouldBe "42 42\n"
     }
 
-    // A nested function states its own signature (`12 §5a`), so a `...` on one is its own tail —
-    // the environment holds the first parameter slot, exactly as a method's receiver does, and the
-    // tail anchors after what the program wrote.
+    // A nested function states its own signature (`reference/declarations.md`), so a `...` on one
+    // is its own tail — the environment holds the first parameter slot, exactly as a method's
+    // receiver does, and the tail anchors after what the program wrote.
     "a nested function may be variadic, and still reach what it captured" in {
       val src =
         """outer(base: int) -> int
@@ -344,10 +344,12 @@ class VariadicFunctionTests extends AnyFreeSpec with CodegenSupport with RunSupp
       err("f(n: int, ...)\n    va_start(1)\nf(1)") should include("'va_start'")
     }
 
-    // An earlier draft of `12 §9` spelled this form `va_arg[T](ap)` and called the type argument
-    // "the same position every other generic puts one in". There was no such position when this
-    // suite was written, and there is one now (`10 §2`) — so the spelling a reader tries first is
-    // the spelling, and it reads the type it is given rather than the one the context supplies.
+    // An earlier draft of `reference/ffi.md § Variadic functions` spelled this form `va_arg[T](ap)`
+    // and called the type argument "the same position every other generic puts one in". There was
+    // no such position when this suite was written, and there is one now (`reference/generics.md §
+    // [] means type application in a type, indexing in an expression`) — so the spelling a reader
+    // tries first is the spelling, and it reads the type it is given rather than the one the
+    // context supplies.
     "va_arg reads a type argument written on it" in {
       val src =
         """f(n: int, ...) -> int
@@ -420,8 +422,8 @@ class VariadicFunctionTests extends AnyFreeSpec with CodegenSupport with RunSupp
     }
   }
 
-  // A walk is handed on by address (`12 §9`, *Handing a walk on*), and the spellings that would
-  // mean something else are each refused for their own reason.
+  // A walk is handed on by address (`reference/ffi.md § Variadic functions`, *Handing a walk on*),
+  // and the spellings that would mean something else are each refused for their own reason.
   "where a va_list may and may not stand" - {
     "a bare va_list parameter names the spelling that works" in {
       val out = err("f(ap: va_list) -> int = 1\nprint(1)")

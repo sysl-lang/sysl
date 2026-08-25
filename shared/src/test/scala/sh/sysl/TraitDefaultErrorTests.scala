@@ -173,8 +173,8 @@ class TraitDefaultErrorTests extends AnyFreeSpec with CodegenSupport {
     }
 
     // Two defaults of one name are two bodies, and a default is filed exactly as a written method
-    // is — so this is `13 §2`'s case and not a collision: both blocks stand, and it is a *use*
-    // reaching both that has nothing to say which was meant.
+    // is — so this is `reference/modules.md § Visibility`'s case and not a collision: both blocks
+    // stand, and it is a *use* reaching both that has nothing to say which was meant.
     "two traits whose defaults share a name may both be implemented for one type" in {
       val both =
         """trait A

@@ -57,17 +57,19 @@ trait DeclParser extends ExprParser {
       (op(":") ~> typeRef) ^^ { case n ~ t => Param(n, t) })
 
   /** A function's parameter, which unlike a struct's field may say what a call that leaves it out
-   * gets instead (`12 §2a`). The default is a full `expression`, so a call, a conditional, or
-   * anything else that yields a value may stand there; whether it *may* — a suffix, naming nothing
-   * local, reaching as far as the declaration does — is the analyzer's, since all three are
-   * questions about meaning rather than about shape.
+   * gets instead (`reference/declarations.md § Default parameters and named arguments`). The
+   * default is a full `expression`, so a call, a conditional, or anything else that yields a value
+   * may stand there; whether it *may* — a suffix, naming nothing local, reaching as far as the
+   * declaration does — is the analyzer's, since all three are questions about meaning rather than
+   * about shape.
    */
   protected lazy val funcParam: Parser[Param] =
     at((byNameParam | param) ~ opt(op("=") ~> expression) ^^ {
       case p ~ d => p.copy(default = d.map(Placeholders.lift))
     })
 
-  /** `x: -> T` — a parameter passed **by name** (`12 § A parameter may be passed by name`).
+  /** `x: -> T` — a parameter passed **by name** (`reference/declarations.md § Default parameters
+   * and named arguments`).
    *
    * The arrow with nothing on its left is the nullary case of the bare-arrow sugar a parameter
    * already has: `f: A -> B` is `[F: Fn(A) -> B](f: F)`, and this is that at arity zero. So the type
@@ -98,7 +100,8 @@ trait DeclParser extends ExprParser {
    * and nothing follows to open a body) and falls through to `exprStmt`.
    */
   /** A calling convention written before a definition: `interrupt handler()`, or with the privilege
-   * mode a processor distinguishes, `interrupt(supervisor) handler()` (`15 §10`).
+   * mode a processor distinguishes, `interrupt(supervisor) handler()` (`reference/ffi.md §
+   * interrupt`).
    *
    * `interrupt` is a soft keyword, and the trailing `guard(ident)` is the whole of what keeps it one.
    * Three things start with that word and only the first is a convention: `interrupt timer()`
@@ -188,10 +191,10 @@ trait DeclParser extends ExprParser {
     case Mem(m: MethodDecl)
     case Inv(e: Expr)
 
-  /** `opaque`, the modifier that withholds a struct's layout from every module but the one declaring
-   * it (`15 §9`). A soft keyword: `opaque` is an ordinary word — an alpha channel's fully-`opaque`
-   * end is the obvious field to want it for — and a language that spent it would be taking a name
-   * away to save itself a lookahead.
+  /** `opaque`, the modifier that withholds a struct's layout from every module but the one
+   * declaring it (`reference/ffi.md § opaque`). A soft keyword: `opaque` is an ordinary word — an
+   * alpha channel's fully-`opaque` end is the obvious field to want it for — and a language that
+   * spent it would be taking a name away to save itself a lookahead.
    */
   protected lazy val opaqueKw: Parser[Unit] = softWord("opaque")
 
@@ -211,9 +214,10 @@ trait DeclParser extends ExprParser {
     opt(softWord("deriving") ~> rep1sep(boundRef, op(","))) ^^ (_.getOrElse(Nil))
 
   /** A **type pack** stands for a list of types and there is one place to write the list out —
-   * `(..A)`, the tuple of it (`10 §10`). A declaration whose parameters *are* its shape has nothing
-   * to do with one: a struct of a pack would be a tuple with a name, which is the thing a program
-   * writes instead when the arity stops being incidental.
+   * `(..A)`, the tuple of it (`reference/generics.md § A parameter may stand for a list of types`).
+   * A declaration whose parameters *are* its shape has nothing to do with one: a struct of a pack
+   * would be a tuple with a name, which is the thing a program writes instead when the arity stops
+   * being incidental.
    *
    * Raised where the parameter list closes rather than left to fail on the pack's use, since the use
    * is what a reader would then be sent to look at.
@@ -282,9 +286,9 @@ trait DeclParser extends ExprParser {
    * `invariant` followed by an expression; and a bare field falls through to `param` (so a field
    * may still be named `invariant`, since `invariant: type` matches neither of the first two).
    *
-   * A field and a member may each carry a **visibility modifier** (`08 § Visibility`), written in
-   * the same place and the same spellings a top-level declaration writes one. An `invariant` clause
-   * declares no name, so like an `impl` block it takes none.
+   * A field and a member may each carry a **visibility modifier** (`reference/modules.md §
+   * Visibility`), written in the same place and the same spellings a top-level declaration writes
+   * one. An `invariant` clause declares no name, so like an `impl` block it takes none.
    */
   private lazy val structItem: Parser[StructPart] =
     restrictedMember ^^ (StructPart.Mem(_)) |
@@ -303,10 +307,10 @@ trait DeclParser extends ExprParser {
       m.copy(vis = v).setPos(m.pos)
     }
 
-  /** The refusal a trait's member and an `impl`'s share (`08 § Visibility`). Both are reached at the
-   * reach the *trait* has — one asks for the member and the other supplies what was asked — so
-   * there is nothing here for a modifier to decide, and saying that is worth more than whatever the
-   * grammar happened to want where the modifier was written.
+  /** The refusal a trait's member and an `impl`'s share (`reference/modules.md § Visibility`). Both
+   * are reached at the reach the *trait* has — one asks for the member and the other supplies what
+   * was asked — so there is nothing here for a modifier to decide, and saying that is worth more
+   * than whatever the grammar happened to want where the modifier was written.
    */
   protected lazy val noVisibility: Parser[Unit] =
     op("private") ~> err("a trait's members and an 'impl' block's carry no visibility of their own — a " +
@@ -415,11 +419,11 @@ trait DeclParser extends ExprParser {
    * `&self`, `&sync self`) followed by ordinary `name: type` parameters. With no receiver the
    * member is an associated function.
    *
-   * Either shape may end in the same trailing `...` a free function's list takes (`12 §9`), and for
-   * the same reason: a member is a function with a receiver in front, so an ellipsis reaching one
-   * and not the other would be a difference in the grammar with nothing behind it. With a receiver
-   * the ellipsis is tried after the parameters, so `add(self, n: int, ...)` still reads its commas
-   * as the separators they are.
+   * Either shape may end in the same trailing `...` a free function's list takes (`reference/ffi.md
+   * § Variadic functions`), and for the same reason: a member is a function with a receiver in
+   * front, so an ellipsis reaching one and not the other would be a difference in the grammar with
+   * nothing behind it. With a receiver the ellipsis is tried after the parameters, so `add(self, n:
+   * int, ...)` still reads its commas as the separators they are.
    */
   protected lazy val methodParams: Parser[(Option[RecvMode], List[Param], Boolean)] =
     receiver ~ rep(op(",") ~> funcParam) ~ opt(op(",") ~> op("...")) <~ opt(op(",")) ^^ {
@@ -638,7 +642,8 @@ trait DeclParser extends ExprParser {
    */
   protected lazy val overrideMod: Parser[Boolean] = opt(op("override")) ^^ (_.isDefined)
 
-  /** The trait an `impl` is of: a name and its arguments, or a callable written as one (`12 §6`).
+  /** The trait an `impl` is of: a name and its arguments, or a callable written as one
+   * (`reference/types.md § Function types`).
    *
    * The arrow spelling is here so that the arity-carrying declaration behind a call trait stays out
    * of programs entirely — a type made callable by hand is written `impl Fn(int) -> int for Doubler`,

@@ -113,10 +113,10 @@ trait AsmAnalysis extends TypeResolution {
           "already exists — an expression needs somewhere to be evaluated to, so bind one first"))
         None
 
-      // A `ref` names a place rather than a slot (`03 § ref`), so there is no storage of its own to
-      // load from or store to — the operand would be emitted against an address that was never
-      // allocated. Refusing it by name is what keeps that from being a module the assembler
-      // rejects for reasons the source does not explain.
+      // A `ref` names a place rather than a slot (`reference/memory.md § ref — a name for a
+      // place`), so there is no storage of its own to load from or store to — the operand would be
+      // emitted against an address that was never allocated. Refusing it by name is what keeps that
+      // from being a module the assembler rejects for reasons the source does not explain.
       case Some((slot, _)) if refPlaces.contains(slot) =>
         at(op.pos)(err(s"'${op.name}' is bound by 'ref', so it names storage somewhere else rather " +
           "than a variable of its own, and there is nothing here for an operand to be. Copy it " +

@@ -86,7 +86,7 @@ class IrModuleTests extends AnyFreeSpec with Matchers {
   /** Module storage, and the `@section` case with it — which is the one place a global says
    * something the type system does not: a linker script gathers it, so nothing in the program reads
    * it and `@llvm.used` is what keeps `-O1` from deleting the object the attribute was written for
-   * (`15 §13`).
+   * (`reference/attributes.md § @section("...")`).
    */
   "module storage is a constant expression and carries where the linker is to put it" in {
     val m = modules(List(

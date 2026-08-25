@@ -2,8 +2,8 @@ package sh.sysl
 
 import scala.collection.mutable
 
-/** The proof backend: a module's typed tree written out as **WhyML**, the input language of the Why3
- * platform (`17 §9`).
+/** The proof backend: a module's typed tree written out as **WhyML**, the input language of the
+ * Why3 platform (`reference/verification.md § sysl prove`).
  *
  * **Why Why3 rather than SMT-LIB.** The goals a program generates are not one prover's shape. Why3
  * splits a verification condition into goals, transforms them, and tries several provers on each;
@@ -86,9 +86,9 @@ object WhyML {
      * declared — and that was wrong in a way worth writing down.** It pulled ordinary code into the
      * term world, and a term keeps plain arithmetic, so `gcd` written as one expression was proved
      * against unbounded integers while the same function written with a local got its overflow
-     * obligations. Two spellings of one function, two models. The mark is what decides now, which is
-     * also what `17 §8` already says: a specification is what `@ghost` marks, and mathematics is
-     * what a specification is written in.
+     * obligations. Two spellings of one function, two models. The mark is what decides now, which
+     * is also what `reference/verification.md § @ghost — what costs nothing to say` already says: a
+     * specification is what `@ghost` marks, and mathematics is what a specification is written in.
      */
     private def terms(name: String): Boolean = ghosts(name)
 
@@ -163,7 +163,7 @@ object WhyML {
 
       // A `@ghost` declaration is a specification, so it is a term whatever it costs to say — a
       // ghost function with a loop in it is refused rather than translated into a program nothing
-      // may mention (`17 §8`).
+      // may mention (`reference/verification.md § @ghost — what costs nothing to say`).
       val isTerm = f.ghost
       val rec    = if recursive(f) then "rec " else ""
 
@@ -324,8 +324,9 @@ object WhyML {
         if inTerm then throw Unsupported("a sequence of expressions in a contract")
         es.map(expr(_, inTerm)).mkString("(", "; ", ")")
 
-      // One copy of an unrolled `for const` (`10 §10`), which is a block wherever it stands. A block
-      // in a term is what the line above refuses for a sequence, and for the same reason.
+      // One copy of an unrolled `for const` (`reference/generics.md § A parameter may stand for a
+      // list of types`), which is a block wherever it stands. A block in a term is what the line
+      // above refuses for a sequence, and for the same reason.
       case _: TBlockExpr => throw Unsupported("a 'for const' in a contract")
 
       case TCall(name, args, _, _) =>
@@ -489,8 +490,9 @@ object WhyML {
       case other => code(other)
     }
 
-    /** `while` with its clauses, which are the leading statements of its body (`17 §3`) and become
-     * WhyML's own `invariant` and `variant`.
+    /** `while` with its clauses, which are the leading statements of its body
+     * (`reference/verification.md § invariant and variant on a loop`) and become WhyML's own
+     * `invariant` and `variant`.
      */
     private def whileLoop(w: TWhile): String = {
       val TWhile(cond, body, elseBlock, _) = w

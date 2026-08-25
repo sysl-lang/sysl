@@ -5,10 +5,11 @@ import io.github.edadma.cross_platform.*
 /** The library the compiler is installed with: the standard module `sysl` that every program is
  * compiled against, and the submodules beneath it (`13 § Open h`).
  *
- * **`sysl` is the auto-imported part and not the whole of it.** `library/sysl` is a tree, so a directory
- * under it is a submodule by `13 §1`'s ordinary rule, and only the standard module's names are the
- * ones every file gets for free. That is what a submodule is for: what a program cannot avoid
- * needing goes in `sysl`, and what it should have to ask for goes below.
+ * **`sysl` is the auto-imported part and not the whole of it.** `library/sysl` is a tree, so a
+ * directory under it is a submodule by `reference/modules.md`'s ordinary rule, and only the
+ * standard module's names are the ones every file gets for free. That is what a submodule is for:
+ * what a program cannot avoid needing goes in `sysl`, and what it should have to ask for goes
+ * below.
  *
  * What a program starts with is a *module*, not a set of declarations threaded in beside it. It was
  * the latter once: a `Prelude` of sysl source held in a string inside the compiler, keyed under the
@@ -42,8 +43,9 @@ import io.github.edadma.cross_platform.*
  *
  * **It is more than one file, and that is load-bearing rather than tidiness.** `Display.display`
  * names `Writer`, which is declared in the other one: a module's members are one set however many
- * files they came from (`13 §6`), so neither file imports the other and the order they are read in
- * decides nothing. A library that could only ever be one file would not be a library.
+ * files they came from (`reference/modules.md § The module graph is acyclic`), so neither file
+ * imports the other and the order they are read in decides nothing. A library that could only ever
+ * be one file would not be a library.
  */
 object Std {
 
@@ -144,14 +146,15 @@ object Std {
    * which of the paths above the root was reached by.
    *
    * Each carries the directory it sits in below the root, which is the module its header has to
-   * agree with (`13 §1`). They are read by the same walk that reads a user's library, because they
-   * *are* a library: `sysl build-lib library --std` is pointed at this same tree and gets these same
-   * values.
+   * agree with (`reference/modules.md`). They are read by the same walk that reads a user's
+   * library, because they *are* a library: `sysl build-lib library --std` is pointed at this same
+   * tree and gets these same values.
    *
-   * **A function of the operating system rather than a `lazy val`, because a library is a tree and a
-   * tree is a per-target answer** (`13 §5`). The library binds one system's `readdir` under
-   * `__linux__/` and another's under `__macos__/`, so what "the library's files" are is a question
-   * with a machine in it — the same shape [[parsed]] already had for the same reason one layer up.
+   * **A function of the operating system rather than a `lazy val`, because a library is a tree and
+   * a tree is a per-target answer** (`reference/modules.md § Platform selection`). The library
+   * binds one system's `readdir` under `__linux__/` and another's under `__macos__/`, so what "the
+   * library's files" are is a question with a machine in it — the same shape [[parsed]] already had
+   * for the same reason one layer up.
    *
    * **Memoized, and that is a correctness requirement rather than a saving.** A `Source` compares by
    * **identity** (`Diagnostics`), and `Stdlib.owns` — which decides whether an unreached declaration
@@ -279,8 +282,8 @@ object Std {
    * condition written anywhere and without the file having to compile.
    *
    * Read through `Project.cSources`, which is the same walk every other tree's C is found by — the
-   * library is a library (`13 §8`), and the one thing that used to be true of it and of nothing else
-   * was that nobody ever looked here.
+   * library is a library (`reference/modules.md § Separate compilation`), and the one thing that
+   * used to be true of it and of nothing else was that nobody ever looked here.
    */
   def cSources(os: Os): List[Source] = readC.synchronized(readC.getOrElseUpdate(os, root match
     case Right(dir) => Project.cSources(dir, Some(os)).sortBy(place)

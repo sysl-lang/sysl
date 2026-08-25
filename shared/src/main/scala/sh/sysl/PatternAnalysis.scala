@@ -199,16 +199,17 @@ trait PatternAnalysis extends TypeResolution {
             err(s"struct '${qn(s.base)}' has ${quantity(s.fields.length, "field")}, " +
               s"but ${supplied(args.length, "sub-pattern")}")
           // Naming every field is reading every field, so the positional pattern needs each of them
-          // visible — the same rule the positional constructor is held to (`08 § Visibility`).
+          // visible — the same rule the positional constructor is held to (`reference/modules.md §
+          // Visibility`).
           checkEveryFieldVisible(s.base, s.fields.map(_._1), "this pattern",
             "match the fields it does offer by name, as 'Name{…}'")
           TStructPattern(s, args.zip(s.fields).map { case (a, (_, fty)) => analyzePattern(a, fty) })
         case other =>
           err(s"'$name(…)' matches an enum variant or a struct, but the value is ${show(other)}" + heldBehind(other))
 
-    // A tuple pattern is the positional struct pattern with the name off (`00 §13`), which is why it
-    // ends as the same node: a tuple's parts are its fields, and matching every one of them is what
-    // the positional form already means.
+    // A tuple pattern is the positional struct pattern with the name off (`reference/types.md §
+    // Tuples`), which is why it ends as the same node: a tuple's parts are its fields, and matching
+    // every one of them is what the positional form already means.
     case TuplePattern(args) =>
       ty match
         case t: Type.Tuple if args.length == t.fields.length =>
@@ -271,7 +272,8 @@ trait PatternAnalysis extends TypeResolution {
    * means.
    *
    * Used where a test that cannot fail is a mistake rather than a tautology to fold away — the
-   * condition of an `if` or a `while` (`09 §12`).
+   * condition of an `if` or a `while` (`reference/expressions.md § is — a pattern where a condition
+   * is wanted`).
    */
   protected def refutable(p: TPattern): Boolean = p match
     case _: TWildPattern | _: TBindPattern => false

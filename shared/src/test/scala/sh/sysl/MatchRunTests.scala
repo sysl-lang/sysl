@@ -260,7 +260,8 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
    * The alternation is the case that made it certain rather than lucky, because an `|` has to
    * evaluate every alternative's test to OR them: `Short('o') | Long("output")` tests a `char`
    * payload and a `string` payload of the same value, and one of the two is always the wrong
-   * reading. That is what took down a `sysl.args` scanner written against `09 §6`'s own example.
+   * reading. That is what took down a `sysl.args` scanner written against `reference/patterns.md §
+   * The pattern forms`'s own example.
    */
   "a variant's payload is tested only when its tag matched" - {
     // The one that crashed. Every call is answered, and the two alternatives are reached through
@@ -320,9 +321,10 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
-  // `09 §6` — a variant may be written with a qualifier, which the scrutinee's type makes
-  // redundant rather than wrong. It reads the same on a nullary variant, which is spelled like a
-  // name and so had nowhere to put one: `Wrap(i)` took a qualifier and `Bare` did not.
+  // `reference/patterns.md § The pattern forms` — a variant may be written with a qualifier, which
+  // the scrutinee's type makes redundant rather than wrong. It reads the same on a nullary variant,
+  // which is spelled like a name and so had nowhere to put one: `Wrap(i)` took a qualifier and
+  // `Bare` did not.
   "a nullary variant pattern takes a qualifier as a data one does" in {
     val src =
       """enum Outer

@@ -2,8 +2,9 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Tier-2 runtime behavior of the core trait catalog (`14 §1`, `§2`, `§5`): `Self`, the operator
- * traits the library declares, and the memberships the compiler provides for the built-in types.
+/** Tier-2 runtime behavior of the core trait catalog (`reference/traits.md § Declaring a trait`,
+ * `§2`, `§5`): `Self`, the operator traits the library declares, and the memberships the compiler
+ * provides for the built-in types.
  *
  * The point of a membership is that it is invisible at run time — a scalar's `add` is the machine's
  * `add`, not a call — so what these check is that the *type system* now agrees a scalar satisfies a
@@ -322,9 +323,10 @@ class CoreTraitRunTests extends AnyFreeSpec with RunSupport with CodegenSupport 
      * nobody put there, while the same comparison between two *named* options worked.
      *
      * An operand is settled by its neighbour here exactly as an argument is settled by the solution
-     * at a call (`12 §5`): whichever side has a type of its own supplies it, and the other is read
-     * again against it. `None` takes the same road one step earlier — it has no reading of its own
-     * at all, so it waits for the neighbour rather than being asked first.
+     * at a call (`reference/expressions.md § Closures`): whichever side has a type of its own
+     * supplies it, and the other is read again against it. `None` takes the same road one step
+     * earlier — it has no reading of its own at all, so it waits for the neighbour rather than
+     * being asked first.
      */
     "and the literal spelling of either side reads at the other's type" in {
       run("""var a: Option[usize] = Some(166)
@@ -434,9 +436,10 @@ class CoreTraitRunTests extends AnyFreeSpec with RunSupport with CodegenSupport 
               |print(Dot == Dot)""".stripMargin) should include("'==' is not defined for Shape")
       }
 
-      // `14 §5`'s rule about a built-in's memberships, reaching the first type a *program* declares.
-      // Refused rather than silently ignored — the operator lowers to the compare whatever the block
-      // says, so a block left standing would be dead code that reads as the thing being called.
+      // `reference/expressions.md § Operator dispatch`'s rule about a built-in's memberships,
+      // reaching the first type a *program* declares. Refused rather than silently ignored — the
+      // operator lowers to the compare whatever the block says, so a block left standing would be
+      // dead code that reads as the thing being called.
       "and writing the 'impl' by hand is refused, saying why the type is already a member" in {
         val e = err("""enum Colorspace
                       |    Srgb

@@ -191,8 +191,9 @@ class StructInvariantRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
-  // `16 §5`. A struct held as a field of another struct is still constructed, so its invariant is
-  // checked where it is built — the outer struct's construction is not a way in.
+  // `reference/errors.md § What the type's own name offers: :: attributes`. A struct held as a
+  // field of another struct is still constructed, so its invariant is checked where it is built —
+  // the outer struct's construction is not a way in.
   "a struct inside a struct is checked as it is built" - {
     val nested =
       """struct Bounded

@@ -2,7 +2,7 @@ package sh.sysl
 
 import scala.collection.mutable
 
-/** What a function marked `@pure` may not do (`17 §6`).
+/** What a function marked `@pure` may not do (`reference/verification.md § @pure`).
  *
  * **Asked of the typed tree**, for the reason `NoAlloc`'s question is: what a caller can observe is
  * decided in a dozen places across the analyzer, and a guard at each of them is a list nobody can
@@ -21,10 +21,11 @@ import scala.collection.mutable
  *   - an `extern` is the other side of the seam and says nothing about itself;
  *   - an `asm` block, an atomic and a fence are each an effect written down as an instruction.
  *
- * **Allocation is deliberately absent from both lists**, and `17 §6` argues it out: a caller cannot
- * observe an object that did not exist when the call began, and `13 §4`'s `no alloc` already answers
- * the allocation question for a whole module. Trapping is absent for the same kind of reason —
- * `16`'s constrained arithmetic can trap, so a purity that excluded it would exclude those types
+ * **Allocation is deliberately absent from both lists**, and `reference/verification.md § @pure`
+ * argues it out: a caller cannot observe an object that did not exist when the call began, and
+ * `reference/modules.md § Capabilities are a module property`'s `no alloc` already answers the
+ * allocation question for a whole module. Trapping is absent for the same kind of reason — `16`'s
+ * constrained arithmetic can trap, so a purity that excluded it would exclude those types
  * wholesale.
  *
  * Purity is **not inferred**. Only the direct callees are checked, which is enough by induction: if

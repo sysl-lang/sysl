@@ -5,7 +5,7 @@ import java.io.IOException
 import io.github.edadma.cross_platform.*
 
 /** Reading a project off the filesystem: which files one invocation compiles, and what each one's
- * location says about the module it belongs to (`13 §1`).
+ * location says about the module it belongs to (`reference/modules.md`).
  *
  * A module is a directory and its name is that directory's path **relative to the project root**, so
  * the root is the one thing a caller has to supply and everything else follows from where a file was
@@ -13,7 +13,7 @@ import io.github.edadma.cross_platform.*
  * compiles a program written on disk asks the same question, and asking it a second way would let
  * the two disagree about what a project is.
  */
-/** What a malformed per-OS directory raises (`13 §5`).
+/** What a malformed per-OS directory raises (`reference/modules.md § Platform selection`).
  *
  * It has a type of its own because one caller — `Project.modules` — deliberately tolerates a
  * directory it cannot read, and a mistake in the tree must not be swallowed by that tolerance. There
@@ -33,10 +33,10 @@ object Project {
    *
    * Naming a single **file** compiles that file alone, as the root module with nothing else in it.
    *
-   * `os` is which operating system's per-OS directories to take (`13 §5`), and it has **no default**
-   * on purpose: a walk that guessed would drop half a tree with nothing said, which is the one
-   * failure mode this whole axis has. `None` takes every one of them, which is what a command that
-   * reads a tree rather than compiling it wants — see [[Every]].
+   * `os` is which operating system's per-OS directories to take (`reference/modules.md § Platform
+   * selection`), and it has **no default** on purpose: a walk that guessed would drop half a tree
+   * with nothing said, which is the one failure mode this whole axis has. `None` takes every one of
+   * them, which is what a command that reads a tree rather than compiling it wants — see [[Every]].
    */
   def collect(path: String, os: Option[Os]): List[Source] =
     if isDirectory(path) then walk(path, Nil, sysl, os, None)
@@ -61,7 +61,7 @@ object Project {
   private val sysl: List[String] = List(".sysl", Literate.Extension)
 
   /** The C files of a source tree, which a `.sysl` file reaches by `extern` and the build compiles
-   * alongside it (`15 §7`).
+   * alongside it (`reference/ffi.md § A library may carry C`).
    *
    * The same walk as `collect` and deliberately so: a C file belongs to the directory it was found
    * in exactly as a sysl file does, which is what lets its object be named after a path that is
@@ -86,19 +86,20 @@ object Project {
    * the C is not looked at until a compilation that got that far is about to link. Which trees are
    * asked is `NativeSources`' — every tree the compilation walked, not only a library's.
    *
-   * Naming a single file is not offered, and gets `Nil` rather than an error. Naming a file compiles
-   * that file alone (`13 §1`), so there is no tree for C to have travelled with — and a lone C file
-   * is not a program.
+   * Naming a single file is not offered, and gets `Nil` rather than an error. Naming a file
+   * compiles that file alone (`reference/modules.md`), so there is no tree for C to have travelled
+   * with — and a lone C file is not a program.
    *
-   * **The per-OS directories of `13 §5` matter most here**, because C is what they exist for: a
-   * module binds one system's header in a `.c` under `__linux__/` and another's under `__macos__/`,
-   * and neither file is compiled — or read — on a target it was not written for.
+   * **The per-OS directories of `reference/modules.md § Platform selection` matter most here**,
+   * because C is what they exist for: a module binds one system's header in a `.c` under
+   * `__linux__/` and another's under `__macos__/`, and neither file is compiled — or read — on a
+   * target it was not written for.
    */
   def cSources(path: String, os: Option[Os]): List[Source] =
     if isDirectory(path) then walkModules(path, Nil, List(".c"), os, None) else Nil
 
-  /** The modules a tree offers to something outside it: the shallowest directories under `root` that
-   * hold source, as dotted paths (`13 §1`).
+  /** The modules a tree offers to something outside it: the shallowest directories under `root`
+   * that hold source, as dotted paths (`reference/modules.md`).
    *
    * **A directory holding no source is not a module**, which is the same rule `walk` applies and is
    * why this lives here rather than beside its caller. A package namespaced by reverse DNS puts its
@@ -180,13 +181,14 @@ object Project {
   /** One directory's contents with per-OS selection already applied: the files that belong to it, and
    * the sub-directories below it paired with whichever `__<os>__` directory each is inside.
    *
-   * **This is the whole of the mechanism, and it is one function on purpose.** All three walks above
-   * split a listing into files and sub-directories and then apply a rule of their own; giving them a
-   * listing that has already had the selection folded into it means every one of those rules — the
-   * shallowest-module rule, `walkModules`' *is this a module*, the `dir` segments a `Source` carries
-   * — goes on being written once and goes on being true. A directory's files are its own plus the
-   * selected `__<os>__` child's, and its sub-directories are its own plus that child's: the folder
-   * disappears, which is exactly what `13 §5` says it does.
+   * **This is the whole of the mechanism, and it is one function on purpose.** All three walks
+   * above split a listing into files and sub-directories and then apply a rule of their own; giving
+   * them a listing that has already had the selection folded into it means every one of those rules
+   * — the shallowest-module rule, `walkModules`' *is this a module*, the `dir` segments a `Source`
+   * carries — goes on being written once and goes on being true. A directory's files are its own
+   * plus the selected `__<os>__` child's, and its sub-directories are its own plus that child's:
+   * the folder disappears, which is exactly what `reference/modules.md § Platform selection` says
+   * it does.
    *
    * The pairing is what carries the nesting refusal down. A sub-directory found inside a selected
    * folder is under it however deep it goes, so `__linux__/fs/__macos__/` is refused for the same
@@ -200,8 +202,9 @@ object Project {
 
     // Every selector is validated, not only the ones this target takes — a misspelling in the Linux
     // half is a mistake a macOS build should report, exactly as `Conditional` checks the conditions
-    // on branches it is not taking. What is *not* looked at is the inside of a folder this target did
-    // not select, which `13 §5` states outright: an unselected tree is never read.
+    // on branches it is not taking. What is *not* looked at is the inside of a folder this target
+    // did not select, which `reference/modules.md § Platform selection` states outright: an
+    // unselected tree is never read.
     val taken = selectors.filter { d =>
       val named = selects(basename(d), within)
 
@@ -231,8 +234,7 @@ object Project {
         throw SelectionError(s"'$name' is in more than one directory that selects source for this " +
           s"machine — ${paths.map(p => s"'${basename(parentOf(p).getOrElse(p))}'").sorted.mkString(" and ")}. " +
           "A selector may name a family, so two of them can answer at once and both files would be " +
-          "taken. Give them different names, or name the machines so that at most one matches " +
-          "(`13 §5`)")
+          "taken. Give them different names, or name the machines so that at most one matches")
 
     (files ::: nestedFiles.flatten,
      plain.map(_ -> within) ::: nestedSubs.flatten)
@@ -273,7 +275,7 @@ object Project {
       throw SelectionError(s"'$name' sits inside '$outer', and both select source for a machine — " +
         "an unselected directory is never read, so nothing inside one could ever be taken. Write " +
         "them beside each other, or use '#if' inside a sysl file or the C preprocessor inside a " +
-        "'.c' (`13 §5`)")
+        "'.c'")
 
     val written = name.stripPrefix("__").stripSuffix("__").split(",", -1).toList.map(_.trim)
 

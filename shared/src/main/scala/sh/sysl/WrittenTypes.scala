@@ -2,7 +2,7 @@ package sh.sysl
 
 /** The questions asked of a type **as it was written**, before anything has resolved it: does it
  * still name a parameter being solved, and is what stands where a length goes something that may
- * stand there at all (`10 §9`).
+ * stand there at all (`reference/generics.md § A parameter may stand for a value`).
  *
  * The two are one area because an array's length is part of whether the type is a type yet —
  * `[N]int` names no type parameter in its element and is not a type until `N` is fixed — so the
@@ -16,11 +16,12 @@ trait WrittenTypes extends GenericInstantiation {
 
   /** Whether a written type names any of the parameters being solved, and so is not yet a type.
    *
-   * **An array's length counts** (`10 §9`). It used to be true that nothing in a length could name a
-   * parameter — the comment here said so — and value generics made it false: `[N]int` names no type
-   * parameter in its element and is still not a type until `N` is fixed. Missing that is not a
-   * missing feature but a wrong answer, since a caller then resolves the signature under an empty
-   * substitution and reports the length as not constant.
+   * **An array's length counts** (`reference/generics.md § A parameter may stand for a value`). It
+   * used to be true that nothing in a length could name a parameter — the comment here said so —
+   * and value generics made it false: `[N]int` names no type parameter in its element and is still
+   * not a type until `N` is fixed. Missing that is not a missing feature but a wrong answer, since
+   * a caller then resolves the signature under an empty substitution and reports the length as not
+   * constant.
    */
   protected def mentions(ref: TypeRef, tps: Set[String]): Boolean = ref match
     case NamedType(n, args) => tps(n) || args.exists(mentions(_, tps))
@@ -49,8 +50,8 @@ trait WrittenTypes extends GenericInstantiation {
     case SomeType(bs)        => bs.exists(_.args.exists(mentions(_, tps)))
 
   /** Whether an array **length** names one of the parameters being solved — a value parameter
-   * standing for the length itself (`10 §9`), or a type parameter reached through a measurement
-   * such as `[sizeof(T)]u8`.
+   * standing for the length itself (`reference/generics.md § A parameter may stand for a value`),
+   * or a type parameter reached through a measurement such as `[sizeof(T)]u8`.
    *
    * It walks the shapes `fold` walks, and no others: the set of expressions a length may be is
    * closed, so anything outside it cannot name a parameter because it cannot be a length at all.
@@ -65,7 +66,8 @@ trait WrittenTypes extends GenericInstantiation {
     case Call(_, args)          => args.exists(lengthMentions(_, tps))
     case _                      => false
 
-  /** Refuses arithmetic on a **value parameter** inside a type (`10 §9`) — `[N + 1]int`.
+  /** Refuses arithmetic on a **value parameter** inside a type (`reference/generics.md § A
+   * parameter may stand for a value`) — `[N + 1]int`.
    *
    * A value parameter may *stand* as a length, and a body may compute with it as freely as with any
    * other `usize`. What neither may do is put the result of a computation in a type. A type carrying
@@ -88,13 +90,14 @@ trait WrittenTypes extends GenericInstantiation {
   /** Refuses a **type** parameter written where an array's length belongs — `f[T](xs: [T]int)` and
    * `impl[N, T] Tag for [N]T`.
    *
-   * A length is a value, and a parameter standing for one is declared `const` (`10 §9`). Before
-   * that spelling existed, the only thing here that could legitimately fail to fold was a
-   * measurement *over* a type parameter — `[sizeof(T)]u8` — and that one reaches the length through
-   * `sizeof` rather than as a bare name. So `awaitsInstantiation` stood a bare name at zero, which
-   * was harmless while no bare name could mean anything, and became a silent wrong answer the day
-   * one could: `impl[N, T] Tag for [N]T` quietly became an implementation for `[0]T`, and
-   * `f[T](xs: [T]int)` compiled with a length nobody wrote.
+   * A length is a value, and a parameter standing for one is declared `const`
+   * (`reference/generics.md § A parameter may stand for a value`). Before that spelling existed,
+   * the only thing here that could legitimately fail to fold was a measurement *over* a type
+   * parameter — `[sizeof(T)]u8` — and that one reaches the length through `sizeof` rather than as a
+   * bare name. So `awaitsInstantiation` stood a bare name at zero, which was harmless while no bare
+   * name could mean anything, and became a silent wrong answer the day one could: `impl[N, T] Tag
+   * for [N]T` quietly became an implementation for `[0]T`, and `f[T](xs: [T]int)` compiled with a
+   * length nobody wrote.
    *
    * A bare name bound to a **type** has no reading at all, which is what makes this a sentence
    * rather than a fallback.
@@ -150,10 +153,11 @@ trait WrittenTypes extends GenericInstantiation {
       case WeakType(inner)         => walk(inner)
       case VolatileType(inner)     => walk(inner)
       // A name spread as a pack has to have been **declared** as one, and this is the only place
-      // that can be said (`10 §10`). Left to resolution it is never said at all: inference binds
-      // whatever `(..T)` matched, so a `T` declared as one type quietly starts standing for a list
-      // and the mistake becomes an implementation for a shape nobody wrote. That is `[N]T`'s bare
-      // name one kind up, and it is caught here for the same reason.
+      // that can be said (`reference/generics.md § A parameter may stand for a list of types`).
+      // Left to resolution it is never said at all: inference binds whatever `(..T)` matched, so a
+      // `T` declared as one type quietly starts standing for a list and the mistake becomes an
+      // implementation for a shape nobody wrote. That is `[N]T`'s bare name one kind up, and it is
+      // caught here for the same reason.
       case TupleType(List(p: PackType), _) => declaredPack(p.name)
       case TupleType(parts, _)             => parts.foreach(walk)
       // A pack reached anywhere *else* is one written outside the tuple that is the only place for

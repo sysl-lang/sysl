@@ -79,8 +79,9 @@ object Allocator {
  *
  * The file is **optional**, and a project without one is not a lesser project: the defaults are the
  * root the driver was given, the machine the compiler is running on, and a target that provides
- * everything. That is the same shape `13 §1` gives the anonymous root module — the bare case is the
- * general one with nothing filled in — and it is what keeps `sysl run hello.sysl` free of ceremony.
+ * everything. That is the same shape `reference/modules.md` gives the anonymous root module — the
+ * bare case is the general one with nothing filled in — and it is what keeps `sysl run hello.sysl`
+ * free of ceremony.
  *
  * Only the part of `packages.md` that has something to enforce is read. `package` and `requires`
  * are parsed and checked so that a file naming them is held to spelling them correctly, and
@@ -400,12 +401,12 @@ object PackageConfig {
    *
    * ==A name, never a path==
    *
-   * `15 §8` refuses a path here in as many words: the file is committed and describes the *package*,
-   * and where a prefix lives on somebody's laptop is not a property of the package. It refuses an
-   * environment variable for the same reason `packages.md § 7` refuses build scripts — a build that
-   * reads the consumer's shell is one that works for whoever wrote it. So what a package may say is
-   * *which* headers it needs; **where** they are stays the driver's question, exactly as it is for
-   * `@link` and `--link-path`.
+   * `reference/ffi.md § @link` refuses a path here in as many words: the file is committed and
+   * describes the *package*, and where a prefix lives on somebody's laptop is not a property of the
+   * package. It refuses an environment variable for the same reason `packages.md § 7` refuses build
+   * scripts — a build that reads the consumer's shell is one that works for whoever wrote it. So
+   * what a package may say is *which* headers it needs; **where** they are stays the driver's
+   * question, exactly as it is for `@link` and `--link-path`.
    *
    * ==The value is the reason, and it is what makes the refusal worth having==
    *
@@ -765,11 +766,11 @@ object PackageConfig {
 
   /** `§ 4`'s rule that the major version rides in the path, checked both ways.
    *
-   * Both halves matter and they catch opposite mistakes. A suffix that disagrees with the version is
-   * a manifest asking for one package and naming another. A major of 2 or more with *no* suffix is
-   * the mistake `/vN` exists to prevent: it would put two incompatible majors under one module name,
-   * and `15 § 2` mangles a module name into every symbol, so the two would collide at the linker
-   * rather than anywhere a diagnostic could reach.
+   * Both halves matter and they catch opposite mistakes. A suffix that disagrees with the version
+   * is a manifest asking for one package and naming another. A major of 2 or more with *no* suffix
+   * is the mistake `/vN` exists to prevent: it would put two incompatible majors under one module
+   * name, and `reference/modules.md § Separate compilation` mangles a module name into every
+   * symbol, so the two would collide at the linker rather than anywhere a diagnostic could reach.
    */
   private def checkMajor(coordinate: String, version: Version, where: String): Either[String, Unit] =
     Dependency.majorSuffix(coordinate) match

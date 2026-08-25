@@ -62,7 +62,8 @@ object Type extends TypeQueries {
   case object Bool extends Type { def lty(using Word) = LType.I(1) }
   case object Unit extends Type { def lty(using Word) = LType.Void }
 
-  /** The state of a walk through a variadic function's tail (`12 §9`) — C's `va_list`.
+  /** The state of a walk through a variadic function's tail (`reference/ffi.md § Variadic
+   * functions`) — C's `va_list`.
    *
    * A predeclared type rather than a struct a program could have written, because its layout is the
    * target ABI's: 24 bytes of register-save bookkeeping under x86-64 SysV, 32 under AAPCS64, a bare
@@ -97,8 +98,8 @@ object Type extends TypeQueries {
    */
   case object Unknown extends Type { def lty(using Word) = LType.Void }
 
-  /** A type parameter as the body that declares it sees it: opaque, and licensed to do exactly
-   * what `bounds` promise (`14 §4`).
+  /** A type parameter as the body that declares it sees it: opaque, and licensed to do exactly what
+   * `bounds` promise (`reference/generics.md § Bounds`).
    *
    * It exists for the one pass that checks a generic body **at its definition**, where `T` stands
    * for itself rather than for whatever a call site supplied. A value of it may be copied, passed,
@@ -172,7 +173,8 @@ object Type extends TypeQueries {
       throw new IllegalStateException(s"the trait '$name' reached codegen as a type of its own")
   }
 
-  /** The call trait a callable's type names (`12 §6`), which the library declares one of per arity.
+  /** The call trait a callable's type names (`reference/types.md § Function types`), which the
+   * library declares one of per arity.
    *
    * The arity is in the name for the reason a tuple's is in its base: one declaration cannot promise
    * a `call` of an arity it does not know, so each arity is its own trait and each is written out.
@@ -221,7 +223,8 @@ object Type extends TypeQueries {
   }
 
   /** `*extern(A, B) -> R` — the address of a function that obeys the machine's C convention, which
-   * is the one word a C library means when it says function pointer (`12 §6a`).
+   * is the one word a C library means when it says function pointer (`reference/ffi.md § A
+   * function's address`).
    *
    * It is its own type rather than `Ptr` of something for the reason `03` gives `*T` its meaning: a
    * raw pointer addresses a *value*, one that can be read through, written through, and measured.
@@ -244,7 +247,7 @@ object Type extends TypeQueries {
   }
 
   /** `volatile T` — storage whose reads and writes are **effects rather than value computations**
-   * (`03 § Device memory`).
+   * (`reference/memory.md § Device memory`).
    *
    * It qualifies the storage, not the value: what comes back out of a `volatile u32` is an ordinary
    * `u32`, so this is stripped the moment a place is projected and never becomes the type of an
@@ -314,8 +317,9 @@ object Type extends TypeQueries {
 
   object Array {
 
-    /** The key an `impl` written for **every** array is filed under, whatever the length — the block
-     * whose length is a value parameter (`10 §9`), `impl[const N: usize, T: Display] Display for [N]T`.
+    /** The key an `impl` written for **every** array is filed under, whatever the length — the
+     * block whose length is a value parameter (`reference/generics.md § A parameter may stand for a
+     * value`), `impl[const N: usize, T: Display] Display for [N]T`.
      *
      * An array filed under it keeps its per-length key as well, and that one is asked first: a block
      * that wrote `[3]T` covers every array of three, and one that wrote `[N]T` covers every array at
@@ -373,8 +377,8 @@ object Type extends TypeQueries {
       case _                                      => false
   }
 
-  /** The argument bound to a **value** parameter (`10 §9`) — `3` where the declaration wrote
-   * `[const N: usize]`.
+  /** The argument bound to a **value** parameter (`reference/generics.md § A parameter may stand
+   * for a value`) — `3` where the declaration wrote `[const N: usize]`.
    *
    * It is a `Type` because a declaration's parameters are one list, one namespace and one argument
    * position, so the substitution that answers "what is this parameter?" answers for both kinds and
@@ -391,8 +395,9 @@ object Type extends TypeQueries {
       throw new IllegalStateException(s"the value argument '$value' reached codegen")
   }
 
-  /** The list bound to a **type pack** (`10 §10`) — `int, string` where the declaration wrote
-   * `[..A]` and the subject matched a `(int, string)`.
+  /** The list bound to a **type pack** (`reference/generics.md § A parameter may stand for a list
+   * of types`) — `int, string` where the declaration wrote `[..A]` and the subject matched a `(int,
+   * string)`.
    *
    * A `Type` for the reason `ConstArg` is one: a declaration's parameters are one list keyed by
    * name, whichever kind each of them is, so the substitution answering "what is this parameter?"
@@ -429,7 +434,7 @@ object Type extends TypeQueries {
    * three words, the same instructions to reach through, and the same thing to keep alive. What the
    * bit changes is only what may be *done* with the view, which is why a `[]T` is accepted wherever
    * a `[]const T` is wanted and never the other way round — dropping the ability to write is safe,
-   * and inventing it is the hole (`07 § Not yet`).
+   * and inventing it is the hole (`reference/arrays.md § What is still refused`).
    *
    * `string` is the same idea arrived at from the other side and kept separate: it is a read-only
    * view of `u8` *plus* the promise that the bytes are well-formed UTF-8, and it is the promise, not
@@ -553,7 +558,8 @@ object Type extends TypeQueries {
     // no identifier, so this cannot shorten a name somebody chose.
     case Abstract(n, _)           => n.takeWhile(_ != '#')
     // A value argument is shown as the value, since that is what a reader wrote and what tells two
-    // instantiations apart: `len[3]` and `len[4]` differ by this and nothing else (`10 §9`).
+    // instantiations apart: `len[3]` and `len[4]` differ by this and nothing else
+    // (`reference/generics.md § A parameter may stand for a value`).
     //
     // **Shown the way it was written, not the way it travels.** A `bool`, a `char` and an enum
     // variant all reach here as the number that makes their type's identity, and a diagnostic
@@ -564,10 +570,12 @@ object Type extends TypeQueries {
     case ConstArg(v, e: Enum)     => e.variants.find(_.tag == v.toInt).fold(v.toString)(_.name)
     case ConstArg(v, _)           => v.toString
     // A pack is shown as the list it stands for, with no parentheses: the only place one is written
-    // is inside a tuple, so whatever is naming this has already supplied them (`10 §10`).
+    // is inside a tuple, so whatever is naming this has already supplied them
+    // (`reference/generics.md § A parameter may stand for a list of types`).
     case Pack(es)                 => es.map(show).mkString(", ")
     // A call trait is spelled the way it is written rather than the way it is filed, so nothing a
-    // reader is told names the arity-carrying declaration behind it (`12 §6`).
+    // reader is told names the arity-carrying declaration behind it (`reference/types.md § Function
+    // types`).
     case Trait(n, args, assocs) =>
       Fn.parts(n, args) match
         case Some((ps, r)) => s"Fn(${ps.map(show).mkString(", ")}) -> ${show(r)}"
@@ -617,7 +625,7 @@ object Type extends TypeQueries {
     var fields: List[(String, Type)] = Nil
 
     /** `@packed` — fields sit at their declared offsets with no interior padding, and the aggregate
-      * needs no alignment of its own (`15 §1`).
+      * needs no alignment of its own (`reference/types.md § Structs`).
       *
       * The two layout facts are separate because they are separate axes: this one is about the gaps
       * *between* fields, `minAlign` about where the whole thing may *start*. A struct may be both,
@@ -631,8 +639,9 @@ object Type extends TypeQueries {
       */
     var minAlign: Option[Int] = None
 
-    /** `@export("b2BodyId")` — the name a generated C header's `typedef` gives this type (`15 §12`),
-      * where `CHeader` otherwise derives one from the mangled instantiation.
+    /** `@export("b2BodyId")` — the name a generated C header's `typedef` gives this type
+      * (`reference/ffi.md § @export`), where `CHeader` otherwise derives one from the mangled
+      * instantiation.
       *
       * **It reaches the header and nothing else.** The emitted aggregate keeps the mangled name
       * `lty` below gives it, which is what every other part of the compiler keys on, and C links
@@ -667,7 +676,8 @@ object Type extends TypeQueries {
     override def toString: String = s"Struct($name)"
   }
 
-  /** A tuple — a positional product with no declaration and no module (`00 §13`).
+  /** A tuple — a positional product with no declaration and no module (`reference/types.md §
+   * Tuples`).
    *
    * **A tuple is a struct**, and not by analogy: it carries the same field list, so it lays out the
    * same way, retains and releases the same way, and is destructured by the same
@@ -697,14 +707,16 @@ object Type extends TypeQueries {
      */
     def shape(n: Int): String = "(" + "," * (n - 1) + ")"
 
-    /** The key an `impl` written for **every tuple at every arity** is filed under (`10 §10`) — the
-     * third and least specific rung of the ladder a tuple's own type and its arity's shape begin.
-     * `[N]` is the same rung one kind down, which is why it is spelled to match.
+    /** The key an `impl` written for **every tuple at every arity** is filed under
+     * (`reference/generics.md § A parameter may stand for a list of types`) — the third and least
+     * specific rung of the ladder a tuple's own type and its arity's shape begin. `[N]` is the same
+     * rung one kind down, which is why it is spelled to match.
      */
     val pack: String = "(..)"
   }
 
-  /** Several results as a **signature** carries them (`12 §5b`) — `-> int, int`.
+  /** Several results as a **signature** carries them (`reference/declarations.md § Several
+   * results`) — `-> int, int`.
    *
    * This is not a type any value has, and that is the whole design: a result list travels from
    * callee to caller and is taken apart there, so it appears in the signature table and nowhere
@@ -882,13 +894,15 @@ object Type extends TypeQueries {
     // `solve` at 8 one body.
     case Vector(n, elem)   => s"vec$n.${mangleOne(elem)}"
     // **A value argument is part of the mangled name**, for exactly the reason a type argument is:
-    // two instantiations that differ only in it are two bodies, and a name that dropped it would let
-    // `total` at length 3 share a body with `total` at length 4 (`10 §9`).
+    // two instantiations that differ only in it are two bodies, and a name that dropped it would
+    // let `total` at length 3 share a body with `total` at length 4 (`reference/generics.md § A
+    // parameter may stand for a value`).
     case ConstArg(v, _)    => s"c$v"
     // A pack carries its length as well as its members, so that two instantiations of one block at
-    // two arities are two bodies — the same reason a value argument is mangled (`10 §10`). The
-    // members alone would already differ, and the count is what keeps the boundary between them
-    // unambiguous when a member's own mangling contains a dot.
+    // two arities are two bodies — the same reason a value argument is mangled
+    // (`reference/generics.md § A parameter may stand for a list of types`). The members alone
+    // would already differ, and the count is what keeps the boundary between them unambiguous when
+    // a member's own mangling contains a dot.
     case Pack(es)          => s"pk${es.length}.${es.map(mangleOne).mkString(".")}"
     // The bit is mangled even though both forms have one layout and one set of instructions, so
     // that a generic instantiated at `[]const T` never shares a body with one instantiated at

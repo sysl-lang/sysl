@@ -151,9 +151,9 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |""".stripMargin) shouldBe "true\n"
   }
 
-  // The bound is `14 §6` working as intended: a body that prints its parameter says so, and the
-  // cost that use imposes is written where the parameter is declared rather than discovered at
-  // whichever call site happened to supply a printable type.
+  // The bound is `library/core.md § Rendering to a sink` working as intended: a body that prints
+  // its parameter says so, and the cost that use imposes is written where the parameter is declared
+  // rather than discovered at whichever call site happened to supply a printable type.
   "a recursive generic function" in {
     run("""countdown[T: Display](n: int, x: T)
           |    if n > 0 then
@@ -815,10 +815,12 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     /** **A call that says nothing about a parameter is sent to the place that would.**
       *
-      * A parameter named by no parameter and by no result is reached by neither of `10 §4`'s two
-      * directions, so `solve` could only report what it failed to find — and what it asked for, an
-      * annotation on the expected type, is impossible advice for an expression that has none. Since
-      * `10 §2` the list may be written at the call, which is the one thing that does settle it.
+      * A parameter named by no parameter and by no result is reached by neither of
+      * `reference/generics.md § Inference is bidirectional`'s two directions, so `solve` could only
+      * report what it failed to find — and what it asked for, an annotation on the expected type,
+      * is impossible advice for an expression that has none. Since `reference/generics.md § []
+      * means type application in a type, indexing in an expression` the list may be written at the
+      * call, which is the one thing that does settle it.
       */
     "a type parameter nothing in the signature mentions is sent to the written list" in {
       val out = err("""scale[const W: usize](xs: []const f32, out: []f32)

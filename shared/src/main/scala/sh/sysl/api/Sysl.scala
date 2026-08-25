@@ -62,9 +62,9 @@ object Sysl {
   /** One file of a program: what to call it in a diagnostic, its text, and the directory it would
    * have sat in.
    *
-   * `dir` is how a module is named without a filesystem — a module is a directory (`13 §1`), so a
-   * file that would live at `std/fs/read.sysl` carries `List("std", "fs")` and one at the project
-   * root carries `Nil`. A single-file program never needs it.
+   * `dir` is how a module is named without a filesystem — a module is a directory
+   * (`reference/modules.md`), so a file that would live at `std/fs/read.sysl` carries `List("std",
+   * "fs")` and one at the project root carries `Nil`. A single-file program never needs it.
    */
   final case class File(name: String, text: String, dir: List[String] = Nil)
 

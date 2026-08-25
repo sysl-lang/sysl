@@ -5,17 +5,19 @@ package sh.sysl
  *
  * ==Identity is two-layered, and this is the layer that is not identity==
  *
- * A module's name is its directory path relative to the project root (`13 §1`), which makes every
- * module name **local and relative** — so a fetched `json` and a project's own `json` are the same
- * name with no domain in the path to separate them. Go does not have this problem because its import
- * path *is* the module name and is globally unique; sysl's rule is the opposite one.
+ * A module's name is its directory path relative to the project root (`reference/modules.md`),
+ * which makes every module name **local and relative** — so a fetched `json` and a project's own
+ * `json` are the same name with no domain in the path to separate them. Go does not have this
+ * problem because its import path *is* the module name and is globally unique; sysl's rule is the
+ * opposite one.
  *
  * The answer is to keep names local and give each package a **canonical prefix** taken from its
  * coordinate, so a module `json` in `github.com/e/sysl-json` is really
  * `github.com.e.sysl-json.json`. That name is what `Modules.qualify` keys tables by and therefore
- * what `15 §2` mangles into every symbol, which is the property that makes two consumers naming one
- * package differently still link one copy of it. What a *file* writes stays short: the prefix is
- * added on the way in, and the leading segment of a written path is read back through this table.
+ * what `reference/modules.md § Separate compilation` mangles into every symbol, which is the
+ * property that makes two consumers naming one package differently still link one copy of it. What
+ * a *file* writes stays short: the prefix is added on the way in, and the leading segment of a
+ * written path is read back through this table.
  *
  * **The mount is never the identity.** If one project mounted a package as `json` and another as
  * `ejson`, a mangler keyed off the local name would emit `json$Parser.next` in one build and
@@ -37,10 +39,10 @@ case class Packages(of: Map[Source, String] = Map.empty, imports: Map[String, Ma
    * *it* calls `json`, while a consumer of that dependency says `json` and may mean something else.
    * Both arrive at one canonical name without ever having to agree on a spelling.
    *
-   * **The whole path is offered and not its first segment**, because what a package binds is a module
-   * path — `sh.sysl.table` for one namespaced by reverse DNS, whose `sh/` holds no source and is
-   * therefore no module of its own (`13 §1`). A single-segment lookup could only ever have found
-   * `sh`, which every such package would claim and none of them declares.
+   * **The whole path is offered and not its first segment**, because what a package binds is a
+   * module path — `sh.sysl.table` for one namespaced by reverse DNS, whose `sh/` holds no source
+   * and is therefore no module of its own (`reference/modules.md`). A single-segment lookup could
+   * only ever have found `sh`, which every such package would claim and none of them declares.
    *
    * The match is by longest key, so a name reaches the most specific package that offers it and
    * anything under that name comes with it: `sh.sysl.table.sub` is answered by `sh.sysl.table` and
@@ -85,9 +87,9 @@ case class LibNeed(who: String, module: String, why: String)
  * Five things and not one, because a package reaches a build by more than one road. Its `.sysl` is
  * **more modules** and joins the compilation's own; the table keeps its module names apart from
  * every other package's; its directory is a tree whose C is compiled and linked beside the
- * program's (`15 §7`, `NativeSources`); what that C needs to *find* is something only the
- * consumer can supply, so the package states it and the driver checks it; and it may name the pair of
- * C functions the whole program allocates through.
+ * program's (`reference/ffi.md § A library may carry C`, `NativeSources`); what that C needs to
+ * *find* is something only the consumer can supply, so the package states it and the driver checks
+ * it; and it may name the pair of C functions the whole program allocates through.
  *
  * The third is here because it was once missing. A package's sysl compiled and its C was dropped
  * with no warning, so a build against any package carrying a shim ended at the linker naming symbols

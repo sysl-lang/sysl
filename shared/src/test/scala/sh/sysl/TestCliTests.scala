@@ -77,9 +77,9 @@ class TestCliTests extends AnyFreeSpec with Matchers {
     }
 
     // A test is ordinary code and takes a visibility like anything else, and a file-private one is
-    // emitted with `internal` linkage (`13 §2`). The runner reaches it from the same module, so that
-    // costs it nothing — but it is worth pinning, because a runner that resolved a test by symbol
-    // from outside would fail on exactly this and on nothing else.
+    // emitted with `internal` linkage (`reference/modules.md § Visibility`). The runner reaches it
+    // from the same module, so that costs it nothing — but it is worth pinning, because a runner
+    // that resolved a test by symbol from outside would fail on exactly this and on nothing else.
     "a file-private test is still one the runner reaches" in {
       assume(Toolchain.clangAvailable, "clang not available")
 

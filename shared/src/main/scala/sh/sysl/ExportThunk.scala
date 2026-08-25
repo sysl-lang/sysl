@@ -2,7 +2,7 @@ package sh.sysl
 
 import ir.{Access, Arg, Inst, LType, Val}
 
-/** The C-callable entry an `@export` publishes (`15 §12`).
+/** The C-callable entry an `@export` publishes (`reference/ffi.md § @export`).
  *
  * **`@export` says the function is callable from C, and a rename is not that.** Until 0137 it was
  * one: the definition took the exported symbol and kept sysl's own parameter lowering, so a C caller

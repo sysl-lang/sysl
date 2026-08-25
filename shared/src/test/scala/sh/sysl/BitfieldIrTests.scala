@@ -86,8 +86,8 @@ class BitfieldIrTests extends AnyFreeSpec with CodegenSupport {
 
   // **`volatile` on a bitfield is a volatile access of the container**, which is what makes a
   // `@packed` struct able to describe the hardware register the feature was asked for. The cost is
-  // stated rather than diagnosed: a write is a read-modify-write, so a register whose reads have side
-  // effects is corrupted by one and nothing here will say so (`15 §1`).
+  // stated rather than diagnosed: a write is a read-modify-write, so a register whose reads have
+  // side effects is corrupted by one and nothing here will say so (`reference/types.md § Structs`).
   "a volatile bitfield is reached through its container" - {
     val reg =
       """|@packed
@@ -129,8 +129,9 @@ class BitfieldIrTests extends AnyFreeSpec with CodegenSupport {
       out should include("load volatile i8")
     }
 
-    // A simple enum is its underlying integer, so it is one load — and `15 §1` names it as the
-    // spelling a mode field wants, which is the whole reason it must be allowed to be volatile.
+    // A simple enum is its underlying integer, so it is one load — and `reference/types.md §
+    // Structs` names it as the spelling a mode field wants, which is the whole reason it must be
+    // allowed to be volatile.
     "a simple enum field may be one" in {
       val src = "enum Mode: u3\n    Off\n    Slow\n    Fast\n" +
         "@packed\nstruct Ctrl\n    enable: volatile u1\n    mode: volatile Mode\n    rest: volatile u4\n" +

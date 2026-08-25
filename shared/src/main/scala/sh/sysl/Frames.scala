@@ -3,7 +3,7 @@ package sh.sysl
 import scala.collection.mutable
 
 /** What a function's `@reads` and `@writes` cover, and the three rules that hold it to them
-  * (`17 §7`).
+  * (`reference/verification.md § @reads and @writes — what a call may touch`).
   *
   * A frame is what makes a call something other than an eraser. Given `f()` with nothing written
   * down, the weakest precondition of anything after the call is `true` — every module variable might
@@ -70,8 +70,9 @@ trait Frames extends ConstFolding {
 
       walk(f.body, r, w, byName, pure, foreign, None)
       // The clauses run on every call, so they are the function's effects as much as its body is.
-      // `17 §7` says reads inside them count, which is the same rule `Purity` applies for the same
-      // reason: an `ensure` that read a module variable would be a frame that did not cover it.
+      // `reference/verification.md § @reads and @writes — what a call may touch` says reads inside
+      // them count, which is the same rule `Purity` applies for the same reason: an `ensure` that
+      // read a module variable would be a frame that did not cover it.
       f.requires.foreach((c, _) => walk(c, r, w, byName, pure, foreign, None))
       f.ensures.foreach((c, _) => walk(c, r, w, byName, pure, foreign, None))
       f.variant.foreach(walk(_, r, w, byName, pure, foreign, None))
@@ -196,8 +197,9 @@ trait Frames extends ConstFolding {
           val gw = g.writes.getOrElse(Set.empty)
           val gr = g.reads.getOrElse(Set.empty) ++ gw
 
-          // The offending *name* is what the diagnostic reports, per `17 §7` — a reader fixing this
-          // needs to know which variable escaped the frame, not that a comparison failed.
+          // The offending *name* is what the diagnostic reports, per `reference/verification.md §
+          // @reads and @writes — what a call may touch` — a reader fixing this needs to know which
+          // variable escaped the frame, not that a comparison failed.
           gw.find(!w(_)).foreach(v =>
             report(here, s"calls '${Modules.show(name)}', which writes '${Modules.show(v)}' — a name " +
               "this function's '@writes' does not have")

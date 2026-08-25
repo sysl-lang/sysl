@@ -18,9 +18,9 @@ class FsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   /** `sysl.fs` is a module of its own, so a program that touches a file says so. Written once and
    * prepended, since what each program below is about is the file and not the import.
    *
-   * `Reader` is named as well as `lines`, because `read` is the trait's member and a trait's members
-   * are reachable where the trait is (`13 §2`) — a program reading a file by the byte has to be able
-   * to write down what makes it readable.
+   * `Reader` is named as well as `lines`, because `read` is the trait's member and a trait's
+   * members are reachable where the trait is (`reference/modules.md § Visibility`) — a program
+   * reading a file by the byte has to be able to write down what makes it readable.
    */
   private val importing =
     "import sysl.fs.*\nimport sysl.io.{lines, Reader}\nimport sysl.text.from_utf8\n\n"

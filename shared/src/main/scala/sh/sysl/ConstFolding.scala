@@ -16,9 +16,9 @@ import scala.collection.mutable
  * expression the programmer actually wrote.
  *
  * A `val` is the other half and needs none of this: its type is **written** rather than inferred
- * (`13 §2`), so it is answered without looking at the initializer, which is what lets one `val` be
- * read from another's neighbourhood with no ordering between them — exactly as two functions may
- * call each other.
+ * (`reference/modules.md § Visibility`), so it is answered without looking at the initializer,
+ * which is what lets one `val` be read from another's neighbourhood with no ordering between them —
+ * exactly as two functions may call each other.
  */
 trait ConstFolding extends ImportResolution {
 
@@ -69,11 +69,12 @@ trait ConstFolding extends ImportResolution {
    * which is what lets a constant be registered in the first hoisting pass and named from an array
    * bound in the second.
    *
-   * **A transparent subtype of a scalar is a scalar**, and is admitted for the reason `16 §1` gives:
-   * without `new` such a type *is* its base, so refusing it here was this rule reaching a case it
-   * was never about. What it buys is the case a `c type` was built for — a typedef whose width the
-   * target decides, and the constants that have to be that width — and, for a written subtype, a
-   * `within` range checked below against a value that is already known.
+   * **A transparent subtype of a scalar is a scalar**, and is admitted for the reason
+   * `reference/errors.md § Constrained types` gives: without `new` such a type *is* its base, so
+   * refusing it here was this rule reaching a case it was never about. What it buys is the case a
+   * `c type` was built for — a typedef whose width the target decides, and the constants that have
+   * to be that width — and, for a written subtype, a `within` range checked below against a value
+   * that is already known.
    */
   protected def constType(key: String): Type = constTypes.getOrElseUpdate(key, {
     val decl = constDecls(key)
@@ -88,8 +89,9 @@ trait ConstFolding extends ImportResolution {
   /** A constrained type as a constant's declared type, or the reason it is not one.
    *
    * **`new` is refused because reaching a distinct type from its base is a written conversion**
-   * (`16 §2`), in both directions and with no position excused — and a constant is the literal it
-   * was written as, so there is nowhere on the line for the conversion to go.
+   * (`reference/errors.md § new is what makes it a type`), in both directions and with no position
+   * excused — and a constant is the literal it was written as, so there is nowhere on the line for
+   * the conversion to go.
    *
    * **A `where` predicate is refused because there is no site to run it at.** A predicate is a sysl
    * function, checked where a value is *made* (`16`), and a constant is folded into every use rather
@@ -111,9 +113,10 @@ trait ConstFolding extends ImportResolution {
 
   /** A constant's value, as the literal every use of it is folded to.
    *
-   * Memoized, and guarded against a constant defined in terms of itself. The cycle is reported once,
-   * at whichever of them the walk reached first, naming the loop in the order it was followed —
-   * which is the same account `13 §6` gives of a cycle between modules.
+   * Memoized, and guarded against a constant defined in terms of itself. The cycle is reported
+   * once, at whichever of them the walk reached first, naming the loop in the order it was followed
+   * — which is the same account `reference/modules.md § The module graph is acyclic` gives of a
+   * cycle between modules.
    */
   protected def constLiteral(key: String): Expr = constLits.getOrElseUpdate(key, {
     val decl = constDecls(key)
@@ -200,7 +203,7 @@ trait ConstFolding extends ImportResolution {
     case _           => "not a constant"
 
   /** The literal a bound **value parameter** stands for, which is decided by the type it was
-   * declared with (`10 §9`).
+   * declared with (`reference/generics.md § A parameter may stand for a value`).
    *
    * The argument travels as a `BigInt` because that is what a type's identity needs — something
    * that compares and mangles — and the declared type is what says how to read it back. A `bool`
@@ -215,10 +218,10 @@ trait ConstFolding extends ImportResolution {
   /** The other direction: the number a written value argument stands for, or `None` where it is not
    * a value an identity can be made of.
    *
-   * The admissible set is `10 §9`'s and the reason is one sentence — a value in a type's identity
-   * must compare and must mangle. An integer, a `bool` and a `char` each do; a float does not
-   * (`NaN != NaN` would make a type unequal to itself) and a string does not until two spellings of
-   * one text are one value.
+   * The admissible set is `reference/generics.md § A parameter may stand for a value`'s and the
+   * reason is one sentence — a value in a type's identity must compare and must mangle. An integer,
+   * a `bool` and a `char` each do; a float does not (`NaN != NaN` would make a type unequal to
+   * itself) and a string does not until two spellings of one text are one value.
    */
   protected def constArgValue(e: Expr, subst: Map[String, Type] = Map.empty): Option[BigInt] =
     fold(e, subst).collect {
@@ -249,9 +252,9 @@ trait ConstFolding extends ImportResolution {
 
   /** The type a module-level `val` was declared with.
    *
-   * Written rather than inferred (`13 §2`), which is what lets this be answered without looking at
-   * the initializer — so one `val` may be read from another's neighbourhood with no ordering
-   * between them, exactly as two functions may call each other.
+   * Written rather than inferred (`reference/modules.md § Visibility`), which is what lets this be
+   * answered without looking at the initializer — so one `val` may be read from another's
+   * neighbourhood with no ordering between them, exactly as two functions may call each other.
    */
   protected def globalType(key: String): Type = valTypes.getOrElseUpdate(key, {
     inDecl(key)(staticVarDecls.get(key).orElse(valDecls.get(key)) match
@@ -413,17 +416,19 @@ trait ConstFolding extends ImportResolution {
 
     // A **value parameter** is asked before a declared constant, and shadows one of the same name
     // for the same reason a type parameter shadows a type: the nearer binding is the one written
-    // where the name is (`10 §9`). During the walk that checks a generic body there is no argument
-    // bound yet, so the name simply is not in the substitution and falls through — `constInt`'s
-    // caller reads that as awaiting instantiation, exactly as it already does for `sizeof(T)`.
+    // where the name is (`reference/generics.md § A parameter may stand for a value`). During the
+    // walk that checks a generic body there is no argument bound yet, so the name simply is not in
+    // the substitution and falls through — `constInt`'s caller reads that as awaiting
+    // instantiation, exactly as it already does for `sizeof(T)`.
     case Ident(n) =>
       subst.get(n).collect { case c: Type.ConstArg => constArgLiteral(c) }
         .orElse(constKey(n).map(k => constLiteral(k)))
 
-    // `A.len` — how many types a **pack** stands for (`10 §10`), which is a compile-time integer and
-    // folds as one. It is here as well as in the analyzer because the range of a `for const` is read
-    // *before* anything is analyzed: the loop has to know how many copies to make before it can make
-    // one. During the walk that checks a generic body the pack stands at two, so this is 2 there.
+    // `A.len` — how many types a **pack** stands for (`reference/generics.md § A parameter may
+    // stand for a list of types`), which is a compile-time integer and folds as one. It is here as
+    // well as in the analyzer because the range of a `for const` is read *before* anything is
+    // analyzed: the loop has to know how many copies to make before it can make one. During the
+    // walk that checks a generic body the pack stands at two, so this is 2 there.
     case Field(Ident(n), "len") =>
       subst.get(n).collect { case Type.Pack(elems) => IntLit(BigInt(elems.length), None) }
 
@@ -459,10 +464,10 @@ trait ConstFolding extends ImportResolution {
     case Compare(List(l, r), List(op)) =>
       for (a <- fold(l, subst); b <- fold(r, subst); v <- binary(op, a, b)) yield v
 
-    // `sizeof(T)` and `alignof(T)` are compile-time constants (`03 § Reinterpreting storage`), so
-    // they fold exactly as a literal does. That is what makes them usable in the two positions this
-    // folder serves — an array bound and an enum discriminant — as well as in a `const`, which is
-    // where a program names the block size a slab is laid out in.
+    // `sizeof(T)` and `alignof(T)` are compile-time constants (`reference/memory.md §
+    // Reinterpreting storage`), so they fold exactly as a literal does. That is what makes them
+    // usable in the two positions this folder serves — an array bound and an enum discriminant — as
+    // well as in a `const`, which is where a program names the block size a slab is laid out in.
     //
     // **The substitution is what lets the measured type be the caller's own parameter.** A generic
     // body is analyzed once per instantiation with its parameters bound to the concrete arguments
@@ -567,7 +572,8 @@ trait ConstFolding extends ImportResolution {
         case _                => false
     // A **value parameter** during the walk that checks the generic body: it is bound to the same
     // `Abstract` stand-in a type parameter gets, so it does not fold and is not an error either
-    // (`10 §9`). A name bound to a `ConstArg` is not here, because that one folds.
+    // (`reference/generics.md § A parameter may stand for a value`). A name bound to a `ConstArg`
+    // is not here, because that one folds.
     case Ident(n) =>
       subst.get(n).exists(_.isInstanceOf[Type.Abstract])
     case Unary(_, operand)             => awaitsInstantiation(operand, subst)

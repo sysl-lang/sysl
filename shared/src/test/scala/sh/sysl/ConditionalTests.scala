@@ -242,9 +242,10 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
         withClue(t.name)(Conditional.defined(t).intersect(Set("android", "linux")).size should be <= 1)
     }
 
-    // The equation `13 § 5` rests on: a directory selects on what an operating system alone settles,
-    // so every symbol a `__<os>__` folder may name has to be one a `#if` names too. A new operating
-    // system is where that could quietly come apart, since the two sets are derived separately.
+    // The equation `reference/modules.md § Platform selection` rests on: a directory selects on
+    // what an operating system alone settles, so every symbol a `__<os>__` folder may name has to
+    // be one a `#if` names too. A new operating system is where that could quietly come apart,
+    // since the two sets are derived separately.
     "a new operating system reaches the directory vocabulary and the '#if' one alike" in {
       Conditional.directorySymbols should contain("android")
       Conditional.directorySymbols.subsetOf(Conditional.symbols) shouldBe true

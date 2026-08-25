@@ -1,6 +1,7 @@
 package sh.sysl
 
-/** Turning `_` into a closure (`12 §5c`).
+/** Turning `_` into a closure (`reference/expressions.md § _ — a parameter with the name left
+ * out`).
  *
  * A placeholder is read as an ordinary operand, and the closure it belongs to is decided by
  * *position* rather than by anything the operand itself carries. So the work happens where the
@@ -72,7 +73,7 @@ object Placeholders {
         Lambda(params, List(ExprStmt(e).setPos(e.pos))).setPos(e.pos)
 
   /** A call argument, which is a boundary except for the one case that would leave the closure
-   * empty (`12 §5c`).
+   * empty (`reference/expressions.md § _ — a parameter with the name left out`).
    *
    * A bare `_` is handed back untouched so the *call* closes over it — `f(_, 0)` is `x -> f(x, 0)`,
    * and lifting here would have made it `f(x -> x, 0)` instead, which is a different program and

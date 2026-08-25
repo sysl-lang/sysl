@@ -32,11 +32,11 @@ case class IdentPattern(name: String) extends Pattern
  * a bare name binds unless something answers to it, so a reader cannot tell a test from a binding
  * without knowing what is in scope. The backticks say which was meant, at the site.
  *
- * A `const` folds to the literal test it always did (`13 §Constants`). Anything else — a `val`, an
- * `extern` variable, a local, a parameter — is storage read where the match runs, so the arm
- * becomes a runtime equality against whatever it holds then. That is a test the compiler cannot
- * reason about, so such an arm contributes nothing to exhaustiveness and a catch-all stays
- * required.
+ * A `const` folds to the literal test it always did (`reference/modules.md § const — a value`).
+ * Anything else — a `val`, an `extern` variable, a local, a parameter — is storage read where the
+ * match runs, so the arm becomes a runtime equality against whatever it holds then. That is a test
+ * the compiler cannot reason about, so such an arm contributes nothing to exhaustiveness and a
+ * catch-all stays required.
  */
 case class EqPattern(name: String) extends Pattern
 
@@ -53,8 +53,8 @@ case class VariantPattern(name: String, args: List[Pattern]) extends Pattern
  */
 case class StructPattern(name: String, fields: List[(String, Pattern)]) extends Pattern
 
-/** `(a, b)` — matches a tuple, one sub-pattern per part (`00 §13`). It is the positional struct
- * pattern with the name left off, which is all a tuple has to leave off.
+/** `(a, b)` — matches a tuple, one sub-pattern per part (`reference/types.md § Tuples`). It is the
+ * positional struct pattern with the name left off, which is all a tuple has to leave off.
  */
 case class TuplePattern(args: List[Pattern]) extends Pattern
 

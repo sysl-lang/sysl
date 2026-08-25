@@ -349,9 +349,9 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
     }
   }
 
-  /** A library built **on another library** — what `--lib` means at `build-lib` (`15 §7`). `sdl3-ttf`
-   * is the case in the org: it declares `Font` in terms of `sdl3`'s `Surface`, so without the other
-   * library's declarations it does not compile at all.
+  /** A library built **on another library** — what `--lib` means at `build-lib` (`reference/ffi.md
+   * § A library may carry C`). `sdl3-ttf` is the case in the org: it declares `Font` in terms of
+   * `sdl3`'s `Surface`, so without the other library's declarations it does not compile at all.
    *
    * The claim worth pinning is the same one separate compilation rests on everywhere else: **a
    * library defines its own modules and nobody else's.** Folded in with the dependent's own files the
@@ -556,11 +556,11 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
 
   /** `LibraryArtifact.collisions`, on the one member name that would evict the library itself.
    *
-   * It is pinned here rather than through the CLI because `15 §7` takes a tree's C from a module or
-   * its root and from nowhere else, so a plain `sysl/` directory of C is skipped before this is ever
-   * consulted. **The guard is still live for the one build whose modules really are `sysl/…`** — a
-   * `build-lib --std` over the standard library — and that build is far too expensive to reach for
-   * an assertion about a string.
+   * It is pinned here rather than through the CLI because `reference/ffi.md § A library may carry
+   * C` takes a tree's C from a module or its root and from nowhere else, so a plain `sysl/`
+   * directory of C is skipped before this is ever consulted. **The guard is still live for the one
+   * build whose modules really are `sysl/…`** — a `build-lib --std` over the standard library — and
+   * that build is far too expensive to reach for an assertion about a string.
    */
   "the member name a library's own compiled half uses" - {
 

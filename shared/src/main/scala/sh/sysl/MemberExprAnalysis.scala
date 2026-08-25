@@ -38,10 +38,11 @@ trait MemberExprAnalysis extends ExprSupport {
     case Field(Ident(written), f) if lookupOpt(written).isEmpty && typeKey(written).exists(structDecls.contains) =>
       structMember(typeKey(written).get, written, f)
 
-    /** `A.len` — how many types a **pack** stands for (`10 §10`), which is what an unrolled loop
-     * counts against. It is a compile-time integer and folds into its use as one, exactly as an
-     * array's length does where the length is known: the tuple `(..A)` denotes is the same length,
-     * so the two spellings agree by construction.
+    /** `A.len` — how many types a **pack** stands for (`reference/generics.md § A parameter may
+     * stand for a list of types`), which is what an unrolled loop counts against. It is a
+     * compile-time integer and folds into its use as one, exactly as an array's length does where
+     * the length is known: the tuple `(..A)` denotes is the same length, so the two spellings agree
+     * by construction.
      *
      * `len` and no other name, because a pack is not a value and has no other member to read. A pack
      * bound to nothing cannot reach here — the substitution holds one wherever the body is walked.
@@ -88,8 +89,9 @@ trait MemberExprAnalysis extends ExprSupport {
         // selection. An index past the end is worth its own complaint: nothing about "no property
         // '3'" tells a reader that what they wrote was one part too far.
         case t: Type.Tuple =>
-          // A **compile-time constant** selects a part by its value, which is what makes one written
-          // line cover parts of different types inside a `for const` (`10 §10`). It is the same
+          // A **compile-time constant** selects a part by its value, which is what makes one
+          // written line cover parts of different types inside a `for const`
+          // (`reference/generics.md § A parameter may stand for a list of types`). It is the same
           // selection `t.0` already is, with the position arriving as a constant rather than as a
           // literal — so an index past the end is the same complaint, said about the name that
           // carried it.
@@ -107,8 +109,9 @@ trait MemberExprAnalysis extends ExprSupport {
               else readProperty(tr, t, f, via)
 
         // A struct's fields have names, and a number does not address one — so a compile-time index
-        // is refused here rather than falling through to a complaint about a missing property, which
-        // would send a reader looking for a field they never meant to name (`10 §10`).
+        // is refused here rather than falling through to a complaint about a missing property,
+        // which would send a reader looking for a field they never meant to name
+        // (`reference/generics.md § A parameter may stand for a list of types`).
         case s: Type.Struct if constSelector(f).isDefined && s.fieldIndex(f) < 0 =>
           err(s"'$f' is a compile-time index, and ${show(s)} is a struct — its fields are reached " +
             "by name, and a position addresses the parts of a tuple")
@@ -118,7 +121,8 @@ trait MemberExprAnalysis extends ExprSupport {
           if idx >= 0 then
             checkFieldVisible(s.base, f)
             // Whatever qualifier the field was declared with stays in the struct's field list and
-            // comes off here: reading a register yields an ordinary value (`03 § Device memory`).
+            // comes off here: reading a register yields an ordinary value (`reference/memory.md §
+            // Device memory`).
             TField(tr, idx, Type.unqualified(s.fields(idx)._2))
           else readProperty(tr, s, f, via)
 
@@ -127,8 +131,9 @@ trait MemberExprAnalysis extends ExprSupport {
 
         // A bound promises behaviour, and a property is behaviour spelled like a field — so this is
         // a bound's to license after all, and it is checked at the definition like every other use
-        // of a parameter. What no bound reaches is a real *field*: that is layout, which is `10 §5`'s
-        // rule and the complaint left when nothing declares a property of the name.
+        // of a parameter. What no bound reaches is a real *field*: that is layout, which is
+        // `reference/generics.md § Bounds`'s rule and the complaint left when nothing declares a
+        // property of the name.
         case a: Type.Abstract => readBoundProperty(a, tr, f)
         // `len`, `bytes` and `chars` are the compiler-provided members: `len` a property on every
         // array, slice, and string, `bytes` the reinterpretation of a string's three words
@@ -162,9 +167,10 @@ trait MemberExprAnalysis extends ExprSupport {
         case other if hasMember(other, f) => readProperty(tr, other, f, via)
 
         // Still a mode after the one automatic dereference, so the receiver carries more
-        // indirection than selection reaches through (`03 § Places`). Falling through to the line
-        // below names what is *left* after that dereference — a type the reader never wrote — and
-        // says the field does not exist, when it does and the shorthand simply stops short of it.
+        // indirection than selection reaches through (`reference/memory.md § Places`). Falling
+        // through to the line below names what is *left* after that dereference — a type the reader
+        // never wrote — and says the field does not exist, when it does and the shorthand simply
+        // stops short of it.
         case _: Type.Ptr | _: Type.Ref =>
           err(s"selection reaches through one level of indirection and ${show(outer.ty)} has more, " +
             s"so the rest is written: '(*x).$f' reads '$f' off the ${show(tr.ty)} it leaves")
@@ -368,7 +374,7 @@ trait MemberExprAnalysis extends ExprSupport {
     case concrete         => TIntLit(typeIdOf(concrete), Type.usize)
 
   /** `T::Min` and `T::Max` where `T` is a **type parameter**, answered from what the instantiation
-   * bound it to (`10`, `16 §5`).
+   * bound it to (`10`, `reference/errors.md § What the type's own name offers: :: attributes`).
    *
    * **The substitution is the same one three other forms already read.** `sizeof(T)` resolves its
    * operand through `tsubst`, `T(x)` finds its target through `typeNamed`, and `T.f(…)` reaches the
@@ -478,8 +484,9 @@ trait MemberExprAnalysis extends ExprSupport {
         err(s"'${qn(key)}' is a trait, not a value, and declares no member '$f'")
 
   /** A type attribute `T::Attr`, with the arguments a call form supplied (empty for the bare form).
-   * Dispatched on the kind of type `T` is: a constrained subtype (`16 §5`) or a simple enum
-   * (`09 §2`), which are the two that have questions to answer about their own value sets.
+   * Dispatched on the kind of type `T` is: a constrained subtype (`reference/errors.md § What the
+   * type's own name offers: :: attributes`) or a simple enum (`reference/types.md § Enums`), which
+   * are the two that have questions to answer about their own value sets.
    */
   protected def typeAttr(key: String, attr: String, args: List[Expr]): TExpr =
     // An alias has no attributes of its own, because it declares no type — the question belongs to
@@ -544,13 +551,13 @@ trait MemberExprAnalysis extends ExprSupport {
       // should not have to learn that a subtype of `u32` renamed it.
       //
       // **An end the declaration does not narrow is the base's**, because that is what the type can
-      // hold. This is the case a `c type` (`15 §7`) is always in — it lowers to a transparent subtype
-      // carrying no range at all — and asking a measured `size_t` for its maximum is asking about the
-      // integer C said it is. A `where` predicate is the exception and keeps the refusal: it narrows
-      // the type without saying where to, so its extremes are not something to read off a
-      // declaration. `First` and `Last` still need a range whatever the predicate says, and that
-      // asymmetry is the same one the paragraph above draws — they name the ends of a range as
-      // *written*, and an unranged subtype has none.
+      // hold. This is the case a `c type` (`reference/ffi.md § A library may carry C`) is always in
+      // — it lowers to a transparent subtype carrying no range at all — and asking a measured
+      // `size_t` for its maximum is asking about the integer C said it is. A `where` predicate is
+      // the exception and keeps the refusal: it narrows the type without saying where to, so its
+      // extremes are not something to read off a declaration. `First` and `Last` still need a range
+      // whatever the predicate says, and that asymmetry is the same one the paragraph above draws —
+      // they name the ends of a range as *written*, and an unranged subtype has none.
       case "Min" => noArgs(); TIntLit(extreme(c.lo, Type.minOf(base)), c)
       case "Max" =>
         noArgs()
@@ -564,16 +571,16 @@ trait MemberExprAnalysis extends ExprSupport {
 
   /** The attributes a **built-in integer type** exposes: its bounds, `Min` and `Max`.
    *
-   * A `within`-ranged subtype has answered `First`/`Last` since `16 §5`, and the integer it is
-   * declared *over* answered nothing — so a type derived from `u32` could state its bounds and
-   * `u32` could not. This closes that, and does it under different names on purpose: `First` and
-   * `Last` are the ends of a *declared sequence*, `Min` and `Max` the numeric extremes a type can
-   * hold. They agree on an integer and part company on an enum, whose first-declared variant need
-   * not carry the smallest discriminant.
+   * A `within`-ranged subtype has answered `First`/`Last` since `reference/errors.md § What the
+   * type's own name offers: :: attributes`, and the integer it is declared *over* answered nothing
+   * — so a type derived from `u32` could state its bounds and `u32` could not. This closes that,
+   * and does it under different names on purpose: `First` and `Last` are the ends of a *declared
+   * sequence*, `Min` and `Max` the numeric extremes a type can hold. They agree on an integer and
+   * part company on an enum, whose first-declared variant need not carry the smallest discriminant.
    *
    * Both fold to a literal here, which is what lets them appear in a `const` initializer and in an
-   * `@assert` condition — neither admits a call (`13 §5`), so an attribute that resolved as one
-   * would be unusable in the two places bounds are most wanted.
+   * `@assert` condition — neither admits a call (`reference/modules.md § Platform selection`), so
+   * an attribute that resolved as one would be unusable in the two places bounds are most wanted.
    */
   protected def integerAttr(i: Type.Integer, written: String, attr: String, args: List[Expr]): TExpr = {
     def noArgs(): Unit = if args.nonEmpty then err(s"'$written::$attr' takes no arguments")
@@ -630,7 +637,9 @@ trait MemberExprAnalysis extends ExprSupport {
    * been either a field or a property, while an enum and a built-in have no fields to have meant.
    */
   /** The value a selector stands for where it names a **compile-time constant** rather than a field
-   * — the loop variable of a `for const`, or a value parameter (`10 §9`, `10 §10`).
+   * — the loop variable of a `for const`, or a value parameter (`reference/generics.md § A
+   * parameter may stand for a value`, `reference/generics.md § A parameter may stand for a list of
+   * types`).
    *
    * A local of the same name is not consulted and does not shadow this, because a selector is not a
    * name being read: `t.i` asks for a part of `t`, and what a variable called `i` happens to hold at

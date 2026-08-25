@@ -1,6 +1,7 @@
 package sh.sysl
 
-/** `@ghost` — what exists for the specification alone (`17 §8`).
+/** `@ghost` — what exists for the specification alone (`reference/verification.md § @ghost — what
+ * costs nothing to say`).
  *
  * **The problem it solves is asymptotic rather than aesthetic.** Everything else in `17` executes,
  * which is `§1` and is what keeps a clause from meaning two things. The one place that costs more

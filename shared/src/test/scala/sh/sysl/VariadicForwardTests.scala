@@ -7,8 +7,8 @@ import org.scalatest.freespec.AnyFreeSpec
  *
  * This is C's `vprintf` shape: the function that received the tail does not read it itself but
  * passes it to somebody who does. The parameter type is **`*va_list`** and the call writes `&ap`,
- * because a parameter is a by-value binding (`12 §2`) and a copy of a walk advances nothing the
- * caller can see — which is the one thing the form exists to do.
+ * because a parameter is a by-value binding (`reference/declarations.md § Functions`) and a copy of
+ * a walk advances nothing the caller can see — which is the one thing the form exists to do.
  *
  * The tests that carry the weight are the ones that *run*. A lent walk advancing the lender's own
  * list is not something the IR can be read for, and it is the whole claim.
@@ -130,9 +130,10 @@ class VariadicForwardTests extends AnyFreeSpec with CodegenSupport with RunSuppo
       run(src) shouldBe "6\n"
     }
 
-    // `12 §9` says a `*va_list` is an ordinary raw pointer and is refused nowhere — the struct
-    // above is one half of that and a *result* is the other, which is the half a `va_list` itself
-    // is refused at. A walk handed straight out of a call is still the lender's own.
+    // `reference/ffi.md § Variadic functions` says a `*va_list` is an ordinary raw pointer and is
+    // refused nowhere — the struct above is one half of that and a *result* is the other, which is
+    // the half a `va_list` itself is refused at. A walk handed straight out of a call is still the
+    // lender's own.
     "and may be returned, since it is a pointer like any other" in {
       val src =
         """lend(ap: *va_list) -> *va_list = ap

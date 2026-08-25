@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** The module graph is acyclic (`13 §6`).
+/** The module graph is acyclic (`reference/modules.md § The module graph is acyclic`).
  *
  * What the rule is about is the **reference** graph: a qualified path reaches another module with
  * no import at all, so an edge is whatever resolution found, and an import adds one of its own. The
@@ -190,9 +190,9 @@ class ModuleGraphTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       ) shouldBe "42\n"
     }
 
-    // The standard module is auto-imported everywhere, so it is outside the dependency graph (`13
-    // §6`) — if a use of `print` were an edge, every named module would depend on it and the
-    // library's own files would depend on themselves.
+    // The standard module is auto-imported everywhere, so it is outside the dependency graph
+    // (`reference/modules.md § The module graph is acyclic`) — if a use of `print` were an edge,
+    // every named module would depend on it and the library's own files would depend on themselves.
     "a module that prints, reached from a root file that prints" in {
       runIn(
         ("", "main.sysl", "print(geom.twice(21))"),
@@ -225,8 +225,8 @@ class ModuleGraphTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     // second dependency running the other way.
     "a trait whose default is copied into another module's type" in {
       runIn(
-        // The trait is imported and the struct is not: `twice` comes with `a.Show` (`13 §2`), while
-        // `b.P` is named where it is used.
+        // The trait is imported and the struct is not: `twice` comes with `a.Show`
+        // (`reference/modules.md § Visibility`), while `b.P` is named where it is used.
         ("", "main.sysl", "import a.Show\nprint(b.P(1).twice())"),
         ("a", "a.sysl", "module a\ntrait Show\n    n(self) -> int\n    twice(self) -> int = self.n() * 2"),
         ("b", "b.sysl", "module b\nstruct P[T]\n    v: T\nimpl[T] a.Show for P[T]\n    n(self) -> int = 21"),

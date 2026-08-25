@@ -67,11 +67,12 @@ trait MemberLowering extends TypeResolution {
    *     across the two ways a composed type can come by one.
    *   - `selfRef` is the receiver's type as written, so a `self` parameter needs no reconstructing.
    *   - `tparams` are the parameters a member's signature may mention — a generic type's own, or a
-   *     generic `impl`'s, **in the order the implementing type applies them**, so that instantiating
-   *     a member from a receiver's type arguments substitutes them positionally. `bounds` is what
-   *     was asked of them where they were declared, and it is what the members may assume.
-   *     `tvalues` says which of them stand for **values** (`10 §9`) and at what type, since a
-   *     member's body reads one of those as the constant it is rather than as an opaque type.
+   * generic `impl`'s, **in the order the implementing type applies them**, so that instantiating a
+   * member from a receiver's type arguments substitutes them positionally. `bounds` is what was
+   * asked of them where they were declared, and it is what the members may assume. `tvalues` says
+   * which of them stand for **values** (`reference/generics.md § A parameter may stand for a
+   * value`) and at what type, since a member's body reads one of those as the constant it is rather
+   * than as an opaque type.
    *   - `taken` are the names already spoken for inside the body (a struct's fields, an enum's
    *     variants), and `noun` what a diagnostic calls one of those.
    *   - `self` is what `Self` means inside these members, empty where the answer waits for an
@@ -108,9 +109,10 @@ trait MemberLowering extends TypeResolution {
       fromTrait: Option[String] = None,
       overrides: Boolean = false,
       tvalues: Map[String, TypeRef] = Map.empty,
-      /** Which of `tparams` stand for a **list** of types (`10 §10`) — carried for the reason
-        * `tvalues` is, so a member's body is walked with the pack standing at what a pack stands at
-        * rather than at one `Abstract` that has no parts for `self.i` to reach.
+      /** Which of `tparams` stand for a **list** of types (`reference/generics.md § A parameter may
+        * stand for a list of types`) — carried for the reason `tvalues` is, so a member's body is
+        * walked with the pack standing at what a pack stands at rather than at one `Abstract` that
+        * has no parts for `self.i` to reach.
         */
       tpacks: Set[String] = Set.empty,
   ) {
@@ -161,7 +163,8 @@ trait MemberLowering extends TypeResolution {
    * The declarations come back so that a caller with something further to do with them — a generic
    * `impl`, whose members are checked at their definition — needs no second walk to find them.
    */
-  /** Turns each bare-arrow parameter into the bounded type parameter it is sugar for (`12 §6`).
+  /** Turns each bare-arrow parameter into the bounded type parameter it is sugar for
+   * (`reference/types.md § Function types`).
    *
    * `map(self, f: A -> B)` is `map[$F: Fn(A) -> B](self, f: $F)`, and the rewrite happens at the
    * declaration so that *everything* after it — resolving the signature, inferring the argument,
@@ -253,9 +256,9 @@ trait MemberLowering extends TypeResolution {
       //
       // A name some **other trait** already gave the type is not a collision, and the block was
       // given a suffix of its own above so that it is not one here either: the two members are told
-      // apart by which trait is in scope at the use (`13 §2`). What still collides is a name the
-      // type's **own** body has, which is reachable wherever the type is and so has no scope to be
-      // told apart by.
+      // apart by which trait is in scope at the use (`reference/modules.md § Visibility`). What
+      // still collides is a name the type's **own** body has, which is reachable wherever the type
+      // is and so has no scope to be told apart by.
       val filed = m.name + home.alt
 
       // Both messages name the member the way it was **written**, which for a setter is the
@@ -292,9 +295,10 @@ trait MemberLowering extends TypeResolution {
           composedMembers((h, m.name)) = home.label
 
       for ty <- home.self.get(selfName) do
-        // A built-in's catalog methods are the compiler's (`14 §5`), and member lookup would find a
-        // member of the same name first — so an `impl` of some *other* trait may not quietly take
-        // `5.add` over from the `Add` the type is already a member of.
+        // A built-in's catalog methods are the compiler's (`reference/expressions.md § Operator
+        // dispatch`), and member lookup would find a member of the same name first — so an `impl`
+        // of some *other* trait may not quietly take `5.add` over from the `Add` the type is
+        // already a member of.
         for tr <- CoreTraits.declaring(m.name) if CoreTraits.builtin(tr, ty) do
           err(s"'${m.name}' is how '$tr' is implemented for ${show(ty)}, and the compiler provides " +
             s"that — a member of this name would hide it")
@@ -319,12 +323,12 @@ trait MemberLowering extends TypeResolution {
       // records nothing, and that absence is what makes its members reachable wherever the type is.
       for tr <- home.fromTrait do memberTrait((home.key, filed)) = tr
 
-      // **A destructor has no caller in the source**, which is the one thing that makes it different
-      // from every other member here: what calls it is the release hook the emitter builds, and that
-      // is decided by a payload type at a site with no name in it. So nothing would mark it reached,
-      // and pruning would drop the body while the hook still named it — a link error against a
-      // symbol no line of the program mentions. Marked at the declaration instead
-      // (`03 § A destructor`).
+      // **A destructor has no caller in the source**, which is the one thing that makes it
+      // different from every other member here: what calls it is the release hook the emitter
+      // builds, and that is decided by a payload type at a site with no name in it. So nothing
+      // would mark it reached, and pruning would drop the body while the hook still named it — a
+      // link error against a symbol no line of the program mentions. Marked at the declaration
+      // instead (`reference/memory.md § A destructor`).
       if filed == "drop" && home.fromTrait.contains(Library.key("Drop")) then dropsDeclared += home.key
 
       // A name a program spells that now reaches more than one member is recorded as reaching all of
@@ -380,7 +384,8 @@ trait MemberLowering extends TypeResolution {
         memberFuncs((home.key, filed)) = fd.name
 
         // The destructor is the one member nothing in the source reaches, so nothing else would
-        // mark it (`03 § A destructor`). Marked here, where the lowered name exists.
+        // mark it (`reference/memory.md § A destructor`). Marked here, where the lowered name
+        // exists.
         if filed == "drop" && home.fromTrait.contains(Library.key("Drop")) then funcsUsed += fd.name
 
       // A member is a function with a receiver in front, so the rules a signature is held to are

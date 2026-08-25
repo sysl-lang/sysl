@@ -134,10 +134,10 @@ class HashingTests extends AnyFreeSpec with Matchers {
     }
 
     // The hash covers what the package *is*, not the part of it a compiler happens to parse. A
-    // package's C is compiled and linked into whoever depends on it (`15 §7`), so a listing that
-    // took only `.sysl` would let a shim be swapped under a `sysl.sum` that still verified — and
-    // that is the one file in a package that can reach a system call without a line of sysl saying
-    // so. `packages.md § 6` is only worth what it covers.
+    // package's C is compiled and linked into whoever depends on it (`reference/ffi.md § A library
+    // may carry C`), so a listing that took only `.sysl` would let a shim be swapped under a
+    // `sysl.sum` that still verified — and that is the one file in a package that can reach a
+    // system call without a line of sysl saying so. `packages.md § 6` is only worth what it covers.
     "a C file beside the sysl, which is as much of the package as the sysl is" in {
       val one = treeOf("a.sysl" -> "one\n", "shim.c" -> "int f(void) { return 1; }\n")
       val two = treeOf("a.sysl" -> "one\n", "shim.c" -> "int f(void) { return 2; }\n")

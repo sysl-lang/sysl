@@ -50,7 +50,8 @@ class MemoryModeParserTests extends AnyFreeSpec with ParseSupport {
       )
     }
 
-    // `03 § weak T` — the third mode, written as a reserved word rather than a sigil.
+    // `reference/memory.md § weak T — breaking cycles` — the third mode, written as a reserved word
+    // rather than a sigil.
     "'weak' applies to a type the way the sigils do" in {
       prog("var w: weak Node = a") shouldBe
         List(VarDecl("w", Some(WeakType(NamedType("Node"))), Some(Ident("a"))))
@@ -61,8 +62,9 @@ class MemoryModeParserTests extends AnyFreeSpec with ParseSupport {
         List(VarDecl("w", Some(ArrayType(None, WeakType(NamedType("Node")))), Some(Ident("a"))))
     }
 
-    // An atomic object has no weak form yet (`03 § weak sync T`), and the refusal is at the
-    // spelling so a reader is told which chapter it waits on rather than "newline expected".
+    // An atomic object has no weak form yet (`reference/memory.md § Crossing a concurrency
+    // domain`), and the refusal is at the spelling so a reader is told which chapter it waits on
+    // rather than "newline expected".
     "'weak sync T' says which chapter it is waiting for" in {
       progError("var w: weak sync Node = a") should include("wants the concurrency model of '06'")
     }

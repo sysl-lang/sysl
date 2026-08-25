@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Storage sized while running (`07 §Storage sized while running`).
+/** Storage sized while running (`reference/arrays.md § Storage sized while running`).
  *
  * Every other array form fixes its length in the type, which is the one thing a program reading a
  * file cannot do — the size is in the header, and the header is read by the code that wants the
@@ -131,8 +131,9 @@ class HeapBufferTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       ) shouldBe "21\n"
     }
 
-    // "Taking a slice retains the owner, dropping one releases it" (`07 §Ownership`). The view the
-    // buffer arrived as is gone by the time this is read; the sub-slice is what keeps it alive.
+    // "Taking a slice retains the owner, dropping one releases it" (`reference/arrays.md § What a
+    // view keeps alive`). The view the buffer arrived as is gone by the time this is read; the
+    // sub-slice is what keeps it alive.
     "a sub-slice outlives the view its storage came from" in {
       run(
         """make(n: usize) -> []int
@@ -194,7 +195,8 @@ class HeapBufferTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
 
     // The elements are reachable only from the hook that destroys them, which is why the count is
-    // in the box: a slice's owner arrives with no static type to consult (`03`, `07 §Ownership`).
+    // in the box: a slice's owner arrives with no static type to consult (`03`,
+    // `reference/arrays.md § What a view keeps alive`).
     "so the deallocation hook walks them" in {
       val out = defineOf(
         ir(

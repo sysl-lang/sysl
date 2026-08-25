@@ -1,6 +1,7 @@
 package sh.sysl
 
-/** Operators, which are trait-method calls with a token for a name (`14 §3`).
+/** Operators, which are trait-method calls with a token for a name (`reference/expressions.md §
+ * Operator dispatch`).
  *
  * `a + b` means `Add::add(a, b)` and type-checks iff the type of `a` satisfies `Add` **at the type
  * of `b`** — one rule, applied the same way whether the operand is a scalar with a
@@ -18,7 +19,8 @@ trait OperatorCalls extends MethodCalls {
 
   // --- operators as trait methods --------------------------------------------------------
 
-  /** `a ⊕ b` where `⊕`'s operands are not something the machine has an instruction for (`14 §3`).
+  /** `a ⊕ b` where `⊕`'s operands are not something the machine has an instruction for
+   * (`reference/expressions.md § Operator dispatch`).
    *
    * A built-in keeps its instruction and this yields `None`, leaving the ordinary scalar path to
    * lower it — that is `§5`'s promise that a membership changes no codegen, and it is also what
@@ -58,8 +60,8 @@ trait OperatorCalls extends MethodCalls {
   }
 
   /** The trait an operator asks of its **pair** of operands: the catalog's binary arithmetic traits
-   * take the right-hand type as an argument (`14 §7`), so `c * 2.0` asks for `Mul[f64]` while
-   * `a * b` on one type asks for that type's own `Mul`.
+   * take the right-hand type as an argument (`library/core.md § Walking a type of your own`), so `c
+   * * 2.0` asks for `Mul[f64]` while `a * b` on one type asks for that type's own `Mul`.
    *
    * A trait that takes no parameters — `Eq`, `Ord`, and the two prefix operators — is asked for
    * bare, which is what keeps a comparison homogeneous.
@@ -119,13 +121,15 @@ trait OperatorCalls extends MethodCalls {
     selfBinding(lhs) ++ traitDecls.get(trName).toList.flatMap(_.tparams).zip(tr.args)
 
   /** Which method an operator on `ty` dispatches to, or `None` when the machine has an instruction
-   * for it — the one dispatch rule of `14 §3`, in the form the operand-sharing lowerings need.
+   * for it — the one dispatch rule of `reference/expressions.md § Operator dispatch`, in the form
+   * the operand-sharing lowerings need.
    *
    * A built-in keeps its instruction. A bounded type parameter answers with the **trait's** own
-   * method: which implementation runs is monomorphization's to decide, and a bound the parameter does
-   * not carry is reported here, at the definition, which is what `14 §4` is for. A user type answers
-   * with the member its `impl` produced. A type with no membership either way answers `None`, so the
-   * diagnostic stays the one the scalar path already gives.
+   * method: which implementation runs is monomorphization's to decide, and a bound the parameter
+   * does not carry is reported here, at the definition, which is what `reference/generics.md §
+   * Bounds` is for. A user type answers with the member its `impl` produced. A type with no
+   * membership either way answers `None`, so the diagnostic stays the one the scalar path already
+   * gives.
    */
   private def dispatchFor(spelling: String, op: String, ty: Type, tr: Type.Bound): Option[TDispatch] = {
     val trName         = Library.key(spelling)
@@ -224,11 +228,11 @@ trait OperatorCalls extends MethodCalls {
    * where they agree — the written counterpart of `boundRhs`, which asks the same question of a type
    * parameter's promises.
    *
-   * A type may implement one operator at more than one right-hand type (`02 § A trait may be
-   * implemented at more than one argument list`), and there is nothing to read off when it does: a
-   * `Complex` that is both `Mul[Complex]` and `Mul[real]` leaves `c * 2` genuinely ambiguous, and
-   * guessing one would be worse than the diagnostic. So the answer is the **agreed** argument or
-   * nothing, which makes this a lookup for the ordinary case and silent for the interesting one.
+   * A type may implement one operator at more than one right-hand type (`reference/traits.md § One
+   * implementation per argument list`), and there is nothing to read off when it does: a `Complex`
+   * that is both `Mul[Complex]` and `Mul[real]` leaves `c * 2` genuinely ambiguous, and guessing
+   * one would be worse than the diagnostic. So the answer is the **agreed** argument or nothing,
+   * which makes this a lookup for the ordinary case and silent for the interesting one.
    */
   private def implRhs(op: String, subject: Type): Option[Type] =
     for
@@ -277,9 +281,9 @@ trait OperatorCalls extends MethodCalls {
    *
    * A scalar's `+=` is homogeneous, so the place's type is what the value should be — that is what
    * makes the `1` in `n += 1` a literal of the place's own width. An operator that **dispatches**
-   * may take a right-hand type of its own (`14 §7`), and there the place's type is the wrong thing
-   * to read the value as: `c *= 2.0` on a complex number wants a `real`, and offering it `Complex`
-   * would hand the literal a type it cannot be.
+   * may take a right-hand type of its own (`library/core.md § Walking a type of your own`), and
+   * there the place's type is the wrong thing to read the value as: `c *= 2.0` on a complex number
+   * wants a `real`, and offering it `Complex` would hand the literal a type it cannot be.
    *
    * A **transparent** subtype is homogeneous at its *base*, which `repr` is: what `t += 120` adds is
    * an ordinary integer, and reading it as the subtype would check the step against a range that

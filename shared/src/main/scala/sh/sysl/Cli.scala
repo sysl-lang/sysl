@@ -14,9 +14,9 @@ import scopt.OParser
  * and as a Node CLI (the JVM build is for a fast development loop).
  *
  * Each subcommand takes a **path**, which is a **project root** or a single file. A module is a
- * directory and its name is that directory's path relative to the root (`13 §1`), so naming a
- * directory compiles the whole tree under it — one module per directory, each holding its files to
- * the name its location gives it — and naming a file compiles that file alone.
+ * directory and its name is that directory's path relative to the root (`reference/modules.md`), so
+ * naming a directory compiles the whole tree under it — one module per directory, each holding its
+ * files to the name its location gives it — and naming a file compiles that file alone.
  *
  * Subcommands:
  *   - `sysl run <path>`            compile and execute
@@ -135,10 +135,10 @@ case class Config(
     failFast: Boolean = false,
     optimize: String = Toolchain.defaultOptimization,
     /** `build-c --header` — where the generated C header goes, when somewhere other than beside the
-      * archive (`15 §12`).
+      * archive (`reference/ffi.md § @export`).
       */
     header: Option[String] = None,
-    /** `prove --emit-whyml` — print the translation instead of running the prover (`17 §9`). */
+    /** `prove --emit-whyml` — print the translation instead of running the prover (`reference/verification.md § sysl prove`). */
     emitWhyML: Boolean = false,
     /** `prove --overflow` — whether staying in an integer's range is a proof obligation. */
     overflow: String = "check",

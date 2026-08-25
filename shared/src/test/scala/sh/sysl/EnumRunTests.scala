@@ -7,10 +7,10 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class EnumRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
-  /** `09 §3` — "storage is sized for the largest variant plus a tag". Four variants carrying one
-   * scalar each are one scalar wide, not four, and the width is the *widest* of them: what the
-   * region is counted in is the strictest alignment any variant needs, which is what keeps a
-   * payload holding an `i64` from landing four bytes past where it may start.
+  /** `reference/types.md § Enums` — "storage is sized for the largest variant plus a tag". Four
+   * variants carrying one scalar each are one scalar wide, not four, and the width is the *widest*
+   * of them: what the region is counted in is the strictest alignment any variant needs, which is
+   * what keeps a payload holding an `i64` from landing four bytes past where it may start.
    */
   private val step =
     """enum Step
@@ -126,9 +126,9 @@ class EnumRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       run(src) shouldBe "1 2\n"
     }
 
-    // `09 §3` — "it moves by copy like any value". The region is written through a stack slot the
-    // whole function shares, so this is also what checks that two enum values of one type are not
-    // quietly the same storage.
+    // `reference/types.md § Enums` — "it moves by copy like any value". The region is written
+    // through a stack slot the whole function shares, so this is also what checks that two enum
+    // values of one type are not quietly the same storage.
     "and it still moves by copy" in {
       val src = step +
         """var a = Work(1)
@@ -253,10 +253,11 @@ class EnumRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     run(src) shouldBe "100\n"
   }
 
-  // `03 § Recursive types` allows a cycle as soon as one edge is a `*T` or a `&T`, and states it
-  // with a struct. An enum is the shape a tree actually wants — a node is one of several kinds
-  // rather than a record with unused fields — and `sysl.regex`'s AST is written on the assumption
-  // that a variant may hold a reference back to its own enum. That is the claim here.
+  // `reference/memory.md § Recursive types` allows a cycle as soon as one edge is a `*T` or a `&T`,
+  // and states it with a struct. An enum is the shape a tree actually wants — a node is one of
+  // several kinds rather than a record with unused fields — and `sysl.regex`'s AST is written on
+  // the assumption that a variant may hold a reference back to its own enum. That is the claim
+  // here.
   //
   // The second half is the asymmetry the compiler is precise about and a reader is not: selection
   // reaches through a reference and a **pattern does not**, so the walk is `*n match` and not

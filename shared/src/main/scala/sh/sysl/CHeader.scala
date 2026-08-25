@@ -1,6 +1,6 @@
 package sh.sysl
 
-/** The C header for whatever a module `@export`ed (`15 §12`).
+/** The C header for whatever a module `@export`ed (`reference/ffi.md § @export`).
  *
  * **It is a translation of one signature at a time and nothing more.** `ExportCheck` has already
  * held every exported function to a signature C can spell, so there is no type here that needs a
@@ -89,9 +89,9 @@ object CHeader {
    *
    * **A `never` result is annotated, and a `unit` one is not**, though both spell as `void`. That
    * difference is the only thing distinguishing the two on this side of the boundary: `never` says
-   * control does not come back (`00 §11`), which lets the caller's compiler drop the code after the
-   * call and stop asking about paths that end in it. Rendered as a bare `void` it would be the
-   * strictly weaker claim `unit` already makes.
+   * control does not come back (`reference/types.md § unit and never`), which lets the caller's
+   * compiler drop the code after the call and stop asking about paths that end in it. Rendered as a
+   * bare `void` it would be the strictly weaker claim `unit` already makes.
    */
   def prototype(f: TFunc): String = {
     val params =
@@ -159,11 +159,11 @@ object CHeader {
 
   /** The C name of a named type — the one the author chose, or the derived one.
    *
-   * **`@export("b2BodyId")` on the struct is what chooses it** (`15 §12`), and it exists because
-   * everything else in this header is either the author's spelling or a C fixed-width name: a
-   * binding mirroring a C library wants to hand back that library's own type names. The choice is a
-   * claim, so `Exports.names` holds it to the property the derived form gives away — that no two
-   * types in one header answer to one name.
+   * **`@export("b2BodyId")` on the struct is what chooses it** (`reference/ffi.md § @export`), and
+   * it exists because everything else in this header is either the author's spelling or a C
+   * fixed-width name: a binding mirroring a C library wants to hand back that library's own type
+   * names. The choice is a claim, so `Exports.names` holds it to the property the derived form
+   * gives away — that no two types in one header answer to one name.
    *
    * Derived, the mangled form is already unique per instantiation — it is what the emitted IR names
    * the aggregate — and the separators it uses are not C identifier characters, so they are replaced

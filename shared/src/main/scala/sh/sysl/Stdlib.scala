@@ -5,11 +5,11 @@ import io.github.edadma.cross_platform.*
 /** The standard module **this** compilation is compiled against, and the one place that says where
  * its trees came from.
  *
- * Every program is compiled against the library (`13 §8`), and there has been one way to be handed
- * it: `Std.parsed` — the files under `library/sysl`, read off disk and parsed. That is what a
- * *source* dependence on the standard module is, and it is what the artifact exists to end: every program
- * re-derives every signature in the standard module from text before it can check its own first
- * line.
+ * Every program is compiled against the library (`reference/modules.md § Separate compilation`),
+ * and there has been one way to be handed it: `Std.parsed` — the files under `library/sysl`, read
+ * off disk and parsed. That is what a *source* dependence on the standard module is, and it is what
+ * the artifact exists to end: every program re-derives every signature in the standard module from
+ * text before it can check its own first line.
  *
  * A `.syslib` carries those same trees already decoded, and — for the half with nothing left to
  * monomorphize — the object code to link against rather than emit a second copy of. Which of the two
@@ -367,11 +367,11 @@ object Stdlib {
    * produce an artifact this compiler will accept. Point it at another library and you get an
    * artifact it refuses, which is `build-lib --std`'s business rather than this routine's.
    *
-   * No C files are gathered, and none can be missed: `15 §7` lets a library carry `.c` beside its
-   * modules, and the standard module carries none. It could not — a `.c` under `library/sysl` would be
-   * hashed into the fingerprint of an artifact built by `build-lib`, while `Std.sources` collects
-   * only sysl files, so every artifact built from the tree would fail the check it is read back
-   * through.
+   * No C files are gathered, and none can be missed: `reference/ffi.md § A library may carry C`
+   * lets a library carry `.c` beside its modules, and the standard module carries none. It could
+   * not — a `.c` under `library/sysl` would be hashed into the fingerprint of an artifact built by
+   * `build-lib`, while `Std.sources` collects only sysl files, so every artifact built from the
+   * tree would fail the check it is read back through.
    *
    * `ar` names the archiver where it is somewhere a search would not look, exactly as `--ar` does;
    * given none, the search runs.
@@ -397,13 +397,13 @@ object Stdlib {
                     val code     = s"$staging/${LibraryArtifact.codeMember}"
                     val metadata = s"$staging/${LibraryArtifact.metadataMember}"
 
-                    // **The library's own C, one member each** (`15 §7`), exactly as `build-lib`
-                    // stages a library's. `build` is handed the same files but only *fingerprints*
-                    // them — archiving is the caller's, and this caller had nothing to archive until
-                    // the library carried C. What that cost was an artifact the compiler builds for
-                    // itself on a machine with a cold cache, holding `sysl.fs$entries` and not the
-                    // shim it calls: everything compiled, and the *program* failed to link on a
-                    // symbol from the standard library.
+                    // **The library's own C, one member each** (`reference/ffi.md § A library may
+                    // carry C`), exactly as `build-lib` stages a library's. `build` is handed the
+                    // same files but only *fingerprints* them — archiving is the caller's, and this
+                    // caller had nothing to archive until the library carried C. What that cost was
+                    // an artifact the compiler builds for itself on a machine with a cold cache,
+                    // holding `sysl.fs$entries` and not the shim it calls: everything compiled, and
+                    // the *program* failed to link on a symbol from the standard library.
                     val objects = Std.cSources(target.os)
                       .map(s => s -> s"$staging/${LibraryArtifact.nativeMember(s)}")
 

@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** A field's and a member's visibility (`08 § Visibility`) — `13 §2`'s four reaches, one level down.
+/** A field's and a member's visibility (`reference/modules.md § Visibility`) —
+ * `reference/modules.md § Visibility`'s four reaches, one level down.
  *
  * Two things make this more than a re-use of the top-level rule, and most of what is below is about
  * one or the other. **Silence means the type's reach, not public**, so a member of a restricted type

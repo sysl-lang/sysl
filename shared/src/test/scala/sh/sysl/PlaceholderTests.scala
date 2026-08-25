@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `_` where a closure's parameter would be named (`12 §5c`).
+/** `_` where a closure's parameter would be named (`reference/expressions.md § _ — a parameter with
+ * the name left out`).
  *
  * The feature is one operand and a boundary rule, and the boundary is the whole of it: a
  * placeholder compiles under either reading of where its closure ends, so a test that only shows
@@ -59,8 +60,8 @@ class PlaceholderTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "42\n"
     }
 
-    // `07 § Length` and the boundary rule meeting: a subscript does not end the closure, so the
-    // array is captured and the placeholder is the index.
+    // `reference/arrays.md § Length` and the boundary rule meeting: a subscript does not end the
+    // closure, so the array is captured and the placeholder is the index.
     "a subscript is inside the body, and the array around it is captured" in {
       run(apply + """val table: [4]int = [10, 20, 30, 40]
                     |

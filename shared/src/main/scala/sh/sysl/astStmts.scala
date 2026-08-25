@@ -9,7 +9,8 @@ package sh.sysl
 
 sealed trait Stmt extends Positioned
 
-/** How far a top-level declaration is visible (`13 §2`), as the modifier before it was written.
+/** How far a top-level declaration is visible (`reference/modules.md § Visibility`), as the
+ * modifier before it was written.
  *
  * Public is the unmarked default, so `Public` is what every declaration carries until one says
  * otherwise and what every declaration the compiler synthesizes carries outright. `private` names
@@ -38,7 +39,8 @@ case class ImportSelector(name: String, alias: Option[String]) extends Positione
 }
 
 /** `import a.b.c`, `import a.b.c as d`, `import a.b.{c, d as e}`, `import a.b.*` — a shorter
- * spelling for names that are already reachable by their full path (`13 §3`).
+ * spelling for names that are already reachable by their full path (`reference/modules.md §
+ * Imports`).
  *
  * The path is kept **as written**, undivided, because which part of `a.b.c` is the module and
  * which the member is a question only the analyzer can answer: `a.b.c` names a member `c` of
@@ -78,8 +80,9 @@ case class ImportDecl(
  * is. It is on the *declaration* and not on the type: `@align` on a struct says every value of that
  * type is aligned, and this says this one object is.
  *
- * `section` is `@section("…")` — the linker section this object is placed in (`15 §13`). It carries
- * the string as written, because a section name is the target's spelling and not sysl's.
+ * `section` is `@section("…")` — the linker section this object is placed in
+ * (`reference/attributes.md § @section("...")`). It carries the string as written, because a
+ * section name is the target's spelling and not sysl's.
  */
 case class VarDecl(name: String, typ: Option[TypeRef], init: Option[Expr],
                    vis: Visibility = Visibility.Public, align: Option[Expr] = None,
@@ -89,10 +92,10 @@ case class VarDecl(name: String, typ: Option[TypeRef], init: Option[Expr],
  * hoisted, order-free, and visible beyond its file under the ordinary rules, where a `var` at the
  * top of a file is a local of the entry point.
  *
- * The type is written rather than inferred because `13 §2`'s "anything visible outside its file
- * states its types" is what keeps interface extraction parse-only, and this is the first
- * declaration that rule has ever had to bind. Writing it is also what fixes the initializer's type,
- * so `const capacity: usize = 512` needs no suffix on the literal.
+ * The type is written rather than inferred because `reference/modules.md § Visibility`'s "anything
+ * visible outside its file states its types" is what keeps interface extraction parse-only, and
+ * this is the first declaration that rule has ever had to bind. Writing it is also what fixes the
+ * initializer's type, so `const capacity: usize = 512` needs no suffix on the literal.
  *
  * It has no address and no storage: every use is folded to the value, which is why it needs no
  * initialization order and why an array bound may name one.
@@ -100,7 +103,7 @@ case class VarDecl(name: String, typ: Option[TypeRef], init: Option[Expr],
 case class ConstDecl(name: String, typ: TypeRef, value: Expr, vis: Visibility = Visibility.Public) extends Stmt
 
 /** One line of a `c const` block: a constant whose value is a **C constant expression**, evaluated
- * by the C compiler for the target this build is for (`15 §7`).
+ * by the C compiler for the target this build is for (`reference/ffi.md § A library may carry C`).
  *
  * It exists because a number a binding needs is sometimes one only C can work out.
  * `sizeof(StaticTask_t)` and `portMAX_DELAY` are not symbols to link against and not text to
@@ -109,11 +112,11 @@ case class ConstDecl(name: String, typ: TypeRef, value: Expr, vis: Visibility = 
  * project configures its headers with. Transcribing either produces a program that is right on the
  * machine it was written on.
  *
- * `15 §7`'s answer for a macro — wrap it in three lines of C and declare the wrapper `extern` — is
- * still the answer for a *function*, and it is not one here. A constant reached through a call is
- * not a constant: it has no value until the program runs, so it cannot size an array, cannot be a
- * `match` arm and cannot be folded into anything. What this adds is the value itself, at the time
- * the rest of the language expects to have it.
+ * `reference/ffi.md § A library may carry C`'s answer for a macro — wrap it in three lines of C and
+ * declare the wrapper `extern` — is still the answer for a *function*, and it is not one here. A
+ * constant reached through a call is not a constant: it has no value until the program runs, so it
+ * cannot size an array, cannot be a `match` arm and cannot be folded into anything. What this adds
+ * is the value itself, at the time the rest of the language expects to have it.
  *
  * The C is held as written and never inspected by sysl. There is nothing to inspect: what is legal
  * in the expression is C's question, and the C compiler is what answers it — a refusal from clang is
@@ -147,7 +150,7 @@ case class CConstDecl(name: String, typ: TypeRef, c: String, vis: Visibility = V
 case class CConstBlock(consts: List[CConstDecl]) extends Stmt
 
 /** One line of a `c type` block: a name for the sysl type a **C typedef** turns out to be, measured
- * by the C compiler for the target this build is for (`15 §7`).
+ * by the C compiler for the target this build is for (`reference/ffi.md § A library may carry C`).
  *
  * It is the type half of `c const` and exists for the same reason. A typedef whose width the target
  * or a `#define` decides — `TickType_t`, `time_t`, `off_t`, `wchar_t`, `sqlite3_int64` — cannot be
@@ -173,11 +176,11 @@ case class CTypeDecl(name: String, c: String, vis: Visibility = Visibility.Publi
 
 /** A `c type` block and the typedefs under it.
  *
- * One block rather than a declaration per line, for the reason a `c const` block is one: the types of
- * a file are measured by a **single probe translation unit**, and that probe is the same one the
- * file's `c const` block uses. A file writing both blocks asks the C compiler one question, not two,
- * which is what keeps `15 §7`'s "one clang per file that writes a block" true rather than doubling it
- * quietly.
+ * One block rather than a declaration per line, for the reason a `c const` block is one: the types
+ * of a file are measured by a **single probe translation unit**, and that probe is the same one the
+ * file's `c const` block uses. A file writing both blocks asks the C compiler one question, not
+ * two, which is what keeps `reference/ffi.md § A library may carry C`'s "one clang per file that
+ * writes a block" true rather than doubling it quietly.
  *
  * A visibility written before the block belongs to every type in it, exactly as a `c const` block's
  * does.
@@ -186,23 +189,25 @@ case class CTypeBlock(types: List[CTypeDecl]) extends Stmt
 
 /** `@assert(cond)`, `@assert(cond, "why")` — a condition checked while compiling.
  *
- * The condition is a constant expression (`13 §Constants`) folded by the same machinery a `const`
- * initializer goes through, so it may name constants, `sizeof`, `alignof`, `offsetof` and the
- * arithmetic over them. A false one is a compile error quoting the message; a true one emits nothing at all.
+ * The condition is a constant expression (`reference/modules.md § const — a value`) folded by the
+ * same machinery a `const` initializer goes through, so it may name constants, `sizeof`, `alignof`,
+ * `offsetof` and the arithmetic over them. A false one is a compile error quoting the message; a
+ * true one emits nothing at all.
  *
  * **It exists because `require` is the wrong tool and there was no right one.** A `require` is a
  * *runtime* precondition — `17` is explicit that it is still compiled, still branches and still
  * traps — so nothing could fail a build on a fact known while compiling. What wants that most is a
  * binding to C: sysl lays a struct out in declaration order and claims C compatibility by
- * construction (`15 §1`), and the claim was unverifiable from inside sysl, because `sizeof` reports
- * what sysl laid out rather than what the header says. Paired with a `_Static_assert` in a `.c`
- * beside it — which `15 §7` already compiles, for the target — the two pin both sides to one
- * number and neither can drift silently.
+ * construction (`reference/types.md § Structs`), and the claim was unverifiable from inside sysl,
+ * because `sizeof` reports what sysl laid out rather than what the header says. Paired with a
+ * `_Static_assert` in a `.c` beside it — which `reference/ffi.md § A library may carry C` already
+ * compiles, for the target — the two pin both sides to one number and neither can drift silently.
  *
- * It is an **attribute rather than a word** for the reason the capability clauses are (`13 §4`): it
- * says something *about* the module rather than being a construct the language executes, and a
- * reserved word would have cost the lexer, the reference's reserved-word table and its stated count,
- * and the highlighting grammar — in two repositories — to buy nothing a sigil does not.
+ * It is an **attribute rather than a word** for the reason the capability clauses are
+ * (`reference/modules.md § Capabilities are a module property`): it says something *about* the
+ * module rather than being a construct the language executes, and a reserved word would have cost
+ * the lexer, the reference's reserved-word table and its stated count, and the highlighting grammar
+ * — in two repositories — to buy nothing a sigil does not.
  */
 case class AssertDecl(cond: Expr, message: Option[String]) extends Stmt
 
@@ -210,10 +215,11 @@ case class AssertDecl(cond: Expr, message: Option[String]) extends Stmt
  * that belongs to the **module** rather than to that file's body (`13 §7`).
  *
  * The file carrying a program's statements is a body, so what it declares is local to that body: a
- * `val` is a stack local, a function is a nested function (`12 §5a`). That is what a reader wants
- * nearly always, and there are three things it cannot be — a nested function may not be generic, has
- * no address, and is not a value — plus one a local cannot be, which is visible to another file. This
- * is how a declaration opts out and becomes an ordinary module member.
+ * `val` is a stack local, a function is a nested function (`reference/declarations.md`). That is
+ * what a reader wants nearly always, and there are three things it cannot be — a nested function
+ * may not be generic, has no address, and is not a value — plus one a local cannot be, which is
+ * visible to another file. This is how a declaration opts out and becomes an ordinary module
+ * member.
  *
  * It is a **wrapper rather than a flag** because that is the whole of what it does: nothing past the
  * point where a file's declarations are separated from its statements ever sees one. `ProgramWalk`
@@ -239,14 +245,15 @@ case class StaticDecl(inner: Stmt) extends Stmt
  * how the read-only-ness survives being handed on. The rule for a reader is short: if it has to be
  * indexed, pointed at, or is bigger than a scalar, it is a `val`.
  *
- * The type is optional in the syntax and required by the analyzer at module level, where `13 §2`'s
- * "anything visible outside its file states its types" applies. A local states nothing to anyone,
- * so it infers exactly as a `var` does.
+ * The type is optional in the syntax and required by the analyzer at module level, where
+ * `reference/modules.md § Visibility`'s "anything visible outside its file states its types"
+ * applies. A local states nothing to anyone, so it infers exactly as a `var` does.
  */
 case class ValDecl(name: String, typ: Option[TypeRef], value: Expr, vis: Visibility = Visibility.Public,
                    align: Option[Expr] = None, section: Option[String] = None) extends Stmt
 
-/** `ref name = place` — a name for a place rather than for a value (`03 § ref`).
+/** `ref name = place` — a name for a place rather than for a value (`reference/memory.md § ref — a
+ * name for a place`).
  *
  * The place is evaluated once, where this is written, and the name means the storage that was found
  * afterwards. So it neither copies what it names nor re-walks the path at each use, which are the
@@ -280,7 +287,7 @@ case class MultiAssign(op: String, targets: List[Expr], values: List[Expr]) exte
 case class MultiDecl(names: List[String], mutable: Boolean, values: List[Expr]) extends Stmt
 
 /** `val (a, b) = …` / `var (a, b) = …` — one binding that takes a tuple apart by **pattern**
- * (`00 §13`).
+ * (`reference/types.md § Tuples`).
  *
  * This is the comma form's sibling and not a replacement for it: `val a, b = f()` takes a result
  * list or a tuple apart at one level, while a pattern says the *shape* and so reaches inside a
@@ -289,8 +296,8 @@ case class MultiDecl(names: List[String], mutable: Boolean, values: List[Expr]) 
  *
  * **Only an irrefutable pattern may stand here** — a tuple pattern, a **struct** pattern, a name, a
  * wildcard, and those nested inside one another. A binding has no arm to fall through to, so a
- * pattern that can fail to match would leave its names standing for nothing; `09 §5`'s refutable
- * forms are refused with that as the reason.
+ * pattern that can fail to match would leave its names standing for nothing;
+ * `reference/statements.md § match`'s refutable forms are refused with that as the reason.
  *
  * **A struct pattern qualifies because a struct has exactly one shape**, which is the same property
  * that makes a tuple pattern irrefutable — `09 §` calls a tuple pattern the positional form of this
@@ -312,8 +319,8 @@ case class Break(label: Option[String], value: Option[Expr]) extends Stmt
 case class Continue(label: Option[String]) extends Stmt
 
 /** `defer stmt` — a statement to run on the way out of the block containing it, whichever edge
- * control leaves by (`03 § defer`). It is registered when control reaches it and not before, so
- * one in a branch never taken schedules nothing.
+ * control leaves by (`reference/memory.md § Where defer sits`). It is registered when control
+ * reaches it and not before, so one in a branch never taken schedules nothing.
  */
 case class Defer(stmt: Stmt) extends Stmt
 
@@ -326,14 +333,15 @@ case class Require(cond: Expr, msg: Option[String]) extends Stmt
 case class Ensure(cond: Expr, msg: Option[String]) extends Stmt
 
 /** `invariant <bool> [, "message"]` at the head of a loop body — a condition that holds on every
- * entry to the body (`17 §3`).
+ * entry to the body (`reference/verification.md § invariant and variant on a loop`).
  *
  * It is a statement rather than a slot in each loop's header so that one rule serves all five loop
  * forms. Where it may stand is the analyzer's: at the head of a loop's body and nowhere else.
  */
 case class Invariant(cond: Expr, msg: Option[String]) extends Stmt
 
-/** `variant <int>` — a measure that strictly decreases (`17 §3`, `17 §4`).
+/** `variant <int>` — a measure that strictly decreases (`reference/verification.md § invariant and
+ * variant on a loop`, `reference/verification.md § variant on a function`).
  *
  * At the head of a loop body it decreases from one iteration to the next. In a function's contract
  * block it decreases at each direct recursive call, and there it may read only the parameters, which
@@ -415,9 +423,10 @@ enum RecvMode:
  * method of a `Box[T]` that also takes a `[U]` is generic over `U` at each call, while `T` is fixed
  * by the receiver. A property has none — there would be nothing at the read to fix them with.
  *
- * `vis` is how far the member may be named from (`08 § Visibility`). The unmarked default means
- * *its type's* reach rather than public, so `Public` here is "said nothing" and not "said public" —
- * which is why a trait's member and an `impl`'s, neither of which may say anything, carry it too.
+ * `vis` is how far the member may be named from (`reference/modules.md § Visibility`). The unmarked
+ * default means *its type's* reach rather than public, so `Public` here is "said nothing" and not
+ * "said public" — which is why a trait's member and an `impl`'s, neither of which may say anything,
+ * carry it too.
  *
  * `overrides` is the `override` keyword written in front of the member (`02 § override`), which says
  * it replaces a body the trait already supplied rather than answering a requirement the trait left
@@ -437,9 +446,10 @@ case class MethodDecl(
     vis: Visibility = Visibility.Public,
     variadic: Boolean = false,
     overrides: Boolean = false,
-    /** Which of `tparams` stand for a **value** rather than a type (`10 §9`), and at what type. */
+    /** Which of `tparams` stand for a **value** rather than a type (`reference/generics.md § A parameter may stand for a value`), and at what type. */
     tvalues: Map[String, TypeRef] = Map.empty,
-    /** Which of `tparams` stand for a **list** of types (`10 §10`).
+    /** Which of `tparams` stand for a **list** of types (`reference/generics.md § A parameter may
+     * stand for a list of types`).
       *
       * A member's parameter list is its own, exactly as a function's is, so a pack may stand in it.
       * What cannot carry one is a declaration whose parameters *are* its shape — a struct, an enum
@@ -460,7 +470,7 @@ case class MethodDecl(
 }
 
 /** The calling convention a definition is entered under, where that is not the ordinary one
- * (`15 §10`).
+ * (`reference/ffi.md § interrupt`).
  *
  * **A name and an optional argument, rather than an LLVM convention spelled through.** What
  * `interrupt` *is* differs by processor — a calling convention on x86-64, a function attribute on
@@ -501,11 +511,12 @@ case class FuncDecl(
     vis: Visibility = Visibility.Public,
     tdefaults: Map[String, TypeRef] = Map.empty,
     /** Which of `tparams` stand for **values** rather than types, and the type each argument must
-      * have — `[const N: usize]` (`10 §9`). The two kinds share `tparams` because they share one
-      * list, one namespace and one argument position; this map is what tells them apart.
+      * have — `[const N: usize]` (`reference/generics.md § A parameter may stand for a value`). The
+      * two kinds share `tparams` because they share one list, one namespace and one argument
+      * position; this map is what tells them apart.
       */
     tvalues: Map[String, TypeRef] = Map.empty,
-    /** Which of `tparams` stand for a **list** of types — `[..A: Display]` (`10 §10`). */
+    /** Which of `tparams` stand for a **list** of types — `[..A: Display]` (`reference/generics.md § A parameter may stand for a list of types`). */
     tpacks: Set[String] = Set.empty,
     test: Option[TestAttr] = None,
     conv: Option[CallConv] = None,
@@ -515,19 +526,20 @@ case class FuncDecl(
     pure: Boolean = false,
     /** `@ghost` — see `TFunc.ghost`. */
     ghost: Boolean = false,
-    /** `@reads(…)` — see `TFunc.reads`. `None` is a function that wrote no frame at all, which is
-      * a different thing from one that wrote an empty one: the first says nothing about its effects
-      * and the second says it has none (`17 §7`).
+    /** `@reads(…)` — see `TFunc.reads`. `None` is a function that wrote no frame at all, which is a
+      * different thing from one that wrote an empty one: the first says nothing about its effects
+      * and the second says it has none (`reference/verification.md § @reads and @writes — what a
+      * call may touch`).
       */
     reads: Option[List[String]] = None,
     /** `@writes(…)` — see `TFunc.writes`. `None`/`Some(Nil)` divide as they do for `reads`. */
     writes: Option[List[String]] = None,
     /** `@export` — see `ExportAttr`. */
     exported: Option[ExportAttr] = None,
-    /** `@section("…")` — the linker section this definition is placed in (`15 §13`). */
+    /** `@section("…")` — the linker section this definition is placed in (`reference/attributes.md § @section("...")`). */
     section: Option[String] = None,
     /** `@crossing(…)` — the parameters through which a value reaches another concurrency domain
-      * (`06 § Marking a domain boundary`).
+      * (`reference/memory.md § @crossing — where the rule is asked`).
       *
       * Carried as the names that were written rather than as positions, for the reason a frame is:
       * the refusal of a word that names no parameter has to say which word, and a position could
@@ -537,7 +549,7 @@ case class FuncDecl(
     crossing: List[String] = Nil,
 ) extends Stmt
 
-/** What `@export` says about the function it is written above (`15 §12`).
+/** What `@export` says about the function it is written above (`reference/ffi.md § @export`).
  *
  * `symbol` is the name the linker files the definition under, and `None` means the function's own.
  * That is `extern` read the other way: `extern exit(code: int)` resolves the symbol `exit`, and
@@ -580,7 +592,8 @@ enum Attr(val word: String) {
   case Pure                 extends Attr("pure")
   case Ghost                extends Attr("ghost")
 
-  /** `@reads(a, b)` and `@writes(c)` — the module storage this function may touch (`17 §7`).
+  /** `@reads(a, b)` and `@writes(c)` — the module storage this function may touch
+   * (`reference/verification.md § @reads and @writes — what a call may touch`).
     *
     * They carry a list rather than a set so the refusal of a name written twice can name the
     * position it was written at a second time; the check turns them into sets once it has looked.
@@ -589,7 +602,7 @@ enum Attr(val word: String) {
   case Writes(names: List[String]) extends Attr("writes")
 
   /** The two that qualify a **layout** rather than a function, and the only attributes a struct
-    * takes (`15 §1`).
+    * takes (`reference/types.md § Structs`).
     *
     * They are two axes and compose: `@packed` removes the padding *between* fields and drops the
     * aggregate's own alignment to one, `@align(n)` raises where the aggregate must *start*. Written
@@ -597,14 +610,16 @@ enum Attr(val word: String) {
     * not a contradiction — a wire header that has to sit in a DMA-capable buffer is both.
     *
     * `@align` carries the expression rather than a number because the bound is folded, not lexed:
-    * `@align(CACHE_LINE)` is the form a program actually wants, and `13 §5` already admits a
-    * `const` and the arithmetic over it wherever a constant is required.
+    * `@align(CACHE_LINE)` is the form a program actually wants, and `reference/modules.md §
+    * Platform selection` already admits a `const` and the arithmetic over it wherever a constant is
+    * required.
     */
   case Packed                extends Attr("packed")
   case Align(bound: Expr)    extends Attr("align")
 
   /** `@export` and `@export("mylib_parse")` — the definition is C-callable under an unmangled
-    * symbol (`15 §12`). See `ExportAttr` for why the rename is the form that matters.
+    * symbol (`reference/ffi.md § @export`). See `ExportAttr` for why the rename is the form that
+    * matters.
     *
     * **It marks a struct as well as a function, and the two are one idea: the name C sees.** On a
     * function that is the symbol the linker resolves; on a struct it is the name the `typedef`
@@ -615,7 +630,8 @@ enum Attr(val word: String) {
     */
   case Export(attr: ExportAttr) extends Attr("export")
 
-  /** `@section(".vectors")` — where the linker puts this one object or definition (`15 §13`).
+  /** `@section(".vectors")` — where the linker puts this one object or definition
+   * (`reference/attributes.md § @section("...")`).
     *
     * It is the one attribute that marks **either** a binding or a function, because both are things
     * that occupy an address: a vector table is storage and a `.ramfunc` is code, and placement is
@@ -630,7 +646,7 @@ enum Attr(val word: String) {
   case Section(name: String) extends Attr("section")
 
   /** `@crossing(state)` — the parameters a value reaches another concurrency domain through
-    * (`06 § Marking a domain boundary`).
+    * (`reference/memory.md § @crossing — where the rule is asked`).
     *
     * It names parameters where `@reads` and `@writes` name module storage, and carries a list for
     * the same reason theirs do: a word that names no parameter is refused by name, and a name
@@ -689,12 +705,12 @@ case class ExternVarDecl(name: String, typ: TypeRef, link: Option[String] = None
  * `bounds` is what the type asks of its own parameters — `struct SortedList[T: Ord]` — keyed by
  * parameter name, with an unbounded one simply absent. Every application of the type is held to
  * them, and its members may assume them: they are what makes a member checkable at its definition
- * rather than once per instantiation (`10 §5`).
+ * rather than once per instantiation (`reference/generics.md § Bounds`).
  *
- * `opaque` withholds the **layout** from every module but the one declaring it (`15 §9`): outside,
- * the type may be named only as the pointee of a `*`. It is not a `vis`, and the two are orthogonal —
- * `vis` decides who may say the *name*, `opaque` decides who may know the *shape*, and a type whose
- * name nobody could say would have nothing to be opaque to.
+ * `opaque` withholds the **layout** from every module but the one declaring it (`reference/ffi.md §
+ * opaque`): outside, the type may be named only as the pointee of a `*`. It is not a `vis`, and the
+ * two are orthogonal — `vis` decides who may say the *name*, `opaque` decides who may know the
+ * *shape*, and a type whose name nobody could say would have nothing to be opaque to.
  */
 case class StructDecl(
     name: String,
@@ -707,17 +723,19 @@ case class StructDecl(
     tdefaults: Map[String, TypeRef] = Map.empty,
     opaque: Boolean = false,
     /** Which of `tparams` stand for **values** rather than types, and the type each argument must
-      * have — `struct Buf[const N: usize]` (`10 §9`).
+      * have — `struct Buf[const N: usize]` (`reference/generics.md § A parameter may stand for a
+      * value`).
       */
     tvalues: Map[String, TypeRef] = Map.empty,
-    /** `@packed` — fields at their declared offsets with no interior padding (`15 §1`). */
+    /** `@packed` — fields at their declared offsets with no interior padding (`reference/types.md § Structs`). */
     packed: Boolean = false,
     /** `@align(n)` — the boundary this type's storage must begin on, as written. Folded by the
       * analyzer rather than the parser, so what is held here is the expression.
       */
     alignment: Option[Expr] = None,
     /** `@export("b2BodyId")` — the name this type's `typedef` carries in a generated C header
-      * (`15 §12`), where without it the name is derived from the mangled instantiation.
+      * (`reference/ffi.md § @export`), where without it the name is derived from the mangled
+      * instantiation.
       *
       * The whole attribute is held rather than the string, so a refusal can point at the annotation
       * rather than at the declaration under it — and a bare `@export` is a real form here, meaning
@@ -755,8 +773,9 @@ case class EnumDecl(name: String, tparams: List[String], underlying: Option[Type
                     bounds: Map[String, List[BoundRef]] = Map.empty,
                     vis: Visibility = Visibility.Public,
                     tdefaults: Map[String, TypeRef] = Map.empty,
-                    /** Which of `tparams` stand for **values** rather than types (`10 §9`), and the
-                      * type each argument must have.
+                    /** Which of `tparams` stand for **values** rather than types
+                      * (`reference/generics.md § A parameter may stand for a value`), and the type
+                      * each argument must have.
                       */
                     tvalues: Map[String, TypeRef] = Map.empty,
                     /** The traits named by a `deriving` clause, exactly as a struct's are. */
@@ -905,16 +924,17 @@ case class ImplDecl(
     tdefaults: Map[String, TypeRef] = Map.empty,
     overrides: Boolean = false,
     /** Which of `tparams` stand for **values** rather than types, and the type each argument must
-      * have — `impl[const N: usize, T: Display] Display for [N]T` (`10 §9`). It is what tells a
-      * block covering every array length from one covering the length it named, which the resolved
-      * subject cannot: a value parameter stands at zero for the walk that checks the body, so `[N]T`
-      * and `[0]T` resolve alike and only the syntax says which was written.
+      * have — `impl[const N: usize, T: Display] Display for [N]T` (`reference/generics.md § A
+      * parameter may stand for a value`). It is what tells a block covering every array length from
+      * one covering the length it named, which the resolved subject cannot: a value parameter
+      * stands at zero for the walk that checks the body, so `[N]T` and `[0]T` resolve alike and
+      * only the syntax says which was written.
       */
     tvalues: Map[String, TypeRef] = Map.empty,
     /** Which of `tparams` stand for a **list** of types rather than one — `impl[..A: Eq] Eq for
-      * (..A)` (`10 §10`). Recorded for the reason `tvalues` is: a pack stands at two types for the
-      * walk that checks the body, so `(..A)` and a written-out pair resolve alike and only the
-      * syntax says which was meant.
+      * (..A)` (`reference/generics.md § A parameter may stand for a list of types`). Recorded for
+      * the reason `tvalues` is: a pack stands at two types for the walk that checks the body, so
+      * `(..A)` and a written-out pair resolve alike and only the syntax says which was meant.
       */
     tpacks: Set[String] = Set.empty,
     /** The `type Body = …` lines — the **associated types this block supplies**, in the order

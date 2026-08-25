@@ -2,9 +2,9 @@ package sh.sysl
 
 /** `match`, its arms, and the patterns they are written with.
  *
- * One area rather than two because a pattern has no other home: it is written in a `match` arm,
- * in an `is` condition, and in an irrefutable binding, and those must be the same grammar rather
- * than three that drift (`09 §12`).
+ * One area rather than two because a pattern has no other home: it is written in a `match` arm, in
+ * an `is` condition, and in an irrefutable binding, and those must be the same grammar rather than
+ * three that drift (`reference/expressions.md § is — a pattern where a condition is wanted`).
  */
 trait PatternParser extends ExprParser {
 

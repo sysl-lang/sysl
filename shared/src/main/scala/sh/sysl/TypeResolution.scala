@@ -36,7 +36,8 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
    */
   protected val unitName = "unit"
 
-  /** The name of the type a trait is being implemented for (`14 §1`).
+  /** The name of the type a trait is being implemented for (`reference/traits.md § Declaring a
+   * trait`).
    *
    * It is a substitution key rather than a type of its own: a trait declaration and an `impl` are
    * both resolved with `Self` bound to the implementing type, so `add(self, rhs: Self) -> Self` and
@@ -238,7 +239,7 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
       finally filling -= key
 
   /** A declaration's type parameters as its own body sees them: each standing in for itself, and
-   * carrying what the declaration asked of it (`14 §4`).
+   * carrying what the declaration asked of it (`reference/generics.md § Bounds`).
    *
    * The bounds are resolved with the *siblings* standing in for themselves too, which is what lets
    * `f[T: Iter[U], U: Display]` know that what `T`'s iterator yields is something printable. A bound
@@ -302,19 +303,21 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
           refs.map(b => recorded(Type.Bound(b.name, Nil))(resolveBound(b, here))),
       )
 
-    // A **value parameter** stands in as a zero rather than as an `Abstract` (`10 §9`). It is not a
-    // type, so nothing may ask what it implements — and standing at a value is what lets the one
-    // walk that checks the generic body read `[N]T` as an array and `N` as a `usize` without a
-    // second mechanism. Zero is the same placeholder `[sizeof(T)]u8` already resolves to for this
-    // walk, whose tree is discarded; every real length is built per instantiation.
+    // A **value parameter** stands in as a zero rather than as an `Abstract`
+    // (`reference/generics.md § A parameter may stand for a value`). It is not a type, so nothing
+    // may ask what it implements — and standing at a value is what lets the one walk that checks
+    // the generic body read `[N]T` as an array and `N` as a `usize` without a second mechanism.
+    // Zero is the same placeholder `[sizeof(T)]u8` already resolves to for this walk, whose tree is
+    // discarded; every real length is built per instantiation.
     //
-    // A **pack** stands at **two** types (`10 §10`), each carrying the pack's own bounds, because an
-    // unrolled loop has no fixed length for this walk to run at. Two rather than one is what makes
-    // the walk worth doing: the body of `for const` is one piece of source repeated, so a copy that
-    // checks at one position checks at every position — and at two the *between* is covered as
-    // well, which is where a separator is emitted and where a body that only works on the first part
-    // gives itself away. Two is also the smallest tuple there is (`00 §13`), so the shape being
-    // checked is one that really exists.
+    // A **pack** stands at **two** types (`reference/generics.md § A parameter may stand for a list
+    // of types`), each carrying the pack's own bounds, because an unrolled loop has no fixed length
+    // for this walk to run at. Two rather than one is what makes the walk worth doing: the body of
+    // `for const` is one piece of source repeated, so a copy that checks at one position checks at
+    // every position — and at two the *between* is covered as well, which is where a separator is
+    // emitted and where a body that only works on the first part gives itself away. Two is also the
+    // smallest tuple there is (`reference/types.md § Tuples`), so the shape being checked is one
+    // that really exists.
     //
     // The members are named with a `#`, which no identifier may hold, so nothing a program writes
     // can collide with one and a diagnostic naming `A#0` is plainly the compiler's own stand-in.
@@ -341,7 +344,7 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
     case _                      => resolveType(t, subst)
 
   /** Resolves a type in one of the three positions a `volatile` qualifier may stand: the pointee of
-   * a `*T`, an element, and a struct field (`03 § Device memory`).
+   * a `*T`, an element, and a struct field (`reference/memory.md § Device memory`).
    *
    * What the three have in common is that the storage being named is **somebody else's** — a device's
    * registers, reached through an address the program was handed. Everywhere else a type is resolved
@@ -360,12 +363,12 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
    * refused outright, since a retain that may not be elided is not a request anybody can act on.
    */
   private def volatileScalar(t: Type): Type = Type.underlying(t) match
-    // A constrained subtype is the claim that a value **has been checked** (`16 §4`), and a register
-    // holds whatever the device put there. Reading one at such a type would hand back that claim
-    // unchecked, through a field selection that looks like any other — and the `ptr_cast` that made
-    // the pointer is too far away to read as the licence for it. Declaring the register at the base
-    // and converting what comes back puts the check where the value arrives, which is one written
-    // conversion and the whole of the fix.
+    // A constrained subtype is the claim that a value **has been checked** (`reference/errors.md §
+    // Where a constraint is checked`), and a register holds whatever the device put there. Reading
+    // one at such a type would hand back that claim unchecked, through a field selection that looks
+    // like any other — and the `ptr_cast` that made the pointer is too far away to read as the
+    // licence for it. Declaring the register at the base and converting what comes back puts the
+    // check where the value arrives, which is one written conversion and the whole of the fix.
     case _ if constrains(t) =>
       err(s"'volatile ${show(t)}' is not a type: a register holds whatever the device put in it, and " +
         s"${show(t)} is the claim that a value has been checked. Declare the register at " +
@@ -373,8 +376,9 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
     case _: Type.Integer | _: Type.Floating | Type.Char | Type.Bool => t
     // A **simple** enum is its underlying integer and nothing else — `llvm` delegates to it — so
     // reading one is the single load the qualifier promises. It is also the spelling a mode field
-    // wants (`15 §1`), which is the reason this is here rather than left to the catch-all: refusing
-    // it would mean a register's mode had to be declared as the raw `u3` the enum exists to name.
+    // wants (`reference/types.md § Structs`), which is the reason this is here rather than left to
+    // the catch-all: refusing it would mean a register's mode had to be declared as the raw `u3`
+    // the enum exists to name.
     case e: Type.Enum if e.simple => t
     // A **data** enum is a tag beside a payload, so touching one is as many accesses as the payload
     // has words however the source writes it — the one promise the qualifier makes, and the one it
@@ -405,15 +409,17 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
         "since it promises the one load or the one store the source wrote and nothing else")
 
   /** Whether a type constrains which **values** it has, as against merely having an identity of its
-   * own. A bare `new` derivation is nominal and asserts nothing about a value (`16 §2`), so there is
-   * nothing for a register to arrive holding that the type would have promised was checked.
+   * own. A bare `new` derivation is nominal and asserts nothing about a value (`reference/errors.md
+   * § new is what makes it a type`), so there is nothing for a register to arrive holding that the
+   * type would have promised was checked.
    */
   private def constrains(t: Type): Boolean = t match
     case c: Type.Constrained => c.lo.isDefined || c.hi.isDefined || c.predFn.isDefined || constrains(c.base)
     case _                   => false
 
   /** Whether the type about to be resolved is what a `*` points at, rather than a value in its own
-   * right. It is the one thing an `opaque` struct may be outside the module declaring it (`15 §9`).
+   * right. It is the one thing an `opaque` struct may be outside the module declaring it
+   * (`reference/ffi.md § opaque`).
    *
    * Set for exactly **one** level and cleared the moment any resolution begins, which is what keeps
    * it honest under nesting: `*Outer` sets it, `Outer`'s own by-value field clears it before
@@ -451,9 +457,9 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
         s"storage is named: a struct field, an element, or the pointee of a '*T', as " +
         s"'*volatile ${inner.show}'")
     // An atomic reference promises that a second domain may hold the object, which is a promise
-    // about everything the object holds (`06 § &sync T`). A trait object is the one shape whose
-    // contents are not known here — the type it forgot is settled where a value is erased into one,
-    // and that is where it is asked.
+    // about everything the object holds (`reference/memory.md § Crossing a concurrency domain`). A
+    // trait object is the one shape whose contents are not known here — the type it forgot is
+    // settled where a value is erased into one, and that is where it is asked.
     case RefType(inner, sync) =>
       val t = traitObject(inner, subst, "&")
         .fold(Type.Ref(addressable(underIndirection(resolveType(inner, subst)), "'&'"), sync))(Type.Ref(_, sync))
@@ -524,11 +530,12 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
 
       Type.Vector(n, resolved)
 
-    // `(..A)` — the tuple of a pack (`10 §10`). The pack is looked up rather than resolved, because
-    // what stands for it in the substitution is already the list of parts: for the walk that checks
-    // a generic body that is the two stand-ins, and for an instantiation it is the parts the subject
-    // matched. Either way the tuple built here is an ordinary one, so nothing downstream of this
-    // point knows a pack was written.
+    // `(..A)` — the tuple of a pack (`reference/generics.md § A parameter may stand for a list of
+    // types`). The pack is looked up rather than resolved, because what stands for it in the
+    // substitution is already the list of parts: for the walk that checks a generic body that is
+    // the two stand-ins, and for an instantiation it is the parts the subject matched. Either way
+    // the tuple built here is an ordinary one, so nothing downstream of this point knows a pack was
+    // written.
     case TupleType(List(PackType(n)), _) =>
       subst.get(n) match
         case Some(Type.Pack(elems)) => tupleType(elems.map(substituted))
@@ -558,7 +565,7 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
     // A callable is not a type: it is a trait, and a trait stands where a type does only behind a
     // mode sigil. The bare arrow is the sugar a **parameter** may use, and it never reaches here —
     // a parameter reads it before resolving one — so what is left to say is that a slot needing a
-    // concrete type needs the box the `&` denotes (`12 §6`).
+    // concrete type needs the box the `&` denotes (`reference/types.md § Function types`).
     case f: FnType =>
       checkFnArity(f)
 
@@ -613,7 +620,8 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
         scalarType(n) match
           case Some(s) => plain(n, targs, s)
           // A declared type is named in this module's terms — its own, or a module's it names in
-          // full (`13 §3`) — so what the tables are asked for is the key that resolves to.
+          // full (`reference/modules.md § Imports`) — so what the tables are asked for is the key
+          // that resolves to.
           case None =>
             typeKey(n) match
               case Some(key) if structDecls.contains(key) =>
@@ -705,7 +713,7 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
   }
 
   /** The tag a **simple enum's variant** stands for, where the value parameter's declared type is
-   * that enum (`10 §9`).
+   * that enum (`reference/generics.md § A parameter may stand for a value`).
    *
    * A simple enum's value *is* its identity — there is nothing else telling two of its variants
    * apart (`09`) — so its tag is exactly the number a type's identity wants. It is read off the
@@ -807,10 +815,11 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
 
           checkAssocArgs(key, declared, assocs, sigil, args)
           deferredBounds(key, decl.tparams, decl.bounds, args)
-          // A `Self` that arrived from one of *this* trait's own defaults is left to the check below,
-          // because there the fix is a spelling: writing the argument out. That now includes the
-          // operator catalog, which it did not when an operator's result was fixed to `Self` and no
-          // argument could rescue it — `&Mul[real, real]` is a formable object (`14 §7`).
+          // A `Self` that arrived from one of *this* trait's own defaults is left to the check
+          // below, because there the fix is a spelling: writing the argument out. That now includes
+          // the operator catalog, which it did not when an operator's result was fixed to `Self`
+          // and no argument could rescue it — `&Mul[real, real]` is a formable object
+          // (`library/core.md § Walking a type of your own`).
           checkObjectSafe(key, args, sigil, decl.tparams.drop(positional.length).toSet, assocs.map(_._1).toSet)
 
           // An object has forgotten which type it holds, so a default that names one has nothing to
@@ -1139,12 +1148,13 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
     checkVaListPositions(name, params, ret, foreign)
   }
 
-  /** Where a `va_list` may stand in a signature (`12 §9`).
+  /** Where a `va_list` may stand in a signature (`reference/ffi.md § Variadic functions`).
    *
    * In a **sysl** signature a walk is handed on **by address**: `*va_list` is the parameter type,
    * and `&ap` is what the caller writes. A bare `va_list` parameter is refused because a parameter
-   * is a by-value binding (`12 §2`) and a copy of a walk is not a walk — advancing it would advance
-   * nothing the caller could see, which is the one thing the form exists to do.
+   * is a by-value binding (`reference/declarations.md § Functions`) and a copy of a walk is not a
+   * walk — advancing it would advance nothing the caller could see, which is the one thing the form
+   * exists to do.
    *
    * An **`extern`** transcribes a C header, so it is written in C's spellings and both are allowed:
    * `va_list` is C's by-value parameter, the one `vprintf` takes, and `*va_list` is C's `va_list *`,

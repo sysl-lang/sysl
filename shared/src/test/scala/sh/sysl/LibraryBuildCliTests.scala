@@ -146,9 +146,10 @@ class LibraryBuildCliTests extends LibraryCliSupport {
     }.getOrElse(fail(s"the build never said where it staged its members:\n$notes"))
   }
 
-  /** A library built **on** another one, which is `--lib` at `build-lib` (`15 §7`). The org's case is
-   * `sdl3-ttf`, whose `Font` renders to an `sdl3` `Surface`: without that library's declarations it
-   * does not compile, and until this worked the flag was read off the command line and dropped.
+  /** A library built **on** another one, which is `--lib` at `build-lib` (`reference/ffi.md § A
+   * library may carry C`). The org's case is `sdl3-ttf`, whose `Font` renders to an `sdl3`
+   * `Surface`: without that library's declarations it does not compile, and until this worked the
+   * flag was read off the command line and dropped.
    *
    * What `build-lib` still does not do is *fetch*. A `dependencies` block is a coordinate to resolve
    * over the network, and a command whose whole job is to compile one tree into an artifact for one
@@ -220,9 +221,10 @@ class LibraryBuildCliTests extends LibraryCliSupport {
   "a library carrying C" - {
 
     /* A C file beside a library's sysl, compiled with it and archived into the same artifact
-     * (`15 §7`). It is what makes a binding to a real C library writable: `sizeof(regex_t)`, the
-     * value of a macro like `REG_EXTENDED`, an anonymous union — each is reachable from C and from
-     * nothing else, and a few lines of C turn each into an ordinary function `extern` can declare.
+     * (`reference/ffi.md § A library may carry C`). It is what makes a binding to a real C library
+     * writable: `sizeof(regex_t)`, the value of a macro like `REG_EXTENDED`, an anonymous union —
+     * each is reachable from C and from nothing else, and a few lines of C turn each into an
+     * ordinary function `extern` can declare.
      *
      * The sysl side needs nothing new. That is the claim these tests are really pinning: the whole
      * feature lives in the build, and a shim is reached by the `extern` that was already there. */
@@ -319,9 +321,10 @@ class LibraryBuildCliTests extends LibraryCliSupport {
     }
 
     "is found at the root of the tree as well as beside a module" in {
-      // `15 §7` says *anywhere* in the tree, and the root is the one place that is not a module's
-      // directory — nothing there declares a module, so a walk that gathered C only where it had
-      // found sysl would skip it. The member takes the bare name, there being no directory to carry.
+      // `reference/ffi.md § A library may carry C` says *anywhere* in the tree, and the root is the
+      // one place that is not a module's directory — nothing there declares a module, so a walk
+      // that gathered C only where it had found sysl would skip it. The member takes the bare name,
+      // there being no directory to carry.
       assume(Toolchain.clangAvailable, "clang not available")
 
       val root = rootWithC("demo", """module demo
@@ -374,10 +377,11 @@ class LibraryBuildCliTests extends LibraryCliSupport {
     }
 
     // The collision this used to reach — a `sysl/code.c` taking the name the library's own compiled
-    // half uses — is no longer reachable from a tree like this one, because `15 §7` takes C only
-    // from a module or the root and a bare `sysl/` is neither. The guard itself is not dead: a
-    // `build-lib --std` walks a tree whose modules genuinely are `sysl/…`, which is the only place
-    // the name can now be produced, and `LibraryArtifactTests` pins it on `collisions` directly.
+    // half uses — is no longer reachable from a tree like this one, because `reference/ffi.md § A
+    // library may carry C` takes C only from a module or the root and a bare `sysl/` is neither.
+    // The guard itself is not dead: a `build-lib --std` walks a tree whose modules genuinely are
+    // `sysl/…`, which is the only place the name can now be produced, and `LibraryArtifactTests`
+    // pins it on `collisions` directly.
     "while a C file in a directory that declares no module is skipped rather than archived" in {
       val root = createTempDirectory("sysl-cli-clash-")
 
@@ -567,8 +571,9 @@ class LibraryBuildCliTests extends LibraryCliSupport {
     * crashed rather than diagnosing — `IllegalStateException: the type parameter 'T' reached codegen`
     * out of `Type.Abstract.llvm` — which is never a correct answer to legal input.
     *
-    * The shape is `sysl.slices`' own, and `12 §6` names a comparator passed to a sort as the bare
-    * arrow's motivating case, so it is one the language invites rather than an exotic corner.
+    * The shape is `sysl.slices`' own, and `reference/types.md § Function types` names a comparator
+    * passed to a sort as the bare arrow's motivating case, so it is one the language invites rather
+    * than an exotic corner.
     */
   "a closure written inside a generic, which nothing in the library instantiates" - {
 

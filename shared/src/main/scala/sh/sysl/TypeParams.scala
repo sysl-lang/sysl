@@ -4,11 +4,12 @@ package sh.sysl
   * parses the same list and hands all three parts to the node it builds. A parameter carrying
   * neither a bound nor a default is simply absent from both maps.
   *
-  * **A parameter may stand for a value rather than a type** (`10 §9`), written `[const N: usize]`.
-  * Those share `names` with the type parameters, because they share one list, one namespace and one
-  * argument position — what marks one out is an entry in `values` giving the type its argument must
-  * have. A value parameter carries no bound (a bound is a trait, and a value does not implement one)
-  * and its default, where it has one, is an expression rather than a type.
+  * **A parameter may stand for a value rather than a type** (`reference/generics.md § A parameter
+  * may stand for a value`), written `[const N: usize]`. Those share `names` with the type
+  * parameters, because they share one list, one namespace and one argument position — what marks
+  * one out is an entry in `values` giving the type its argument must have. A value parameter
+  * carries no bound (a bound is a trait, and a value does not implement one) and its default, where
+  * it has one, is an expression rather than a type.
   */
 case class TypeParams(
     names: List[String],
@@ -34,9 +35,10 @@ case class TypeParamSpec(name: String, bounds: List[BoundRef], default: Option[T
 
 case class ValueParamSpec(name: String, typ: TypeRef, default: Option[Expr]) extends ParamSpec
 
-/** `..A: Display` — a parameter standing for a **list** of types (`10 §10`). Its bound distributes
-  * over the members, which is why the bounds go in the same map a type parameter's do: everything
-  * downstream that asks what a name is bounded by gets the same answer, and only the walk that
-  * matches a subject needs to know this one is a pack.
+/** `..A: Display` — a parameter standing for a **list** of types (`reference/generics.md § A
+  * parameter may stand for a list of types`). Its bound distributes over the members, which is why
+  * the bounds go in the same map a type parameter's do: everything downstream that asks what a name
+  * is bounded by gets the same answer, and only the walk that matches a subject needs to know this
+  * one is a pack.
   */
 case class PackParamSpec(name: String, bounds: List[BoundRef]) extends ParamSpec

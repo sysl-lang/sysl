@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** A program of more than one module, and the fully-qualified path that reaches into one (`13 §3`).
+/** A program of more than one module, and the fully-qualified path that reaches into one
+ * (`reference/modules.md § Imports`).
  *
  * A public member is reachable by its module path with no import at all — import exists only to
  * shorten the reference — so this is the whole of cross-module access as it stands: what a path
@@ -152,7 +153,8 @@ class MultiModuleTests extends AnyFreeSpec with CodegenSupport with RunSupport {
   }
 
   "what a module can see" - {
-    // The library is in scope everywhere with no import; nothing else is (`13 §8`).
+    // The library is in scope everywhere with no import; nothing else is (`reference/modules.md §
+    // Separate compilation`).
     "the library, wherever it is written" in {
       runIn(
         ("", "main.sysl", "print(m.label(2))"),
@@ -204,8 +206,9 @@ class MultiModuleTests extends AnyFreeSpec with CodegenSupport with RunSupport {
   }
 
   "a local binding shadows a module name" - {
-    // `13 §3`: resolution is innermost-first, so a value bound to `geom` makes `geom.x` the field
-    // read it looks like. This is also why the module graph cannot come from a textual scan.
+    // `reference/modules.md § Imports`: resolution is innermost-first, so a value bound to `geom`
+    // makes `geom.x` the field read it looks like. This is also why the module graph cannot come
+    // from a textual scan.
     "so a dotted reference off it is a field read" in {
       runIn(
         ("", "main.sysl", "struct Holder\n    v: int\nvar geom = Holder(9)\nprint(geom.v)"),
@@ -333,9 +336,9 @@ class MultiModuleTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     // A default is copied into every implementing type, wherever those are, and its body is the
     // trait's source — so it reads the trait's module even in a copy made for a foreign type.
     //
-    // The `import` is what lets `P(5).show()` be written at all: a member arrives with its **trait**
-    // (`13 §2`), and writing the `impl` says which trait is being implemented rather than which one
-    // this file's calls may reach.
+    // The `import` is what lets `P(5).show()` be written at all: a member arrives with its
+    // **trait** (`reference/modules.md § Visibility`), and writing the `impl` says which trait is
+    // being implemented rather than which one this file's calls may reach.
     "and a trait's default reads the trait's module in every copy of it" in {
       runIn(
         ("", "main.sysl",

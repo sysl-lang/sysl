@@ -557,7 +557,8 @@ class ArrayClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     /* The gate a writable view goes through is about the storage it views rather than the spelling
-     * that took it: such a view is an alias like any other, and `16 §6` refuses one over storage a
+     * that took it: such a view is an alias like any other, and `reference/errors.md § Struct
+     * invariants` refuses one over storage a
      * struct's invariant reads. */
     "so is one inside a struct whose invariant reads it" in {
       err("""struct Box

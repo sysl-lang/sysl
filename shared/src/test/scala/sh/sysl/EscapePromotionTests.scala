@@ -2,8 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Promotion: what `05 § What happens when a slice escapes` says to do about a view that outlives
- * the array it views.
+/** Promotion: what `reference/memory.md § What happens when a slice escapes` says to do about a
+ * view that outlives the array it views.
  *
  * Every program here was a **compile error** until promotion was built, and the diagnostic told the
  * programmer to declare the storage as a `[]T` or a `&[N]T` themselves. Now the compiler does it:

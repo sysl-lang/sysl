@@ -4,12 +4,13 @@ import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
 /** The address of a **generic** function, whose instantiation is read off the expected type
- * (`12 §6a`).
+ * (`reference/ffi.md § A function's address`).
  *
- * `12 §6a` refused this outright, on the grounds that a generic function "is a body per set of type
- * arguments, so there is no one body to name". That is true only until the arguments are settled,
- * and the chapter's own next sentence — *"a wrapper that calls it at the arguments wanted is what
- * has an address"* — describes exactly what an instantiation is. The refusal was too broad.
+ * `reference/ffi.md § A function's address` refused this outright, on the grounds that a generic
+ * function "is a body per set of type arguments, so there is no one body to name". That is true
+ * only until the arguments are settled, and the chapter's own next sentence — *"a wrapper that
+ * calls it at the arguments wanted is what has an address"* — describes exactly what an
+ * instantiation is. The refusal was too broad.
  *
  * **What it was costing is a library's ability to offer a callback helper at all.** Every C
  * interface that calls back takes a `void *userdata` beside the function pointer; the trampoline
@@ -155,8 +156,9 @@ class GenericFuncAddressTests extends AnyFreeSpec with Matchers with CodegenSupp
     }
 
     // A declaration's parameters are one list and one argument position, whichever kind each is
-    // (`10 §9`), so a value parameter is written here like any other — and a value generic is the
-    // other declaration whose parameter can be absent from the signature entirely.
+    // (`reference/generics.md § A parameter may stand for a value`), so a value parameter is
+    // written here like any other — and a value generic is the other declaration whose parameter
+    // can be absent from the signature entirely.
     "a value argument" in {
       run(
         """scaled[const N: usize](x: i32) -> i32 = x * i32(N)
@@ -245,7 +247,8 @@ class GenericFuncAddressTests extends AnyFreeSpec with Matchers with CodegenSupp
     // The honest hole in the form, pinned so it is a known cost rather than a surprise. A slice, a
     // `weak`, a `volatile` and a callable have spellings the expression grammar has no production
     // for at all, so they are refused a level earlier — by the parser, in its own words. The
-    // annotated `val` still reaches every one of them, which is what `12 §6a` says to write.
+    // annotated `val` still reaches every one of them, which is what `reference/ffi.md § A
+    // function's address` says to write.
     "a slice, which the expression grammar has no production for" in {
       err(
         """count[T](p: *u8) -> i32 = 0

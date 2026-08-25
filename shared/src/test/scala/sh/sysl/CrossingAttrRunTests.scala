@@ -2,8 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** What a `@crossing` parameter **accepts**, run rather than compiled (`06 § Marking a domain
- * boundary`).
+/** What a `@crossing` parameter **accepts**, run rather than compiled (`reference/memory.md §
+ * @crossing — where the rule is asked`).
  *
  * The annotation adds a refusal and nothing else — it emits no code, changes no signature, and a
  * program that satisfies it is the program it would have been without the line. These are what says

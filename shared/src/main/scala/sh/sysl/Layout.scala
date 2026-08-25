@@ -20,11 +20,12 @@ package sh.sysl
  * wrong place — the emitted module states its triple and LLVM derives the data layout from it, so
  * everything but this one number is written down once, by LLVM.
  *
- * The language's `sizeof` and `alignof` (`03 § Reinterpreting storage`) are these two functions asked
- * from outside, so the answer a program gets and the width the compiler writes into a union agree by
- * construction rather than by being kept in step. Everything reaches them through
- * `ConstFolding.layoutBytes`, which is where the two operands with no answer — a type parameter
- * standing in for itself, and a type already complained about — are turned away before they arrive.
+ * The language's `sizeof` and `alignof` (`reference/memory.md § Reinterpreting storage`) are these
+ * two functions asked from outside, so the answer a program gets and the width the compiler writes
+ * into a union agree by construction rather than by being kept in step. Everything reaches them
+ * through `ConstFolding.layoutBytes`, which is where the two operands with no answer — a type
+ * parameter standing in for itself, and a type already complained about — are turned away before
+ * they arrive.
  *
  * @param word how wide an address is, and the whole of what a target contributes here.
  */
@@ -146,7 +147,8 @@ case class Layout(word: Word) {
     (roundUp(offset, widest), widest)
   }
 
-  /** A struct's size and alignment, with its layout attributes applied (`15 §1`).
+  /** A struct's size and alignment, with its layout attributes applied (`reference/types.md §
+   * Structs`).
    *
    * `@packed` lays the fields end to end with no interior padding and drops the aggregate's own
    * alignment to one — what a register block, and a C struct that has to match one, need.
@@ -175,14 +177,15 @@ case class Layout(word: Word) {
       case _                        => (bytes, alignment)
   }
 
-  /** Where a field starts, in bytes from the front of the struct it is written in (`03 § Reinterpreting
-   * storage`), or `None` where the struct stores no field of that name.
+  /** Where a field starts, in bytes from the front of the struct it is written in
+   * (`reference/memory.md § Reinterpreting storage`), or `None` where the struct stores no field of
+   * that name.
    *
-   * It walks the same members `structLayout` walks, in the same order, under the same `@packed` rule
-   * — deliberately, and for the reason the class doc gives about `sizeof` and the union width: the
-   * whole worth of an `offsetof` is that it is measured by the thing that did the laying out, so a
-   * second walk that agreed by inspection rather than by construction would be the tautology `15 §7`
-   * refuses.
+   * It walks the same members `structLayout` walks, in the same order, under the same `@packed`
+   * rule — deliberately, and for the reason the class doc gives about `sizeof` and the union width:
+   * the whole worth of an `offsetof` is that it is measured by the thing that did the laying out,
+   * so a second walk that agreed by inspection rather than by construction would be the tautology
+   * `reference/ffi.md § A library may carry C` refuses.
    *
    * `@align(n)` is not consulted, because it moves where the *struct* may start and never shifts a
    * field inside it.

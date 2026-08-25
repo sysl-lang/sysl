@@ -160,9 +160,9 @@ class ImplGenericRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
-  // An operator resolves to the one method its trait requires (`14 §3`), and on a generic type that
-  // method is an instantiation — so the operator has to name it the way a call does rather than by
-  // appending the method to the type.
+  // An operator resolves to the one method its trait requires (`reference/expressions.md § Operator
+  // dispatch`), and on a generic type that method is an instantiation — so the operator has to name
+  // it the way a call does rather than by appending the method to the type.
   "an operator implemented for a generic type" - {
 
     "dispatches to the instantiation the operands are" in {

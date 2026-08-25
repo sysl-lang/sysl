@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `09 §3` — **a variant belongs to its enum rather than to the module it was declared in.**
+/** `reference/types.md § Enums` — **a variant belongs to its enum rather than to the module it was
+ * declared in.**
  *
  * Two enums may each name a variant `Circle`, and what a bare `Circle(3)` means is settled by the
  * type expected where it is written. Where nothing expects a type, the qualified `Shape.Circle`
@@ -331,8 +332,9 @@ class VariantNamespaceTests extends AnyFreeSpec with RunSupport with CodegenSupp
           |""".stripMargin) shouldBe "7\n100\n"
   }
 
-  // `10 §9` — a simple enum's variant stands for its tag where a value parameter's declared type is
-  // that enum. The tag is read off the *instantiated* enum, so it has to reach the right one of two.
+  // `reference/generics.md § A parameter may stand for a value` — a simple enum's variant stands
+  // for its tag where a value parameter's declared type is that enum. The tag is read off the
+  // *instantiated* enum, so it has to reach the right one of two.
   "a simple enum's variant as a value argument picks the right enum" in {
     run("""enum Level
           |    Low

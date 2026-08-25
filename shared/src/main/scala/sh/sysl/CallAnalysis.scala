@@ -23,8 +23,8 @@ trait CallAnalysis extends OperatorCalls {
   protected def typeNamed(written: String): Option[Type] =
     tsubst.get(written).orElse(scalarType(written))
 
-  /** `T.f(…)` — an associated function reached through a **type** rather than through a value of one
-   * (`02 § Reaching a trait's members without a value`).
+  /** `T.f(…)` — an associated function reached through a **type** rather than through a value of
+   * one (`reference/traits.md § Reaching a trait's members without a value`).
    *
    * The two cases are the two things a name in that position can stand for. A **parameter** reaches
    * what its bounds promise, checked against the trait's signature exactly as a method call on a
@@ -199,11 +199,12 @@ trait CallAnalysis extends OperatorCalls {
         case _             => autoDeref(tr)
 
       // A by-value receiver is a **copy**, made by the caller, so calling one needs the layout
-      // exactly as building the value does (`15 §9`). Without this an opaque type's `self` methods
-      // are reachable from outside and the copy is laid out to the fields as they stood when that
-      // caller was compiled — which is the silent ABI break the modifier exists to prevent, since
-      // adding a field to the library would leave the call site copying the old shape. `*self` and
-      // `&self` need no shape and stay reachable, which is what makes them the forms to write.
+      // exactly as building the value does (`reference/ffi.md § opaque`). Without this an opaque
+      // type's `self` methods are reachable from outside and the copy is laid out to the fields as
+      // they stood when that caller was compiled — which is the silent ABI break the modifier
+      // exists to prevent, since adding a field to the library would leave the call site copying
+      // the old shape. `*self` and `&self` need no shape and stay reachable, which is what makes
+      // them the forms to write.
       Type.underlying(recv.ty) match
         case s: Type.Struct => checkLayoutKnown(s.base, s.name)
         case _              => ()
@@ -246,8 +247,9 @@ trait CallAnalysis extends OperatorCalls {
                   s"'$member' takes '*self', so it writes through what it is called on, and a 'val' " +
                     s"is written once$fix")
           // A `*self` method is handed somewhere to write, so it is the one call that could move
-          // storage a live `ref` is standing on (`03 § ref`). It is asked here because this is where
-          // the receiver becomes a place the caller can be told about.
+          // storage a live `ref` is standing on (`reference/memory.md § ref — a name for a place`).
+          // It is asked here because this is where the receiver becomes a place the caller can be
+          // told about.
           checkRefCall(place)
           TAddrOf(place, Type.Ptr(place.ty))
 
@@ -272,22 +274,24 @@ trait CallAnalysis extends OperatorCalls {
     val decl = structDecls(name)
 
     // A field is a named parameter of the constructor, so a value may be written at the name of the
-    // field it is for. A field declares no default (`12 §2a`), so nothing is filled here — the
-    // constructor still writes every field, and this only lets the call say which is which.
+    // field it is for. A field declares no default (`reference/declarations.md § Default parameters
+    // and named arguments`), so nothing is filled here — the constructor still writes every field,
+    // and this only lets the call say which is which.
     val args = bindArgs(s"struct '${qn(name)}'", Some(name), decl.fields, written)
 
     if args.length != decl.fields.length then
       err(s"struct '${qn(name)}' has ${quantity(decl.fields.length, "field")}, but ${supplied(args.length, "value")}")
 
     // The positional constructor writes every field, so a restricted one puts it out of reach
-    // (`08 § Visibility`) — a private field a caller could still set by position would restrict
-    // nothing worth restricting.
+    // (`reference/modules.md § Visibility`) — a private field a caller could still set by position
+    // would restrict nothing worth restricting.
     checkEveryFieldVisible(name, decl.fields.map(_.name), "the constructor",
       "build it through an associated function of its own")
 
     // Building one writes every field in order, which is the layout — so a type whose layout is
-    // withheld cannot be built from out here whatever its fields say (`15 §9`). This is not covered
-    // by resolving the name as a type: a construction never names one, it names the constructor.
+    // withheld cannot be built from out here whatever its fields say (`reference/ffi.md § opaque`).
+    // This is not covered by resolving the name as a type: a construction never names one, it names
+    // the constructor.
     checkLayoutKnown(name, qn(name))
 
     val (targs, pre) =
@@ -394,9 +398,10 @@ trait CallAnalysis extends OperatorCalls {
       err(s"'$shown' takes exactly one integer argument")
     val t = analyzeExpr(args.head, Some(en.underlying))
     // Asked of `repr` rather than of the written type, because a **transparent** subtype *is* its
-    // base (`16 §1`) and its values flow where the base's do. `repr` strips exactly that and leaves
-    // a `new` derivation standing, which is the other half of the same rule: a derived type does not
-    // mix with its base, so `Color(m)` on a `Meters` is still the written `Color(int(m))`.
+    // base (`reference/errors.md § Constrained types`) and its values flow where the base's do.
+    // `repr` strips exactly that and leaves a `new` derivation standing, which is the other half of
+    // the same rule: a derived type does not mix with its base, so `Color(m)` on a `Meters` is
+    // still the written `Color(int(m))`.
     if !Type.repr(t.ty).isInstanceOf[Type.Integer] then
       err(s"'$shown' converts an integer, but the value has type ${show(t.ty)}")
     (en, t)

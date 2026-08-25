@@ -2,8 +2,9 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** The capability annotations of `13 §4` and `capabilities.md`: `@no_alloc` narrowing a module below
- * what its target offers, and `@requires(alloc)` declaring what it cannot be built without.
+/** The capability annotations of `reference/modules.md § Capabilities are a module property` and
+ * `capabilities.md`: `@no_alloc` narrowing a module below what its target offers, and
+ * `@requires(alloc)` declaring what it cannot be built without.
  *
  * It is a property of the **module** written on each of its **files**, which is where most of the
  * rules here come from: the files have to agree, it has a place in the file, and the module's own set
@@ -614,10 +615,11 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
       out should include("declare i32 @putchar")
     }
 
-    // A call out of the module is the other half of `13 §4`, and `line_text` is what it catches:
-    // the module's own text makes nothing, and the library function it calls validates bytes into a
-    // fresh `string`. Without the reachability half this compiles, and the output holds one real
-    // call to the allocator in a module that declared it would make none.
+    // A call out of the module is the other half of `reference/modules.md § Capabilities are a
+    // module property`, and `line_text` is what it catches: the module's own text makes nothing,
+    // and the library function it calls validates bytes into a fresh `string`. Without the
+    // reachability half this compiles, and the output holds one real call to the allocator in a
+    // module that declared it would make none.
     "a call into a function that allocates is refused too" in {
       val e = errOf(
         "thing/a.sysl" ->
@@ -727,8 +729,9 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
       e should include("a module that gave one up may not reach one that needs it")
     }
 
-    // A qualified path needs no import (`13 §3`), so a rule stated over imports would have missed
-    // this entirely — which is why the graph is the reference graph and not the import graph.
+    // A qualified path needs no import (`reference/modules.md § Imports`), so a rule stated over
+    // imports would have missed this entirely — which is why the graph is the reference graph and
+    // not the import graph.
     "nor by a qualified path, which needs no import at all" in {
       err("@no_os\n\nprint(sysl.fs.exists(\"x\"))\n") should include("which requires 'os'")
     }

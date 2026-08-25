@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** What a bound on a **type's own** parameters refuses (`10 §5`).
+/** What a bound on a **type's own** parameters refuses (`reference/generics.md § Bounds`).
  *
  * There are two sides to it and they are the two halves of what a bound *is*. Everything applying
  * the type must supply what it asks — that is checked at the application, wherever one is written.
@@ -143,7 +143,7 @@ class TypeBoundsErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppo
     }
 
     // A field is layout rather than behaviour, so no bound could ever license one — the rule is the
-    // same inside a type's member as inside a generic function (`10 §5`).
+    // same inside a type's member as inside a generic function (`reference/generics.md § Bounds`).
     "while a field read off the parameter is refused with no bound to suggest" in {
       val out = err(
         """struct Wrap[T]

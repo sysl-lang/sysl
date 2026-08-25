@@ -1,7 +1,7 @@
 package sh.sysl
 
-/** Holds a definition carrying a calling convention to what the **processor being built for** allows
- * (`15 §10`).
+/** Holds a definition carrying a calling convention to what the **processor being built for**
+ * allows (`reference/ffi.md § interrupt`).
  *
  * Every rule here is the machine's rather than the language's, which is why the target is a
  * parameter of the analysis at all. There is no portable answer to check against: `interrupt` is a

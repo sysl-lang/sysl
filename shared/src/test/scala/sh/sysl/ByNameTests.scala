@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `x: -> T` — a parameter passed by name (`12 § A parameter may be passed by name`).
+/** `x: -> T` — a parameter passed by name (`reference/declarations.md § Default parameters and
+ * named arguments`).
   *
   * The feature is one thing the call site does, so the tests are about *when the argument runs*
   * rather than about what it is. Three properties carry the design and each has a test that would
