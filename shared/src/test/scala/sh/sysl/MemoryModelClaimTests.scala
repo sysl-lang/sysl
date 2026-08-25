@@ -456,6 +456,17 @@ class MemoryModelClaimTests extends AnyFreeSpec with RunSupport with CodegenSupp
         include("contains itself")
     }
 
+    // A tuple holds its parts the way a struct holds its fields, so it is a by-value edge and the
+    // walk has to cross it. Nothing else here does: every shape above reaches through a named type,
+    // and a tuple carries its parts without one. Both directions are asserted, since a walk that
+    // simply did not descend into tuples would pass the first of these for the wrong reason.
+    "a tuple is a by-value edge, so the walk crosses it in both directions" in {
+      run(s"${bufs}enum Json\n    Null\n    Obj(ms: Buf[(string, Json)])\n" +
+        "var ms: Buf[(string, Json)] = buf()\nms.push((\"a\", Null))\nprint(ms.at(0).0)") shouldBe "a\n"
+      err(s"${wrap}struct A\n    w: Wrap[(int, B)]\nstruct B\n    a: A\nvar x: A\nprint(1)") should
+        include("contains itself")
+    }
+
     "a generic holding a Buf of the type is finite again, since the Buf is where the edge is" in {
       run(s"$bufs${wrap}struct Node\n    w: Wrap[Buf[Node]]\n" +
         "var n: Buf[Node] = buf()\nprint(Node(Wrap(n)).w.x.len())") shouldBe "0\n"
