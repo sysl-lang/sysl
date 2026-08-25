@@ -80,8 +80,21 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * child ended — so they guard the same second thing that comment names. They also guard something
    * no other test in the tree does: that `fork` and `execvp` reach a real program and come back,
    * which cannot be asserted without starting one.
+   *
+   * Raised to **482** when `Chars` stopped trusting `char_width` over bytes nobody validated -- nine
+   * tests for the walk, the count, `peek`, `char_indices`' offsets, and the agreement between all of
+   * them and `from_utf8_lossy`, which is the only thing that says three readers of one table read it
+   * the same way.
+   *
+   * **Nine of those sixteen were the drift again, and it is the third time this comment has recorded
+   * it.** The tree was collecting 473 while the floor still read 457, so a module's worth could have
+   * stopped being found with nothing said -- which is the exact failure the number exists to catch,
+   * and it cannot catch it from below. **Read the count rather than adding to the last one**: set
+   * the floor absurdly high for one run and the failure names it (`482 was not greater than or equal
+   * to 99999`), which is one run and settles it. Adding your own tests to a number nobody measured
+   * carries the drift forward, which is how it got here twice before.
    */
-  private val floor = 457
+  private val floor = 482
 
   /** The library, compiled as a **test build of itself**.
    *
