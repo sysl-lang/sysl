@@ -442,7 +442,8 @@ trait ProgramWalk extends OpaqueResults {
     // Asked of the finished tree, because what allocates is a node rather than a place in the
     // analyzer — and asked here rather than after `analyze` returns, so that a module doing what it
     // declared it would not is one of this walk's diagnostics like any other.
-    checkNoAlloc(allFuncs, abstractFuncs.toList, tvals.toList, vtables.values.toList, tmain, mainScope.module)
+    checkNoAlloc(allFuncs, abstractFuncs.toList, tvals.toList, vtables.values.toList, tmain, mainScope.module,
+      tests.map(_.func).toSet)
 
     // And what a `@pure` function promised, asked of the same tree for the same reason (`17 §6`).
     checkPurity(allFuncs, externs)
@@ -496,6 +497,12 @@ trait ProgramWalk extends OpaqueResults {
       tmain,
       tentry,
       noAllocModules = moduleNarrows.collect { case (m, caps) if caps.contains(Capability.Heap) => m }.toSet,
+      // The same set for the module's *tests*, which may have taken the allocator back. Read
+      // through `testNarrows`, so a module with no `@tests` file answers with its own clause and
+      // the two sets agree — which is what they did before a test file could differ.
+      noAllocTestModules = (moduleNarrows.keySet ++ moduleTestNarrows.keySet)
+        .filter(m => testNarrows(m).contains(Capability.Heap))
+        .toSet,
       mainModule = mainScope.module,
       // Only the tests whose bodies survived analysis. A test whose body was reported is not a test
       // the runner could run, and listing it would put a name in the report that no dispatcher arm

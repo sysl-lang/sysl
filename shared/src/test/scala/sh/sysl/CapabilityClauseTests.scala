@@ -171,6 +171,106 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
     }
   }
 
+  /** The one exception to the rule above, and the reason it is not a hole in it: a `@tests` file is
+   * dropped by every build but `sysl test`, so the module's clause — which is a promise about what a
+   * program linking this module may do — was never a promise about that file.
+   *
+   * Held to one set, the clause was unavailable to precisely the modules that would want it. The
+   * standard library measured it: the one module carrying `@no_alloc` was the one module with no
+   * `tests.sysl`, because testing an allocation-free primitive means rendering what it produced and
+   * rendering allocates. `sysl.crypto` is what took the clause once this existed.
+   */
+  "a '@tests' file states what the module's tests need" - {
+
+    "it need not repeat the module's clause, which is what used to be refused" in {
+      runOf(
+        "thing/a.sysl" -> "module thing\n@no_alloc\n\nf() -> int = 1\n",
+        "thing/tests.sysl" -> "module thing\n@tests\n\nhelper() -> int = 2\n",
+        "main.sysl" -> "print(thing.f())",
+      ) shouldBe "1\n"
+    }
+
+    "and it may take back what the module gave up, since what it declares does not ship" in {
+      runOf(
+        "thing/a.sysl" -> "module thing\n@no_alloc\n\nf() -> int = 1\n",
+        "thing/tests.sysl" -> "module thing\n@tests\n@requires(heap)\n\nboxed() -> &int = 1\n",
+        "main.sysl" -> "print(thing.f())",
+      ) shouldBe "1\n"
+    }
+
+    "while the same construction in a file that ships is refused as it always was" in {
+      errOf(
+        "thing/a.sysl" -> "module thing\n@no_alloc\n\nf() -> &int = 1\n",
+        "thing/tests.sysl" -> "module thing\n@tests\n@requires(heap)\n\nboxed() -> &int = 1\n",
+        "main.sysl" -> "print(1)",
+      ) should include("a reference needs an allocator, and this module declared '@no_alloc'")
+    }
+
+    // The silent case is the common one and it has to keep meaning what it meant: every `@tests`
+    // file in the standard library repeats its module's clause today, and none of them changes
+    // meaning by dropping the line. A file states its own only where it says something.
+    "a test file that says nothing is held to its module's clause" in {
+      errOf(
+        "thing/a.sysl" -> "module thing\n@no_alloc\n\nf() -> int = 1\n",
+        "thing/tests.sysl" -> "module thing\n@tests\n\nboxed() -> &int = 1\n",
+        "main.sysl" -> "print(thing.f())",
+      ) should include("a reference needs an allocator, and this module declared '@no_alloc'")
+    }
+
+    "and one that narrows on its own is held to that, where its module narrowed nothing" in {
+      errOf(
+        "thing/a.sysl" -> "module thing\n\nf() -> &int = 1\n",
+        "thing/tests.sysl" -> "module thing\n@tests\n@no_alloc\n\nboxed() -> &int = 1\n",
+        "main.sysl" -> "print(*thing.f())",
+      ) should include("a reference needs an allocator, and this module's '@tests' file declared '@no_alloc'")
+    }
+
+    // The module's own set is read off a file that ships. It used to be read off whichever file the
+    // group happened to hold first, which is source order — so a module whose test file sorted ahead
+    // of its code would have recorded the scaffolding's clause as the module's.
+    "the module's clause is read off a file that ships, whatever order the files arrive in" in {
+      errOf(
+        "thing/a.sysl" -> "module thing\n@tests\n@requires(heap)\n\nboxed() -> &int = 1\n",
+        "thing/b.sysl" -> "module thing\n@no_alloc\n\nf() -> &int = 1\n",
+        "main.sysl" -> "print(1)",
+      ) should include("a reference needs an allocator, and this module declared '@no_alloc'")
+    }
+
+    // The scaffolding is held to agreeing with itself for the reason the shipping files are held to
+    // agreeing with each other: a module has one answer to what its tests may do.
+    "two '@tests' files of one module state one thing between them" in {
+      val e = errOf(
+        "thing/a.sysl" -> "module thing\n@no_alloc\n\nf() -> int = 1\n",
+        "thing/t1.sysl" -> "module thing\n@tests\n@requires(heap)\n\nhelper() -> int = 2\n",
+        "thing/t2.sysl" -> "module thing\n@tests\n\nother() -> int = 3\n",
+        "main.sysl" -> "print(thing.f())",
+      )
+
+      e should include("declare different capabilities")
+      e should include("its '@tests' files state one thing between them")
+    }
+
+    // A test is scaffolding wherever it is written, and `testing.md` asks for one written beside
+    // what it tests. Answering to the module while the `@tests` file beside it answered to
+    // something else would put a seam through the middle of one module's tests.
+    "a '@test' function in an ordinary file answers to the tests' clause too" in {
+      runOf(
+        "thing/a.sysl" -> ("module thing\n@no_alloc\n\nf() -> int = 1\n\n@test\n" +
+          "beside_what_it_tests() =\n    val r: &int = 1\n    assert(*r == 1)\n"),
+        "thing/tests.sysl" -> "module thing\n@tests\n@requires(heap)\n\nhelper() -> int = 2\n",
+        "main.sysl" -> "print(thing.f())",
+      ) shouldBe "1\n"
+    }
+
+    "and is refused with the module where no '@tests' file took the allocator back" in {
+      errOf(
+        "thing/a.sysl" -> ("module thing\n@no_alloc\n\nf() -> int = 1\n\n@test\n" +
+          "beside_what_it_tests() =\n    val r: &int = 1\n    assert(*r == 1)\n"),
+        "main.sysl" -> "print(thing.f())",
+      ) should include("a reference needs an allocator, and this module declared '@no_alloc'")
+    }
+  }
+
   "'no alloc' refuses every construction that makes heap storage" - {
 
     "a reference" in {
@@ -448,6 +548,31 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
       val e = errOf(
         "thing/a.sysl" -> "module thing\n@no_alloc\n\nf() -> []int\n    var a: [3]int = [1, 2, 3]\n    a[0..<3]\n",
         "main.sysl" -> "print(thing.f()[0])",
+      )
+
+      e should include("would move to the heap")
+      e should include("this module declared '@no_alloc'")
+    }
+
+    // Promotion is decided after the walk, so the exemption has to be carried onto the typed tree
+    // rather than answered where the clause was read. A `@tests` file that took the allocator back
+    // took it back for this too, or the one allocation no expression spells would be the one thing
+    // its tests still could not do.
+    "the same body in a '@tests' file whose module gave the allocator up is promoted" in {
+      runOf(
+        "thing/a.sysl" -> "module thing\n@no_alloc\n\ng() -> int = 1\n",
+        "thing/tests.sysl" -> ("module thing\n@tests\n@requires(heap)\n\n" +
+          "f() -> []int\n    var a: [3]int = [1, 2, 3]\n    a[0..<3]\n"),
+        "main.sysl" -> "print(thing.g())",
+      ) shouldBe "1\n"
+    }
+
+    "while one whose '@tests' file said nothing is refused with its module" in {
+      val e = errOf(
+        "thing/a.sysl" -> "module thing\n@no_alloc\n\ng() -> int = 1\n",
+        "thing/tests.sysl" -> ("module thing\n@tests\n\n" +
+          "f() -> []int\n    var a: [3]int = [1, 2, 3]\n    a[0..<3]\n"),
+        "main.sysl" -> "print(thing.g())",
       )
 
       e should include("would move to the heap")

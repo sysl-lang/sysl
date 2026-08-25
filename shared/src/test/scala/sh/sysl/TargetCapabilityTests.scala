@@ -242,4 +242,42 @@ class TargetCapabilityTests extends AnyFreeSpec with Matchers {
         "main.sysl" -> "print(1)\n") should include("define")
     }
   }
+
+  /** A `@tests` file states what a module's tests need, which may be more than the module itself
+   * gave up (`reference/modules.md § A '@tests' file states its own capabilities`). **Only the
+   * module's half of the two-level rule moves.**
+   *
+   * The asymmetry is what keeps the exemption honest. A file that ships nowhere may take back a
+   * promise the module made about what ships; nothing may take back a facility the machine does not
+   * have, so vectors are never reported as passing on a target that could not have run them.
+   */
+  "a '@tests' file lifts its module's clause and not the target's" - {
+
+    "the tests of an allocator-free module may allocate on a machine that has an allocator" in {
+      accepted(everything)(
+        "thing/a.sysl"     -> "module thing\n@no_alloc\n\nf() -> int = 1\n",
+        "thing/tests.sysl" -> "module thing\n@tests\n@requires(heap)\n\nboxed() -> &int = 1\n",
+        "main.sysl"        -> "print(thing.f())\n") should include("define")
+    }
+
+    "and may not on one that has none, whatever the file declares" in {
+      val e = refused(everything - Capability.Heap)(
+        "thing/a.sysl"     -> "module thing\n@no_alloc\n\nf() -> int = 1\n",
+        "thing/tests.sysl" -> "module thing\n@tests\n@requires(heap)\n\nboxed() -> &int = 1\n",
+        "main.sysl"        -> "print(thing.f())\n")
+
+      e should include("a reference needs an allocator")
+      e should include("provides no allocator")
+    }
+
+    // The requirement itself is not asked of the target, and the omission is the reason the file is
+    // allowed to write one at all: `sysl build` analyzes a `@tests` file and then drops it, so a
+    // requirement checked here would refuse a build over a facility only the discarded file wanted.
+    "the requirement itself refuses nothing, since the file it is on is about to be dropped" in {
+      accepted(everything - Capability.Heap)(
+        "thing/a.sysl"     -> "module thing\n@no_alloc\n\nf() -> int = 1\n",
+        "thing/tests.sysl" -> "module thing\n@tests\n@requires(heap)\n\nhelper() -> int = 2\n",
+        "main.sysl"        -> "print(thing.f())\n") should include("define")
+    }
+  }
 }

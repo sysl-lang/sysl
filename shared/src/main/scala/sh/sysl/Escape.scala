@@ -55,6 +55,11 @@ object Escape {
 
 private class Escape(program: TProgram) {
 
+  /** The `@test` functions by name, which `program.testOnly` does not carry: that set is what a
+   * `@tests` *file* declared, and a test may be written in an ordinary file beside what it tests.
+   */
+  private val testFuncs: Set[String] = program.tests.map(_.func).toSet
+
   private val funcs = program.funcs.map(f => f.name -> f).toMap
 
   /** For each function, which of its slice-typed parameters it lets outlive the call. Starts
@@ -482,14 +487,24 @@ private class Escape(program: TProgram) {
     val (who, w) = walk
     val module   = who.map(Modules.moduleOf).getOrElse(program.mainModule)
 
-    if !program.noAllocModules(module) then Nil
+    // A test answers to its module's `@tests` clause rather than to the module's, since that file is
+    // dropped by every build but `sysl test` and the module's promise is about what ships. The two
+    // sets are equal for a module whose tests said nothing, so this reads the same as it did.
+    val scaffolding = who.exists(n => program.testOnly(n) || testFuncs(n))
+    val narrowed    = if scaffolding then program.noAllocTestModules(module) else program.noAllocModules(module)
+
+    // Named as the tests' own clause only where the module has none, since a `@tests` file that
+    // wrote nothing is being held to its module's line and that is the line to go and read.
+    val theirs = scaffolding && !program.noAllocModules(module)
+
+    if !narrowed then Nil
     else
       w.sites.toList.map((name, pos, how) =>
         Diagnostic(
           s"this view of '$name' $how, so the array would move to the heap to outlive the frame — " +
-            "and this module declared '@no_alloc', so there is nothing to move it into. Keep the view " +
-            "inside the frame, or take the storage from a caller as a '[]T' parameter, which is " +
-            "already wherever its owner put it",
+            s"and ${if theirs then "this module's '@tests' file" else "this module"} declared '@no_alloc', " +
+            "so there is nothing to move it into. Keep the view inside the frame, or take the storage " +
+            "from a caller as a '[]T' parameter, which is already wherever its owner put it",
           pos,
         ),
       )

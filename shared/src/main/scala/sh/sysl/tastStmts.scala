@@ -362,6 +362,15 @@ case class TProgram(
      * outlives its frame, which escape analysis decides after the walk has finished (`05`).
      */
     noAllocModules: Set[String] = Set.empty,
+    /** The same, for what each module's **tests** may do
+     * (`reference/modules.md § A '@tests' file states its own capabilities`).
+     *
+     * It is a second set rather than a flag because a `@tests` file may take the allocator back — a
+     * module can ship allocating nowhere and still be tested by rendering what it produced. A
+     * module with no `@tests` file is in this set exactly when it is in the one above, so the two
+     * part company only where a file said they should.
+     */
+    noAllocTestModules: Set[String] = Set.empty,
     /** The module whose terms the statements in `main` were written in — the file that carries the
      * program's entry point (`13 §7`). Every other body says which module it belongs to in its own
      * key; these have no key, so the answer is carried here.

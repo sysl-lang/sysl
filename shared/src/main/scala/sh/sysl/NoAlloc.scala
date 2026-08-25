@@ -40,6 +40,31 @@ trait NoAlloc extends AnalyzerBase {
     (!targetProvides(Capability.Heap) && !std.carries(module)) ||
       moduleNarrows.get(module).exists(_.contains(Capability.Heap))
 
+  /** The same question asked of a module's **tests**, which have an answer of their own
+   * (`reference/modules.md § A '@tests' file states its own capabilities`).
+   *
+   * **Only the module's half moves. The target's does not**, and the asymmetry is the honest part of
+   * this: a `@tests` file may take back what the module gave up, because the module's clause is a
+   * promise about what ships and the file does not ship. It cannot take back what the machine never
+   * had. So a test that allocates is refused on a target with no allocator whatever its file says,
+   * which is what keeps `sysl test --target thumb-freestanding` from reporting that vectors passed
+   * where they could not have run.
+   */
+  protected def noAllocTests(module: String): Boolean =
+    (!targetProvides(Capability.Heap) && !std.carries(module)) ||
+      testNarrows(module).contains(Capability.Heap)
+
+  /** Which of the two governs a declaration: the module's clause, or its tests'.
+   *
+   * **A test is scaffolding wherever it is written**, so the set this asks is the one every build
+   * but `sysl test` drops — a declaration in a `@tests` file, a closure lowered inside one, and a
+   * `@test` function itself. A `@test` in an ordinary file answering to the module while the
+   * closure inside it answered to the tests would be one rule with a seam through the middle of a
+   * single body.
+   */
+  private def noAllocFor(module: String, name: String, scaffolding: Set[String]): Boolean =
+    if scaffolding(name) then noAllocTests(module) else noAlloc(module)
+
   /** Reports every construction that makes heap storage in a module that declared `no alloc`, and
    * every call out of one that arrives somewhere that does.
    *
@@ -64,7 +89,13 @@ trait NoAlloc extends AnalyzerBase {
       vtables: List[TVtable],
       main: List[TStmt],
       mainModule: String,
+      testFuncs: Set[String],
   ): Unit = {
+    // Everything a test build keeps and every other build drops. `testOnlyDecls` is the `@tests`
+    // files' declarations and the closures lowered inside any test body; the `@test` functions
+    // themselves are named nowhere else, and are what the second half adds.
+    val scaffolding = testOnlyDecls.toSet ++ testFuncs
+
     // Lazily, because building it walks every body in the program: a compilation with no clause
     // anywhere — which is almost all of them — should pay nothing at all for this pass.
     lazy val allocator = new Allocators(funcs, vtables)
@@ -77,8 +108,8 @@ trait NoAlloc extends AnalyzerBase {
     // call something spelled the same would be answered with a body it never called.
     lazy val abstractly = new Allocators(aliased(abstracts) ::: funcs, vtables)
 
-    for f <- funcs if !genericInsts(f.name) && noAlloc(Modules.moduleOf(f.name)) do
-      val why = because(Modules.moduleOf(f.name))
+    for f <- funcs if !genericInsts(f.name) && noAllocFor(Modules.moduleOf(f.name), f.name, scaffolding) do
+      val why = because(Modules.moduleOf(f.name), scaffolding(f.name))
 
       scan(f.body, why)
       allocator.blame(f.body, why)
@@ -87,19 +118,21 @@ trait NoAlloc extends AnalyzerBase {
     // whose key names no module — so reading the key puts the library's own tuple renderer in the
     // anonymous module, which is the *program's*, and a freestanding program is then refused for a
     // string the library builds. Every other kind of declaration answers the same either way.
-    for f <- abstracts; module = scopeFor(f.name).module if noAlloc(module) do
-      val why = because(module)
+    for f <- abstracts; module = scopeFor(f.name).module if noAllocFor(module, f.name, scaffolding) do
+      val why = because(module, scaffolding(f.name))
 
       scan(f.body, why)
       abstractly.blame(f.body, why)
-    for v <- vals if noAlloc(Modules.moduleOf(v.symbol)); init <- v.init do
-      val why = because(Modules.moduleOf(v.symbol))
+    for v <- vals if noAllocFor(Modules.moduleOf(v.symbol), v.symbol, scaffolding); init <- v.init do
+      val why = because(Modules.moduleOf(v.symbol), scaffolding(v.symbol))
 
       scan(init, why)
       allocator.blame(init, why)
+    // The entry file's statements are never scaffolding: a `@tests` file has no body to run, and a
+    // program's own top-level code is what every build keeps.
     if noAlloc(mainModule) then
-      scan(main, because(mainModule))
-      allocator.blame(main, because(mainModule))
+      scan(main, because(mainModule, scaffolding = false))
+      allocator.blame(main, because(mainModule, scaffolding = false))
   }
 
   /** Each abstract body again under every name a call in another one gave it, so that a walk
@@ -124,8 +157,16 @@ trait NoAlloc extends AnalyzerBase {
    * clause that is not there. Where the target is what has no allocator, the thing to change is the
    * config or the target, and the message has to point at that instead.
    */
-  private def because(module: String): String =
-    if moduleNarrows.get(module).exists(_.contains(Capability.Heap)) then "this module declared '@no_alloc'"
+  private def because(module: String, scaffolding: Boolean): String =
+    // **Told apart by the position the clause was read at**, which is the only thing that answers
+    // it: a `@tests` file writing nothing inherits its module's entry, pos and all, so an entry
+    // carrying a *different* position is one that file wrote. Naming the wrong file here sends a
+    // reader to delete a line that is not there.
+    val ours   = testNarrows(module).get(Capability.Heap)
+    val theirs = moduleNarrows.get(module).flatMap(_.get(Capability.Heap))
+
+    if scaffolding && ours.isDefined && ours != theirs then "this module's '@tests' file declared '@no_alloc'"
+    else if (if scaffolding then ours else theirs).isDefined then "this module declared '@no_alloc'"
     else s"'${target.name}' provides no allocator"
 
   /** Which functions make heap storage, and which trees reach one (`13 §4` — *propagation is over

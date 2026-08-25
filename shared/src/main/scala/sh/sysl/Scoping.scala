@@ -224,6 +224,34 @@ trait Scoping extends DeclTables {
    */
   protected val moduleRequires = mutable.LinkedHashMap.empty[String, Map[String, Option[Pos]]]
 
+  /** What each module's **test scaffolding** gave up, which is not always what the module did
+   * (`reference/modules.md § A '@tests' file states its own capabilities`).
+   *
+   * A `@tests` file is dropped by every build but `sysl test`, so the module's clause — a promise
+   * about what *ships* — is not a promise about it. Testing a module can need what the module gave
+   * up: a digest that allocates nowhere is checked against vectors rendered as text, and rendering
+   * one builds a string. So the file states its own, and this is where the answer goes.
+   *
+   * It is an **override of the module's, per capability**, rather than a set of its own: a `@tests`
+   * file that writes nothing means the module's clause, which is what almost every one of them
+   * wants and is what they all meant before this table existed. Only a capability the file
+   * explicitly requires back, or gives up on its own, differs from the module's.
+   *
+   * A module with no `@tests` file has no entry, and `testNarrows` falls back to `moduleNarrows`
+   * for it. An entry that is present and **empty** is therefore different from an absent one: it is
+   * a test file that lifted everything the module narrowed.
+   */
+  protected val moduleTestNarrows = mutable.LinkedHashMap.empty[String, Map[String, Option[Pos]]]
+
+  /** What the module's test scaffolding gave up — its own answer where it has one, and the module's
+   * where it has not.
+   *
+   * Everything asking whether a *test* may allocate goes through this rather than reading either
+   * table, since which of the two answers is the whole of the rule.
+   */
+  protected def testNarrows(module: String): Map[String, Option[Pos]] =
+    moduleTestNarrows.getOrElse(module, moduleNarrows.getOrElse(module, Map.empty))
+
   // --- visibility -----------------------------------------------------------------------
 
   /** Where a **restricted** declaration may be named from (`13 §2`): the file that wrote it, and —

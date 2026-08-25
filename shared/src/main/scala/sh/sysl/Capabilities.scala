@@ -84,6 +84,14 @@ object Capability {
  * the same thing, and the module's own set is what every later question is asked of. The redundancy
  * is deliberate — you can never open a file of a `no alloc` module and fail to see that it is one.
  *
+ * **A `@tests` file is the one exception, and it is an exception to the agreement rather than to the
+ * rule** (`reference/modules.md § A '@tests' file states its own capabilities`). The module's clause
+ * is a promise about what a program linking this module may do, and a `@tests` file is dropped by
+ * every build but `sysl test`, so it was never in that promise. Held to one set, the clause was
+ * unavailable to exactly the modules that would want it: testing an allocation-free primitive means
+ * rendering what it produced, and rendering allocates. So the scaffolding states its own — as an
+ * override of the module's, per capability, which leaves the silent case meaning what it always did.
+ *
  * What is enforced *by* the resulting set lives elsewhere: `AnalyzerBase.needsAlloc` is what every
  * construction that makes heap storage asks.
  */
@@ -104,6 +112,13 @@ trait Capabilities extends AnalyzerBase {
       checkRepeats(u)
 
     for (module, files) <- units.groupBy(declaredModule) do
+      // **The files that ship and the files that do not are two groups, held apart.** A `@tests`
+      // file is dropped by every build but `sysl test`, so the module's clause — which is a promise
+      // about what a program linking this module may do — is not a promise about it, and holding
+      // the two to one set made the clause unavailable to exactly the modules that would want it:
+      // an allocation-free primitive is tested by rendering its output, and rendering allocates.
+      val (scaffolding, shipped) = files.partition(_.testOnly)
+
       // A handed-over library is asked the first of these and not the second, and the split is over
       // *whose mistake it could be*. Whether a clause names a capability at all, and whether the
       // files of one module agree, are facts about the **files** — a typo is a typo wherever it is
@@ -111,9 +126,23 @@ trait Capabilities extends AnalyzerBase {
       // the **machine** provides is the program author's business and not the library author's: a
       // library holding one POSIX module is not a library that cannot be used on a target without
       // POSIX, it is a library one module of which that program cannot reach.
-      checkAgreement(module, files)
-      if ownModule(module) then checkAgainstTarget(module, files.head)
-      record(module, files.head)
+      checkAgreement(module, shipped)
+
+      // The scaffolding is held to agreeing with *itself* for the reason the shipping files are held
+      // to agreeing with each other: a module has one answer to what its tests may do, and two
+      // `@tests` files saying different things describe two of them. What it is no longer held to is
+      // the module's own clause.
+      checkAgreement(module, scaffolding)
+
+      for first <- shipped.headOption do
+        // Read off a file that **ships**, which is the whole reason `head` could not stay as it was:
+        // the group is in source order, so a module whose test file happened to sort first would
+        // have recorded the scaffolding's clause as the module's.
+        if ownModule(module) then checkAgainstTarget(module, first)
+        record(module, first)
+
+      // After `record`, because what the scaffolding states is an override of what the module did.
+      for first <- scaffolding.headOption do recordTests(module, first)
 
     // The library's own headers, read but **not checked**. They were checked when the library was
     // built — and where this compilation is the one building it, those files are in `units` above
@@ -139,6 +168,32 @@ trait Capabilities extends AnalyzerBase {
 
     if narrows.nonEmpty then moduleNarrows(module) = spread(narrows)
     if requires.nonEmpty then moduleRequires(module) = spread(requires)
+  }
+
+  /** What a module's `@tests` files leave behind, which is the module's own answer with the
+   * scaffolding's changes folded into it.
+   *
+   * **It is an override per capability and not a set of its own**, and that is what keeps the
+   * silent case meaning what it always meant: a `@tests` file writing no clause records the
+   * module's, so every test file in the standard library goes on saying exactly what it said. A
+   * file that writes `@requires(heap)` takes the heap back out of the narrowing — that being what a
+   * requirement *means* here, since the scaffolding cannot be built without it — and one that
+   * writes `@no_alloc` of its own narrows it whatever the module said.
+   *
+   * Only the narrowing is kept. What the scaffolding **requires** is not asked of the target, and
+   * the omission is deliberate: `sysl build` and `sysl run` analyze a `@tests` file and then drop
+   * it, so a requirement checked here would refuse a build for a facility only the file that is
+   * about to be discarded ever wanted. The honest refusal survives anyway and lands where it can be
+   * read — a target with no allocator makes every module allocator-free, scaffolding included, so a
+   * test that allocates on such a target is refused at the allocation.
+   */
+  private def recordTests(module: String, first: Program): Unit = {
+    val kept                = first.capabilities.filter(enforceable)
+    val (narrows, requires) = kept.partition(_.direction == CapabilityDirection.Narrows)
+
+    val inherited = moduleNarrows.getOrElse(module, Map.empty)
+
+    moduleTestNarrows(module) = (inherited -- spread(requires).keySet) ++ spread(narrows)
   }
 
   /** Refuses a module that requires something the target does not provide (`capabilities.md
@@ -298,15 +353,25 @@ trait Capabilities extends AnalyzerBase {
     def written(u: Program): Set[(CapabilityDirection, String)] =
       u.capabilities.map(c => (c.direction, c.name)).toSet
 
-    val first = files.head
+    // A module need not have either kind of file: one written entirely as scaffolding has no
+    // shipping file, and almost every module has no `@tests` file at all.
+    for first <- files.headOption do
+      for u <- files.tail if written(u) != written(first) do
+        recover(())(at(u.capabilities.headOption.flatMap(_.pos).orElse(u.module.flatMap(_.pos))) {
+          val whose =
+            // The two groups are held to agreeing for the same reason and are not held to each
+            // other, so the sentence has to say which rule was broken — a reader told that every
+            // file of the module states the clause, having just been told a `@tests` file states
+            // its own, would take one of the two for a lie.
+            if first.testOnly then
+              "the tests of a module are one body of scaffolding, so its '@tests' files state one " +
+                "thing between them"
+            else "a capability is a property of the module, so every one of its files states it"
 
-    for u <- files.tail if written(u) != written(first) do
-      recover(())(at(u.capabilities.headOption.flatMap(_.pos).orElse(u.module.flatMap(_.pos))) {
-        err(s"${u.source.name} and ${first.source.name} are both files of " +
-          s"${if module.isEmpty then "the same module" else s"'$module'"}, and they declare different " +
-          "capabilities — a capability is a property of the module, so every one of its files states " +
-          s"it: ${spell(u)} against ${spell(first)}")
-      })
+          err(s"${u.source.name} and ${first.source.name} are both files of " +
+            s"${if module.isEmpty then "the same module" else s"'$module'"}, and they declare different " +
+            s"capabilities — $whose: ${spell(u)} against ${spell(first)}")
+        })
   }
 
   /** A file's clauses as a reader wrote them, for a message comparing two files. */

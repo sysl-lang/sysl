@@ -71,6 +71,12 @@ case class IncludeClause(header: String) extends Positioned
  * buys is the pair of rules the declarations could not state for themselves — every build but a test
  * build drops them, and nothing outside a test may name them.
  *
+ * What it does say about the **file** is that its capability clauses are the module's *tests'*
+ * rather than the module's, since a file every other build drops was never part of what the module
+ * promised a program linking it (`reference/modules.md § A '@tests' file states its own
+ * capabilities`). A file that writes no clause is held to the module's, which is what all of them
+ * did before there was any other answer.
+ *
  * It carries no argument. What a *test* says about itself is `@test`'s to say, and this is a
  * property of the file rather than of any declaration in it.
  */
