@@ -225,9 +225,9 @@ trait Scoping extends DeclTables {
 
   /** What each module declared it cannot be built without, the other direction of the same clause.
    *
-   * A requirement is documentation plus an early diagnostic (`capabilities.md`): using a gated
-   * feature already implies the requirement, so nothing here changes what a module may do. What it
-   * changes is what a *dependent* is told, and when.
+   * A requirement is documentation plus an early diagnostic (`reference/modules.md § Capabilities
+   * are a module property`): using a gated feature already implies the requirement, so nothing here
+   * changes what a module may do. What it changes is what a *dependent* is told, and when.
    */
   protected val moduleRequires = mutable.LinkedHashMap.empty[String, Map[String, Option[Pos]]]
 
@@ -367,9 +367,10 @@ trait Scoping extends DeclTables {
    *
    * This is the question the readings below are chosen by, and asking it of the path rather than of
    * its leading segment is the difference between them working and not. A segment is shared by
-   * everything a convention namespaces together — `packages.md § 9`'s reverse DNS puts every package
-   * in an org under `sh` — so `namesModule(head)` answers yes for a path that names nothing at all,
-   * and answers it on the strength of some unrelated tree that happens to sit under the same word.
+   * everything a convention namespaces together — `reference/packages.md § What a dependency's
+   * modules are called`'s reverse DNS puts every package in an org under `sh` — so
+   * `namesModule(head)` answers yes for a path that names nothing at all, and answers it on the
+   * strength of some unrelated tree that happens to sit under the same word.
    */
   protected def reachesModule(path: String): Boolean =
     namesModule(path) || (path.lastIndexOf('.') > 0 && moduleNames(path.take(path.lastIndexOf('.'))))
@@ -408,7 +409,7 @@ trait Scoping extends DeclTables {
       .getOrElse(written)
 
   /** What a written path's leading segment means in the **package the file itself belongs to**
-   * (`packages.md § 9`).
+   * (`reference/packages.md § What a dependency's modules are called`).
    *
    * A package's own modules sit under its canonical prefix, so a file of `github.com/e/json` writing
    * `json.Parser` means that package's `json` and nothing else — which is what makes a package's

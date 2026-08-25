@@ -3,11 +3,11 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
-/** The project config of `packages.md § 1–2`: what `package.hocon` says, and what a file that says
- * it wrongly is told.
+/** The project config (`reference/packages.md § What a project is called`): what `package.hocon`
+ * says, and what a file that says it wrongly is told.
  *
  * Reading is a pure function of the file's text, so every case here runs identically on all three
- * platforms — which is the property `cross-platform.md` asks of anything below the driver, and the
+ * platforms — which is what anything below the driver is held to, and the
  * reason the parse is separated from finding the file at all.
  */
 class PackageConfigTests extends AnyFreeSpec with Matchers {
@@ -304,8 +304,9 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
     }
   }
 
-  /** The `headers` sub-block: which C headers this package includes and does not carry, each under a
-   * name a consumer answers with `--include-path <name>=<dir>` (`packages.md § 8`).
+  /** The `headers` sub-block: which C headers this package includes and does not carry, each under
+   * a name a consumer answers with `--include-path <name>=<dir>` (`reference/packages.md §
+   * Capabilities`).
    *
    * It sits under `requires` because that is already *what this package needs of its environment*,
    * and the only thing separating it from the capabilities beside it is that satisfying it is a
@@ -360,7 +361,7 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
   }
 
   /** The `pkg_config` sub-block: which installed libraries this package binds, each under the name
-   * `pkg-config` files it as (`packages.md § 8`).
+   * `pkg-config` files it as (`reference/packages.md § Capabilities`).
    *
    * A requirement kind of its own rather than a field on `headers`, because it answers both halves of
    * one fact — the headers to compile against and the library to link — and a consumer who has one of
@@ -592,8 +593,8 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
     }
   }
 
-  /** `packages.md § 13` — a package may name the pair a program's storage comes from, and a program
-   * has one of them.
+  /** `reference/packages.md § One heap, and the package that names it` — a package may name the
+   * pair a program's storage comes from, and a program has one of them.
    */
   "the allocator" - {
 

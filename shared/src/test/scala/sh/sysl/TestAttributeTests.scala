@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `@test` as the grammar and the analyzer see it (`testing.md`).
+/** `@test` as the grammar and the analyzer see it (`reference/attributes.md § @test — a function with a caller nothing else has`).
  *
  * The attribute is the language's first, so half of what is pinned here is about the *mechanism*
  * rather than about tests: that `#` opens one, that the word after it is checked rather than

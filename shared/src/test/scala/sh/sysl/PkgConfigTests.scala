@@ -3,7 +3,7 @@ package sh.sysl
 import io.github.edadma.cross_platform.*
 
 /** A package that names an installed library, answered by asking this machine where it is
- * (`packages.md § 8`, `PkgConfig`).
+ * (`reference/packages.md § Capabilities`, `PkgConfig`).
  *
  * ==Why the happy path discovers its module rather than naming one==
  *
@@ -165,8 +165,9 @@ class PkgConfigTests extends PackageCacheSupport {
   }
 
   /** The declaration is worth the same whichever road the package arrived by, which is the rule
-   * `packages.md § 8` already states for header requirements. These are the two roads a *package's*
-   * declaration travels — the project's own is every other case in this suite.
+   * `reference/packages.md § Capabilities` already states for header requirements. These are the
+   * two roads a *package's* declaration travels — the project's own is every other case in this
+   * suite.
    */
   "a package that arrived some other way" - {
 

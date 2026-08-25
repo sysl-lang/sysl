@@ -775,9 +775,9 @@ trait ExprEmitter extends ArithEmitter {
       r
 
     // The one place the C ABI is not the same on every machine, so the one place codegen reads the
-    // target (`targets.md`). All three answers are a `ptr`, and all three start from the address of
-    // the walk — what differs is whether the callee is handed that address, the value in it, or the
-    // address of a copy of it.
+    // target (`getting-started/cli.md § targets`). All three answers are a `ptr`, and all three
+    // start from the address of the walk — what differs is whether the callee is handed that
+    // address, the value in it, or the address of a copy of it.
     case TVaPass(ap) =>
       val addr = genExpr(ap)
 

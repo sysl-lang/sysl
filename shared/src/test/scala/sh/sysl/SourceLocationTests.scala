@@ -2,7 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Tier-2: what the six built-in identifiers evaluate to (`reserved-identifiers.md`).
+/** Tier-2: what the six built-in identifiers evaluate to (`reference/lexical.md § Reserved
+ * identifiers`).
  *
  * The load-bearing group is *the caller's location*, near the bottom. Everything above it is a
  * constant folded into its use and would be hard to get wrong; the thing worth pinning is that a

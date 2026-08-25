@@ -161,7 +161,7 @@ class SyslLexical
     ".*",
     ",", "::", ":", "->",
     // Opens an **annotation**, which is a declaration's only prefix that is not a word
-    // (`testing.md`). It is deliberately not an operator: nothing in the expression grammar spells
+    // (`reference/attributes.md § @test — a function with a caller nothing else has`). It is deliberately not an operator: nothing in the expression grammar spells
     // `@`, so a line beginning with one can only be an annotation and the reading needs no
     // lookahead.
     //
@@ -352,7 +352,7 @@ class SyslLexical
     case _              => true
 
   /** Materializes the token stream with each token's source position, so the parser can
-   * memoize over a fixed `List` (not the stateful scanner — see design/front-end.md)
+   * memoize over a fixed `List` rather than over the stateful scanner,
    * yet still report where a parse error occurred.
    *
    * The third element is the offset **just past** the token, which is what lets a diagnostic

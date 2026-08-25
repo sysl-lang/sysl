@@ -3,8 +3,8 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** The capability annotations of `reference/modules.md § Capabilities are a module property` and
- * `capabilities.md`: `@no_alloc` narrowing a module below what its target offers, and
- * `@requires(alloc)` declaring what it cannot be built without.
+ * `reference/modules.md § Capabilities are a module property`: `@no_alloc` narrowing a module below
+ * what its target offers, and `@requires(alloc)` declaring what it cannot be built without.
  *
  * It is a property of the **module** written on each of its **files**, which is where most of the
  * rules here come from: the files have to agree, it has a place in the file, and the module's own set
@@ -251,7 +251,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
       e should include("its '@tests' files state one thing between them")
     }
 
-    // A test is scaffolding wherever it is written, and `testing.md` asks for one written beside
+    // A test is scaffolding wherever it is written, and `reference/attributes.md § @tests — a file of scaffolding` asks for one written beside
     // what it tests. Answering to the module while the `@tests` file beside it answered to
     // something else would put a seam through the middle of one module's tests.
     "a '@test' function in an ordinary file answers to the tests' clause too" in {
@@ -476,10 +476,10 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
         ) should include(s"call void @bound.${Library.key("Integer")}.display.")
     }
 
-    // `capabilities.md` lists this among the no-alloc subset by name: the allocator's own building
-    // blocks. Nothing follows a call out of the language, so what a C function does with the storage
-    // it hands back is not this compiler's question — which is what makes an allocator writable in a
-    // module that has none.
+    // `reference/modules.md § Capabilities are a module property` lists this among the no-alloc
+    // subset by name: the allocator's own building blocks. Nothing follows a call out of the
+    // language, so what a C function does with the storage it hands back is not this compiler's
+    // question — which is what makes an allocator writable in a module that has none.
     "the malloc a module provides itself, which is an extern like any other" in {
       irOf(
         "thing/a.sysl" ->

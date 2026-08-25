@@ -240,8 +240,9 @@ class ExternVarTests
         include("may only be declared at the top level")
     }
 
-    // `capabilities.md`: what a C function does is not this compiler's to know, so an `extern` is not
-    // followed. Naming C's storage allocates nothing either, and a `no alloc` module may do it.
+    // `reference/modules.md § Capabilities are a module property`: what a C function does is not
+    // this compiler's to know, so an `extern` is not followed. Naming C's storage allocates nothing
+    // either, and a `no alloc` module may do it.
     "a 'no alloc' module may name one, because reading C's storage allocates nothing" in {
       irOf(
         "drv/a.sysl" -> "module drv\n@no_alloc\n\nextern optind: i32\n\nstep()\n    optind = 1i32\n",
@@ -373,9 +374,10 @@ class ExternVarTests
       out should not include s"@${Modules.qualify("sysl", "environ")}"
     }
 
-    // `capabilities.md`: an `extern` is not followed at all, because what a C function does is not
-    // this compiler's to know. Storage is the same question with a smaller answer — naming it does
-    // nothing at all — so a `no alloc` module writing one is not a narrowing it broke.
+    // `reference/modules.md § Capabilities are a module property`: an `extern` is not followed at
+    // all, because what a C function does is not this compiler's to know. Storage is the same
+    // question with a smaller answer — naming it does nothing at all — so a `no alloc` module
+    // writing one is not a narrowing it broke.
     "a 'no alloc' module writing one is not a narrowing it broke" in {
       irOf(
         "drv/a.sysl" -> "module drv\n@no_alloc\n\nextern optind: i32\n\nreset()\n    optind = 1i32\n",
@@ -392,7 +394,7 @@ class ExternVarTests
       run("extern optind: i32\nstatic val start: i32 = optind\nprint(start)") shouldBe "1\n"
     }
 
-    // `testing.md`: a test build drops the entry point and dispatches to the `@test` functions
+    // `reference/attributes.md § What is dropped, and when`: a test build drops the entry point and dispatches to the `@test` functions
     // instead, so what a test reaches is reached from a different root. An extern variable read only
     // from a test still has to be declared, and the storage read is still C's.
     "a '@test' build declares one that only a test reads" in {

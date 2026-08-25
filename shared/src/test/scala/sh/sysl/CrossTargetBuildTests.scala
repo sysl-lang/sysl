@@ -209,7 +209,7 @@ class CrossTargetBuildTests extends AnyFreeSpec with Matchers {
   }
 
   /** That the **C a package carries** is compiled position-independently for Android, which is the
-   * half `targets.md § Android` did not cover and the half that actually breaks.
+   * half `getting-started/cli.md § targets` did not cover and the half that actually breaks.
    *
    * The finding there is about sysl's own object and stands: every global the emitter writes is
    * `Linkage.Private`, so it is not preemptible and needs no relocation model. **A vendored library's

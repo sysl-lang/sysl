@@ -2,14 +2,15 @@ package sh.sysl
 
 import io.github.edadma.cross_platform.*
 
-/** The content hash a fetched package is held to (`packages.md § 6`).
+/** The content hash a fetched package is held to (`reference/packages.md § sysl.sum`).
  *
- * `sysl.sum` records what a package's source *was* when it was first resolved, and every fetch after
- * that is checked against it. What that protects against is the class of change a version number
- * cannot describe — a tag moved to point somewhere else, a repository rewritten, a mirror serving
- * something other than what the author published. Minimal Version Selection has already made the
- * *selection* deterministic (`packages.md § 5`), so there is nothing here about which version was
- * chosen; this is only ever about whether the bytes are the ones that were promised.
+ * `sysl.sum` records what a package's source *was* when it was first resolved, and every fetch
+ * after that is checked against it. What that protects against is the class of change a version
+ * number cannot describe — a tag moved to point somewhere else, a repository rewritten, a mirror
+ * serving something other than what the author published. Minimal Version Selection has already
+ * made the *selection* deterministic (`reference/packages.md § Which version you get`), so there is
+ * nothing here about which version was chosen; this is only ever about whether the bytes are the
+ * ones that were promised.
  *
  * **This is not `LibraryArtifact.fingerprint` and must not become it.** That one answers "did my own
  * library change, so is the cached artifact stale", where FNV-1a is the right tool and a

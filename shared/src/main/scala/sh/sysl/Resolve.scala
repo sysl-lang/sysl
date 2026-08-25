@@ -5,11 +5,11 @@ import io.github.edadma.cross_platform.*
 /** One package of a resolved graph: where its source is, what it says about itself, and what the
  * names in *its* import lines mean.
  *
- * `imports` is per-package and that is the whole of `packages.md § 9`'s two-layer identity. A
- * package's own source says `json.Parser` and means whatever *it* calls `json`; a consumer of that
- * package says `json.Parser` and may mean something else entirely. Both resolve through their own
- * table to one canonical name, so the two never have to agree on a spelling and always agree on
- * which code they linked.
+ * `imports` is per-package and that is the whole of `reference/packages.md § What a dependency's
+ * modules are called`'s two-layer identity. A package's own source says `json.Parser` and means
+ * whatever *it* calls `json`; a consumer of that package says `json.Parser` and may mean something
+ * else entirely. Both resolve through their own table to one canonical name, so the two never have
+ * to agree on a spelling and always agree on which code they linked.
  */
 case class ResolvedPackage(
     canonical: String,
@@ -25,7 +25,7 @@ case class ResolvedPackage(
   def isRoot: Boolean = canonical.isEmpty
 }
 
-/** The dependency graph, resolved (`packages.md § 5`).
+/** The dependency graph, resolved (`reference/packages.md § Which version you get`).
  *
  * Minimal Version Selection: the version chosen for a package is **the highest minimum anybody
  * asked for**, not the newest that exists. It is a walk taking a maximum rather than a search, which
@@ -45,7 +45,7 @@ case class ResolvedPackage(
 object Resolve {
 
   /** One manifest asking for one coordinate at one floor, kept so that `sysl deps` can say who
-   * wanted what (`packages.md § 5`).
+   * wanted what (`reference/packages.md § Which version you get`).
    *
    * `asker` is named the way a reader can go and look it up: a fetched package by its coordinate, a
    * path dependency by its label, and the root by whatever its manifest calls itself. Not the
@@ -145,7 +145,7 @@ object Resolve {
    */
   private def rootName(config: PackageConfig): String = config.name.getOrElse("this project")
 
-  /** Every dependency's stated floor against the compiler in hand (`packages.md § 1`).
+  /** Every dependency's stated floor against the compiler in hand (`reference/packages.md`).
    *
    * **This is the whole point of the field**, and it is why the check is here rather than left to
    * whatever fails later: a package using something the language grew fails somewhere *inside*
@@ -298,7 +298,7 @@ object Resolve {
     }
 
   /** Every package reachable through the ones a manifest named, minus those it named itself
-   * (`packages.md § 9`).
+   * (`reference/packages.md § What a dependency's modules are called`).
    *
    * ==Imports are transitive, and a manifest names what it *takes* rather than what it sees==
    *

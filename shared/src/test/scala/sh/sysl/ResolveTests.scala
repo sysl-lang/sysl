@@ -1,6 +1,7 @@
 package sh.sysl
 
-/** Minimal Version Selection and the naming rules over it (`packages.md § 5`, `§ 9`).
+/** Minimal Version Selection and the naming rules over it (`reference/packages.md § Which version
+ * you get`, `§ 9`).
  *
  * Every graph here is built in a cache of its own, so the answers are about the resolver rather than
  * about what this machine happens to have fetched before.
@@ -411,9 +412,10 @@ class ResolveTests extends PackageCacheSupport {
     }
 
     // The case the whole path rule exists for. Two packages laid out by the convention
-    // `packages.md § 9` recommends share `sh` and `sh.sysl`, and neither declares either — a
-    // directory holding no source is not a module. Binding the top-level directory made every
-    // namespaced package claim `sh`, so no project could depend on two of them.
+    // `reference/packages.md § What a dependency's modules are called` recommends share `sh` and
+    // `sh.sysl`, and neither declares either — a directory holding no source is not a module.
+    // Binding the top-level directory made every namespaced package claim `sh`, so no project could
+    // depend on two of them.
     "two packages namespaced under one prefix are not a collision" in {
       val cache = emptyCache()
 

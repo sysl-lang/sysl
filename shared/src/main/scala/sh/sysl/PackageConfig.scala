@@ -3,16 +3,17 @@ package sh.sysl
 import io.github.edadma.hocon.{ConfigBoolean, ConfigNumber, ConfigObject, ConfigString, ConfigValue, Hocon, HoconException}
 
 /** What a target provides, as the project says rather than as the registry knows
- * (`packages.md § 2`).
+ * (`reference/packages.md § What a project is called`).
  *
  * A `triple` here declares a machine the registry does not have; omitted, the block adds
- * capabilities to a registry entry of the same name. The split is the line `targets.md` draws:
- * **capabilities are policy and the ABI is not**, so a project may say what its kernel target can
- * do and may not say how a call to it is made.
+ * capabilities to a registry entry of the same name. The split is the line `getting-started/cli.md
+ * § targets` draws: **capabilities are policy and the ABI is not**, so a project may say what its
+ * kernel target can do and may not say how a call to it is made.
  */
 case class TargetConfig(triple: Option[String], capabilities: Map[String, Boolean])
 
-/** The pair of C symbols a program's storage comes from and goes back to (`packages.md § 13`).
+/** The pair of C symbols a program's storage comes from and goes back to (`reference/packages.md §
+ * One heap, and the package that names it`).
  *
  * A program has **one** of these, and `03` is why: whoever holds the last reference is what frees,
  * so two heaps in one program would mean a box whose payload cannot be given back by the code that
@@ -75,7 +76,7 @@ object Allocator {
           who.mkString("; ") + ". Drop one of the declarations, or depend on only one of them")
 }
 
-/** The project config — `package.hocon` at the project root (`packages.md § 1`).
+/** The project config — `package.hocon` at the project root (`reference/packages.md`).
  *
  * The file is **optional**, and a project without one is not a lesser project: the defaults are the
  * root the driver was given, the machine the compiler is running on, and a target that provides
@@ -83,9 +84,9 @@ object Allocator {
  * bare case is the general one with nothing filled in — and it is what keeps `sysl run hello.sysl`
  * free of ceremony.
  *
- * Only the part of `packages.md` that has something to enforce is read. `package` and `requires`
- * are parsed and checked so that a file naming them is held to spelling them correctly, and
- * `dependencies` says what to fetch and what to call it (`§ 2`, `§ 3`).
+ * Only the part of `reference/packages.md` that has something to enforce is read. `package` and
+ * `requires` are parsed and checked so that a file naming them is held to spelling them correctly,
+ * and `dependencies` says what to fetch and what to call it (`§ 2`, `§ 3`).
  */
 case class PackageConfig(
     name: Option[String] = None,
@@ -103,7 +104,7 @@ case class PackageConfig(
 ) {
 
   /** Refuses to build where the compiler in hand is older than the floor this manifest states
-   * (`packages.md § 1`).
+   * (`reference/packages.md`).
    *
    * **The whole of what the field buys is this sentence.** A package that uses something the language
    * grew builds or does not depending on what the consumer happens to have installed, and when it
@@ -183,8 +184,9 @@ case class PackageConfig(
    * declaring.
    *
    * Whether a heap exists is a **project engineering decision**, which is the whole reason this is
-   * here rather than derived: `targets.md` deliberately carries no capabilities, because a target's
-   * capabilities are exactly the part a project has an opinion about (`packages.md § 2`).
+   * here rather than derived: `getting-started/cli.md § targets` deliberately carries no
+   * capabilities, because a target's capabilities are exactly the part a project has an opinion
+   * about (`reference/packages.md § What a project is called`).
    */
   def provides(target: String): Set[String] = {
     val perTarget = targets.get(target).map(_.capabilities).getOrElse(Map.empty)
@@ -202,7 +204,7 @@ object PackageConfig {
   val HeadersKey = "headers"
 
   /** The sub-block of `requires` that names libraries this machine is asked about by `pkg-config`
-   * (`packages.md § 8`).
+   * (`reference/packages.md § Capabilities`).
    */
   val PkgConfigKey = "pkg_config"
 
@@ -223,7 +225,7 @@ object PackageConfig {
   /** Reads the file's text, or says what is wrong with it in one line.
    *
    * It takes **text rather than a path** so that the whole of it runs on every platform with no
-   * filesystem in the way (`cross-platform.md`): finding the file is the driver's, and what the file
+   * filesystem in the way: finding the file is the driver's, and what the file
    * means is here, where a test can ask about it directly.
    */
   def read(text: String): Either[String, PackageConfig] =
@@ -268,11 +270,11 @@ object PackageConfig {
 
   /** Refuses `requires { … = false }`, which parsed cleanly and was then thrown away.
    *
-   * `requires` is what a package **needs of its host** (`packages.md § 8`), so a `false` there says
-   * nothing: a package does not need a facility *not* to exist. It was collected with
-   * `collect { case (name, true) => name }` and silently dropped, which is worse than a refusal —
-   * the file then reads as though the project had said something, and it is the spelling somebody
-   * reaches for first when what they mean is *this project has no heap*.
+   * `requires` is what a package **needs of its host** (`reference/packages.md § Capabilities`), so
+   * a `false` there says nothing: a package does not need a facility *not* to exist. It was
+   * collected with `collect { case (name, true) => name }` and silently dropped, which is worse
+   * than a refusal — the file then reads as though the project had said something, and it is the
+   * spelling somebody reaches for first when what they mean is *this project has no heap*.
    *
    * The two blocks are named in the message because they are the two directions, and somebody who
    * wrote one of them wanted the other.
@@ -296,7 +298,8 @@ object PackageConfig {
    * for the same reason: each is a legal segment that names a directory rather than a file, so the
    * link would fail at the far end with a message about a path rather than about this line.
    */
-  /** `package.sysl` — the oldest compiler this package is known to build with (`packages.md § 1`).
+  /** `package.sysl` — the oldest compiler this package is known to build with
+   * (`reference/packages.md`).
    *
    * It is a **floor** rather than a range, and it is three numbers like every other version here, so
    * `Version.parse` is what reads it and a pre-release spelling is refused along with everything else
@@ -395,18 +398,18 @@ object PackageConfig {
   private def capabilitiesOf(section: Option[ConfigObject]): Option[ConfigObject] =
     section.map(caps => ConfigObject(caps.fields - HeadersKey - PkgConfigKey))
 
-  /** The `headers` sub-block of `requires` — the C headers this package's own C includes and does not
-   * carry, each under a name the consumer satisfies with `--include-path <name>=<dir>`
-   * (`packages.md § 8`).
+  /** The `headers` sub-block of `requires` — the C headers this package's own C includes and does
+   * not carry, each under a name the consumer satisfies with `--include-path <name>=<dir>`
+   * (`reference/packages.md § Capabilities`).
    *
    * ==A name, never a path==
    *
    * `reference/ffi.md § @link` refuses a path here in as many words: the file is committed and
    * describes the *package*, and where a prefix lives on somebody's laptop is not a property of the
-   * package. It refuses an environment variable for the same reason `packages.md § 7` refuses build
-   * scripts — a build that reads the consumer's shell is one that works for whoever wrote it. So
-   * what a package may say is *which* headers it needs; **where** they are stays the driver's
-   * question, exactly as it is for `@link` and `--link-path`.
+   * package. It refuses an environment variable for the same reason `reference/packages.md § No
+   * build scripts, ever` refuses build scripts — a build that reads the consumer's shell is one
+   * that works for whoever wrote it. So what a package may say is *which* headers it needs;
+   * **where** they are stays the driver's question, exactly as it is for `@link` and `--link-path`.
    *
    * ==The value is the reason, and it is what makes the refusal worth having==
    *
@@ -429,8 +432,8 @@ object PackageConfig {
                 "headers are and where they come from")
         }.map(_.toMap)
 
-  /** The `pkg_config` sub-block of `requires` — the installed libraries this package binds, each under
-   * the name `pkg-config` files it as (`packages.md § 8`).
+  /** The `pkg_config` sub-block of `requires` — the installed libraries this package binds, each
+   * under the name `pkg-config` files it as (`reference/packages.md § Capabilities`).
    *
    * ==Both halves of one declaration==
    *
@@ -471,14 +474,14 @@ object PackageConfig {
   private val AllocatorKeys = Set("alloc", "free")
 
   /** The `allocator` block — the pair of C symbols this package's storage comes from
-   * (`packages.md § 13`).
+   * (`reference/packages.md § One heap, and the package that names it`).
    *
    * ==Why a package and not a target==
    *
    * The allocator is a fact about the software a program is built *on*, not about the machine:
-   * `thumbv7em` does not imply FreeRTOS, two RTOSes on one chip want different pairs, and a bare-metal
-   * program on that same chip wants libc's. A target-level answer would need a target per RTOS, which
-   * `targets.md` already declined to do for a float variant.
+   * `thumbv7em` does not imply FreeRTOS, two RTOSes on one chip want different pairs, and a
+   * bare-metal program on that same chip wants libc's. A target-level answer would need a target
+   * per RTOS, which `getting-started/cli.md § targets` already declined to do for a float variant.
    *
    * ==Both keys, or neither==
    *
@@ -516,7 +519,7 @@ object PackageConfig {
     }
 
   /** The `defines` block: the macros a package's **own carried C** is compiled with
-   * (`packages.md § 7`).
+   * (`reference/packages.md § No build scripts, ever`).
    *
    * ==Why a package says this and a consumer does not==
    *
@@ -677,7 +680,8 @@ object PackageConfig {
         "starting with a letter")
 
   /** The `dependencies` block: what to fetch, at what version, and what a consumer may rename it to
-   * (`packages.md § 2–4`, `§ 9`).
+   * (`reference/packages.md § Dependencies`,
+   * `reference/packages.md § What a dependency's modules are called`).
    *
    * Each entry is checked here rather than at the fetch, because every mistake below is one the file
    * makes on its own — a coordinate with a scheme on the front, a major version that disagrees with

@@ -132,7 +132,7 @@ trait ProgramWalk extends OpaqueResults {
     val body = written.flatMap((scope, stmt) => (scope, stmt) :: Deriving.expand(stmt).map((scope, _)))
 
     // What a `@tests` file declares, before anything is hoisted, because hoisting is where a
-    // declaration stops remembering which file wrote it (`testing.md`). The library's files go
+    // declaration stops remembering which file wrote it (`reference/attributes.md § @tests — a file of scaffolding`). The library's files go
     // through it too: they are files of modules like any other, and the standard module having no
     // test files today is a fact about today.
     for (u, s) <- library ::: files if u.testOnly do
@@ -466,7 +466,7 @@ trait ProgramWalk extends OpaqueResults {
     // costs nothing to say`), which is the rule that makes erasing one sound.
     checkGhost(allFuncs, tmain)
 
-    // And who may name what a `@tests` file declared (`testing.md`), which is the rule that makes
+    // And who may name what a `@tests` file declared (`reference/attributes.md § @tests — a file of scaffolding`), which is the rule that makes
     // dropping one sound in the same way.
     checkTestScope(allFuncs, tmain, testOnlyDecls.toSet, tests.map(_.func).toSet)
 

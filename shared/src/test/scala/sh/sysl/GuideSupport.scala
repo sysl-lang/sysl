@@ -37,7 +37,7 @@ trait GuideSupport extends Matchers { this: Assertions =>
   }
 
   /** Runs the `@test` functions of `guide/<name>` and fails naming any that did not pass
-   * (`testing.md`).
+   * (`getting-started/cli.md § test`).
    *
    * This is the half of a guide program its own run cannot assert: a refusal traps, and a trap ends
    * the run rather than reporting a failure into it. Driven through the same functions the CLI

@@ -422,7 +422,8 @@ trait SyslParserBase extends PackratParsers {
   protected def pattern: Parser[Pattern]
 
   /** A soft keyword: a word that is only special where the grammar expects it, and an ordinary
-   * identifier everywhere else (`front-end.md`). `sync`, `Fn`, `end`, `new`, `within` and `where`
+   * identifier everywhere else (`reference/lexical.md § Reserved words`). `sync`, `Fn`, `end`,
+   * `new`, `within` and `where`
    * are all of them, which is why the three below are declared beside it.
    */
   protected def softWord(word: String): Parser[Unit]

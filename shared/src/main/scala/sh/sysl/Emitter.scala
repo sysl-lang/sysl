@@ -31,14 +31,15 @@ case class CallForm(ret: ir.LType, retAttrs: List[ir.Attr] = Nil,
  */
 trait Emitter {
 
-  /** The machine this module is being emitted for (`targets.md`). Little consults it directly: what
-   * does is the handful of places where the C ABI genuinely differs, each of which says so where it
-   * reads this, plus the two derived values below that every emitter uses without naming a target
-   * at all.
+  /** The machine this module is being emitted for (`getting-started/cli.md § targets`). Little
+   * consults it directly: what does is the handful of places where the C ABI genuinely differs,
+   * each of which says so where it reads this, plus the two derived values below that every emitter
+   * uses without naming a target at all.
    */
   protected def target: Target
 
-  /** The two C symbols this module's storage comes from and goes back to (`packages.md § 13`).
+  /** The two C symbols this module's storage comes from and goes back to (`reference/packages.md §
+   * One heap, and the package that names it`).
    *
    * A program has one pair, settled from the packages it is built from before any of this runs, so
    * nothing below decides it — every emitter that allocates or releases reads it here rather than

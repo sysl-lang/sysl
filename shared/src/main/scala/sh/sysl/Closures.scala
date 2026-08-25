@@ -219,7 +219,7 @@ trait Closures extends CallAnalysis {
     val name = s"${Type.mangle(struct)}.call"
 
     // A closure written inside a test is the test's, and is scaffolding on both counts the header
-    // says (`testing.md`): it may name what the test file declared, and every build that drops the
+    // says (`reference/attributes.md § @tests — a file of scaffolding`): it may name what the test file declared, and every build that drops the
     // test drops it too. Recorded before the body is analyzed, so that a closure nested inside this
     // one is judged against a set this one is already in.
     if inTestBody then testOnlyDecls += name

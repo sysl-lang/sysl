@@ -83,9 +83,10 @@ import scopt.OParser
  * `--explain-escapes` may be given to any of them: it reports, on stderr, every local array the
  * compiler moved to the heap and the view that forced it (`05`).
  *
- * `--target` names the machine to build for (`targets.md`). Given none, a build is for the machine
- * it is running on — and if that is one sysl has no entry for, it says so and stops rather than
- * guessing, because a wrong guess produces a module that looks right and is not.
+ * `--target` names the machine to build for (`getting-started/cli.md § targets`). Given none, a
+ * build is for the machine it is running on — and if that is one sysl has no entry for, it says so
+ * and stops rather than guessing, because a wrong guess produces a module that looks right and is
+ * not.
  *
  * `--optimize` names the level handed to clang, spelled as clang spells one after the `-O`, and it
  * reaches every object a build produces rather than only the link. The default is `1` rather than
@@ -122,7 +123,7 @@ case class Config(
     linkPaths: List[String] = Nil,
     includePaths: List[String] = Nil,
     /** `--include-path <name>=<dir>` — the same flag naming which of a package's declared header
-      * requirements the directory answers (`packages.md § 8`).
+      * requirements the directory answers (`reference/packages.md § Capabilities`).
       *
       * Kept beside `includePaths` rather than instead of it: the directory goes to the C compiler
       * either way, and what the name adds is that a package which asked for it and got nothing is

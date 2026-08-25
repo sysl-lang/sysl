@@ -2,8 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** The reserved identifier shape (`reserved-identifiers.md`): which names belong to the language,
- * that no declaration may take one, and the two build-stamp formats.
+/** The reserved identifier shape (`reference/lexical.md § Reserved identifiers`): which names
+ * belong to the language, that no declaration may take one, and the two build-stamp formats.
  *
  * The shape is tested apart from the built-ins on purpose. Reserving the space is the half that has
  * to be right *before* anything occupies it — a release that adds a seventh built-in is only

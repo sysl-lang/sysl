@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** `assert_eq` and the two beside it — an assertion that reports the **values**, which is the whole
- * of what it adds over `assert(a == b)` (`testing.md`).
+ * of what it adds over `assert(a == b)` (`library/core.md § assert_eq — the assertion that says what the values were`).
  *
  * A failed `assert` names the line, so its reader knows which check broke and has to run the thing
  * again to learn what the values were. These say so the first time. The hand-written alternative —

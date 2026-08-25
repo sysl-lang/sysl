@@ -2,20 +2,20 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Claims `codegen.md` makes about the shape of the emitted module that nothing else measures.
+/** Claims about the shape of the emitted module that nothing else measures.
  *
- * Most of that document restates the language and is pinned by the chapter's own tests. What is its
- * own are the two things it says about the *text*: the header a counted box carries, and the
- * over-approximations it lists as shortcuts. A shortcut is a claim like any other — it says the
+ * Everything else about codegen is the language, and is pinned by the suite for whichever rule it
+ * implements. What has no other home is what is true of the emitted *text*: the header a counted
+ * box carries, and the over-approximations the emitter deliberately makes. A shortcut is a claim like any other — it says the
  * compiler is still wrong in a named direction — so it needs a test that fails when the shortcut is
  * finally taken away, rather than leaving the document to drift into describing a compiler that no
  * longer exists.
  */
 class CodegenClaimTests extends AnyFreeSpec with CodegenSupport {
 
-  /** `codegen.md § Deliberate shortcuts 7`: making a slice turns the ARC runtime on even where the
-   * owner is statically null, so the smallest program there is carries an allocator it never
-   * reaches; and a non-generic type is instantiated eagerly wherever it is declared, so
+  /** Two shortcuts the emitter takes on purpose: making a slice turns the ARC runtime on even
+   * where the owner is statically null, so the smallest program there is carries an allocator it
+   * never reaches; and a non-generic type is instantiated eagerly wherever it is declared, so
    * `FormatSpec`'s layout is emitted whether or not anything renders.
    */
   private val printOnly = ir("print(1)")
@@ -38,7 +38,7 @@ class CodegenClaimTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
-  "the over-approximations codegen.md lists as shortcuts are still there" - {
+  "the over-approximations the emitter takes as shortcuts are still there" - {
 
     "a program that prints one integer still declares an allocator" in {
       printOnly should include("declare ptr @malloc(i64)")

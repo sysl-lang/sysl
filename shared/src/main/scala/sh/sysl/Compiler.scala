@@ -5,9 +5,10 @@ package sh.sysl
  * Everything here is platform-independent and cross-compiles to JVM, JS, and Native — the
  * parts that touch the filesystem and invoke a toolchain live in the JVM CLI.
  *
- * A compilation is **for** a target (`targets.md`), which is a parameter and not an ambient fact:
- * the machine the compiler is running on reaches this only as the default `Target.default` picks,
- * and a caller that names one is building for it whether or not it could run the result.
+ * A compilation is **for** a target (`getting-started/cli.md § targets`), which is a parameter and
+ * not an ambient fact: the machine the compiler is running on reaches this only as the default
+ * `Target.default` picks, and a caller that names one is building for it whether or not it could
+ * run the result.
  *
  * A compilation also allocates from **one** pair of C functions (`reference/ffi.md § interrupt`),
  * and that pair is a parameter for the same reason: it is settled by the packages a program depends
@@ -247,7 +248,7 @@ object Compiler {
   }
 
   /** The same compilation as a **test build**: the IR whose entry point dispatches to one `@test`
-   * function by name, and the tests it can be asked for (`testing.md`).
+   * function by name, and the tests it can be asked for (`getting-started/cli.md § test`).
    *
    * This is the one compilation that keeps the tests and drops the program — `Tests.only` says why —
    * and the tests come back beside the IR because the runner needs both: the binary to execute and

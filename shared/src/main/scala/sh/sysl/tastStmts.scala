@@ -98,7 +98,8 @@ case class TContinue(depth: Int)                    extends TStmt
  */
 case class TDefer(stmts: List[TStmt]) extends TStmt
 
-/** The one assembly arm that answered for the processor being built for (`inline-assembly.md`).
+/** The one assembly arm that answered for the processor being built for
+ * (`reference/inline-assembly.md`).
  *
  * The other arms are gone by the time this exists — an architecture is chosen once, in the
  * analyzer, so nothing downstream carries a branch that was never going to be taken. The
@@ -298,7 +299,7 @@ case class TVal(
 case class TEntry(func: String, argsFn: Option[String],
                   resultFn: Option[String] = None, resultTy: Option[Type] = None)
 
-/** One `@test` function, as the runner needs it (`testing.md`).
+/** One `@test` function, as the runner needs it (`reference/attributes.md § The runner`).
  *
  * `func` is the key the function is filed under, which is what makes it reachable and what the
  * dispatcher matches an argument against. Everything else is for the report: what to call the test,
@@ -386,7 +387,7 @@ case class TProgram(
      * key; these have no key, so the answer is carried here.
      */
     mainModule: String = Modules.root,
-    /** The `@test` functions the sources declared, in the order they were written (`testing.md`).
+    /** The `@test` functions the sources declared, in the order they were written (`reference/attributes.md § @test — a function with a caller nothing else has`).
      *
      * They are carried on the program rather than looked up from `funcs` because what a test *is* —
      * its reported name, what it expects — lives in the attribute, and the typed function is the
@@ -400,7 +401,7 @@ case class TProgram(
      */
     externVars: List[TExternVar] = Nil,
     /** Everything declared in a file that said `@tests` — the scaffolding a module's tests are
-     * written against (`testing.md`).
+     * written against (`reference/attributes.md § @tests — a file of scaffolding`).
      *
      * Keys rather than declarations, because what is carried here is asked of several lists at once:
      * a test file may declare functions, storage and `extern`s, and `Tests.strip` drops all three by

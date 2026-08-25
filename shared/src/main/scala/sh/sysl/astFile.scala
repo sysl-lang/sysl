@@ -15,8 +15,8 @@ case class ModuleName(parts: List[String]) extends Positioned {
   def show: String = parts.mkString(".")
 }
 
-/** Which way a capability clause points (`capabilities.md`, `reference/modules.md § Capabilities
- * are a module property`).
+/** Which way a capability clause points (`reference/modules.md § Capabilities are a module
+ * property`, `reference/modules.md § Capabilities are a module property`).
  *
  * The two are not opposites of one degree: `Narrows` *removes* a capability the target offers and
  * is enforced at every use inside the module, while `Requires` states a dependency the module
@@ -35,8 +35,8 @@ enum CapabilityDirection:
  *
  * The name is kept as written rather than resolved to a member of the core set, because which names
  * are capabilities is a property of the project's configuration and not of the grammar
- * (`capabilities.md` — "the set is extensible"). The analyzer is what holds the set and what says
- * so when a clause names something that is not in it.
+ * (`reference/modules.md § Capabilities are a module property` — "the set is extensible"). The
+ * analyzer is what holds the set and what says so when a clause names something that is not in it.
  */
 case class CapabilityClause(direction: CapabilityDirection, name: String) extends Positioned
 
@@ -68,7 +68,7 @@ case class LinkClause(name: String) extends Positioned
 case class IncludeClause(header: String) extends Positioned
 
 /** `@tests` — the file holds a module's tests and the scaffolding they need, and no build but
- * `sysl test` keeps any of it (`testing.md`).
+ * `sysl test` keeps any of it (`reference/attributes.md § What is dropped, and when`).
  *
  * It says nothing about the declarations under it beyond where they go: a helper in such a file is
  * an ordinary function, written and analyzed exactly as it would be anywhere else. What the header
@@ -87,7 +87,7 @@ case class IncludeClause(header: String) extends Positioned
 case class TestsClause() extends Positioned
 
 /** What one `@` line of a file's header may turn out to be (`reference/modules.md § Capabilities
- * are a module property`, `reference/ffi.md § @link`, `testing.md`).
+ * are a module property`, `reference/ffi.md § @link`, `reference/attributes.md § @tests — a file of scaffolding`).
  *
  * They are gathered as one list because they are read as one run of lines, and separated by what
  * each means once the file is parsed rather than by which rule matched — `@requires` alone yields

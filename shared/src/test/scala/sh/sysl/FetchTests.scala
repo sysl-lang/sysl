@@ -3,7 +3,7 @@ package sh.sysl
 import io.github.edadma.cross_platform.*
 
 /** Getting a package's source onto this machine, and what it is checked against on the way
- * (`packages.md § 3`, `§ 6`).
+ * (`reference/packages.md § Dependencies`, `§ 6`).
  *
  * The clone itself is one `git` invocation and is not exercised here; everything either side of it
  * is. What that covers is the part with decisions in it — whether a populated cache may be trusted,

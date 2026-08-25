@@ -14,11 +14,11 @@ import io.github.edadma.cross_platform.*
  * block brought in. Each is a directory of sysl files that reached this compilation as modules, and
  * a C file beside them is as much a part of one as of another.
  *
- * **A dependency's C is the case this exists for.** `packages.md § 7` refuses build scripts on the
- * grounds that sysl already compiles a package's C declaratively — which was true of a package built
- * into a `.syslib` and false of one brought in as source, where the sysl compiled and the C was
- * dropped with no warning at all. What arrived was a linker naming symbols the package's own C
- * defines, from a build whose every other part had worked.
+ * **A dependency's C is the case this exists for.** `reference/packages.md § No build scripts,
+ * ever` refuses build scripts on the grounds that sysl already compiles a package's C declaratively
+ * — which was true of a package built into a `.syslib` and false of one brought in as source, where
+ * the sysl compiled and the C was dropped with no warning at all. What arrived was a linker naming
+ * symbols the package's own C defines, from a build whose every other part had worked.
  *
  * ==Objects, not an archive==
  *

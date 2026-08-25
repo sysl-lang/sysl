@@ -3,7 +3,7 @@ package sh.sysl
 import scala.collection.mutable
 
 /** Conditional compilation: the lines of a file that belong to the target being built for
- * (`targets.md § Conditional compilation`).
+ * (`reference/attributes.md § #if — gating lines before the lexer`).
  *
  * A systems language needs one file to be able to say two things, because the two machines it is
  * describing genuinely differ — a syscall number, a struct a header lays out differently, a symbol

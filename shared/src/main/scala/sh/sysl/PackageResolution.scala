@@ -2,12 +2,12 @@ package sh.sysl
 
 import io.github.edadma.cross_platform.*
 
-// The driver's half of the package system (`packages.md`): the manifest read off the root, the
-// dependencies fetched and version-selected, and the `sysl.sum` checked and written back.
+// The driver's half of the package system (`reference/packages.md`): the manifest read off the
+// root, the dependencies fetched and version-selected, and the `sysl.sum` checked and written back.
 // Everything below resolution is `Resolve`'s and `Fetch`'s.
 
 /** What this compilation depends on, brought onto this machine and turned into what it needs from
- * them (`packages.md § 3`, `§ 5`, `§ 9`).
+ * them (`reference/packages.md § Dependencies`, `§ 5`, `§ 9`).
  *
  * A dependency reaches a compilation the way a `--lib` source tree does — as **more modules**, and
  * as a tree whose C is compiled beside the program's (`reference/ffi.md § A library may carry C`).
@@ -94,8 +94,8 @@ private def resolvedGraph(cfg: Config, project: PackageConfig, roots: List[Strin
     graph
 }
 
-/** Say so when the build is against a **higher** version than this project asked for (`packages.md
- * § 5`).
+/** Say so when the build is against a **higher** version than this project asked for
+ * (`reference/packages.md § Which version you get`).
  *
  * **Selection is silent by design and this is the one case worth breaking that for.** MVS raises
  * floors constantly — that is what it is — and a line per raise would be a wall of them, every one
@@ -141,7 +141,8 @@ private def reportRaised(project: PackageConfig, graph: Resolve.Graph): Unit =
     Console.err.println(s"sysl: note: '${dep.label}' is named at $asked and the build " +
       s"selected $resolved$because")
 
-/** What each `--lib` source root says it depends on (`packages.md § 2`).
+/** What each `--lib` source root says it depends on (`reference/packages.md § What a project is
+ * called`).
  *
  * A root with no manifest depends on nothing, exactly as for the header requirements and the allocator
  * beside it, and one whose manifest will not parse stops the build rather than being skipped — the
@@ -229,7 +230,7 @@ private def projectRoot(file: String): String =
 
     if slash >= 0 then file.substring(0, slash) else "."
 
-/** The project config, read from the root this invocation was given (`packages.md § 1`).
+/** The project config, read from the root this invocation was given (`reference/packages.md`).
  *
  * **A missing file is not an error.** A single-file program has no config and wants none, so what
  * comes back is the empty one — the same shape `reference/modules.md` gives the anonymous root
@@ -259,7 +260,8 @@ private def readPackageConfig(file: String): Either[String, PackageConfig] = {
     catch case e: Exception => Left(s"cannot read $path: ${e.getMessage}")
 }
 
-/** `sysl deps` — the resolved graph, and who asked for each version (`packages.md § 5`).
+/** `sysl deps` — the resolved graph, and who asked for each version (`reference/packages.md § Which
+ * version you get`).
  *
  * ==What the command is for==
  *

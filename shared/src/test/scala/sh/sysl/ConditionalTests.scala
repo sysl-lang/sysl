@@ -3,7 +3,8 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
-/** Conditional compilation (`targets.md § Conditional compilation`, `Conditional`).
+/** Conditional compilation (`reference/attributes.md § #if — gating lines before the lexer`,
+ * `Conditional`).
  *
  * A target is a value here, which is the whole reason this is testable at all: one laptop can ask
  * what each of the ten machines in the registry sees, and reading the emitted text is the whole of
@@ -497,7 +498,7 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
     }
 
     "a declaration's '@test' attribute at the margin is untouched" in {
-      // `#` opens an attribute too (`testing.md`), and this pass has no business with one. The words
+      // `#` opens an attribute too (`reference/attributes.md § @test — a function with a caller nothing else has`), and this pass has no business with one. The words
       // are what tell them apart, and `test` is not one of them.
       ir("""@test
            |proves_nothing()

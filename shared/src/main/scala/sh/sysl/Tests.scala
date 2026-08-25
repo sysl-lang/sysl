@@ -1,7 +1,7 @@
 package sh.sysl
 
 /** The `@test` functions a program declares, and what separates a test build from every other one
- * (`testing.md`).
+ * (`reference/attributes.md § What is dropped, and when`).
  *
  * A test is an ordinary function with an attribute on it. That is the whole of the language part:
  * nothing about the body is special, it may call anything the module can reach, and it is analyzed
@@ -188,7 +188,7 @@ object Tests {
     units.filterNot(_.testOnly).map(u => u.copy(body = u.body.filter(kept)))
 
   /** Whether a top-level statement survives into a library. Only a `@test` function does not — an
-   * `impl` may not sit in a `@tests` file at all (`testing.md`), so nothing here has to reason about
+   * `impl` may not sit in a `@tests` file at all (`reference/attributes.md § @tests — a file of scaffolding`), so nothing here has to reason about
    * a method table with a slot filled by something that is about to go.
    */
   private def kept(stmt: Stmt): Boolean = stmt match

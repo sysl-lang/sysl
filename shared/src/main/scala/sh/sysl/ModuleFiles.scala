@@ -31,7 +31,7 @@ trait ModuleFiles
 
   /** The module a file contributes to: what its header says, or the **anonymous root module** when
    * it declares none (`reference/modules.md`) — under the canonical prefix of the package it came
-   * from (`packages.md § 9`).
+   * from (`reference/packages.md § What a dependency's modules are called`).
    *
    * The prefix is what keeps a dependency's `json` and this project's `json` apart, and it is added
    * *here* rather than being written in the file so that a package's source is the same source

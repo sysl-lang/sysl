@@ -4,7 +4,7 @@ import scala.collection.mutable.ListBuffer
 import scala.util.parsing.input.Position
 
 /** The sysl parser: a packrat combinator grammar over the materialized token list from
- * `SyslLexical` (see design/front-end.md).
+ * `SyslLexical`.
  *
  * The grammar is split by area, each area a trait: `SyslParserBase` (the token reader, position
  * stamping, terminals, and the crossings between areas), `ExprParser` (the precedence ladder and
@@ -200,7 +200,8 @@ class SyslParser(val source: Source, val recovering: Boolean = false) extends Co
   protected lazy val program: PackratParser[Program] =
     skipNewlines ~> maybe(moduleHeader) >> { m =>
       // An attribute goes on a line of its own, which is what both `reference/modules.md §
-      // Capabilities are a module property` and `capabilities.md` show and what keeps `module m
+      // Capabilities are a module property` and `reference/modules.md § Capabilities are a module
+      // property` show and what keeps `module m
       // @no_alloc @requires(os)` from being a line anyone has to read. The exception is a file that
       // declares no module: the root module is a module like any other, and there is no header for
       // its attributes to sit below, so there they may open the file.

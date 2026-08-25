@@ -733,7 +733,8 @@ trait StmtParser
   protected lazy val deferStmt: PackratParser[Stmt] =
     op("defer") ~> inlineStatement ^^ Defer.apply
 
-  /** `asm` with an architecture arm per line under it (`inline-assembly.md §1`).
+  /** `asm` with an architecture arm per line under it (`reference/inline-assembly.md § One arm per
+   * architecture`).
    *
    * Every word the construct spends is contextual, `asm` included: each is recognized in one
    * position and is an ordinary identifier everywhere else, so a program may still call a variable

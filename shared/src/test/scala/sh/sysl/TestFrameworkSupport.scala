@@ -5,7 +5,7 @@ import io.github.edadma.cross_platform.*
 import org.scalatest.Assertions
 import org.scalatest.matchers.should.Matchers
 
-/** Shared helpers for the suites that exercise `@test` and `sysl test` (`testing.md`).
+/** Shared helpers for the suites that exercise `@test` and `sysl test` (`reference/attributes.md § @test — a function with a caller nothing else has`).
  *
  * These drive the **same** three steps the CLI drives — compile as a test build, link, run one
  * process per test — through the same functions, so what a suite asserts about is what a user gets.

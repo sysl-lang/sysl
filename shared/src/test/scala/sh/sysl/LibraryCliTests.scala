@@ -143,7 +143,8 @@ class LibraryCliTests extends LibraryCliSupport {
     }
   }
 
-  /** The allocator a `--lib` **source root** declares, which is the program's (`packages.md § 13`).
+  /** The allocator a `--lib` **source root** declares, which is the program's
+   * (`reference/packages.md § One heap, and the package that names it`).
    *
    * A package that brings its own heap settles the question for the whole program, and that is a
    * property of the *package* rather than of the road it arrived by — so the same directory answers
@@ -485,10 +486,11 @@ class LibraryCliTests extends LibraryCliSupport {
       }
 
       "and by the allocator, for the reason the target is in there" in {
-        // The object half calls the allocator's two functions by name, so an artifact is built for one
-        // allocator exactly as it is built for one machine (`packages.md § 13`). Without a key of its
-        // own, `read` refusing the wrong one is not a diagnostic but the same rebuild-and-overwrite
-        // loop the paragraph above describes.
+        // The object half calls the allocator's two functions by name, so an artifact is built for
+        // one allocator exactly as it is built for one machine (`reference/packages.md § One heap,
+        // and the package that names it`). Without a key of its own, `read` refusing the wrong one
+        // is not a diagnostic but the same rebuild-and-overwrite loop the paragraph above
+        // describes.
         assume(cacheDirectory.isDefined, "this machine has no cache directory")
 
         val libc = LibraryArtifact.stdDefault(Target.default, Allocator.c)

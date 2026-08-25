@@ -204,7 +204,7 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
 
   // The other half of the ring's evidence, and the half its own run cannot produce: a refusal
   // traps, and a trap ends the run rather than reporting into it. Each of these passes by not
-  // coming back (`testing.md`). This was `RingClaimTests`, asserting the same claims from Scala
+  // coming back (`reference/attributes.md § What a test may be`). This was `RingClaimTests`, asserting the same claims from Scala
   // against cut-down copies of the ring's shapes; it is now stated in sysl against the shapes
   // themselves, which is what `@test(should_trap)` bought.
   //

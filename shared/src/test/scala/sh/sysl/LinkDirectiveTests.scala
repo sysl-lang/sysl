@@ -68,10 +68,11 @@ class LinkDirectiveTests extends AnyFreeSpec with Matchers with RunSupport with 
     }
   }
 
-  // A header line is a line, so `targets.md`'s gate reaches it — the lines of a branch this build is
-  // not for are blanked before anything is parsed. That is worth having rather than incidental: a
-  // library is named differently on different platforms often enough (`ws2_32` for the sockets that
-  // are in libc elsewhere) that a binding needs to be able to say so.
+  // A header line is a line, so `getting-started/cli.md § targets`'s gate reaches it — the lines of
+  // a branch this build is not for are blanked before anything is parsed. That is worth having
+  // rather than incidental: a library is named differently on different platforms often enough
+  // (`ws2_32` for the sockets that are in libc elsewhere) that a binding needs to be able to say
+  // so.
   "a directive can be gated on the target, like any other line" - {
     val src = "#if macos\n@link(\"framework-ish\")\n#endif\n\nprint(1)\n"
 

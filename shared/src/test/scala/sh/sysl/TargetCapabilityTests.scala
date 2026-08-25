@@ -3,8 +3,9 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
-/** The **target provides** half of `capabilities.md § Two levels`, which the project config is what
- * finally declares (`packages.md § 2`).
+/** The **target provides** half of `reference/modules.md § The target's half needs no clause at
+ * all`, which the project config is what finally declares (`reference/packages.md § What a project
+ * is called`).
  *
  * Until there was a file to say otherwise every target offered everything, so the whole of this is
  * new behaviour and none of it can be reached without a `package.hocon`. The two halves meet at one
@@ -190,11 +191,12 @@ class TargetCapabilityTests extends AnyFreeSpec with Matchers {
 
   "what the target does not provide is out of reach for the program, with no clause written" - {
 
-    // The ceiling half of `capabilities.md § Two levels`, which is what makes the exemption above
-    // safe: a library's gated module stops refusing a build it has nothing to do with, and starts
-    // refusing the programs that actually reach one. Until this, the target half of the rule was
-    // enforced for `heap` and for a module's own `requires` and nowhere else — so a program on a
-    // machine its own config said has no operating system linked `sysl.fs` and said nothing.
+    // The ceiling half of `reference/modules.md § The target's half needs no clause at all`, which
+    // is what makes the exemption above safe: a library's gated module stops refusing a build it
+    // has nothing to do with, and starts refusing the programs that actually reach one. Until this,
+    // the target half of the rule was enforced for `heap` and for a module's own `requires` and
+    // nowhere else — so a program on a machine its own config said has no operating system linked
+    // `sysl.fs` and said nothing.
     val probe = "probe/probe.sysl" -> "module demo.probe\n@requires(posix)\n\nsize() -> usize = 32\n"
 
     "a program reaching a library's gated module is refused at the reference" in {

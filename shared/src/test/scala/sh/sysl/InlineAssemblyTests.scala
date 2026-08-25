@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
-/** Inline assembly (`inline-assembly.md`).
+/** Inline assembly (`reference/inline-assembly.md`).
  *
  * A target is a value, so every one of these questions is answerable on one laptop: which arm a
  * processor selects, what the constraint string comes out as, and which programs are refused for a

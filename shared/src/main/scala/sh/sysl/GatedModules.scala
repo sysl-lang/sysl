@@ -2,8 +2,9 @@ package sh.sysl
 
 import scala.collection.mutable
 
-/** What a module that gave up an environment capability may not reach (`capabilities.md §
- * Propagation through imports`, `reference/modules.md § Capabilities are a module property`).
+/** What a module that gave up an environment capability may not reach (`reference/modules.md §
+ * Capabilities are a module property`, `reference/modules.md § Capabilities are a module
+ * property`).
  *
  * **The question is asked of the module graph, and that is what makes it a different pass from
  * `NoAlloc`.** `alloc` changes what the *language* allows, so it is checked at each construction
@@ -18,19 +19,21 @@ import scala.collection.mutable
  * about the module's own text.
  *
  * **A requirement is transitive.** A module that gave up `os` may not reach one that requires it
- * *through* a third, since what the third offers is only reachable because the gated module is: what
- * `capabilities.md` asks for is that "the whole transitive graph must fit within the target's
- * capabilities", and this is that rule for the half of it a module states about itself.
+ * *through* a third, since what the third offers is only reachable because the gated module is:
+ * what `reference/modules.md § Capabilities are a module property` asks for is that "the whole
+ * transitive graph must fit within the target's capabilities", and this is that rule for the half
+ * of it a module states about itself.
  */
 trait GatedModules extends AnalyzerBase {
 
   /** Reports every reference into a module that needs an environment capability the reaching module
    * does not have — **either because it gave the capability up, or because the target never had it**.
    *
-   * The two halves are one check because they are one rule: `capabilities.md § Two levels` says a
-   * module's effective set is `target ∩ narrowing`, so a capability is out of reach whichever of the
-   * two removed it, and the edge that reached it is the line a reader has to change either way. Only
-   * the sentence differs, since only one of them names something the reader wrote.
+   * The two halves are one check because they are one rule: `reference/modules.md § The target's
+   * half needs no clause at all` says a module's effective set is `target ∩ narrowing`, so a
+   * capability is out of reach whichever of the two removed it, and the edge that reached it is the
+   * line a reader has to change either way. Only the sentence differs, since only one of them names
+   * something the reader wrote.
    *
    * It runs after the module graph is settled and held to being acyclic, for both of the reasons
    * that pass does: an edge is made by a reference and a reference may be anywhere a body is, and
@@ -45,8 +48,9 @@ trait GatedModules extends AnalyzerBase {
     // The ceiling half of the two-level rule, which is the machine's rather than any module's: what
     // the target does not provide is out of reach for every module of the program, with no clause
     // written anywhere. It is the same treatment `NoAlloc` gives a target with no heap, and for the
-    // same reason — `capabilities.md` says the whole transitive graph must fit within the target's
-    // set, and a module that inherits the target's capabilities by default inherits their absence too.
+    // same reason — `reference/modules.md § Capabilities are a module property` says the whole
+    // transitive graph must fit within the target's set, and a module that inherits the target's
+    // capabilities by default inherits their absence too.
     //
     // **Reported here at the reference rather than at the required module's own clause**, which is
     // the whole of what makes it answerable. That clause is in a file the program's author did not

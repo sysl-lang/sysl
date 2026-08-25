@@ -214,9 +214,10 @@ case class Target(
    *
    * ==Why this is about the CARRIED C and not about sysl's own output==
    *
-   * `targets.md § Android` establishes that sysl's own objects need no relocation model: every global
-   * the emitter writes is `Linkage.Private`, so it is not preemptible and lowers to a PC-relative
-   * pair against a local section. That is still true and nothing here changes it.
+   * `getting-started/cli.md § targets` establishes that sysl's own objects need no relocation
+   * model: every global the emitter writes is `Linkage.Private`, so it is not preemptible and
+   * lowers to a PC-relative pair against a local section. That is still true and nothing here
+   * changes it.
    *
    * **A package's vendored C is the other half, and it has ordinary C globals.** Those *are*
    * preemptible, so without `-fPIC` clang emits `ADR_PREL_PG_HI21` against the symbol itself and the
@@ -265,9 +266,10 @@ case class Target(
  * `{ ptr, ptr, iN }` where `N` is the address width, because its length is a `usize` — so the LLVM
  * form of a slice, and of anything containing one, cannot be written without knowing the machine.
  *
- * It is a parameter rather than a global for the reason `targets.md` gives for the target itself: a
- * compiler that reads the width from somewhere ambient can be wrong about it silently, and one that
- * is handed it cannot compile at all until every caller has said which machine it means.
+ * It is a parameter rather than a global for the reason `getting-started/cli.md § targets` gives
+ * for the target itself: a compiler that reads the width from somewhere ambient can be wrong about
+ * it silently, and one that is handed it cannot compile at all until every caller has said which
+ * machine it means.
  */
 case class Word(bits: Int) {
   def bytes: Int = bits / 8
@@ -356,14 +358,14 @@ enum Cpu(val bits: Int) {
 object Cpu {
 
   /** The processors a target can actually be built for, which is what an exhaustive set of assembly
-   * arms has to cover (`inline-assembly.md §2`).
+   * arms has to cover (`reference/inline-assembly.md § Every architecture needs an answer`).
    *
    * `x86` is nameable and not lowerable, and **the reason is no longer its width** — 32-bit targets
    * build. It is that nothing has measured i386's C calling convention against clang, which is what
-   * `targets.md § Adding one` says a target's answers have to come from. Requiring an assembly arm
-   * for a processor no program can be built for would be requiring an answer to a question nobody
-   * can ask; when the convention is measured it joins this list, and the arms that do not cover it
-   * become errors, which is the work of supporting it.
+   * `getting-started/cli.md § targets` says a target's answers have to come from. Requiring an
+   * assembly arm for a processor no program can be built for would be requiring an answer to a
+   * question nobody can ask; when the convention is measured it joins this list, and the arms that
+   * do not cover it become errors, which is the work of supporting it.
    */
   def buildable: List[Cpu] = values.filterNot(_ == X86).toList
 }
@@ -690,11 +692,11 @@ object Target {
    * the LLVM and stops, and `Toolchain` refuses this target rather than going looking for a driver
    * that is not there (`buildsWithClang`).
    *
-   * **Everything a target usually records about a C call is unanswerable here, which is a fact about
-   * the machine rather than a measurement nobody made.** `targets.md § Adding one` says an ABI
-   * answer comes from compiling the equivalent C and reading what clang did; there is no C on the
-   * other side of any call on this machine, so there is nothing to agree with. The fields below are
-   * therefore what the *LLVM back end* does, and `CAbi` says so where it is asked.
+   * **Everything a target usually records about a C call is unanswerable here, which is a fact
+   * about the machine rather than a measurement nobody made.** `getting-started/cli.md § targets`
+   * says an ABI answer comes from compiling the equivalent C and reading what clang did; there is
+   * no C on the other side of any call on this machine, so there is nothing to agree with. The
+   * fields below are therefore what the *LLVM back end* does, and `CAbi` says so where it is asked.
    *
    * `softFloat` and `noFpu` are both plainly true: there is no floating-point unit and no plan for
    * one, so every operation on a `float` or a `double` is a call to a runtime routine the back end
@@ -710,9 +712,9 @@ object Target {
    * limit is the compiler's and not the machine's, and a reader who names it deserves to be told
    * what is missing rather than told the name is unknown.
    *
-   * **The limit is no longer its width.** 32-bit targets build; what i386 has not got is a C calling
-   * convention measured against clang, which is the only way `targets.md § Adding one` allows one to
-   * be arrived at.
+   * **The limit is no longer its width.** 32-bit targets build; what i386 has not got is a C
+   * calling convention measured against clang, which is the only way `getting-started/cli.md §
+   * targets` allows one to be arrived at.
    */
   val x86Linux: Target =
     Target("x86-linux", "i386-unknown-linux-gnu", Cpu.X86, Os.Linux, VaListAbi.Address, 4)
@@ -780,8 +782,8 @@ object Target {
   }
 
   /** This machine, when the registry knows it. The compiler asks its own platform what it is
-   * running on — that is a question about the edge and `hostMachine` answers it there
-   * (`cross-platform.md`) — and the pair is turned into a target here.
+   * running on — that is a question about the edge and `hostMachine` answers it there, per
+   * platform — and the pair is turned into a target here.
    */
   val host: Option[Target] = byName.get(hostName(hostMachine._1, hostMachine._2)).filter(_.supported)
 

@@ -1,6 +1,7 @@
 package sh.sysl
 
-/** The named environment facts a module may narrow away or declare it needs (`capabilities.md`).
+/** The named environment facts a module may narrow away or declare it needs (`reference/modules.md
+ * § Capabilities are a module property`).
  *
  * The set is a property of the **project**, not of the grammar: a capability's name arrives from
  * the parser as whatever was written, and this is what says which spellings mean something.
@@ -46,7 +47,7 @@ object Capability {
   val core: List[String] = List(Heap, Os, Posix)
 
   /** The capabilities that gate **which standard-library modules exist**, as against `heap`, which
-   * changes what the language allows (`capabilities.md § Two kinds of capability`).
+   * changes what the language allows (`reference/modules.md § Capabilities are a module property`).
    *
    * The distinction is what decides where each is enforced. `heap` is asked of every construction
    * that makes heap storage and of every call that reaches one, because the standard module is one
@@ -77,7 +78,8 @@ object Capability {
 }
 
 /** Reading the capability clauses of a program's files into the module property they describe
- * (`reference/modules.md § Capabilities are a module property`, `capabilities.md`).
+ * (`reference/modules.md § Capabilities are a module property`, `reference/modules.md §
+ * Capabilities are a module property`).
  *
  * A clause is written per **file** and means something about the **module**, which is the whole of
  * why there is a pass here rather than a field: the files of one module have to be held to saying
@@ -196,8 +198,8 @@ trait Capabilities extends AnalyzerBase {
     moduleTestNarrows(module) = (inherited -- spread(requires).keySet) ++ spread(narrows)
   }
 
-  /** Refuses a module that requires something the target does not provide (`capabilities.md
-   * § Two levels`).
+  /** Refuses a module that requires something the target does not provide (`reference/modules.md §
+   * The target's half needs no clause at all`).
    *
    * This is the whole point of writing `requires` rather than relying on use sites: the chapter's
    * own words are *"one clean error if built for a no-alloc target, instead of one error at every

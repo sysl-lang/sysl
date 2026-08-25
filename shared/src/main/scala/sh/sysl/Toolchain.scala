@@ -98,7 +98,8 @@ case class SearchPaths(link: List[String] = Nil, include: List[String] = Nil,
   def defineFlags: List[String] = defines.map(d => s"-D$d")
 
   /** The macros one **carried** C file is compiled with: the build's own, then whatever the package
-   * that carries the file declared for it in `defines` (`packages.md § 7`).
+   * that carries the file declared for it in `defines` (`reference/packages.md § No build scripts,
+   * ever`).
    *
    * ==Why the package's come second==
    *
@@ -151,7 +152,8 @@ object SearchPaths {
   val none: SearchPaths = SearchPaths()
 
   /** `--include-path` written as `<name>=<dir>`, which satisfies a package's declared header
-   * requirement (`packages.md § 8`), or nothing where it is the ordinary bare directory.
+   * requirement (`reference/packages.md § Capabilities`), or nothing where it is the ordinary bare
+   * directory.
    *
    * ==Why a bare path cannot be mistaken for a named one==
    *
@@ -791,9 +793,10 @@ object Toolchain {
    * `relocation R_AARCH64_ADR_PREL_PG_HI21 cannot be used against symbol 'b2AssertHandler';
    * recompile with -fPIC`. It reads as a broken package and is not one.
    *
-   * **This does not contradict `targets.md § Android`'s finding that sysl needs no relocation
-   * model.** That was measured on sysl's *own* object, whose globals are all `Linkage.Private` and
-   * therefore not preemptible. Carried C is the half that finding did not cover.
+   * **This does not contradict `getting-started/cli.md § targets`'s finding that sysl needs no
+   * relocation model.** That was measured on sysl's *own* object, whose globals are all
+   * `Linkage.Private` and therefore not preemptible. Carried C is the half that finding did not
+   * cover.
    *
    * `named` says which compiler to use instead of searching for one, exactly as `compileObject`'s
    * does and for the same narrow reason: a C file that includes nothing needs no sysroot, so a test

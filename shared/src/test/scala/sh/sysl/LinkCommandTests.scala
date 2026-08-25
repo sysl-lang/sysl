@@ -246,7 +246,7 @@ class LinkCommandTests extends AnyFreeSpec with Matchers {
     cmd.indexOf("-lm") should be > cmd.indexOf("prog.ll")
   }
 
-  /** Where what `pkg-config` answered lands on the line (`packages.md § 8`).
+  /** Where what `pkg-config` answered lands on the line (`reference/packages.md § Capabilities`).
    *
    * This is the suite's own argument exactly: **macOS cannot find this bug.** `ld64` gathers every
    * `-L` before it resolves anything, so both orders link here — checked with clang rather than

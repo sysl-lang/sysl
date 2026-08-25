@@ -9,11 +9,12 @@ package sh.sysl
  * seventh built-in cannot collide with a name somebody already declared, because the shape was never
  * theirs to declare.
  *
- * It is the same decision the `#if` vocabulary made (`targets.md`): a closed set, and a name outside
- * it is an **error rather than false**, because a misspelling that quietly meant nothing is the one
- * failure C has here and the one worth not repeating. C reserves this space too and diagnoses
- * nothing in it, so `__FILE_` — one underscore short — is a name C will happily let you declare and
- * then collide with. Here it is either the shape or it is not, and the shape is refused outright.
+ * It is the same decision the `#if` vocabulary made (`getting-started/cli.md § targets`): a closed
+ * set, and a name outside it is an **error rather than false**, because a misspelling that quietly
+ * meant nothing is the one failure C has here and the one worth not repeating. C reserves this
+ * space too and diagnoses nothing in it, so `__FILE_` — one underscore short — is a name C will
+ * happily let you declare and then collide with. Here it is either the shape or it is not, and the
+ * shape is refused outright.
  *
  * **These are not reserved words.** They lex as ordinary identifiers and are resolved by the
  * analyzer, exactly as `int`, `usize` and `f32` are (`SyslLexical`). That is what keeps the space

@@ -792,7 +792,7 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     // the arity check, the generic solve, `checkArgs` — sees the call written out in full.
     val args = bindArgs(s"function '$shown'", Some(f.name), f.params, written, variadic)
 
-    // A `@test` function has one caller and it is not in the program (`testing.md`). Every build but
+    // A `@test` function has one caller and it is not in the program (`reference/attributes.md § A test has one caller, and the program is not it`). Every build but
     // `sysl test` drops it, so a call would compile and then fail at the *link*, naming a symbol
     // nothing in the source explains — which is the shape of failure a diagnostic exists to prevent.
     // Refused wherever the call is written, a test's own body included: two tests sharing work share
@@ -912,7 +912,7 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
         at(a.pos)(Sharing.crossing(subject, crossed).foreach(err))
 
   /** The arguments of a foreign call, with each one headed for a C by-value `va_list` parameter
-   * turned into what the target's ABI passes there (`targets.md`).
+   * turned into what the target's ABI passes there (`getting-started/cli.md § targets`).
    *
    * The address is what was checked and is what all three answers are formed from, so this wraps
    * rather than replaces — and it happens here, once, because a foreign call is the only place a
@@ -951,11 +951,11 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
    *
    * An **aggregate** crosses to a *foreign* callee and not to a sysl one, and the asymmetry is not
    * an oversight. C allows a struct in a variadic tail and hands it over under exactly the
-   * classification a declared parameter of the same type gets (`targets.md`), so a foreign call needs
-   * no rule of its own — whoever compiled the other side applies that classification too. A **sysl**
-   * variadic callee reads its own tail back with a walk (§9), and the walk is written for values that
-   * fit a register; an aggregate would have to be read back some other way, which is a question about
-   * the walk and not about the call.
+   * classification a declared parameter of the same type gets (`getting-started/cli.md § targets`),
+   * so a foreign call needs no rule of its own — whoever compiled the other side applies that
+   * classification too. A **sysl** variadic callee reads its own tail back with a walk (§9), and
+   * the walk is written for values that fit a register; an aggregate would have to be read back
+   * some other way, which is a question about the walk and not about the call.
    */
   protected def variadicArg(a: Expr, foreign: Boolean = false): TExpr = {
     val t = analyzeExpr(a)

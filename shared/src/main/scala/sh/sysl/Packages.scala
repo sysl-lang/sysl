@@ -1,7 +1,7 @@
 package sh.sysl
 
 /** Which package each file came from, and what the names at the head of its import lines mean
- * (`packages.md § 9`).
+ * (`reference/packages.md § What a dependency's modules are called`).
  *
  * ==Identity is two-layered, and this is the layer that is not identity==
  *
@@ -63,7 +63,8 @@ case class Packages(of: Map[Source, String] = Map.empty, imports: Map[String, Ma
   def isEmpty: Boolean = of.isEmpty && imports.isEmpty
 }
 
-/** One package's declared need of a header it includes and does not carry (`packages.md § 8`).
+/** One package's declared need of a header it includes and does not carry (`reference/packages.md §
+ * Capabilities`).
  *
  * `who` is the package's coordinate rather than its module name, because that is what a consumer
  * wrote in their `dependencies` block and therefore what they can go and look at. `why` is the
@@ -72,7 +73,7 @@ case class Packages(of: Map[Source, String] = Map.empty, imports: Map[String, Ma
 case class HeaderNeed(who: String, name: String, why: String)
 
 /** One package's declared need of an **installed library**, under the name `pkg-config` files it as
- * (`packages.md § 8`).
+ * (`reference/packages.md § Capabilities`).
  *
  * The same shape as `HeaderNeed` and deliberately not the same type. A header requirement is answered
  * by a directory somebody types; this one is answered by asking the machine, and the two produce
@@ -92,13 +93,15 @@ case class LibNeed(who: String, module: String, why: String)
  * it; and it may name the pair of C functions the whole program allocates through.
  *
  * The third is here because it was once missing. A package's sysl compiled and its C was dropped
- * with no warning, so a build against any package carrying a shim ended at the linker naming symbols
- * that package's own C defines — which `packages.md § 7` had already promised would not happen, on
- * the grounds that sysl compiles a package's C declaratively and needs no build script to do it.
+ * with no warning, so a build against any package carrying a shim ended at the linker naming
+ * symbols that package's own C defines — which `reference/packages.md § No build scripts, ever` had
+ * already promised would not happen, on the grounds that sysl compiles a package's C declaratively
+ * and needs no build script to do it.
  *
- * `defines` is what each package declared for its **own carried C** (`packages.md § 7`), already
- * keyed by the path the file will be compiled from: a package's manifest names it relative to the
- * package root, and where that root is on this machine is known here and nowhere downstream.
+ * `defines` is what each package declared for its **own carried C** (`reference/packages.md § No
+ * build scripts, ever`), already keyed by the path the file will be compiled from: a package's
+ * manifest names it relative to the package root, and where that root is on this machine is known
+ * here and nowhere downstream.
  *
  * `allocators` is carried as the **declarations** rather than as the answer, because the project's
  * own is not here: the root is not a fetched package, and `Allocator.choose` has to see every claim

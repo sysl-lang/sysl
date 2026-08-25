@@ -49,7 +49,7 @@ trait HeaderParser extends AttrParser {
 
   /** A file-header attribute: `@no_alloc`, `@requires(os, posix)`, `@link("z")`, `@tests`
    * (`reference/modules.md § Capabilities are a module property`, `reference/ffi.md § @link`,
-   * `capabilities.md`, `testing.md`).
+   * `reference/attributes.md § @tests — a file of scaffolding`).
    *
    * **These are attributes rather than grammar, and that is the point of the spelling.** A capability
    * and a library name are things said *about* a module, not constructs the language executes, so
@@ -85,8 +85,8 @@ trait HeaderParser extends AttrParser {
    * It is one list because two would drift, and both readers of it are about the boundary rather
    * than about any one attribute: the commit point below, and the refusal of one written where a
    * statement goes. `reference/modules.md § Capabilities are a module property` and
-   * `capabilities.md` are where the vocabulary is documented; this is the grammar's single copy of
-   * it.
+   * `reference/modules.md § Capabilities are a module property` are where the vocabulary is
+   * documented; this is the grammar's single copy of it.
    *
    * **`@test` and `@tailrec` are deliberately not here.** The header's repetition runs before the
    * statements, so it also sees the attributes written above the first declaration — a list that
@@ -96,7 +96,7 @@ trait HeaderParser extends AttrParser {
     attrWordPrefixed("no_") | attrWord("requires") | attrWord("link") | attrWord("include") |
       attrWord("tests")
 
-  /** `@tests` — the file is the module's test scaffolding (`testing.md`).
+  /** `@tests` — the file is the module's test scaffolding (`reference/attributes.md § @tests — a file of scaffolding`).
    *
    * It sits with the capability clauses rather than above a declaration because it is a property of
    * the **file**: what it governs is every declaration in it at once, and a mark that had to be

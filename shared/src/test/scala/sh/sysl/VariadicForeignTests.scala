@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** A walk over a variadic tail handed to a **C** function — `vprintf` and its family
- * (`12-functions-and-closures.md` §9, `targets.md`).
+ * (`12-functions-and-closures.md` §9, `getting-started/cli.md § targets`).
  *
  * This is the one thing in the compiler that is genuinely different on different machines. C's
  * `va_list` is a different type on every target and is passed three different ways, so the address

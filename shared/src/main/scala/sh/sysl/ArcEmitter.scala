@@ -756,11 +756,11 @@ object ArcEmitter {
     // object on machines chosen for having very little memory, which is the argument the comment
     // above already makes about the counts — so the phase travels as an argument instead.
     //
-    // The free is in the hook rather than in `arc.unshare` because `capabilities.md` says the free
-    // path goes through the object's own hook, and because it is the only arrangement under which
-    // the two halves of that chapter are both true: a module that allocates nothing emits no hook
-    // and so names no `free`, while one holding a heap slice something else made frees it with the
-    // allocator that made it.
+    // The free is in the hook rather than in `arc.unshare` because `reference/modules.md §
+    // Capabilities are a module property` says the free path goes through the object's own hook,
+    // and because it is the only arrangement under which the two halves of that chapter are both
+    // true: a module that allocates nothing emits no hook and so names no `free`, while one holding
+    // a heap slice something else made frees it with the allocator that made it.
     s"""%arc.header = type { $word, ptr, $word }
       |
       |%arc.reaper = type { ptr, i8 }

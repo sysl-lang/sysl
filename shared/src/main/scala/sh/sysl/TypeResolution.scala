@@ -1157,11 +1157,11 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
    * exists to do.
    *
    * An **`extern`** transcribes a C header, so it is written in C's spellings and both are allowed:
-   * `va_list` is C's by-value parameter, the one `vprintf` takes, and `*va_list` is C's `va_list *`,
-   * the one a function that must advance its caller's own walk takes. What a call actually hands
-   * the first of those is a different thing on every target and is `TVaPass`'s business
-   * (`targets.md`); the *call* writes `&ap` for either, because the address is the only thing sysl
-   * has and it is what both are formed from.
+   * `va_list` is C's by-value parameter, the one `vprintf` takes, and `*va_list` is C's `va_list
+   * *`, the one a function that must advance its caller's own walk takes. What a call actually
+   * hands the first of those is a different thing on every target and is `TVaPass`'s business
+   * (`getting-started/cli.md § targets`); the *call* writes `&ap` for either, because the address
+   * is the only thing sysl has and it is what both are formed from.
    *
    * **Returning a bare `va_list` is refused everywhere**, foreign or not: sysl has no by-value
    * `va_list` at all — the type names the storage a walk lives in — so there would be nothing to
@@ -1200,7 +1200,7 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
   protected def foreignParam(t: Type): Type = if t == Type.VaList then Type.Ptr(Type.VaList) else t
 
   /** Which of a foreign declaration's parameters were written as C's by-value `va_list`, and so
-   * need what a call passes converted to the target's ABI (`targets.md`).
+   * need what a call passes converted to the target's ABI (`getting-started/cli.md § targets`).
    */
   protected def foreignVaByValue(e: ExternDecl): Set[Int] =
     e.params.zipWithIndex.collect {

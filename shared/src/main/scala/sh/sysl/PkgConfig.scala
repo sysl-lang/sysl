@@ -16,7 +16,7 @@ case class PkgConfigAnswer(cflags: List[String], ldflags: List[String])
 
 /** The one machine-side question a package is allowed to ask: **where does this library live here?**
  *
- * ==Why this does not reopen `packages.md § 7`==
+ * ==Why this does not reopen `reference/packages.md § No build scripts, ever`==
  *
  * `§ 7` refuses build scripts, and the reason it gives is that a package must not run code on the
  * consumer's machine. Nothing here does. The package contributes a **name** — `sdl3` — and the

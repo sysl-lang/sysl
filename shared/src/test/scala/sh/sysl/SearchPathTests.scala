@@ -294,7 +294,7 @@ class SearchPathTests extends LibraryCliSupport {
   }
 
   /** A package saying which headers its own C needs, and the driver checking somebody supplied them
-   * (`packages.md § 8`).
+   * (`reference/packages.md § Capabilities`).
    *
    * **The refusal is the feature.** `--include-path` already worked, and a project that passes it
    * built before this existed and builds now — what did not exist was any way for the *package* to

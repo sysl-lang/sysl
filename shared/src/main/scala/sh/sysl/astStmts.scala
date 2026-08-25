@@ -350,7 +350,7 @@ case class Invariant(cond: Expr, msg: Option[String]) extends Stmt
  */
 case class Variant(expr: Expr) extends Stmt
 
-/** `asm` — machine instructions, in an arm per architecture (`inline-assembly.md`).
+/** `asm` — machine instructions, in an arm per architecture (`reference/inline-assembly.md`).
  *
  * Exactly one arm is selected, and every architecture the compiler can build for has to appear in
  * one, so a processor with no answer is reported while building for a different one. What an arm
@@ -565,7 +565,7 @@ case class FuncDecl(
  */
 case class ExportAttr(symbol: Option[String]) extends Positioned
 
-/** What `@test` says about the function it is written above (`testing.md`).
+/** What `@test` says about the function it is written above (`reference/attributes.md § @test — a function with a caller nothing else has`).
  *
  * A test is a function the program does not call: `sysl test` calls it, and whether it *returned* is
  * the whole of the result. So the attribute carries only what the runner cannot work out for itself

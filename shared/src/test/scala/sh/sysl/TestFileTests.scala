@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** `@tests` — a file of a module's test scaffolding, kept by `sysl test` and dropped by every other
- * build (`testing.md`).
+ * build (`reference/attributes.md § @tests — a file of scaffolding`).
  *
  * The header says two things and both are pinned here, because either alone is unsound. It **drops**
  * the file, which is what keeps a helper out of a program and out of a library's artifact; and it
@@ -11,7 +11,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * than a link error waiting for whoever writes the reference.
  *
  * The restriction is stated over the referring *declaration* and not over the file it sits in, and
- * the case that forces it is the one `testing.md` asks for: a `@test` written beside what it tests,
+ * the case that forces it is the one `reference/attributes.md § @tests — a file of scaffolding` asks for: a `@test` written beside what it tests,
  * in an ordinary file, calling scaffolding from the test file. A rule about files would refuse that
  * and drive every test out of the module's real files.
  */

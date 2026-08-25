@@ -71,7 +71,8 @@ trait DeclTables extends Reporting {
    */
   protected def target: Target
 
-  /** Which package each file came from, and what its import lines mean (`packages.md § 9`).
+  /** Which package each file came from, and what its import lines mean (`reference/packages.md §
+   * What a dependency's modules are called`).
    *
    * Empty for a compilation with no dependencies, which is every compilation that does not go
    * through the package system — so nothing about a one-project build is changed by this being here.
@@ -79,7 +80,8 @@ trait DeclTables extends Reporting {
   protected def packages: Packages
 
   /** What the target **provides**, which the project config says and the registry does not
-   * (`packages.md § 2`, `capabilities.md § Two levels: target provides, module narrows`).
+   * (`reference/packages.md § What a project is called`, `reference/modules.md § The target's half
+   * needs no clause at all`).
    *
    * This is the ceiling half of the two-level rule: a module's effective set is what the target
    * offers intersected with what the module gave up, so a capability absent here is absent
@@ -199,13 +201,13 @@ trait DeclTables extends Reporting {
    */
   protected val dropsDeclared = mutable.Set.empty[String]
 
-  /** The `@test` functions the sources declared, in the order hoisting met them (`testing.md`). A
+  /** The `@test` functions the sources declared, in the order hoisting met them (`reference/attributes.md § @test — a function with a caller nothing else has`). A
    * report lists tests in the order they were written, and this is where that order comes from —
    * the typed functions are grouped by what reaches them and say nothing about where they sat.
    */
   protected val tests = mutable.ListBuffer.empty[TTest]
 
-  /** Everything declared in a file whose header said `@tests` (`testing.md`), by the module-qualified
+  /** Everything declared in a file whose header said `@tests` (`reference/attributes.md § @tests — a file of scaffolding`), by the module-qualified
    * key every other table here uses.
    *
    * It is filled from the **parsed** files rather than from hoisting, because the question is about
@@ -216,7 +218,7 @@ trait DeclTables extends Reporting {
   protected val testOnlyDecls = mutable.Set.empty[String]
 
   /** Whether the body being analyzed is one a test build keeps and every other build drops — a
-   * declaration written in a `@tests` file, or a `@test` function written anywhere (`testing.md`).
+   * declaration written in a `@tests` file, or a `@test` function written anywhere (`reference/attributes.md § @tests — a file of scaffolding`).
    *
    * It is carried rather than looked up because a **closure has no declaration to ask**. Lowering
    * one produces a function under a name the compiler made up (`Closures.base`), and that name is in
@@ -647,8 +649,9 @@ trait DeclTables extends Reporting {
    * An instantiation's name says nothing about where the choice came from: `lib$twice.Loud` is
    * spelled from the declaration's module and the caller's type, and `Modules.moduleOf` reads only
    * the first half. So what a module promised about its own conduct cannot be asked of an
-   * instantiation — the answer would hold the library to a type it never saw — and this is what lets
-   * the promise be asked of the generic's **own** body instead (`capabilities.md § A generic`).
+   * instantiation — the answer would hold the library to a type it never saw — and this is what
+   * lets the promise be asked of the generic's **own** body instead (`reference/modules.md § A
+   * generic answers for what it wrote, not for what its caller chose`).
    */
   protected val genericInsts = mutable.HashSet.empty[String]
 

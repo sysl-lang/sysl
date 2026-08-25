@@ -3,7 +3,8 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
-/** `sysl.sum` — what a resolved package's source was when it was first seen (`packages.md § 6`).
+/** `sysl.sum` — what a resolved package's source was when it was first seen (`reference/packages.md
+ * § sysl.sum`).
  *
  * Reading is a pure function of the file's text, as `package.hocon`'s is, so every case here runs
  * identically on all three platforms and none of them needs a package to exist.

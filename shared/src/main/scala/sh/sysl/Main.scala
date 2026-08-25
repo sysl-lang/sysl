@@ -182,9 +182,9 @@ private[sysl] def execute(cfg: Config): Int = {
   // moving it costs is that the reader meets it earlier than the code that uses it most.
   val (artifacts, roots) = cfg.libs.partition(LibraryArtifact.isArtifact)
 
-  // What this compilation depends on, fetched and version-selected (`packages.md § 3`, `§ 5`). A
-  // project with no `dependencies` and no declaring source root resolves to itself and this costs
-  // nothing, which is what keeps `sysl run hello.sysl` free of ceremony.
+  // What this compilation depends on, fetched and version-selected (`reference/packages.md §
+  // Dependencies`, `§ 5`). A project with no `dependencies` and no declaring source root resolves
+  // to itself and this costs nothing, which is what keeps `sysl run hello.sysl` free of ceremony.
   //
   // **Above the standard module rather than below it, because the allocator is settled here** and
   // every artifact this compilation reads is built for one allocator — the standard module's included.
@@ -201,12 +201,13 @@ private[sysl] def execute(cfg: Config): Int = {
         case Left(err) => return fail(err)
         case Right(d)  => d
 
-  // The pair of C functions this whole program allocates through (`packages.md § 13`). A package that
-  // brings its own heap says so, and saying so settles it for the program — which is the only shape
-  // that can work, because there is one heap and whoever holds the last reference to something is who
-  // frees it (`03`). Two packages naming different pairs is refused here rather than at the link,
-  // where it would not be refused at all: both symbols resolve, and the program simply gives one
-  // allocator's storage back to another.
+  // The pair of C functions this whole program allocates through (`reference/packages.md § One
+  // heap, and the package that names it`). A package that brings its own heap says so, and saying
+  // so settles it for the program — which is the only shape that can work, because there is one
+  // heap and whoever holds the last reference to something is who frees it (`03`). Two packages
+  // naming different pairs is refused here rather than at the link, where it would not be refused
+  // at all: both symbols resolve, and the program simply gives one allocator's storage back to
+  // another.
   //
   // The project's own declaration is folded in beside the fetched ones, so an application with its own
   // heap and no dependency that has one is answered by the same rule — and so is a **library** being
@@ -368,15 +369,14 @@ private[sysl] def execute(cfg: Config): Int = {
   //
   // Compiled only where something is about to be linked. `emit-llvm` prints IR and `prove` stops at
   // the typed tree, and neither has a use for an object file — running clang for one would be work
-  // whose result is thrown away.
-  // Where this machine keeps what the toolchain was not told the location of (`SearchPaths`). One
-  // value rather than two lists threaded separately, because the two halves are one setting: a
-  // binding to a library outside the default prefix needs its headers to compile and its archive to
-  // link, and a build given only one of them fails at whichever step comes first.
-  // What this machine answered about the installed libraries the packages named (`packages.md § 8`).
-  // Asked under the same guard as the header requirements below and for the same reason — a command
-  // compiling no C opens none of these — and asked *here* because the answer is part of the paths
-  // every C compilation and the link are given.
+  // whose result is thrown away. Where this machine keeps what the toolchain was not told the
+  // location of (`SearchPaths`). One value rather than two lists threaded separately, because the
+  // two halves are one setting: a binding to a library outside the default prefix needs its headers
+  // to compile and its archive to link, and a build given only one of them fails at whichever step
+  // comes first. What this machine answered about the installed libraries the packages named
+  // (`reference/packages.md § Capabilities`). Asked under the same guard as the header requirements
+  // below and for the same reason — a command compiling no C opens none of these — and asked *here*
+  // because the answer is part of the paths every C compilation and the link are given.
   val probed =
     if links(cfg.command) || cLibrary(cfg.command) then
       val fromLibs = libPkgNeeds(roots) match
@@ -391,10 +391,10 @@ private[sysl] def execute(cfg: Config): Int = {
         case Right(answer) => answer
     else SearchPaths()
 
-  // What each package said its **own** carried C is compiled with (`packages.md § 7`), keyed by the
-  // path that C will be compiled from. Three roads reach it and all three are here: the project's
-  // own manifest, each `--lib` source root's, and each fetched package's — the same three the
-  // header requirements are gathered from, for the same reason.
+  // What each package said its **own** carried C is compiled with (`reference/packages.md § No
+  // build scripts, ever`), keyed by the path that C will be compiled from. Three roads reach it and
+  // all three are here: the project's own manifest, each `--lib` source root's, and each fetched
+  // package's — the same three the header requirements are gathered from, for the same reason.
   val carried = (for
     own      <- carriedOf(cfg.file, project, target.os)
     fromLibs <- libDefines(roots, target.os)
@@ -421,9 +421,10 @@ private[sysl] def execute(cfg: Config): Int = {
       who.fold(" (the C default)")(n => s" (named by $n)"))
 
   // What the packages said their C has to be able to find, asked of what this command line supplied
-  // (`packages.md § 8`). Answered here rather than left to clang because a header that is not there
-  // fails inside a compiler that has never heard of sysl: what comes back is `'lwip/tcp.h' file not
-  // found`, which names neither the package that wanted it nor the flag that would have supplied it.
+  // (`reference/packages.md § Capabilities`). Answered here rather than left to clang because a
+  // header that is not there fails inside a compiler that has never heard of sysl: what comes back
+  // is `'lwip/tcp.h' file not found`, which names neither the package that wanted it nor the flag
+  // that would have supplied it.
   //
   // Asked only where C is going to be compiled. The requirement exists so that a tree's C compiles,
   // so a command that compiles none has nothing unmet — and refusing `emit-llvm` or `prove` over a
@@ -575,10 +576,11 @@ private def links(command: String): Boolean = command == "build" || command == "
 
 /** The allocator each `--lib` **source root** declares, named by the root as the reader wrote it.
  *
- * `packages.md § 13` makes the allocator a property of the *package*: one that brings its own heap
- * settles the question for the whole program, because there is one heap and whoever holds the last
- * reference is who frees it. That is a claim about the package rather than about the road it arrived
- * by, so a package reached as a directory answers exactly as the same package reached by coordinate.
+ * `reference/packages.md § One heap, and the package that names it` makes the allocator a property
+ * of the *package*: one that brings its own heap settles the question for the whole program,
+ * because there is one heap and whoever holds the last reference is who frees it. That is a claim
+ * about the package rather than about the road it arrived by, so a package reached as a directory
+ * answers exactly as the same package reached by coordinate.
  *
  * **Until this existed the two roads disagreed in silence**, which is the worst way for them to
  * disagree: a coordinate adopted the pair and a source root ignored it, so one program allocated
@@ -602,7 +604,7 @@ private def libAllocators(roots: List[String]): Either[String, List[(String, All
   }
 
 /** What the `--lib` **source roots** declare their own carried C is compiled with
- * (`packages.md § 7`).
+ * (`reference/packages.md § No build scripts, ever`).
  *
  * Read off the same manifest as `libHeaderNeeds` and for the same reason: a package handed over as a
  * directory is the same package it is by coordinate, so what its C is compiled with cannot depend on
@@ -611,9 +613,10 @@ private def libAllocators(roots: List[String]): Either[String, List[(String, All
  * `defines` block that worked only once fetched would fail exactly where it is being written.
  *
  * **Unlike the allocator beside it, this is safe to take from a `--lib` root.** An allocator taken
- * silently is the mixed heap `packages.md § 13` exists to prevent, because it decides something for
- * the whole program; a macro here reaches one translation unit in the tree that declared it, and a
- * root that is not a package has no `defines` block to be read.
+ * silently is the mixed heap `reference/packages.md § One heap, and the package that names it`
+ * exists to prevent, because it decides something for the whole program; a macro here reaches one
+ * translation unit in the tree that declared it, and a root that is not a package has no `defines`
+ * block to be read.
  */
 private def libDefines(roots: List[String], os: Os): Either[String, Map[String, List[String]]] =
   roots.foldLeft[Either[String, Map[String, List[String]]]](Right(Map.empty)) { (acc, root) =>
@@ -635,7 +638,8 @@ private def carriedOf(root: String, config: PackageConfig, os: Os)
   if config.defines.isEmpty then Right(Map.empty)
   else config.carriedDefines(Project.cSources(root, Some(os)).map(_.name))
 
-/** What the `--lib` **source roots** declare they need headers for (`packages.md § 8`).
+/** What the `--lib` **source roots** declare they need headers for (`reference/packages.md §
+ * Capabilities`).
  *
  * **This is the one road a declared requirement used to fall through.** The other two are already
  * answered and neither needed anything: a package reached through `dependencies` arrives with its
@@ -646,10 +650,11 @@ private def carriedOf(root: String, config: PackageConfig, os: Os)
  * `'cairo.h' file not found` answered in its place, naming neither the package nor the flag.
  *
  * **Only `requires { headers }` is taken from the manifest, and that is deliberate.** `--lib` names
- * a *source root*, which need not be a package at all, and a root that is not one has nothing to say
- * here. Reading the rest of what a manifest can declare is a different question with a real cost —
- * an allocator taken silently from a `--lib` root is the mixed heap `packages.md § 13` exists to
- * prevent — so it is left alone rather than guessed at.
+ * a *source root*, which need not be a package at all, and a root that is not one has nothing to
+ * say here. Reading the rest of what a manifest can declare is a different question with a real
+ * cost — an allocator taken silently from a `--lib` root is the mixed heap `reference/packages.md §
+ * One heap, and the package that names it` exists to prevent — so it is left alone rather than
+ * guessed at.
  *
  * **The root is named as the reader wrote it**, which is a path here where it is a coordinate for a
  * dependency. Both are the thing the person reading the message typed and can go and look at; the
@@ -667,7 +672,8 @@ private def libHeaderNeeds(roots: List[String]): Either[String, List[HeaderNeed]
     yield seen ::: config.headers.toList.sortBy(_._1).map((name, why) => HeaderNeed(root, name, why))
   }
 
-/** What the `--lib` **source roots** declare they need an installed library for (`packages.md § 8`).
+/** What the `--lib` **source roots** declare they need an installed library for
+ * (`reference/packages.md § Capabilities`).
  *
  * Read off the same manifest as `libHeaderNeeds`, on the same road and for the same reason: a package
  * handed over as a directory is the same package it is by coordinate, so what it needs of this
@@ -681,8 +687,8 @@ private def libPkgNeeds(roots: List[String]): Either[String, List[LibNeed]] =
     yield seen ::: config.pkgConfig.toList.sortBy(_._1).map((mod, why) => LibNeed(root, mod, why))
   }
 
-/** What this machine says about the libraries the packages named, or the one line the build stops on
- * (`packages.md § 8`, `PkgConfig`).
+/** What this machine says about the libraries the packages named, or the one line the build stops
+ * on (`reference/packages.md § Capabilities`, `PkgConfig`).
  *
  * ==Asked only for the host==
  *
@@ -742,7 +748,7 @@ private def probeLibs(needs: List[LibNeed], supplied: Set[String], target: Targe
 }
 
 /** The header requirements nothing on this command line answered, as the one line a build stops on
- * (`packages.md § 8`).
+ * (`reference/packages.md § Capabilities`).
  *
  * ==Why the message is this long==
  *

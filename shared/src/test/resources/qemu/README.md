@@ -260,7 +260,7 @@ where one of them recovered — they name the cause in a sentence.
 ## What this tier found
 
 **Releasing a slice calls `@free`, and an `@no_alloc` module emits it too** — ticket 0037.
-`capabilities.md` puts slices *in* the no-alloc subset, says the free path "goes through the object's
+`reference/modules.md § Capabilities are a module property` puts slices *in* the no-alloc subset, says the free path "goes through the object's
 own hook", and calls such a module allocator-free and portable to every target.
 `NoAllocEmissionTests` carries the diagnosis and the contrast; the claim about `@no_alloc` is
 `ignore`d with the assertion it should make.

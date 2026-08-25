@@ -34,9 +34,10 @@ case class Poisoned() extends RuntimeException
  */
 trait Reporting {
 
-  /** The machine this compilation is **for** (`targets.md`), which reaches the analyzer and not only
-   * codegen because two of the language's types are answers about it: `usize` and `isize` are
-   * pointer-width by definition, so what they resolve to is the target's business.
+  /** The machine this compilation is **for** (`getting-started/cli.md § targets`), which reaches
+   * the analyzer and not only codegen because two of the language's types are answers about it:
+   * `usize` and `isize` are pointer-width by definition, so what they resolve to is the target's
+   * business.
    *
    * It sits at the root of the analyzer's trait chain for the same reason the diagnostics do — every
    * layer needs it, and a layer handed it separately is a layer that could be handed a different one.

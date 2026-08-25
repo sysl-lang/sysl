@@ -20,8 +20,9 @@ class LayoutTests extends AnyFreeSpec with Matchers with CodegenSupport with Run
   }
 
   /** The machine every assertion in this file is about unless it says otherwise. `Layout` takes a
-   * target now (`targets.md`), so a bare number here is a claim about *a* machine and has to say
-   * which — the 32-bit answers are pinned in their own section at the bottom.
+   * target now (`getting-started/cli.md § targets`), so a bare number here is a claim about *a*
+   * machine and has to say which — the 32-bit answers are pinned in their own section at the
+   * bottom.
    */
   private val at64 = Layout(Word(64))
 

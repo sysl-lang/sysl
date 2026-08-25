@@ -3,7 +3,8 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
-/** The pair of C functions a program allocates through (`packages.md § 13`).
+/** The pair of C functions a program allocates through (`reference/packages.md § One heap, and the
+ * package that names it`).
  *
  * A package that brings its own heap names the pair, that settles it for the whole program, and every
  * allocation the compilation emits calls it. What the choice is made *of* — one declaration, two that

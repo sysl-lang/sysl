@@ -282,7 +282,7 @@ trait AttrParser extends ExprParser {
 
   /** An annotation's name. Each stays an ordinary identifier — reserving them would spend the words
    * out of every program's namespace for the sake of one line apiece, which is the trade `alloc`
-   * made and the one `capabilities.md § Open` is still paying for.
+   * made and is still paying for.
    */
   protected def attrWord(w: String): Parser[Unit] =
     accept(s"'$w'", { case t: lexical.Identifier if t.chars == w => () })

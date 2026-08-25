@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `sysl test` — the runner, end to end (`testing.md`).
+/** `sysl test` — the runner, end to end (`getting-started/cli.md § test`).
  *
  * Everything here compiles a real program, links it and starts a real process per test, because
  * every claim the runner makes is about something only a process can do: a trap ends one, a status

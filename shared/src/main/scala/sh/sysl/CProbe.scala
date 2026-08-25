@@ -36,10 +36,10 @@ import io.github.edadma.cross_platform.*
  * cross-compiling as they are at home — which is the whole reason for going through the IR rather
  * than through a program that prints them.
  *
- * **`AbiAgainstClangTests` is the precedent and this is the same move.** `targets.md § Adding one`
- * says an answer about a machine is measured against clang and never taken from a document; these
- * blocks are that rule handed to the programmer, for the numbers and the widths a compiler has no
- * way to know it should have asked about.
+ * **`AbiAgainstClangTests` is the precedent and this is the same move.** `getting-started/cli.md §
+ * targets` says an answer about a machine is measured against clang and never taken from a
+ * document; these blocks are that rule handed to the programmer, for the numbers and the widths a
+ * compiler has no way to know it should have asked about.
  *
  * ==What a type measurement is==
  *
@@ -128,7 +128,8 @@ object CProbe {
       }
 
   /** Whether this file's blocks must not be measured, because the machine being built for cannot
-   * have what the file says it needs (`capabilities.md`, `reference/ffi.md § c type`).
+   * have what the file says it needs (`reference/modules.md § Capabilities are a module property`,
+   * `reference/ffi.md § c type`).
    *
    * **A probe is a C compilation, so a file carrying one asks for headers.** A file that also
    * declares `@requires(posix)` has said which machines it is for, and a freestanding target is not

@@ -74,9 +74,10 @@ trait CodegenSupport extends Matchers { this: Assertions =>
    */
   private lazy val libraryEnvs: Set[String] = envDefs(ir("print(1)\n")).keySet
 
-  /** The IR for a program built for a machine other than this one (`targets.md`). Reading the text
-   * is the whole of what a cross-target test can do — there is nothing here to run the result on —
-   * and it is enough, because what a target decides is what instructions come out.
+  /** The IR for a program built for a machine other than this one (`getting-started/cli.md §
+   * targets`). Reading the text is the whole of what a cross-target test can do — there is nothing
+   * here to run the result on — and it is enough, because what a target decides is what
+   * instructions come out.
    */
   protected def irFor(target: Target, src: String): String =
     Compiler.compileToLlvm(src, "<input>", target) match {

@@ -3,7 +3,7 @@ package sh.sysl
 import io.github.edadma.cross_platform.*
 
 /** A program built against what its `package.hocon` depends on — the whole of the package system
- * from the outside (`packages.md`).
+ * from the outside (`reference/packages.md`).
  *
  * This is the seam that matters: the suites either side of it check the resolver's answers and the
  * hash's definition, and none of them says that a `sysl run` over a project with a `dependencies`
@@ -224,8 +224,8 @@ class PackageBuildTests extends PackageCacheSupport {
     }
   }
 
-  /** The convention `packages.md § 9` recommends, from the consuming side — and the case it was
-   * recommended *for*.
+  /** The convention `reference/packages.md § What a dependency's modules are called` recommends,
+   * from the consuming side — and the case it was recommended *for*.
    *
    * A package that namespaces itself by reverse DNS puts its source at `sh/sysl/<name>/`, so `sh`
    * and `sh/sysl` hold none and neither is a module it declares. Binding the top-level **directory**
@@ -372,11 +372,12 @@ class PackageBuildTests extends PackageCacheSupport {
   /** `reference/ffi.md § A library may carry C` from the consuming side: a package carries C, and a
    * build against it compiles that C and links it.
    *
-   * **This is the seam a whole release shipped without.** A package's `.sysl` compiled, its `.c` was
-   * dropped with nothing said, and the build ended at the linker naming symbols the package's own C
-   * defines — which made every package with a shim unusable as a dependency, and a shim is what a
-   * binding to a real library *is*. `packages.md § 7` had already promised the opposite in as many
-   * words, refusing build scripts on the grounds that sysl compiles a package's C declaratively.
+   * **This is the seam a whole release shipped without.** A package's `.sysl` compiled, its `.c`
+   * was dropped with nothing said, and the build ended at the linker naming symbols the package's
+   * own C defines — which made every package with a shim unusable as a dependency, and a shim is
+   * what a binding to a real library *is*. `reference/packages.md § No build scripts, ever` had
+   * already promised the opposite in as many words, refusing build scripts on the grounds that sysl
+   * compiles a package's C declaratively.
    *
    * Nothing else in the suite could have caught it: every package above is pure sysl, so the walk
    * that never looked for C was never asked a question it could get wrong.
@@ -788,7 +789,8 @@ class PackageBuildTests extends PackageCacheSupport {
       |#endif
       |""".stripMargin
 
-  /** `packages.md § 7`'s `defines` block: the macros a package's own carried C is compiled with.
+  /** `reference/packages.md § No build scripts, ever`'s `defines` block: the macros a package's own
+   * carried C is compiled with.
    *
    * Every case here is end to end — the package is built and the program is run — because what the
    * feature claims is about a clang command line, and the only thing that can check a clang command

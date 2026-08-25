@@ -768,8 +768,8 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
 
       List(TDefer(body))
 
-    // `asm` (`inline-assembly.md`). The arms are chosen between here, so what reaches the emitter is
-    // one architecture's instructions and no record that there were others.
+    // `asm` (`reference/inline-assembly.md`). The arms are chosen between here, so what reaches the
+    // emitter is one architecture's instructions and no record that there were others.
     case a: AsmStmt => List(analyzeAsm(a))
 
     // A `const` written at the top of a file is hoisted and folded into its uses before anything

@@ -5,7 +5,8 @@ import io.github.edadma.cross_platform.*
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
-/** The standard library's **own** `@test` functions, run as part of this suite (`testing.md` Tier 3).
+/** The standard library's **own** `@test` functions, run as part of this suite
+ * (`reference/attributes.md § @test — a function with a caller nothing else has`).
  *
  * `library/` is packed with tests written in sysl, and they are the right place for what is true of the
  * *library* — that a `Buf` grows geometrically, that `truncate` keeps its storage. This is the one

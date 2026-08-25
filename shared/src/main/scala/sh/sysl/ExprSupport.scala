@@ -59,11 +59,12 @@ trait ExprSupport extends SpecialForms with PatternAnalysis with StmtAnalysis {
    * And the **longest** module prefix wins, so a module `a.b` is reached as one rather than as
    * `a`'s `b`.
    *
-   * A head bound by an import is read as that import, which is what makes the `fs` of `import std.fs`
-   * a prefix everywhere a written path is. Everything after that is `inPackage`'s to decide — the
-   * package the file belongs to, the path as written, and the packages its manifest named, in that
-   * order — which is what makes `sqlite.open` reach a dependency's module without an import and
-   * without the coordinate it is really named under (`packages.md § 9`).
+   * A head bound by an import is read as that import, which is what makes the `fs` of `import
+   * std.fs` a prefix everywhere a written path is. Everything after that is `inPackage`'s to decide
+   * — the package the file belongs to, the path as written, and the packages its manifest named, in
+   * that order — which is what makes `sqlite.open` reach a dependency's module without an import
+   * and without the coordinate it is really named under (`reference/packages.md § What a
+   * dependency's modules are called`).
    *
    * **The package layer is asked with the whole chain and the import layer with its head**, and the
    * asymmetry is the two layers' own. An import binds one name, so only a head can answer to it. A

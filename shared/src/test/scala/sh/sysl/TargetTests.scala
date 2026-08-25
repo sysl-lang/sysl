@@ -2,8 +2,8 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** The machine a program is compiled **for** (`targets.md`): the registry, how a machine names
- * itself, and what naming a target changes about the module that comes out.
+/** The machine a program is compiled **for** (`getting-started/cli.md § targets`): the registry,
+ * how a machine names itself, and what naming a target changes about the module that comes out.
  *
  * What a target actually *decides* is one thing today — how a walk reaches a foreign function — and
  * that is `VariadicForeignTests`. What is here is the model around it: that the registry says the
@@ -482,7 +482,7 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
 
   /** Everything whose width `Layout` has to state in the emitted text rather than leave to LLVM: a
    * padded aggregate, a nested one, an array, a data enum's union region — and a `va_list`, whose
-   * storage `targets.md § What a target does not decide` says is one width for every target.
+   * storage `getting-started/cli.md § targets` says is one width for every target.
    */
   private val shapes =
     """struct Padded
@@ -523,9 +523,9 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
   private def typeLines(t: Target): List[String] =
     irFor(t, shapes).linesIterator.filter(_.contains("= type")).toList
 
-  /** `targets.md § What a target does not decide` used to rest the whole of `Layout` on one claim:
-   * every target in the registry answers a layout question the same way, so the object that answers
-   * them takes no `Target`. **A 32-bit target falsifies that**, and what replaced it is narrower and
+  /** `getting-started/cli.md § targets` used to rest the whole of `Layout` on one claim: every
+   * target in the registry answers a layout question the same way, so the object that answers them
+   * takes no `Target`. **A 32-bit target falsifies that**, and what replaced it is narrower and
    * says more: a layout question is answered by the *word*, and by nothing else a target carries.
    *
    * So `Layout` takes a `Word` rather than a `Target` — which is a stronger statement than taking

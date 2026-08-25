@@ -2,7 +2,7 @@ package sh.sysl
 
 import io.github.edadma.cross_platform.*
 
-/** Getting a package's source onto this machine (`packages.md § 3`).
+/** Getting a package's source onto this machine (`reference/packages.md § Dependencies`).
  *
  * A coordinate is a git repository and a version is a tag on it, so fetching is a clone at a tag and
  * nothing more — there is no registry to ask, no account to have, and no service that has to be up.

@@ -1,6 +1,7 @@
 package sh.sysl
 
-/** Chooses an assembly statement's architecture arm and binds its operands (`inline-assembly.md`).
+/** Chooses an assembly statement's architecture arm and binds its operands
+ * (`reference/inline-assembly.md`).
  *
  * Two questions are answered here and nowhere else. **Which arm applies** is a fact about the target
  * and so belongs to the analysis rather than to the emitter, which is then handed one arm and never
@@ -78,8 +79,9 @@ trait AsmAnalysis extends TypeResolution {
   }
 
   /** Every processor a target can be built for needs an answer, whether or not it is the one being
-   * built for now (`inline-assembly.md §2`). An architecture with nothing to say says
-   * `unavailable` and why; leaving it out is the mistake this reports.
+   * built for now (`reference/inline-assembly.md § Every architecture needs an answer`). An
+   * architecture with nothing to say says `unavailable` and why; leaving it out is the mistake this
+   * reports.
    */
   private def checkExhaustive(stmt: AsmStmt): Unit = {
     val covered = stmt.arms.flatMap(_.archs).toSet

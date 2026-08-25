@@ -370,7 +370,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
   }
 
   /** `@main` for a **test build**: the entry point `sysl test` drives, which runs the one test named
-   * on its command line and nothing else (`testing.md`).
+   * on its command line and nothing else (`getting-started/cli.md § test`).
    *
    * **One test to a process, chosen from outside.** A test that fails does so by trapping, and a trap
    * takes the process with it — so a runner that called them in a loop would learn the name of the
@@ -792,8 +792,9 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     case TDefer(stmts) =>
       deferStmts(stmts)
 
-    // `asm` (`inline-assembly.md`). One architecture's instructions arrived here; the arms that
-    // answered for the others were chosen between in the analyzer and are not represented.
+    // `asm` (`reference/inline-assembly.md`). One architecture's instructions arrived here; the
+    // arms that answered for the others were chosen between in the analyzer and are not
+    // represented.
     case TAsm(lines, operands, clobbers) =>
       if lines.nonEmpty then genAsm(lines, operands, clobbers)
 
@@ -867,8 +868,8 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
 object Codegen {
 
-  /** Lowers a typed program to a module, for a given machine (`targets.md`) and from a given heap
-   * (`packages.md § 13`).
+  /** Lowers a typed program to a module, for a given machine (`getting-started/cli.md § targets`)
+   * and from a given heap (`reference/packages.md § One heap, and the package that names it`).
    *
    * **This is where a back end that is not LLVM starts.** What comes back is an `ir.Module` — the
    * types, the globals, the declarations and the functions, as data — rather than the text of one,

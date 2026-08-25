@@ -2,7 +2,7 @@ package sh.sysl
 
 /** How far a declaration may be named from, and — the part this file exists for — how far a
  * **field** or a **member** of a type may be (`reference/modules.md § Visibility`,
- * `reference/modules.md § Visibility`).
+ * `reference/declarations.md § Visibility`).
  *
  * The machinery is `AnalyzerBase`'s `declAccess`, which is keyed by a string and holds an entry only
  * for a declaration that restricted itself. A field and a member join it under `owner.name`, which

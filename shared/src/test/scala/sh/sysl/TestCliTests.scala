@@ -161,8 +161,8 @@ class TestCliTests extends AnyFreeSpec with Matchers {
 
   /** `--std`: the tree in front of the compiler **is** the standard module.
    *
-   * Tier 3 exists to test "the standard library and language behavior" (`testing.md`), and until this
-   * flag there was no way to point `sysl test` at the library at all — the compiler supplies `sysl`
+   * A test written in sysl is what covers the library and the language itself, and until this flag
+   * there was no way to point `sysl test` at the library at all — the compiler supplies `sysl`
    * to every compilation, so the library's own tree collided with itself, every declaration already
    * declared. `build-lib` has said `--std` for the same reason since libraries existed; this is the
    * word arriving at the command that runs the tests.

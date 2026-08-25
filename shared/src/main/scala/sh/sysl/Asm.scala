@@ -1,7 +1,7 @@
 package sh.sysl
 
 /** The two things sysl does to an assembly template, and the one thing it builds beside it
- * (`inline-assembly.md §5`).
+ * (`reference/inline-assembly.md § What the compiler owns`).
  *
  * A program writes `{name}` and never writes a constraint. Both halves of that promise live here,
  * together, because they are one agreement seen from two sides: an operand's position in the
@@ -89,9 +89,9 @@ object Asm {
    * since they wrote names.
    *
    * **Memory and the condition flags are always clobbered**, and that is the conservative direction
-   * on purpose (`inline-assembly.md §4`). Assuming them costs optimization quality across a handful
-   * of instructions; not assuming them costs a value kept in a register the block overwrote, which
-   * is a wrong answer with nothing to point at.
+   * on purpose (`reference/inline-assembly.md § What the block destroys`). Assuming them costs
+   * optimization quality across a handful of instructions; not assuming them costs a value kept in
+   * a register the block overwrote, which is a wrong answer with nothing to point at.
    */
   def constraints(operands: List[TAsmOperand], clobbers: List[String]): String = {
     val outs = operands.filter(_.dir == AsmDir.Out).map(o => s"=${place(o)}")

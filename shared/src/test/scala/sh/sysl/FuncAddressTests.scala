@@ -306,9 +306,10 @@ class FuncAddressTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     /** An aggregate crosses to C in whichever registers that machine's convention names, which is
-      * not where a sysl definition put it (`targets.md`, and the ABI work `CAbi` holds). So the
-      * address of such a function would be an address C cannot call correctly — and nothing
-      * downstream could notice, which is why it is refused at the `&` rather than passed on.
+      * not where a sysl definition put it (`getting-started/cli.md § targets`, and the ABI work
+      * `CAbi` holds). So the address of such a function would be an address C cannot call correctly
+      * — and nothing downstream could notice, which is why it is refused at the `&` rather than
+      * passed on.
       *
       * The refusal is by **shape** rather than by asking the target's classification, so a program
       * accepted for one machine is accepted for every machine.
@@ -682,11 +683,10 @@ class FuncAddressTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     // A slice of them, which is the table shape a dispatch loop reads.
-    /** An allocator-free module (`reference/modules.md § Capabilities are a module property`,
-      * `capabilities.md`) is held to what its calls **reach**, and taking an address is a way of
-      * reaching. Refusing it is conservative in the right direction: the address is handed to
-      * something this compiler cannot see, so if it were not a use here it would be no use
-      * anywhere.
+    /** An allocator-free module (`reference/modules.md § Capabilities are a module property`) is
+      * held to what its calls **reach**, and taking an address is a way of reaching. Refusing it is conservative in the
+      * right direction: the address is handed to something this compiler cannot see, so if it were
+      * not a use here it would be no use anywhere.
       *
       * The allocator-free half is what makes the test discriminating — a rule that refused every
       * address would pass the second half of this and mean nothing.

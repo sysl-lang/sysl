@@ -211,9 +211,10 @@ class NeverErrorTests extends AnyFreeSpec with CodegenSupport {
     }
 
     // An **aggregate** does cross to a foreign callee, and under exactly the classification a
-    // declared parameter of that type gets (`targets.md`) — C allows a struct in a variadic tail and
-    // says which registers it arrives in, so there is nothing left for sysl to withhold. The shapes
-    // that are refused are the ones with no layout to hand over, or none C could read back.
+    // declared parameter of that type gets (`getting-started/cli.md § targets`) — C allows a struct
+    // in a variadic tail and says which registers it arrives in, so there is nothing left for sysl
+    // to withhold. The shapes that are refused are the ones with no layout to hand over, or none C
+    // could read back.
     "carries a string, a struct, a slice — every aggregate" in {
       ir("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p, \"hi\"))") should
         include("declare i32 @printf(ptr, ...)")

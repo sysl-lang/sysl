@@ -1,6 +1,7 @@
 package sh.sysl
 
-/** A version, as `packages.md § 4` fixes them: semver, three numbers, nothing else.
+/** A version, as `reference/packages.md § The major version rides in the coordinate` fixes them:
+ * semver, three numbers, nothing else.
  *
  * Pre-release and build metadata are refused rather than ignored. Minimal Version Selection takes a
  * maximum over what the manifests ask for (`§ 5`), so every version has to be comparable to every
@@ -57,7 +58,7 @@ object Version {
   }
 }
 
-/** Where a dependency's source comes from (`packages.md § 3`).
+/** Where a dependency's source comes from (`reference/packages.md § Dependencies`).
  *
  * The two are not variations of one shape: a git dependency always has a version, because that is
  * what a coordinate resolves *at*, and a path dependency never does, because the directory is
@@ -77,7 +78,7 @@ enum Origin {
   case Local(dir: String)
 }
 
-/** One entry of the `dependencies` block (`packages.md § 2`).
+/** One entry of the `dependencies` block (`reference/packages.md § What a project is called`).
  *
  * `label` is the key it was written under. It is **not** the module name the code will use: `§ 9`
  * gives the root name to the dependency itself, so that a consumer's import lines match the

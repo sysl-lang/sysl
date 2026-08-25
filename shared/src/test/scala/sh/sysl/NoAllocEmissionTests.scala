@@ -6,12 +6,12 @@ import org.scalatest.matchers.should.Matchers
 /** What a program built for a bare board actually **calls**, which is a different question from what
  * it is allowed to write.
  *
- * `capabilities.md` is about the second: what the type system admits in a module without `alloc`.
- * This is about the first, and only a link finds it — a call to a function nothing defines is a
- * perfectly good module, assembles into a perfectly good object, and fails at the one step no test
- * tier below `QemuRunTests` performs. Which is how the finding below went unnoticed: every
- * freestanding target has been in the registry for months and nothing had ever linked a program for
- * one.
+ * `reference/modules.md § Capabilities are a module property` is about the second: what the type
+ * system admits in a module without `alloc`. This is about the first, and only a link finds it — a
+ * call to a function nothing defines is a perfectly good module, assembles into a perfectly good
+ * object, and fails at the one step no test tier below `QemuRunTests` performs. Which is how the
+ * finding below went unnoticed: every freestanding target has been in the registry for months and
+ * nothing had ever linked a program for one.
  */
 class NoAllocEmissionTests extends AnyFreeSpec with Matchers with QemuSupport {
 
@@ -57,11 +57,12 @@ class NoAllocEmissionTests extends AnyFreeSpec with Matchers with QemuSupport {
      * view's owner word brings the runtime in. A view of an array on the *frame* did exactly that,
      * and such a view's owner is null, so the call could never run. It still had to resolve.
      *
-     * `capabilities.md` says three things that together made that wrong rather than merely
-     * wasteful: slices `[]T` are in the **no-alloc subset** (§ *What `alloc` gates, precisely*);
-     * holding, passing and releasing one needs no allocator because **"the free path goes through
-     * the object's own hook"**; and an `@no_alloc` module is *"allocator-free, enforced"* and
-     * *"portable across every target"*. The free is in the hook now, so all three are true.
+     * `reference/modules.md § Capabilities are a module property` says three things that together
+     * made that wrong rather than merely wasteful: slices `[]T` are in the **no-alloc subset** (§
+     * *What `alloc` gates, precisely*); holding, passing and releasing one needs no allocator
+     * because **"the free path goes through the object's own hook"**; and an `@no_alloc` module is
+     * *"allocator-free, enforced"* and *"portable across every target"*. The free is in the hook
+     * now, so all three are true.
      */
     "reaches no allocator for a slice of storage it did not allocate" in {
       callsOf(s"$uart\nvar a = [u8('a'), u8('b')]\nval s = a[..]\nputc(u8(s.len))\n") shouldBe empty

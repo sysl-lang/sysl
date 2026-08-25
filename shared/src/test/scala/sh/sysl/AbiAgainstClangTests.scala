@@ -15,9 +15,9 @@ import org.scalatest.matchers.should.Matchers
  *
  * So this asks the authority directly. For each shape it compiles the equivalent C for the same
  * triple, reads the `declare` clang produced for a function returning the aggregate and one taking
- * it, and requires sysl's to say the same thing. **`targets.md § Adding one` says an ABI answer is
- * measured against clang and never taken from a document; this is that rule as a test rather than
- * as a practice.**
+ * it, and requires sysl's to say the same thing. **`getting-started/cli.md § targets` says an ABI
+ * answer is measured against clang and never taken from a document; this is that rule as a test
+ * rather than as a practice.**
  *
  * It needs no emulator, no linker script and no hardware — only a clang with the back end, which is
  * what `Toolchain.findBackendClang` finds. A target whose back end this machine's clang does not have

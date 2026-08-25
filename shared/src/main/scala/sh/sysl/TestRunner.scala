@@ -2,7 +2,7 @@ package sh.sysl
 
 import io.github.edadma.cross_platform.*
 
-/** `sysl test` — builds the `@test` functions of a source tree and runs them (`testing.md`).
+/** `sysl test` — builds the `@test` functions of a source tree and runs them (`getting-started/cli.md § test`).
  *
  * **One build, one process per test.** The whole tree is compiled once, into a binary whose entry
  * point takes a test's name and runs that test alone (`Codegen.genTestMain`); the runner then starts
@@ -48,8 +48,8 @@ object TestRunner {
    *
    * **`--std` is what lets the standard library's own tests run**, and it is the same word
    * `build-lib` uses for the same reason: the tree in front of the compiler *is* the library rather
-   * than a program compiled against one. Testing sysl's own library is what `testing.md` says Tier 3
-   * is for, and without this the tree collides with the copy the compiler supplies — every
+   * than a program compiled against one. Testing sysl's own library is what a `@test` written in
+   * sysl is for, and without this the tree collides with the copy the compiler supplies — every
    * declaration already declared, because it is the same declaration twice.
    *
    * `librarySources` is a library handed over as source, kept apart from `sources` rather than

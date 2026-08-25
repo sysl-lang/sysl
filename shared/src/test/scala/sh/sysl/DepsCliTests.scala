@@ -2,7 +2,8 @@ package sh.sysl
 
 import io.github.edadma.cross_platform.*
 
-/** `sysl deps` — the resolved graph, printed, and who asked for each version (`packages.md § 5`).
+/** `sysl deps` — the resolved graph, printed, and who asked for each version
+ * (`reference/packages.md § Which version you get`).
  *
  * ==Why the command exists, which is what these cases are really pinning==
  *

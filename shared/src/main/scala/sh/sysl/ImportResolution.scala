@@ -62,10 +62,10 @@ trait ImportResolution extends TraitLookup {
   // --- one import ------------------------------------------------------------------------
 
   private def bind(decl: ImportDecl, acc: Imports): Imports = {
-    // What was written is what a diagnostic quotes; what it *names* is that read through the package
-    // layer, so a file of a fetched package writes its own short names and a consumer writes the
-    // name the manifest gave the package (`packages.md § 9`). For a project with no dependencies the
-    // two are the same string.
+    // What was written is what a diagnostic quotes; what it *names* is that read through the
+    // package layer, so a file of a fetched package writes its own short names and a consumer
+    // writes the name the manifest gave the package (`reference/packages.md § What a dependency's
+    // modules are called`). For a project with no dependencies the two are the same string.
     val written = decl.show
     val path    = inPackage(written)
 

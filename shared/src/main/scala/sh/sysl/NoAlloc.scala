@@ -1,7 +1,7 @@
 package sh.sysl
 
-/** What a module that declared `no alloc` may not do: make heap storage
- * (`capabilities.md § What alloc gates, precisely`).
+/** What a module that declared `no alloc` may not do: make heap storage (`reference/modules.md §
+ * Capabilities are a module property`).
  *
  * **It is asked of the typed tree rather than of each construction as it is built**, and that is the
  * whole design here. The constructions that allocate are written down in a dozen places across the
@@ -21,8 +21,9 @@ package sh.sysl
  */
 trait NoAlloc extends AnalyzerBase {
 
-  /** Whether `module` is allocator-free — because it gave the allocator up, or because the target it
-   * is being built for has none (`capabilities.md § Two levels`, `packages.md § 2`).
+  /** Whether `module` is allocator-free — because it gave the allocator up, or because the target
+   * it is being built for has none (`reference/modules.md § The target's half needs no clause at
+   * all`, `reference/packages.md § What a project is called`).
    *
    * The two arrive at the same place by design: a module's effective set is the target's
    * intersected with its own narrowing, so a target that provides no allocator makes every module
@@ -72,11 +73,12 @@ trait NoAlloc extends AnalyzerBase {
    * that file's code however little they look like a declaration.
    *
    * **A generic is answered for by the body it was written as, and an instantiation of one by
-   * nobody** (`capabilities.md § A generic`). The clause is a promise about a module's own conduct,
-   * and a generic has no conduct until a type is chosen — by somebody else, in a module of their
-   * own. So `abstracts` carries what the definition-time pass of `reference/generics.md § Bounds`
-   * analyzed, where the declaring module's own calls still have their names and a call through a
-   * bound is the trait's, and the instantiations are passed over.
+   * nobody** (`reference/modules.md § A generic answers for what it wrote, not for what its caller
+   * chose`). The clause is a promise about a module's own conduct, and a generic has no conduct
+   * until a type is chosen — by somebody else, in a module of their own. So `abstracts` carries
+   * what the definition-time pass of `reference/generics.md § Bounds` analyzed, where the declaring
+   * module's own calls still have their names and a call through a bound is the trait's, and the
+   * instantiations are passed over.
    *
    * They are passed over rather than dropped: an instance is still part of the program every other
    * walk goes through, so a module calling a generic that allocates is reported at *its* call, which
@@ -174,10 +176,10 @@ trait NoAlloc extends AnalyzerBase {
    *
    * **The diagnostic lands at the call rather than at the import**, and the reason is the standard
    * library: `sysl` is one module and is half allocator-free, so a rule stated over modules would
-   * refuse every `no alloc` module that names anything at all — `print` and `from_utf8` are the same
-   * module, and only one of them allocates. What `capabilities.md` asks for is that an
-   * allocator-free module "can only import and call things that are themselves no-alloc-compatible",
-   * and calls are what this is stated over.
+   * refuse every `no alloc` module that names anything at all — `print` and `from_utf8` are the
+   * same module, and only one of them allocates. What `reference/modules.md § Capabilities are a
+   * module property` asks for is that an allocator-free module "can only import and call things
+   * that are themselves no-alloc-compatible", and calls are what this is stated over.
    *
    * The reachable set is the one `Reachability` computes, which **over-approximates** where a call's
    * target is decided at run time: a method-table slot is answered with what every table for that

@@ -6,7 +6,7 @@ import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
 /** `package.hocon` at the seam a person actually meets it: a real file in a real directory, read by
- * the driver (`packages.md § 1`).
+ * the driver (`reference/packages.md`).
  *
  * `PackageConfigTests` asks what the text means and `TargetCapabilityTests` asks what a capability
  * set does to a compilation. Neither of them would notice if the driver never looked for the file,

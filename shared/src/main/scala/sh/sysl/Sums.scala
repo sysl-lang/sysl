@@ -1,6 +1,7 @@
 package sh.sysl
 
-/** `sysl.sum` — what each resolved package's source was when it was first seen (`packages.md § 6`).
+/** `sysl.sum` — what each resolved package's source was when it was first seen
+ * (`reference/packages.md § sysl.sum`).
  *
  * It sits beside `package.hocon`, is committed, and is checked on every fetch that populates the
  * cache. **It is not a lockfile**, and the difference is worth keeping straight: Minimal Version

@@ -28,12 +28,13 @@ import scala.collection.mutable
  * a result is what the *callee* owes. `extension` says which side owes what.
  *
  * Every rule below was read off `clang -S -emit-llvm` for the triple, which is the method
- * `targets.md` prescribes, and it is the only method that finds the parts no document states
- * plainly: that AAPCS64 hands a small struct **back** in an integer of its exact width while taking
- * the same struct widened to a whole register; that System V splits a sixteen-byte struct into two
- * *separate* parameters where AAPCS64 passes one array of two; that RISC-V flattens a struct of one
- * float and one integer into two registers but does **not** flatten one of a pointer and a float;
- * and that both of those name a sixteen-byte aggregate `i128` once it is aligned to sixteen.
+ * `getting-started/cli.md § targets` prescribes, and it is the only method that finds the parts no
+ * document states plainly: that AAPCS64 hands a small struct **back** in an integer of its exact
+ * width while taking the same struct widened to a whole register; that System V splits a
+ * sixteen-byte struct into two *separate* parameters where AAPCS64 passes one array of two; that
+ * RISC-V flattens a struct of one float and one integer into two registers but does **not** flatten
+ * one of a pointer and a float; and that both of those name a sixteen-byte aggregate `i128` once it
+ * is aligned to sixteen.
  */
 object CAbi {
 
@@ -247,13 +248,14 @@ object CAbi {
       case Cpu.Riscv32                           => riscv(t, size, target.hardFloat, xlen = 4)
       case Cpu.Thumb                             => aapcs32(t, size, target.hardFloat)
       case Cpu.Wasm32                            => wasm(t, size)
-      // **CRAFT has no C compiler, so there is no convention to agree with**, and that is the answer
-      // rather than a measurement nobody made. Every other row here was established by compiling the
-      // equivalent C and reading what clang did (`targets.md § Adding one`); this machine has no
-      // libc, no craft clang and no linker, so nothing on the other side of a call is C. What is
-      // left is the **back end's own** lowering, and passing an aggregate through memory is what it
-      // does: a register is two bytes, so anything past a single scalar is already indirect, and
-      // `CanLowerReturn` demotes a result wider than the two registers a return travels in.
+      // **CRAFT has no C compiler, so there is no convention to agree with**, and that is the
+      // answer rather than a measurement nobody made. Every other row here was established by
+      // compiling the equivalent C and reading what clang did (`getting-started/cli.md § targets`);
+      // this machine has no libc, no craft clang and no linker, so nothing on the other side of a
+      // call is C. What is left is the **back end's own** lowering, and passing an aggregate
+      // through memory is what it does: a register is two bytes, so anything past a single scalar
+      // is already indirect, and `CanLowerReturn` demotes a result wider than the two registers a
+      // return travels in.
       case Cpu.Craft                             => craft(t, size)
       // i386 is refused at the registry (`Target.supported`) for want of exactly this, so nothing
       // reaches here — and when its convention is measured, this is the line that gains it.
@@ -497,8 +499,8 @@ object CAbi {
    * homogeneous floating aggregate rule and no threshold to be off by one about: the whole convention
    * is one predicate and two answers, and this function is what that predicate costs.
    *
-   * Measured against clang for `wasm32-unknown-unknown`, as `targets.md § Adding one` requires, and
-   * `AbiAgainstClangTests` re-asks it every run.
+   * Measured against clang for `wasm32-unknown-unknown`, as `getting-started/cli.md § targets`
+   * requires, and `AbiAgainstClangTests` re-asks it every run.
    */
   private def wasm(t: Type, size: Int)(using l: Layout): Shape =
     onlyScalar(t, size) match

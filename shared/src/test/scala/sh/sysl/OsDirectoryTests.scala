@@ -485,7 +485,8 @@ class OsDirectoryTests extends LibraryCliSupport {
   }
 
   /** What a tree *offers* is a property of the tree rather than of the machine consuming it
-   * (`packages.md § 9`), so this one walk takes every folder whatever target is asking.
+   * (`reference/packages.md § What a dependency's modules are called`), so this one walk takes
+   * every folder whatever target is asking.
    */
   "the modules a tree offers" - {
 

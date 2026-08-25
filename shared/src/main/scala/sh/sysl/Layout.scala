@@ -12,7 +12,8 @@ package sh.sysl
  * an aggregate is laid out in declaration order with each member on its own alignment and the whole
  * rounded up to the widest member's. That is C's rule and LLVM's. Exactly one input varies, and it
  * is the one a 32-bit target changes — **how wide an address is** — so this is a value built from a
- * target rather than an object with eight bytes written into it (`targets.md`).
+ * target rather than an object with eight bytes written into it (`getting-started/cli.md §
+ * targets`).
  *
  * That distinction is worth stating precisely, because it is easy to read as more than it is: the
  * *rules* are target-independent and the *width they are applied to* is not. Nothing here asks the
@@ -55,8 +56,9 @@ case class Layout(word: Word) {
     // reader sees instead of a stack trace about a type they were already told about.
     case Type.Unknown                    => 0
     // Sysl's own storage for a walk, not any target's `va_list`: the widest a target needs, given
-    // to all of them (`targets.md`). What is per-target is how many bytes are *copied* out of it.
-    // Four words, which is what `Type.VaList.llvm` writes, so the two cannot drift.
+    // to all of them (`getting-started/cli.md § targets`). What is per-target is how many bytes are
+    // *copied* out of it. Four words, which is what `Type.VaList.llvm` writes, so the two cannot
+    // drift.
     case Type.VaList                     => pointerBytes * 4
     case t2 @ (_: Type.Ptr | _: Type.Ref) => if Type.erased(t2) then fat else pointerBytes
     // A weak reference is an address like the other two, and a weak trait object is the same pair

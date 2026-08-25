@@ -4,7 +4,7 @@ import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
 /** `@no_alloc` meeting a **generic**, which is where "what this module does" stops being obvious
- * (`capabilities.md § Open sub-questions`).
+ * (`reference/modules.md § A generic answers for what it wrote, not for what its caller chose`).
  *
  * The clause is a promise a module makes about its own conduct — *no execution that begins in this
  * module's code makes heap storage.* A generic has no execution until a type is chosen, so the module

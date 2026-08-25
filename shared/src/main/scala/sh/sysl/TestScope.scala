@@ -2,7 +2,7 @@ package sh.sysl
 
 import scala.collection.mutable
 
-/** Who may name what a `@tests` file declares (`testing.md`).
+/** Who may name what a `@tests` file declares (`reference/attributes.md § @tests — a file of scaffolding`).
  *
  * The header says two things and this is the second of them. The first — that every build but a test
  * build drops the file — is `Tests.strip`'s, and on its own it would be unsound: a program that
@@ -12,7 +12,7 @@ import scala.collection.mutable
  * So the rule is stated over the **referring declaration** rather than over the file it sits in:
  *
  *   - a declaration in a `@tests` file may name another, since the two are dropped together;
- *   - a `@test` function may name one wherever it was written, because `testing.md` puts a test
+ *   - a `@test` function may name one wherever it was written, because `reference/attributes.md § @tests — a file of scaffolding` puts a test
  *     beside what it tests and `Tests.strip` drops it in the same builds;
  *   - anything else may not, and is told so where it wrote the name.
  *

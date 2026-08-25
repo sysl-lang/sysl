@@ -199,11 +199,11 @@ trait FuncAddress extends CallCore {
   /** Whether a type is handed over to C as the thing it is, so a sysl definition of that signature
    * is already one the other side can call.
    *
-   * The test is by **shape** rather than by asking `CAbi`, and deliberately: the classification is a
-   * property of the target and this runs before one is chosen, so a rule that consulted it would let
-   * a program compile for one machine and not another. What every convention agrees about is the
-   * boundary drawn here — a value that occupies one register crosses as itself everywhere, and an
-   * aggregate is what each of them has its own reading of (`targets.md`).
+   * The test is by **shape** rather than by asking `CAbi`, and deliberately: the classification is
+   * a property of the target and this runs before one is chosen, so a rule that consulted it would
+   * let a program compile for one machine and not another. What every convention agrees about is
+   * the boundary drawn here — a value that occupies one register crosses as itself everywhere, and
+   * an aggregate is what each of them has its own reading of (`getting-started/cli.md § targets`).
    */
   private def crossesAsItself(t: Type): Boolean = Type.underlying(t) match
     case _: Type.Integer | _: Type.Floating | Type.Bool | Type.Char => true
