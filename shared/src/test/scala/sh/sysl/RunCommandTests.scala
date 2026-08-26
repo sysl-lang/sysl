@@ -12,7 +12,7 @@ import org.scalatest.matchers.should.Matchers
  * `git`, `llvm-ar`, each of them run for a value the compiler goes on to inspect. `exec` closes the
  * child's input before it starts, which is exactly right for a tool that has nothing to read and
  * exactly wrong for a program the user asked to run — so every sysl program that reads was handed
- * end-of-input at once. `examples/wc.sysl` read nothing from a pipe, and a console printed its
+ * end-of-input at once. A `wc` read nothing from the pipe it was given, and a console printed its
  * banner and exited.
  *
  * The input is copied from `Console.in`, which is why these tests can drive it: what the program

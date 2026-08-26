@@ -117,7 +117,7 @@ class OutputPathTests extends AnyFreeSpec with Matchers {
 
   /** A directory is a project because it holds `.sysl` files, and nothing gives one an identity of
    * its own. Requiring a `package.hocon` would supply one and charge every project the ceremony —
-   * every `guide/` and `examples/` directory in this repo has none, and neither does a scratch
+   * every `guide/` directory in this repo has none, and neither does a scratch
    * directory anybody makes in thirty seconds. So a bare directory is still a project and is still
    * named for itself; a project that wants to be called something says so.
    */

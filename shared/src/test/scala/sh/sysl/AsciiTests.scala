@@ -26,7 +26,8 @@ class AsciiTests extends AnyFreeSpec with RunSupport {
     }
 
     // The discriminating case, and the reason this member exists: a hand-rolled whitespace test
-    // stops after space and tab, which is exactly what `examples/wc.sysl` did. All six, or the
+    // stops after space and tab, which is exactly what the `wc` this member was written for did.
+    // All six, or the
     // member is no better than the two comparisons it replaces.
     "whitespace is all six of C's, not the two that are easy to remember" in {
       ascii("""var ws: [6]u8 = [32u8, 9u8, 10u8, 11u8, 12u8, 13u8]

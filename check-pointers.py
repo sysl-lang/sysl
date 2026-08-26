@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check that every reference pointer in this tree names a section that exists.
 
-The compiler's comments, `library/`, `guide/` and `examples/` cite the specification as
+The compiler's comments, `library/` and `guide/` cite the specification as
 `reference/<page>.md § <Section>` — the spelling card 0199 replaced the deleted `design/`
 chapters with.  A pointer names its section by **title**, so retitling a heading on sysl.sh
 breaks it in this repository and nothing here fails: both halves are correct prose, the gate
@@ -20,7 +20,7 @@ import re
 import sys
 
 TREE = os.path.dirname(os.path.abspath(__file__))
-SEARCHED = ("shared/src", "library", "guide", "examples", "doc")
+SEARCHED = ("shared/src", "library", "guide", "doc")
 
 # A pointer's section name may be wrapped across two comment lines, which puts a ` * ` or a
 # `// ` in the middle of it.  Collapsing those first is what separates about a hundred false

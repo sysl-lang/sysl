@@ -130,8 +130,8 @@ class BlockInBracketsTests extends AnyFreeSpec with RunSupport with CodegenSuppo
 
     // The one thing the rule costs, and the whole of it: a function *type* whose line is broken
     // immediately after its arrow used to be joined and is now read as opening a block. Nothing in
-    // the tree is written that way — all 161 arrow-terminated lines in `library/`, `guide/` and
-    // `examples/` are match arms — and breaking the line anywhere else still joins.
+    // the tree is written that way — all 148 arrow-terminated lines in `library/` and `guide/` are
+    // match arms — and breaking the line anywhere else still joins.
     "a function type may not be broken immediately after its arrow" in {
       err("""apply(f: int ->
             |    int, n: int) -> int = f(n)

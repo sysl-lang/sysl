@@ -50,7 +50,7 @@ established that the reference documents every language feature and every piece 
 documents saying the same thing is one that goes stale, and the reference is the one with a test
 suite behind it. The chapters are in the history: `git show b12e60c3:design/13-modules.md`.
 
-What stays here is `guide/` and `examples/`, which are checked against `dev` on every run.
+What stays here is `guide/`, which is checked against `dev` on every run.
 
 ## Building
 
@@ -62,16 +62,15 @@ sbt syslJVM/test        # run the test suite
 sbt syslJVM/run         # run the CLI
 ```
 
-To see the language run end to end — source, through the compiler, to a native binary:
+To see the language run end to end — source, through the compiler, to a native binary, run one of
+the guide programs:
 
 ```bash
-./run-example.sh                     # examples/hello.sysl
-./run-example.sh examples/hello.sysl # or name one
-./run-example.sh examples/args.sysl -- -n one two
+sbt "syslJVM/run run guide/bytecode"
 ```
 
 Anything after a `--` goes to the program rather than to sysl, which is what a `main(args: []string)`
-reads — the same convention `sysl run <path> -- <args>` follows.
+reads — `sysl run <path> -- <args>`.
 
 That needs a `clang` on the PATH: sysl emits textual LLVM IR and links it with clang.
 
