@@ -57,21 +57,26 @@ object MarkdownWriter {
    * `slugStyle = "github"` for exactly this reason; that setting and this function are two halves of
    * one contract, and `MarkdownWriterTests` pins the cases that differ from the other algorithm.
    *
-   * **"Must stay identical" is the whole of the mechanism: NOTHING RECONCILES THEM.** juicer's copy
-   * is `githubSlugify` in `core/shared/.../package.scala`, a separate implementation in a separate
-   * repository on a separate release cycle, and no test anywhere compares the two. They agree
-   * character for character today, which is what makes this a hazard rather than a defect — and it
-   * is the *renderer* whose answer a reader's link actually lands on, so a divergence makes this
-   * function wrong however carefully it was written.
+   * **"Must stay identical" USED TO BE THE WHOLE OF THE MECHANISM, AND `SlugConformanceTests` IS
+   * WHAT REPLACED IT.** juicer's copy is `githubSlugify` in `core/shared/.../package.scala`, a
+   * separate implementation in a separate repository on a separate release cycle; until card `0286`
+   * no test anywhere compared the two, and they agreed character for character only because nobody
+   * had touched either. That suite lives in `doc/`, which is the one place in the org where this
+   * function and `juicer-core` are on the same classpath, and it fails the moment a juicer bump
+   * moves the answer.
    *
-   * **A one-character divergence is silent and total.** Collapse runs of spaces in either loop —
-   * which most slug implementations do and GitHub deliberately does not — and every anchor on every
-   * generated page lands at the top of the right page, with no complaint from juicer, from the
-   * site's `DocsTests`, or from its `AnchorTests`, which calls *this* function and therefore
-   * inherits the blind spot rather than covering it. Card `0286` carries what to do about it.
+   * **A one-character divergence is silent and total, which is why the check has to be against the
+   * RENDERER and not against a table.** Collapse runs of spaces in either loop — which most slug
+   * implementations do and GitHub deliberately does not — and every anchor on every generated page
+   * lands at the top of the right page, with no complaint from juicer, from the site's `DocsTests`,
+   * or from its `AnchorTests`, which calls *this* function and therefore inherits the blind spot
+   * rather than covering it.
    *
    * The same is true a second time and one layer down: the `-1` numbering for a repeated heading is
-   * implemented here and implemented again by juicer's `dedupeHeadingIds`.
+   * implemented here, in `anchors`, and implemented again by juicer's `dedupeHeadingIds`. That one
+   * cannot be called at all from outside juicer, so the suite reaches it by building a real site and
+   * reading the ids back out of the HTML — which is also the honest place to assert, since a
+   * reader's link lands on what the renderer emitted.
    *
    * **The setting is written into each generated page's frontmatter, not into the site.** juicer
    * made `slugStyle` a per-page key in 0.4.1 for this case: a generated section nearly always lands
@@ -99,6 +104,13 @@ object MarkdownWriter {
    * `Buf`, `map()` and `Map` — and case-folding makes those one slug. GitHub renders the second as
    * `buf-1`, so that is what a link has to say. Computed once for the whole page rather than per
    * link, because the answer depends on everything before it.
+   *
+   * **The walk past an already-taken candidate is not belt and braces.** A page carrying a heading
+   * that slugs to `buf-1` *before* a pair that collides on `buf` needs the second `buf` to land on
+   * `buf-2`, and trusting the counter would hand out `buf-1` twice. juicer's `dedupeHeadingIds`
+   * carries the same loop for the same reason, and `SlugConformanceTests` orders its fixture so that
+   * both are actually entered — written the other way round every heading resolves on its first try
+   * and deleting the loop from either implementation leaves the suite green.
    *
    * **It answers a LIST rather than a map from heading text, and that is not a stylistic choice.**
    * sysl has function overloading, so `parse_int` really is two declarations with the same name and

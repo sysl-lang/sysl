@@ -287,7 +287,15 @@ lazy val syslDoc = crossProject(JVMPlatform, NativePlatform)
       "org.scalatest" %%% "scalatest" % "3.2.20" % "test",
       // The site generator as a library — the SiteBuild pipeline without juicer's own option parser.
       // Split out and published for this consumer; see juicer 0.4.0.
-      "io.github.edadma" %%% "juicer-core" % "0.4.0",
+      //
+      // **0.4.1 IS A FLOOR RATHER THAN A CURRENT VERSION.** `MarkdownWriter` writes `slugStyle:
+      // github` into every generated page's frontmatter, and a per-page `slugStyle` is exactly what
+      // 0.4.1 added — 0.4.0 ignores the key and slugs with the site's default, which puts every
+      // anchor on every generated page at the top of the right page. The pin sat at 0.4.0 for a
+      // release with the frontmatter already being written, so `sysl doc --site` rendered dead links
+      // and nothing said so. `SlugConformanceTests` is what notices now, and it only notices because
+      // it renders through this jar.
+      "io.github.edadma" %%% "juicer-core" % "0.4.1",
     ),
     // Not published. It is a binary somebody installs, exactly as the compiler is, and a coordinate
     // for it would be one nothing should depend on.
