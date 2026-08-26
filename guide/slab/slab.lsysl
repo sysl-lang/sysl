@@ -103,10 +103,32 @@ could not have and this file called it `take`. **Capabilities are attributes now
 `requires` and `link` all came back to every program at once. This file is the one that wanted the
 word most, which is why it is the one that reports the change.
 
+**Rounding an address up is the library's now, and this program used to carry its own.** It had a
+four-line `aligned_up(n: usize, a: usize)` doing the arithmetic on a bare number, because nothing in
+`library/` did it and the shim every C binding wrote was in C — on the belief, stated in more than one
+package, that sysl had no way to read a pointer as an integer. It always had one. `sysl.slices` now
+carries `align_up` and `is_aligned` over pointers, so the helper is gone and the call below says what
+it wants rather than how the mask works.
+
+**The address arithmetic this program owns is not diminished by that**, which is worth saying because
+the helper looked like the axis. What the allocator has to know is still here and still explicit: it
+reads its region's address with `usize`, asks `alignof(T)` what boundary the element wants, measures
+what the rounding cost with a subtraction, and reinterprets bytes with `ptr_cast`. What left is one
+mask expression that every caller of it had to get right independently.
+
 **The one thing the compiler still refuses is a `&T`.** An early draft tried to hand back a counted
 reference, on the grounds that a slab block outlives its user. It cannot: ARC would have no count to
 own, and the safe subset relies on a `&T` being a live object. So an allocator's result is a `*T` and
 stays in the raw tier, which is where a caller reaching for one already is.
+
+
+What this needs from the library
+--------------------------------
+
+One function, and the module it is in allocates nothing — which is what makes it reachable from a
+program written without an allocator.
+
+    import sysl.slices.align_up
 
 
 Reading a free block as a link
@@ -154,14 +176,14 @@ to hold the link is a build that stops, naming the instantiation that asked for 
         @assert(sizeof(T) >= sizeof(*u8), "a free block has to be wide enough to hold the link through it")
 
 Rounding the base up is what costs the region its first `lost` bytes, and `made` counts what fits
-after that rather than what would have fit from the region's own start.
+after that rather than what would have fit from the region's own start. `align_up` answers the first
+address at or after the region's own that `alignof(T)` divides, so `lost` is a subtraction rather
+than a second computation of the same thing.
 
-        var start = usize(region)
-        var base = aligned_up(start, alignof(T))
-        var lost = base - start
+        var first = align_up(region, alignof(T))
+        var lost = usize(first) - usize(region)
         var block = sizeof(T)
         var made = if bytes > lost then (bytes - lost) / block else 0
-        var first: *u8 = ptr_cast(base)
         var head: *u8 = null
         var i = made
 
@@ -179,13 +201,6 @@ came from.
 
         Slab(ptr_cast(first), head, made)
     end slab_over
-
-The next address at or above `n` that `a` divides. `a` is a power of two here — every alignment is —
-but the arithmetic is written the way that does not depend on it, since nothing in the type says so.
-
-    aligned_up(n: usize, a: usize) -> usize
-        (n + a - 1) / a * a
-    end aligned_up
 
 
 Taking and returning a block

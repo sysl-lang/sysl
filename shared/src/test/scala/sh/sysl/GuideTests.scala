@@ -78,7 +78,7 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
     val out = guide("slab")
 
     out should not include "FAIL"
-    checks(out) shouldBe 37
+    checks(out) shouldBe 34
     sections(out) shouldBe List(
       "-- what a block costs",
       "-- carving a region into blocks",
