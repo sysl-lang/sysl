@@ -56,7 +56,8 @@ class CrossTargetBuildTests extends AnyFreeSpec with Matchers {
     // helpers are IR templates rather than generated code, so a `usize` in one of them is a
     // hardwired `i64` until something makes it verify for a machine that has not got one.
     "a string built at run time, and the renderers behind it" ->
-      """var greeting = "he" + "llo"
+      """import sysl.text.from_utf8_unchecked
+        |var greeting = "he" + "llo"
         |var counted = str(greeting.len) + str('!')
         |var padded = f"${greeting}%8s ${greeting.len}%d ${0.5}%6.2f"
         |var same = greeting == "hello"

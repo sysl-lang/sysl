@@ -542,7 +542,8 @@ class ArrayClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     "and 'from_utf8_unchecked' is one of the positions that asks, so it takes the bytes as they are" in {
-      run("""val bytes: [3]u8 = [104, 105, 33]
+      run("""import sysl.text.from_utf8_unchecked
+            |val bytes: [3]u8 = [104, 105, 33]
             |print(from_utf8_unchecked(bytes))
             |""".stripMargin) shouldBe "hi!\n"
     }

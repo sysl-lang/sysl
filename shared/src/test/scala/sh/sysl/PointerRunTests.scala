@@ -348,7 +348,8 @@ class PointerRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // The whole point of the feature, end to end: a C function's `*u8`, a length it reported
     // separately, and the bytes read back and turned into text.
     "which is what makes a buffer a C function filled readable at all" in {
-      run("""extern "strlen" c_strlen(p: *u8) -> usize
+      run("""import sysl.text.from_utf8_unchecked
+            |extern "strlen" c_strlen(p: *u8) -> usize
             |extern "getenv" c_getenv(n: *u8) -> *u8
             |var home = c_getenv(c"HOME")
             |var n = c_strlen(home)
@@ -462,7 +463,8 @@ class PointerRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       * out of, and it is what the operator was added for.
       */
     "which is what makes memchr usable at all" in {
-      run("""extern memchr(p: *u8, c: int, n: usize) -> *u8
+      run("""import sysl.text.from_utf8_unchecked
+            |extern memchr(p: *u8, c: int, n: usize) -> *u8
             |var buf: [8]u8 = [65u8, 66u8, 10u8, 67u8, 0u8, 0u8, 0u8, 0u8]
             |var hit = memchr(&buf[0], 10, 8usize)
             |if hit == null
