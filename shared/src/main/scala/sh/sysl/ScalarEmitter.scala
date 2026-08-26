@@ -87,8 +87,72 @@ trait ScalarEmitter extends StringEmitter {
             divisor = safe
       case _ =>
 
-    val r = freshReg(); emit(Inst.Bin(r, instr, ty.lty, lv, divisor)); r
+    // A shift amount at or past the operand's width is undefined on every machine instruction this
+    // lowers to, and LLVM propagates that as poison rather than as a number — so an over-shift did
+    // not merely give a wrong answer, it gave a *different* one between two runs of one binary.
+    // `01`'s rule is that raw integer arithmetic is total and defined, so the amount is bounded here
+    // and the shift is defined at every amount. See `boundedShift`.
+    lane match
+      case i: Type.Integer if op == "<<" || op == ">>" =>
+        boundedShift(ty, i, instr, lv, divisor)
+      case _ =>
+        val r = freshReg(); emit(Inst.Bin(r, instr, ty.lty, lv, divisor)); r
   }
+
+  /** A shift whose amount may be anything, lowered so that every amount means something.
+   *
+   * **Shifting a value by its own width or more answers what shifting it all the way answers**: zero
+   * for `<<` and for an unsigned `>>`, and the sign for a signed one, since an arithmetic right
+   * shift fills from the top and a value shifted past its width is all sign. That is Go's rule and
+   * Swift's, and it is the only one under which `x >> (w - n)` is total at `n == 0` — which is what
+   * a routine reversing the low `n` bits of a word needs, and what `Bits.rotate_left` exists to work
+   * around for rotation.
+   *
+   * **It is not the machine's rule and not C's.** The bare instruction on x86 and on AArch64 masks
+   * the amount, so `x >> 64` would be `x >> 0`, which is `x` — an answer nobody means and the one
+   * Java shipped. Masking is available to a caller who wants the raw instruction, under a name, if
+   * one ever asks; it is not what an operator should do silently.
+   *
+   * The amount is clamped rather than the shift being emitted and thrown away, so **no poison is
+   * built at all**: at `width - 1` the arithmetic shift is already the sign fill, which is why the
+   * signed case needs nothing further. The two logical shifts then select their zero over the
+   * clamped result. On a constant amount every instruction here folds away; on a variable one it is
+   * a compare and a select.
+   */
+  protected def boundedShift(ty: Type, lane: Type.Integer, instr: BinOp, lv: Val, amt: Val): Val = {
+    val bits    = lane.bits
+    val condTy  = ty match
+      case Type.Vector(n, _) => LType.Vec(n, i1)
+      case _                 => i1
+    val width   = constantAt(ty, bits)
+    val highest = constantAt(ty, bits - 1)
+
+    val tooBig = freshReg(); emit(Inst.IntCmp(tooBig, ICmp.Uge, ty.lty, amt, width))
+    val safe   = freshReg(); emit(Inst.Select(safe, tooBig, ty.lty, highest, amt, condTy))
+    val r      = freshReg(); emit(Inst.Bin(r, instr, ty.lty, lv, safe))
+
+    // An arithmetic right shift by `width - 1` is already every bit of the sign, so the clamp alone
+    // is the whole of the signed case. The other two have to say zero.
+    if instr == BinOp.AShr then r
+    else
+      val out = freshReg(); emit(Inst.Select(out, tooBig, ty.lty, Val.Zero, r, condTy)); out
+  }
+
+  /** An integer constant at a type, splat across the lanes where that type is a vector.
+   *
+   * A scalar constant carries no width — the instruction names it — so a vector needs the value put
+   * in lane zero and shuffled out, which is the same idiom `TSplat` emits and is recognised by every
+   * back end.
+   */
+  protected def constantAt(ty: Type, value: BigInt): Val = ty match
+    case v: Type.Vector =>
+      val one = freshReg()
+      emit(Inst.InsertElement(one, v.lty, Val.Poison, Type.underlying(v.elem).lty, Val.Int(value),
+        Arg(i32, Val.Int(0))))
+      val r = freshReg()
+      emit(Inst.Shuffle(r, v.lty, one, Val.Poison, Arg(LType.Vec(v.length, i32), Val.Zero)))
+      r
+    case _ => Val.Int(value)
 
   /** Integer `+`, `-`, `*` where the operands' declared ranges allow a result the base width cannot
    * hold, so a plain instruction would wrap before the range check at the produce site could see it.

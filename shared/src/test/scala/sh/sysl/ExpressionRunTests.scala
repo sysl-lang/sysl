@@ -218,6 +218,66 @@ class ExpressionRunTests extends AnyFreeSpec with RunSupport {
   // A compound assignment to an indexed element must evaluate the place once, not once for the
   // load and again for the store. A side-effecting index prints a single time, and the element
   // holds the read-modify-write result.
+  // A shift amount at or past the operand's width used to be undefined: the machine instruction masks
+  // it, LLVM calls the result poison, and what came out was not even a stable wrong answer — `11 >> 64`
+  // printed `0`, then `2`, then `8503132480` across compilations of one source, and `11 >> 65` printed
+  // `4341799456` on one run of a binary and `0` on the next. Raw integer arithmetic is defined to
+  // wrap, so a shift is defined too: shifting a value all the way answers what shifting it all the way
+  // means.
+  "a shift by the width answers zero rather than anything" in {
+    run("""main()
+          |    var u: usize = 11
+          |    print(u >> 64, u << 64, u >> 65, u << 65)""".stripMargin) shouldBe "0 0 0 0\n"
+  }
+
+  // The amount is a variable here, so nothing folds and the emitted compare and select are what runs.
+  "and it does so when the amount is not a constant" in {
+    run("""main()
+          |    var u: usize = 11
+          |    var w: usize = 64
+          |    var past: usize = 1000
+          |    print(u >> w, u << w, u >> past, u >> (w - 1))""".stripMargin) shouldBe "0 0 0 0\n"
+  }
+
+  // An arithmetic right shift fills from the sign, so a signed value shifted past its width is all
+  // sign — which is the answer that keeps `x >> n` meaning "divide by two, n times" in the limit.
+  "a signed right shift past the width is the sign, not zero" in {
+    run("""main()
+          |    var neg: int = -8
+          |    var pos: int = 8
+          |    var w: int = 64
+          |    print(neg >> 64, pos >> 64, neg >> w, pos >> w)""".stripMargin) shouldBe "-1 0 -1 0\n"
+  }
+
+  // The width is the operand's own, so a narrow type reaches the case at a much smaller amount — and
+  // `u8` is where masking would have been most visible, since the machine masks to five or six bits
+  // and would have left every one of these shifting by something.
+  "the width that bounds it is the operand's own, not the machine's" in {
+    run("""main()
+          |    var b: u8 = 0b1011
+          |    var s: i8 = -8
+          |    print(b >> 8, b << 8, b >> 200, s >> 8)""".stripMargin) shouldBe "0 0 0 -1\n"
+  }
+
+  // Nothing about an in-range shift changes, which is the half a bounds check could quietly break.
+  "an in-range shift is untouched" in {
+    run("""main()
+          |    var u: usize = 11
+          |    var s: int = -8
+          |    var b: u8 = 0b1011
+          |    print(u >> 1, u << 1, s >> 1, b << 1)""".stripMargin) shouldBe "5 22 -4 22\n"
+  }
+
+  // A vector shifts lane-wise and is bounded lane-wise, so the amount is splat across the register
+  // and the select is a lane mask rather than a branch.
+  "a vector shift is bounded in every lane" in {
+    run("""main()
+          |    var counts: <8>u32 = [1, 2, 4, 8, 16, 32, 64, 128]
+          |    var big: <8>u32 = [40, 40, 40, 40, 40, 40, 40, 40]
+          |    print((counts << 1)[7], (counts << big)[0], (counts >> big)[7], (counts >> 1)[7])""".stripMargin) shouldBe
+      "256 0 0 64\n"
+  }
+
   "a compound assignment evaluates a side-effecting index exactly once" in {
     val src =
       """next() -> int
