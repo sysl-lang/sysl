@@ -11,14 +11,14 @@ next compiler change.
 Run one directly:
 
 ```
-sbt "syslJVM/run run guide/bytecode"
+sbt "syslJVM/run run guide/ring"
 ```
 
 Each directory is a **project root**, so the files in it are the anonymous root module and any
-sub-directory is a module named by its path (`13 §1`). One kind of sub-directory is the exception and
-none of these programs has one: a directory named `__<machines>__` selects source for the machines it
-names — one operating system, a comma-separated list of them, or a family such as `posix` — and names
-nothing, so its files belong to the directory holding it (`13 §5`).
+sub-directory is a module named by its path (`reference/modules.md`). One kind of sub-directory is
+the exception and none of these programs has one: a directory named `__<machines>__` selects source
+for the machines it names — one operating system, a comma-separated list of them, or a family such as
+`posix` — and names nothing, so its files belong to the directory holding it.
 
 **Each program checks itself.** Every line it prints is either a `--` section header or `ok`
 followed by what was checked, so a failure is a line that says otherwise. `GuideTests` runs each
@@ -31,11 +31,11 @@ that quietly stopped running would otherwise look like a check that passed.
 die rather than report it, and the run would look truncated instead of failing. The run therefore
 asserts a refusal only through a total operation that answers instead of trapping.
 
-**The traps are asserted in `@test(should_trap)` functions** (`testing.md`), which live in the
-program's own directory and are run by `sysl test <directory>`. Each runs in a process of its own
-and passes by not coming back, so a trap is an observation there rather than the end of the run —
-which is what lets a refusal be stated in sysl, beside the code it is about. `guide/ring` was the
-first to need this and `guide/ring/tests.sysl` is where that half of its evidence lives.
+**The traps are asserted in `@test(should_trap)` functions** (`reference/attributes.md`), which live
+in the program's own directory and are run by `sysl test <directory>`. Each runs in a process of its
+own and passes by not coming back, so a trap is an observation there rather than the end of the run —
+which is what lets a refusal be stated in sysl, beside the code it is about. `guide/ring/tests.sysl`
+is where that half of the ring's evidence lives.
 
 **Such a file opens with `@tests`**, which says the whole of it is scaffolding: every build but
 `sysl test` drops what it declares, and nothing outside a test may name any of it. A program did not
@@ -56,31 +56,22 @@ contract.
 
 | directory | axis it owns |
 |---|---|
-| `bytecode` | the module system, and the set's one end-to-end assertion — source in, bytecode out, run it |
-| `png` | the byte level — endianness, bit streams, checksums, a format someone else defined |
-| `fft` | an algorithm checked against its own definition |
-| `shapes` | dynamic dispatch — a heterogeneous collection whose element types are forgotten |
-| `scheduler` | OS shapes — a run queue, blocking and waking, and `&T` graphs mutated through references |
-| `kernel` | the same scheduler with no heap — a fixed table, indices for identity, intrusive lists |
 | `ring` | the constrained-subtype surface — range types, their `::` attributes, contracts, struct invariants, and a loop's termination measure |
 | `slab` | raw storage — reinterpreting bytes as a typed pointer, `sizeof`/`alignof`, and a free list threaded through the free blocks themselves |
-| `lisp` | the reference cycle — the one shape a count cannot reclaim, `weak T` as both the cure and the instrument that measures it |
-| `simd` | one kernel compiled for more than one register width — a lane count as a value parameter, a run of a slice loaded and stored back, and the two places "write it once" stops being true |
 
-The rest of the set, and the coverage map that justifies each entry, is recorded outside the repo
-with the rest of the project's decisions. A candidate that does not own an axis already unclaimed is
-a variation, and belongs in the test suite instead.
+A candidate that does not own an axis already unclaimed is a variation, and belongs in the test suite
+instead.
 
-**`slab` and `lisp` are written as literate files** (`15 §11`). Both crossed the same line: their
-findings ran past sixty lines of header comment before anything executable appeared, which is the
-length at which a comment stops being one — so each is a document with the program indented inside
-it, and the essay that was fighting the `//` is prose. Nothing about either program changed; a
+**`slab` is written as a literate file** (`reference/lexical.md § Literate source`). It crossed a line the others do
+not: its findings ran past sixty lines of header comment before anything executable appeared, which
+is the length at which a comment stops being one — so it is a document with the program indented
+inside it, and the essay that was fighting the `//` is prose. Nothing about the program changed; a
 directory holds a `.lsysl` beside `.sysl` files and `Project.collect` reads both.
 
 **The threshold is worth stating, because it is the whole of when to reach for the format.** It is
 not comment *volume* — it is an argument that has to sit between two declarations rather than above
-one. `lisp` has four paragraphs inside the body of `eval`, each explaining the arm under it; as
-`//` they were a wall above the function that nobody would read at the point it mattered. Consecutive
+one. `slab`'s paragraph about what the raw tier takes on belongs beside the three operations that
+take it on, not in a wall above the file that nobody reads at the point it matters. Consecutive
 indented blocks are one block, so prose costs the program nothing to split.
 
 ## What each program found
@@ -95,3 +86,14 @@ reason, waiting on that" is a decision. Writing it down is not. The rule exists 
 compound: two of these programs independently paid the same cost for the same missing feature, and
 the second one taught us nothing the first had not, because nothing had been settled in between. A
 program written on top of an undecided finding spends its budget rediscovering it.
+
+**A program that has discharged its findings and whose subject has found a better home is retired**
+rather than kept for the coverage — the code goes to a package where it can be used, or to the
+standard library, or nowhere. What the set is for is the friction, and a program nothing is learning
+from any more is only a tree to keep green.
+
+Two of them are packages in the org rather than gone: `guide/fft` is
+[`fft`](https://github.com/sysl-lang/fft), generic over its float width rather than fixed at one, and
+`guide/png` is [`png`](https://github.com/sysl-lang/png), whose CRC table had to stop being module
+storage before it could go on a board. Both had to change to be depended on, which is the difference
+between a program written to find something out and one written to be used.

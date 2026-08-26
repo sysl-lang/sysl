@@ -20,8 +20,12 @@ import org.scalatest.freespec.AnyFreeSpec
 class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
   "what the documents claim" - {
-    // The customer the feature was opened for: `guide/png`'s CRC table is derived rather than
-    // written down, so a constant tree could never have carried it.
+    // The customer the feature was opened for: a CRC table is derived rather than written down, so a
+    // constant tree could never have carried it. Worth knowing that the customer has since moved off
+    // it — a derived table in module storage is what a freestanding `build-c` archive has no
+    // initializer to fill, so `sysl-lang/png` holds its table on a value instead. The feature is
+    // right for a program, and a *library* that might be linked into an archive wants the other
+    // shape.
     "a table a function builds is a 'val'" in {
       val src =
         """build() -> [256]u32
