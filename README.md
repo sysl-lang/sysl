@@ -8,7 +8,7 @@
   <a href="https://github.com/sysl-lang/sysl/commits"><img alt="Last Commit" src="https://img.shields.io/github/last-commit/sysl-lang/sysl"></a>
   <img alt="License" src="https://img.shields.io/github/license/sysl-lang/sysl">
   <img alt="Scala Version" src="https://img.shields.io/badge/Scala-3.8.4-blue.svg">
-  <img alt="Scala.js Version" src="https://img.shields.io/badge/Scala.js-1.21.0-blue.svg">
+  <img alt="Scala.js Version" src="https://img.shields.io/badge/Scala.js-1.22.0-blue.svg">
   <img alt="Scala Native Version" src="https://img.shields.io/badge/Scala_Native-0.5.12-blue.svg">
 </p>
 
