@@ -181,11 +181,23 @@ trait NoAlloc extends AnalyzerBase {
    * module property` asks for is that an allocator-free module "can only import and call things
    * that are themselves no-alloc-compatible", and calls are what this is stated over.
    *
-   * The reachable set is the one `Reachability` computes, which **over-approximates** where a call's
-   * target is decided at run time: a method-table slot is answered with what every table for that
-   * trait put there. That is the right direction to be wrong in — a refusal names a function the
-   * program might really arrive at — and it is why the answer is cached per tree rather than
-   * recomputed.
+   * The reachable set is the one `Reachability` computes **in its `written` mode**, which answers a
+   * run-time target with the tables this code erased a value into rather than with every table for
+   * the trait. The distinction is the whole of `reference/modules.md § Capabilities are a module
+   * property`: the clause is a promise about a module's own conduct, and which `impl Writer` is
+   * behind a `*Writer` parameter is its caller's choice, made in a module of their own.
+   *
+   * **The default walk over-approximates and is right to** — it exists for emission, where keeping a
+   * function nobody calls costs a symbol and dropping one the program reaches is a link error. Asked
+   * for a capability the same answer refuses a module for what somebody else's code does: writing
+   * into a caller's sink was judged against `sysl.buf`'s `ByteSink`, so a module rendering into a
+   * `*Writer` was legal or refused according to what the *program* linked, and no `Display` in
+   * `library/` could carry the clause at all.
+   *
+   * **What is not relaxed is making the sink yourself.** A body that builds a growable buffer and
+   * hands it over as a trait object wrote the erasure, so the table is named in its own tree and the
+   * walk follows it — which is the case that would otherwise escape, and the reason this is a
+   * narrowing rather than a hole.
    */
   private class Allocators(funcs: List[TFunc], vtables: List[TVtable]) {
 
@@ -196,7 +208,7 @@ trait NoAlloc extends AnalyzerBase {
 
     /** Every allocating function this tree can arrive at. */
     private def reached(x: Any): Set[String] =
-      Reachability.reachedFrom(List(x), funcs, vtables).calls.filter(direct)
+      Reachability.reachedFrom(List(x), funcs, vtables, written = true).calls.filter(direct)
 
     /** Reports the **smallest** sub-tree that still reaches an allocator, which is as close to the
      * call as the tree can put the caret: a body reaches one through some statement, that statement
