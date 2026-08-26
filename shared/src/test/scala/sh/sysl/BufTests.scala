@@ -439,6 +439,90 @@ class BufTests extends AnyFreeSpec with RunSupport {
     }
   }
 
+  // Both blocks delegate to the slice's, over `view()` — so what is asserted here is that a `Buf`
+  // says it is the sequence it holds, and that the storage past `count` is not part of it.
+  //
+  // **The buffers below are values, where every other block in this file holds a `&Buf`.** A
+  // reference compares by address (`reference/memory.md § &T — counted references`), so `==` between
+  // two `&Buf` asks whether they are the same buffer and not whether they hold the same elements —
+  // and `print` on one refuses, a `&T` implementing nothing its referent implements. The last test
+  // here pins both, since this file's own convention is the one that walks into them.
+  "comparing and rendering one" - {
+    val three = "var b: Buf[int] = buf()\nfor i in 1..3 do b.push(i)\n"
+
+    "two buffers with the same elements are equal" in {
+      run(three + "var c: Buf[int] = buf()\nfor i in 1..3 do c.push(i)\nprint(b == c)") shouldBe "true\n"
+    }
+
+    "a differing element or a differing length makes them unequal" in {
+      val src =
+        """var b: Buf[int] = buf()
+          |var c: Buf[int] = buf()
+          |var d: Buf[int] = buf()
+          |for i in 1..3 do b.push(i)
+          |c.push(1)
+          |c.push(9)
+          |c.push(3)
+          |d.push(1)
+          |d.push(2)
+          |print(b == c, b == d, b != d)""".stripMargin
+
+      run(src) shouldBe "false false true\n"
+    }
+
+    // The capacity is eight after two pushes and sixteen after nine, so a comparison reading the
+    // backing slice rather than the view would be comparing slots nobody wrote.
+    "the spare capacity is not part of the value" in {
+      val src =
+        """var b: Buf[int] = buf()
+          |var c: Buf[int] = buf()
+          |b.push(1)
+          |b.push(2)
+          |for i in 0..<9 do c.push(i)
+          |c.truncate(2)
+          |c.set(0, 1)
+          |c.set(1, 2)
+          |print(b.cap() == c.cap(), b == c)""".stripMargin
+
+      run(src) shouldBe "false true\n"
+    }
+
+    "two empty buffers are equal" in {
+      run("var b: Buf[int] = buf()\nvar c: Buf[int] = buf()\nprint(b == c)") shouldBe "true\n"
+    }
+
+    "it renders as the sequence it holds" in {
+      run(three + "print(b)") shouldBe "[1, 2, 3]\n"
+    }
+
+    "an empty one renders as an empty sequence" in {
+      run("var b: Buf[int] = buf()\nprint(b)") shouldBe "[]\n"
+    }
+
+    // A specifier describes the field the whole value occupies, which is the padding the slice
+    // block already measures — the delegation is what gets it, rather than a second copy.
+    "a width pads the whole rendering, on either side" in {
+      run(three + """print(f"${b}%13s|")""" + "\n" + """print(f"${b}%-13s|")""") shouldBe
+        "    [1, 2, 3]|\n[1, 2, 3]    |\n"
+    }
+
+    // Neither of these is about `Buf`: a reference compares by address and implements nothing its
+    // referent implements, whatever the referent is. They are here because this file holds its
+    // buffers by reference everywhere else, so this is where somebody meets both.
+    "a reference to one compares by address, and the deref is the way past" in {
+      val src =
+        """var b: &Buf[int] = buf()
+          |var c: &Buf[int] = buf()
+          |var d = b
+          |for i in 1..3
+          |    b.push(i)
+          |    c.push(i)
+          |print(b == c, b == d, *b == *c)""".stripMargin
+
+      run(src) shouldBe "false true true\n"
+    }
+  }
+
   "what stops the program" - {
     // Reading past the end is a panic rather than a trap, because a `Buf` is written in sysl and
     // what sysl has to stop with is the library's own `exit` — so it can say what went wrong.

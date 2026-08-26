@@ -116,8 +116,13 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * `is_aligned` with six tests: the measurement above reads 448, and taking the number exactly is
    * what proves the six are collected rather than merely that nothing vanished. The gap the entry
    * above kept was the residue of a removal, not a target to hold.
+   *
+   * Raised to **457**, again with no slack, when `Buf[T]` and `[]T` became `Eq` and a `Buf` became
+   * `Display`: nine tests, four for the slice and the array in the root module's own file and five
+   * for the buffer. The measurement above reads 457 and the runner agrees, which is what says the
+   * nine are collected rather than that nothing vanished.
    */
-  private val floor = 448
+  private val floor = 457
 
   /** The library, compiled as a **test build of itself**.
    *

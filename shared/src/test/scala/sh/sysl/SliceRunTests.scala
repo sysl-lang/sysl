@@ -6,7 +6,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * of what is worth checking is that the view and its buffer agree — and that the buffer
  * outlives every view of it.
  */
-class SliceRunTests extends AnyFreeSpec with RunSupport {
+class SliceRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   private val buf = "var buf: &[8]u8 = [1, 2, 3, 4, 5, 6, 7, 8]\n"
 
@@ -207,6 +207,77 @@ class SliceRunTests extends AnyFreeSpec with RunSupport {
         |""".stripMargin
 
     run(src) shouldBe "10 99 30 99\n"
+  }
+
+  // -- equality -----------------------------------------------------------------------------
+  //
+  // `impl[T: Eq] Eq for []T` in `library/sysl/ops.sysl`, and the array block beside it. The
+  // expectations here are written in Scala and compared by another runtime, which is what a sysl
+  // `@test` asserting `==` cannot do about `==`.
+
+  "two slices with the same elements are equal" in {
+    run(buf + "print(buf[0..<3] == buf[0..<3])") shouldBe "true\n"
+  }
+
+  "a differing element makes them unequal" in {
+    run(buf + "print(buf[0..<3] == buf[1..<4], buf[0..<3] != buf[1..<4])") shouldBe "false true\n"
+  }
+
+  // The length test runs first, so this never reads an element that is only in one of them.
+  "a differing length makes them unequal whatever the shared prefix is" in {
+    run(buf + "print(buf[0..<3] == buf[0..<4], buf[0..<4] == buf[0..<3])") shouldBe "false false\n"
+  }
+
+  "two empty slices are equal, and an empty one differs from a non-empty one" in {
+    run(buf + "print(buf[3..<3] == buf[5..<5], buf[3..<3] == buf[0..<1])") shouldBe "true false\n"
+  }
+
+  // A slice of a type of its own compares through that type's own `eq`, which is what the bound
+  // asks for -- nothing here knows how a `Cell` decides it.
+  "the element's own equality is what decides" in {
+    val src =
+      """struct Cell
+        |    n: int
+        |
+        |impl Eq for Cell
+        |    eq(self, rhs: Cell) -> bool = self.n % 10 == rhs.n % 10
+        |var a: &[2]Cell = [Cell(1), Cell(2)]
+        |var b: &[2]Cell = [Cell(11), Cell(22)]
+        |var c: &[2]Cell = [Cell(11), Cell(23)]
+        |print(a[..] == b[..], a[..] == c[..])
+        |""".stripMargin
+
+    run(src) shouldBe "true false\n"
+  }
+
+  // The arrays are values rather than references on purpose: a `&[3]int` compares **by address**
+  // (`reference/memory.md § &T — counted references`), so a reference would be asking a different
+  // question and would answer `false` to two arrays holding the same elements.
+  "an array compares as the elements a slice of it would have walked" in {
+    val src =
+      """var a: [3]int = [1, 2, 3]
+        |var b: [3]int = [1, 2, 3]
+        |var c: [3]int = [1, 9, 3]
+        |print(a == b, a == c, a != c)
+        |""".stripMargin
+
+    run(src) shouldBe "true false true\n"
+  }
+
+  "a reference to an array still compares by address, which the deref is the way past" in {
+    val src =
+      """var a: &[3]int = [1, 2, 3]
+        |var b: &[3]int = [1, 2, 3]
+        |print(a == b, *a == *b)
+        |""".stripMargin
+
+    run(src) shouldBe "false true\n"
+  }
+
+  // Ordering was deliberately not supplied: nothing needed it, and a lexicographic `<` is a
+  // separate claim from an element-wise `==`.
+  "a slice still has no ordering" in {
+    err(buf + "print(buf[0..<3] < buf[1..<4])") should include("'<' is not defined for []byte")
   }
 
   "a bound past the end stops the program" in {
