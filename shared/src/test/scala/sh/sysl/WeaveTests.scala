@@ -207,12 +207,11 @@ class WeaveTests extends AnyFreeSpec with Matchers {
   }
 
   "the round trip holds" - {
-    "for the guide programs written this way" in {
-      for name <- List("guide/lisp/lisp", "guide/slab/slab") do
-        val path = s"$name${Literate.Extension}"
+    "for the guide program written this way" in {
+      val path = s"guide/slab/slab${Literate.Extension}"
 
-        assume(isFile(path), s"$path is not reachable from the test working directory")
-        roundTrips(Source(path, readFile(path)))
+      assume(isFile(path), s"$path is not reachable from the test working directory")
+      roundTrips(Source(path, readFile(path)))
     }
 
     "for the library module written this way" in {

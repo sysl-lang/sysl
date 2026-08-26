@@ -69,7 +69,7 @@ class TangleTests extends AnyFreeSpec with Matchers {
   "what it prints is what the compiler reads" in {
     // The command exists to answer exactly this question, so the two must not be separately
     // computed -- what is asserted is that the driver hands over the reader's own output.
-    val path = s"guide/lisp/lisp${Literate.Extension}"
+    val path = s"guide/slab/slab${Literate.Extension}"
 
     assume(isFile(path), s"$path is not reachable from the test working directory")
 
