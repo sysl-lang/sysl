@@ -323,21 +323,22 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
         "        display_str(text, out, fmt)\n    end display\n\nprint(Fail.Singular)\n") shouldBe "singular\n"
     }
 
-    /** **Both cases above pass because the program links no allocating `Writer`, and neither of them
-     * is a statement about the module.** `sysl.buf`'s `ByteSink` is a `Writer` too, so importing it
-     * puts an allocating implementation into the method table a `*Writer` call is judged against —
-     * and the reachable set over-approximates through method tables on purpose, which is the right
-     * direction to be wrong in.
+    /** **And they keep passing when the program links an allocating `Writer`, which is the point.**
+     * `sysl.buf`'s `ByteSink` is a `Writer` too, so importing it puts an allocating implementation
+     * into the method table a `*Writer` call goes through — and which implementation is behind a
+     * parameter is the *caller's* choice, made in a module of their own.
      *
-     * So the same `display`, unchanged, is legal or refused according to what the *program* imports.
-     * That is why no `Display` in `library/` can carry the clause — the library build compiles
-     * `sysl.buf` alongside everything else — and it is why `sysl.math.complex` still has none after
-     * its rendering stopped building strings. Card `0282` carries the question, which is one of
-     * granularity and is the user's; this pair is here so that whichever way it goes, the pair moves
-     * together.
+     * `reference/modules.md § A generic answers for what it wrote, not for what its caller chose`
+     * states exactly this for a type parameter: an allocator-free module may call `s.put(msg)`
+     * through a bound whose `impl` allocates. A trait object is the same borrowing one level along,
+     * and the two now answer alike.
+     *
+     * Before they did not, and the cost was that the same `display` — unchanged, byte for byte — was
+     * legal or refused according to what the *program* imported. No `Display` in `library/` could
+     * carry the clause, because the library build compiles `sysl.buf` alongside everything else.
      */
-    "though linking an allocating 'Writer' refuses the same module, since a '*Writer' reaches every one" in {
-      errOf(
+    "and linking an allocating 'Writer' leaves it alone, since which one is behind a '*Writer' is the caller's" in {
+      irOf(
         "mark/a.sysl" ->
           """module mark
             |@no_alloc
@@ -358,6 +359,49 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
             |Mark(3).display(out, FormatSpec(0, -1, false))
             |putbytes(sink.text())
             |""".stripMargin,
+      ) should include("mark")
+    }
+
+    /** **The other half, and the one that makes the relaxation a narrowing rather than a hole: a
+     * module is still answerable for the erasure it wrote itself.**
+     *
+     * `TErase` names the table, so a body that puts a value behind a trait object has said which
+     * implementation it is reaching, in its own tree, and the walk follows that one. Only a trait
+     * object that *arrived* is somebody else's choice.
+     *
+     * The allocating `Writer` has to live in a module without the clause for this to test what it
+     * says it tests. Written inside `mark` its `write` would be refused where it stands, by the
+     * direct walk, and the case would pass without the erasure being consulted at all — which is
+     * also why `sysl.buf`'s own `byte_sink` cannot play this part: `ByteSink` holds a `&Buf[u8]`, so
+     * making one allocates before any table is reached.
+     */
+    "but a module that erased the value itself is still answerable for what it reaches" in {
+      errOf(
+        "loud/a.sysl" ->
+          """module loud
+            |
+            |struct Loud
+            |    n: int
+            |
+            |impl Fallible for Loud
+            |
+            |impl Writer for Loud
+            |    write(*self, bytes: []const u8)
+            |        var kept: &int = 1
+            |""".stripMargin,
+        "mark/a.sysl" ->
+          """module mark
+            |@no_alloc
+            |
+            |import loud.Loud
+            |
+            |say()
+            |    var sink = Loud(0)
+            |    var out: *Writer = &sink
+            |
+            |    display_str("mark", out, FormatSpec(0, -1, false))
+            |""".stripMargin,
+        "main.sysl" -> "mark.say()\n",
       ) should include("which makes heap storage, and this module declared '@no_alloc'")
     }
   }

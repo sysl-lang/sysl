@@ -213,41 +213,109 @@ object Reachability {
    * A plain reachability walk rather than a fixpoint. Recursion among the callees is fine — what is
    * being accumulated is a set, and a function already visited adds nothing a second time.
    */
-  def reachedFrom(roots: List[Any], funcs: List[TFunc], vtables: List[TVtable]): Refs = {
+  def reachedFrom(
+      roots: List[Any],
+      funcs: List[TFunc],
+      vtables: List[TVtable],
+      written: Boolean = false,
+  ): Refs = {
     val byName = funcs.map(f => f.name -> f).toMap
     val vals   = mutable.HashSet.empty[String]
     val called = mutable.HashSet.empty[String]
+    val erased = mutable.HashSet.empty[String]
+    val sites  = mutable.HashSet.empty[(String, Int)]
     val queue  = mutable.Queue.empty[String]
 
     def take(r: Refs): Unit =
       vals ++= r.vals
+      erased ++= r.erased
+      sites ++= r.dynamicSites
       for c <- r.calls if called.add(c) do queue += c
 
-    roots.foreach(r => take(summarize(r, vtables)))
+    def drain(): Unit =
+      while queue.nonEmpty do for f <- byName.get(queue.dequeue()) do take(summarize(f, vtables, written))
 
-    while queue.nonEmpty do for f <- byName.get(queue.dequeue()) do take(summarize(f, vtables))
+    roots.foreach(r => take(summarize(r, vtables, written)))
+    drain()
 
-    Refs(vals.toSet, called.toSet)
+    // Under `written` a dynamic site is answered against the tables this walk saw a value erased
+    // into, and an erasure can turn up in a body reached only through an earlier answer -- so
+    // answering opens sites and sites open answers. Repeat until neither grows.
+    //
+    // It terminates because both sets only ever gain, and both are bounded by the program: the
+    // tables it declares and the (trait, slot) pairs its bodies name. In practice one pass settles
+    // it, since a body that erases a value into a table almost always calls through it in the same
+    // breath -- the loop is here for the case that does not, which is a sink made in one function
+    // and written to in another.
+    if written then
+      var growing = true
+
+      while growing do
+        val before = called.size
+
+        for (traitName, slot) <- sites.toList; t <- vtables if t.name != "" && erased(t.name) && t.traitName == traitName
+            s <- t.slots.lift(slot) if called.add(s.target)
+        do queue += s.target
+
+        drain()
+        growing = called.size != before
+
+    Refs(vals.toSet, called.toSet, erased.toSet, sites.toSet)
   }
 
   /** What one tree names, without following any of it: the `val`s read out of it and the functions
    * it can call.
+   *
+   * The last two are empty unless the walk was asked for `written`, and are what that mode needs to
+   * reach its answer: the tables the trees themselves erased a value into, and the dynamic calls
+   * left unresolved so that they can be answered once the tables are all known.
    */
-  case class Refs(vals: Set[String], calls: Set[String])
+  case class Refs(
+      vals: Set[String],
+      calls: Set[String],
+      erased: Set[String] = Set.empty,
+      dynamicSites: Set[(String, Int)] = Set.empty,
+  )
 
-  private def summarize(root: Any, vtables: List[TVtable]): Refs = {
-    val vals  = mutable.HashSet.empty[String]
-    val calls = mutable.HashSet.empty[String]
+  /** `written` asks a narrower question than the default, and only one caller wants it: **what does
+   * this code reach through tables it put a value into itself?**
+   *
+   * The difference is a dynamic call whose receiver came from somewhere else. Answering it with every
+   * table for the trait is right for emission — a table is a constant the program can read a function
+   * out of, so a definition it points at has to survive — and wrong for a *capability*, which
+   * `reference/modules.md § Capabilities are a module property` states over what a module's own
+   * source does. `reference/modules.md § A generic answers for what it wrote, not for what its caller
+   * chose` already says this for a type parameter: an allocator-free module may call `s.put(msg)`
+   * through a bound whose `impl` allocates, because it never saw the type. A trait object is the same
+   * borrowing one level along — a `*Writer` parameter is a choice its caller made — and the two now
+   * answer alike.
+   *
+   * **What a module is still held to is the erasure it wrote.** `TErase` names the table, so a body
+   * that makes a growable sink and hands it over as a `*Writer` is answered with that sink's
+   * implementation and nothing else. This is sharper than the walk it replaces in both directions:
+   * narrower, because the tables somebody else's code built are not the module's business, and no
+   * looser, because the case that would otherwise escape — making an allocating sink and reaching it
+   * through a trait object — is exactly the case where the erasure is in the module's own tree.
+   */
+  private def summarize(root: Any, vtables: List[TVtable], written: Boolean): Refs = {
+    val vals    = mutable.HashSet.empty[String]
+    val calls   = mutable.HashSet.empty[String]
+    val erased  = mutable.HashSet.empty[String]
+    val pending = mutable.HashSet.empty[(String, Int)]
 
     // Every table for a trait supplies one function per slot, so a call at a slot can be answered
-    // with the functions every implementation of that trait put there.
+    // with the functions every implementation of that trait put there. Under `written` the site is
+    // recorded instead and answered later, against the tables this walk saw a value erased into --
+    // which are not all known until the walk has finished.
     def dynamic(recvTy: Type, slot: Int): Unit =
       val name = recvTy match
         case Type.Ptr(Type.Trait(n, _, _))    => Some(n)
         case Type.Ref(Type.Trait(n, _, _), _) => Some(n)
         case _                             => None
 
-      for t <- vtables if name.contains(t.traitName); s <- t.slots.lift(slot) do calls += s.target
+      for n <- name do
+        if written then pending += (n -> slot)
+        else for t <- vtables if t.traitName == n; s <- t.slots.lift(slot) do calls += s.target
 
     // A `Type` is where the descent stops — it holds no expression, and a recursive one would
     // otherwise be walked forever. The one function name that lives inside a type rather than beside
@@ -294,6 +362,10 @@ object Reachability {
         calls += e.func
         e.argsFn.foreach(calls += _)
         e.resultFn.foreach(calls += _)
+      // Erasing a value into a trait object is where a body says which implementation it is putting
+      // behind the trait. The name is the table's, which is what a dynamic site is answered against
+      // under `written`; the default walk has no use for it and pays a set insertion.
+      case e: TErase  => erased += e.vtable; scan(e.operand)
       case s: TVSlot  => calls += s.target
       case r: TRender =>
         r.slot match
@@ -308,6 +380,6 @@ object Reachability {
       case _               => ()
 
     scan(root)
-    Refs(vals.toSet, calls.toSet)
+    Refs(vals.toSet, calls.toSet, erased.toSet, pending.toSet)
   }
 }
