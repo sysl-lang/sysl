@@ -53,6 +53,27 @@ class DocCliTests extends AnyFreeSpec with Matchers {
       DocCli.parse(List("--note")).left.toOption.get should include("'--note' needs a value")
     }
 
+    "takes -w and --weight alike, and has none by default" in {
+      DocCli.parse(List("-w", "45")).toOption.get.weight shouldBe Some(45)
+      DocCli.parse(List("--weight", "45")).toOption.get.weight shouldBe Some(45)
+      DocCli.parse(Nil).toOption.get.weight shouldBe None
+    }
+
+    "refuses a --weight that is not a number, and says what it got" in {
+      // Carried as an Int rather than a string precisely so this can be refused. A frontmatter
+      // `weight: nine` is not an error anywhere downstream — the site reads it as nothing and puts
+      // the section wherever the unweighted default lands, which is the state this flag exists to
+      // end. Failing here is the only place it can be noticed.
+      val message = DocCli.parse(List("--weight", "nine")).left.toOption.get
+
+      message should include("'--weight' needs a whole number")
+      message should include("nine")
+    }
+
+    "names --weight when its value is missing, as it does every other valued flag" in {
+      DocCli.parse(List("--weight")).left.toOption.get should include("'--weight' needs a value")
+    }
+
     "reads the flags that take no value" in {
       val opts = DocCli.parse(List("--private", "--check")).toOption.get
 

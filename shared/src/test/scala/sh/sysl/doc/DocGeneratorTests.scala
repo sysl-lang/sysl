@@ -406,6 +406,36 @@ class DocGeneratorTests extends AnyFreeSpec with Matchers {
         MarkdownWriter.indexPage(modules, "T").text
     }
 
+    "puts the site's weight in the index frontmatter when it is given" in {
+      // Where the generated section sits in the navigation is the site's decision and not the
+      // generator's: it knows what it wrote and cannot know what it was written beside.
+      val a    = parse("module sysl.a\n\nf() -> int = 1")
+      val page = MarkdownWriter.indexPage(ApiModel.build(List(a)), "Library API", weight = Some(45))
+
+      page.text should include("weight: 45")
+      page.text.indexOf("weight: 45") should be < page.text.indexOf("---\n\n")
+    }
+
+    "leaves the index exactly as it was when no weight is given" in {
+      // The key's absence has to cost nothing: a package generating for GitHub alone has no
+      // navigation to sit in, and a `weight` there is a line about somebody else's menu.
+      val a       = parse("module sysl.a\n\nf() -> int = 1")
+      val modules = ApiModel.build(List(a))
+
+      MarkdownWriter.indexPage(modules, "T", weight = None).text shouldBe
+        MarkdownWriter.indexPage(modules, "T").text
+    }
+
+    "weighs the index and not the module pages" in {
+      // A weight orders sections, and the module pages are inside one — giving them a weight each
+      // would order them against their own index. `pages` threads it to exactly one of the two.
+      val a     = parse("module sysl.a\n\nf() -> int = 1")
+      val built = MarkdownWriter.pages(ApiModel.build(List(a)), "Library API", weight = Some(45))
+
+      built.find(_.path == "_index.md").get.text should include("weight: 45")
+      built.filter(_.path != "_index.md").foreach(_.text should not include "weight:")
+    }
+
     "gives the index the same per-page settings as a module page" in {
       // The index links to its own `## Modules` heading and sits in the same generated section, so
       // it needs both keys for the same reasons. Asserted separately because it is written by a

@@ -275,17 +275,29 @@ object MarkdownWriter {
    * other — the module pages link outward from the declarations they list, and this is where the
    * index links back. The text is the *site's* to write: where the written pages live, and what
    * they are for, is not something a generator can know.
+   *
+   * `weight` is where the section sits in the site's navigation, and it is the site's for the same
+   * reason: a generator knows what it wrote and cannot know what it was written *beside*. Omitted
+   * entirely when not given, so a package generating for GitHub alone — where nothing reads the key
+   * — gets a file with nothing in it about somebody else's menu.
+   *
+   * **A general `frontmatter k=v` was refused rather than not thought of.** Passing arbitrary keys
+   * through would make this output depend on a string nothing checks, and the whole value of the
+   * committed pages being compared against the generator is that the two cannot drift. One named
+   * parameter per key a site actually needs.
    */
   def indexPage(
       modules: List[Module],
       title:   String,
       version: Option[String] = None,
       note:    Option[String] = None,
+      weight:  Option[Int] = None,
   ): Page = {
     val out = new StringBuilder
 
     out ++= "---\n"
     out ++= s"title: ${yamlScalar(title)}\n"
+    weight.foreach(w => out ++= s"weight: $w\n")
     out ++= "layout: api-index\n"
     out ++= "headingShift: 0\n"
     out ++= "slugStyle: github\n"
@@ -311,8 +323,9 @@ object MarkdownWriter {
       title:   String,
       version: Option[String] = None,
       note:    Option[String] = None,
+      weight:  Option[Int] = None,
   ): List[Page] =
-    indexPage(modules, title, version, note) :: modules.map(modulePage(_, version))
+    indexPage(modules, title, version, note, weight) :: modules.map(modulePage(_, version))
 
   /** A YAML scalar that cannot be misread.
    *

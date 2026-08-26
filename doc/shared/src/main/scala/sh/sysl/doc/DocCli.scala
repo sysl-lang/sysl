@@ -26,6 +26,7 @@ object DocCli {
       out: String = "docs/api",
       title: String = "API reference",
       note: Option[String] = None,
+      weight: Option[Int] = None,
       version: Option[String] = None,
       site: Option[String] = None,
       includePrivate: Boolean = false,
@@ -43,6 +44,8 @@ object DocCli {
       |  -t, --title <text> the index page's title (default: "API reference")
       |  -n, --note <text>  a line of Markdown under the index title, above the table —
       |                     where a site links back to its hand-written pages
+      |  -w, --weight <n>   the index page's place in the site's navigation. Omitted from
+      |                     the frontmatter entirely when not given
       |  -V, --docversion <v>  the version being documented, shown on the pages
       |      --site <dir>   after writing, build the juicer site rooted at <dir>
       |                     (<dir> must be a juicer site, and -o must be inside it)
@@ -65,6 +68,13 @@ object DocCli {
       case ("-o" | "--out") :: v :: t          => loop(t, opts.copy(out = v))
       case ("-t" | "--title") :: v :: t        => loop(t, opts.copy(title = v))
       case ("-n" | "--note") :: v :: t         => loop(t, opts.copy(note = Some(v)))
+
+      // Rejected here rather than carried as a string, so `--weight nine` fails saying so instead
+      // of writing a frontmatter key the site reads as nothing and silently ignores.
+      case ("-w" | "--weight") :: v :: t =>
+        v.toIntOption match
+          case Some(n) => loop(t, opts.copy(weight = Some(n)))
+          case None    => Left(s"sysl-doc: '--weight' needs a whole number, got '$v'")
       case ("-V" | "--docversion") :: v :: t   => loop(t, opts.copy(version = Some(v)))
       case "--site" :: v :: t                  => loop(t, opts.copy(site = Some(v)))
       case "--private" :: t                    => loop(t, opts.copy(includePrivate = true))
@@ -72,8 +82,8 @@ object DocCli {
 
       // A flag that takes a value and was given none. Saying which flag beats "unexpected end of
       // input", which is what a positional fallthrough would produce here.
-      case (f @ ("-o" | "--out" | "-t" | "--title" | "-n" | "--note" | "-V" | "--docversion" |
-          "--site")) :: Nil =>
+      case (f @ ("-o" | "--out" | "-t" | "--title" | "-n" | "--note" | "-w" | "--weight" |
+          "-V" | "--docversion" | "--site")) :: Nil =>
         Left(s"sysl-doc: '$f' needs a value after it")
 
       case a :: _ if a.startsWith("-") => Left(s"sysl-doc: unknown option '$a'\n\n$Usage")
@@ -145,7 +155,7 @@ object DocCli {
         case Left(err) => Console.err.println(err); 1
 
         case Right(modules) =>
-          val pages = MarkdownWriter.pages(modules, opts.title, opts.version, opts.note)
+          val pages = MarkdownWriter.pages(modules, opts.title, opts.version, opts.note, opts.weight)
 
           if opts.check then check(opts.out, pages)
           else
