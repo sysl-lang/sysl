@@ -1,5 +1,7 @@
 package sh.sysl.doc
 
+import io.github.edadma.cross_platform.*
+
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
@@ -19,6 +21,50 @@ class DocCliTests extends AnyFreeSpec with Matchers {
 
     sh.sysl.Project.discard(dir)
     dir
+  }
+
+  /** The smallest juicer site that renders a generated page, built from nothing.
+   *
+   * `api-module` and `api-index` are the `juicerapi` theme's layouts and juicer-core is a library
+   * jar with no theme files in it, so the templates are supplied here — the smallest thing that
+   * emits a body, since none of this is about the theme.
+   */
+  private def site(name: String): String = {
+    val root = s"target/doc-cli-tests/$name"
+
+    sh.sysl.Project.discard(root)
+    sh.sysl.Project.makeDirectories(s"$root/content")
+    sh.sysl.Project.makeDirectories(s"$root/layouts/_default")
+
+    val template = "<html><body>{{ .content }}</body></html>\n"
+
+    writeFile(s"$root/site.toml", "title = \"probe\"\n")
+    writeFile(s"$root/content/_index.md", "---\ntitle: home\n---\n\nprobe\n")
+    writeFile(s"$root/layouts/_default/folder.html", template)
+    writeFile(s"$root/layouts/_default/api-module.html", template)
+    writeFile(s"$root/layouts/_default/api-index.html", template)
+
+    root
+  }
+
+  /** The HTML juicer wrote for one content page, wherever its URL layout put it.
+   *
+   * **Where juicer puts it depends on how the content is organised, so both spellings are tried.**
+   * These pages are a *section* — `content/api/` with an `_index.md` — and come out under
+   * `public/html/api/…`; a single loose page at `content/probe.md` comes out at
+   * `public/probe/index.html` with no `html/` segment at all, measured by `SlugConformanceTests`
+   * beside this file against the same `baseConfig`. So the segment is not something the base config
+   * always does, and a helper that assumed either spelling would be wrong for the other suite.
+   *
+   * Asserting one hardcoded path made a working render look like a broken one for a round trip,
+   * which is why this names what it looked for rather than throwing a `NoSuchFileException`.
+   */
+  private def rendered(root: String, page: String): String = {
+    val candidates = List(s"$root/public/html/$page", s"$root/public/$page")
+
+    candidates.find(isFile).map(readFile).getOrElse {
+      fail(s"no rendered page for '$page' — looked at ${candidates.mkString(", ")}")
+    }
   }
 
   "the argument parser" - {
@@ -72,6 +118,15 @@ class DocCliTests extends AnyFreeSpec with Matchers {
 
     "names --weight when its value is missing, as it does every other valued flag" in {
       DocCli.parse(List("--weight")).left.toOption.get should include("'--weight' needs a value")
+    }
+
+    "takes --site, and has none by default" in {
+      DocCli.parse(List("--site", "docs")).toOption.get.site shouldBe Some("docs")
+      DocCli.parse(Nil).toOption.get.site shouldBe None
+    }
+
+    "names --site when its value is missing, as it does every other valued flag" in {
+      DocCli.parse(List("--site")).left.toOption.get should include("'--site' needs a value")
     }
 
     "reads the flags that take no value" in {
@@ -134,6 +189,62 @@ class DocCliTests extends AnyFreeSpec with Matchers {
       io.github.edadma.cross_platform.writeFile(s"$dir/sysl-text.md", "stale\n")
 
       DocCli.run(List("library", "--out", dir, "--check")) shouldBe 1
+    }
+  }
+
+  /** The `--site` path: generate, then render with juicer, in one command.
+   *
+   * **Nothing exercised this before card `0290`, and that is why the defect it records existed.**
+   * `sysl.sh` renders by invoking the juicer *CLI*, a separate artifact at its own version; `--site`
+   * calls **juicer-core as a library**, at whatever `build.sbt` pins. Two renderers over the same
+   * pages, and only the one nobody ships was covered.
+   *
+   * The last case is the one that bites. `MarkdownWriter` writes `slugStyle: github` into every
+   * generated page's frontmatter — card `0258`'s mechanism for keeping generated anchors off the
+   * site's default slugging — and **per-page `slugStyle` arrived in juicer 0.4.1** (`95ae3d0`,
+   * *"Make slugStyle overridable per page, and cut 0.4.1"*). A juicer-core older than that ignores
+   * the key, slugs with its default, and every link on every generated page lands at the top of the
+   * right page with nothing complaining anywhere.
+   *
+   * **It is a different claim from `SlugConformanceTests`', one layer up.** That suite proves the two
+   * *algorithms* agree, driving `SiteRenderer.build` over a page it built itself. This drives the
+   * **command**, from argv to HTML, and so proves the wiring as well: that `--site` reaches the
+   * renderer at all, with the pages `-o` just wrote, carrying the frontmatter that decides their ids.
+   */
+  "the --site path" - {
+
+    "refuses pages written outside the site it was asked to build, naming both" in {
+      // The guard exists because generating into one place and building another would otherwise
+      // produce a site that silently lacks the pages — which looks like a theme problem.
+      val root = site("site-outside")
+
+      DocCli.run(List("library", "--out", "target/doc-cli-tests/elsewhere", "--site", root)) shouldBe 1
+    }
+
+    "is 0 when the pages are written inside the site and it builds" in {
+      val root = site("site-builds")
+
+      DocCli.run(List("library", "--out", s"$root/content/api", "--site", root)) shouldBe 0
+
+      rendered(root, "api/index.html") should include("<html>")
+    }
+
+    "renders the generated anchors as the ids the pages link to" in {
+      // Card 0290. A juicer-core that does not know the per-page `slugStyle` key renders these with
+      // its default slugger — which keeps no underscore and collapses runs — so `from_utf8_lossy`
+      // comes out as `from-utf8-lossy` while the page's own index links to `#from_utf8_lossy`. The
+      // render still succeeds and the exit code is still 0, which is why the case above cannot see
+      // it and this one has to read the HTML.
+      val root = site("site-anchors")
+
+      DocCli.run(List("library", "--out", s"$root/content/api", "--site", root)) shouldBe 0
+
+      val html = rendered(root, "api/sysl-text/index.html")
+      val ids  = """<h3[^>]*\bid="([^"]*)""".r.findAllMatchIn(html).map(_.group(1)).toList
+
+      withClue("the renderer ignored the page's slugStyle — juicer-core older than 0.4.1: ") {
+        ids should contain("from_utf8_lossy")
+      }
     }
   }
 
