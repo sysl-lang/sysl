@@ -157,11 +157,16 @@ class ImplShapeRunTests extends AnyFreeSpec with RunSupport {
     // An operator is one of the library's catalog traits, so a *shape* carrying one is the library's
     // to write (its tuple rows are exactly that). What a program may write is the composed type
     // spelled out, which its own element type gives a home to.
+    //
+    // **The `override` is what the library supplying `Eq for []T` costs a program that wants its
+    // own.** A blanket is an implementation, so a second one for a narrower shape is the ordinary
+    // duplicate until the keyword says the replacement was meant — the same bargain
+    // `override impl Display for []Rect` has always made, arriving at `Eq` when the blanket did.
     "a composed type carries an operator, dispatched to the instantiated member" in {
       run(
         """struct N
           |    v: int
-          |impl Eq for []N
+          |override impl Eq for []N
           |    eq(self, rhs: Self) -> bool = self.len == rhs.len
           |var a = [N(1), N(2)]
           |var b = [N(3), N(4)]

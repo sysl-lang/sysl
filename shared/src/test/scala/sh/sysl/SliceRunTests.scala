@@ -274,6 +274,20 @@ class SliceRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     run(src) shouldBe "false true\n"
   }
 
+  // The blanket is an implementation like any other, so a program wanting its own for a narrower
+  // slice is writing a second one — and pays the same `override` the printable blanket has always
+  // charged. The diagnostic is what names the fix; `ImplShapeRunTests` has the working form.
+  "a program's own Eq for a slice of its type is the ordinary duplicate until it says override" in {
+    val e = err("""struct N
+                  |    v: int
+                  |impl Eq for []N
+                  |    eq(self, rhs: Self) -> bool = self.len == rhs.len
+                  |print(1)""".stripMargin)
+
+    e should include("every slice already implements 'sysl.Eq'")
+    e should include("write 'override impl'")
+  }
+
   // Ordering was deliberately not supplied: nothing needed it, and a lexicographic `<` is a
   // separate claim from an element-wise `==`.
   "a slice still has no ordering" in {
