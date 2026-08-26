@@ -272,11 +272,18 @@ class Utf8Tests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
-  "the unchecked primitive" - {
+  // As of 0.0.82 this is an ordinary library function in `sysl.text`, not a form the analyzer
+  // resolves by name — so it is imported like anything else, and it sits on the page beside
+  // `from_utf8`, which is the whole of what a reader has to choose between. What could not move is
+  // the operation: `str_cast` is the raw-tier primitive underneath, tested in its own section below.
+  "the unchecked conversion" - {
+    val importing = "import sysl.text.from_utf8_unchecked\n"
+
     "bytes straight through" in {
       run(
-        """var b: []u8 = [0x68u8, 0x69u8]
-          |print(from_utf8_unchecked(b))""".stripMargin,
+        importing +
+          """var b: []u8 = [0x68u8, 0x69u8]
+            |print(from_utf8_unchecked(b))""".stripMargin,
       ) shouldBe "hi\n"
     }
 
@@ -284,10 +291,11 @@ class Utf8Tests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // and a `string` whose bytes still change is not one that was ever validated.
     "the string it makes does not follow later writes to the bytes" in {
       run(
-        """var b: []u8 = [0x68u8, 0x69u8]
-          |var s = from_utf8_unchecked(b)
-          |b[0] = 0x4Au8
-          |print(s, from_utf8_unchecked(b))""".stripMargin,
+        importing +
+          """var b: []u8 = [0x68u8, 0x69u8]
+            |var s = from_utf8_unchecked(b)
+            |b[0] = 0x4Au8
+            |print(s, from_utf8_unchecked(b))""".stripMargin,
       ) shouldBe "hi Ji\n"
     }
 
@@ -295,10 +303,11 @@ class Utf8Tests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // which the same expression over `a[..]` alone could not.
     "and so it may outlive the array it read" in {
       run(
-        """name() -> string
-          |    var a: [3]u8 = [0x61u8, 0x62u8, 0x63u8]
-          |    from_utf8_unchecked(a[..])
-          |print(name())""".stripMargin,
+        importing +
+          """name() -> string
+            |    var a: [3]u8 = [0x61u8, 0x62u8, 0x63u8]
+            |    from_utf8_unchecked(a[..])
+            |print(name())""".stripMargin,
       ) shouldBe "abc\n"
     }
 
@@ -306,39 +315,66 @@ class Utf8Tests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // these bytes, and the point of the long name is that the line saying so is greppable.
     "nothing is checked, which is the whole of what it is for" in {
       run(
-        """var b: []u8 = [0xFFu8, 0xFEu8]
-          |print(from_utf8_unchecked(b).len)""".stripMargin,
+        importing +
+          """var b: []u8 = [0xFFu8, 0xFEu8]
+            |print(from_utf8_unchecked(b).len)""".stripMargin,
       ) shouldBe "2\n"
+    }
+
+    // An array standing where a `[]const u8` parameter is asked for is a view of itself, on the same
+    // terms every other argument position takes one on.
+    "an array of bytes is taken as it is, needing no '[..]'" in {
+      run(
+        importing +
+          """var a: [3]u8 = [0x61u8, 0x62u8, 0x63u8]
+            |print(from_utf8_unchecked(a))""".stripMargin,
+      ) shouldBe "abc\n"
+    }
+
+    // It is a function now, so the wrong argument is an ordinary parameter mismatch rather than a
+    // complaint written by hand at a form. That is the trade the move makes, and it is the right way
+    // round: one fewer bespoke message, and the same one every other call gets.
+    "a string is not bytes" in {
+      err(importing + """print(from_utf8_unchecked("hi"))""") should include("string")
+    }
+
+    "and it must be imported, being a member of a module like any other" in {
+      err(
+        """var b: []u8 = [0x68u8, 0x69u8]
+          |print(from_utf8_unchecked(b))""".stripMargin,
+      ) should include("from_utf8_unchecked")
+    }
+  }
+
+  // The primitive the function above is one line of. A program has no reason to write it, but its
+  // refusals are the ones that cannot be an ordinary parameter check — it takes bytes and produces a
+  // `string`, and neither end is expressible as a signature the analyzer could check for itself.
+  "the raw-tier form underneath" - {
+    "takes bytes and nothing else" in {
+      err("""print(str_cast("hi"))""") should include("already a string")
+      err("print(str_cast(5))") should include("but the value has type int")
+    }
+
+    "one value, no more and no fewer" in {
+      err("print(str_cast())") should include("exactly one value")
+      err(
+        """var b: []u8 = [0x61u8]
+          |print(str_cast(b, b))""".stripMargin,
+      ) should include("exactly one value")
+    }
+
+    // A form belongs to no module, so an import naming one used to be told the name does not exist —
+    // of a name that works one line below. Card 0296.
+    "an import naming a form says which situation the reader is in" in {
+      val e = err("""import sysl.text.str_cast
+                    |print(1)""".stripMargin)
+
+      e should include("built-in form")
+      e should include("needs no import")
     }
   }
 
   "the error path" - {
-    // This form asks for a `[]u8`, and an array standing where a view is asked for is a view of
-    // itself — so the advice that used to be here, to write `a[..]`, was advice to type what the
-    // position already does. The bytes are read exactly as the sliced spelling reads them.
-    "an array of bytes is taken as it is, needing no '[..]'" in {
-      run(
-        """var a: [3]u8 = [0x61u8, 0x62u8, 0x63u8]
-          |print(from_utf8_unchecked(a))""".stripMargin,
-      ) shouldBe "abc\n"
-    }
-
-    "a string is already a string" in {
-      err("""print(from_utf8_unchecked("hi"))""") should include("already a string")
-    }
-
-    "some other type entirely" in {
-      err("print(from_utf8_unchecked(5))") should include("but the value has type int")
-    }
-
-    "one value, no more and no fewer" in {
-      err("print(from_utf8_unchecked())") should include("exactly one value")
-      err(
-        """var b: []u8 = [0x61u8]
-          |print(from_utf8_unchecked(b, b))""".stripMargin,
-      ) should include("exactly one value")
-    }
-
     "the safe form wants bytes too" in {
       err("""print(from_utf8("hi").is_ok())""") should include("string")
     }

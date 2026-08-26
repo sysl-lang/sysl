@@ -547,4 +547,39 @@ class VariantNamespaceTests extends AnyFreeSpec with RunSupport with CodegenSupp
           |    Slot(l) -> print(l)
           |""".stripMargin)) shouldBe "1\n2\n"
   }
+
+  // Card `0295`, which is `0220` one kind of type over. `0220` guarded the *struct* arm and left the
+  // variant arm below the conversion arms, so an **alias** of a variant's name never reached it: a
+  // `type Eval = Result[…]` beside a `StmtKind.Eval` read `Eval(target)` as a cast from an integer
+  // and refused it for carrying data — at a call whose parameter already said `StmtKind`. The
+  // expected type was there and nothing asked it. Found writing slate.
+  "an alias and a variant of one name are told apart the same way" - {
+    val aliased =
+      """enum StmtKind
+        |    Eval(n: int)
+        |    Skip
+        |type Eval = Result[int, string]
+        |""".stripMargin
+
+    "the variant wins where the expected type names its enum" in {
+      run(aliased +
+        """take(k: StmtKind) -> int = k match
+          |    Eval(n) -> n
+          |    Skip -> 0
+          |print(take(Eval(3)))
+          |""".stripMargin) shouldBe "3\n"
+    }
+
+    // And the alias keeps call position where nothing expects the enum, exactly as a struct does —
+    // a plain alias's name is its base's name, so this is the `Result` conversion a reader wrote.
+    "and the alias keeps it where nothing expects the enum" in {
+      run(aliased + "val e: Eval = Ok(7)\nprint(e.unwrap())\n") shouldBe "7\n"
+    }
+
+    // The refusal that used to fire, kept as a refusal at a site that really has no expected type
+    // naming the enum: it is the conversion being complained about, which is now correct.
+    "with the old refusal still reached where the alias really is what was named" in {
+      err(aliased + "print(Eval(3))") should include("carries data")
+    }
+  }
 }

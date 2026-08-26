@@ -2,7 +2,7 @@ package sh.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** The `deriving` clause — `struct Size deriving Eq, Ord, Hash, Display` (`reference/traits.md`).
+/** The `derives` clause — `struct Size derives Eq, Ord, Hash, Display` (`reference/traits.md`).
   *
   * What the clause promises is that the compiler writes the block a person would have written out
   * field by field, so the suite asserts against the **behaviour** of the four traits rather than
@@ -16,7 +16,7 @@ import org.scalatest.freespec.AnyFreeSpec
 class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   private val sized =
-    """struct Size deriving Eq, Ord, Hash, Display
+    """struct Size derives Eq, Ord, Hash, Display
       |    w: int
       |    h: int
       |end Size
@@ -24,7 +24,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       |""".stripMargin
 
   private val shape =
-    """enum Shape deriving Eq, Ord, Hash, Display
+    """enum Shape derives Eq, Ord, Hash, Display
       |    Circle(r: int)
       |    Rect(w: int, h: int)
       |    Empty
@@ -97,7 +97,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // the value owns is read twice and released once. A `string` field is what makes that visible:
     // an owned one released by the measuring pass would leave the second pass reading freed bytes.
     "a value the rendering owns survives being rendered twice" in {
-      run("""struct Named deriving Display
+      run("""struct Named derives Display
             |    name: string
             |    n: int
             |end Named
@@ -113,12 +113,12 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // The inner value is a part of the outer rendering, so it is written through the same sink the
     // outer one was pointed at — which is what makes the measuring pass see the whole thing.
     "a width over a nesting measures the whole nesting" in {
-      run("""struct Point deriving Display
+      run("""struct Point derives Display
             |    x: int
             |    y: int
             |end Point
             |
-            |struct Line deriving Display
+            |struct Line derives Display
             |    a: Point
             |    b: Point
             |end Line
@@ -128,7 +128,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     "one field" in {
-      run("""struct Wrap deriving Eq, Ord, Display
+      run("""struct Wrap derives Eq, Ord, Display
             |    v: int
             |end Wrap
             |
@@ -139,7 +139,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // A struct with no fields is one value, so it equals itself, is not less than itself, and has
     // nothing to put in brackets.
     "no fields at all" in {
-      run("""struct Unit deriving Eq, Ord, Hash, Display
+      run("""struct Unit derives Eq, Ord, Hash, Display
             |end Unit
             |
             |print(Unit() == Unit(), Unit() < Unit(), Unit())
@@ -147,12 +147,12 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     "a field whose own type derives" in {
-      run("""struct Point deriving Eq, Display
+      run("""struct Point derives Eq, Display
             |    x: int
             |    y: int
             |end Point
             |
-            |struct Line deriving Eq, Display
+            |struct Line derives Eq, Display
             |    a: Point
             |    b: Point
             |end Line
@@ -164,7 +164,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     "a string field" in {
-      run("""struct Named deriving Eq, Ord, Display
+      run("""struct Named derives Eq, Ord, Display
             |    name: string
             |    n: int
             |end Named
@@ -174,7 +174,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     "a derived membership satisfies a bound" in {
-      run("""struct Size deriving Eq
+      run("""struct Size derives Eq
             |    w: int
             |end Size
             |
@@ -188,7 +188,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   "a generic type derives conditionally" - {
 
     "the parts have the trait, so the whole does" in {
-      run("""struct Box[T] deriving Eq, Display
+      run("""struct Box[T] derives Eq, Display
             |    v: T
             |end Box
             |
@@ -204,7 +204,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |    v: int
           |end Opaque
           |
-          |struct Box[T] deriving Eq
+          |struct Box[T] derives Eq
           |    v: T
           |end Box
           |
@@ -215,7 +215,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     "the type's own bounds are kept" in {
-      run("""struct Sorted[T: Ord] deriving Eq
+      run("""struct Sorted[T: Ord] derives Eq
             |    v: T
             |end Sorted
             |
@@ -229,7 +229,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // Every variant is dataless, so `Ord` is the discriminants' order — and the discriminants are in
     // declaration order unless the enum said otherwise.
     "orders by declaration order" in {
-      run("""enum Colour deriving Ord
+      run("""enum Colour derives Ord
             |    Red
             |    Green
             |    Blue
@@ -240,7 +240,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     "an explicit discriminant is what is ordered" in {
-      run("""enum Level deriving Ord
+      run("""enum Level derives Ord
             |    Low = 10
             |    High = 2
             |end Level
@@ -250,7 +250,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     "renders as the variant's name" in {
-      run("""enum Colour deriving Display
+      run("""enum Colour derives Display
             |    Red
             |    Green
             |end Colour
@@ -260,7 +260,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     "hashes, and two variants differ" in {
-      run("""enum Colour deriving Hash
+      run("""enum Colour derives Hash
             |    Red
             |    Green
             |end Colour
@@ -272,17 +272,17 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // `Eq` is the one trait a simple enum already has, by the rule that its value *is* its
     // discriminant — so the clause is told to drop it rather than the block being refused later.
     "'Eq' is refused, at the word the reader wrote" in {
-      val e = err("""enum Colour deriving Eq
+      val e = err("""enum Colour derives Eq
                     |    Red
                     |end Colour
                     |""".stripMargin)
 
       e should include("a simple enum is already 'Eq'")
-      e should include("Remove 'Eq' from the 'deriving' clause")
+      e should include("Remove 'Eq' from the 'derives' clause")
     }
 
     "and the enum is Eq anyway, with the clause not naming it" in {
-      run("""enum Colour deriving Display
+      run("""enum Colour derives Display
             |    Red
             |    Green
             |end Colour
@@ -338,7 +338,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     // The tag is mixed before the payload, so two variants carrying equal payloads are not one key.
     "the variant is part of the hash" in {
-      run("""enum Two deriving Hash
+      run("""enum Two derives Hash
             |    A(v: int)
             |    B(v: int)
             |end Two
@@ -348,7 +348,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     "one variant, so there is no pair the match does not cover" in {
-      run("""enum Only deriving Eq, Ord, Display
+      run("""enum Only derives Eq, Ord, Display
             |    Just(v: int)
             |end Only
             |
@@ -357,7 +357,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     "a generic data enum derives conditionally" in {
-      run("""enum Maybe[T] deriving Eq, Display
+      run("""enum Maybe[T] derives Eq, Display
             |    Yes(v: T)
             |    No
             |end Maybe
@@ -376,7 +376,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // the type and every field is in scope there. That is the whole of why visibility never became a
     // question this feature had to answer.
     "a private field is walked, because the block is written where the type is" in {
-      run("""struct P deriving Eq, Display
+      run("""struct P derives Eq, Display
             |    private x: int
             |end P
             |
@@ -385,7 +385,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     "a type's own members are untouched by it" in {
-      run("""struct P deriving Eq, Display
+      run("""struct P derives Eq, Display
             |    x: int
             |
             |    twice(self) -> int = self.x * 2
@@ -398,11 +398,11 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // A counted field is `Eq` by address, which is what `&` already means for `==` — deriving adds
     // no rule of its own about what a field's equality is.
     "a counted field compares as one does anywhere else" in {
-      run("""struct Node deriving Eq
+      run("""struct Node derives Eq
             |    v: int
             |end Node
             |
-            |struct Holder deriving Eq
+            |struct Holder derives Eq
             |    n: &Node
             |end Holder
             |
@@ -420,7 +420,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |    v: int
             |end Opaque
             |
-            |struct S deriving Hash
+            |struct S derives Hash
             |    a: Opaque
             |end S
             |
@@ -437,7 +437,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // block is an ordinary block with an ordinary method, so it can — and the page says "found,
     // checked, dispatched and erased exactly as a written one is", which is this.
     "a derived implementation can be erased to a trait object" in {
-      run("""struct Size deriving Display
+      run("""struct Size derives Display
             |    w: int
             |    h: int
             |end Size
@@ -454,7 +454,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // A value parameter is not a type and has no membership to ask for, so it gains no bound — which
     // is only observable on a type that has one, since a bound on a `const` would not resolve.
     "a const value parameter gains no bound" in {
-      run("""struct Buf[const N: usize] deriving Eq, Display
+      run("""struct Buf[const N: usize] derives Eq, Display
             |    n: usize
             |end Buf
             |
@@ -468,7 +468,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // ones included, so it is instantiated at whatever the value was — and a width goes through it
     // twice at that instantiation.
     "and a rendering under a width still reaches a value-parameterised type" in {
-      run("""struct Buf[const N: usize] deriving Display
+      run("""struct Buf[const N: usize] derives Display
             |    n: usize
             |end Buf
             |
@@ -482,7 +482,7 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // And a type parameter, where the renderer is generic over it and the bound the clause added is
     // what lets the part be written at all.
     "and a generic one is rendered at each argument it is used at" in {
-      run("""struct Box[T] deriving Display
+      run("""struct Box[T] derives Display
             |    v: T
             |end Box
             |
@@ -497,36 +497,36 @@ class DerivingTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       err("""trait Show
             |    show(self) -> string
             |
-            |struct P deriving Show
+            |struct P derives Show
             |    x: int
             |end P
             |""".stripMargin) should include("is not a trait the compiler knows how to write")
     }
 
     "the four are named" in {
-      err("struct P deriving Nope\n    x: int\nend P\n") should include("Eq, Ord, Hash or Display")
+      err("struct P derives Nope\n    x: int\nend P\n") should include("Eq, Ord, Hash or Display")
     }
 
     "trait arguments" in {
-      err("struct P deriving Eq[int]\n    x: int\nend P\n") should
+      err("struct P derives Eq[int]\n    x: int\nend P\n") should
         include("a derived implementation takes none")
     }
 
     // C's incomplete type: nothing here knows its shape, so a derived block would answer `true` for
     // every pair with nothing to tell the reader it had done so.
     "an opaque struct with no fields" in {
-      err("opaque struct Handle deriving Eq\n\nprint(1)\n") should
+      err("opaque struct Handle derives Eq\n\nprint(1)\n") should
         include("opaque and declares no fields")
     }
 
     "the same trait twice" in {
-      err("struct P deriving Eq, Eq\n    x: int\nend P\n") should include("is named twice")
+      err("struct P derives Eq, Eq\n    x: int\nend P\n") should include("is named twice")
     }
 
     // Deriving is all-or-nothing per trait: there is no writing the block and then replacing one
     // method of it, and the duplicate-implementation rule is what says so.
     "a derived block and a hand-written one for the same trait collide" in {
-      err("""struct P deriving Eq
+      err("""struct P derives Eq
             |    x: int
             |end P
             |

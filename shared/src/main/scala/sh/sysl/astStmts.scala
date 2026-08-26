@@ -743,7 +743,7 @@ case class StructDecl(
       * the declared name.
       */
     cname: Option[ExportAttr] = None,
-    /** The traits named by a `deriving` clause — `struct Size deriving Eq, Ord`.
+    /** The traits named by a `derives` clause — `struct Size derives Eq, Ord`.
       *
       * Each is a trait the compiler knows how to write memberwise, and what it writes is an ordinary
       * `impl` block synthesised before anything is hoisted (`Deriving`). The clause is held as
@@ -779,7 +779,7 @@ case class EnumDecl(name: String, tparams: List[String], underlying: Option[Type
                       * each argument must have.
                       */
                     tvalues: Map[String, TypeRef] = Map.empty,
-                    /** The traits named by a `deriving` clause, exactly as a struct's are. */
+                    /** The traits named by a `derives` clause, exactly as a struct's are. */
                     deriving: List[BoundRef] = Nil) extends Stmt
 
 /** The `within lo..hi` clause of a constrained subtype. `exclusiveHi` marks `..<`, which excludes

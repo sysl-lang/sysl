@@ -226,7 +226,7 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
   "a compound rendering builds no string" - {
 
     val sized =
-      """struct Size deriving Display
+      """struct Size derives Display
         |    w: int
         |    h: int
         |
@@ -285,7 +285,7 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
     // A shape with no parts renders as one string literal, so there was never anything to gather and
     // the one-call form is kept — no renderer is written for it at all.
     "and a shape with no parts gets no renderer" in {
-      val out = ir("""struct Unit deriving Display
+      val out = ir("""struct Unit derives Display
                      |end Unit
                      |
                      |print(Unit())

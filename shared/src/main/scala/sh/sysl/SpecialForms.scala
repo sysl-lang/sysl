@@ -3,7 +3,7 @@ package sh.sysl
 /** The call forms the compiler resolves by name.
  *
  * A call is normally a name looked up among the program's declarations. These nine are not: the
- * analyzer recognizes `print`, `str`, `format`, `from_utf8_unchecked`, `va_start`, `va_end`,
+ * analyzer recognizes `print`, `str`, `format`, `str_cast`, `va_start`, `va_end`,
  * `va_arg`, `va_copy`, and `ptr_cast` before it gets that far. Collecting them in one file is
  * deliberate — it is the whole of what the language knows that a program could not have told it, and
  * the list is meant to shrink.
@@ -14,23 +14,39 @@ package sh.sysl
  *
  * The four `va_*` forms belong here permanently. Each is an **ABI primitive** that no sysl body
  * could implement, in the same category as `sizeof`, so there is nothing to put in the library
- * (`12` §9). `from_utf8_unchecked` is permanent for the same reason from the other direction: every
- * safe route to a `string` carries the UTF-8 guarantee, so the one operation that sets it aside can
- * only come from underneath the language. The other three are the temporary ones: all three are now
+ * (`12` §9). `str_cast` is permanent for the same reason from the other direction: every safe route
+ * to a `string` carries the UTF-8 guarantee, so the one operation that sets it aside can only come
+ * from underneath the language. **What is not permanent is the NAME a program reaches for**, and it
+ * is no longer this one: `sysl.text.from_utf8_unchecked` is an ordinary library function whose body
+ * is a call to this form, so the pair a reader compares — validating and not — sits together in the
+ * module that owns strings. This is the raw tier's spelling, beside `ptr_cast`, and it reinterprets
+ * for the same reason that one does. The other three are the temporary ones: all three are now
  * desugarings onto a `Display`, and what keeps them here is the **arity** — `print(a, b, c)` is
  * variadic and heterogeneous, and sysl has no overloading — together with the buffer `str` and
  * `format` render into, which is a growable byte array the library cannot yet name. The sink
  * `print` writes into is no longer one of the reasons: it is an ordinary library value now.
  */
+/** The names the forms below answer to, in an object so that the import resolver can ask.
+ *
+ * It is read in two places that must not disagree: the analyzer's dispatch, and the refusal an
+ * `import` gives when somebody guesses at a module for one of these. A form belongs to no module, so
+ * that refusal has to say which of the two situations the reader is in rather than reporting a name
+ * that does not exist — which is what it used to do, of a name that works one line below.
+ */
+object SpecialForms {
+
+  val names: Set[String] =
+    Set("print", "str", "format", "str_cast", "va_start", "va_end", "va_arg", "va_copy", "ptr_cast") ++
+      Atomics.names
+}
+
 trait SpecialForms extends Closures {
 
   /** The names recognized here, so that a mistake written *at* one of them can name the form rather
    * than falling through to the general complaint about a callee. Nothing looks these up, so
    * nothing else would know they are forms at all.
    */
-  protected val specialFormNames: Set[String] =
-    Set("print", "str", "format", "from_utf8_unchecked", "va_start", "va_end", "va_arg", "va_copy", "ptr_cast") ++
-      Atomics.names
+  protected val specialFormNames: Set[String] = SpecialForms.names
 
   /** `print(a, b, …)` — each value rendered by the library function its type reaches, a space
    * between and a newline at the end.
@@ -115,20 +131,24 @@ trait SpecialForms extends Closures {
         TRender(value, method, plainSpec, slot)
   }
 
-  /** `from_utf8_unchecked(b)` — a `[]u8` taken as a `string` without looking at it.
+  /** `str_cast(b)` — a `[]u8` taken as a `string` without looking at it.
    *
    * This is the whole of what the library's `from_utf8` cannot write for itself: it validates, and
    * then it needs somewhere to say "these bytes are a string now". `04` puts the unchecked form in
-   * the `*T` tier deliberately — breaking the UTF-8 invariant breaks `char`'s downstream — so the
-   * spelling is long and greppable rather than convenient.
+   * the `*T` tier deliberately — breaking the UTF-8 invariant breaks `char`'s downstream.
+   *
+   * **A program does not write this; it writes `sysl.text.from_utf8_unchecked`**, which is an
+   * ordinary library function over this form and is where the long, greppable spelling lives now.
+   * Keeping the primitive under a raw-tier name rather than the readable one is what lets the two
+   * halves of the pair — validating and not — sit beside each other in `sysl.text`.
    *
    * A `string` argument is refused rather than passed through. It would be the identity, but the
    * only way to write one is to have gone looking for this function, and a program that reaches for
    * the unchecked conversion on a value that is already checked has misunderstood which direction it
    * is going.
    */
-  protected def fromUtf8Unchecked(args: List[Expr]): TExpr = {
-    if args.length != 1 then err("'from_utf8_unchecked' takes exactly one value, the bytes to take as a string")
+  protected def strCast(args: List[Expr]): TExpr = {
+    if args.length != 1 then err("'str_cast' takes exactly one value, the bytes to take as a string")
     val t = analyzeExpr(args.head)
 
     Type.underlying(t.ty) match
@@ -140,9 +160,9 @@ trait SpecialForms extends Closures {
       // need be sliced by hand no more than an argument to a `[]u8` parameter does.
       case Type.Array(_, Type.Byte) => TFromBytes(coerce(t, Type.Slice(Type.Byte, readOnly = true)))
       case Type.Str =>
-        err("'from_utf8_unchecked' makes a string out of bytes, and this value is already a string")
+        err("'str_cast' makes a string out of bytes, and this value is already a string")
       case other =>
-        err(s"'from_utf8_unchecked' takes a []u8, but the value has type ${show(other)}")
+        err(s"'str_cast' takes a []u8, but the value has type ${show(other)}")
   }
 
   /** `format(value, "%spec")` renders one value through a printf specifier. It is the desugaring of

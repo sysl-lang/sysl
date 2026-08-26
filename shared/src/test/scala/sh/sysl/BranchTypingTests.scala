@@ -183,4 +183,112 @@ class BranchTypingTests extends AnyFreeSpec with RunSupport with CodegenSupport 
             |""".stripMargin) should not be empty
     }
   }
+
+  // Card `0294`, from slate. A bare `None` is the same shape as a bare literal one tier along: it is
+  // not a literal, so the rule above never reached it, and analyzed alone it is asking what an
+  // `Option` of nothing in particular holds. The sibling says.
+  "a payload-free variant of a generic enum takes its sibling's type too" - {
+    "in the else branch, which is where it was refused" in {
+      val src =
+        """struct Expr
+          |    n: int
+          |
+          |maybe(c: bool) -> Option[Expr]
+          |    val b = if c then Some(Expr(1)) else None
+          |    b
+          |
+          |print(maybe(true).unwrap().n, maybe(false).is_none())
+          |""".stripMargin
+
+      run(src) shouldBe "1 true\n"
+    }
+
+    "and in the then branch, which is the same rule read the other way" in {
+      val src =
+        """maybe(c: bool) -> Option[int]
+          |    val b = if c then None else Some(4)
+          |    b
+          |
+          |print(maybe(false).unwrap(), maybe(true).is_none())
+          |""".stripMargin
+
+      run(src) shouldBe "4 true\n"
+    }
+
+    "a match arm settles it the same way" in {
+      val src =
+        """pick(n: int) -> Option[int]
+          |    val b = n match
+          |        0 -> None
+          |        _ -> Some(n)
+          |    b
+          |
+          |print(pick(0).is_none(), pick(5).unwrap())
+          |""".stripMargin
+
+      run(src) shouldBe "true 5\n"
+    }
+
+    // A `Result` is the other generic enum with a payload-free variant in reach, and nothing about
+    // the rule is special to `Option` — it is asked of the declaration.
+    "and it is not special to Option" in {
+      val src =
+        """enum Step[T]
+          |    Done
+          |    Going(v: T)
+          |
+          |go(c: bool) -> Step[int]
+          |    val s = if c then Going(2) else Done
+          |    s
+          |
+          |go(true) match
+          |    Going(v) -> print(v)
+          |    Done -> print("done")
+          |""".stripMargin
+
+      run(src) shouldBe "2\n"
+    }
+
+    // What has NOT moved: with both branches payload-free there is nothing to settle it, so the
+    // annotation is still the only thing that can say — exactly as two bare literals still fall to
+    // `int`. The refusal is the same one, and it is right.
+    "while two variants that both carry nothing still have nothing to go on" in {
+      err("""f(c: bool) =
+            |    val b = if c then None else None
+            |    print(b.is_none())
+            |""".stripMargin) should include("cannot infer the type argument")
+    }
+
+    // And a variant that CARRIES something is an answer rather than a question, so it keeps supplying
+    // the type rather than taking one — which is what makes the first case above work at all. The
+    // payload is a `usize` here rather than a bare `1`, because a literal inside the carrying variant
+    // is the *older* tiering and would fall to `int` with nothing to say otherwise: `Some(1)` beside
+    // a `None` settles the pair at `Option[int]`, correctly, and that is a separate rule from this
+    // one.
+    "and a carrying variant still supplies the type rather than taking one" in {
+      val src =
+        """f(c: bool, n: usize) -> Option[usize]
+          |    val b = if c then Some(n) else None
+          |    b
+          |
+          |print(f(true, 1).unwrap() + 2usize)
+          |""".stripMargin
+
+      run(src) shouldBe "3\n"
+    }
+
+    // The same pair with a bare literal in the payload, pinned because it is the case the comment
+    // above is about: nothing here says `usize`, so the whole thing is an `Option[int]`.
+    "with a bare payload the pair settles at int, which is the older rule and unchanged" in {
+      val src =
+        """f(c: bool) -> Option[int]
+          |    val b = if c then Some(1) else None
+          |    b
+          |
+          |print(f(true).unwrap(), f(false).is_none())
+          |""".stripMargin
+
+      run(src) shouldBe "1 true\n"
+    }
+  }
 }

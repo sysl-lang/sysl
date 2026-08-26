@@ -219,6 +219,19 @@ trait Literals extends TypeResolution {
    */
   protected def typedByPosition(e: Expr): Boolean = e match
     case Call(Field(_, "load"), List(_)) => true
+    // A **payload-free variant of a generic enum** — `None` above all. It is not a literal and it is
+    // not a load, and until 0.0.82 it fell through both tiers to be analyzed alone, which is asking
+    // what an `Option` of nothing in particular holds: the refusal was *"cannot infer the type
+    // argument 'T' of 'None'"* at a site whose other branch said `Some(parse_expr(p))` (card `0294`
+    // filed it from slate). It belongs here for precisely the reason `.red` does — the form has no
+    // type at all until something says which type is wanted, and a sibling is something.
+    //
+    // **A variant that CARRIES something is deliberately not here.** `Some(3)` knows what it is
+    // before anything asks, so it is what the pair takes its type *from* — read by the top tier and
+    // then, where its argument was itself adaptable, re-read at what the pair settled. That is
+    // `adaptable`'s job and it already worked; putting a carrying variant in this tier would take a
+    // type away from the branch that had one.
+    case Ident(name) if payloadFreeGenericVariant(name) => true
     // `.red` is the other one, and it is the reason the tier is worth having rather than a special
     // case: `c == .Red` is what a reader writes first, and the form has no type at all until
     // something says which type is wanted. The neighbour is what says it here, exactly as it says
@@ -226,6 +239,23 @@ trait Literals extends TypeResolution {
     case _: ImplicitMember               => true
     case Call(_: ImplicitMember, _)      => true
     case _                               => false
+
+  /** Whether a bare name is a variant that carries nothing, of an enum that takes type arguments.
+   *
+   * Both halves are needed and each rules out a case that must not be in the tier above. A variant
+   * of a **non-generic** enum has a type the moment it is named — `Colour.Red` is a `Colour` — so it
+   * is an answer rather than a question. One that **carries** something derives its arguments from
+   * what it was given, which is what makes `Some(3)` a type its sibling can be read against.
+   *
+   * Asked with `variantKey`, so a spelling that reaches no variant from here is simply not one.
+   */
+  protected def payloadFreeGenericVariant(name: String): Boolean =
+    variantKey(name).exists { key =>
+      variantOwners.getOrElse(key, Nil).exists { own =>
+        enumDecls.get(own).exists(d =>
+          d.tparams.nonEmpty && d.variants.find(_.name == Modules.split(key)._2).exists(_.fields.isEmpty))
+      }
+    }
 
   /** Whether an expression is a literal with no type of its own. A suffixed numeric literal
    * has already said what it is, so it counts as fixed rather than adaptable.

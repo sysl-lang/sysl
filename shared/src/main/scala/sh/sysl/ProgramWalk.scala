@@ -112,7 +112,7 @@ trait ProgramWalk extends OpaqueResults {
 
     val written = (library ::: files).flatMap((u, s) => contributed(u).map((s, _)))
 
-    // A `deriving` clause is answered here, before anything is hoisted: what it names becomes an
+    // A `derives` clause is answered here, before anything is hoisted: what it names becomes an
     // ordinary `impl` block standing directly after the declaration that asked for it, and every
     // pass below sees a program in which somebody wrote those blocks out (`Deriving`).
     //
@@ -127,7 +127,7 @@ trait ProgramWalk extends OpaqueResults {
 
     for (_, stmt) <- written; entry <- Deriving.duplicates(Deriving.clause(stmt)) do
       currentPos = entry.pos
-      recover(())(at(entry.pos)(err(s"'${entry.show}' is named twice by one 'deriving' clause")))
+      recover(())(at(entry.pos)(err(s"'${entry.show}' is named twice by one 'derives' clause")))
 
     val body = written.flatMap((scope, stmt) => (scope, stmt) :: Deriving.expand(stmt).map((scope, _)))
 

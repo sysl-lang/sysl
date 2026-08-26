@@ -374,7 +374,7 @@ case class TSeq(exprs: List[TExpr]) extends TExpr { def ty: Type = Type.Unit }
  */
 case class TStr(arg: TExpr) extends TExpr { def ty: Type = Type.Str }
 
-/** The built-in `from_utf8_unchecked(b)` — the bytes of a `[]u8` as a `string`, with nothing
+/** The built-in `str_cast(b)` — the bytes of a `[]u8` as a `string`, with nothing
  * checked (`reference/strings.md § Validity`).
  *
  * It is here rather than in the library for the reason the `va_*` forms are: no sysl body can build

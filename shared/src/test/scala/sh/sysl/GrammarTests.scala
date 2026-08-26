@@ -73,14 +73,14 @@ class GrammarTests extends AnyFreeSpec with Matchers {
     * where the grammar expects one and ordinary identifiers everywhere else, so `SyslLexical` never
     * sees them. Adding to this set is a decision about the language, not a way to fix a red test.
     *
-    * **`opaque` and `deriving` are here because the parser reads them with `softWord`**, in
+    * **`opaque` and `derives` are here because the parser reads them with `softWord`**, in
     * `DeclParser` — so the decision was taken when they were written, and the grammar catching up
     * with it (`71436553`) is what left this list behind. That commit brought `grammars/` into line
     * with the site's copy and turned this half of the reconciliation red on dev; the words are soft
     * keywords in fact, so the list is what was wrong.
     */
   private val soft =
-    Set("is", "not", "invariant", "new", "within", "where", "with", "opaque", "deriving")
+    Set("is", "not", "invariant", "new", "within", "where", "with", "opaque", "derives")
 
   "the highlighting grammar" - {
 

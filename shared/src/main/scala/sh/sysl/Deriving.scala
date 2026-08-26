@@ -1,6 +1,6 @@
 package sh.sysl
 
-/** The `deriving` clause: turning `struct Size deriving Eq, Ord` into the `impl` blocks a person
+/** The `derives` clause: turning `struct Size derives Eq, Ord` into the `impl` blocks a person
  * would otherwise have written out field by field.
  *
  * **What is synthesised is source-level AST**, an `ImplDecl` carrying ordinary `MethodDecl` bodies,
@@ -181,14 +181,14 @@ object Deriving {
     else if simple == "Eq" && (stmt match { case e: EnumDecl => Sum(e.variants).simple; case _ => false })
     then
       Some("a simple enum is already 'Eq' — no variant of it carries anything, so its value is its " +
-        "discriminant and '==' is that comparison. Remove 'Eq' from the 'deriving' clause; the " +
+        "discriminant and '==' is that comparison. Remove 'Eq' from the 'derives' clause; the " +
         "other three are still worth deriving")
     else if entry.args.nonEmpty then
       Some(s"'${entry.show}' writes trait arguments, and a derived implementation takes none — the " +
         s"compiler writes ${traits.mkString(", ")} over a type's own fields, and there is nothing " +
         "for an argument to vary")
     else if !traits.contains(simple) then
-      Some(s"'$simple' is not a trait the compiler knows how to write — 'deriving' names " +
+      Some(s"'$simple' is not a trait the compiler knows how to write — 'derives' names " +
         s"${traits.init.mkString(", ")} or ${traits.last}, which are the four the library provides " +
         "structurally for every tuple. A trait of your own is implemented with an 'impl' block")
     else None

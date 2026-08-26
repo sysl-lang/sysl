@@ -198,7 +198,7 @@ trait DeclParser extends ExprParser {
    */
   protected lazy val opaqueKw: Parser[Unit] = softWord("opaque")
 
-  /** `deriving Eq, Ord, Hash, Display` — the traits the compiler writes a memberwise implementation
+  /** `derives Eq, Ord, Hash, Display` — the traits the compiler writes a memberwise implementation
    * of, on the declaration of the type it writes them for.
    *
    * A **soft** keyword, for the reason `opaque` and `invariant` are: `deriving` is an ordinary word
@@ -211,7 +211,7 @@ trait DeclParser extends ExprParser {
    * takes no arguments, and `Deriving` is where that is said.
    */
   protected lazy val derivingClause: Parser[List[BoundRef]] =
-    opt(softWord("deriving") ~> rep1sep(boundRef, op(","))) ^^ (_.getOrElse(Nil))
+    opt(softWord("derives") ~> rep1sep(boundRef, op(","))) ^^ (_.getOrElse(Nil))
 
   /** A **type pack** stands for a list of types and there is one place to write the list out —
    * `(..A)`, the tuple of it (`reference/generics.md § A parameter may stand for a list of types`).

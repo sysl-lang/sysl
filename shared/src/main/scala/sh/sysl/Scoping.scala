@@ -513,20 +513,26 @@ trait Scoping extends DeclTables {
     resolveName(written)(n => structDecls.contains(n) || enumDecls.contains(n) || constrainedDecls.contains(n))
       .map(followAlias)
 
-  /** Whether a **struct** answers to this name here, asked without resolving it.
+  /** Whether a **type** answers to this name here, asked without resolving it.
    *
    * The one caller is the call-position arm that has to choose between a variant and a same-named
-   * struct (card `0220`), and it cannot use `typeKey`: that raises on a candidate the site may not
-   * name and records a module dependency, neither of which belongs to a question nobody asked. A
-   * variant call in a module where some *other* module happens to keep a private `Segment` would
-   * otherwise be refused for naming that struct, and one that merely shares a spelling with a
-   * struct next door would file an edge the program never wrote.
+   * type, and it cannot use `typeKey`: that raises on a candidate the site may not name and records
+   * a module dependency, neither of which belongs to a question nobody asked. A variant call in a
+   * module where some *other* module happens to keep a private `Segment` would otherwise be refused
+   * for naming that struct, and one that merely shares a spelling with a struct next door would file
+   * an edge the program never wrote.
+   *
+   * **It asks about every kind of type rather than only a struct, which is card `0295`.** `0220`
+   * wrote this for the struct case and named it for one, and the arm below it then treated an
+   * *alias* of a variant's name as a conversion outright — `type Eval = Result[Value, Signal]` beside
+   * a `StmtKind.Eval` made `stmt(…, Eval(target))` a cast from an integer, at a call whose parameter
+   * already said `StmtKind`. A struct is not what made that case work; **being a type is**, and
+   * every kind of type reaches call position the same way.
    */
-  protected def structInScope(written: String): Boolean =
+  protected def typeInScope(written: String): Boolean =
     resolveName(written, quiet = true)(n =>
       structDecls.contains(n) || enumDecls.contains(n) || constrainedDecls.contains(n))
-      .map(followAlias)
-      .exists(structDecls.contains)
+      .isDefined
 
   /** What an alias names, overridden where the constrained-type tables are in scope. It is the
    * identity here because `Scoping` sits below them, and because a compiler pass that has not yet

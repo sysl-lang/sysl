@@ -157,10 +157,20 @@ trait ImportResolution extends TraitLookup {
    * where it was named: being told a helper is private is a more useful answer at the import than
    * an undefined name at every use of the shorter spelling it would have bound.
    */
-  private def checkDeclared(key: String, written: String): Unit =
+  private def checkDeclared(key: String, written: String): Unit = {
+    val selector = Modules.split(key)._2
+
     if !declaresAnything(key) then
-      err(s"'${Modules.moduleOf(key)}' declares no '${Modules.split(key)._2}' — there is no '$written'")
+      // A form the analyzer resolves by name is in scope everywhere and belongs to no module, so
+      // the general complaint is true and useless: it says the name does not exist, of a name that
+      // works one line below. Somebody who guessed at a module for one has to be told which of the
+      // two they are looking at.
+      if SpecialForms.names(selector) then
+        err(s"'$selector' is a built-in form rather than a member of any module — it is in scope " +
+          s"everywhere and needs no import")
+      else err(s"'${Modules.moduleOf(key)}' declares no '$selector' — there is no '$written'")
     else if !visible(key) then err(s"'$written' is ${restriction(key)}")
+  }
 
   /** Whether anything at all is declared under a key. An import binds a *name*, and which of the
    * tables answers to it is the use site's question — the same spelling may be a type in one module

@@ -495,7 +495,7 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // A generic struct of the program's own, so the rule is pinned about constructions rather than
     // about the enum the library happens to ship.
     "a generic struct of the program's own is read the same way" in {
-      run("""struct Box[T] deriving Eq
+      run("""struct Box[T] derives Eq
             |    v: T
             |same[T: Eq](a: T, b: T) -> bool = a == b
             |var b: Box[usize] = Box(3)

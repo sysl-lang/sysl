@@ -31,7 +31,7 @@ trait CallExprAnalysis extends ExprCoercion with MemberExprAnalysis with RawStor
     case Call(Ident("print"), args)                         => printCall(args)
     case Call(Ident("str"), args)                           => strCall(args)
     case Call(Ident("format"), List(argExpr, StrLit(spec))) => formatCall(argExpr, spec)
-    case Call(Ident("from_utf8_unchecked"), args)           => fromUtf8Unchecked(args)
+    case Call(Ident("str_cast"), args)                      => strCast(args)
     case Call(Ident("va_start"), args)                      => vaStart(args)
     case Call(Ident("va_end"), args)                        => vaEnd(args)
     case Call(Ident("va_arg"), args)                        => vaArg(args, expected)
@@ -70,6 +70,38 @@ trait CallExprAnalysis extends ExprCoercion with MemberExprAnalysis with RawStor
         (tsubst.contains(name) || (typeKey(name).isEmpty && scalarType(name).isDefined)) =>
       convertAt(typeNamed(name).get, name, args)
 
+    // A bare variant name in call position — `Circle(3)` — with the enum taken from the expected
+    // type, exactly as `Ident` above takes it for a nullary one.
+    //
+    // **A TYPE of the same name is asked about first**, which is what the guard is for. The two are
+    // in different namespaces — a variant is a value name and a type is a type name — so a module
+    // may declare both, and only the *call* has to choose between them. It chooses the way a bare
+    // variant is resolved everywhere else: the expected type decides where it names the variant's
+    // enum, and the type wins where it does not.
+    //
+    // **The asymmetry is the argument, rather than a preference for types.** A variant always has
+    // the qualified `Enum.Variant` spelling, so standing aside costs it nothing it cannot get back;
+    // a struct constructor is named by the struct's own name and has no second spelling at all. The
+    // arm used to come first unguarded, which left such a struct impossible to construct by any
+    // spelling — found from `box2d`, whose `ShapeKind` names five of the shapes it also declares
+    // (card `0220`).
+    //
+    // **IT SITS ABOVE THE CONVERSION ARMS, AND THAT IS CARD `0295`.** `0220` put the guard on a
+    // *struct* and left this arm below them, so an **alias** of a variant's name never reached it:
+    // `type Eval = Result[Value, Signal]` beside a `StmtKind.Eval` made `stmt(…, Eval(target))` a
+    // cast from an integer, refused for carrying data, at a call whose parameter already said
+    // `StmtKind`. The expected type was there and nothing asked it. Being a *type* is what puts a
+    // name here, so every kind of type is asked the same question in the same place.
+    //
+    // **The type is asked about with `typeInScope` rather than `typeKey`**, because this is the
+    // compiler asking itself a question rather than resolving a name a file wrote — `typeKey` would
+    // raise on a candidate the site may not name, and would file a module dependency for a
+    // declaration the program never reached.
+    case Call(Ident(name), args)
+        if lookupOpt(name).isEmpty && variantKey(name).isDefined &&
+          (!typeInScope(name) || variantEnumExpected(variantKey(name).get, expected).isDefined) =>
+      constructVariant(variantKey(name).get, args, expected)
+
     // A constrained subtype's name in call position wraps a base value into the subtype, checking it
     // — `Age(n)`, `Meters(3.0)`. Unlike an implicit produce site, the cast is written, so it applies
     // even where the base would not flow in on its own.
@@ -91,30 +123,8 @@ trait CallExprAnalysis extends ExprCoercion with MemberExprAnalysis with RawStor
     case Call(TypeAttr(Ident(name), attr), args) if lookupOpt(name).isEmpty && builtinInteger(name).isDefined =>
       integerAttr(builtinInteger(name).get, name, attr, args)
 
-    // A bare variant name in call position — `Circle(3)` — with the enum taken from the expected
-    // type, exactly as `Ident` above takes it for a nullary one.
-    //
-    // **A struct of the same name is asked about first**, which is what the guard is for. The two
-    // are in different namespaces — a variant is a value name and a struct is a type name — so a
-    // module may declare both, and only the *call* has to choose between them. It chooses the way a
-    // bare variant is resolved everywhere else: the expected type decides where it names the
-    // variant's enum, and the struct wins where it does not.
-    //
-    // **The asymmetry is the argument, rather than a preference for structs.** A variant always has
-    // the qualified `Enum.Variant` spelling, so standing aside costs it nothing it cannot get back;
-    // a struct constructor is named by the struct's own name and has no second spelling at all. The
-    // arm used to come first unguarded, which left such a struct impossible to construct by any
-    // spelling — found from `box2d`, whose `ShapeKind` names five of the shapes it also declares
-    // (card `0220`).
-    // **The struct is asked about with `structInScope` rather than `typeKey`**, because this is the
-    // compiler asking itself a question rather than resolving a name a file wrote — `typeKey` would
-    // raise on a candidate the site may not name, and would file a module dependency for a
-    // declaration the program never reached.
-    case Call(Ident(name), args)
-        if lookupOpt(name).isEmpty && variantKey(name).isDefined &&
-          (!structInScope(name) || variantEnumExpected(variantKey(name).get, expected).isDefined) =>
-      constructVariant(variantKey(name).get, args, expected)
-
+    // A struct's name in call position is its positional constructor. The variant arm above has
+    // already stood aside or claimed the name, so nothing here has to ask about variants.
     case Call(Ident(name), args) if lookupOpt(name).isEmpty && typeKey(name).exists(structDecls.contains) =>
       constructStruct(typeKey(name).get, args, expected)
 
