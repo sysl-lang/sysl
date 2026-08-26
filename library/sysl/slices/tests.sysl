@@ -56,6 +56,101 @@ as_ptr_is_generic()
     assert_eq(*as_ptr(xs[2..]), 9)
 end as_ptr_is_generic
 
+// -- align_up and is_aligned ----------------------------------------------------------------------
+
+// Every offset into the storage is tried rather than one, because the interesting property is
+// relative: whatever the storage's own address happens to be, an aligned answer is at most
+// `alignment - 1` bytes ahead of where it started and never behind it. A test that indexed one fixed
+// offset would pass or fail on the base address the machine handed out that run.
+@test("align_up answers the first aligned address at or after the pointer")
+align_up_moves_forward_to_the_next_boundary()
+    var storage: [32]u8 = [0; 32]
+
+    for i in 0..<8usize
+        val p = &storage[i]
+        val q = align_up(p, 8)
+
+        assert(is_aligned(q, 8), "the answer is aligned")
+        assert(usize(q) >= usize(p), "and never behind where it started")
+        assert(usize(q) - usize(p) < 8, "and no further ahead than the alignment")
+end align_up_moves_forward_to_the_next_boundary
+
+// The case that hides a missing call: on a 64-bit machine storage usually *is* already aligned, so a
+// binding that forgot to align works until the day its storage does not start on a boundary.
+@test("a pointer that is already aligned is answered unchanged")
+align_up_of_an_aligned_pointer_is_that_pointer()
+    var storage: [32]u8 = [0; 32]
+    val aligned = align_up(&storage[0], 8)
+
+    assert_eq(usize(align_up(aligned, 8)), usize(aligned))
+    assert_eq(usize(align_up(aligned, 4)), usize(aligned))
+    assert_eq(usize(align_up(aligned, 1)), usize(aligned))
+end align_up_of_an_aligned_pointer_is_that_pointer
+
+// An alignment of one divides every address, so the mask is zero and nothing moves. It is the edge
+// the arithmetic could most easily get wrong -- `alignment - 1` underflowing would be a `usize` wrap
+// rather than a diagnostic -- and a caller reaches it honestly, by asking for `alignof(u8)`.
+@test("an alignment of one moves nothing, at every offset")
+align_up_by_one_is_the_identity()
+    var storage: [32]u8 = [0; 32]
+
+    for i in 0..<8usize
+        val p = &storage[i]
+
+        assert_eq(usize(align_up(p, 1)), usize(p))
+        assert(is_aligned(p, 1), "and every address is aligned to one")
+end align_up_by_one_is_the_identity
+
+@test("is_aligned answers for the address rather than for the storage it points into")
+is_aligned_reads_the_address()
+    var storage: [32]u8 = [0; 32]
+    val base = align_up(&storage[0], 8)
+
+    assert(is_aligned(base, 8))
+    assert(is_aligned(base, 4))
+    assert(is_aligned(base, 2))
+
+    // The offsets are built by arithmetic on the address rather than by indexing, because what is
+    // being asked about is the address itself -- nothing here reads the storage, and a pointer one
+    // byte past a boundary is exactly the input a binding must not hand to C.
+    val one_past: *u8 = ptr_cast(usize(base) + 1)
+    val four_past: *u8 = ptr_cast(usize(base) + 4)
+
+    assert(!is_aligned(one_past, 8), "one byte past a boundary is not on one")
+    assert(!is_aligned(one_past, 2))
+    assert(is_aligned(four_past, 4), "four bytes past an eight-boundary is on a four-boundary")
+    assert(!is_aligned(four_past, 8))
+end is_aligned_reads_the_address
+
+// The whole reason this pair is here, written the way `miniz` writes it: over-size the storage by
+// `alignment - 1`, place the C state at the first aligned address inside it, and read and write
+// through the result. A binding that got the arithmetic wrong here produces a pointer C dereferences
+// unaligned, which is undefined rather than slow.
+@test("a value placed at an aligned address inside caller storage round-trips")
+align_up_places_a_value_in_caller_storage()
+    var storage: [sizeof(u64) + alignof(u64) - 1]u8 = [0; sizeof(u64) + alignof(u64) - 1]
+    val state: *u64 = ptr_cast(align_up(as_mut_ptr(storage[..]), alignof(u64)))
+
+    assert(is_aligned(state, alignof(u64)))
+
+    *state = 0x0123456789abcdef
+
+    assert_eq(*state, 0x0123456789abcdef)
+
+// The generic parameter is the pointer's element type and has nothing to do with the alignment asked
+// for, which is why a binding may align a `*u8` to what a `*Deflater` wants. Both directions are
+// exercised: a wide element aligned to a narrow boundary, and a byte aligned to a wide one.
+@test("and both are generic in the pointer's element type")
+align_up_is_generic()
+    var wide: [8]u64 = [0; 8]
+    var bytes: [32]u8 = [0; 32]
+
+    val p = align_up(&wide[0], 2)
+
+    assert_eq(usize(p), usize(&wide[0]), "a u64's address already divides by two")
+    assert(is_aligned(align_up(&bytes[1], alignof(u64)), alignof(u64)))
+end align_up_is_generic
+
 // -- the plain operations -------------------------------------------------------------------------
 
 @test("swap exchanges two elements and leaves the rest alone")

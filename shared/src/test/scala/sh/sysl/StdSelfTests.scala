@@ -111,8 +111,13 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * --include="*.sysl" | wc -l` reads **442**, and the gap of two is the same handful the raises
    * above kept. The module is `sh.sysl.linalg` now -- a leaf nothing else in `library/` imported, and
    * the only domain in a library otherwise made of the platform and of what all code touches.
+   *
+   * Raised to **448**, and with no slack this time, when `sysl.slices` gained `align_up` and
+   * `is_aligned` with six tests: the measurement above reads 448, and taking the number exactly is
+   * what proves the six are collected rather than merely that nothing vanished. The gap the entry
+   * above kept was the residue of a removal, not a target to hold.
    */
-  private val floor = 440
+  private val floor = 448
 
   /** The library, compiled as a **test build of itself**.
    *

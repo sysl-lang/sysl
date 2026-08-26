@@ -50,6 +50,41 @@ as_ptr[T](xs: []const T) -> *T = if xs.len == 0 then null else &xs[0]
  */
 as_mut_ptr[T](xs: []T) -> *T = if xs.len == 0 then null else &xs[0]
 
+/** The first address at or after `p` that `alignment` divides.
+ *
+ * **This is what a binding needs to place a C struct in storage the caller supplied.** A `[]u8`
+ * promises nothing about its own address, while the struct C is about to read wants its natural
+ * alignment -- so a caller over-sizes its storage by `alignment - 1` and puts the state at the first
+ * aligned address inside it. `miniz` is the package that does this, and it wrote the arithmetic in C
+ * because a comment there says sysl has no pointer-to-integer cast. It has one: an address read as a
+ * `usize` is an ordinary conversion (`reference/memory.md`), and reading it back is `ptr_cast`, so
+ * this needs no C at all.
+ *
+ * The alignment a type wants is `alignof(T)`, which is a compile-time constant, so the usual call
+ * spells it rather than repeating a number the C header already knows.
+ *
+ * **A pointer that is already aligned is answered unchanged**, which is what makes it safe to call
+ * on storage that happens to be aligned already -- the common case on a 64-bit machine, and the one
+ * that hides a missing call until the day it does not.
+ *
+ * **`alignment` must be a power of two and nothing checks it.** The mask this is computed with means
+ * something only for a power of two; any other value silently answers an address that is not aligned
+ * to anything. It is the caller's to get right, exactly as it is in C.
+ */
+align_up[T](p: *T, alignment: usize) -> *T
+    val mask = alignment - 1
+
+    ptr_cast((usize(p) + mask) & ~mask)
+
+/** Whether an address is already a multiple of `alignment`.
+ *
+ * The question `align_up` answers by construction, asked on its own -- for an assertion in a binding's
+ * raw layer, or to find out whether over-sizing the storage was needed at all. **A power of two is
+ * assumed here too**, though this one is a remainder rather than a mask, so a value that is not one
+ * answers a real question about divisibility rather than nonsense.
+ */
+is_aligned[T](p: *T, alignment: usize) -> bool = usize(p) % alignment == 0
+
 /** Two elements exchanged, in place.
  *
  * Out-of-range indices trap, as any other subscript does: this is an operation on storage the caller
