@@ -307,7 +307,7 @@ class GenericsClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport
     }
 
     /** And the whole point of the shape, which is a routine that compares magnitudes without naming
-     * the type they come out at — `sysl.math.matrix` pivots this way, over element types whose sizes
+     * the type they come out at — `sh.sysl.linalg` pivots this way, over element types whose sizes
      * are not their own values.
      */
     "and a routine bounded by the trait compares what it answers with" in {
@@ -338,7 +338,7 @@ class GenericsClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport
         include("'T' is not a name a call could reach it through")
     }
 
-    /** What the memberships add up to, which is the claim `sysl.math.matrix` makes about its element
+    /** What the memberships add up to, which is the claim `sh.sysl.linalg` makes about its element
      * type: an integer meets a *field*-shaped bound — the four operators, both identities, equality,
      * rendering and a size — with nothing written for it anywhere. That is exactly why the bound is
      * not enough: `int` satisfies it and `/` still truncates, so the library carries a separate

@@ -100,8 +100,19 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * were drift again** -- the tree was at 485 against a floor of 482, from `Complex[F]`'s rendering
    * tests the day before. That is the fourth time, and it was found by the measurement this comment
    * prescribes rather than by adding two to the number above it.
+   *
+   * **LOWERED to 442 when `sysl.math.matrix` left the library**, which is the first time this number
+   * has gone down and the one direction the guard cannot check for itself: a floor that is too high
+   * fails loudly and a floor left too high after a removal fails *every* run, so the temptation is to
+   * drop it far enough to be safe and stop thinking. That is the drift this comment has recorded four
+   * times, arrived at from the other side.
+   *
+   * So it is measured, not subtracted: 45 tests left with the module, `grep -rh "^@test(" library
+   * --include="*.sysl" | wc -l` reads **442**, and the gap of two is the same handful the raises
+   * above kept. The module is `sh.sysl.linalg` now -- a leaf nothing else in `library/` imported, and
+   * the only domain in a library otherwise made of the platform and of what all code touches.
    */
-  private val floor = 487
+  private val floor = 440
 
   /** The library, compiled as a **test build of itself**.
    *
