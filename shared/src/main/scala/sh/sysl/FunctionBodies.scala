@@ -25,8 +25,15 @@ trait FunctionBodies extends ModuleStorage {
 
   private def analyzeFuncBodyAt(name: String, f: FuncDecl, subst: Map[String, Type]): TFunc = {
     val (params, rtype) = funcInsts(name)
+    val saved           = inConstSelf
 
-    analyzeBodyWith(name, f, subst, params, rtype)
+    // Set for the body of a slice shape block made real at the read-only view, and cleared after —
+    // saved and restored rather than assigned, because a body may be analyzed inside another one
+    // (`analyzeNested`) and a closure written in a writable instance must not inherit the note.
+    inConstSelf = constSelfInsts.contains(name)
+
+    try analyzeBodyWith(name, f, subst, params, rtype)
+    finally inConstSelf = saved
   }
 
   /** Analyzes a body **inside** the analysis of another one, and gives back what it yields as well
@@ -356,14 +363,40 @@ trait FunctionBodies extends ModuleStorage {
     (requires.toList, ensures.toList, olds.toList, variant)
   }
 
-  protected def instantiateFunc(f: FuncDecl, targs: List[Type]): String = {
+  /** The parameter list of a slice shape block made real at the read-only view: `self` at the view
+   * the receiver actually had, and everything after it untouched.
+   *
+   * Only the receiver moves. A member declaring a `[]T` **parameter** asked for one that may be
+   * written, and the read-only receiver says nothing about what its arguments are allowed to be —
+   * `eq(self, rhs: Self)` is the one that reads as if it should follow, and it does, because it
+   * names `Self` rather than the shape.
+   */
+  private def constReceiver(params: List[(String, Type)]): List[(String, Type)] = params match
+    case (name, ty) :: rest if name == "self" => (name, constSelfType(ty)) :: rest
+    case other                                => other
+
+  /** A receiver's type with its view made read-only, through whatever mode the sigil asked for —
+   * `[]T`, `*[]T`. A receiver that is not a slice at all is unchanged, so this is safe to apply to
+   * the head of any parameter list.
+   */
+  private def constSelfType(t: Type): Type = t match
+    case Type.Ptr(inner) => Type.Ptr(constSelfType(inner))
+    case other           => Type.constView(other)
+
+  protected def instantiateFunc(f: FuncDecl, targs: List[Type], constSelf: Boolean = false): String = {
     // The tag is empty for every instantiation a value is ever made at, so an emitted symbol is
     // exactly what it always was. It is not empty for a **stand-in**, which is its name and nothing
     // else — so `Buf.at.T` under one declaration's `[T: Ord]` and under another's `[T: Display]`
     // would be one entry, and the second declaration's body would read the first one's signature
     // back. The instantiation is definition-time and never emitted, so the name is free to say which
     // walk it belongs to (`Type.standInTag`).
-    val name = Type.mangled(f.name, targs) + targs.map(Type.standInTag).mkString
+    //
+    // `constSelf` is the slice shape's second instantiation (`Type.Slice.shape`): the same block,
+    // made real at the read-only view because that is what the receiver was. It is a different name
+    // because it is a different **body** — the machine code is identical and only one of the two had
+    // its writes checked, which is the reason `Type.mangle` carries the bit through everywhere else.
+    val name = Type.mangled(if constSelf then Type.Slice.constOwner(f.name) else f.name, targs) +
+      targs.map(Type.standInTag).mkString
 
     // Recorded here because this is the one place a generic becomes a function, and the name it
     // becomes cannot be read back to say so: what tells `lib$twice.Loud` from a member of a type
@@ -382,11 +415,19 @@ trait FunctionBodies extends ModuleStorage {
 
     // The signature being made real is the declaration's, so it is resolved in the declaration's
     // module however far from it the call that asked for this instantiation was written.
+    if constSelf then constSelfInsts += name
+
     if !funcInsts.contains(name) then
       inDecl(f.name) {
-        val subst = withSelf(f.name, f.tparams.zip(targs).toMap)
+        val plain = withSelf(f.name, f.tparams.zip(targs).toMap)
+        // `Self` and the `self` parameter are moved to the read-only view together, and they have to
+        // be: the block writes its receiver as `[]T` rather than as `Self`, so the parameter is not
+        // reached by rebinding the name, and a member answering `-> Self` would otherwise hand back a
+        // view the receiver never was.
+        val subst = if constSelf then plain.updatedWith(selfName)(_.map(Type.constView)) else plain
+        val params = f.params.map(p => (p.name, resolveType(p.typ, subst)))
         funcInsts(name) =
-          (f.params.map(p => (p.name, resolveType(p.typ, subst))),
+          (if constSelf then constReceiver(params) else params,
            f.retType.map(resolveReturn(_, subst)).getOrElse(Type.Unit))
         pending.enqueue((name, f, subst))
       }

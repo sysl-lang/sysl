@@ -124,7 +124,7 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
             checkMemberVisible(base, chosen, m)
             callGenericMethod(genericMembers((base, chosen)), m, targs, tr,
               bindArgs(s"method '$base.$chosen'", Some(base), m.params, args, m.variadic), expected,
-              writtenTargs)
+              writtenTargs, viewedConst(rty, base))
           case Some(m) if m.receiver.isDefined =>
             checkMemberVisible(base, chosen, m)
 
@@ -400,6 +400,7 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
       args: List[Expr],
       expected: Option[Type],
       writtenTargs: List[Expr],
+      constSelf: Boolean,
   ): TExpr = {
     val shown = qn(fd.name)
 
@@ -463,7 +464,7 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
     // was made.
     inDecl(fd.name)(checkParamBounds(shown, m.tparams, mbounds, own, ownerSeed))
 
-    val name            = instantiateFunc(fd, ownerArgs ::: own)
+    val name            = instantiateFunc(fd, ownerArgs ::: own, constSelf)
     val (params, rtype) = funcInsts(name)
     val recvArg         = buildReceiver(m.receiver.get, recv, m.name)
 

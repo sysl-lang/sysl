@@ -316,20 +316,63 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
     * `[]const T` the form to write a block for, since a `[]T` widens into it and nothing widens the
     * other way. It is the advice C++ gives about `span<const T>`, reached here by the same route.
     */
+  /** A block for `[]T` reached on a `[]const T` — which it is, since both views share the one shape
+   * key, and the block is made real at whichever view the receiver had.
+   *
+   * What is refused is therefore a **body**, not a call: a member that writes through `self` has
+   * nothing to write through when `self` is a read-only view, and the refusal lands on the line that
+   * writes. That is where the reader can act on it, and it is what the shape key exists to allow —
+   * "a block that does write is caught where it writes, which is a better place to say so than a
+   * missing implementation" (`TraitLookup.shapeOwners`).
+   *
+   * The reaching half is in `ImplShapeRunTests`; what is pinned here is the refusal and the sentence
+   * that explains where the `const` nobody typed came from.
+   */
   "a shape block and the two views" - {
-    "a block for '[]T' does not reach a view that may not be written" in {
-      err("""trait Total
-            |    total(self) -> usize
-            |impl[T] Total for []T
-            |    total(self) -> usize = self.len
-            |var s = "hello"
-            |print(s.bytes.total())
-            |""".stripMargin) should include("does not become the other")
+    "a body that writes through 'self' is refused on the read-only view" in {
+      err("""trait Bump
+            |    bump(self)
+            |impl[T] Bump for []T
+            |    bump(self)
+            |        self[0] = self[0]
+            |var a = [1, 2, 3]
+            |val c: []const int = a[..]
+            |c.bump()
+            |""".stripMargin) should include("views elements it may not write")
     }
 
-    // The same block written the other way, to show the refusal is about which form was chosen and
-    // not about `s.bytes` being unable to find a member at all.
-    "while the same block written for '[]const T' reaches it" in {
+    // The message lands in the block's own file, on a line whose author wrote `[]T` and never typed
+    // a `const` — so it has to name the one thing that line cannot show, which is the receiver at
+    // the call.
+    "and says which of the block's two instances this body is" in {
+      err("""trait Bump
+            |    bump(self)
+            |impl[T] Bump for []T
+            |    bump(self)
+            |        self[0] = self[0]
+            |var a = [1, 2, 3]
+            |val c: []const int = a[..]
+            |c.bump()
+            |""".stripMargin) should include("made real at the read-only view")
+    }
+
+    // The same body, reached the other way — which is what makes the refusal above about this call
+    // rather than about the block being unwritable.
+    "while the same block writes freely when the receiver may be written" in {
+      run("""trait Bump
+            |    bump(self)
+            |impl[T] Bump for []T
+            |    bump(self)
+            |        self[0] = 9
+            |var a = [1, 2, 3]
+            |a[..].bump()
+            |print(a[0])
+            |""".stripMargin) shouldBe "9\n"
+    }
+
+    // A block written for `[]const T` is unaffected: its members were already at the view they were
+    // written for, and nothing about the receiver changes them.
+    "and a block written for '[]const T' reaches a read-only view as it always did" in {
       run("""trait Total
             |    total(self) -> usize
             |impl[T] Total for []const T

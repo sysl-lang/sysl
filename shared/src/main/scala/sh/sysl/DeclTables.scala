@@ -644,6 +644,16 @@ trait DeclTables extends Reporting {
    */
   protected val pending = mutable.Queue.empty[(String, FuncDecl, Map[String, Type])]
 
+  /** The instantiations of a slice shape block made real at the **read-only** view, by mangled name
+   * (`TraitLookup.viewedConst`).
+   *
+   * What reads it is the write diagnostic, and that is the whole of why it is recorded. A block
+   * written `impl[T] Sort for []T` whose body writes through `self` is refused when a `[]const T`
+   * receiver asks for it, and the refusal lands in the *library's* file on a line whose author did
+   * nothing wrong — so the message has to say that this body is one of two, and which one.
+   */
+  protected val constSelfInsts = mutable.HashSet.empty[String]
+
   /** Which lowered functions are a **generic's** body at some choice of type, by mangled name.
    *
    * An instantiation's name says nothing about where the choice came from: `lib$twice.Loud` is

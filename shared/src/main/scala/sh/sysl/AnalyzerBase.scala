@@ -241,6 +241,28 @@ trait AnalyzerBase extends Scoping {
    */
   protected var pendingVariant: Option[(String, Type)] = None
 
+  /** Whether the body being analyzed is a slice shape block made real at the **read-only** view.
+   *
+   * The block was written for `[]T` and this instance's `self` is a `[]const T`, because that is
+   * what the receiver was (`TraitLookup.viewedConst`). A write through it is refused like any other
+   * write through a read-only view, and this is what lets the refusal say why the view is read-only
+   * — which the author of the block never wrote and cannot see from the line it lands on.
+   */
+  protected var inConstSelf: Boolean = false
+
+  /** What a refusal to write through a read-only view adds when the view is a shape block's own
+   * `self` — empty everywhere else, so it may be appended without asking.
+   *
+   * Without it the message lands on a line whose author wrote `[]T` and reads as the compiler having
+   * invented a `const` nobody typed. The one thing the reader cannot see from that line is the
+   * receiver at the call, and the receiver is the whole explanation.
+   */
+  protected def constSelfNote: String =
+    if !inConstSelf then ""
+    else " — and this body is the block written for '[]T', made real at the read-only view because " +
+      "that is what the receiver was. A member writing through 'self' is one only a '[]T' can be " +
+      "given, so what has to change is the call on the '[]const T'"
+
   /** Numbers the variant slots so two loops in one function cannot share storage. */
   protected var variantSeq: Int = 0
 
@@ -530,7 +552,7 @@ trait AnalyzerBase extends Scoping {
    * `*self` receiver asks it in `CallAnalysis`, which is the same question about the same place.
    */
   protected def readOnly(t: TExpr): Boolean
-  protected def instantiateFunc(f: FuncDecl, targs: List[Type]): String
+  protected def instantiateFunc(f: FuncDecl, targs: List[Type], constSelf: Boolean = false): String
 
   /** The call trait a value of this type implements, where it implements one (`reference/types.md § Function types`). */
   protected def callableOf(t: Type): Option[Type.Bound]

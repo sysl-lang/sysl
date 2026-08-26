@@ -802,7 +802,8 @@ trait ExprAnalysis
       case TIndex(recv, _, _) if writes && Type.readOnlyView(recv.ty) && recv.ty != Type.Str =>
         err(s"this element belongs to a '${show(recv.ty)}', which views elements it may not write, " +
           "so there is nothing to assign through. Elements you may write are elements of your own: " +
-          s"copy them into a '[]${show(Type.element(recv.ty).getOrElse(Type.Unknown))}' first")
+          s"copy them into a '[]${show(Type.element(recv.ty).getOrElse(Type.Unknown))}' first" +
+          constSelfNote)
 
       case _ =>
         // The enumeration names all four kinds rather than the three it used to: an element is a

@@ -42,6 +42,15 @@ class AssertEqTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       run("var a = [1, 2, 3]\nvar b = [1, 2, 3]\nassert_slice_eq(a[..], b[..])\nprint(\"through\")") shouldBe
         "through\n"
     }
+
+    // The read-only view, which is the slice most tests actually hold: `.bytes` answers one, every
+    // text routine takes one, and a scanner hands one back. It reached `Eq` and `Display` and then
+    // could not be given to the assertion built out of them, so what `assert_eq` adds over
+    // `assert(a == b)` was unavailable to exactly the callers most likely to want it.
+    "and for a read-only view, which is what '.bytes' answers" in {
+      run("val a: []const u8 = \"ab\".bytes\nval b: []const u8 = \"ab\".bytes\n" +
+        "assert_eq(a, b)\nprint(\"through\")") shouldBe "through\n"
+    }
   }
 
   "a check that fails names both values and where it was written" - {
@@ -84,6 +93,15 @@ class AssertEqTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       val (_, out) = stopped("assert_slice_eq([1, 2], [1, 2, 3])")
 
       out should include("got 2 elements, want 3")
+    }
+
+    // The failing half of the read-only case: what makes the covering worth having is not that the
+    // call compiles but that the report names both sequences, which is the whole of why `assert_eq`
+    // is a function rather than an `assert`.
+    "a read-only view renders both sequences when they differ" in {
+      val (_, out) = stopped("val a: []const u8 = \"ab\".bytes\nval b: []const u8 = \"az\".bytes\nassert_eq(a, b)")
+
+      out should include("got [97, 98], want [97, 122]")
     }
 
     "and a length mismatch is reported instead of an index, not as well" in {

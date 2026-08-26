@@ -214,7 +214,7 @@ trait VectorMethods extends FuncAddress {
         if Type.readOnlyView(rty) then
           err(s"this run belongs to a '${show(rty)}', which views elements it may not write, so " +
             s"there is nothing to store through. Lanes you may write are elements of your own: " +
-            s"copy them into a '[]${show(elem)}' first")
+            s"copy them into a '[]${show(elem)}' first" + constSelfNote)
         if !isPlace(probe) then
           err(s"'store' writes into the elements it is read off, and ${show(rty)} has no address " +
             "to write through")

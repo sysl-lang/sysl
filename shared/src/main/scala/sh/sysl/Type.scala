@@ -442,6 +442,31 @@ object Type extends TypeQueries {
    */
   case class Slice(elem: Type, readOnly: Boolean = false) extends View
 
+  object Slice {
+
+    /** The key an `impl` written for **every** slice is filed under — `impl[T: Display] Display for
+     * []T`, and the one place both views of a slice answer to the same name.
+     *
+     * A `[]T` and a `[]const T` share it because the block is written against what a slice *is*, a
+     * pointer and a count of `T`, and whether this one may be written through is not part of that
+     * (`TraitLookup.shapeOwners`). What the shared key does not mean is a shared *body*: the block
+     * is made real at the receiver's own view, so a member reached on a `[]const T` is checked with
+     * a `self` it may not write, and one that writes is refused there rather than being missing here.
+     */
+    val shape: String = "[]"
+
+    /** The name a slice shape block's members take when the block is made real at the **read-only**
+     * view — `slice.display` becoming `constslice.display`, which is the rename `mangle` gives the
+     * type itself.
+     *
+     * A shape block's members are emitted under `slice` (`ImplTarget.shapeSymbol`), so this is a
+     * prefix rather than a suffix and the two instantiations sort beside their own views' types. It
+     * is the identity for anything else, which is what makes it safe to apply without asking: only
+     * a slice shape reaches it.
+     */
+    def constOwner(name: String): String = if name.startsWith("slice.") then s"const$name" else name
+  }
+
   /** A view of bytes that are well-formed UTF-8 and stay that way: the same three words a slice
    * is, minus the ability to write through it. The validity invariant is what separates the two
    * types, so converting a `[]u8` to a `string` is checked and the other direction is free.

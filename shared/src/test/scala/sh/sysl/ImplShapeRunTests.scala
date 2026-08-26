@@ -253,14 +253,116 @@ class ImplShapeRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
+  /** Both views of a slice share the one shape key, so a block written for `[]T` covers a
+   * `[]const T` — and covering it means the block is made **real at that view**, with a `self` the
+   * body may not write through.
+   *
+   * Before this a `[]const T` satisfied a bound the block supplied and then could not call the
+   * member it had just been granted, which is the one shape of failure a trait system must not have.
+   * `[]const u8` is what made it matter rather than a curiosity: it is what `.bytes` answers, so the
+   * commonest slice in the language was the one that could not be rendered or compared through the
+   * library's own blocks.
+   *
+   * The two instances are two bodies with one machine code, and that is deliberate — only one of
+   * them had its writes checked, so sharing the analysis is how the read-only bit would stop meaning
+   * anything (`Type.mangle`).
+   */
+  "a block written for '[]T' and a receiver that may not be written" - {
+
+    "reaches the block, since the body only reads" in {
+      run(
+        s"""${total}impl[T] Total for []T
+           |    total(self) -> usize = self.len
+           |var a = [1, 2, 3]
+           |val c: []const int = a[..]
+           |print(a[..].total())
+           |print(c.total())""".stripMargin,
+      ) shouldBe "3\n3\n"
+    }
+
+    // `s.bytes` is a `[]const u8` nobody wrote a `const` for, which is how a caller meets this
+    // without ever having named the read-only view.
+    "including the read-only view a string hands over" in {
+      run(
+        s"""${total}impl[T] Total for []T
+           |    total(self) -> usize = self.len
+           |var s = "hello"
+           |print(s.bytes.total())""".stripMargin,
+      ) shouldBe "5\n"
+    }
+
+    // A member with type parameters of its own is named by the call rather than by the receiver, so
+    // it takes the other road through the analyzer and needs its own claim.
+    "and a member generic in its own right, which is named by the call" in {
+      run(
+        """trait Pick
+          |    pick[U: Display](self, u: U)
+          |impl[T: Display] Pick for []T
+          |    pick[U: Display](self, u: U)
+          |        print(self.len)
+          |        print(u)
+          |var a = [1, 2, 3]
+          |val c: []const int = a[..]
+          |c.pick("hi")""".stripMargin,
+      ) shouldBe "3\nhi\n"
+    }
+
+    // The library's own two blocks, which are what the whole thing was found through: `assert_eq`
+    // renders both sequences and could not be given the slice most tests hold.
+    "so the library's own 'Eq' and 'Display' cover it" in {
+      run(
+        """val a: []const u8 = "ab".bytes
+          |val b: []const u8 = "ab".bytes
+          |print(a == b)
+          |print(a)
+          |assert_eq(a, b)
+          |print("through")""".stripMargin,
+      ) shouldBe "true\n[97, 98]\nthrough\n"
+    }
+
+    // An operator, which reaches the same block by another road: `==` binds `Self` from the left
+    // operand, so a read-only view on the left dispatches at the read-only instance and the writable
+    // view on the right converts into it.
+    //
+    // The other operand order — `a[..] == c` — is refused, and that is a defect of its own rather
+    // than of this rule: nothing widens the *left* operand, so which order compiles depends on which
+    // side happened to be read-only. It was refused at 0.0.82 too, before any of this. Card `0303`.
+    "and an operator, where the read-only view is the left operand" in {
+      run(
+        """var a = [1, 2, 3]
+          |var b = [1, 2, 3]
+          |val c: []const int = b[..]
+          |print(c == a[..])""".stripMargin,
+      ) shouldBe "true\n"
+    }
+
+    // A slice of a type the program declared, to show the covering is not a special case for the
+    // built-in elements the library's blocks are usually reached at.
+    "for an element type of the program's own" in {
+      run(
+        """struct P
+          |    x: int
+          |impl Display for P
+          |    display(self, out: *Writer, fmt: FormatSpec) = self.x.display(out, fmt)
+          |impl Eq for P
+          |    eq(self, rhs: P) -> bool = self.x == rhs.x
+          |var a = [P(1), P(2)]
+          |val c: []const P = a[..]
+          |val d: []const P = a[..]
+          |print(c)
+          |print(c == d)""".stripMargin,
+      ) shouldBe "[1, 2]\ntrue\n"
+    }
+  }
+
   "a shape and the types it covers" - {
 
     // `string` is a view of bytes that are valid UTF-8, and that invariant is the whole difference
     // between it and a `[]u8` — so a block written for every slice has said nothing about it.
     //
-    // The block is written for `[]const T` because that is the form that covers both: a `[]T`
-    // widens into it, and `s.bytes` already is one. A block for `[]T` covers only the writable
-    // half, which the two tests below pin from either side.
+    // The block is written for `[]const T` here because `s.bytes` is one, and the point being made
+    // is about `string` rather than about which form was chosen — a `[]T` block reaches the same
+    // receiver, as the section above pins.
     "leave 'string' alone, since a string is not a slice" in {
       run(
         s"""${total}impl[T] Total for []const T
@@ -273,8 +375,11 @@ class ImplShapeRunTests extends AnyFreeSpec with RunSupport {
       ) shouldBe "0\n5\n"
     }
 
-    // One block, both views — the reason to write the read-only form even when the writable one
-    // would do, and the same advice C++ gives about `span<const T>`.
+    // One block, both views. Writing the read-only form is still the thing to reach for where the
+    // members only read — it says so in the subject, where a reader sees it, rather than leaving it
+    // to be discovered by a write being refused — and it is the same advice C++ gives about
+    // `span<const T>`. What has changed is that choosing the other form no longer shuts a read-only
+    // receiver out.
     "so a block for '[]const T' covers a writable view and a read-only one alike" in {
       run(
         s"""${total}impl[T] Total for []const T
@@ -285,8 +390,9 @@ class ImplShapeRunTests extends AnyFreeSpec with RunSupport {
       ) shouldBe "4 3\n"
     }
 
-    // The other direction does not hold — a block for `[]T` reserves the right to write — and that
-    // refusal is pinned in `ImplShapeErrorTests`, where the error helper lives.
+    // The other direction holds too, one member at a time: a `[]T` block reaches a read-only
+    // receiver for every member that only reads, and the one that writes is refused in its own body.
+    // That refusal is pinned in `ImplShapeErrorTests`, where the error helper lives.
 
     // A slice and an array of two are two shapes, so one trait may be implemented for both — the
     // key is the shape, and neither of these covers what the other does.

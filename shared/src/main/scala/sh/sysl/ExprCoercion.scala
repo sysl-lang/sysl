@@ -289,7 +289,7 @@ trait ExprCoercion extends ExprSupport {
       err(s"a '[]const ${show(want)}' views elements it may not write, and a '[]${show(want)}' is a " +
         "licence to write them — so the one does not become the other. Copy what you need into a " +
         s"'[]${show(want)}' of your own, or take the parameter as '[]const ${show(want)}' if it is " +
-        "only read")
+        "only read" + constSelfNote)
 
     // An array where a view of it was asked for, which is `a[..]` performed by the position rather
     // than written by hand. The array is the one thing that already knows both halves a view is made

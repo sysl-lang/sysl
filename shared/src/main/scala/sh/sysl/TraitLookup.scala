@@ -386,7 +386,13 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
     // every slice is written against what a slice *is* — a pointer and a count of `T` — and whether
     // this one may be written through is not part of that. A block that does write is caught where
     // it writes, which is a better place to say so than a missing implementation.
-    case Type.Slice(elem, _) => List(("[]", List(elem)))
+    //
+    // **`viewedConst` is what makes that second sentence true rather than an intention.** Sharing
+    // the key found the block; what the receiver then got was a `self` spelled `[]T`, so a
+    // `[]const T` satisfied the bound and could not call the member the bound had just granted it.
+    // The block is made real at the receiver's own view instead, and the write is caught in the body
+    // exactly as this says.
+    case Type.Slice(elem, _) => List((Type.Slice.shape, List(elem)))
     // The length is dropped from the second key and handed back as an **argument**, exactly as the
     // element type is: a `[3]int` matches `[N]T` at `N = 3` and `T = int`, and the block's members
     // are instantiated from that pair the way a slice's are from one.
@@ -484,6 +490,27 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
    * a trait declares no generic method — so the case is reported rather than answered with a name
    * built from too few arguments.
    */
+  /** Whether a member was reached on a **read-only** slice through the block written for every
+   * slice — which is the one case where the key a member was found under says less about the
+   * receiver than the receiver does.
+   *
+   * `shapeOwners` files both views under `[]` on purpose: a block written for `[]T` is written
+   * against what a slice is, and whether this one may be written through is not part of that. What
+   * that leaves is a block whose `self` is spelled `[]T` and a receiver that is a `[]const T`, and
+   * the two are reconciled here rather than at the call — the block is made real at the receiver's
+   * own view, so a body that writes through `self` is refused where it writes and a body that only
+   * reads is simply callable. Before this it was neither: the bound was satisfied and the member
+   * could not be called, which is `[]const u8` — the commonest slice in the language — unable to
+   * reach the `Display` it conforms to.
+   *
+   * Asked of the **key** rather than of the type alone, so a written-out `impl Display for []const
+   * int` is untouched: its members are filed under its own key and are already at the view they were
+   * written for.
+   */
+  protected def viewedConst(ty: Type, key: String): Boolean = key == Type.Slice.shape && (ty match
+    case Type.Slice(_, readOnly) => readOnly
+    case _                       => false)
+
   protected def memberFuncName(ty: Type, mname: String): String = {
     val (base, targs) = memberKey(ty, mname)
 
@@ -491,7 +518,7 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
       case Some(fd) if fd.tparams.length > targs.length =>
         err(s"'$mname' has type parameters of its own, so ${show(ty)} alone does not say which " +
           "instantiation is meant — call it, and the arguments will")
-      case Some(fd) => instantiateFunc(fd, targs)
+      case Some(fd) => instantiateFunc(fd, targs, constSelf = viewedConst(ty, base))
       case None     => s"${Type.memberSymbol(memberReceiverType(ty, mname))}.$mname"
   }
 
