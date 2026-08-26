@@ -32,28 +32,6 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
 
   private def sections(out: String): List[String] = out.linesIterator.filter(_.startsWith("--")).toList
 
-  // Everything this one checks was computed by somebody else: the fixtures came out of a different
-  // encoder and the checksum vectors are the published ones, which is the only way a decoder's
-  // tests mean anything.
-  "png — the byte level" in {
-    val out = guide("png")
-
-    out should not include "FAIL"
-    // 82 rather than the 84 this once had: `decode` sizes its own intermediate buffers now, so the
-    // two checks that made a caller supply one too small have nothing left to provoke.
-    checks(out) shouldBe 82
-    sections(out) shouldBe List(
-      "-- checksums",
-      "-- deflate",
-      "-- streams the decoder refuses",
-      "-- headers",
-      "-- pixels",
-      "-- filters",
-      "-- chunks",
-      "-- files the reader refuses",
-    )
-  }
-
   // The one program whose subject is the checking rather than the computing: two implementations of
   // the same buffer, one keeping where the elements end and one computing it, driven through every
   // scenario side by side and required to agree. What this run cannot do is break a contract — a

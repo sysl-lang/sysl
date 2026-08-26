@@ -11,7 +11,7 @@ next compiler change.
 Run one directly:
 
 ```
-sbt "syslJVM/run run guide/png"
+sbt "syslJVM/run run guide/ring"
 ```
 
 Each directory is a **project root**, so the files in it are the anonymous root module and any
@@ -56,7 +56,6 @@ contract.
 
 | directory | axis it owns |
 |---|---|
-| `png` | the byte level — endianness, bit streams, checksums, a format someone else defined |
 | `ring` | the constrained-subtype surface — range types, their `::` attributes, contracts, struct invariants, and a loop's termination measure |
 | `slab` | raw storage — reinterpreting bytes as a typed pointer, `sizeof`/`alignof`, and a free list threaded through the free blocks themselves |
 
@@ -92,3 +91,9 @@ program written on top of an undecided finding spends its budget rediscovering i
 rather than kept for the coverage — the code goes to a package where it can be used, or to the
 standard library, or nowhere. What the set is for is the friction, and a program nothing is learning
 from any more is only a tree to keep green.
+
+Two of them are packages in the org rather than gone: `guide/fft` is
+[`fft`](https://github.com/sysl-lang/fft), generic over its float width rather than fixed at one, and
+`guide/png` is [`png`](https://github.com/sysl-lang/png), whose CRC table had to stop being module
+storage before it could go on a board. Both had to change to be depended on, which is the difference
+between a program written to find something out and one written to be used.

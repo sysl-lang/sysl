@@ -66,7 +66,7 @@ To see the language run end to end — source, through the compiler, to a native
 the guide programs:
 
 ```bash
-sbt "syslJVM/run run guide/png"
+sbt "syslJVM/run run guide/ring"
 ```
 
 Anything after a `--` goes to the program rather than to sysl, which is what a `main(args: []string)`
