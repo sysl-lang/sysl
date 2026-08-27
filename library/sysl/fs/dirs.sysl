@@ -104,6 +104,18 @@ make_dir_all(path: string) -> Result[unit, IoError]
         Err(e) -> Err(e)
 end make_dir_all
 
+// **`remove_dir_all` is posix-only and `make_dir_all` above it is not**, which looks arbitrary and
+// is the one call each needs that the other does not. `make_dir_all` climbs with `sysl.path.parent`
+// and asks `exists` and `make_dir`, all of which every target has. `remove_dir_all` has to know
+// whether an entry is a symbolic link *without following it*, and the only reading in the library
+// that answers that is `link_metadata` -- which `meta.sysl` gates on `posix`, because a Windows
+// reading of a filesystem entry is a different struct rather than the same one with fields missing.
+//
+// Following the link instead is not an option worth taking to keep the function portable: the whole
+// point of the test is that a link pointing out of the tree is unlinked rather than walked into, so
+// a version without it deletes things nobody asked it to.
+#if posix
+
 /** A directory and everything under it removed.
  *
  * **The walk is post-order** -- a directory is emptied before it is taken -- because `rmdir` refuses
@@ -130,6 +142,8 @@ remove_dir_all(path: string) -> Result[unit, IoError]
 
     remove_dir(path)
 end remove_dir_all
+
+#endif
 
 /** A C call that reports success as zero. */
 private told(rc: int) -> Result[unit, IoError] = if rc != 0 then Err(why()) else Ok(())
