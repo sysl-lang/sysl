@@ -121,8 +121,18 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * `Display`: nine tests, four for the slice and the array in the root module's own file and five
    * for the buffer. The measurement above reads 457 and the runner agrees, which is what says the
    * nine are collected rather than that nothing vanished.
+   *
+   * Raised to **467** when `sysl.io` gained `read_all`, `read_all_text` and `read_exact` — the
+   * whole-stream reads the surface was missing — with eight tests in the module's **first** test
+   * file of its own. Every one of them is really about a reader that answers *short*, which is what
+   * a pipe with one write in it, a socket and a terminal all do, and is the case a hand-rolled loop
+   * gets wrong; `bytes_reader_at_most` is the fixture that poses it.
+   *
+   * **Two of the ten were drift again, and that is the fifth time.** The measurement read 467 with
+   * eight added, so the tree was at 459 against a floor of 457 — from the two the `Buf`/`Eq` entry
+   * above says it took exactly. Taken exactly again here.
    */
-  private val floor = 457
+  private val floor = 467
 
   /** The library, compiled as a **test build of itself**.
    *
