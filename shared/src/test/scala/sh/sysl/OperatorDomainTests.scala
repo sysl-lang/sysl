@@ -83,6 +83,44 @@ class OperatorDomainTests extends AnyFreeSpec with CodegenSupport with RunSuppor
             |var k: u16 = 2
             |print(x << u8(k))""".stripMargin) shouldBe "4\n"
     }
+
+    /** The one pair with a meeting point, and so the one place "the same type" is reached rather
+      * than required: a `[]T` and a `[]const T` are one type with a bit, and the writable one is
+      * accepted wherever the read-only one is wanted.
+      *
+      * Until they were made to meet, the **order the pair was written in** decided whether it
+      * compiled — the first operand's type was taken and the second re-read at it, so the direction
+      * that happened to be safe worked and its mirror was refused for the same two values.
+      */
+    "except the two views of one slice, which meet at the read-only one" - {
+      val setup =
+        """var a = [1, 2, 3]
+          |var b = [1, 2, 3]
+          |val c: []const int = b[..]
+          |val w: []int = a[..]
+          |""".stripMargin
+
+      "with the read-only view on the left" in {
+        run(setup + "print(c == w)") shouldBe "true\n"
+      }
+
+      "and on the right, which is the half that was refused" in {
+        run(setup + "print(w == c)") shouldBe "true\n"
+      }
+
+      // Written as a slicing expression rather than as a name, since an expression can be re-read at
+      // a type it was not first given and a name cannot — so the pair had to be settled rather than
+      // one side adapted.
+      "however the writable side is spelled" in {
+        run(setup + "print(a[..] == c, c == a[..])") shouldBe "true true\n"
+      }
+
+      // Nothing about the meeting weakens what the bit is for: it is reached only when one operand
+      // is already read-only, so two writable views settle where they always did.
+      "while two writable views settle on the writable type as before" in {
+        run(setup + "print(a[..] == b[..])") shouldBe "true\n"
+      }
+    }
   }
 
   "a literal takes its type from its position, and a suffixed one never adapts" - {

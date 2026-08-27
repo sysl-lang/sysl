@@ -146,9 +146,28 @@ trait Literals extends TypeResolution {
    */
   private def firmest(operands: List[Expr], read: List[Option[TExpr]]): Option[Type] = {
     val pairs = operands.zip(read).collect { case (e, Some(t)) => (e, t) }
+    val taken = pairs.find((e, t) => !adaptable(e, t)).orElse(pairs.headOption).map((_, t) => Type.repr(t.ty))
 
-    pairs.find((e, t) => !adaptable(e, t)).orElse(pairs.headOption).map((_, t) => Type.repr(t.ty))
+    taken.map(meetViews(pairs.map(_._2.ty)))
   }
+
+  /** The two views of one slice, met at the read-only one — the only place a pair of operands has a
+   * type to settle on that neither of them wrote.
+   *
+   * Everywhere else `firmest` takes an operand's type as it stands, and it can, because sysl has no
+   * subtyping among concrete types to widen towards. A `[]T` and a `[]const T` are the exception the
+   * language already made: they are one type with a bit, and the writable one is accepted wherever
+   * the read-only one is wanted (`reference/arrays.md § []const T`). So the pair has a meeting point,
+   * and taking the first operand's type instead made **which order it was written in** decide whether
+   * it compiled — `c == a[..]` yes, `a[..] == c` no, for the same two values.
+   *
+   * The read-only view is the meeting point rather than a choice between them: it is the one either
+   * side converts to, and it is the one a comparison needs, since comparing reads.
+   */
+  private def meetViews(types: List[Type])(taken: Type): Type = taken match
+    case Type.Slice(elem, false) if types.contains(Type.Slice(elem, readOnly = true)) =>
+      Type.Slice(elem, readOnly = true)
+    case other => other
 
   /** Whether a value block's value is one of the forms that has **no type of its own** — the two
    * tiers `analyzeOperands` reads last, applied to a branch of an `if` or an arm of a `match`

@@ -307,12 +307,21 @@ trait PatternAnalysis extends TypeResolution {
     // unify them to. Diagnosed like an `if` with mismatched branches rather than collapsed to a
     // silent `unit`, which would hide the mistake. A value/unit mix is the "not every arm yields"
     // case and stays `unit`, exactly as an `if` with no `else` does.
-    val valueTys = reached.filterNot(_ == Type.Unit)
+    // The two views of one slice are the one pair of *known* types with a meeting point, and they
+    // meet at the read-only one — the same rule `join` gives an `if`'s branches and `meetViews`
+    // gives a pair of operands. Applied only where there were two to reconcile, so a lone `[]T` arm
+    // stays the writable view it was.
+    val yielded  = reached.filterNot(_ == Type.Unit)
+    val met      = yielded.map(Type.constView).distinct
+    val merged   = yielded.sizeIs > 1 && met.sizeIs == 1
+    val settled  = if merged then reached.map(Type.constView).distinct else reached
+    val valueTys = if merged then met else yielded
+
     if valueTys.size > 1 then
       err(s"match arms have different types: ${valueTys.map(show).mkString(" and ")}")
     val valueTy =
-      if reached.isEmpty then Type.Never
-      else if reached.size == 1 && reached.head != Type.Unit then reached.head
+      if settled.isEmpty then Type.Never
+      else if settled.size == 1 && settled.head != Type.Unit then settled.head
       else Type.Unit
 
     // An enum match is checked wherever it stands, because falling off the end of one has no

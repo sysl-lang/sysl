@@ -320,20 +320,17 @@ class ImplShapeRunTests extends AnyFreeSpec with RunSupport {
       ) shouldBe "true\n[97, 98]\nthrough\n"
     }
 
-    // An operator, which reaches the same block by another road: `==` binds `Self` from the left
-    // operand, so a read-only view on the left dispatches at the read-only instance and the writable
-    // view on the right converts into it.
-    //
-    // The other operand order — `a[..] == c` — is refused, and that is a defect of its own rather
-    // than of this rule: nothing widens the *left* operand, so which order compiles depends on which
-    // side happened to be read-only. It was refused at 0.0.82 too, before any of this. Card `0303`.
-    "and an operator, where the read-only view is the left operand" in {
+    // An operator, which reaches the same block by another road: a pair of operands meets at the
+    // read-only view where one of them is read-only, so `==` dispatches at the read-only instance
+    // whichever side the const view was written on. The meeting itself is
+    // `OperatorDomainTests`; what is claimed here is that what it meets at has a member to call.
+    "and an operator, in either order" in {
       run(
         """var a = [1, 2, 3]
           |var b = [1, 2, 3]
           |val c: []const int = b[..]
-          |print(c == a[..])""".stripMargin,
-      ) shouldBe "true\n"
+          |print(c == a[..], a[..] == c)""".stripMargin,
+      ) shouldBe "true true\n"
     }
 
     // A slice of a type the program declared, to show the covering is not a special case for the

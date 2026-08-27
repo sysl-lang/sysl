@@ -146,6 +146,48 @@ class BranchTypingTests extends AnyFreeSpec with RunSupport with CodegenSupport 
     }
   }
 
+  /** The one pair of *known* types that has a meeting point, and so the one exception to the section
+    * below: a `[]T` and a `[]const T` are one type with a bit, not two types, and the writable one
+    * is accepted wherever the read-only one is wanted.
+    *
+    * They meet at the read-only view, which is the only view either side converts to. Without it the
+    * form's type depended on **which branch was written first** — the same defect a pair of operands
+    * had, and `OperatorDomainTests` is where that half is pinned.
+    */
+  "two views of one slice meet at the read-only one" - {
+    val setup =
+      """var a = [1, 2, 3]
+        |var b = [1, 2, 3]
+        |val c: []const int = b[..]
+        |""".stripMargin
+
+    "however the branches are ordered" in {
+      run(setup +
+        """val j = if a.len > 0 then a[..] else c
+          |val k = if a.len > 0 then c else a[..]
+          |print(j.len, k.len)
+          |""".stripMargin) shouldBe "3 3\n"
+    }
+
+    // The result is the read-only view, not the writable one, which is what makes the meeting safe
+    // rather than a way of laundering a `[]const T` into a `[]T`.
+    "and the result may not be written through" in {
+      err(setup +
+        """var j = if a.len > 0 then a[..] else c
+          |j[0] = 9
+          |""".stripMargin) should include("views elements it may not write")
+    }
+
+    "a match settles the same way" in {
+      run(setup +
+        """val k = a.len match
+          |    0 -> c
+          |    else a[..]
+          |print(k.len)
+          |""".stripMargin) shouldBe "3\n"
+    }
+  }
+
   "what the rule does not do" - {
     // The property the refusal exists for: neither side is silently decided by the other, because
     // both of them arrived with an opinion.

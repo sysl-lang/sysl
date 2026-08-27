@@ -740,6 +740,12 @@ trait DeclTables extends Reporting {
     // Two transparent-compatible types — a subtype and its base, or two subtypes over one base —
     // meet at that base, since either may stand where the base is asked for.
     else if Type.repr(a) == Type.repr(b) then Some(Type.repr(a))
+    // The two views of one slice, which are one type with a bit and not two types: the writable one
+    // is accepted wherever the read-only one is wanted, so the pair has a meeting point and it is
+    // the read-only one. This is the same rule `Literals.meetViews` applies to a pair of operands,
+    // and it is here for the reason it is there — without it, which branch of the `if` was written
+    // first decided whether the form had a type at all.
+    else if Type.constView(a) == Type.constView(b) then Some(Type.constView(a))
     else None
 
   protected def show(t: Type): String = Type.show(t)
