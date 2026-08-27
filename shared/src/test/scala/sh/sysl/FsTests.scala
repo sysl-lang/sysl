@@ -650,6 +650,27 @@ class FsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |    print(Other(99), Other(99).code())""".stripMargin,
       ) shouldBe "no such file or directory\nno such file or directory 2\nerror 99 99\n"
     }
+
+    /** **A variant is a name of its module, reached unqualified** — so a second enum here naming one
+      * `Other` or `File` would give the older name a second answer, and an ordinary use of it becomes
+      * ambiguous one program away. Neither is refused at the declaration, which is what makes this a
+      * test rather than something the compiler catches: `Kind` was written with `File` and `Other`
+      * and both were found by a program that had never heard of it.
+      *
+      * `Kind` is `Regular` and `Special` for that reason, and this is what says the two names it gave
+      * up still mean what they meant.
+      */
+    "and a name this module already had is not taken by a later enum's variant" in {
+      inDir(
+        """main(args: []string)
+          |    var f = create(args[1] + "/k").unwrap()      // 'File', the handle
+          |
+          |    f.close().unwrap()
+          |
+          |    print(metadata(args[1] + "/k").unwrap().kind())
+          |    print(Other(99).code())                      // 'Other', the IoError""".stripMargin,
+      ) shouldBe "file\n99\n"
+    }
   }
 
   /** The two things in the module that differ between the platforms, built for the platform this is

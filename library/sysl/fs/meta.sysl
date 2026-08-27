@@ -40,35 +40,43 @@ private const s_iflnk: u32 = 0o120000
 
 /** What a filesystem entry is, beside what is in it.
  *
- * The three a program branches on are named and everything else is `Other` carrying the raw type
+ * The three a program branches on are named and everything else is `Special` carrying the raw type
  * bits, for the same reason `IoError` names ten codes and carries the rest: a table of every device
  * flavour is one nobody could keep current, and a program that genuinely cares about a socket is
- * already reading the number.
+ * already reading the number. `Special` is POSIX's own word for what is left -- a fifo, a socket, a
+ * character or block device.
+ *
+ * **`Regular` rather than `File`, and `Special` rather than `Other`, and both are about COLLISION
+ * rather than about taste.** A variant is a name of its module, reached unqualified, so `File` here
+ * would be a second answer for the name `sysl.fs.File` -- the open-file handle, which is what a
+ * program means by it -- and `Other` a second answer for `IoError.Other`, which every program
+ * matching on a filesystem error already writes bare. Neither is refused at the declaration; both
+ * make an ordinary use of the older name ambiguous, one program away.
  */
 enum Kind
-    File
+    Regular
     Directory
     Symlink
-    Other(bits: u32)
+    Special(bits: u32)
 
-    /** So that `k == Directory` reads as itself. `Other` carries a payload, so this cannot be the
+    /** So that `k == Directory` reads as itself. `Special` carries a payload, so this cannot be the
      * free discriminant comparison a bare enum gets.
      */
     is_dir(self) -> bool = self match
         Directory -> true
         _ -> false
 
-    /** The word for what this is. `Other` renders the type bits in octal, which is the notation
+    /** The word for what this is. `Special` renders the type bits in octal, which is the notation
      * every `stat(2)` page writes them in and the one a reader can look up.
      */
     name(self) -> string = self match
-        File -> "file"
+        Regular -> "file"
         Directory -> "directory"
         Symlink -> "symbolic link"
-        Other(bits) -> f"other ($bits%#o)"
+        Special(bits) -> f"special ($bits%#o)"
 end Kind
 
-/** So that a kind prints as the word rather than as a number, and `Other` says what it is carrying:
+/** So that a kind prints as the word rather than as a number, and `Special` says what it is carrying:
  * a program reporting what it found in a directory has one thing to print, and the alternative is a
  * `match` at every such site.
  */
@@ -77,8 +85,8 @@ impl Display for Kind
 
 impl Eq for Kind
     eq(self, other: Kind) -> bool = self match
-        File -> other match
-            File -> true
+        Regular -> other match
+            Regular -> true
             _ -> false
         Directory -> other match
             Directory -> true
@@ -86,8 +94,8 @@ impl Eq for Kind
         Symlink -> other match
             Symlink -> true
             _ -> false
-        Other(a) -> other match
-            Other(b) -> a == b
+        Special(a) -> other match
+            Special(b) -> a == b
             _ -> false
 end Kind
 
@@ -140,10 +148,10 @@ struct Meta
     kind(self) -> Kind
         val t = self.mode & s_ifmt
 
-        if t == s_ifreg then File
+        if t == s_ifreg then Regular
         elif t == s_ifdir then Directory
         elif t == s_iflnk then Symlink
-        else Other(t)
+        else Special(t)
 
     /** The permission bits alone -- the low twelve, which are the nine `rwx` plus setuid, setgid and
      * the sticky bit. This is what `set_permissions` takes, so the two are a round trip.
