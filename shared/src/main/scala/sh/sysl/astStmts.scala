@@ -548,6 +548,11 @@ case class FuncDecl(
       * second one.
       */
     crossing: List[String] = Nil,
+    /** `@needs(…)` — the capabilities reaching this declaration requires (`reference/modules.md § A
+      * declaration may name what reaching it needs`). See `Attr.Needs` for why it is a different
+      * word from the file header's `@requires(…)`.
+      */
+    needs: List[String] = Nil,
 ) extends Stmt
 
 /** What `@export` says about the function it is written above (`reference/ffi.md § @export`).
@@ -654,6 +659,25 @@ enum Attr(val word: String) {
     * written twice is refused at its second position.
     */
   case Crossing(names: List[String]) extends Attr("crossing")
+
+  /** `@needs(heap)`, `@needs(os, posix)` — the capabilities reaching this **declaration** requires
+    * (`reference/modules.md § A declaration may name what reaching it needs`).
+    *
+    * **It is a different statement from the file header's `@requires(...)`, which is why it is a
+    * different word.** A file's clause is about the **module**: it cannot be built at all without
+    * the capability, and it is checked once, against the target. This is about one declaration:
+    * reaching it needs the capability, and it is checked at the **call**, in the caller's module,
+    * where the line a reader can change is. A module too coarse for the question is the whole reason
+    * the finer form exists — `@requires(heap)` written on `sysl` would say something false about
+    * most of it.
+    *
+    * **It is what an `extern` had no way to say.** Every other declaration has a body the compiler
+    * reads: a function that makes heap storage is found by looking, which is what `NoAlloc` does. An
+    * `extern` is a name and a signature, so a module that gave up an environment capability could
+    * reach `open()` straight through one — and the only thing that could ever close that is the
+    * declaration saying so itself.
+    */
+  case Needs(caps: List[String]) extends Attr("needs")
 }
 
 /** `extern name(params) -> ret` — a function this program does not define but may call, resolved
@@ -676,7 +700,12 @@ enum Attr(val word: String) {
  */
 case class ExternDecl(name: String, params: List[Param], retType: Option[TypeRef],
                       variadic: Boolean = false, link: Option[String] = None,
-                      vis: Visibility = Visibility.Public) extends Stmt:
+                      vis: Visibility = Visibility.Public,
+                      /** `@needs(…)` — the capabilities calling this requires. It is the declaration
+                        * that had no other way to say so: an `extern` is a name and a signature, and
+                        * there is no body for the compiler to read the answer out of.
+                        */
+                      needs: List[String] = Nil) extends Stmt:
   /** The symbol the linker resolves this to. */
   def symbol: String = link.getOrElse(name)
 

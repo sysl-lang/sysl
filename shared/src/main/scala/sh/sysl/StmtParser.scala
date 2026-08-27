@@ -238,12 +238,47 @@ trait StmtParser
             case Visibility.Public ~ (f: FuncDecl) => attributed(f, as)
             case v ~ (f: FuncDecl)                 => restrict(v, attributed(f, as))
             case _ ~ other                         => other
-          } | err(
-            "an annotation marks a function, and only a function — neither what 'sysl test' calls " +
-              "nor what recurses is anything a declaration of another kind supplies. '@packed', " +
-              "'@align(n)' and '@export(\"...\")' are the three that mark a struct instead",
+          } | externNeeds(as) | err(
+            (if as.forall(needsCap) then
+               "'@needs(...)' names what reaching a declaration requires, so it marks a function or " +
+                 "an 'extern' — and this declares neither"
+             else
+               "an annotation marks a function, and only a function — neither what 'sysl test' calls " +
+                 "nor what recurses is anything a declaration of another kind supplies. '@packed', " +
+                 "'@align(n)' and '@export(\"...\")' are the three that mark a struct instead"),
           )
     }
+
+  /** An `extern` carrying `@needs(...)`, which is the one annotation it may take
+   * (`reference/modules.md § A declaration may name what reaching it needs`).
+   *
+   * **It is the declaration the annotation exists for.** Every other declaration has a body the
+   * compiler reads — a function that makes heap storage is found by looking — and an `extern` is a
+   * name and a signature, so nothing but the declaration itself can say what calling it costs.
+   *
+   * Nothing else may stand above one, and the alternative declines rather than refusing so that
+   * whichever sentence the caller wrote is the one reported: `@pure` above an `extern` is a claim
+   * about a body that is not here, and that is the refusal already written for it.
+   */
+  private def externNeeds(as: List[Attr]): PackratParser[Stmt] =
+    if !as.forall(needsCap) then failure("not an extern's annotation")
+    else
+      (visibility ~ externDecl) ^^ {
+        case Visibility.Public ~ (e: ExternDecl) => e.copy(needs = capabilitiesOf(as)).setPos(e.pos)
+        case v ~ (e: ExternDecl)                 => restrict(v, e.copy(needs = capabilitiesOf(as)).setPos(e.pos))
+        case _ ~ other                           => other
+      }
+
+  /** Whether an attribute is `@needs(...)`, which is the one an `extern` may carry. */
+  private def needsCap(a: Attr): Boolean = a match
+    case _: Attr.Needs => true
+    case _             => false
+
+  /** The capabilities a set of attributes names, flattened — one `@needs` per declaration is what
+   * `duplicated` already enforces, so this is a list of at most one attribute's worth.
+   */
+  private def capabilitiesOf(as: List[Attr]): List[String] =
+    as.collect { case Attr.Needs(cs) => cs }.flatten
 
   /** A struct carrying `@export("…")`, and — where that is the only annotation above it — a function
    * carrying it instead.

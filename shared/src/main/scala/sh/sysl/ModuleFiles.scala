@@ -21,6 +21,7 @@ trait ModuleFiles
     with ConventionCheck
     with ExportCheck
     with NoAlloc
+    with DeclCapabilities
     with Purity
     with Frames
     with TestScope

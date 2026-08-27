@@ -69,7 +69,7 @@ object AstCodec {
    * conflict**, and that is the case the rule above is written for: read dev's number, take the one
    * after it, and do not assume a clean merge means the versions agree.
    */
-  val Version: Int = 47
+  val Version: Int = 48
 
   private val Magic = "sysl-ast"
 
@@ -406,7 +406,7 @@ object AstCodec {
         case Variant(e)                   => tok("vnt"); expr(e)
 
         case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, tvs, tpk, t, cv, tr, pu, gh, rd, wr, ex, sc,
-                      cr) =>
+                      cr, nd) =>
           tok("fn"); sref(n); list(tps)(sref); list(ps)(param); opt(rt)(typ); list(b)(stmt)
           bounds(bs); bool(va); vis(vs); tdefaults(tds); tdefaults(tvs); list(tpk.toList)(sref)
           opt(t)(testAttr)
@@ -425,9 +425,15 @@ object AstCodec {
           // an artifact is read for are in the consumer. A declaration that dropped it would be the
           // same signature with the rule silently off for everybody but the library's own tests.
           list(cr)(sref)
+          // `@needs` travels for the reason `@crossing` does, and more sharply: the check it asks
+          // for is made at the **call**, and the calls an artifact is read for are all in the
+          // consumer. A declaration that dropped it would be a capability requirement that held
+          // inside the library and nowhere else.
+          list(nd)(sref)
 
-        case ExternDecl(n, ps, rt, va, lk, vs) =>
+        case ExternDecl(n, ps, rt, va, lk, vs, nd) =>
           tok("ext"); sref(n); list(ps)(param); opt(rt)(typ); bool(va); opt(lk)(sref); vis(vs)
+          list(nd)(sref)
 
         case ExternVarDecl(n, t, lk, vs) =>
           tok("extv"); sref(n); typ(t); opt(lk)(sref); vis(vs)
@@ -841,9 +847,9 @@ object AstCodec {
             bounds(), bool(), vis(), tdefaults(), tdefaults(), list(sref()).toSet, opt(testAttr()),
             opt(at(CallConv(sref(), opt(sref())))), bool(), bool(), bool(),
             opt(list(sref())), opt(list(sref())), opt(at(ExportAttr(opt(sref())))), opt(sref()),
-            list(sref()))
+            list(sref()), list(sref()))
         case "ext" =>
-          ExternDecl(sref(), list(param()), opt(typ()), bool(), opt(sref()), vis())
+          ExternDecl(sref(), list(param()), opt(typ()), bool(), opt(sref()), vis(), list(sref()))
         case "extv" =>
           ExternVarDecl(sref(), typ(), opt(sref()), vis())
         case "sd" =>

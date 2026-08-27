@@ -452,6 +452,11 @@ trait ProgramWalk extends OpaqueResults {
     checkNoAlloc(allFuncs, abstractFuncs.toList, tvals.toList, vtables.values.toList, tmain, mainScope.module,
       tests.map(_.func).toSet)
 
+    // And what a declaration that wrote `@needs(...)` costs whoever reaches it — the same question
+    // one granularity down, asked of the same tree (`reference/modules.md § A declaration may name
+    // what reaching it needs`).
+    checkDeclCapabilities(allFuncs, tvals.toList, vtables.values.toList, tmain, mainScope.module)
+
     // And what a `@pure` function promised, asked of the same tree for the same reason
     // (`reference/verification.md § @pure`).
     checkPurity(allFuncs, externs)

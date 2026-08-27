@@ -409,7 +409,8 @@ trait Hoisting extends HoistMembers {
 
       if externVarDecls.contains(key) then
         duplicate(key, s"'${e.name}' is already declared as an 'extern' variable")
-      funcDecls(key) = FuncDecl(key, Nil, e.params, e.retType, Nil, variadic = e.variadic).setPos(e.pos)
+      funcDecls(key) = FuncDecl(key, Nil, e.params, e.retType, Nil, variadic = e.variadic,
+        needs = e.needs).setPos(e.pos)
       declScope(key) = currentScope
       recordAccess(key, e.vis)
       if libraryOffers(e, currentModule) && key == plain then libraryNames(e.name) = key

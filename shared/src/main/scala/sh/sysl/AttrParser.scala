@@ -16,7 +16,8 @@ trait AttrParser extends ExprParser {
    */
   protected lazy val attribute: PackratParser[Attr] =
     testAttr ^^ Attr.Test.apply | tailrecAttr | pureAttr | ghostAttr | readsAttr | writesAttr |
-      crossingAttr | packedAttr | alignAttr | exportAttr | sectionAttr | unknownAttr | hashAttr
+      crossingAttr | needsAttr | packedAttr | alignAttr | exportAttr | sectionAttr | unknownAttr |
+      hashAttr
 
   /** An `@` — or a `#` — where a member was wanted, which the four member blocks — a struct's body,
    * an enum's, a trait's and an `impl`'s — each open their lines with.
@@ -257,14 +258,38 @@ trait AttrParser extends ExprParser {
       "parentheses — '@crossing(state)'. There is no empty form: a function that hands nothing " +
       "across a boundary says so by not writing the annotation")
 
+  /** `@needs(heap)`, `@needs(os, posix)` — the capabilities reaching this declaration requires
+   * (`reference/modules.md § A declaration may name what reaching it needs`).
+   *
+   * Parenthesised and plural, exactly as the file header's `@requires(...)` is and for the same
+   * reason: a declaration needs several capabilities at once and gives none up. **What the two
+   * spellings buy is that neither can be read as the other** — a file header is a prefix of the
+   * file, so an `@requires` written above the first declaration would be the file's whatever the
+   * writer meant, and nothing in the grammar could tell. Two words, two positions, one meaning
+   * each.
+   *
+   * The list is raised **inside** the parentheses, per the dead-`err` rule: a sentence written past
+   * the point of divergence is outranked by whichever alternative got further along the line.
+   */
+  protected lazy val needsAttr: PackratParser[Attr] =
+    op("@") ~> attrWord("needs") ~> (op("(") ~> (needsNames | needsErr) <~ op(")") | needsErr)
+
+  private lazy val needsNames: Parser[Attr] =
+    rep1sep(ident, op(",")) ^^ Attr.Needs.apply
+
+  private def needsErr: Parser[Attr] =
+    err("'@needs' names the capabilities reaching this declaration requires, in parentheses — " +
+      "'@needs(heap)', '@needs(os, posix)'. There is no empty form: a declaration that needs " +
+      "nothing beyond what its module has says so by not writing the annotation")
+
   private lazy val unknownAttr: PackratParser[Attr] =
     op("@") ~> ident >> (n =>
       err(s"'$n' is not an annotation a declaration takes — '@test', '@tailrec', '@pure', " +
         "'@ghost', '@export', '@reads(...)', '@writes(...)' and '@crossing(...)' mark a function, " +
         "'@packed' and " +
         "'@align(n)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C " +
-        "header, and '@section(\"...\")' marks either a binding or a " +
-        "function. '@no_<capability>', " +
+        "header, '@section(\"...\")' marks either a binding or a " +
+        "function, and '@needs(...)' marks a function or an 'extern'. '@no_<capability>', " +
         "'@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header"))
 
   /** `#test` where `@test` was meant — the sigil a reader arriving from Rust or C reaches for first.
@@ -325,6 +350,7 @@ trait AttrParser extends ExprParser {
       // is storage placed somewhere.
       case (d, Attr.Section(s)) => d.copy(section = Some(s))
       case (d, Attr.Crossing(ns)) => d.copy(crossing = ns)
+      case (d, Attr.Needs(cs))    => d.copy(needs = cs)
       // A layout attribute never reaches here: the grammar routes a declaration carrying one to a
       // struct, and refuses the mix. Listed so that a new attribute makes this fold fail to compile
       // rather than silently drop what it was asked to record.
