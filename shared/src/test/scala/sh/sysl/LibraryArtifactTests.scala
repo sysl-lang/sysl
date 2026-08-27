@@ -337,13 +337,17 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
           case Left(err)    => fail(err)
 
       val exe = createTempFile("sysl-test-", "")
-      val ran = Toolchain.build(emitted.ir, exe, Target.default, objects, links = emitted.links).map { _ =>
+      // The library's own C goes on the line too: a hosted program's entry point calls into it
+      // (`Codegen.genStackGuard`), so the sysl half alone is not a program.
+      val cs  = StdNative.objects()
+      val ran = Toolchain.build(emitted.ir, exe, Target.default, objects ::: cs, links = emitted.links).map { _ =>
         val r = exec(List(exe))
 
         (r.exitCode, r.stdout)
       }
 
       objects.foreach(deleteFile)
+      StdNative.clean(cs)
       deleteFile(exe)
       ran shouldBe Right((0, "1\n3\n2\n"))
     }
@@ -470,13 +474,15 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
       case Left(err)    => fail(err)
 
     val exe = createTempFile("sysl-test-", "")
+    val cs  = StdNative.objects()
     val ran =
-      Toolchain.build(emitted.ir, exe, Target.default, List(obj), links = emitted.links).map { _ =>
+      Toolchain.build(emitted.ir, exe, Target.default, obj :: cs, links = emitted.links).map { _ =>
         val r = exec(List(exe))
         (r.exitCode, r.stdout)
       }
 
     deleteFile(obj)
+    StdNative.clean(cs)
     deleteFile(exe)
     (emitted.ir, ran)
   }

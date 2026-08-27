@@ -322,11 +322,34 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
    * is what lets a declared `main(args: []string)` be handed a slice: the pair is converted by an
    * ordinary library call, and neither `argc` nor `argv` appears in a sysl signature anywhere.
    */
+  /** Installs the handler that says *why* a program that ran out of stack stopped, and recovers what
+   * it had already printed (`library/sysl/__posix__/stackguard.c`).
+   *
+   * **It is the first thing the program does**, before the module's storage is filled and before any
+   * statement runs — a fault during initialization is exactly as unexplained as one later, and a
+   * guard installed after the thing it guards is a guard for the second half of the program.
+   *
+   * **Only where the machine has signals.** The C sits in a `__posix__` directory, so it is neither
+   * compiled nor linked for a freestanding target; emitting the call there would be a reference to a
+   * symbol nothing defines. A `build-c` archive reaches none of this either, having no entry point:
+   * what a project links its own `main` to is that project's business.
+   *
+   * The symbol is spelled here rather than reached through a library declaration because there is
+   * nothing in sysl for it to be: no program calls it, so a declaration would be a name with no use
+   * and `Reachability` would drop the archive member it names.
+   */
+  private def genStackGuard(): Unit =
+    if target.os.inherentCapabilities.contains(Capability.Posix) then
+      satDecls += ir.FuncSig(Codegen.StackGuardSymbol, ir.FnType(LType.Void, Nil))
+      emit(Inst.Call(None, LType.Void, Val.Global(Codegen.StackGuardSymbol), Nil))
+
   private def genMain(vals: List[TVal], stmts: List[TStmt], entry: Option[TEntry]): ir.Func = {
     startFunction()
     promoted = promotions(None)
     pushTemps()
     pushOwned()
+
+    genStackGuard()
 
     for v <- vals if v.computed; init <- v.init do
       pushTemps()
@@ -867,6 +890,12 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 }
 
 object Codegen {
+
+  /** The C function a hosted program calls first: the SIGSEGV/SIGBUS handler that tells an
+    * overflowed stack from a wild pointer, and flushes what the program had already printed.
+    * Its definition is `library/sysl/__posix__/stackguard.c`.
+    */
+  val StackGuardSymbol = "sysl_install_stack_guard"
 
   /** Lowers a typed program to a module, for a given machine (`getting-started/cli.md § targets`)
    * and from a given heap (`reference/packages.md § One heap, and the package that names it`).

@@ -474,9 +474,15 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
     "and the build for this machine is not disturbed by stating it" in {
       assume(Toolchain.clangAvailable, "clang not available")
 
+      // The library's own C goes on the line because a hosted program's entry point calls into it
+      // (`Codegen.genStackGuard`) — a link of the sysl half alone is not a link of a program.
+      val cs = StdNative.objects()
+
       Target.host.foreach { t =>
-        Toolchain.build(irFor(t, "print(1)"), "/tmp/sysl-host-target-test", t) shouldBe Right(())
+        Toolchain.build(irFor(t, "print(1)"), "/tmp/sysl-host-target-test", t, objects = cs) shouldBe Right(())
       }
+
+      StdNative.clean(cs)
     }
   }
 

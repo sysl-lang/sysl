@@ -1,5 +1,6 @@
 package sh.sysl
 
+import io.github.edadma.cross_platform.*
 import org.scalatest.Assertions
 import org.scalatest.matchers.should.Matchers
 

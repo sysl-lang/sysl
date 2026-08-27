@@ -599,12 +599,13 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
       val program = "print(1)\nprint(\"two\")\nprint(3.5)\nprint(true)\n"
       val obj     = createTempFile("sysl-std-", ".o")
       val exe     = createTempFile("sysl-std-", "")
+      val cs      = StdNative.objects()
 
       Toolchain.compileObject(artifact._1, obj, Target.default) match
         case Left(err) => fail(s"the standard module library did not assemble: $err")
         case Right(_)  => ()
 
-      val ran = Toolchain.build(linked(program), exe, Target.default, List(obj)).map { _ =>
+      val ran = Toolchain.build(linked(program), exe, Target.default, obj :: cs).map { _ =>
         val r = exec(List(exe))
 
         (r.exitCode, r.stdout)
@@ -612,6 +613,7 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
 
       deleteFile(obj)
       deleteFile(exe)
+      StdNative.clean(cs)
       ran shouldBe Right((0, "1\ntwo\n3.5\ntrue\n"))
     }
 
@@ -649,12 +651,13 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
 
       val obj = createTempFile("sysl-std-", ".o")
       val exe = createTempFile("sysl-std-", "")
+      val cs  = StdNative.objects()
 
       Toolchain.compileObject(artifact._1, obj, Target.default) match
         case Left(err) => fail(s"the standard module library did not assemble: $err")
         case Right(_)  => ()
 
-      val ran = Toolchain.build(linked(program), exe, Target.default, List(obj)).map { _ =>
+      val ran = Toolchain.build(linked(program), exe, Target.default, obj :: cs).map { _ =>
         val r = exec(List(exe))
 
         (r.exitCode, r.stdout)
@@ -662,6 +665,7 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
 
       deleteFile(obj)
       deleteFile(exe)
+      StdNative.clean(cs)
       ran shouldBe Right((0, "2023-11-05 06:30 Z\n"))
     }
 
@@ -676,12 +680,13 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
 
       val obj = createTempFile("sysl-std-", ".o")
       val exe = createTempFile("sysl-std-", "")
+      val cs  = StdNative.objects()
 
       Toolchain.compileObject(artifact._1, obj, Target.default) match
         case Left(err) => fail(s"the standard module library did not assemble: $err")
         case Right(_)  => ()
 
-      Toolchain.build(linked("print(1)\n"), exe, Target.default, List(obj)) match
+      Toolchain.build(linked("print(1)\n"), exe, Target.default, obj :: cs) match
         case Left(err) => fail(s"the program did not link: $err")
         case Right(_)  => ()
 
@@ -693,6 +698,7 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
 
       deleteFile(obj)
       deleteFile(exe)
+      StdNative.clean(cs)
 
       // Skipped rather than failed where there is no `nm`: this asserts something about the
       // platform's linker, and a machine that cannot list symbols cannot be asked about it.
