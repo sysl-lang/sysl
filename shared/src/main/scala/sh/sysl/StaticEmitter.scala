@@ -66,8 +66,21 @@ trait StaticEmitter extends StringEmitter {
     case TFloatLit(bits, ty) => constantFloat(bits, ty)
     case TArrayLit(elems, arrayTy) =>
       ir.Val.Array(elems.map(e => ir.Arg(arrayTy.elem.lty, constantValue(e))))
+    // **`[0; N]` is one word, not N of them.** `zeroinitializer` is what LLVM takes for an
+    // aggregate whose every bit is zero, at any element type, and writing the elements out instead
+    // is correct and costs the whole array in the module's text — a 16 MiB byte array became a
+    // 100 MB `.ll`, which the linker then folded straight back into a zerofill section. So the
+    // whole of that size was paid in compiling and none of it reached the binary: builds went
+    // 2.4 s at 1 MiB, 3.9 s at 4 and 12.6 s at 16, for an output that never grew.
+    //
+    // A fill of anything *else* genuinely needs its N elements, because an array has no splat form
+    // the way a vector does — so the test is on the value rather than on the shape, and the
+    // element's constant is computed once here rather than once per element by `List.fill`.
     case TArrayFill(value, arrayTy) =>
-      ir.Val.Array(List.fill(arrayTy.length)(ir.Arg(arrayTy.elem.lty, constantValue(value))))
+      val elem = constantValue(value)
+
+      if isZero(elem) then ir.Val.Zero
+      else ir.Val.Array(List.fill(arrayTy.length)(ir.Arg(arrayTy.elem.lty, elem)))
 
     // Three words naming bytes that are never freed. The owner is null, which is what makes the
     // whole value a constant expression rather than something a prologue has to build — and what
@@ -93,6 +106,23 @@ trait StaticEmitter extends StringEmitter {
     case TNullLit(ty) => if ty.lty == ir.LType.Ptr then ir.Val.Null else ir.Val.Zero
 
     case other => sys.error(s"unreachable constant ${other.getClass.getSimpleName}")
+
+  /** Whether a constant is every bit zero, which is the one thing `zeroinitializer` may stand for.
+   *
+   * A float is zero at bit pattern zero alone, so `-0.0` — whose sign bit is set — is correctly not
+   * one: it is a different value, and an array of it is an array LLVM has to be told about. An
+   * aggregate is zero when all of its members are, which is what makes `[Point(0, 0); N]` and a
+   * fill of the empty string reach the one-word form as well.
+   */
+  private def isZero(v: ir.Val): Boolean = v match
+    case ir.Val.Int(n)     => n == 0
+    case ir.Val.Bool(b)    => !b
+    case ir.Val.Float(bits) => bits == 0
+    case ir.Val.Null       => true
+    case ir.Val.Zero       => true
+    case ir.Val.Agg(fields) => fields.forall(f => isZero(f.value))
+    case ir.Val.Array(elems) => elems.forall(e => isZero(e.value))
+    case _                 => false
 
   /** A float constant at the width it is stored at.
    *

@@ -104,6 +104,51 @@ class IrModuleTests extends AnyFreeSpec with Matchers {
       case other                 => fail(s"@llvm.used is not an array of symbols: $other")
   }
 
+  /** A zero-filled array is one word, and the one that is not zero-filled is still N of them.
+   *
+   * **The size is paid entirely in compiling.** Writing `[0; N]` out element by element is correct
+   * — LLVM folds an all-zero global straight into a zerofill section, so the binary never grows —
+   * and it costs the whole array in the module's text on the way there. A 16 MiB byte array made a
+   * 100 MB `.ll`, and the build went from 2.4 s at 1 MiB to 12.6 s at 16 for an output that was
+   * identical. Found from `slate`, whose collected heap is exactly this declaration and which was
+   * capped at 16 MiB because of it.
+   *
+   * **Asserted on the model rather than on a size or a duration**, which is what makes it a test
+   * rather than a benchmark: `Val.Zero` is the one-word form and `Val.Array` is not, so the claim
+   * is about which of the two the global holds and nothing about how long anything took.
+   */
+  "a zero fill is one word of storage and a non-zero fill is still every element" in {
+    def storage(ty: String, init: String, lty: LType, len: Int): Option[Val] =
+      modules(List(
+        Source("m.sysl", s"module m\n\nvar cells: [$len]$ty = $init\n", List("m")),
+        Source("main.sysl", "print(m.cells[0])\n")))
+        .globals.find(_.ty == LType.Arr(len, lty)).flatMap(_.value)
+
+    // The whole point: 4096 elements, one word of initializer.
+    storage("u8", "[0u8; 4096]", LType.I(8), 4096) shouldBe Some(Val.Zero)
+
+    // An array has no splat form the way a vector does, so a fill of anything else genuinely needs
+    // its elements — the test is on the value being zero, not on the shape being a fill.
+    storage("u8", "[7u8; 4]", LType.I(8), 4) match
+      case Some(Val.Array(elems)) => elems.map(_.value) shouldBe List.fill(4)(Val.Int(7))
+      case other                  => fail(s"a non-zero fill collapsed to $other")
+  }
+
+  /** A float is zero at bit pattern zero alone, so `-0.0` is a different value and an array of it
+   * is an array LLVM has to be told about. The obvious spelling of the optimization — "the literal
+   * reads as zero" — gets this one wrong and silently changes what the program starts with.
+   */
+  "a fill of negative zero is not a zero fill" in {
+    val m = modules(List(
+      Source("m.sysl", "module m\n\nvar cells: [4]real = [-0.0; 4]\n", List("m")),
+      Source("main.sysl", "print(m.cells[0])\n")))
+
+    m.globals.find(_.ty == LType.Arr(4, LType.F(64))).flatMap(_.value) match
+      case Some(Val.Zero) => fail("'-0.0' was collapsed to zeroinitializer, which is a different value")
+      case Some(Val.Array(elems)) => elems.map(_.value).distinct.length shouldBe 1
+      case other                  => fail(s"unexpected initializer: $other")
+  }
+
   /** The interned bytes carry the terminator a C caller reads by, which a `string` — knowing its own
    * length — has never had a use for.
    *
