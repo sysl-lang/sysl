@@ -904,8 +904,9 @@ object Toolchain {
    * enough only while the driver carried one hardcoded library for every build.
    */
   private[sysl] def runIr(compiled: Either[String, Compiled], args: List[String],
-                          archives: List[String] = Nil): Either[String, (Int, String)] =
-    runIrFully(compiled, args, archives).map { case (code, out, _) => (code, out) }
+                          archives: List[String] = Nil,
+                          level: String = defaultOptimization): Either[String, (Int, String)] =
+    runIrFully(compiled, args, archives, level).map { case (code, out, _) => (code, out) }
 
   /** The same, keeping the two streams apart.
    *
@@ -916,12 +917,19 @@ object Toolchain {
    * concatenated them could not tell whether that had happened.
    */
   private[sysl] def runIrFully(compiled: Either[String, Compiled], args: List[String],
-                               archives: List[String] = Nil): Either[String, (Int, String, String)] =
+                               archives: List[String] = Nil,
+                               // **The level is a parameter because one feature's whole claim is
+                               // about it.** `become` promises a tail call LLVM has to make, and at
+                               // `-O1` the sibling-call pass makes one anyway — so a test that ran
+                               // only at the default would pass on a compiler that had never emitted
+                               // `musttail` at all.
+                               level: String = defaultOptimization)
+      : Either[String, (Int, String, String)] =
     compiled.flatMap { c =>
       val exe = createTempFile("sysl-", "")
 
       libraryObjects.flatMap { objects =>
-        build(c.ir, exe, Target.default, archives, defaultOptimization, c.links, objects).map { _ =>
+        build(c.ir, exe, Target.default, archives, level, c.links, objects).map { _ =>
           val result = exec(exe :: args)
           deleteFile(exe)
           (result.exitCode, result.stdout, result.stderr)

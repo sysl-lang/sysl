@@ -27,18 +27,25 @@ trait RunSupport extends Matchers { this: Assertions =>
   protected def prebuiltStd: Option[Stdlib.Resolved] =
     Stdlib.resolve(Stdlib.Choice.Default(), Target.default).toOption
 
-  private def compiled(sources: List[Source], args: List[String]): Either[String, (Int, String)] =
+  private def compiled(sources: List[Source], args: List[String],
+                       level: String = Toolchain.defaultOptimization): Either[String, (Int, String)] =
     prebuiltStd match {
       case Some(Stdlib.Resolved(std, precompiled, Some(archive))) =>
-        Toolchain.compileAndRun(sources, Nil, args, Some(std), precompiled, List(archive))
+        Toolchain.runIr(Compiler.compiledWith(sources, Nil, Target.default, precompiled, Some(std)),
+                        args, List(archive), level)
       case _ =>
-        Toolchain.compileAndRun(sources, Nil, args, None, Set.empty, Nil)
+        Toolchain.runIr(Compiler.compiledWith(sources, Nil, Target.default, Set.empty, None),
+                        args, Nil, level)
     }
 
-  protected def run(src: String): String = {
+  /** The program, run. `optimize` is the level clang is given, and it defaults to the one every
+   * other run in the suite uses — what asks for another is a claim that is *about* the level, which
+   * `BecomeTests` is: a guaranteed tail call has to hold where nothing is eliminated by luck.
+   */
+  protected def run(src: String, optimize: String = Toolchain.defaultOptimization): String = {
     assume(Toolchain.clangAvailable, "clang not available")
 
-    compiled(List(Source("<input>", src)), Nil) match {
+    compiled(List(Source("<input>", src)), Nil, optimize) match {
       case Right((0, out))    => out
       case Right((code, out)) => fail(s"program exited with $code:\n$out")
       case Left(err)          => fail(err)

@@ -124,6 +124,49 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     Val.Nothing
   }
 
+  /** `become f(…)` — the call is emitted with `musttail`, and the `ret` it requires goes with it
+   * (`TailJumps`).
+   *
+   * **The order is `genTailSelfCall`'s, for the same reason and one step further.** Each argument is
+   * computed while the frame is still whole; only then does the frame give up everything it holds;
+   * only then does the call happen. What the self-jump does after that is store into its own
+   * parameter slots and branch, because the frame is being reused; what this does is hand the
+   * arguments to a **different** function, whose frame replaces this one.
+   *
+   * **Nothing is retained here and that is a rule rather than an omission.** A callee takes its own
+   * count on every parameter at entry (`Codegen.genFunction`), so a retain on this side would be a
+   * second count nobody releases. What makes the release below safe without one is `TailJumps`'
+   * restriction: no parameter carries a count at all, so there is nothing in the frame the release
+   * could free that an argument still names.
+   *
+   * **`musttail` and the `ret` are one instruction as far as a reader is concerned** — LLVM refuses
+   * a `musttail` that is not immediately followed by a return of its own result — so both are
+   * emitted here rather than left to whatever comes next.
+   */
+  protected def genBecome(call: TExpr): Unit = {
+    val (what, callee, args) =
+      call match
+        case TCall(name, as, ty, _) =>
+          val (form, fn) = calleeParts(name, ty)
+
+          (form, fn: ir.Val, as)
+        case TCallPtr(fn, as, _, ty) => (syslResult(ty), genExpr(fn), as)
+        case other                   => sys.error(s"'become' reached codegen with ${other.getClass.getSimpleName}")
+
+    val staged = formatArgs(args.map(argValue))
+
+    releaseAll()
+
+    if Type.noValue(call.ty) then
+      emit(Inst.Call(None, what.ret, callee, staged, what.retAttrs, what.whole, Nil, mustTail = true))
+      emitTerm(Inst.Ret(None, None))
+    else
+      val r = freshReg()
+
+      emit(Inst.Call(Some(r), what.ret, callee, staged, what.retAttrs, what.whole, Nil, mustTail = true))
+      emitTerm(Inst.Ret(Some(call.ty.lty), Some(r)))
+  }
+
   /** Every callee declared with a `...`, foreign or sysl's own, mapped to the LLVM function type a
    * call to it must name: result type, declared parameter types, ellipsis.
    */

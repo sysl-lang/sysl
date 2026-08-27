@@ -21,7 +21,8 @@ class StringSurfaceTests extends AnyFreeSpec with CodegenSupport with RunSupport
 
   private def runBare(src: String): String = super.run(src)
 
-  override protected def run(src: String): String = super.run(importing + src)
+  override protected def run(src: String, optimize: String = Toolchain.defaultOptimization): String =
+    super.run(importing + src, optimize)
 
   override protected def err(src: String): String = super.err(importing + src)
 

@@ -22,7 +22,8 @@ class MathTests extends AnyFreeSpec with RunSupport with CodegenSupport {
    */
   private val importing = "import sysl.math.*\n\n"
 
-  override protected def run(src: String): String = super.run(importing + src)
+  override protected def run(src: String, optimize: String = Toolchain.defaultOptimization): String =
+    super.run(importing + src, optimize)
 
   "the trait reaches both widths" - {
     "one spelling, two receivers" in {

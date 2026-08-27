@@ -32,7 +32,8 @@ class IndexTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
    */
   private val importing = "import sysl.buf.*\n\n"
 
-  override protected def run(src: String): String = super.run(importing + src)
+  override protected def run(src: String, optimize: String = Toolchain.defaultOptimization): String =
+    super.run(importing + src, optimize)
 
   override protected def err(src: String): String = super.err(importing + src)
 

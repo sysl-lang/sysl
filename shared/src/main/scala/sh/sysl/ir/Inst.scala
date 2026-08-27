@@ -226,7 +226,19 @@ enum Inst {
    */
   case Call(dest: Option[Val], ret: LType, callee: Val, args: List[Arg],
             retAttrs: List[Attr] = Nil, calleeType: Option[FnType] = None,
-            fast: List[FastMath] = Nil)
+            fast: List[FastMath] = Nil,
+            /** `musttail` — the frame is **replaced** rather than added to, and LLVM refuses the
+              * module where it cannot do that (`reference/declarations.md § become`).
+              *
+              * It is what makes a chain of calls a loop rather than a stack, and the guarantee is
+              * the point: a program built on it is one chain of them from beginning to end, so an
+              * un-eliminated call is an immediate overflow rather than a slowdown. LLVM verifies it,
+              * which is why this is a flag on the instruction rather than a hint anybody has to
+              * check afterwards.
+              *
+              * The `ret` that must follow is emitted with it, at the one site that sets this.
+              */
+            mustTail: Boolean = false)
 
   case VaArg(dest: Val, list: Val, ty: LType)
   case AtomicRmw(dest: Val, op: RmwOp, ptr: Val, ty: LType, value: Val, ordering: Ordering)
@@ -295,13 +307,13 @@ enum Inst {
 
       s"""${lhs}call ${ret.render} asm sideeffect "$text", "$cons"(${args.map(_.render).mkString(", ")})"""
 
-    case Call(d, ret, callee, args, retAttrs, fn, fast) =>
+    case Call(d, ret, callee, args, retAttrs, fn, fast, must) =>
       val lhs  = d.map(r => s"${r.render} = ").getOrElse("")
       // A variadic callee is named by its whole type; everything else by its result alone.
       val kind = fn.map(_.render).getOrElse((retAttrs.map(_.render) :+ ret.render).mkString(" "))
       val fm   = fast.map(_.render + " ").mkString
 
-      s"${lhs}call $fm$kind ${callee.render}(${args.map(_.render).mkString(", ")})"
+      s"${lhs}${if must then "musttail " else ""}call $fm$kind ${callee.render}(${args.map(_.render).mkString(", ")})"
 
     case VaArg(d, list, ty) => s"${d.render} = va_arg ptr ${list.render}, ${ty.render}"
 

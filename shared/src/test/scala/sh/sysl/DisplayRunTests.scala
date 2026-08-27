@@ -18,7 +18,8 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
    */
   private val importing = "import sysl.buf.*\n\n"
 
-  override protected def run(src: String): String = super.run(importing + src)
+  override protected def run(src: String, optimize: String = Toolchain.defaultOptimization): String =
+    super.run(importing + src, optimize)
 
   /** A pair whose rendering is unmistakable — punctuation the two fields could not have produced
    * on their own, so a call that reached the wrong renderer shows up as missing text rather than

@@ -33,7 +33,8 @@ class Utf8Tests extends AnyFreeSpec with RunSupport with CodegenSupport {
    */
   private val importing = "import sysl.text.from_utf8\n\n"
 
-  override protected def run(src: String): String = super.run(importing + src)
+  override protected def run(src: String, optimize: String = Toolchain.defaultOptimization): String =
+    super.run(importing + src, optimize)
 
   override protected def exits(src: String): Unit = super.exits(importing + src)
 

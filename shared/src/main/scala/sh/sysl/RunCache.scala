@@ -54,17 +54,26 @@ object RunCache {
    */
   private val Off = "SYSL_NO_CACHE"
 
-  /** How many entries a program's cache is allowed to keep before the oldest go.
+  /** How many entries a program's cache holds before eviction is considered at all.
    *
    * The standard-module cache evicts nothing, which is right for it — one entry per library per
-   * release, and a developer has a handful. This one takes an entry per *edit*, so a morning's work
-   * on one program leaves dozens, and unbounded is the wrong answer at that rate.
-   *
-   * Oldest-first by last-modified rather than by last-read: a read that touched the file would make
-   * every run a write, and what the bound is protecting is disk rather than correctness — the worst
-   * an eviction costs is one rebuild.
+   * release, and a developer has a handful. This one takes an entry per *edit*, so a week's work on
+   * one program leaves hundreds, and unbounded is the wrong answer at that rate.
    */
-  private val Keep = 64
+  private val Keep = 256
+
+  /** How old an entry has to be before it is a candidate, in milliseconds — a week.
+   *
+   * **Age is what makes eviction safe beside a build that is running**, which is the half a bare
+   * count gets wrong. Several compilations share one cache directory, and a hit is `isFile` and then
+   * an `exec`: an eviction that took a *fresh* entry could take one another process was about to
+   * run, or had already checked for. Nothing this old is in flight anywhere, so the two cannot meet.
+   *
+   * By last-modified rather than by last-read: a read that touched the file would make every run a
+   * write, and what the bound protects is disk rather than correctness — the worst an eviction costs
+   * is one rebuild.
+   */
+  private val Stale = 7L * 24 * 60 * 60 * 1000
 
   /** Where a built program is kept, or nothing where this machine has no cache directory — the same
    * condition the standard module's own path falls back on, and the same answer: behave as though
@@ -79,27 +88,39 @@ object RunCache {
    * counted entries in the developer's real cache would be measuring their morning, and one that
    * wrote into it would be spending their disk.
    */
-  private var override_ : Option[String] = None
+  /** **Per thread rather than per process**, which `Fetch`'s equivalent is not and which this one
+   * has to be: a suite that redirects the cache so it can count what lands in it runs beside other
+   * suites driving the same compiler, and a process-wide override would collect their entries as
+   * well as its own. A thread-local is exact — the redirect covers the calls the redirecting thread
+   * makes and no others — and costs a compilation nothing, since the ordinary answer is `None`.
+   */
+  private val override_ = new ThreadLocal[Option[String]] {
+    override def initialValue(): Option[String] = None
+  }
 
-  private var disabled: Boolean = false
+  private val off = new ThreadLocal[Boolean] {
+    override def initialValue(): Boolean = false
+  }
 
-  private def root: Option[String] = override_.orElse(cacheDirectory)
+  private def disabled: Boolean = off.get
+
+  private def root: Option[String] = override_.get.orElse(cacheDirectory)
 
   private[sysl] def usingCache[T](path: String)(body: => T): T = {
-    val saved = override_
+    val saved = override_.get
 
-    override_ = Some(path)
+    override_.set(Some(path))
     try body
-    finally override_ = saved
+    finally override_.set(saved)
   }
 
   /** The escape hatch, reachable from a test without an environment to set. */
   private[sysl] def disabledFor[T](body: => T): T = {
-    val saved = disabled
+    val saved = off.get
 
-    disabled = true
+    off.set(true)
     try body
-    finally disabled = saved
+    finally off.set(saved)
   }
 
   /** The program built for this key, where one is there and is still executable. */
@@ -116,24 +137,38 @@ object RunCache {
     slot(key).flatMap { path =>
       try
         Project.parentOf(path).foreach(Project.makeDirectories)
-        evict(path)
+        evict(path, newest(path))
         Some(path)
       catch case _: Exception => None
     }
 
-  /** The oldest entries beyond [[Keep]], removed. A failure here is not a failure of the build: the
-   * worst an unevicted cache costs is disk, and the worst a failed eviction costs is nothing at all.
+  /** Entries past [[Keep]] that are also older than [[Stale]], removed. A failure here is not a
+   * failure of the build: the worst an unevicted cache costs is disk, and the worst a failed
+   * eviction costs is nothing at all.
+   *
+   * `now` is read from the newest entry rather than from a clock, so that a machine whose clock has
+   * moved evicts nothing rather than everything.
    */
-  private def evict(fresh: String): Unit =
+  private def evict(fresh: String, now: Long): Unit =
     for dir <- Project.parentOf(fresh) do
       try
         val kept = listFiles(dir).toList.filterNot(_ == fresh)
 
         if kept.length >= Keep then
-          for old <- kept.sortBy(lastModified).take(kept.length - Keep + 1) do
+          for old <- kept if now - lastModified(old) > Stale do
             try deleteFile(old)
             catch case _: Exception => ()
       catch case _: Exception => ()
+
+  /** The most recent entry's timestamp, which stands in for the clock. A directory with nothing in
+   * it answers zero, which evicts nothing — the right answer for a cache being made.
+   */
+  private def newest(fresh: String): Long =
+    Project.parentOf(fresh).toList
+      .flatMap(dir => try listFiles(dir).toList catch case _: Exception => Nil)
+      .map(lastModified)
+      .maxOption
+      .getOrElse(0L)
 
   /** The **test list** beside a cached test binary, which is the one thing `sysl test` needs that
    * the executable does not carry: what to call, what to report it as, whether it should trap and

@@ -719,6 +719,33 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
         case _                                =>
       List(TReturn(tv))
 
+    /** `become f(…)` — `return f(…)` with the jump guaranteed (`TailJumps`).
+     *
+     * The value is read at the function's own result type, exactly as a `return`'s is, because that
+     * is what it is: the callee's result is this function's. What is *not* settled here is whether
+     * the frame can be replaced — that needs the callee's own signature and this function's
+     * parameters as the typed tree has them, so it is `TailJumps.check`'s and runs over the whole
+     * program.
+     *
+     * What is settled here is that there is a call at all. Anything else is a mistake about what the
+     * word means rather than about what a frame is, and saying so at the statement is where a reader
+     * is looking.
+     */
+    case Become(call) =>
+      val t = analyzeExpr(call, Some(retTy))
+
+      t match
+        case _: TCall | _: TCallPtr => ()
+        case _ =>
+          err("'become' replaces this frame with a call's, so what follows it has to be a call — " +
+            "'return' is what hands a value back without replacing anything")
+
+      if disagree(t.ty, retTy) then
+        err(s"'become' hands on this function's result, so the call has to answer ${show(retTy)} — " +
+          s"this one answers ${show(t.ty)}")
+
+      List(TBecome(t))
+
     // `break value` records its type against the loop it targets — the nearest, or the one a
     // `'label` names — which unites it with that loop's other breaks and its `else` to fix the
     // loop's result type. The value is analyzed in the target loop's expected type, so a `break &T`

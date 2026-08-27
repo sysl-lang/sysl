@@ -69,7 +69,7 @@ object AstCodec {
    * conflict**, and that is the case the rule above is written for: read dev's number, take the one
    * after it, and do not assume a clean merge means the versions agree.
    */
-  val Version: Int = 50
+  val Version: Int = 51
 
   private val Magic = "sysl-ast"
 
@@ -399,6 +399,7 @@ object AstCodec {
         case PatternDecl(p, mut, v)       => tok("pdcl"); pattern(p); bool(mut); expr(v)
         case ExprStmt(x)                  => tok("es"); expr(x)
         case Return(v)                    => tok("ret"); opt(v)(expr)
+        case Become(c)                    => tok("bcm"); expr(c)
         case Break(l, v)                  => tok("brk"); opt(l)(sref); opt(v)(expr)
         case Continue(l)                  => tok("cnt"); opt(l)(sref)
         case Defer(s)                     => tok("dfr"); stmt(s)
@@ -846,6 +847,7 @@ object AstCodec {
         case "pdcl" => PatternDecl(pattern(), bool(), expr())
         case "es"   => ExprStmt(expr())
         case "ret"  => Return(opt(expr()))
+        case "bcm"  => Become(expr())
         case "brk"  => Break(opt(sref()), opt(expr()))
         case "cnt"  => Continue(opt(sref()))
         case "dfr"  => Defer(stmt())

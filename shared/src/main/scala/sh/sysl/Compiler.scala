@@ -291,6 +291,7 @@ object Compiler {
                         own = ownModules(mine))
           promoted <- Escape.check(typed)
           _        <- TailCalls.check(typed)
+          _        <- TailJumps.check(typed, target)
 
           // **The same check `analyzed` runs, against the tree *this* build emits.** It was missing
           // here outright, which made every rule about an exported symbol silent under `sysl test` —
@@ -381,6 +382,7 @@ object Compiler {
                                    own = ownModules(units))
       promoted <- Escape.check(typed)
       _        <- TailCalls.check(typed)
+      _        <- TailJumps.check(typed, target)
     yield
       val mine = units.map(moduleOf).toSet
 
@@ -502,6 +504,7 @@ object Compiler {
       typed     = walked.copy(entryPoint = entryPoint, cArtifact = !entryPoint)
       promoted <- Escape.check(typed)
       _        <- TailCalls.check(typed)
+      _        <- TailJumps.check(typed, target)
 
       // **`Exports.check` reads the tree this build is going to emit, which is the stripped one.**
       // Reading `typed` instead made an `@export` in a `@tests` file a definition in every build,

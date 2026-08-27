@@ -286,7 +286,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
   private def allocates(r: ir.Runtime): Boolean = r match
     case ir.Runtime.Emitted(f) =>
       f.blocks.exists(_.instrs.exists {
-        case Inst.Call(_, _, Val.Global(n), _, _, _, _) => n == mallocSym
+        case Inst.Call(_, _, Val.Global(n), _, _, _, _, _) => n == mallocSym
         case _                                          => false
       })
     case ir.Runtime.Template(_, llvm) => llvm.contains(s"call ptr @$mallocSym(")
@@ -780,6 +780,8 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
     case TMultiAssign(writes) =>
       genMultiAssign(writes)
+
+    case TBecome(call) => genBecome(call)
 
     case TReturn(opt) =>
       opt match

@@ -37,6 +37,9 @@ class RunCacheTests extends AnyFreeSpec with Matchers {
     out.toString
   }
 
+  /** A report with its durations removed, so that two of them can be compared. */
+  private def untimed(report: String): String = report.replaceAll("[0-9]+ms", "<ms>")
+
   private def entries(cache: String): Int =
     if isDirectory(s"$cache/sysl/run") then listFiles(s"$cache/sysl/run").length else 0
 
@@ -169,7 +172,9 @@ class RunCacheTests extends AnyFreeSpec with Matchers {
 
       val second = ran(Config(command = "test", file = root))
 
-      second shouldBe first
+      // Compared with the **timings taken out**, which are the one part of a report that is a clock
+      // rather than a fact: two runs of one suite differ by a millisecond and are the same report.
+      untimed(second) shouldBe untimed(first)
       first should include("two doubled is four")
       first should include("2 passed")
       entries(cache) shouldBe 2

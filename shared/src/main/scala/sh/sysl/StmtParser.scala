@@ -26,6 +26,7 @@ trait StmtParser
   lazy val statement: PackratParser[Stmt] =
     at(
       misplacedHeaderAttr | importDecl | implDecl | declaration | varDecl | refDecl | returnStmt |
+        becomeStmt |
         breakStmt | continueStmt | deferStmt | asmStmt | requireStmt | ensureStmt | invariantStmt |
         variantStmt | multiAssign | resultListStmt | exprStmt,
     )
@@ -40,6 +41,7 @@ trait StmtParser
   protected lazy val inlineStatement: PackratParser[Stmt] =
     at(
       importDecl | implDecl | declaration | varDecl | refDecl | returnStmt |
+        becomeStmt |
         breakStmt | continueStmt | deferStmt | requireStmt | ensureStmt | multiAssign | exprStmt,
     )
 
@@ -743,6 +745,27 @@ trait StmtParser
 
   protected lazy val returnStmt: PackratParser[Stmt] =
     op("return") ~> opt(resultValue) ^^ Return.apply
+
+  /** `become f(…)` — a call that replaces this frame rather than adding to it
+   * (`reference/declarations.md § become — a call that replaces the frame`).
+   *
+   * **A soft word rather than a reserved one**, so `become` goes on being a legal identifier
+   * everywhere else. It is unambiguous where it stands: two identifiers in a row are not otherwise a
+   * statement, and a call written through an index or a field starts with an identifier too — so
+   * `become handlers[op](vm)` reads as one form and `become(x)`, a call to a function of that name,
+   * reads as the other.
+   *
+   * The lookahead is what makes that true. Without it a `become` read as the keyword would commit
+   * the line, and `become = 1` — an assignment to an ordinary variable of that name — would be a
+   * parse error about a call. `guard` costs one token and gives the word back.
+   */
+  protected lazy val becomeStmt: PackratParser[Stmt] =
+    guard(softWord("become") ~ (ident | op("("))) ~> softWord("become") ~> expression >> {
+      case c: Call => success(Become(c))
+      case other =>
+        err("'become' takes a call — it is the call that replaces this frame, so there has to be " +
+          "one. 'return' is what hands a value back without replacing anything")
+    }
 
   /** What a function hands back: one expression, or the several its result list declares. */
   protected lazy val resultValue: PackratParser[Expr] =

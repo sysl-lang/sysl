@@ -64,7 +64,7 @@ class IrModuleTests extends AnyFreeSpec with Matchers {
     val m      = module("twice(n: int) -> int = n * 2\nprint(twice(21))\n")
     // The entry point is its own field rather than one of `funcs`, because a library has none.
     val main   = m.entry.getOrElse(fail("the program has no entry point"))
-    val called = instrs(main).collect { case Inst.Call(_, _, Val.Global(n), _, _, _, _) => n }
+    val called = instrs(main).collect { case Inst.Call(_, _, Val.Global(n), _, _, _, _, _) => n }
 
     called should contain("twice")
   }

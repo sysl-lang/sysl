@@ -312,6 +312,21 @@ case class ExprStmt(expr: Expr)                                    extends Stmt
 /** `return` / `return expr` inside a function body. */
 case class Return(value: Option[Expr]) extends Stmt
 
+/** `become f(…)` — a call that **replaces** this frame rather than adding to it
+ * (`reference/declarations.md § become — a call that replaces the frame`).
+ *
+ * It is `return f(…)` with the jump guaranteed rather than hoped for. `@tailrec` recognizes a
+ * function's calls to *itself* and lowers them as a jump back to its own entry; this is the same
+ * guarantee for a call to a **different** function, which is what a chain of them needs to be a loop
+ * rather than a stack.
+ *
+ * **`become` is a soft word, not a reserved one.** A reserved word is spent out of every program's
+ * namespace for the sake of one line apiece — the trade `alloc` made and is still paying for — and
+ * this needs no reservation: two identifiers in a row are not otherwise a statement, so
+ * `become next(vm)` is unambiguous wherever it stands.
+ */
+case class Become(call: Expr) extends Stmt
+
 /** `break ['label] [expr]` — leaves an enclosing loop, optionally carrying the loop's value; the
  * label names which loop, defaulting to the nearest. `continue ['label]` skips to a loop's next
  * iteration.

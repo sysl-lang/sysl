@@ -81,6 +81,16 @@ case class TMultiAssign(writes: List[TWrite]) extends TStmt
 
 case class TReturn(value: Option[TExpr])                  extends TStmt
 
+/** `become f(…)` — the call is emitted with LLVM's `musttail` and the `ret` that must follow it
+ * (`reference/declarations.md § become — a call that replaces the frame`).
+ *
+ * The whole of what the analyzer settled is behind it: the callee's prototype matches this
+ * function's, no parameter carries a reference count, nothing is deferred, and there is no
+ * postcondition to check on a frame that will not be there. So codegen has one decision left, which
+ * is the order — arguments, then the frame's own releases, then the jump.
+ */
+case class TBecome(call: TExpr)                          extends TStmt
+
 /** `break [expr]` and `continue`. `break` carries the loop's value when the loop yields one.
  * `depth` names the target loop by its distance out from the innermost — `0` is the nearest,
  * a larger number a loop reached through a `'label` — and indexes the codegen loop stack directly.

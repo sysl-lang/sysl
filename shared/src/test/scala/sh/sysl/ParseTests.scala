@@ -19,7 +19,8 @@ class ParseTests extends AnyFreeSpec with RunSupport {
 
   private val importing = "import sysl.text.*\n\n"
 
-  override protected def run(src: String): String = super.run(importing + src)
+  override protected def run(src: String, optimize: String = Toolchain.defaultOptimization): String =
+    super.run(importing + src, optimize)
 
   "whole numbers" - {
 
