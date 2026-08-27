@@ -149,17 +149,28 @@ object Signature {
 
       s"[${parts.mkString(", ")}]"
 
-  /** One parameter, as written: `xs: []const u8`, `n: usize = 0`, `f: -> int`.
+  /** One parameter, as written: `xs: []const u8`, `n: usize = 0`, `f: -> int`, `xs: ...int`.
    *
-   * A by-name parameter's `-> T` is a property of the parameter rather than of its type, so it is
-   * spelled here and not in `typeText` — which is the same split the AST makes and the reason this
-   * takes a `Param` rather than a `TypeRef`.
+   * **Two of those are properties of the PARAMETER rather than of its type**, so both are spelled
+   * here and not in `typeText` — which is the same split the AST makes and the reason this takes a
+   * `Param` rather than a `TypeRef`. A by-name parameter's `-> T` is one; a rest parameter's `...T`
+   * is the other, and it matters more, because a rest parameter's `typ` is already the `[]const T`
+   * its body sees. Rendering that would document a signature nobody can call: the caller writes
+   * `total(1, 2, 3)`, not a slice.
    */
   def paramText(p: Param): String =
     val arrow   = if p.byName then "-> " else ""
     val default = p.default.map(d => s" = ${exprText(d)}").getOrElse("")
 
-    s"${p.name}: $arrow${typeText(p.typ)}$default"
+    s"${p.name}: $arrow${paramTypeText(p)}$default"
+
+  /** A parameter's type as the **caller** meets it, which for a rest parameter is not the type the
+   * body sees. The fallback is the plain rendering, so a `rest` whose type is somehow not the
+   * read-only view the parser builds prints something true rather than nothing.
+   */
+  private def paramTypeText(p: Param): String = (p.rest, p.typ) match
+    case (true, ArrayType(None, elem, true)) => s"...${typeText(elem)}"
+    case _                                   => typeText(p.typ)
 
   /** The parameter list with its parentheses, variadic marker included. */
   private def paramsText(params: List[Param], variadic: Boolean): String =

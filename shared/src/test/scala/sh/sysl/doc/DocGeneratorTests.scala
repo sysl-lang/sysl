@@ -60,6 +60,24 @@ class DocGeneratorTests extends AnyFreeSpec with Matchers {
       sig("f(a: *u8, b: &int, c: &sync int)\n    print(1)") shouldBe "f(a: *u8, b: &int, c: &sync int)"
     }
 
+    /** A rest parameter's own type is the `[]const T` its **body** sees, so rendering that would
+      * document a signature nobody can call: the caller writes `total(1, 2, 3)`, not a slice. It is
+      * the same split `-> T` already has, and it is the one that matters more.
+      */
+    "a rest parameter renders as the caller writes it, not as the body sees it" in {
+      sig("total(xs: ...int) -> int = 0") shouldBe "total(xs: ...int) -> int"
+    }
+
+    "and beside the fixed parameters in front of it" in {
+      sig("label(tag: string, xs: ...&Display) -> string = tag") shouldBe
+        "label(tag: string, xs: ...&Display) -> string"
+    }
+
+    // C's ellipsis is the other variadic and is not a parameter at all, so it keeps the form it had.
+    "while C's own ellipsis is still the bare marker it was" in {
+      sig("count(first: int, ...) -> int = first") shouldBe "count(first: int, ...) -> int"
+    }
+
     "a generic function renders its type parameters and their bounds" in {
       sig("show[T: Display](x: T) -> string = \"\"") shouldBe "show[T: Display](x: T) -> string"
     }
