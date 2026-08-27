@@ -393,7 +393,15 @@ trait ExprEmitter extends ArithEmitter {
       requestText("sysl.str.from_bytes")(StringEmitter.fromBytes)
 
       val table = bufferTable()
-      val v     = genExpr(value)
+      // **A large receiver crosses as the address of storage the caller holds**, exactly as it does
+      // at any other call (`CallEmitter.argValue`) — a value past the indirect boundary is passed
+      // and received through memory, so its parameter is a pointer. Producing it as a first-class
+      // aggregate and handing that over instead put the struct's first word where the callee reads
+      // an address, which is a `SIGSEGV` with nothing to read: `print(x)` went through an ordinary
+      // call and worked, so a type could render all through development and die the first time it
+      // was put in a string.
+      val big   = layout.indirect(value.ty)
+      val v     = if big then address(value) else genExpr(value)
       val s     = genExpr(spec)
       val slot  = emitAlloca(freshReg(), bufferLty)
 
@@ -417,7 +425,8 @@ trait ExprEmitter extends ArithEmitter {
 
           emit(Inst.Call(None, LType.Void, fn, List(Arg(LType.Ptr, data), Arg(LType.fat, w), Arg(spec.ty.lty, s))))
         case None =>
-          emit(Inst.Call(None, LType.Void, Val.Global(method), List(Arg(value.ty.lty, v), Arg(LType.fat, w), Arg(spec.ty.lty, s))))
+          emit(Inst.Call(None, LType.Void, Val.Global(method),
+            List(Arg(if big then LType.Ptr else value.ty.lty, v), Arg(LType.fat, w), Arg(spec.ty.lty, s))))
 
       val r = freshReg()
       emit(Inst.Call(Some(r), Type.Str.lty, Val.Global("sysl.w.buf.finish"), List(Arg(LType.Ptr, slot))))

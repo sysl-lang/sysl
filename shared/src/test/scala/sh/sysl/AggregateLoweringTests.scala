@@ -318,6 +318,113 @@ class AggregateLoweringTests extends AnyFreeSpec with CodegenSupport with RunSup
     }
   }
 
+  /** `?` out of a function whose result is large, which is an early `return` and has to leave the
+    * same way the written one does — through the out-pointer, with the function itself `void`.
+    *
+    * It did not, and the failure was **clang refusing the compiler's own IR**: a `ret` of the
+    * aggregate out of a function the ABI had already made `void`. The message named LLVM's textual
+    * IR in a temporary file the driver deletes, and named `void`, so it read as a fault in the C
+    * toolchain rather than in the sysl that was written. The analysis passed all the way to clang,
+    * so a package could be type-correct, reviewed and unbuildable.
+    *
+    * Where it bites is bindings: a `?` on a status code followed by `Ok(<something big>)` is the
+    * shape of every constructor in a binding to a C library with caller-placed storage. It was found
+    * in `sysl-lang/libuv`, whose address type is a 128-byte `sockaddr_storage`.
+    */
+  "an early return out of one leaves through the out-pointer too" - {
+    val chk = "chk(c: int) -> Result[unit, int] = if c < 0 then Err(c) else Ok(())\n"
+
+    "the value arrives when nothing fails" in {
+      run(big + chk +
+        """mk(x: int) -> Result[Big, int]
+          |    chk(x)?
+          |    Ok(Big([1; 64], 2))
+          |print(mk(3).unwrap().tag)""".stripMargin) shouldBe "2\n"
+    }
+
+    "and the failure arrives when something does" in {
+      run(big + chk +
+        """mk(x: int) -> Result[Big, int]
+          |    chk(x)?
+          |    Ok(Big([1; 64], 2))
+          |mk(-7) match
+          |    Err(e) -> print("err", e)
+          |    Ok(_) -> print("ok")""".stripMargin) shouldBe "err -7\n"
+    }
+
+    // Two of them, since each emits its own early return and the second one's block is reached only
+    // after the first has already terminated one.
+    "twice in one function" in {
+      run(big + chk +
+        """mk(x: int) -> Result[Big, int]
+          |    chk(x)?
+          |    chk(x)?
+          |    Ok(Big([1; 64], 3))
+          |print(mk(3).unwrap().tag, mk(-1).is_err())""".stripMargin) shouldBe "3 true\n"
+    }
+
+    // The IR side of the same claim: the function is `void` with an `sret` parameter, so no `ret`
+    // in it may carry the enum. Asserted on the text because the run tier above passes on any IR
+    // clang happens to accept, and what was wrong here was IR clang did not.
+    "and no return in it hands the result back directly" in {
+      val text = ir(big + chk +
+        """mk(x: int) -> Result[Big, int]
+          |    chk(x)?
+          |    Ok(Big([1; 64], 2))
+          |print(mk(3).unwrap().tag)""".stripMargin)
+
+      text should include("sret")
+      // Named at the *big* instantiation: `chk` returns a small `Result[unit, int]` and hands it
+      // back directly, which is correct and is what a bare `Result` in the pattern would have
+      // caught instead.
+      text should not include "ret %enum.sysl$Result.Big.int"
+    }
+  }
+
+  /** Rendering one, which hands it to `display` as an **argument** — and a large argument crosses at
+    * an address, so producing it as a first-class value put the struct's first word where the callee
+    * reads a pointer.
+    *
+    * `print(x)` went through an ordinary call and worked; `str(x)` and an interpolation built the
+    * string first and took the broken path, so a type rendered all through development and died the
+    * first time it was put in a message — as a bare `SIGSEGV`, since a crash discards what the
+    * program had already printed.
+    *
+    * There was no workaround at the `impl` site either: a reference receiver is refused as differing
+    * from the trait's, so the rule as it stood was that a type over the threshold could not implement
+    * `Display` at all.
+    */
+  "rendering one hands it over at an address, like any other large argument" - {
+    val shown =
+      "impl Display for Big\n" +
+        "    display(self, out: *Writer, fmt: FormatSpec) = self.tag.display(out, fmt)\n"
+
+    "print, which was always the working path" in {
+      run(big + shown + "var b = Big([0; 64], 7)\nprint(b)") shouldBe "7\n"
+    }
+
+    "str, which built the string first and did not" in {
+      run(big + shown + "var b = Big([0; 64], 7)\nprint(str(b))") shouldBe "7\n"
+    }
+
+    "an interpolation, which is the shape a message is actually written in" in {
+      run(big + shown + "var b = Big([0; 64], 7)\nprint(s\"<$b>\")") shouldBe "<7>\n"
+    }
+
+    "and one through a specifier, which is the other renderer" in {
+      run(big + shown + "var b = Big([0; 64], 7)\nprint(f\"${b}%3s|\")") shouldBe "  7|\n"
+    }
+
+    // A small one keeps crossing as a value, which is the other side of the threshold and the reason
+    // the fix is a branch rather than a change of convention.
+    "while a small one still crosses as a value" in {
+      run(small +
+        "impl Display for Small\n" +
+          "    display(self, out: *Writer, fmt: FormatSpec) = self.y.display(out, fmt)\n" +
+          "var s = Small(1, 4)\nprint(str(s))") shouldBe "4\n"
+    }
+  }
+
   // The value a postcondition is written about is read back out of the out-pointer, which is the
   // one whole-aggregate load this lowering still emits — and only on a function that asked for it.
   "a contract on one still sees the value it is written about" in {
