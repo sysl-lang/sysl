@@ -331,6 +331,12 @@ object Reachability {
       // there is nothing else that could keep the definition from being dropped.
       case a: TFuncAddr       => calls += a.name
       case p: TCallPtr        => scan(p.callee); p.args.foreach(scan)
+      // A `?` that widens the callee's error carries the conversion as a **name** rather than as a
+      // node, for the reason `TRecheck`'s predicate does: what it converts is the failure payload,
+      // which exists only inside the branch the emitter builds. So the shape cannot tell it from any
+      // other string and it is read out here — without which the call is emitted and the definition
+      // is pruned, which clang reports as a use of an undefined value.
+      case t: TTry            => t.convert.foreach(calls += _); scan(t.operand)
       case s: TStructInvCheck => calls += s.invFn; scan(s.value)
       case r: TRecheck        => calls += r.invFn; scan(r.after); scan(r.recv)
       // A multi-assignment's arm carries its re-check as data rather than as a node, so the

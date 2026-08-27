@@ -865,8 +865,8 @@ trait ExprEmitter extends ArithEmitter {
     case TEnumAttr(kind, en, arg, _) =>
       genEnumAttr(kind, en, arg)
 
-    case TTry(operand, ok, fail, retEnum, retFail, _) =>
-      genTry(operand, ok, fail, retEnum, retFail)
+    case TTry(operand, ok, fail, retEnum, retFail, _, convert) =>
+      genTry(operand, ok, fail, retEnum, retFail, convert)
 
     case TField(receiver, _, ty) if Type.zeroSized(ty) =>
       genExpr(receiver); Val.Nothing

@@ -400,4 +400,100 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     emitLabel(endL)
   }
 
+
+  /** `expr?` — on success the payload becomes the expression's value; on failure the function
+   * returns immediately with the failure re-wrapped in its own return type, carrying the error
+   * payload across unchanged.
+   */
+  protected def genTry(
+      operand: TExpr,
+      ok: Type.EnumVariant,
+      fail: Type.EnumVariant,
+      retEnum: Type.Enum,
+      retFail: Type.EnumVariant,
+      convert: Option[String] = None,
+  ): Val = {
+    val en = operand.ty.asInstanceOf[Type.Enum]
+    val v  = genExpr(operand)
+
+    val tag  = freshReg(); emit(Inst.Extract(tag, en.lty, v, List(0)))
+    val isOk = freshReg(); emit(Inst.IntCmp(isOk, ICmp.Eq, i32, tag, Val.Int(ok.tag)))
+
+    val okL   = freshLabel("try.ok")
+    val failL = freshLabel("try.fail")
+    emitTerm(Inst.CondBr(isOk, okL, failL))
+
+    emitLabel(failL)
+    // **The conversion happens here and nowhere else**, which is why `TTry` carries a name rather
+    // than a node: what it converts is the failure payload, and the payload exists only inside this
+    // branch. Everything else about the early return is unchanged, so a `?` that converts and one
+    // that does not lower to the same shape with one call in the middle
+    // (`reference/errors.md § A '?' converts through 'From'`).
+    val failed = convert match
+      case None =>
+        val f = enumValue(retEnum, retFail, payloadFields(en, fail, v))
+        // The payload was borrowed out of the operand, so the value leaving the function takes a
+        // count of its own.
+        retainValue(retEnum, f)
+        f
+      case Some(fn) =>
+        // **A converted failure arrives owned and is NOT retained again.** The conversion is a call,
+        // and a call's result is a share of its own — so the count the early return carries out is
+        // the one `from` already took. Retaining here would be the second of two and nothing would
+        // ever release it.
+        enumValue(retEnum, retFail,
+          List(genConversion(fn, payloadFields(en, fail, v).head, en.targs(1), retEnum.targs(1))))
+
+    // **A large result leaves through the caller's storage, and `?` is a `return` like any other.**
+    // The ABI has already made this function `void` and given it an `sret` out-parameter
+    // (`Codegen.genIndirectReturn`), so handing the value back directly emits a `ret` of an
+    // aggregate out of a `void` function — IR that LLVM refuses, in a temporary file the driver
+    // deletes, naming `void` and so reading as a fault in the C toolchain rather than in the sysl
+    // that was written. The function's own final `return` was always lowered correctly; this early
+    // one is the path that had no case for it.
+    if layout.indirect(retEnum) then
+      emit(Inst.Store(retEnum.lty, failed, sretParam, Access.Plain))
+      releaseAll()
+      emitTerm(Inst.Ret(None, None))
+    else
+      releaseAll()
+      emitTerm(Inst.Ret(Some(retEnum.lty), Some(failed)))
+
+    emitLabel(okL)
+    payloadFields(en, ok, v).head
+  }
+
+  /** One call to a conversion function whose argument is a value already in hand.
+   *
+   * The ordinary call path takes typed **expressions**, so it can ask each argument for its address
+   * where the ABI wants one. Here the argument is a register, so a value the ABI passes indirectly
+   * has to be given storage first — which is the whole of what this does beyond the call itself.
+   */
+  private def genConversion(fn: String, arg: Val, from: Type, to: Type): Val = {
+    val passed =
+      if !layout.indirect(from) then Arg(from.lty, arg)
+      else
+        val slot = emitAlloca(freshReg(), from.lty)
+        emit(Inst.Store(from.lty, arg, slot, Access.Plain))
+        Arg(LType.Ptr, slot)
+
+    val (what, callee) = calleeParts(fn, to)
+
+    // **Emitted rather than sent through `genSyslCall`, because the result must NOT be a temp.** A
+    // temp is released where the surrounding statement ends, and this call happens inside the branch
+    // that returns — so the release would be emitted in a block the value does not reach, which LLVM
+    // refuses outright with *"Instruction does not dominate all uses"*. The count the call took is
+    // exactly the one the early return carries out, which is why `genTry` does not retain it either.
+    syslSret(to) match
+      case Some(_) =>
+        val slot = emitAlloca(freshReg(), to.lty)
+        val out  = Arg(LType.Ptr, slot, sretAttrs(to.lty, layout.align(to)))
+
+        emit(what.call(None, callee, out :: List(passed)))
+
+        val r = freshReg(); emit(Inst.Load(r, to.lty, slot, Access.Plain)); r
+
+      case None =>
+        val r = freshReg(); emit(what.call(Some(r), callee, List(passed))); r
+  }
 }

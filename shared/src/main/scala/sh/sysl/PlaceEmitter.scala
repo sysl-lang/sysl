@@ -748,48 +748,4 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
           emit(Inst.Extract(f, en.payloadLty(variant), p, List(variant.slot(i))))
           f
       }.toList
-
-  /** `expr?` — on success the payload becomes the expression's value; on failure the function
-   * returns immediately with the failure re-wrapped in its own return type, carrying the error
-   * payload across unchanged.
-   */
-  protected def genTry(
-      operand: TExpr,
-      ok: Type.EnumVariant,
-      fail: Type.EnumVariant,
-      retEnum: Type.Enum,
-      retFail: Type.EnumVariant,
-  ): Val = {
-    val en = operand.ty.asInstanceOf[Type.Enum]
-    val v  = genExpr(operand)
-
-    val tag  = freshReg(); emit(Inst.Extract(tag, en.lty, v, List(0)))
-    val isOk = freshReg(); emit(Inst.IntCmp(isOk, ICmp.Eq, i32, tag, Val.Int(ok.tag)))
-
-    val okL   = freshLabel("try.ok")
-    val failL = freshLabel("try.fail")
-    emitTerm(Inst.CondBr(isOk, okL, failL))
-
-    emitLabel(failL)
-    val failed = enumValue(retEnum, retFail, payloadFields(en, fail, v))
-    retainValue(retEnum, failed)
-
-    // **A large result leaves through the caller's storage, and `?` is a `return` like any other.**
-    // The ABI has already made this function `void` and given it an `sret` out-parameter
-    // (`Codegen.genIndirectReturn`), so handing the value back directly emits a `ret` of an
-    // aggregate out of a `void` function — IR that LLVM refuses, in a temporary file the driver
-    // deletes, naming `void` and so reading as a fault in the C toolchain rather than in the sysl
-    // that was written. The function's own final `return` was always lowered correctly; this early
-    // one is the path that had no case for it.
-    if layout.indirect(retEnum) then
-      emit(Inst.Store(retEnum.lty, failed, sretParam, Access.Plain))
-      releaseAll()
-      emitTerm(Inst.Ret(None, None))
-    else
-      releaseAll()
-      emitTerm(Inst.Ret(Some(retEnum.lty), Some(failed)))
-
-    emitLabel(okL)
-    payloadFields(en, ok, v).head
-  }
 }

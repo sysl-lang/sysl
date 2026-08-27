@@ -160,7 +160,7 @@ object TreeWalk {
     case TVaArg(ap, _)              => List(ap)
     case TVaCopy(d, s)              => List(d, s)
     case TVaPass(ap)                => List(ap)
-    case TTry(v, _, _, _, _, _)     => List(v)
+    case TTry(v, _, _, _, _, _, _)  => List(v)
     case TField(r, _, _)            => List(r)
     case TIf(c, t, el, _)           => condExprs(c) ::: t.result.toList ::: el.flatMap(_.result).toList
     // One copy of an unrolled `for const` (`reference/generics.md § A parameter may stand for a

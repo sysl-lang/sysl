@@ -559,6 +559,15 @@ case class TTry(
     retEnum: Type.Enum,
     retFail: Type.EnumVariant,
     ty: Type,
+    /** The `impl From[E] for F` this `?` widens the failure through, as the key of the function it
+      * lowered to — nothing where the two error types already agree
+      * (`reference/errors.md § A '?' converts through 'From'`).
+      *
+      * It is a **name** rather than a node because there is no expression for it to be applied to:
+      * what it converts is the failure payload, which exists only inside the branch the emitter
+      * builds. `genTry` calls it between unwrapping and re-wrapping.
+      */
+    convert: Option[String] = None,
 ) extends TExpr
 
 /** Read field `index` of a struct value. It is also a *place* when its receiver is one, which

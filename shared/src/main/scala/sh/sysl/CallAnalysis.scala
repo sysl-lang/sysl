@@ -444,8 +444,17 @@ trait CallAnalysis extends OperatorCalls {
   }
 
   /** `expr?` — unwraps an `Option`/`Result`, or returns the enclosing function early with the
-   * failure re-wrapped in *its* return type. The two enums must agree, and a propagated error
-   * must be the one the function returns.
+   * failure re-wrapped in *its* return type.
+   *
+   * The two **enums** must agree — an `Option` does not become a `Result` — and the error a `Result`
+   * propagates is either the one the function returns or one that converts into it through `From`
+   * (`reference/errors.md § A '?' converts through 'From'`).
+   *
+   * **The conversion is looked up rather than written**, which is the whole of what it buys: every
+   * layer of a program otherwise writes `.map_err(…)` at each call that crosses between two error
+   * types, and the shape the library's error types get designed around is decided by whether that
+   * step exists. What is found here is the concrete function `impl From[E] for F` lowered to, and
+   * the emitter splices a call to it between unwrapping the failure and re-wrapping it.
    */
   protected def analyzeTry(t: TExpr): TExpr = {
     val en = t.ty match
@@ -456,10 +465,49 @@ trait CallAnalysis extends OperatorCalls {
 
     retTy match
       case ret: Type.Enum if ret.base == en.base =>
-        if en.base == Library.key("Result") && ret.targs(1) != en.targs(1) then
-          err(s"'?' propagates a ${show(en.targs(1))} error, but this function returns ${show(ret.targs(1))}")
-        TTry(t, en.variant(okName).get, en.variant(failName).get, ret, ret.variant(failName).get, en.targs.head)
+        val convert =
+          if en.base != Library.key("Result") || ret.targs(1) == en.targs(1) then None
+          else
+            val from = fromConversion(en.targs(1), ret.targs(1))
+
+            if from.isEmpty then
+              err(s"'?' propagates a ${show(en.targs(1))} error, but this function returns " +
+                s"${show(ret.targs(1))} — a '?' converts through '${qn(Library.key("From"))}', so " +
+                s"'impl ${Modules.bare(Library.key("From"))}[${show(en.targs(1))}] for " +
+                s"${show(ret.targs(1))}' is what joins the two layers")
+            from.foreach(funcsUsed += _)
+            from
+
+        TTry(t, en.variant(okName).get, en.variant(failName).get, ret, ret.variant(failName).get,
+          en.targs.head, convert)
       case other =>
         err(s"'?' may only be used in a function returning ${Modules.show(en.base)}, not ${show(other)}")
+  }
+
+  /** The `From[from]` conversion into `to`, as the key of the function that performs it.
+   *
+   * **A type may implement `From` several times over**, so the answer is not "the member called
+   * `from`" — it is the overload slot whose one parameter is the source type and whose result is the
+   * destination. That is the same question a written call answers with its argument
+   * (`MethodCalls.pickOverload`), asked here with a type instead, because a `?` has no argument
+   * written anywhere for the ordinary path to read.
+   *
+   * The trait is checked as well as the shape: an inherent `from` of the right signature is a
+   * function that happens to be spelled the same, and reading it would make `?` convert through
+   * something nobody declared a conversion.
+   */
+  protected def fromConversion(from: Type, to: Type): Option[String] = {
+    val (owner, _) = memberKey(to, "from")
+    val slots      = memberAlts.getOrElse((owner, "from"), List("from"))
+
+    slots
+      .filter(c => memberTrait.get((owner, c)).contains(Library.key("From")))
+      .filter(c => memberDecls.get((owner, c)).exists(m => m.receiver.isEmpty && !m.isProperty))
+      .find { c =>
+        funcInsts.get(s"$owner.$c").exists { (params, rt) =>
+          params.length == 1 && params.head._2 == from && rt == to
+        }
+      }
+      .map(c => s"$owner.$c")
   }
 }

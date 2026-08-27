@@ -184,6 +184,10 @@ object Library {
       // The traits whose members a built-in has by rule rather than by an `impl`
       // (`reference/expressions.md § Operator dispatch`).
       "Display", "Hash",
+      // The conversion `?` widens a callee's error into the caller's through
+      // (`reference/errors.md § A '?' converts through 'From'`). The compiler spells it because it is
+      // what the operator looks for: there is no call in the source to read the name off.
+      "From",
       // What a type does when the last reference to one of its values goes (`reference/memory.md §
       // A destructor`). The compiler spells it because the *hook* is what calls it: a release site
       // has a payload type and no source anywhere near it, so the member is found by name rather
