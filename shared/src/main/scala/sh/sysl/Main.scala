@@ -491,18 +491,70 @@ private[sysl] def execute(asked: Config): Int = {
         target, cfg.optimize, paths, cfg.verbose)
     else Right(NativeSources.none)
 
+  // **What `sysl run` built last time**, keyed over everything that can reach the bytes (`RunCache`).
+  //
+  // The check is here rather than beside the link, and that is the whole of what it buys: the
+  // compilation below is the expensive half, so a cache consulted after it would have saved the
+  // linker's second and paid the analyzer's nine. Everything the key is over is settled by this
+  // point — the sources, the libraries, the standard module, the target, the allocator and the
+  // search paths — which is why this is the first line at which it *can* be asked.
+  //
+  // `run` alone. A `build` writes a binary somebody named and is expected to have built it; a
+  // `build-c` and a `build-lib` write artifacts for somebody else's toolchain, and neither is
+  // something a reader would want quietly skipped.
+  val runKey =
+    Option.when(cfg.command == "run" || cfg.command == "test")(RunCache.key(List(
+      cfg.command,
+      BuildInfo.version,
+      target.name,
+      s"${allocator.alloc}/${allocator.free}",
+      cfg.optimize,
+      // The standard module's own identity: the archive's bytes where one was read, and the
+      // library's fingerprint where it was compiled from source. `Std.fingerprint` is not enough on
+      // its own, because `--std-lib` may name an artifact built from a different tree entirely.
+      coreArchive.map(a => s"$a:${fingerprintOfFile(a)}")
+        .getOrElse(s"source:${Std.root.map(Std.fingerprintOf(_, target.os)).getOrElse("none")}"),
+      // Every file the program is made of, and the C beside it. `fingerprint` is over each file's
+      // place in its tree and its text, sorted, so the order these arrive in cannot matter.
+      LibraryArtifact.fingerprint(sources ::: librarySources),
+      LibraryArtifact.fingerprint(NativeSources.of(cfg.file :: roots ::: fetched.roots ::: stdTree,
+                                                   target.os).flatten),
+      // An artifact named with `--lib` has no source to hash, so it is hashed as bytes.
+      artifacts.map(a => s"$a:${fingerprintOfFile(a)}").mkString("\u0000"),
+      paths.toString,
+      archives.mkString("\u0000"),
+    )))
+
+  if cfg.command == "run" then
+    for key <- runKey; built <- RunCache.hit(key) do
+      if cfg.verbose then Console.err.println(s"cached: $built")
+
+      return runProgram(built :: cfg.programArgs)
+
   // A test build is its own compilation and branches before the one below, rather than sharing it:
   // it keeps the `@test` functions every other build drops, and it lowers a different entry point
   // (`Tests`). Everything up to here — the libraries, the standard module, the target — is the same,
   // which is why the branch is here and not at the top.
   if cfg.command == "test" then
+    // A cached test build needs **two** things — the binary and what to call in it — so the hit is
+    // both or neither. The filter is applied to the list afterwards, exactly as it is to a freshly
+    // compiled one, which is what keeps `--filter` out of the key.
+    for
+      key   <- runKey
+      built <- RunCache.hit(key)
+      list  <- RunCache.tests(key).filter(isFile).flatMap(p => RunCache.decode(readFile(p)))
+    do
+      if cfg.verbose then Console.err.println(s"cached: $built")
+
+      return TestRunner.rerun(cfg, built, list)
+
     val native = nativeSources() match
       case Left(err)    => return fail(err)
       case Right(built) => built
 
     val status =
       TestRunner.run(cfg, sources, libraryTrees, target, precompiled, std, archives,
-        native.objects, paths, allocator, librarySources)
+        native.objects, paths, allocator, librarySources, runKey)
 
     native.scratch.foreach(Project.discard)
     return status
@@ -571,7 +623,11 @@ private[sysl] def execute(asked: Config): Int = {
           case Right(_)  => Console.err.println(s"wrote $exe"); 0
 
     case "run" =>
-      val exe = createTempFile("sysl-", "")
+      // Linked **straight into the cache slot** where there is one, rather than to a temporary that
+      // is copied afterwards: a copy would have to reproduce the executable bit, which is a thing to
+      // get wrong once per platform, and linking there gets it from the linker.
+      val keeping = runKey.flatMap(RunCache.reserve)
+      val exe     = keeping.getOrElse(createTempFile("sysl-", ""))
 
       Toolchain.build(compiled.ir, exe, target, archives, cfg.optimize, compiled.links, native.objects,
         paths, cfg.verbose) match
@@ -586,7 +642,8 @@ private[sysl] def execute(asked: Config): Int = {
           // nothing from the pipe it was given and a console exited after its banner.
           val status = runProgram(exe :: cfg.programArgs)
 
-          Project.discard(exe)
+          // Kept where it is the cache's, discarded where it is a temporary of this run.
+          if keeping.isEmpty then Project.discard(exe)
           status
 
     case other =>
@@ -597,6 +654,18 @@ private[sysl] def execute(asked: Config): Int = {
   native.scratch.foreach(Project.discard)
   status
 }
+
+/** One file's bytes as a fingerprint, for the two inputs to a run key that are compiled artifacts
+ * rather than source: a `.syslib` named with `--lib`, and the standard module's archive.
+ *
+ * Read as text rather than as bytes, which is safe here for the one reason it usually is not: what
+ * comes back is fed to a hash and never written out again, so a decode that maps two byte sequences
+ * to one string would cost a false *hit* — and the encoding is fixed, so two runs of one file map to
+ * one string whatever that string is. A file that will not read at all is a miss, which is a rebuild.
+ */
+private def fingerprintOfFile(path: String): String =
+  try LibraryArtifact.fingerprint(List(Source(path, readFile(path))))
+  catch case _: Exception => "unreadable"
 
 /** Whether a subcommand ends at the linker, which is what decides whether a tree's C is worth
  * compiling. `emit-llvm` and `prove` do not, and `build-lib` never reaches here — it archives its

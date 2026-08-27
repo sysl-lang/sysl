@@ -61,7 +61,8 @@ object TestRunner {
   def run(cfg: Config, sources: List[Source], libraries: List[Program], target: Target,
           precompiled: Set[String], std: Stdlib, archives: List[String],
           objects: List[String] = Nil, paths: SearchPaths = SearchPaths.none,
-          allocator: Allocator = Allocator.c, librarySources: List[Source] = Nil): Int = {
+          allocator: Allocator = Allocator.c, librarySources: List[Source] = Nil,
+          cacheKey: Option[String] = None): Int = {
     if !Target.host.contains(target) then
       return fail(s"'test' runs what it builds, and '${target.name}' is not this machine")
 
@@ -91,16 +92,50 @@ object TestRunner {
       Console.err.println(s"no test matches '${opts.filter.getOrElse("")}' — ${tests.length} to choose from")
       return 0
 
-    val exe = createTempFile("sysl-test-", "")
+    // Linked straight into the cache slot where there is one, for `run`'s reason: a copy would have
+    // to reproduce the executable bit, and the linker already knows how.
+    val keeping = cacheKey.flatMap(RunCache.reserve)
+    val exe     = keeping.getOrElse(createTempFile("sysl-test-", ""))
 
     Toolchain.build(built.ir, exe, target, archives, cfg.optimize, built.links, objects, paths) match
       case Left(err) => Project.discard(exe); fail(err)
       case Right(_) =>
+        // **The sidecar is written after the binary exists**, so a hit that finds both finds a pair
+        // that was made together. A failure to write it costs a rebuild next time and nothing else.
+        for key <- cacheKey if keeping.isDefined; path <- RunCache.tests(key) do
+          try writeFile(path, RunCache.encode(tests))
+          catch case _: Exception => ()
+
         val outcomes = execute(exe, selected, opts)
 
-        Project.discard(exe)
+        if keeping.isEmpty then Project.discard(exe)
         stdout(rendered(outcomes, tests.length - selected.length))
         if outcomes.forall(_.passed) then 0 else 1
+  }
+
+  /** A cached test build, run without compiling anything (`RunCache`).
+   *
+   * It is the tail of `run` above with the compile taken out: the same filtering, the same
+   * reporting, the same two ways of saying that nothing matched. Written here rather than in the
+   * driver so that the two paths cannot drift — what a reader sees for a cached suite has to be what
+   * they see for a fresh one, and the report is most of what a test run *is*.
+   */
+  def rerun(cfg: Config, exe: String, tests: List[TTest]): Int = {
+    val opts     = Options(cfg.filter, cfg.failFast)
+    val selected = tests.filter(matches(_, opts.filter))
+
+    if tests.isEmpty then
+      Console.err.println(s"no '@test' functions in ${cfg.file}")
+      return 0
+
+    if selected.isEmpty then
+      Console.err.println(s"no test matches '${opts.filter.getOrElse("")}' — ${tests.length} to choose from")
+      return 0
+
+    val outcomes = execute(exe, selected, opts)
+
+    stdout(rendered(outcomes, tests.length - selected.length))
+    if outcomes.forall(_.passed) then 0 else 1
   }
 
   /** Every selected test, run in the order it was written — which is the order it is reported in, so
