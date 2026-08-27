@@ -143,8 +143,21 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * really does put twenty values through a ring of two on another thread. Measured with
    * `grep -rh "^@test(" library --include="*.sysl" | wc -l`, which counts the parenthesis so that
    * the file-level `@tests` above each of them is not counted as one.
+   *
+   * Raised to **513** when `sysl.path` arrived with 23 of its own and `sysl.container`'s map and set
+   * gained 4 for the table that is not made until the first insert. `sysl.path` is the first module
+   * in the library whose tests could run on a target with **no filesystem at all** — every one of
+   * them is a claim about a string — which is the property that made it a module rather than more of
+   * `sysl.fs`. Measured, no slack.
+   *
+   * Raised to **544** when `sysl.fs` gained the working set it was missing: one reading of an entry
+   * (`metadata`, `link_metadata`, `set_permissions`), symbolic and hard links, `canonicalize`,
+   * `make_dir_all`/`remove_dir_all`, `copy_file`, `truncate` and a temporary directory. Thirty-one
+   * tests, and they guard the same second thing the `sysl.fs` and `sysl.process` entries above name,
+   * for a **third** shim: `meta.c` is what knows where `st_size` sits, so a wrong offset shows up
+   * here as a size that is not ten rather than as a build that failed. Measured, no slack.
    */
-  private val floor = 486
+  private val floor = 544
 
   /** The library, compiled as a **test build of itself**.
    *

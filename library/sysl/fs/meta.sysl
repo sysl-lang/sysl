@@ -1,0 +1,253 @@
+module sysl.fs
+@requires(os)
+
+import sysl.text.cstring
+import sysl.time.Instant
+
+// What a program can learn about a path without reading what is at the end of it.
+//
+// **`stat` is the call the rest of this module was written around not having.** `path.sysl` says why
+// -- a `struct stat` is laid out differently by every platform's headers, and a transcription of one
+// is numbers nothing checks -- and it names the answer in the same breath: a shim beside the module,
+// under a per-OS directory, which reads the header and hands back what a caller wants. That is what
+// `meta.c` is. Nothing here knows an offset.
+//
+// So this file is the shape that paragraph prescribed, at the size the question turned out to need:
+// thirteen numbers rather than one. `size_of` and `is_dir` were the two questions the module could
+// answer before it, and they were the two whose answers happen to be reachable through calls whose
+// signatures are all there is to get right -- which is a fact about `fopen` and `opendir` rather than
+// about what a program wants to know.
+
+// The shim. Declared on every target and defined only where a `__posix__` directory supplies it,
+// which is the same arrangement `sysl_fs_file_size` is under: an `extern` costs nothing until
+// something links it, and the `#if posix` at each caller is what keeps anything from doing so.
+private[sysl] extern "sysl_fs_stat" c_stat(path: *u8, follow: int, out: *long) -> int
+
+/** How many numbers `sysl_fs_stat` writes. It is written here rather than in the shim's own terms
+ * because the sysl side is what supplies the storage, and a mismatch would be a write past the end
+ * of an array rather than a compilation failure.
+ */
+private const stat_words: usize = 13
+
+// The file type is the top bits of the mode, and the mask and the values are POSIX's own -- fixed
+// since V7 and identical on every system this compiler targets, which is why they are literals here
+// where `mode_t`'s *width* two files away is a `#if`. A width is an ABI question; these are numbers
+// the standard fixes.
+private const s_ifmt: u32 = 0o170000
+private const s_ifreg: u32 = 0o100000
+private const s_ifdir: u32 = 0o040000
+private const s_iflnk: u32 = 0o120000
+
+/** What a filesystem entry is, beside what is in it.
+ *
+ * The three a program branches on are named and everything else is `Other` carrying the raw type
+ * bits, for the same reason `IoError` names ten codes and carries the rest: a table of every device
+ * flavour is one nobody could keep current, and a program that genuinely cares about a socket is
+ * already reading the number.
+ */
+enum Kind
+    File
+    Directory
+    Symlink
+    Other(bits: u32)
+
+    /** So that `k == Directory` reads as itself. `Other` carries a payload, so this cannot be the
+     * free discriminant comparison a bare enum gets.
+     */
+    is_dir(self) -> bool = self match
+        Directory -> true
+        _ -> false
+
+    /** The word for what this is. `Other` renders the type bits in octal, which is the notation
+     * every `stat(2)` page writes them in and the one a reader can look up.
+     */
+    name(self) -> string = self match
+        File -> "file"
+        Directory -> "directory"
+        Symlink -> "symbolic link"
+        Other(bits) -> f"other ($bits%#o)"
+end Kind
+
+/** So that a kind prints as the word rather than as a number, and `Other` says what it is carrying:
+ * a program reporting what it found in a directory has one thing to print, and the alternative is a
+ * `match` at every such site.
+ */
+impl Display for Kind
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.name(), out, fmt)
+
+impl Eq for Kind
+    eq(self, other: Kind) -> bool = self match
+        File -> other match
+            File -> true
+            _ -> false
+        Directory -> other match
+            Directory -> true
+            _ -> false
+        Symlink -> other match
+            Symlink -> true
+            _ -> false
+        Other(a) -> other match
+            Other(b) -> a == b
+            _ -> false
+end Kind
+
+/** Everything one `stat` answers, in one value.
+ *
+ * **One call rather than several is the point.** Asking separately whether a path is a directory,
+ * how big it is and when it changed is three trips into the kernel and three chances for the answer
+ * to be about three different files -- something can be replaced between them. A `Meta` is one
+ * reading of one entry.
+ *
+ * The times are `Instant`s, so `sysl.time` turns them into a date with nothing here knowing about
+ * calendars. That costs the nanoseconds the platform reports: an `Instant` is microseconds, which is
+ * the library's resolution everywhere and is finer than any filesystem here records reliably.
+ */
+struct Meta
+    /** How many bytes the file holds. Meaningful for a regular file; for a directory it is whatever
+     * the filesystem keeps its own bookkeeping in and is not a count of entries.
+     */
+    size: long
+
+    /** The type bits and the permission bits together, as the platform reports them. `kind` and
+     * `permissions` are the two halves, and are what a program should read instead.
+     */
+    mode: u32
+
+    /** How many names in the filesystem lead to this entry. Greater than one means a hard link
+     * exists, which is what a backup or a de-duplicating copy needs to know.
+     */
+    links: u64
+
+    owner: u32
+    group: u32
+
+    /** The entry's number within its filesystem, and which filesystem that is. **Neither identifies
+     * a file on its own** -- inode numbers are reused and are only unique within a device -- so the
+     * pair together is what says "these two paths are the same file".
+     */
+    inode: u64
+    device: u64
+
+    /** When the contents last changed, when they were last read, and when the entry itself last
+     * changed. The third moves when permissions or ownership do, which the first does not, and it
+     * cannot be set to the past by any ordinary call -- which is what makes it the one a security
+     * check reads.
+     */
+    modified: Instant
+    accessed: Instant
+    changed: Instant
+
+    kind(self) -> Kind
+        val t = self.mode & s_ifmt
+
+        if t == s_ifreg then File
+        elif t == s_ifdir then Directory
+        elif t == s_iflnk then Symlink
+        else Other(t)
+
+    /** The permission bits alone -- the low twelve, which are the nine `rwx` plus setuid, setgid and
+     * the sticky bit. This is what `set_permissions` takes, so the two are a round trip.
+     */
+    permissions(self) -> u32 = self.mode & 0o7777
+
+    is_file(self) -> bool = (self.mode & s_ifmt) == s_ifreg
+
+    is_dir(self) -> bool = (self.mode & s_ifmt) == s_ifdir
+
+    /** Whether the entry **itself** is a symbolic link, which only `link_metadata` can ever answer
+     * `true` to: `metadata` follows links, so what it describes is never one.
+     */
+    is_link(self) -> bool = (self.mode & s_ifmt) == s_iflnk
+
+    /** Whether two readings name the same file, which is the inode and the device together and is
+     * not the path. Two hard links to one file answer `true`; two copies of identical contents
+     * answer `false`.
+     */
+    same_file(self, other: Meta) -> bool = self.inode == other.inode && self.device == other.device
+end Meta
+
+/** The one place the two platforms disagree, and they disagree about a *width* rather than about a
+ * meaning -- `mode_t` is 16 bits on macOS and 32 on Linux. The gate is on whole declarations, which
+ * is what conditional compilation is comfortable with, exactly as `mkdir`'s is one file away.
+ */
+#if macos
+private[sysl] extern "chmod" c_chmod(path: *u8, mode: u16) -> int
+
+private chmod_done(path: string, mode: u32) -> Result[unit, IoError] =
+    reported(c_chmod(cstring(path).ptr, u16(mode & 0o7777)))
+#else
+private[sysl] extern "chmod" c_chmod(path: *u8, mode: u32) -> int
+
+private chmod_done(path: string, mode: u32) -> Result[unit, IoError] =
+    reported(c_chmod(cstring(path).ptr, mode & 0o7777))
+#endif
+
+// **The reading surface is POSIX's, and is declared only where the shim beside it is.** `Meta` and
+// `Kind` above are plain data and exist on every target; what needs a `#if` is the four calls that
+// ask, because the shim they reach is compiled from a `__posix__` directory and there is no
+// `__windows__` one. A target with no shim gets an undefined name at the call, which says what is
+// true -- rather than a `Result` that is always an error, which would say the file was not there.
+//
+// A Windows reading would not be this shape anyway: there is no inode, no owner and no group, and
+// the permission bits are not twelve. That is a `Meta` of its own when somebody wants one.
+#if posix
+
+/** Everything one `stat` answers about what a path names, following symbolic links.
+ *
+ * A path that does not exist reports `NotFound`, which is the distinction a caller has to be able to
+ * make and the reason this answers a `Result` rather than an `Option`: "there is nothing there" and
+ * "the directory above it is not searchable" are different facts and lead to different programs.
+ */
+metadata(path: string) -> Result[Meta, IoError] = stat_of(path, 1)
+
+/** The same, about the path **itself** -- so a symbolic link is described rather than followed.
+ *
+ * This is the only call in the module that can report a link at all. `is_dir`, `exists` and
+ * `metadata` all follow one silently, which is the right default and was until now the only
+ * behaviour available.
+ */
+link_metadata(path: string) -> Result[Meta, IoError] = stat_of(path, 0)
+
+/** Whether the path itself is a symbolic link. It follows nothing, so a link to a directory answers
+ * `true` here and `is_dir` answers `true` about the same path -- the two are asking different
+ * questions and both answers are right.
+ */
+is_link(path: string) -> bool
+    link_metadata(path) match
+        Ok(m) -> m.is_link()
+        Err(_) -> false
+
+/** The permission bits set to exactly what is given. It is not a mask to add: `0o644` means the file
+ * ends up `0o644` whatever it was, which is `chmod(2)`'s own meaning and the one a program that read
+ * `permissions()` first is expecting.
+ */
+set_permissions(path: string, mode: u32) -> Result[unit, IoError] = chmod_done(path, mode)
+
+/** One reading, turned from thirteen numbers into the struct.
+ *
+ * **The array is a local and the shim writes into it**, which is the caller-supplied-storage shape
+ * the whole org uses for a C structure that will not cross: there is no allocation, the size is
+ * `stat_words` on both sides, and nothing outlives the call.
+ */
+private stat_of(path: string, follow: int) -> Result[Meta, IoError]
+    var raw: [stat_words]long = [0; stat_words]
+
+    if c_stat(cstring(path).ptr, follow, &raw[0]) != 0 then return Err(why())
+
+    Ok(Meta(raw[0], u32(raw[1]), u64(raw[2]), u32(raw[3]), u32(raw[4]), u64(raw[5]), u64(raw[6]),
+            at(raw[7], raw[8]), at(raw[9], raw[10]), at(raw[11], raw[12])))
+end stat_of
+
+#endif
+
+/** A POSIX timestamp as an `Instant`. The nanoseconds are divided rather than dropped, so a file
+ * written twice within a second is still ordered as long as the filesystem recorded it that way.
+ */
+private at(secs: long, nanos: long) -> Instant = Instant(secs * 1000000 + nanos / 1000)
+
+/** A C call that reports success as zero, as this module's `Result`. `path.sysl` has one of these
+ * too and they are the same three lines; they are separate because `private` in sysl is
+ * file-private, which is what keeps a helper from becoming a name every file in a module competes
+ * over.
+ */
+private reported(rc: int) -> Result[unit, IoError] = if rc != 0 then Err(why()) else Ok(())

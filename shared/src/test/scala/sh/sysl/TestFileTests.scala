@@ -489,6 +489,58 @@ class TestFileTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
   }
 
+  /** **Two `@tests` files of one module, each with a `private` helper of the same name.**
+   *
+   * `private` in sysl is file-private, so this is ordinary — the two are different declarations and
+   * `declKey` gives the second a numbered key of its own so they can coexist. What that key does not
+   * inherit for free is being scaffolding: `testOnlyDecls` is filled *before* hoisting, which is what
+   * lets it remember which file wrote a declaration and is also why it can only hold the plain
+   * spelling. So the second file's body was held to the rule for shipped code and reported for
+   * calling the very file it is in.
+   *
+   * Found 2026-08-27 by `sysl.fs` growing a third test file, each with a `private scratch`.
+   */
+  "a file-private helper declared in two '@tests' files of one module is scaffolding in both" - {
+
+    "the second file's helper may name what its own file declares" in {
+      // **The shape matters and a symmetrical fixture misses the branch entirely.** What is scanned
+      // is a function whose key is *not* in `testOnlyDecls`, and what is reported is a name that
+      // *is* — so the numbered `scratch` has to call something whose key is plain. Two files each
+      // declaring `helper` and `scratch` gives the second file a numbered key for both, and then
+      // nothing it calls is reportable: the fixture passes with the fix removed. `only_here` is
+      // declared once, so it keeps the plain key and is the name the walk would object to.
+      val ran = ranIn(
+        ("", "main.sysl", "import m.*\nprint(double(21))"),
+        ("m", "m.sysl", "module m\n\ndouble(n: int) -> int = n * 2"),
+        ("m", "a_tests.sysl",
+         "module m\n@tests\n\nprivate scratch(n: int) -> int = n + 1\n\n" +
+           "@test\nfirst_file() =\n    assert(scratch(1) == 2)\n"),
+        ("m", "b_tests.sysl",
+         "module m\n@tests\n\nonly_here(n: int) -> int = n + 10\n\n" +
+           "private scratch(n: int) -> int = only_here(n)\n\n" +
+           "@test\nsecond_file() =\n    assert(scratch(1) == 11)\n"),
+      )
+
+      ran.map(o => o.test.display -> o.passed) shouldBe
+        List("first_file" -> true, "second_file" -> true)
+    }
+
+    // The drop is the other half of the header's promise, and a numbered key that was never marked
+    // scaffolding would be asked about under a name `Tests.strip` does not know. Neither helper may
+    // reach a program built beside them.
+    "and neither file's helper is defined in the program built beside them" in {
+      val out = irIn(
+        ("", "main.sysl", "import m.*\nprint(double(21))"),
+        ("m", "m.sysl", "module m\n\ndouble(n: int) -> int = n * 2"),
+        ("m", "a_tests.sysl", "module m\n@tests\n\nprivate scratch(n: int) -> int = n + 1"),
+        ("m", "b_tests.sysl", "module m\n@tests\n\nprivate scratch(n: int) -> int = n + 10"),
+      )
+
+      out should include("@m$double")
+      out should not include "scratch"
+    }
+  }
+
   "the flag survives the artifact codec" in {
     // It is never written to a real artifact, since the file is filtered out before the encode. It
     // travels anyway because a codec that quietly defaulted a field is the failure `Version` exists

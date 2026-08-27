@@ -28,6 +28,13 @@ module sysl.container
  * wrong slot without touching either string; and `rehash` re-places every entry without hashing
  * anything, since the number it needs is already sitting beside the key.
  *
+ * **An empty map has no table**, which is the fourth piece and the only one that is about what a map
+ * costs when nothing is in it. `map()` allocates nothing; the first `put` makes the table. A program
+ * that builds a map per loop iteration, or holds one in a struct that is usually empty, or makes one
+ * on a branch that turns out not to be taken, pays nothing for any of them -- and none of those
+ * callers could see that they were paying before, which is why the fix belongs here rather than at
+ * each of them.
+ *
  * ## What this replaced, and what that exercise found
  *
  * A chained map lived in `guide/hashmap` until this module existed, and it is gone -- a guide
@@ -150,6 +157,10 @@ struct Map[K: Hash + Eq, V]
 
     /** How many slots the table has, which is what the load factor is measured against. It is not a
      * promise about how many entries fit -- the map rehashes at three quarters of this.
+     *
+     * **A map that has never been put into answers zero**, because it has no table: one is made by
+     * the first insert. That is the one number here a caller might be surprised by, and it is the
+     * whole of what "an empty map does not allocate" looks like from outside.
      */
     capacity(self) -> usize = self.cell.len
 
@@ -158,8 +169,14 @@ struct Map[K: Hash + Eq, V]
      * The walk stops at `Empty` and steps over `Dead`, which is the rule the two variants exist to
      * express. It terminates because the load factor keeps at least one slot in four empty, so the
      * `Empty` case is always reachable from anywhere in the table.
+     *
+     * **A map with no table at all is answered before the probe starts.** A table is made by the
+     * first `put`, so `cell` is empty until then, and `cell.len - 1` on an empty run is not a mask
+     * of no bits -- it is every bit, and the index it makes is off the end.
      */
     private find(self, k: K) -> Option[usize]
+        if self.cell.len == 0 then return None
+
         val h = k.hash()
         val mask = self.cell.len - 1
         var i = usize(h) & mask
@@ -240,11 +257,13 @@ struct Map[K: Hash + Eq, V]
                 true
     end remove
 
-    /** Every entry dropped and the table returned to its starting size, so that a map used as
-     * scratch across a loop does not keep the largest table any pass through it needed.
+    /** Every entry dropped and the table let go entirely, so that a map used as scratch across a
+     * loop does not keep the largest table any pass through it needed -- and a map that is cleared
+     * and never used again costs nothing at all. The next `put` makes a fresh table, exactly as it
+     * would for a map that had never held anything.
      */
     clear(*self)
-        self.cell = [Slot.Empty; initial_slots]
+        self.cell = []
         self.count = 0
         self.dead = 0
 
@@ -304,14 +323,24 @@ struct Map[K: Hash + Eq, V]
     walk(self) -> Cursor[K, V] = Cursor(self.cell, 0)
 end Map
 
-/** An empty map, with a table already under it so that every later question can assume one.
+/** An empty map, which holds **no table at all** until something is put in it.
+ *
+ * **An empty map does not allocate**, which matters far more than it looks: a map built inside a
+ * loop, held in a struct that is usually empty, or made and dropped on a branch that turns out not
+ * to be taken costs a `malloc` and the `free` behind it every time, and no caller can see that it is
+ * paying. The first `put` finds the table over its load -- nothing is over nothing -- and rehashes
+ * to `initial_slots` before it places anything, which is the path `put` already took for a table
+ * that had filled up. So there is no separate "grow from empty" case to get wrong.
+ *
+ * Reach for `map_with_capacity` where entries are known to be coming: a caller who names a size is
+ * saying so, and gets its table immediately.
  *
  * **The annotation on `m` is required and is not noise.** `Map`'s parameters would have to come from
- * the constructor's arguments while the bare `Slot.Empty` filling the table waits to hear what it is
- * a slot of, and neither can go first.
+ * the constructor's arguments while the empty table waits to hear what it is a table of, and neither
+ * can go first.
  */
 map[K: Hash + Eq, V]() -> Map[K, V]
-    var m: Map[K, V] = Map([Slot.Empty; initial_slots], 0, 0)
+    var m: Map[K, V] = Map([], 0, 0)
 
     m
 

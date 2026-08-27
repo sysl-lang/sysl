@@ -1,0 +1,135 @@
+module sysl.fs
+@requires(os)
+
+import sysl.path.{join, parent}
+import sysl.slices.{as_mut_ptr, as_ptr}
+import sysl.text.{cstring, from_cstring}
+
+// Where the program is, where it can put something nobody else will take, and the two directory
+// operations that are loops rather than calls.
+//
+// **`make_dir_all` and `remove_dir_all` are not syscalls and belong here anyway.** Neither is one
+// right answer per operating system -- they are loops over calls that already exist -- so they earn
+// their place on the other test `library/_index.md` sets: hand-writing a post-order delete walk is a
+// tax every test suite with a scratch directory was paying, not a domain anybody chose to take on.
+//
+// They are also where this module and `sysl.path` meet, and the split is visible in one line:
+// `make_dir_all` asks `sysl.path.parent` where to climb to, and asks the filesystem whether it is
+// there. The first question needs no operating system and the second is nothing else.
+
+private[sysl] extern "getcwd" c_getcwd(into: *u8, room: usize) -> *u8
+private[sysl] extern "chdir" c_chdir(path: *u8) -> int
+private[sysl] extern "sysl_fs_temp_dir" c_temp_dir(prefix: *u8, into: *u8, room: usize) -> int
+
+/** How much storage a path answer is given, which `links.sysl` explains at length. */
+private const path_bytes: usize = 4096
+
+/** Where the program is, which nothing in the library could ask before.
+ *
+ * `sysl.process` takes a `dir` for a child to start in, so a program could say where somebody *else*
+ * should be and not where it was itself. This is the other half.
+ *
+ * **It is a global the whole process shares**, so a threaded program that reads this while another
+ * thread is calling `set_current_dir` gets one of the two answers and no promise about which.
+ * Building an absolute path once at start-up is the shape that avoids the question.
+ */
+current_dir() -> Result[string, IoError]
+    var into: []u8 = [0; path_bytes]
+
+    if c_getcwd(as_mut_ptr(into), into.len) == null then return Err(why())
+
+    from_cstring(as_ptr(into)) match
+        Ok(s) -> Ok(s)
+        Err(_) -> Err(Other(84))
+end current_dir
+
+/** Moves the program. **It is process-wide**, which is the thing to know before reaching for it: a
+ * library that changes the working directory changes it for every thread and for every other library
+ * in the program, and puts it back only if it remembers to.
+ *
+ * Prefer building an absolute path. This exists because a program that drives a build, or that is
+ * the shell-like thing at the top, genuinely needs it.
+ */
+set_current_dir(path: string) -> Result[unit, IoError] = told(c_chdir(cstring(path).ptr))
+
+/** A directory that did not exist a moment ago and that nobody else can take, made inside whatever
+ * `TMPDIR` names -- or `/tmp` where it names nothing.
+ *
+ * **It is created, not merely named**, which is the whole point: inventing a path and then making it
+ * leaves a gap between the two in which somebody else on a shared `/tmp` can take the name, and that
+ * somebody is not necessarily friendly. The prefix is for a human reading a directory listing and is
+ * not what makes the name unique.
+ *
+ * **Removing it is the caller's**, and `remove_dir_all` is the call: nothing here runs at the end of
+ * a scope that the scope did not say, so `defer remove_dir_all(d)` is the idiom.
+ */
+#if posix
+make_temp_dir(prefix: string) -> Result[string, IoError]
+    var into: []u8 = [0; path_bytes]
+    val code = c_temp_dir(cstring(prefix).ptr, as_mut_ptr(into), into.len)
+
+    if code != 0 then return Err(from_errno(code))
+
+    from_cstring(as_ptr(into)) match
+        Ok(s) -> Ok(s)
+        Err(_) -> Err(Other(84))
+end make_temp_dir
+#endif
+
+/** Every directory on the path made, from the topmost one that is missing down.
+ *
+ * **A path that is already a directory is success, not `AlreadyExists`**, which is the difference
+ * between this and a loop over `make_dir` and is what every caller of it wanted: the question being
+ * asked is "make sure this is there", and a program that has to distinguish "I made it" from "it was
+ * there" is asking a question this cannot answer honestly anyway, since somebody else may have made
+ * it in between.
+ *
+ * It climbs with `sysl.path.parent` and recurses, so the work is done from the top down and each
+ * level is attempted exactly once. A component that exists and is **not** a directory reports
+ * `NotADirectory` from the `make_dir` beneath it rather than being silently accepted.
+ */
+make_dir_all(path: string) -> Result[unit, IoError]
+    if path.len == 0 || is_dir(path) then return Ok(())
+
+    parent(path) match
+        Some(up) -> make_dir_all(up)?
+        None -> ()
+
+    make_dir(path) match
+        Ok(_) -> Ok(())
+        // Somebody else may have made it between the `is_dir` above and this call, and a program
+        // that asked for the directory to exist got what it asked for. Anything else it was is a
+        // real failure and is reported.
+        Err(AlreadyExists) -> if is_dir(path) then Ok(()) else Err(AlreadyExists)
+        Err(e) -> Err(e)
+end make_dir_all
+
+/** A directory and everything under it removed.
+ *
+ * **The walk is post-order** -- a directory is emptied before it is taken -- because `rmdir` refuses
+ * one that is not empty, which is the rule `remove_dir` states and this exists to work within rather
+ * than around.
+ *
+ * **A symbolic link is unlinked, not followed**, which is the property that keeps this from deleting
+ * something outside the tree it was pointed at. `entries` says what is in a directory and `is_dir`
+ * follows links, so the test here is `link_metadata` -- the one reading in the module that describes
+ * the path itself.
+ *
+ * A path that is not there at all is success. A caller tearing down after a failure should not have
+ * to know how far the failure got.
+ */
+remove_dir_all(path: string) -> Result[unit, IoError]
+    if !exists(path) && !is_link(path) then return Ok(())
+
+    if is_link(path) || !is_dir(path) then return remove_file(path)
+
+    val names = entries(path)?
+
+    for name in names.view()
+        remove_dir_all(join(path, name))?
+
+    remove_dir(path)
+end remove_dir_all
+
+/** A C call that reports success as zero. */
+private told(rc: int) -> Result[unit, IoError] = if rc != 0 then Err(why()) else Ok(())

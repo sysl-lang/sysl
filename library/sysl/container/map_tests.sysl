@@ -71,7 +71,7 @@ map_remove_reports()
     assert_eq(m.get("k"), None)
 end map_remove_reports
 
-@test("clear empties the map and returns the table to its starting size")
+@test("clear empties the map and lets the table go entirely")
 clear_resets()
     var m: Map[int, int] = map()
 
@@ -83,8 +83,13 @@ clear_resets()
     m.clear()
 
     assert_eq(m.len(), 0)
-    assert_eq(m.capacity(), 8)
+    assert_eq(m.capacity(), 0)
     assert_eq(m.get(3), None)
+
+    m.put(3, 3)
+
+    assert_eq(m.capacity(), 8)
+    assert_eq(m.get(3), Some(3))
 end clear_resets
 
 // -- probing --------------------------------------------------------------------------------------
@@ -162,6 +167,8 @@ end map_growth_keeps_everything
 map_growth_is_geometric()
     var m: Map[int, int] = map()
 
+    m.put(0, 0)
+
     assert_eq(m.capacity(), 8)
 
     for i in 0..<1000
@@ -169,6 +176,56 @@ map_growth_is_geometric()
 
     assert_eq(m.capacity(), 2048)
 end map_growth_is_geometric
+
+// -- the table is made by the first insert --------------------------------------------------------
+
+/** **The reduction from the card that asked for this**: a map made and dropped without an insert
+ * used to be a `malloc` of eight slots and the `free` behind it. `capacity` is how that is visible
+ * from outside -- a fresh map has no table, and the first `put` makes one at the starting size.
+ */
+@test("a fresh map holds no table until something is put in it")
+fresh_map_has_no_table()
+    var m: Map[string, int] = map()
+
+    assert_eq(m.capacity(), 0)
+
+    m.put("k", 1)
+
+    assert_eq(m.capacity(), 8)
+    assert_eq(m.get("k"), Some(1))
+end fresh_map_has_no_table
+
+/** Every question that can be asked of a map must answer on one with no table, since `find` masks
+ * with `cell.len - 1` and that is every bit rather than no bits when the run is empty.
+ */
+@test("every read answers on a map that has no table")
+reads_answer_on_an_empty_table()
+    var m: Map[string, int] = map()
+
+    assert_eq(m.get("nothing"), None)
+    assert_eq(m.get_or("nothing", -1), -1)
+    assert(!m.has("nothing"))
+    assert(!m.remove("nothing"))
+    assert_eq(m.len(), 0)
+    assert(m.is_empty())
+
+    var seen = 0
+
+    for pair in m.walk()
+        seen += 1
+
+    assert_eq(seen, 0)
+end reads_answer_on_an_empty_table
+
+/** A map asked for a capacity gets its table immediately: a caller who names a size is saying
+ * entries are coming, which is the one case where allocating up front is what was wanted.
+ */
+@test("map_with_capacity still allocates its table up front")
+reserved_map_allocates_eagerly()
+    var m: Map[int, int] = map_with_capacity(100)
+
+    assert(m.capacity() >= 200)
+end reserved_map_allocates_eagerly
 
 @test("a reserved map does not rehash while it is filled to what was asked for")
 reserved_does_not_rehash()

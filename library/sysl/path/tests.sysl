@@ -1,0 +1,225 @@
+module sysl.path
+@tests
+
+// What `sysl.path` claims, asserted against the string alone -- there is no filesystem in any of
+// this, which is the module's whole property and is what lets these run on any target at all.
+
+// -- what a path starts with ----------------------------------------------------------------------
+
+@test("a path starting at the root is absolute and nothing else is")
+absolute_is_the_leading_separator()
+    assert(is_absolute("/"))
+    assert(is_absolute("/etc/hosts"))
+    assert(!is_absolute(""))
+    assert(!is_absolute("etc/hosts"))
+    assert(!is_absolute("./etc"))
+    assert(is_relative("etc"))
+    assert(!is_relative("/etc"))
+end absolute_is_the_leading_separator
+
+// -- components -----------------------------------------------------------------------------------
+
+@test("components are the non-empty pieces, and a leading separator is not one of them")
+components_drop_the_empties()
+    assert_eq(components("/a/b/c"), ["a", "b", "c"])
+    assert_eq(components("a/b"), ["a", "b"])
+    assert_eq(components("//a///b//"), ["a", "b"])
+    assert_eq(components("/"), [])
+    assert_eq(components(""), [])
+end components_drop_the_empties
+
+@test("a dot is a component, since removing one is normalize's job and not this one's")
+components_keep_the_dots()
+    assert_eq(components("a/./../b"), ["a", ".", "..", "b"])
+end components_keep_the_dots
+
+// -- join -----------------------------------------------------------------------------------------
+
+@test("joining writes exactly one separator however many the first path ended with")
+join_writes_one_separator()
+    assert_eq(join("/home/me", "notes"), "/home/me/notes")
+    assert_eq(join("/home/me/", "notes"), "/home/me/notes")
+    assert_eq(join("/home/me///", "notes"), "/home/me/notes")
+    assert_eq(join("a", "b"), "a/b")
+end join_writes_one_separator
+
+/** **The case a hand-rolled `a + "/" + b` gets wrong**, and the reason `join` is worth having: the
+ * second path already says where it starts, so putting the first in front of it names somewhere
+ * neither of them meant.
+ */
+@test("an absolute second path replaces the first rather than being appended to it")
+join_absolute_replaces()
+    assert_eq(join("/home/me", "/etc"), "/etc")
+    assert_eq(join("relative", "/etc"), "/etc")
+end join_absolute_replaces
+
+@test("an empty piece on either side contributes nothing")
+join_with_an_empty_side()
+    assert_eq(join("", "b"), "b")
+    assert_eq(join("a", ""), "a")
+    assert_eq(join("", ""), "")
+    assert_eq(join("/", "etc"), "/etc")
+end join_with_an_empty_side
+
+@test("join_all folds the same rule over every piece")
+join_all_folds()
+    assert_eq(join_all(["/home/me", ".config", "thing"]), "/home/me/.config/thing")
+    assert_eq(join_all([]), "")
+    assert_eq(join_all(["a", "/b", "c"]), "/b/c")
+end join_all_folds
+
+// -- decomposition --------------------------------------------------------------------------------
+
+@test("the parent is everything above the last component, and the root has none")
+parent_climbs_one()
+    assert_eq(parent("/a/b/c"), Some("/a/b"))
+    assert_eq(parent("/a/b"), Some("/a"))
+    assert_eq(parent("/a"), Some("/"))
+    assert_eq(parent("/"), None)
+    assert_eq(parent(""), None)
+    assert_eq(parent("a/b"), Some("a"))
+    assert_eq(parent("a"), None)
+end parent_climbs_one
+
+@test("a trailing separator does not give a path an extra level")
+parent_ignores_a_trailing_separator()
+    assert_eq(parent("/a/b/"), Some("/a"))
+    assert_eq(parent("/a//"), Some("/"))
+end parent_ignores_a_trailing_separator
+
+@test("the file name is the last component, and a path that names no file has none")
+file_name_is_the_last_component()
+    assert_eq(file_name("/a/b.txt"), Some("b.txt"))
+    assert_eq(file_name("b.txt"), Some("b.txt"))
+    assert_eq(file_name("/a/b/"), Some("b"))
+    assert_eq(file_name("/"), None)
+    assert_eq(file_name(""), None)
+    assert_eq(file_name("."), None)
+    assert_eq(file_name("a/.."), None)
+end file_name_is_the_last_component
+
+@test("the extension is what follows the final dot")
+extension_is_after_the_last_dot()
+    assert_eq(extension("/a/b.txt"), Some("txt"))
+    assert_eq(extension("b.tar.gz"), Some("gz"))
+    assert_eq(extension("b"), None)
+    assert_eq(extension("/"), None)
+end extension_is_after_the_last_dot
+
+/** A name that begins with a dot and has no other is a name, not an empty stem with an extension --
+ * which is what every filesystem's own tooling means by it.
+ */
+@test("a leading dot does not make an extension, and a trailing one makes an empty one")
+extension_edges()
+    assert_eq(extension(".bashrc"), None)
+    assert_eq(extension("/home/me/.bashrc"), None)
+    assert_eq(extension(".tar.gz"), Some("gz"))
+    assert_eq(extension("b."), Some(""))
+end extension_edges
+
+@test("the stem is the file name without its extension")
+stem_drops_the_extension()
+    assert_eq(stem("/a/b.txt"), Some("b"))
+    assert_eq(stem("b.tar.gz"), Some("b.tar"))
+    assert_eq(stem("b"), Some("b"))
+    assert_eq(stem(".bashrc"), Some(".bashrc"))
+    assert_eq(stem("/"), None)
+end stem_drops_the_extension
+
+/** The two are a decomposition, so putting them back together has to give the name again. That is
+ * the property a pair of them can get wrong while each looks right on its own.
+ */
+@test("stem and extension put back together are the file name")
+stem_and_extension_reconstruct()
+    for p in ["/a/b.txt", "b.tar.gz", "plain", ".bashrc", "trailing."]
+        val name = file_name(p).unwrap()
+
+        val back = extension(p) match
+            Some(e) -> stem(p).unwrap() + "." + e
+            None -> stem(p).unwrap()
+
+        assert_eq(back, name)
+end stem_and_extension_reconstruct
+
+// -- normalize ------------------------------------------------------------------------------------
+
+@test("normalize resolves the dots and collapses the separators")
+normalize_resolves_the_dots()
+    assert_eq(normalize("/a/./b/../c"), "/a/c")
+    assert_eq(normalize("/a//b/"), "/a/b")
+    assert_eq(normalize("a/b/../c"), "a/c")
+    assert_eq(normalize("./a"), "a")
+end normalize_resolves_the_dots
+
+/** The root has no parent, so a path may not climb above it. A relative path has nothing above it
+ * that this module can name, so its leading `..` are kept -- which is the same absence read from the
+ * other side, and is why a relative path never normalizes into an absolute one.
+ */
+@test("a climb above the root is dropped and a climb above a relative path is kept")
+normalize_at_the_top()
+    assert_eq(normalize("/../a"), "/a")
+    assert_eq(normalize("/a/../../b"), "/b")
+    assert_eq(normalize("../a"), "../a")
+    assert_eq(normalize("a/../../b"), "../b")
+    assert_eq(normalize("../../a"), "../../a")
+end normalize_at_the_top
+
+@test("a path that cancels down to nothing is the root or a dot, never the empty string")
+normalize_never_answers_empty()
+    assert_eq(normalize("/"), "/")
+    assert_eq(normalize("/a/.."), "/")
+    assert_eq(normalize(""), ".")
+    assert_eq(normalize("."), ".")
+    assert_eq(normalize("a/.."), ".")
+end normalize_never_answers_empty
+
+@test("normalizing twice changes nothing the first pass did not")
+normalize_is_settled()
+    for p in ["/a/./b/../c", "a/../../b", "//x//", "/..", "."]
+        assert_eq(normalize(normalize(p)), normalize(p))
+end normalize_is_settled
+
+// -- relative_to ----------------------------------------------------------------------------------
+
+@test("a path expressed against a base above it is the rest of it")
+relative_to_a_base_above()
+    assert_eq(relative_to("/a/b/c", "/a"), Some("b/c"))
+    assert_eq(relative_to("/a/./b", "/a"), Some("b"))
+    assert_eq(relative_to("x/y", "x"), Some("y"))
+end relative_to_a_base_above
+
+@test("a path expressed against a base beside it climbs first")
+relative_to_a_base_beside()
+    assert_eq(relative_to("/a/b", "/a/c"), Some("../b"))
+    assert_eq(relative_to("/a", "/a/b/c"), Some("../.."))
+end relative_to_a_base_beside
+
+@test("a path against itself is a dot, which is what a caller then joins onto")
+relative_to_itself()
+    assert_eq(relative_to("/a/b", "/a/b"), Some("."))
+    assert_eq(relative_to("/", "/"), Some("."))
+end relative_to_itself
+
+/** The two refusals, and both are about a name that is not in the string: an absolute path has no
+ * expression against a relative one without knowing where the program is, and a `..` in the base
+ * names a directory whose name nothing here can see.
+ */
+@test("relative_to answers nothing where the answer is not in the two strings")
+relative_to_refuses()
+    assert_eq(relative_to("/a/b", "a"), None)
+    assert_eq(relative_to("a/b", "/a"), None)
+    assert_eq(relative_to("a", ".."), None)
+end relative_to_refuses
+
+/** The property that makes the answer worth having: joining it back onto the base gives the path
+ * again. It is asserted through `normalize` because the answer is normalized and the input need not
+ * have been.
+ */
+@test("joining a relative answer back onto its base gives the original path")
+relative_to_round_trips()
+    for pair in [("/a/b/c", "/a"), ("/a/b", "/a/c"), ("/a", "/a/b/c"), ("x/y", "x")]
+        val (p, base) = pair
+        val rel = relative_to(p, base).unwrap()
+
+        assert_eq(normalize(join(base, rel)), normalize(p))
+end relative_to_round_trips

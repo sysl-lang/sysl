@@ -829,7 +829,20 @@ trait Hoisting extends HoistMembers {
                 then s"$plain.private${filePrivateSlots(plain).length + 1}"
                 else plain
 
-              if key != plain then filePrivateSlots(plain) = filePrivateSlots(plain) :+ key
+              if key != plain then
+                filePrivateSlots(plain) = filePrivateSlots(plain) :+ key
+
+                // **A numbered key is the same declaration, so it inherits the plain key's
+                // scaffolding.** `testOnlyDecls` is filled before anything is hoisted — that is what
+                // lets it remember which file wrote a declaration — so it can only hold the plain
+                // spelling, and the second file to declare a file-private name is the one that gets
+                // a key nobody put in it. Every consumer then reads that body as shipped code:
+                // `TestScope` reports its calls into the test file it is *in*, `Tests.strip` is
+                // asked about a name it does not know, and `NoAlloc` holds it to the module's clause
+                // rather than to the tests'. Two `tests.sysl` files of one module each writing a
+                // `private scratch` is the whole of what it takes.
+                if testOnlyDecls(plain) then testOnlyDecls += key
+
               filePrivateKeys((file, plain)) = key
               key
   }

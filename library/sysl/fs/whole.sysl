@@ -3,7 +3,7 @@ module sysl.fs
 
 import sysl.buf.{Buf, buf}
 import sysl.io.Reader
-import sysl.text.from_utf8
+import sysl.text.{cstring, from_utf8}
 
 // A whole file in one call, which is what most programs that touch a file want and all of what some
 // of them want.
@@ -109,3 +109,64 @@ private put(f: File, bytes: []const u8) -> Result[unit, IoError]
 
     out.close()
 end put
+
+/** One file copied to another path, replacing whatever was at the destination.
+ *
+ * **It is a read-and-write loop rather than a platform fast path**, which is a decision rather than
+ * an omission. `copyfile(3)` on macOS and `copy_file_range(2)` on Linux can hand the whole thing to
+ * the kernel, and on a filesystem that supports reflinks they can do it without moving any data at
+ * all -- but the two have different names, different signatures and different failure modes, and
+ * neither is reachable without a shim per platform. What is here is correct everywhere and is what
+ * every caller needs; the fast path is worth adding the day something measures that it is missed.
+ *
+ * **The permission bits are not carried over.** The destination is made the way `create` makes any
+ * file, which is what the process umask decides. A caller that wants the mode preserved reads
+ * `metadata(from).permissions()` and writes it with `set_permissions`, which says out loud that it
+ * is doing so -- and a copy that silently reproduced a `0o600` into a directory where that was not
+ * intended is the kind of surprise a library should not spring.
+ */
+copy_file(from: string, to: string) -> Result[unit, IoError]
+    var src = open(from)?
+
+    defer src.close()
+
+    var dst = create(to)?
+
+    defer dst.close()
+
+    var chunk: []u8 = [0; 8192]
+
+    loop
+        var got = src.read(chunk)
+
+        if got.len == 0 then break
+
+        dst.write(got)
+
+        if dst.failed() then return Err(why())
+
+    if src.failed() then return Err(why())
+
+    // The `defer` above closes it too, and closing twice is deliberately harmless -- but a close is
+    // where a full disk finally reports, so a copy that did not ask would answer `Ok` for a file
+    // that never reached the platter.
+    dst.close()
+end copy_file
+
+/** A file cut to a length, or extended to one with zeroes. It makes nothing: a path that is not
+ * there reports `NotFound` rather than becoming an empty file.
+ *
+ * Extending is `truncate(2)`'s own behaviour and is worth knowing, since the name says only half of
+ * it: a length past the end of the file leaves a hole that reads as zeroes and that most filesystems
+ * do not store.
+ */
+truncate(path: string, length: long) -> Result[unit, IoError]
+#if posix
+    if c_truncate(cstring(path).ptr, length) != 0 then Err(why()) else Ok(())
+#else
+    Err(unsupported())
+#endif
+
+// `truncate(2)` is POSIX rather than ISO C, so the declaration is here and the `#if` above is what
+// keeps a target without it from linking one that is not there.
+private extern "truncate" c_truncate(path: *u8, length: long) -> int

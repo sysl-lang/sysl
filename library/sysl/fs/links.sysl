@@ -1,0 +1,118 @@
+module sysl.fs
+@requires(os)
+
+import sysl.text.{cstring, from_utf8}
+
+// Symbolic and hard links, and the path the filesystem itself agrees on.
+//
+// **A path buffer is a local array here rather than a growing `Buf`**, and that is the shape to copy
+// wherever this module next binds a call that fills one. `readlink` and `getcwd` both write into
+// storage the caller supplies and report what they could not fit, so a caller either guesses a size
+// or asks the platform for one -- and `PATH_MAX` is a `#define`, which is among the three things
+// only C can reach. A fixed 4,096 bytes is what every Linux allows and four times what macOS does,
+// so a path this refuses is one no filesystem here can hold; the shim in `meta.c` resolves into a
+// local of exactly `PATH_MAX` and copies out, which is the same answer written where the constant
+// lives.
+
+private[sysl] extern "symlink" c_symlink(target: *u8, link: *u8) -> int
+private[sysl] extern "link" c_link(existing: *u8, fresh: *u8) -> int
+private[sysl] extern "readlink" c_readlink(path: *u8, into: *u8, room: usize) -> long
+private[sysl] extern "sysl_fs_realpath" c_realpath(path: *u8, into: *u8, room: u64) -> long
+
+/** How much storage a path answer is given. See the note at the head of this file.
+ *
+ * The name says what it is a bound on -- the *bytes* of a path, not its components -- because a
+ * caller reading `ENAMETOOLONG` back wants to know which.
+ */
+private const path_bytes: usize = 4096
+
+/** A symbolic link created at `link`, pointing at `target`.
+ *
+ * **`target` is not checked and does not have to exist.** A dangling link is a legal thing to make
+ * and is sometimes the point -- a package manager writes one before what it names has been
+ * unpacked. It is also stored **as written**: a relative target is resolved against the directory
+ * the link is in, every time it is followed, rather than against wherever the program was when it
+ * made the link.
+ */
+symlink(target: string, link: string) -> Result[unit, IoError]
+    var a = cstring(target)
+    var b = cstring(link)
+
+    said(c_symlink(a.ptr, b.ptr))
+
+/** A second name for a file that already exists, in the same filesystem.
+ *
+ * The two names are equal afterwards -- there is no original -- and the file goes when the last of
+ * them does, which is what `Meta.links` counts. It fails across filesystems, and it fails on a
+ * directory, both of which are the kernel's rules rather than this module's.
+ */
+hard_link(existing: string, fresh: string) -> Result[unit, IoError]
+    var a = cstring(existing)
+    var b = cstring(fresh)
+
+    said(c_link(a.ptr, b.ptr))
+
+/** What a symbolic link points at, exactly as it was written -- which may be relative, and may name
+ * nothing at all.
+ *
+ * A path that is not a link reports `Other(22)`, which is `EINVAL`: "this is not the kind of thing
+ * that has a target". Ask `is_link` first where the difference matters.
+ */
+read_link(path: string) -> Result[string, IoError]
+    var into: [path_bytes]u8 = [0; path_bytes]
+    val n = c_readlink(cstring(path).ptr, &into[0], path_bytes)
+
+    if n < 0 then return Err(why())
+
+    // `readlink` does not terminate what it writes and does not report truncation -- a target that
+    // filled the buffer exactly is indistinguishable from one that was cut short, so a full buffer
+    // is refused rather than answered. Nothing here can grow and retry, since there is no size that
+    // would be enough on a filesystem that allowed more.
+    if usize(n) >= path_bytes then return Err(name_too_long())
+
+    text(into[0..<usize(n)])
+end read_link
+
+/** The path the filesystem agrees on: every `.`, every `..` and every symbolic link resolved, and
+ * the answer absolute.
+ *
+ * **This is not `sysl.path.normalize`, and the difference is a security bug when it is not known.**
+ * `normalize` is string surgery and touches no disk; where `a/b` is a link to `/elsewhere`,
+ * `a/b/../c` normalizes to `a/c` and canonicalizes to `/c` -- two different files. Every path so far
+ * has to exist, which is the price of the real answer and is also a useful check in itself.
+ */
+#if posix
+canonicalize(path: string) -> Result[string, IoError]
+    var into: [path_bytes]u8 = [0; path_bytes]
+    val n = c_realpath(cstring(path).ptr, &into[0], u64(path_bytes))
+
+    if n < 0 then return Err(why())
+
+    text(into[0..<usize(n)])
+end canonicalize
+#endif
+
+/** `ENAMETOOLONG`, which is 63 on macOS and 36 on Linux -- one of the few codes the two disagree
+ * about, like `ENOTEMPTY` one file away and for the same historical reason.
+ */
+#if macos
+private name_too_long() -> IoError = Other(63)
+#else
+private name_too_long() -> IoError = Other(36)
+#endif
+
+/** Bytes from the filesystem as a `string`.
+ *
+ * **A path that is not UTF-8 is an error rather than a trap**, which is the opposite of what
+ * `entries` does with a name, and the two differ for a reason: a name comes out of a listing a
+ * program is walking, where one bad entry should not be the caller's problem to have anticipated,
+ * while these two answer about a path the caller named and can report on. `Other(84)` is `EILSEQ`,
+ * which is the same number on both platforms.
+ */
+private text(bytes: []const u8) -> Result[string, IoError]
+    from_utf8(bytes) match
+        Ok(s) -> Ok(s)
+        Err(_) -> Err(Other(84))
+
+/** A C call that reports success as zero. */
+private said(rc: int) -> Result[unit, IoError] = if rc != 0 then Err(why()) else Ok(())

@@ -39,6 +39,12 @@ private[sysl] extern "feof" c_feof(f: *u8) -> int
 // no shim was compiled.
 private[sysl] extern "sysl_fs_file_size" c_file_size(f: *u8) -> long
 
+// The other shim beside it, and the reason it is one rather than an `ftruncate` binding: a `File` is
+// C's *buffered* handle, so bytes a program has written may still be in the buffer, and cutting
+// underneath them would put them back afterwards past the length that was asked for. The shim
+// flushes first, which is a fact about `FILE *` and belongs where the header is.
+private[sysl] extern "sysl_fs_file_truncate" c_file_truncate(f: *u8, length: long) -> int
+
 /** Where a seek counts from. C standardises the three names and every platform has agreed on the
  * three values since V7, but the *names* are what the calls below read, so a reader never has to
  * know which is which.
@@ -166,6 +172,27 @@ struct File
      * should stop rather than spin.
      */
     at_end(*self) -> bool = self.inner.shut || c_feof(self.inner.handle) != 0
+
+    /** The file cut to a length, or extended to one with zeroes -- the one thing this surface could
+     * not do, having `seek` and `size` and no way to change what is there.
+     *
+     * **The position is not moved**, which is what makes this usable in the middle of writing: a
+     * program that has written a header, written a body and discovered the body was short cuts to
+     * the length it meant and goes on from where it was. A position now past the end of the file is
+     * legal and a write there leaves a hole, exactly as a seek past the end always did.
+     *
+     * Anything still buffered is flushed first, so the length means what the caller meant at the
+     * moment they said it rather than what it meant once the buffer next drained.
+     */
+    truncate(*self, length: long) -> Result[unit, IoError]
+        if self.inner.shut then return Err(NotOpen)
+
+#if posix
+        if c_file_truncate(self.inner.handle, length) != 0 then Err(why()) else Ok(())
+#else
+        Err(unsupported())
+#endif
+    end truncate
 end File
 
 /** Whether anything has gone wrong on this file since it was opened. It latches, so it is worth

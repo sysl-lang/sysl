@@ -1,0 +1,314 @@
+module sysl.fs
+@requires(os)
+@tests
+
+import sysl.path.{is_absolute, join}
+
+// The tree operations, the working directory, and the two whole-file calls that were missing.
+
+private ignore(r: Result[unit, IoError]) = ()
+
+private scratch(name: string) -> string
+    val dir = "/tmp/sysl-fs-dirs-" + name
+
+    ignore(remove_dir_all(dir))
+    make_dir(dir).unwrap()
+    dir
+end scratch
+
+// -- make_dir_all ---------------------------------------------------------------------------------
+
+@test("a chain of directories is made from the topmost missing one down")
+make_dir_all_builds_a_chain()
+    val dir = scratch("chain")
+    val deep = join(dir, "a/b/c")
+
+    make_dir_all(deep).unwrap()
+
+    assert(is_dir(join(dir, "a")))
+    assert(is_dir(join(dir, "a/b")))
+    assert(is_dir(deep))
+
+    ignore(remove_dir_all(dir))
+end make_dir_all_builds_a_chain
+
+/** **The difference between this and a loop over `make_dir`**, and what every caller of it wanted:
+ * the question is "make sure this is there", so a directory that is already there is success rather
+ * than `AlreadyExists`.
+ */
+@test("a directory that is already there is success rather than an error")
+make_dir_all_is_idempotent()
+    val dir = scratch("again")
+
+    make_dir_all(join(dir, "x/y")).unwrap()
+    make_dir_all(join(dir, "x/y")).unwrap()
+    make_dir_all(dir).unwrap()
+
+    assert(is_dir(join(dir, "x/y")))
+
+    ignore(remove_dir_all(dir))
+end make_dir_all_is_idempotent
+
+@test("a component that exists and is not a directory is reported rather than accepted")
+make_dir_all_over_a_file()
+    val dir = scratch("overfile")
+
+    write_text(join(dir, "f"), "x").unwrap()
+
+    make_dir_all(join(dir, "f/below")) match
+        Ok(_) -> assert(false, "making a directory under a file answered")
+        Err(_) -> ()
+
+    ignore(remove_dir_all(dir))
+end make_dir_all_over_a_file
+
+// -- remove_dir_all -------------------------------------------------------------------------------
+
+@test("a tree is removed with everything under it")
+remove_dir_all_empties_a_tree()
+    val dir = scratch("tree")
+
+    make_dir_all(join(dir, "a/b")).unwrap()
+    write_text(join(dir, "a/one"), "1").unwrap()
+    write_text(join(dir, "a/b/two"), "2").unwrap()
+    write_text(join(dir, "top"), "3").unwrap()
+
+    remove_dir_all(dir).unwrap()
+
+    assert(!exists(dir))
+end remove_dir_all_empties_a_tree
+
+@test("a path that is not there is success, so a teardown after a failure need not know how far it got")
+remove_dir_all_of_nothing()
+    remove_dir_all("/tmp/sysl-fs-dirs-never-existed").unwrap()
+
+@test("a plain file is removed, so the call does not have to be told which it is")
+remove_dir_all_of_a_file()
+    val dir = scratch("justafile")
+    val path = join(dir, "f")
+
+    write_text(path, "x").unwrap()
+    remove_dir_all(path).unwrap()
+
+    assert(!exists(path))
+    assert(is_dir(dir))
+
+    ignore(remove_dir_all(dir))
+end remove_dir_all_of_a_file
+
+/** **The property that keeps this from deleting something it was never pointed at.** A link into a
+ * tree outside is unlinked rather than walked, so the tree at the other end survives -- which is why
+ * the walk tests `link_metadata` rather than `is_dir`, since `is_dir` follows.
+ */
+@test("a symbolic link is unlinked rather than followed")
+remove_dir_all_does_not_follow_a_link()
+    val keep = scratch("keep")
+    val dir = scratch("walk")
+
+    write_text(join(keep, "precious"), "still here").unwrap()
+    symlink(keep, join(dir, "elsewhere")).unwrap()
+
+    remove_dir_all(dir).unwrap()
+
+    assert(!exists(dir))
+    assert(is_dir(keep))
+    assert_eq(read_text(join(keep, "precious")).unwrap(), "still here")
+
+    ignore(remove_dir_all(keep))
+end remove_dir_all_does_not_follow_a_link
+
+// -- copy_file ------------------------------------------------------------------------------------
+
+@test("a copy has the same bytes and is a different file")
+copy_file_copies()
+    val dir = scratch("copy")
+
+    write_bytes(join(dir, "src"), [0u8, 1, 2, 255, 10]).unwrap()
+    copy_file(join(dir, "src"), join(dir, "dst")).unwrap()
+
+    assert_eq(read_bytes(join(dir, "dst")).unwrap(), read_bytes(join(dir, "src")).unwrap())
+
+    // A copy is not a link: the two have different inodes, and changing one does not change the
+    // other. That is what a hard link would have got wrong while passing the assertion above.
+    assert(!metadata(join(dir, "src")).unwrap().same_file(metadata(join(dir, "dst")).unwrap()))
+
+    write_text(join(dir, "src"), "changed").unwrap()
+
+    assert_eq(read_bytes(join(dir, "dst")).unwrap().len, 5)
+
+    ignore(remove_dir_all(dir))
+end copy_file_copies
+
+@test("a copy replaces whatever was at the destination rather than appending to it")
+copy_file_replaces()
+    val dir = scratch("replace")
+
+    write_text(join(dir, "src"), "short").unwrap()
+    write_text(join(dir, "dst"), "a much longer thing that was already there").unwrap()
+
+    copy_file(join(dir, "src"), join(dir, "dst")).unwrap()
+
+    assert_eq(read_text(join(dir, "dst")).unwrap(), "short")
+
+    ignore(remove_dir_all(dir))
+end copy_file_replaces
+
+@test("an empty file copies to an empty file rather than failing on the first read")
+copy_file_of_an_empty_file()
+    val dir = scratch("empty")
+
+    write_text(join(dir, "src"), "").unwrap()
+    copy_file(join(dir, "src"), join(dir, "dst")).unwrap()
+
+    assert_eq(size_of(join(dir, "dst")).unwrap(), 0)
+
+    ignore(remove_dir_all(dir))
+end copy_file_of_an_empty_file
+
+@test("copying a source that is not there reports it and makes no destination")
+copy_file_of_nothing()
+    val dir = scratch("nosrc")
+
+    copy_file(join(dir, "missing"), join(dir, "dst")) match
+        Ok(_) -> assert(false, "copying a file that does not exist answered")
+        Err(e) -> assert_eq(e, IoError.NotFound)
+
+    assert(!exists(join(dir, "dst")))
+
+    ignore(remove_dir_all(dir))
+end copy_file_of_nothing
+
+// -- truncate -------------------------------------------------------------------------------------
+
+@test("a file is cut to a length, and extended to one with zeroes")
+truncate_cuts_and_extends()
+    val dir = scratch("cut")
+    val path = join(dir, "f")
+
+    write_text(path, "0123456789").unwrap()
+
+    truncate(path, 4).unwrap()
+
+    assert_eq(read_text(path).unwrap(), "0123")
+
+    truncate(path, 6).unwrap()
+
+    assert_eq(size_of(path).unwrap(), 6)
+    assert_eq(read_bytes(path).unwrap(), [u8('0'), u8('1'), u8('2'), u8('3'), 0, 0])
+
+    ignore(remove_dir_all(dir))
+end truncate_cuts_and_extends
+
+@test("truncate makes nothing: a path that is not there is reported")
+truncate_of_nothing()
+    truncate("/tmp/sysl-fs-dirs-no-such-file", 0) match
+        Ok(_) -> assert(false, "cutting a file that does not exist answered")
+        Err(e) -> assert_eq(e, IoError.NotFound)
+
+/** **What makes the buffered handle worth a shim**: bytes still in the buffer would be written back
+ * past the cut if nothing flushed first, so this asserts the length *after* a write that has not
+ * been flushed by anything else.
+ */
+@test("cutting an open file flushes first and leaves the position where it was")
+file_truncate_flushes()
+    val dir = scratch("open")
+    val path = join(dir, "f")
+
+    var f = create(path).unwrap()
+
+    f.write("0123456789".bytes)
+    f.truncate(4).unwrap()
+
+    assert_eq(f.tell().unwrap(), 10)
+
+    f.close().unwrap()
+
+    assert_eq(read_text(path).unwrap(), "0123")
+
+    ignore(remove_dir_all(dir))
+end file_truncate_flushes
+
+@test("cutting a closed file reports rather than reaching a handle C has freed")
+file_truncate_when_closed()
+    val dir = scratch("closed")
+    val path = join(dir, "f")
+
+    var f = create(path).unwrap()
+
+    f.close().unwrap()
+
+    f.truncate(0) match
+        Ok(_) -> assert(false, "cutting a closed file answered")
+        Err(e) -> assert_eq(e, IoError.NotOpen)
+
+    ignore(remove_dir_all(dir))
+end file_truncate_when_closed
+
+// -- where the program is -------------------------------------------------------------------------
+
+/** Nothing here may assert a particular directory, since the suite runs from wherever it is run
+ * from. What it can assert is the shape of the answer and that the two calls agree.
+ */
+@test("the working directory is absolute, exists, and is what set_current_dir just set")
+current_dir_reads_and_moves()
+    val dir = scratch("cwd")
+    val was = current_dir().unwrap()
+
+    assert(is_absolute(was))
+    assert(is_dir(was))
+
+    set_current_dir(dir).unwrap()
+
+    // Through `canonicalize` on both sides, because `/tmp` is itself a link on macOS and the kernel
+    // answers the resolved path -- comparing the string as written would fail there and pass on
+    // Linux, which is a test that reports the platform rather than the behaviour.
+    assert_eq(canonicalize(current_dir().unwrap()).unwrap(), canonicalize(dir).unwrap())
+
+    set_current_dir(was).unwrap()
+
+    assert_eq(current_dir().unwrap(), was)
+
+    ignore(remove_dir_all(dir))
+end current_dir_reads_and_moves
+
+@test("moving to a directory that is not there is reported and moves nothing")
+set_current_dir_of_nothing()
+    val was = current_dir().unwrap()
+
+    set_current_dir("/tmp/sysl-fs-dirs-no-such-directory") match
+        Ok(_) -> assert(false, "moving to a directory that does not exist answered")
+        Err(e) -> assert_eq(e, IoError.NotFound)
+
+    assert_eq(current_dir().unwrap(), was)
+end set_current_dir_of_nothing
+
+// -- a directory nobody else can take -------------------------------------------------------------
+
+/** **It is created, not merely named**, which is the whole point of the call: the directory is there
+ * when it answers, so there is no gap in which somebody else takes the name.
+ */
+@test("a temporary directory exists when it is answered, and is empty")
+temp_dir_is_made()
+    val d = make_temp_dir("sysl-fs-test-").unwrap()
+
+    assert(is_dir(d))
+    assert(is_absolute(d))
+    assert_eq(entries(d).unwrap().len(), 0)
+
+    remove_dir_all(d).unwrap()
+
+    assert(!exists(d))
+end temp_dir_is_made
+
+@test("two temporary directories are two directories")
+temp_dirs_are_distinct()
+    val a = make_temp_dir("sysl-fs-test-").unwrap()
+    val b = make_temp_dir("sysl-fs-test-").unwrap()
+
+    assert(a != b)
+    assert(is_dir(a))
+    assert(is_dir(b))
+
+    ignore(remove_dir_all(a))
+    ignore(remove_dir_all(b))
+end temp_dirs_are_distinct

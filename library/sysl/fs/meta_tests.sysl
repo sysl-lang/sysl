@@ -1,0 +1,234 @@
+module sysl.fs
+@requires(os)
+@tests
+
+import sysl.path.file_name
+import sysl.text.Search
+
+// What one reading of an entry claims, and what a link is.
+//
+// **These depend on the module's own C**, like the rest of `sysl.fs`'s tests and more sharply: the
+// shim in `meta.c` is what knows where `st_size` sits, so a wrong offset shows up here as a size
+// that is not ten rather than as a build that failed. That is the whole reason the assertions are
+// against files this file wrote and whose contents it therefore knows exactly.
+
+private ignore(r: Result[unit, IoError]) = ()
+
+private scratch(name: string) -> string
+    val dir = "/tmp/sysl-fs-meta-" + name
+
+    ignore(remove_dir_all(dir))
+    make_dir(dir).unwrap()
+    dir
+end scratch
+
+// -- what one reading says ------------------------------------------------------------------------
+
+@test("metadata answers the size, the kind and a time, in one reading")
+metadata_reads_a_file()
+    val dir = scratch("file")
+    val path = dir + "/ten"
+
+    write_text(path, "0123456789").unwrap()
+
+    val m = metadata(path).unwrap()
+
+    assert_eq(m.size, 10)
+    assert(m.is_file())
+    assert(!m.is_dir())
+    assert(!m.is_link())
+    assert_eq(m.kind(), Kind.File)
+    assert(m.links >= 1)
+
+    // Nothing here may assert a particular time, since the machine's clock is whatever it is. What
+    // it can assert is that a time was read at all: the epoch would be what a shim that wrote
+    // nothing left behind.
+    assert(m.modified.us > 0)
+
+    ignore(remove_dir_all(dir))
+end metadata_reads_a_file
+
+@test("a directory reads as one, and agrees with is_dir")
+metadata_reads_a_directory()
+    val dir = scratch("dir")
+    val m = metadata(dir).unwrap()
+
+    assert(m.is_dir())
+    assert(!m.is_file())
+    assert_eq(m.kind(), Kind.Directory)
+    assert_eq(m.is_dir(), is_dir(dir))
+
+    ignore(remove_dir_all(dir))
+end metadata_reads_a_directory
+
+@test("a path that is not there reports why rather than answering a zero reading")
+metadata_of_nothing()
+    metadata("/tmp/sysl-fs-meta-nothing-is-here") match
+        Ok(_) -> assert(false, "a reading of a path that does not exist answered")
+        Err(e) -> assert_eq(e, IoError.NotFound)
+
+@test("the permission bits round trip through set_permissions")
+permissions_round_trip()
+    val dir = scratch("perm")
+    val path = dir + "/f"
+
+    write_text(path, "x").unwrap()
+    set_permissions(path, 0o600).unwrap()
+
+    assert_eq(metadata(path).unwrap().permissions(), 0o600)
+
+    set_permissions(path, 0o644).unwrap()
+
+    assert_eq(metadata(path).unwrap().permissions(), 0o644)
+
+    ignore(remove_dir_all(dir))
+end permissions_round_trip
+
+/** The type bits and the permission bits share one number, so a `permissions` that forgot to mask
+ * would answer something enormous for every file. This is what says the two halves are separated.
+ */
+@test("the mode carries the kind and the permissions together")
+mode_carries_both()
+    val dir = scratch("mode")
+    val path = dir + "/f"
+
+    write_text(path, "x").unwrap()
+    set_permissions(path, 0o640).unwrap()
+
+    val m = metadata(path).unwrap()
+
+    assert_eq(m.permissions(), 0o640)
+    assert(m.mode > m.permissions())
+    assert(m.is_file())
+
+    ignore(remove_dir_all(dir))
+end mode_carries_both
+
+// -- links ----------------------------------------------------------------------------------------
+
+@test("a symbolic link is made, read back as written, and followed by metadata")
+symlink_is_made_and_read()
+    val dir = scratch("link")
+
+    write_text(dir + "/target", "hello").unwrap()
+    symlink("target", dir + "/here").unwrap()
+
+    // As written, not resolved: a relative target stays relative, which is what makes a tree of
+    // links movable.
+    assert_eq(read_link(dir + "/here").unwrap(), "target")
+
+    assert(is_link(dir + "/here"))
+    assert(!is_link(dir + "/target"))
+
+    // `metadata` follows, `link_metadata` does not -- which is the whole difference between them.
+    assert_eq(metadata(dir + "/here").unwrap().size, 5)
+    assert(metadata(dir + "/here").unwrap().is_file())
+    assert(link_metadata(dir + "/here").unwrap().is_link())
+
+    ignore(remove_dir_all(dir))
+end symlink_is_made_and_read
+
+/** A link is allowed to point at nothing, and is sometimes made that way on purpose. What must not
+ * happen is `symlink` refusing it or `read_link` failing to say what it says.
+ */
+@test("a link may point at nothing, and still reads back")
+a_dangling_link()
+    val dir = scratch("dangling")
+
+    symlink("not-there", dir + "/dangling").unwrap()
+
+    assert_eq(read_link(dir + "/dangling").unwrap(), "not-there")
+    assert(is_link(dir + "/dangling"))
+    assert(!exists(dir + "/dangling"))
+
+    metadata(dir + "/dangling") match
+        Ok(_) -> assert(false, "following a link to nothing answered")
+        Err(e) -> assert_eq(e, IoError.NotFound)
+
+    ignore(remove_dir_all(dir))
+end a_dangling_link
+
+@test("read_link on something that is not a link reports rather than answering the path")
+read_link_of_a_file()
+    val dir = scratch("notalink")
+
+    write_text(dir + "/f", "x").unwrap()
+
+    read_link(dir + "/f") match
+        Ok(_) -> assert(false, "reading a target from a file answered")
+        Err(e) -> assert_eq(e, IoError.Other(22))
+
+    ignore(remove_dir_all(dir))
+end read_link_of_a_file
+
+/** Two names, one file: the link count says so, and `same_file` says so from the other direction.
+ * A copy would agree about the contents and disagree about both of these, which is what makes them
+ * the assertions worth writing.
+ */
+@test("a hard link is a second name for one file")
+hard_link_is_one_file()
+    val dir = scratch("hard")
+
+    write_text(dir + "/one", "shared").unwrap()
+    hard_link(dir + "/one", dir + "/two").unwrap()
+
+    val a = metadata(dir + "/one").unwrap()
+    val b = metadata(dir + "/two").unwrap()
+
+    assert_eq(a.links, 2)
+    assert(a.same_file(b))
+    assert(!a.is_link())
+    assert_eq(read_text(dir + "/two").unwrap(), "shared")
+
+    remove_file(dir + "/one").unwrap()
+
+    // The file goes when the last name does, not when the first does.
+    assert_eq(read_text(dir + "/two").unwrap(), "shared")
+    assert_eq(metadata(dir + "/two").unwrap().links, 1)
+
+    ignore(remove_dir_all(dir))
+end hard_link_is_one_file
+
+// -- canonicalize ---------------------------------------------------------------------------------
+
+/** **The difference this test exists for**: `sysl.path.normalize` is string surgery and would answer
+ * `dir/c` for a path through a link, where the filesystem answers somewhere else entirely. The two
+ * are not interchangeable and confusing them is a security bug.
+ */
+@test("canonicalize resolves links where normalize would not")
+canonicalize_follows_links()
+    val dir = scratch("canon")
+
+    make_dir(dir + "/real").unwrap()
+    write_text(dir + "/real/f", "x").unwrap()
+    symlink("real", dir + "/via").unwrap()
+
+    val through = canonicalize(dir + "/via/f").unwrap()
+
+    assert_eq(file_name(through), Some("f"))
+    assert(through.contains("/real/"))
+    assert(!through.contains("/via/"))
+
+    ignore(remove_dir_all(dir))
+end canonicalize_follows_links
+
+@test("canonicalize answers an absolute path and resolves the dots in it")
+canonicalize_is_absolute()
+    val dir = scratch("dots")
+
+    make_dir(dir + "/a").unwrap()
+    write_text(dir + "/a/f", "x").unwrap()
+
+    val out = canonicalize(dir + "/a/./../a/f").unwrap()
+
+    assert(out.starts_with("/"))
+    assert(out.ends_with("/a/f"))
+
+    ignore(remove_dir_all(dir))
+end canonicalize_is_absolute
+
+@test("canonicalize refuses a path that is not there, since it has nothing to resolve")
+canonicalize_of_nothing()
+    canonicalize("/tmp/sysl-fs-meta-nothing/at/all") match
+        Ok(_) -> assert(false, "resolving a path that does not exist answered")
+        Err(e) -> assert_eq(e, IoError.NotFound)
