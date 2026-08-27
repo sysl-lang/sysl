@@ -516,7 +516,15 @@ object Resolve {
 
     if !isFile(path) then Right(PackageConfig.empty)
     else
-      try PackageConfig.read(readFile(path)).left.map(e => s"$root: $e")
+      try
+        PackageConfig.read(readFile(path)).left.map(e => s"$root: $e").map { config =>
+          // A **dependency's** unknown keys are worth saying more than a project's, because this is
+          // the case the manifest cannot report for itself: a package written against a newer sysl
+          // than the one in hand, being built by the older one. The root says whose manifest it is,
+          // since the reader did not write this file.
+          config.warnings.foreach(w => Console.err.println(s"$root: $w"))
+          config
+        }
       catch case e: Exception => Left(s"cannot read $path: ${e.getMessage}")
   }
 

@@ -101,6 +101,13 @@ case class PackageConfig(
     allocator: Option[Allocator] = None,
     defines: Map[String, List[String]] = Map.empty,
     sysl: Option[Version] = None,
+    /** Keys this compiler did not recognize, as sentences to print — one per key, in the order the
+      * file writes them (`unknownKeys`).
+      *
+      * Carried rather than printed from the read, because reading a manifest is a function from text
+      * to a value and a test asks it directly. The driver prints these.
+      */
+    warnings: List[String] = Nil,
 ) {
 
   /** Refuses to build where the compiler in hand is older than the floor this manifest states
@@ -262,6 +269,8 @@ object PackageConfig {
         dependencies = deps,
         allocator = alloc,
         defines = defs,
+        warnings = unknownKeys(root, TopLevelKeys, "") :::
+          pkg.toList.flatMap(unknownKeys(_, PackageKeys, "package.")),
       )
     catch
       // Every way HOCON can be wrong arrives as one of these, and the driver wants a line rather
@@ -723,6 +732,42 @@ object PackageConfig {
   }
 
   private val DependencyKeys = Set("git", "version", "path", "mount")
+
+  /** The blocks this compiler knows at the top level of a manifest, and the fields it knows inside
+   * `package`.
+   *
+   * Both were **silently ignored** when unrecognized, which is the state card `0194 d` is about:
+   * whatever 0.1.0's parser does with a key it does not know is the compatibility floor every later
+   * manifest has to clear.
+   */
+  private val TopLevelKeys =
+    Set("package", "targets", "capabilities", "requires", "dependencies", "allocator", "defines")
+
+  private val PackageKeys = Set("name", "version", "sysl")
+
+  /** Says what this compiler did not understand, and goes on.
+   *
+   * ==Warn and ignore, which is the middle of three==
+   *
+   * **Refusing** is the strictest and it is what the format could never undo: no key could ever be
+   * added without breaking every released compiler, and fifty-one repositories in the org already
+   * pin coordinates that a newer manifest would have to reach. **Ignoring silently** is what this
+   * replaces, and its failure is a manifest that looks configured and is not — a mistyped
+   * `dependencis` block does nothing and says nothing.
+   *
+   * Warning keeps the format extensible in the only direction that matters — a compiler older than
+   * a key still builds the project — while a typo is still something somebody is told about. The
+   * warning names the key and the file, or it is noise.
+   *
+   * **This does not soften the two refusals inside `dependencies` and `allocator`**, which are
+   * argued where they stand and are about a *closed* vocabulary rather than a growing one: somebody
+   * who wrote `versoin = "1.0.0"` believes they have pinned a version, and a build that resolved the
+   * default branch while they believed it is a worse outcome than a stopped one.
+   */
+  private def unknownKeys(obj: ConfigObject, known: Set[String], prefix: String): List[String] =
+    obj.fields.keys.toList.filterNot(known.contains)
+      .map(k => s"$FileName: '$prefix$k' is not something this sysl understands, and is ignored — " +
+        "either it is a misspelling, or it was added by a newer compiler")
 
   /** Where the source comes from — exactly one of the two, with the fields that one of them takes. */
   private def readOrigin(sub: ConfigObject, where: String): Either[String, Origin] =

@@ -22,6 +22,75 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
       case Left(e)  => e
       case Right(c) => fail(s"expected a refusal, got: $c")
 
+  /** **An unknown key is said out loud and then ignored** (`PackageConfig.unknownKeys`, card
+   * `0194 d`).
+   *
+   * Whatever 0.1.0's parser does with a key it does not know is the compatibility floor every later
+   * manifest has to clear, so this is the tag-time decision: refuse, and no key can ever be added
+   * without breaking every released compiler; ignore silently, which is what this replaces, and a
+   * mistyped block does nothing and says nothing.
+   */
+  "an unknown key" - {
+
+    "at the top level is reported and ignored" in {
+      val c = read("""profiles { release { } }""")
+
+      c.warnings.length shouldBe 1
+      c.warnings.head should include("'profiles'")
+      c.warnings.head should include(PackageConfig.FileName)
+      c.warnings.head should include("ignored")
+    }
+
+    // The point of warning rather than refusing: the rest of the file still takes effect, so a
+    // project built by a compiler older than one of its keys still builds.
+    "does not stop the keys beside it from being read" in {
+      val c = read(
+        """package { name = "thing", version = "1.0.0" }
+          |profiles { release { } }
+          |""".stripMargin)
+
+      c.name shouldBe Some("thing")
+      c.version shouldBe Some("1.0.0")
+      c.warnings.length shouldBe 1
+    }
+
+    "inside 'package' is reported the same way, under its own path" in {
+      val c = read("""package { name = "thing", licence = "MIT" }""")
+
+      c.warnings.length shouldBe 1
+      c.warnings.head should include("'package.licence'")
+    }
+
+    // One per key, so a file with two mistakes is told about both rather than about whichever came
+    // first — which is the behaviour a refusal cannot have.
+    "and each one is reported, not merely the first" in {
+      read("""alpha { }
+             |beta { }
+             |""".stripMargin).warnings.length shouldBe 2
+    }
+
+    // The negative control: everything the format actually has must stay silent, or the warning is
+    // noise and gets ignored the way noise is.
+    "while a file using every block this compiler knows says nothing" in {
+      read(
+        """package { name = "thing", version = "1.0.0", sysl = "0.0.80" }
+          |targets { default = "aarch64-macos" }
+          |capabilities { heap = true }
+          |requires { heap = true }
+          |dependencies { }
+          |defines { }
+          |""".stripMargin).warnings shouldBe Nil
+    }
+
+    // **The two argued refusals are untouched.** They are about a closed vocabulary rather than a
+    // growing one: somebody who wrote `versoin` believes they have pinned a version, and resolving
+    // the default branch while they believe it is worse than stopping.
+    "but a misspelling inside 'dependencies' is still refused, not warned about" in {
+      refused("""dependencies { ogol { git = "github.com/sysl-lang/ogol", versoin = "0.1.0" } }""") should
+        include("versoin")
+    }
+  }
+
   "a project may have no file at all, and every capability is then provided" in {
     PackageConfig.empty.provides("aarch64-macos") shouldBe Set("heap", "os", "posix")
   }

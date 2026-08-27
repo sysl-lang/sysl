@@ -99,6 +99,10 @@ private[sysl] def execute(cfg: Config): Int = {
     case Left(err) => return fail(err)
     case Right(p)  => p
 
+  // A key this compiler does not understand is said out loud and then ignored (`PackageConfig`'s
+  // `unknownKeys`). On stderr, so it never lands in a program's own output, and once per key.
+  project.warnings.foreach(Console.err.println)
+
   // **Above the target, and above every other question a compilation settles.** A graph is a
   // property of the manifests rather than of the machine, so a project that cannot be built here can
   // still be inspected — which is the same argument `weave` makes above, and the reason this sits
