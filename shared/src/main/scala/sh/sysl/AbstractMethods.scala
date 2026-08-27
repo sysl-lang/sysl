@@ -83,7 +83,10 @@ trait AbstractMethods extends FuncAddress {
           val ts = provisional.getOrElse(
             declared.zip(params).map { case (arg, (_, pty)) => analyzeExpr(arg, Some(pty)) })
           val rtype = m.retType.map(resolveReturn(_, subst)).getOrElse(Type.Unit)
-          TCall(fname, recv :: (checkArgs(fname, params, declared, Some(ts)) ::: tail.map(variadicArg(_))), rtype)
+          val checked = checkArgs(fname, params, declared, Some(ts))
+
+          checkCrossings(m.crossing, fname, params, checked)
+          TCall(fname, recv :: (checked ::: tail.map(variadicArg(_))), rtype)
         }
 
   /** `T.f(…)` where `T` is a type parameter and `f` is an associated function one of its bounds
@@ -117,7 +120,10 @@ trait AbstractMethods extends FuncAddress {
           val (declared, tail) = bound.splitAt(params.length)
           val ts    = declared.zip(params).map { case (arg, (_, pty)) => analyzeExpr(arg, Some(pty)) }
           val rtype = m.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
-          TCall(fname, checkArgs(fname, params, declared, Some(ts)) ::: tail.map(variadicArg(_)), rtype)
+          val checked = checkArgs(fname, params, declared, Some(ts))
+
+          checkCrossings(m.crossing, fname, params, checked)
+          TCall(fname, checked ::: tail.map(variadicArg(_)), rtype)
         }
 
   /** The trait a bound reaches an associated function of that name through, where one does — asked
@@ -260,7 +266,13 @@ trait AbstractMethods extends FuncAddress {
         val ts    = bound.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
         val rtype = m.retType.map(resolveReturn(_, subst)).getOrElse(Type.Unit)
 
-        TVCall(recv, slot, checkArgs(fname, params, bound, Some(ts), callable), rtype)
+        val checked = checkArgs(fname, params, bound, Some(ts), callable)
+
+        // A trait object's body is chosen while the program runs, so what the check reads is the
+        // **slot's** signature — the trait's own declaration, which is where the annotation was
+        // written and is what every implementation was held to.
+        checkCrossings(m.crossing, fname, params, checked)
+        TVCall(recv, slot, checked, rtype)
   }
 
   /** `obj.p` on a `*Trait` or a `&Trait` — a property read through the table, which is the same

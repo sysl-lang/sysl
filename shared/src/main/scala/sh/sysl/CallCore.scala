@@ -870,7 +870,7 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
     // both lists are cut to the parameters — which is also what keeps them aligned.
     val checked  = checkArgs(shown, params, args.take(params.length), pre.map(_.take(params.length)))
 
-    checkCrossings(f, shown, params, checked)
+    checkCrossings(f.crossing, shown, params, checked)
 
     val declared = externDecls.get(f.name).fold(checked)(vaPassed(checked, _))
 
@@ -896,15 +896,20 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
    * whatever it names.
    *
    * Reported at the **argument**, since that is the thing that could have been written differently.
+   *
+   * **It takes the list rather than a declaration**, because a member carries one too (card `0313`)
+   * and a member reaches a call through `MethodCalls` and `AbstractMethods` rather than through the
+   * free-function path here. A receiver among `params` is skipped by construction: `@crossing` names
+   * the member's own parameters and `self` is not one of them.
    */
   protected def checkCrossings(
-      f: FuncDecl,
+      crossing: List[String],
       shown: String,
       params: List[(String, Type)],
       args: List[TExpr],
   ): Unit =
-    if f.crossing.nonEmpty then
-      for ((pname, pty), a) <- params.zip(args) if f.crossing.contains(pname) do
+    if crossing.nonEmpty then
+      for ((pname, pty), a) <- params.zip(args) if crossing.contains(pname) do
         val (subject, crossed) = pty match
           case Type.Ptr(inner) => (s"what '$pname' of '$shown' points at", inner)
           case other           => (s"'$pname' of '$shown'", other)

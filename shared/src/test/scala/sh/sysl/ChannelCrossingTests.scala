@@ -24,7 +24,7 @@ class ChannelCrossingTests extends AnyFreeSpec with RunSupport with CodegenSuppo
         """var slots: [2]int = [0; 2]
           |var ch = channel(slots[..])
           |
-          |print(try_send(&ch, 7), try_receive(&ch))
+          |print(ch.try_send(7), ch.try_receive())
           |""".stripMargin) shouldBe "true Some(7)\n"
     }
 
@@ -38,7 +38,7 @@ class ChannelCrossingTests extends AnyFreeSpec with RunSupport with CodegenSuppo
           |var slots: [2]&Node = [Node(0); 2]
           |var ch = channel(slots[..])
           |
-          |print(send(&ch, Node(1)))
+          |print(ch.send(Node(1)))
           |""".stripMargin) should
         include("reaches another concurrency domain, so every count inside it has to be atomic")
     }
@@ -51,7 +51,7 @@ class ChannelCrossingTests extends AnyFreeSpec with RunSupport with CodegenSuppo
           |var slots: [2]&Node = [Node(0); 2]
           |var ch = channel(slots[..])
           |
-          |print(send(&ch, Node(1)))
+          |print(ch.send(Node(1)))
           |""".stripMargin) should include("Hold it as a '&sync Node'")
     }
 
@@ -63,7 +63,7 @@ class ChannelCrossingTests extends AnyFreeSpec with RunSupport with CodegenSuppo
           |var slots: [2]&Node = [Node(0); 2]
           |var ch = channel(slots[..])
           |
-          |print(try_send(&ch, Node(1)))
+          |print(ch.try_send(Node(1)))
           |""".stripMargin) should include("has to be atomic")
     }
   }
@@ -80,7 +80,7 @@ class ChannelCrossingTests extends AnyFreeSpec with RunSupport with CodegenSuppo
         |
         |feeder(f: *Feed) -> unit
         |    for i in 1..5
-        |        send(&f.ch, i)
+        |        f.ch.send(i)
         |
         |    f.ch.close()
         |
@@ -93,7 +93,7 @@ class ChannelCrossingTests extends AnyFreeSpec with RunSupport with CodegenSuppo
         |var total = 0
         |
         |loop
-        |    receive(&f.ch) match
+        |    f.ch.receive() match
         |        Some(v) -> total += v
         |        None -> break
         |

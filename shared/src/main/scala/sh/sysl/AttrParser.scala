@@ -19,21 +19,20 @@ trait AttrParser extends ExprParser {
       crossingAttr | needsAttr | packedAttr | alignAttr | exportAttr | sectionAttr | unknownAttr |
       hashAttr
 
-  /** An `@` — or a `#` — where a member was wanted, which the four member blocks — a struct's body,
-   * an enum's, a trait's and an `impl`'s — each open their lines with.
+  /** What a member block reads where a member was wanted, for the three blocks that do not keep the
+   * annotations: a trait's body, an `impl`'s, and a setter's line.
    *
-   * `attribute` is read at **statement** position and nowhere else, so no member block ever tries it
-   * and an annotation written above a method reaches whichever rule was going to complain about the
-   * line: `dedent expected` where a member had already been read, `identifier expected` where none
-   * had. Both are about indentation and about names, which is the one thing that is not wrong, and
-   * the reader is left with nothing to act on — while the reader most likely to write it is the one
-   * arriving from a language where `#[test]` on a method is ordinary.
+   * It is `memberAttrs` with the answer thrown away, so the refusals below reach every block alike
+   * and only the *keeping* differs. `attribute` is read at **statement** position and nowhere else,
+   * so without this an annotation written above a method reached whichever rule was going to
+   * complain about the line — `dedent expected` where a member had already been read, `identifier
+   * expected` where none had. Both are about indentation and about names, which is the one thing
+   * that is not wrong.
    *
-   * That no annotation marks a member is `reference/memory.md § Crossing a concurrency domain`, so
-   * this is a sentence rather than a form the grammar could still have read. `@assert` is told
-   * apart and answered separately: it stands *where* a declaration stands rather than saying
-   * anything about one, so the sentence about what annotations mark is exactly the wrong thing to
-   * say about it — the same distinction `assertDecl` is ordered before `attributedDecl` for.
+   * `@assert` is told apart and answered separately: it stands *where* a declaration stands rather
+   * than saying anything about one, so the sentence about what annotations mark is exactly the wrong
+   * thing to say about it — the same distinction `assertDecl` is ordered before `attributedDecl`
+   * for.
    *
    * **`#` is read here as well**, and it is the spelling the reader this rule is for actually writes:
    * `#[test]` above a method is Rust's, and an indented `#` never reaches the directive pass, which
@@ -47,23 +46,68 @@ trait AttrParser extends ExprParser {
    * before it declines, and a `Failure` one token further along **outranks** an `Error` raised back
    * at the `@` — so the sentence a reader was meant to get lost to `'assert' expected` every time.
    * Written this way the lookahead cannot fail past the sigil, and the one refusal it then raises
-   * points at the sigil itself, which is the line the reader has to delete.
+   * points at the sigil itself, which is the line the reader has to change.
    */
-  protected lazy val noMemberAttr: Parser[Unit] =
+  protected lazy val noMemberAttr: Parser[Unit] = memberAttrs ^^ (_ => ())
+
+  /** The annotations a member may carry, which are the ones that are **about a parameter**.
+   *
+   * `@crossing`, `@reads` and `@writes` each name parameters, and a member has parameters exactly as
+   * a free function does — so there was never anything for the refusal below to be about in their
+   * case, and refusing them cost `Channel[T]` its `send` and `try_send`, which had to be free
+   * functions taking the channel by address so that a wrapper existed to write the word on. Card
+   * `0313`.
+   *
+   * Everything else stays refused, and the sentence is shorter for it: what `@test`, `@tailrec`,
+   * `@export` and the layout attributes say is about a free function or about a type, and a member
+   * is neither.
+   */
+  protected lazy val memberAttrs: Parser[List[Attr]] =
+    rep(memberAttr <~ skipNewlines) >> { as =>
+      duplicated(as) match
+        case Some(dup) =>
+          err(s"'@$dup' is written twice above one member, and it says nothing the once does not")
+        case None => success(as)
+    }
+
+  /** One annotation above a member: read it, and answer with the sentence where it is not one of the
+   * three.
+   *
+   * The word is read through `opt(ident)` rather than by alternation, for the reason the refusal
+   * below records: separate alternatives fail at separate positions, and a `Failure` one token past
+   * the `@` outranks an `Error` raised back at it.
+   */
+  private lazy val memberAttr: Parser[Attr] =
     guard((op("@") | op("#")) ~ opt(ident)) >> {
+      case "@" ~ Some("crossing") => crossingAttr
+      case "@" ~ Some("reads")    => readsAttr
+      case "@" ~ Some("writes")   => writesAttr
       case "@" ~ Some("assert") =>
         err("'@assert' stands where a declaration stands, and a type's body holds its members — " +
           "write it beside the type rather than inside it, where 'sizeof' and 'offsetof' still name " +
           "what it is about")
       case sigil ~ _ =>
-        err("an annotation marks a function, and a member is not one — no annotation in this " +
-          "language marks a method, a property, a field or a variant, so it goes above a free " +
-          "function instead: what 'sysl test' calls is a function calling the member, and a " +
-          "'@crossing' is written on the wrapper a caller already goes through ('06')" +
+        err("the only annotations a member may carry are the ones about a parameter — '@crossing', " +
+          "'@reads' and '@writes'. What the rest say is about a free function or about a type: what " +
+          "'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member " +
+          "is neither, so it goes above a free function instead ('06')" +
           (if sigil == "#" then ". An annotation is written '@' in any case — '#' opens a directive, " +
              "which gates lines before the lexer sees them and sits at the margin"
            else ""))
-    } | success(())
+    }
+
+  /** The three folded onto the member they were written above. It is `attributed`'s counterpart and
+   * is deliberately not `attributed` itself: the fold there is total over `Attr`, so a new
+   * attribute makes it fail to compile rather than be silently dropped, and that property is worth
+   * keeping in both places.
+   */
+  protected def attributedMember(m: MethodDecl, as: List[Attr]): MethodDecl =
+    as.foldLeft(m) {
+      case (d, Attr.Crossing(ns)) => d.copy(crossing = ns)
+      case (d, Attr.Reads(ns))    => d.copy(reads = Some(ns))
+      case (d, Attr.Writes(ns))   => d.copy(writes = Some(ns))
+      case (d, _)                 => d
+    }.setPos(m.pos)
 
   /** `@packed` — fields at their declared offsets with no interior padding, and an aggregate that
    * needs no alignment of its own (`reference/types.md § Structs`). It takes no arguments: there is

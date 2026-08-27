@@ -27,7 +27,7 @@ import sysl.slices.as_mut_ptr
  * spawn(&producer, &ch)
  *
  * loop
- *     receive(&ch) match
+ *     ch.receive() match
  *         Some(v) -> print(v)
  *         None -> break
  * ```
@@ -140,6 +140,57 @@ struct Channel[T]
         self.drop_lock()
         out
 
+    // The four transfers, and they are members like everything else here.
+    //
+    // **`@crossing(value)` is what holds a caller to the rule about what may reach another domain**,
+    // and it is written above `send` and `try_send` -- the two operations that put a value in.
+    // Marking the way *in* is the whole of the check: nothing can be taken out that was not put in,
+    // so a channel whose sends are held to the rule can hold nothing that breaks it. `receive`
+    // carries no annotation and needs none.
+    //
+    // Sysl admits the annotations that are about a **parameter** on a member, which is what makes
+    // this shape available: a member has parameters exactly as a free function does. Everything else
+    // -- `@test`, `@tailrec`, `@export`, the layout attributes -- says something about a free
+    // function or about a type, and stays where it was.
+
+    /** Puts a value in, waiting while the channel is full, and answers whether it went in.
+     *
+     * `false` is a closed channel and nothing else: the wait is unbounded, so the only thing that
+     * ends it other than a free slot is somebody closing.
+     */
+    @crossing(value)
+    send(*self, value: T) -> bool
+        loop
+            if self.is_closed() then return false
+
+            if self.push(value) then return true
+
+            yield_now()
+    end send
+
+    /** Puts a value in if there is room, and answers whether it went. Never waits. */
+    @crossing(value)
+    try_send(*self, value: T) -> bool =
+        if self.is_closed() then false else self.push(value)
+
+    /** Takes a value out, waiting while the channel is empty.
+     *
+     * `None` means the channel is closed **and drained**, which is what makes a receiver's loop
+     * terminate: a closed channel with values still in it goes on answering `Some`.
+     */
+    receive(*self) -> Option[T]
+        loop
+            self.pop() match
+                Some(v) -> return Some(v)
+                None ->
+                    if self.is_closed() then return self.pop()
+
+                    yield_now()
+    end receive
+
+    /** Takes a value out if there is one, and answers nothing where there is not. Never waits. */
+    try_receive(*self) -> Option[T] = self.pop()
+
 end Channel
 
 /** Builds an empty channel over storage the caller supplies.
@@ -156,48 +207,3 @@ end Channel
  */
 channel[T](slots: []T) -> Channel[T] = Channel(0, as_mut_ptr(slots), slots.len, 0, 0, 0)
 
-/** Puts a value in, waiting while the channel is full, and answers whether it went in.
- *
- * `false` is a closed channel and nothing else: the wait is unbounded, so the only thing that ends
- * it other than a free slot is somebody closing.
- *
- * **`@crossing(value)` is what holds a caller to the rule about what may reach another domain**, and
- * it is why this is a free function rather than `ch.send(v)`. No annotation in sysl marks a member
- * (`reference/memory.md § Crossing a concurrency domain`), and the refusal says what to do about it:
- * write it on the wrapper a caller already goes through. So the four transfers are functions taking
- * the channel by address, which is `spawn(&body, &state)`'s own shape and reads as what it is — the
- * operations that move a value between two threads, taking the thing both of them hold.
- *
- * Marking the way **in** is the whole of the check: nothing can be taken out that was not put in, so
- * a channel whose sends are held to the rule can hold nothing that breaks it.
- */
-@crossing(value)
-send[T](ch: *Channel[T], value: T) -> bool
-    loop
-        if ch.is_closed() then return false
-
-        if ch.push(value) then return true
-
-        yield_now()
-
-/** Puts a value in if there is room, and answers whether it went. Never waits. */
-@crossing(value)
-try_send[T](ch: *Channel[T], value: T) -> bool =
-    if ch.is_closed() then false else ch.push(value)
-
-/** Takes a value out, waiting while the channel is empty.
- *
- * `None` means the channel is closed **and drained**, which is what makes a receiver's loop
- * terminate: a closed channel with values still in it goes on answering `Some`.
- */
-receive[T](ch: *Channel[T]) -> Option[T]
-    loop
-        ch.pop() match
-            Some(v) -> return Some(v)
-            None ->
-                if ch.is_closed() then return ch.pop()
-
-                yield_now()
-
-/** Takes a value out if there is one, and answers nothing where there is not. Never waits. */
-try_receive[T](ch: *Channel[T]) -> Option[T] = ch.pop()

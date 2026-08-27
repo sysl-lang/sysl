@@ -535,8 +535,14 @@ trait Hoisting extends HoistMembers {
    * declaration says about itself, so a misspelt parameter is reported once at the annotation rather
    * than once per call site or, worse, not at all: a name matching no parameter would otherwise mark
    * nothing and read exactly like a rule that was being enforced.
+   *
+   * **A member's is asked here too**, of the function it was lowered to (card `0313`), which is why
+   * this is reachable from `MemberLowering`. The receiver is a parameter of that function and not of
+   * the member, so `@crossing(self)` is legal after lowering and would say something a writer could
+   * not have meant — but a member's own body may not name `self` as a parameter either, so the
+   * spelling is unreachable from source and needs no rule of its own.
    */
-  private def checkCrossingNames(f: FuncDecl): Unit = {
+  protected def checkCrossingNames(f: FuncDecl): Unit = {
     val declared = f.params.map(_.name).toSet
 
     for (n, i) <- f.crossing.zipWithIndex do

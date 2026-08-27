@@ -319,15 +319,42 @@ trait DeclParser extends ExprParser {
 
   /** A member of a type's own body, which is the one kind that may say how far it is visible.
    *
-   * It opens with `noMemberAttr` so that an annotation written above a member is answered by the
-   * sentence that rule carries. A struct's body and an enum's both read their lines through here, and
-   * a member is the first alternative each tries, so the refusal is reached wherever the `@` is —
-   * including the position a field or a variant would have been read at.
+   * It opens with `memberAttrs`, which reads the three a member may carry — `@crossing`, `@reads`
+   * and `@writes`, the ones that are about a parameter — and answers everything else with the
+   * sentence that rule carries. A struct's body and an enum's both read their lines through here,
+   * and a member is the first alternative each tries, so the refusal is reached wherever the `@` is
+   * — including the position a field or a variant would have been read at.
    */
   protected lazy val restrictedMember: PackratParser[MethodDecl] =
-    noMemberAttr ~> visibility ~ (noOverride ~> (setter | member)) ^^ { case v ~ m =>
-      m.copy(vis = v).setPos(m.pos)
+    memberAttrs >> { as =>
+      // **Reading an annotation commits the line to being a member**, which is what keeps a
+      // `@crossing` written above a *field* from falling back into the field rule and being reported
+      // as a missing identifier. The three say something about a parameter, and a field and a
+      // variant have none — so there is nothing for the alternation to still try.
+      if as.isEmpty then plainMember
+      else (fieldAhead ~> notAMember) | plainMember ^^ (attributedMember(_, as))
     }
+
+  /** Whether the line the annotations stand above is a **field** — `name: type`, with or without a
+   * visibility modifier in front of it.
+   *
+   * It is a lookahead rather than an `err` after the member form, and the reason is the one a dead
+   * `err` taught: `member` reads the name and fails at the `->` it wanted, which is a position
+   * further along than the `@`, and a `Failure` there **outranks** an `Error` raised back at the
+   * annotation. So the refusal has to be reached *before* the member form is tried, which means
+   * deciding on the shape rather than on the failure — and the field shape is the one that can be
+   * recognised without ambiguity. A variant carrying fields is spelled `A(x: int)`, which is a
+   * method's shape exactly, so it is left to the member form and the sentence it produces.
+   */
+  private lazy val fieldAhead: Parser[Unit] = guard(visibility ~> ident ~ op(":")) ^^^ (())
+
+  private lazy val plainMember: PackratParser[MethodDecl] =
+    visibility ~ (noOverride ~> (setter | member)) ^^ { case v ~ m => m.copy(vis = v).setPos(m.pos) }
+
+  private def notAMember: Parser[MethodDecl] =
+    err("'@crossing', '@reads' and '@writes' are about a parameter, so they stand above a method or " +
+      "an associated function — a field and a variant have none, and there is nothing for one of " +
+      "them to name there")
 
   /** The refusal a trait's member and an `impl`'s share (`reference/modules.md § Visibility`). Both
    * are reached at the reach the *trait* has — one asks for the member and the other supplies what
@@ -606,7 +633,12 @@ trait DeclParser extends ExprParser {
    * an implementation for that member; one written with a body supplies a default instead.
    */
   protected lazy val traitMember: PackratParser[MethodDecl] =
-    noMemberAttr ~> noVisibility ~> noOverride ~> (setter | setterSig | member | methodSig | propertySig)
+    memberAttrs ~ (noVisibility ~> noOverride ~>
+      (setter | setterSig | member | methodSig | propertySig)) ^^ { case as ~ m =>
+      attributedMember(m, as)
+    }
+    // A trait's body holds nothing but members, so an annotation above one needs no commit of the
+    // kind `restrictedMember` makes — there is no field rule underneath it to fall into.
 
   /** A trait method signature: a header with no `= body`. The receiver and parameters parse
    * exactly as a real method's do, so a signature and its implementation are compared shape for
@@ -704,8 +736,8 @@ trait DeclParser extends ExprParser {
    * implements is the only thing a member of a type can be replacing a body from.
    */
   protected lazy val implMember: PackratParser[MethodDecl] =
-    noMemberAttr ~> noVisibility ~> overrideMod ~ (setter | member) ^^ { case ov ~ m =>
-      m.copy(overrides = ov).setPos(m.pos)
+    memberAttrs ~ (noVisibility ~> overrideMod) ~ (setter | member) ^^ { case as ~ ov ~ m =>
+      attributedMember(m.copy(overrides = ov).setPos(m.pos), as)
     }
 
   /** An optional `end Name` marker closing a declaration block, Scala-style. `end` is a soft

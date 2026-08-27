@@ -69,7 +69,7 @@ object AstCodec {
    * conflict**, and that is the case the rule above is written for: read dev's number, take the one
    * after it, and do not assume a clean merge means the versions agree.
    */
-  val Version: Int = 49
+  val Version: Int = 50
 
   private val Magic = "sysl-ast"
 
@@ -242,6 +242,11 @@ object AstCodec {
       vis(m.vis)
       bool(m.variadic)
       bool(m.overrides)
+      // The three a member may carry, and they travel for the reason `FuncDecl`'s do: each is
+      // checked at the **call**, and the calls an artifact is read for are all in the consumer.
+      list(m.crossing)(sref)
+      opt(m.reads)(ns => list(ns)(sref))
+      opt(m.writes)(ns => list(ns)(sref))
     }
 
     private def variant(v: EnumVariantDecl): Unit = {
@@ -717,9 +722,13 @@ object AstCodec {
       case "2"   => RecvMode.ByRef(bool())
       case other => fail(s"'$other' is not a receiver mode")
 
+    // The three trailing fields are named rather than positional because `tvalues` and `tpacks`
+    // sit between them and `overrides` in the constructor and are not encoded — a member's are
+    // solved where it is lowered rather than carried.
     private def method(): MethodDecl =
       at(MethodDecl(sref(), opt(recv()), bool(), list(sref()), list(param()), opt(typ()),
-        list(stmt()), bounds(), tdefaults(), vis(), bool(), bool()))
+        list(stmt()), bounds(), tdefaults(), vis(), bool(), bool(),
+        crossing = list(sref()), reads = opt(list(sref())), writes = opt(list(sref()))))
 
     private def variant(): EnumVariantDecl =
       at(EnumVariantDecl(sref(), opt(expr()), list(param())))

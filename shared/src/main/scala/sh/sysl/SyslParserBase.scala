@@ -461,11 +461,19 @@ trait SyslParserBase extends PackratParsers {
    */
   protected def contractMsg: Parser[String]
 
-  /** The refusal every member block opens each of its lines with: an annotation's sigil where a
-   * member was wanted. Defined beside the annotations it is about, and reached from the rules that
-   * read a member.
+  /** The refusal every member block opens each of its lines with, for the blocks that keep nothing:
+   * an annotation's sigil where a member was wanted. Defined beside the annotations it is about, and
+   * reached from the rules that read a member.
    */
   protected def noMemberAttr: Parser[Unit]
+
+  /** The annotations a member may carry — the three that are about a **parameter** — with everything
+   * else answered by the sentence `noMemberAttr` carries. Empty where the member wrote none.
+   */
+  protected def memberAttrs: Parser[List[Attr]]
+
+  /** Those three folded onto the member they stood above. */
+  protected def attributedMember(m: MethodDecl, as: List[Attr]): MethodDecl
 
   /** A statement written on the same line as the keyword that introduces it. */
   protected def inlineStatement: PackratParser[Stmt]

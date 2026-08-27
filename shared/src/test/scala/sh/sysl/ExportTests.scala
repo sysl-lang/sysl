@@ -200,15 +200,15 @@ class ExportTests extends AnyFreeSpec with CodegenSupport with TestFrameworkSupp
         include("cannot be generic")
     }
 
-    // Not an export rule at all: `SyslParser.attributedDecl` reads attributes at statement position
-    // only, so no attribute reaches a member — `@test` and `@pure` are as unavailable there. Pinned
-    // because it decides the shape a binding is written in: the boundary layer is free functions,
-    // and a method is reached by exporting one that takes the receiver. What the reader is told is
-    // `noMemberAttr`'s sentence, and `MemberAttrErrorTests` is where that is pinned.
+    // Not an export rule at all: a member may carry only the three annotations that are about a
+    // **parameter** (card `0313`), and `@export` is about a symbol. Pinned because it decides the
+    // shape a binding is written in: the boundary layer is free functions, and a method is reached
+    // by exporting one that takes the receiver. What the reader is told is `memberAttrs`' sentence,
+    // and `MemberAttrErrorTests` is where that is pinned.
     "a member, which the grammar refuses before any rule here is reached" in {
       val src = "module demo\n\nstruct P\n    x: i32\n    @export\n    get(self) -> i32 = self.x\n"
 
-      err(src) should include("an annotation marks a function, and a member is not one")
+      err(src) should include("the only annotations a member may carry are the ones about a parameter")
     }
 
     "private" in {

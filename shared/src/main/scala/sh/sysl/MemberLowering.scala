@@ -42,6 +42,9 @@ trait MemberLowering extends TypeResolution {
   /** Whether a member's own type parameters collide with names already spoken for. */
   protected def checkBoundNames(name: String, bounds: Map[String, List[BoundRef]]): Unit
 
+  /** Whether a `@crossing` above a member names parameters it actually has (card `0313`). */
+  protected def checkCrossingNames(f: FuncDecl): Unit
+
   /** Turning a trait's default into an ordinary function under the implementing type's name. */
   protected def synthesize(home: MemberHome, m: MethodDecl): FuncDecl
 
@@ -394,6 +397,10 @@ trait MemberLowering extends TypeResolution {
       // `make(...)` has nothing to anchor on. Asked after the member is registered, so a mistake
       // here does not also erase the member it is about.
       recover(())(at(m.pos)(checkSignatureRules(fd.name, fd.params, fd.retType, fd.variadic)))
+      // A member's `@crossing` names its own parameters, and the lowered form is where those have
+      // become an ordinary list — so the question is asked here for the same reason the signature
+      // rules are, and answers about the same names a reader wrote.
+      recover(())(at(m.pos)(checkCrossingNames(fd)))
       recover(())(at(m.pos)(checkValueParamArithmetic(
         fd.tvalues.keySet, fd.params.map(_.typ) ::: fd.retType.toList, fd.tparams.toSet, fd.tpacks)))
 

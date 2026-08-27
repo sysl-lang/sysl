@@ -219,6 +219,13 @@ trait ImplConformance extends MemberLowering {
       m.variadic,
       tvalues = home.tvalues ++ m.tvalues,
       tpacks = home.tpacks ++ m.tpacks,
+      // The three annotations a member may carry are about its **parameters**, so they cross to the
+      // lowered function unchanged — the receiver is prepended in front of them and the names they
+      // gave still name the same parameters. Nothing here resolves one: `@crossing` and the frames
+      // are checked against the signature later, exactly as a free function's are.
+      reads = m.reads,
+      writes = m.writes,
+      crossing = m.crossing,
     ).setPos(m.pos)
   }
 

@@ -5,16 +5,21 @@ import org.scalatest.freespec.AnyFreeSpec
 /** An annotation written above a **member** — a method, a property, an associated function, a field
  * or an enum variant.
  *
- * No annotation in this language marks one (`reference/memory.md § Crossing a concurrency domain`),
- * and until this suite the grammar said so by having no alternative that begins with `@`: the block
- * simply ended there, and what the reader was shown was whichever rule was going to complain about
- * the line anyway — `dedent expected` where a member had already been read, `identifier expected`
- * where none had. Both are about indentation and about names, which is the one thing that is not
- * wrong.
+ * **Three of them are legal and the rest are not**, and the line is what the annotation is *about*
+ * (card `0313`): `@crossing`, `@reads` and `@writes` each name **parameters**, which a member has
+ * exactly as a free function does, and everything else says something about a free function or
+ * about a type — what `sysl test` calls, what recurses, what a symbol names, how fields are laid
+ * out. `MemberAttrTests` is where the three are accepted and enforced; this suite is the refusal.
+ *
+ * Until this suite existed the grammar said so by having no alternative that begins with `@`: the
+ * block simply ended there, and what the reader was shown was whichever rule was going to complain
+ * about the line anyway — `dedent expected` where a member had already been read, `identifier
+ * expected` where none had. Both are about indentation and about names, which is the one thing that
+ * is not wrong.
  *
  * So the assertions below are about **what the sentence says and where the caret is**, in every
  * block that reads a member, rather than about the refusal existing. The caret belongs on the `@`
- * itself, since that is the line the reader has to delete.
+ * itself, since that is the line the reader has to change.
  */
 class MemberAttrErrorTests extends AnyFreeSpec with ParseSupport {
 
@@ -28,19 +33,21 @@ class MemberAttrErrorTests extends AnyFreeSpec with ParseSupport {
     (msg, where)
   }
 
-  private val sentence = "an annotation marks a function, and a member is not one"
+  private val sentence = "the only annotations a member may carry are the ones about a parameter"
 
   "an annotation above a member is refused with a sentence" - {
 
     // The reduction the card was written from: the `@` follows a field, so the member block had
     // already read a line and ended at the annotation — which is where `dedent expected` came from.
+    // The annotation is `@tailrec` rather than the card's `@crossing`, which is one of the three a
+    // member may carry now.
     "a method inside a struct, after a field" in {
       val (msg, where) = refusal(
         """struct S
           |    v: int
           |
-          |    @crossing(p)
-          |    take(self, p: *int) -> int = p[0]
+          |    @tailrec
+          |    take(self, n: int) -> int = n
           |
           |main() =
           |    print(1)
@@ -82,6 +89,27 @@ class MemberAttrErrorTests extends AnyFreeSpec with ParseSupport {
       msg should startWith(sentence)
       where shouldBe "<input>:2:5"
     }
+
+    /** **The three a member may carry are still refused above a FIELD**, and by a different
+     * sentence: they are about a parameter, and a field has none. Without the commit this asserts,
+     * reading the annotation and then failing to find a member drops the line back into the field
+     * rule, which reports `identifier expected` about the `@`.
+     */
+    "one of the three above a field, which has no parameters to name" in {
+      val (msg, _) = refusal(
+        """struct S
+          |    @crossing(v)
+          |    v: int
+          |
+          |main() =
+          |    print(1)
+          |""".stripMargin,
+      )
+
+      msg should include("are about a parameter")
+      msg should include("a field and a variant have none")
+    }
+
 
     "a member of an enum" in {
       val (msg, where) = refusal(
@@ -191,6 +219,7 @@ class MemberAttrErrorTests extends AnyFreeSpec with ParseSupport {
       msg should include("above a free function")
       msg should include("'sysl test'")
       msg should include("'@crossing'")
+      msg should include("'@reads'")
 
       // And the sigil is named only where it was the wrong one, so an `@` is not told about `#`.
       msg should not include "'#' opens a directive"

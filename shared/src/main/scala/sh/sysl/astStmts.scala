@@ -457,6 +457,20 @@ case class MethodDecl(
       * or a trait — and that refusal is about the shape rather than about members.
       */
     tpacks: Set[String] = Set.empty,
+    /** `@crossing(…)` — see `FuncDecl.crossing`.
+      *
+      * **A member may carry the annotations that are about its PARAMETERS, and only those.** What
+      * `@test`, `@tailrec` and `@export` say is about a free function — what a runner calls, what
+      * recurses, what a symbol names — and a member supplies none of it. What these three say is
+      * about a parameter, which a member has exactly as a free function does, so refusing them here
+      * would mean an API asking for one had to route every such call through a wrapper whose only
+      * purpose was to carry the word. `Channel[T]`'s transfers were exactly that.
+      */
+    crossing: List[String] = Nil,
+    /** `@reads(…)` — see `FuncDecl.reads`. `None` and `Some(Nil)` divide as they do there. */
+    reads: Option[List[String]] = None,
+    /** `@writes(…)` — see `FuncDecl.writes`. */
+    writes: Option[List[String]] = None,
 ) extends Positioned {
 
   /** The mode this member takes its receiver in, or `None` for an associated function — which is the
