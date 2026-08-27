@@ -24,14 +24,7 @@ trait ArcEmitter extends Emitter {
    * it is the mode that opts out of management — and a `&T` is a leaf, so a recursive type
    * cannot make this recur forever.
    */
-  protected def containsRef(t: Type): Boolean = t match
-    case _: Type.Ref         => true
-    case _: Type.Weak        => true
-    case _: Type.View        => true // the owner word, which may or may not be there
-    case Type.Array(_, elem) => containsRef(elem)
-    case s: Type.Struct      => s.fields.exists(f => containsRef(f._2))
-    case e: Type.Enum        => e.variants.exists(_.fields.exists(f => containsRef(f._2)))
-    case _                   => false
+  protected def containsRef(t: Type): Boolean = Type.containsCounted(t)
 
   /** Where a box's own contents begin, once the three header words — the strong count, the
    * destruction hook, and the weak count (`reference/memory.md § What a heap object costs`) — are

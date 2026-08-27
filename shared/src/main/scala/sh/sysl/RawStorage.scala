@@ -74,6 +74,7 @@ trait RawStorage extends ExprSupport {
     case Type.Ptr(_: Type.Trait) =>
       err("'ptr_cast' produces a plain pointer, and a pointer to a trait is two words — the address " +
         "and the table of the type it was erased from, which an address alone does not say")
+
     case _: Type.Ptr => ()
 
     // A function pointer is an address like any other, and this is how the one `dlsym` hands back

@@ -473,6 +473,28 @@ object Type extends TypeQueries {
    */
   case object Str extends View { def elem: Type = Byte }
 
+  /** Whether a value of this type carries anything a **refcount** has to be touched for: a `&T`, a
+   * `weak T`, or a view's owner word — directly, or in a field of a struct or an enum variant.
+   *
+   * A raw pointer never does; it is the mode that opts out of management. A `&T` is a **leaf** here
+   * rather than something to recur into, which is what keeps a recursive type from recurring
+   * forever: the reference is itself the thing being asked about.
+   *
+   * Two passes ask this and they must not be able to disagree, which is why it is here rather than
+   * in either of them. `ArcEmitter` asks it to decide whether copying a value emits a retain, and
+   * the raw tier asks it to decide whether an address may be read as a pointer to this type at all
+   * (`RawStorage.castTarget`) — the assignment through such a pointer is what would release
+   * whatever the bytes happened to look like.
+   */
+  def containsCounted(t: Type): Boolean = t match
+    case _: Ref         => true
+    case _: Weak        => true
+    case _: View        => true
+    case Array(_, elem) => containsCounted(elem)
+    case s: Struct      => s.fields.exists(f => containsCounted(f._2))
+    case e: Enum        => e.variants.exists(_.fields.exists(f => containsCounted(f._2)))
+    case _              => false
+
   /** Whether a view refuses to be written through. Both read-only views answer yes, and they are
    * read-only for different reasons: a `[]const T` views elements somebody else promised not to
    * have written, and a `string` views bytes whose UTF-8 a write is what would break.
