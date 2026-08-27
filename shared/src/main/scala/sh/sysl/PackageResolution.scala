@@ -230,6 +230,39 @@ private def projectRoot(file: String): String =
 
     if slash >= 0 then file.substring(0, slash) else "."
 
+/** The package an **example** belongs to: the root two levels above a program that sits in a
+ * package's `examples/` directory, or nothing (`reference/packages.md § A package may carry
+ * examples`).
+ *
+ * **This is the half that makes the feature worth having.** Excluding `examples/` from the library
+ * build is what lets a package carry one at all; without this, building it means knowing to write
+ * `--lib ..`, and a demo you have to know a flag to build is half an answer — which is what card
+ * `0194 h` says a package format that cannot carry a demo already is.
+ *
+ * **It is not an upward search, and the distinction is the whole of why it is allowed here.**
+ * `readPackageConfig` looks beside the sources on purpose, because a search that walked upward would
+ * make a build depend on directories above the one named. This looks at exactly two levels and only
+ * where the intervening one is literally `examples` — a rule about the shape of a path rather than a
+ * hunt, so a reader can apply it by looking, and nothing outside a package's own tree can be picked
+ * up by accident.
+ *
+ * The manifest has to be there. A directory called `examples` beside a tree that is not a package is
+ * somebody's ordinary folder, and answering with its parent would compile a program against a
+ * library nobody claimed.
+ */
+private[sysl] def owningPackage(file: String): Option[String] = {
+  val root = projectRoot(file)
+
+  // Two shapes reach here and both are ordinary: `examples/demo.sysl`, whose root is the `examples`
+  // directory itself, and `examples/demo/`, whose root is a directory inside it.
+  val pkg =
+    if Project.basename(root) == Project.ExamplesDir then Project.parentOf(root)
+    else Project.parentOf(root).filter(p => Project.basename(p) == Project.ExamplesDir)
+           .flatMap(Project.parentOf)
+
+  pkg.filter(p => isFile(s"$p/${PackageConfig.FileName}"))
+}
+
 /** The project config, read from the root this invocation was given (`reference/packages.md`).
  *
  * **A missing file is not an error.** A single-file program has no config and wants none, so what

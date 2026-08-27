@@ -203,6 +203,21 @@ class MultiAssignTests extends AnyFreeSpec with ParseSupport with RunSupport wit
       err(fn("""val a, b = 1, 2
                |a = 3""".stripMargin)) should include("'val' is written once")
     }
+
+    /** The **parenthesised** spelling, which takes one tuple apart rather than pairing two lists,
+     * and which the comma form's assertions above say nothing about. `var` is the writable one and
+     * `val` is not, exactly as they are for an ordinary binding — which is what makes a pattern
+     * binding's write-once rule consistent rather than the odd one out: an arm carries no keyword,
+     * and a name with no `var` in front of it is written once everywhere in this language.
+     */
+    "the tuple form divides the same way, and 'var' is the writable one" in {
+      run(fn("""var (a, b) = (1, 2)
+               |a = 3
+               |print(a, b)""".stripMargin)) shouldBe "3 2\n"
+
+      err(fn("""val (a, b) = (1, 2)
+               |a = 3""".stripMargin)) should include("written once")
+    }
   }
 
   "the rules the form still owes" - {

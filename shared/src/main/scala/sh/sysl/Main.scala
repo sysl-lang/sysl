@@ -70,7 +70,17 @@ private def subcommand(name: String, rest: Seq[String]): Int =
  * the driver rather than re-implementing it — the error paths here are the ones a user meets, and
  * none of them is reachable from the compiler's own API.
  */
-private[sysl] def execute(cfg: Config): Int = {
+private[sysl] def execute(asked: Config): Int = {
+  // **A program in a package's `examples/` compiles against that package**, with nothing on the
+  // command line saying so (`owningPackage`). It is added as a source root rather than handled
+  // anywhere special, so everything downstream — the manifest's own `dependencies`, the C it
+  // carries, the search paths — is what a `--lib` already gets, and a caller who wrote `--lib`
+  // themselves is unaffected because a root named twice is one root.
+  val cfg =
+    owningPackage(asked.file) match
+      case Some(pkg) if !asked.libs.contains(pkg) => asked.copy(libs = asked.libs :+ pkg)
+      case _                                      => asked
+
   if cfg.command == "version" then return printVersion()
   if cfg.command == "help" then return printUsage()
   if cfg.command == "targets" then return listTargets()

@@ -60,6 +60,26 @@ object Project {
    */
   private val sysl: List[String] = List(".sysl", Literate.Extension)
 
+  /** The one directory name a project root gives up: `examples/`, which holds **programs** rather
+   * than part of the tree they are written against (`reference/packages.md § A package may carry
+   * examples`).
+   *
+   * Everything under a project root compiles *into* it, which is what made a package unable to carry
+   * a demo at all: `build-lib` refused `examples/demo.sysl` because a file with no `module` header
+   * is the anonymous root module wherever it sits, and a library may not have one. So every binding
+   * in the org kept its example as a fenced block in a README that nothing compiles — an example
+   * that rots, which is what card `0194 h` was filed about.
+   *
+   * **The exclusion is at the root and nowhere else**, so `sh/sysl/thing/examples/` is an ordinary
+   * module named `sh.sysl.thing.examples`. One name, one place, and a package that wants the word
+   * for a module still has it.
+   *
+   * It is unconditional rather than asked of the manifest: a rule the *format* states is one a
+   * reader can apply by looking at the tree, and making it depend on whether a `package.hocon`
+   * happens to be there would mean the same directory is source in one project and not in another.
+   */
+  val ExamplesDir = "examples"
+
   /** The C files of a source tree, which a `.sysl` file reaches by `extern` and the build compiles
    * alongside it (`reference/ffi.md § A library may carry C`).
    *
@@ -137,7 +157,7 @@ object Project {
 
       if dir.nonEmpty && files.exists(f => sysl.exists(f.endsWith)) then List(dir.mkString("."))
       else
-        subs.filterNot((d, _) => basename(d).startsWith("."))
+        outside(dir, subs).filterNot((d, _) => basename(d).startsWith("."))
           .flatMap((d, w) => under(d, dir :+ basename(d), w))
     }
 
@@ -153,8 +173,15 @@ object Project {
     val (files, subs) = contents(path, os, within)
     val here          = files.filter(f => exts.exists(f.endsWith)).map(f => Source(f, readFile(f), dir))
 
-    here ::: subs.flatMap((sub, w) => walk(sub, dir :+ basename(sub), exts, os, w))
+    here ::: outside(dir, subs).flatMap((sub, w) => walk(sub, dir :+ basename(sub), exts, os, w))
   }
+
+  /** A directory's sub-directories with the root's `examples/` left out. The `dir.isEmpty` test is
+   * what makes it the *root's* one: everywhere else the name is ordinary.
+   */
+  private def outside(dir: List[String], subs: List[(String, Option[String])])
+      : List[(String, Option[String])] =
+    if dir.nonEmpty then subs else subs.filterNot((d, _) => basename(d) == ExamplesDir)
 
   /** `walk`, taking a directory's own files only where that directory is a **module** — where it
    * holds a sysl file of its own — or is the tree's own root. Sub-directories are still descended
@@ -176,7 +203,7 @@ object Project {
     val here          = if mine then files.filter(f => exts.exists(f.endsWith)).map(f => Source(f, readFile(f), dir))
                         else Nil
 
-    here ::: subs.flatMap((sub, w) => walkModules(sub, dir :+ basename(sub), exts, os, w))
+    here ::: outside(dir, subs).flatMap((sub, w) => walkModules(sub, dir :+ basename(sub), exts, os, w))
   }
 
   /** One directory's contents with per-OS selection already applied: the files that belong to it, and
