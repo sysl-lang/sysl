@@ -526,8 +526,31 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
       |var s: *u8 = null
       |print(n.p.a, what(Small(1u8)), log(s, 1))""".stripMargin
 
-  private def typeLines(t: Target): List[String] =
+  private def allTypeLines(t: Target): List[String] =
     irFor(t, shapes).linesIterator.filter(_.contains("= type")).toList
+
+  private def typeName(l: String): String = l.takeWhile(_ != '=').trim
+
+  /** The type names **every** supported target declares.
+   *
+   * The module carries the standard library's types as well as the fixture's, and an
+   * OS-conditional declaration decides which generic *instantiations* the library asks for:
+   * `sysl.fs.metadata` is `#if posix`, so `Result[Meta, IoError]` is instantiated on macOS and
+   * Linux and on nothing freestanding. That is **reachability**, and every claim below is about
+   * **layout** — a type only some targets declare has nothing to be laid out differently from.
+   */
+  private lazy val sharedNames: Set[String] =
+    Target.all.filter(_.supported).map(t => allTypeLines(t).map(typeName).toSet).reduce(_ intersect _)
+
+  /** The comparable `= type` lines a target emits, which is what the layout claims are made over.
+   *
+   * **Intersecting is not a weakening, and the assertion below is what keeps it from becoming
+   * one.** An intersection that had quietly collapsed would make every test in this block pass
+   * while comparing almost nothing, which is the failure mode of narrowing a comparison to fit —
+   * so the size of what survives is asserted rather than assumed.
+   */
+  private def typeLines(t: Target): List[String] =
+    allTypeLines(t).filter(l => sharedNames(typeName(l)))
 
   /** `getting-started/cli.md § targets` used to rest the whole of `Layout` on one claim: every
    * target in the registry answers a layout question the same way, so the object that answers them
@@ -540,6 +563,16 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
    * only be made by emitting one program for more than one of them, which is what is here.
    */
   "what a target does not decide" - {
+    // The guard on the intersection `typeLines` is taken over. Without it every claim in this block
+    // could be made vacuously true by the comparison shrinking to nothing, which is exactly what a
+    // session narrowing a failing comparison would produce.
+    "and the types every target has in common are nearly all of them" in {
+      val counts = Target.all.filter(_.supported).map(t => allTypeLines(t).length)
+
+      sharedNames.size should be > (counts.max * 9 / 10)
+      sharedNames.size should be > 250
+    }
+
     "targets of one width lay an aggregate out the same way, which is why Layout takes a Word" in {
       for (word, group) <- Target.all.filter(_.supported).groupBy(_.word) do
         val first = typeLines(group.head)
