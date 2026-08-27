@@ -203,6 +203,18 @@ trait ExprEmitter extends ArithEmitter {
       val p = elementAddr(receiver, index)
       val r = freshReg(); emit(Inst.Load(r, ty.lty, p, access(e))); r
 
+    // A whole array literal viewed, where the view **escapes**: the storage is the buffer form's
+    // rather than the frame's, which is what an array literal written where a `[]T` is expected
+    // already gets (`Escape.Promotions.temporaries`). Everything else about the node is unchanged —
+    // it is the same elements at the same slice type, laid somewhere that outlives the frame.
+    case slice @ TSlice(TArrayLit(elems, _), None, None, _, sliceTy: Type.Slice)
+      if slice.pos.exists(promotedTemps) =>
+      genExpr(TBufLit(elems, sliceTy))
+
+    case slice @ TSlice(TArrayFill(value, Type.Array(n, _)), None, None, _, sliceTy: Type.Slice)
+      if slice.pos.exists(promotedTemps) =>
+      genExpr(TBufFill(value, TIntLit(n, Type.usize), sliceTy))
+
     case TSlice(base, lo, hi, inclusive, sliceTy) =>
       genSlice(base, lo, hi, inclusive, sliceTy)
 

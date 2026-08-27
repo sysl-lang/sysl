@@ -30,6 +30,10 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
                        override protected val allocator: Allocator)
     extends ExprEmitter with ExportThunk {
 
+  // The temporaries to give storage of their own. Set once: a position identifies one node in one
+  // source file, so this is whole-program where `promoted` is per body.
+  promotedTemps = promotions.temporaries
+
   /** The ghost functions of this program, which nothing emitted may name (`reference/verification.md § @ghost — what costs nothing to say`). */
   private val ghostFuncs: Set[String] = program.funcs.filter(_.ghost).map(_.name).toSet
 

@@ -535,6 +535,12 @@ trait Emitter {
    * it as its owner, where a frame-backed array has none.
    */
   protected var promoted: Set[String]                 = Set.empty
+
+  /** The **temporaries** given storage of their own, by the position of the slice node that escapes
+   * (`Escape.Promotions.temporaries`). Whole-program rather than per-function, since a position
+   * identifies one node in one source file.
+   */
+  protected var promotedTemps: Set[Pos]               = Set.empty
   protected var promotedBoxes: mutable.HashMap[String, ir.Val] = mutable.HashMap.empty
 
   /** One stack slot per LLVM type per function, for the type punning a union needs: a value goes

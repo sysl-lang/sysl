@@ -39,6 +39,21 @@ object Escape {
        * answer.
        */
       explanations: List[String] = Nil,
+      /** The **temporaries** to give storage of their own: a full-range slice of an array literal
+       * that escapes, by the position of the slice node.
+       *
+       * A declared array has a declaration to promote and is named above; an array literal in
+       * expression position has none, and until this set existed it was refused outright — with a
+       * sentence offering two explanations ("a field of a value", "an array a caller passed by
+       * value") that are neither of them true of a temporary in the frame that made it. Card `0314`.
+       *
+       * **A variadic call is the shape that meets this**, because `...T` packs its trailing
+       * arguments into exactly `[a, b, c][..]` — so a `take(self, xs: ...int)` on a trait was
+       * refused through the object and worked under static dispatch. It costs an allocation at such
+       * a call and only where one escapes, which is visible rather than hidden: a `@no_alloc` module
+       * is refused at the call.
+       */
+      temporaries: Set[Pos] = Set.empty,
   ) {
     def apply(func: Option[String]): Set[String] =
       func.fold(inMain)(byFunc.getOrElse(_, Set.empty))
@@ -108,6 +123,7 @@ private class Escape(program: TProgram) {
           walks.collect { case (Some(n), _, w) if w.promoted.nonEmpty => n -> w.promoted.toSet }.toMap,
           walks.collectFirst { case (None, _, w) => w.promoted.toSet }.getOrElse(Set.empty),
           walks.flatMap(_._3.why.toList),
+          walks.flatMap(_._3.temps.toList).toSet,
         ),
       )
   }
@@ -192,15 +208,16 @@ private class Escape(program: TProgram) {
    * `reference/memory.md § What happens when a slice escapes`'s unspecified "promotion of
    * aggregates", and the second is storage this frame was handed rather than storage it made.
    */
-  private case class View(named: Set[String], anonymous: Boolean) {
-    def nonEmpty: Boolean  = named.nonEmpty || anonymous
-    def ++(o: View): View  = View(named ++ o.named, anonymous || o.anonymous)
+  private case class View(named: Set[String], anonymous: Boolean, temps: Set[Pos] = Set.empty) {
+    def nonEmpty: Boolean = named.nonEmpty || anonymous || temps.nonEmpty
+    def ++(o: View): View = View(named ++ o.named, anonymous || o.anonymous, temps ++ o.temps)
   }
 
   private object View {
     val none: View                = View(Set.empty, anonymous = false)
     val unnamed: View             = View(Set.empty, anonymous = true)
     def of(name: String): View    = View(Set(name), anonymous = false)
+    def temp(at: Pos): View       = View(Set.empty, anonymous = false, temps = Set(at))
     def any(vs: Iterable[View]): View = vs.foldLeft(none)(_ ++ _)
   }
 
@@ -219,6 +236,11 @@ private class Escape(program: TProgram) {
 
     /** The arrays this body must allocate on the heap. */
     val promoted = mutable.Set.empty[String]
+
+    /** The temporaries this body must give storage of their own — a full-range slice of an array
+     * literal that got out, by the position of the slice.
+     */
+    val temps = mutable.Set.empty[Pos]
 
     /** Why each of them moved, in the order the escapes were found. */
     val why = mutable.ListBuffer.empty[String]
@@ -250,6 +272,14 @@ private class Escape(program: TProgram) {
     private def views(e: TExpr): View = if !carriesView(e.ty) then View.none else viewsValue(e)
 
     private def viewsValue(e: TExpr): View = e match
+      // A **whole** array literal, viewed. It has no declaration to promote, so it was refused
+      // outright until card `0314`; what it is instead is a temporary this frame made, which is
+      // exactly the thing promotion exists for. The escape gives it storage of its own — which is
+      // what an array literal written where a `[]T` is expected already gets — and the element
+      // views are still walked, since what the literal was *filled with* may be the frame's.
+      case slice @ TSlice(base @ (_: TArrayLit | _: TArrayFill), None, None, _, _)
+        if slice.pos.isDefined =>
+        views(base) ++ View.temp(slice.pos.get)
       case TSlice(base, _, _, _, _) =>
         base.ty match
           // A view of a `*T` region is the programmer's problem, like every `*T` — it is
@@ -474,15 +504,26 @@ private class Escape(program: TProgram) {
         sites += ((name, at.pos, how))
 
       promoted ++= v.named
+
+      // A temporary is promoted like a named array and is reported like one under `no alloc`, since
+      // what it costs there is the same allocation. It has no name a reader wrote, so it is named
+      // for what it is.
+      for pos <- v.temps if !temps(pos) do
+        why += Diagnostic.explain(s"an array literal is given storage of its own, because this view " +
+          s"of it $how", Some(pos))
+        sites += (("an array literal", Some(pos), how))
+
+      temps ++= v.temps
       gotOut = true
 
       if v.anonymous && escape.isEmpty then
         escape = Some(
           Diagnostic(
             s"a slice of an array this frame owns $how, so it would outlive the array, and the " +
-              "storage is not this body's to move — it is a field of a value, or an array a caller " +
-              "passed by value. Declare it as a '[]T', which makes a buffer of its own and owns it, " +
-              "or as a '&[N]T' where the length is fixed",
+              "storage is not this body's to move — it is a field of a value, an array a caller " +
+              "passed by value, or part of an array literal, which has no declaration to move. " +
+              "Declare it as a '[]T', which makes a buffer of its own and owns it, or as a '&[N]T' " +
+              "where the length is fixed",
             at.pos,
           ),
         )
@@ -518,7 +559,8 @@ private class Escape(program: TProgram) {
     else
       w.sites.toList.map((name, pos, how) =>
         Diagnostic(
-          s"this view of '$name' $how, so the array would move to the heap to outlive the frame — " +
+          s"this view of ${if name == "an array literal" then name else s"'$name'"} $how, so the " +
+            s"array would move to the heap to outlive the frame — " +
             s"and ${if theirs then "this module's '@tests' file" else "this module"} declared '@no_alloc', " +
             "so there is nothing to move it into. Keep the view inside the frame, or take the storage " +
             "from a caller as a '[]T' parameter, which is already wherever its owner put it",
