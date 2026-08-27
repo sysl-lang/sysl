@@ -501,9 +501,9 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   "what is refused" - {
     /** Both fields are private, so the positional constructor is out of reach — which is the whole
      * of what makes `Mutex.new` the only way in, and what keeps a lock from being built already
-     * held. `reference/modules.md § A restriction is about naming, not about existence` puts the
-     * constructor in the same list as a selection and a pattern for exactly
-     * this reason: a private field a caller could still set by position restricts nothing.
+     * held. `reference/modules.md § Visibility` is the rule the refusal comes from, and the
+     * constructor is held to it for exactly this reason: a private field a caller could still set by
+     * position restricts nothing.
      */
     "building one by naming its fields, which would let it start held" in {
       val out = err("var m = Mutex(1i32, 5)\nprint(m.try_lock().is_some())")

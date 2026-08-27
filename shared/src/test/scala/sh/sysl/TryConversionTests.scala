@@ -3,7 +3,7 @@ package sh.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** `?` widening a callee's error into the caller's through `From`
- * (`reference/errors.md § A '?' converts through 'From'`).
+ * (`reference/errors.md § A ? converts through From`).
  *
  * **What it is for is the shape a library's error types get designed around.** With exact-match `?`
  * and nothing else, every layer of a program writes the conversion into its own signatures — either

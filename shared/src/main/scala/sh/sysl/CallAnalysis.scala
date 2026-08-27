@@ -448,7 +448,7 @@ trait CallAnalysis extends OperatorCalls {
    *
    * The two **enums** must agree — an `Option` does not become a `Result` — and the error a `Result`
    * propagates is either the one the function returns or one that converts into it through `From`
-   * (`reference/errors.md § A '?' converts through 'From'`).
+   * (`reference/errors.md § A ? converts through From`).
    *
    * **The conversion is looked up rather than written**, which is the whole of what it buys: every
    * layer of a program otherwise writes `.map_err(…)` at each call that crosses between two error

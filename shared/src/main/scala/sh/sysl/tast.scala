@@ -561,7 +561,7 @@ case class TTry(
     ty: Type,
     /** The `impl From[E] for F` this `?` widens the failure through, as the key of the function it
       * lowered to — nothing where the two error types already agree
-      * (`reference/errors.md § A '?' converts through 'From'`).
+      * (`reference/errors.md § A ? converts through From`).
       *
       * It is a **name** rather than a node because there is no expression for it to be applied to:
       * what it converts is the failure payload, which exists only inside the branch the emitter

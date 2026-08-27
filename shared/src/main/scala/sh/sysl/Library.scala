@@ -185,7 +185,7 @@ object Library {
       // (`reference/expressions.md § Operator dispatch`).
       "Display", "Hash",
       // The conversion `?` widens a callee's error into the caller's through
-      // (`reference/errors.md § A '?' converts through 'From'`). The compiler spells it because it is
+      // (`reference/errors.md § A ? converts through From`). The compiler spells it because it is
       // what the operator looks for: there is no call in the source to read the name off.
       "From",
       // What a type does when the last reference to one of its values goes (`reference/memory.md §

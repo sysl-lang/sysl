@@ -428,7 +428,7 @@ trait CallEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     // than a node: what it converts is the failure payload, and the payload exists only inside this
     // branch. Everything else about the early return is unchanged, so a `?` that converts and one
     // that does not lower to the same shape with one call in the middle
-    // (`reference/errors.md § A '?' converts through 'From'`).
+    // (`reference/errors.md § A ? converts through From`).
     val failed = convert match
       case None =>
         val f = enumValue(retEnum, retFail, payloadFields(en, fail, v))
