@@ -400,3 +400,128 @@ mixed_views_compare()
     assert(c == a[..])
     assert(a[..] == c)
     assert(a[..] == b[..])
+
+// -- the transforming combinators -----------------------------------------------------------------
+//
+// The forcing ones -- `unwrap`, `unwrap_or`, `expect` -- shipped with the enums. These are the half
+// that transforms, and they exist so that `o match Some(v) -> Some(g(v)); None -> None` is written
+// once rather than four lines at every call, where one of the four can be got wrong.
+//
+// Each is asserted on **both** variants, because a combinator that is right about the present case
+// and wrong about the absent one is the shape that survives a casual test.
+
+private double_it(n: int) -> int = n * 2
+private halve(n: int) -> Option[int] = if n % 2 == 0 then Some(n / 2) else None
+private is_even(n: int) -> bool = n % 2 == 0
+private zero() -> int = 0
+private fallback() -> Option[int] = Some(99)
+private grow(n: int) -> Result[int, string] = if n < 100 then Ok(n * 10) else Err("too big")
+private recover(e: string) -> Result[int, int] = Ok(int(e.len))
+private width(e: string) -> int = int(e.len)
+
+@test("Option.map transforms the payload and carries absence through")
+option_map()
+    val some: Option[int] = Some(21)
+    val none: Option[int] = None
+
+    assert_eq(some.map(double_it), Some(42))
+    assert_eq(none.map(double_it), None)
+
+@test("Option.and_then does not nest where map would")
+option_and_then()
+    val four: Option[int] = Some(4)
+    val five: Option[int] = Some(5)
+    val none: Option[int] = None
+
+    assert_eq(four.and_then(halve), Some(2))
+    assert_eq(five.and_then(halve), None)
+    assert_eq(none.and_then(halve), None)
+
+@test("Option.or_else takes the second only where the first has nothing")
+option_or_else()
+    val some: Option[int] = Some(1)
+    val none: Option[int] = None
+
+    assert_eq(some.or_else(fallback), Some(1))
+    assert_eq(none.or_else(fallback), Some(99))
+
+@test("Option.filter keeps a payload that passes and drops one that does not")
+option_filter()
+    val four: Option[int] = Some(4)
+    val five: Option[int] = Some(5)
+    val none: Option[int] = None
+
+    assert_eq(four.filter(is_even), Some(4))
+    assert_eq(five.filter(is_even), None)
+    assert_eq(none.filter(is_even), None)
+
+@test("Option.unwrap_or_else computes the default only where it is wanted")
+option_unwrap_or_else()
+    val some: Option[int] = Some(7)
+    val none: Option[int] = None
+
+    assert_eq(some.unwrap_or_else(zero), 7)
+    assert_eq(none.unwrap_or_else(zero), 0)
+
+// The crossing that makes a lookup usable in a body that propagates with `?`, which is the whole
+// reason the two enums need a way across.
+@test("Option.ok_or names the error that absence becomes")
+option_ok_or()
+    val some: Option[int] = Some(3)
+    val none: Option[int] = None
+
+    assert_eq(some.ok_or("missing"), Ok(3))
+    assert_eq(none.ok_or("missing"), Err("missing"))
+
+@test("Result.map transforms the success and carries the failure through")
+result_map()
+    val ok: Result[int, string] = Ok(21)
+    val err: Result[int, string] = Err("no")
+
+    assert_eq(ok.map(double_it), Ok(42))
+    assert_eq(err.map(double_it), Err("no"))
+
+// How one layer's error type becomes the next one's at a boundary the caller chose.
+@test("Result.map_err transforms the failure and carries the success through")
+result_map_err()
+    val ok: Result[int, string] = Ok(1)
+    val err: Result[int, string] = Err("abc")
+
+    assert_eq(ok.map_err(width), Ok(1))
+    assert_eq(err.map_err(width), Err(3))
+
+@test("Result.and_then is '?' written as an expression")
+result_and_then()
+    val small: Result[int, string] = Ok(5)
+    val big: Result[int, string] = Ok(500)
+    val err: Result[int, string] = Err("no")
+
+    assert_eq(small.and_then(grow), Ok(50))
+    assert_eq(big.and_then(grow), Err("too big"))
+    assert_eq(err.and_then(grow), Err("no"))
+
+@test("Result.or_else gets the failure in hand to decide by")
+result_or_else()
+    val ok: Result[int, string] = Ok(1)
+    val err: Result[int, string] = Err("abc")
+
+    assert_eq(ok.or_else(recover), Ok(1))
+    assert_eq(err.or_else(recover), Ok(3))
+
+@test("Result.ok and Result.err cross to the enum that carries no reason")
+result_to_option()
+    val ok: Result[int, string] = Ok(4)
+    val err: Result[int, string] = Err("no")
+
+    assert_eq(ok.ok(), Some(4))
+    assert_eq(ok.err(), None)
+    assert_eq(err.ok(), None)
+    assert_eq(err.err(), Some("no"))
+
+@test("Result.unwrap_or_else computes the value from the failure")
+result_unwrap_or_else()
+    val ok: Result[int, string] = Ok(7)
+    val err: Result[int, string] = Err("abc")
+
+    assert_eq(ok.unwrap_or_else(width), 7)
+    assert_eq(err.unwrap_or_else(width), 3)

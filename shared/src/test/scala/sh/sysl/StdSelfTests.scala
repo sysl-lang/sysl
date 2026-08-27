@@ -131,8 +131,14 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * **Two of the ten were drift again, and that is the fifth time.** The measurement read 467 with
    * eight added, so the tree was at 459 against a floor of 457 — from the two the `Buf`/`Eq` entry
    * above says it took exactly. Taken exactly again here.
+   *
+   * Raised to **479** when `Option` and `Result` gained the transforming combinators — `map`,
+   * `and_then`, `or_else`, `unwrap_or_else` on both, `filter` and `ok_or` on the option, `map_err`,
+   * `ok` and `err` on the result. Twelve tests, each asserting **both** variants, because a
+   * combinator that is right about the present case and wrong about the absent one is exactly the
+   * shape that survives a casual test. Measured, no slack.
    */
-  private val floor = 467
+  private val floor = 479
 
   /** The library, compiled as a **test build of itself**.
    *
