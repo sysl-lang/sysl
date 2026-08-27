@@ -1145,8 +1145,41 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
     // C reads a variadic call's arguments relative to the last named parameter, so there has to be
     // one; `f(...)` is not a callable declaration in any C either.
     if variadic && params.isEmpty then err(s"'$name' needs at least one named parameter before '...'")
+    checkRestPosition(name, params, variadic, foreign)
     checkVaListPositions(name, params, ret, foreign)
   }
+
+  /** Where a `...T` parameter may stand, which is last and only last
+   * (`reference/declarations.md § A parameter may collect the rest of the call`).
+   *
+   * **It collects everything the call has left**, so a parameter after it could never be given
+   * anything: the arguments that would have been its are already inside the slice. That is the same
+   * rule Go, Swift, Java and C# each arrived at, and it is a fact about what "the rest" means rather
+   * than a limitation of the packing.
+   *
+   * **It may not stand beside the C ellipsis**, which is a different feature wearing the same three
+   * characters: `...` with no name and no type is the foreign tail, walked with `va_arg`, and a
+   * declaration carrying both would have two tails and one call.
+   *
+   * **And an `extern` may not carry one.** The packing happens at the call and hands over a sysl
+   * slice — three words with an owner in them — which is not something a C function was compiled to
+   * read. What a C variadic takes is the other form.
+   */
+  private def checkRestPosition(name: String, params: List[Param], variadic: Boolean, foreign: Boolean): Unit =
+    for p <- params.find(_.rest) do
+      at(p.pos) {
+        if foreign then
+          err(s"'$name' is an 'extern', and '${p.name}: ...T' hands over a sysl slice — which is " +
+            "three words with an owner in them, and not what a C function was compiled to read. " +
+            "C's own tail is the bare '...' with no name and no type")
+        else if variadic then
+          err(s"'$name' has two tails: '${p.name}: ...T' collects the rest of the call into a " +
+            "slice, and '...' is C's ellipsis, walked with 'va_arg'. A call has one tail, so a " +
+            "declaration may write one of them")
+        else if params.last ne p then
+          err(s"'${p.name}' collects the rest of the call, so nothing can follow it — the " +
+            s"arguments that would be '${params.last.name}' are already inside it")
+      }
 
   /** Where a `va_list` may stand in a signature (`reference/ffi.md § Variadic functions`).
    *
@@ -1204,7 +1237,7 @@ trait TypeResolution extends GenericInstantiation, Aliasing, WrittenTypes, Const
    */
   protected def foreignVaByValue(e: ExternDecl): Set[Int] =
     e.params.zipWithIndex.collect {
-      case (Param(_, NamedType(n, Nil), _, _, _), i) if scalarType(n).contains(Type.VaList) => i
+      case (Param(_, NamedType(n, Nil), _, _, _, _), i) if scalarType(n).contains(Type.VaList) => i
     }.toSet
 
 }

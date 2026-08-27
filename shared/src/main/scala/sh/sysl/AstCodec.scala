@@ -69,7 +69,7 @@ object AstCodec {
    * conflict**, and that is the case the rule above is written for: read dev's number, take the one
    * after it, and do not assume a clean merge means the versions agree.
    */
-  val Version: Int = 48
+  val Version: Int = 49
 
   private val Magic = "sysl-ast"
 
@@ -182,7 +182,9 @@ object AstCodec {
     private def param(p: Param): Unit = {
       // `byName` is carried because it is not recoverable from the type: `x: -> T` and `x: () -> T`
       // are the same `Fn() -> T`, and only this says which of the two a caller was written against.
-      pos(p); sref(p.name); typ(p.typ); vis(p.vis); opt(p.default)(expr); bool(p.byName)
+      // `rest` is carried for `byName`'s reason: `xs: ...T` and `xs: []const T` are the same
+      // parameter type, and only this says which of the two a caller was written against.
+      pos(p); sref(p.name); typ(p.typ); vis(p.vis); opt(p.default)(expr); bool(p.byName); bool(p.rest)
     }
 
     private def bound(b: BoundRef): Unit = { pos(b); sref(b.name); list(b.args)(typ) }
@@ -332,6 +334,7 @@ object AstCodec {
         case Lambda(ps, b, _)        => tok("lam"); list(ps)(lambdaParam); list(b)(stmt)
         case BlockArg(b)             => tok("barg"); list(b)(stmt)
         case ArrayLit(es)            => tok("arr"); list(es)(expr)
+        case Spread(v)               => tok("sprd"); expr(v)
         case ArrayFill(v, c)         => tok("afl"); expr(v); expr(c)
         case Block(ss)               => tok("blk"); list(ss)(stmt)
         case IfExpr(c, t, e2)        => tok("if"); expr(c); list(t)(stmt); opt(e2)(b => list(b)(stmt))
@@ -675,7 +678,7 @@ object AstCodec {
 
     // -------------------------------------------------------------- pieces
 
-    private def param(): Param  = at(Param(sref(), typ(), vis(), opt(expr()), bool()))
+    private def param(): Param  = at(Param(sref(), typ(), vis(), opt(expr()), bool(), bool()))
     private def bound(): BoundRef = at(BoundRef(sref(), list(typ())))
     private def assocDecl(): AssocDecl = at(AssocDecl(sref(), list(bound())))
     private def assocBind(): AssocBind = at(AssocBind(sref(), typ()))
@@ -803,6 +806,7 @@ object AstCodec {
         case "lam"  => Lambda(list(lambdaParam()), list(stmt()))
         case "barg" => BlockArg(list(stmt()))
         case "arr"  => ArrayLit(list(expr()))
+        case "sprd" => Spread(expr())
         case "afl"  => ArrayFill(expr(), expr())
         case "blk"  => Block(list(stmt()))
         case "if"   => IfExpr(expr(), list(stmt()), opt(list(stmt())))

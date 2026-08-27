@@ -193,6 +193,15 @@ case class Param(
       * differs is only how the call site binds it, which is where the desugar lives.
       */
     byName: Boolean = false,
+    /** Written `xs: ...T`: the parameter collects the call's trailing arguments into a `[]const T`
+      * (`reference/declarations.md § A parameter may collect the rest of the call`).
+      *
+      * It is a property of the **parameter** rather than of its type, exactly as `byName` is, and
+      * for the same reason: `typ` is already the `[]const T` the body sees, so nothing downstream —
+      * the signature, the monomorphization, the escape analysis — has a new case to learn. What
+      * differs is only how the call site binds it, which is where the packing lives.
+      */
+    rest: Boolean = false,
 ) extends Positioned
 
 /** `T::Body` — the **associated type** a trait declares, read off the type that implements it.

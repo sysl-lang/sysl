@@ -500,6 +500,13 @@ trait ExprAnalysis
       err(s"'$name = …' names an argument, and this is not a call to a declaration that names its " +
         s"parameters — write the value on its own, or '($name = …)' for the assignment")
 
+    // Argument binding replaces this one too, and it needs the same thing to replace it against: a
+    // `...T` parameter for the slice to be handed to. One arriving here was written somewhere no
+    // parameter collects anything, where it says nothing at all.
+    case _: Spread =>
+      err("'...' says an argument is already the slice a '...T' parameter collects, and nothing " +
+        "here collects one — it stands in a call's argument list and nowhere else")
+
     // Argument binding replaces every one of these too, and for the same reason it needs a
     // parameter to replace it against: a block is an array of its lines at a collection parameter
     // and a closure over them at a callable one, and a callee with no parameters at all — a value

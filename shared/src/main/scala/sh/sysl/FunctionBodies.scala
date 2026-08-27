@@ -235,7 +235,7 @@ trait FunctionBodies extends ModuleStorage {
     // And which of the body's own names hold one of them, for the members reached through a value
     // rather than through the parameter's name. Only a parameter written as the bare type parameter
     // qualifies: a `Box[T]` is a `Box`, and what its members mean is the `Box`'s question.
-    pbounds = f.params.collect { case Param(n, NamedType(w, Nil), _, _, _) if f.bounds.contains(w) => n -> w }.toMap
+    pbounds = f.params.collect { case Param(n, NamedType(w, Nil), _, _, _, _) if f.bounds.contains(w) => n -> w }.toMap
 
     // A result list is the signature's, and the body produces the tuple its parts lay out as — so
     // the body is analyzed against that tuple, with the list itself recorded beside it as the one

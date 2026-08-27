@@ -105,7 +105,16 @@ trait CollectionExprAnalysis extends ExprSupport {
     case Index(receiver, RangeExpr(lo, hi, inclusive)) =>
       if !inclusive && hi.isEmpty then err("an open-ended slice is written 'a[lo..]'")
 
-      val tr = analyzeExpr(receiver)
+      // **An array literal is the one receiver with no type of its own**, so a view of one is the
+      // one place the *view's* expectation has to reach through to the elements: `[1, "hi", true][..]`
+      // at a `[]const &Display` is three erasures, and read with nothing expected it is three types
+      // that are told they do not agree. Every other receiver is storage that already has a type,
+      // and asking it for one would be the expectation overruling what is really there.
+      val elemHint = (receiver, expected) match
+        case (ArrayLit(es), Some(Type.Slice(elem, _))) => Some(Type.Array(es.length, elem))
+        case _                                         => None
+
+      val tr = analyzeExpr(receiver, elemHint)
 
       // A view of read-only storage is read-only, which is the whole of what it takes to make this
       // safe: the view records the property, so it carries it wherever it is bound or passed rather

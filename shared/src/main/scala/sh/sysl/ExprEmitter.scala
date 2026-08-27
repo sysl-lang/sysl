@@ -171,6 +171,12 @@ trait ExprEmitter extends ArithEmitter {
     // The same two forms, sized and owned rather than laid out in a frame. Each element the buffer
     // takes is a share of its own — the box holds them until its hook lets them go — so the value
     // that lands in one is retained as it is stored, exactly as a slot that binds an array is.
+    // An empty view has no storage to make, so it is the zero value of its own representation:
+    // `{owner = null, data = null, len = 0}`. It is not `ownTemp`'d either — there is no box for a
+    // release to let go of, and a null owner is what a view that owns nothing already carries. The
+    // `TArrayFill` case above is the same observation about the length being zero, one form over.
+    case TBufLit(Nil, _) => Val.Zero
+
     case TBufLit(elems, sliceTy) =>
       val vals       = elems.map(genExpr)
       val (box, data) = genBuffer(sliceTy.elem, Val.Int(vals.length))

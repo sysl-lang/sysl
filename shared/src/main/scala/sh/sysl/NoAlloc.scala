@@ -238,6 +238,10 @@ trait NoAlloc extends AnalyzerBase {
    */
   private def allocates(e: TExpr): Option[String] = e match
     case _: TBox                       => Some("a reference")
+    // An **empty** one makes none: a view of nothing is `{null, null, 0}`, which is the zero value
+    // of its own representation and reaches no allocator. `[]` is therefore ordinary in an
+    // allocator-free module, which is what a function returning "no results" wants to write.
+    case TBufLit(Nil, _)               => None
     case _: TBufLit | _: TBufFill      => Some("a slice with storage of its own")
     case _: TStr | _: TRender          => Some("the string a value renders as")
     case _: TFormat                    => Some("the string a formatted value renders as")

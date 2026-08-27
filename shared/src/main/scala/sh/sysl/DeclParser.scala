@@ -64,9 +64,31 @@ trait DeclParser extends ExprParser {
    * about shape.
    */
   protected lazy val funcParam: Parser[Param] =
-    at((byNameParam | param) ~ opt(op("=") ~> expression) ^^ {
+    restParam | at((byNameParam | param) ~ opt(op("=") ~> expression) ^^ {
       case p ~ d => p.copy(default = d.map(Placeholders.lift))
     })
+
+  /** `xs: ...T` — the parameter that collects the call's trailing arguments
+   * (`reference/declarations.md § A parameter may collect the rest of the call`).
+   *
+   * **The type it carries is the `[]const T` the body sees**, built here rather than left for the
+   * analyzer, so that everything downstream reads an ordinary slice parameter and only the call
+   * site knows this was written differently. Read-only because the values are the caller's, laid
+   * out for the length of the call and not the callee's to write over.
+   *
+   * It takes no default: what a call that leaves it out gets is the empty slice, which is the whole
+   * of what "collects the rest" means when there is no rest. Saying it twice could only disagree,
+   * and the refusal below is where that is said.
+   *
+   * The C ellipsis is a different form and is read in `paramList`: that one is a bare `...` with no
+   * name and no type, and its tail is walked with `va_arg` rather than handed over as a slice.
+   */
+  private lazy val restParam: Parser[Param] =
+    at((ident <~ op(":") <~ op("...")) ~ typeRef ^^ {
+      case n ~ t => Param(n, ArrayType(None, t, readOnly = true), rest = true)
+    }) <~ (op("=") ~> err("a parameter that collects the rest of the call declares no default — a " +
+      "call that leaves it out gets the empty slice, which is what 'the rest' means when there is " +
+      "none, and a default beside that is a second answer to a settled question") | success(()))
 
   /** `x: -> T` — a parameter passed **by name** (`reference/declarations.md § Default parameters
    * and named arguments`).

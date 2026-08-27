@@ -84,6 +84,17 @@ case class Call(callee: Expr, args: List[Expr]) extends Expr
  */
 case class NamedArg(name: String, value: Expr) extends Expr
 
+/** `xs...` in an argument list — the one argument that is **already** the slice a `...T` parameter
+ * collects (`reference/declarations.md § A parameter may collect the rest of the call`).
+ *
+ * Without it a rest parameter could only ever be given values written out one by one, so a function
+ * that forwards its own tail to another could not be written at all — which is the case Go added
+ * the same spelling for. It is not an operator and not an expression anywhere else: it says how one
+ * argument is bound, exactly as `name = value` beside it does, and the analyzer refuses it wherever
+ * there is no rest parameter for it to be about.
+ */
+case class Spread(value: Expr) extends Expr
+
 /** A parameter's default, spliced in at a call that left the argument out
  * (`reference/declarations.md § Default parameters and named arguments`).
  *

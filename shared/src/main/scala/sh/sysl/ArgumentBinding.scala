@@ -42,13 +42,85 @@ trait ArgumentBinding extends TraitLookup {
       args: List[Expr],
       variadic: Boolean = false,
   ): List[Expr] = {
-    val names = args.collect { case n: NamedArg => n }
+    // The rest parameter is packed first, so everything after this — the names, the defaults, the
+    // arity check, the generic solve — sees one argument per parameter exactly as it always did.
+    val supplied = packRest(shown, params, args)
+    val names    = supplied.collect { case n: NamedArg => n }
 
     val bound =
-      if names.isEmpty && !params.exists(_.default.isDefined) then args
-      else bind(shown, owner, params, args, variadic, names)
+      if names.isEmpty && !params.exists(_.default.isDefined) then supplied
+      else bind(shown, owner, params, supplied, variadic, names)
 
     blocked(params, thunked(params, bound))
+  }
+
+  /** Collects a call's trailing arguments into the slice a `...T` parameter takes
+   * (`reference/declarations.md § A parameter may collect the rest of the call`).
+   *
+   * **It is a rewrite of the argument list and nothing more**, which is the whole reason the feature
+   * is small: `xs: ...int` already carries the type `[]const int`, so the callee is an ordinary
+   * function taking a slice and every pass downstream is untouched. What the call site does is write
+   * out the array literal the caller would otherwise have written by hand.
+   *
+   * **The array is the caller's frame, not the heap.** `[a, b, c][..]` is an array literal sliced,
+   * which is storage laid out where the call is written — so a variadic call costs no allocator, and
+   * a module that gave one up may still make one. The empty call is the exception in form and not in
+   * cost: it is the bare literal, which under the expected `[]const T` is the empty view
+   * `{null, null, 0}` and reaches no allocator either. Wrapping *that* in a slice would have nowhere
+   * to read the element type from.
+   *
+   * **`xs...` hands an existing slice straight through**, which is the case a rewrite cannot cover
+   * and Go added the same spelling for: a function forwarding its own tail to another has a slice
+   * and not a list of values, and packing it would make a slice of one slice.
+   */
+  private def packRest(shown: String, params: List[Param], args: List[Expr]): List[Expr] = {
+    val restAt = params.indexWhere(_.rest)
+
+    if restAt < 0 then
+      // A spread outside a call that collects anything is a word about a parameter that is not
+      // there, so it is refused here rather than reaching the type checker as an argument of a
+      // shape nothing takes.
+      for sp <- args.collectFirst { case s: Spread => s } do
+        at(sp.pos)(err(s"'...' says this argument is already the slice a '...T' parameter " +
+          s"collects, and $shown has no such parameter"))
+      args
+    else
+      val rest = params(restAt)
+
+      // **The split is over the POSITIONAL arguments alone.** A name is written after them, so a
+      // call that gives every fixed parameter by name has left nothing positional at all — and
+      // `label(tag = "none")` still means the empty tail rather than a tail beginning at index one.
+      val positional = args.takeWhile(!_.isInstanceOf[NamedArg])
+      val named      = args.drop(positional.length)
+
+      // A rest parameter has one name and any number of arguments, so there is nothing for a name
+      // to pick out. The fixed parameters in front of it may still be named.
+      for n <- named.collectFirst { case n: NamedArg if n.name == rest.name => n } do
+        at(n.pos)(err(s"'${rest.name}' collects the rest of the call, so its arguments are " +
+          "positional — a name picks out one parameter and this one takes as many as are left"))
+
+      val tail = positional.drop(restAt)
+
+      val packed = tail match
+        case List(sp: Spread) => sp.value
+        case _ =>
+          for sp <- tail.collectFirst { case s: Spread => s } do
+            at(sp.pos)(err(s"'...' hands the whole of '${rest.name}' over, so it is the only " +
+              "argument there — a slice and a value cannot both be part of one tail"))
+
+          // An empty tail cannot be sliced: `[]` inside a subscript has no context to read its
+          // element type from, while the bare literal is answered by the parameter's own `[]const T`.
+          val lit =
+            if tail.isEmpty then ArrayLit(Nil)
+            else Index(ArrayLit(tail), RangeExpr(None, None, inclusive = true))
+
+          tail.headOption.flatMap(_.pos).fold(lit)(lit.setPos)
+
+      // **Placed by NAME rather than by position**, which is what lets a fixed parameter be given by
+      // name in front of it: a positional argument may not follow a named one, and the packed slice
+      // is written after whatever the call wrote. Naming it costs nothing — `bind` is what runs
+      // either way once a name is in the list.
+      positional.take(restAt) ::: named ::: List(NamedArg(rest.name, packed))
   }
 
   /** Turns each trailing block into what the parameter it stands at asks for (`reference/

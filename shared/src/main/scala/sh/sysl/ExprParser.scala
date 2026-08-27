@@ -437,8 +437,12 @@ trait ExprParser extends SyslParserBase {
    * parameter is refused by the analyzer rather than quietly falling back to the store.
    */
   protected lazy val argument: PackratParser[Expr] =
-    (at(ident ~ (op("=") ~> expression) ^^ { case n ~ v => NamedArg(n, v) }) | expression) ^^
-      Placeholders.liftArg
+    (at(ident ~ (op("=") ~> expression) ^^ { case n ~ v => NamedArg(n, v) }) |
+      // `xs...` — this argument is already the slice a `...T` parameter collects. It is read here
+      // rather than as a postfix operator because that is what it is: a statement about how one
+      // argument is bound, which is the same category `name = value` above belongs to.
+      at(expression <~ op("...") ^^ Spread.apply) |
+      expression) ^^ Placeholders.liftArg
 
   protected def commaList[T](p: Parser[T]): Parser[List[T]] = commaList1(p) | success(Nil)
 
