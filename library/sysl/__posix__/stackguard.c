@@ -17,6 +17,14 @@
  * so installs nothing: what a project links its own `main` to is that project's business.
  */
 
+/* **`pthread_getattr_np` is a GNU extension and glibc hides it behind this**, so a file without it
+ * compiles cleanly here and fails on Linux with a call to an undeclared function — which clang
+ * treats as an error rather than a warning. macOS needs nothing for its own pair, which is exactly
+ * why the omission would have been invisible until the release's Linux tarballs were built.
+ *
+ * It has to come before every include: a header included first has already made its decisions. */
+#define _GNU_SOURCE
+
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -77,17 +85,19 @@ static void sysl_fault(int sig, siginfo_t *info, void *ctx) {
 void sysl_install_stack_guard(void) {
   stack_t alt;
   struct sigaction sa;
-  pthread_attr_t attr;
-  void *base = 0;
-  size_t size = 0;
 
   /* Where the main thread's stack is. macOS answers with the high address and the size; Linux
    * answers with the low address and the size, through an attribute object it fills. Neither is
-   * portable to the other, and there is no third form to want. */
+   * portable to the other, and there is no third form to want. The three locals the second form
+   * needs are declared inside it, or the first form compiles with three it never touches. */
 #if defined(__APPLE__)
   sysl_stack_high = (char *)pthread_get_stackaddr_np(pthread_self());
   sysl_stack_low = sysl_stack_high - pthread_get_stacksize_np(pthread_self());
 #else
+  pthread_attr_t attr;
+  void *base = 0;
+  size_t size = 0;
+
   if (pthread_getattr_np(pthread_self(), &attr) == 0) {
     if (pthread_attr_getstack(&attr, &base, &size) == 0) {
       sysl_stack_low = (char *)base;

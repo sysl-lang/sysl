@@ -115,6 +115,30 @@ class ShiftCountTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
   }
 
+  /** A `within` type's left shift is the **checked** one — it traps rather than wrapping, on the
+    * ranged type's own terms — and the count is brought to width *before* that check rather than
+    * after, so the two spellings of one shift agree.
+    */
+  "a ranged receiver takes a foreign count on the same terms" - {
+
+    "and the checked shift computes what the plain one computes" in {
+      run("type Slot = new u8 within 0..<200\n\n" +
+        "var s: Slot = Slot(3)\n" +
+        "var narrow: u8 = 4\n" +
+        "var wide: u32 = 4\n\n" +
+        "print(int(s << narrow), int(s << wide))") shouldBe "48 48\n"
+    }
+
+    // The clamp happens before `checkedShl`'s own comparison against the width, so a wide count whose
+    // result leaves the range still trips the range check rather than slipping past it.
+    "while a shift that leaves the range still traps" in {
+      exits("type Slot = new u8 within 0..<200\n\n" +
+        "var s: Slot = Slot(3)\n" +
+        "var wide: u32 = 7\n\n" +
+        "print(int(s << wide))")
+    }
+  }
+
   /** A vector's count is lane-wise and is already the same register type, so nothing is relaxed
     * there — which is why the analyzer's exception is written against a scalar integer. A scalar
     * count still reaches a vector, by the splat every mixed vector operand takes, and that is a

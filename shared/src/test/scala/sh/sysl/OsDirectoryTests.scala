@@ -410,7 +410,8 @@ class OsDirectoryTests extends LibraryCliSupport {
       val hosted = Std.cSources(Os.Linux).map(s => Project.basename(s.name)).sorted
 
       bare shouldBe empty
-      hosted shouldBe List("clock.c", "dirent.c", "spawn.c", "stat.c", "termios.c", "zone.c")
+      hosted shouldBe List("clock.c", "dirent.c", "spawn.c", "stackguard.c", "stat.c", "termios.c",
+        "zone.c")
 
       // And macOS sees the same files, which is the deduplication itself: before this they were
       // two directories of identical copies, and a build could only ever have seen one of them.
