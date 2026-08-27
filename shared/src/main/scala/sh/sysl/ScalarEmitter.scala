@@ -203,6 +203,33 @@ trait ScalarEmitter extends StringEmitter {
     r
   }
 
+  /** A shift's count, brought to the shifted value's own width.
+   *
+   * The count may be any integer type — it is a count rather than a value being combined with the
+   * left, and `Literals.arithType` says so — while LLVM's `shl`, `lshr` and `ashr` each take two
+   * operands of one type. So the conversion happens here rather than in a cast the reader had to
+   * write for the compiler's benefit.
+   *
+   * A **narrower** count is extended, which preserves its value whichever way it is signed. A
+   * **wider** one is clamped at the shifted width *before* it is truncated, and that order is the
+   * whole of the care this needs: truncating first turns a count of 256 into a count of 0, so
+   * `x << n` would answer `x` where every other over-shift answers zero. Clamping at the count's own
+   * width and then truncating cannot, since the clamp value is the shifted width and always fits.
+   *
+   * A vector arrives unchanged: its count is lane-wise and is already the same register type, which
+   * is why `arithType` does not relax the rule there.
+   */
+  protected def shiftAmount(ty: Type, amtTy: Type, amt: Val): Val =
+    (Type.underlying(ty), Type.underlying(amtTy)) match
+      case (to: Type.Integer, from: Type.Integer) if to.bits != from.bits =>
+        if from.bits < to.bits then convert(from, to, amt)
+        else
+          val width  = Val.Int(to.bits)
+          val tooBig = freshReg(); emit(Inst.IntCmp(tooBig, ICmp.Uge, from.lty, amt, width))
+          val safe   = freshReg(); emit(Inst.Select(safe, tooBig, from.lty, width, amt))
+          convert(from, to, safe)
+      case _ => amt
+
   /** The `icmp` / `fcmp` predicate for an operator at a type. `char` compares by scalar
    * value, so it uses the unsigned predicates over its `i32` representation.
    */

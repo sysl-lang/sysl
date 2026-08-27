@@ -72,16 +72,27 @@ class OperatorDomainTests extends AnyFreeSpec with CodegenSupport with RunSuppor
         include("'+' needs matching types, got u12 and u20")
     }
 
-    "which includes the shift amount, so `01`'s `x << u8(k)` is what has to be written" in {
-      err("""var x: u8 = 1
+    /** A shift is the exception, and the rest of the rule is untouched by it: `x << n` asks for `x`
+      * shifted `n` places, so `n`'s width has nothing to do with `x`'s. C, Rust, Java, Go and Scala
+      * all read it that way, and the cast this used to require was noise a reader had to check for
+      * a subtlety that is not there.
+      */
+    "except a shift, whose right operand is a count and may be any integer width" in {
+      run("""var x: u8 = 1
             |var k: u16 = 2
-            |print(x << k)""".stripMargin) should include("matching types")
+            |print(x << k)""".stripMargin) shouldBe "4\n"
     }
 
-    "and the conversion makes it compile" in {
+    "and the conversion still compiles, meaning the same thing" in {
       run("""var x: u8 = 1
             |var k: u16 = 2
             |print(x << u8(k))""".stripMargin) shouldBe "4\n"
+    }
+
+    "but the count must still be an integer, and the message names it as a count" in {
+      err("""var x: u8 = 1
+            |print(x << 1.5)""".stripMargin) should
+        include("'<<' shifts by a count, and real is not an integer")
     }
 
     /** The one pair with a meeting point, and so the one place "the same type" is reached rather

@@ -447,17 +447,33 @@ trait Literals extends TypeResolution {
    *
    * Only the mismatch moves. "operator is not defined for" below is about the operator and the type
    * it was applied to rather than about one operand, so it keeps the expression's own position.
+   *
+   * **A shift is the exception, and it is the one operator where the rule above does not apply.**
+   * `a + b` combines two values that have to agree on what they are; `x << n` asks for `x` shifted
+   * `n` places, and `n`'s width has nothing to do with `x`'s. So the count may be any integer, the
+   * result is the shifted value's own type, and the count is brought to that width by codegen
+   * (`ScalarEmitter.shiftAmount`) rather than by a conversion the reader has to write. That is C's
+   * rule, Rust's, Java's, Go's and Scala's; a `x << usize(n)` written for the compiler's benefit is
+   * noise in exactly the code — a hash, a bitset, a decoder — where widths are already being
+   * juggled. It reaches a **scalar** shift only: LLVM's vector `shl` takes one register type, and a
+   * lane-wise count is a different question from this one.
    */
   protected def arithType(op: String, a: Type, b: Type, rhs: Option[Pos]): Type = {
     // Operands must agree on their *representation*: a transparent subtype meets its base and other
     // subtypes over it, while a derived type meets only itself (`repr` keeps it distinct). The
     // result is that shared representation — except two values of one derived type stay in it, since
     // arithmetic on a derived numeric yields the same derived numeric.
-    val ra = Type.repr(a)
-    if ra != Type.repr(b) then at(rhs)(err(s"'$op' needs matching types, got ${show(a)} and ${show(b)}"))
+    val ra    = Type.repr(a)
+    val shift = (op == "<<" || op == ">>") && Type.underlying(a).isInstanceOf[Type.Integer]
+    if !shift && ra != Type.repr(b) then
+      at(rhs)(err(s"'$op' needs matching types, got ${show(a)} and ${show(b)}"))
+    // A shift's count is a count, so what it has to be is an integer rather than the shifted
+    // value's own type. The message names it as a count for the same reason.
+    if shift && !Type.underlying(b).isInstanceOf[Type.Integer] then
+      at(rhs)(err(s"'$op' shifts by a count, and ${show(b)} is not an integer"))
     val result = a match
-      case c: Type.Constrained if c.derived && a == b => a
-      case _                                          => ra
+      case c: Type.Constrained if c.derived && (a == b || shift) => a
+      case _                                                     => ra
     (Type.underlying(a), op) match
       case (_: Type.Integer, "+" | "-" | "*" | "/" | "%" | "<<" | ">>" | "&" | "|" | "^") => result
       case (_: Type.Floating, "+" | "-" | "*" | "/")                                      => result

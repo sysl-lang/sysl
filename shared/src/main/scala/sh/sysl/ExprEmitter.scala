@@ -464,9 +464,12 @@ trait ExprEmitter extends ArithEmitter {
       // analyzer but is added, multiplied, and divided as the base it is laid out as. When an operand
       // was produced through a ranged type and the result could leave the base width, the operation
       // is overflow-detecting so a wrap cannot slip past the produce-site range check.
-      val bt = Type.underlying(l.ty)
-      val lv = genExpr(l)
-      val rv = genExpr(r)
+      val bt  = Type.underlying(l.ty)
+      val lv  = genExpr(l)
+      val rv0 = genExpr(r)
+      // A shift's count may be any integer width, so it is brought to the shifted value's own here —
+      // every instruction below takes two operands of one type. See `ScalarEmitter.shiftAmount`.
+      val rv  = if op == "<<" || op == ">>" then shiftAmount(bt, r.ty, rv0) else rv0
 
       bt match
         case it: Type.Integer if op == "<<" && isRanged(l.ty)  => checkedShl(it, lv, rv)

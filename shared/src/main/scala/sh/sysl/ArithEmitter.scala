@@ -38,12 +38,15 @@ trait ArithEmitter extends CallEmitter {
       case _ =>
         val bin = op.dropRight(1)
         val bt  = Type.underlying(ty)
+        // `x <<= n` computes what `x = x << n` computes, so the count is widened or clamped on the
+        // same terms — see `ScalarEmitter.shiftAmount`.
+        val rv  = if bin == "<<" || bin == ">>" then shiftAmount(bt, valueTy, v) else v
 
         bt match
-          case it: Type.Integer if bin == "<<" && isRanged(ty)                       => checkedShl(it, cur, v)
+          case it: Type.Integer if bin == "<<" && isRanged(ty)                       => checkedShl(it, cur, rv)
           case it: Type.Integer if (bin == "+" || bin == "-" || bin == "*") && isRanged(ty) =>
-            checkedArith(bin, it, cur, v)
-          case _ => arith(bin, bt, cur, v)
+            checkedArith(bin, it, cur, rv)
+          case _ => arith(bin, bt, cur, rv)
 
   /** Whether an integer `+`/`-`/`*` needs the overflow-detecting form. Arithmetic on raw integers is
    * defined to wrap, so it is only in play when an operand was produced through a ranged (`within`)
