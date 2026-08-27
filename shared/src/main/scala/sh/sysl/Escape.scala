@@ -152,9 +152,22 @@ private class Escape(program: TProgram) {
   private def borrows(ty: Type): Boolean =
     Type.erasedTrait(ty).exists(_.name == Library.key("Writer"))
 
-  /** Whether a value of this type could carry a view of somebody's elements. */
+  /** Whether a value of this type could carry a view of somebody's elements.
+   *
+   * **A `string` cannot, and saying it could was a false refusal on the most ordinary line there
+   * is.** It is a `Type.View` in the layout — three words over bytes — and it is a *counted heap
+   * object* to this analysis: `str_cast` copies into storage of its own (`TFromBytes` calls
+   * `sysl.str.from_bytes`, which allocates), a literal is static, and nothing else makes one. So a
+   * string outlives every frame by construction and there is nothing in it for a frame to own.
+   *
+   * What the answer `true` did was make a **call returning a string** inherit its arguments' views,
+   * since a call views whatever it was passed. `hex_string(sha3_256(msg))` is exactly that shape —
+   * a temporary array into a `[]const u8` parameter, from a function answering a `string` — so the
+   * refusal landed on the most ordinary line a user of either hashing package writes, and only when
+   * the *enclosing* function returned a string, which is what made it read as arbitrary.
+   */
   private def carriesView(t: Type): Boolean = t match
-    case _: Type.View        => true
+    case _: Type.Slice       => true
     case Type.Array(_, elem) => carriesView(elem)
     case s: Type.Struct      => s.fields.exists(f => carriesView(f._2))
     case e: Type.Enum        => e.variants.exists(_.fields.exists(f => carriesView(f._2)))

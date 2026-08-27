@@ -535,10 +535,25 @@ private[sysl] def execute(cfg: Config): Int = {
     case "build" =>
       val exe = cfg.output.getOrElse(defaultOutput(cfg.file, project.name))
 
-      Toolchain.build(compiled.ir, exe, target, archives, cfg.optimize, compiled.links, native.objects,
-        paths, cfg.verbose) match
-        case Left(err) => fail(err)
-        case Right(_)  => Console.err.println(s"wrote $exe"); 0
+      // **The output path being a directory is caught here rather than by the linker.** A project
+      // named for its own module directory is the obvious layout and reaches this without trying:
+      // the executable takes the package's name, the module directory has the same one, and `ld`
+      // answers `open() failed, errno=21 (Is a directory)` — an errno, naming neither the package
+      // nor the directory, from a tool the reader did not invoke. The condition is known long
+      // before clang is, and which of the two names to change depends on where this one came from.
+      if isDirectory(exe) then
+        fail(
+          if cfg.output.isDefined then
+            s"'-o $exe' names a directory, and an executable cannot be written over one"
+          else
+            s"this project builds an executable named '${Project.basename(exe)}', and '$exe' is a " +
+              "directory — the two cannot both have that name. Rename the package or the directory, " +
+              "or say where the binary goes with '-o <path>'")
+      else
+        Toolchain.build(compiled.ir, exe, target, archives, cfg.optimize, compiled.links, native.objects,
+          paths, cfg.verbose) match
+          case Left(err) => fail(err)
+          case Right(_)  => Console.err.println(s"wrote $exe"); 0
 
     case "run" =>
       val exe = createTempFile("sysl-", "")

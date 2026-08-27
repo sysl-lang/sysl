@@ -957,4 +957,76 @@ class PackageBuildTests extends PackageCacheSupport {
     }
   }
 
+  /** The executable takes the package's name, so a project named after its own module directory has
+    * two things wanting one name — and it is the obvious layout rather than an exotic one: name the
+    * package for the language and put the language in a directory of that name.
+    *
+    * Left to the linker it surfaced as `ld: open() failed, errno=21 (Is a directory)`, from a tool
+    * the reader never invoked, naming neither the package nor the directory. The condition is known
+    * long before clang is.
+    *
+    * **`run` never meets it**, since that writes to a temporary file — so a project can carry the
+    * collision indefinitely and meet it the first time somebody asks for a binary.
+    */
+  "an executable that would be written over a directory" - {
+
+    /** `build` rather than `run`, into a working directory of the test's own, since the default
+      * output path is relative to where the project is.
+      */
+    def built(root: String): (Int, String) = {
+      val notes  = new java.io.ByteArrayOutputStream
+      val status = Console.withOut(Discarded)(
+        Console.withErr(notes)(sh.sysl.execute(Config(command = "build", file = root))))
+
+      (status, notes.toString)
+    }
+
+    /** A project whose package name is also the name of a module directory in it, which is what
+      * makes the two collide.
+      */
+    def colliding(name: String): String = {
+      val root = createTempDirectory("sysl-collide-")
+
+      writeFile(s"$root/${PackageConfig.FileName}",
+        s"""package { name = "$name", version = "0.1.0" }\n""")
+      createDirectories(s"$root/$name")
+      writeFile(s"$root/$name/$name.sysl", s"module $name\n\nvalue() -> int = 7\n")
+      writeFile(s"$root/main.sysl", s"print($name.value())\n")
+      root
+    }
+
+    "is refused, naming both names and what to do about it" in {
+      val (status, said) = built(colliding("slate"))
+
+      status should not be 0
+      said should include("executable named 'slate'")
+      said should include("Rename the package or the directory")
+    }
+
+    // The message is different when the path was written by hand, because the advice is: there is
+    // no package name to rename, and the reader chose the path.
+    "and says so differently when '-o' named the directory" in {
+      val root   = colliding("slate")
+      val notes  = new java.io.ByteArrayOutputStream
+      val status = Console.withOut(Discarded)(Console.withErr(notes)(
+        sh.sysl.execute(Config(command = "build", file = root, output = Some(s"$root/slate")))))
+
+      status should not be 0
+      notes.toString should include("names a directory")
+    }
+
+    // The other half of the threshold: a project whose directory does not share the package's name
+    // builds, which is what says the refusal is about the collision and not about a module directory
+    // being there at all.
+    "while a package named something else builds" in {
+      val root = colliding("slate")
+      val out  = s"$root/slate-bin"
+      val notes = new java.io.ByteArrayOutputStream
+      val status = Console.withOut(Discarded)(Console.withErr(notes)(
+        sh.sysl.execute(Config(command = "build", file = root, output = Some(out)))))
+
+      withClue(notes.toString)(status shouldBe 0)
+    }
+  }
+
 }

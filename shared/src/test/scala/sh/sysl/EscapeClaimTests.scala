@@ -103,4 +103,48 @@ class EscapeClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         |print(out.len, out[0])
         |""".stripMargin) shouldBe "8 1 2\n4 1\n"
   }
+
+  /** A `string` owns its bytes, so nothing that answers one is carrying a view of the caller's
+   * frame — and a call that answers one must not inherit its arguments' views.
+   *
+   * It did, because a `string` is a `Type.View` in the layout, and the consequence was a refusal on
+   * the most ordinary line there is: a temporary array handed to something taking a `[]const u8`
+   * and answering a `string`. `hex_string(sha3_256(msg))` is exactly that, so both hashing packages
+   * met it. What made it read as arbitrary is that the **enclosing** function's result decided it —
+   * the identical call compiled when the caller answered a `usize` or a `bool`.
+   */
+  "a string owns its bytes, so answering one carries no view out" - {
+    val fixture =
+      """filled() -> [4]u8
+        |    var out: [4]u8 = [0; 4]
+        |    for i in 0..<out.len do out[i] = u8(i)
+        |    out
+        |
+        |shown(xs: []const u8) -> string = if xs.len == 4 then "yes" else "no"
+        |counted(xs: []const u8) -> usize = xs.len
+        |""".stripMargin
+
+    "a temporary array reaches it from a function answering a string" in {
+      run(fixture + "c() -> string = shown(filled())\nprint(c())") shouldBe "yes\n"
+    }
+
+    "and from a block body, which is the same call written the other way" in {
+      run(fixture + "c() -> string\n    shown(filled())\nprint(c())") shouldBe "yes\n"
+    }
+
+    // The two that always compiled, kept as the other side of the claim: what changed is the string
+    // case, and a suite that only pinned the string case could not say the rest was untouched.
+    "as it always did from one answering something that is not a view at all" in {
+      run(fixture + "c() -> usize = counted(filled())\nprint(c())") shouldBe "4\n"
+    }
+
+    // The real escape is unaffected: a slice of a local array handed *out* is still promoted, and a
+    // slice of an array the frame does not own is still refused. Both are elsewhere in this file and
+    // in `EscapeErrorTests`; what is pinned here is that a string in the result type does not turn
+    // an ordinary call into one.
+    "while a slice answered directly still leaves as a view" in {
+      promotions(fixture + "c() -> []const u8\n    var b: [4]u8 = [1; 4]\n    b[..]\nprint(c().len)")
+        .mkString should include("promoted to the heap")
+    }
+  }
 }
