@@ -156,8 +156,12 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * tests, and they guard the same second thing the `sysl.fs` and `sysl.process` entries above name,
    * for a **third** shim: `meta.c` is what knows where `st_size` sits, so a wrong offset shows up
    * here as a size that is not ten rather than as a build that failed. Measured, no slack.
+   *
+   * Raised to **545** for one more in : resolving an import against the file that named
+   * it, which is the shape a module loader actually writes and which arrived as four assertions from
+   * an outside consumer rather than from taste.
    */
-  private val floor = 544
+  private val floor = 545
 
   /** The library, compiled as a **test build of itself**.
    *
