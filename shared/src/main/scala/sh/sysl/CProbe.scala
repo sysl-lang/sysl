@@ -231,7 +231,7 @@ object CProbe {
       // A missing back end is the *toolchain's* refusal rather than the program's, so it carries no
       // position — but it arrives on this compilation's error channel and is read beside diagnostics
       // that do, which is why it is one now rather than a bare sentence among them.
-      Toolchain.findClang(target).left.map(Diagnostic(_, None)).flatMap { cc =>
+      Toolchain.findClang(target, paths.cc).left.map(Diagnostic(_, None)).flatMap { cc =>
         val command = Seq(cc, s"--target=${target.triple}", "-S", "-emit-llvm", "-O0") ++
           Toolchain.machineFlags(target) ++
           Option.when(target.shortEnums)("-fshort-enums") ++

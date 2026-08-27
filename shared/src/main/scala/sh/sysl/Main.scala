@@ -235,7 +235,7 @@ private[sysl] def execute(cfg: Config): Int = {
   // Which standard module this compilation is compiled against — an error if there is none, the same
   // as any other missing library.
   val Stdlib.Resolved(std, coreSymbols, coreArchive) =
-    Stdlib.resolve(stdChoice(cfg, target), target, allocator) match
+    Stdlib.resolve(stdChoice(cfg, target), target, allocator, cfg.cc) match
     case Left(err) => return fail(err)
     case Right(c)  => c
 
@@ -345,7 +345,8 @@ private[sysl] def execute(cfg: Config): Int = {
                                     libPaths.probed, libPaths.probedLibs,
                                     carriedOf(cfg.file, project, target.os) match
                                       case Left(err)     => return fail(err)
-                                      case Right(answer) => answer))
+                                      case Right(answer) => answer,
+                                    cfg.cc))
 
   val librarySources = collected.flatMap(_._2) ::: fetched.sources
   val packages       = fetched.packages
@@ -403,7 +404,7 @@ private[sysl] def execute(cfg: Config): Int = {
     case Right(answer) => answer
 
   val paths = SearchPaths(cfg.linkPaths, cfg.includePaths, cfg.defines,
-                          probed.probed, probed.probedLibs, carried)
+                          probed.probed, probed.probedLibs, carried, cfg.cc)
 
   if cfg.verbose then
     for lib <- cfg.libs do trace(s"library: $lib")

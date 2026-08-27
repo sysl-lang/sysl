@@ -124,11 +124,11 @@ object Stdlib {
    * once, with the diagnostic naming where it looked, rather than at whichever branch happened to
    * touch `Std.sources` first, where it would arrive as an exception.
    */
-  def resolve(choice: Choice, target: Target, allocator: Allocator = Allocator.c)
-      : Either[String, Resolved] =
+  def resolve(choice: Choice, target: Target, allocator: Allocator = Allocator.c,
+              cc: Option[String] = None): Either[String, Resolved] =
     Std.root.flatMap: _ =>
       choice match
-        case Choice.FromSource      => Right(Resolved(fromSource(target), Set.empty, None))
+        case Choice.FromSource      => Right(Resolved(fromSource(target, cc), Set.empty, None))
         case Choice.Artifact(named) => load(named, target, allocator)
         case Choice.Default(search) =>
           val path = search.getOrElse(LibraryArtifact.stdDefault(target, allocator))
@@ -137,7 +137,7 @@ object Stdlib {
             resolved.get((path, target, allocator)) match
               case Some(answer) => answer
               case None         =>
-                val answer = found(path, target, allocator)
+                val answer = found(path, target, allocator, cc)
 
                 resolved.clear()
                 resolved((path, target, allocator)) = answer
@@ -209,7 +209,8 @@ object Stdlib {
    * wrapped in a complaint about the standard module — which is exactly the misreading Android's
    * missing NDK produces, since a toolchain fault there already looks like a broken library.
    */
-  private def found(path: String, target: Target, allocator: Allocator): Either[String, Resolved] = {
+  private def found(path: String, target: Target, allocator: Allocator,
+                    cc: Option[String]): Either[String, Resolved] = {
     val already = if isFile(path) then load(path, target, allocator) else Left(s"$path does not exist")
 
     already match
@@ -217,9 +218,9 @@ object Stdlib {
       case Left(why) =>
         Console.err.println(s"building the standard module at $path ($why)")
 
-        writeArtifact(path, target, allocator = allocator) match
+        writeArtifact(path, target, allocator = allocator, cc = cc) match
           case Right(_)  => load(path, target, allocator)
-          case Left(err) => Left(rebuildFailure(err, Toolchain.findClang(target)))
+          case Left(err) => Left(rebuildFailure(err, Toolchain.findClang(target, cc)))
   }
 
   /** What to say when the rebuild above did not happen: the toolchain's own sentence where there is
@@ -308,26 +309,27 @@ object Stdlib {
    * module is the compiler's own, so a header it cannot read is a broken installation and not
    * something a program did.
    */
-  def fromSource(target: Target): Stdlib =
+  def fromSource(target: Target, cc: Option[String] = None): Stdlib =
     cache.synchronized {
-      cache.get(target) match
+      cache.get((target, cc)) match
         case Some(std) => std
         case None =>
-          val units = CProbe.lower(Tests.stripSource(Std.parsed(target)), target) match
+          val units = CProbe.lower(Tests.stripSource(Std.parsed(target)), target,
+                                   SearchPaths(cc = cc)) match
             case Right(lowered) => lowered
             case Left(e)        => sys.error(s"the standard module's 'c const' could not be measured: $e")
 
           val std = new Stdlib(units)
 
           cache.clear()
-          cache(target) = std
+          cache((target, cc)) = std
           std
     }
 
   /** Locked for the reason `Std.parsed`'s is: this was a `lazy val`, which is initialized once
    * however many threads reach it, and a bare mutable `Map` is not.
    */
-  private val cache = collection.mutable.Map.empty[Target, Stdlib]
+  private val cache = collection.mutable.Map.empty[(Target, Option[String]), Stdlib]
 
   /** Whether a second ask for one target answers from memory, decided without releasing the lock
    * between the two asks — `Std.memoAnswersTwice`'s reason, for the slot one layer up.
@@ -387,12 +389,13 @@ object Stdlib {
    * there, rather than deleting a working artifact on its way to not producing one.
    */
   def writeArtifact(out: String, target: Target, ar: Option[String] = None,
-                    allocator: Allocator = Allocator.c): Either[String, Unit] =
+                    allocator: Allocator = Allocator.c,
+                    cc: Option[String] = None): Either[String, Unit] =
     for
       archiver <- Toolchain.findAr(ar)
       built    <- LibraryArtifact.build(Std.sources(target.os), target, LibraryArtifact.std,
-                                        Some(fromSource(target)), native = Std.cSources(target.os),
-                                        allocator = allocator)
+                                        Some(fromSource(target, cc)), native = Std.cSources(target.os),
+                                        paths = SearchPaths(cc = cc), allocator = allocator)
       _        <- {
                     val staging  = createTempDirectory("sysl-std-")
                     val code     = s"$staging/${LibraryArtifact.codeMember}"
@@ -420,13 +423,14 @@ object Stdlib {
 
                     val outcome =
                       for
-                        _ <- Toolchain.compileObject(built._1, code, target)
-                        _ <- Toolchain.compileObject(LibraryArtifact.metadataIr(built._2, target), metadata, target)
+                        _ <- Toolchain.compileObject(built._1, code, target, named = cc)
+                        _ <- Toolchain.compileObject(LibraryArtifact.metadataIr(built._2, target), metadata,
+                                                     target, named = cc)
                         // Each C file is its own member, so the linker pulls a shim in the way it
                         // pulls anything else in: because something left its symbol undefined.
                         _ <- objects.foldLeft[Either[String, Unit]](Right(()))((so_far, entry) =>
                                so_far.flatMap(_ =>
-                                 Toolchain.compileC(entry._1.name, entry._2, target)))
+                                 Toolchain.compileC(entry._1.name, entry._2, target, named = cc)))
                         _ <- Toolchain.archive(code :: metadata :: objects.map(_._2), pending, archiver)
                         _ <- publish(pending, out)
                       yield ()

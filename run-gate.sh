@@ -95,7 +95,7 @@ watchdog_self_test () {
 
   LIMIT=60 OOM_GRACE=2       # the outer limit is a long way off, so only the inner one can explain a fast cut
   start=$SECONDS
-  attempt_group "oom.log" 16g 3 "sh.probe.Whatever"
+  attempt_group "oom.log" 16g 3 syslNative "sh.probe.Whatever"
   elapsed=$(( SECONDS - start ))
 
   (( elapsed > 15 )) && {
@@ -110,7 +110,7 @@ watchdog_self_test () {
 
   LIMIT=5 OOM_GRACE=2
   start=$SECONDS
-  attempt_group "quiet.log" 16g 3 "sh.probe.Whatever"
+  attempt_group "quiet.log" 16g 3 syslNative "sh.probe.Whatever"
   elapsed=$(( SECONDS - start ))
 
   (( elapsed < LIMIT )) && {
@@ -178,6 +178,35 @@ fi
 
 print "  $(wc -l < "$LOGS/defined.txt" | tr -d ' ') suites, and sbt agrees" | tee -a "$SUMMARY"
 
+# **THE DOC SUITES ARE THE SECOND SOURCE ROOT, AND UNTIL 2026-08-27 THE GATE COULD NOT SEE THEM.**
+# `doc/shared/src/test/` holds the sixteen `DocCliTests` that pin the `sysl doc` command's exit codes
+# -- where its only real bug so far lived -- and `SlugConformanceTests`, which is the only thing that
+# renders through juicer's jar and so the only thing that would notice a per-page `slugStyle`
+# regression. A release ran both by hand; a gate that says GREEN without them was saying less than
+# the reader assumed. Card `0273`.
+#
+# They are DISCOVERED rather than listed: `gate-groups.py` reads the compiler's source root and knows
+# nothing about this one, and a hand-written list here would be the same staleness one file over.
+# There is therefore nothing to reconcile the list against -- so what is checked is that it is not
+# EMPTY, which is the failure that would otherwise read as a clean run of nothing.
+print "listing the doc suites" | tee -a "$SUMMARY"
+
+sbt -batch --error "print syslDocNative/Test/definedTestNames" > "$LOGS/defined-doc.log" 2>&1
+
+grep -oE 'sh\.sysl\.doc\.[A-Za-z0-9_.]+' "$LOGS/defined-doc.log" | sort -u > "$LOGS/defined-doc.txt"
+
+DOC_SUITES=$(tr '\n' ' ' < "$LOGS/defined-doc.txt")
+
+if [[ -z "${DOC_SUITES// }" ]]; then
+  {
+    print "GATE: RED -- sbt named no doc suites, so the doc group would run nothing"
+    print "  see $LOGS/defined-doc.log"
+  } | tee -a "$SUMMARY"
+  exit 1
+fi
+
+print "  $(wc -l < "$LOGS/defined-doc.txt" | tr -d ' ') doc suites" | tee -a "$SUMMARY"
+
 # One attempt at one group, into `$LOGS/$log`. Two watchdogs, and the inner one is why a kill no
 # longer costs the whole limit.
 #
@@ -192,11 +221,11 @@ print "  $(wc -l < "$LOGS/defined.txt" | tr -d ' ') suites, and sbt agrees" | te
 # agent and still report on the others -- so a minute is given for a verdict to appear before the
 # group is cut. A minute against fourteen is worth paying for the case where the run recovers.
 attempt_group () {
-  local log=$1 heap=$2 agents=$3 suites=$4
+  local log=$1 heap=$2 agents=$3 project=$4 suites=$5
 
   GC_MAXIMUM_HEAP_SIZE=$heap SYSL_RELEASE=1 sbt -J-XX:-DoEscapeAnalysis -batch \
     "set Global/concurrentRestrictions += Tags.limit(Tags.Test, $agents)" \
-    "syslNative/testOnly $suites" > "$LOGS/$log" 2>&1 &
+    "$project/testOnly $suites" > "$LOGS/$log" 2>&1 &
   local sbt_pid=$!
 
   ( sleep $LIMIT; kill -9 $sbt_pid 2>/dev/null ) &
@@ -223,11 +252,11 @@ read_result () { grep -E "^\[(info|error)\] Tests: succeeded" "$LOGS/$1" | tail 
 read_last ()   { grep -E "^\[info\] [A-Z][A-Za-z]*Tests:" "$LOGS/$1" | tail -1 }
 
 run_group () {
-  local label=$1 heap=$2 agents=$3 suites=$4
+  local label=$1 heap=$2 agents=$3 project=$4 suites=$5
 
-  print "=== $label start $(date +%H:%M:%S)  heap=$heap agents=$agents" >> "$SUMMARY"
+  print "=== $label start $(date +%H:%M:%S)  heap=$heap agents=$agents project=$project" >> "$SUMMARY"
 
-  attempt_group "$label.log" $heap $agents "$suites"
+  attempt_group "$label.log" $heap $agents "$project" "$suites"
 
   local result=$(read_result "$label.log")
   local failed=$(grep -c "\*\*\* FAILED \*\*\*" "$LOGS/$label.log")
@@ -249,7 +278,7 @@ run_group () {
     print "$label  no verdict $(date +%H:%M:%S)  oom=$oom  last suite: $(read_last "$label.log")" >> "$SUMMARY"
     print "$label  RETRY alone $(date +%H:%M:%S)  heap=$HEAVY_HEAP agents=$HEAVY_AGENTS" >> "$SUMMARY"
 
-    attempt_group "$label-retry.log" $HEAVY_HEAP $HEAVY_AGENTS "$suites"
+    attempt_group "$label-retry.log" $HEAVY_HEAP $HEAVY_AGENTS "$project" "$suites"
 
     result=$(read_result "$label-retry.log")
     failed=$(grep -c "\*\*\* FAILED \*\*\*" "$LOGS/$label-retry.log")
@@ -283,13 +312,15 @@ WATCHDOG_RC=$?
 print "$WATCHDOG_OUT" | tee -a "$SUMMARY"
 (( WATCHDOG_RC == 0 )) || exit 1
 
-run_group heavy $HEAVY_HEAP $HEAVY_AGENTS \
+run_group heavy $HEAVY_HEAP $HEAVY_AGENTS syslNative \
   "$(python3 -c "import json;print(' '.join(json.load(open('$LOGS/heavy.json'))))")"
+
+run_group doc $LIGHT_HEAP $LIGHT_AGENTS syslDocNative "$DOC_SUITES"
 
 NCHUNKS=$(python3 -c "import json;print(len(json.load(open('$LOGS/chunks.json'))))")
 
 for i in $(seq 0 $((NCHUNKS - 1))); do
-  run_group "chunk-$i" $LIGHT_HEAP $LIGHT_AGENTS \
+  run_group "chunk-$i" $LIGHT_HEAP $LIGHT_AGENTS syslNative \
     "$(python3 -c "import json;print(' '.join(json.load(open('$LOGS/chunks.json'))[$i]))")"
 done
 
@@ -319,7 +350,14 @@ print('TIMED OUT: ' + (', '.join(stalled) if stalled else 'none'))
 # that needs it repeatedly is the evidence for promoting one of its suites into HEAVY, and that
 # evidence exists nowhere else.
 print('RETRIED (passed alone): ' + (', '.join(retried) if retried else 'none'))
-print('GATE: ' + ('GREEN' if failed == 0 and not stalled else 'RED'))
+# **THE VERDICT NAMES ITS OWN SCOPE, AND THAT IS THE WHOLE OF WHAT THIS LINE IS FOR.** Three words
+# on their own invite the reader to infer the tree: two sessions independently read `GATE: GREEN` as
+# covering everything the repository builds. It covers the two Native projects and nothing else --
+# `syslJS` has never been reached, because `syslJS/Test/fastLinkJS` exhausts the heap at 8g and again
+# at 16g and the bundle has never linked at all (card `0272`). Naming the gap is what makes leaving
+# it out honest rather than silent; a green verdict that states its scope cannot be over-read.
+print('GATE: ' + ('GREEN' if failed == 0 and not stalled else 'RED')
+      + '  -- syslNative and syslDocNative; NOT syslJS, which has never linked (card 0272)')
 PY
 
 tail -3 "$SUMMARY"

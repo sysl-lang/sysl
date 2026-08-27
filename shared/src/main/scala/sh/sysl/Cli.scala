@@ -115,6 +115,15 @@ case class Config(
       */
     stdSearch: Option[String] = None,
     ar: Option[String] = None,
+    /** `--cc` — the clang to build with, where a search would not find the right one.
+      *
+      * The companion of `--ar`, and it exists because three `Toolchain` diagnostics told the reader
+      * to name one for months while nothing parsed the flag (card `0197`). It reaches every place
+      * the compiler runs clang, the standard module's own rebuild included — a flag honoured in
+      * `build` and dropped when the library is rebuilt underneath it would fail later than the flag
+      * and blame the library.
+      */
+    cc: Option[String] = None,
     /** `--link-path` and `--include-path` — where on this machine to look for a library a `@link`
       * named, and for a header a carried `.c` includes or an `@include` names (`SearchPaths`). Lists
       * rather than single values because a build that needs one prefix usually needs the two it came
@@ -294,6 +303,9 @@ private[sysl] val parser = {
       opt[String]("ar")
         .action((a, c) => c.copy(ar = Some(a)))
         .text("the llvm-ar to build a library with; defaults to searching for one"),
+      opt[String]("cc")
+        .action((a, c) => c.copy(cc = Some(a)))
+        .text("the clang to build with; defaults to searching for one"),
       opt[String]("link-path")
         .unbounded()
         .action((d, c) => c.copy(linkPaths = c.linkPaths :+ d))

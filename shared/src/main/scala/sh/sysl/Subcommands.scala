@@ -162,7 +162,7 @@ private def buildForC(cfg: Config, compiled: Compiled, target: Target, named: Op
 
   val outcome =
     for
-      _ <- Toolchain.compileObject(compiled.ir, code, target, cfg.optimize)
+      _ <- Toolchain.compileObject(compiled.ir, code, target, cfg.optimize, cfg.cc)
       _ <- objects.foldLeft[Either[String, Unit]](Right(()))((so_far, entry) =>
              so_far.flatMap(_ => Toolchain.compileC(entry._1.name, entry._2, target, cfg.optimize,
                paths, cfg.verbose)))
@@ -349,8 +349,9 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
 
       val outcome =
         for
-          _ <- Toolchain.compileObject(ir, code, target, cfg.optimize)
-          _ <- Toolchain.compileObject(LibraryArtifact.metadataIr(meta, target), metadata, target, cfg.optimize)
+          _ <- Toolchain.compileObject(ir, code, target, cfg.optimize, cfg.cc)
+          _ <- Toolchain.compileObject(LibraryArtifact.metadataIr(meta, target), metadata, target,
+                                       cfg.optimize, cfg.cc)
           // Each C file becomes its own member, so the linker pulls in a shim the same way it pulls
           // in anything else: because something left its symbol undefined.
           _ <- objects.foldLeft[Either[String, Unit]](Right(()))((so_far, entry) =>

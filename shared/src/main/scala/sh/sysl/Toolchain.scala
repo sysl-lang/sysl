@@ -57,7 +57,29 @@ import io.github.edadma.cross_platform.*
 case class SearchPaths(link: List[String] = Nil, include: List[String] = Nil,
                        defines: List[String] = Nil,
                        probed: List[String] = Nil, probedLibs: List[String] = Nil,
-                       carried: Map[String, List[String]] = Map.empty) {
+                       carried: Map[String, List[String]] = Map.empty,
+                       /** `--cc` — the clang to build with, instead of searching for one
+                         * (`findClang`'s `named`).
+                         *
+                         * ==Why the compiler's NAME rides with the search paths==
+                         *
+                         * It is the same class of fact as the rest of this record: what *this build*
+                         * needs from *this machine's* toolchain, written down in the command rather
+                         * than picked up from the environment — which is the argument the header
+                         * makes for `--link-path` and holds unchanged here.
+                         *
+                         * The practical half is that this record is already carried to every place
+                         * that reaches clang. A parameter of its own would have to be added beside
+                         * every existing `paths` parameter and then remembered at every call, and
+                         * the flag that is honoured in some of those places and not others is
+                         * exactly the half-measure card `0197` says to avoid.
+                         *
+                         * **The one path that carries no `SearchPaths` is the standard module's own
+                         * rebuild**, which is why `Stdlib.writeArtifact` takes it as an explicit
+                         * argument. A `--cc` that stopped applying the moment the library was
+                         * rebuilt would fail later than the flag, and blame the library.
+                         */
+                       cc: Option[String] = None) {
 
   /** What the linker is told, as clang spells it — `--link-path`'s directories, then any a probe
    * answered with. Joined rather than passed as two arguments, which is how `-L` has been written
@@ -534,7 +556,7 @@ object Toolchain {
             archives: List[String] = Nil, level: String = defaultOptimization,
             links: List[String] = Nil, objects: List[String] = Nil,
             paths: SearchPaths = SearchPaths.none, verbose: Boolean = false): Either[String, Unit] = {
-    findClang(target).flatMap { cc =>
+    findClang(target, paths.cc).flatMap { cc =>
       val ll = createTempFile("sysl-", ".ll")
       writeFile(ll, ir)
 
@@ -814,7 +836,7 @@ object Toolchain {
                level: String = defaultOptimization,
                paths: SearchPaths = SearchPaths.none, verbose: Boolean = false,
                named: Option[String] = None): Either[String, Unit] = {
-    findClang(target, named).flatMap { cc =>
+    findClang(target, named orElse paths.cc).flatMap { cc =>
       val command = Seq(cc, s"--target=${target.triple}", flag(level)) ++ machineFlags(target) ++
         Option.when(target.shortEnums)("-fshort-enums") ++
         Option.when(target.positionIndependent)("-fPIC") ++ paths.defineFlagsFor(source) ++
