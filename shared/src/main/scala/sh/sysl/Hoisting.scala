@@ -55,7 +55,7 @@ trait Hoisting extends HoistMembers {
    */
   protected def hoistType(stmt: Stmt): Unit = stmt match
     case s: StructDecl =>
-      val key = Modules.qualify(currentModule, s.name)
+      val key = declKey(s.name, s.vis, typeNameTaken(_, s.name))
 
       if typeNameTaken(key, s.name) then err(s"type '${s.name}' is already declared")
       checkNoModuleOfThatName(key, s.name, "member")
@@ -70,7 +70,7 @@ trait Hoisting extends HoistMembers {
       for m <- s.members do at(m.pos)(recordMemberAccess(key, m.name, m.vis, s"${s.name}.${m.name}"))
       if libraryOffers(s, currentModule) then libraryNames(s.name) = key
     case e: EnumDecl =>
-      val key = Modules.qualify(currentModule, e.name)
+      val key = declKey(e.name, e.vis, typeNameTaken(_, e.name))
 
       if typeNameTaken(key, e.name) then err(s"type '${e.name}' is already declared")
       checkNoModuleOfThatName(key, e.name, "variant")
@@ -111,7 +111,7 @@ trait Hoisting extends HoistMembers {
         variantOwners(vkey) = variantOwners.getOrElse(vkey, Nil) :+ key
         if libraryOffers(e, currentModule) then libraryNames(v.name) = vkey
     case t: TraitDecl =>
-      val key = Modules.qualify(currentModule, t.name)
+      val key = declKey(t.name, t.vis, typeNameTaken(_, t.name))
 
       if typeNameTaken(key, t.name) then err(s"the name '${t.name}' is already declared")
       // A trait asking for a setter is asking about a property it also declares, so the two are put
@@ -159,7 +159,7 @@ trait Hoisting extends HoistMembers {
     // A constrained subtype shares the type namespace, so a name clash is caught here; the base and
     // bounds are resolved and validated lazily, the first time the name is used as a type.
     case t: TypeDecl =>
-      val key = Modules.qualify(currentModule, t.name)
+      val key = declKey(t.name, t.vis, typeNameTaken(_, t.name))
 
       if typeNameTaken(key, t.name) then err(s"type '${t.name}' is already declared")
       checkNoModuleOfThatName(key, t.name, "member")
@@ -177,7 +177,7 @@ trait Hoisting extends HoistMembers {
     // (`reference/modules.md § const — a value`). Its *value* is not evaluated here — a constant may be written in terms of one
     // declared below it, so folding waits until something asks.
     case c: ConstDecl =>
-      val key = Modules.qualify(currentModule, c.name)
+      val key = declKey(c.name, c.vis, k => constDecls.contains(k) || valueNameHolder(k).isDefined)
 
       // A constant, a function, and an enum variant are all *values* a bare name can reach, so the
       // three share one namespace and each pass checks the tables filled before it.
@@ -193,7 +193,7 @@ trait Hoisting extends HoistMembers {
     // read. Its type and its value wait, exactly as a constant's do: one `val` may be written in
     // terms of a `const` declared below it.
     case v: ValDecl =>
-      val key = Modules.qualify(currentModule, v.name)
+      val key = declKey(v.name, v.vis, k => valDecls.contains(k) || valueNameHolder(k).isDefined)
 
       if valDecls.contains(key) then duplicate(key, s"'${v.name}' is already declared")
       else for what <- valueNameHolder(key) do duplicate(key, s"'${v.name}' is already used by $what")
@@ -217,7 +217,7 @@ trait Hoisting extends HoistMembers {
     // write `static` in a file that refuses the word, or told to drop it in the one file that needs
     // it, would be told something false.
     case v: VarDecl =>
-      val key = Modules.qualify(currentModule, v.name)
+      val key = declKey(v.name, v.vis, k => staticVarDecls.contains(k) || valueNameHolder(k).isDefined)
 
       if staticVarDecls.contains(key) then duplicate(key, s"'${v.name}' is already declared")
       else for what <- valueNameHolder(key) do duplicate(key, s"'${v.name}' is already used by $what")
@@ -238,7 +238,7 @@ trait Hoisting extends HoistMembers {
     // is not qualified for the reason the `extern` function's is not: the linker knows nothing about
     // sysl's modules, so the key carries the module and the symbol is what was written.
     case e: ExternVarDecl =>
-      val key = Modules.qualify(currentModule, e.name)
+      val key = declKey(e.name, e.vis, k => externVarDecls.contains(k) || valueNameHolder(k).isDefined)
 
       if externVarDecls.contains(key) then duplicate(key, s"'${e.name}' is already declared")
       else for what <- valueNameHolder(key) do duplicate(key, s"'${e.name}' is already used by $what")
@@ -314,7 +314,16 @@ trait Hoisting extends HoistMembers {
         original.copy(tparams = tps, params = ps, bounds = original.bounds ++ bs).setPos(original.pos)
       }
       val plain = Modules.qualify(currentModule, f.name)
-      val key   = if funcDecls.contains(plain) then overloadSlot(plain) else plain
+      val key   =
+        // A file-private declaration whose plain key belongs to a *sibling file's* file-private one
+        // is not an overload of it — neither is ever a candidate at the other's call sites, so
+        // there is nothing for a call to be told apart. It takes a private slot, and `overloadKeys`
+        // never sees it, which is what keeps `checkOverloadDistinct` from comparing two
+        // declarations no call site can confuse.
+        declKey(f.name, f.vis, funcDecls.contains) match
+          case k if k != plain           => k
+          case _ if funcDecls.contains(plain) => overloadSlot(plain)
+          case _                              => plain
 
       // The other side of the `extern` rule below: overloads of an `extern` are told apart by the
       // symbol each names, and a sysl function has none to give.
@@ -353,7 +362,7 @@ trait Hoisting extends HoistMembers {
         recover(())(err("'main' is where a program starts, so there is one — a second declaration " +
           "of it would overload the name, and a program has one beginning rather than a set of them"))
       else if key != plain then
-        recover(())(checkOverloadDistinct(plain, key, f.params, f.retType, f.variadic))
+        recover(())(checkOverloadDistinct(plain, key, f.params, f.retType, f.variadic, f.vis))
       checkSignatureRules(f.name, f.params, f.retType, f.variadic)
       checkValueParamArithmetic(f.tvalues.keySet, f.params.map(_.typ) ::: f.retType.toList,
         f.tparams.toSet, f.tpacks)
@@ -784,6 +793,51 @@ trait Hoisting extends HoistMembers {
    * after it is given a numbered one. Nothing changes for a name declared once: it gets no entry
    * here, and every lookup answers exactly as it did.
    */
+  /** The key a declaration of `name` is filed under: the module's plain one, unless this
+   * declaration is **file-private** and a *sibling file's* file-private declaration already holds
+   * that key — in which case this one gets a numbered key of its own (`filePrivateKeys`).
+   *
+   * `taken` is the question "does something already hold the plain key", asked by the caller because
+   * each kind of declaration checks a different set of tables — a constant asks about the value
+   * namespace, a struct about the type one. Passing it keeps this from having to know which
+   * namespace it is being asked about, which is the thing that would go stale.
+   *
+   * **Three cases and only the third is new.** Nothing holds the key: this declaration takes it, and
+   * where it is file-private the claim is recorded so its own file resolves to it. Something holds
+   * it and is *not* another file's file-private declaration: the plain key comes back and the
+   * caller's existing duplicate check reports it, so a private name against a public one of the
+   * same spelling is refused exactly as it was. Something holds it and **is** another file's
+   * file-private declaration: a numbered key, and the two coexist.
+   */
+  protected def declKey(name: String, vis: Visibility, taken: String => Boolean): String = {
+    val plain = Modules.qualify(currentModule, name)
+
+    if vis != Visibility.File then plain
+    else
+      currentFile match
+        case None => plain
+        case Some(file) =>
+          filePrivateKeys.get((file, plain)) match
+            // This file has already claimed a key for the spelling, so a second declaration of it
+            // *here* is an ordinary duplicate and must arrive at the same key to be reported as one.
+            case Some(claimed) => claimed
+            case None =>
+              val key =
+                if !taken(plain) then plain
+                else if fileLocal(plain) && !declAccess.get(plain).exists(_.file.exists(f => currentFile.exists(_ eq f)))
+                then s"$plain.private${filePrivateSlots(plain).length + 1}"
+                else plain
+
+              if key != plain then filePrivateSlots(plain) = filePrivateSlots(plain) :+ key
+              filePrivateKeys((file, plain)) = key
+              key
+  }
+
+  /** The numbered keys handed out for one contended file-private spelling, so the next file gets a
+   * fresh one. Empty for every name only one file declares privately, which is nearly all of them.
+   */
+  private val filePrivateSlots = mutable.Map.empty[String, List[String]].withDefaultValue(Nil)
+
   private def overloadSlot(plain: String): String = {
     val existing = overloadKeys(plain)
     val key      = s"$plain.${existing.length + 1}"
@@ -824,12 +878,23 @@ trait Hoisting extends HoistMembers {
       params: List[Param],
       retType: Option[TypeRef],
       variadic: Boolean,
+      vis: Visibility = Visibility.Public,
   ): Unit = {
+    // **A declaration this file cannot name is not one a call here could be confused with**, so two
+    // functions file-private to two files are not an overload pair at all — there is no call site
+    // that sees both (`reference/modules.md § Visibility`).
+    //
+    // The condition is deliberately both-ways: it takes a file-private declaration past a sibling's
+    // file-private one, and takes nothing past a **public** one. A public declaration beside another
+    // file's private one of the same spelling is still a duplicate, because the sibling file's own
+    // references would then have two answers with nothing to tell them apart.
+    def separable(other: String): Boolean = vis == Visibility.File && !visible(other)
+
     def low(ps: List[Param]) = ps.count(_.default.isEmpty)
     def high(ps: List[Param], v: Boolean) = if v then Int.MaxValue else ps.length
 
     for
-      other <- overloadKeys(plain).filter(_ != key).flatMap(funcDecls.get)
+      other <- overloadKeys(plain).filter(k => k != key && !separable(k)).flatMap(funcDecls.get)
       lo = low(params) max low(other.params)
       hi = high(params, variadic) min high(other.params, other.variadic)
       if lo <= hi

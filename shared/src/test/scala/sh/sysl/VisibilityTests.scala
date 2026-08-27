@@ -138,10 +138,20 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
     }
   }
 
-  "a file is not a namespace, only a visibility level" - {
-    // `reference/modules.md § Separate compilation`: the file is a contribution to its module, not
-    // a unit of its own. So a private declaration still spends its name in the module it belongs
-    // to.
+  /** **A file-private name is scoped to its file, and a public one is not** (`reference/modules.md
+   * § Visibility`).
+   *
+   * This section pinned the opposite until 2026-08-27 — a file was a visibility level and not a
+   * namespace at all, so `private` restricted the *reach* of a name without restricting the
+   * *namespace*, and a sibling file could not declare its own `scale`. Card `0306`: that defeated
+   * what file-privacy is for, since the reason to keep a helper to its file is that its name is a
+   * local matter. Rust, C and Go all scope the name as well as the reach.
+   *
+   * What did **not** move is the public case, and the two are asserted together because the
+   * distinction is the whole rule: a private declaration against a sibling's public one is a real
+   * ambiguity for that sibling's own references, and is still refused.
+   */
+  "a file scopes a private name, and only a private one" - {
     "a private declaration still collides with a sibling file's public one" in {
       errIn(
         ("", "main.sysl", "print(1)"),
@@ -150,12 +160,16 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
       ) should include("function 'scale' is already declared")
     }
 
-    "nor with a second file's private one, for the same reason" in {
-      errIn(
-        ("", "main.sysl", "print(1)"),
-        ("geom", "g.sysl", "module geom\nprivate scale(n: int) -> int = n * 2"),
-        ("geom", "h.sysl", "module geom\nprivate scale(n: int) -> int = n + 1"),
-      ) should include("function 'scale' is already declared")
+    // The half that moved. Two files that each keep a `scale` to themselves have written two
+    // declarations no call site can confuse, since neither is ever a candidate where the other is.
+    "but a second file's private one is its own, and both are named from their own file" in {
+      runIn(
+        ("", "main.sysl", "print(geom.from_g(), geom.from_h())"),
+        ("geom", "g.sysl",
+         "module geom\nprivate scale(n: int) -> int = n * 2\nfrom_g() -> int = scale(10)"),
+        ("geom", "h.sysl",
+         "module geom\nprivate scale(n: int) -> int = n + 1\nfrom_h() -> int = scale(10)"),
+      ) shouldBe "20 11\n"
     }
 
     "and two modules may each keep one of the same name" in {
@@ -188,7 +202,7 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
     "and the file that loses the collision is not also told the name is not its own" in {
       val out = errIn(
         ("", "main.sysl", "print(1)"),
-        ("geom", "g.sysl", "module geom\nprivate scale(n: int) -> int = n * 2"),
+        ("geom", "g.sysl", "module geom\nscale(n: int) -> int = n * 2"),
         ("geom", "h.sysl", "module geom\nprivate scale(n: int) -> int = n + 1\ntwice(n: int) -> int = scale(n)"),
       )
 

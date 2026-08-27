@@ -127,7 +127,8 @@ trait Scoping extends DeclTables {
     val key =
       if written.indexOf(Modules.sep.toInt) >= 0 then Option.when(declared(written))(written).flatMap(reach)
       else if dot < 0 then
-        val own     = Modules.qualify(currentModule, written)
+        val plain   = Modules.qualify(currentModule, written)
+        val own     = filePrivateKey(plain).getOrElse(plain)
         val library = libraryNames.get(written).filter(declared)
 
         // The library's step is held to the same restriction as every other, so a helper the
@@ -282,6 +283,39 @@ trait Scoping extends DeclTables {
    * already failing on the duplicate.
    */
   protected val contestedNames = mutable.Set.empty[String]
+
+  /** Where a **file-private** declaration went when a sibling file's file-private declaration
+   * already held the plain key: `(the file that wrote it, the plain key) -> the key it got`
+   * (`reference/modules.md § Visibility`).
+   *
+   * `private` in sysl is private to the *file*, and until 2026-08-27 it restricted visibility
+   * without restricting the namespace — so two files of one module could not each declare a
+   * `Limit`, and a module of any size grew `MaxCallDepth` and `MaxHashDepth` for two things that
+   * were each one file's business. Rust, C and Go all scope the name as well as the reach: a
+   * `static` in one C translation unit does not collide with a `static` of that name in another.
+   *
+   * **Only a name two files contend for gets an entry**, which is what keeps this from moving any
+   * key that exists today: the first file keeps the plain key, and a key is also the emitted symbol
+   * (`Modules`), so re-keying every private declaration would have changed symbols and the artifact
+   * they are recorded in for a change that adds nothing. It is the same arrangement `overloadSlot`
+   * already makes for the second and later declarations of one function name, down to the dotted
+   * suffix, which is a character an LLVM symbol may carry unquoted.
+   *
+   * **A file-private name against a PUBLIC one of the same spelling is still a duplicate**, and
+   * deliberately: the sibling file's own references to that name would have two answers with
+   * nothing to tell them apart. Only the all-private case is separable.
+   */
+  protected val filePrivateKeys = mutable.HashMap.empty[(Source, String), String]
+
+  /** The key a name written in the current file resolves to before the module's own plain key is
+   * tried — this file's own file-private declaration, where it has one.
+   *
+   * Nothing else changes about resolution: a file with no private declaration of that spelling gets
+   * `None` and the plain key exactly as before, and another file's private key is not reachable
+   * from here whether or not it is looked for, since `visible` refuses it.
+   */
+  protected def filePrivateKey(plain: String): Option[String] =
+    currentFile.flatMap(f => filePrivateKeys.get((f, plain)))
 
   /** Reports a name a second declaration claimed, marking the key contested first so that later uses
    * of it are not also told whose the name is (`contestedNames`).
@@ -588,7 +622,8 @@ trait Scoping extends DeclTables {
    * duplicate rather than quietly resolved one way by this.
    */
   protected def ownValueName(written: String): Boolean = {
-    val own = Modules.qualify(currentModule, written)
+    val plain = Modules.qualify(currentModule, written)
+    val own   = filePrivateKey(plain).getOrElse(plain)
 
     !funcDecls.contains(own) && visible(own) &&
     (constDecls.contains(own) || valDecls.contains(own) || externVarDecls.contains(own) ||
