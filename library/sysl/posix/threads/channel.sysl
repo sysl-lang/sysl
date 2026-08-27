@@ -1,0 +1,203 @@
+module sysl.posix.threads
+@no_alloc
+@requires(posix)
+
+import sysl.sync.*
+import sysl.slices.as_mut_ptr
+
+/** A bounded queue two threads hand values across, and the one place the language's rule about what
+ * may leave a concurrency domain is enforced on a *value* rather than on an address
+ * (`library/sync.md`, `reference/memory.md § Crossing a concurrency domain`).
+ *
+ * **It is what `Thread.join` says it does not have.** Everything else in this module shares by
+ * *address*: `spawn` hands the new thread a `*T`, `Mutex[T]` hands a holder a `*T`, and what crosses
+ * is a pointer whose far end both threads are looking at. A channel is the other shape — a value
+ * goes in on one thread and comes out on another, and the two are never looking at one object.
+ *
+ * **The storage is the caller's, which is this module's house style rather than a limitation.**
+ * `Mutex[T]` wraps a value the caller built and `spawn` takes an address the caller has; a channel
+ * takes the slots. What that buys is that the type needs no allocator — `@no_alloc` on the file is
+ * the whole of the claim — so a channel is available to a program that has given the heap up, and
+ * its capacity is a number the program chose rather than one this file did.
+ *
+ * ```
+ * var slots: [8]int = [0; 8]
+ * var ch = channel(slots[..])
+ *
+ * spawn(&producer, &ch)
+ *
+ * loop
+ *     receive(&ch) match
+ *         Some(v) -> print(v)
+ *         None -> break
+ * ```
+ *
+ * **A waiter yields rather than sleeps**, exactly as `Mutex` does and for the same reason: there is
+ * no wait queue in this module, so a full send and an empty receive give the processor up and try
+ * again. That costs a context switch per attempt where a futex would cost none, and it is a
+ * scheduler call rather than a spin, so a waiter cannot starve the thread it is waiting for.
+ *
+ * **The copying half of the crossing rule is NOT built.** `reference/memory.md § Crossing a
+ * concurrency domain` allows a channel to take a heap-backed view *because it copies the bytes*, and
+ * this one does not copy: a slot is assigned, which is the same share the sender held. So a view is
+ * refused here exactly as it is at `spawn`, and the relaxation waits on something that copies.
+ */
+struct Channel[T]
+
+    // Zero when free, one when held. Private for `Mutex.held`'s reason: what it guards is fields of
+    // this struct that nothing outside can see, so a program has nothing to do with the flag.
+    private held: i32
+
+    // The ring, and where the live run inside it starts and how long it is. `head` is the next slot
+    // to be read and `live` the number of values in it, which is what tells a full ring from an
+    // empty one — two indices alone cannot, since `head == tail` means both.
+    //
+    // **The storage is a `*T` and a count rather than a `[]T`, and that is the crossing rule rather
+    // than a preference.** A view owns its elements through a count that is not atomic, so a struct
+    // holding one may not reach another domain at all — which would refuse the channel at the
+    // `spawn` that shares it, one line before the first `send`. A raw pointer carries no count, so
+    // it crosses; what it costs is the same trust `*p` already asks for, and it is the trust every
+    // other thing in this module already asks (`spawn` takes a `*T`, `Mutex.lock` gives one back).
+    // The caller writes a slice at `channel(…)` and never sees the pointer.
+    private slots: *T
+    private room: usize
+    private head: usize
+    private live: usize
+
+    // One once `close` has been called. An `i32` rather than a `bool` because it is read outside the
+    // lock — `is_closed` is a hint a waiter checks — and `Atomic`'s widths are the machine's.
+    private closed: i32
+
+    /** How many values the channel can hold at once, which is the storage it was given. */
+    capacity(*self) -> usize = self.room
+
+    /** How many values are waiting to be taken. Read under the lock, so it is a fact rather than a
+     * hint — of the moment it was read, which is all any such number can be.
+     */
+    len(*self) -> usize
+        self.take_lock()
+
+        var n = self.live
+
+        self.drop_lock()
+        n
+
+    /** Whether `close` has been called. Read outside the lock, so it is a **hint** except in the one
+     * case that matters: a thread that closed the channel itself.
+     */
+    is_closed(*self) -> bool = atomic_load(&self.closed, Acquire) != 0
+
+    /** Stops the channel taking anything further, and lets every waiter go.
+     *
+     * A receiver goes on taking what is already inside — closing says no more will arrive, not that
+     * what arrived is discarded — and a sender is refused from here on. Closing twice is harmless.
+     */
+    close(*self)
+        atomic_store(&self.closed, 1, Release)
+
+    // The lock is `Mutex.lock`'s, written out here rather than reached through a `Mutex[T]`: what it
+    // guards is four fields of this struct, and a mutex guards one value.
+    private take_lock(*self)
+        while atomic_swap(&self.held, 1, Acquire) != 0
+            while atomic_load(&self.held, Relaxed) != 0
+                yield_now()
+
+    private drop_lock(*self)
+        atomic_store(&self.held, 0, Release)
+
+    // What the four transfers below reach past the lock. They are members rather than free functions
+    // because they touch private fields, and private in sysl is file-private — so this file is where
+    // they have to be either way, and a member is the shorter spelling.
+    private push(*self, value: T) -> bool
+        self.take_lock()
+
+        var free = self.live < self.room
+
+        if free
+            var at = self.head + self.live
+
+            if at >= self.room then at -= self.room
+
+            self.slots[at] = value
+            self.live += 1
+
+        self.drop_lock()
+        free
+
+    private pop(*self) -> Option[T]
+        self.take_lock()
+
+        var out: Option[T] = None
+
+        if self.live > 0
+            out = Some(self.slots[self.head])
+            self.head += 1
+
+            if self.head >= self.room then self.head = 0
+
+            self.live -= 1
+
+        self.drop_lock()
+        out
+
+end Channel
+
+/** Builds an empty channel over storage the caller supplies.
+ *
+ * A function rather than an associated `new`, because the element type is inferred from the slots
+ * and there is no receiver for it to be read off: `channel(slots[..])` says everything, where
+ * `Channel[int].new(…)` would say the element type twice.
+ *
+ * **The slice is read here and not kept**, for the reason the `slots` field gives: what is stored is
+ * its address and its length, so that the channel may cross a domain. The storage has to outlive
+ * every thread that holds the channel, which is the same contract `spawn(&body, &state)` already
+ * has with whatever `state` points at — a module-level `static var`, or a local of a `main` that
+ * joins before it returns.
+ */
+channel[T](slots: []T) -> Channel[T] = Channel(0, as_mut_ptr(slots), slots.len, 0, 0, 0)
+
+/** Puts a value in, waiting while the channel is full, and answers whether it went in.
+ *
+ * `false` is a closed channel and nothing else: the wait is unbounded, so the only thing that ends
+ * it other than a free slot is somebody closing.
+ *
+ * **`@crossing(value)` is what holds a caller to the rule about what may reach another domain**, and
+ * it is why this is a free function rather than `ch.send(v)`. No annotation in sysl marks a member
+ * (`reference/memory.md § Crossing a concurrency domain`), and the refusal says what to do about it:
+ * write it on the wrapper a caller already goes through. So the four transfers are functions taking
+ * the channel by address, which is `spawn(&body, &state)`'s own shape and reads as what it is — the
+ * operations that move a value between two threads, taking the thing both of them hold.
+ *
+ * Marking the way **in** is the whole of the check: nothing can be taken out that was not put in, so
+ * a channel whose sends are held to the rule can hold nothing that breaks it.
+ */
+@crossing(value)
+send[T](ch: *Channel[T], value: T) -> bool
+    loop
+        if ch.is_closed() then return false
+
+        if ch.push(value) then return true
+
+        yield_now()
+
+/** Puts a value in if there is room, and answers whether it went. Never waits. */
+@crossing(value)
+try_send[T](ch: *Channel[T], value: T) -> bool =
+    if ch.is_closed() then false else ch.push(value)
+
+/** Takes a value out, waiting while the channel is empty.
+ *
+ * `None` means the channel is closed **and drained**, which is what makes a receiver's loop
+ * terminate: a closed channel with values still in it goes on answering `Some`.
+ */
+receive[T](ch: *Channel[T]) -> Option[T]
+    loop
+        ch.pop() match
+            Some(v) -> return Some(v)
+            None ->
+                if ch.is_closed() then return ch.pop()
+
+                yield_now()
+
+/** Takes a value out if there is one, and answers nothing where there is not. Never waits. */
+try_receive[T](ch: *Channel[T]) -> Option[T] = ch.pop()

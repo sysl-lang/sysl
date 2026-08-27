@@ -137,8 +137,14 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * `ok` and `err` on the result. Twelve tests, each asserting **both** variants, because a
    * combinator that is right about the present case and wrong about the absent one is exactly the
    * shape that survives a casual test. Measured, no slack.
+   *
+   * Raised to **486** when `sysl.posix.threads` gained `Channel[T]` and its first `tests.sysl` —
+   * seven, six of them single-threaded facts about the ring and the closing rule, and one that
+   * really does put twenty values through a ring of two on another thread. Measured with
+   * `grep -rh "^@test(" library --include="*.sysl" | wc -l`, which counts the parenthesis so that
+   * the file-level `@tests` above each of them is not counted as one.
    */
-  private val floor = 479
+  private val floor = 486
 
   /** The library, compiled as a **test build of itself**.
    *
