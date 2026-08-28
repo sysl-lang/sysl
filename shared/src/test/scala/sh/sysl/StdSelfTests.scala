@@ -157,11 +157,16 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * for a **third** shim: `meta.c` is what knows where `st_size` sits, so a wrong offset shows up
    * here as a size that is not ten rather than as a build that failed. Measured, no slack.
    *
-   * Raised to **545** for one more in : resolving an import against the file that named
+   * Raised to **545** for one more in `sysl.path`: resolving an import against the file that named
    * it, which is the shape a module loader actually writes and which arrived as four assertions from
    * an outside consumer rather than from taste.
+   *
+   * Raised to **549** for `sysl.time.checked_date`, which refuses a date the calendar does not have
+   * where `date_at` answers with a day count. Four cases, and two of them assert `date_at`'s
+   * *unchecked* answer, since what the pair is for is that the walk keeps its arithmetic. Measured,
+   * no slack.
    */
-  private val floor = 545
+  private val floor = 549
 
   /** The library, compiled as a **test build of itself**.
    *
