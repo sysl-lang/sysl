@@ -560,6 +560,56 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
            |print(double(3))
            |""".stripMargin) should include("@main")
     }
+
+    // **A `*self` method called ON a capture is admitted, and this is the boundary worth pinning.**
+    // `writesEnvironment` looks for a store whose place reaches `self`, and `c.bump()` has none —
+    // the store is inside `bump`'s own body, and what the closure writes is the receiver it passed.
+    // So this is called on a `val`, and the answer is the by-value one the `var` form gives.
+    "one calling a '*self' method on a capture is called, with the by-value answer" in {
+      run("""struct Counter
+            |    n: int
+            |
+            |    bump(*self) -> int
+            |        self.n += 1
+            |        self.n
+            |
+            |var c = Counter(0)
+            |
+            |val tick = () -> c.bump()
+            |
+            |print(tick(), tick(), c.n)
+            |""".stripMargin) shouldBe "1 2 0\n"
+    }
+
+    /** **The storage that would have made the case above unsound cannot be written at all**, which
+     * is what licenses admitting it rather than luck.
+     *
+     * `ValReceiverTests` names a module-level `val` as the one place where a write through a `val`
+     * receiver aims a store into storage the emitted module marks `constant`. A closure cannot get
+     * there by two independent refusals, and both are checked here rather than reasoned about: a
+     * module-level `val` must state its type, and a bare closure's type is a struct with no
+     * spellable name; and the only spellable one, `&Fn`, is a box whose `call` is the trait's, where
+     * the mode is unchanged. Then a module-level closure cannot capture module storage either.
+     */
+    "and a module-level 'val' cannot hold one at all, which is why none of this reaches read-only storage" in {
+      val counter = "struct Counter\n    n: int\n\n    bump(*self) -> int\n        self.n += 1\n" +
+        "        self.n\n\nprivate var c = Counter(0)\n\n"
+
+      errOf(
+        "m/m.sysl"  -> ("module m\n\n" + counter + "val tick = () -> c.bump()\n"),
+        "main.sysl" -> "print(m.tick())\n",
+      ) should include("a module-level 'val' states its type")
+    }
+
+    "and one that names its type cannot reach module storage from there" in {
+      val counter = "struct Counter\n    n: int\n\n    bump(*self) -> int\n        self.n += 1\n" +
+        "        self.n\n\nprivate var c = Counter(0)\n\n"
+
+      errOf(
+        "m/m.sysl"  -> ("module m\n\n" + counter + "val tick: &Fn() -> int = () -> c.bump()\n"),
+        "main.sysl" -> "print(m.tick())\n",
+      ) should include("undefined name 'c'")
+    }
   }
 
   "how a call on one goes wrong" - {

@@ -50,7 +50,10 @@ trait DeclCapabilities extends NoAlloc {
     // (`reference/modules.md § A @tests file states its own capabilities`). Asking the module's
     // clause here would refuse a test that took `os` back in order to reach a real filesystem —
     // which is the one thing a `@tests` clause is for.
-    val scaffolding = testOnlyDecls.toSet ++ testFuncs
+    // Lazily, for the reason the guard below is written: `testOnlyDecls` is every declaration a test
+    // build keeps, so building this set is work a compilation with no `@needs` anywhere should not
+    // be charged for.
+    lazy val scaffolding = testOnlyDecls.toSet ++ testFuncs
 
     // Almost every compilation writes no `@needs` at all, and the walk below reads every body — so
     // one with nothing to ask should pay nothing for it.

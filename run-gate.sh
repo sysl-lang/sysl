@@ -312,8 +312,27 @@ WATCHDOG_RC=$?
 print "$WATCHDOG_OUT" | tee -a "$SUMMARY"
 (( WATCHDOG_RC == 0 )) || exit 1
 
-run_group heavy $HEAVY_HEAP $HEAVY_AGENTS syslNative \
-  "$(python3 -c "import json;print(' '.join(json.load(open('$LOGS/heavy.json'))))")"
+# **ONE GROUP PER HEAVY SUITE, WHICH IS WHAT `gate-groups.py` HAS ALWAYS SAID AND NOT WHAT THIS DID.**
+# Its docstring answers "which suites need a group to **themselves**"; this ran all of them in one
+# `sbt`, which is a group *between* them. That was invisible while the four totalled about thirty
+# seconds, and it made `LIMIT` a budget for the whole set rather than for one suite -- so promoting a
+# suite into `HEAVY` could push the group past a limit meant to catch a wedge.
+#
+# It fired the first time a fifth was added. `ConditionalTests` was put in `HEAVY` on 2026-08-28
+# (card `0324`) and the combined group ran **19 minutes with `oom=0`** before the watchdog cut it,
+# then went to a retry that could only do the same -- a `TIMEOUT/KILLED` reporting nothing wrong with
+# the tree. A heavy suite is heavy because it builds for every target; five of them serially at one
+# agent is five times that, and there is no number for `LIMIT` that is right for both one and five.
+#
+# **That suite did not belong in `HEAVY` and is now `ALONE`**, which is the other half of the same
+# finding -- see `gate-groups.py`. This change stands on its own regardless: the four that remain
+# still share a budget meant for one, and the next promotion would hit the same wall.
+#
+# Per suite, the limit means what it says again, and a sixth costs its own budget rather than
+# everyone else's.
+for suite in $(python3 -c "import json;print(' '.join(json.load(open('$LOGS/heavy.json'))))"); do
+  run_group "heavy-${suite##*.}" $HEAVY_HEAP $HEAVY_AGENTS syslNative "$suite"
+done
 
 run_group doc $LIGHT_HEAP $LIGHT_AGENTS syslDocNative "$DOC_SUITES"
 
