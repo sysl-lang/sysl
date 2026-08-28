@@ -124,10 +124,10 @@ class CAbiTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     "a fifth member makes it an ordinary aggregate, and its size is then too much" in {
       shape(arm, "    a: f64\n    b: f64\n    c: f64\n    d: f64\n    e: f64") shouldBe
-        ("declare void @give(ptr sret(%struct.S) align 8)", "declare void @take(ptr)")
+        ("declare void @give(ptr sret(%struct.S) align 8)", "declare void @take(ptr align 8)")
       // Twenty bytes, and aligned to four — the aggregate's own alignment, not the register's.
       shape(arm, "    a: f32\n    b: f32\n    c: f32\n    d: f32\n    e: f32") shouldBe
-        ("declare void @give(ptr sret(%struct.S) align 4)", "declare void @take(ptr)")
+        ("declare void @give(ptr sret(%struct.S) align 4)", "declare void @take(ptr align 4)")
     }
 
     "a mixture of two floating widths is never homogeneous" in {
@@ -170,7 +170,7 @@ class CAbiTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     "past two registers the caller supplies the storage" in {
       shape(arm, "    a: i64\n    b: i64\n    c: i64") shouldBe
-        ("declare void @give(ptr sret(%struct.S) align 8)", "declare void @take(ptr)")
+        ("declare void @give(ptr sret(%struct.S) align 8)", "declare void @take(ptr align 8)")
     }
 
     // Darwin's variant of AAPCS64 leaves this off and every other AAPCS64 system asks for it: a
@@ -270,9 +270,13 @@ class CAbiTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   "RISC-V flattens the narrow floating cases" - {
 
+    // **One register is named by the aggregate's own WIDTH and not by the register's**, which is
+    // what LLVM 23 changed and sysl followed (card `0339`): `i8`, `i24`, `i32` for one, three and
+    // four bytes, where clang 22 said `i64` for all of them. Two registers are unmoved — the pair
+    // has always been named in whole ones.
     "everything that fits two registers is named in whole ones" in {
-      shape(rv, "    a: u8") shouldBe ("declare i64 @give()", "declare void @take(i64)")
-      shape(rv, "    a: u8\n    b: u8\n    c: u8") shouldBe ("declare i64 @give()", "declare void @take(i64)")
+      shape(rv, "    a: u8") shouldBe ("declare i8 @give()", "declare void @take(i8)")
+      shape(rv, "    a: u8\n    b: u8\n    c: u8") shouldBe ("declare i24 @give()", "declare void @take(i24)")
       shape(rv, "    a: i32\n    b: i32") shouldBe ("declare i64 @give()", "declare void @take(i64)")
       shape(rv, "    a: i64\n    b: u8") shouldBe ("declare [2 x i64] @give()", "declare void @take([2 x i64])")
       shape(rv, "    a: i64\n    b: i64") shouldBe ("declare [2 x i64] @give()", "declare void @take([2 x i64])")
@@ -345,9 +349,9 @@ class CAbiTests extends AnyFreeSpec with RunSupport with CodegenSupport {
    */
   "RV32 is the same rule with a narrower word" - {
 
-    "one word or less is one register" in {
-      shape(rv32, "    a: u8") shouldBe ("declare i32 @give()", "declare void @take(i32)")
-      shape(rv32, "    a: u8\n    b: u8\n    c: u8") shouldBe ("declare i32 @give()", "declare void @take(i32)")
+    "one word or less is one register, named by the aggregate's own width" in {
+      shape(rv32, "    a: u8") shouldBe ("declare i8 @give()", "declare void @take(i8)")
+      shape(rv32, "    a: u8\n    b: u8\n    c: u8") shouldBe ("declare i24 @give()", "declare void @take(i24)")
       shape(rv32, "    a: i32") shouldBe ("declare i32 @give()", "declare void @take(i32)")
       shape(rv32, "    p: *u8") shouldBe ("declare i32 @give()", "declare void @take(i32)")
     }
@@ -364,9 +368,9 @@ class CAbiTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     "and past two words it is memory, by address in both directions" in {
       shape(rv32, "    a: i64\n    b: u8") shouldBe
-        ("declare void @give(ptr sret(%struct.S) align 8)", "declare void @take(ptr)")
+        ("declare void @give(ptr sret(%struct.S) align 8)", "declare void @take(ptr align 8)")
       shape(rv32, "    a: i32\n    b: i32\n    c: i32") shouldBe
-        ("declare void @give(ptr sret(%struct.S) align 4)", "declare void @take(ptr)")
+        ("declare void @give(ptr sret(%struct.S) align 4)", "declare void @take(ptr align 4)")
     }
 
     // No floating registers to flatten into, so a float is bytes like any other. `f64` beside `f64`
@@ -452,25 +456,25 @@ class CAbiTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       shape(win, "    a: f32") shouldBe ("declare i32 @give()", "declare void @take(i32)")
       shape(win, "    a: f32\n    b: f32") shouldBe ("declare i64 @give()", "declare void @take(i64)")
       shape(win, "    a: f64\n    b: f64") shouldBe
-        ("declare void @give(ptr sret(%struct.S) align 8)", "declare void @take(ptr)")
+        ("declare void @give(ptr sret(%struct.S) align 8)", "declare void @take(ptr align 8)")
     }
 
     "and any other size at all goes by address, three bytes as much as thirty" in {
       shape(win, "    a: u8\n    b: u8\n    c: u8") shouldBe
-        ("declare void @give(ptr sret(%struct.S) align 1)", "declare void @take(ptr)")
+        ("declare void @give(ptr sret(%struct.S) align 1)", "declare void @take(ptr align 1)")
       shape(win, "    a: i32\n    b: i32\n    c: i32") shouldBe
-        ("declare void @give(ptr sret(%struct.S) align 4)", "declare void @take(ptr)")
+        ("declare void @give(ptr sret(%struct.S) align 4)", "declare void @take(ptr align 4)")
       shape(win, "    a: i64\n    b: i64") shouldBe
-        ("declare void @give(ptr sret(%struct.S) align 8)", "declare void @take(ptr)")
+        ("declare void @give(ptr sret(%struct.S) align 8)", "declare void @take(ptr align 8)")
       shape(win, "    a: u128") shouldBe
-        ("declare void @give(ptr sret(%struct.S) align 16)", "declare void @take(ptr)")
+        ("declare void @give(ptr sret(%struct.S) align 16)", "declare void @take(ptr align 16)")
     }
 
     // An address gets no special name here either: it is the eight bytes it occupies.
     "an address is eight bytes and nothing more" in {
       shape(win, "    p: *u8") shouldBe ("declare i64 @give()", "declare void @take(i64)")
       shape(win, "    p: *u8\n    q: *u8") shouldBe
-        ("declare void @give(ptr sret(%struct.S) align 8)", "declare void @take(ptr)")
+        ("declare void @give(ptr sret(%struct.S) align 8)", "declare void @take(ptr align 8)")
     }
   }
 
@@ -559,7 +563,7 @@ class CAbiTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // function declared to take a matching three-word struct is the only one it can reach.
     "a view is three words and so travels by address" in {
       spelled(arm, "[]u8") shouldBe ("declare void @give(ptr sret({ ptr, ptr, i64 }) align 8)",
-        "declare void @take(ptr)")
+        "declare void @take(ptr align 8)")
       spelled(x64, "string") shouldBe ("declare void @give(ptr sret({ ptr, ptr, i64 }) align 8)",
         "declare void @take(ptr byval({ ptr, ptr, i64 }) align 8)")
     }
@@ -635,7 +639,7 @@ class CAbiTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |var f: u8 = 0
           |print(report(&f, S24(1i64, 2i64, 3i64)))""".stripMargin
 
-      irFor(arm, big) should include regex """@report\(ptr %[\w.]+, ptr %[\w.]+\)"""
+      irFor(arm, big) should include regex """@report\(ptr %[\w.]+, ptr align 8 %[\w.]+\)"""
       irFor(x64, big) should include regex """@report\(ptr %[\w.]+, ptr byval\(%struct.S24\) align 8 %[\w.]+\)"""
     }
 
@@ -823,7 +827,7 @@ class CAbiTests extends AnyFreeSpec with RunSupport with CodegenSupport {
                         |end use
                         |use()""".stripMargin)
 
-      out should include("declare void @take(ptr)")
+      out should include("declare void @take(ptr align 8)")
 
       val body = defineOf(out, "use")
 

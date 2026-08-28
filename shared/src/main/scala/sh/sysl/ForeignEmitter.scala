@@ -50,7 +50,11 @@ trait ForeignEmitter extends ArcEmitter {
     case CAbi.Param.Plain                     => List(ir.Param(p.lty, CAbi.extension(p, target)))
     case CAbi.Param.Coerced(pieces)           => pieces
     case CAbi.Param.Indirect(ty, align, true) => List(ir.Param(LType.Ptr, byvalAttrs(ty, align)))
-    case CAbi.Param.Indirect(_, _, false)     => List(ir.Param(LType.Ptr))
+    // **A pointer the callee is handed rather than a copy it is given carries the alignment too**,
+    // which is the half `byval` states as part of its own attribute. clang states it on both, and
+    // sysl follows clang wherever the two can differ — card `0339`. It is a claim about the pointer
+    // and not about where the bytes travel, so the placement is what it always was.
+    case CAbi.Param.Indirect(_, align, false) => List(ir.Param(LType.Ptr, List(ir.Attr.Align(align))))
 
   /** Lowers a call to a foreign function. `what` is what the `call` names between the keyword and
    * the callee — the result type, or the callee's whole function type where it is variadic.
@@ -86,7 +90,8 @@ trait ForeignEmitter extends ArcEmitter {
             val slot = emitAlloca(freshReg(), ty)
 
             emit(Inst.Store(ty, v, slot, Access.Plain))
-            List(ir.Arg(LType.Ptr, slot, if byval then byvalAttrs(ty, align) else Nil))
+            List(ir.Arg(LType.Ptr, slot,
+                        if byval then byvalAttrs(ty, align) else List(ir.Attr.Align(align))))
     }
 
     val arguments = returned.map(_._2).toList ::: passed

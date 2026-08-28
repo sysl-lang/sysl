@@ -19,9 +19,11 @@ import org.scalatest.matchers.should.Matchers
  * answer is measured against clang and never taken from a document; this is that rule as a test
  * rather than as a practice.**
  *
- * It needs no emulator, no linker script and no hardware — only a clang with the back end, which is
- * what `Toolchain.findBackendClang` finds. A target whose back end this machine's clang does not have
- * is **cancelled and named**, never silently passed.
+ * It needs no emulator, no linker script and no hardware — only **one chosen clang** with the back
+ * end (see `oracleCandidates` below, and card `0339` for why choosing it rather than searching for
+ * it is the whole point). A target whose back end that clang does not have is **cancelled and
+ * named**, never silently passed, and so is the whole suite where the clang is older than the
+ * convention sysl lowers to.
  *
  * **The back end and not the toolchain, which is a distinction Android made real.** The C compiled
  * here is declarations and one call — it includes no header and is never linked — so a sysroot has
@@ -161,11 +163,66 @@ class AbiAgainstClangTests extends AnyFreeSpec with Matchers with CodegenSupport
   // an out-of-tree `llc` — so nothing could ever answer for it. Nor is there a question: that
   // machine has no libc and no linker, so nothing on the far side of a call is C, and `CAbi.craft`
   // says so from the other side.
+  /** The clang this suite asks, which is **chosen rather than found** — and that distinction is the
+   * whole of card `0339`.
+   *
+   * `Toolchain.findBackendClang` takes the first candidate carrying the back end, which is the right
+   * answer for *building* and the wrong one for *measuring*: on this machine the vendor's clang has
+   * aarch64, x86 and ARM and has no RISC-V, so the ABI question was being put to two different
+   * compilers of two different generations and "agrees with clang" meant two different things in one
+   * run. That is how LLVM 23's small-aggregate spelling arrived as **thirty-two red RISC-V cases and
+   * nothing anywhere else**, which reads as a RISC-V defect and was a version boundary.
+   *
+   * So one clang answers for every target, and it is the newest LLVM installed rather than whatever
+   * a bare name resolves to. `SYSL_ABI_CLANG` names one outright, which is what a bisection wants.
+   */
+  private val oracleCandidates: List[String] =
+    envVar("SYSL_ABI_CLANG").toList ::: List(
+      "/opt/homebrew/opt/llvm/bin/clang",
+      "/usr/local/opt/llvm/bin/clang",
+      "clang",
+    )
+
+  /** The major version a clang reports, from its first line — `clang version 23.1.0`. */
+  private def majorOf(path: String): Option[Int] = {
+    val r = exec(Seq(path, "--version"))
+
+    Option.when(r.exitCode == 0)(r.stdout).flatMap(out =>
+      """version (\d+)\.""".r.findFirstMatchIn(out).map(_.group(1).toInt))
+  }
+
+  /** **The convention sysl lowers to is a version of clang's, and this is that version written
+   * down.** A `struct { char }` comes back as `i8` from LLVM 23 and as `i64` from 22, and an
+   * indirect argument carries `align` from 23 and not from 22 — so an older clang measures sysl
+   * against a convention sysl has deliberately stopped implementing, and every answer it gives is a
+   * false red.
+   *
+   * Raising it is the same act as changing `CAbi`: whoever follows clang forward moves both, in one
+   * commit, and `.github/workflows/ci.yml` pins the runner's LLVM to match.
+   */
+  private val oracleFloor = 23
+
+  private lazy val oracle: Either[String, (String, Int)] =
+    oracleCandidates.flatMap(p => majorOf(p).map(p -> _)).headOption match
+      case None => Left(s"no clang answered '--version' among ${oracleCandidates.mkString(", ")}")
+      case Some((p, v)) if v < oracleFloor =>
+        Left(s"'$p' is clang $v and this oracle needs $oracleFloor or newer — sysl's conventions " +
+          s"follow LLVM $oracleFloor's, so an older clang reports differences that are its own. " +
+          "Install a newer LLVM, or name one with SYSL_ABI_CLANG")
+      case Some(found) => Right(found)
+
+  /** The chosen clang, or the cancel that says which one was found and why it will not do. */
+  private def oracleClang(t: Target): String = oracle match
+    case Left(why)      => cancel(why)
+    case Right((p, _))  =>
+      if Toolchain.backendsOf(p).contains(t.cpu.backend) then p
+      else cancel(s"'$p' has no '${t.cpu.backend}' back end, which '${t.name}' needs")
+
   for t <- Target.all if t.supported && t.buildsWithClang do
     s"${t.name} agrees with clang about" - {
       for s <- shapes do
         s.what in {
-          val cc = Toolchain.findBackendClang(t).getOrElse(cancel(s"no clang here has a back end for ${t.name}"))
+          val cc = oracleClang(t)
 
           val (cGive, cTake) = clangSays(cc, t, s.c, s.packed)
           val (mGive, mTake) = syslSays(t, s.sysl, s.packed)
@@ -210,7 +267,7 @@ class AbiAgainstClangTests extends AnyFreeSpec with Matchers with CodegenSupport
   )
 
   private def scalarsAgree(t: Target): Unit = {
-    val cc  = Toolchain.findBackendClang(t).getOrElse(cancel(s"no clang here has a back end for ${t.name}"))
+    val cc  = oracleClang(t)
     val src = createTempFile("sysl-abi-scalar-", ".c")
 
     val fromClang =

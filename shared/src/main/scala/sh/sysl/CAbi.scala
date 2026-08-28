@@ -462,6 +462,23 @@ object CAbi {
    * one double-width integer, and otherwise it is an array of two. Verified against
    * `clang -target riscv32-unknown-elf -march=rv32imac -mabi=ilp32`, where `{ double }` comes back as
    * `i64` and `{ int, int }` as `[2 x i32]` — same eight bytes, different alignment, different name.
+   *
+   * ==One register is named by the aggregate's own WIDTH, and that changed under us==
+   *
+   * A span inside one register is `i8`, `i24`, `i32`, `i40` — the bits the aggregate actually has,
+   * not the register it rides in. **clang said `i64` here until LLVM 23 and says the exact width
+   * now**, in both directions, and sysl follows clang wherever the two can differ
+   * (`getting-started/cli.md § targets`). Card `0339`.
+   *
+   * **It is a spelling change and not a placement change**, which is worth knowing before anybody
+   * reads it as an ABI break: the byte is in `a0` under either name, and the only difference in the
+   * generated asm is a defensive `zext.b` clang 22 emitted at the call site and 23 does not. A caller
+   * of one generation interoperates with a callee of the other. What it costs to be wrong is
+   * therefore nothing at run time and a permanently red oracle at development time, which is the
+   * thing actually worth spending a line on.
+   *
+   * `aapcs64` has said the same thing about its own one-register case since it was written, so this
+   * is RISC-V arriving at the shape the file already had rather than a rule of its own.
    */
   private def riscv(t: Type, size: Int, hardFloat: Boolean, xlen: Int)(using l: Layout): Shape = {
     val ls   = leaves(t).map(l2 => Type.underlying(l2._2))
@@ -471,7 +488,7 @@ object CAbi {
 
     if hardFloat && ls.length <= 2 && fps >= 1 && fps + ints == ls.length then
       alike(ls.map(m => if floating(m) then m.lty else LType.I(l.size(m) * 8)))
-    else if size <= xlen then alike(List(one))
+    else if size <= xlen then alike(List(LType.I(size * 8)))
     else if size <= xlen * 2 then
       alike(List(if l.align(t) >= xlen * 2 then LType.I(xlen * 16) else LType.Arr(2, one)))
     else Shape.Memory

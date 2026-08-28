@@ -358,6 +358,12 @@ object Toolchain {
    */
   private val backendCache = collection.mutable.Map.empty[String, Set[String]]
 
+  /** The back ends a *named* clang has, for a caller that chose the compiler rather than searching
+   * for one. `AbiAgainstClangTests` is the case: an oracle asks one clang about every target, so it
+   * needs the same question `findBackendClang` asks internally without the search in front of it.
+   */
+  def backendsOf(path: String): Set[String] = backends(path)
+
   private def backends(path: String): Set[String] = backendCache.getOrElseUpdate(path, {
     val r = exec(Seq(path, "-print-targets"))
 
