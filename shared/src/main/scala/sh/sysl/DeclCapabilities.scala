@@ -38,10 +38,19 @@ trait DeclCapabilities extends NoAlloc {
       vtables: List[TVtable],
       main: List[TStmt],
       mainModule: String,
+      testFuncs: Set[String],
   ): Unit = {
     checkNeedsNames()
 
     val needed = declaredNeeds
+
+    // Everything a test build keeps and every other build drops, built exactly as `checkNoAlloc`
+    // builds it and for the same reason: a `@tests` file may take back what the module gave up,
+    // because the module's clause is a promise about what *ships* and the file does not ship
+    // (`reference/modules.md § A @tests file states its own capabilities`). Asking the module's
+    // clause here would refuse a test that took `os` back in order to reach a real filesystem —
+    // which is the one thing a `@tests` clause is for.
+    val scaffolding = testOnlyDecls.toSet ++ testFuncs
 
     // Almost every compilation writes no `@needs` at all, and the walk below reads every body — so
     // one with nothing to ask should pay nothing for it.
@@ -51,19 +60,23 @@ trait DeclCapabilities extends NoAlloc {
       for cap <- Capability.core.filter(c => needed.values.exists(_.contains(c))) do
         val seeds = new Reaches(funcs, vtables, needed.collect { case (k, cs) if cs(cap) => k }.toSet)
 
-        def check(x: Any, module: String): Unit =
-          if lacks(module, cap) then
+        def check(x: Any, module: String, isScaffolding: Boolean): Unit =
+          if lacks(module, cap, isScaffolding) then
             seeds.blame(x) { (pos, who) =>
               recover(())(at(pos)(err(s"this reaches '${Modules.show(who)}', which needs '$cap', " +
-                s"and ${why(module, cap)}")))
+                s"and ${why(module, cap, isScaffolding)}")))
             }
 
         // A generic is answered for by the body it was written as, exactly as `NoAlloc` answers it:
         // an instantiation belongs to whoever chose the type, in a module of their own, and is
         // reported at *their* call.
-        for f <- funcs if !genericInsts(f.name) do check(f.body, Modules.moduleOf(f.name))
-        for v <- vals; init <- v.init do check(init, Modules.moduleOf(v.symbol))
-        check(main, mainModule)
+        for f <- funcs if !genericInsts(f.name) do
+          check(f.body, Modules.moduleOf(f.name), scaffolding(f.name))
+        for v <- vals; init <- v.init do
+          check(init, Modules.moduleOf(v.symbol), scaffolding(v.symbol))
+        // The entry file's statements are never scaffolding: a `@tests` file has no body to run,
+        // and a program's own top-level code is what every build keeps.
+        check(main, mainModule, isScaffolding = false)
   }
 
   /** Every declaration that wrote `@needs(...)`, as the capabilities it needs with their
@@ -115,19 +128,45 @@ trait DeclCapabilities extends NoAlloc {
    * reason it is exempt there — its files are compiled into every program, so applying it would
    * report a mistake in source this compilation's author did not write.
    */
-  private def lacks(module: String, cap: String): Boolean =
-    if cap == Capability.Heap then noAlloc(module)
+  private def lacks(module: String, cap: String, scaffolding: Boolean): Boolean =
+    if cap == Capability.Heap then
+      if scaffolding then noAllocTests(module) else noAlloc(module)
     else
-      moduleNarrows.get(module).exists(_.contains(cap)) ||
+      narrowing(module, scaffolding).contains(cap) ||
         (!targetProvides(cap) && ownModule(module) && !std.carries(module))
+
+  /** Which clause governs a declaration: the module's, or its tests'.
+   *
+   * **Only the module's half moves. The target's does not**, which is why the caller intersects
+   * this with `targetProvides` rather than this answering both — the asymmetry is `noAllocTests`'s
+   * and is the honest part of it. A `@tests` file may take back what the module gave up, because
+   * the module's clause is a promise about what ships. It cannot take back what the machine never
+   * had, so a test reaching `@needs(os)` is still refused on a target with no OS whatever its file
+   * says.
+   */
+  private def narrowing(module: String, scaffolding: Boolean): Map[String, Option[Pos]] =
+    if scaffolding then testNarrows(module) else moduleNarrows.getOrElse(module, Map.empty)
 
   /** Which of the two put the capability out of reach, said the way the diagnostic needs it. A
    * reader told their module "declared 'no os'" when no file of it says any such thing would go
    * looking for a clause that is not there.
+   *
+   * **And a test refused under its own `@tests` file's narrowing has a third answer**, told apart
+   * the way `NoAlloc.because` tells it apart: a `@tests` file writing nothing inherits its module's
+   * entry, pos and all, so an entry carrying a *different* position is one that file wrote. Naming
+   * the module there sends a reader to delete a line that is not in it.
    */
-  private def why(module: String, cap: String): String =
-    if moduleNarrows.get(module).exists(_.contains(cap)) then
-      s"${here(module)} declared '@no_${Capability.narrowWord(cap)}'"
+  private def why(module: String, cap: String, scaffolding: Boolean): String =
+    val ours   = testNarrows(module).get(cap)
+    val theirs = moduleNarrows.get(module).flatMap(_.get(cap))
+    val word   = Capability.narrowWord(cap)
+
+    // Not `<module>'s '@tests' file`, which renders as `'sys''s` for every module that has a name —
+    // `here` quotes what it answers.
+    if scaffolding && ours.isDefined && ours != theirs then
+      s"the '@tests' file of ${here(module)} declared '@no_$word'"
+    else if (if scaffolding then ours else theirs).isDefined then
+      s"${here(module)} declared '@no_$word'"
     else s"'${target.name}' does not provide it — a target's capabilities are what " +
       s"'${PackageConfig.FileName}' declares, so either this reference cannot be made on this " +
       "machine or the config is understating it"

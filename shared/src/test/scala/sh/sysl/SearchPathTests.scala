@@ -625,6 +625,91 @@ class SearchPathTests extends LibraryCliSupport {
     }
   }
 
+  /** **The commands that never reach a linker still read C**, because a `c const` block is evaluated
+   * by running the C compiler over the file's `@include`s during *analysis* — which `emit-llvm` and
+   * `prove` do exactly as `build` does (card `0325`).
+   *
+   * The guard they were both outside asked "does this command link?", and the include half needs
+   * "does this command read a header?". So `sysl emit-llvm` failed with `'probe.h' file not found`
+   * on a project `sysl build` compiled — on the one command somebody reaches for to *diagnose* a
+   * build, where a message naming a header reads as a broken dependency rather than as a command
+   * that was not given something.
+   *
+   * **`prove` was the worse half and is the one with no workaround.** It branched before the call
+   * that receives the paths, into a function taking no `SearchPaths` at all, so `--include-path` was
+   * *ignored* rather than insufficient — the flag that rescued `emit-llvm` did nothing for it.
+   *
+   * Asserted on the diagnostic rather than on the exit status, because a proof run needs why3 and
+   * this machine may not have one: what is being pinned is that the *header* stopped being the
+   * obstacle, which is the whole of the defect.
+   */
+  "a command that never links still reads the headers" - {
+
+    /** A project whose only need of a header is the `c const` block — no shim, so nothing here is
+     * about compiling C beside the module and every failure is the probe's.
+     */
+    def measuring(): String = {
+      val root = createTempDirectory("sysl-noreach-")
+
+      createDirectories(s"$root/m")
+      writeFile(s"$root/main.sysl", "print(m.width())\n")
+      writeFile(s"$root/m/m.sysl",
+        """module m
+          |@include("probe.h")
+          |
+          |c const
+          |    WIDTH: int = "PROBE_WIDTH"
+          |
+          |width() -> int = WIDTH
+          |""".stripMargin)
+      root
+    }
+
+    "emit-llvm cannot find it unaided, which is the failure that was reported" in {
+      guard()
+
+      val (status, notes) = diagnostics(Config(command = "emit-llvm", file = measuring()))
+
+      status should not be 0
+      notes should include("probe.h")
+    }
+
+    // 41 is the header's own number, so an IR carrying it is one the C compiler really produced.
+    // Bound as `dir` rather than `include`, which would shadow the matcher of that name below it.
+    "and emits the constant once --include-path names where it is" in {
+      val (dir, _) = guard()
+
+      emitted(Config(command = "emit-llvm", file = measuring(), includePaths = List(dir))) should
+        include("41")
+    }
+
+    "prove cannot find it either" in {
+      guard()
+
+      val (status, notes) = diagnostics(Config(command = "prove", file = measuring()))
+
+      status should not be 0
+      notes should include("probe.h")
+    }
+
+    // The regression that matters: this flag used to reach nothing, so the message was identical
+    // with it and without it. Whatever why3 then says, the header is no longer what stopped it.
+    "and gets past the header once it is given one, which it used to ignore" in {
+      val (dir, _) = guard()
+
+      val (_, notes) =
+        diagnostics(Config(command = "prove", file = measuring(), includePaths = List(dir)))
+
+      notes should not include "probe.h"
+    }
+
+    // **The `requires { headers }` check stays where it was, and that is a decision rather than an
+    // oversight.** It is about the tree's *carried* C — a project whose only C is a shim needs those
+    // headers to build and does not need them to print its IR — so charging these commands for it
+    // would refuse them over a file they never open. *"does not hold up a command that compiles no
+    // C"*, in the section above, is what pins that half and it is unchanged.
+  }
+
   private def parsed(args: String*): Config =
     parseArgs(args).getOrElse(fail(s"these arguments did not parse: ${args.mkString(" ")}"))
 }

@@ -455,7 +455,8 @@ trait ProgramWalk extends OpaqueResults {
     // And what a declaration that wrote `@needs(...)` costs whoever reaches it — the same question
     // one granularity down, asked of the same tree (`reference/modules.md § A declaration may name
     // what reaching it needs`).
-    checkDeclCapabilities(allFuncs, tvals.toList, vtables.values.toList, tmain, mainScope.module)
+    checkDeclCapabilities(allFuncs, tvals.toList, vtables.values.toList, tmain, mainScope.module,
+      tests.map(_.func).toSet)
 
     // And what a `@pure` function promised, asked of the same tree for the same reason
     // (`reference/verification.md § @pure`).
@@ -627,8 +628,14 @@ trait ProgramWalk extends OpaqueResults {
               Some(e)
             case _ =>
               if !Type.noValue(ret) then
+                // **And the refusal names the answer**, which is the whole of what it was missing:
+                // a reader here wants to choose a status, `exit` is how, and being told only what a
+                // signature may not do leaves them looking for a language feature that is already
+                // built. Reported as card `0326` by somebody who read this message and concluded
+                // sysl could not do it.
                 err(s"'main' yields nothing or a 'Result[unit, E]', so it may not result in " +
-                  s"${show(ret)} — a program's exit status is not something a signature can say")
+                  s"${show(ret)} — a program's exit status is not something a signature can say. " +
+                  s"'exit(code)' is how a program chooses its own, and prints nothing")
               None
           if decl.variadic then err("'main' is called with the arguments the platform has, not a list it reads")
 

@@ -97,6 +97,74 @@ class DeclCapabilityTests extends AnyFreeSpec with RunSupport with CodegenSuppor
     }
   }
 
+  /** A module's **tests** answer to their own clause here, exactly as they do for the allocator
+   * (`reference/modules.md § A @tests file states its own capabilities`).
+   *
+   * The clause a module writes is a promise about what **ships**, and scaffolding does not ship — so
+   * a `@tests` file may take back what the module gave up. `NoAlloc` implemented that from the day
+   * the table existed; this check read the module's clause for every capability and every
+   * declaration, so a module that gave up `os` in order to say something true about what it ships
+   * could not test itself against a real filesystem. Card `0318`.
+   *
+   * **Only the module's half moves. The target's does not**, which is the asymmetry `noAllocTests`
+   * already carries: a file may lift a promise its author made, and cannot lift what the machine
+   * never had.
+   */
+  "a '@tests' file's clause is what its tests are held to" - {
+
+    "so a test may reach what the module gave up, since what it declares does not ship" in {
+      runOf(
+        "sys/a.sysl" -> "module sys\n@no_os\n\n@needs(os)\nextern \"getpid\" pid() -> int\n",
+        "sys/tests.sysl" -> ("module sys\n@tests\n@requires(os)\n\n@test\n" +
+          "reaches_the_machine() =\n    assert(pid() > 0)\n"),
+        "main.sysl" -> "print(1)\n",
+      ) shouldBe "1\n"
+    }
+
+    // The half that must not move with it: a shipping file of the same module is refused exactly as
+    // it was, so what the `@tests` file lifted is lifted for scaffolding and for nothing else.
+    "while a shipping declaration of that module is refused as it always was" in {
+      errOf(
+        "sys/a.sysl" -> ("module sys\n@no_os\n\n@needs(os)\nextern \"getpid\" pid() -> int\n\n" +
+          "ships() -> int = pid()\n"),
+        "sys/tests.sysl" -> "module sys\n@tests\n@requires(os)\n\nhelper() -> int = 2\n",
+        "main.sysl" -> "print(1)\n",
+      ) should include("this reaches 'sys.pid', which needs 'os', and 'sys' declared '@no_os'")
+    }
+
+    // The silent case has to keep meaning what it meant, which is the reason `testNarrows` falls
+    // back rather than being a table of its own.
+    "and a test file that says nothing is held to its module's clause" in {
+      errOf(
+        "sys/a.sysl" -> "module sys\n@no_os\n\n@needs(os)\nextern \"getpid\" pid() -> int\n",
+        "sys/tests.sysl" -> ("module sys\n@tests\n\n@test\n" +
+          "reaches_the_machine() =\n    assert(pid() > 0)\n"),
+        "main.sysl" -> "print(1)\n",
+      ) should include("which needs 'os', and 'sys' declared '@no_os'")
+    }
+
+    // `why` moves with `lacks` or the diagnostic sends a reader to delete a line that is not there.
+    "a test refused under its OWN narrowing is told which file declared it" in {
+      errOf(
+        "sys/a.sysl" -> "module sys\n\n@needs(os)\nextern \"getpid\" pid() -> int\n",
+        "sys/tests.sysl" -> ("module sys\n@tests\n@no_os\n\n@test\n" +
+          "reaches_the_machine() =\n    assert(pid() > 0)\n"),
+        "main.sysl" -> "print(1)\n",
+      ) should include("the '@tests' file of 'sys' declared '@no_os'")
+    }
+
+    // A test is scaffolding wherever it is written, which is the set `checkNoAlloc` builds and the
+    // set this now builds — a `@test` beside what it tests answers to the tests' clause.
+    "a '@test' in an ordinary file answers to the tests' clause too" in {
+      runOf(
+        "sys/a.sysl" -> ("module sys\n@no_os\n\n@needs(os)\nextern \"getpid\" pid() -> int\n\n" +
+          "@test\nbeside_what_it_tests() =\n    assert(pid() > 0)\n"),
+        "sys/tests.sysl" -> "module sys\n@tests\n@requires(os)\n\nhelper() -> int = 2\n",
+        "main.sysl" -> "print(1)\n",
+      ) shouldBe "1\n"
+    }
+  }
+
   "what the annotation may say" - {
 
     "a capability nothing has heard of is refused, in the words a file header's is" in {

@@ -119,6 +119,29 @@ object Project {
   def cSources(path: String, os: Option[Os]): List[Source] =
     if isDirectory(path) then walkModules(path, Nil, List(".c"), os, None) else Nil
 
+  /** The directories `cSources` walked past that a reader is likely to have meant it to take: ones
+   * holding C and no sysl, so they are not modules and their `.c` files are compiled by nothing.
+   *
+   * **This exists because the skip is silent, and that silence cost an investigation.** The rule is
+   * the one `walkModules` states and is deliberate — a directory the sysl walk claimed nothing from
+   * was never part of the tree, and taking C out of it would compile whatever a build directory or a
+   * vendored library happened to leave there. What was missing is any word of it: a `c/` holding a
+   * bare `side.c` produced no `compile:` line, no note, and then a link error naming a symbol, which
+   * reads as a defect in the compiler rather than as a file it never looked at. Card `0323` was
+   * filed against `sysl build` on exactly that reading, and the premise was false — the root module
+   * supplies C like any other, once the directory is a module.
+   *
+   * **Only a directory holding `.c` is reported**, which is what keeps this from being noise: an
+   * empty directory, a `docs/`, a `.git` are all walked past too and none of them was meant to be
+   * compiled. A `.c` sitting somewhere nothing will read is a file somebody wrote for this build.
+   *
+   * The answer is the directories themselves, so the caller decides what to say and about which
+   * trees — a dependency's stray `.c` is its author's to fix and not something the consumer can act
+   * on.
+   */
+  def skippedC(path: String, os: Option[Os]): List[String] =
+    if isDirectory(path) then skippedUnder(path, Nil, os, None) else Nil
+
   /** The modules a tree offers to something outside it: the shallowest directories under `root`
    * that hold source, as dotted paths (`reference/modules.md`).
    *
@@ -204,6 +227,19 @@ object Project {
                         else Nil
 
     here ::: outside(dir, subs).flatMap((sub, w) => walkModules(sub, dir :+ basename(sub), exts, os, w))
+  }
+
+  /** `walkModules`' own descent, answering with the directories it takes **nothing** from that hold
+   * C — see `skippedC`. It is the same walk deliberately: a rule stated twice is a rule that will
+   * disagree with itself, and what this reports has to be exactly what the other one skipped.
+   */
+  private def skippedUnder(path: String, dir: List[String], os: Option[Os],
+                           within: Option[String]): List[String] = {
+    val (files, subs) = contents(path, os, within)
+    val mine          = dir.isEmpty || files.exists(f => sysl.exists(f.endsWith))
+    val here          = if !mine && files.exists(_.endsWith(".c")) then List(path) else Nil
+
+    here ::: outside(dir, subs).flatMap((sub, w) => skippedUnder(sub, dir :+ basename(sub), os, w))
   }
 
   /** One directory's contents with per-OS selection already applied: the files that belong to it, and

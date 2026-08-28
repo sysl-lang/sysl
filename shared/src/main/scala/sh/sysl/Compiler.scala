@@ -184,9 +184,17 @@ object Compiler {
    * dropped from the emitted module by design (`reference/verification.md § @ghost — what costs
    * nothing to say`), so a proof run reading the lowered tree would have lost exactly the
    * predicates the specification is written in.
+   *
+   * **`paths` is here for the reason it is on `compiledWith`, and it used to be missing.** Stopping
+   * before lowering does not stop before *analysis*, and a `c const` block is evaluated by running
+   * the C compiler over the file's `@include`s during analysis (`CProbe`). So a proof run over a
+   * project binding an installed library needs the include paths exactly as a build does — without
+   * them it failed with `'uv.h' file not found` on a project that builds, and `--include-path` was
+   * ignored rather than insufficient, since there was nothing here for it to reach (card `0325`).
    */
   def typedWith(sources: List[Source], libraries: List[Program], target: Target = Target.default,
-                std: Option[Stdlib] = None, provides: Set[String] = Capability.core.toSet)
+                std: Option[Stdlib] = None, provides: Set[String] = Capability.core.toSet,
+                paths: SearchPaths = SearchPaths.none)
       : Either[String, (TProgram, Set[String])] = rendered {
     val parsed = sources.map(SyslParser.checked(_, target))
 
@@ -201,7 +209,7 @@ object Compiler {
         // module", and they are only known here — which is the same fact the analyzer is handed, for
         // the same reason.
         Analyzer.analyze(libraries ::: mine, std = carried(std, target), target = target,
-                         provides = provides, own = ownModules(mine))
+                         provides = provides, paths = paths, own = ownModules(mine))
           .map((_, mine.map(moduleOf).toSet))
       case errs => Left(errs.flatten)
   }

@@ -382,18 +382,23 @@ private[sysl] def execute(asked: Config): Int = {
   // `NativeSources`). An artifact is not among them: a `.syslib` carries its C already compiled, as
   // archive members.
   //
-  // Compiled only where something is about to be linked. `emit-llvm` prints IR and `prove` stops at
-  // the typed tree, and neither has a use for an object file — running clang for one would be work
-  // whose result is thrown away. Where this machine keeps what the toolchain was not told the
+  // Where this machine keeps what the toolchain was not told the
   // location of (`SearchPaths`). One value rather than two lists threaded separately, because the
   // two halves are one setting: a binding to a library outside the default prefix needs its headers
   // to compile and its archive to link, and a build given only one of them fails at whichever step
   // comes first. What this machine answered about the installed libraries the packages named
   // (`reference/packages.md § Capabilities`). Asked under the same guard as the header requirements
-  // below and for the same reason — a command compiling no C opens none of these — and asked *here*
+  // below and for the same reason — a command that reads no C opens none of these — and asked *here*
   // because the answer is part of the paths every C compilation and the link are given.
+  //
+  // **The guard used to be `links || cLibrary`, and the two halves it bundles are not one question.**
+  // The *link* half is right to stop there: `emit-llvm` and `prove` never reach a linker. The
+  // *include* half is not, because a `c const` block is evaluated during analysis, which they both
+  // do — so `sysl emit-llvm` failed with `'uv.h' file not found` on a project `sysl build` compiled
+  // (card `0325`). Probing for a command that will not link costs a `pkg-config` run whose ldflags
+  // go unread, which is the right price for the two agreeing.
   val probed =
-    if links(cfg.command) || cLibrary(cfg.command) then
+    if analyzesC(cfg.command) then
       val fromLibs = libPkgNeeds(roots) match
         case Left(err)   => return fail(err)
         case Right(need) => need
@@ -446,6 +451,13 @@ private[sysl] def execute(asked: Config): Int = {
   // path they would never open would be charging for something they do not do. `build-lib` compiles
   // C too and is asked at its own return above, for its own manifest only.
   //
+  // **Deliberately narrower than `analyzesC` above, and the two are different questions.** A
+  // declared requirement is about the tree's *carried* C: a project whose only C is a shim needs
+  // those headers to build and does not need them to print its IR. What `emit-llvm` and `prove` were
+  // missing is the probe's answer and `--include-path`, which they now have; a `c const` in a
+  // declaring project meets clang's message rather than this one, which is the price of not refusing
+  // a command over a file it never opens.
+  //
   // A `--lib` **source root** is asked too, and is the one road that used to fall through. A package
   // reached through `dependencies` is checked because its manifest came back with the graph, and one
   // reached as a `.syslib` needs no header at all — its `c const` was lowered when the artifact was
@@ -472,6 +484,23 @@ private[sysl] def execute(asked: Config): Int = {
   // being compiled *is* the standard module (`reference/modules.md § Separate compilation`), so
   // `cfg.file` is already this very directory — `sysl test library --std` is the case, and what it
   // produced was two `sysl.fs.dirent.o` and a duplicate symbol at the link.
+  // **A `.c` nothing will compile, named at the moment it is walked past.** A directory holding C
+  // and no sysl is not a module, so its files belong to no compilation — which is deliberate, and
+  // which said nothing at all until card `0323`: what a reader got was no `compile:` line and then a
+  // link error naming a symbol, indistinguishable from the compiler having ignored a file it should
+  // have taken. This is that skip in one sentence, with the one-file remedy in it.
+  //
+  // Asked of the reader's own trees only. A dependency's stray `.c` is its author's to fix and a
+  // consumer can do nothing with the warning, and the standard library has none.
+  if analyzesC(cfg.command) then
+    for
+      root <- cfg.file :: roots
+      dir  <- Project.skippedC(root, Some(target.os))
+    do
+      Console.err.println(s"sysl: warning: '$dir' holds C and no sysl, so it is not a module and " +
+        "its '.c' files are compiled by nothing — a directory becomes one by holding the '.sysl' " +
+        "that declares those 'extern's")
+
   val stdTree =
     Option.when(coreArchive.isEmpty && !cfg.std)(Std.root.toOption).flatten.toList
 
@@ -575,7 +604,7 @@ private[sysl] def execute(asked: Config): Int = {
   // `@ghost` erasure, because the predicates a specification is written in are exactly what the
   // lowering drops.
   if cfg.command == "prove" then
-    return prove(cfg, librarySources ::: sources, libraryTrees, target, std, provides)
+    return prove(cfg, librarySources ::: sources, libraryTrees, target, std, provides, paths)
 
   // One compilation, whatever the subcommand does with it. The notes come back beside the IR
   // rather than being printed from inside the compiler, which has no business writing to a console.
@@ -683,6 +712,22 @@ private def fingerprintOfFile(path: String): String =
  * own C rather than linking it.
  */
 private def links(command: String): Boolean = command == "build" || command == "run" || command == "test"
+
+/** Whether a subcommand **reads** C, which is what decides whether the headers have to be found.
+ *
+ * It is every command that gets this far, and saying so as a list rather than as `true` is the
+ * point: the ones that do not — `deps`, `weave`, `tangle`, `version` — have already returned above,
+ * and `build-lib` asks its own question at its own return. A later subcommand that analyzes sysl
+ * source belongs here, and one that does not will not reach the guard anyway.
+ *
+ * **This is `links` split in two, and conflating them was card `0325`.** A `c const` block is
+ * evaluated by running the C compiler over the file's `@include`s during analysis (`CProbe`), so a
+ * command that never links still needs somewhere to find `uv.h`. Asking "does this link?" where the
+ * question is "does this read a header?" made `sysl emit-llvm` fail on a project `sysl build`
+ * compiled — on the one command somebody reaches for to *diagnose* a build.
+ */
+private def analyzesC(command: String): Boolean =
+  links(command) || cLibrary(command) || command == "emit-llvm" || command == "prove"
 
 /** The allocator each `--lib` **source root** declares, named by the root as the reader wrote it.
  *

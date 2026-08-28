@@ -474,6 +474,82 @@ class PackageBuildTests extends PackageCacheSupport {
     }
   }
 
+  /** **A `.c` the walk goes past, named rather than left silent.**
+   *
+   * A directory holding C and no sysl is not a module, so its files belong to no compilation. That
+   * rule is deliberate — a directory the sysl walk claimed nothing from was never part of the tree,
+   * and taking C out of it would compile whatever a `build/` or a vendored library happened to leave
+   * there — and it said nothing whatever: no `compile:` line, no note, and then a link error naming
+   * a symbol.
+   *
+   * **Card `0323` was filed against `sysl build` on exactly that reading**, claiming the root
+   * module's `c/` was never compiled while a dependency's was. The premise was false: `Main` passes
+   * the root first, nothing on the path distinguishes it, and the card's own reduction compiles once
+   * the directory is made a module. What was real is that the two cases are indistinguishable from
+   * outside, and this is what tells them apart.
+   */
+  "a directory of C that is not a module" - {
+
+    /** A project whose own tree carries the files named, so the warning is about something its
+     * author can change — which is why a dependency's stray `.c` is deliberately not reported.
+     */
+    def carrying(files: (String, String)*): String = {
+      val root = createTempDirectory("sysl-stray-c-")
+
+      writeFile(s"$root/${PackageConfig.FileName}", """package { name = "app", version = "0.1.0" }""")
+      writeFile(s"$root/main.sysl", "print(thing.answer())")
+      createDirectories(s"$root/thing")
+      writeFile(s"$root/thing/thing.sysl", "module thing\n\nanswer() -> int = 42\n")
+
+      for (path, body) <- files do
+        Project.parentOf(s"$root/$path").foreach(createDirectories)
+        writeFile(s"$root/$path", body)
+
+      root
+    }
+
+    /** A run that had to succeed, with what it said on the way. The build working is half the
+     * observation here: the skip is not an error and must not become one.
+     */
+    def noted(root: String): String = {
+      val notes  = new java.io.ByteArrayOutputStream
+      val status = Console.withOut(Discarded)(
+        Console.withErr(notes)(sh.sysl.execute(Config(command = "run", file = root))))
+
+      withClue(notes.toString)(status shouldBe 0)
+      notes.toString
+    }
+
+    "is named, with the one-file remedy in the sentence" in {
+      val notes = noted(carrying("thing/c/side.c" -> "int side_answer(void) { return 7; }\n"))
+
+      notes should include("holds C and no sysl")
+      notes should include("compiled by nothing")
+      notes should include("declares those 'extern's")
+    }
+
+    // The remedy the warning names, run rather than described: one `.sysl` in the directory makes it
+    // a module, and the C is compiled and linked like any other. This is the card's own reduction,
+    // repaired.
+    "and compiles once that directory holds the sysl declaring its externs" in {
+      val root = carrying(
+        "thing/c/side.c"   -> "int side_answer(void) { return 7; }\n",
+        "thing/c/c.sysl"   -> "module thing.c\n\nextern \"side_answer\" side() -> int\n",
+        "thing/thing.sysl" -> "module thing\n\nimport thing.c\n\nanswer() -> int = c.side()\n",
+      )
+
+      run(root) shouldBe "7\n"
+      noted(root) should not include "holds C and no sysl"
+    }
+
+    // Noise is what would make this worth turning off, so the rule is narrow: only a directory
+    // actually holding `.c` is reported. Every tree has directories the walk takes nothing from.
+    "while a directory holding no C at all is passed over in silence, as everything else is" in {
+      noted(carrying("thing/notes/README.md" -> "nothing to compile here\n")) should
+        not include "holds C and no sysl"
+    }
+  }
+
   "a project with no dependencies block is untouched by any of this" in {
     val root = createTempDirectory("sysl-plain-")
 

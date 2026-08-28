@@ -203,6 +203,16 @@ class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
             |""".stripMargin) should include("a program's exit status is not something a signature can say")
     }
 
+    // **And the refusal names the answer.** A reader here wants to choose a status; `exit` is how,
+    // and has been since before this rule was written. Saying only what a signature may not do sent
+    // somebody looking for a language feature that was already built, which is card `0326` — filed
+    // to ask for `exit` by an author who had read this message.
+    "and it says how a program does choose one, which is the half it was missing" in {
+      err("""main() -> int
+            |    0
+            |""".stripMargin) should include("'exit(code)' is how a program chooses its own")
+    }
+
     "type parameters the platform could not supply" in {
       err("""main[T]()
             |    print("hi")

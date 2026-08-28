@@ -204,10 +204,18 @@ private def buildForC(cfg: Config, compiled: Compiled, target: Target, named: Op
  *
  * The exit status is Why3's, so a proof run is usable in a build script that wants to fail on an
  * undischarged goal.
+ *
+ * **`paths` is not a build's leftovers, and this took a `SearchPaths` at all only from card `0325`.**
+ * A proof stops before lowering, which is not before analysis, and a `c const` block is evaluated by
+ * running the C compiler over the file's `@include`s while the tree is analyzed. So a proof of a
+ * project binding an installed library needs the include paths a build needs — and with no parameter
+ * here to receive them, `--include-path` was ignored rather than insufficient, which is why the flag
+ * that rescued `emit-llvm` did nothing for this.
  */
 private def prove(cfg: Config, sources: List[Source], libraries: List[Program], target: Target,
-                  std: Stdlib, provides: Set[String]): Int = {
-  val (typed, ownModules) = Compiler.typedWith(sources, libraries, target, Some(std), provides) match
+                  std: Stdlib, provides: Set[String], paths: SearchPaths): Int = {
+  val (typed, ownModules) =
+    Compiler.typedWith(sources, libraries, target, Some(std), provides, paths) match
     case Left(err)  => return report(err)
     case Right(out) => out
 
