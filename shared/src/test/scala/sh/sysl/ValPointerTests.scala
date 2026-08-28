@@ -219,9 +219,21 @@ class ValPointerTests extends AnyFreeSpec with CodegenSupport with RunSupport {
         include("@ps = private constant [2 x ptr] [ptr null, ptr null]")
     }
 
+    // **A repeat collapses and the literal above it does not, and the asymmetry is the point.** A
+    // fill says one value and a count, so writing the count out is work proportional to a number
+    // the source never spelled -- that is card 0319, where a 16 MiB `[0u8; N]` became 100 MB of
+    // module text. An array *literal* already has its elements in the source, so there is nothing to
+    // save and the line above goes on naming each one.
+    //
+    // `zeroinitializer` at a pointer type is the null pointer, which is why this is a spelling
+    // change and not a behaviour one -- the trait-pointer case two tests up already expected that
+    // word for a null. The claim in the name is unchanged and is what the assertion still makes:
+    // the global is written out, so there is no loop anywhere to run.
     "and a repeat of one, written out as a global has no loop to run" in {
-      ir("static val ps: [3]*u8 = [null; 3]\nprint(\"ok\")") should
-        include("@ps = private constant [3 x ptr] [ptr null, ptr null, ptr null]")
+      val m = ir("static val ps: [3]*u8 = [null; 3]\nprint(\"ok\")")
+
+      m should include("@ps = private constant [3 x ptr] zeroinitializer")
+      m should not include "fill.test"
     }
 
     // The address of code is the same shape and lands the same way: a reset vector read as
