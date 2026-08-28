@@ -320,7 +320,7 @@ class EscapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSupport {
             |    take(buf[0..<2])
             |end use
             |use()
-            |""".stripMargin) should include("declare void @take(ptr)")
+            |""".stripMargin) should include("declare void @take(ptr align 8)")
   }
 
   "a recursive function converges rather than assuming the worst" in {

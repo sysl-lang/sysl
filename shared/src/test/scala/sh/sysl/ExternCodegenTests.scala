@@ -43,7 +43,7 @@ class ExternCodegenTests extends AnyFreeSpec with CodegenSupport {
     // a claim about AAPCS64 that holds wherever the suite runs.
     "a pointer lowers as it does everywhere else, and a view as the ABI passes an aggregate" in {
       irFor(Target.aarch64MacOS, "extern f(p: *u8, s: string) -> *int\nvar b: u8 = 0\nprint(f(&b, \"hi\") == null)") should
-        include("declare ptr @f(ptr, ptr)")
+        include("declare ptr @f(ptr, ptr align 8)")
     }
 
     // The library declares `exit` for `unwrap` to stop with, and almost no program calls it. An
