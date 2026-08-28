@@ -246,6 +246,37 @@ private[sysl] def execute(asked: Config): Int = {
     case Left(err) => return fail(err)
     case Right(a)  => a
 
+  // **A heap the machine has no libc to supply, said here rather than left to the linker.** A
+  // package requiring one, built for a freestanding target by a command that links, has asked for
+  // `malloc` and `free` from a machine that has neither — and what a reader got was one
+  // `undefined symbol` line per allocation, from a toolchain that already knew the answer.
+  //
+  // **It cannot be folded into the `unmet` test above, and the reason is the point.**
+  // `PackageConfig.provides` defaults every capability to *provided*: the prior is that a machine
+  // can do everything, and a config records what a machine cannot do. So a freestanding target
+  // answers "I have a heap" unless the project wrote `capabilities { heap = false }`, and `unmet`
+  // is empty. `Target.inherentCapabilities` is the physical half that would have caught it, and
+  // `heap` is deliberately not in it — whether an allocator exists is an engineering decision about
+  // a machine that could have one either way, which is what keeps a Pico project building against
+  // newlib's `malloc` without having to say so.
+  //
+  // **So the discriminator is not the target. It is who is doing the link.** `build-c` and
+  // `build-lib` are excluded because an archive's allocator arrives from CMake or Gradle, which the
+  // compiler cannot see and must not second-guess; every board project in the org is built that way.
+  // Where sysl invokes the linker itself, there is nothing else left to supply the pair.
+  //
+  // **Naming an allocator is the way out, and naming libc's own pair is not.** A project that
+  // declared `malloc`/`free` explicitly is in exactly the position of one that declared nothing —
+  // the symbols still have to come from somewhere — so the test is the resulting pair rather than
+  // whether a block was written.
+  if links(cfg.command) && target.os == Os.Freestanding &&
+    project.requires(Capability.Heap) && allocator == Allocator.c
+  then
+    return fail(s"this package requires a heap and '${target.name}' is freestanding, so nothing " +
+      s"supplies '${allocator.alloc}' and '${allocator.free}' — the link would answer with an " +
+      "undefined symbol for each. Name a heap of your own in " +
+      s"${PackageConfig.FileName}'s 'allocator' block, or build for a target that has a libc")
+
   // Which standard module this compilation is compiled against — an error if there is none, the same
   // as any other missing library.
   val Stdlib.Resolved(std, coreSymbols, coreArchive) =

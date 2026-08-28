@@ -167,6 +167,83 @@ class PackageConfigCliTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  /** A heap asked for on a machine with no libc to supply one (card `0329`).
+    *
+    * The refusal cannot come from `requires` alone: `PackageConfig.provides` defaults every
+    * capability to provided, so a freestanding target says it has a heap and the `unmet` test above
+    * is empty. What is asserted here is the *other* condition — that sysl is the one doing the link
+    * — and each case below turns exactly one part of it off.
+    */
+  private val freestandingHeap =
+    """requires { heap = true }
+      |targets { default = "wasm32-freestanding" }
+      |""".stripMargin
+
+  "a heap on a target with no libc is refused before the linker sees it" in {
+    project("main()\n    print(1)\n", Some(freestandingHeap)) { dir =>
+      val (code, said) = stderrOf(cli(Config(command = "build", file = dir, output = Some(s"$dir/out"))))
+
+      code should not be 0
+      said should include("requires a heap")
+      said should include("'wasm32-freestanding' is freestanding")
+      // The two symbols by name, because what a reader was getting was a wall of `undefined symbol`
+      // lines about exactly these and nothing connecting them to the clause they wrote.
+      said should include("'malloc'")
+      said should include("'free'")
+      // And the way out, which is a block they can write rather than a target they cannot change.
+      said should include("'allocator' block")
+      // Nothing reached the toolchain: the refusal is the whole output.
+      said shouldNot include("wasm-ld")
+    }
+  }
+
+  "and naming a heap of your own is the way out" in {
+    project(
+      "main()\n    print(1)\n",
+      Some(freestandingHeap + """allocator { alloc = "heap_alloc", free = "heap_free" }""" + "\n"),
+    ) { dir =>
+      val (_, said) = stderrOf(cli(Config(command = "build", file = dir, output = Some(s"$dir/out"))))
+
+      // Not `shouldBe 0` — whether a wasm link succeeds on this machine is a question about the
+      // toolchain, and this suite is not asking it. What is asserted is that the driver stopped
+      // holding the project back.
+      said shouldNot include("requires a heap")
+    }
+  }
+
+  "declaring libc's own pair is not a way out, because the symbols still come from nowhere" in {
+    project(
+      "main()\n    print(1)\n",
+      Some(freestandingHeap + """allocator { alloc = "malloc", free = "free" }""" + "\n"),
+    ) { dir =>
+      val (code, said) = stderrOf(cli(Config(command = "build", file = dir, output = Some(s"$dir/out"))))
+
+      code should not be 0
+      said should include("requires a heap")
+    }
+  }
+
+  "a hosted target is untouched, whatever the package requires" in {
+    project(
+      "main()\n    print(1)\n",
+      Some("requires { heap = true }\n"),
+    ) { dir =>
+      cli(Config(command = "build", file = dir, output = Some(s"$dir/out"))) shouldBe 0
+    }
+  }
+
+  /** The condition that keeps every board repo in the org building. `build-c` writes an archive and
+    * CMake or Gradle links it, so the allocator arrives from somewhere the compiler cannot see —
+    * which is why the test is `links`, not the target.
+    */
+  "and an archive is not refused, because sysl is not the one linking it" in {
+    project("@export(\"main\")\nmain()\n    print(1)\n", Some(freestandingHeap)) { dir =>
+      val (_, said) = stderrOf(cli(Config(command = "build-c", file = dir, output = Some(s"$dir/out"))))
+
+      said shouldNot include("requires a heap")
+    }
+  }
+
   "a config that is there and will not read stops the build" in {
     project("main()\n    print(1)\n", Some("targets { default = \n")) { dir =>
       val (code, said) = stderrOf(cli(Config(command = "build", file = dir, output = Some(s"$dir/out"))))
