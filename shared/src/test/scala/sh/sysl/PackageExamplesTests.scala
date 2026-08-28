@@ -54,7 +54,6 @@ class PackageExamplesTests extends PackageCacheSupport {
      */
     "a library builds with a program sitting in it" in {
       val root = packageWithExamples("examples/demo.sysl" -> "import geom.*\n\nprint(double(21))\n")
-      val out  = createTempDirectory("sysl-out-") + "/geom.syslib"
 
       val (code, _, errors) =
         driven("build-lib", root) match

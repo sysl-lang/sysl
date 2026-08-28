@@ -75,7 +75,7 @@ object TailJumps {
     }
 
     forEachStmt(f.body.stmts) {
-      case s @ TBecome(call) =>
+      case TBecome(call) =>
         val at = position(call)
 
         if f.variadic then

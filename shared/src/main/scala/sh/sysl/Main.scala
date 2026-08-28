@@ -525,11 +525,17 @@ private[sysl] def execute(asked: Config): Int = {
       archives.mkString("\u0000"),
     )))
 
+  // `for ... yield` rather than `for ... do`, and the difference is not style: a `do` desugars to a
+  // `foreach`, so the `return` inside it would be a *non-local* return out of a closure — which
+  // Scala 3 no longer supports. Yielding the hit and matching on it puts the return back in this
+  // method's own body, where it means what it says.
   if cfg.command == "run" then
-    for key <- runKey; built <- RunCache.hit(key) do
-      if cfg.verbose then Console.err.println(s"cached: $built")
+    (for key <- runKey; built <- RunCache.hit(key) yield built) match
+      case Some(built) =>
+        if cfg.verbose then Console.err.println(s"cached: $built")
 
-      return runProgram(built :: cfg.programArgs)
+        return runProgram(built :: cfg.programArgs)
+      case None => ()
 
   // A test build is its own compilation and branches before the one below, rather than sharing it:
   // it keeps the `@test` functions every other build drops, and it lowers a different entry point
@@ -539,14 +545,19 @@ private[sysl] def execute(asked: Config): Int = {
     // A cached test build needs **two** things — the binary and what to call in it — so the hit is
     // both or neither. The filter is applied to the list afterwards, exactly as it is to a freshly
     // compiled one, which is what keeps `--filter` out of the key.
-    for
-      key   <- runKey
-      built <- RunCache.hit(key)
-      list  <- RunCache.tests(key).filter(isFile).flatMap(p => RunCache.decode(readFile(p)))
-    do
-      if cfg.verbose then Console.err.println(s"cached: $built")
+    val cached =
+      for
+        key   <- runKey
+        built <- RunCache.hit(key)
+        list  <- RunCache.tests(key).filter(isFile).flatMap(p => RunCache.decode(readFile(p)))
+      yield (built, list)
 
-      return TestRunner.rerun(cfg, built, list)
+    cached match
+      case Some((built, list)) =>
+        if cfg.verbose then Console.err.println(s"cached: $built")
+
+        return TestRunner.rerun(cfg, built, list)
+      case None => ()
 
     val native = nativeSources() match
       case Left(err)    => return fail(err)

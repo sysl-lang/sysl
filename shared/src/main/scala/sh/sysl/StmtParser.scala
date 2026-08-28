@@ -762,7 +762,7 @@ trait StmtParser
   protected lazy val becomeStmt: PackratParser[Stmt] =
     guard(softWord("become") ~ (ident | op("("))) ~> softWord("become") ~> expression >> {
       case c: Call => success(Become(c))
-      case other =>
+      case _ =>
         err("'become' takes a call — it is the call that replaces this frame, so there has to be " +
           "one. 'return' is what hands a value back without replacing anything")
     }
