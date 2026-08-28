@@ -14,3 +14,104 @@ module sysl
  * other name here while going on resolving to `exit`.
  */
 extern exit(code: int) -> never
+
+/** The operating system a program was compiled for.
+ *
+ * **These are the same five machines `#if` gates on**, under the same names a source file writes at
+ * the margin: `#if macos` and `os() == MacOS` ask one question, and the two must never come to
+ * disagree. `Freestanding` is a member because a target with no operating system under it is still a
+ * target with an answer, and a program that has to say what it is running on would otherwise have
+ * one case it could not spell.
+ *
+ * `Android` is its own row rather than a kind of `Linux`, for the reason `Conditional.osSymbol`
+ * gives: what a program asking this wants to know is which libc and which conventions it has, and
+ * Bionic is neither glibc's nor its headers'. A program that means either writes
+ * `os() == Linux || os() == Android`.
+ */
+enum Os derives Display
+    MacOS
+    Linux
+    Windows
+    Freestanding
+    Android
+end Os
+
+/** The processor a program was compiled for, named as `#if` and an `asm` arm name it.
+ *
+ * **`Thumb` rather than `Arm`, because it is the instruction set that a program gating on a
+ * processor has to be right about** -- a Cortex-M executes Thumb and nothing else. The two widths of
+ * RISC-V are two rows for the same reason a 32-bit and a 64-bit x86 are: an address width is the
+ * thing most code asking this question is asking about.
+ */
+enum Cpu derives Display
+    Aarch64
+    X86_64
+    Riscv64
+    Riscv32
+    Thumb
+    Wasm32
+    X86
+    Craft
+end Cpu
+
+/** Which operating system this program was compiled for.
+ *
+ * **It is a constant, not a query.** A sysl program is compiled for exactly one target, so the
+ * answer is something the compiler already holds and this costs a program nothing at run time --
+ * there is no table to consult and no environment to read, and a freestanding target pays for it
+ * exactly as much as a hosted one does, which is nothing.
+ *
+ * **What it adds over `#if` is expression position.** `#if` gates lines, before the lexer, so a
+ * program could already define a different `val` per platform; what it could not do is pass a
+ * platform to a function, compare one, or `match` on one. This is that half:
+ *
+ * ```
+ * val leaf = os() match
+ *     MacOS -> "Library/Caches"
+ *     Windows -> "AppData"
+ *     _ -> ".cache"
+ * ```
+ *
+ * **There is deliberately no `#else` under this**, so an operating system added to the compiler's
+ * registry without a branch here fails to build for that target rather than quietly answering
+ * something else.
+ */
+os() -> Os
+#if macos
+    MacOS
+#elif linux
+    Linux
+#elif windows
+    Windows
+#elif android
+    Android
+#elif freestanding
+    Freestanding
+#endif
+end os
+
+/** Which processor this program was compiled for, on the same terms as `os` above: a constant the
+ * compiler already holds, reaching an expression rather than a gated line.
+ *
+ * A program wanting an address width should ask for one -- `sizeof(usize)` is the question, and it
+ * is right for a processor this list has not got yet.
+ */
+cpu() -> Cpu
+#if aarch64
+    Aarch64
+#elif x86_64
+    X86_64
+#elif riscv64
+    Riscv64
+#elif riscv32
+    Riscv32
+#elif thumb
+    Thumb
+#elif wasm32
+    Wasm32
+#elif x86
+    X86
+#elif craft
+    Craft
+#endif
+end cpu

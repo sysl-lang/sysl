@@ -1,6 +1,7 @@
 module sysl.fs
 @requires(os)
 
+import sysl.env.get
 import sysl.path.{join, parent}
 import sysl.slices.{as_mut_ptr, as_ptr}
 import sysl.text.{cstring, from_cstring}
@@ -51,6 +52,85 @@ end current_dir
  * the shell-like thing at the top, genuinely needs it.
  */
 set_current_dir(path: string) -> Result[unit, IoError] = told(c_chdir(cstring(path).ptr))
+
+// ## Where a directory BELONGS, as against where one IS
+//
+// The four below answer a different question from `current_dir`: not where the program happens to
+// be, but where the machine's own conventions say a file of a given kind goes. A program that wants
+// to cache a download, remember a setting or keep a database has to put it somewhere, and before
+// these the only way to decide was to read `HOME` and invent a rule -- which is how every program
+// ends up with a rule of its own and the conventions stop being conventions.
+//
+// **They are `Option` because a machine may genuinely not say.** An environment with no `HOME` set
+// is not a failure to report an errno about; it is a machine that has not told the program where its
+// user lives. A caller that gets `None` falls back to something of its own knowingly, which is the
+// whole difference between this and reading the variable itself.
+//
+// **They name a directory and do not make one.** Nothing here touches the filesystem at all -- the
+// answer is a path, and whether it exists is `exists` and whether it should is `make_dir_all`. That
+// is deliberate: a program asking where its configuration belongs is often about to *read*, and a
+// question that created a directory as a side effect could not be asked.
+
+/** Where the user's home directory is, or `None` where the environment does not say.
+ *
+ * `HOME` everywhere but Windows, which spells it `USERPROFILE`. **A variable set to nothing counts
+ * as unset here**, which is where this differs from `sysl.env.get`: an empty string is a truthful
+ * reading of an environment and is not a place, and every specification that mentions the case says
+ * to treat it as absent.
+ */
+home_dir() -> Option[string] =
+    os() match
+        Windows -> named("USERPROFILE")
+        _ -> named("HOME")
+
+/** Where a program's own cache belongs -- the things it can regenerate and would rather not.
+ *
+ * `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows, and `$XDG_CACHE_HOME` or `~/.cache`
+ * elsewhere, which is the freedesktop rule.
+ *
+ * **A program appends its own name and nothing here does it for you**: this answers where the
+ * machine keeps caches, not where yours goes, so the call is
+ * `cache_dir().map((d) -> join(d, "myprogram"))`. A library that guessed the leaf would be guessing
+ * the program's identity.
+ */
+cache_dir() -> Option[string] =
+    os() match
+        MacOS -> under_home("Library/Caches")
+        Windows -> named("LOCALAPPDATA")
+        _ -> named("XDG_CACHE_HOME").or_else(() -> under_home(".cache"))
+
+/** Where a program's configuration belongs -- what a person edits, and what survives a reinstall.
+ *
+ * `~/Library/Application Support` on macOS, `%APPDATA%` on Windows, `$XDG_CONFIG_HOME` or
+ * `~/.config` elsewhere.
+ *
+ * **macOS answers the same directory for this and for `data_dir`, and that is Apple's convention
+ * rather than an omission here.** The platform draws the line between *cache* and *everything else*
+ * and does not draw one between configuration and data; a library that invented a `~/Library/Config`
+ * to make the four look symmetrical would be putting files where nothing else on the machine looks.
+ */
+config_dir() -> Option[string] =
+    os() match
+        MacOS -> under_home("Library/Application Support")
+        Windows -> named("APPDATA")
+        _ -> named("XDG_CONFIG_HOME").or_else(() -> under_home(".config"))
+
+/** Where a program's own data belongs -- what it wrote and cannot regenerate.
+ *
+ * `~/Library/Application Support` on macOS, `%APPDATA%` on Windows, `$XDG_DATA_HOME` or
+ * `~/.local/share` elsewhere. See `config_dir` for why two of those three are the same answer.
+ */
+data_dir() -> Option[string] =
+    os() match
+        MacOS -> under_home("Library/Application Support")
+        Windows -> named("APPDATA")
+        _ -> named("XDG_DATA_HOME").or_else(() -> under_home(".local/share"))
+
+/** An environment variable read as a directory, where set-to-empty is the same answer as unset. */
+private named(name: string) -> Option[string] = get(name).filter((s) -> s.len > 0)
+
+/** A leaf under the home directory, or `None` where there is no home to put it under. */
+private under_home(leaf: string) -> Option[string] = home_dir().map((h) -> join(h, leaf))
 
 /** A directory that did not exist a moment ago and that nobody else can take, made inside whatever
  * `TMPDIR` names -- or `/tmp` where it names nothing.

@@ -172,8 +172,15 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * module may not import a submodule at all, tests included -- `library/sysl` declares `sysl`, so
    * `import sysl.buf.byte_sink` in a `@tests` file beside it is refused as a cycle. Measured, no
    * slack.
+   *
+   * Raised to **561** for the platform constants and the four directory conventions: four cases in
+   * the root module's file asserting that `os()` and `cpu()` answer what a `#if` on the same machine
+   * gates on, and three in `sysl.fs`'s asserting what can be said about a directory whose path is the
+   * running machine's rather than this file's. The compiler-side half is `PlatformRegistryTests`,
+   * which is derived from the registry and checks the machines a program on one machine cannot see.
+   * Measured, no slack.
    */
-  private val floor = 554
+  private val floor = 561
 
   /** The library, compiled as a **test build of itself**.
    *
