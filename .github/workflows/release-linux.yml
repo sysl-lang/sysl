@@ -85,12 +85,19 @@ jobs:
       # **The tag and `build.sbt` must agree, and this is where that is caught.** A tag cut before
       # the version bump would otherwise produce a tarball named for the new version containing a
       # compiler that answers with the old one — which installs, runs, and lies.
+      #
+      # **The declared version is read WHOLE, suffix and all.** It used to be run through
+      # `[0-9]+\.[0-9]+\.[0-9]+`, which strips a pre-release suffix — so `0.0.82-alpha` in
+      # `build.sbt` read as `0.0.82` while `${tag#v}` was `0.0.82-alpha`, and they could never be
+      # equal. The check was not comparing the tag against the tree; it was comparing the tag
+      # against a truncation of itself, so **both jobs failed and no Linux tarball was attached at
+      # all** for any pre-release tag. Observed on run 33018836090, `v0.0.82-alpha`; card `0321`.
       - name: Work out the version
         id: version
         run: |
           set -euo pipefail
           declared=$(grep -oE '^ThisBuild / version[[:space:]]*:=[[:space:]]*"[^"]+"' build.sbt \
-                     | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+                     | sed 's/.*"\(.*\)"/\1/')
           tag="${{ steps.what.outputs.tag }}"
           if [ -n "$tag" ] && [ "${tag#v}" != "$declared" ]; then
             echo "tag $tag names ${tag#v}, but build.sbt declares $declared" >&2

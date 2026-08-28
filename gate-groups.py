@@ -32,11 +32,31 @@ import sys
 
 # Measured on an 18-core, 64 GB machine, 2026-08-08: each of these wedges a chunk that four agents
 # share at 12g, and passes alone at 24g.
+#
+# **`ConditionalTests` joined them 2026-08-28, and it is the first entry the designed-for failure
+# actually produced.** The docstring above says heaviness cannot be computed and that a suite which
+# becomes heavy will land in a chunk, wedge it, and be named in the summary; that is exactly what
+# happened. Its chunk announced an OOM and was retried alone on **all three** full gates of the
+# 0.0.86 release, which is the evidence a single retry does not give -- a group needing the recovery
+# across successive runs is over budget rather than unlucky (card `0324`).
+#
+# **The three suites the summary named were bystanders and the chunk was the finding.** `last suite:`
+# is whatever happened to be running when the heap ran out, and it differed each time
+# (`EscapeClaimTests`, `StdCacheBoundTests`, `ImplGenericRunTests`) -- which is what said the group
+# was over budget rather than that any one of those was the cost.
+#
+# Measured by timing the group's nine suites alone at the heavy settings: `AssociatedTypeRunTests`
+# **106 s**, `ConditionalTests` **past 12 minutes and 12.1 GB resident** with the machine to itself.
+# It is also the only registry-iterating suite in that chunk, and it is heavy for the reason the
+# docstring names rather than for iterating: `Std.parsed(t)` and `Std.decls(t)` parse and analyze
+# the standard library **once per target**, and its own `run(...)` cases compile and link beside
+# that. 12.1 GB in one agent against a 16 GB chunk cap is why three of them cannot share.
 HEAVY = {
     'sh.sysl.CrossTargetBuildTests',
     'sh.sysl.QemuRunTests',
     'sh.sysl.QemuHarnessTests',
     'sh.sysl.NoAllocEmissionTests',
+    'sh.sysl.ConditionalTests',
 }
 
 # Measured and found cheap despite walking the registry. Listed so that "it iterates and is not
