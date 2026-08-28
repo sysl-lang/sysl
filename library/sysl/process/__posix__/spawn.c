@@ -22,14 +22,38 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/* One of the child's streams pointed at a file the parent named. Answers an `errno`, or zero.
+ *
+ * A path that is empty, or absent, means the stream is left alone -- so a capture of standard
+ * output only, of standard error only, or of both is the same code path with a different pair of
+ * arguments, and there is no combination the caller can ask for that this does not answer.
+ */
+static int redirect(const char *path, int fd_no) {
+    if (!path || !path[0]) return 0;
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+    if (fd < 0) return errno;
+
+    if (dup2(fd, fd_no) < 0) {
+        int e = errno;
+
+        close(fd);
+        return e;
+    }
+
+    close(fd);
+    return 0;
+}
+
 /* Everything the child does before it becomes the other program, as one function so that the
  * caller below is a straight line. Answers an `errno`, or zero.
  *
- * It allocates nothing and opens at most one descriptor, which is the constraint the whole
- * between-fork-and-exec window is written under.
+ * It allocates nothing and opens at most one descriptor per stream, which is the constraint the
+ * whole between-fork-and-exec window is written under.
  */
 static int child_setup(const char *const *names, const char *const *values,
-                       const char *dir, const char *out_path) {
+                       const char *dir, const char *out_path, const char *err_path) {
     /* `setenv` here rather than a whole `envp` handed to `execve`, so that a caller adds to the
      * environment instead of replacing it -- a child that lost PATH, HOME and TMPDIR because its
      * parent wanted to set one variable is a surprise nobody wants. This is also the one place
@@ -43,22 +67,11 @@ static int child_setup(const char *const *names, const char *const *values,
 
     if (dir && dir[0] && chdir(dir) != 0) return errno;
 
-    if (out_path && out_path[0]) {
-        int fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    int e = redirect(out_path, STDOUT_FILENO);
 
-        if (fd < 0) return errno;
+    if (e != 0) return e;
 
-        if (dup2(fd, STDOUT_FILENO) < 0) {
-            int e = errno;
-
-            close(fd);
-            return e;
-        }
-
-        close(fd);
-    }
-
-    return 0;
+    return redirect(err_path, STDERR_FILENO);
 }
 
 /* Start `program`, wait for it, and say how it ended.
@@ -74,7 +87,8 @@ static int child_setup(const char *const *names, const char *const *values,
  */
 int sysl_proc_run(const char *program, char *const *argv,
                   const char *const *env_names, const char *const *env_values,
-                  const char *dir, const char *out_path, int *code, int *sig) {
+                  const char *dir, const char *out_path, const char *err_path,
+                  int *code, int *sig) {
     /* **Everything this program has written, written, before anything else can write.**
      *
      * A C library buffers standard output, and it buffers it *fully* rather than by line whenever
@@ -119,7 +133,7 @@ int sysl_proc_run(const char *program, char *const *argv,
     if (pid == 0) {
         close(report[0]);
 
-        int e = child_setup(env_names, env_values, dir, out_path);
+        int e = child_setup(env_names, env_values, dir, out_path, err_path);
 
         if (e == 0) {
             execvp(program, argv);

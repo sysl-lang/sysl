@@ -179,8 +179,13 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * running machine's rather than this file's. The compiler-side half is `PlatformRegistryTests`,
    * which is derived from the registry and checks the machines a program on one machine cannot see.
    * Measured, no slack.
+   *
+   * Raised to **566** for `capture`'s `stderr`, which collects the child's other stream into
+   * `Output.err`. Five cases, and every one of them asserts something about `text` as well: a
+   * capture that quietly merged the two streams would satisfy any test that only ever read `err`.
+   * Measured, no slack.
    */
-  private val floor = 561
+  private val floor = 566
 
   /** The library, compiled as a **test build of itself**.
    *

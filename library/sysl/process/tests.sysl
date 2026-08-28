@@ -162,3 +162,54 @@ a_status_says_which()
     assert_eq(s"${Status.Exited(0)}", "exited")
     assert_eq(s"${Status.Exited(2)}", "exited 2")
     assert_eq(s"${Status.Signalled(9)}", "killed by signal 9")
+
+// ## What it wrote to the OTHER stream
+//
+// **The claim these are about is that the two streams are separate**, so every one of them asserts
+// something about `text` as well: a capture that quietly merged them would satisfy any test that
+// only ever looked at `err`.
+
+@test("standard error is left alone unless it is asked for")
+stderr_is_not_collected_by_default()
+    val out = capture("sh", ["-c", "echo out; echo boom >&2"]).unwrap()
+
+    assert_eq(out.text, "out\n")
+    assert(out.err.is_none(), "a call that did not ask for standard error says so with 'None'")
+
+@test("standard error comes back when it is asked for, and the two streams stay apart")
+stderr_comes_back_when_asked()
+    val out = capture("sh", ["-c", "echo out; echo boom >&2"], "", [], true).unwrap()
+
+    assert_eq(out.text, "out\n")
+    assert_eq(out.err.unwrap(), "boom\n")
+
+// **`None` and `Some("")` are the two answers a bare string could not tell apart**, which is the
+// whole reason the field is an `Option`: a tool reporting why a child failed has to know whether it
+// is looking at silence or at a stream nobody collected.
+@test("a child that says nothing on standard error is not the same as not asking")
+stderr_empty_is_not_absent()
+    val asked = capture("true", [], "", [], true).unwrap()
+
+    assert(asked.err.is_some(), "it was collected")
+    assert_eq(asked.err.unwrap(), "")
+    assert(capture("true").unwrap().err.is_none(), "and this one was not")
+end stderr_empty_is_not_absent
+
+// The reason the card exists: a failed child's diagnosis is on the stream a plain capture lets
+// through to the terminal, where a tool cannot read it.
+@test("a failed child's reason is readable rather than only its status")
+stderr_carries_the_reason()
+    val out = capture("sh", ["-c", "echo why >&2; exit 3"], "", [], true).unwrap()
+
+    assert_eq(out.status, Status.Exited(3))
+    assert_eq(out.err.unwrap(), "why\n")
+    assert_eq(out.text, "")
+
+// Two files rather than one, so the same collision the pair of captures above looks for is worth
+// looking for across the streams of a single call.
+@test("the two streams do not share a file")
+stderr_does_not_collide_with_stdout()
+    val out = capture("sh", ["-c", "echo aaa; echo bbb >&2"], "", [], true).unwrap()
+
+    assert_eq(out.text, "aaa\n")
+    assert_eq(out.err.unwrap(), "bbb\n")

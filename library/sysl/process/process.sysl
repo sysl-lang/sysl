@@ -29,7 +29,8 @@ import sysl.text.{CString, cstring, from_cstring}
 // the vector as it is given, so a path is a path whatever is in it.
 
 private extern "sysl_proc_run" c_run(program: *u8, argv: **u8, names: **u8, values: **u8,
-                                     dir: *u8, out_path: *u8, code: *i32, sig: *i32) -> int
+                                     dir: *u8, out_path: *u8, err_path: *u8,
+                                     code: *i32, sig: *i32) -> int
 
 private extern "sysl_proc_temp_path" c_temp_path(buf: *u8, n: usize) -> int
 
@@ -90,16 +91,24 @@ struct Var
     name: string
     value: string
 
-/** A child's standard output, and how it ended.
+/** A child's output, and how it ended.
  *
- * `text` is what the program wrote to its standard output and nothing else. **Standard error is not
- * captured**: it goes wherever this program's does, which is what a shell's `$(...)` leaves it
- * doing. A tool asking a program a question wants its answer without a warning it printed mixed
- * into the middle of it, and a warning is still worth seeing.
+ * `text` is what the program wrote to its standard output. `err` is what it wrote to its standard
+ * error, and only where the caller asked for it -- by default that stream goes wherever this
+ * program's does, which is what a shell's `$(...)` leaves it doing. A tool asking a program a
+ * question wants its answer without a warning printed into the middle of it, and a warning is still
+ * worth seeing.
+ *
+ * **`None` and `Some("")` are different answers and the distinction is the point.** `None` is "this
+ * call did not collect standard error"; `Some("")` is "it was collected and the child wrote
+ * nothing". A `string` alone could not tell a caller which of those it had, so a tool reporting why
+ * a child failed would have had to guess between "it said nothing" and "nobody was listening" --
+ * which is the whole reason this field is an `Option`.
  */
 struct Output
     status: Status
     text: string
+    err: Option[string]
 
 /** The `argv` an `execvp` is given: the program's own name first, then the arguments, then a null.
  *
@@ -152,19 +161,21 @@ private pairs_of(env: []const Var) -> (Buf[CString], Buf[*u8], Buf[*u8])
 end pairs_of
 
 private started(program: string, args: []const string, env: []const Var, dir: string,
-                out_path: string) -> Result[Status, IoError]
+                out_path: string, err_path: string) -> Result[Status, IoError]
     val (owned, ptrs) = vector_of(program, args)
     val (env_owned, names, values) = pairs_of(env)
     val d = cstring(dir)
     val o = cstring(out_path)
+    val er = cstring(err_path)
 
     var code: i32 = 0
     var sig: i32 = 0
 
-    // An empty `dir` or `out_path` is a one-byte string holding only its terminator, which the shim
-    // reads as "not asked for" -- so neither needs a null pointer and neither is optional here.
+    // An empty `dir`, `out_path` or `err_path` is a one-byte string holding only its terminator,
+    // which the shim reads as "not asked for" -- so none needs a null pointer and none is optional
+    // here.
     val e = c_run(owned.at(0).ptr, as_ptr(ptrs.elems), as_ptr(names.elems),
-                  as_ptr(values.elems), d.ptr, o.ptr, &code, &sig)
+                  as_ptr(values.elems), d.ptr, o.ptr, er.ptr, &code, &sig)
 
     if e != 0 then return Err(from_errno(e))
 
@@ -187,7 +198,7 @@ end started
  */
 run(program: string, args: []const string = [], dir: string = "",
     env: []const Var = []) -> Result[Status, IoError] =
-    started(program, args, env, dir, "")
+    started(program, args, env, dir, "", "")
 
 /** Run a program, wait for it, and collect what it wrote to its standard output.
  *
@@ -195,12 +206,40 @@ run(program: string, args: []const string = [], dir: string = "",
  * attached. The output is collected through a file rather than a pipe, which is not an
  * implementation detail worth hiding: a pipe has a buffer, and a parent that waits for a child
  * while the child waits for the parent to drain that buffer is a deadlock that only appears once
- * the output gets long enough. Nothing here can deadlock.
+ * the output gets long enough. Nothing here can deadlock, and adding a second stream does not
+ * change that -- two pipes is where the deadlock gets *easier* to reach, and two files is two
+ * files.
  *
- * The file is removed before this returns, whether the child succeeded or not.
+ * **`stderr` is what a tool reporting a failure needs, and it is off by default.** Without it a
+ * program that ran and exited non-zero says only that it failed: the reason was written to a stream
+ * this call let through to the terminal, where a tool cannot read it and a person may not be
+ * looking. Asking for it puts the message in `Output.err` and takes it *off* the terminal, which is
+ * the trade -- so a call whose output a person is watching should leave it alone, and one whose
+ * answer another program is reading should not.
+ *
+ * The files are removed before this returns, whether the child succeeded or not.
  */
-capture(program: string, args: []const string = [], dir: string = "",
-        env: []const Var = []) -> Result[Output, IoError]
+capture(program: string, args: []const string = [], dir: string = "", env: []const Var = [],
+        stderr: bool = false) -> Result[Output, IoError]
+    val out_path = temp_path()?
+    val err_path = if stderr then temp_path()? else ""
+
+    val status = started(program, args, env, dir, out_path, err_path)
+
+    // Read and removed whatever happened, so that a failed child leaves nothing behind. The read is
+    // attempted first because a child that wrote something and then failed still wrote it.
+    val text = read_text(out_path)
+    val errs = if stderr then Some(read_text(err_path).unwrap_or("")) else None
+
+    remove_file(out_path)
+
+    if stderr then remove_file(err_path)
+
+    Ok(Output(status?, text.unwrap_or(""), errs))
+end capture
+
+/** A file nothing else holds, made empty, for a child to write one of its streams into. */
+private temp_path() -> Result[string, IoError]
     var raw: []u8 = [0; 512]
 
     val made = c_temp_path(as_mut_ptr(raw), raw.len)
@@ -210,17 +249,7 @@ capture(program: string, args: []const string = [], dir: string = "",
     // The path came from `TMPDIR` and a template of this module's own; a `TMPDIR` that is not valid
     // UTF-8 is the only way this can fail, and there is no error case in `IoError` that is more
     // honest about it than the number the platform would have reported for a bad argument.
-    val path = from_cstring(as_ptr(raw)) match
-        Ok(p) -> p
-        Err(_) -> return Err(IoError.Other(22))
-
-    val status = started(program, args, env, dir, path)
-
-    // Read and removed whatever happened, so that a failed child leaves nothing behind. The read is
-    // attempted first because a child that wrote something and then failed still wrote it.
-    val text = read_text(path)
-
-    remove_file(path)
-
-    Ok(Output(status?, text.unwrap_or("")))
-end capture
+    from_cstring(as_ptr(raw)) match
+        Ok(p) -> Ok(p)
+        Err(_) -> Err(IoError.Other(22))
+end temp_path
