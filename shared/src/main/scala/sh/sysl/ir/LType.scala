@@ -97,7 +97,7 @@ enum LType {
     // at all — so this is here to be right rather than because anything reaches it.
     case Struct(Nil)     => "{}"
     case Struct(fields)  => fields.map(_.render).mkString("{ ", ", ", " }")
-    case Named(name)     => name
+    case Named(name)     => LlvmName.safeSigiled(name)
 
   /** The suffix LLVM spells an **overloaded intrinsic's** operand type with — `v4f32` in
    * `llvm.vector.reduce.fadd.v4f32`.

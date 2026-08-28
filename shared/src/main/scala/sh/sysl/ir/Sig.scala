@@ -185,10 +185,10 @@ case class FuncSig(name: String, ty: FnType, linkage: Linkage = Linkage.Default,
     val sec = section.map(s => s""" section "$s"""").getOrElse("")
 
     s"define ${linkage.prefix}${cconv.map(_ + " ").getOrElse("")}${ty.result} " +
-      s"@$name(${ty.paramList})$fn$sec"
+      s"@${LlvmName.safe(name)}(${ty.paramList})$fn$sec"
 
   /** The `declare` line. */
-  def declare: String = s"declare ${ty.result} @$name(${ty.paramList})"
+  def declare: String = s"declare ${ty.result} @${LlvmName.safe(name)}(${ty.paramList})"
 
   /** The symbol as an operand — what a call to this names. */
   def symbol: Val.Global = Val.Global(name)

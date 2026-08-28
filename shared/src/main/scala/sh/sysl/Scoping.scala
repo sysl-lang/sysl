@@ -922,15 +922,17 @@ trait Scoping extends DeclTables {
   }
 
   protected def freshName(base: String): String = {
-    /* A backtick-quoted name may hold characters LLVM will not accept in an identifier, and a local
-     * reaches the IR as `%name.addr` — so the escaping happens here, once, rather than at the
-     * several emitters that build that string.
+    /* A name may hold characters LLVM will not accept in an identifier — any letter outside ASCII,
+     * and anything at all if it was written between backticks. Making it *legal* happens at the
+     * emitter (`LlvmName.safe`, where `%name.addr` is finally written), so what is owed here is the
+     * narrower thing: `guard` marks a `$` so that two names cannot collide under that encoding.
+     * Without it `` `a b` `` and `` `a$20b` `` would be one register.
      *
      * A name the compiler made for itself is left alone, and is told by its leading separator:
-     * `$parts` and `$env0` are already safe, and running them through the escape would rewrite
-     * that separator and change IR that has not otherwise moved.
+     * `$parts` and `$env0` are already safe, and guarding them would mark that separator and
+     * change IR that has not otherwise moved.
      */
-    val safe = if base.nonEmpty && base.head == Modules.sep then base else LlvmName.escape(base)
+    val safe = if base.nonEmpty && base.head == Modules.sep then base else LlvmName.guard(base)
 
     if !used(safe) then { used += safe; safe }
     else {

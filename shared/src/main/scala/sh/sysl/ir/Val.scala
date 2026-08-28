@@ -109,8 +109,8 @@ enum Val {
   case Bytes(bytes: List[Byte])
 
   def render: String = this match
-    case Reg(name)    => s"%$name"
-    case Global(name) => s"@$name"
+    case Reg(name)    => s"%${LlvmName.safe(name)}"
+    case Global(name) => s"@${LlvmName.safe(name)}"
     case Int(v)       => v.toString
     case Float(bits)  => f"0x$bits%016X"
     case Bool(b)      => b.toString

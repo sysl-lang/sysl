@@ -347,10 +347,23 @@ trait CallAnalysis extends OperatorCalls {
                                  owner: Option[String] = None): TExpr = {
     // The key says which module's variant this is; the name inside the enum is what the enum's own
     // declaration and its instantiation both know it by.
-    val name  = Modules.split(key)._2
-    val ename = owner.orElse(variantOwnerOf(key, expected)).getOrElse(ambiguousVariant(name, key))
+    //
+    // **The declaration is matched through `LlvmName.guard`, not by string equality with the key's
+    // tail**, because `Modules.qualify` marks a `$` on the way in — the one character a name may not
+    // contribute raw, since the first `$` in a key is the module separator. Everything else a name
+    // may hold reaches the key as written, so `Otoño` and `` `late autumn` `` match themselves. A
+    // bare `.get` here crashed the compiler outright on a quoted variant in every release up to
+    // 0.0.88, since the escape that was applied at `qualify` then made the key's tail a spelling no
+    // declaration had.
+    val tail  = Modules.split(key)._2
+    val ename = owner.orElse(variantOwnerOf(key, expected)).getOrElse(ambiguousVariant(tail, key))
     val decl  = enumDecls(ename)
-    val vdecl = decl.variants.find(_.name == name).get
+    val vdecl = decl.variants.find(v => LlvmName.guard(v.name) == tail).get
+
+    // Every message below names the variant the way it was **written**, which is what a reader can
+    // type — the key's tail is a marked form and would send them looking for a name with a `$24` in
+    // it.
+    val name = vdecl.name
 
     // A variant's payload is named the same way a struct's fields are, and takes a name at the call
     // for the same reason.

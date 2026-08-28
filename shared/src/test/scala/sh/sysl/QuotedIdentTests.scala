@@ -78,9 +78,11 @@ class QuotedIdentTests extends AnyFreeSpec with Matchers with CodegenSupport wit
     }
   }
 
-  // `Modules.split` recovers a module from a key by finding its first `$`, and the escape writes
-  // `$`. That survives only because the escape can put one in after the separator and never before
-  // it — which is exactly what a quoted module segment would do.
+  // `Modules.split` recovers a module from a key by finding its first `$`, and `LlvmName.guard`
+  // marks a `$` a *name* holds. Nothing marks a module path, so a quoted segment could put a raw
+  // one before the separator and the key would name a module nobody declared. An accented segment
+  // could not — a letter is not a `$` — which is why `UnicodeIdentTests` has a nested accented
+  // module path and this refusal did not move.
   "a module path may not be quoted" - {
     "in the header" in {
       errOf(
@@ -123,10 +125,15 @@ class QuotedIdentTests extends AnyFreeSpec with Matchers with CodegenSupport wit
       run(src) shouldBe "42\n"
     }
 
-    // A bare identifier is ASCII by construction, so the escape's non-ASCII path is reachable only
-    // through quoting. One byte becomes `$XX`; a codepoint above it becomes `$uXXXXXX` per UTF-16
-    // unit, which is injective even though a supplementary character takes two of them.
-    "a name outside ASCII, which only quoting can reach" in {
+    // **This used to say "which only quoting can reach", and that stopped being true when an
+    // identifier could be written in any script** (`reference/lexical.md § Identifiers`, 0.0.89).
+    // `café` is now a name the ordinary grammar produces, and the two spellings are one name at one
+    // symbol — `UnicodeIdentTests` asserts that pair directly. What quoting still reaches alone is
+    // punctuation, spaces and a reserved word.
+    //
+    // The encoding is unchanged and is `LlvmName.safe`'s: one byte becomes `$XX`, a codepoint above
+    // it `$uXXXXXX` per UTF-16 unit.
+    "a name outside ASCII, which quoting reaches and no longer reaches alone" in {
       val src =
         """var `café` = 3
           |`café` += 1
@@ -144,6 +151,58 @@ class QuotedIdentTests extends AnyFreeSpec with Matchers with CodegenSupport wit
           |print(c.`row index`)""".stripMargin
 
       run(src) shouldBe "9\n"
+    }
+
+    // **Both of the two below crashed or refused every release up to 0.0.88, and neither had a
+    // case.** A quoted name reached its key already made LLVM-safe, so the key was a spelling no
+    // declaration had and no composition site downstream had ever seen a character worth escaping.
+    // Making an identifier writable in any script is what forced the split those two now rest on: a
+    // key is guarded (`LlvmName.guard`, `$` alone) and IR text is made safe (`LlvmName.safe`).
+    //
+    // A **method** on a quoted type composed `<type key>.<member>` with the member raw, so the
+    // define line read `define i32 @Point.is ok(...)` and clang refused the module — a link-shaped
+    // failure from a name-shaped mistake.
+    "a quoted method name, which used to emit IR that would not parse" in {
+      val src =
+        """struct Point
+          |    x: int
+          |
+          |    `is ok`(self) -> int = self.x
+          |
+          |val p = Point(3)
+          |
+          |print(p.`is ok`())""".stripMargin
+
+      run(src) shouldBe "3\n"
+    }
+
+    // And a quoted **variant** crashed the compiler outright — `None.get` out of
+    // `CallAnalysis.constructVariant`, which looked its declaration up by comparing the key's tail
+    // against the written name. Nothing about accents was needed to reach it; it is the same defect
+    // `UnicodeIdentTests` found from the other side.
+    "a quoted enum variant, which used to crash the compiler" in {
+      val src =
+        """enum Season
+          |    `late autumn`
+          |    Winter
+          |
+          |val e = Season.`late autumn`
+          |
+          |print(e == `late autumn`, e == Winter)""".stripMargin
+
+      run(src) shouldBe "true false\n"
+    }
+
+    // The collision `LlvmName.guard` exists for, and the only reason a key is not simply the name
+    // as written: `safe` writes a space as `$20`, so a name that already holds that text has to be
+    // told apart from one that does not. Two names, two symbols, two values.
+    "a name holding a dollar sign is not the name that encodes to it" in {
+      val src =
+        """var `a b` = 1
+          |var `a$20b` = 2
+          |print(`a b`, `a$20b`)""".stripMargin
+
+      run(src) shouldBe "1 2\n"
     }
   }
 

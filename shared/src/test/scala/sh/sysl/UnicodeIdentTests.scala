@@ -15,10 +15,22 @@ import org.scalatest.matchers.should.Matchers
   * the words that suffer are the domain ones — the names a reader most needs to recognise. Go, Java,
   * Scala and C# all took this road.
   *
-  * **The symbol half needed nothing**, which is the fact worth carrying: `LlvmName.escape` already
-  * wrote a non-ASCII character as `$XX` / `$uXXXXXX`, because a backtick-quoted name could already
-  * hold one. So a name that was previously reachable only by quoting is now reachable by writing it,
-  * and it lowers to exactly the symbol the quoted form always did.
+  * **The symbol half was expected to need nothing and needed a rearrangement**, which is the fact
+  * worth carrying. The encoding was already there — a quoted name could hold anything, so `$XX` /
+  * `$uXXXXXX` was written years before this — but it was applied at `Modules.qualify`, where a
+  * *key* is built, and a key is read back as a name in several places and printed in diagnostics.
+  * That was invisible while every bare identifier was ASCII, because the encoding was then the
+  * identity on all but a handful of quoted names.
+  *
+  * So the two jobs were split (`LlvmName`): a key is **guarded**, which marks a `$` alone so that
+  * `Modules.split` still finds the module separator, and IR text is made **safe** at the five
+  * renderings that write a name. **Three defects fell out of that and all three were reachable in
+  * released 0.0.88 through a quoted name** — a method whose IR would not parse, a module segment
+  * likewise, and a variant that crashed the compiler. `QuotedIdentTests` holds the cases from the
+  * other side; the accents were a second vehicle rather than the cause.
+  *
+  * A name that was previously reachable only by quoting is now reachable by writing it, and it
+  * lowers to exactly the symbol the quoted form always did.
   */
 class UnicodeIdentTests extends AnyFreeSpec with Matchers with CodegenSupport with RunSupport {
 
@@ -136,8 +148,8 @@ class UnicodeIdentTests extends AnyFreeSpec with Matchers with CodegenSupport wi
     }
 
     // The one that exercises the symbol rather than the scope: module storage is laid into the
-    // object file under a mangled name, so this is what says `LlvmName.escape` carries a bare
-    // identifier as well as it carried a quoted one.
+    // object file under a mangled name, so this is what says the encoding carries a bare identifier
+    // as well as it carried a quoted one.
     "as module storage, which is what reaches the emitted symbol" in {
       val src =
         """module contabilidad
@@ -171,6 +183,218 @@ class UnicodeIdentTests extends AnyFreeSpec with Matchers with CodegenSupport wi
         "geometría/a.sysl" -> "module geometría\n\nárea(x: int) -> int = x + 1",
         "main.sysl"        -> "import geometría.área\n\nprint(área(41))",
       ) shouldBe "42\n"
+    }
+
+    "through a nested module path, every segment of which is accented" in {
+      runOf(
+        "geometría/básica/a.sysl" -> "module geometría.básica\n\nárea(x: int) -> int = x * 2",
+        "main.sysl"               -> "import geometría.básica.área\n\nprint(área(21))",
+      ) shouldBe "42\n"
+    }
+  }
+
+  /** The composition sites, one case each.
+   *
+   * **A name reaches IR text through four renderings and no others** — a function's `define`, a
+   * function's `declare`, a global's definition, and a value naming one — plus the sigilled name of
+   * a declared LLVM type. `LlvmName.safe` sits at those five and nowhere earlier, so what these
+   * cases are really asking is whether a shape composes its name somewhere those five do not see.
+   *
+   * They are written as one case per *mechanism* rather than per feature, because the mechanism is
+   * what decides: a generic's mangled name, a vtable's slot, a variant's payload type, a closure's
+   * environment, a destructor's hook, an ownership box. Each of those builds a symbol by
+   * concatenation from a user's name, and each was unreachable while a bare identifier was ASCII.
+   */
+  "a name in any script survives every place a symbol is composed" - {
+
+    // The mangled name of an instantiation carries the type argument, so this is the one that says
+    // a generic's symbol is composed from a name and still lands somewhere `safe` can see.
+    "a generic instantiated at a type whose name is not ASCII" in {
+      val src =
+        """struct Estación
+          |    día: int
+          |
+          |primero[T](xs: []const T) -> T = xs[0]
+          |
+          |val es = [Estación(4), Estación(9)]
+          |
+          |print(primero(es).día)""".stripMargin
+
+      run(src) shouldBe "4\n"
+    }
+
+    // A trait's method reaches its implementation through a vtable slot, which is a global whose
+    // initializer names each function — so the name travels as a `Val.Global` rather than as a
+    // `define`, and the two renderings are separate lines of `LlvmName`'s.
+    "a trait, its impl and a dynamic call through the slot" in {
+      val src =
+        """trait Área
+          |    área(self) -> int
+          |
+          |struct Círculo
+          |    radio: int
+          |
+          |impl Área for Círculo
+          |    área(self) -> int = 3 * self.radio * self.radio
+          |
+          |describir(f: &Área) -> int = f.área()
+          |
+          |print(describir(Círculo(2)))""".stripMargin
+
+      run(src) shouldBe "12\n"
+    }
+
+    // **The payload type of a variant is a declared LLVM type named `%<enum>.<variant>`**, composed
+    // in `Type.scala` from the mangled enum and the variant's own name — which is the one site a
+    // nullary variant never reaches, so the case above it would have passed with this broken.
+    "an enum variant that carries a payload, which names a type of its own" in {
+      val src =
+        """enum Medida
+          |    Ancho(valor: int)
+          |    Altura(valor: int)
+          |
+          |val m = Ancho(7)
+          |
+          |print(m match
+          |    Ancho(n) -> n
+          |    Altura(n) -> n * 100)""".stripMargin
+
+      run(src) shouldBe "7\n"
+    }
+
+    // A closure's environment is a struct the compiler names, and a captured local's name is a
+    // field of it — so a body local written in another script reaches a second naming path.
+    "a closure capturing a local whose name is not ASCII" in {
+      val src =
+        """aplicar(f: () -> int) -> int = f()
+          |
+          |val año = 40
+          |
+          |print(aplicar(() -> año + 2))""".stripMargin
+
+      run(src) shouldBe "42\n"
+    }
+
+    // A destructor is reached by a hook the emitter builds rather than by anything the source
+    // writes, and the hook's name is composed from the type's — `arc.drop.<mangled>`.
+    //
+    // **The receiver has to be a `&T` for the hook to exist at all**, which is a fact about `Drop`
+    // rather than about names: a plain value's scope end runs nothing, checked against an ASCII
+    // control before this fixture was believed. Written as a `val` in a function so the release is
+    // at the dedent and the ordering is what the assertion is about.
+    "a destructor, whose hook the emitter names for the type" in {
+      val src =
+        """struct Cuentaañ
+          |    valor: int
+          |
+          |impl Drop for Cuentaañ
+          |    drop(self) = print("suelto", self.valor)
+          |
+          |hacer()
+          |    val c: &Cuentaañ = Cuentaañ(5)
+          |    print("hecho", c.valor)
+          |
+          |hacer()
+          |print("fin")""".stripMargin
+
+      run(src) shouldBe "hecho 5\nsuelto 5\nfin\n"
+    }
+
+    // `Display` is the rendering path, and an associated function is the receiverless half of
+    // member lowering — a member is named `<type symbol>.<member>` either way, and only a receiver
+    // decides which of the two lookups finds it.
+    "an impl of Display, and an associated function beside it" in {
+      val src =
+        """struct Número
+          |    valor: int
+          |
+          |    cero() -> Número = Número(0)
+          |
+          |impl Display for Número
+          |    display(self, out: *Writer, fmt: FormatSpec)
+          |        "№".display(out, fmt)
+          |        self.valor.display(out, fmt)
+          |
+          |print(Número(8), Número.cero())""".stripMargin
+
+      run(src) shouldBe "№8 №0\n"
+    }
+
+    // A `&T` is a counted box, and the retain and release the emitter inserts are named for the
+    // type they are about — a third composition site, reached only by a value that is boxed.
+    "a boxed value of a type whose name is not ASCII" in {
+      val src =
+        """struct Árbol
+          |    peso: int
+          |
+          |val a: &Árbol = Árbol(11)
+          |val b = a
+          |
+          |print(a.peso + b.peso)""".stripMargin
+
+      run(src) shouldBe "22\n"
+    }
+
+    // **A `declare` line is the one rendering a whole-program compile never reaches**, since
+    // everything it needs it also defines. What reaches it is separate compilation: a library built
+    // against another states the dependency's half rather than emitting a second copy of it
+    // (`LibraryArtifactTests`, "declares the dependency's compiled half"), and that statement is a
+    // `declare` carrying a name somebody else wrote.
+    //
+    // Written here rather than left to a fixture that could not reach it: with the encoding removed
+    // from `Sig.declare` alone, every other case in this suite stays green.
+    "a dependency's compiled half, declared rather than defined, across an artifact" in {
+      val base =
+        """module geometría
+          |
+          |área(x: int) -> int = x + 1
+          |""".stripMargin
+
+      val piel =
+        """module piel
+          |
+          |import geometría.área
+          |
+          |doble(x: int) -> int = área(área(x))
+          |""".stripMargin
+
+      val baseSource = List(Source("geometría/lib.sysl", base, List("geometría")))
+      val pielSource = List(Source("piel/lib.sysl", piel, List("piel")))
+
+      val ir =
+        LibraryArtifact.build(pielSource, Target.default, Set.empty, None, Nil, SearchPaths.none,
+          baseSource, Nil) match
+          case Left(err)     => fail(s"the dependent did not build: $err")
+          case Right((t, _)) => t
+
+      def has(kind: String, symbol: String): Boolean =
+        ir.linesIterator.exists(l => l.startsWith(s"$kind ") && l.contains(s"@$symbol("))
+
+      // The dependency is stated and not copied, and the name it is stated under is the encoded
+      // one — `geometr$eda$$e1rea`, which is what the definition in the other artifact is called.
+      // Both halves of the module key needed the encoding, which is the shape a single-module
+      // program never produces.
+      has("declare", "geometr$eda$$e1rea") shouldBe true
+      has("define", "geometr$eda$$e1rea") shouldBe false
+      has("define", "piel$doble") shouldBe true
+    }
+
+    // Module storage is laid into the object file under its own global, and an accented module
+    // makes both halves of `<module>$<name>` need the encoding rather than only the tail. This is
+    // the case the `geometría$$e1rea` failure came from, one indirection further in.
+    "module storage in an accented module, read from another module" in {
+      runOf(
+        "contabilidad/c.sysl" ->
+          """module contabilidad
+            |
+            |var contador: int = 0
+            |
+            |incrementar(cuánto: int) -> int
+            |    contador += cuánto
+            |    contador""".stripMargin,
+        "main.sysl" ->
+          "import contabilidad.incrementar\n\nprint(incrementar(5), incrementar(37))",
+      ) shouldBe "5 42\n"
     }
   }
 }

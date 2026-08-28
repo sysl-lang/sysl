@@ -32,19 +32,21 @@ object Modules {
 
   /** The key a declaration named `name` in `module` is filed under.
    *
-   * **The name is escaped here**, which is where a backtick-quoted identifier (`09`) stops being a
-   * problem for everything downstream: a key is still the emitted symbol, as the note above says,
-   * so a name carrying a space had to become LLVM-safe somewhere, and this is the one place every
-   * declaration passes through. `LlvmName.escape` is the identity on every name the ordinary
-   * identifier grammar can produce, so no key that existed before this moves.
+   * **The name is guarded here and NOT made LLVM-safe here**, and the split is what
+   * `reference/lexical.md § Identifiers` costs: a name may be written in any script and a quoted
+   * one may hold a space, so a key that had been made LLVM-safe would no longer spell the name the
+   * programmer wrote — and the analyzer compares a key's tail against a declared name in several
+   * places, and diagnostics print one. `LlvmName.guard` marks a `$` and touches nothing else;
+   * `LlvmName.safe` finishes the job at the emitter, where a name becomes IR text.
    *
-   * **`split` still recovers the module**, although the escape's marker is the separator itself.
-   * The escape can only introduce a `$` *after* the separator is written, and a module path holds
-   * no quoted segment — refused where a module path is read, precisely so that the first `$` in a
-   * key remains the one this function put there.
+   * **That is what keeps `split` working.** The module a key belongs to is everything before its
+   * first `$`, so the one character a name may not contribute raw is `$` — which the ordinary
+   * identifier grammar cannot produce and only a quoted name can. A module path holds no quoted
+   * segment, refused where a module path is read, so the first `$` in a key is always the one this
+   * function put there.
    */
   def qualify(module: String, name: String): String =
-    if module.isEmpty then LlvmName.escape(name) else s"$module$sep${LlvmName.escape(name)}"
+    if module.isEmpty then LlvmName.guard(name) else s"$module$sep${LlvmName.guard(name)}"
 
   /** The module a key belongs to, and everything after it — which for a member or an
    * instantiation is itself a dotted name (`Point.dist`, `f.int`) and is left as one.

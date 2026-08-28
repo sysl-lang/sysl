@@ -272,7 +272,8 @@ trait Literals extends TypeResolution {
     variantKey(name).exists { key =>
       variantOwners.getOrElse(key, Nil).exists { own =>
         enumDecls.get(own).exists(d =>
-          d.tparams.nonEmpty && d.variants.find(_.name == Modules.split(key)._2).exists(_.fields.isEmpty))
+          d.tparams.nonEmpty &&
+            d.variants.find(v => LlvmName.guard(v.name) == Modules.split(key)._2).exists(_.fields.isEmpty))
       }
     }
 

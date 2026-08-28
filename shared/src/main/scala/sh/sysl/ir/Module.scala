@@ -48,7 +48,7 @@ case class TypeDef(name: String, fields: List[LType], packed: Boolean = false) {
       if packed then fields.map(_.render).mkString("<{ ", ", ", " }>")
       else fields.map(_.render).mkString("{ ", ", ", " }")
 
-    s"$name = type $body"
+    s"${LlvmName.safeSigiled(name)} = type $body"
 
   override def toString: String = render
 }
@@ -71,7 +71,7 @@ case class Global(name: String, constant: Boolean, ty: LType, value: Option[Val]
     val sec  = section.map(s => s""", section "$s"""").getOrElse("")
     val at   = align.map(n => s", align $n").getOrElse("")
 
-    s"@$name = ${linkage.prefix}$kind ${ty.render}$init$sec$at"
+    s"@${LlvmName.safe(name)} = ${linkage.prefix}$kind ${ty.render}$init$sec$at"
 
   override def toString: String = render
 }

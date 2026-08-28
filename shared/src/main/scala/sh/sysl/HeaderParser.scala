@@ -18,9 +18,12 @@ trait HeaderParser extends AttrParser {
    * Two reasons, and the second is the load-bearing one. A module names a *directory*
    * (`reference/modules.md`), so a path is the one name that is not purely the programmer's to
    * choose. And `Modules.split` recovers a module from a key by finding its **first** `$` — an
-   * invariant that survives quoting only because the escape `Modules.qualify` applies can introduce
-   * a `$` after the separator and never before it. A quoted module segment would put one before it,
-   * and the key would be read as belonging to a module nobody declared.
+   * invariant that holds only because the one character a name may not contribute raw is `$`, which
+   * `Modules.qualify` marks on the way in and which nothing marks on a module path. A quoted module
+   * segment could hold one, and the key would then be read as belonging to a module nobody
+   * declared. **This survived the identifier grammar opening up to every script**
+   * (`reference/lexical.md § Identifiers`): a letter in any script is not a `$`, so `geometría` is a
+   * module path like any other and only quoting was ever the risk.
    */
   protected lazy val modulePath: Parser[List[String]] =
     rep1sep(
