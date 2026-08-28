@@ -437,8 +437,39 @@ class SyslLexical
   private def isBinDigit(c: Char): Boolean = c == '0' || c == '1'
   private def isOctDigit(c: Char): Boolean = c >= '0' && c <= '7'
 
-  private def isIdentStart(c: Char): Boolean = c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-  private def isIdentPart(c: Char): Boolean  = isIdentStart(c) || isDigit(c)
+  /** What may begin a name: `_`, or any character Unicode calls a letter.
+   *
+   * **`café`, `año`, `μ` and `名前` are names, and that is a readability decision rather than an
+   * internationalisation one.** A language whose identifiers are ASCII asks everybody who does not
+   * think in English to transliterate their own vocabulary, and the words that suffer most are the
+   * domain ones — the very names a reader needs to recognise. Go, Java, Scala and C# all took this
+   * road; the ASCII rule here was never argued for, it was what `>= 'a' && <= 'z'` happened to say.
+   *
+   * **One predicate rather than a list of ranges**, which is what makes it a rule rather than a
+   * table somebody extends every time a script is asked for. `Character.isLetter` is Unicode's own
+   * answer and it moves with the JDK's Unicode version rather than with this file.
+   *
+   * The ASCII test is first because it is what almost every character is, and `isLetter` is a table
+   * lookup; the two agree on `a`–`z` and `A`–`Z`, so the fast path changes no answer.
+   *
+   * **It is BMP-only, and that is a real edge rather than an oversight.** A `Char` is one UTF-16
+   * unit, so a letter above U+FFFF arrives as a surrogate pair and `isLetter` answers false for
+   * either half — the character is refused as illegal. Every living script's letters are inside the
+   * BMP, CJK Unified Ideographs included; what is outside is historic scripts and the CJK extension
+   * planes. Scala's own lexer draws the line in the same place and for the same reason.
+   */
+  private def isIdentStart(c: Char): Boolean =
+    c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || Character.isLetter(c)
+
+  /** What may continue one: anything that may begin it, plus a digit.
+   *
+   * `Character.isDigit` rather than the ASCII test, so that a name written in a script with its own
+   * digits can use them — `caf٣` is a name where `٣` alone is not, since a digit may not *begin*
+   * one. The number **literal** grammar is deliberately unmoved: `isDigit` above is ASCII and stays
+   * ASCII, because a literal is a value the machine has to read and `٣` is not a spelling of three
+   * that any of this compiler's arithmetic knows.
+   */
+  private def isIdentPart(c: Char): Boolean = isIdentStart(c) || isDigit(c) || Character.isDigit(c)
 
   private def takeWhile(in: Reader[Char], pred: Char => Boolean): (String, Reader[Char]) = {
     val buf = new StringBuilder
