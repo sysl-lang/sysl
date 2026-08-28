@@ -165,8 +165,15 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * where `date_at` answers with a day count. Four cases, and two of them assert `date_at`'s
    * *unchecked* answer, since what the pair is for is that the walk keeps its arithmetic. Measured,
    * no slack.
+   *
+   * Raised to **554** for `display_real_shortest`, a `real` at the shortest precision that reads
+   * back equal. Five cases, and they sit in `sysl.text`'s file rather than the root module's for two
+   * reasons: the property is a **round trip** and the other half of it is `parse_real`, and the root
+   * module may not import a submodule at all, tests included -- `library/sysl` declares `sysl`, so
+   * `import sysl.buf.byte_sink` in a `@tests` file beside it is refused as a cycle. Measured, no
+   * slack.
    */
-  private val floor = 549
+  private val floor = 554
 
   /** The library, compiled as a **test build of itself**.
    *

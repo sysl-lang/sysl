@@ -1,6 +1,9 @@
 module sysl.text
 @tests
 
+import sysl.buf.byte_sink
+import sysl.math.Float
+
 // What `sysl.text` promises, asserted in sysl.
 //
 // These are the clearest case for a library test rather than a Scala one: every claim below is about
@@ -375,3 +378,71 @@ chars_over_valid_text()
     assert_eq(cs.next(), None)
     assert_eq(chars_of("aé世\u{1F600}".bytes).count(), 4)
 end chars_over_valid_text
+
+// -- the shortest rendering of a real ----------------------------------------------------------------
+
+// `display_real_shortest` is the root module's, and its cases are here because what it promises is a
+// **round trip** -- and the other half of that trip is `parse_real`, three hundred lines up this
+// module. A rendering asserted against a literal string says only that this library agrees with
+// itself; asserted against the reader a consumer will use, it says the value survives.
+
+private shortest(x: real) -> string
+    var sink = byte_sink()
+
+    display_real_shortest(x, &sink, FormatSpec(0, -1, false))
+    from_utf8(sink.text()).unwrap()
+
+// The values that matter are the ones a fixed precision breaks in each direction: six digits -- the
+// default, and what `str` shows a person -- loses 3.141592653589793, and seventeen would spell 0.1
+// with noise on the end.
+@test("a real renders at the shortest precision that reads back equal")
+real_renders_shortest()
+    assert_eq(shortest(3.141592653589793), "3.141592653589793")
+    assert_eq(shortest(0.1), "0.1")
+    assert_eq(shortest(0.5), "0.5")
+    assert_eq(shortest(1.0 / 3.0), "0.3333333333333333")
+
+// The value `str` shows a person, beside the one a document has to carry. They are different
+// renderings of one number on purpose -- six significant digits is a reasonable thing to print and a
+// broken thing to serialize -- and this is the case that says the default did not move.
+@test("and str still renders the six digits a person reads")
+str_is_unchanged()
+    assert_eq(str(3.141592653589793), "3.14159")
+
+// Fifteen digits round-trips most reals and not all of them, which is the whole reason the search
+// has three steps rather than one. 0.1 needs no more than one digit and 1/3 needs sixteen; the
+// assertion here is the property itself, over values chosen to reach each step.
+private assert_round_trip(x: real)
+    val same = parse_real(shortest(x)) match
+        Ok(back) -> back == x
+        Err(_) -> false
+
+    assert(same, "a real did not survive its own shortest rendering")
+
+@test("every rendering parses back to the value it came from")
+real_round_trips()
+    assert_round_trip(0.1)
+    assert_round_trip(1.0 / 3.0)
+    assert_round_trip(2.0 / 3.0)
+    assert_round_trip(1.7976931348623157e308)
+    assert_round_trip(5e-324)
+    assert_round_trip(-1234.56789012345)
+    assert_round_trip(0.0)
+
+// `%g` chooses the exponent form for a value whose plain decimal would be long, and this function
+// leaves that choice where it found it: it decides the precision and nothing else. A `1` with no
+// point in it is the same fact one step smaller -- writing a number a format's reader will take as
+// an integer is that format's problem, not the number's.
+@test("the exponent form and a whole number are left as %g spells them")
+real_keeps_its_form()
+    assert_eq(shortest(1e300), "1e+300")
+    assert_eq(shortest(1.0), "1")
+
+// A value with no decimal reading never compares equal to anything, so the loop cannot stop early
+// and the seventeen-digit rendering is what comes out. That it is `%g`'s spelling rather than a
+// name this library chose is deliberate: a format that wants `null` here is writing its own syntax.
+@test("an infinity and a NaN fall through the search")
+real_non_finite()
+    assert_eq(shortest(real.infinity()), "inf")
+    assert_eq(shortest(-real.infinity()), "-inf")
+    assert_eq(shortest(real.nan()), "nan")
