@@ -477,6 +477,91 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  /** `call` is `*self` on every arity of the call trait, because a closure captures by value and one
+   * that counts has to write its own copy. That mode asks a call for a *place*, so a closure bound
+   * with `val` used to be refused for being written once — a name only ever read, told it was meant
+   * to change.
+   *
+   * A body that writes none of its captures emits no store, so the address the receiver takes is
+   * used for reading and the refusal protected nothing. These hold both halves: the reading closure
+   * is called on a `val`, and the counting one still is not.
+   */
+  "a 'val' holds a closure that only reads its captures" - {
+
+    "one that captures nothing is called" in {
+      run("""val double = (x: int) -> x * 2
+            |
+            |print(double(3))
+            |""".stripMargin) shouldBe "6\n"
+    }
+
+    "one that reads a capture is called" in {
+      run("""var k = 10
+            |val add = (x: int) -> x + k
+            |
+            |print(add(3))
+            |""".stripMargin) shouldBe "13\n"
+    }
+
+    // The case that filed the card, from `library/sysl/path/tests.sysl`: a closure named to be used
+    // twice, never reassigned, and `var` was the only word that would take it.
+    "one named to be used twice" in {
+      run("""val twice = (s: string) -> s + s
+            |
+            |print(twice("ab"), twice("cd"))
+            |""".stripMargin) shouldBe "abab cdcd\n"
+    }
+
+    // **The half that must keep failing.** A closure captures by value and carries its own mutable
+    // copy, so calling this one writes through the receiver — which is exactly what `*self` is for,
+    // and what a `val` cannot supply.
+    "and one that WRITES a capture is still refused, naming the binding" in {
+      err("""var n = 0
+            |val bump = () ->
+            |    n += 1
+            |    n
+            |
+            |print(bump())
+            |""".stripMargin) should include("write 'var bump'")
+    }
+
+    // The counting closure is the reason the mode is `*self` at all (`library/sysl/iter.sysl`), so
+    // it is pinned here rather than left to the refusal above: the captures are the closure's own
+    // copies, and the variable they were taken from does not move.
+    "a counting closure still counts, and does not touch what it captured" in {
+      run("""var n = 0
+            |
+            |var bump = () ->
+            |    n += 1
+            |    n
+            |
+            |print(bump(), bump(), bump(), n)
+            |""".stripMargin) shouldBe "1 2 3 0\n"
+    }
+
+    // A boxed callable is a `&Fn`, dispatched on the trait's own declaration where `call` stays
+    // `*self` for every closure alike — so this path is untouched by the relaxation and the box is
+    // what supplies the place.
+    "a boxed callable in a 'val' is unaffected" in {
+      run("""val g: &Fn(int) -> int = (x) -> x * 2
+            |
+            |print(g(3))
+            |""".stripMargin) shouldBe "6\n"
+    }
+
+    // **The case no spelling reached before.** `&Fn` is a box, so the annotation above is refused
+    // where there is no allocator — which left a freestanding target with no way at all to bind a
+    // closure to an immutable name and call it. The bare closure needs none.
+    "and the reading closure is callable where there is no allocator" in {
+      ir("""@no_alloc
+           |
+           |val double = (x: int) -> x * 2
+           |
+           |print(double(3))
+           |""".stripMargin) should include("@main")
+    }
+  }
+
   "how a call on one goes wrong" - {
     "too few arguments" in {
       err("""var f: &Fn(int, int) -> int = (a, b) -> a + b

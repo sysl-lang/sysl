@@ -228,7 +228,25 @@ trait CallAnalysis extends OperatorCalls {
           //
           // The message names the *member*, because the write is not here: the caller wrote a call
           // and the assignment is a line inside somebody else's body.
-          if readOnly(place) then
+          // **A closure that only reads its captures is called on a `val`**, because the address a
+          // `*self` receiver takes is used for reading and the store the rule exists to refuse is
+          // one the body does not contain (`DeclTables.readOnlyClosures`). Without this a name that
+          // is only ever read is refused for being written once, which is the reader's own program
+          // described back to them wrongly.
+          //
+          // It is asked of the **concrete** receiver, which is the only place it can be answered: a
+          // call through `&Fn(...)` is dispatched on the trait's declaration, where `call` is
+          // `*self` for every closure alike and the box supplies the place.
+          //
+          // The set is filled where the closure is lowered, which is before anything can name it —
+          // a closure has to be bound before it is called. An entry that is somehow not there yet
+          // costs the old refusal rather than a wrong answer, so the order is a property to rely on
+          // and not one to depend on.
+          val readsOnly = member == "call" && (Type.underlying(place.ty) match
+            case s: Type.Struct => readOnlyClosures(s.base)
+            case _              => false)
+
+          if readOnly(place) && !readsOnly then
             // **The message says what to write**, because one `val` produces one of these per
             // mutating call — a five-line program that binds a table with `val` gets five, and
             // every one of them is about the same word. Naming the binding is what makes the fix

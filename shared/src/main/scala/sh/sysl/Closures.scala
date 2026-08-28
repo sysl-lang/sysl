@@ -112,6 +112,43 @@ object Closures {
    */
   def mentioned(name: String): Boolean =
     name.split('.').exists(part => part.startsWith(prefix) || part.startsWith(envPrefix))
+
+  /** Whether a lowered closure body ever **writes** through the environment it was handed.
+   *
+   * A closure captures by value (`reference/expressions.md § Closures`), so its captures are fields
+   * of its own struct and a write to one is a store reaching `self`. That makes this the question
+   * `call`'s receiver mode is really about: a body that only reads its captures needs the address
+   * for nothing but reading, and asking a caller for a place it may write is asking for something
+   * the body will not use.
+   *
+   * **Asked of the typed tree, for the reason `Purity`'s question is** — a write is a *node*, and
+   * the four below are all of them, so a fifth added later is visibly absent from this list rather
+   * than silently missing from a condition spread across the analyzer.
+   *
+   * A closure nested inside this one is lowered separately and carries its own `self`, so its body
+   * is not walked here and its writes are its own.
+   */
+  def writesEnvironment(body: Any): Boolean = {
+    def reachesSelf(place: TExpr): Boolean = place match
+      case TLoad("self", _)      => true
+      case TDeref(inner, _)      => reachesSelf(inner)
+      case TField(recv, _, _)    => reachesSelf(recv)
+      case TIndex(recv, _, _)    => reachesSelf(recv)
+      case TSlice(base, _, _, _, _) => reachesSelf(base)
+      case _                     => false
+
+    def walk(x: Any): Boolean = x match
+      case _: Type                     => false
+      case TStore(place, _, _)         => reachesSelf(place)
+      case TUpdate(place, _, _, _, _, _) => reachesSelf(place)
+      case TIncDec(place, _, _, _, _)  => reachesSelf(place)
+      case TVecStore(recv, _, _)       => reachesSelf(recv)
+      case xs: Iterable[?]             => xs.exists(walk)
+      case p: Product                  => p.productIterator.exists(walk)
+      case _                           => false
+
+    walk(body)
+  }
 }
 
 trait Closures extends CallAnalysis {
@@ -229,6 +266,13 @@ trait Closures extends CallAnalysis {
 
     closureFuncs += func
     funcInsts(name) = (func.params.map((n, t) => (n, t)), ret)
+
+    // Asked once, here, where the body has just been analyzed and before anything can call it.
+    // What it decides is whether a `val` holding this closure may be called (`DeclTables`), which is
+    // a property of the body rather than of any call site — so a closure that only reads answers the
+    // same at every one of them.
+    if !Closures.writesEnvironment(func.body) then readOnlyClosures += struct.base
+
     registerCallTrait(struct, ptypes, ret, pos)
 
     // Every capture is read where the closure is *formed* (`reference/expressions.md § Closures`),

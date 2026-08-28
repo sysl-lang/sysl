@@ -459,6 +459,22 @@ trait DeclTables extends Reporting {
    */
   protected val memberDecls = mutable.LinkedHashMap.empty[(String, String), MethodDecl]
 
+  /** The closure structs whose `call` reads its environment and never writes it
+   * (`Closures.writesEnvironment`).
+   *
+   * `call` is declared `*self` on every arity of the call trait, because a closure captures by
+   * value and one that counts has to be able to write its own copy. That mode is what a *place*
+   * is asked for at a call, so a closure bound with `val` could not be called at all — a name only
+   * ever read, refused for being written once.
+   *
+   * A body that writes none of its captures emits no store, so the address a `*self` receiver takes
+   * is used for reading and nothing else, and the refusal protects nothing. This set is what lets
+   * the check say so. It holds **concrete** closure structs only: a call through `&Fn(...)` is
+   * dispatched on the trait's own declaration, where the mode stays `*self` for every closure alike
+   * and the box supplies the place.
+   */
+  protected val readOnlyClosures = mutable.Set.empty[String]
+
   /** Every member a type has under one **source** name, where more than one implementation of one
    * trait gave it one — keyed by (type name, the name as written) and holding the names those
    * members are actually filed under, in source order.
