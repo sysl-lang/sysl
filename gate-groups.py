@@ -19,18 +19,16 @@ chunk, wedges it, and is killed and named in the summary as the last suite that 
 That is the failure being designed for rather than prevented, which is the honest arrangement when
 the classification cannot be computed.
 
-**There are two ways to give a suite a group, and they answer different questions.** `HEAVY`
-isolates *and* serializes -- one agent -- which is what a suite that builds for every target needs.
-`ALONE` gives a suite a chunk of its own at the ordinary chunk settings, which is what a suite whose
-cost is *retention in a shared agent* needs, and it keeps the three-way parallelism that `HEAVY`
-takes away. Putting a memory-bound suite in `HEAVY` costs the wall clock for nothing, which is a
-mistake this file has now made once and recorded beside `ALONE`.
+**A suite that needs a group needs `HEAVY`, and there is deliberately no second kind.** A middle
+setting was tried on 2026-08-28 -- a chunk of one at the light heap, for a suite whose cost looked
+like retention rather than isolation -- and it OOM'd, because a suite big enough to want its own
+group is big enough to want the big heap too. `HEAVY` is the answer; what the episode changed is
+`run-gate.sh`, which now gives each of them a group rather than one between them.
 
 What this file does do is print the suites that iterate the registry and are not classified either
 way, as candidates worth measuring -- advisory only, and deliberately not acted on.
 
-Emits `heavy.json` and `chunks.json` into the output directory. An `ALONE` suite is a chunk of one
-rather than a third file, so `run-gate.sh` needs no group kind for it.
+Emits `heavy.json` and `chunks.json` into the output directory.
 """
 
 import json
@@ -40,45 +38,34 @@ import sys
 
 # Measured on an 18-core, 64 GB machine, 2026-08-08: each of these wedges a chunk that four agents
 # share at 12g, and passes alone at 24g. They are **serialized** as well as isolated -- one agent --
-# which is what a suite that builds for every target needs and is only affordable because the four
-# together are about thirty seconds.
+# which is what a suite that builds for every target needs.
+#
+# **THE "about thirty seconds" THIS COMMENT USED TO CLAIM IS SIX RELEASES STALE.** Measured
+# 2026-08-28 at `SYSL_RELEASE=1`, one group each: `CrossTargetBuildTests` 118 tests in **9:00**,
+# `NoAllocEmissionTests` 6 tests in **7:10** (seventy-two seconds a test), `QemuHarnessTests` 30 in
+# **9:17**, `QemuRunTests` 61 in **2:09**. The four are ~27 minutes between them, against a "4:15 for
+# all four" recorded at 0.0.79 three days earlier. Nothing here caused it and nothing here can see
+# it; what the spread tracks is how often a suite compiles the standard library *per target*, which
+# is the same property this list is defined by.
+#
+# `ConditionalTests` joined 2026-08-28, card `0324`. **It took two wrong answers to get here and both
+# are worth knowing**, because each looked right:
+#
+#   - It was put here first, and the next gate's combined heavy group ran **19 minutes with `oom=0`**
+#     against a 900-second limit. That looked like the wrong home and was the wrong *grouping*:
+#     `run-gate.sh` ran all five in one `sbt`, so `LIMIT` was a budget for the set. Fixed there.
+#   - It was then given a chunk of its own at the light settings, on the reading that its cost was
+#     retention rather than a need to be alone. **That OOM'd**: 16g is not enough for it whatever
+#     else is in the agent, so the light heap was never the answer.
+#
+# What it actually needs is this list's settings, in a group of its own: **89 tests, 11:58, at 24g
+# and one agent**, measured as that chunk's retry. That fits the 900-second limit with about three
+# minutes to spare, which is thin -- if it grows, raise `LIMIT` rather than re-deriving this.
 HEAVY = {
     'sh.sysl.CrossTargetBuildTests',
     'sh.sysl.QemuRunTests',
     'sh.sysl.QemuHarnessTests',
     'sh.sysl.NoAllocEmissionTests',
-}
-
-# **A suite that needs a chunk to ITSELF, at the ordinary chunk settings.** It is the third answer
-# between `HEAVY` and a shared chunk, and it exists because the two questions a group settles are
-# different ones: `HEAVY` isolates *and* serializes, and a suite whose problem is only memory pays
-# the serialization for nothing.
-#
-# **`sh.sysl.ConditionalTests` is the case, and getting it wrong first is what found the
-# distinction** (card `0324`). Its chunk announced an OOM and was retried alone on **all three** full
-# gates of the 0.0.86 release -- the evidence a single retry does not give, since a group needing the
-# recovery across successive runs is over budget rather than unlucky. The three suites those
-# summaries named were bystanders: `last suite:` is whatever was running when the heap ran out, and
-# it differed each time (`EscapeClaimTests`, `StdCacheBoundTests`, `ImplGenericRunTests`), which is
-# what said the *chunk* was the finding.
-#
-# It was put in `HEAVY` first and the next gate reported the mistake: the combined heavy group ran
-# **19 minutes with `oom=0`** against a 900-second limit, where the four alone are about thirty
-# seconds. So at one agent this suite is past fourteen minutes even at `SYSL_RELEASE=1`, and inside
-# an ordinary chunk it finishes -- because there its tests spread across three agents. **Its cost is
-# retention in a shared agent, not a need to run alone in time.**
-#
-# Why it is expensive at all is the reason `HEAVY`'s docstring gives for the others, and it is a
-# property of the source rather than a timing: `Std.parsed(t)` and `Std.decls(t)` parse and analyze
-# the standard library **once per target**, and its `run(...)` cases compile and link beside that.
-# Growth is monotonic per agent within one `sbt`, so what it leaves behind is what the suites sharing
-# its agent then run out of.
-#
-# **A DEBUG BINARY IS NOT THE GATE'S BINARY, AND ONE MEASUREMENT HERE WAS TAKEN AGAINST ONE.** A
-# `syslNative/testOnly` run without `SYSL_RELEASE=1` links the unoptimized compiler, so figures from
-# it -- 12.1 GB resident and past twelve minutes, quoted here for a day -- say nothing about a gate.
-# Set `SYSL_RELEASE=1` when timing anything this file is going to record.
-ALONE = {
     'sh.sysl.ConditionalTests',
 }
 
@@ -275,14 +262,12 @@ def main():
     found = suites(root)
 
     heavy = sorted(HEAVY & found.keys())
-    alone = sorted(ALONE & found.keys())
-    light = sorted(found.keys() - set(heavy) - set(alone))
+    light = sorted(found.keys() - set(heavy))
 
-    for name in sorted((HEAVY | ALONE) - found.keys()):
-        print(f'  WARNING: {name} is recorded as needing a group but no longer exists -- prune it.')
+    for name in sorted(HEAVY - found.keys()):
+        print(f'  WARNING: {name} is recorded as heavy but no longer exists -- prune it.')
 
-    unclassified = ({n for n, src in found.items() if ITERATES.search(src)}
-                    - HEAVY - ALONE - LIGHT_SWEEPERS)
+    unclassified = {n for n, src in found.items() if ITERATES.search(src)} - HEAVY - LIGHT_SWEEPERS
 
     for name in sorted(unclassified):
         print(f'  NOTE: {name} iterates the target registry and has not been measured.')
@@ -290,13 +275,9 @@ def main():
     if unclassified:
         print('        Not acted on: iterating is not what makes a suite heavy. If a chunk times')
         print('        out the summary names the suite; if it OOMs across successive runs the chunk')
-        print('        is the finding. HEAVY if it needs one agent, ALONE if it needs the pool.')
+        print('        is the finding, and the suite belongs in HEAVY.')
 
-    # **An `ALONE` suite is a chunk of one, at the front.** It needs no group kind of its own in
-    # `run-gate.sh` and no second set of settings: a chunk already runs at the light heap and the
-    # light agent count, which is exactly what this wants -- the whole agent pool, and nobody else's
-    # retention in it. Placed first so a reader sees it before forty ordinary chunks.
-    chunks = [[name] for name in alone] + deal(light)
+    chunks = deal(light)
 
     os.makedirs(out, exist_ok=True)
     json.dump(heavy, open(os.path.join(out, 'heavy.json'), 'w'), indent=1)
@@ -307,9 +288,8 @@ def main():
     # measured size has the warning that was missing for four releases.
     widest = max((len(c) for c in chunks), default=0)
 
-    print(f'  {len(found)} suites: {len(heavy)} serialized alone, {len(alone)} in a chunk of one, '
-          f'{len(light)} in {len(chunks) - len(alone)} chunks of at most {widest} '
-          f'(target {SUITES_PER_CHUNK})')
+    print(f'  {len(found)} suites: {len(heavy)} run alone, '
+          f'{len(light)} in {len(chunks)} chunks of at most {widest} (target {SUITES_PER_CHUNK})')
 
 
 if __name__ == '__main__':

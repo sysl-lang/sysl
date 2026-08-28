@@ -324,9 +324,10 @@ print "$WATCHDOG_OUT" | tee -a "$SUMMARY"
 # the tree. A heavy suite is heavy because it builds for every target; five of them serially at one
 # agent is five times that, and there is no number for `LIMIT` that is right for both one and five.
 #
-# **That suite did not belong in `HEAVY` and is now `ALONE`**, which is the other half of the same
-# finding -- see `gate-groups.py`. This change stands on its own regardless: the four that remain
-# still share a budget meant for one, and the next promotion would hit the same wall.
+# **It does belong in `HEAVY`, and this is the change that makes that true** -- see the measurements
+# beside that list. On its own it is 11:58, which fits the limit; sharing one with four suites that
+# now cost 27 minutes between them, it could not. The four already there were most of the way to the
+# limit before a fifth was ever proposed.
 #
 # Per suite, the limit means what it says again, and a sixth costs its own budget rather than
 # everyone else's.
