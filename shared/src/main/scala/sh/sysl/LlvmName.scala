@@ -4,9 +4,10 @@ package sh.sysl
  *
  * An LLVM identifier admits `[-A-Za-z$._0-9]` and nothing else. A sysl identifier is a letter or
  * `_` followed by letters, digits and `_` — where *letter* is Unicode's answer rather than ASCII's
- * (`reference/lexical.md § Identifiers`) — and a backtick-quoted name (`reference/lexical.md §
- * A name between backticks`) may hold anything but a backtick, a newline and a `.`. So a space, a
- * `+`, an `á` or a `名` all reach the emitter and would produce IR that does not parse.
+ * (`reference/lexical.md § Identifiers`) — and a backtick-quoted name
+ * (`reference/lexical.md § Quoted identifiers`) may hold anything but a backtick, a newline and a
+ * `.`. So a space, a `+`, an `á` or a `名` all reach the emitter and would produce IR that does not
+ * parse.
  *
  * ==Two jobs, and keeping them apart is the whole of this file==
  *
@@ -72,7 +73,7 @@ object LlvmName {
    * **This one takes a MANGLED name and is applied at the emitter**, which is the difference from
    * [[guard]]: it leaves a `$` exactly where it found it, so a separator survives and so does a
    * mark [[guard]] already wrote. Applying it twice changes nothing, which is what lets it sit at
-   * the four places a name becomes IR text rather than at the many places names are composed.
+   * the handful of places a name becomes IR text rather than at the many places names are composed.
    *
    * **An ordinary name passes through untouched**, which is the property that matters most: every
    * symbol this compiler has ever emitted keeps the spelling it had, so `reference/modules.md §

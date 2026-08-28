@@ -61,6 +61,20 @@ class GrammarTests extends AnyFreeSpec with Matchers {
     """[a-z_]{2,}""".r.findAllMatchIn(text).map(_.matched).toSet
   }
 
+  /** The `match` patterns of a section, compiled — which is the other question this file can ask of
+    * the grammar and did not until 2026-08-28: whether a pattern **matches** what it claims to,
+    * rather than which words appear inside one.
+    *
+    * The JSON holds each one doubly escaped, so `\\b` in the file is `\b` in the pattern, and one
+    * `replace` is the whole of the decoding. Compiled with `java.util.regex`, which is what juicer
+    * uses for a TextMate grammar — so `\p{L}` means here what it means on the published page.
+    */
+  private def patterns(name: String): List[scala.util.matching.Regex] = {
+    val field = """"match"\s*:\s*"((?:[^"\\]|\\.)*)"""".r
+
+    field.findAllMatchIn(section(name)).map(m => m.group(1).replace("\\\\", "\\").r).toList
+  }
+
   private lazy val asKeyword: Set[String] = styledIn(section("keyword"))
 
   /** `true`, `false` and `null` are reserved words that the grammar styles as constants rather than
@@ -129,6 +143,37 @@ class GrammarTests extends AnyFreeSpec with Matchers {
         case Left(err) => fail(s"the grammar does not parse: $err")
         case Right(highlighter) =>
           highlighter.highlight("val x = 1") should include("""<span class="hl-keyword">val</span>""")
+    }
+    // **The reconciliation above is about WORDS, and the grammar also carries identifier PATTERNS
+    // that nothing checked.** A pattern is an ASCII character class in a language whose identifiers
+    // are Unicode's letters (`reference/lexical.md § Identifiers`), and what that produces is a page
+    // where `struct Círculo` renders as an unstyled word — a thing that looks like a line with
+    // little to highlight rather than like a fault, which is the same failure the reserved-word half
+    // exists for, one construct over.
+    //
+    // Asserted against `java.util.regex`, which is what juicer compiles these with.
+    "matches a declaration, a call and a type whose name is not ASCII" in {
+      // **What is asserted is the WHOLE name and not that something matched**, which is the
+      // difference between a real check and one that cannot fail here. An ASCII class matches
+      // `struct C` and stops at the accent, so a `findFirstIn` answers `Some` on a pattern that
+      // styles one letter of the name — checked by reverting each class and watching this go red.
+      def spans(section: String, sample: String, name: String): Boolean =
+        patterns(section).exists(_.findFirstMatchIn(sample).exists(_.matched.endsWith(name)))
+
+      spans("declaration", "struct Círculo", "Círculo") shouldBe true
+      spans("declaration", "end Círculo", "Círculo") shouldBe true
+      spans("declaration", "área(ancho: real)", "área") shouldBe true
+      spans("call", "área(3.0)", "área") shouldBe true
+      spans("type", "Círculo", "Círculo") shouldBe true
+    }
+
+    // The other direction, so the classes above cannot be widened into matching anything at all: a
+    // digit still does not begin a name, in any script.
+    "and still refuses a name beginning with a digit" in {
+      val started =
+        patterns("declaration").exists(_.findFirstMatchIn("struct 3café").exists(_.matched.contains("3")))
+
+      started shouldBe false
     }
   }
 }
