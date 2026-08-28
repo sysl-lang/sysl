@@ -78,9 +78,18 @@ class GrammarTests extends AnyFreeSpec with Matchers {
     * with it (`71436553`) is what left this list behind. That commit brought `grammars/` into line
     * with the site's copy and turned this half of the reconciliation red on dev; the words are soft
     * keywords in fact, so the list is what was wrong.
+    *
+    * **`become` joined them in 0.0.86 and the same thing happened again**, which is what makes this
+    * a pattern rather than one stale line. `StmtParser.becomeStmt` reads the word with `softWord`,
+    * so it is soft by construction — a variable and a function may both still be called `become`.
+    * The grammar was taught to colour it and this list was not, and the two are in different files
+    * *and different repositories*: `sysl.sh` carries a copy of the grammar with a `soft` set of its
+    * own, so a word can be right in three places and wrong in the fourth. Adding a soft keyword
+    * means editing the grammar here, this set, and the site's `GrammarTests` — and CI diffs the two
+    * grammar files against each other, so the copy is the half that announces itself.
     */
   private val soft =
-    Set("is", "not", "invariant", "new", "within", "where", "with", "opaque", "derives")
+    Set("is", "not", "invariant", "new", "within", "where", "with", "opaque", "derives", "become")
 
   "the highlighting grammar" - {
 
