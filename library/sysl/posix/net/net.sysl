@@ -1,0 +1,371 @@
+module sysl.posix.net
+@requires(posix)
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{IoError, from_errno}
+import sysl.slices.{as_mut_ptr, as_ptr}
+import sysl.text.{cstring, from_cstring}
+
+// Blocking TCP, and the names a host and a service resolve to.
+//
+// **It is `sysl.posix.net` rather than `sysl.net`, and the namespace is a promise about the shape.**
+// The library has two conventions and the rule that separates them is visible in one pair:
+// `sysl.term` is the portable surface sysl invented over a terminal, and `sysl.posix.tty` is
+// `termios` presented as `termios`. Everything under `sysl.posix` keeps the underlying API's own
+// vocabulary. So this is `socket`, `bind`, `listen`, `accept`, `connect`, `send`, `recv`,
+// `shutdown` and `close`, in that order and with those meanings, and it is deliberately **not** a
+// `TcpStream`.
+//
+// **A portable `sysl.net` comes later, over this, and doing it in that order is the point.** POSIX
+// made every decision this module needs forty years ago, so mirroring it cannot guess wrong -- and a
+// module that cannot guess wrong is one that can be frozen. What a *portable* address is, what a
+// portable error is, how a timeout is spelled, whether a listener is a type or a function: those are
+// guesses, and they want real consumers before anything is fixed. Adding a module later is free.
+//
+// ## Blocking, and only blocking
+//
+// Every call here returns when its work is done. There is no event loop, no non-blocking mode and
+// no readiness notification, and that is the same line Rust draws -- `std::net` is blocking and
+// every async runtime is a package outside it. `sysl-lang/libuv` is where the event-loop story
+// lives, and the two compose: a program that wants one uses the package, and a program that wants a
+// straight line uses this.
+//
+// **A timeout is the one thing a blocking call cannot do without**, because otherwise "returns when
+// the work is done" can mean never. `read_timeout` and `write_timeout` are what bound it, and a call
+// that hits one answers an error `timed_out` recognises.
+//
+// ## What is deliberately out
+//
+// UDP, multicast, unix domain sockets, non-blocking mode, and every socket option beyond the timeout
+// and the one a listener needs. All of them are **additive**, so leaving them out costs a later
+// release nothing; guessing at them now would fix a shape before anybody has used one.
+
+private extern "sysl_net_resolve" c_resolve(host: *u8, service: *u8, passive: int,
+                                            out: *u8, lens: *i32, max: int, count: *i32) -> int
+private extern "sysl_net_family" c_family(addr: *u8) -> int
+private extern "sysl_net_text" c_text(addr: *u8, len: int, out: *u8, n: usize, port: *i32) -> int
+private extern "sysl_net_socket" c_socket(addr: *u8, fd: *i32) -> int
+private extern "sysl_net_connect" c_connect(fd: int, addr: *u8, len: int) -> int
+private extern "sysl_net_bind" c_bind(fd: int, addr: *u8, len: int) -> int
+private extern "sysl_net_listen" c_listen(fd: int, backlog: int) -> int
+private extern "sysl_net_accept" c_accept(fd: int, addr: *u8, len: *i32, out_fd: *i32) -> int
+private extern "sysl_net_local" c_local(fd: int, addr: *u8, len: *i32) -> int
+private extern "sysl_net_send" c_send(fd: int, buf: *u8, n: usize, sent: *usize) -> int
+private extern "sysl_net_recv" c_recv(fd: int, buf: *u8, n: usize, got: *usize) -> int
+private extern "sysl_net_shutdown" c_shutdown(fd: int, how: int) -> int
+private extern "sysl_net_close" c_close(fd: int) -> int
+private extern "sysl_net_timeout" c_timeout(fd: int, recv_side: int, ms: long) -> int
+private extern "sysl_net_reuse_address" c_reuse_address(fd: int, on: int) -> int
+private extern "sysl_net_is_timeout" c_is_timeout(code: int) -> int
+
+/** How wide an address is carried, which is `sizeof(struct sockaddr_storage)` on both platforms and
+ * is the one number this file and its shim have to agree about.
+ */
+private const addr_bytes: usize = 128
+
+/** Which version of the protocol an address is for.
+ *
+ * Named by the version rather than by `AF_INET`'s number, which is the thing a program must not be
+ * handed: `AF_INET6` is 30 on Darwin and 10 under glibc, so a program that compared against a
+ * literal would be right on one machine and silently wrong on the other.
+ */
+enum Family derives Display
+    Ipv4
+    Ipv6
+
+/** Somewhere a socket can be connected to, or bound to.
+ *
+ * **It carries the platform's own bytes and sysl never looks inside them.** A `sockaddr_in` and a
+ * `sockaddr_in6` are different layouts, and Darwin's carry a length byte glibc's do not, so a
+ * struct written here would be a transcription of a layout — which `reference/ffi.md § A library
+ * may carry C` says is the thing that compiles everywhere and is wrong somewhere. What crosses is
+ * the bytes and their length; everything a program wants to *know* about an address it asks for.
+ */
+struct Address
+    private bytes: [addr_bytes]u8
+    private used: i32
+
+    /** Which protocol version this is for. */
+    family(self) -> Family = if c_family(&self.bytes[0]) == 6 then Ipv6 else Ipv4
+
+    /** The numeric form, as a person writes it — `127.0.0.1`, or `::1`.
+     *
+     * **Numeric, never a name.** Turning an address back into a hostname is a second lookup over the
+     * network, which is not what a program printing what it just connected to is asking for, and is
+     * a thing an attacker controls the answer to.
+     */
+    text(self) -> string
+        var raw: []u8 = [0; 64]
+        var port: i32 = 0
+
+        if c_text(&self.bytes[0], int(self.used), as_mut_ptr(raw), raw.len, &port) != 0 then
+            return "?"
+
+        from_cstring(as_ptr(raw)).unwrap_or("?")
+    end text
+
+    /** The port. */
+    port(self) -> int
+        var raw: []u8 = [0; 64]
+        var port: i32 = 0
+
+        if c_text(&self.bytes[0], int(self.used), as_mut_ptr(raw), raw.len, &port) != 0 then
+            return 0
+
+        int(port)
+    end port
+end Address
+
+/** So that printing one says where it is rather than how it is stored. */
+impl Display for Address
+    display(self, out: *Writer, fmt: FormatSpec)
+        val text = self.family() match
+            // The brackets are not decoration: a v6 address has colons in it, so `::1:8080` cannot
+            // be read apart and `[::1]:8080` can. It is the form the URL syntax settled on.
+            Ipv6 -> f"[${self.text()}]:${self.port()}%d"
+            Ipv4 -> f"${self.text()}:${self.port()}%d"
+
+        display_str(text, out, fmt)
+end Address
+
+/** How much of a connection is being given up. */
+enum Shutdown derives Display
+    Read
+    Write
+    Both
+
+/** Every address a host and a port resolve to, in the order the machine ranked them.
+ *
+ * **Both protocol versions are asked for and both come back.** That is what makes a program work on
+ * a v6-only network without knowing it is on one, and the *order* is the system's answer to which
+ * to prefer — RFC 6724 says how a machine sorts them, and second-guessing it here would be this
+ * module inventing policy that is not its to have. So the ordinary client is a loop:
+ *
+ * ```
+ * for a in resolve("example.com", 80)?.view()
+ *     var s = socket(a)?
+ *     if s.connect(a).is_ok() then break
+ *     s.close()
+ * ```
+ *
+ * A failure to resolve is reported as `NotFound`, whatever the resolver's own reason was. The
+ * `EAI_*` numbers are a numbering of their own and overlap `errno`'s — `EAI_AGAIN` is 2 on Darwin,
+ * which is `ENOENT` — so passing them through would produce an `IoError` that means something else
+ * entirely.
+ */
+resolve(host: string, port: int) -> Result[Buf[Address], IoError] = resolved(host, port, 0)
+
+/** Where a **listener** binds: the wildcard, meaning every address this machine answers on.
+ *
+ * A separate call rather than an empty host, because the same question has two answers and nothing
+ * about the arguments alone says which is wanted — `AI_PASSIVE` is the flag that decides it, and a
+ * caller that got the wrong one binds to the loopback and wonders why nobody can reach it.
+ */
+resolve_passive(port: int) -> Result[Buf[Address], IoError] = resolved("", port, 1)
+
+private resolved(host: string, port: int, passive: int) -> Result[Buf[Address], IoError]
+    val max: usize = 8
+    var raw: []u8 = [0; max * addr_bytes]
+    var lens: []i32 = [0; max]
+    var count: i32 = 0
+
+    val h = cstring(host)
+    val service = cstring(str(port))
+
+    val e = c_resolve(h.ptr, service.ptr, passive, as_mut_ptr(raw), as_mut_ptr(lens), int(max), &count)
+
+    if e != 0 then return Err(from_errno(e))
+
+    var out: Buf[Address] = buf()
+
+    for i in 0..<usize(count)
+        var a = Address([0; addr_bytes], lens[i])
+
+        for j in 0..<usize(lens[i]) do a.bytes[j] = raw[i * addr_bytes + j]
+
+        out.push(a)
+
+    Ok(out)
+end resolved
+
+/** A connection, or something listening for one. One type, because POSIX has one.
+ *
+ * **A socket is not closed by going out of scope.** `close` is a call, exactly as it is in C, and a
+ * program that drops one without closing it leaks a descriptor until it exits — which is C's own
+ * rule rather than something this binding introduced, and is the same shape `sysl-lang/libuv` states
+ * about a handle. `defer s.close()` is the idiom.
+ */
+struct Socket
+    private fd: i32
+
+    /** Connect to somewhere. The address must be of the family this socket was made for, which it
+     * is whenever the two came from the same `resolve`.
+     */
+    connect(*self, to: Address) -> Result[unit, IoError] =
+        told(c_connect(int(self.fd), &to.bytes[0], int(to.used)))
+
+    /** Take a local address, which is what a listener does before it listens. */
+    bind(*self, to: Address) -> Result[unit, IoError] =
+        told(c_bind(int(self.fd), &to.bytes[0], int(to.used)))
+
+    /** Start accepting connections, with `backlog` of them allowed to queue.
+     *
+     * 128 is `SOMAXCONN` on both platforms here and is what nearly everything uses; it is a default
+     * rather than a constant because the number is the caller's business and a server under load
+     * knows more about it than this module does.
+     */
+    listen(*self, backlog: int = 128) -> Result[unit, IoError] =
+        told(c_listen(int(self.fd), backlog))
+
+    /** Wait for a connection, and answer it together with where it came from.
+     *
+     * The address is the peer's, which is what a server wants for a log line and for deciding
+     * whether to talk to somebody at all.
+     */
+    accept(*self) -> Result[(Socket, Address), IoError]
+        var a = Address([0; addr_bytes], 0)
+        var used: i32 = 0
+        var fd: i32 = 0
+
+        val e = c_accept(int(self.fd), &a.bytes[0], &used, &fd)
+
+        if e != 0 then return Err(from_errno(e))
+
+        a.used = used
+
+        Ok((Socket(fd), a))
+    end accept
+
+    /** Where this socket is, which is how a listener that asked for port 0 learns which port it
+     * got. Asking the system rather than remembering what was requested is the only thing that
+     * answers it.
+     */
+    local(self) -> Result[Address, IoError]
+        var a = Address([0; addr_bytes], 0)
+        var used: i32 = 0
+
+        val e = c_local(int(self.fd), &a.bytes[0], &used)
+
+        if e != 0 then return Err(from_errno(e))
+
+        a.used = used
+
+        Ok(a)
+    end local
+
+    /** Write some of `bytes`, and say how many.
+     *
+     * **A short write is not an error**, and this is the call that says so: a stream moves what it
+     * can and the caller comes back for the rest. `send_all` is the loop, and is what almost every
+     * caller actually wants.
+     */
+    send(*self, bytes: []const u8) -> Result[usize, IoError]
+        if bytes.len == 0 then return Ok(0)
+
+        var sent: usize = 0
+        val e = c_send(int(self.fd), as_ptr(bytes), bytes.len, &sent)
+
+        if e != 0 then Err(from_errno(e)) else Ok(sent)
+    end send
+
+    /** Every byte of `bytes`, however many calls that takes.
+     *
+     * An interrupted call is retried rather than reported, for the reason `sysl.process` restarts
+     * its `waitpid`: a signal arriving mid-write is not a failure of the write, and a caller that
+     * had to handle `Interrupted` at every call would handle it by looping — here.
+     */
+    send_all(*self, bytes: []const u8) -> Result[unit, IoError]
+        var at: usize = 0
+
+        while at < bytes.len
+            self.send(bytes[at..<bytes.len]) match
+                Ok(n) -> at += n
+                Err(Interrupted) -> ()
+                Err(e) -> return Err(e)
+
+        Ok(())
+    end send_all
+
+    /** Read into `into`, and say how many bytes arrived.
+     *
+     * **Zero means the peer has finished writing** — end of stream, not an error and not a timeout.
+     * That is the one answer every reader of this has to handle, and it is why the count is a
+     * `usize` rather than something with a case for it: a stream that is over is an ordinary
+     * outcome, and a loop that reads until zero is the whole protocol.
+     */
+    recv(*self, into: []u8) -> Result[usize, IoError]
+        if into.len == 0 then return Ok(0)
+
+        var got: usize = 0
+        val e = c_recv(int(self.fd), as_mut_ptr(into), into.len, &got)
+
+        if e != 0 then Err(from_errno(e)) else Ok(got)
+    end recv
+
+    /** Stop reading, stop writing, or stop both — while the descriptor stays open.
+     *
+     * **`Write` is the one with a protocol behind it.** It sends the peer an end of stream, so a
+     * program that has finished asking can say so and then go on reading the answer. Closing would
+     * have said nothing and thrown the answer away.
+     */
+    shutdown(*self, how: Shutdown = Both) -> Result[unit, IoError] =
+        told(c_shutdown(int(self.fd), how match
+            Read -> 0
+            Write -> 1
+            Both -> 2))
+
+    /** Give the descriptor back.
+     *
+     * A socket closed twice is a descriptor number that may by then belong to something else, which
+     * is C's rule and is not checked here — for the reason `sysl.posix.threads` gives about joining
+     * twice: the word it would take to notice is paid by every correct program.
+     */
+    close(*self) -> Result[unit, IoError] = told(c_close(int(self.fd)))
+
+    /** How long a `recv` may wait before giving up, in milliseconds. Zero is no limit, which is
+     * where a socket starts.
+     */
+    read_timeout(*self, ms: int) -> Result[unit, IoError] =
+        told(c_timeout(int(self.fd), 1, long(ms)))
+
+    /** How long a `send` may wait before giving up, in milliseconds. Zero is no limit. */
+    write_timeout(*self, ms: int) -> Result[unit, IoError] =
+        told(c_timeout(int(self.fd), 0, long(ms)))
+
+    /** Let a listener take a port that a recently stopped one was using.
+     *
+     * Without it, a server that has just been stopped cannot be started again until the kernel's
+     * `TIME_WAIT` has run out — a minute or two, during which the program looks broken. It is the
+     * one socket option here beyond the timeouts, and it is here because every listener wants it.
+     *
+     * Set it **before** `bind`, which is the only point at which it has any effect.
+     */
+    reuse_address(*self, on: bool = true) -> Result[unit, IoError] =
+        told(c_reuse_address(int(self.fd), if on then 1 else 0))
+end Socket
+
+/** A socket of the family an address belongs to, ready to be connected or bound.
+ *
+ * The family comes from the address rather than being said separately: a socket of the wrong one
+ * cannot be connected to it, so letting the two be given apart would only make it possible to
+ * disagree.
+ */
+socket(for_address: Address) -> Result[Socket, IoError]
+    var fd: i32 = 0
+    val e = c_socket(&for_address.bytes[0], &fd)
+
+    if e != 0 then Err(from_errno(e)) else Ok(Socket(fd))
+end socket
+
+/** Whether an error is a call that ran out of its timeout rather than one that failed.
+ *
+ * A timed-out blocking call reports `EAGAIN`, which is a number rather than a case of `IoError` —
+ * so this is the question to ask instead of comparing against one. It is a function rather than an
+ * enum case because the alternative is adding a variant to an error type every module in the
+ * library shares, for a condition only this one can produce.
+ */
+timed_out(e: IoError) -> bool = c_is_timeout(e.code()) != 0
+
+/** A shim call that reports success as zero. */
+private told(rc: int) -> Result[unit, IoError] =
+    if rc != 0 then Err(from_errno(rc)) else Ok(())

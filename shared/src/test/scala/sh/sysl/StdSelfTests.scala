@@ -184,8 +184,16 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * `Output.err`. Five cases, and every one of them asserts something about `text` as well: a
    * capture that quietly merged the two streams would satisfy any test that only ever read `err`.
    * Measured, no slack.
+   *
+   * Raised to **582** when `sysl.posix.net` arrived with 16 of its own. Like `sysl.fs`'s and
+   * `sysl.process`'s they depend on the library's own C -- the shim under
+   * `library/sysl/posix/net/__posix__` owns every layout and every constant -- and they guard
+   * something nothing else in the tree does: that a socket is made, bound, listened on, connected
+   * to, accepted and talked through, in one thread, over the loopback. A `connect` to a listening
+   * socket succeeds as soon as the kernel queues it, which is what makes that single-threaded and so
+   * makes it something a suite can contain.
    */
-  private val floor = 566
+  private val floor = 582
 
   /** The library, compiled as a **test build of itself**.
    *

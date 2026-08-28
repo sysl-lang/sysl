@@ -1,0 +1,294 @@
+module sysl.posix.net
+@requires(posix)
+@tests
+
+import sysl.fs.IoError
+
+// Blocking TCP over the loopback, and the names it resolves.
+//
+// **Everything here runs in one thread, and it can because a `connect` to a listening socket
+// succeeds as soon as the kernel queues it.** The backlog is what makes that true, so a test can
+// listen, connect, accept and talk to itself without a second thread and without a timing
+// assumption. That is worth more than tidiness: a networking test that needs two threads to make its
+// point is a test that can hang, and one that can hang in a suite is one somebody eventually marks
+// `ignore`.
+//
+// **The port is always 0 and always asked back.** A fixed port is a test that fails on whichever
+// machine happens to be running something on it, and asking the socket what it got is the only
+// thing that answers.
+
+/** A listener on the loopback, on whatever port the machine had free, and the address to reach it
+ * at. Every test that needs two ends starts here.
+ */
+private listener() -> (Socket, Address)
+    val addrs = resolve("127.0.0.1", 0).unwrap()
+    var s = socket(addrs.at(0)).unwrap()
+
+    s.reuse_address().unwrap()
+    s.bind(addrs.at(0)).unwrap()
+    s.listen().unwrap()
+
+    (s, s.local().unwrap())
+end listener
+
+/** The other end: a socket connected to `to`. */
+private client(to: Address) -> Socket
+    var c = socket(to).unwrap()
+
+    c.connect(to).unwrap()
+    c
+end client
+
+// ## Resolving
+
+@test("a name resolves to somewhere to connect to")
+localhost_resolves()
+    val addrs = resolve("localhost", 80).unwrap()
+
+    assert(addrs.len() > 0, "localhost resolved to nothing")
+
+    for a in addrs.view()
+        assert(a.port() == 80, "the port asked for is the port that came back")
+        assert(a.text().len > 0, "an address with no numeric form")
+
+// A literal is not looked up, so this one holds on a machine with no resolver at all.
+@test("a numeric address resolves to itself")
+numeric_resolves()
+    val addrs = resolve("127.0.0.1", 8080).unwrap()
+
+    assert_eq(addrs.len(), 1)
+    assert_eq(addrs.at(0).text(), "127.0.0.1")
+    assert_eq(addrs.at(0).port(), 8080)
+    assert_eq(addrs.at(0).family(), Ipv4)
+
+@test("a name that is not a name is NotFound, whatever the resolver called it")
+unresolvable_is_not_found()
+    // `.invalid` is reserved by RFC 2606 precisely so that it can never be delegated, which is what
+    // keeps this from depending on somebody's wildcard DNS.
+    assert_eq(resolve("no-such-host.invalid", 80).unwrap_err(), IoError.NotFound)
+
+@test("a listener's address is the wildcard rather than the loopback")
+passive_resolves_to_the_wildcard()
+    val addrs = resolve_passive(0).unwrap()
+
+    assert(addrs.len() > 0, "nothing to bind to")
+
+    // The whole difference between the two calls: a wildcard is not the loopback, and a listener
+    // that got the loopback by mistake works locally and is unreachable from anywhere else.
+    for a in addrs.view()
+        assert(a.text() != "127.0.0.1", "a passive address should not be the loopback")
+
+// ## An address as a value
+
+@test("an address renders as somewhere a person could type back")
+address_renders()
+    assert_eq(str(resolve("127.0.0.1", 8080).unwrap().at(0)), "127.0.0.1:8080")
+
+// A v6 address has colons in it, so the brackets are what makes the port readable apart from the
+// address. Skipped where the machine has no v6 at all rather than asserted into a failure.
+@test("a v6 address renders with the brackets that make its port readable")
+v6_address_renders()
+    resolve("::1", 8080) match
+        Ok(addrs) ->
+            assert_eq(str(addrs.at(0)), "[::1]:8080")
+            assert_eq(addrs.at(0).family(), Ipv6)
+        Err(_) -> ()
+
+// ## A connection, both ways
+
+@test("what one end writes is what the other end reads")
+bytes_cross()
+    var (server, at) = listener()
+    var c = client(at)
+    var (accepted, from) = server.accept().unwrap()
+
+    assert(from.text().len > 0, "the peer's address came with the connection")
+
+    c.send_all([104, 105]).unwrap()
+
+    var into: []u8 = [0; 8]
+    val got = accepted.recv(into).unwrap()
+
+    assert_eq(got, 2)
+    assert_eq(into[0], u8('h'))
+    assert_eq(into[1], u8('i'))
+
+    accepted.close().unwrap()
+    c.close().unwrap()
+    server.close().unwrap()
+end bytes_cross
+
+@test("the answer comes back the other way")
+bytes_cross_back()
+    var (server, at) = listener()
+    var c = client(at)
+    var (accepted, _) = server.accept().unwrap()
+
+    accepted.send_all([111, 107]).unwrap()
+
+    var into: []u8 = [0; 8]
+
+    assert_eq(c.recv(into).unwrap(), 2)
+    assert_eq(into[0], u8('o'))
+    assert_eq(into[1], u8('k'))
+
+    accepted.close().unwrap()
+    c.close().unwrap()
+    server.close().unwrap()
+end bytes_cross_back
+
+// **Zero bytes is end of stream and is not an error**, which is the one answer every reader of a
+// socket has to handle. `shutdown(Write)` is how the other end says so while still being able to
+// read -- which is the whole reason it exists beside `close`.
+@test("a read of a finished stream answers zero rather than failing")
+end_of_stream_is_zero()
+    var (server, at) = listener()
+    var c = client(at)
+    var (accepted, _) = server.accept().unwrap()
+
+    c.shutdown(Write).unwrap()
+
+    var into: []u8 = [0; 8]
+
+    assert_eq(accepted.recv(into).unwrap(), 0)
+
+    accepted.close().unwrap()
+    c.close().unwrap()
+    server.close().unwrap()
+end end_of_stream_is_zero
+
+@test("a half-closed connection can still be read from")
+shutdown_write_keeps_reading()
+    var (server, at) = listener()
+    var c = client(at)
+    var (accepted, _) = server.accept().unwrap()
+
+    c.shutdown(Write).unwrap()
+    accepted.send_all([121]).unwrap()
+
+    var into: []u8 = [0; 4]
+
+    assert_eq(c.recv(into).unwrap(), 1)
+    assert_eq(into[0], u8('y'))
+
+    accepted.close().unwrap()
+    c.close().unwrap()
+    server.close().unwrap()
+end shutdown_write_keeps_reading
+
+// ## The bound this module exists to give a blocking call
+
+@test("a read that nobody answers gives up, and says that is what happened")
+read_timeout_expires()
+    var (server, at) = listener()
+    var c = client(at)
+    var (accepted, _) = server.accept().unwrap()
+
+    accepted.read_timeout(50).unwrap()
+
+    var into: []u8 = [0; 8]
+
+    // Nothing was ever sent, so without the timeout this call would not return at all -- which is
+    // exactly the failure a blocking API has to be able to bound.
+    val e = accepted.recv(into).unwrap_err()
+
+    assert(timed_out(e), "a call that ran out of time reported something else")
+
+    accepted.close().unwrap()
+    c.close().unwrap()
+    server.close().unwrap()
+end read_timeout_expires
+
+// The timeout has to be a *bound* rather than a deadline for the call, or a socket with one set
+// could not be used for anything slow.
+@test("a timeout does not disturb a read that arrives in time")
+read_timeout_lets_data_through()
+    var (server, at) = listener()
+    var c = client(at)
+    var (accepted, _) = server.accept().unwrap()
+
+    accepted.read_timeout(5000).unwrap()
+    c.send_all([122]).unwrap()
+
+    var into: []u8 = [0; 4]
+
+    assert_eq(accepted.recv(into).unwrap(), 1)
+    assert_eq(into[0], u8('z'))
+
+    accepted.close().unwrap()
+    c.close().unwrap()
+    server.close().unwrap()
+end read_timeout_lets_data_through
+
+// ## The edges
+
+@test("a connection nobody is listening for is refused rather than hanging")
+connect_to_nothing_is_refused()
+    // A port that was bound and then given up: nothing is listening there, and it is a port the
+    // machine has just demonstrated it will hand out.
+    var (server, at) = listener()
+
+    server.close().unwrap()
+
+    var s = socket(at).unwrap()
+    val outcome = s.connect(at)
+
+    assert(outcome.is_err(), "connecting to a closed port succeeded")
+
+    s.close()
+end connect_to_nothing_is_refused
+
+@test("a send of nothing is nothing, and a read into nothing is too")
+empty_transfers_are_free()
+    var (server, at) = listener()
+    var c = client(at)
+    var (accepted, _) = server.accept().unwrap()
+
+    var none: []u8 = [0; 0]
+
+    assert_eq(c.send(none[0..<0]).unwrap(), 0)
+    assert_eq(accepted.recv(none).unwrap(), 0)
+
+    accepted.close().unwrap()
+    c.close().unwrap()
+    server.close().unwrap()
+end empty_transfers_are_free
+
+// A whole message rather than a byte, so that `send_all`'s loop is over something: a short write is
+// legal at any length and this is the call that must not report one.
+@test("send_all moves every byte it was given")
+send_all_moves_everything()
+    var (server, at) = listener()
+    var c = client(at)
+    var (accepted, _) = server.accept().unwrap()
+
+    var payload: []u8 = [65; 4096]
+
+    c.send_all(payload).unwrap()
+    c.shutdown(Write).unwrap()
+
+    var into: []u8 = [0; 1024]
+    var total: usize = 0
+
+    loop
+        val n = accepted.recv(into).unwrap()
+
+        if n == 0 then break
+
+        total += n
+
+    assert_eq(total, 4096)
+
+    accepted.close().unwrap()
+    c.close().unwrap()
+    server.close().unwrap()
+end send_all_moves_everything
+
+@test("a listener is told which port it was actually given")
+local_answers_the_real_port()
+    var (server, at) = listener()
+
+    assert(at.port() > 0, "port 0 was asked for and port 0 came back")
+    assert_eq(at.text(), "127.0.0.1")
+
+    server.close().unwrap()
