@@ -110,6 +110,42 @@ object CProbe {
   private val constFloatEmitted =
     raw"@$constMarker(\d+) = .*?(?:global|constant) double (\S+)".r
 
+  /** One `double` operand as LLVM printed it, or `None` where the spelling is one nobody has
+   * measured — which the caller reports as sysl's own bug rather than the programmer's.
+   *
+   * **The hex form carries an optional `f` in front of it, and that prefix is LLVM 23's.** The bits
+   * are the same sixteen digits either way; only the marker moved. Reading one spelling and not the
+   * other is not a wrong answer but **no** answer, since the text then parses as neither form —
+   * every floating `c const` in every binding refusing on a current toolchain, with a diagnostic
+   * saying the probe is at fault, which it was.
+   *
+   * `parseUnsignedLong` is what makes the top bit ordinary rather than a sign, so a negative value
+   * and a NaN read back as themselves.
+   */
+  private[sysl] def floatOf(operand: String): Option[Double] = {
+    val text = operand.stripSuffix(",")
+    val hex  = if text.startsWith("f0x") then Some(text.drop(3)) else Option.when(text.startsWith("0x"))(text.drop(2))
+
+    text match
+      // **LLVM 23 writes a non-finite value as a WORD**, where every earlier one wrote the bit
+      // pattern. sysl refuses such a constant either way (`fraction` says why), so what these are
+      // for is that the refusal is the one about the value rather than the one about the probe:
+      // dropping the line reports sysl's own bug, which is a message the reader can do nothing with.
+      case "+inf"                    => Some(Double.PositiveInfinity)
+      case "-inf"                    => Some(Double.NegativeInfinity)
+      // A quiet NaN and a signalling one are both NaN by the time this is a `Double`, and the sign
+      // is a bit of a value nothing may carry -- so all four spellings are the one answer.
+      case "+qnan" | "-qnan" | "+snan" | "-snan" => Some(Double.NaN)
+      case _ =>
+        hex match
+          case Some(digits) if digits.length == 16 =>
+            scala.util.Try(java.lang.Double.longBitsToDouble(java.lang.Long.parseUnsignedLong(digits, 16))).toOption
+          // A hex operand of some other width is a type this probe never asks for -- `0xH` is a half
+          // and `0xK` an x86 long double -- so it is dropped rather than read at the wrong width.
+          case Some(_) => None
+          case None    => text.toDoubleOption
+  }
+
   /** Every file's blocks lowered to ordinary declarations, or the first refusal.
    *
    * A compilation with no `c const` and no `c type` anywhere returns its units untouched and never
@@ -292,26 +328,29 @@ object CProbe {
   private def read(pattern: scala.util.matching.Regex, ir: String): Map[Int, BigInt] =
     pattern.findAllMatchIn(ir).map(m => m.group(1).toInt -> BigInt(m.group(2))).toMap
 
-  /** Every `double` global the probe printed, in the two forms LLVM writes one in.
+  /** Every `double` global the probe printed, in the forms LLVM writes one in.
    *
-   * `0x` followed by sixteen hex digits is the binary64 bit pattern itself and is exact by
-   * construction; anything else is a decimal LLVM only prints where it reads back as the same
-   * double, so parsing it is exact as well. A line whose text is neither is dropped rather than
-   * guessed at, and the missing answer is reported as sysl's own bug by the caller — which is the
-   * right side to fail on, since a shape this does not know is a shape nobody has measured.
+   * Sixteen hex digits are the binary64 bit pattern itself and are exact by construction; anything
+   * else is a decimal LLVM only prints where it reads back as the same double, so parsing that is
+   * exact as well. A line whose text is neither is dropped rather than guessed at, and the missing
+   * answer is reported as sysl's own bug by the caller — which is the right side to fail on, since a
+   * shape this does not know is a shape nobody has measured.
+   *
+   * ==THE PREFIX IS `0x` OR `f0x`, AND THE SECOND ARRIVED WITH LLVM 23==
+   *
+   * A hex floating literal gained a `f` in front of it, so the same constant clang 22 wrote as
+   * `double 0x400921FB54442EEA` clang 23 writes as `double f0x400921FB54442EEA`. Reading only the
+   * older spelling is not a wrong answer — it is **no** answer, since the text then parses as
+   * neither form and the line is dropped, and every floating `c const` in every binding refuses on
+   * a current toolchain with a message saying the probe is at fault. It was.
+   *
+   * Found by moving CI to LLVM 23 (card `0339`) and reproduced locally by putting Homebrew's clang
+   * ahead of the vendor's on the PATH; the machine's own `clang` is Apple's and still writes the
+   * old spelling, which is why nothing here saw it.
    */
   private def readFloats(ir: String): Map[Int, Double] =
-    constFloatEmitted.findAllMatchIn(ir).flatMap { m =>
-      val text = m.group(2).stripSuffix(",")
-
-      val value =
-        if text.startsWith("0x") && text.length == 18 then
-          scala.util.Try(java.lang.Double.longBitsToDouble(
-            java.lang.Long.parseUnsignedLong(text.drop(2), 16))).toOption
-        else text.toDoubleOption
-
-      value.map(m.group(1).toInt -> _)
-    }.toMap
+    constFloatEmitted.findAllMatchIn(ir).flatMap(m => CProbe.floatOf(m.group(2)).map(m.group(1).toInt -> _))
+      .toMap
 
   /** Whether plain `char` is signed here. A probe with no `c type` in it never asks, and nothing
    * reads the answer in that case.

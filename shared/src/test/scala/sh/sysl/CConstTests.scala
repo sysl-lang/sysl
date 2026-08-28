@@ -981,6 +981,53 @@ class CConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
     }
   }
 
+  /** **Both spellings of a hex floating operand, because this machine's clang only ever writes one
+    * of them and the suite above therefore cannot see the other.**
+    *
+    * LLVM 23 puts an `f` in front of a hex float — `double f0x400921FB54442EEA` for what 22 wrote as
+    * `double 0x400921FB54442EEA` — and the bits are identical either way. Reading one and not the
+    * other is not a wrong answer but **no** answer: the text parses as neither form, the line is
+    * dropped, and every floating `c const` refuses with a diagnostic saying sysl's probe is at
+    * fault. It was, for as long as the probe knew one spelling.
+    *
+    * The cases above cannot cover this. They run the real clang, and which spelling comes back is a
+    * property of whichever clang is installed — Apple's writes the old one, so on this machine the
+    * whole suite passes against a probe that cannot read a current LLVM's output. Found by moving CI
+    * to LLVM 23 (card `0339`), which is a second reason the two versions are one decision.
+    */
+  "a hex float operand is read at either LLVM's spelling of it, and a decimal one as itself" in {
+    val bits = 0x400921FB54442EEAL
+
+    CProbe.floatOf("0x400921FB54442EEA") shouldBe Some(java.lang.Double.longBitsToDouble(bits))
+    CProbe.floatOf("f0x400921FB54442EEA") shouldBe Some(java.lang.Double.longBitsToDouble(bits))
+
+    // The trailing comma is what an operand carries when the global states an alignment after it.
+    CProbe.floatOf("f0x400921FB54442EEA,") shouldBe Some(java.lang.Double.longBitsToDouble(bits))
+
+    // The short decimal form, which LLVM prints only where it reads back as the same double.
+    CProbe.floatOf("5.000000e-01") shouldBe Some(0.5)
+
+    // The top bit is a bit rather than a sign, which is what `parseUnsignedLong` is for: this is a
+    // NaN, and reading it as a signed long would refuse the whole line.
+    CProbe.floatOf("f0x7FF8000000000000").exists(_.isNaN) shouldBe true
+    CProbe.floatOf("0xFFF0000000000000") shouldBe Some(Double.NegativeInfinity)
+
+    // A width this probe never asks for is dropped rather than read at the wrong one -- `0xH` is a
+    // half and `0xK` an x86 long double. Dropping is what makes the caller say so.
+    CProbe.floatOf("0xH3C00") shouldBe None
+    CProbe.floatOf("f0xH3C00") shouldBe None
+
+    // **And LLVM 23 writes a non-finite value as a WORD**, which is the other half of the same
+    // change and is easy to miss, since the two cases that reach it are the ones asserting a
+    // REFUSAL -- so they stay red either way and it takes reading the message to see that the
+    // refusal is the wrong one. sysl declines to carry any of these; what these lines pin is that
+    // the value parses, so the diagnostic is about the value rather than about the probe.
+    CProbe.floatOf("+inf") shouldBe Some(Double.PositiveInfinity)
+    CProbe.floatOf("-inf") shouldBe Some(Double.NegativeInfinity)
+    CProbe.floatOf("+qnan").exists(_.isNaN) shouldBe true
+    CProbe.floatOf("-snan").exists(_.isNaN) shouldBe true
+  }
+
   /** The two vocabularies for one fact, held to agreeing. `Conditional` names a symbol a source line
     * may test and `Capability` names something a module may require, and both are asking whether the
     * machine is hosted — so a target that answered one way here and the other way there would gate a

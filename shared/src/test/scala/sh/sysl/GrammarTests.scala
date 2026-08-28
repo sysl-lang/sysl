@@ -75,6 +75,17 @@ class GrammarTests extends AnyFreeSpec with Matchers {
     field.findAllMatchIn(section(name)).map(m => m.group(1).replace("\\\\", "\\").r).toList
   }
 
+  /** Whether this runtime's regex engine understands a lookaround, which Scala Native's does not.
+    *
+    * The grammar's boundaries are written out as lookarounds rather than as `\b`, because
+    * `java.util.regex` reads `\b` over ASCII word characters — so `\bÁrbol` has no boundary to
+    * match at and a widened character class would style nothing. That is right for the engine the
+    * site renders with and unrepresentable in RE2.
+    */
+  private lazy val lookaroundCompiles: Boolean =
+    try { "(?!x)a".r.pattern; true }
+    catch { case _: Exception => false }
+
   private lazy val asKeyword: Set[String] = styledIn(section("keyword"))
 
   /** `true`, `false` and `null` are reserved words that the grammar styles as constants rather than
@@ -144,6 +155,15 @@ class GrammarTests extends AnyFreeSpec with Matchers {
         case Right(highlighter) =>
           highlighter.highlight("val x = 1") should include("""<span class="hl-keyword">val</span>""")
     }
+    // **THE PATTERNS BELOW CANNOT BE COMPILED ON EVERY PLATFORM THIS SUITE RUNS ON, AND THAT IS A
+    // FACT ABOUT THE RUNTIME RATHER THAN ABOUT THE GRAMMAR.** Scala Native's `Regex` is RE2, which
+    // has no lookaround at all — `(?![\p{L}\p{Nd}_])` is refused as an *"Unknown inline modifier"*,
+    // which reads as a malformed pattern and is a missing feature.
+    //
+    // The claim is about `java.util.regex` specifically: that is what juicer compiles a TextMate
+    // grammar with, so it is the engine the published page is rendered by and the only one this is
+    // about. Asked as a **capability** rather than as a platform, so the message says what is
+    // missing rather than which build it is.
     // **The reconciliation above is about WORDS, and the grammar also carries identifier PATTERNS
     // that nothing checked.** A pattern is an ASCII character class in a language whose identifiers
     // are Unicode's letters (`reference/lexical.md § Identifiers`), and what that produces is a page
@@ -153,6 +173,12 @@ class GrammarTests extends AnyFreeSpec with Matchers {
     //
     // Asserted against `java.util.regex`, which is what juicer compiles these with.
     "matches a declaration, a call and a type whose name is not ASCII" in {
+      // Cancelled rather than skipped, and named: RE2 has no lookaround, and the two cases above
+      // are unaffected and still run here.
+      if !lookaroundCompiles then
+        cancel("this runtime's regex engine is RE2 (Scala Native), which has no lookaround — the " +
+          "grammar is rendered by java.util.regex, so the JVM run is where this claim is checked")
+
       // **What is asserted is the WHOLE name and not that something matched**, which is the
       // difference between a real check and one that cannot fail here. An ASCII class matches
       // `struct C` and stops at the accent, so a `findFirstIn` answers `Some` on a pattern that
@@ -170,6 +196,12 @@ class GrammarTests extends AnyFreeSpec with Matchers {
     // The other direction, so the classes above cannot be widened into matching anything at all: a
     // digit still does not begin a name, in any script.
     "and still refuses a name beginning with a digit" in {
+      // Cancelled rather than skipped, and named: RE2 has no lookaround, and the two cases above
+      // are unaffected and still run here.
+      if !lookaroundCompiles then
+        cancel("this runtime's regex engine is RE2 (Scala Native), which has no lookaround — the " +
+          "grammar is rendered by java.util.regex, so the JVM run is where this claim is checked")
+
       val started =
         patterns("declaration").exists(_.findFirstMatchIn("struct 3café").exists(_.matched.contains("3")))
 
