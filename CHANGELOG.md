@@ -7,6 +7,145 @@ copy -- correct a mistake there and regenerate, rather than editing this file. V
 `MAJOR.MINOR.PATCH`; while the leading zero stands the language is still moving, and a release may
 change what an existing program means. Where it does, the release says so.
 
+## 0.0.90 — 2026-08-29
+
+Seven cards, and one of them was a heap-corruption bug that had blocked another.
+
+### A `return` out of a `for` gave the element back twice
+
+An iterating loop keeps what `next` handed over in a temporary region that both edges out of the test
+release for themselves — the body on the way in, the exhausted path on the way out — so the region
+stays populated across both. `releaseAll`, which a `return` emits, walks *every* region, and so gave
+that one back a second time.
+
+It is an over-release, so a program that hit it printed the right answer until the storage was reused
+by something else. That made it intermittent and made it look like a defect in whatever happened to
+be looping. `break` was never affected.
+
+**What found it in one run is the other half of the fix**: `SYSL_EXTRA_CFLAGS` is spliced into every
+clang a build drives, and the emitted IR is marked `sanitize_address` when those flags ask for it.
+The attribute is what makes the answer mean something — LLVM instruments only functions carrying it,
+and a *frontend* is what normally adds one, so IR handed to clang as a `.ll` links the sanitizer's
+runtime and is instrumented nowhere. The first ASan run of the program that provoked this came back
+green with the bug live.
+
+### `sysl.fs` walks a directory tree, and copies one
+
+```sysl
+for item in walk(root)
+    val e = item?
+
+    if e.is_dir() then print(e.path)
+```
+
+Five programs across this org and slate had each hand-written a recursion through a directory, and
+they differed on three axes: what they did at a leaf, what they did about a directory they could not
+read, and whether they descended into everything. An iterator answers all three — the leaf action is
+the loop body, the error policy is the caller's because each item is a `Result`, and pruning is
+`skip_dir`.
+
+A symbolic link is reported and never followed. `bottom_up()` reverses the order for a caller that
+needs a directory after its contents.
+
+`copy_dir_all` is the walk with a leaf action: a directory is merged into, a file is never
+overwritten, permissions are carried, and a link is copied as a link. `remove_dir_all` is now the
+same walk asked the other way round rather than a recursion of its own.
+
+### A trait may promise to borrow what it is handed
+
+```sysl
+trait Sink
+    @borrows(bytes)
+    put(*self, bytes: []const u8)
+```
+
+A call through a trait object is opaque, so escape analysis assumed every argument was kept and a
+local array passed through one was promoted to the heap. `sysl.Writer` was the one exception and it
+was hardcoded twice. `@borrows` is that promise written down, checked against every implementation —
+and `Writer` now declares it, which is the test that the feature is real rather than a second way of
+spelling what was already there.
+
+### `sysl add` and `sysl vendor`
+
+```
+sysl add github.com/sysl-lang/sdl3
+sysl vendor .
+```
+
+The package manager could resolve, fetch and report a graph, and could not add to one. `add` writes
+the entry at the repository's newest tag or at one you pin, asking `git ls-remote` rather than a
+forge's API — so it works for a self-hosted server or a mirror. **The manifest is rewritten one run
+of bytes at a time**, so your comments and layout survive it, and the result is read back before it
+is written.
+
+`vendor` puts what a project depends on into `vendor/` beside the manifest, which is the machine's
+package cache moved into the project: same layout, same resolution, same `sysl.sum`. A project that
+has one builds with the network off.
+
+### `wasm32-wasi`, and the first cross target that runs on this machine
+
+sysl built for `wasm32-unknown-unknown` and nothing else in the family — the bare target, with no
+libc and no convention for what the host supplies. WASI is a standardised table of imports, wasi-libc
+is a real libc built on them, and the new row reaches both through wasi-sdk's clang, found from
+`WASI_SDK_PATH`.
+
+```
+export WASI_SDK_PATH=~/wasi-sdk-34.0-arm64-macos
+sysl build --target wasm32-wasi hello.sysl -o hello.wasm
+wasmtime hello.wasm
+```
+
+It needs no new capability: a preview1 module has files, a clock, randomness and exit and has no
+fork, sockets or threads, which is hosted-but-not-POSIX — the rung Windows already stood on.
+
+Three things had to be right and each would have produced a module that linked and did not run: the
+bare row's `-nostdlib` and `--entry=main` are keyed on the *operating system* now rather than the
+processor; the entry symbol on WASI is `__main_argc_argv`, because wasm cannot overload on arity and
+IR handed over as a `.ll` never went through the frontend that renames it; and `fseek`/`ftell` take
+C's `long`, which is pointer-width — 32 bits on wasm32 — where sysl's `long` is 64 everywhere.
+
+`sysl.process` moves to `@requires(posix)`, a correction the new row made visible: it is `fork` and
+`execvp` underneath.
+
+### A type's own width is a member of `Bits`
+
+```sysl
+low[T: Bits + Shr](v: T, n: u32) -> T = v.reverse_bits() >> T(T.width() - n)
+```
+
+`width()` is answered from the receiver's own type the way `zero()` and `one()` are, so a bit
+expression can be written in a body that does not know its width. `sysl.crypto.Word` requires `Bits`
+and `word_bits()` is gone.
+
+### `raw` means raw
+
+`raw` was an interpolator following Scala's -- escapes off, `${...}` still read. That left one
+combination nobody could write: a plain string reads no `${...}` and *does* decode escapes, and
+Scala's `raw` does the opposite, so *leave all of it alone* had no spelling.
+
+That combination is the only one a literal carrying another language's source can use, and `${` is
+not exotic: shell, Make, Kotlin, Groovy and JavaScript template literals all spell interpolation with
+it. So `raw` leaves the interpolator family and becomes a prefix like `c`'s -- no escapes decoded, no
+holes read, and a raw block still strips its incidental indentation like any other block.
+
+```sysl
+val program = raw"""
+    fn main() {
+        let re = "\d+\.\d+";
+        println!("{}", re);
+    }
+    """
+```
+
+Byte for byte what was written. On one line a `raw"..."` cannot hold a `"` -- the first one ends it,
+because there is no escape left to write one with -- which is what the tripled form is for.
+
+Nothing in the org used a `raw` literal, so this breaks nobody.
+
+### A changelog
+
+`CHANGELOG.md` at the repository root, generated from every release body by `./changelog.py`.
+
 ## 0.0.89 — 2026-08-29
 
 ### An identifier may be written in any script
