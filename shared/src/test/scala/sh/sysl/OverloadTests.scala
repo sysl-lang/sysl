@@ -318,6 +318,35 @@ class OverloadTests extends LibraryCliSupport with RunSupport with CodegenSuppor
             |
             |print(q("a"))""".stripMargin) shouldBe "generic\n"
     }
+
+    // Card 0369. The type parameter is inside the parameter's type rather than being the whole of
+    // it, so nothing is exact at an array argument — the view is a conversion, and both candidates
+    // need it. Tie-break three was filtering the *exact* candidates, so an empty set meant it never
+    // ran, and the same two declarations resolved at a slice and were ambiguous at an array.
+    "and an ordinary declaration wins through a conversion both candidates took" in {
+      run("""g(x: []u8) -> string = "plain"
+            |g[T](x: []T) -> string = "generic"
+            |
+            |var a: [3]u8 = [1, 2, 3]
+            |val v: []u8 = a[..]
+            |
+            |print(g(v))
+            |print(g(a))""".stripMargin) shouldBe "plain\nplain\n"
+    }
+
+    // And the widening stops exactly where the "no ranking between conversions" rule does. These two
+    // fit at `[]const int` and `[]int`, which are two different routes out of one array, so there is
+    // nothing to choose between them that is not a preference among conversions.
+    "while two fitted at DIFFERENT types are still ambiguous" in {
+      val e = err("""h(x: []const int) -> string = "const"
+                    |h[T](x: []T) -> string = "generic"
+                    |
+                    |var a = [1, 2, 3]
+                    |
+                    |print(h(a))""".stripMargin)
+
+      e should include("'h' is ambiguous here")
+    }
   }
 
   // C has no overloading, so an overload set has at most one member that may take its own name as a

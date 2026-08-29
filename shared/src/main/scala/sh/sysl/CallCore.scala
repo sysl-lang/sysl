@@ -557,16 +557,27 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
    *    asked of the types the fit settled on rather than of the types the declaration wrote — so
    *    `g[T](x: T)` is exact at a `[]int` argument and beats `g(s: []const int)`, which is reached
    *    only by giving up the ability to write.
-   * 3. **A candidate that named its parameters beats one that was solved for them**, where both are
-   *    exact. `f(x: int)` beside `f[T](x: T)` at `f(0)` fits both at `int`, and a generic
-   *    declaration is the one that took the call by being told what to be. Without this the second
-   *    tie-break would turn that call — which resolves today — into an ambiguity, so it is a guard
-   *    rather than a preference.
+   * 3. **A candidate that named its parameters beats one that was solved for them**, where both
+   *    fitted at the same types. `f(x: int)` beside `f[T](x: T)` at `f(0)` fits both at `int`, and
+   *    a generic declaration is the one that took the call by being told what to be. Without this
+   *    the second tie-break would turn that call — which resolves today — into an ambiguity, so it
+   *    is a guard rather than a preference.
    *
    * What is deliberately *not* here is a rule ranking one conversion above another. Two candidates
    * each reached by a different conversion are ambiguous, and saying so is better than a ladder of
    * precedences nobody can predict from the source. Ranking a declaration against a declaration, as
    * the third does, is a different question from ranking the routes the arguments took.
+   *
+   * **THE THIRD ASKS ITS QUESTION OF A POOL, AND THE POOL IS NOT ALWAYS THE EXACT ONES.** It read
+   * `exactTypes` until card `0369`, so it was skipped outright whenever *no* candidate was exact —
+   * which is every call reached by a conversion. `g(x: []u8)` beside `g[T](x: []T)` resolves at a
+   * `[]u8` argument and was ambiguous at a `[3]u8` one, on the same two declarations fitted at the
+   * same signature, because the array had to be viewed to reach either.
+   *
+   * The widening is bounded by the paragraph above rather than by a new principle: where the
+   * candidates all fitted at **identical** parameter types, they took identical routes, so choosing
+   * between them ranks nothing but the declarations. Candidates that fitted at different types stay
+   * ambiguous, since telling them apart would be ranking the conversions.
    */
   private def narrow(
       fits: List[(FuncDecl, List[Type])],
@@ -586,7 +597,12 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
 
         if exactTypes.length == 1 then exactTypes
         else
-          val spelled = exactTypes.filter(_._1.tparams.isEmpty)
+          val pool =
+            if exactTypes.nonEmpty then exactTypes
+            else if ranked.map(_._2).distinct.length == 1 then ranked
+            else Nil
+
+          val spelled = pool.filter(_._1.tparams.isEmpty)
 
           if spelled.length == 1 then spelled else ranked
 
