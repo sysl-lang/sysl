@@ -218,6 +218,80 @@ class EnumParserTests extends AnyFreeSpec with ParseSupport {
     }
   }
 
+  /** **A payload written positionally, which is what somebody porting an enum writes first.**
+    *
+    * Rust, Swift, OCaml and Haskell all take one, and a data enum is exactly the construct most
+    * likely to be coming from one of them. The old refusal was `')' expected` with the caret on the
+    * `[`, which reads as a complaint about the *type* -- a slice that may not go there, a bracket
+    * needing something -- so the next moves are `Url([]u8)` and `Url(*u8)`, and both fail the same
+    * way. Card `0367`, found twice in one file writing `sysl-lang/llhttp`.
+    */
+  "a positional payload" - {
+    "is refused by naming the form that was wanted, and the line to write" in {
+      val said = parseError("enum Event\n    Url([]const u8)\n")
+
+      said should include("a variant's payload names its fields")
+      said should include("'name: []const u8'")
+    }
+
+    // The type is read back out rather than recited, so the suggestion is the reader's own type.
+    "and the suggestion carries whatever type was written" in {
+      parseError("enum Event\n    At(*u8)\n") should include("'name: *u8'")
+      parseError("enum Event\n    Buf([4]u8)\n") should include("'name: [4]u8'")
+    }
+
+    /** **Every shape of type gets the same message, and that is why the check sits above the member
+      * parser rather than inside the variant one.**
+      *
+      * Measured before it was moved, the answer depended on the type and three of the four were bad:
+      * `[]const u8` and `[4]u8` said `')' expected` with the caret on the `[`, which reads as a
+      * complaint about the type; `int` and `Buf[int]` were read as far as a member header and said
+      * `':' expected`, which is fine; and `*u8` and `&Node` said **`'self' expected`**, which is
+      * worse than either, because it names the one word that would not help.
+      */
+    "whatever the type is written as" in {
+      for t <- List("[]const u8", "[4]u8", "*u8", "&Node", "int", "(int, real)", "Buf[int]") do
+        withClue(s"payload '$t': ")(
+          parseError(s"enum Event\n    V($t)\n") should include(s"'name: $t'")
+        )
+    }
+
+    /** **The named form is untouched, and this is the assertion that says the guard cannot misfire.**
+      * `typeRef` reads `r` as a name and then finds a `:`, which is neither `,` nor `)`, so the
+      * positional case declines and the field list runs as it always did.
+      */
+    /** **A receiver is a type to a type parser, and this is what stands aside for it.** `area(self)`
+      * reads as a bare name followed by `)`, and `write(*self, …)` as a pointer to one — both of
+      * which are exactly the shape being refused. `namesSelf` is the whole of the exception.
+      */
+    "but a member's receiver is not a payload" in {
+      val src = "enum Shape\n    Circle(r: real)\n\n    area(self) -> real = 1.0\n"
+
+      prog(src).headOption.getOrElse(fail("did not parse")) shouldBe a[EnumDecl]
+    }
+
+    "while a named payload, a bare variant and an explicit value are unaffected" in {
+      prog("enum Shape\n    Circle(r: real)\n    Empty\n") shouldBe List(
+        EnumDecl("Shape", Nil, None, List(
+          EnumVariantDecl("Circle", None, List(Param("r", NamedType("real")))),
+          EnumVariantDecl("Empty", None, Nil),
+        ))
+      )
+
+      prog("enum Code\n    Ok = 0\n") shouldBe List(
+        EnumDecl("Code", Nil, None, List(EnumVariantDecl("Ok", Some(i(0)), Nil)))
+      )
+    }
+
+    // Empty parentheses are a variant with no fields and have always been legal, so the positional
+    // case has to decline on them rather than read them as a malformed payload.
+    "and empty parentheses are still a variant with no payload" in {
+      prog("enum Event\n    Nothing()\n") shouldBe List(
+        EnumDecl("Event", Nil, None, List(EnumVariantDecl("Nothing", None, Nil)))
+      )
+    }
+  }
+
   "end markers" - {
     "a matching end name closes a struct" in {
       prog("struct Point\n    x: int\nend Point") shouldBe List(

@@ -510,7 +510,48 @@ trait DeclParser extends ExprParser {
    * so `Circle(radius: int)` — a header with nothing after it — falls through to `enumVariant`.
    */
   protected lazy val enumItem: Parser[Either[EnumVariantDecl, MethodDecl]] =
-    restrictedMember ^^ (Right(_)) | enumVariant ^^ (Left(_))
+    positionalPayload | restrictedMember ^^ (Right(_)) | enumVariant ^^ (Left(_))
+
+  /** Whether a type is `self` under whatever a receiver may be written with, which is the one thing
+   * `positionalPayload` has to stand aside for: `area(self)` and `write(*self, …)` are members, and
+   * to a type parser they are a name and a pointer to one.
+   */
+  private def namesSelf(t: TypeRef): Boolean = t match
+    case NamedType("self", _) => true
+    case PtrType(inner)       => namesSelf(inner)
+    case RefType(inner, _)    => namesSelf(inner)
+    case _                    => false
+
+  /** What a variant's parentheses say when they hold a bare **type** rather than `name: type`.
+   *
+   * **The habit it answers is a port rather than ignorance.** Rust, Swift, OCaml and Haskell all
+   * take a positional payload, and a data enum is exactly the construct somebody is most likely to
+   * be bringing from one of them — so `Url([]const u8)` is what gets written first. Card `0367`,
+   * found twice in one file writing `sysl-lang/llhttp`.
+   *
+   * **It sits above `restrictedMember` because otherwise the message depends on the type**, and
+   * three of the four answers were bad. Measured before it was moved: `[]const u8` and `[4]u8`
+   * reached the variant parser and said `')' expected` with the caret on the `[` — a complaint that
+   * reads as being about the type; `int` and `Buf[int]` were read as far as a member header and said
+   * `':' expected`, which is fine; and **`*u8` and `&Node` said `'self' expected`**, which is worse
+   * than either, because it tells the reader to write the one word that would not help. One rule
+   * above all of them answers every shape the same way.
+   *
+   * **The suggestion is constructed rather than recited**: the type has been read by here, and
+   * `TypeRef.show` writes its spelling back out, so the message names the line the reader should
+   * have written instead of describing it.
+   *
+   * **The whole test is a `guard`, so nothing is consumed and the caret lands on the name** rather
+   * than past the offending text. It declines on everything that is not this mistake: a named field
+   * breaks at the `:`, empty parentheses have no type to read, and a receiver is `namesSelf`.
+   */
+  private lazy val positionalPayload: Parser[Either[EnumVariantDecl, MethodDecl]] =
+    guard(ident ~ (op("(") ~> typeRef) <~ (op(")") | op(","))) >> { case _ ~ t =>
+      if namesSelf(t) then failure("a receiver, not a payload")
+      else
+        err(s"a variant's payload names its fields, as 'Circle(r: real)' — write a name before the " +
+          s"type, as 'name: ${t.show}'")
+    }
 
   protected lazy val enumVariant: Parser[EnumVariantDecl] =
     at(
