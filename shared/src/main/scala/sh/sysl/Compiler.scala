@@ -38,7 +38,7 @@ package sh.sysl
  */
 case class Compiled private (ir: String, notes: List[String], links: List[String],
                              exports: List[TFunc], module: sh.sysl.ir.Module,
-                             warnings: List[Diagnostic] = Nil)
+                             warnings: List[Diagnostic])
 
 object Compiled {
 

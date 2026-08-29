@@ -98,6 +98,22 @@ class DropReturnWarningTests extends AnyFreeSpec with Matchers {
     warningsOf(dropping + "first(xs: []Thing) -> []Thing = xs\nprint(1)\n") shouldBe empty
   }
 
+  // **The boundary, asserted rather than described.** A `Drop` type held in a container or in a
+  // struct field leaks exactly as a by-value return does, and this check does not see either — it
+  // is keyed on declarations, and a `Buf[Handle]` is not a return type at all. That is a real limit
+  // and the tests say so, because a limit nobody wrote down is a coverage claim somebody will make.
+  //
+  // Raised by a peer sweeping the org against the warning: nothing there holds one this way today,
+  // so there is no natural case in the tree and a deliberate one is what pins it.
+  "a Drop type held by a struct is not warned about, which is a limit rather than a decision" in {
+    warningsOf(dropping +
+      """struct Holder
+        |    it: Thing
+        |wrap(t: Thing) -> Holder = Holder(t)
+        |print(1)
+        |""".stripMargin) shouldBe empty
+  }
+
   // The position is what makes a warning worth having over a note: it names the declaration rather
   // than the type, because the declaration is what has to change.
   "the warning points at the declaration, which is what has to change" in {
@@ -109,7 +125,12 @@ class DropReturnWarningTests extends AnyFreeSpec with Matchers {
 
   // A compilation that warns still succeeds — that is the whole difference between the two
   // severities, and a rule that stopped a build would have to be right every time.
+  //
+  // **`isRight shouldBe true` rather than `should be a Symbol("right")`**, which compiles on the JVM
+  // and **not** on Scala.js: the symbol form goes through reflection, and `syslJS/Test/compile`
+  // refuses it. The gate compiles `syslJVM` alone, so nothing but the release warnings census sees
+  // this — and it saw it, one commit after the merge.
   "a warning does not fail the compilation" in {
-    Compiler.compileToLlvm(dropping + "make(n: int) -> Thing = Thing(n)\nprint(1)\n") should be a Symbol("right")
+    Compiler.compileToLlvm(dropping + "make(n: int) -> Thing = Thing(n)\nprint(1)\n").isRight shouldBe true
   }
 }
