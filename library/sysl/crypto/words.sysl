@@ -14,7 +14,7 @@ module sysl.crypto
 // untruncated one.
 
 // The rotation the mixing functions are built out of. This used to be a generic `rotr` written here
-// — `(x >> n) | (x << (T.word_bits() - n))`, which is the expression everybody writes and which is
+// — `(x >> n) | (x << (T.width() - n))`, which is the expression everybody writes and which is
 // undefined at `n = 0`, since shifting by the whole width is. SHA-2 never rotates by zero, so the
 // version that was here worked; a reader copying it into something that does would have found out
 // the hard way. `rotate_right` is the machine's own instruction and is defined at every amount.
@@ -106,10 +106,11 @@ private[crypto] val iv512: [8]u64 = [
         0x1f83d9abfb41bd6b, 0x5be0cd19137e2179,
     ]
 
-// What the compression needs to know about its word type. The first three are facts about `u32` and
-// `u64` rather than about any particular word — the width, the round count, and the two constant
-// tables — so they are declared with **no receiver** and reached through the type: `T.word_bits()` inside
-// anything bounded by `Word`, and `u32.word_bits()` from outside. The rest act on a word and take one.
+// What the compression needs to know about its word type. The first two are facts about `u32` and
+// `u64` rather than about any particular word — the round count and the two constant tables — so
+// they are declared with **no receiver** and reached through the type: `T.word_rounds()` inside
+// anything bounded by `Word`, and `u32.word_rounds()` from outside. The rest act on a word and take
+// one.
 //
 // The arithmetic is **required** rather than repeated. `Word` is a promise the trait itself makes,
 // so `[T: Word]` licenses every operator below without naming one of them, and `impl Word for u32`
@@ -121,8 +122,13 @@ private[crypto] val iv512: [8]u64 = [
 // width now, so requiring it says the same thing and the two blocks say nothing at all — `T.zero()`
 // in the compression is the standard module's member, reached through the bound like every operator
 // beside it.
-private[crypto] trait Word: Add + BitAnd + BitOr + BitXor + Not + Shl + Shr + Sub + Zero
-    word_bits() -> Self
+//
+// **`Bits` is the same story told twice, and the width was the second telling.** This trait declared
+// a `word_bits()` of its own for exactly the reason it once declared a `zero()`: there was no way to
+// ask an integer type how wide it is. `Bits.width()` is that way, so requiring `Bits` says what
+// `word_bits()` said and the two blocks below say nothing at all — `T.width()` in the compression is
+// `sysl.math`'s member, reached through the bound like `T.zero()` beside it.
+private[crypto] trait Word: Add + BitAnd + BitOr + BitXor + Bits + Not + Shl + Shr + Sub + Zero
     word_rounds() -> usize
 
     round_key(i: usize) -> Self
@@ -136,7 +142,6 @@ private[crypto] trait Word: Add + BitAnd + BitOr + BitXor + Not + Shl + Shr + Su
     ssig1(self) -> Self
 
 impl Word for u32
-    word_bits() -> u32 = 32
     word_rounds() -> usize = 64
 
     round_key(i: usize) -> u32 = k256[i]
@@ -147,7 +152,6 @@ impl Word for u32
     ssig1(self) -> u32 = self.rotate_right(17) ^ self.rotate_right(19) ^ (self >> 10)
 
 impl Word for u64
-    word_bits() -> u64 = 64
     word_rounds() -> usize = 80
 
     round_key(i: usize) -> u64 = k512[i]

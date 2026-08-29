@@ -113,6 +113,33 @@ object CoreTraits {
     "one"  -> ("One",  1),
   )
 
+  /** The compiler-provided receiverless members whose answer is **read off the type** rather than
+   * stated — `u32.width()`, and `T.width()` in a body bounded by `Bits`.
+   *
+   * These are `constants`' other half and are a table of their own for the reason `constants` is
+   * one: a receiverless member has no value to lower from, so something here has to supply the
+   * answer. The difference is where the answer comes from. `zero` is `0` at every width, so the
+   * number is written in the table; a width is different at every width, so what is written here is
+   * only which trait declares it and `measure` computes the rest.
+   *
+   * **`Bits`' membership is the compiler's, which is why this cannot be an `impl` in the library.**
+   * The integers are an open family — the trait's own comment turns `swap_bytes` away over `u24` —
+   * so there is no finite list of widths to write blocks for, and a member every integer has must be
+   * supplied the way the rest of `Bits` is.
+   */
+  val measures: Map[String, String] = Map("width" -> "Bits")
+
+  /** What a measure answers for one subject type, and nothing for a type it has no answer about.
+   *
+   * Asked at `opSubject` for the reason `builtin` asks there: a constrained subtype has its base's
+   * whole catalog, and a range narrows which values a type holds rather than how wide it is — so a
+   * subtype of `u32` is thirty-two bits, and a vector is asked about at its lane.
+   */
+  def measure(mname: String, subject: Type): Option[Int] =
+    (mname, Type.opSubject(subject)) match
+      case ("width", i: Type.Integer) => Some(i.bits)
+      case _                          => None
+
   /** Each infix operator token, and the trait its operands must satisfy (`§3`). The four derived
    * comparisons name the trait they are derived *from*, not one of their own — there is no `Gt`.
    */

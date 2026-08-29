@@ -573,6 +573,43 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
    * finding the compiler already there is `HoistImpl`'s complaint to make and not a call's.
    */
   protected def builtinAssociated(ty: Type, mname: String, args: List[Expr]): Option[TExpr] =
+    builtinConstant(ty, mname, args).orElse(builtinMeasure(ty, mname, args))
+
+  /** `T.width()` — a receiverless member whose answer is read off the type (`CoreTraits.measures`).
+   *
+   * It is `builtinConstant`'s sibling and differs from it in one place: the number. A `zero()` is
+   * `0` whatever the width, so the table states it; a width is the width, so the table names the
+   * trait and `CoreTraits.measure` answers. Everything either side of that — the scope gate, the
+   * declaration being read rather than assumed, the refusal of arguments — is the same and is the
+   * same for the same reasons.
+   *
+   * **The result type is the declaration's and not the subject's**, which is the one thing that
+   * could not be shared with `zero()`. `Zero.zero()` answers `Self` and this answers `u32`, so the
+   * literal is built at the type `trait Bits` wrote down — a width is a count of bit positions, and
+   * building it at `Self` would make `u8.width()` a `u8` that cannot hold `256`.
+   */
+  private def builtinMeasure(ty: Type, mname: String, args: List[Expr]): Option[TExpr] =
+    for
+      trName <- CoreTraits.measures.get(mname)
+      if CoreTraits.builtin(trName, ty)
+      key = Library.key(trName)
+      if traitInScope(key)
+      decl <- traitDecls.get(key)
+      m    <- decl.methods.find(_.name == mname)
+      // Read rather than assumed, exactly as `builtinConstant` reads it: a trait that grew a
+      // receiver or a parameter here would otherwise be answered with a number that ignored it.
+      if m.receiver.isEmpty && !m.isProperty && m.params.isEmpty
+      declared <- m.retType
+      value    <- CoreTraits.measure(mname, ty)
+    yield {
+      if args.nonEmpty then
+        err(s"associated function '$trName.$mname' takes no arguments, but " +
+          s"${supplied(args.length, "argument")}")
+
+      TIntLit(value, inDecl(decl.name)(resolveType(declared, selfBinding(Type.underlying(ty)))))
+    }
+
+  private def builtinConstant(ty: Type, mname: String, args: List[Expr]): Option[TExpr] =
     for
       (trName, value) <- CoreTraits.constants.get(mname)
       if CoreTraits.builtin(trName, ty)

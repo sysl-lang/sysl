@@ -54,6 +54,63 @@ class MathTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  /** `T.width()` — the receiverless member whose answer is read off the type rather than stated.
+   *
+   * It is `zero()`'s sibling and the tests below are the two halves that could come apart: the
+   * number has to be the *subject's* width, and the result has to be at the *declaration's* type
+   * rather than the subject's. A `width` built at `Self` would make `u8.width()` a `u8`, which
+   * cannot hold `256` and would silently wrap at every width above eight.
+   */
+  "a type's own width" - {
+    "each width answers with its own" in {
+      run("import sysl.math.Bits\nprint(u8.width(), u32.width(), i64.width())") shouldBe "8 32 64\n"
+    }
+
+    // The answer is a `u32` whatever the subject, which is what lets a narrow type state a width its
+    // own range could not hold. At `Self` this would print `0`, having wrapped.
+    "the answer is a u32 and not the subject's type" in {
+      run("import sysl.math.Bits\nprint(u8.width() + 248, i8.width() == u8.width())") shouldBe
+        "256 true\n"
+    }
+
+    "a bound reaches it, so one body serves every width" in {
+      run(
+        """import sysl.math.Bits
+          |w[T: Bits]() -> u32 = T.width()
+          |print(w[u16](), w[u64]())""".stripMargin
+      ) shouldBe "16 64\n"
+    }
+
+    // The expression the member exists for: reversing the low `n` bits needs the width, and without
+    // one a body bounded by `Bits` knows every operation on its width and not the width itself.
+    "the shift a generic body could not otherwise write" in {
+      run(
+        """import sysl.math.Bits
+          |low[T: Bits + Shr](v: T, n: u32) -> T = v.reverse_bits() >> T(T.width() - n)
+          |print(low(u8(0b001), 3), low(u32(0b001), 3))""".stripMargin
+      ) shouldBe "4 4\n"
+    }
+
+    "it takes no arguments" in {
+      err("import sysl.math.Bits\nprint(u32.width(1))") should include(
+        "associated function 'Bits.width' takes no arguments")
+    }
+
+    "an unbounded type parameter is refused, naming the bound that would license it" in {
+      err(
+        """import sysl.math.Bits
+          |w[T]() -> u32 = T.width()
+          |print(w[u8]())""".stripMargin
+      ) should include("'width' needs 'T: sysl.math.Bits'")
+    }
+
+    // A float has a width and no bit surface, which is `Bits`' membership rather than an oversight:
+    // there is no bit pattern a float agrees to be treated as.
+    "a float has no width, because it has no bit surface" in {
+      err("import sysl.math.Bits\nprint(real.width())") should include("no associated function 'width'")
+    }
+  }
+
   /** The members with no receiver, which is what lets a body shared by two widths name a value of
    * whichever width it was instantiated at. Before them, `signum` and `recip` had to be written per
    * width for want of a one to divide, and a routine generic over the width could not start a
