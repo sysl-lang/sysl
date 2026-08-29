@@ -102,6 +102,33 @@ class TextBlockTests extends AnyFreeSpec with Matchers with RunSupport with Code
              |print(s.len)""".stripMargin) shouldBe "5\n"
     }
 
+    /** **`raw` leaves the `$$` alone too, and that is the whole of what it is for.**
+      *
+      * It used to be an interpolator following Scala's — escapes off, holes still read — and that
+      * left the one combination nobody could write: a plain block reads no `$${…}` and *does* decode
+      * escapes, so "leave all of it alone" had no spelling. A literal whose job is to carry another
+      * language's source needs exactly that, and `$${` is not exotic: shell, Make, Kotlin, Groovy and
+      * JS template literals all spell interpolation with it.
+      */
+    "and a raw block reads no holes either, so it can carry another language" in {
+      run(s"""var x = 7
+             |var s = raw$Q
+             |    let re = "${BS}d+" and $${x} and $$x
+             |    $Q
+             |print(s)""".stripMargin) shouldBe
+        s"""let re = "${BS}d+" and $${x} and $$x
+
+"""
+    }
+
+    // The counting claim, said in bytes rather than by eye: what goes in is what comes out.
+    "a raw block is byte for byte what was written" in {
+      run(s"""var s = raw$Q
+             |    a${BS}nb$${c}
+             |    $Q
+             |print(s.len)""".stripMargin) shouldBe "9\n"
+    }
+
     // `01`'s escape table is unchanged inside a block — the line discipline is layered over the
     // one-quote scan, not a replacement for it.
     "the escape table still applies" in {

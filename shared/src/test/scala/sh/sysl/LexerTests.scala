@@ -154,9 +154,8 @@ class LexerTests extends AnyFreeSpec with Matchers {
       l.bare("""s"hi $who"""") shouldBe List(l.StrInterp(List("hi ", ""), List("who"), List(None)))
     }
 
-    "the parts still decode escapes, but raw does not" in withLexer { l =>
+    "the parts still decode escapes" in withLexer { l =>
       l.bare("""s"a\tb"""") shouldBe List(l.StrInterp(List("a\tb"), Nil, Nil))
-      l.bare("""raw"a\tb"""") shouldBe List(l.StrInterp(List("a\\tb"), Nil, Nil))
     }
 
     "a hole's source keeps a nested string and brace verbatim for re-lexing" in withLexer { l =>
@@ -168,7 +167,7 @@ class LexerTests extends AnyFreeSpec with Matchers {
       l.bare("""s"$$"""") shouldBe List(l.StrInterp(List("$"), Nil, Nil))
     }
 
-    "s or raw not against a quote is an ordinary identifier" in withLexer { l =>
+    "s not against a quote is an ordinary identifier" in withLexer { l =>
       l.bare("s + raw") shouldBe List(l.Identifier("s"), l.Keyword("+"), l.Identifier("raw"))
     }
 
@@ -186,8 +185,25 @@ class LexerTests extends AnyFreeSpec with Matchers {
         List(l.StrInterp(List("", " and ", ""), List("x", "y"), List(None, None)))
     }
 
-    "s and raw never capture a specifier — the percent is text" in withLexer { l =>
+    "s never captures a specifier — the percent is text" in withLexer { l =>
       l.bare("""s"$x%d"""") shouldBe List(l.StrInterp(List("", "%d"), List("x"), List(None)))
+    }
+
+    /** **`raw` is NOT one of these, and that is the point of it.** It was, following Scala, where
+      * `raw` is an interpolator that happens to leave backslashes alone — and the combination that
+      * left unwritable is the only one a literal carrying another language's source can use: a plain
+      * block reads no `${…}` and *does* decode escapes, and Scala's `raw` did the opposite.
+      *
+      * So it lexes as an ordinary `StrLit` rather than a `StrInterp`, which is what says it went
+      * through no interpolation scan at all.
+      */
+    "raw is a plain string with nothing read inside it" in withLexer { l =>
+      l.bare("""raw"a\tb"""") shouldBe List(l.StrLit("a\\tb"))
+      l.bare("""raw"${x} $y"""") shouldBe List(l.StrLit("${x} $y"))
+    }
+
+    "and raw not against a quote is still an ordinary identifier" in withLexer { l =>
+      l.bare("raw + 1") shouldBe List(l.Identifier("raw"), l.Keyword("+"), l.IntLit(1, None))
     }
 
     "f is only a prefix against a quote" in withLexer { l =>

@@ -427,7 +427,7 @@ class SyslLexical
   }
 
   override def token: Parser[Token] =
-    interpString | cString | identifier | number | label | character | string | quotedIdent |
+    interpString | rawString | cString | identifier | number | label | character | string | quotedIdent |
       (elem(EofCh) ^^^ EOF) | delim | failure(
         "illegal character",
       )
@@ -683,12 +683,39 @@ class SyslLexical
     }
   }
 
-  /** The shared body of both quote forms: scan to the closing `"`, decoding escapes. `token` is what
-   * to build from the decoded value, which is the only thing the two forms differ by.
+  /** `raw"…"` — **the literal that is left exactly alone**: no escape decoding and no `${…}`
+   * (`reference/lexical.md § Strings`).
+   *
+   * It is a prefix like `c`'s rather than an interpolator like `s`'s, and that placement is the
+   * whole of what it says. `raw` meaning *raw* is one rule with nothing to remember; `raw` meaning
+   * "an interpolator that skips escapes" is Scala's, and it left a program carrying another
+   * language's source with nowhere to put a `${`, which shell, Make, Kotlin, Groovy and JS template
+   * literals all spell.
+   *
+   * The tripled form is where this earns its keep: a `raw` block strips its incidental indentation
+   * like any other block, so 500 lines of somebody else's program sit at the margin of the code
+   * around them and say byte for byte what they hold.
    */
-  private def stringBody(token: String => Token): Parser[Token] = Parser { in =>
+  private lazy val rawString: Parser[Token] = Parser { in =>
+    if (in.atEnd || in.first != 'r') Failure("not a raw string literal", in)
+    else {
+      val (name, after) = takeWhile(in, isIdentPart)
+
+      if (name == "raw" && !after.atEnd && after.first == '"') stringBody(StrLit.apply, escapes = false)(after)
+      else Failure("not a raw string literal", in)
+    }
+  }
+
+  /** The shared body of every quote form: scan to the closing `"`, decoding escapes unless the form
+   * says not to. `token` is what to build from the value, which is most of what the forms differ by.
+   *
+   * **`escapes = false` is `raw"…"`, and on one line it means the literal cannot hold a `"`** — the
+   * first one closes it, because there is no escape left to write one with. That is not a hole in
+   * the form; it is what the tripled spelling is for, where a `"` is ordinary content.
+   */
+  private def stringBody(token: String => Token, escapes: Boolean = true): Parser[Token] = Parser { in =>
     if (in.atEnd || in.first != '"') Failure("not a string literal", in)
-    else if (opensBlock(in)) scanBlock(in.rest.rest.rest, escapes = true, token)
+    else if (opensBlock(in)) scanBlock(in.rest.rest.rest, escapes, token)
     else {
       val buf                                = new StringBuilder
       var rest                               = in.rest
@@ -698,6 +725,8 @@ class SyslLexical
         if (rest.atEnd || rest.first == '\n') result = Some(Success(errorToken("unterminated string literal"), rest))
         else if (rest.first == '"') {
           result = Some(Success(token(buf.toString), rest.rest))
+        } else if (!escapes) {
+          buf += rest.first; rest = rest.rest
         } else
           scanChar(rest) match {
             case Left((msg, next)) => result = Some(Success(errorToken(msg), next))
@@ -757,27 +786,33 @@ class SyslLexical
         result.get
     }
 
-  /** An interpolated string is an identifier `s`, `raw`, or `f` written directly against a `"`. The
-   * prefix has to be the whole identifier — `sfoo"…"` is an ordinary name beside a string, not an
+  /** An interpolated string is an identifier `s` or `f` written directly against a `"`. The prefix
+   * has to be the whole identifier — `sfoo"…"` is an ordinary name beside a string, not an
    * interpolation — so a mismatch falls through to `identifier`, which keeps those names usable.
-   * `raw` alone keeps backslashes literal; `f` alone allows a printf specifier after a hole.
+   * `f` alone allows a printf specifier after a hole.
+   *
+   * **`raw` is deliberately not among them** (`rawString`). It was, following Scala, where `raw` is
+   * an interpolator that happens to leave backslashes alone — and that left the one combination
+   * nobody could write: a plain block reads no `${…}` and *does* decode escapes, a `raw` block did
+   * the opposite, and neither answered "leave all of it alone", which is the only thing a literal
+   * carrying another language's source can use.
    */
   private lazy val interpString: Parser[Token] = Parser { in =>
     if (in.atEnd || !isIdentStart(in.first)) Failure("not an interpolated string", in)
     else {
       val (name, afterName) = takeWhile(in, isIdentPart)
 
-      if ((name == "s" || name == "raw" || name == "f") && !afterName.atEnd && afterName.first == '"')
+      if ((name == "s" || name == "f") && !afterName.atEnd && afterName.first == '"')
         if (opensBlock(afterName))
           // A block's shape is settled before its holes are, since the strip has to be known at the
           // first line and only the last line can lower it.
-          blockIndent(afterName.rest.rest.rest, escapes = name != "raw") match {
+          blockIndent(afterName.rest.rest.rest, escapes = true) match {
             case Left((msg, at)) => Success(errorToken(msg), at)
             case Right((strip, first)) =>
-              scanInterp(afterIndent(first, strip), escapes = name != "raw",
+              scanInterp(afterIndent(first, strip), escapes = true,
                          allowSpec = name == "f", block = true, strip = strip)
           }
-        else scanInterp(afterName.rest, escapes = name != "raw", allowSpec = name == "f")
+        else scanInterp(afterName.rest, escapes = true, allowSpec = name == "f")
       else Failure("not an interpolated string", in)
     }
   }
