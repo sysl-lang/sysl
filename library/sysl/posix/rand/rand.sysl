@@ -16,10 +16,18 @@ import sysl.encoding.get_u64_le
 // is**, and that is the rule the whole namespace follows: a module there is one a freestanding
 // target does not get. `sysl.posix.tty` sits beside `sysl.term` for the same reason.
 //
-// **This is entropy for seeding, not a cryptographic generator.** What it feeds is PCG32, whose whole
-// output is computable by anyone who sees a few of its values. Seeding a predictable generator
-// unpredictably does not make it unpredictable, and nothing here should be mistaken for a source of
-// key material.
+// **`seed_from_os` is entropy for SEEDING, and it is not a cryptographic generator.** What it feeds
+// is PCG32, whose whole output is computable by anyone who sees a few of its values. Seeding a
+// predictable generator unpredictably does not make it unpredictable, and `sysl.rand` should not be
+// mistaken for a source of key material.
+//
+// **`entropy_from_os` IS that source, and the distinction is the point of having both.** The kernel's
+// pool is exactly what a salt, a nonce, an IV, a session id or a token wants; what must not be
+// mistaken for one is the generator the seed is fed to. Everything `sysl.crypto` and every binding
+// over monocypher or openssl says about randomness is *"the caller brings it"*, and before this
+// there was nothing in sysl for the caller to bring it from -- so a program wanting sixteen fresh
+// bytes opened `/dev/urandom` by hand, which works, and is a descriptor, an open, a read and a close
+// for something the kernel answers in one call.
 
 // `getentropy(2)`: at most 256 bytes, straight from the kernel's pool, with no file to open and no
 // descriptor to run out of. It is on macOS 10.12 and later, glibc 2.25 and later, and the BSDs.
@@ -43,3 +51,34 @@ seed_from_os() -> Option[u64]
      * release exists to remove.
      */
     get_u64_le(b)
+
+/** `into` filled from the kernel's entropy pool, or `false` where the host would not supply it.
+ *
+ * **This is the source key material comes from**, unlike `seed_from_os` above it, which feeds a
+ * generator that is not one. A salt, a nonce, an IV, a session id and a token all want these bytes
+ * and want nothing computed from them.
+ *
+ * **A slice longer than 256 bytes is filled by looping**, because that is `getentropy(2)`'s limit
+ * per call and not a limit on what a caller may ask for. Refusing a longer slice was the other road
+ * and is worse: every real caller wants 16 or 32, so the cap would be a rule nobody meets and
+ * everybody has to read about, and the loop is three lines.
+ *
+ * **An empty slice is filled successfully**, which is what a loop over no bytes means. It is worth
+ * saying because the alternative -- asking the kernel for zero bytes -- is a call some libcs refuse.
+ *
+ * Answers a `bool` rather than trapping, for `seed_from_os`'s reason turned the other way round: a
+ * caller who cannot get entropy has no reasonable fallback for key material and must **stop**, and a
+ * value it has to look at is what makes that a decision rather than an omission.
+ */
+entropy_from_os(into: []u8) -> bool
+    var done: usize = 0
+
+    while done < into.len
+        val want = if into.len - done > 256 then 256 else into.len - done
+
+        if c_getentropy(as_mut_ptr(into[done..]), want) != 0 then return false
+
+        done += want
+
+    true
+end entropy_from_os
