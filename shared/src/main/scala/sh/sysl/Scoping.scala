@@ -643,6 +643,47 @@ trait Scoping extends DeclTables {
   protected def variantKey(written: String): Option[String] =
     resolveName(written, inReach = variantVisible)(variantOwners.contains)
 
+  /** The same, with the **expected type given the first word** — which is what a bare variant name
+   * needs and `variantKey` alone cannot give it.
+   *
+   * A key says which *module*, and `resolveName` answers with this file's own module before it looks
+   * at the library. That is right for every other kind of name and wrong for a variant: a module
+   * declaring `enum Status` with an `Ok` in it made **every** `Result` in that module unwritable,
+   * because the bare `Ok` resolved to the local key and the expected type was never asked. The
+   * refusal then said *"variant 'Ok' carries nothing"* over a line whose expected type has an `Ok`
+   * that carries an `int`, naming neither the enum it had chosen nor the one the reader meant.
+   *
+   * **The rule is the one card `0220` arrived at for a struct standing beside a variant** — *the
+   * expected type decides where it names the variant's enum* — and this is that rule reaching the
+   * case where the two candidates are in different modules rather than the same one. `Result` and
+   * `Option` are the prelude's, so the module that loses is always the program's own, and the two
+   * enums it loses to are the two every package returns.
+   *
+   * It is deliberately narrower than making `resolveName` consult the expected type in general. A
+   * local name shadowing the library's is the behaviour everywhere else and is worth keeping; what
+   * is special here is that a variant is *already* chosen by the expected type wherever more than
+   * one owner shares a key, so consulting it across keys is the same rule and not a new one.
+   *
+   * The qualified spelling stays the escape for the other direction: where the expected type is a
+   * `Result` and the program's own `Status.Ok` is what was meant, writing `Status.Ok` says so and
+   * takes the `owner` road instead.
+   */
+  protected def variantKeyFor(written: String, expected: Option[Type]): Option[String] =
+    expectedVariantKey(written, expected).orElse(variantKey(written))
+
+  /** The key the expected type's own enum offers for this written name, where it offers one.
+   *
+   * Distinct from `variantEnumExpected`, which asks the same question of a key already chosen: this
+   * one *builds* the key from the expected enum's module, so it can answer where the name would
+   * otherwise have resolved somewhere else entirely.
+   */
+  private def expectedVariantKey(written: String, expected: Option[Type]): Option[String] =
+    expected.map(Type.repr).collect { case e: Type.Enum => e.base }.flatMap { base =>
+      val key = Modules.qualify(Modules.moduleOf(base), written)
+
+      Option.when(variantOwners.getOrElse(key, Nil).contains(base) && variantVisible(key))(key)
+    }
+
   /** Whether an **enum variant** may be named from here: whether any enum offering it may be.
    *
    * A variant declares no visibility of its own and records none — it follows the enum that

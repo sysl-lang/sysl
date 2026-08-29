@@ -97,10 +97,15 @@ trait CallExprAnalysis extends ExprCoercion with MemberExprAnalysis with RawStor
     // compiler asking itself a question rather than resolving a name a file wrote — `typeKey` would
     // raise on a candidate the site may not name, and would file a module dependency for a
     // declaration the program never reached.
+    //
+    // **The key is `variantKeyFor` rather than `variantKey`, so that the expected type is consulted
+    // across modules as well as within one** (card `0370`). A module declaring its own `Ok` made
+    // every `Result` in it unwritable, because a bare name resolves to this module before the
+    // library and nothing asked what the site wanted.
     case Call(Ident(name), args)
-        if lookupOpt(name).isEmpty && variantKey(name).isDefined &&
-          (!typeInScope(name) || variantEnumExpected(variantKey(name).get, expected).isDefined) =>
-      constructVariant(variantKey(name).get, args, expected)
+        if lookupOpt(name).isEmpty && variantKeyFor(name, expected).isDefined &&
+          (!typeInScope(name) || variantEnumExpected(variantKeyFor(name, expected).get, expected).isDefined) =>
+      constructVariant(variantKeyFor(name, expected).get, args, expected)
 
     // A constrained subtype's name in call position wraps a base value into the subtype, checking it
     // — `Age(n)`, `Meters(3.0)`. Unlike an implicit produce site, the cast is written, so it applies

@@ -281,7 +281,10 @@ trait ExprAnalysis
         // Closures`).
         case Some((u, ty)) => capturedFields.getOrElse(u, TLoad(u, ty))
         case None =>
-          variantKey(name) match
+          // `variantKeyFor` rather than `variantKey`: the expected type picks the enum across
+          // modules as well as within one, so a bare `None` still means `Option`'s in a module that
+          // declares a `None` of its own (card `0370`).
+          variantKeyFor(name, expected) match
             case Some(key) => constructVariant(key, Nil, expected)
             case None =>
               // A constant is folded into its use and analyzed as the literal it stands for, at the

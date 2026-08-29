@@ -350,9 +350,13 @@ class VariantNamespaceTests extends AnyFreeSpec with RunSupport with CodegenSupp
           |""".stripMargin) shouldBe "3\n"
   }
 
-  // A program's own declaration outranks the library's, which is what makes this legal at all — and
-  // it was legal before, since `Option` is another module. Kept because a reader meeting the new
-  // rule will ask whether it changed.
+  // A program's own declaration outranks the library's *where nothing else decides*, which is what
+  // makes this legal — and it was legal before, since `Option` is another module. Kept because a
+  // reader meeting the new rule will ask whether it changed.
+  //
+  // **It is the expected type that outranks both**, which the block below this one is about: the
+  // annotation here says `Maybe`, so the program's own is what it names, and the same program with
+  // `val m: Option[int]` on that line would name the library's.
   "a program may name a variant the library also names" in {
     run("""enum Maybe
           |    Some(v: int)
@@ -364,6 +368,94 @@ class VariantNamespaceTests extends AnyFreeSpec with RunSupport with CodegenSupp
           |val m: Maybe = Some(5)
           |print(unwrap(m))
           |""".stripMargin) shouldBe "5\n"
+  }
+
+  /** Card `0370`. The rule above crosses a **module** boundary, which it did not until this landed:
+   * a key says which module, and `resolveName` answers with the file's own before it looks at the
+   * library — so a module declaring an `Ok` of its own made every `Result` in it unwritable.
+   *
+   * The refusal named the wrong `Ok` and read as a defect in the call: *"variant 'Ok' carries
+   * nothing, so it is written as a name on its own"*, over a line whose expected type has an `Ok`
+   * that carries an `int`, with nothing in it mentioning the enum thirty lines above.
+   *
+   * Found writing `sysl-lang/libpq`, where `PQstatus` answers `CONNECTION_OK`/`CONNECTION_BAD` and
+   * the enum over it wants the name every other language gives it. The workaround was to rename the
+   * variant, and the cost was real: the collision is invisible until a `Result` is returned
+   * somewhere else in the same file.
+   */
+  "the expected type reaches across modules, not only within one" - {
+
+    // The card's own reduction, at all four of the prelude's names — `Result` and `Option` are what
+    // every package returns, so these are the four words a module cannot afford to lose.
+    val shadows =
+      """enum Status
+        |    Ok
+        |    Bad
+        |enum Outcome
+        |    Err
+        |    Some
+        |    None
+        |""".stripMargin
+
+    "so a module declaring its own Ok may still return a Result" in {
+      run(shadows +
+        """f() -> Result[int, string] = Ok(1)
+          |g() -> Result[int, string] = Err("no")
+          |print(f().unwrap(), g().is_err())
+          |""".stripMargin) shouldBe "1 true\n"
+    }
+
+    "and Some and None still mean Option's" in {
+      run(shadows +
+        """h() -> Option[int] = Some(2)
+          |k() -> Option[int] = None
+          |print(h().unwrap(), k().is_none())
+          |""".stripMargin) shouldBe "2 true\n"
+    }
+
+    // The other direction, which is the half that would break if the expected type were ignored the
+    // opposite way. A nullary local variant is the shape that has no arguments to be read from.
+    "while the module's own still wins where its own type is expected" in {
+      run(shadows +
+        """s() -> Status = Ok
+          |o() -> Outcome = None
+          |print(s() == Ok, o() == None)
+          |""".stripMargin) shouldBe "true true\n"
+    }
+
+    // The escape for a site whose expected type is the library's and whose meaning is not.
+    "and the qualified spelling says which, as it does everywhere else" in {
+      run(shadows +
+        """want(x: Status) -> bool = x == Status.Ok
+          |r() -> Result[int, string] = Ok(1)
+          |print(want(Status.Ok), r().unwrap())
+          |""".stripMargin) shouldBe "true 1\n"
+    }
+
+    // Nothing here weakens the ambiguity rule: two owners and no expected type is still refused, and
+    // still names both enums.
+    "and two owners with nothing to choose by are still refused" in {
+      err("""enum A
+            |    Thing
+            |enum B
+            |    Thing
+            |f() = print(Thing)
+            |""".stripMargin) should include("'Thing' is a variant of 'A' and 'B'")
+    }
+
+    // Patterns were never affected — the scrutinee's type says which enum before a name is looked
+    // at — and this says so with **nothing constructed**, which the first draft of it did not: a
+    // program that builds its own scrutinee fails on the construction line and reports a green
+    // pattern rule it never reached. The `Result` comes out of the library instead, so the only
+    // shadowed names in the program are the two in the arms.
+    "and a pattern was never affected, because the scrutinee already says which" in {
+      run("import sysl.text.parse_int\n" + shadows +
+        """f(s: string) -> int = parse_int(s) match
+          |    Ok(v) -> v
+          |    Err(_) -> -1
+          |print(f("42"), f("x"))
+          |""".stripMargin) shouldBe "42 -1\n"
+    }
   }
 
   "a variant clashes with a module 'var' as it does with a constant" in {
