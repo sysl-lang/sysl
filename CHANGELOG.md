@@ -9,7 +9,8 @@ change what an existing program means. Where it does, the release says so.
 
 ## 0.0.90 — 2026-08-29
 
-Seven cards, and one of them was a heap-corruption bug that had blocked another.
+Eight cards. One was a heap-corruption bug that had blocked another, and two more were cards
+filed against gaps that turned out not to exist.
 
 ### A `return` out of a `for` gave the element back twice
 
