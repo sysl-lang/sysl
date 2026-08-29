@@ -443,6 +443,51 @@ class VariantNamespaceTests extends AnyFreeSpec with RunSupport with CodegenSupp
             |""".stripMargin) should include("'Thing' is a variant of 'A' and 'B'")
     }
 
+    // **The regression 0.0.91 shipped, and the reason the rule is worded as re-pointing.** Asking
+    // the expected type *instead of* asking whether the name resolves at all made a bare variant
+    // reachable with no import — and then let it beat a name that already meant something else.
+    "and a name that resolves to something else is NOT re-pointed at a variant" in {
+      // A module's own function against a distant enum's variant of the same name. On 0.0.91 the
+      // call constructed the variant and the function was never reached: `DOT` became `VARIANT 1`,
+      // silently. That is card `0220`'s finding across modules rather than within one.
+      runIn(
+        ("pal", "pal.sysl",
+          """module pal
+            |enum Shape
+            |    Segment(n: int)
+            |    Dot
+            |describe(s: Shape) -> string = s match
+            |    Segment(n) -> s"VARIANT ${n}"
+            |    Dot -> "DOT"
+            |""".stripMargin),
+        ("app", "app.sysl",
+          """module app
+            |import pal.{Shape, describe}
+            |Segment(n: int) -> Shape = Shape.Dot
+            |go() -> string = describe(Segment(1))
+            |""".stripMargin),
+        ("", "main.sysl", "print(app.go())"),
+      ) shouldBe "DOT\n"
+    }
+
+    // The other half of the same mistake: a variant the file never imported is not in scope, and
+    // the expected type naming its enum does not put it there. `sysl.sh`'s `library/sync.md`
+    // asserts exactly this refusal and is what caught it, one release too late.
+    "and an unimported variant is still out of scope, whatever the expected type names" in {
+      errIn(
+        ("pal", "pal.sysl",
+          """module pal
+            |enum Mode
+            |    Fast
+            |    Slow
+            |pick(m: Mode) -> int = m match
+            |    Fast -> 1
+            |    Slow -> 0
+            |""".stripMargin),
+        ("", "main.sysl", "print(pal.pick(Fast))"),
+      ) should include("undefined name 'Fast'")
+    }
+
     // Patterns were never affected — the scrutinee's type says which enum before a name is looked
     // at — and this says so with **nothing constructed**, which the first draft of it did not: a
     // program that builds its own scrutinee fails on the construction line and reports a green

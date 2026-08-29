@@ -667,9 +667,22 @@ trait Scoping extends DeclTables {
    * The qualified spelling stays the escape for the other direction: where the expected type is a
    * `Result` and the program's own `Status.Ok` is what was meant, writing `Status.Ok` says so and
    * takes the `owner` road instead.
+   *
+   * **IT RE-POINTS A NAME AND NEVER CONJURES ONE, which `0.0.91` got wrong and shipped.** The
+   * question this answers is *which owner*, and it is asked only where `variantKey` has already
+   * answered *yes, this is a variant here*. Written as `expectedVariantKey(…).orElse(variantKey(…))`
+   * it also answered for a name that resolves to no variant at all — so a bare `Relaxed` compiled in
+   * a file that never imported `sysl.sync.Ordering`, and, worse, `describe(Segment(1))` stopped
+   * calling the module's own `Segment` **function** and silently constructed a distant enum's
+   * variant instead. `DOT` on 0.0.90 and `VARIANT 1` on 0.0.91, no diagnostic either way.
+   *
+   * That is card `0220`'s finding — a name in call position losing to an enum variant — reintroduced
+   * across modules, and it is why the two questions have to stay apart: **reachability is the import
+   * system's and ownership is the expected type's.** `variantVisible` answers a `private`/public
+   * question and was doing duty as an in-scope one.
    */
   protected def variantKeyFor(written: String, expected: Option[Type]): Option[String] =
-    expectedVariantKey(written, expected).orElse(variantKey(written))
+    variantKey(written).map(near => expectedVariantKey(written, expected).getOrElse(near))
 
   /** The key the expected type's own enum offers for this written name, where it offers one.
    *

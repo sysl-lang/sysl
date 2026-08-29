@@ -15,7 +15,7 @@ import org.scalatest.matchers.should.Matchers
  * diagnostic carries a severity rather than the driver printing a string: a warning is data, the
  * same as an error, and a test that matched a console line would be testing `Main`.
  */
-class DropReturnWarningTests extends AnyFreeSpec with Matchers {
+class DropReturnWarningTests extends AnyFreeSpec with Matchers with RunSupport {
 
   private val dropping =
     """struct Thing
@@ -112,6 +112,35 @@ class DropReturnWarningTests extends AnyFreeSpec with Matchers {
         |wrap(t: Thing) -> Holder = Holder(t)
         |print(1)
         |""".stripMargin) shouldBe empty
+  }
+
+  // **Boxing the HOLDER does not save a field held by value**, which is the same mistake one level
+  // in and the more surprising half: the holder really is on the heap and its count really does
+  // reach zero, and the `Thing` inside it is a copy in that box rather than a box of its own, so
+  // there is nothing whose count could reach zero for it. The rule is the type at every level that
+  // owns a resource, not the outermost one.
+  //
+  // Not warned about either, for the same reason as the field case above — and run rather than
+  // asserted, since what makes it worth a test is that the answer is not what a reader predicts.
+  "boxing the holder does not run a by-value field's destructor" in {
+    run("""struct Thing
+          |    n: int
+          |
+          |impl Drop for Thing
+          |    drop(self) = print("drop", self.n)
+          |
+          |struct ByValue
+          |    inner: Thing
+          |
+          |struct Boxed
+          |    inner: &Thing
+          |
+          |hold()
+          |    val a: &ByValue = ByValue(Thing(1))
+          |    val b: &Boxed = Boxed(Thing(2))
+          |
+          |hold()
+          |""".stripMargin) shouldBe "drop 2\n"
   }
 
   // The position is what makes a warning worth having over a note: it names the declaration rather
