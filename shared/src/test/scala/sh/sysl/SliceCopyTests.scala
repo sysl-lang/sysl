@@ -23,6 +23,13 @@ import org.scalatest.matchers.should.Matchers
  * and hands the source's boxes out twice, which AddressSanitizer reports as a `heap-use-after-free`
  * in the renderer — and which prints the right answer without it. That is why the generic
  * declaration is a loop and why nothing may quietly widen the byte one to cover `T`.
+ *
+ * **And there is a third, which the gate found rather than anybody predicting it: a freestanding
+ * target must name no `memmove` at all.** A bare board is linked `-nostdlib`, so there is nothing to
+ * call — and `sysl.harness` is written for exactly such a board and reaches this module, so the
+ * whole QEMU tier failed to link the day the byte declaration reached libc unconditionally. The
+ * declaration is the same on every target and its *body* is gated; what a caller writes does not
+ * change, and what it costs does.
  */
 class SliceCopyTests extends AnyFreeSpec with Matchers with CodegenSupport with RunSupport {
 
@@ -52,6 +59,22 @@ class SliceCopyTests extends AnyFreeSpec with Matchers with CodegenSupport with 
                    |""".stripMargin)
 
     out should not include "@memmove("
+  }
+
+  // The same call on a bare board, where there is nothing to call. `sysl.harness` reaches this
+  // module and a QEMU image is linked `-nostdlib`, so a `memmove` here is an undefined symbol at
+  // the link — which is where this was found, six suites deep into a gate.
+  "and a freestanding target names no memmove at all, because there is nothing to link against" in {
+    val src = """import sysl.slices.copy
+                |
+                |var dst: [4]u8 = [0, 0, 0, 0]
+                |var src: [3]u8 = [1, 2, 3]
+                |
+                |copy(dst[..], src[..])
+                |""".stripMargin
+
+    irFor(Target.aarch64Freestanding, src) should not include "@memmove("
+    irFor(Target.riscv64Freestanding, src) should not include "@memmove("
   }
 
   // The case the loop exists for, run rather than reasoned about: the destination's own strings have

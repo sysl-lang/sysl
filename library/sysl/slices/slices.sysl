@@ -18,11 +18,10 @@ import sysl.sys.sysl_memmove
  * the first thing a binding reaches for, and acquiring an allocator by asking for it would be a poor
  * trade. Sorting is in `sort.sysl` beside this file and holds to the same rule.
  *
- * **The one thing here that reaches C is the byte `copy`, and it costs a freestanding target
- * nothing**: `memmove` is in the family a compiler emits calls to on its own, so an image that can
- * initialize an array already needs it. Checked rather than reasoned about -- an archive built for
- * `thumb-freestanding-softfp` names `__aeabi_memmove` beside the `__aeabi_memclr` it wanted anyway,
- * and newlib defines both in the same library.
+ * **The byte `copy` reaches libc, and it is gated on the target rather than reaching it everywhere.**
+ * A bare board is linked `-nostdlib` and has no `memmove` to call, so a hosted target hands the move
+ * to libc and a freestanding one walks the elements. Nothing about what `copy` promises differs
+ * between the two; only what it costs does.
  */
 
 /** A pointer to the first element, for handing a slice to C as the pointer-and-length pair every C
@@ -119,7 +118,20 @@ is_aligned[T](p: *T, alignment: usize) -> bool = usize(p) % alignment == 0
 copy[T](dst: []T, src: []const T) -> usize
     val n = if dst.len < src.len then dst.len else src.len
 
-    if n > 0 && usize(as_ptr(src)) < usize(as_mut_ptr(dst))
+    move_elems(dst, src, n)
+    n
+
+/** The first `n` elements assigned one at a time, back to front where the destination begins after
+ * the source so that an overlap does not overwrite what has not been read yet.
+ *
+ * Shared by the generic `copy` and by the byte one on a target with no `memmove` to call. The
+ * direction is chosen from the two addresses, and an empty move asks nothing of them -- `as_ptr`
+ * answers `null` for an empty slice, which is a fine thing to compare and a poor thing to trust.
+ */
+private move_elems[T](dst: []T, src: []const T, n: usize)
+    if n == 0 then return
+
+    if usize(as_ptr(src)) < usize(as_mut_ptr(dst))
         var i = n
 
         while i > 0
@@ -127,9 +139,7 @@ copy[T](dst: []T, src: []const T) -> usize
             dst[i] = src[i]
     else
         for i in 0..<n do dst[i] = src[i]
-
-    n
-end copy
+end move_elems
 
 /** The same over bytes, which libc moves a word at a time where a sysl loop moves one byte.
  *
@@ -140,13 +150,29 @@ end copy
  *
  * A byte carries no count, so the bitwise move the generic form must not make is the right one
  * here. `memmove` rather than `memcpy`, for the overlap the other declaration promises.
+ *
+ * **A FREESTANDING TARGET WALKS THE ELEMENTS INSTEAD, because there is nothing to call.** A bare
+ * board is linked `-nostdlib`, so a `memmove` reached from here is an undefined symbol at the link
+ * -- and this module is one a board reaches, `sysl.harness` being written for exactly that. The
+ * declaration stays either way, so a caller writes one thing and a program's own targets decide what
+ * it costs.
+ *
+ * The gate is `freestanding` rather than anything finer, and that is deliberately conservative: a
+ * board with an SDK usually *does* have a libc -- the Pico's newlib defines `__aeabi_memmove` -- but
+ * whether one is on the link line is the application's to decide and not something the library can
+ * read. Being wrong in this direction costs a loop; being wrong in the other costs a build.
  */
 copy(dst: []u8, src: []const u8) -> usize
     val n = if dst.len < src.len then dst.len else src.len
 
+#if freestanding
+    move_elems(dst, src, n)
+#else
     if n > 0 then sysl_memmove(as_mut_ptr(dst), as_ptr(src), n)
+#endif
 
     n
+end copy
 
 /** The whole of `src` copied, or nothing at all -- `true` when it fitted.
  *
