@@ -38,17 +38,17 @@ object WriterEmitter {
   /** The order `Writer` offers its members in — which is **not** the order it declares them, since a
    * trait offers what it requires first and `Writer: Fallible`.
    *
-   * It is written down once because three things depend on it and none of them can see the other
-   * two: the table below is laid out by hand in this order, `Escape` reaches into a program's own
-   * `Writer` tables by slot, and every call through a `*Writer` indexes by whatever the analyzer
-   * computed. `SpecialForms.checkWriterShape` compares this list against the flattened member list
-   * the analyzer builds, so a library edit that reorders them fails the build here rather than
-   * calling the wrong function with the right arguments.
+   * It is written down once because two things depend on it and neither can see the other: the
+   * table below is laid out by hand in this order, and every call through a `*Writer` indexes by
+   * whatever the analyzer computed. `SpecialForms.checkWriterShape` compares this list against the
+   * flattened member list the analyzer builds, so a library edit that reorders them fails the build
+   * here rather than calling the wrong function with the right arguments.
+   *
+   * **`Escape` used to be the third**, reaching into a program's `Writer` tables at the writing slot
+   * to check that no implementation kept the bytes. It reads `@borrows` off each slot now, so the
+   * borrow rule belongs to the traits that declare it rather than to this emitter's layout.
    */
   val members: List[String] = List("failed", "write")
-
-  /** Which slot of a `Writer`'s table holds the writing. */
-  val writeSlot: Int = members.indexOf("write")
 
   /** Writing into a growable buffer, and finishing with one.
    *

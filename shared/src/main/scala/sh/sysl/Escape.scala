@@ -128,45 +128,53 @@ private class Escape(program: TProgram) {
       )
   }
 
-  /** A `Writer` is handed a **borrowed** view of the bytes to write, and that is the whole reason
-   * the sink takes bytes rather than a string: a renderer writes into a buffer on its own stack and
-   * passes a slice of it, which is what keeps rendering allocation-free (`library/core.md § Rendering to a sink`).
+  /** A trait method that declared `@borrows` is handed a view it must not keep, and this is what
+   * makes that true rather than trusted.
    *
-   * Nothing in the type says "borrowed", so it is checked here instead of trusted. An
-   * implementation that lets those bytes outlive the call is rejected, which is what licenses the
-   * call site below to pass a frame-backed slice through a `Writer` at all.
+   * **Nothing in a type says "borrowed", so a promise a trait writes down has to be checked against
+   * every implementation of it.** That check is what licenses the call site below to pass a
+   * frame-backed slice through a trait object at all — a call through one is otherwise opaque, so
+   * the analysis must assume the worst of every argument and a local array passed through one is
+   * promoted.
+   *
+   * `sysl.Writer` is the reason this exists and is now an ordinary user of it: its `write` declares
+   * `@borrows(bytes)`, which is what keeps rendering allocation-free (`library/core.md § Rendering
+   * to a sink`) — a renderer writes into a buffer on its own stack and passes a slice of it.
    */
   private def borrowed: List[Diagnostic] = {
     // Both flavours of a type's table name the same implementation, so the offender is named once
     // however many ways the program erased it.
-    // The writing is **not** the first slot: `Writer: Fallible`, and a trait offers what it requires
-    // before what it declares. Reaching for the head would ask this question of `failed`, which
-    // keeps nothing, and would quietly stop refusing the implementations this check exists for —
-    // so the slot is read from the one place the layout is written down.
     val offenders =
       for
-        vt   <- program.vtables if vt.traitName == Library.key("Writer")
-        slot <- vt.slots.lift(WriterEmitter.writeSlot).toList if keeps((slot.target, 1))
-      yield slot.target
+        vt   <- program.vtables
+        slot <- vt.slots
+        (at, pname) <- slot.borrows.toList.sortBy(_._1) if keeps((slot.target, at))
+      yield (slot.target, vt.traitName, pname)
 
-    offenders.distinct.map { name =>
+    offenders.distinct.map { (name, tr, pname) =>
       Diagnostic(
         // The trait is named by its key, never spelled: a program with a `Writer` of its own reaches
         // the library's only by path, and a message that spells it plainly names the wrong trait to
         // the one reader who has to tell them apart.
-        s"'$name' keeps the bytes it is written, but a '${Modules.show(Library.key("Writer"))}' " +
-          "borrows them for the call — they may be a view of the caller's stack, so copy what the " +
-          "writer needs into storage of its own",
+        s"'$name' keeps what it is passed as '$pname', but '${Modules.show(tr)}' declares that " +
+          "parameter borrowed for the call — it may be a view of the caller's stack, so copy what " +
+          "this needs into storage of its own",
         None,
       )
     }
   }
 
-  /** Whether a trait object's methods borrow what they are passed rather than possibly keeping it.
-   * `Writer` is the one trait that says so, and the check above is what makes it true.
+  /** Which of a trait object call's arguments the trait promised to borrow, by **argument**
+   * position — one less than the parameter position, since a call site's list has no receiver in it.
+   *
+   * Read off any table for that trait, because the promise is the trait's and every table carries
+   * the same answer. A trait nothing implements has no table and answers with nothing, which is the
+   * conservative answer and is also unreachable: a call through an object of it could not run.
    */
-  private def borrows(ty: Type): Boolean =
-    Type.erasedTrait(ty).exists(_.name == Library.key("Writer"))
+  private def borrows(ty: Type, slot: Int): Set[Int] =
+    Type.erasedTrait(ty).flatMap { tr =>
+      program.vtables.find(_.traitName == tr.name).flatMap(_.slots.lift(slot)).map(_.borrows)
+    }.getOrElse(Map.empty).keySet.map(_ - 1)
 
   /** Whether a value of this type could carry a view of somebody's elements.
    *
@@ -474,9 +482,12 @@ private class Escape(program: TProgram) {
         // summary to consult — the conservative answer is the only sound one, exactly as it is for
         // a function whose body this program does not have. A `Writer` is the exception, and only
         // because every implementation of one has been checked to borrow rather than keep.
-        case TVCall(recv, _, args, _, _) if !borrows(recv.ty) =>
-          for a <- args do
-            if viewsFrame(a) then gets_out(a, "is passed through a trait object, which may hold on to it")
+        case TVCall(recv, slot, args, _, _) =>
+          val promised = borrows(recv.ty, slot)
+
+          for (a, i) <- args.zipWithIndex do
+            if !promised(i) && viewsFrame(a) then
+              gets_out(a, "is passed through a trait object, which may hold on to it")
 
         // Nothing is known about what is at the other end of a function pointer — not even which
         // program compiled it — so the worst is assumed of every argument, exactly as `reference/ffi.md § extern — a declaration with no body` has

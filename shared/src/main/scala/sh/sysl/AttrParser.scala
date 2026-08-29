@@ -16,8 +16,8 @@ trait AttrParser extends ExprParser {
    */
   protected lazy val attribute: PackratParser[Attr] =
     testAttr ^^ Attr.Test.apply | tailrecAttr | pureAttr | ghostAttr | readsAttr | writesAttr |
-      crossingAttr | needsAttr | packedAttr | alignAttr | exportAttr | sectionAttr | unknownAttr |
-      hashAttr
+      crossingAttr | needsAttr | packedAttr | alignAttr | exportAttr | sectionAttr | borrowsHere |
+      unknownAttr | hashAttr
 
   /** What a member block reads where a member was wanted, for the three blocks that do not keep the
    * annotations: a trait's body, an `impl`'s, and a setter's line.
@@ -80,6 +80,7 @@ trait AttrParser extends ExprParser {
   private lazy val memberAttr: Parser[Attr] =
     guard((op("@") | op("#")) ~ opt(ident)) >> {
       case "@" ~ Some("crossing") => crossingAttr
+      case "@" ~ Some("borrows")  => borrowsAttr
       case "@" ~ Some("reads")    => readsAttr
       case "@" ~ Some("writes")   => writesAttr
       case "@" ~ Some("assert") =>
@@ -88,7 +89,7 @@ trait AttrParser extends ExprParser {
           "what it is about")
       case sigil ~ _ =>
         err("the only annotations a member may carry are the ones about a parameter — '@crossing', " +
-          "'@reads' and '@writes'. What the rest say is about a free function or about a type: what " +
+          "'@borrows', '@reads' and '@writes'. What the rest say is about a free function or about a type: what " +
           "'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member " +
           "is neither, so it goes above a free function instead ('06')" +
           (if sigil == "#" then ". An annotation is written '@' in any case — '#' opens a directive, " +
@@ -104,6 +105,7 @@ trait AttrParser extends ExprParser {
   protected def attributedMember(m: MethodDecl, as: List[Attr]): MethodDecl =
     as.foldLeft(m) {
       case (d, Attr.Crossing(ns)) => d.copy(crossing = ns)
+      case (d, Attr.Borrows(ns))  => d.copy(borrows = ns)
       case (d, Attr.Reads(ns))    => d.copy(reads = Some(ns))
       case (d, Attr.Writes(ns))   => d.copy(writes = Some(ns))
       case (d, _)                 => d
@@ -297,6 +299,42 @@ trait AttrParser extends ExprParser {
   private lazy val crossingNames: Parser[Attr] =
     rep1sep(ident, op(",")) ^^ Attr.Crossing.apply
 
+  /** What `@borrows` gets where it cannot mean anything, which is above a **free function**.
+   *
+   * The exemption it asks for exists because a call through a trait object is opaque — any
+   * implementation could be behind it, so the analysis must assume the worst. A free function's body
+   * is right here, and the analysis reads the answer out of it; a written promise would restate what
+   * the compiler can see and would go stale the moment the body changed.
+   *
+   * Ordered before `unknownAttr`, for `@reads`' reason: the general refusal wins by position
+   * otherwise, and says `borrows` is not an annotation — which is wrong as well as unhelpful.
+   */
+  private lazy val borrowsHere: Parser[Attr] =
+    op("@") ~> attrWord("borrows") ~>
+      err("'@borrows' is about a call whose body the compiler cannot see, so it says something only " +
+        "on a trait's method. A free function's body is right here and the analysis reads the " +
+        "answer out of it — a promise written above one would restate what the compiler already " +
+        "knows, and would go stale the moment the body changed")
+
+  /** `@borrows(bytes)` — the parameters a trait method promises not to keep past the call.
+   *
+   * `@crossing`'s shape exactly, including that there is no empty form: a method that keeps
+   * everything says so by not writing the annotation, so `@borrows()` would be a line meaning what
+   * its absence already means. The refusal is raised inside the parentheses for `@crossing`'s
+   * reason — an alternative failing at the `(` is outranked by one that got past it.
+   */
+  protected lazy val borrowsAttr: PackratParser[Attr] =
+    op("@") ~> attrWord("borrows") ~> (op("(") ~> (borrowsNames | borrowsErr) <~ op(")") |
+      borrowsErr)
+
+  private lazy val borrowsNames: Parser[Attr] =
+    rep1sep(ident, op(",")) ^^ Attr.Borrows.apply
+
+  private def borrowsErr: Parser[Attr] =
+    err("'@borrows' names the parameters a trait's method promises not to keep past the call, in " +
+      "parentheses — '@borrows(bytes)'. There is no empty form: a method that may keep what it is " +
+      "handed says so by not writing the annotation")
+
   private def crossingErr: Parser[Attr] =
     err("'@crossing' names the parameters a value reaches another concurrency domain through, in " +
       "parentheses — '@crossing(state)'. There is no empty form: a function that hands nothing " +
@@ -395,6 +433,10 @@ trait AttrParser extends ExprParser {
       case (d, Attr.Section(s)) => d.copy(section = Some(s))
       case (d, Attr.Crossing(ns)) => d.copy(crossing = ns)
       case (d, Attr.Needs(cs))    => d.copy(needs = cs)
+      // `@borrows` never reaches here — `borrowsHere` refuses it at statement position, where a free
+      // function's annotations are read. Listed rather than left out so that this fold stays total
+      // over `Attr`, which is what makes a new attribute fail to compile instead of being dropped.
+      case (d, _: Attr.Borrows) => d
       // A layout attribute never reaches here: the grammar routes a declaration carrying one to a
       // struct, and refuses the mix. Listed so that a new attribute makes this fold fail to compile
       // rather than silently drop what it was asked to record.

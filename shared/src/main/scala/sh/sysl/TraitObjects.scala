@@ -180,7 +180,14 @@ trait TraitObjects extends TypeResolution {
         // Object safety already refused a trait with an associated function in it, so every member
         // reaching a slot has a receiver to dispatch on — a property's being the by-value one it
         // never had to write.
-        TVSlot(fname, m.recvMode.get, params.tail.map(_._2), rtype)
+        // The promise is the **trait's**, so it is read off the member the trait declared and not
+        // off whatever the `impl` wrote — an implementation cannot grant itself the exemption, and
+        // `Escape` is what holds it to the one it inherited. Positions are the implementation's, so
+        // a written parameter's index is one past its place in the declared list.
+        val promised =
+          m.borrows.flatMap(n => Option(m.params.indexWhere(_.name == n)).filter(_ >= 0).map(_ + 1 -> n))
+
+        TVSlot(fname, m.recvMode.get, params.tail.map(_._2), rtype, promised.toMap)
       }
 
       vtables(name) = TVtable(name, tr.name, ty, boxed, slots, typeIdOf(ty))

@@ -486,6 +486,14 @@ case class MethodDecl(
     reads: Option[List[String]] = None,
     /** `@writes(…)` — see `FuncDecl.writes`. */
     writes: Option[List[String]] = None,
+    /** `@borrows(…)` — the parameters this member promises not to keep past the call.
+      *
+      * **Meaningful on a trait's members and nowhere else**, which is checked rather than assumed:
+      * the exemption exists because a call through a trait object is opaque, and a body the compiler
+      * can see needs no promise — the analysis reads the answer out of it, and a written one would
+      * restate what is there and go stale the moment the body changed.
+      */
+    borrows: List[String] = Nil,
 ) extends Positioned {
 
   /** The mode this member takes its receiver in, or `None` for an associated function — which is the
@@ -688,6 +696,23 @@ enum Attr(val word: String) {
     * written twice is refused at its second position.
     */
   case Crossing(names: List[String]) extends Attr("crossing")
+
+  /** `@borrows(bytes)` — the parameters a **trait method** promises not to keep past the call
+    * (`reference/traits.md § A method may promise to borrow`).
+    *
+    * A call through a trait object is opaque: any implementation could be behind it, so the escape
+    * analysis has to assume every argument is kept, and a local array passed through one is
+    * promoted to the heap. This is how a trait says otherwise — and the compiler holds every
+    * implementation to it, so the promise is checked rather than trusted.
+    *
+    * **It is `borrows` rather than `borrowed` because sysl names a promise by the action.** The same
+    * question was settled once for `@no_alloc`, which is not `@no_heap`: a clause is a promise about
+    * conduct, and what is checked here is conduct — that no implementation keeps what it is handed.
+    *
+    * A list of names rather than a flag, because a method may take a buffer it borrows *and*
+    * something it legitimately retains, and because the analysis is parameter-indexed already.
+    */
+  case Borrows(names: List[String]) extends Attr("borrows")
 
   /** `@needs(heap)`, `@needs(os, posix)` — the capabilities reaching this **declaration** requires
     * (`reference/modules.md § A declaration may name what reaching it needs`).

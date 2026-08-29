@@ -269,7 +269,22 @@ case class TVtable(name: String, traitName: String, forType: Type, boxed: Boolea
  * the signature a call site sees. Between the data word and the receiver the function declared
  * there may be a header to step over and a value to load, which is what the mode decides.
  */
-case class TVSlot(target: String, recv: RecvMode, params: List[Type], retTy: Type)
+case class TVSlot(target: String, recv: RecvMode, params: List[Type], retTy: Type,
+                  /** Which of the target's parameters the **trait** declared `@borrows`, by the
+                    * implementation's own parameter positions — so the receiver is 0 and the first
+                    * written parameter is 1 — against the name the trait gave each one.
+                    *
+                    * The name is carried because it is what a refusal has to say: an implementation
+                    * is told which of *its* parameters it kept, and the reader finds that word in
+                    * the trait rather than counting places.
+                    *
+                    * It is on the slot rather than looked up per call because that is where the two
+                    * questions meet: the escape analysis checks each implementation against it, and
+                    * a call site reads it to know which arguments it may pass a frame-backed slice
+                    * for. Every table for one trait carries the same answer, since the promise is
+                    * the trait's.
+                    */
+                  borrows: Map[Int, String] = Map.empty)
 
 /** One module-level `val`: read-only storage laid down whole, under the key its module gives it.
  *

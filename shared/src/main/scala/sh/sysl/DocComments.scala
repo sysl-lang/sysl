@@ -79,8 +79,8 @@ object DocComments {
    * a sentence about the capability clause, and a warning there would be noise on correct prose.
    */
   private val Annotations =
-    Set("test", "tests", "requires", "export", "no_alloc", "link", "crossing", "packed", "align",
-        "section", "assert", "ghost", "include", "inline")
+    Set("test", "tests", "requires", "export", "no_alloc", "link", "crossing", "borrows", "packed",
+        "align", "section", "assert", "ghost", "include", "inline")
 
   /** Strip the delimiters and the left margin, leaving the lines the author wrote.
    *

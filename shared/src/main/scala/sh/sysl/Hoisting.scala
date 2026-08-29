@@ -122,6 +122,8 @@ trait Hoisting extends HoistMembers {
       // directly rather than for one in a counted box. What it costs is the member's table slot,
       // which is the standing rule about a member that declares type parameters of its own rather
       // than anything new: the function does not exist until a call names them.
+      t.methods.foreach(checkBorrowNames(_, t.name))
+
       traitDecls(key) = t.copy(name = key, methods = loweredMembers(pairSetters(t.methods, t.name)))
         .setPos(t.pos)
       declScope(key) = currentScope
@@ -552,6 +554,30 @@ trait Hoisting extends HoistMembers {
            else s" — its parameters are ${f.params.map(p => s"'${p.name}'").mkString(", ")}")))
       else if f.crossing.take(i).contains(n) then
         recover(())(err(s"'@crossing' names '$n' twice, and a parameter crosses a boundary once — " +
+          "the second says nothing the first does not"))
+  }
+
+  /** `@borrows` names the member's own parameters, and a word that names none is refused here.
+   *
+   * **A misspelling would otherwise promise nothing and say nothing**, which is the worst of the
+   * three outcomes: the annotation reads as a rule being enforced, every implementation is free to
+   * keep what it likes, and the call sites that were counting on the exemption quietly go back to
+   * promoting. `@crossing`'s names are checked for the same reason and in the same words.
+   *
+   * The receiver is not among them. A member cannot name `self` as a parameter, so `@borrows(self)`
+   * is unreachable from source and needs no rule of its own — and a receiver is borrowed or not by
+   * the mode it was declared in, which is a thing the signature already says.
+   */
+  protected def checkBorrowNames(m: MethodDecl, owner: String): Unit = {
+    val declared = m.params.map(_.name).toSet
+
+    for (n, i) <- m.borrows.zipWithIndex do
+      if !declared(n) then
+        recover(())(err(s"'@borrows' names '$n', which is not a parameter of '$owner.${m.name}'" +
+          (if m.params.isEmpty then " — it takes none"
+           else s" — its parameters are ${m.params.map(p => s"'${p.name}'").mkString(", ")}")))
+      else if m.borrows.take(i).contains(n) then
+        recover(())(err(s"'@borrows' names '$n' twice, and a parameter is borrowed or it is not — " +
           "the second says nothing the first does not"))
   }
 
