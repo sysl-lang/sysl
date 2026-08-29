@@ -542,7 +542,17 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
   private lazy val sharedNames: Set[String] =
     Target.all.filter(_.supported).map(t => allTypeLines(t).map(typeName).toSet).reduce(_ intersect _)
 
-  /** The comparable `= type` lines a target emits, which is what the layout claims are made over.
+  /** The comparable `= type` lines a target emits, which is what the layout claims are made over —
+   * **sorted by name**, so that what is compared below is what each type *is* and never where it
+   * happened to be emitted.
+   *
+   * **Order is not a layout property, and comparing by position asserted that it was.** The lines
+   * come out in the order the module reached the types, which a target changes for reasons that have
+   * nothing to do with layout: `sysl.process` moving from `os` to `posix` reordered what was left on
+   * Windows, and every claim in this block failed with sets that were *identical* — 333 lines each,
+   * no name on one side and not the other, differing first at index 23. Sorting says the intended
+   * thing, and it makes the positional `zip`s below pair each type with itself instead of with
+   * whatever sat at the same index.
    *
    * **Intersecting is not a weakening, and the assertion below is what keeps it from becoming
    * one.** An intersection that had quietly collapsed would make every test in this block pass
@@ -550,7 +560,7 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
    * so the size of what survives is asserted rather than assumed.
    */
   private def typeLines(t: Target): List[String] =
-    allTypeLines(t).filter(l => sharedNames(typeName(l)))
+    allTypeLines(t).filter(l => sharedNames(typeName(l))).sortBy(typeName)
 
   /** `getting-started/cli.md § targets` used to rest the whole of `Layout` on one claim: every
    * target in the registry answers a layout question the same way, so the object that answers them
@@ -637,7 +647,9 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
 
       // Every width declares the same types under the same names -- that is the "nothing else about
       // a type" half, and it is asked of all three rather than of the two extremes, since a middle
-      // one that had grown a type of its own would slip between them.
+      // one that had grown a type of its own would slip between them. The lists are name-sorted
+      // (`typeLines`), so the `zip`s below pair each type with itself rather than with whatever the
+      // other module emitted in that position.
       for l <- lines do l.map(name) shouldBe lines.head.map(name)
 
       // And the other half: something moved between each adjacent pair, so the comparison is not

@@ -154,24 +154,30 @@ class TypeLevelTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   // A trait the file may not **name** is not one the reader can act on, so neither diagnostic below
   // may mention it. `sysl.crypto.Word` is the standard library's own worked example: it declares
-  // `word_bits` for `u32` and `u64` and is `private[crypto]`, so a program can neither import it nor
-  // implement it — and before this was filtered, both messages named it and one advised importing it.
+  // `word_rounds` for `u32` and `u64` and is `private[crypto]`, so a program can neither import it
+  // nor implement it — and before this was filtered, both messages named it and one advised
+  // importing it.
+  //
+  // **It used to be `word_bits` here, and that member is gone.** `Bits.width()` says what it said,
+  // so the trait requires `Bits` and declares one associated function fewer — which is the shape of
+  // the thing this pair needs rather than the particular name, so the name moved and the claim did
+  // not.
   "a private trait is not offered as the bound a type parameter is missing" in {
     val out = err(
-      """howWide[T](x: T) -> usize = T.word_bits()
+      """howMany[T](x: T) -> usize = T.word_rounds()
         |
         |main()
-        |    print(howWide(1u32))
+        |    print(howMany(1u32))
         |""".stripMargin)
 
-    out should include("no trait declares an associated function 'word_bits'")
+    out should include("no trait declares an associated function 'word_rounds'")
     out should not include "sysl.crypto.Word"
   }
 
   "and a member reached through one says it is private rather than advising an import" in {
     val out = err(
       """main()
-        |    print(u32.word_bits())
+        |    print(u32.word_rounds())
         |""".stripMargin)
 
     out should include("private to the module that wrote it")

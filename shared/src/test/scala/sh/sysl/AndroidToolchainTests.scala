@@ -153,18 +153,27 @@ class AndroidToolchainTests extends AnyFreeSpec with Matchers {
   }
 
   "the two searches" - {
+    /** The targets whose toolchain is a *download* rather than a back end.
+      *
+      * **Android was the first and WASI is the second, and the argument is one argument.** Bionic's
+      * headers are the NDK's and wasi-libc's are wasi-sdk's, so a clang picked for having the back
+      * end succeeds at the search and fails at the first `#include` — which is the failure the split
+      * exists to replace with a sentence naming a variable.
+      */
+    val downloaded = Set(Os.Android, Os.Wasi)
+
     // The split is the point of the change, so it is pinned from both sides: they part company on
-    // Android and agree everywhere else. `findBackendClang` answers *can this machine lower for that
-    // one*; `findClang` answers *can this machine build a program for it*, which is the stronger
-    // question and the one an NDK is needed for.
-    "agree for every target that is not Android" in {
-      for t <- Target.all if t.supported && t.buildsWithClang && t.os != Os.Android do
+    // those two and agree everywhere else. `findBackendClang` answers *can this machine lower for
+    // that one*; `findClang` answers *can this machine build a program for it*, which is the
+    // stronger question and the one a downloaded toolchain is needed for.
+    "agree for every target whose toolchain is not a download" in {
+      for t <- Target.all if t.supported && t.buildsWithClang && !downloaded(t.os) do
         withClue(t.name)(Toolchain.findClang(t) shouldBe Toolchain.findBackendClang(t))
     }
 
-    // Which is a claim about Android alone, and would be vacuous if the registry lost the row.
-    "and Android is a target, so the case above is excluding something" in {
-      Target.all.map(_.os) should contain(Os.Android)
+    // Which is a claim about those two alone, and would be vacuous if the registry lost either row.
+    "and both of those are targets, so the case above is excluding something" in {
+      for os <- downloaded do withClue(os.toString)(Target.all.map(_.os) should contain(os))
     }
   }
 

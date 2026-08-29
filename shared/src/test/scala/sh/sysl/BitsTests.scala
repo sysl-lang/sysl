@@ -223,11 +223,16 @@ class BitsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |""".stripMargin) shouldBe "2 591751041\n"
     }
 
-    // Every member answers something that mentions `Self` or is a count, so an erased value has
-    // forgotten what it would have to answer — which is object safety's ordinary rule reaching this
-    // trait rather than anything new about it.
-    "but there is no trait object over it, because Self is in the answers" in {
-      err(importing + "main()\n    var x: &Bits = null\n    print(1)") should include("Self")
+    // **The reason moved when `width` arrived, and the refusal is the stronger one now.** Every
+    // member used to answer something mentioning `Self` or a count, so an erased value had forgotten
+    // what it would have to answer; `width()` has no receiver at all, and a member with nothing to
+    // dispatch on cannot be a table slot whatever it answers. Both rules refuse this trait and the
+    // second is the one a reader is told, because it is the first member the check reaches.
+    "but there is no trait object over it" in {
+      val out = err(importing + "main()\n    var x: &Bits = null\n    print(1)")
+
+      out should include("the associated function 'width'")
+      out should include("no receiver to dispatch on")
     }
   }
 
