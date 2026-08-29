@@ -249,6 +249,12 @@ It is a sibling of `sh.sysl.api` rather than part of it, precisely because the p
 commitment: an IR *is* a tree. What it offers in exchange is a version to pin — **before 0.1.0
 anything in it may change in any release**.
 
+## Changelog
+
+[CHANGELOG.md](CHANGELOG.md) carries every release, newest first. It is generated from the GitHub
+release bodies by `changelog.py`, so the releases page and the file say the same thing and the file
+is the copy that works offline and shows up in a diff.
+
 ## License
 
 ISC — see [LICENSE](LICENSE).
