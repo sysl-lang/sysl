@@ -206,6 +206,24 @@ trait Reporting {
    */
   protected def diagnosticCount: Int = found.size
 
+  /** Warnings, kept apart from errors because they answer a different question — *this compiles and
+   * is probably not what you meant* — and because mixing them into `found` would make every walk
+   * that asks "did I report anything?" answer yes for a program that is fine.
+   *
+   * They are **not** taken back by `restoreComplaints`, and that is deliberate: a speculative walk
+   * undoes what it *said about a mistake*, because the reading was thrown away. A warning here is
+   * raised by a whole-program check over declarations, not from inside a speculative reading, so
+   * there is nothing for a rewind to be about.
+   */
+  private val warned = mutable.LinkedHashSet.empty[Diagnostic]
+
+  /** Says something about a declaration without refusing it. */
+  protected def warn(msg: String, pos: Option[Pos]): Unit =
+    warned += Diagnostic(msg, pos, Severity.Warning)
+
+  /** The warnings, in source order, as the driver prints them. */
+  protected def warnings: List[Diagnostic] = Diagnostic.inSourceOrder(warned.toList)
+
   /** What has been complained about so far, and putting it back — which is what a **speculative**
    * walk needs and `sandboxed` does not supply.
    *

@@ -22,7 +22,7 @@ import scala.collection.mutable
  * `units` — the files being analyzed together — is supplied by the class and declared alongside the
  * other things a walk is told about its compilation (`DeclTables`).
  */
-trait ProgramWalk extends OpaqueResults {
+trait ProgramWalk extends OpaqueResults with DropReturnCheck {
 
   /** The imports a file starts with, before it has written any of its own (`AutoImport`).
    *
@@ -282,6 +282,11 @@ trait ProgramWalk extends OpaqueResults {
     // moment and for the same reason: the block being replaced may be hoisted after it.
     checkOverrides()
 
+    // And whether any declaration hands back a type whose destructor could then never run, which
+    // waits for the same moment for the same reason — `dropsDeclared` is filled by the hoisting
+    // above (card `0372`).
+    checkDropReturns()
+
     // Every `some` result is settled here — the one pass that reads a body in order to learn a
     // *type*. It waits for this moment because such a body may name anything the program declares,
     // and it runs before the pass below because that one, and every body after it, may ask what an
@@ -531,6 +536,7 @@ trait ProgramWalk extends OpaqueResults {
       // answers.
       testOnly = testOnlyDecls.toSet,
       destructors = destructorsOf,
+      warnings = warnings,
       // The graph `checkModuleGraph` and `checkGatedModules` have just read, carried out of the
       // analyzer because one question about it is asked after this walk: which of a dependency's
       // exports this program reaches (`Reachability.prune`).

@@ -447,6 +447,17 @@ case class TProgram(
      * A map from one to the other is the whole of what has to cross.
      */
     destructors: Map[String, String] = Map.empty,
+    /** What the analyzer wants to **say** about this program without refusing it — currently the
+     * one rule in `DropReturnCheck` (card `0372`).
+     *
+     * It travels on the tree for the same reason `destructors` does: the two ends are in different
+     * phases and neither can ask the other. A warning is found while declarations are being walked
+     * and is printed by the driver, which has no analyzer to ask by then — and `Analyzer.analyze`
+     * answers `Either[List[Diagnostic], TProgram]`, whose left is *failure*. A warning is not
+     * failure, so it cannot go there, and a third channel through six call sites would be a wider
+     * change than one field on the value they already hand back.
+     */
+    warnings: List[Diagnostic] = Nil,
     /** Which module refers to which, as name resolution settled it (`reference/modules.md § The
      * module graph is acyclic`) — the same edges `ModuleGraph` holds to being acyclic, kept for the
      * one question that is asked after the analyzer has finished.

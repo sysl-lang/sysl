@@ -664,6 +664,12 @@ private[sysl] def execute(asked: Config): Int = {
       if cfg.explainEscapes then
         if result.notes.isEmpty then Console.err.println("no arrays were promoted to the heap")
         else result.notes.foreach(Console.err.println)
+
+      // Warnings are printed on **every** successful compilation, unlike the notes above, which are
+      // an answer to a question `--explain-escapes` asked. A warning is not something a reader
+      // opted into: it is the compiler saying the program compiles and is probably not what was
+      // meant, and one nobody sees is one that has done nothing (card `0372`).
+      result.warnings.foreach(w => Console.err.println(w.rendered))
       result
 
   // Below the compilation, which is the whole point of it being a function — see `nativeSources`.

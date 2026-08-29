@@ -37,13 +37,17 @@ package sh.sysl
  * not LLVM reads `module`; the point of the two being one value is that they cannot be two answers.
  */
 case class Compiled private (ir: String, notes: List[String], links: List[String],
-                             exports: List[TFunc], module: sh.sysl.ir.Module)
+                             exports: List[TFunc], module: sh.sysl.ir.Module,
+                             warnings: List[Diagnostic] = Nil)
 
 object Compiled {
 
   def apply(module: sh.sysl.ir.Module, notes: List[String], links: List[String],
-            exports: List[TFunc] = Nil): Compiled =
-    Compiled(sh.sysl.ir.Printer.module(module), notes, links, exports, module)
+            exports: List[TFunc], warnings: List[Diagnostic]): Compiled =
+    Compiled(sh.sysl.ir.Printer.module(module), notes, links, exports, module, warnings)
+
+  def apply(module: sh.sysl.ir.Module, notes: List[String], links: List[String]): Compiled =
+    Compiled(sh.sysl.ir.Printer.module(module), notes, links, Nil, module, Nil)
 }
 
 object Compiler {
@@ -321,7 +325,8 @@ object Compiler {
           // they link is the same.
           (Compiled(Codegen.module(kept.copy(precompiled = precompiled), promoted, target, allocator),
                     promoted.explanations,
-                    LinkDirectives.required(units ::: whole.units)),
+                    LinkDirectives.required(units ::: whole.units),
+                    Nil, kept.warnings),
            kept.tests)
   }
 
@@ -550,5 +555,6 @@ object Compiler {
                               promoted, target, allocator),
                promoted.explanations,
                LinkDirectives.required(units ::: std.units),
-               pruned.funcs.filter(_.exported.isDefined))
+               pruned.funcs.filter(_.exported.isDefined),
+               pruned.warnings)
 }

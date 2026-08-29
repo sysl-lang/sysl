@@ -210,8 +210,13 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * Scala, over the IR -- the split this file's own docstring prescribes, arrived at from the side
    * it does not name: not a language claim a sysl test would compile into its own assertion, but a
    * claim about *which code was emitted*, which no program can observe about itself.
+   *
+   * Raised to **608** when `sysl.posix.rand` gained `entropy_from_os` (card `0373`): four cases for
+   * it and one for `seed_from_os`, which had been covered by **nothing** — that module had no test
+   * file at all until this needed one, which is the sort of hole a floor cannot see and only a
+   * reader can.
    */
-  private val floor = 603
+  private val floor = 608
 
   /** The library, compiled as a **test build of itself**.
    *

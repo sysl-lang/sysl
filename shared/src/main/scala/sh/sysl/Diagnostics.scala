@@ -131,7 +131,7 @@ final case class Pos(source: Source, line: Int, col: Int, endLine: Int, endCol: 
    * longer than it would be pointing at nothing. A span with no extent gets a single caret, which
    * is what every diagnostic looked like before spans existed.
    */
-  def render(msg: String): String = {
+  def render(msg: String, severity: Severity = Severity.Error): String = {
     val number = line.toString
     val gutter = " " * number.length
     val text   = source.line(line)
@@ -140,8 +140,12 @@ final case class Pos(source: Source, line: Int, col: Int, endLine: Int, endCol: 
     val past   = if endLine == line then math.min(endCol, text.length + 1) else text.length + 1
     val width  = math.max(1, past - column)
 
+    val label = severity match
+      case Severity.Error   => "error"
+      case Severity.Warning => "warning"
+
     List(
-      s"error: $msg",
+      s"$label: $msg",
       s"$gutter--> $location",
       s"$gutter |",
       s"$number | $text",
@@ -230,16 +234,34 @@ trait Positioned {
  * `pos` is absent for a rule that fires away from any one node — a synthesized declaration, a
  * whole-program check — and that is a reason to say less rather than to say nothing.
  *
- * **There is no severity, because every one of these is an error.** The compiler's only two warnings
- * are the driver's, written straight to standard error and carrying no position; a field with one
- * inhabitant is a field a reader stops to wonder about, and it goes in when a positioned warning
- * does.
+ * **`severity` arrived with the first positioned warning** (card `0372`), which is the condition
+ * this comment used to name for adding it: until then every diagnostic here was an error, the
+ * compiler's only two warnings were the driver's — written straight to standard error, carrying no
+ * position — and a field with one inhabitant is a field a reader stops to wonder about.
+ *
+ * **A warning does not fail a compilation and an error does, and that is the whole of the
+ * difference here.** Everything else about the two is the same: both carry a position, both are
+ * ordered by it, both reach `api.Sysl.check` as data. What must not follow is a *level* — an
+ * argument about which warnings are errors is one this compiler has no reason to have while it has
+ * one warning.
  */
-final case class Diagnostic(message: String, pos: Option[Pos]) {
+final case class Diagnostic(message: String, pos: Option[Pos], severity: Severity = Severity.Error) {
 
   /** This one on its own, as a reader sees it. */
-  def rendered: String = Diagnostic.render(message, pos)
+  def rendered: String = Diagnostic.render(message, pos, severity)
+
+  /** Whether this one stops the compilation. */
+  def isError: Boolean = severity == Severity.Error
 }
+
+/** Whether a diagnostic stops the compilation.
+ *
+ * Two values and no ordering between them: a warning is not a lesser error, it is a different claim
+ * — *this compiles and is probably not what you meant* — and the day it becomes worth promoting one
+ * to an error is the day this grows a third thing to be, not a comparison.
+ */
+enum Severity:
+  case Error, Warning
 
 object Diagnostic {
 
@@ -260,8 +282,13 @@ object Diagnostic {
    * a synthesized node (the library's, a desugaring's) may have no place to point at, and that
    * is a reason to say less rather than to say nothing.
    */
-  def render(msg: String, pos: Option[Pos]): String =
-    pos.map(_.render(msg)).getOrElse(s"error: $msg")
+  def render(msg: String, pos: Option[Pos], severity: Severity = Severity.Error): String = {
+    val label = severity match
+      case Severity.Error   => "error"
+      case Severity.Warning => "warning"
+
+    pos.map(_.render(msg, severity)).getOrElse(s"$label: $msg")
+  }
 
   /** A note rather than a complaint: the location first, in the one-line form a build log wants,
    * since these are printed by the handful and not read one at a time.
