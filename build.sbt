@@ -198,7 +198,7 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
       "io.github.edadma"         %%% "markdown"                 % "0.4.7",
       // Turns the TextMate grammar into the spans the woven document's stylesheet colours, so a
       // reader needs no JavaScript for the code.
-      "io.github.edadma"         %%% "highlighter"              % "0.0.10",
+      "io.github.edadma"         %%% "highlighter"              % "0.0.11",
 //      "com.lihaoyi" %%% "pprint" % "0.9.6" % "test",
     ),
     publishMavenStyle      := true,
@@ -295,7 +295,7 @@ lazy val syslDoc = crossProject(JVMPlatform, NativePlatform)
       // release with the frontmatter already being written, so `sysl doc --site` rendered dead links
       // and nothing said so. `SlugConformanceTests` is what notices now, and it only notices because
       // it renders through this jar.
-      "io.github.edadma" %%% "juicer-core" % "0.4.1",
+      "io.github.edadma" %%% "juicer-core" % "0.4.2",
     ),
     // Not published. It is a binary somebody installs, exactly as the compiler is, and a coordinate
     // for it would be one nothing should depend on.

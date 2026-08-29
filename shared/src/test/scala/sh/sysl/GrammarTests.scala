@@ -1,5 +1,7 @@
 package sh.sysl
 
+import io.github.edadma.highlighter.Highlighter
+
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
@@ -60,31 +62,6 @@ class GrammarTests extends AnyFreeSpec with Matchers {
 
     """[a-z_]{2,}""".r.findAllMatchIn(text).map(_.matched).toSet
   }
-
-  /** The `match` patterns of a section, compiled — which is the other question this file can ask of
-    * the grammar and did not until 2026-08-28: whether a pattern **matches** what it claims to,
-    * rather than which words appear inside one.
-    *
-    * The JSON holds each one doubly escaped, so `\\b` in the file is `\b` in the pattern, and one
-    * `replace` is the whole of the decoding. Compiled with `java.util.regex`, which is what juicer
-    * uses for a TextMate grammar — so `\p{L}` means here what it means on the published page.
-    */
-  private def patterns(name: String): List[scala.util.matching.Regex] = {
-    val field = """"match"\s*:\s*"((?:[^"\\]|\\.)*)"""".r
-
-    field.findAllMatchIn(section(name)).map(m => m.group(1).replace("\\\\", "\\").r).toList
-  }
-
-  /** Whether this runtime's regex engine understands a lookaround, which Scala Native's does not.
-    *
-    * The grammar's boundaries are written out as lookarounds rather than as `\b`, because
-    * `java.util.regex` reads `\b` over ASCII word characters — so `\bÁrbol` has no boundary to
-    * match at and a widened character class would style nothing. That is right for the engine the
-    * site renders with and unrepresentable in RE2.
-    */
-  private lazy val lookaroundCompiles: Boolean =
-    try { "(?!x)a".r.pattern; true }
-    catch { case _: Exception => false }
 
   private lazy val asKeyword: Set[String] = styledIn(section("keyword"))
 
@@ -155,57 +132,122 @@ class GrammarTests extends AnyFreeSpec with Matchers {
         case Right(highlighter) =>
           highlighter.highlight("val x = 1") should include("""<span class="hl-keyword">val</span>""")
     }
-    // **THE PATTERNS BELOW CANNOT BE COMPILED ON EVERY PLATFORM THIS SUITE RUNS ON, AND THAT IS A
-    // FACT ABOUT THE RUNTIME RATHER THAN ABOUT THE GRAMMAR.** Scala Native's `Regex` is RE2, which
-    // has no lookaround at all — `(?![\p{L}\p{Nd}_])` is refused as an *"Unknown inline modifier"*,
-    // which reads as a malformed pattern and is a missing feature.
+    // **The reconciliation above is about WORDS. The grammar also carries identifier PATTERNS, and
+    // nothing checked those at all** — so an ASCII character class in a language whose identifiers
+    // are Unicode's letters (`reference/lexical.md § Identifiers`) was invisible here, and what it
+    // produces is a page where `struct Círculo` renders as an unstyled word. That reads as a line
+    // with little to highlight rather than as a fault, which is the same failure the reserved-word
+    // half exists for, one construct over.
     //
-    // The claim is about `java.util.regex` specifically: that is what juicer compiles a TextMate
-    // grammar with, so it is the engine the published page is rendered by and the only one this is
-    // about. Asked as a **capability** rather than as a platform, so the message says what is
-    // missing rather than which build it is.
-    // **The reconciliation above is about WORDS, and the grammar also carries identifier PATTERNS
-    // that nothing checked.** A pattern is an ASCII character class in a language whose identifiers
-    // are Unicode's letters (`reference/lexical.md § Identifiers`), and what that produces is a page
-    // where `struct Círculo` renders as an unstyled word — a thing that looks like a line with
-    // little to highlight rather than like a fault, which is the same failure the reserved-word half
-    // exists for, one construct over.
+    // **Asked of the renderer rather than of a regex engine**, which is the only way the question is
+    // well posed: a TextMate grammar is matched by Oniguruma (`io.github.edadma.oniguruma`, through
+    // `highlighter`), and that is what `Weave` uses here and what juicer uses on the site. Compiling
+    // these patterns with some *other* engine tests that engine — its `\b`, its Unicode classes, its
+    // lookaround support — and says nothing about what a reader sees.
     //
-    // Asserted against `java.util.regex`, which is what juicer compiles these with.
-    "matches a declaration, a call and a type whose name is not ASCII" in {
-      // Cancelled rather than skipped, and named: RE2 has no lookaround, and the two cases above
-      // are unaffected and still run here.
-      if !lookaroundCompiles then
-        cancel("this runtime's regex engine is RE2 (Scala Native), which has no lookaround — the " +
-          "grammar is rendered by java.util.regex, so the JVM run is where this claim is checked")
+    // It also makes the claim end-to-end: what is asserted is the SCOPE a name is styled with, which
+    // is the thing the page shows, rather than that some pattern matched some substring.
+    // `Grammar.sysl` rather than the file on disk: it is what `build.sbt` embeds and therefore what
+    // `Weave` actually renders with, and a generated copy that had drifted from its source is a
+    // different defect from this one.
+    def styled(code: String, name: String): List[String] =
+      Highlighter.fromJson(Grammar.sysl) match
+        case Left(why) => fail(s"the grammar did not load, so nothing could be styled: $why")
+        case Right(h)  =>
+          // Trimmed, because a capture may take the space in front of the name with it — `end`'s
+          // second group is `\s+<name>` — and the scope is still the one on that name.
+          h.tokens(code).flatten.filter(_.text.trim == name).flatMap(_.scopes).distinct
 
-      // **What is asserted is the WHOLE name and not that something matched**, which is the
-      // difference between a real check and one that cannot fail here. An ASCII class matches
-      // `struct C` and stops at the accent, so a `findFirstIn` answers `Some` on a pattern that
-      // styles one letter of the name — checked by reverting each class and watching this go red.
-      def spans(section: String, sample: String, name: String): Boolean =
-        patterns(section).exists(_.findFirstMatchIn(sample).exists(_.matched.endsWith(name)))
-
-      spans("declaration", "struct Círculo", "Círculo") shouldBe true
-      spans("declaration", "end Círculo", "Círculo") shouldBe true
-      spans("declaration", "área(ancho: real)", "área") shouldBe true
-      spans("call", "área(3.0)", "área") shouldBe true
-      spans("type", "Círculo", "Círculo") shouldBe true
+    // **THE ONE THAT WOULD HAVE CAUGHT THE WORST OF THIS, AND WHICH NOTHING ASKED.** A pattern the
+    // engine cannot compile does not stop the grammar loading: `fromJson` still answers `Right`, the
+    // pattern is dropped, and everything it would have styled comes out bare. So a grammar that
+    // highlights **nothing** loads exactly as cleanly as one that works, and the only record is a
+    // list nobody read.
+    //
+    // Written after doing precisely that: widening the identifier classes to `\p{Nd}` and `\p{Lu}`
+    // — which `java.util.regex` accepts and this engine does not — silently unstyled every
+    // declaration, call and type in `sysl weave` and on the whole site.
+    "loads with every pattern compiled, since one that does not is dropped in silence" in {
+      Highlighter.fromJson(Grammar.sysl) match
+        case Left(why) => fail(s"the grammar did not load at all: $why")
+        case Right(h)  =>
+          withClue(s"patterns the engine refused:\n  ${h.loadWarnings.mkString("\n  ")}\n") {
+            h.loadWarnings shouldBe empty
+          }
     }
 
-    // The other direction, so the classes above cannot be widened into matching anything at all: a
-    // digit still does not begin a name, in any script.
-    "and still refuses a name beginning with a digit" in {
-      // Cancelled rather than skipped, and named: RE2 has no lookaround, and the two cases above
-      // are unaffected and still run here.
-      if !lookaroundCompiles then
-        cancel("this runtime's regex engine is RE2 (Scala Native), which has no lookaround — the " +
-          "grammar is rendered by java.util.regex, so the JVM run is where this claim is checked")
+    "styles a declaration whose name is not ASCII, and a name whose tail is not" in {
+      // The WHOLE name has to be the token: an ASCII class matches `struct C` and stops at the
+      // accent, which styles one letter and leaves the rest bare. Matching the exact text is what
+      // makes that a failure rather than a pass — checked by reverting each widened class.
+      styled("struct Círculo", "Círculo") should contain("entity.name.type.sysl")
+      styled("end Círculo", "Círculo") should contain("entity.name.type.sysl")
+      styled("área(ancho: real) -> real = ancho", "área") should contain("entity.name.function.sysl")
+      styled("val c: Círculo = q", "Círculo") should contain("entity.name.type.sysl")
+      styled("val x = area(3.0)", "area") should contain("entity.name.function.call.sysl")
+    }
 
-      val started =
-        patterns("declaration").exists(_.findFirstMatchIn("struct 3café").exists(_.matched.contains("3")))
+    /** **A name whose FIRST letter is not ASCII is styled where the rule names a declaration and not
+      * where it depends on case**, and that is a limit of the engine rather than a decision.
+      *
+      * Two of the grammar's rules are about capitalisation — a capitalised name is a type, a
+      * lowercase one at a call is a function — and this Oniguruma port supports the general Unicode
+      * categories (`\p{L}`, `\p{N}`) and not the subcategories, so there is no way to write "an
+      * uppercase letter" that it will compile. `\p{Lu}` and `\p{Ll}` are refused, and a refused
+      * pattern is silently dropped.
+      *
+      * So the case-dependent rules keep an ASCII first character and take the Unicode class for
+      * everything after it, which is why `Círculo` styles and `Ómnibus` does not. The rules that
+      * name a declaration — `struct X`, `end X`, a function at the head of a line — have no such
+      * dependency and are Unicode throughout.
+      *
+      * Pinned rather than left as an absence, so that whoever adds the subcategories to the engine
+      * finds the case that says what changes.
+      */
+    "and does not style one whose first letter is not ASCII where the rule is about case" in {
+      styled("val x = área(3.0)", "área") should not contain "entity.name.function.call.sysl"
+      styled("val c: Ómnibus = q", "Ómnibus") should not contain "entity.name.type.sysl"
+    }
 
-      started shouldBe false
+    /** **A KEYWORD INSIDE AN IDENTIFIER IS NOT A KEYWORD, WHICH STOPPED BEING TRUE THE DAY A NAME
+      * COULD HOLD A LETTER OUTSIDE ASCII.**
+      *
+      * Every `\bword\b` in this grammar depends on what the engine thinks a word character is, and
+      * Oniguruma keeps two answers: `\w` is ASCII and `\b` is encoding-aware. The port tied `\b` to
+      * its ASCII `\w`, so a boundary fired wherever the script changed *inside* a word — `síif`
+      * rendering `if` as a keyword, `realíssimo` rendering `real` as a primitive type — on the whole
+      * docs site and in everything `sysl weave` writes.
+      *
+      * Fixed upstream in `io.github.edadma:oniguruma` 0.0.5 (`UCDProperty.BoundaryWord`, `L | M | N
+      * | Pc`), which reaches here through `highlighter` 0.0.11. Pinned here as well as there because
+      * this is where the symptom is, and because the pin is what would notice a downgrade.
+      */
+    "and does not find a keyword inside a name that merely contains one" in {
+      // **Asked over the WHOLE LINE rather than over the name's own token, because with the defect
+      // present there IS no token for the name** — `síif` arrives split into `sí` and `if`, so a
+      // filter on the exact text answers empty and `should not contain` passes having compared
+      // nothing. The first version of this case did exactly that and was green against the broken
+      // engine; it is the same trap as asserting that some pattern matched, one level in.
+      def scopes(code: String): List[String] =
+        Highlighter.fromJson(Grammar.sysl) match
+          case Left(why) => fail(s"the grammar did not load: $why")
+          case Right(h)  => h.tokens(code).flatten.flatMap(_.scopes).distinct
+
+      scopes("val síif = 1") should not contain "keyword.control.sysl"
+      scopes("val realíssimo = 1") should not contain "support.type.primitive.sysl"
+      scopes("var estáreal = 3") should not contain "support.type.primitive.sysl"
+
+      // The keyword itself is still a keyword, so none of the above can pass by styling nothing.
+      scopes("val x = 1") should contain("keyword.declaration.sysl")
+      scopes("val x: real = 1.0") should contain("support.type.primitive.sysl")
+      scopes("if x then 1 else 2") should contain("keyword.control.sysl")
+    }
+
+    // The other direction, so the classes above cannot be widened into styling anything at all: a
+    // digit still does not begin a name, in any script. `source.sysl` is on every token, so what is
+    // asserted is the absence of the *type* scope rather than of all scopes.
+    "and still refuses to style a name beginning with a digit as a type" in {
+      styled("struct 3café", "3café") should not contain "entity.name.type.sysl"
     }
   }
 }
