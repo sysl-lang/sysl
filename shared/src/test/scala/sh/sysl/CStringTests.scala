@@ -31,8 +31,8 @@ class CStringTests extends AnyFreeSpec with ParseSupport with CodegenSupport wit
       prog("""var a = c""""") shouldBe List(VarDecl("a", None, Some(CStrLit(""))))
     }
 
-    // The prefix has to be the whole identifier, exactly as for `s"…"` / `raw"…"` / `f"…"`, so a
-    // name that merely begins with `c` stays a name beside a string.
+    // The prefix has to be the whole identifier, exactly as for `raw"…"` and the two interpolators
+    // `s"…"` and `f"…"`, so a name that merely begins with `c` stays a name beside a string.
     "a name ending in c does not become a prefix" in {
       prog("""var abc = 1
              |var x = abc""".stripMargin) shouldBe

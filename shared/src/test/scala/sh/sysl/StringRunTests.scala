@@ -344,9 +344,12 @@ class StringRunTests extends AnyFreeSpec with RunSupport {
             |print(s"$$$n")""".stripMargin) shouldBe "$5\n"
     }
 
-    "raw leaves a backslash alone yet still interpolates" in {
+    // `raw` is the one form that reads nothing: no escape decoded and no hole rendered. What it is
+    // for is carrying another language's source, and `${` is how shell, Make, Kotlin, Groovy and JS
+    // template literals all spell interpolation — so a `raw` that read holes could not carry them.
+    "raw leaves both a backslash and a hole alone" in {
       run("""var x = "hi"
-            |print(raw"a\n$x")""".stripMargin) shouldBe "a\\n" + "hi\n"
+            |print(raw"a\n$x and ${x}")""".stripMargin) shouldBe "a\\n$x and ${x}\n"
     }
 
     "the result is a real owning string, usable like any other" in {

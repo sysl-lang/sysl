@@ -177,8 +177,17 @@ class ExpressionParserTests extends AnyFreeSpec with ParseSupport {
       expr("""s"${x}${y}"""") shouldBe cat(str(Ident("x")), str(Ident("y")))
     }
 
-    "raw keeps a backslash as an ordinary character but still interpolates" in {
-      expr("""raw"a\n$x"""") shouldBe cat(StrLit("a\\n"), str(Ident("x")))
+    /** **`raw` reads nothing at all, which is why it is not in this block's subject.**
+      *
+      * It used to be an interpolator following Scala's — backslashes left alone, holes still read —
+      * and the combination that left unwritable is the only one a literal carrying another
+      * language's source can use: a plain string reads no `${…}` and *does* decode escapes, and
+      * Scala's `raw` does the opposite. So it lexes as one `StrLit` rather than a concatenation,
+      * which is what says no interpolation scan ran over it.
+      */
+    "raw keeps both a backslash and a hole as ordinary characters" in {
+      expr("""raw"a\n$x"""") shouldBe StrLit("a\\n$x")
+      expr("""raw"${x}"""") shouldBe StrLit("${x}")
     }
 
     "a malformed hole is a fatal error naming the interpolation" in {
