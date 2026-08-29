@@ -85,6 +85,16 @@ private[sysl] def execute(asked: Config): Int = {
   if cfg.command == "help" then return printUsage()
   if cfg.command == "targets" then return listTargets()
 
+  // **Above everything a compilation needs, and above `readPackageConfig`.** Adding a dependency is
+  // an edit to the manifest, so it asks for no target, no standard module and no library — and it
+  // must not go through the reader that would refuse a project whose manifest is already saying
+  // something this compiler cannot build here. What it does read the manifest for, it reads itself,
+  // and it reads the *result* back before writing (`Add.run`).
+  if cfg.command == "add" then
+    return Add.run(if cfg.file.isEmpty then "." else cfg.file, cfg.spec) match
+      case Left(err)  => fail(err)
+      case Right(say) => println(say); 0
+
   // Rendering is a **source-level** job and stops here, above everything a compilation needs. It
   // asks for no target, no standard module and no library, which is not a shortcut but the whole
   // reason the command is usable: a package's prose is worth reading on a machine that could not
@@ -123,6 +133,12 @@ private[sysl] def execute(asked: Config): Int = {
   // source roots are handed over; `dependencies` splits them the same way for the same reason.
   if cfg.command == "deps" then
     return showDeps(cfg, project, cfg.libs.filterNot(LibraryArtifact.isArtifact))
+
+  // Beside `deps` and for its reason: what a project takes is a property of the manifests rather
+  // than of the machine, so a project that cannot be *built* here can still have its packages
+  // brought down — which is most of what vendoring is for.
+  if cfg.command == "vendor" then
+    return vendorAll(cfg, project, cfg.libs.filterNot(LibraryArtifact.isArtifact))
 
   val target = chooseTarget(cfg.target, project.defaultTarget) match
     case Left(err) => return fail(err)

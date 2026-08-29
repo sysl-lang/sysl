@@ -32,11 +32,17 @@ object Fetch {
    * every project on the machine and the alternative is N copies of one library. This is the same
    * reasoning, and the same root, as the standard module's prebuilt artifact.
    */
-  def cacheRoot: Either[String, String] =
-    override_.map(Right(_)).getOrElse(
-      cacheDirectory.map(c => s"$c/sysl/pkg").toRight(
-        "cannot find a cache directory to fetch packages into — set XDG_CACHE_HOME, or vendor the " +
-          "dependencies so that nothing has to be fetched"))
+  def cacheRoot(projectRoot: String = ""): Either[String, String] =
+    override_.map(Right(_)).getOrElse {
+      val vendored = s"$projectRoot/${Project.VendorDir}"
+
+      if projectRoot.nonEmpty && isDirectory(vendored) then Right(vendored)
+      else
+        cacheDirectory.map(c => s"$c/sysl/pkg").toRight(
+          "cannot find a cache directory to fetch packages into — set XDG_CACHE_HOME, or vendor the " +
+            "dependencies so that nothing has to be fetched")
+    }
+
 
   private var override_ : Option[String] = None
 

@@ -80,6 +80,17 @@ object Project {
    */
   val ExamplesDir = "examples"
 
+  /** A project's own copy of what it depends on, which `sysl vendor` fills and a build reads instead
+   * of the machine's cache.
+   *
+   * **It is skipped for exactly `examples`' reason, one line below**: it sits at the root and it is
+   * full of `.sysl`, so a walk that took it would compile every dependency *as this project's own
+   * modules* — which fails on the first file, saying that `sh.sysl.json` sits in
+   * `vendor.github.com.sysl-lang.json.@v0.1.2.sh.sysl.json`. A dependency is reached as a package,
+   * through the resolver, and never as a directory that happens to be here.
+   */
+  val VendorDir = "vendor"
+
   /** The C files of a source tree, which a `.sysl` file reaches by `extern` and the build compiles
    * alongside it (`reference/ffi.md § A library may carry C`).
    *
@@ -204,7 +215,8 @@ object Project {
    */
   private def outside(dir: List[String], subs: List[(String, Option[String])])
       : List[(String, Option[String])] =
-    if dir.nonEmpty then subs else subs.filterNot((d, _) => basename(d) == ExamplesDir)
+    if dir.nonEmpty then subs
+    else subs.filterNot((d, _) => basename(d) == ExamplesDir || basename(d) == VendorDir)
 
   /** `walk`, taking a directory's own files only where that directory is a **module** — where it
    * holds a sysl file of its own — or is the tree's own root. Sub-directories are still descended

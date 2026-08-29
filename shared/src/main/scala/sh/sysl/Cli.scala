@@ -26,6 +26,8 @@ import scopt.OParser
  *   - `sysl weave <path>`          render a literate source as an HTML document
  *   - `sysl tangle <path>`         print the program a literate source holds
  *   - `sysl deps <path>`           print the resolved dependency graph
+ *   - `sysl add <coordinate>`      add a dependency to this project's manifest
+ *   - `sysl vendor <path>`         put what this project depends on into vendor/
  *   - `sysl targets`               list the machines sysl can build for
  *
  * **`--lib` takes either a source tree or an artifact**, and which one is read off the name: a
@@ -97,6 +99,12 @@ import scopt.OParser
 case class Config(
     command: String = "",
     file: String = "",
+    /** `sysl add`'s coordinate, as it was typed — `github.com/owner/repo`, or that with `@version`.
+      *
+      * Kept as the whole string rather than split here, because what a malformed one is worth is a
+      * sentence explaining the shape, and argument parsing is not where that reads well.
+      */
+    spec: String = "",
     output: Option[String] = None,
     explainEscapes: Boolean = false,
     verbose: Boolean = false,
@@ -255,6 +263,19 @@ private[sysl] val parser = {
       cmd("deps")
         .action((_, c) => c.copy(command = "deps"))
         .text("print the dependency graph this project resolves to, and who asked for each version")
+        .children(arg[String]("<path>").required().action((f, c) => c.copy(file = f))),
+      cmd("add")
+        .action((_, c) => c.copy(command = "add"))
+        .text("add a dependency to this project's package.hocon, at its newest version or a pinned one")
+        .children(
+          arg[String]("<coordinate>").required().action((s, c) => c.copy(spec = s))
+            .text("'github.com/sysl-lang/sdl3', or 'github.com/sysl-lang/sdl3@0.3.1'"),
+          arg[String]("<path>").optional().action((f, c) => c.copy(file = f))
+            .text("the project to add it to; the working directory by default"),
+        ),
+      cmd("vendor")
+        .action((_, c) => c.copy(command = "vendor"))
+        .text("put every package this project depends on into vendor/, so that a build fetches nothing")
         .children(arg[String]("<path>").required().action((f, c) => c.copy(file = f))),
       cmd("targets")
         .action((_, c) => c.copy(command = "targets"))

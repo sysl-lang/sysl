@@ -86,7 +86,7 @@ private def resolvedGraph(cfg: Config, project: PackageConfig, roots: List[Strin
   val root = projectRoot(cfg.file)
 
   for
-    cache <- Fetch.cacheRoot
+    cache <- Fetch.cacheRoot(root)
     sums  <- readSums(root)
     graph <- Resolve.graph(root, project, sums, cache, roots)
   yield
@@ -330,6 +330,51 @@ private def readPackageConfig(file: String): Either[String, PackageConfig] = {
  * A path dependency takes no part in selection and has no version, so it prints its directory
  * instead — which is the only thing that says which tree it is.
  */
+/** `sysl vendor` — every package this project depends on, put beside the manifest.
+ *
+ * **The whole of it is making the directory and then resolving.** `Fetch.cacheRoot` prefers a
+ * `vendor/` beside the manifest over the machine's cache, so once the directory exists the ordinary
+ * resolution fetches into it, and every later build reads from it and asks the network nothing.
+ * There is no copy step and no second layout: vendoring is the cache moved into the project.
+ *
+ * A dependency that is a **path** is not vendored and cannot be. It is a directory somebody is
+ * editing beside this one — `§ 6` keeps no sum for it precisely because it is expected to change —
+ * so copying it would freeze the thing whose whole purpose is not to be frozen. It is named in what
+ * this prints, so that a reader is told rather than left to notice.
+ */
+private def vendorAll(cfg: Config, project: PackageConfig, roots: List[String]): Int = {
+  val root = projectRoot(cfg.file)
+  val dir  = s"$root/${Project.VendorDir}"
+
+  try Project.makeDirectories(dir)
+  catch case e: Exception => return fail(s"cannot make '$dir': ${e.getMessage}")
+
+  val listed =
+    for
+      fromRoots <- libDependencies(roots)
+      graph     <- resolvedGraph(cfg, project.copy(dependencies = project.dependencies ::: fromRoots),
+                     roots)
+    yield graph
+
+  listed match
+    case Left(err) => fail(err)
+    case Right(graph) =>
+      val vendored = graph.packages.filterNot(_.isRoot).filter(_.version.isDefined)
+      val local    = project.dependencies.count(d => d.origin match
+        case Origin.Local(_) => true
+        case _               => false)
+
+      stdout(s"vendored ${vendored.length} package${if vendored.length == 1 then "" else "s"} " +
+        s"into ${Project.VendorDir}/\n")
+
+      if local > 0 then
+        stdout(s"\n$local path dependenc${if local == 1 then "y is" else "ies are"} not vendored — a " +
+          "path is a directory you are editing, and freezing a copy of it is the one thing it is " +
+          "there not to do\n")
+
+      0
+}
+
 private def showDeps(cfg: Config, project: PackageConfig, roots: List[String]): Int = {
   val listed =
     for
