@@ -2,7 +2,7 @@ module sysl.fs
 @requires(os)
 
 import sysl.env.get
-import sysl.path.{join, parent}
+import sysl.path.{join, parent, relative_to}
 import sysl.slices.{as_mut_ptr, as_ptr}
 import sysl.text.{cstring, from_cstring}
 
@@ -213,15 +213,62 @@ end make_dir_all
 remove_dir_all(path: string) -> Result[unit, IoError]
     if !exists(path) && !is_link(path) then return Ok(())
 
-    if is_link(path) || !is_dir(path) then return remove_file(path)
+    for item in walk(path).bottom_up()
+        val e = item?
 
-    val names = entries(path)?
+        if e.is_dir() then remove_dir(e.path)? else remove_file(e.path)?
 
-    for name in names.view()
-        remove_dir_all(join(path, name))?
-
-    remove_dir(path)
+    Ok(())
 end remove_dir_all
+
+/** A directory and everything under it copied, making the destination and everything under it.
+ *
+ * **A directory is merged into and a file is never overwritten.** Those are the safe half of each
+ * question: a destination that already holds a subtree gains what this brings, and a destination
+ * that already holds a *file* of a name being copied reports `AlreadyExists` rather than quietly
+ * replacing something. `make_dir_all` is idempotent, so the merge half is simply what happens.
+ *
+ * **Permissions are carried**, which is where this differs from `copy_file` -- an executable copied
+ * with that one stops being executable, and this org copies build inputs. A symbolic link is copied
+ * *as a link*, pointing wherever it pointed, which may be nothing and may be outside the tree.
+ *
+ * **A failure part way through leaves what it has already written.** Nothing here removes a tree on
+ * the way out, because it cannot know whether the destination existed before it started, and
+ * deleting one the caller owned would be far worse than the failure being reported. A caller that
+ * needs the destination to appear whole or not at all copies into `make_temp_dir` and `rename`s the
+ * result into place, which is one call each and is the only way to get atomicity from a filesystem.
+ *
+ * The source may be a plain file, in which case this is `copy_file` with the mode carried.
+ */
+copy_dir_all(from: string, to: string) -> Result[unit, IoError]
+    for item in walk(from)
+        val e = item?
+
+        // `e.path` is the root or was built from it by `join`, so the two always agree about
+        // starting at the root and `relative_to` always answers. It is checked rather than assumed
+        // because a walk that ever reported something else should say so rather than go on.
+        val rel = relative_to(e.path, from)
+
+        if rel.is_none() then return Err(Other(22))
+
+        val dst = if e.depth == 0 then to else join(to, rel.unwrap())
+
+        if e.is_link()
+            symlink(read_link(e.path)?, dst)?
+            continue
+        end if
+
+        if e.is_dir()
+            make_dir_all(dst)?
+        else
+            if exists(dst) || is_link(dst) then return Err(AlreadyExists)
+
+            copy_file(e.path, dst)?
+
+        set_permissions(dst, e.meta.permissions())?
+
+    Ok(())
+end copy_dir_all
 
 #endif
 

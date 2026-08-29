@@ -1,0 +1,209 @@
+module sysl.fs
+@requires(os)
+
+import sysl.buf.{Buf, buf}
+import sysl.path.{join, relative_to}
+
+// Walking a directory tree, and the two operations that are a walk with a leaf action.
+//
+// **The walk is the primitive and `copy_dir_all` and `remove_dir_all` are callers of it**, which is
+// the shape this file exists to establish. Before it, five programs across this org and slate had
+// each hand-written a recursion through a directory, and they differed on three axes: what they did
+// at a leaf, what they did about a directory they could not read, and whether they descended into
+// everything. `remove_dir_all` already existed and one of the five wrote its own anyway, because
+// what it needed was the second axis answered differently. A leaf action is the only thing a caller
+// should be writing.
+//
+// An iterator answers all three at once. The leaf action is whatever the loop body does; the error
+// policy is the caller's, because each item is a `Result` and a caller may `?` it or ignore it; and
+// pruning is `skip_dir`, which is a method on a live walker because the question has to be answered
+// after a directory is reported and before it is descended into.
+//
+// **A symbolic link is reported and never followed.** `is_dir` follows a link, so a walk that
+// classified with it would descend into a link to a directory without ever deciding to -- and a link
+// pointing at one of its own ancestors would then make the walk unbounded. `entries` already carries
+// one walk hazard on every caller's behalf, dropping `.` and `..` so that a recursion terminates;
+// this is the same hazard one level up and is answered the same way, once, here.
+
+#if posix
+
+/** One entry a walk reported: where it is, how far down, and one reading of what it is.
+ *
+ * **The `Meta` is a `link_metadata`**, so a symbolic link describes itself rather than whatever it
+ * points at. That is what `is_dir` on this answers about, and it is why a walk never follows one.
+ *
+ * The depth is from the root the walk was given, which is itself depth zero. A caller reproducing
+ * the tree somewhere else wants `sysl.path.relative_to` rather than this, but a caller that only
+ * needs to know how deep it has got -- a printer indenting, a search bounding itself -- would
+ * otherwise have to count separators.
+ */
+struct Entry
+    path: string
+    depth: usize
+    meta: Meta
+
+    /** Whether this is a directory the walk will descend into -- so a link to one answers `false`. */
+    is_dir(self) -> bool = self.meta.is_dir() && !self.meta.is_link()
+
+    /** Whether this is a symbolic link, which a walk reports and does not follow. */
+    is_link(self) -> bool = self.meta.is_link()
+end Entry
+
+/** A directory the walk has opened and not yet finished with, and how far through it the walk has
+ * got.
+ */
+private struct Frame
+    dir: string
+    names: Buf[string]
+    at: usize
+    depth: usize
+    meta: Meta
+
+/** A cursor over a directory tree, reporting the root and then everything under it.
+ *
+ * **The default order is parents first**, which is what a caller reproducing a tree needs: a
+ * directory has to exist before anything can be written into it. `bottom_up` reverses that for the
+ * callers that need the opposite, `remove_dir_all` being the one in this file -- `rmdir` refuses a
+ * directory that is not empty.
+ *
+ * **A failure is reported as an item rather than ending the walk**, so a directory that cannot be
+ * read is one `Err` and the walk carries on with what is left. That is the axis `remove_dir_all` and
+ * a best-effort cleanup disagree about, and neither answer is now the library's: `?` in the loop
+ * body makes the first `Err` fatal, and ignoring it makes the walk best effort.
+ */
+struct Walk
+    private stack: Buf[Frame]
+    private root: string
+    private started: bool
+    private up: bool
+    private open_next: Option[Entry]
+    private pruned: bool
+
+    /** The same walk, reporting a directory *after* everything under it.
+     *
+     * `skip_dir` does nothing in this order and cannot: by the time a directory is reported its
+     * contents have already been walked, so there is nothing left to prune.
+     */
+    bottom_up(self) -> Walk =
+        Walk(self.stack, self.root, self.started, true, self.open_next, false)
+
+    /** Do not descend into the directory just reported.
+     *
+     * It applies to the most recent item and only until the next `next`, so it is answered where a
+     * caller has just seen what the directory is. Anything but a directory the walk was about to
+     * descend into ignores it.
+     *
+     * **It cannot be used from a `for`**, because a `for` walks a *copy* of the cursor and this
+     * would be setting a flag on the original. Pruning needs the explicit form:
+     *
+     * ```
+     * var w = walk(root)
+     *
+     * loop
+     *     val e = w.next() match
+     *         None -> break
+     *         Some(item) -> item?
+     *
+     *     if e.is_dir() && hidden(e.path) then w.skip_dir()
+     * ```
+     */
+    skip_dir(*self) = self.pruned = true
+
+    /** A directory opened and pushed, so that the walk has somewhere to go next. */
+    private open(*self, dir: string, depth: usize, m: Meta) -> Result[unit, IoError]
+        val names = entries(dir)?
+
+        self.stack.push(Frame(dir, names, 0, depth, m))
+        Ok(())
+    end open
+end Walk
+
+/** Everything at or under a path, the path itself first.
+ *
+ * The root is reported whatever it is, so a walk of a plain file yields that one entry -- which is
+ * what lets `copy_dir_all` be given either and do the right thing without asking first.
+ */
+walk(root: string) -> Walk = Walk(buf(), root, false, false, None, false)
+
+impl Iterate for Walk
+    type Item = Result[Entry, IoError]
+
+    next(*self) -> Option[Result[Entry, IoError]]
+        if !self.started
+            self.started = true
+
+            val m = link_metadata(self.root) match
+                Err(e) -> return Some(Err(e))
+                Ok(m) -> m
+
+            val here = Entry(self.root, 0, m)
+
+            if !here.is_dir() then return Some(Ok(here))
+
+            // Parents first reports the root now and opens it on the next call, which is the gap
+            // `skip_dir` answers in. Bottom up has nothing to report yet and opens it immediately.
+            if !self.up
+                self.open_next = Some(here)
+                return Some(Ok(here))
+
+            self.open(self.root, 0, m) match
+                Err(e) -> return Some(Err(e))
+                Ok(_) -> ()
+
+        loop
+            self.open_next match
+                Some(e) ->
+                    // Read what the pending entry says before clearing the field, rather than
+                    // after: a match binds *into* the value it matched, so the three reads below
+                    // would be reads of a slot the assignment had already let go of.
+                    val at = e.path
+                    val down = e.depth
+                    val m = e.meta
+
+                    self.open_next = None
+
+                    if !self.pruned
+                        self.open(at, down, m) match
+                            Err(err) -> return Some(Err(err))
+                            Ok(_) -> ()
+
+                    self.pruned = false
+                None -> ()
+
+            if self.stack.len() == 0 then return None
+
+            val top = self.stack.len() - 1
+            var f = self.stack.at(top)
+
+            if f.at >= f.names.len()
+                self.stack.pop()
+
+                if self.up then return Some(Ok(Entry(f.dir, f.depth, f.meta)))
+
+                continue
+            end if
+
+            val child = join(f.dir, f.names.at(f.at))
+
+            f.at += 1
+            self.stack.set(top, f)
+
+            val m = link_metadata(child) match
+                Err(e) -> return Some(Err(e))
+                Ok(m) -> m
+
+            val e = Entry(child, f.depth + 1, m)
+
+            if !e.is_dir() then return Some(Ok(e))
+
+            if !self.up
+                self.open_next = Some(e)
+                return Some(Ok(e))
+
+            self.open(child, e.depth, m) match
+                Err(err) -> return Some(Err(err))
+                Ok(_) -> ()
+    end next
+end Walk
+
+#endif

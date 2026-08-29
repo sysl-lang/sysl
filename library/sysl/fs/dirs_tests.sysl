@@ -119,6 +119,131 @@ end remove_dir_all_does_not_follow_a_link
 
 // -- copy_file ------------------------------------------------------------------------------------
 
+// -- copy_dir_all ---------------------------------------------------------------------------------
+
+@test("a tree is copied with its structure and its bytes")
+copy_dir_all_copies_a_tree()
+    val dir = scratch("copytree")
+    val from = join(dir, "src")
+    val to = join(dir, "dst")
+
+    make_dir_all(join(from, "a/b")).unwrap()
+    write_text(join(from, "top"), "1").unwrap()
+    write_text(join(from, "a/mid"), "2").unwrap()
+    write_text(join(from, "a/b/deep"), "3").unwrap()
+
+    copy_dir_all(from, to).unwrap()
+
+    assert(is_dir(join(to, "a/b")))
+    assert_eq(read_text(join(to, "top")).unwrap(), "1")
+    assert_eq(read_text(join(to, "a/mid")).unwrap(), "2")
+    assert_eq(read_text(join(to, "a/b/deep")).unwrap(), "3")
+
+    ignore(remove_dir_all(dir))
+end copy_dir_all_copies_a_tree
+
+/** Where this differs from `copy_file`, which does not carry the mode: an executable copied with
+ * that one stops being executable, and a tree copy is how build inputs move.
+ */
+@test("permissions are carried, so an executable copies as an executable")
+copy_dir_all_carries_permissions()
+    val dir = scratch("copymode")
+    val from = join(dir, "src")
+    val to = join(dir, "dst")
+
+    make_dir_all(from).unwrap()
+    write_text(join(from, "run"), "#!/bin/sh\n").unwrap()
+    set_permissions(join(from, "run"), 0o755).unwrap()
+
+    copy_dir_all(from, to).unwrap()
+
+    assert_eq(metadata(join(to, "run")).unwrap().permissions(), 0o755)
+
+    ignore(remove_dir_all(dir))
+end copy_dir_all_carries_permissions
+
+/** The safe half of each question: a directory that is already there is merged into, and a file that
+ * is already there is reported rather than quietly replaced.
+ */
+@test("a directory is merged into and an existing file is refused")
+copy_dir_all_merges_and_refuses()
+    val dir = scratch("copymerge")
+    val from = join(dir, "src")
+    val to = join(dir, "dst")
+
+    make_dir_all(join(from, "shared")).unwrap()
+    write_text(join(from, "shared/new"), "n").unwrap()
+
+    make_dir_all(join(to, "shared")).unwrap()
+    write_text(join(to, "shared/old"), "o").unwrap()
+
+    copy_dir_all(from, to).unwrap()
+
+    assert_eq(read_text(join(to, "shared/new")).unwrap(), "n")
+    assert_eq(read_text(join(to, "shared/old")).unwrap(), "o")
+
+    copy_dir_all(from, to) match
+        Ok(_) -> assert(false, "copying over an existing file answered")
+        Err(e) -> assert_eq(e, AlreadyExists)
+
+    // The refusal changed nothing about what was already there.
+    assert_eq(read_text(join(to, "shared/new")).unwrap(), "n")
+
+    ignore(remove_dir_all(dir))
+end copy_dir_all_merges_and_refuses
+
+/** Copied *as a link*, pointing wherever it pointed -- which may be outside the tree and may be
+ * nothing at all. Following it instead would duplicate whatever it names and, for a link to an
+ * ancestor, would not terminate.
+ */
+@test("a symbolic link is copied as a link rather than as what it points at")
+copy_dir_all_copies_a_link()
+    val dir = scratch("copylink")
+    val from = join(dir, "src")
+    val to = join(dir, "dst")
+
+    make_dir_all(join(from, "real")).unwrap()
+    write_text(join(from, "real/f"), "x").unwrap()
+    symlink(join(from, "real"), join(from, "to_real")).unwrap()
+
+    copy_dir_all(from, to).unwrap()
+
+    assert(is_link(join(to, "to_real")), "the link was copied as something other than a link")
+    assert_eq(read_link(join(to, "to_real")).unwrap(), join(from, "real"))
+
+    ignore(remove_dir_all(dir))
+end copy_dir_all_copies_a_link
+
+@test("a source that is a plain file copies as one, mode and all")
+copy_dir_all_of_a_file()
+    val dir = scratch("copyone")
+    val from = join(dir, "only")
+    val to = join(dir, "copy")
+
+    write_text(from, "x").unwrap()
+    set_permissions(from, 0o600).unwrap()
+
+    copy_dir_all(from, to).unwrap()
+
+    assert_eq(read_text(to).unwrap(), "x")
+    assert_eq(metadata(to).unwrap().permissions(), 0o600)
+
+    ignore(remove_dir_all(dir))
+end copy_dir_all_of_a_file
+
+@test("copying a source that is not there reports it")
+copy_dir_all_of_nothing()
+    val dir = scratch("copymissing")
+
+    copy_dir_all(join(dir, "gone"), join(dir, "dst")) match
+        Ok(_) -> assert(false, "copying a tree that is not there answered")
+        Err(e) -> assert_eq(e, NotFound)
+
+    assert(!exists(join(dir, "dst")))
+
+    ignore(remove_dir_all(dir))
+end copy_dir_all_of_nothing
+
 @test("a copy has the same bytes and is a different file")
 copy_file_copies()
     val dir = scratch("copy")

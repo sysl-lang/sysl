@@ -1,0 +1,224 @@
+module sysl.fs
+@requires(os)
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.path.join
+
+// The tree walk, and the two properties everything else in the file rests on: a parent is reported
+// before what is under it, and a symbolic link is reported without being followed.
+//
+// **The assertions are about ORDER RELATIONS rather than about a sequence**, because `entries`
+// answers in whatever order the filesystem keeps, and a test naming an exact sequence would be
+// asserting something neither the library nor the platform promises. What the walk does promise is
+// that a directory comes before its contents -- or after them, asked the other way -- and that is
+// what `before` checks.
+
+private ignore(r: Result[unit, IoError]) = ()
+
+private scratch(name: string) -> string
+    val dir = "/tmp/sysl-fs-walk-" + name
+
+    ignore(remove_dir_all(dir))
+    make_dir_all(dir).unwrap()
+    dir
+end scratch
+
+/** A small tree: two directories, three files, one link. */
+private populate(dir: string)
+    make_dir_all(join(dir, "a/b")).unwrap()
+    write_text(join(dir, "top"), "1").unwrap()
+    write_text(join(dir, "a/mid"), "2").unwrap()
+    write_text(join(dir, "a/b/deep"), "3").unwrap()
+end populate
+
+/** Every path a walk reported, in the order it reported them. */
+private paths(w: Walk) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for item in w
+        out.push(item.unwrap().path)
+
+    out
+end paths
+
+private index_of(xs: Buf[string], p: string) -> usize
+    for i in 0..<xs.len()
+        if xs.at(i) == p then return i
+
+    xs.len()
+end index_of
+
+private has(xs: Buf[string], p: string) -> bool = index_of(xs, p) < xs.len()
+
+/** Whether one path was reported before another, both having been reported at all. */
+private before(xs: Buf[string], a: string, b: string) -> bool =
+    has(xs, a) && has(xs, b) && index_of(xs, a) < index_of(xs, b)
+
+@test("the root is reported first, and a directory before everything under it")
+walk_is_parents_first()
+    val dir = scratch("order")
+
+    populate(dir)
+
+    val seen = paths(walk(dir))
+
+    assert_eq(seen.len(), 6)
+    assert_eq(seen.at(0), dir)
+    assert(before(seen, join(dir, "a"), join(dir, "a/mid")), "a directory came after its own file")
+    assert(before(seen, join(dir, "a"), join(dir, "a/b")), "a directory came after its own directory")
+    assert(before(seen, join(dir, "a/b"), join(dir, "a/b/deep")), "a nested file came before its directory")
+
+    ignore(remove_dir_all(dir))
+end walk_is_parents_first
+
+/** The order `remove_dir_all` needs, and the reason it is offered at all: `rmdir` refuses a
+ * directory that is not empty, so the leaf action has to reach a directory last.
+ */
+@test("bottom up reports a directory after everything under it, and the root last")
+walk_bottom_up_reverses()
+    val dir = scratch("bottomup")
+
+    populate(dir)
+
+    val seen = paths(walk(dir).bottom_up())
+
+    assert_eq(seen.len(), 6)
+    assert_eq(seen.at(seen.len() - 1), dir)
+    assert(before(seen, join(dir, "a/mid"), join(dir, "a")), "a file came after its directory")
+    assert(before(seen, join(dir, "a/b/deep"), join(dir, "a/b")), "a nested file came after its directory")
+    assert(before(seen, join(dir, "a/b"), join(dir, "a")), "an inner directory came after its parent")
+
+    ignore(remove_dir_all(dir))
+end walk_bottom_up_reverses
+
+/** The axis that cannot be bolted on afterwards, since it has to be answered between a directory
+ * being reported and being descended into -- which is why it is a method on a live cursor and why a
+ * `for` cannot reach it.
+ */
+@test("skip_dir prunes the directory just reported, and nothing else")
+walk_skip_dir_prunes()
+    val dir = scratch("prune")
+
+    populate(dir)
+
+    var w = walk(dir)
+    var seen: Buf[string] = buf()
+
+    loop
+        val e = w.next() match
+            None -> break
+            Some(item) -> item.unwrap()
+
+        seen.push(e.path)
+
+        if e.path == join(dir, "a") then w.skip_dir()
+
+    assert(has(seen, join(dir, "a")), "the pruned directory was not itself reported")
+    assert(has(seen, join(dir, "top")), "pruning one directory hid a sibling")
+    assert(!has(seen, join(dir, "a/mid")), "a pruned directory was descended into")
+    assert(!has(seen, join(dir, "a/b")), "a pruned directory was descended into")
+
+    ignore(remove_dir_all(dir))
+end walk_skip_dir_prunes
+
+/** The hazard the walk exists to answer once: `is_dir` follows a link, so a walk classifying with it
+ * would descend into a link to a directory without ever deciding to -- and a link to one of its own
+ * ancestors would then never terminate.
+ */
+@test("a link to a directory is reported as a link and is not descended into")
+walk_does_not_follow_a_link()
+    val dir = scratch("link")
+
+    populate(dir)
+    symlink(join(dir, "a"), join(dir, "as_link")).unwrap()
+
+    val seen = paths(walk(dir))
+
+    assert(has(seen, join(dir, "as_link")), "the link itself was not reported")
+    assert(!has(seen, join(dir, "as_link/mid")), "the walk followed a symbolic link")
+    assert_eq(seen.len(), 7)
+
+    ignore(remove_dir_all(dir))
+end walk_does_not_follow_a_link
+
+@test("a link is described as a link rather than as what it points at")
+walk_classifies_a_link()
+    val dir = scratch("classify")
+
+    make_dir_all(join(dir, "real")).unwrap()
+    symlink(join(dir, "real"), join(dir, "to_real")).unwrap()
+
+    var w = walk(dir)
+    var links: usize = 0
+    var dirs: usize = 0
+
+    loop
+        val e = w.next() match
+            None -> break
+            Some(item) -> item.unwrap()
+
+        if e.is_link() then links += 1
+        if e.is_dir() then dirs += 1
+
+    assert_eq(links, 1)
+    // The root and `real`. The link is not counted, which is the whole point.
+    assert_eq(dirs, 2)
+
+    ignore(remove_dir_all(dir))
+end walk_classifies_a_link
+
+@test("depth counts from the root the walk was given, which is itself zero")
+walk_reports_depth()
+    val dir = scratch("depth")
+
+    populate(dir)
+
+    var w = walk(dir)
+    var deepest: usize = 0
+
+    loop
+        val e = w.next() match
+            None -> break
+            Some(item) -> item.unwrap()
+
+        if e.path == dir then assert_eq(e.depth, 0)
+        if e.path == join(dir, "a/b/deep") then assert_eq(e.depth, 3)
+        if e.depth > deepest then deepest = e.depth
+
+    assert_eq(deepest, 3)
+
+    ignore(remove_dir_all(dir))
+end walk_reports_depth
+
+/** What lets `copy_dir_all` take either without asking first. */
+@test("a walk of a plain file reports that one entry")
+walk_of_a_file()
+    val dir = scratch("onefile")
+    val f = join(dir, "only")
+
+    write_text(f, "x").unwrap()
+
+    val seen = paths(walk(f))
+
+    assert_eq(seen.len(), 1)
+    assert_eq(seen.at(0), f)
+
+    ignore(remove_dir_all(dir))
+end walk_of_a_file
+
+/** A failure is an item rather than the end of the walk, which is the axis a best-effort cleanup and
+ * a fatal one disagree about -- and neither answer is the library's.
+ */
+@test("a root that is not there is reported as an item rather than as an empty walk")
+walk_of_nothing_reports()
+    var w = walk("/tmp/sysl-fs-walk-nothing-at-all")
+
+    w.next() match
+        None -> assert(false, "a missing root walked to nothing instead of reporting")
+        Some(item) -> item match
+            Ok(_) -> assert(false, "a missing root answered an entry")
+            Err(e) -> assert_eq(e, NotFound)
+
+    assert(w.next().is_none(), "the walk carried on past a root it could not read")
+end walk_of_nothing_reports

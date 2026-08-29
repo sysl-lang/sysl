@@ -192,8 +192,14 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * to, accepted and talked through, in one thread, over the loopback. A `connect` to a listening
    * socket succeeds as soon as the kernel queues it, which is what makes that single-threaded and so
    * makes it something a suite can contain.
+   *
+   * Raised to **598** when `sysl.fs` gained a directory walk: eight for `walk` itself -- the order
+   * both ways, a link reported and not followed, pruning, and a walk of a plain file -- and six for
+   * `copy_dir_all`, which is the walk's first caller outside the module that declares it. **Two of
+   * the sixteen were drift**, measured the way the paragraph above prescribes rather than added to
+   * the number below it, which is the fifth time that has paid for itself.
    */
-  private val floor = 582
+  private val floor = 598
 
   /** The library, compiled as a **test build of itself**.
    *
