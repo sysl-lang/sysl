@@ -735,12 +735,24 @@ trait ControlFlowEmitter extends PlaceEmitter {
     emitLabel(bodyL)
     pushOwned()
     patternBind(bind, opt)
-    releaseTemps()
+
+    // **The frame is emptied here, not merely released, and that is what a `return` from the body
+    // needs.** `releaseTemps` gives the counts back on this edge and leaves the region populated so
+    // that the exhausted edge below can give them back too — but `releaseAll`, which a `return`
+    // emits, walks *every* temp region and so would give this one back a second time. A `break` is
+    // already safe: `releaseToDepth` stops at the depth the `GenLoop` recorded, which is outside
+    // this frame. Clearing rather than popping keeps the stack the same height, so the depths that
+    // `break` and `continue` were recorded against still mean what they meant.
+    val held = tempsHere
+
+    releaseValues(held)
+    tempStack.head.clear()
     body.foreach(genStmt)
     popOwned()
     emitTerm(Inst.Br(condL))
 
     emitLabel(doneL)
+    tempStack.head ++= held
     releaseTemps()
     dropTemps()
     emitTerm(Inst.Br(elseL))

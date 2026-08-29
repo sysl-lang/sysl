@@ -304,6 +304,46 @@ object Toolchain {
    */
   private def flag(level: String) = s"-O$level"
 
+  /** Extra flags spliced into every clang the build drives, read from `SYSL_EXTRA_CFLAGS`.
+   *
+   * **A build sysl drives is several clang invocations** — the module's IR, each C file a package
+   * vendors, and the link — so a flag that has to be on all of them cannot be passed to one of them
+   * by hand. `-fsanitize=address` is the case this exists for: given to the link alone it brings in
+   * a runtime that instruments nothing, and given to a C file alone it instruments the binding and
+   * not the program.
+   *
+   * It is an environment variable rather than an option because it is a *developer's* seam — a way
+   * to reach the toolchain sysl is already driving — and not a thing a project should be able to
+   * write down. Nothing here validates it: whatever it says goes to clang, and clang answers for it.
+   */
+  private[sysl] def extraFlags: List[String] =
+    envVar("SYSL_EXTRA_CFLAGS").toList.flatMap(_.split(" ").toList.filter(_.nonEmpty))
+
+  /** Whether those flags asked for AddressSanitizer, which is the one thing sysl has to read out of
+   * them rather than pass along — the IR needs marking and only this file knows that.
+   */
+  private[sysl] def asanAsked: Boolean = extraFlags.exists(_.contains("sanitize=address"))
+
+  /** The IR with every function marked for AddressSanitizer, where the extra flags asked for it.
+   *
+   * **LLVM instruments only functions carrying `sanitize_address`, and it is a *frontend* that adds
+   * it** — so IR handed to clang as a `.ll` links against the sanitizer's runtime and is
+   * instrumented nowhere. That reads as a clean run and is a sanitizer that never looked, which is
+   * the worst of the three possible outcomes; marking the functions here is what makes the answer
+   * mean something.
+   *
+   * The attribute group is numbered because LLVM's syntax takes nothing else, and the number is one
+   * nothing else emits — sysl's IR carries no attribute groups of its own.
+   */
+  private[sysl] def sanitized(ir: String, on: Boolean = asanAsked): String =
+    if !on then ir
+    else
+      val marked = ir.linesIterator
+        .map(l => if l.startsWith("define ") && l.endsWith(" {") then l.dropRight(1) + "#99 {" else l)
+        .mkString("\n")
+
+      marked + "\n\nattributes #99 = { sanitize_address }\n"
+
   /** Where an `llvm-ar` is looked for, in order, when none was named.
    *
    * The PATH first, since a toolchain installed to be used is on it. Then the places a package
@@ -564,7 +604,7 @@ object Toolchain {
             paths: SearchPaths = SearchPaths.none, verbose: Boolean = false): Either[String, Unit] = {
     findClang(target, paths.cc).flatMap { cc =>
       val ll = createTempFile("sysl-", ".ll")
-      writeFile(ll, ir)
+      writeFile(ll, sanitized(ir))
 
       val command = linkCommand(ll, archives, exe, target, level, links, objects, paths, cc)
 
@@ -602,7 +642,7 @@ object Toolchain {
                                 links: List[String] = Nil, objects: List[String] = Nil,
                                 paths: SearchPaths = SearchPaths.none,
                                 cc: String = "clang"): List[String] =
-    List(cc, s"--target=${target.triple}", "-Wno-override-module", flag(level)) :::
+    List(cc, s"--target=${target.triple}", "-Wno-override-module", flag(level)) ::: extraFlags :::
       machineFlags(target) ::: linkerFlags(target) ::: deadStrip(target) :::
       paths.linkFlags ::: List(ll) ::: objects ::: archives ::: libraryFlags(links, target) :::
       paths.probedLinkFlags ::: List("-o", exe)
@@ -775,10 +815,10 @@ object Toolchain {
                     named: Option[String] = None): Either[String, Unit] = {
     findClang(target, named).flatMap { cc =>
       val ll = createTempFile("sysl-", ".ll")
-      writeFile(ll, ir)
+      writeFile(ll, sanitized(ir))
 
       val result = exec(Seq(cc, s"--target=${target.triple}", "-Wno-override-module", flag(level)) ++
-        machineFlags(target) ++
+        extraFlags ++ machineFlags(target) ++
         Seq("-ffunction-sections", "-fdata-sections", "-c", ll, "-o", obj))
       deleteFile(ll)
 
@@ -843,7 +883,8 @@ object Toolchain {
                paths: SearchPaths = SearchPaths.none, verbose: Boolean = false,
                named: Option[String] = None): Either[String, Unit] = {
     findClang(target, named orElse paths.cc).flatMap { cc =>
-      val command = Seq(cc, s"--target=${target.triple}", flag(level)) ++ machineFlags(target) ++
+      val command = Seq(cc, s"--target=${target.triple}", flag(level)) ++ extraFlags ++
+        machineFlags(target) ++
         Option.when(target.shortEnums)("-fshort-enums") ++
         Option.when(target.positionIndependent)("-fPIC") ++ paths.defineFlagsFor(source) ++
         paths.includeFlags ++

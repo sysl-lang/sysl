@@ -38,6 +38,22 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
       |    end next
       |""".stripMargin
 
+  /** A cursor whose items own heap, which is what an over-release can be seen through: an `int`
+    * is copied and has no count to get wrong.
+    */
+  private val cursor =
+    """struct Src
+      |    at: int
+      |end Src
+      |impl Iterate for Src
+      |    type Item = string
+      |    next(*self) -> Option[string]
+      |        if self.at >= 3 then return None
+      |        self.at += 1
+      |        Some("v" + str(self.at - 1))
+      |    end next
+      |""".stripMargin
+
   "what the documents claim" - {
     // `library/core.md § Walking a type of your own` — the protocol's whole reason to exist is a
     // sequence that is not storage.
@@ -125,6 +141,47 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
   }
 
   "what the edges do" - {
+
+    // **A `return` out of the body used to give the option back twice.** The loop releases what
+    // `next` handed over on the way into the body and again on the exhausted edge, so the region
+    // holding it stays populated across both — and `releaseAll`, which a `return` emits, walks
+    // every region and reached that one as well. A `break` was never affected: it stops at the
+    // depth the loop recorded, which is outside that region.
+    //
+    // Counted in the IR rather than run, because the second release is a *count*, and a program
+    // that over-releases still prints the right answer until the storage is reused by something
+    // else — which is what made this intermittent, and filesystem-shaped, when the walk in
+    // `sysl.fs` first hit it.
+    "a 'return' from the body gives what 'next' handed over back exactly once per edge" in {
+      val out = ir(cursor + """first(s: Src) -> string
+                              |    for x in s
+                              |        return x
+                              |
+                              |    "none"
+                              |
+                              |print(first(Src(0)))
+                              |""".stripMargin)
+
+      val disposes = raw"call void @arc\.dispose\.${keyRe("Option")}\.string".r.findAllIn(out).length
+
+      disposes shouldBe 2
+    }
+
+    // The same shape a program actually writes, run: a search that leaves the loop as soon as it
+    // has an answer, over a cursor whose items own heap. Two of them, because one over-release is
+    // survivable and the second is what took the storage away.
+    "and a value found by an early return survives the loop it was found in" in {
+      run(cursor + """first(s: Src) -> string
+                     |    for x in s
+                     |        return x
+                     |
+                     |    "none"
+                     |
+                     |print(first(Src(0)))
+                     |print(first(Src(0)))
+                     |""".stripMargin) shouldBe "v0\nv0\n"
+    }
+
     // The empty case runs the body no times and the `else` once, which is the same rule an empty
     // range follows. A cursor whose first `next` is `None` is the shape a filter ends at.
     "a sequence with no elements runs the body no times" in {
