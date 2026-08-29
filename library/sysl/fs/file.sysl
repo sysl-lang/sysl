@@ -25,8 +25,14 @@ private[sysl] extern "fclose" c_fclose(f: *u8) -> int
 private[sysl] extern "fread" c_fread(p: *u8, size: usize, n: usize, f: *u8) -> usize
 private[sysl] extern "fwrite" c_fwrite(p: *u8, size: usize, n: usize, f: *u8) -> usize
 private[sysl] extern "fflush" c_fflush(f: *u8) -> int
-private[sysl] extern "fseek" c_fseek(f: *u8, off: long, whence: int) -> int
-private[sysl] extern "ftell" c_ftell(f: *u8) -> long
+// **`isize` and not `long`, and the difference is the machine rather than the spelling.** C's `long`
+// is a *pointer-width* type on every target sysl builds for -- 64 bits on the LP64 desktops, 32 on
+// wasm32 and on the 32-bit boards -- while sysl's `long` is 64 bits everywhere by definition. Naming
+// sysl's here made the declaration disagree with the libc on every 32-bit target, which most linkers
+// accept silently; `wasm-ld` checks signatures and said so. The surface below still speaks `long`,
+// which is what a caller wants to hold an offset in, and the conversion happens at the call.
+private[sysl] extern "fseek" c_fseek(f: *u8, off: isize, whence: int) -> int
+private[sysl] extern "ftell" c_ftell(f: *u8) -> isize
 private[sysl] extern "ferror" c_ferror(f: *u8) -> int
 private[sysl] extern "feof" c_feof(f: *u8) -> int
 
@@ -116,14 +122,14 @@ struct File
 
         var at = c_ftell(self.inner.handle)
 
-        if at < 0 then Err(why()) else Ok(at)
+        if at < 0 then Err(why()) else Ok(long(at))
     end tell
 
     /** Moves to an absolute offset, which also clears the end-of-file mark. */
     seek(*self, to: long) -> Result[unit, IoError]
         if self.inner.shut then return Err(NotOpen)
 
-        if c_fseek(self.inner.handle, to, seek_set()) != 0 then Err(why()) else Ok(())
+        if c_fseek(self.inner.handle, isize(to), seek_set()) != 0 then Err(why()) else Ok(())
 
     /** How many bytes the file holds.
      *
@@ -160,7 +166,7 @@ struct File
         if n < 0 then return Err(why())
         if c_fseek(self.inner.handle, here, seek_set()) != 0 then return Err(why())
 
-        Ok(n)
+        Ok(long(n))
 #endif
     end size
 

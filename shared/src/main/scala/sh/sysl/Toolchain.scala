@@ -463,6 +463,7 @@ object Toolchain {
           s"'$path' has no '${target.cpu.backend}' back end, so it cannot build for " +
             s"'${target.name}' — it registers ${shown(backends(path))}")
     case None if target.os == Os.Android => androidClang
+    case None if target.os == Os.Wasi    => wasiClang
     case None                            => findBackendClang(target)
 
   private def shown(bs: Set[String]): String =
@@ -471,6 +472,42 @@ object Toolchain {
   private def runs(path: String): Boolean =
     try exec(Seq(path, "--version")).exitCode == 0
     catch case _: Exception => false
+
+  /** wasi-sdk's clang, found from the environment, or the sentence saying what to set.
+   *
+   * **The same shape as the NDK's, for the same reason.** wasi-sdk is clang, wasi-libc and a sysroot
+   * in one download that is installed nowhere in particular, and a clang picked merely for having
+   * the `wasm32` back end carries no sysroot at all — so it succeeds at the search and fails at the
+   * first `#include`. Homebrew's clang is exactly that here, which makes this the `dirent.h` case
+   * with a different header name.
+   *
+   * **Its clang self-resolves the sysroot for a `wasm32-wasip1` triple**, checked rather than
+   * assumed — a `clang.cfg` beside the binary points at `share/wasi-sysroot` — so naming the binary
+   * is the whole of it and there is no `--sysroot` for sysl to pass.
+   */
+  private def wasiClang: Either[String, String] =
+    wasiClangIn(envVar("WASI_SDK_PATH"))
+      .flatMap(cc => Either.cond(runs(cc), cc, s"cannot run '$cc', which is wasi-sdk's clang"))
+
+  /** The path resolution behind `wasiClang`, taking its directory rather than reading it, so that
+   * what it decides can be asserted on a machine with no wasi-sdk on it.
+   */
+  private[sysl] def wasiClangIn(sdkRoot: Option[String]): Either[String, String] =
+    sdkRoot match
+      case None =>
+        Left("building for WASI needs wasi-sdk's own clang, and nothing here says where it is — a " +
+          "clang picked for having the wasm32 back end carries no sysroot, so it fails at the first " +
+          "'#include'. Set WASI_SDK_PATH to the directory holding 'bin/clang' " +
+          "(github.com/WebAssembly/wasi-sdk/releases)")
+      case Some(sdk) =>
+        val cc = s"$sdk/bin/clang"
+
+        if !isFile(cc) then
+          // The path rather than the variable: what somebody set is in the message, so a WASI_SDK_PATH
+          // pointing one directory too high or too low is visible rather than described.
+          Left(s"'$sdk' holds no 'bin/clang' — WASI_SDK_PATH names the wasi-sdk directory itself, " +
+            "the one with 'bin' and 'share' in it")
+        else Right(cc)
 
   /** The NDK's clang, found from the environment, or the sentence saying what to set.
    *
@@ -665,9 +702,18 @@ object Toolchain {
    * The failure that replaces it is the honest one this page describes for every freestanding target:
    * a program that prints fails at the link naming `putchar`, because nothing on a bare target
    * defines it.
+   *
+   * **NONE of it applies to `wasm32-wasi`, and both halves would break it.** WASI is the same
+   * processor with a libc under it: wasi-libc supplies `_start`, which is what a runtime calls and
+   * which calls `main` itself — so `-nostdlib` drops the very libc that makes the row worth having,
+   * and naming `main` as the entry replaces the `_start` a runtime is looking for. The condition is
+   * therefore the *operating system* and not the processor, which is the distinction the row exists
+   * to draw.
    */
   private def linkerFlags(target: Target): List[String] =
-    if target.cpu == Cpu.Wasm32 then List("-nostdlib", "-Wl,--entry=main") else Nil
+    if target.cpu == Cpu.Wasm32 && target.os == Os.Freestanding then
+      List("-nostdlib", "-Wl,--entry=main")
+    else Nil
 
   /** What the machine needs said to clang **beyond its triple**, on every command line that produces
    * code for it or reads a header as it.
@@ -770,6 +816,12 @@ object Toolchain {
       // undefined symbol without `-lm`. (`sqrt` alone is not the test — it lowers to an instruction
       // and links either way, which is the shape of the mistake this line would otherwise make.)
       case Os.Linux | Os.Android => Set("c")
+      // wasi-libc carries both and the driver links them, measured the way Android's was: a program
+      // calling `tgamma` links and runs under `wasm32-wasip1` with no `-lm` at all. (`sqrt` alone is
+      // not the test — it lowers to an instruction and links either way.) `-lm` is *accepted*, since
+      // wasi-libc ships an empty archive of that name, which is why the answer had to be measured
+      // rather than read off whether the flag was refused.
+      case Os.Wasi => Set("c", "m")
       // No libc exists here, so there is nothing to pass for one.
       case Os.Freestanding => Set("c", "m")
 

@@ -220,6 +220,11 @@ object Conditional {
     // of `-l` names nor its headers. A program wanting both says `#if linux || android`, which is
     // the same shape `posix` exists to shorten.
     case Os.Android      => "android"
+    // `wasi` and not `wasm`: the processor is what `#if wasm32` answers, and this is the *system* —
+    // wasi-libc and a table of imports the host supplies. A module built for `wasm32-unknown-unknown`
+    // is the same processor and answers `freestanding`, which is the distinction that matters to a
+    // file choosing an implementation.
+    case Os.Wasi         => "wasi"
 
   private def cpuSymbol(cpu: Cpu): String = cpu.symbol
 

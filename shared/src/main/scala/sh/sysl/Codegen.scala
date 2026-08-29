@@ -540,9 +540,18 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
   /** The platform's own start-up code calls `main` with two arguments whether or not the program
    * asked for them, so this is C's signature and not a sysl one — neither `argc` nor `argv` appears
    * in a sysl declaration anywhere.
+   *
+   * **On WASI the symbol is `__main_argc_argv`, and that is not a decoration.** wasm has no
+   * out-of-band way to say how many arguments a function takes, so a two-argument `main` and a
+   * no-argument one cannot share a name: clang's *frontend* renames the two-argument form, and
+   * wasi-libc's `crt1-command.o` calls `__main_void`, which calls `__main_argc_argv` where it exists
+   * and falls back to a weak `main` of no arguments. IR handed to clang as a `.ll` never went through
+   * that frontend, so a `main` emitted here at the two-argument signature is a *different* symbol
+   * from the `main` the start-up code weakly refers to — and the link succeeds, drops it, and the
+   * module traps on `unreachable` at `undefined_weak:main` the moment it is run.
    */
   private def entrySig: ir.FuncSig =
-    ir.FuncSig("main",
+    ir.FuncSig(if target.os == Os.Wasi then "__main_argc_argv" else "main",
                ir.FnType(i32, List(ir.Param(i32, name = Some(Val.Reg("argc"))),
                                    ir.Param(LType.Ptr, name = Some(Val.Reg("argv"))))))
 

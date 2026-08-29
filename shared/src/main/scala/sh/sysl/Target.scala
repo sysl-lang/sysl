@@ -376,7 +376,7 @@ object Cpu {
  * hosted one of the same processor only where the OS is what fixed the convention.
  */
 enum Os {
-  case MacOS, Linux, Windows, Freestanding, Android
+  case MacOS, Linux, Windows, Freestanding, Android, Wasi
 
   /** The environment capabilities a machine running this operating system has **at all** — the
    * physical half of the two-level rule, as against what `package.hocon` says a target offers.
@@ -392,6 +392,12 @@ enum Os {
    * and the graphics and logging a program reaches for are `libandroid`/`liblog` rather than
    * anything a desktop has. Answering `linux` to those questions would be answering them wrong, and
    * a symbol a source file can test is exactly where that has to be distinguishable.
+   *
+   * **WASI answers the way Windows does, and that rung was already occupied.** A preview1 module has
+   * files, a clock, randomness, arguments and exit, so it is plainly not freestanding; it has no
+   * fork, no sockets and no threads, so it is plainly not POSIX. That is hosted-but-not-POSIX, which
+   * is what `Os.Windows` has always been — so this needs no capability of its own, and the two-level
+   * model absorbs it with one more name in the `case` above.
    */
   def inherentCapabilities: Set[String] =
     Option.when(this != Os.Freestanding)(Capability.Os).toSet ++
@@ -682,6 +688,32 @@ object Target {
     Target("wasm32-freestanding", "wasm32-unknown-unknown", Cpu.Wasm32, Os.Freestanding,
       VaListAbi.Loaded, 4)
 
+  /** WebAssembly against **WASI preview1** — the same machine as the row above with a libc under it.
+   *
+   * `wasm32-unknown-unknown` is the bare target: no libc, no convention for what the host supplies,
+   * so a program with `requires { heap = true }` cannot link until somebody writes `malloc` by hand.
+   * WASI is a standardised table of imports a module asks its host for by name, and **wasi-libc** is
+   * a real libc built on it — musl above, those imports below. So this row is what makes an ordinary
+   * sysl program run in a wasm runtime, and `sysl.fs`, `sysl.env` and `exit` have something real
+   * underneath them.
+   *
+   * **The triple handed to clang is `wasm32-wasip1`**, which is the modern spelling; bare
+   * `wasm32-wasi` is the deprecated alias, and the row keeps that name because it is what somebody
+   * types and what the family is called.
+   *
+   * **preview1 rather than preview2, and the asymmetry is the whole reason.** preview1 is a flat
+   * table of imports producing an ordinary core module — a target, and nothing in codegen changes.
+   * preview2 is that rebuilt on the Component Model: WIT, worlds, resource handles, and an output
+   * that is not a core module at all, which browsers do not run natively. That is a binding system
+   * rather than a target. The standard preview1-to-preview2 adapter lifts a module into a component,
+   * so this choice is reversible by tooling somebody else maintains.
+   *
+   * The machine is the row above's, so the ABI answers are too — one linear memory, four-byte
+   * pointers, and a `va_list` that is a pointer to be loaded through.
+   */
+  val wasm32Wasi: Target =
+    Target("wasm32-wasi", "wasm32-wasip1", Cpu.Wasm32, Os.Wasi, VaListAbi.Loaded, 4)
+
   /** CRAFT — a 16-bit load/store teaching machine with a 64 KiB virtual address space, and the first
    * row here that **no clang can build for**.
    *
@@ -741,6 +773,7 @@ object Target {
       thumbv7emFreestandingSoft,
       riscv32Freestanding,
       wasm32Freestanding,
+      wasm32Wasi,
       craftFreestanding,
       x86Linux,
     )
