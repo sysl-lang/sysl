@@ -151,6 +151,106 @@ align_up_is_generic()
     assert(is_aligned(align_up(&bytes[1], alignof(u64)), alignof(u64)))
 end align_up_is_generic
 
+// -- copy and copy_exact --------------------------------------------------------------------------
+
+// Every length relation the two answer differently, at the generic declaration.
+@test("copy moves as much as fits and says how much that was")
+copy_moves_what_fits()
+    var exact = [0, 0, 0]
+    var short_dst = [0, 0]
+    var short_src = [9, 9, 9, 9]
+    var src = [1, 2, 3]
+    var none: [0]int = []
+
+    assert_eq(copy(exact[..], src[..]), 3)
+    assert_eq(exact[..], [1, 2, 3])
+
+    assert_eq(copy(short_dst[..], src[..]), 2)
+    assert_eq(short_dst[..], [1, 2])
+
+    assert_eq(copy(short_src[..], src[..]), 3)
+    assert_eq(short_src[..], [1, 2, 3, 9], "the tail past the source is left alone")
+
+    assert_eq(copy(short_src[..], none[..]), 0)
+    assert_eq(short_src[..], [1, 2, 3, 9], "an empty source writes nothing")
+end copy_moves_what_fits
+
+// The case a plain forward loop gets wrong in one direction and right in the other, which is why
+// both are here: a forward loop over the second would answer [1, 2, 1, 2, 1].
+@test("copy is right where the two slices are views of one array, in both directions")
+copy_handles_overlap()
+    var down = [1, 2, 3, 4, 5]
+    var up = [1, 2, 3, 4, 5]
+
+    assert_eq(copy(down[0..<3], down[2..<5]), 3)
+    assert_eq(down[..], [3, 4, 5, 4, 5], "moving toward the front")
+
+    assert_eq(copy(up[2..<5], up[0..<3]), 3)
+    assert_eq(up[..], [1, 2, 1, 2, 3], "moving toward the back")
+end copy_handles_overlap
+
+// The byte declaration is a different function with the same claims, so it owes the same cases --
+// what it hands the move to is asserted in `IrLibraryTests`, since nothing observable here differs.
+@test("the byte declaration answers exactly as the generic one does")
+copy_over_bytes()
+    var exact: [3]u8 = [0, 0, 0]
+    var short_dst: [2]u8 = [0, 0]
+    var short_src: [4]u8 = [9, 9, 9, 9]
+    var src: [3]u8 = [1, 2, 3]
+    var none: [0]u8 = []
+    var down: [5]u8 = [1, 2, 3, 4, 5]
+    var up: [5]u8 = [1, 2, 3, 4, 5]
+
+    assert_eq(copy(exact[..], src[..]), 3)
+    assert_eq(exact[..], src[..])
+
+    assert_eq(copy(short_dst[..], src[..]), 2)
+    assert_eq(short_dst[..], src[0..<2])
+
+    assert_eq(copy(short_src[..], src[..]), 3)
+    assert_eq(short_src[3], 9)
+
+    assert_eq(copy(short_src[..], none[..]), 0)
+    assert_eq(short_src[..], [u8(1), u8(2), u8(3), u8(9)])
+
+    assert_eq(copy(down[0..<3], down[2..<5]), 3)
+    assert_eq(down[..], [u8(3), u8(4), u8(5), u8(4), u8(5)])
+
+    assert_eq(copy(up[2..<5], up[0..<3]), 3)
+    assert_eq(up[..], [u8(1), u8(2), u8(1), u8(2), u8(3)])
+end copy_over_bytes
+
+// A destination larger than the source fits, which is the half Rust's `copy_from_slice` refuses.
+@test("copy_exact takes all or nothing, and a roomy destination is a fit")
+copy_exact_is_all_or_nothing()
+    var same = [0, 0, 0]
+    var roomy = [0, 0, 0, 0]
+    var tight = [0, 0]
+    var src = [1, 2, 3]
+
+    assert(copy_exact(same[..], src[..]))
+    assert_eq(same[..], [1, 2, 3])
+
+    assert(copy_exact(roomy[..], src[..]))
+    assert_eq(roomy[..], [1, 2, 3, 0])
+
+    assert(!copy_exact(tight[..], src[..]))
+    assert_eq(tight[..], [0, 0], "a refusal writes nothing at all")
+end copy_exact_is_all_or_nothing
+
+@test("copy_exact over bytes answers the same three ways")
+copy_exact_over_bytes()
+    var roomy: [4]u8 = [0, 0, 0, 0]
+    var tight: [2]u8 = [0, 0]
+    var src: [3]u8 = [1, 2, 3]
+
+    assert(copy_exact(roomy[..], src[..]))
+    assert_eq(roomy[..], [u8(1), u8(2), u8(3), u8(0)])
+
+    assert(!copy_exact(tight[..], src[..]))
+    assert_eq(tight[..], [u8(0), u8(0)], "a refusal writes nothing at all")
+end copy_exact_over_bytes
+
 // -- the plain operations -------------------------------------------------------------------------
 
 @test("swap exchanges two elements and leaves the rest alone")

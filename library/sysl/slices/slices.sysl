@@ -1,6 +1,8 @@
 module sysl.slices
 @no_alloc
 
+import sysl.sys.sysl_memmove
+
 /** Operations over a built-in slice, and the pointer a C binding needs to hand one across.
  *
  * **These are free functions over `[]T` rather than members of anything**, which is the call
@@ -15,6 +17,12 @@ module sysl.slices
  * freestanding target, which is deliberate and is what keeps it usable by a C binding: `as_ptr` is
  * the first thing a binding reaches for, and acquiring an allocator by asking for it would be a poor
  * trade. Sorting is in `sort.sysl` beside this file and holds to the same rule.
+ *
+ * **The one thing here that reaches C is the byte `copy`, and it costs a freestanding target
+ * nothing**: `memmove` is in the family a compiler emits calls to on its own, so an image that can
+ * initialize an array already needs it. Checked rather than reasoned about -- an archive built for
+ * `thumb-freestanding-softfp` names `__aeabi_memmove` beside the `__aeabi_memclr` it wanted anyway,
+ * and newlib defines both in the same library.
  */
 
 /** A pointer to the first element, for handing a slice to C as the pointer-and-length pair every C
@@ -84,6 +92,84 @@ align_up[T](p: *T, alignment: usize) -> *T
  * answers a real question about divisibility rather than nonsense.
  */
 is_aligned[T](p: *T, alignment: usize) -> bool = usize(p) % alignment == 0
+
+/** As much of `src` as fits in `dst`, copied element by element, answering how much moved.
+ *
+ * **This exists because every caller was writing the loop**, `Buf.extend` included -- and a loop at
+ * a call site is both noise and slower than the platform's own move. C has `memcpy`, Rust has
+ * `copy_from_slice` and Go has `copy` for the same reason.
+ *
+ * **The two slices may be views of one array, and the direction is chosen from their addresses** so
+ * that an overlap does not overwrite what has not been read yet. `usize(p)` reads an address as a
+ * number, which is an ordinary conversion (`reference/memory.md`), so this needs nothing raw.
+ * Overlapping is `memmove`'s guarantee rather than `memcpy`'s, and it is the right one to make: two
+ * views into one array is an ordinary thing to have, and a silently wrong answer is not worth the
+ * nanoseconds.
+ *
+ * **The short answer is the point rather than a failure.** A streaming caller writes what fits and
+ * asks again; `copy_exact` is for a caller who has already sized the destination and for whom a
+ * mismatch is a mistake.
+ *
+ * The declaration beside this one takes byte slices and is what a call over `[]u8` reaches, since
+ * `reference/declarations.md § Overloading` prefers a declaration that named its parameters. That
+ * one hands the move to `memmove`; this one cannot, because an element carrying a reference count
+ * needs the retain and the release an assignment does, and a bitwise move would leak what the
+ * destination held and hand the source's boxes out twice.
+ */
+copy[T](dst: []T, src: []const T) -> usize
+    val n = if dst.len < src.len then dst.len else src.len
+
+    if n > 0 && usize(as_ptr(src)) < usize(as_mut_ptr(dst))
+        var i = n
+
+        while i > 0
+            i -= 1
+            dst[i] = src[i]
+    else
+        for i in 0..<n do dst[i] = src[i]
+
+    n
+end copy
+
+/** The same over bytes, which libc moves a word at a time where a sysl loop moves one byte.
+ *
+ * **Measured rather than assumed**: the loop above compiles to a `ldrb`/`strb` pair per element at
+ * the default optimization, because the destination's bounds check survives inside the body and
+ * stops the optimizer recognising the idiom. `sysl.io.find_byte` reaches `memchr` for exactly this
+ * reason and says so.
+ *
+ * A byte carries no count, so the bitwise move the generic form must not make is the right one
+ * here. `memmove` rather than `memcpy`, for the overlap the other declaration promises.
+ */
+copy(dst: []u8, src: []const u8) -> usize
+    val n = if dst.len < src.len then dst.len else src.len
+
+    if n > 0 then sysl_memmove(as_mut_ptr(dst), as_ptr(src), n)
+
+    n
+
+/** The whole of `src` copied, or nothing at all -- `true` when it fitted.
+ *
+ * **The question `copy` does not answer.** A caller who sized the destination once and is filling it
+ * has a bug rather than a state when the source is too long, and reading a returned count back
+ * against `src.len` at every call is the check this is instead.
+ *
+ * **A destination LARGER than the source is a fit**, where Rust's `copy_from_slice` asks for equal
+ * lengths. A buffer sized once and written into in runs is the ordinary caller, and refusing that
+ * would send them back to `copy` for a question they were not asking.
+ */
+copy_exact[T](dst: []T, src: []const T) -> bool
+    if src.len > dst.len then return false
+
+    copy(dst, src)
+    true
+
+/** The same over bytes, reaching `memmove` through the byte `copy` beside it. */
+copy_exact(dst: []u8, src: []const u8) -> bool
+    if src.len > dst.len then return false
+
+    copy(dst, src)
+    true
 
 /** Two elements exchanged, in place.
  *

@@ -198,8 +198,20 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * `copy_dir_all`, which is the walk's first caller outside the module that declares it. **Two of
    * the sixteen were drift**, measured the way the paragraph above prescribes rather than added to
    * the number below it, which is the fifth time that has paid for itself.
+   *
+   * Raised to **603** when `sysl.slices` gained `copy` and `copy_exact` (card `0368`): five cases,
+   * covering every length relation and both overlap directions at each of the two declarations, plus
+   * `copy_exact`'s three answers. **No drift this time** -- the measurement read 598 before the
+   * cases were written, which is the first run since this comment began to find the number already
+   * right, and is what the previous entry's discipline was for.
+   *
+   * **What these cases cannot say is which declaration answered**, since the byte one and the
+   * generic one are specified to behave identically and do. That claim is `SliceCopyTests`, in
+   * Scala, over the IR -- the split this file's own docstring prescribes, arrived at from the side
+   * it does not name: not a language claim a sysl test would compile into its own assertion, but a
+   * claim about *which code was emitted*, which no program can observe about itself.
    */
-  private val floor = 598
+  private val floor = 603
 
   /** The library, compiled as a **test build of itself**.
    *
