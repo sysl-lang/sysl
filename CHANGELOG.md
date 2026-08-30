@@ -7,6 +7,242 @@ copy -- correct a mistake there and regenerate, rather than editing this file. V
 `MAJOR.MINOR.PATCH`; while the leading zero stands the language is still moving, and a release may
 change what an existing program means. Where it does, the release says so.
 
+## 0.0.92 — 2026-08-30
+
+One card, and it undoes something 0.0.91 should not have shipped.
+
+### A variant re-points a name; it never conjures one
+
+0.0.91 fixed a real problem — a module declaring its own `Ok` could not use `Result` — and fixed it
+too widely. The rule consulted the expected type *instead of* asking whether the name resolved at
+all, and that turned out to do two things rather than one.
+
+**The first is benign.** A bare variant became reachable with no import, which cannot change the
+meaning of anything, since a name that was an error was not meaning something else:
+
+```sysl
+import sysl.sync.Atomic          // Ordering is NOT imported
+
+var a = Atomic(0)
+
+print(a.load(Relaxed))
+```
+
+`0.0.90` refused that. `0.0.91` compiled it. `0.0.92` refuses it again — sysl already has the leading
+dot for a variant the context knows, and the bare form was never meant to work.
+
+**The second is not benign, and is why this release exists.** A name that *already resolved to
+something else* was taken:
+
+```sysl
+module app
+import pal.{Shape, describe}     // pal has enum Shape { Segment(n: int), Dot }
+
+Segment(n: int) -> Shape = Shape.Dot
+
+go() -> string = describe(Segment(1))
+```
+
+`0.0.90` prints **`DOT`** — the module's own function. `0.0.91` prints **`VARIANT 1`**, having
+constructed a distant enum's variant instead, with the function never reached and **no diagnostic
+either way**. That is 0.0.68's *"a name in call position loses to an enum variant"* reintroduced
+across modules rather than within one.
+
+**The rule now keeps two questions apart: reachability is the import system's and ownership is the
+expected type's.** The expected type is consulted only where the name already resolves as a variant —
+which is exactly the case 0.0.91 was written for, where a module's own `Status.Ok` makes `Ok`
+resolvable and only the *owner* was wrong. That case still works:
+
+```sysl
+enum Status
+    Ok
+    Bad
+
+f() -> Result[int, string] = Ok(1)
+s() -> Status = Ok
+```
+
+**Everything else 0.0.91 shipped is unaffected** — `sysl.slices.copy`, the `Drop` warning,
+`entropy_from_os` and the overload tie-break are all unchanged, and no program that compiled under
+0.0.90 or 0.0.91 compiles differently now except the one shape above, which was wrong.
+
+#### How it was caught
+
+`sysl.sh`'s `library/sync.md` asserts the `Relaxed` refusal, so `DocsTests` reported *"the page says
+the compiler refuses this, and it compiled"* — an unrefused refusal, found by the only suite that
+could find it and one release too late, since the site is pinned after the tag by design.
+
+The call-site case was found by probing a question rather than answering it: the first report of this
+said the widening was purely additive, on the strength of probes where the shadowed name was a
+**local** — which a top-level `val` in an entry file is, and which was never at risk. A function is
+not a local, and nine lines settled it the other way.
+
+## 0.0.91 — 2026-08-29
+
+Six cards. One is a library function every caller in the org had been writing by hand, two are what
+writing it turned up, and three came out of writing packages against 0.0.90 — including a leak that
+was costing 26 GB in a package that had already shipped.
+
+### `sysl.slices` copies a slice, and it is right where the two overlap
+
+```sysl
+import sysl.slices.{copy, copy_exact}
+
+val moved = copy(dst, src)          // as much as fits, answering how much
+if !copy_exact(dst, src) then ...   // all or nothing
+```
+
+Every caller was writing `for i in 0..<src.len do dst[i] = src[i]`, the standard library included —
+`Buf.extend`, HMAC's key padding, `cstring`, both of `parse_real`'s scratch fills, the test harness's
+name buffer. C has `memcpy`, Rust has `copy_from_slice` and Go has `copy` because the loop is noise at
+the call site and slower than the platform's own move.
+
+`copy` answers how much moved, which is what a caller streaming into a buffer wants. `copy_exact`
+writes the whole of the source or nothing and answers whether it fitted — a destination *larger* than
+the source is a fit, since a buffer sized once and written into in runs is the ordinary caller.
+
+**Both are right where the two slices are views of one array**, which is `memmove`'s guarantee rather
+than `memcpy`'s. Two views into one array is an ordinary thing to have and a silently wrong answer is
+not worth the nanoseconds.
+
+#### There are two declarations of each, and that is what makes the generic one correct
+
+A call over `[]u8` reaches a declaration that hands the move to `memmove`; every other element type
+reaches a generic one that assigns element by element.
+
+That is not an optimization detail. An element carrying a reference count needs the retain and the
+release an assignment does — a bitwise move over a `[]string` leaks what the destination held and
+hands the source's boxes out twice, and it **prints the right answer while doing so**. The fault
+arrives later, if it arrives anywhere anybody is looking. So the fast path is exactly as wide as the
+type where it is sound, and it was measured rather than assumed: at the default `-O1` the generic
+loop compiles to one `ldrb` and one `strb` per element, because the destination's bounds check
+survives inside the body and stops the optimizer recognising the idiom.
+
+**A freestanding target walks the elements instead**, because a bare board is linked with no C
+library and there is nothing to call. The declaration and what it promises are the same on every
+target; only the cost differs, which is what keeps `sysl.slices` usable where the operating system is
+not.
+
+### The third overload tie-break, where nothing is exact
+
+`reference/declarations.md § Overloading`'s third tie-break — a candidate that named its parameters
+beats one that was solved for them — was asked only of the candidates the second tie-break found
+*exact*. Where the argument reached every candidate by a conversion that set is empty, so the rule was
+skipped in precisely the case it exists for:
+
+```sysl
+g(x: []u8) -> string = "plain"
+g[T](x: []T) -> string = "generic"
+
+var a: [3]u8 = [1, 2, 3]
+
+print(g(a))     // was: 'g' is ambiguous here
+```
+
+Two declarations, one fitted signature, and an array that had to be viewed to reach either. It is
+what `copy` needed to exist in the shape above, and it is the shape any binding wanting a fast path
+for one element type will reach for.
+
+The widening is bounded by the rule the page is emphatic about: candidates that all fitted at
+**identical** parameter types took identical routes, so choosing between them ranks nothing but the
+declarations. Two fitted at different types stay ambiguous, since telling them apart would be ranking
+the conversions. **No call that already resolved can resolve differently** — the widening only ever
+turns an ambiguity into an answer.
+
+### A module may name a variant the prelude also names
+
+A module declaring an enum with an `Ok` in it could not use `Result` in that module at all:
+
+```sysl
+enum Status
+    Ok
+    Bad
+
+f() -> Result[int, string] = Ok(1)
+```
+
+```
+error: variant 'Ok' carries nothing, so it is written as a name on its own — drop the
+parentheses and the 1 argument inside them
+```
+
+The expected type is on the same line and nothing asked it. `Err`, `Some` and `None` are the same
+shape, so the four names every package returns through were four a module could not afford to
+declare — found writing `sysl-lang/libpq`, where `PQstatus` answers `CONNECTION_OK`/`CONNECTION_BAD`
+and the enum over it wants the name every other language gives it.
+
+**The diagnosis is one layer out from where it reads.** A variant key says which *module*, and a
+bare name resolves to this file's own module before the library — so the local key was chosen and the
+expected type was never consulted. It is now consulted across modules as well as within one, which is
+the rule a variant already followed wherever two enums in one module shared a name.
+
+A bare name still means the module's own where the module's own type is expected, a genuine ambiguity
+is still refused naming both enums, and `Status.Ok` still says which for a site whose expected type
+is a `Result` and whose meaning is not. Patterns were never affected — the scrutinee says which enum
+before a name is looked at.
+
+### A destructor that can never run is now told so
+
+`impl Drop for T` is dead code unless something hands back a `&T`: a destructor fires when a *box's*
+strong count reaches zero, so a constructor declared `handle() -> Result[Handle, Error]` leaks the
+resource on every call — with every test green and every answer correct.
+
+**It was leaking three shipped packages at once.** Measured over 50,000 iterations: `sysl-lang/brotli`
+v0.1.0 leaked a `BrotliEncoderState` per `compress` — **26 GB**, against 4.8 MB once fixed —
+`hiredis` a `redisReader` per reader, and `libpq` a `PGconn` per failed connect. No test anywhere
+could have caught any of them; the compression, the parsing and the queries are all correct while it
+happens.
+
+```
+warning: 'make' hands back 'Thing' by value, and 'Thing' has a 'Drop' — a destructor runs when a
+box's count reaches zero, so nothing here will ever call it. Return '&Thing' instead, or take the
+resource apart before returning it
+```
+
+`&T`, `*T`, a slice of them and the `drop` member itself are all silent, each for its own reason.
+
+**This is the compiler's first warning that carries a position**, so a diagnostic now has a
+`severity`. Two values and no ordering between them — a warning is not a lesser error, it is a
+different claim — and deliberately no *level*: an argument about which warnings are errors is one
+this compiler has no reason to have while it has one warning. `reference/memory.md` states the
+consequence beside the rule now, which is where somebody writing a binding will meet it.
+
+### `sysl.posix.rand` can be asked for key material
+
+`getentropy(2)` was bound and eight bytes of it given away. `seed_from_os` feeds PCG32, and nothing
+in sysl could ask the kernel for a salt, a nonce, an IV, a session id or a token — so a program
+wanting sixteen fresh bytes opened `/dev/urandom` by hand, which works, and is a descriptor, an open,
+a read and a close for one kernel call.
+
+```sysl
+import sysl.posix.rand.entropy_from_os
+
+var salt: [16]u8 = [0; 16]
+
+print(entropy_from_os(salt[..]))
+```
+
+A slice longer than 256 bytes is filled by looping — that is `getentropy`'s limit per call, not the
+caller's — and it answers a `bool` rather than an `Option`, which is `seed_from_os`'s reasoning turned
+round: a caller who cannot seed has a fallback, and one who cannot get key material has none and must
+stop.
+
+### A positional variant payload says what to write instead
+
+`Url([]const u8)` is what somebody porting an enum from Rust, Swift, OCaml or Haskell writes first,
+and sysl refused it with `')' expected` and the caret on the `[` — which reads as a complaint about
+the *type*. The next two moves, `Url([]u8)` and `Url(*u8)`, failed the same way, and a pointer
+payload got `'self' expected`, which names the one word that would not have helped.
+
+```
+a variant's payload names its fields, as 'Circle(r: real)' — write a name before the type,
+as 'name: []const u8'
+```
+
+The suggestion is built from the type that was actually read rather than recited, so all seven forms
+give one message with their own spelling in it. Not a language change: the reference had already
+chosen the named form, and this is one sentence at the point of refusal.
+
 ## 0.0.90 — 2026-08-29
 
 Eight cards. One was a heap-corruption bug that had blocked another, and two more were cards
