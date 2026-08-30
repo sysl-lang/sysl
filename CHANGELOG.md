@@ -7,6 +7,77 @@ copy -- correct a mistake there and regenerate, rather than editing this file. V
 `MAJOR.MINOR.PATCH`; while the leading zero stands the language is still moving, and a release may
 change what an existing program means. Where it does, the release says so.
 
+## 0.0.93 — 2026-08-30
+
+### `dev_dependencies` — a package your tests need and your consumers do not
+
+A manifest could only say a dependency one way, so a package needed solely by a project's own suite
+was declared as an ordinary one and fetched and built by everybody who depended on it.
+
+```hocon
+dependencies {
+  parsing { git = "github.com/sysl-lang/parsing", version = "0.5.0" }
+}
+
+dev_dependencies {
+  quickjs { git = "github.com/sysl-lang/quickjs", version = "0.1.0" }
+}
+```
+
+The block has Cargo's `[dev-dependencies]` semantics. `sysl test` on this project resolves them;
+`build`, `build-lib` and `build-c` do not; and **anything that depends on this package does not
+resolve them at any command** — not fetched, not built, not on the link line. For a binding to a
+system library that is the difference between a consumer having to install it first and not knowing
+it exists.
+
+A dev dependency may only be imported from a `@tests` file or a `@test` function, checked against
+the tree an ordinary build already strips. Without that the mistake is invisible to the person
+making it: the suite passes and every consumer is refused at a module that was never fetched for
+them. `sysl deps` lists them marked `(dev)`, and a package named by both blocks is refused.
+
+**Scope, stated plainly**: this is ergonomics rather than correctness. Test source never reached a
+consumer's compilation — `Tests.stripSource` removes a `@tests` file whole and each `@test` function
+before anything else runs. What was wrong is that the *package* was still fetched and built.
+
+### ThreadSanitizer over a sysl program now looks at something
+
+`SYSL_EXTRA_CFLAGS="-fsanitize=thread"` linked TSan's runtime and instrumented nothing, so a run was
+green whatever the program did. It is the hole ASan had one release ago, from the same cause: LLVM
+instruments only functions carrying the attribute, and sysl emitted `sanitize_address` alone.
+
+The attributes are a table now — `address`, `hwaddress`, `memory`, `thread`. On the two-thread
+reduction through `sysl.posix.threads.spawn`, `nm -u` goes from **0** `__tsan_read`/`__tsan_write`
+hooks to **4**, and the race is reported and named.
+
+**`-fsanitize=undefined` is deliberately not in the table, and that is worth knowing before you
+trust a clean run.** UBSan has no such attribute: clang emits its checks and their
+`__ubsan_handle_*` calls during codegen, so there is nothing to switch on afterwards. A UBSan run
+over a sysl build covers the C a package vendors and none of the sysl, and no change here could
+alter that.
+
+Two smaller fixes came with it: one flag may name several sanitizers (`-fsanitize=address,undefined`
+is split rather than matched whole), and the prefix is anchored, so `-fno-sanitize=address` is no
+longer read as a request to instrument for it.
+
+### `spawn`'s docstring said sysl could not check what a closure captures
+
+It can, and it could four days before that sentence was written. `sysl.posix.threads.spawn` takes a
+`*extern` because the module is `@no_alloc` and a boxed closure needs an allocator — a limit of that
+module, not of the language. A package with an allocator may take a `&sync Fn`, whose captures the
+compiler checks one at a time. Corrected in place rather than deleted, so a reader who designed
+around it can see why.
+
+### The gate: one suite wanted the whole heap
+
+A chunk of nine Native suites had been producing no verdict, and the reading taken at the time was
+that nine suites accumulate about 2 GB each and never give it back. Measured one at a time on an
+idle machine, `StdCacheBoundTests` alone peaks at **24.0 GB** against a 24 GB ceiling and the other
+eight sit between **4.7 and 6.1 GB**.
+
+It runs alone now. The chunk size is unchanged at nine — at 24.0 GB against a 24 GB ceiling, any
+chunk holding that suite and anything else is over, so shrinking every chunk in the gate would have
+cost an invocation apiece and not fixed it.
+
 ## 0.0.92 — 2026-08-30
 
 One card, and it undoes something 0.0.91 should not have shipped.
