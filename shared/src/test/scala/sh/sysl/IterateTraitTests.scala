@@ -246,6 +246,64 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
             |for v in P(1) do print(v)""".stripMargin) should (include("Iterate") and include("slice"))
     }
 
+    // A container is deliberately not a cursor, which is what the header of this suite says and
+    // what keeps `for x in b` from quietly reading storage a `push` inside the body has replaced.
+    // What that costs is that the obvious line is refused on the one sequence a program reaches
+    // for most, and the refusal used to name `Iterate` and stop — sending a reader to look for a
+    // missing implementation when the road was a method on the type in front of them.
+    "a 'Buf' names 'view()', which is the road a container takes" in {
+      val why = err("""import sysl.buf.*
+                      |var b: Buf[int] = buf()
+                      |b.push(1)
+                      |for x in b do print(x)""".stripMargin)
+
+      why should include("'view()'")
+      why should include("for x in b.view()")
+    }
+
+    // The other road, and the one every `sysl.container` type takes: a `walk()` that answers with a
+    // cursor. It is found the same way — a nullary member whose declared result a `for` walks — so
+    // the two need no list of names between them.
+    "a container that hands out a cursor names the member that does it" in {
+      val why = err(upto +
+        """struct Bag
+          |    n: int
+          |
+          |    walk(self) -> Upto = Upto(0, self.n)
+          |end Bag
+          |for x in Bag(2) do print(x)""".stripMargin)
+
+      why should include("'walk()'")
+      // The subject here is a call rather than a name, so there is no spelling to hand back — the
+      // member is named and the worked line is left off rather than reconstructed from the tree.
+      why should not(include("is the loop"))
+    }
+
+    // Only a member the call could have been. One taking an argument is not the loop that was
+    // meant, and naming it would send the reader to write a call they have no argument for.
+    "a member that takes an argument is not offered as the road" in {
+      val why = err("""struct Win
+                      |    xs: []int
+                      |
+                      |    first(self, n: usize) -> []int = self.xs[0..<n]
+                      |end Win
+                      |for x in Win([1, 2]) do print(x)""".stripMargin)
+
+      why should include("Iterate")
+      why should not(include("first"))
+    }
+
+    // And a type with no such member says exactly what it said before: the list, and nothing
+    // invented. A hint that fires on everything is a hint nobody reads.
+    "a type with no road to offer gets the list alone" in {
+      val why = err("""struct P
+                      |    x: int
+                      |end P
+                      |for v in P(1) do print(v)""".stripMargin)
+
+      why should not(include("what it does have"))
+    }
+
     // The element is bound by value, exactly as an array's is: assigning to the loop variable
     // changes the binding and nothing behind it.
     "the loop variable is a copy" in {

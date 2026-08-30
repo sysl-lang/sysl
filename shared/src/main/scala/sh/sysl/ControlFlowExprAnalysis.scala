@@ -255,7 +255,8 @@ trait ControlFlowExprAnalysis extends ExprSupport {
               iterating(label, name, seq, iterateElem(ty).get, body, elseOpt, expected, discarded)
             case other =>
               err(s"'for' iterates an integer range, an array, a slice, or a type that implements " +
-                s"'${qn(Library.key("Iterate"))}', and ${show(other)} is none of those")
+                s"'${qn(Library.key("Iterate"))}', and ${show(other)} is none of those" +
+                walkHint(other, name, iter))
 
     // `for all i in lo..hi do pred` (`reference/verification.md § for all and for some`). The range
     // is read exactly as a counted `for`'s is — same node, same two diagnostics — so the two forms
@@ -475,6 +476,64 @@ trait ControlFlowExprAnalysis extends ExprSupport {
    * argument, so a type chooses it once and a `for` has nothing to disambiguate.
    */
   private val iterateItem = "Item"
+
+  /** The member a `for` was reaching for, on a type that has one.
+   *
+   * A container is not itself a cursor here and is not meant to be: `sysl.buf.Buf` hands out a
+   * `view()` of the elements it holds and every `sysl.container` type hands out a `walk()`. Both are
+   * one call away from what a loop wants, and the refusal above named the trait without naming
+   * either — so a reader who had written the obvious line had to go and find out that the road was
+   * a method rather than a missing implementation.
+   *
+   * ==Read off the declaration rather than resolved==
+   *
+   * A member of a generic type has no signature until something instantiates it, and this runs on
+   * the path where the compilation is about to stop — so the question is asked of what the member
+   * was *written* as. A slice or an array is one syntactically; anything else is a cursor, and is
+   * walkable exactly when its type implements `Iterate`, which is the same question the loop just
+   * asked of the receiver and answered no to.
+   *
+   * Only a member the site could have called: no arguments, no type arguments of its own, and
+   * visible from here. Naming one a reader may not write would be worse than naming nothing.
+   */
+  private def walkVia(ty: Type): List[String] = {
+    val iterate = Library.key("Iterate")
+    val owner   = ownerKey(ty)
+
+    def cursorKey(written: String): Option[String] =
+      resolveName(written, quiet = true)(n => structDecls.contains(n) || enumDecls.contains(n))
+        .map(followAlias)
+
+    def walkable(r: TypeRef): Boolean = r match
+      case _: ArrayType    => true
+      case NamedType(n, _) => cursorKey(n).exists(k => implsOf(iterate, k).nonEmpty)
+      case _               => false
+
+    memberDecls.toList.collect {
+      case ((base, name), m)
+          if base == owner && m.receiver.isDefined && !m.isProperty && m.params.isEmpty &&
+            m.tparams.isEmpty && m.retType.exists(walkable) &&
+            visible(memberAccessKey(base, name)) =>
+        name
+    }
+  }
+
+  /** `walkVia`'s answer as the tail of the refusal, and the loop as it should have been written.
+   *
+   * The worked line is offered only where the subject is a plain name, which is what a loop over a
+   * container almost always writes. Anything else would have to be reproduced from the tree to be
+   * shown, and a spelling the reader did not write is worse than the sentence alone.
+   */
+  private def walkHint(ty: Type, name: String, iter: Expr): String =
+    walkVia(ty) match
+      case Nil => ""
+      case roads =>
+        val named = roads.map(r => s"'$r()'").mkString(" and ")
+        val shown = iter match
+          case Ident(subject) => s", so 'for $name in $subject.${roads.head}()' is the loop"
+          case _              => ""
+
+        s" — what it does have is $named, which answers with something a 'for' walks$shown"
 
   /** What a type's `Iterate` implementation yields, or `None` where it has none.
    *
