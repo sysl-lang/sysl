@@ -7,6 +7,75 @@ copy -- correct a mistake there and regenerate, rather than editing this file. V
 `MAJOR.MINOR.PATCH`; while the leading zero stands the language is still moving, and a release may
 change what an existing program means. Where it does, the release says so.
 
+## 0.0.94 — 2026-08-30
+
+### A pkg-config module's name is not yours to choose, so the rule stopped pretending it was
+
+A `pkg_config` requirement was held to the same name rule as a `headers` one — letters, digits, `_`
+and `-` — and the two are not the same question. A `headers` name is invented by whoever writes the
+manifest, so a plain word costs nobody anything. A `.pc` name is what `pkg-config` answers to, and a
+great many of the world's libraries file under one with a version in it.
+
+```hocon
+requires {
+  pkg_config { "yaml-0.1" = "libyaml — brew install libyaml, or Debian's libyaml-dev" }
+}
+```
+
+libyaml is `yaml-0.1` on macOS, Debian and Arch alike; GLib is `glib-2.0`; GTK 3 is `gtk+-3.0`. So
+the refusal was never "pick a better name" — it was "this library cannot be declared", and a binding
+to one had to declare a `headers` requirement instead and hand every consumer two flags on a command
+line, where every other installed-library binding builds with the bare command.
+
+A `.pc` name may now hold a `.` and a `+`. What still bounds it is the flag rather than taste: the
+name is written back to you as `--include-path <name>=<dir>`, so it may hold neither a separator nor
+an `=`, and it may not begin with a dot — `./x=y` and `../x=y` are directories exactly as they were.
+`--include-path` reads the wider of the two spellings, because the refusal a build stops on tells you
+to type one and the flag has to be able to take it.
+
+A name with a `.` in it has to be **quoted** in the manifest, since an unquoted dot is HOCON's path
+separator.
+
+### A `for` that is refused now names the member the type does have
+
+`for x in b` over a `Buf` is refused, and the refusal named `sysl.Iterate` and stopped — sending you
+to look for a missing implementation when the road was a method on the type in front of you.
+
+```
+'for' iterates an integer range, an array, a slice, or a type that implements 'sysl.Iterate', and
+sysl.buf.Buf[int] is none of those — what it does have is 'view()', which answers with something a
+'for' walks, so 'for x in b.view()' is the loop
+```
+
+A container stays deliberately not a cursor, which this does not reverse: a `view()` is valid only
+while nothing pushes, and `for x in b.view()` says at the call that a view was taken where an
+`impl Iterate` would hide it. `Buf` has no cursor position to advance either, and giving every buffer
+one so that the obvious line works would be a word on the type that means nothing outside a loop.
+
+The member is found structurally rather than from a list of names: a nullary, visible member with no
+type arguments of its own whose declared result a `for` walks — a slice or an array syntactically, or
+anything whose type implements `Iterate`. So it answers for `Buf`'s `view()`, for `walk()` on `Map`,
+`List`, `Deque` and `Set`, and for a type you write tomorrow under a name nobody here chose. The
+worked line is offered only where the subject is a plain name; a spelling you did not write would be
+worse than the sentence alone.
+
+### Every `llvm.` name the compiler emits, declared in one place
+
+The names were literals in nine files, so the only way to find out what sysl asks of LLVM was to grep
+and hope. That is exactly what a port to a back end which is not LLVM has to know, and what a target
+whose LLVM is missing an intrinsic asks.
+
+`Llvm` is the single declaration site now, and it is documentation that happens to be executable:
+each entry carries the prose a standalone page would have held, and every emitter builds its names by
+asking for an entry — so a name that is not declared cannot be emitted. A page would have gone stale
+the first time an emitter reached for a name, silently; this cannot. The reserved globals are entries
+too: `llvm.global_ctors`, `llvm.used`, `llvm.compiler.used` and the `llvm.metadata` section are
+equally things a port has to answer.
+
+`LlvmRegistryTests` makes the claim a census rather than a spelling: one program per family, every
+`@llvm.` name read out of the IR, each asserted to be one the registry accounts for — plus the
+complement, that no callable entry is declared and never emitted.
+
 ## 0.0.93 — 2026-08-30
 
 ### `dev_dependencies` — a package your tests need and your consumers do not
