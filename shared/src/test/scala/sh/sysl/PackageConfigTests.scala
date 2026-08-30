@@ -470,6 +470,37 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
     // requirement, so the name has to survive the same flag.
     "a name a command line could not carry is refused" in {
       refused("""requires { pkg_config { "sd/l3" = "why" } }""") should include("--include-path <name>=<dir>")
+      refused("""requires { pkg_config { "sd=l3" = "why" } }""") should include("--include-path <name>=<dir>")
+    }
+
+    // The name is not the package author's to choose: it is what `pkg-config` answers to, and a
+    // great many of the world's libraries file under one with a version in it. A rule that refused
+    // a dot refused to bind them at all — `sysl-lang/yaml` had to declare a `headers` requirement
+    // instead and hand every consumer two flags on the command line.
+    "a '.pc' name with a version in it is taken, which is how much of the world is packaged" in {
+      read("""requires { pkg_config { "yaml-0.1" = "libyaml — brew install libyaml" } }""")
+        .pkgConfig.keySet shouldBe Set("yaml-0.1")
+      read("""requires { pkg_config { "glib-2.0" = "GLib — brew install glib" } }""")
+        .pkgConfig.keySet shouldBe Set("glib-2.0")
+      read("""requires { pkg_config { "gtk+-3.0" = "GTK 3 — brew install gtk+3" } }""")
+        .pkgConfig.keySet shouldBe Set("gtk+-3.0")
+    }
+
+    // The widening is the `pkg_config` block's alone. A `headers` name *is* invented by whoever
+    // writes the manifest, so there is nothing it cannot be called and no reason to widen it — and
+    // the two refusals say different things because they are about different authors.
+    "and the same name in the headers block is still refused, where the author chose it" in {
+      val why = refused("""requires { headers { "yaml-0.1" = "libyaml" } }""")
+
+      why should include("header requirement's name")
+      why should include("letters, digits, '_' and '-'")
+    }
+
+    "the refusal says what a '.pc' name may be, rather than suggesting a better one" in {
+      val why = refused("""requires { pkg_config { "sd/l3" = "why" } }""")
+
+      why should include("pkg-config module's name")
+      why should include("'.' and '+'")
     }
 
     "a reason that says nothing is refused, because the reason is the point" in {

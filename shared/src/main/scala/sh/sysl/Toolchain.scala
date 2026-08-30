@@ -180,11 +180,17 @@ object SearchPaths {
    * ==Why a bare path cannot be mistaken for a named one==
    *
    * The two forms share a flag, so the split has to be decidable by looking rather than by guessing.
-   * A name is what `PackageConfig.isHeaderName` allows — letters, digits, `_` and `-`, starting with
-   * a letter — so a directory read as one would have to hold an `=`, be a single segment with no
-   * separator before it, and have a non-empty remainder. Where the text before the first `=` is not a
-   * name the whole string is a directory, which is what an absolute path, a relative one and `.` all
-   * are.
+   * A name is what `PackageConfig.isPkgConfigName` allows — letters, digits, `_`, `-`, `.` and `+`,
+   * starting with a letter — so a directory read as one would have to hold an `=`, be a single
+   * segment with no separator before it, and have a non-empty remainder. Where the text before the
+   * first `=` is not a name the whole string is a directory, which is what an absolute path, a
+   * relative one and `.` all are.
+   *
+   * **The widest of the two requirement kinds, because the flag serves both.** A `headers` name is
+   * the narrower `isHeaderName`, since its author chooses it; a `pkg_config` name may hold a dot or
+   * a `+` because `pkg-config` chose it — `yaml-0.1`, `glib-2.0`, `gtk+-3.0`. A flag that read only
+   * the narrow spelling would leave those requirements declarable and unanswerable, which is worse
+   * than either rule alone: the refusal a build stops on tells the reader to type exactly this.
    *
    * **The name is not checked against any requirement here**, and a consumer satisfying one no
    * package declared is not an error: the directory reaches the C compiler exactly as the bare form
@@ -198,7 +204,7 @@ object SearchPaths {
         val name = text.take(at)
         val dir  = text.drop(at + 1)
 
-        if dir.nonEmpty && PackageConfig.isHeaderName(name) then Some(name -> dir) else None
+        if dir.nonEmpty && PackageConfig.isPkgConfigName(name) then Some(name -> dir) else None
 }
 
 object Toolchain {

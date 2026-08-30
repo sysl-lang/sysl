@@ -236,6 +236,24 @@ object PackageConfig {
   def isHeaderName(name: String): Boolean =
     name.nonEmpty && name.head.isLetter && name.forall(c => c.isLetterOrDigit || c == '_' || c == '-')
 
+  /** Whether a `pkg_config` requirement may be called this.
+   *
+   * Wider than `isHeaderName` by a dot and a `+`, and the widening is not a relaxation — it is the
+   * recognition that **this name is not the package author's to choose**. A `headers` name is
+   * invented by whoever writes the manifest, so holding it to a plain word costs nobody anything.
+   * A `.pc` name is what `pkg-config` answers to, and a great many of the world's libraries file
+   * under one with a version in it: libyaml is `yaml-0.1` on macOS, Debian and Arch alike, glib is
+   * `glib-2.0`, GTK is `gtk+-3.0`. Refusing those is refusing to bind the library at all.
+   *
+   * What the flag needs is unchanged and is what still bounds this: the name reaches a command line
+   * as `--include-path <name>=<dir>`, so it may hold neither a separator nor an `=` — which is what
+   * keeps `SearchPaths.namedInclude` able to tell a name from a directory by looking. A dot and a
+   * `+` are in neither of those, which is why they cost nothing to allow.
+   */
+  def isPkgConfigName(name: String): Boolean =
+    name.nonEmpty && name.head.isLetter &&
+      name.forall(c => c.isLetterOrDigit || c == '_' || c == '-' || c == '.' || c == '+')
+
   /** A project that said nothing, which is what a missing file means. */
   val empty: PackageConfig = PackageConfig()
 
@@ -473,8 +491,13 @@ object PackageConfig {
    * The name is what `pkg-config` answers to, and `PkgConfig` says why it cannot be derived from
    * anything already in the package: sdl3 writes `@link("SDL3")` and files as `sdl3`.
    *
-   * The name is checked by `isHeaderName` because a consumer overrides this exactly as they answer a
-   * header requirement — `--include-path <name>=<dir>` — so it has to survive the same flag.
+   * The name is checked by `isPkgConfigName` rather than by `isHeaderName`, and the two differ by a
+   * dot and a `+` for one reason: a `headers` name is invented by the package's author and a `.pc`
+   * name is not. libyaml files as `yaml-0.1` everywhere it is packaged, glib as `glib-2.0`, GTK as
+   * `gtk+-3.0` — so a rule that refuses a dot is a rule that refuses to bind them. What both
+   * predicates still guarantee is the flag: a consumer overrides this exactly as they answer a
+   * header requirement, with `--include-path <name>=<dir>`, and neither a dot nor a `+` is anything
+   * that flag could not carry.
    */
   private def readPkgConfig(section: Option[ConfigObject]): Either[String, Map[String, String]] =
     section.flatMap(s => block2(s, PkgConfigKey)) match
@@ -482,7 +505,7 @@ object PackageConfig {
       case Some(mods) =>
         collect(mods.fields.toList.sortBy(_._1)) { (name, value) =>
           value match
-            case ConfigString(why) if why.trim.nonEmpty => checkHeaderName(name).map(_ => name -> why)
+            case ConfigString(why) if why.trim.nonEmpty => checkPkgConfigName(name).map(_ => name -> why)
             case ConfigString(_) =>
               Left(s"$FileName: 'requires.$PkgConfigKey.$name' says nothing about what it needs — the " +
                 "text is quoted back at whoever has to install the library, so an empty one helps " +
@@ -700,6 +723,17 @@ object PackageConfig {
       Left(s"$FileName: '$name' is not usable as a header requirement's name — it is written on a " +
         "command line as '--include-path <name>=<dir>', so it must be letters, digits, '_' and '-', " +
         "starting with a letter")
+
+  /** The same check for a `.pc` name, which says what a `pkg-config` module may be called rather
+   * than what this file's author may call something — so the refusal names the flag and stops
+   * there, instead of suggesting a better name for something the author did not name.
+   */
+  private def checkPkgConfigName(name: String): Either[String, Unit] =
+    if isPkgConfigName(name) then Right(())
+    else
+      Left(s"$FileName: '$name' is not usable as a pkg-config module's name — it is written on a " +
+        "command line as '--include-path <name>=<dir>', so it must be letters, digits, '_', '-', " +
+        "'.' and '+', starting with a letter")
 
   /** The `dependencies` block: what to fetch, at what version, and what a consumer may rename it to
    * (`reference/packages.md § Dependencies`,

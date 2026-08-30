@@ -267,6 +267,23 @@ class SearchPathTests extends LibraryCliSupport {
       SearchPaths.namedInclude("pico-sdk_2=/x") shouldBe Some("pico-sdk_2" -> "/x")
     }
 
+    // The flag answers a `pkg_config` requirement as well as a `headers` one, and a `.pc` name is
+    // not the package author's to choose — libyaml files as `yaml-0.1` wherever it is packaged. So
+    // the split reads the wider of the two spellings, or the refusal a build stops on would be
+    // telling the reader to type something this flag then took for a directory.
+    "allows the dot and the '+' a pkg-config module name may hold" in {
+      SearchPaths.namedInclude("yaml-0.1=/x")  shouldBe Some("yaml-0.1" -> "/x")
+      SearchPaths.namedInclude("glib-2.0=/x")  shouldBe Some("glib-2.0" -> "/x")
+      SearchPaths.namedInclude("gtk+-3.0=/x")  shouldBe Some("gtk+-3.0" -> "/x")
+    }
+
+    // The dot being allowed *within* a name is what makes this worth pinning: a relative directory
+    // starts with one, and a name may not, so `./x=y` and `../x=y` are still paths.
+    "is not a name where a dot begins it, which is what a relative directory does" in {
+      SearchPaths.namedInclude("./x=y") shouldBe None
+      SearchPaths.namedInclude(".=y")   shouldBe None
+    }
+
     // The path is the rest of the string rather than the next segment, so a directory holding an
     // `=` still arrives whole.
     "splits at the first '=' and keeps the rest" in {
