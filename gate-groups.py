@@ -61,12 +61,43 @@ import sys
 # What it actually needs is this list's settings, in a group of its own: **89 tests, 11:58, at 24g
 # and one agent**, measured as that chunk's retry. That fits the 900-second limit with about three
 # minutes to spare, which is thin -- if it grows, raise `LIMIT` rather than re-deriving this.
+# `StdCacheBoundTests` joined 2026-08-30, card `0375`, and it is the first entry measured **per
+# suite** rather than inferred from a chunk. The chunk it was in produced no verdict twice and the
+# reading taken at the time was that nine suites accumulate about 2 GB each -- which is what running
+# them in groups of three, six and nine suggests, and it is wrong. Run one at a time at 24g and one
+# agent, on an idle box, the nine are:
+#
+#   StdCacheBoundTests            24.0 GB   44 s
+#   QuantifierTests                6.1 GB   12 s
+#   AssociatedGenericRunTests      6.1 GB   10 s
+#   ImplGenericRunTests            6.1 GB    9 s
+#   EnumRunTests                   6.1 GB    8 s
+#   TraitObjectCodegenTests        6.1 GB    8 s
+#   CompoundConstrainedRunTests    4.8 GB    8 s
+#   MemberAttrTests                4.7 GB    7 s
+#   VersionCliTests                    --    3 s   (forks no agent)
+#
+# **One suite reaches the whole ceiling and the other eight are a quarter of it.** The group of
+# three measured 6.1 GB because it was three of the light ones; the linear-looking curve was an
+# artifact of which group happened to contain this suite. Eight unrelated suites landing on two
+# values within 20 MB of each other is a heap size rather than a live set, which is the other half
+# of why the per-suite number is the one to trust.
+#
+# The cost is the suite's whole purpose rather than a defect in it: it sweeps
+# `Target.all.filter(_.supported).take(4)` across three tests, and `Std.parsed` clears its slot
+# before each insert, so it forces repeated full re-parses of the standard library -- which is
+# exactly the property this list is defined by, arrived at from the memo side instead of the
+# toolchain side.
+#
+# **Lowering `SUITES_PER_CHUNK` would not have fixed it.** At 24.0 GB against a 24 GB ceiling, any
+# chunk holding this suite and anything else is over, so the lever is isolation and not size.
 HEAVY = {
     'sh.sysl.CrossTargetBuildTests',
     'sh.sysl.QemuRunTests',
     'sh.sysl.QemuHarnessTests',
     'sh.sysl.NoAllocEmissionTests',
     'sh.sysl.ConditionalTests',
+    'sh.sysl.StdCacheBoundTests',
 }
 
 # Measured and found cheap despite walking the registry. Listed so that "it iterates and is not
