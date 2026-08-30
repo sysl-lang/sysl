@@ -166,7 +166,7 @@ trait ScalarEmitter extends StringEmitter {
       case "-" => "sub"
       case "*" => "mul"
       case _   => sys.error(s"unreachable checkedArith '$op'")
-    val fn = s"llvm.${if ty.signed then "s" else "u"}$name.with.overflow.${ty.llvm}"
+    val fn = Llvm.withOverflow(name, ty.signed).at(ty.lty)
 
     // The intrinsic hands back the value and the overflow flag together, in an aggregate LLVM does
     // not name: `{ i32, i1 }`, which the declaration and the three uses below all take from here.
@@ -356,8 +356,7 @@ trait ScalarEmitter extends StringEmitter {
    * NaN becomes zero. `int()` stays total; `char()` remains the one conversion that traps.
    */
   private def saturatingCast(from: Type.Floating, to: Type.Integer, v: Val): Val = {
-    val op   = if to.signed then "fptosi.sat" else "fptoui.sat"
-    val name = s"llvm.$op.${to.llvm}.f${from.bits}"
+    val name = Llvm.fptoiSat(to.signed).at(to.lty, from.lty)
     satDecls += ir.FuncSig(name, ir.FnType(to.lty, List(ir.Param(from.lty))))
     val r = freshReg()
     emit(Inst.Call(Some(r), to.lty, Val.Global(name), List(Arg(from.lty, v))))
@@ -392,7 +391,7 @@ trait ScalarEmitter extends StringEmitter {
 
     emitTerm(Inst.CondBr(ok, okL, badL))
     emitLabel(badL)
-    emit(Inst.Call(None, LType.Void, Val.Global("llvm.trap"), Nil))
+    emit(Inst.Call(None, LType.Void, Val.Global(Llvm.trap.name), Nil))
     emitTerm(Inst.Unreachable)
     emitLabel(okL)
   }

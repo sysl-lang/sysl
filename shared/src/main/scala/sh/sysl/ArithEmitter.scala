@@ -194,13 +194,14 @@ trait ArithEmitter extends CallEmitter {
    * table an `extern "llvm.…"` is checked against, and nothing in `sysl.math` could have declared
    * these: `Bits`' membership covers an open family of widths, so there is no finite set of
    * `extern`s to write. What the two mechanisms share is the reason the name carries the width,
-   * which is that LLVM overloads on the operand type and spells the choice in the name.
+   * which is that LLVM overloads on the operand type and spells the choice in the name — and they
+   * share `Llvm`, which declares the base names both of them complete.
    *
    * `zeroFlag` is the extra `i1` that `ctlz` and `cttz` take and no other intrinsic here does. It
    * is always `false`, meaning a zero operand is defined rather than poison — see the call sites.
    */
   protected def intrinsic(base: String, ty: LType, args: List[Val], zeroFlag: Boolean = false): Val = {
-    val name   = s"llvm.$base.${ty.render}"
+    val name   = Llvm.bits(base).at(ty)
     val params = List.fill(args.length)(ir.Param(ty)) ++ Option.when(zeroFlag)(ir.Param(LType.I(1)))
 
     satDecls += ir.FuncSig(name, ir.FnType(ty, params))

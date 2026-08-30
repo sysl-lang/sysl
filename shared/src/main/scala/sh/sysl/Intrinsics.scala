@@ -1,5 +1,7 @@
 package sh.sysl
 
+import sh.sysl.ir.LType
+
 /** The back end's own operations, reachable from the library as `extern`s.
  *
  * **This is not a new mechanism so much as an opened one.** The compiler has always emitted LLVM
@@ -28,8 +30,11 @@ package sh.sysl
  */
 object Intrinsics {
 
-  /** The namespace LLVM reserves, and the whole of how an intrinsic is told from a linked symbol. */
-  val prefix = "llvm."
+  /** The namespace LLVM reserves, and the whole of how an intrinsic is told from a linked symbol.
+   *
+   * `Llvm` is where it is declared, along with every name the compiler emits on its own account.
+   */
+  val prefix = Llvm.prefix
 
   /** What an intrinsic takes: `arity` value parameters, all of one floating type, returning that
    * same type.
@@ -47,30 +52,27 @@ object Intrinsics {
    * checked by every build that runs one, which is a stronger guarantee than a table could give and
    * the same one the checked arithmetic and the saturating casts already rely on.
    *
-   * So this stays float-shaped, and stays about the library. **What no single place holds is the
-   * list of `llvm.` names sysl itself emits** — they are here, in `Codegen`'s module header, in
-   * `ScalarEmitter`, and in `ArithEmitter`. That is a real gap, and it is not this table's to close
-   * while this table is about what a program may name.
+   * So this stays float-shaped, and stays about the library. **The list of `llvm.` names sysl
+   * itself emits is `Llvm`**, which is also where the base names below are declared — this file
+   * holds what a declaration is checked against, and that file holds what may be named at all.
    */
   private case class Shape(arity: Int)
 
-  /** The supported base names.
+  /** The supported base names, with what each takes.
    *
-   * These are the float operations that lower to an **instruction** on the machines sysl targets.
-   * `llvm.sin`, `llvm.exp`, `llvm.log` and `llvm.pow` deliberately are *not* here: they exist, but no
-   * target sysl serves has hardware for them, so each lowers to a call to the libm function of the
-   * same name — which is what the library's `extern` already says, more directly and with nothing
-   * gained by routing it through here.
+   * These are the float operations that lower to an **instruction** on the machines sysl targets;
+   * `Llvm` declares them and says which ones are deliberately absent and why. What is added here is
+   * the arity, since that is what a written declaration can get wrong.
    */
-  private val table: Map[String, Shape] = Map(
-    "llvm.sqrt"     -> Shape(1),
-    "llvm.fabs"     -> Shape(1),
-    "llvm.floor"    -> Shape(1),
-    "llvm.ceil"     -> Shape(1),
-    "llvm.trunc"    -> Shape(1),
-    "llvm.round"    -> Shape(1),
-    "llvm.copysign" -> Shape(2),
-  )
+  private val table: Map[String, (Llvm.Intrinsic, Shape)] = List(
+    Llvm.sqrt     -> Shape(1),
+    Llvm.fabs     -> Shape(1),
+    Llvm.floor    -> Shape(1),
+    Llvm.ceil     -> Shape(1),
+    Llvm.trunc    -> Shape(1),
+    Llvm.round    -> Shape(1),
+    Llvm.copysign -> Shape(2),
+  ).map((entry, shape) => entry.base -> (entry, shape)).toMap
 
   /** The supported base names, for a diagnostic to list. */
   def supported: List[String] = table.keys.toList.sorted
@@ -86,13 +88,15 @@ object Intrinsics {
   def resolve(base: String, params: List[Type], ret: Type): Either[String, String] =
     table.get(base) match
       case None => Left(s"'$base' is not an intrinsic sysl supports — it has ${supported.mkString(", ")}")
-      case Some(shape) =>
+      case Some((entry, shape)) =>
         if params.length != shape.arity then
           Left(s"'$base' takes ${shape.arity} argument${if shape.arity == 1 then "" else "s"}, " +
             s"but ${params.length} were declared")
         else
           (params :+ ret).distinct match
-            case List(Type.Floating(bits)) => Right(s"$base.f$bits")
+            // The suffix is built by the registry rather than spelled here, so the one place a name
+            // is assembled is the one place they are declared.
+            case List(Type.Floating(bits)) => Right(entry.at(LType.F(bits)))
             case _                         =>
               Left(s"'$base' takes and returns one floating-point type, and this declaration " +
                 s"states ${(params :+ ret).map(Type.show).distinct.mkString(" and ")}")

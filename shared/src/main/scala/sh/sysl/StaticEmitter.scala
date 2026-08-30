@@ -48,12 +48,12 @@ trait StaticEmitter extends StringEmitter {
    */
   protected def genUsed(names: List[String]): Option[ir.Global] =
     Option.when(names.nonEmpty)(
-      ir.Global("llvm.used",
+      ir.Global(Llvm.used.name,
                 constant = false,
                 ir.LType.Arr(names.length, ir.LType.Ptr),
                 Some(ir.Val.Array(names.map(n => ir.Arg(ir.LType.Ptr, ir.Val.Global(n))))),
                 linkage = ir.Linkage.Appending,
-                section = Some("llvm.metadata")))
+                section = Some(Llvm.metadataSection.name)))
 
   /** A `val`'s initializer as a **constant expression** — text laid straight into the object file,
    * with no instruction emitted for any of it.

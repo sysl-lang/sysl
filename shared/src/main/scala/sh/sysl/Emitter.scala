@@ -663,7 +663,7 @@ trait Emitter {
    */
   protected def emitMemcpy(dst: ir.Val, src: ir.Val, bytes: Int, align: Int): Unit = {
     usesMemcpy = true
-    emit(ir.Inst.Call(None, ir.LType.Void, ir.Val.Global("llvm.memcpy.p0.p0.i64"),
+    emit(ir.Inst.Call(None, ir.LType.Void, ir.Val.Global(Llvm.memcpyName),
                       List(ir.Arg(ir.LType.Ptr, dst, List(ir.Attr.Align(align))),
                            ir.Arg(ir.LType.Ptr, src, List(ir.Attr.Align(align))),
                            ir.Arg(ir.LType.I(64), ir.Val.Int(bytes)),

@@ -474,11 +474,15 @@ object LibraryArtifact {
    * nothing behind for the linker to see.
    */
   def metadataIr(meta: String, target: Target): String = {
-    val blob    = frame(meta)
-    val escaped = blob.map(b => f"\\${b & 0xff}%02x").mkString
+    val blob     = frame(meta)
+    val escaped  = blob.map(b => f"\\${b & 0xff}%02x").mkString
+    // Named rather than written out, so this hand-built IR reaches the same registry the emitters
+    // do — it is the one place in the compiler that writes a module's text instead of building it.
+    val held     = Llvm.compilerUsed.name
+    val metadata = Llvm.metadataSection.name
 
     s"""@sysl.metadata = private constant [${blob.length} x i8] c"$escaped", section "${section(target)}"
-       |@llvm.compiler.used = appending global [1 x ptr] [ptr @sysl.metadata], section "llvm.metadata"
+       |@$held = appending global [1 x ptr] [ptr @sysl.metadata], section "$metadata"
        |""".stripMargin
   }
 

@@ -104,7 +104,7 @@ trait ExprEmitter extends ArithEmitter {
     case TReduce(op, receiver, ty) =>
       val v     = genExpr(receiver)
       val vecTy = Type.repr(receiver.ty).asInstanceOf[Type.Vector]
-      val name  = s"llvm.vector.reduce.$op.${vecTy.lty.overloadSuffix}"
+      val name  = Llvm.reduce(op).at(vecTy.lty)
       val r     = freshReg()
 
       // **The float sum takes a starting accumulator and the others do not**, which is not a
@@ -793,11 +793,15 @@ trait ExprEmitter extends ArithEmitter {
     // instruction whose lowering every backend supplies for it.
     case TVaStart(ap) =>
       usesVarargs = true
-      emit(Inst.Call(None, LType.Void, Val.Global("llvm.va_start.p0"), List(Arg(LType.Ptr, genExpr(ap))))); Val.Nothing
+      emit(Inst.Call(None, LType.Void, Val.Global(Llvm.vaStart.at(LType.Ptr)),
+                     List(Arg(LType.Ptr, genExpr(ap)))))
+      Val.Nothing
 
     case TVaEnd(ap) =>
       usesVarargs = true
-      emit(Inst.Call(None, LType.Void, Val.Global("llvm.va_end.p0"), List(Arg(LType.Ptr, genExpr(ap))))); Val.Nothing
+      emit(Inst.Call(None, LType.Void, Val.Global(Llvm.vaEnd.at(LType.Ptr)),
+                     List(Arg(LType.Ptr, genExpr(ap)))))
+      Val.Nothing
 
     case TVaArg(ap, ty) =>
       val r = freshReg()
@@ -829,7 +833,9 @@ trait ExprEmitter extends ArithEmitter {
       // same expression cannot see a half-written destination.
       val d = genExpr(dst)
       val s = genExpr(src)
-      emit(Inst.Call(None, LType.Void, Val.Global("llvm.va_copy.p0"), List(Arg(LType.Ptr, d), Arg(LType.Ptr, s)))); Val.Nothing
+      emit(Inst.Call(None, LType.Void, Val.Global(Llvm.vaCopy.at(LType.Ptr)),
+                     List(Arg(LType.Ptr, d), Arg(LType.Ptr, s))))
+      Val.Nothing
 
     case e @ TStructNew(struct, _) if layout.indirect(struct) => throughSlot(e)
 

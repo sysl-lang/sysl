@@ -173,7 +173,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // runtime, whose own spelling of `malloc` is the one its code calls, or by an earlier `extern`,
     // since two declarations may name one symbol under different sysl names. A module may not
     // declare one symbol twice.
-    val declared = mutable.Set("llvm.trap") ++
+    val declared = mutable.Set(Llvm.trap.name) ++
       (if heap then Set(mallocSym, freeSym) else Set.empty) ++
       (if usesSnprintf then Set("snprintf") else Set.empty) ++
       (if program.entryPoint && program.tests.nonEmpty then Set("strcmp") else Set.empty)
@@ -229,12 +229,12 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     val overflow = ir.FnType(LType.Struct(List(wordLty, i1)), List(ir.Param(wordLty), ir.Param(wordLty)))
 
     List.concat(
-      Option.when(traps)(sig("llvm.trap", LType.Void)),
+      Option.when(traps)(sig(Llvm.trap.name, LType.Void)),
       if heap then List(sig(mallocSym, LType.Ptr, wordLty), sig(freeSym, LType.Void, LType.Ptr))
       else Nil,
       if checked then
-        List(ir.FuncSig(s"llvm.umul.with.overflow.$word", overflow),
-             ir.FuncSig(s"llvm.uadd.with.overflow.$word", overflow))
+        List(ir.FuncSig(Llvm.withOverflow("mul", signed = false).at(wordLty), overflow),
+             ir.FuncSig(Llvm.withOverflow("add", signed = false).at(wordLty), overflow))
       else Nil,
       Option.when(usesSnprintf)(
         ir.FuncSig("snprintf",
@@ -246,11 +246,12 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       Option.when(program.entryPoint && program.tests.nonEmpty)(
         sig("strcmp", i32, LType.Ptr, LType.Ptr)),
       if usesVarargs then
-        List(sig("llvm.va_start.p0", LType.Void, LType.Ptr), sig("llvm.va_end.p0", LType.Void, LType.Ptr))
+        List(sig(Llvm.vaStart.at(LType.Ptr), LType.Void, LType.Ptr),
+             sig(Llvm.vaEnd.at(LType.Ptr), LType.Void, LType.Ptr))
       else Nil,
-      Option.when(usesVaCopy)(sig("llvm.va_copy.p0", LType.Void, LType.Ptr, LType.Ptr)),
+      Option.when(usesVaCopy)(sig(Llvm.vaCopy.at(LType.Ptr), LType.Void, LType.Ptr, LType.Ptr)),
       Option.when(usesMemcpy)(
-        sig("llvm.memcpy.p0.p0.i64", LType.Void, LType.Ptr, LType.Ptr, LType.I(64), i1)),
+        sig(Llvm.memcpyName, LType.Void, LType.Ptr, LType.Ptr, LType.I(64), i1)),
     )
   }
 
@@ -515,7 +516,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
     ir.Initializer(
       finishFunc(sig),
-      ir.Global("llvm.global_ctors",
+      ir.Global(Llvm.globalCtors.name,
                 constant = false,
                 LType.Arr(1, slot),
                 Some(ir.Val.Array(List(ir.Arg(slot,

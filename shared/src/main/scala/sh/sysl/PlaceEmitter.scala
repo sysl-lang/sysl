@@ -505,13 +505,13 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val pair  = LType.Struct(List(wordLty, i1))
     val mul   = freshReg()
 
-    emit(Inst.Call(Some(mul), pair, Val.Global(s"llvm.umul.with.overflow.$word"),
+    emit(Inst.Call(Some(mul), pair, Val.Global(Llvm.withOverflow("mul", signed = false).at(wordLty)),
       List(Arg(wordLty, n), Arg(wordLty, esz))))
     val bytes = freshReg(); emit(Inst.Extract(bytes, pair, mul, List(0)))
     val over1 = freshReg(); emit(Inst.Extract(over1, pair, mul, List(1)))
     val add   = freshReg()
 
-    emit(Inst.Call(Some(add), pair, Val.Global(s"llvm.uadd.with.overflow.$word"),
+    emit(Inst.Call(Some(add), pair, Val.Global(Llvm.withOverflow("add", signed = false).at(wordLty)),
       List(Arg(wordLty, bytes), Arg(wordLty, hsz))))
     val total = freshReg(); emit(Inst.Extract(total, pair, add, List(0)))
     val over2 = freshReg(); emit(Inst.Extract(over2, pair, add, List(1)))
