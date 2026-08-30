@@ -319,30 +319,72 @@ object Toolchain {
   private[sysl] def extraFlags: List[String] =
     envVar("SYSL_EXTRA_CFLAGS").toList.flatMap(_.split(" ").toList.filter(_.nonEmpty))
 
-  /** Whether those flags asked for AddressSanitizer, which is the one thing sysl has to read out of
-   * them rather than pass along — the IR needs marking and only this file knows that.
-   */
-  private[sysl] def asanAsked: Boolean = extraFlags.exists(_.contains("sanitize=address"))
-
-  /** The IR with every function marked for AddressSanitizer, where the extra flags asked for it.
+  /** The LLVM function attribute each `-fsanitize=` name needs on the IR sysl generates.
    *
-   * **LLVM instruments only functions carrying `sanitize_address`, and it is a *frontend* that adds
-   * it** — so IR handed to clang as a `.ll` links against the sanitizer's runtime and is
+   * **This table is the whole of what sysl reads out of the extra flags** — everything else is
+   * passed to clang, which answers for it. A sanitizer is in here when it works by instrumenting
+   * functions that carry an attribute, and a frontend is what normally adds one.
+   *
+   * **UndefinedBehaviorSanitizer is deliberately absent, and its absence is the interesting entry.**
+   * UBSan has no such attribute: clang implements it by emitting the checks and their
+   * `__ubsan_handle_*` calls into the IR as it generates it, so there is nothing to switch on
+   * afterwards. `-fsanitize=undefined` over a sysl build therefore covers the C a package vendors
+   * and none of the sysl, and no marking here could change that. It is written down because the
+   * failure is silent in exactly the way this whole mechanism exists to prevent.
+   */
+  private val SanitizerAttrs = Map(
+    "address"   -> "sanitize_address",
+    "hwaddress" -> "sanitize_hwaddress",
+    "memory"    -> "sanitize_memory",
+    "thread"    -> "sanitize_thread",
+  )
+
+  /** The sanitizers those flags asked for, by their `-fsanitize=` name.
+   *
+   * One flag may name several — `-fsanitize=address,undefined` is the ordinary way to ask for two —
+   * so the list is split rather than matched whole. **`-fno-sanitize=` is not an ask**, which is
+   * why the prefix is anchored: a substring test reads a suppression as a request and marks the IR
+   * for a sanitizer the build has just turned off.
+   */
+  private[sysl] def sanitizersAsked(flags: List[String] = extraFlags): List[String] =
+    flags.filter(_.startsWith("-fsanitize="))
+      .flatMap(_.stripPrefix("-fsanitize=").split(",").toList)
+      .map(_.trim).filter(_.nonEmpty).distinct
+
+  /** The attributes every generated function needs, for what was asked. Sorted so that the IR a
+   * build writes is the same from one run to the next.
+   *
+   * The flags are a parameter so that a test can ask about a build it is not running in: they are
+   * read from the environment, which a suite cannot set for itself.
+   */
+  private[sysl] def sanitizerAttrs(flags: List[String] = extraFlags): List[String] =
+    sanitizersAsked(flags).flatMap(SanitizerAttrs.get).distinct.sorted
+
+  /** The IR with every function marked for the sanitizers the extra flags asked for.
+   *
+   * **LLVM instruments only functions carrying the right attribute, and it is a *frontend* that
+   * adds one** — so IR handed to clang as a `.ll` links against the sanitizer's runtime and is
    * instrumented nowhere. That reads as a clean run and is a sanitizer that never looked, which is
    * the worst of the three possible outcomes; marking the functions here is what makes the answer
    * mean something.
    *
+   * It was `sanitize_address` alone until the same hole was found one sanitizer along: a program
+   * running sysl on another thread was checked with ThreadSanitizer, which reported nothing because
+   * it had been given nothing to look at. `nm -u <binary> | grep -c "tsan_read\|tsan_write"`
+   * answered zero, against three for the same race written in C. The attributes are a table now so
+   * that the next one is an entry rather than a repeat of that afternoon.
+   *
    * The attribute group is numbered because LLVM's syntax takes nothing else, and the number is one
    * nothing else emits — sysl's IR carries no attribute groups of its own.
    */
-  private[sysl] def sanitized(ir: String, on: Boolean = asanAsked): String =
-    if !on then ir
+  private[sysl] def sanitized(ir: String, attrs: List[String] = sanitizerAttrs()): String =
+    if attrs.isEmpty then ir
     else
       val marked = ir.linesIterator
         .map(l => if l.startsWith("define ") && l.endsWith(" {") then l.dropRight(1) + "#99 {" else l)
         .mkString("\n")
 
-      marked + "\n\nattributes #99 = { sanitize_address }\n"
+      marked + s"\n\nattributes #99 = { ${attrs.mkString(" ")} }\n"
 
   /** Where an `llvm-ar` is looked for, in order, when none was named.
    *
