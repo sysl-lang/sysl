@@ -135,6 +135,27 @@ class PkgConfigTests extends PackageCacheSupport {
                  file = project("""kayro = "a library nothing has" """),
                  namedIncludes = Map("kayro" -> "/nonexistent/include"))) shouldBe "42\n"
     }
+
+    // **The whole chain, from the flag's text, over a name with a dot in it.** Three pieces have to
+    // agree for a `.pc` name to be usable at all: the manifest must take it, `--include-path` must
+    // read it as a *name* rather than as a directory, and the probe must then match the two strings.
+    // Each half is pinned on its own elsewhere — `PackageConfigTests` for the manifest,
+    // `SearchPathTests` for the flag — and only their composition says the feature works.
+    //
+    // It is the link that would have silently undone card `0380`. Widening the manifest alone leaves
+    // `yaml-0.1` declarable and **unanswerable**: the refusal a build stops on tells the reader to
+    // type `--include-path yaml-0.1=<dir>`, and a flag still reading the narrower spelling would
+    // take that whole string for a directory, satisfy nothing, and refuse again in the same words.
+    "a '.pc' name with a dot in it is answered by the flag the refusal names" in {
+      assume(Toolchain.clangAvailable)
+
+      val root = project(""" "yaml-0.1" = "libyaml, which this machine need not have" """)
+      val cfg  = parseArgs(Seq("run", root, "--include-path", "yaml-0.1=/nonexistent/include"))
+        .getOrElse(fail("the flags did not parse"))
+
+      cfg.namedIncludes shouldBe Map("yaml-0.1" -> "/nonexistent/include")
+      ran(cfg) shouldBe "42\n"
+    }
   }
 
   "a build for another machine" - {
