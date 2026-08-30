@@ -285,7 +285,8 @@ object Compiler {
   def compileTests(sources: List[Source], libraries: List[Program], target: Target = Target.default,
                    precompiled: Set[String] = Set.empty, std: Option[Stdlib] = None,
                    building: Set[String] = Set.empty, paths: SearchPaths = SearchPaths.none,
-                   allocator: Allocator = Allocator.c, librarySources: List[Source] = Nil)
+                   allocator: Allocator = Allocator.c, librarySources: List[Source] = Nil,
+                   devModules: Set[String] = Set.empty)
       : Either[String, (Compiled, List[TTest])] = rendered {
     val supplied = librarySources.map(SyslParser.checked(_, target))
     val parsed   = sources.map(SyslParser.checked(_, target))
@@ -299,6 +300,10 @@ object Compiler {
         val whole  = carried(std, target)
 
         for
+          // **Before the analysis, because it is about what a *consumer* would compile.** A dev
+          // dependency is in scope for the whole of this build, so an ordinary module importing one
+          // type-checks here and is refused for everybody else (`Tests.checkDevImports`).
+          _        <- Tests.checkDevImports(mine, devModules)
           typed    <- Analyzer.analyze(units, building, whole, target, paths = paths,
                         own = ownModules(mine))
           promoted <- Escape.check(typed)

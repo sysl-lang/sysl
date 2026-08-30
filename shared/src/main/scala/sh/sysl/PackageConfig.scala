@@ -98,6 +98,16 @@ case class PackageConfig(
     headers: Map[String, String] = Map.empty,
     pkgConfig: Map[String, String] = Map.empty,
     dependencies: List[Dependency] = Nil,
+    /** What this package's own tests need and its consumers do not
+      * (`reference/packages.md § Dependencies a test alone needs`).
+      *
+      * Read exactly as `dependencies` is and resolved the same way — the difference is entirely in
+      * who resolves them. They join the graph for this project's `sysl test`, and they are **not**
+      * walked when this package is somebody's dependency, so a consumer neither fetches nor builds
+      * them. `Tests.stripSource` already removes the source that would import one, so what this
+      * adds is that the package is not fetched either.
+      */
+    devDependencies: List[Dependency] = Nil,
     allocator: Option[Allocator] = None,
     defines: Map[String, List[String]] = Map.empty,
     sysl: Option[Version] = None,
@@ -254,6 +264,8 @@ object PackageConfig {
         headers <- readHeaders(block2(root, "requires"))
         pkgs    <- readPkgConfig(block2(root, "requires"))
         deps    <- readDependencies(root)
+        dev     <- readDependencies(root, "dev_dependencies")
+        _       <- notInBoth(deps, dev)
         alloc   <- readAllocator(root)
         defs    <- readDefines(root)
       yield PackageConfig(
@@ -267,6 +279,7 @@ object PackageConfig {
         headers = headers,
         pkgConfig = pkgs,
         dependencies = deps,
+        devDependencies = dev,
         allocator = alloc,
         defines = defs,
         warnings = unknownKeys(root, TopLevelKeys, "") :::
@@ -697,18 +710,37 @@ object PackageConfig {
    * the path it rides in — and finding them needs neither the network nor the package. A build that
    * cannot mean anything should stop before it clones a repository to discover that.
    */
-  private def readDependencies(root: ConfigObject): Either[String, List[Dependency]] =
-    block2(root, "dependencies") match
+  private def readDependencies(root: ConfigObject, block: String = "dependencies")
+      : Either[String, List[Dependency]] =
+    block2(root, block) match
       case None => Right(Nil)
       case Some(deps) =>
         for
           entries <- collect(deps.fields.toList.sortBy(_._1)) {
-            case (label, sub: ConfigObject) => readDependency(label, sub)
-            case (label, _) => Left(s"$FileName: 'dependencies.$label' is not a block — a dependency " +
+            case (label, sub: ConfigObject) => readDependency(label, sub, block)
+            case (label, _) => Left(s"$FileName: '$block.$label' is not a block — a dependency " +
               "is a git coordinate and a version, or a path")
           }
           _ <- unique(entries)
         yield entries
+
+  /** Refuses a package named by both blocks.
+   *
+   * The two say different things about the same package — one that a consumer gets it, the other
+   * that a consumer does not — and there is no reading under which both are meant. It is the
+   * judgement `readOrigin` makes about a `git` beside a `path`: a closed vocabulary, where the
+   * writer believes they have said one thing and a build that quietly picked one of them would let
+   * them go on believing it.
+   */
+  private def notInBoth(deps: List[Dependency], dev: List[Dependency]): Either[String, Unit] =
+    dev.map(_.label).toSet.intersect(deps.map(_.label).toSet).toList.sorted match
+      case Nil => Right(())
+      case both =>
+        Left(s"$FileName: ${both.map(l => s"'$l'").mkString(", ")} " +
+          s"${if both.length == 1 then "is" else "are"} named by both 'dependencies' and " +
+          "'dev_dependencies' — a dependency reaches this package's consumers or it does not, and " +
+          "it cannot do both. Name it once, in 'dependencies' if anything a consumer compiles " +
+          "imports it")
 
   /** One entry, held to a shape in which every field is decided by the others.
    *
@@ -717,8 +749,9 @@ object PackageConfig {
    * and ignoring the key would resolve whatever the repository's default branch happens to be while
    * they went on believing it.
    */
-  private def readDependency(label: String, sub: ConfigObject): Either[String, Dependency] = {
-    val where = s"dependencies.$label"
+  private def readDependency(label: String, sub: ConfigObject, block: String)
+      : Either[String, Dependency] = {
+    val where = s"$block.$label"
 
     def unknown: Option[String] =
       sub.fields.keys.toList.sorted.find(!DependencyKeys.contains(_))
@@ -741,7 +774,8 @@ object PackageConfig {
    * manifest has to clear.
    */
   private val TopLevelKeys =
-    Set("package", "targets", "capabilities", "requires", "dependencies", "allocator", "defines")
+    Set("package", "targets", "capabilities", "requires", "dependencies", "dev_dependencies",
+        "allocator", "defines")
 
   private val PackageKeys = Set("name", "version", "sysl")
 

@@ -641,7 +641,7 @@ private[sysl] def execute(asked: Config): Int = {
 
     val status =
       TestRunner.run(cfg, sources, libraryTrees, target, precompiled, std, archives,
-        native.objects, paths, allocator, librarySources, runKey)
+        native.objects, paths, allocator, librarySources, runKey, fetched.devModules)
 
     native.scratch.foreach(Project.discard)
     return status

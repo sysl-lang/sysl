@@ -230,4 +230,46 @@ object Tests {
       funcs = kept.funcs.filter(f => live(f.name)),
     )
   }
+
+  /** Refuses a `dev_dependencies` package imported from source a consumer would compile
+   * (`reference/packages.md § Dependencies a test alone needs`).
+   *
+   * **The question is asked of the STRIPPED tree, which is the whole of the check.** A dev
+   * dependency is resolved for `sysl test` and pruned from a consumer's graph, so what has to be
+   * true is that nothing surviving into a library names one — and `stripSource` is already the
+   * function that says what survives. An import inside a `@tests` file or a `@test` function is
+   * gone by the time this looks, so neither needs a case of its own and neither can be got wrong
+   * separately.
+   *
+   * Without it the mistake is a package that builds its own suite perfectly and cannot be used:
+   * `sysl test` resolves the dev dependency and the ordinary module importing it compiles, while
+   * every consumer is refused at a module that was never fetched for them. The author is the last
+   * person to see it.
+   *
+   * `devModules` are the paths **as a file writes them** — `sh.sysl.quickjs`, not the coordinate,
+   * which has a hyphen in it and is no module path at all (`PackageSources.devModules`).
+   *
+   * **It reads a file's own `import` statements and not an import written inside a block.** A block
+   * import binds for the rest of that block, so one buried in an ordinary function's body would
+   * reach a consumer unreported — and would arrive there as an ordinary undefined-module error
+   * naming the package, which is a worse diagnostic rather than a silent one. Widening this to a
+   * full walk of every statement is the fix if that ever happens in practice.
+   */
+  def checkDevImports(units: List[Program], devModules: Set[String])
+      : Either[List[Diagnostic], Unit] =
+    if devModules.isEmpty then Right(())
+    else
+      val offenders =
+        for
+          unit  <- stripSource(units)
+          decl  <- unit.body.collect { case i: ImportDecl => i }
+          named <- devModules.find(m => decl.show == m || decl.show.startsWith(s"$m."))
+        yield Diagnostic(
+          s"'${decl.show}' comes from '$named', which this project declares in " +
+            "'dev_dependencies' — that is not fetched for anything depending on this project, so " +
+            "only a '@tests' file or a '@test' function may import it. Move the import into the " +
+            "tests, or declare the package in 'dependencies' if the library itself needs it",
+          decl.pos)
+
+      if offenders.isEmpty then Right(()) else Left(offenders)
 }

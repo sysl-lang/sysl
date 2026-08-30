@@ -112,7 +112,22 @@ case class PackageSources(sources: List[Source], packages: Packages, roots: List
                           needs: List[HeaderNeed] = Nil,
                           libs: List[LibNeed] = Nil,
                           allocators: List[(String, Allocator)] = Nil,
-                          defines: Map[String, List[String]] = Map.empty)
+                          defines: Map[String, List[String]] = Map.empty,
+                          /** The module paths **as a file writes them** that reach a
+                            * `dev_dependencies` package, and so may be imported only from this
+                            * project's tests (`Tests.checkDevImports`).
+                            *
+                            * Written paths rather than canonical prefixes, because an import line
+                            * carries neither the coordinate nor its dots: a package mounted from
+                            * `github.com/sysl-lang/quickjs` is imported as `sh.sysl.quickjs`, and a
+                            * coordinate is not even spellable as a path — `sysl-lang` has a hyphen
+                            * in it. The translation between the two is `Packages.mounted`, and it
+                            * is done once here rather than at every import.
+                            *
+                            * Empty on every build but `sysl test`, because that is the only one
+                            * that resolves a dev dependency at all.
+                            */
+                          devModules: Set[String] = Set.empty)
 
 object PackageSources {
 

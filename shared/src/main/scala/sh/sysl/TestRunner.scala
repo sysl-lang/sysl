@@ -62,7 +62,7 @@ object TestRunner {
           precompiled: Set[String], std: Stdlib, archives: List[String],
           objects: List[String] = Nil, paths: SearchPaths = SearchPaths.none,
           allocator: Allocator = Allocator.c, librarySources: List[Source] = Nil,
-          cacheKey: Option[String] = None): Int = {
+          cacheKey: Option[String] = None, devModules: Set[String] = Set.empty): Int = {
     if !Target.host.contains(target) then
       return fail(s"'test' runs what it builds, and '${target.name}' is not this machine")
 
@@ -74,7 +74,7 @@ object TestRunner {
     // `test` the one subcommand a package built on `c const` could not run.
     val (built, tests) =
       Compiler.compileTests(sources, libraries, target, precompiled, Some(std), building, paths,
-                            allocator, librarySources) match
+                            allocator, librarySources, devModules) match
       case Left(err)     => return report(err)
       case Right(result) => result
 

@@ -956,4 +956,83 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
     e should startWith("package.hocon:")
     e shouldNot include("Exception")
   }
+
+  /** `dev_dependencies` — what this package's own tests need and its consumers do not
+   * (`reference/packages.md § Dependencies a test alone needs`).
+   *
+   * Read exactly as `dependencies` is, which is the point: the entries are the same shape, get the
+   * same refusals, and differ only in who resolves them.
+   */
+  "dev_dependencies" - {
+
+    "reads the same entries dependencies does" in {
+      val c = read("""
+        dependencies { parsing { git = "github.com/sysl-lang/parsing", version = "0.5.0" } }
+        dev_dependencies { quickjs { git = "github.com/sysl-lang/quickjs", version = "0.1.0" } }
+      """)
+
+      c.dependencies.map(_.label) shouldBe List("parsing")
+      c.devDependencies.map(_.label) shouldBe List("quickjs")
+      c.devDependencies.head.canonical shouldBe "github.com.sysl-lang.quickjs"
+    }
+
+    "is not an unknown key" in {
+      read("""dev_dependencies { q { path = "../q" } }""").warnings shouldBe Nil
+    }
+
+    "is absent by default" in {
+      read("""package { name = "p" }""").devDependencies shouldBe Nil
+    }
+
+    // The same misspelling refusal `dependencies` makes, and it has to name the right block or a
+    // reader goes looking in the other one.
+    "reports a misspelled key against its own block" in {
+      val e = refused("""dev_dependencies { q { versoin = "1.0.0", git = "github.com/e/q" } }""")
+
+      e should include("'dev_dependencies.q.versoin'")
+    }
+
+    "is not a block of blocks" in {
+      refused("""dev_dependencies { q = "1.0.0" }""") should include("'dev_dependencies.q'")
+    }
+
+    /** A package named by both blocks says two things about one package — that a consumer gets it,
+     * and that a consumer does not. It is `readOrigin`'s judgement about a `git` beside a `path`:
+     * a closed vocabulary, where quietly picking one lets the writer go on believing the other.
+     */
+    "refuses a package named by both blocks" in {
+      val e = refused("""
+        dependencies     { q { git = "github.com/e/q", version = "1.0.0" } }
+        dev_dependencies { q { git = "github.com/e/q", version = "1.0.0" } }
+      """)
+
+      e should include("'q'")
+      e should include("both")
+      e should include("cannot do both")
+    }
+
+    "names every package in both, not only the first" in {
+      val e = refused("""
+        dependencies     { a { path = "../a" }, b { path = "../b" } }
+        dev_dependencies { a { path = "../a" }, b { path = "../b" } }
+      """)
+
+      e should include("'a'")
+      e should include("'b'")
+      e should include("are named by both")
+    }
+
+    // Different labels for different packages is the ordinary case and must not be caught by the
+    // check above -- which is the assertion that says the refusal is about the label rather than
+    // about the two blocks both being present.
+    "allows both blocks when they name different packages" in {
+      val c = read("""
+        dependencies     { a { path = "../a" } }
+        dev_dependencies { b { path = "../b" } }
+      """)
+
+      c.dependencies.map(_.label) shouldBe List("a")
+      c.devDependencies.map(_.label) shouldBe List("b")
+    }
+  }
 }

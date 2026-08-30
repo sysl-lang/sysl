@@ -50,10 +50,11 @@ private def dependencies(cfg: Config, project: PackageConfig, roots: List[String
     : Either[String, PackageSources] =
   for
     fromRoots <- libDependencies(roots)
-    declared   = project.dependencies ::: fromRoots
+    dev        = devDependencies(cfg, project)
+    declared   = project.dependencies ::: dev ::: fromRoots
     got       <- if declared.isEmpty then Right(PackageSources.none)
                  else resolveDependencies(cfg, project.copy(dependencies = declared), roots, os)
-  yield got
+  yield got.copy(devModules = devModules(got, dev))
 
 /** Resolving a non-empty dependency list against this machine's cache, and recording what it got.
  *
@@ -140,6 +141,45 @@ private def reportRaised(project: PackageConfig, graph: Resolve.Graph): Unit =
 
     Console.err.println(s"sysl: note: '${dep.label}' is named at $asked and the build " +
       s"selected $resolved$because")
+
+/** Which module paths a file of this project would have to write to reach a dev dependency.
+ *
+ * **The translation from a coordinate to something an import line can say**, and it has to happen
+ * somewhere: `Dependency.canonical` is `github.com.sysl-lang.quickjs`, which is not a module path
+ * and is not even spellable as one — a hyphen is not an identifier character. What a file writes is
+ * the mount, `sh.sysl.quickjs`, and the table that relates the two is the root's own row of
+ * `Packages.imports`.
+ *
+ * The root's row is the right one because the check is about the root's files. A dependency's own
+ * files resolve their imports through their own row, and a dev dependency is not in anybody's graph
+ * but this project's.
+ */
+private def devModules(got: PackageSources, dev: List[Dependency]): Set[String] = {
+  val prefixes = dev.map(_.canonical).toSet
+
+  got.packages.imports.getOrElse("", Map.empty).collect {
+    case (written, canonical) if prefixes.exists(p => canonical == p || canonical.startsWith(s"$p.")) =>
+      written
+  }.toSet
+}
+
+/** The root project's `dev_dependencies`, when this build is the one they are for.
+ *
+ * **`sysl test` and nothing else** (`reference/packages.md § Dependencies a test alone needs`). A
+ * `dev_dependencies` entry is imported only from a `@tests` file or a `@test` function, and every
+ * other build drops that source before analysis (`Tests.stripSource`) — so on a `build`, a
+ * `build-lib` or a `build-c` there is nothing left that could name one, and resolving it would fetch
+ * and compile a package the compilation cannot refer to. Cargo draws the line in the same place:
+ * `cargo build` does not build a dev-dependency and `cargo test` does.
+ *
+ * **The root project's only**, which is what prunes them from a consumer's graph. A fetched package
+ * is walked through its own `dependencies`, and nothing anywhere reads a *dependency's*
+ * `devDependencies` — so the pruning is an omission rather than a filter, and a package added to the
+ * graph tomorrow gets it for free. A `--lib` source root is somebody else's package for this
+ * purpose: its tests are not the ones being run.
+ */
+private def devDependencies(cfg: Config, project: PackageConfig): List[Dependency] =
+  if cfg.command == "test" then project.devDependencies else Nil
 
 /** What each `--lib` source root says it depends on (`reference/packages.md § What a project is
  * called`).
@@ -379,8 +419,12 @@ private def showDeps(cfg: Config, project: PackageConfig, roots: List[String]): 
   val listed =
     for
       fromRoots <- libDependencies(roots)
-      graph     <- resolvedGraph(cfg, project.copy(dependencies = project.dependencies ::: fromRoots),
-                     roots)
+      // **`deps` lists what a project takes, so it shows the dev half too** -- unlike a build,
+      // which resolves them only for `test`. A reader asking what this project depends on wants
+      // the whole answer with the parts labelled, and the label is what says a consumer will not
+      // fetch that one.
+      graph     <- resolvedGraph(cfg, project.copy(dependencies =
+                     project.dependencies ::: project.devDependencies ::: fromRoots), roots)
     yield graph
 
   listed match
@@ -392,6 +436,8 @@ private def showDeps(cfg: Config, project: PackageConfig, roots: List[String]): 
 private def printGraph(project: PackageConfig, graph: Resolve.Graph): Int = {
   val depended = graph.packages.filterNot(_.isRoot)
   val spelling = coordinates(graph)
+  val devOnly  = project.devDependencies.map(_.canonical).toSet --
+                   project.dependencies.map(_.canonical).toSet
 
   stdout(s"${project.name.getOrElse("this project")}${project.version.fold("")(v => s" $v")}\n")
 
@@ -416,7 +462,13 @@ private def printGraph(project: PackageConfig, graph: Resolve.Graph): Int = {
     // only thing that says which tree it is.
     val at     = p.version.map(_.toString).getOrElse(p.root)
 
-    stdout(s"${named(p).padTo(width, ' ')}  $at${if raised then "  (raised)" else ""}\n")
+    // Marked rather than listed apart, because what a reader is checking is usually one package
+    // and the question is which kind it is -- and a package reached *through* a dev dependency is
+    // in the same position without being named in either block, so a second section would have
+    // nowhere to put it.
+    val kind   = if devOnly.contains(p.canonical) then "  (dev)" else ""
+
+    stdout(s"${named(p).padTo(width, ' ')}  $at$kind${if raised then "  (raised)" else ""}\n")
 
     // In the order the walk asked, which is the root's manifest first and then breadth first through
     // the graph — so the line a reader is most likely to be able to edit is the one at the top.
