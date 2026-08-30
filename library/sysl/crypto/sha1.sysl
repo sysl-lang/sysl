@@ -1,0 +1,241 @@
+module sysl.crypto
+@no_alloc
+
+import sysl.math.Bits
+import sysl.slices.copy
+
+// SHA-1 — here for one wire protocol, and not for anything a new program is choosing.
+//
+// **It is broken, and has been publicly broken since 2017**: `SHAttered` exhibited two PDFs with one
+// digest, and `SHA-1 is a Shambles` made that a *chosen-prefix* collision in 2019 for about $45,000
+// of rented compute. A SHA-1 digest therefore says nothing about a document nobody could have
+// substituted, so it must not carry a signature, a certificate, a content address, or a
+// deduplication key. **`sha256` is what all of those want** and it is in this same module.
+//
+// What it is here for is **RFC 6455's opening handshake**, where the server answers
+// `base64(sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))` and every browser checks the answer.
+// There is no substitute: the constant and the algorithm are both written into the standard. That
+// use makes no security claim at all — the handshake shows that the far end read the request and
+// understood the protocol, not that anybody is who they say — which is why an algorithm this broken
+// is still adequate for it, and why nothing else here should follow it.
+//
+// `hmac1` is a second case of the same kind. HMAC's security does not rest on collision resistance,
+// so HMAC-SHA-1 is not broken the way SHA-1 is, and it is what RFC 6238 specifies for TOTP by
+// default and what a good deal of deployed request signing still uses. A protocol being written now
+// wants `hmac256` regardless.
+
+// The four constants, one per twenty rounds. They are the first thirty-two bits of the fractional
+// parts of the square roots of 2, 3, 5 and 10 — the same kind of derivation SHA-2's tables have, and
+// the reason a table of four is a table rather than four numbers in the round.
+private val k1: [4]u32 = [0x5a827999, 0x6ed9eba1, 0x8f1bbcdc, 0xca62c1d6]
+
+// The published initial values, which are not derived from anything.
+private val iv1: [5]u32 = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0]
+
+// SHA-1's block and length conventions are SHA-256's exactly: sixty-four bytes to a block, and a
+// message length in bits written big-endian into the last eight. That is what lets `finish` below
+// read the same as `Sha`'s, and it is a fact about the standards rather than a coincidence — SHA-1
+// is what SHA-2's 32-bit half was designed from.
+private const block_bytes: usize = 64
+private const digest_bytes: usize = 20
+
+// A SHA-1 hash in progress.
+//
+// It is an ordinary struct like the four SHA-2 hashers beside it, so **copying one is starting
+// another from the same point**, and `hmac` below is written in terms of exactly that. `update` may
+// be called as often as you like and `finish` writes into storage the caller owns.
+//
+// **This is not `Sha[T]` and could not be.** That type is written around an eight-word state, a
+// message schedule of `w[i-16] + ssig0 + w[i-7] + ssig1`, and a round function reached through the
+// `Word` bound — none of which SHA-1 has. `Word` is a bound on the *width*, and both algorithms are
+// `u32` here, so it is not the axis that could have told them apart either.
+//
+// **What is shared is `ch`, `maj`, `shift_in` and `top_byte`**, which are the module's own free
+// functions and which SHA-1 genuinely uses — `ch` for rounds 0–19 and `maj` for 40–59 are the same
+// two functions SHA-2 applies every round.
+//
+// **What is NOT shared, and was looked at: the buffering and the padding.** SHA-1's block and length
+// conventions are SHA-256's exactly, so `update` and the first half of `finish` below read almost
+// word for word like `Sha`'s. Lifting them into one helper founders on `finish` compressing *in the
+// middle* of padding when the length will not fit — a helper would have to hand control back rather
+// than run to completion, and this module is `@no_alloc`, so there is no closure to hand it. The
+// driver each caller would then need is longer than the fifteen lines it saves. Thirty duplicated
+// lines is the price, and it is recorded here rather than left for a reader to wonder about.
+struct Sha1
+    private h: [5]u32
+    private block: [block_bytes]u8
+    private used: usize
+    private total: u64
+
+    // Zero until `new_sha1` fills it in, which is what makes a hasher nobody started answer
+    // `NotStarted` rather than a plausible digest over the wrong initial values.
+    private dlen: usize
+
+    private start(*self)
+        copy(self.h[..], iv1[..])
+
+        self.used = 0
+        self.total = 0
+        self.dlen = digest_bytes
+    end start
+
+    update(*self, data: []const u8)
+        for i in 0..<data.len
+            self.block[self.used] = data[i]
+            self.used += 1
+            self.total += 1
+
+            if self.used == block_bytes
+                self.compress()
+                self.used = 0
+    end update
+
+    // One block, in place.
+    //
+    // **The schedule is where SHA-1 was broken.** SHA-2 mixes each new word through two rotate-heavy
+    // functions; SHA-1 rotates a four-way XOR by one, and that single bit of rotation is what leaves
+    // enough linear structure for the published attacks. It is written out here rather than
+    // abstracted because there is one of it.
+    private compress(*self)
+        var w = [0u32; 80]
+
+        for i in 0..<16usize
+            var v = 0u32
+
+            for j in 0..<4usize do v = shift_in(v, self.block[i * 4 + j])
+
+            w[i] = v
+
+        for i in 16..<80usize
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1)
+
+        var a = self.h[0]
+        var b = self.h[1]
+        var c = self.h[2]
+        var d = self.h[3]
+        var e = self.h[4]
+
+        for i in 0..<80usize
+            // **`ch` and `maj` are SHA-2's own, and they are the right functions rather than close
+            // ones.** SHA-1 publishes the first as `(b & c) | (~b & d)` and the third as
+            // `(b & c) | (b & d) | (c & d)`, both written with `|` where `ch` and `maj` use `^` —
+            // and the two agree, because in each case no two terms can have a bit set at once.
+            var f = if i < 20 then ch(b, c, d) else if i < 40 || i >= 60 then b ^ c ^ d else maj(b, c, d)
+            var t = a.rotate_left(5) + f + e + k1[i / 20] + w[i]
+
+            e = d
+            d = c
+            c = b.rotate_left(30)
+            b = a
+            a = t
+
+        self.h[0] += a
+        self.h[1] += b
+        self.h[2] += c
+        self.h[3] += d
+        self.h[4] += e
+    end compress
+
+    // Appends the one bit, the zeroes and the message length in bits, then publishes the state.
+    finish(*self, digest: []u8) -> Result[unit, Fault]
+        if self.dlen == 0 then return Err(NotStarted)
+        if digest.len < digest_bytes then return Err(DigestTooSmall)
+
+        var nbits = self.total * 8
+
+        self.block[self.used] = 0x80
+        self.used += 1
+
+        // Where the length will not fit under the padding, this block goes out full of zeroes and
+        // the length lands in the next one.
+        if self.used + 8 > block_bytes
+            while self.used < block_bytes
+                self.block[self.used] = 0
+                self.used += 1
+
+            self.compress()
+            self.used = 0
+
+        while self.used < block_bytes - 8
+            self.block[self.used] = 0
+            self.used += 1
+
+        for i in 0..<8usize
+            self.block[block_bytes - 1 - i] = u8(nbits >> (i * 8))
+
+        self.compress()
+
+        for i in 0..<5usize
+            var v = self.h[i]
+
+            for j in 0..<4usize
+                digest[i * 4 + j] = top_byte(v)
+                v = v << 8
+
+        Ok(())
+    end finish
+end Sha1
+
+// A hasher ready for its first `update`.
+new_sha1() -> Sha1
+    var h: Sha1
+    h.start()
+    h
+
+// The digest of one slice of bytes, which is the whole of what most callers want.
+sha1(data: []const u8) -> [20]u8
+    var h = new_sha1()
+    var out: [20]u8
+
+    h.update(data)
+    h.finish(out[0..<20]).expect("a digest buffer sized from the hasher itself")
+    out
+
+// HMAC-SHA-1, answering a twenty-byte tag.
+//
+// A key longer than a block is replaced by its own digest; a shorter one is padded with zeroes.
+hmac1(key: []const u8, msg: []const u8) -> [20]u8
+    var tag: [20]u8
+    hmac_sha1(key, msg, tag[0..<20]).expect("a tag buffer sized from the hasher itself")
+    tag
+
+// The construction, into storage the caller owns — the same shape `hmac` has next door, and written
+// separately for the same reason `Sha1` is: `hmac[T: Word]` is typed against `Sha[T]`, and a bound
+// wide enough to cover both hashers would have to be a trait declaring `update` and `finish`, which
+// is a change to the tested SHA-2 path for the sake of twenty lines here.
+private hmac_sha1(key: []const u8, msg: []const u8, tag: []u8) -> Result[unit, Fault]
+    if tag.len < digest_bytes then return Err(DigestTooSmall)
+
+    var k: [block_bytes]u8
+
+    if key.len > block_bytes
+        var h = new_sha1()
+        var kd: [20]u8
+
+        h.update(key)
+        h.finish(kd[0..<20])?
+
+        copy(k[..], kd[..])
+    else
+        copy(k[..], key)
+
+    var ipad: [block_bytes]u8
+    var opad: [block_bytes]u8
+
+    for i in 0..<block_bytes
+        ipad[i] = k[i] ^ 0x36
+        opad[i] = k[i] ^ 0x5c
+
+    var inner = new_sha1()
+    var id: [20]u8
+
+    inner.update(ipad[..])
+    inner.update(msg)
+    inner.finish(id[..])?
+
+    var outer = new_sha1()
+
+    outer.update(opad[..])
+    outer.update(id[..])
+    outer.finish(tag[0..<digest_bytes])
+end hmac_sha1

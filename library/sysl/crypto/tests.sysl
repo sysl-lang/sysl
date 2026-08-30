@@ -7,7 +7,7 @@ module sysl.crypto
 // back builds a string — and the padding boundaries are the test, so the inputs are built to a
 // chosen length. Neither is incidental to checking SHA-2, and neither ships.
 
-import sysl.encoding.hex_string
+import sysl.encoding.{base64_string, hex_string, Alphabet}
 import sysl.math.Bits
 
 // What `sysl.crypto` claims, asserted in sysl.
@@ -486,3 +486,175 @@ verify_checks_a_tag()
 
     assert(!verify(tag, flipped))
 end verify_checks_a_tag
+
+
+// -- SHA-1 -------------------------------------------------------------------------------------
+//
+// **The vectors are published ones throughout**: FIPS 180-4's four messages, RFC 2202's keyed-hash
+// cases — which are SHA-1's own rather than the SHA-2 fixtures above reused — and RFC 6455 §1.3's
+// worked handshake, which is the case the digest is in this module for.
+
+private sha1_streamed(chunk: []const u8, times: usize) -> string
+    var h = new_sha1()
+    var out: [20]u8
+
+    for i in 0..<times do h.update(chunk)
+
+    h.finish(out[..]).expect("a digest buffer sized from the hasher itself")
+
+    hex_string(out[..])
+end sha1_streamed
+
+// The same bytes handed over one at a time, which must be the digest of the whole.
+private sha1_one_at_a_time(data: []const u8) -> string
+    var h = new_sha1()
+    var out: [20]u8
+
+    for i in 0..<data.len do h.update(data[i..<i + 1])
+
+    h.finish(out[..]).expect("a digest buffer sized from the hasher itself")
+
+    hex_string(out[..])
+end sha1_one_at_a_time
+
+// The same bytes in two pieces, divided wherever the caller says.
+private sha1_split(data: []const u8, at: usize) -> string
+    var h = new_sha1()
+    var out: [20]u8
+
+    h.update(data[0..<at])
+    h.update(data[at..<data.len])
+    h.finish(out[..]).expect("a digest buffer sized from the hasher itself")
+
+    hex_string(out[..])
+end sha1_split
+
+
+@test("the messages FIPS 180-4 publishes for SHA-1")
+sha1_standard_messages()
+    assert_eq(hex_string(sha1(abc())), "a9993e364706816aba3e25717850c26c9cd0d89d")
+    assert_eq(hex_string(sha1(alpha448())), "84983e441c3bd26ebaae4aa1f95129e5e54670f1")
+    assert_eq(hex_string(sha1(alpha896())), "a49b2446a02c645bf419f995b67091253a04a259")
+    assert_eq(hex_string(sha1(pattern(0))), "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+end sha1_standard_messages
+
+@test("SHA-1 padding at every boundary")
+sha1_padding_at_every_boundary()
+    assert_eq(hex_string(sha1(pattern(0))), "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+    assert_eq(hex_string(sha1(pattern(1))), "9842926af7ca0a8cca12604f945414f07b01e13d")
+    assert_eq(hex_string(sha1(pattern(55))), "ddf57317ef34bfee3b6df83d359098930eb278bc")
+    assert_eq(hex_string(sha1(pattern(56))), "a0d492bb0fc889d0eca3bc137066ab6f4f74f369")
+    assert_eq(hex_string(sha1(pattern(63))), "c55856749bef509bdfe6bfebfc7bf4e793e82132")
+    assert_eq(hex_string(sha1(pattern(64))), "bede92be29c3874e1b54ddc77988d606fc857a8e")
+    assert_eq(hex_string(sha1(pattern(65))), "b05a80522b053d6dc7e0a517d0e70212c7dad11f")
+    assert_eq(hex_string(sha1(pattern(119))), "504e27376a6e0f0dba8295b85cb25dc4dfa17d23")
+    assert_eq(hex_string(sha1(pattern(120))), "82134b02fb3f702491be9bed581eeab59334acb2")
+    assert_eq(hex_string(sha1(pattern(127))), "34d5e582029e9b9b85b2febe31da3db7cdabaaea")
+    assert_eq(hex_string(sha1(pattern(128))), "a09133e6730ffe899efb70204cb5646cd5dc24ee")
+    assert_eq(hex_string(sha1(pattern(129))), "808aea332ce367541d37adae7f94e59c5c1a934e")
+    assert_eq(hex_string(sha1(pattern(200))), "892b673ca3c696ab13ab8aab3cf3abfbc3aaeb3b")
+end sha1_padding_at_every_boundary
+
+// FIPS 180-4's third published message, and the only one here long enough to run the counter across
+// thousands of blocks. **The thousand-byte chunk is the point**: 1000 is not a multiple of 64, so
+// every one of the thousand `update` calls lands at a different offset within the block, and the
+// buffering is exercised at every one of them rather than at the handful a short message reaches.
+@test("SHA-1 over a million bytes, in a thousand pieces")
+sha1_a_million_bytes()
+    assert_eq(sha1_streamed(repeated(97, 1000), 1000), "34aa973cd4c4daa4f61eeb2bdbad27316534016f")
+end sha1_a_million_bytes
+
+@test("RFC 2202's keyed-hash vectors")
+sha1_keyed_hashing()
+    assert_eq(hex_string(hmac1(repeated(0x0b, 20), "Hi There".bytes)), "b617318655057264e28bc0b6fb378c8ef146be00")
+    assert_eq(hex_string(hmac1("Jefe".bytes, "what do ya want for nothing?".bytes)), "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79")
+    assert_eq(hex_string(hmac1(repeated(0xaa, 20), repeated(0xdd, 50))), "125d7342b9ac11cd91a39af48aa17b4f63f175d3")
+    assert_eq(hex_string(hmac1(counting(25), repeated(0xcd, 50))), "4c9007f4026250c6bc8414f9bf50c86c2d7235da")
+
+    // The two cases whose key is longer than a block, so the key is replaced by its own digest.
+    var long_key = repeated(0xaa, 80)
+    assert_eq(hex_string(hmac1(long_key, "Test Using Larger Than Block-Size Key - Hash Key First".bytes)),
+        "aa4ae5e15272d00e95705637ce8a3b55ed402112")
+    assert_eq(hex_string(hmac1(long_key, "Test Using Larger Than Block-Size Key and Larger Than One Block-Size Data".bytes)),
+        "e8e99d0f45237d786d6bbaa7965c7808bbff1a91")
+end sha1_keyed_hashing
+
+// **The reason SHA-1 is in this module at all.** RFC 6455 §1.3 works the opening handshake through
+// with a named key, and every browser computes this same answer before it will speak WebSocket. The
+// two numbers below are the standard's own, not this implementation's read back.
+@test("the WebSocket accept key RFC 6455 publishes")
+the_websocket_accept_key()
+    val key = "dGhlIHNhbXBsZSBub25jZQ=="
+    val guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    val d = sha1((key + guid).bytes)
+
+    assert_eq(hex_string(d), "b37a4f2cc0624f1690f64606cf385945b2bec4ea")
+    assert_eq(base64_string(d[..], Alphabet.Standard, true), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+end the_websocket_accept_key
+
+@test("SHA-1 streams, and copying a hasher copies the hash in progress")
+the_sha1_hasher()
+    var p200 = pattern(200)
+    val whole = hex_string(sha1(p200))
+
+    assert_eq(sha1_one_at_a_time(abc()), hex_string(sha1(abc())))
+    assert_eq(sha1_one_at_a_time(p200), whole)
+
+    // Every division of the message, which is the boundary cases and everything between them.
+    for at in 0..<201usize
+        assert_eq(sha1_split(p200, at), whole, f"a message divided at $at hashed differently")
+
+    // A common prefix hashed once and finished two ways, which is what makes a hasher a value.
+    var prefix = new_sha1()
+    prefix.update("abc".bytes)
+
+    var left = prefix
+    var right = prefix
+    var lo: [20]u8
+    var ro: [20]u8
+
+    left.update("def".bytes)
+    right.update("xyz".bytes)
+    left.finish(lo[..]).expect("a digest buffer sized from the hasher itself")
+    right.finish(ro[..]).expect("a digest buffer sized from the hasher itself")
+
+    assert_eq(hex_string(lo[..]), hex_string(sha1("abcdef".bytes)))
+    assert_eq(hex_string(ro[..]), hex_string(sha1("abcxyz".bytes)))
+end the_sha1_hasher
+
+@test("what a SHA-1 hasher refuses")
+what_a_sha1_hasher_refuses()
+    var out: [20]u8
+    var never_started: Sha1
+
+    assert_eq(why(never_started.finish(out[..])), "this hasher was never given its initial values")
+
+    var h = new_sha1()
+    var too_small: [19]u8
+
+    assert_eq(why(h.finish(too_small[..])), "the digest does not fit in the space provided")
+
+    // A buffer larger than the digest is fine, and only the first twenty bytes are written.
+    var roomy: [24]u8 = [0xff; 24]
+    var g = new_sha1()
+
+    g.update(abc())
+    g.finish(roomy[..]).expect("a digest buffer larger than the digest")
+
+    assert_eq(hex_string(roomy[0..<20]), "a9993e364706816aba3e25717850c26c9cd0d89d")
+    assert_eq(hex_string(roomy[20..<24]), "ffffffff")
+end what_a_sha1_hasher_refuses
+
+@test("one flipped bit moves almost every nibble of a SHA-1 digest")
+the_sha1_avalanche()
+    var m = pattern(64)
+    val before = hex_string(sha1(m))
+
+    m[0] = m[0] ^ 1
+
+    val after = hex_string(sha1(m))
+
+    assert_eq(before, "bede92be29c3874e1b54ddc77988d606fc857a8e")
+    assert_eq(after, "616cf0fe9a77fa3cf594fe6c8c2206ea2038fe1f")
+    assert(apart(before, after) > 30, "one flipped bit moved too little of the digest")
+end the_sha1_avalanche

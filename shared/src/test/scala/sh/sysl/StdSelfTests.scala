@@ -215,8 +215,19 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * it and one for `seed_from_os`, which had been covered by **nothing** — that module had no test
    * file at all until this needed one, which is the sort of hole a floor cannot see and only a
    * reader can.
+   *
+   * Raised to **616** when `sysl.crypto` gained SHA-1 (card `0363`): seven cases — the published
+   * FIPS 180-4 messages, the padding boundaries, a million bytes in thousand-byte pieces, RFC 2202's
+   * keyed-hash vectors, RFC 6455 §1.3's worked WebSocket handshake, the streaming and hasher-copying
+   * claims, and what the hasher refuses. **One of the seven was drift**, measured before the cases
+   * were written rather than added to the number above.
+   *
+   * The handshake case is the one worth naming, because it is the only reason SHA-1 is in the
+   * standard module at all: RFC 6455 publishes a key and the accept value a server must answer with,
+   * and a browser will not open a socket against any other answer. Every other digest in that module
+   * is there to be chosen; this one is there because a wire protocol names it.
    */
-  private val floor = 608
+  private val floor = 616
 
   /** The library, compiled as a **test build of itself**.
    *
