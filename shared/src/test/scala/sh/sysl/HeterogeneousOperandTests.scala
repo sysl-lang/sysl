@@ -634,6 +634,27 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
             |    neg(self) -> N = self""".stripMargin) should
         include("already implements 'sysl.Neg'")
     }
+
+    /** A blanket of the program's **own** trait, whose member name the compiler owns for the whole
+     * family. This is `0389`'s shape one trait over, and it is here because it looked like the same
+     * defect and is not: `MemberLowering`'s net against a block taking a compiler-owned name reads
+     * `home.self`, which is empty for *every* generic block, blankets included -- so nothing there
+     * fires, and `provides` above is keyed on the trait being implemented, which a program's own
+     * trait is not.
+     *
+     * It answers `7` rather than `11`, so an integer's own `add` is reached and the block's is not.
+     * Probed before the merge rather than reasoned about, and kept as a test because a claim nothing
+     * pins is a claim that stops being true quietly.
+     */
+    "a blanket of a program's own trait does not take a member name the compiler owns" in {
+      run("""trait Doubling
+            |    add(self, rhs: int) -> int
+            |
+            |impl[N: Integer] Doubling for N
+            |    add(self, rhs: int) -> int = int(self) + rhs * 2
+            |
+            |print(5.add(1))""".stripMargin) shouldBe "7\n"
+    }
   }
 
   "a result is not a selector" - {
