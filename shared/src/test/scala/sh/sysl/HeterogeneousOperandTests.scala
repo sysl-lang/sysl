@@ -223,12 +223,25 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
       err("sq[T](x: T) -> T = x * x") should include(s"'*' needs 'T: ${lib("Mul")}'")
     }
 
-    "a scalar keeps its instruction rather than taking a user implementation" in {
-      err(complex + """impl Mul[C] for f64
+    /** **This asserted the opposite until card `0385`**, and the rule it was written against is what
+      * that card removed: coherence looked only at an `impl`'s subject, so `f64` being the
+      * library's settled it and the local `C` in the trait's argument list was never consulted.
+      * `c * 2.0` was writable and `2.0 * c` was a block nobody could write in any module.
+      *
+      * What survives of the old claim is the half that was always the point, and it is asserted
+      * beside this one: the scalar keeps its **own** instruction. Only the argument list tells the
+      * two apart.
+      */
+    "a scalar takes a user implementation at an argument list of its own" in {
+      run(complex + """impl Mul[C] for f64
                       |    mul(self, c: C) -> f64 = self * c.re
-                      |print(show(2.0 * C(1.0, 2.0)))""".stripMargin) should include(
-        "'*' needs matching types",
-      )
+                      |print(2.0 * C(1.5, 2.0))""".stripMargin) shouldBe "3\n"
+    }
+
+    "and keeps its instruction for its own pair, by the operator and by name" in {
+      run(complex + """impl Mul[C] for f64
+                      |    mul(self, c: C) -> f64 = self * c.re
+                      |print(2.0 * 3.0, 2.0.mul(3.0))""".stripMargin) shouldBe "6 6\n"
     }
 
     // Two implementations at one argument list is still one implementation too many, and the

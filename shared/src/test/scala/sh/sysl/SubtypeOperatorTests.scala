@@ -404,5 +404,22 @@ class SubtypeOperatorTests extends AnyFreeSpec with RunSupport with CodegenSuppo
     "a derived one reaches it too" in {
       run(Stamp + "twice[T: Add](x: T) -> T = x + x\nprint(i64(twice(Stamp(7i64))))") shouldBe "14\n"
     }
+
+    /** **A derived subtype may be given an operator at an argument list its base has not**, as of
+      * card `0385` — which is the ceiling `SubtypeErrorTests`' *"a derived type inherits behaviour
+      * it cannot replace"* describes, lifted exactly as far as it should be and no further.
+      *
+      * It is the timeline shape one layer down: a struct has been able to say that two moments and
+      * a length add differently since a trait became a family of promises, and a derived subtype
+      * could not. **Replacing** what the base has is still refused, and that is what the block over
+      * there now asserts — the compiler provides `Stamp + Stamp` and has nothing to say about
+      * `Stamp + Span`.
+      */
+    "and a derived one may add an argument list its base has not, keeping the base's own" in {
+      run(Stamp + "type Span = new i64\n" +
+        "impl Add[Span] for Stamp\n" +
+        "    add(self, s: Span) -> Stamp = Stamp(i64(self) + i64(s))\n" +
+        "print(i64(Stamp(100i64) + Span(7i64)), i64(Stamp(100i64) + Stamp(5i64)))") shouldBe "107 105\n"
+    }
   }
 }

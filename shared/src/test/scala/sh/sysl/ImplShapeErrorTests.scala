@@ -218,7 +218,7 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
             |print(1)
             |""".stripMargin) should include(
         s"an 'impl' may be written only in the module that declares the trait or in one that " +
-          s"declares a type named in the subject, and '${lib("Hash")}' is the library's while " +
+          s"declares a type the block names, and '${lib("Hash")}' is the library's while " +
           s"nothing in '${lib("Option")}' is declared outside the library — so this one has no home")
     }
 

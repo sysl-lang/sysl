@@ -300,7 +300,7 @@ trait ImplTarget extends ImplConformance {
    * than the key — `Stdlib.owns`. A program at the project root is therefore as foreign to `Eq` as
    * any named module is.
    */
-  protected def checkCoherence(impl: ImplDecl): Unit = {
+  protected def checkCoherence(impl: ImplDecl, label: String): Unit = {
     val home     = if libraryOwns(impl, currentModule) then None else Some(currentModule)
     val declarer = declaringModule(impl.traitName)
     val subject  = subjectHomes(impl.forType) ++ impl.traitArgs.flatMap(subjectHomes)
@@ -308,20 +308,26 @@ trait ImplTarget extends ImplConformance {
     if home != declarer && !subject(home) then
       err(s"an 'impl' may be written only in the module that declares the trait or in one that " +
         s"declares a type the block names, and '${qn(impl.traitName)}' ${whose(declarer)} " +
-        s"while ${subjectPhrase(subject)} — so this one has no home. A trait of your own, or " +
+        s"while ${subjectPhrase(subject, label, impl.traitArgs.nonEmpty)} — so this one has no home. A trait of your own, or " +
         "a type of your own in what it is written for or in the trait's arguments, gives it one")
   }
 
   /** What the block names, and where those names live.
    *
-   * It stopped naming the **subject** at card `0385`, when the trait's arguments began to count: a
-   * phrase reading "nothing in 'real' is declared outside the library" would be answering a
-   * narrower question than the rule asks, and a reader would go looking at the `for` type when the
-   * fix is as likely to be an argument.
+   * **It names the subject where the block wrote no trait arguments, and the block where it did**,
+   * which is card `0385`'s widening carried into the message. A trait taking no arguments has
+   * nothing but the subject to name, so "nothing in `[]int` is declared outside the library" is the
+   * whole truth and is the more useful half of it — the reader is looking at that type. A trait
+   * that *does* take arguments has two places a local name could have gone, and a phrase naming
+   * only the `for` type would send a reader to the one the fix is less likely to be in.
    */
-  protected def subjectPhrase(homes: Set[Option[String]]): String =
-    if homes == Set(None) then s"nothing this block names is declared outside the library"
-    else s"it names only what ${homes.toList.map(whose).sorted.mkString(" and ")}"
+  protected def subjectPhrase(homes: Set[Option[String]], label: String, args: Boolean): String = {
+    val what = if args then "this block names" else s"in '$label'"
+
+    if homes == Set(None) then s"nothing $what is declared outside the library"
+    else if args then s"it names only what ${homes.toList.map(whose).sorted.mkString(" and ")}"
+    else s"'$label' names only what ${homes.toList.map(whose).sorted.mkString(" and ")}"
+  }
 
   /** Every module the **subject** of an `impl` belongs to: its own where it is a declared type, and
    * every one its parts belong to where it is composed (`reference/traits.md § Where an impl may

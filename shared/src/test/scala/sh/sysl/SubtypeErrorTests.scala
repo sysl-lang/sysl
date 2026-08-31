@@ -182,10 +182,16 @@ class SubtypeErrorTests extends AnyFreeSpec with CodegenSupport {
   "a derived type inherits behaviour it cannot replace" - {
     val Stamp = "type Stamp = new i64\ntype Span = new i64\n"
 
+    /** **Replacing** it is what is refused, and the block that does so is the one writing no
+      * arguments: `impl Add for Stamp` is the `Add[Stamp, Stamp]` the compiler already provides.
+      */
     "an operator implementation collides with the one the compiler provides" in {
-      err(Stamp + "impl Add[Span] for Stamp\n    add(self, s: Span) -> Stamp = self\nprint(1)") should
-        include("'add' is how 'Add' is implemented for Stamp, and the compiler provides that")
+      err(Stamp + "impl Add for Stamp\n    add(self, s: Stamp) -> Stamp = self\nprint(1)") should
+        include("'Stamp' already implements 'sysl.Add' — the compiler provides it")
     }
+
+    // A NEW argument list is not a replacement and IS writable, as of card `0385`. That case is
+    // in `SubtypeOperatorTests`, where there is a runtime to check it against.
 
     "and so does any other row of the catalog" in {
       err(Stamp + "impl Display for Stamp\n    display(self, out: *Writer, fmt: FormatSpec)\n" +

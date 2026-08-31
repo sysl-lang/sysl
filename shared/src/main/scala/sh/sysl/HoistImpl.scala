@@ -230,7 +230,7 @@ trait HoistImpl extends ImplTarget {
     // Last of the checks about the block as a whole, because every one above it is more specific:
     // a block with no home is often also one the library has already written, and being told which
     // implementation already covers the type is the more useful half of that.
-    checkCoherence(impl)
+    checkCoherence(impl, outer.label)
 
     // The first implementation of a trait for a type files its members under the names they were
     // written with; each one after it under names that differ, since a type's members are one
