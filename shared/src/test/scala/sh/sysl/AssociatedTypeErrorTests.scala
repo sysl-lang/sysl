@@ -261,6 +261,30 @@ class AssociatedTypeErrorTests extends AnyFreeSpec with CodegenSupport {
             |print(1)""".stripMargin,
       ) should include("implements no trait declaring the associated type 'Item'")
     }
+
+    /** The same refusal from a **struct field**, which is the road card `0384` opened: a field is
+      * resolved before any `impl` block is hoisted, so it answers off the declarations instead —
+      * and it has to answer *nothing* for a type no block is written for. Without this, the
+      * projection would be reported at whichever body first read the field rather than at the
+      * declaration that is wrong, or not at all.
+      */
+    "and the same from a field, which is answered off the declarations" in {
+      err(
+        seq +
+          """struct Box
+            |    v: int
+            |struct Other
+            |    v: int
+            |impl Seq for Box
+            |    type Item = string
+            |    head(self) -> Self::Item = "s"
+            |struct Cell[C: Seq]
+            |    v: C::Item
+            |struct Holder
+            |    inner: Cell[Other]
+            |print(1)""".stripMargin,
+      ) should include("implements no trait declaring the associated type 'Item'")
+    }
   }
 
   "two traits cannot bring one associated-type name to one type" in {

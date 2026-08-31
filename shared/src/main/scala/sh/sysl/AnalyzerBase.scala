@@ -446,6 +446,7 @@ trait AnalyzerBase extends Scoping {
   // called across the feature traits, so they are declared abstract here for the traits to see.
 
   protected def resolveBound(b: BoundRef, subst: Map[String, Type]): Type.Bound
+  protected def resolveType(t: TypeRef, subst: Map[String, Type]): Type
   protected def selfBinding(t: Type): Map[String, Type]
   protected def substParams(t: Type, subst: Map[String, Type]): Type
 

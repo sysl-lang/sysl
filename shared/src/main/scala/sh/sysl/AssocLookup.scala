@@ -168,7 +168,8 @@ trait AssocLookup { this: TraitLookup =>
         Left(s"no trait declares an associated type '$member', so '${show(t)}::$member' names " +
           s"nothing — a trait declares one with 'type $member: …' among its members")
       case Nil =>
-        Left(s"${show(t)} implements no trait declaring the associated type '$member' — " +
+        declaredAssoc(t, member, keys).toRight(
+          s"${show(t)} implements no trait declaring the associated type '$member' — " +
           s"${quantity(names.length, "trait")} ${if names.length == 1 then "declares" else "declare"} " +
           s"one (${names.map(qn).mkString(", ")}), and this type implements none of them")
       case one :: Nil =>
@@ -187,6 +188,69 @@ trait AssocLookup { this: TraitLookup =>
         Left(s"'$member' is declared by ${many.map(qn).mkString(" and ")}, and ${show(t)} implements " +
           s"more than one of them — an associated type is named without its trait, so a type may " +
           s"have at most one of any name")
+  }
+
+  /** The same question answered off the **`impl` declarations** rather than off the table
+   * `hoistImpl` fills, for the window in which the table does not exist yet — which is card `0384`.
+   *
+   * **A struct's fields are resolved before any `impl` block is hoisted, and a field may name a
+   * projection.** A non-generic type is instantiated eagerly so that it is emitted whether or not
+   * anything uses it, and that pass runs where it does because `concrete` reads its answer: a
+   * member's `Self` and an `impl`'s subject are both the instantiation, so the blocks below cannot
+   * be hoisted until it exists. So `struct Sha256` holding a `Sha[Sha2Narrow]` asked what
+   * `Sha2Narrow::W` was of an empty table, and was told the type implemented no trait declaring a
+   * `W` — pointing at the generic's own field, and naming a type whose `impl` stands three lines
+   * below its own. A **generic** type had nothing wrong with it, since it is instantiated by
+   * whatever first asks for one and that is always later than this.
+   *
+   * What breaks the circle is that an `impl`'s `type W = u32` is a **declaration**, and needs none
+   * of what the block is hoisted *for*: the subject's key is the name it was declared under
+   * (`implTarget` says so in as many words), and the supplied type is a reference resolved in the
+   * block's own file. Neither waits on conformance, coherence, or a member being lowered.
+   *
+   * **It answers only where the ordinary road found nothing and only before the table is filled**,
+   * so it can neither shadow an implementation nor change a diagnostic anything already gave.
+   *
+   * A **generic** block is read the same way, since `Cell[Wrap[int]]` is the same case one type
+   * argument deeper: what the block supplies is a promise about a particular subject, so the
+   * block's own parameters stand at the type's arguments and the substitution is the one
+   * `implAssoc` makes from a filed block. The pairing is `implArgs`', read here without reporting —
+   * a block whose arguments are not its own parameters, one per parameter, is one `hoistImpl`
+   * refuses, and answering nothing leaves it to say so.
+   */
+  private def declaredAssoc(t: Type, member: String, keys: List[(String, List[Type])]): Option[Type] = {
+    /** The key a block is filed under, and the block's parameter standing at each of the type's
+      * arguments. `implTarget` says the key is the name the subject was declared under, which is
+      * exactly what makes this answerable with nothing hoisted.
+      */
+    def subject(i: ImplDecl): Option[(String, List[String])] = i.forType match
+      case NamedType(written, argRefs) =>
+        val names = argRefs.collect { case NamedType(n, Nil) if i.tparams.contains(n) => n }
+
+        typeKey(written)
+          .flatMap(k => structDecls.get(k).map(_.tparams).orElse(enumDecls.get(k).map(_.tparams)).map(k -> _))
+          .collect {
+            case (k, tps) if tps.length == argRefs.length && names.length == argRefs.length &&
+              names.distinct.length == i.tparams.length => (k, names)
+          }
+      case _ => None
+
+    def supplied =
+      for
+        (scope, i)     <- implDecls.toList
+        (key, params)  <- inScope(scope)(subject(i)).toList
+        (owner, targs) <- keys if owner == key && targs.length == params.length
+        name           <- inScope(scope)(traitKey(i.traitName)).toList
+        decl           <- traitDecls.get(name).toList if decl.assocs.exists(_.name == member)
+        written        <- i.assocs.find(_.name == member).toList
+      yield inScope(scope)(resolveType(written.typ, params.zip(targs).toMap ++ selfBinding(t)))
+
+    // Silent where two blocks would answer differently, exactly as `blanketAssoc` is: the block
+    // that creates the collision is refused when it is hoisted, and saying so here would report it
+    // against whoever wrote the projection instead.
+    if implsHoisted then None else supplied.distinct match
+      case ty :: Nil => Some(ty)
+      case _         => None
   }
 
   /** `T::Item` — the associated type, or the diagnostic saying why there is none. */

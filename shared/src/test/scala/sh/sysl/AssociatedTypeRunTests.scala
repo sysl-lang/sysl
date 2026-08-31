@@ -532,4 +532,112 @@ class AssociatedTypeRunTests extends AnyFreeSpec with RunSupport {
       run(src) shouldBe "5 5\n"
     }
   }
+
+  /** A projection asked while the `impl` blocks are still being hoisted — card `0384`.
+   *
+   * A **non-generic** type is instantiated eagerly, so that it is emitted whether or not anything
+   * uses it, and that pass runs before any `impl` block is hoisted because the blocks read its
+   * answer. So a field naming a generic applied to a concrete type asked what that type's
+   * associated type was of a table that did not exist yet, and was told the type implemented no
+   * trait declaring one — pointing at the generic's own field, three lines above the `impl` that
+   * plainly supplies it.
+   *
+   * **A generic holder never reproduced it**, which is what made it look like a defect in the
+   * projection rather than in the ordering: a generic type is instantiated by whatever first asks
+   * for one, and that is always after the blocks are in.
+   */
+  "a generic instantiated in a struct field sees the impl supplying its associated type" - {
+
+    /** The shape `sysl.crypto`'s hashers are: a wrapper holding one `Sha[C]`, whose own field is an
+      * array of `C::W`.
+      */
+    "a field holding a generic applied to a concrete type" in {
+      val src =
+        """trait Comp
+          |    type W: Add
+          |    step(h: *[4]Self::W)
+          |struct Machine[C: Comp]
+          |    h: [4]C::W
+          |    run(*self) -> C::W
+          |        C.step(&self.h)
+          |        self.h[0]
+          |struct Narrow
+          |end Narrow
+          |impl Comp for Narrow
+          |    type W = u32
+          |    step(h: *[4]u32) = h[0] += h[1]
+          |struct Wrapper
+          |    inner: Machine[Narrow]
+          |var w = Wrapper(Machine([7; 4]))
+          |print(w.inner.run())""".stripMargin
+
+      run(src) shouldBe "14\n"
+    }
+
+    /** The `impl` written **below** the field that reads it, which is the ordering the defect was
+      * about: hoisting is what makes a declaration usable before it appears, and this is the one
+      * road on which it was not.
+      */
+    "the impl may be written below the type whose field reads it" in {
+      val src =
+        """struct Holder
+          |    inner: Cell[Tag]
+          |struct Cell[C: Named]
+          |    v: C::Label
+          |    show(self) -> C::Label = self.v
+          |trait Named
+          |    type Label: Display
+          |struct Tag
+          |end Tag
+          |impl Named for Tag
+          |    type Label = string
+          |print(Holder(Cell("hi")).inner.show())""".stripMargin
+
+      run(src) shouldBe "hi\n"
+    }
+
+    /** The block supplying it is **generic**, so the answer is one type per instantiation and the
+      * block's own parameter is what stands at the subject's argument — the substitution a filed
+      * block is read under, made here from the declaration.
+      */
+    "a generic impl block supplies it, at the argument the field fixed" in {
+      val src =
+        """trait Named
+          |    type Label: Display
+          |struct Wrap[T: Display]
+          |    v: T
+          |impl[T: Display] Named for Wrap[T]
+          |    type Label = T
+          |struct Cell[C: Named]
+          |    v: C::Label
+          |struct Holder
+          |    inner: Cell[Wrap[int]]
+          |print(Holder(Cell(4)).inner.v)""".stripMargin
+
+      run(src) shouldBe "4\n"
+    }
+
+    /** An **enum** eagerly instantiated for the same reason, so that the fix is not about structs.
+      */
+    "a variant may carry one too" in {
+      val src =
+        """trait Named
+          |    type Label: Display
+          |struct Cell[C: Named]
+          |    v: C::Label
+          |struct Tag
+          |end Tag
+          |impl Named for Tag
+          |    type Label = int
+          |enum Slot
+          |    Empty
+          |    Full(cell: Cell[Tag])
+          |val s = Slot.Full(Cell(9))
+          |print(s match
+          |    Full(c) -> c.v
+          |    Empty -> 0)""".stripMargin
+
+      run(src) shouldBe "9\n"
+    }
+  }
 }
