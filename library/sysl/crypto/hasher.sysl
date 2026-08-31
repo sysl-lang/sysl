@@ -118,15 +118,20 @@ private[crypto] struct Sha[C: Compression]
     // Appends the one bit, the zeroes, and the message length in bits, then publishes as much of
     // the state as this digest is defined to publish.
     //
-    // **The length field is eight bytes for every member here**, SHA-512's included: it is defined
-    // as sixteen there, and `total` is a `u64`, so the high eight are the zeroes the padding already
-    // wrote and a message long enough to disagree cannot be counted in the first place.
+    // **The length FIELD is two words and the length VALUE is eight bytes, and the two are not the
+    // same number.** SHA-512 reserves sixteen bytes for it where SHA-1 and SHA-256 reserve eight;
+    // `total` is a `u64` either way, so the high eight of SHA-512's are zeroes the padding writes
+    // and a message long enough to disagree cannot be counted in the first place. Reserving eight
+    // everywhere is wrong only at the boundary — a 112-byte message under SHA-512 then puts the
+    // 0x80 into the first byte of its own length field — which is why the field's width is what the
+    // test below is written against.
     finish(*self, digest: []u8) -> Result[unit, Fault]
         if self.dlen == 0 then return Err(NotStarted)
         if digest.len < self.dlen then return Err(DigestTooSmall)
 
         var bs = C.block_bytes()
         var wl = C.word_bytes()
+        var lb = wl * 2
         var nbits = self.total * 8
 
         self.block[self.used] = 0x80
@@ -134,7 +139,7 @@ private[crypto] struct Sha[C: Compression]
 
         // Where the length will not fit under the padding, this block goes out full of zeroes and
         // the length lands in the next one.
-        if self.used + 8 > bs
+        if self.used + lb > bs
             while self.used < bs
                 self.block[self.used] = 0
                 self.used += 1
