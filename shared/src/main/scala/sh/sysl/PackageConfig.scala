@@ -88,6 +88,14 @@ object Allocator {
  * `requires` are parsed and checked so that a file naming them is held to spelling them correctly,
  * and `dependencies` says what to fetch and what to call it (`§ 2`, `§ 3`).
  */
+/** What one `requires { headers { … } }` entry declares: the prose a consumer is shown, and the
+ * environment variable the ecosystem conventionally keeps the path in.
+ *
+ * The bare-string form of the entry is this with `env = None`, so a manifest written before this
+ * existed means exactly what it always meant.
+ */
+case class HeaderReq(why: String, env: Option[String] = None)
+
 case class PackageConfig(
     name: Option[String] = None,
     version: Option[String] = None,
@@ -95,7 +103,7 @@ case class PackageConfig(
     targets: Map[String, TargetConfig] = Map.empty,
     capabilities: Map[String, Boolean] = Map.empty,
     requires: Set[String] = Set.empty,
-    headers: Map[String, String] = Map.empty,
+    headers: Map[String, HeaderReq] = Map.empty,
     pkgConfig: Map[String, String] = Map.empty,
     dependencies: List[Dependency] = Nil,
     /** What this package's own tests need and its consumers do not
@@ -442,14 +450,22 @@ object PackageConfig {
    * not carry, each under a name the consumer satisfies with `--include-path <name>=<dir>`
    * (`reference/packages.md § Capabilities`).
    *
-   * ==A name, never a path==
+   * ==A name, never a path — and, since 0391, the NAME of a variable==
    *
    * `reference/ffi.md § @link` refuses a path here in as many words: the file is committed and
    * describes the *package*, and where a prefix lives on somebody's laptop is not a property of the
-   * package. It refuses an environment variable for the same reason `reference/packages.md § No
-   * build scripts, ever` refuses build scripts — a build that reads the consumer's shell is one
-   * that works for whoever wrote it. So what a package may say is *which* headers it needs;
-   * **where** they are stays the driver's question, exactly as it is for `@link` and `--link-path`.
+   * package. That half is unchanged and is the whole of why an `env` is allowed.
+   *
+   * **This paragraph used to refuse an environment variable too**, on the grounds that a build
+   * reading the consumer's shell is one that works for whoever wrote it. What that missed is that a
+   * variable's *name* is not a path: `PICO_SDK_PATH` is the same string on every machine in the
+   * world, it is what the pico-sdk's own CMake reads, and this file already named it in prose inside
+   * the `note`. Carrying it as data mechanises a sentence that was written down anyway.
+   *
+   * It also cannot turn a working build into a differently-working one, which is the objection that
+   * would have bitten: an `env` is consulted **only** where no `--include-path` supplied the name,
+   * and where it is unset the build stops exactly as it did before. So it converts a refusal into a
+   * success and never one success into another.
    *
    * ==The value is the reason, and it is what makes the refusal worth having==
    *
@@ -457,20 +473,67 @@ object PackageConfig {
    * guess what that is and where it lives. The string is quoted back at them instead, so the build
    * that stops says what to go and find. It is prose for a person and nothing reads it as data.
    */
-  private def readHeaders(section: Option[ConfigObject]): Either[String, Map[String, String]] =
+  private def readHeaders(section: Option[ConfigObject]): Either[String, Map[String, HeaderReq]] =
     section.flatMap(s => block2(s, HeadersKey)) match
       case None => Right(Map.empty)
       case Some(headers) =>
         collect(headers.fields.toList.sortBy(_._1)) { (name, value) =>
           value match
-            case ConfigString(why) if why.trim.nonEmpty => checkHeaderName(name).map(_ => name -> why)
+            case ConfigString(why) if why.trim.nonEmpty =>
+              checkHeaderName(name).map(_ => name -> HeaderReq(why, None))
             case ConfigString(_) =>
               Left(s"$FileName: 'requires.$HeadersKey.$name' says nothing about what it needs — the " +
                 "text is quoted back at whoever has to supply the path, so an empty one helps nobody")
+            case o: ConfigObject => readHeaderObject(name, o)
             case _ =>
               Left(s"$FileName: 'requires.$HeadersKey.$name' must be a string saying what these " +
-                "headers are and where they come from")
+                "headers are and where they come from, or a block with a 'note' and the 'env' the " +
+                "path conventionally lives in")
         }.map(_.toMap)
+
+  /** The long form of a `headers` entry: the prose, plus the environment variable the ecosystem
+   * conventionally keeps this path in.
+   *
+   * **`note` is required and `env` is optional**, which is the way round that keeps the refusal
+   * worth reading: a consumer who has neither the variable set nor a flag to hand is shown the
+   * prose, and a block that supplied only a variable name would leave them with nothing to go and
+   * look for on a machine where it is unset.
+   */
+  private def readHeaderObject(name: String, o: ConfigObject): Either[String, (String, HeaderReq)] = {
+    val where = s"'requires.$HeadersKey.$name'"
+
+    def str(key: String): Either[String, Option[String]] = o.fields.toMap.get(key) match
+      case None                                     => Right(None)
+      case Some(ConfigString(v)) if v.trim.nonEmpty => Right(Some(v))
+      case Some(ConfigString(_))                    => Left(s"$FileName: $where's '$key' is empty")
+      case Some(_)                                  => Left(s"$FileName: $where's '$key' must be a string")
+
+    val known = Set("note", "env")
+
+    for
+      _    <- o.fields.map(_._1).find(!known.contains(_))
+                .map(k => Left(s"$FileName: $where has no '$k' — a headers block takes 'note' and 'env'"))
+                .getOrElse(Right(()))
+      note <- str("note")
+      env  <- str("env")
+      _    <- checkHeaderName(name)
+      n    <- note.toRight(s"$FileName: $where needs a 'note' saying what these headers are and " +
+                "where they come from — it is what a consumer without the variable set is shown")
+      _    <- env.filter(!isEnvName(_))
+                .map(e => Left(s"$FileName: $where's 'env' is '$e', which is not the name of an " +
+                  "environment variable — letters, digits and '_', not starting with a digit"))
+                .getOrElse(Right(()))
+    yield name -> HeaderReq(n, env)
+  }
+
+  /** Whether a string is the name of an environment variable rather than a path or a value.
+   *
+   * Checked for the same reason a `headers` name and a `.pc` name are: what the manifest carries has
+   * to be tellable from what it must never carry. A directory holds a separator and a variable's
+   * name does not, so the refusal can say which mistake was made.
+   */
+  private def isEnvName(s: String): Boolean =
+    s.nonEmpty && !s.head.isDigit && s.forall(c => c.isLetterOrDigit || c == '_')
 
   /** The `pkg_config` sub-block of `requires` — the installed libraries this package binds, each
    * under the name `pkg-config` files it as (`reference/packages.md § Capabilities`).

@@ -389,7 +389,8 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
         """requires {
           |  headers { lwip = "lwIP's headers, from the pico-sdk" }
           |}
-          |""".stripMargin).headers shouldBe Map("lwip" -> "lwIP's headers, from the pico-sdk")
+          |""".stripMargin).headers shouldBe
+        Map("lwip" -> HeaderReq("lwIP's headers, from the pico-sdk", None))
     }
 
     // The two kinds of requirement share the block, so each has to survive the other being there.
@@ -426,6 +427,49 @@ class PackageConfigTests extends AnyFreeSpec with Matchers {
 
     "and a path where the reason belongs is refused as the wrong kind of thing" in {
       refused("""requires { headers { lwip = true } }""") should include("must be a string")
+    }
+
+    /** The long form: the prose, plus the environment variable the ecosystem keeps the path in.
+     *
+     * **A variable's NAME is not a path**, which is the whole of why this may be in a committed
+     * file when a directory may not: `PICO_SDK_PATH` is the same string on every machine, and it is
+     * what the pico-sdk's own CMake reads.
+     */
+    "may name the environment variable the path conventionally lives in" in {
+      read(
+        """requires {
+          |  headers {
+          |    pico_sdk = { note = "the pico-sdk's headers", env = "PICO_SDK_PATH" }
+          |  }
+          |}
+          |""".stripMargin).headers shouldBe
+        Map("pico_sdk" -> HeaderReq("the pico-sdk's headers", Some("PICO_SDK_PATH")))
+    }
+
+    // The `note` is what a consumer *without* the variable set is shown, so a block that gave only a
+    // variable name would leave them nothing to go and look for -- which is the one case this whole
+    // requirement exists to serve.
+    "but the note is still required, because it is what an unset variable falls back to" in {
+      refused("""requires { headers { pico_sdk = { env = "PICO_SDK_PATH" } } }""") should
+        include("needs a 'note'")
+    }
+
+    "and the env is optional, so a block may carry only a note" in {
+      read("""requires { headers { lwip = { note = "lwIP's headers" } } }""").headers shouldBe
+        Map("lwip" -> HeaderReq("lwIP's headers", None))
+    }
+
+    // A directory holds a separator and a variable's name does not, so the refusal can say which
+    // mistake was made -- which matters because putting a *path* here is exactly the mistake the
+    // manifest refuses everywhere else.
+    "a path where the variable's name belongs is refused as what it is" in {
+      refused("""requires { headers { pico_sdk = { note = "why", env = "/opt/pico-sdk" } } }""") should
+        include("not the name of an environment variable")
+    }
+
+    "a key the block does not have is refused rather than ignored" in {
+      refused("""requires { headers { pico_sdk = { note = "why", path = "/opt" } } }""") should
+        include("no 'path'")
     }
   }
 

@@ -160,7 +160,21 @@ case class Config(
     emitWhyML: Boolean = false,
     /** `prove --overflow` — whether staying in an integer's range is a proof obligation. */
     overflow: String = "check",
-)
+) {
+
+  /** The same config with header requirements an environment variable answered folded in, exactly as
+   * `--include-path <name>=<dir>` would have.
+   *
+   * **Both fields, because they do different jobs**: `namedIncludes` is what a requirement is
+   * checked against, and `includePaths` is what reaches the C compiler. Adding to only the first
+   * gives a build that passes its own check and then fails inside clang.
+   */
+  def withNamedIncludes(found: List[(String, String)]): Config =
+    if found.isEmpty then this
+    else
+      copy(includePaths = includePaths ::: found.map(_._2),
+           namedIncludes = namedIncludes ++ found)
+}
 
 /** The option grammar, held apart from the entry point so that a test can ask what an argument list
  * parses to. The alternative is a suite that builds a `Config` by hand and so never finds out

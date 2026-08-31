@@ -227,7 +227,7 @@ private def collectPackages(graph: Resolve.Graph, os: Os): Either[String, Packag
           Packages(owned, graph.packages.map(p => p.canonical -> p.imports).toMap),
           fetched.map(_.root),
           fetched.flatMap(p =>
-            p.config.headers.toList.sortBy(_._1).map((name, why) => HeaderNeed(p.canonical, name, why))),
+            p.config.headers.toList.sortBy(_._1).map((name, h) => HeaderNeed(p.canonical, name, h.why, h.env))),
           fetched.flatMap(p =>
             p.config.pkgConfig.toList.sortBy(_._1).map((mod, why) => LibNeed(p.canonical, mod, why))),
           fetched.flatMap(p => p.config.allocator.map(p.canonical -> _)),

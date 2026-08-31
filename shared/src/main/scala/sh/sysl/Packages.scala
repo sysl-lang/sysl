@@ -69,8 +69,13 @@ case class Packages(of: Map[Source, String] = Map.empty, imports: Map[String, Ma
  * `who` is the package's coordinate rather than its module name, because that is what a consumer
  * wrote in their `dependencies` block and therefore what they can go and look at. `why` is the
  * package's own prose and is quoted rather than summarised.
+ *
+ * `env` is the environment variable the ecosystem conventionally keeps this path in, where there is
+ * one — `PICO_SDK_PATH` for the pico-sdk. **A variable's NAME is not a path**: it is the same on
+ * every machine in the world, which is what makes it a property of the package rather than of
+ * whoever is building it, and is why the manifest may carry it when it may not carry a directory.
  */
-case class HeaderNeed(who: String, name: String, why: String)
+case class HeaderNeed(who: String, name: String, why: String, env: Option[String] = None)
 
 /** One package's declared need of an **installed library**, under the name `pkg-config` files it as
  * (`reference/packages.md § Capabilities`).

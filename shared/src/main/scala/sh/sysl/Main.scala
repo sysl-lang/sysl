@@ -76,7 +76,11 @@ private[sysl] def execute(asked: Config): Int = {
   // anywhere special, so everything downstream — the manifest's own `dependencies`, the C it
   // carries, the search paths — is what a `--lib` already gets, and a caller who wrote `--lib`
   // themselves is unaffected because a root named twice is one root.
-  val cfg =
+  // **Rebindable, because a header requirement may be answered by an environment variable the
+  // package named and that answer is not known until the manifest has been read.** Folding it into
+  // the config is what makes every path below — the requirement check, clang's command line, a
+  // dependency's own C — see it exactly as it sees a `--include-path`.
+  var cfg =
     owningPackage(asked.file) match
       case Some(pkg) if !asked.libs.contains(pkg) => asked.copy(libs = asked.libs :+ pkg)
       case _                                      => asked
@@ -386,6 +390,8 @@ private[sysl] def execute(asked: Config): Int = {
     // — a `--lib` source root's C is not, because that root's C belongs in that root's own artifact,
     // and a `dependencies` block is refused outright a few lines into `buildLibrary` rather than
     // fetched. Charging for either would be charging for a header this command will never open.
+    cfg = cfg.withNamedIncludes(envHeaders(ownHeaderNeeds(project), cfg.namedIncludes.keySet))
+
     unmetHeaders(project, Nil, cfg.namedIncludes.keySet) match
       case Some(err) => return fail(err)
       case None      => ()
@@ -514,6 +520,12 @@ private[sysl] def execute(asked: Config): Int = {
     val fromLibs = libHeaderNeeds(roots) match
       case Left(err)    => return fail(err)
       case Right(needs) => needs
+
+    // **The dependencies' needs are in here too, not only this project's.** A program depending on
+    // `pico2` never writes that requirement down itself, so resolving only the project's own would
+    // leave the one case this exists for unanswered.
+    cfg = cfg.withNamedIncludes(
+      envHeaders(ownHeaderNeeds(project) ::: fetched.needs ::: fromLibs, cfg.namedIncludes.keySet))
 
     unmetHeaders(project, fetched.needs ::: fromLibs, cfg.namedIncludes.keySet) match
       case Some(err) => return fail(err)
@@ -877,7 +889,7 @@ private def libHeaderNeeds(roots: List[String]): Either[String, List[HeaderNeed]
     for
       seen   <- acc
       config <- readPackageConfig(root)
-    yield seen ::: config.headers.toList.sortBy(_._1).map((name, why) => HeaderNeed(root, name, why))
+    yield seen ::: config.headers.toList.sortBy(_._1).map((name, h) => HeaderNeed(root, name, h.why, h.env))
   }
 
 /** What the `--lib` **source roots** declare they need an installed library for
@@ -955,6 +967,15 @@ private def probeLibs(needs: List[LibNeed], supplied: Set[String], target: Targe
     }
 }
 
+/** This project's own header requirements, in the order they were declared.
+ *
+ * Named rather than inlined because two things ask for them and they must agree: the refusal, and
+ * the environment-variable resolution that runs just before it. A resolution over a different list
+ * from the check would answer a requirement nothing was going to ask about, or miss one that was.
+ */
+private def ownHeaderNeeds(project: PackageConfig): List[HeaderNeed] =
+  project.headers.toList.sortBy(_._1).map((name, h) => HeaderNeed("this project", name, h.why, h.env))
+
 /** The header requirements nothing on this command line answered, as the one line a build stops on
  * (`reference/packages.md § Capabilities`).
  *
@@ -978,14 +999,47 @@ private def probeLibs(needs: List[LibNeed], supplied: Set[String], target: Targe
  */
 private def unmetHeaders(project: PackageConfig, fromPackages: List[HeaderNeed],
                          supplied: Set[String]): Option[String] = {
-  val own  = project.headers.toList.sortBy(_._1).map((name, why) => HeaderNeed("this project", name, why))
-  val need = own ::: fromPackages
+  val need = ownHeaderNeeds(project) ::: fromPackages
 
   need.find(n => !supplied.contains(n.name)).map { n =>
-    s"${n.who} needs the '${n.name}' headers and nothing supplied them — ${n.why}. Say where they " +
-      s"are with '--include-path ${n.name}=<dir>'"
+    // **Where the package named a variable, that is the thing to say first.** Setting it is done
+    // once and answers every build in that tree; the flag is what somebody types every time. A
+    // reader who has arrived here has neither, so they are owed both and in that order.
+    val how = n.env match
+      case Some(v) =>
+        s"Set $v, which is where this package's own ecosystem looks for it, or say where they are " +
+          s"with '--include-path ${n.name}=<dir>'"
+      case None =>
+        s"Say where they are with '--include-path ${n.name}=<dir>'"
+
+    s"${n.who} needs the '${n.name}' headers and nothing supplied them — ${n.why}. $how"
   }
 }
+
+/** The header requirements answered by an environment variable the package named, as the include
+ * paths a `--include-path` would have added.
+ *
+ * ==Why this is not reading the consumer's shell==
+ *
+ * `reference/packages.md § No build scripts, ever` refuses a build that behaves differently because
+ * of the environment it was started in, and this does not do that. **A variable is consulted only
+ * where nothing on the command line named that requirement**, and where it is unset the build stops
+ * with the refusal it stopped with before — so the environment can turn a failure into a success and
+ * can never turn one success into a different one. An explicit flag wins, always, which is what
+ * makes a one-off override possible.
+ *
+ * ==An empty variable is unset==
+ *
+ * `PICO_SDK_PATH=` in a shell profile is somebody clearing it, not somebody naming the root
+ * directory. Treating it as a path would hand clang an empty `-I` and fail somewhere with no
+ * connection to the variable.
+ */
+private def envHeaders(needs: List[HeaderNeed], supplied: Set[String],
+                       lookup: String => Option[String] = envVar): List[(String, String)] =
+  needs
+    .filterNot(n => supplied.contains(n.name))
+    .flatMap(n => n.env.flatMap(lookup).map(_.trim).filter(_.nonEmpty).map(n.name -> _))
+    .distinctBy(_._1)
 
 /** Whether a subcommand is producing something a **C project** links, which is what decides that
  * the module is emitted with no entry point (`reference/ffi.md § @export`).
