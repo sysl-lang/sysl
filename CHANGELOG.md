@@ -7,6 +7,118 @@ copy -- correct a mistake there and regenerate, rather than editing this file. V
 `MAJOR.MINOR.PATCH`; while the leading zero stands the language is still moving, and a release may
 change what an existing program means. Where it does, the release says so.
 
+## 0.0.96 — 2026-08-31
+
+Two cards, and together they are the other half of 0.0.95's headline. A scalar may sit on the left
+of an operator — unless the type on the right is generic, which is every type a library writes, and
+unless you want one block to cover every integer width at once.
+
+### A scalar goes on the left of a generic subject too
+
+0.0.95 widened the orphan rule to count a trait's **arguments**, so `impl Mul[Point, Point] for real`
+has a home in the module declaring `Point`. The very next check took it back whenever the block was
+generic. It asked whether a written trait argument *mentioned* the subject's name rather than whether
+it *was* the subject, so this was refused:
+
+```sysl
+struct Box[T]
+    v: T
+
+struct Pair[T]
+    a: T
+
+impl[T] Mul[Box[Pair[T]], Box[Pair[T]]] for Pair[T]
+    mul(self, b: Box[Pair[T]]) -> Box[Pair[T]] = b
+```
+
+```
+error: 'Box[Pair[T]]' is a Pair, and a 'sysl.Mul' whose arguments default names the type it is
+written for — so at one Pair this block and a defaulted one would promise the same thing
+```
+
+`Box[Pair[T]]` is a `Box`. A defaulted argument list on this subject is `Pair[T]`, and there is no
+instantiation at which the two are one type — so there was nothing to choose between and nothing to
+refuse. Containment is not overlap.
+
+The check now asks the argument for its own owner key. `impl[T] Mul[Box[int]] for Box[T]` — the case
+the rule exists for, which really does collide with a defaulted `Box[T]` at `T = int` — is refused
+exactly as before.
+
+**What it cost was the packages, which is where a generic type actually lives.** `linalg`'s elements
+are `real`, `f32`, `int` and `Complex[F]`; only the fourth is generic, so three quarters of a scalar
+on the left was writable and the quarter the package is generic *for* was not.
+
+### A count goes on either side of a duration
+
+The sweep 0.0.95 owed its own library. `sysl.time` carried a docstring saying `2 * d` could never be
+written, which had stopped being true one release earlier.
+
+```sysl
+import sysl.time.*
+
+var d = seconds(3i64)
+
+print(whole_seconds(d * 3), whole_seconds(2 * d))
+```
+
+**The two sides are two blocks, because they do not type a literal the same way.** `d * 3` reads its
+`3` off the parameter it is passed to, so a count on the right arrives as a `long` whatever the
+reader wrote. `2 * d` has nothing to read it off — the literal is an `int` before the operator is
+looked at — so the left-hand side is a block of its own.
+
+### A blanket over the integers covers every width, and hides none of their own
+
+That left-hand block is written once, over the whole family, rather than once per width:
+
+```sysl
+impl[N: Integer] Mul[Duration, Duration] for N
+    mul(self, d: Duration) -> Duration = d * long(self)
+```
+
+`Integer` is a bound the compiler closes — every `iN` and `uN` is in it, an open family of arbitrary
+widths, and nothing a program declares can join — which is what lets one block stand for all of it.
+
+**Writing that was accepted before this release and it was not safe.** A blanket is filed under its
+bound's key rather than under any type's, so the question every other block is asked — *does the
+compiler already provide this member?* — was put to a subject that is not a type, and answered no.
+The block then took the plain `mul`, and an integer's own multiplication reached by name stopped
+compiling in **every** program, whether or not it mentioned the block:
+
+```
+error: 'd' of 'bound.sysl$Integer.mul.int' is Duration, but int was given
+```
+
+The operator was never affected. Only `5.mul(2)` was, which is the spelling nothing in a working
+program uses and every core-trait test does.
+
+The family is what gets asked now, so a blanket over the integers is the second implementation it
+always was and takes a suffix exactly as `impl Mul[Point, Point] for real` does. What it buys over a
+block per width is the narrow count on the left:
+
+```sysl
+import sysl.time.*
+
+var d = seconds(3i64)
+var w: u8 = 4
+
+print(whole_seconds(w * d))
+```
+
+```
+12
+```
+
+A blanket writing **no** arguments is refused, which is the same predicate the other way round:
+`impl[N: Integer] Mul for N` is the implementation the compiler already provides. That one is
+reachable only from inside the library — a program's own attempt has no home and is refused a step
+earlier — and its refusal used to name the block's type *parameter*, which is the one thing a reader
+cannot act on. It names the family.
+
+### Nothing else changes
+
+No syntax moved, nothing was removed, and every program that compiled under 0.0.95 compiles here.
+This release only accepts more.
+
 ## 0.0.95 — 2026-08-31
 
 Five cards, and four of them are one feature seen from four sides: an **associated type** is a thing
