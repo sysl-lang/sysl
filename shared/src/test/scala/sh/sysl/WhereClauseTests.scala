@@ -83,6 +83,25 @@ class WhereClauseTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       )
     }
 
+    /** The two spellings are one bound map, so a declaration may use both — which is what makes the
+      * choice per *bound* rather than per declaration: the short obvious constraint stays in the
+      * brackets and the long one that would crowd the signature goes below it. `reference/generics.md`
+      * says so, so it owes a case.
+      */
+    "the bracket list and a clause may bound the SAME parameter between them" in {
+      bothWays(
+        inline = """same[T: Eq + Display](a: T, b: T) -> string =
+                   |    if a == b then str(a) else "different"
+                   |print(same(3, 3))
+                   |print(same(3, 4))""".stripMargin,
+        clause = """same[T: Eq](a: T, b: T) -> string where T: Display =
+                   |    if a == b then str(a) else "different"
+                   |print(same(3, 3))
+                   |print(same(3, 4))""".stripMargin,
+        want = "3\ndifferent\n",
+      )
+    }
+
     "an enum takes one" in {
       bothWays(
         inline = """enum Slot[T: Display]
