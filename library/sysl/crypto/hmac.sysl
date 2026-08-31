@@ -3,7 +3,7 @@ module sysl.crypto
 
 import sysl.slices.copy
 
-// HMAC over any of the four, written once.
+// HMAC over any of the five, written once.
 //
 // The interesting part is not the construction — two hashes and two pads — but what it takes to
 // say "a hash function" here. A trait would be the obvious way, and it is the wrong one: an
@@ -15,8 +15,12 @@ import sysl.slices.copy
 // The tag is written into storage the caller owns, which is the same shape `Sha.finish` has and the
 // same reason: an HMAC is a fixed number of bytes the caller almost always already has somewhere to
 // put, and a function that allocated one would put this module behind an allocator for no gain.
-private[crypto] hmac[T: Word](proto: Sha[T], key: []const u8, msg: []const u8, tag: []u8) -> Result[unit, Fault]
-    var bs = proto.block_len()
+// **Generic over the compression rather than over the word width**, which is what lets one
+// implementation serve SHA-1 as well as the four SHA-2 digests: they compress differently and are
+// keyed identically, and `Compression` is the axis they differ on.
+private[crypto] hmac[C: Compression](proto: Sha[C], key: []const u8, msg: []const u8,
+        tag: []u8) -> Result[unit, Fault]
+    var bs = C.block_bytes()
     var n = proto.dlen
 
     if n == 0 then return Err(NotStarted)
@@ -58,7 +62,20 @@ private[crypto] hmac[T: Word](proto: Sha[T], key: []const u8, msg: []const u8, t
     outer.finish(tag[0..<n])
 end hmac
 
-// HMAC over each of the four, answering a tag the size of that digest.
+/** HMAC-SHA-1, answering a twenty-byte tag. A key longer than a block is replaced by its own
+ * digest; a shorter one is padded with zeroes.
+ *
+ * **This is a weaker warning than `sha1` carries, and deliberately so.** HMAC's security does not
+ * rest on the hash being collision resistant, so HMAC-SHA-1 is not broken the way SHA-1 is -- which
+ * is why RFC 6238 still specifies it as TOTP's default and why a great deal of deployed request
+ * signing still uses it. It is here to talk to those. A protocol being written now wants `hmac256`.
+ */
+hmac1(key: []const u8, msg: []const u8) -> [20]u8
+    var tag: [20]u8
+    hmac(new_sha1().inner, key, msg, tag[0..<20]).expect("a tag buffer sized from the hasher itself")
+    tag
+
+// HMAC over each of the four SHA-2 digests, answering a tag the size of that digest.
 //
 // A key longer than a block is replaced by its own digest; a shorter one is padded with zeroes.
 hmac224(key: []const u8, msg: []const u8) -> [28]u8

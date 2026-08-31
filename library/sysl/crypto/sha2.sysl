@@ -1,219 +1,129 @@
 module sysl.crypto
 @no_alloc
 
-import sysl.slices.copy
-
-// The half of SHA-2 that does not care how wide a word is.
+// SHA-2: four digests, two compressions, one implementation.
 //
-// The message schedule, the eighty-line round, the padding, the streaming buffer and the digest
-// are one implementation serving four functions. What varies is reached through the `Word` bound:
-// the width, the round count, the constant table and the four mixing functions. What varies per
-// *digest* rather than per width — the initial values, and how much of the state to publish — is
-// an argument, because SHA-224 and SHA-256 are the same word type and a type may implement a trait
-// once.
+// SHA-224 and SHA-256 are the same 32-bit compression started from different initial values and
+// truncated differently; SHA-384 and SHA-512 are the same 64-bit one. So the width is what a type
+// parameter carries, and the compression below is written once over the `Word` bound in
+// `words.sysl` — which is where everything that depends on how wide a word is lives: the round
+// count, the constant table and the four mixing functions.
+//
+// The buffering, the padding and the publication are not here at all: they are `Sha[C]` in
+// `hasher.sysl`, which SHA-1 shares.
 
-import sysl.math.Bits
+// One block into an eight-word state, for either width.
+//
+// The schedule is sized for the longer of the two round counts and only the first `rounds` entries
+// are ever read.
+private sha2_compress[T: Word](h: *[8]T, block: []const u8)
+    var wl = usize(T.width()) / 8
+    var n = T.word_rounds()
+    var w = [T.zero(); 80]
 
-enum Fault
-    NotStarted
-    DigestTooSmall
+    for i in 0..<16usize
+        var v = T.zero()
 
-    describe(self) -> string = self match
-        NotStarted -> "this hasher was never given its initial values"
-        DigestTooSmall -> "the digest does not fit in the space provided"
-end Fault
+        for j in 0..<wl do v = shift_in(v, block[i * wl + j])
 
-// The two directions of one byte, and the pair is symmetric now that a conversion may be written at
-// a type parameter: `T(b)` builds a word out of a byte and `u8(x)` takes one back out, both resolved
-// once the instantiation says what the width is. Bytes arrive most significant first, so a word is
-// built by shifting each one in from the bottom.
-private[crypto] shift_in[T: Word](x: T, b: u8) -> T = (x << 8) | T(b)
+        w[i] = v
 
-// The shift amount is converted because `Bits.width()` answers a `u32` while `Shr` on a `[T: Word]`
-// body shifts by `T` — a width is a count of bit positions and not a value of the type it measures,
-// which is the same reason `rotate_left` takes one.
-private[crypto] top_byte[T: Word](x: T) -> u8 = u8(x >> T(T.width() - 8))
+    for i in 16..<n
+        w[i] = w[i - 16] + w[i - 15].ssig0() + w[i - 7] + w[i - 2].ssig1()
 
-// Choose: wherever `x` has a one bit take `y`'s bit, elsewhere take `z`'s.
-private[crypto] ch[T: BitAnd + BitXor + Not](x: T, y: T, z: T) -> T = (x & y) ^ (~x & z)
+    var a = h[0]
+    var b = h[1]
+    var c = h[2]
+    var d = h[3]
+    var e = h[4]
+    var f = h[5]
+    var g = h[6]
+    var t = h[7]
 
-// Majority: each output bit is whichever value at least two of the three inputs agree on.
-private[crypto] maj[T: BitAnd + BitXor](x: T, y: T, z: T) -> T = (x & y) ^ (x & z) ^ (y & z)
+    for i in 0..<n
+        var t1 = t + e.bsig1() + ch(e, f, g) + T.round_key(i) + w[i]
+        var t2 = a.bsig0() + maj(a, b, c)
 
-// A hash in progress. The bound is written once, here, and every member inherits it — which is the
-// answer to the repetition the free functions above show, and the reason a container is a better
-// place to put a bound than a pile of functions is.
-private[crypto] struct Sha[T: Word]
-    h: [8]T
-    block: [128]u8
-    used: usize
-    total: u64
-    dlen: usize
+        t = g
+        g = f
+        f = e
+        e = d + t1
+        d = c
+        c = b
+        b = a
+        a = t1 + t2
 
-    // Three sizes, all of them the width in disguise: sixteen words to a block, a length field of
-    // two words, and a digest of eight. The width is a fact about `T`, and asking `T` for it is what
-    // these read as — no word has to be in hand for a size to be known.
-    block_len(self) -> usize = 2 * usize(T.width())
-    word_len(self) -> usize = usize(T.width()) / 8
-    len_bytes(self) -> usize = usize(T.width()) / 4
+    h[0] += a
+    h[1] += b
+    h[2] += c
+    h[3] += d
+    h[4] += e
+    h[5] += f
+    h[6] += g
+    h[7] += t
+end sha2_compress
 
-    start(*self, iv: [8]T, dlen: usize)
-        copy(self.h[..], iv[..])
+// The two compressions, which are the one above at two widths.
+//
+// They carry no data, so they are empty structs closed by an `end` marker — which is what
+// distinguishes a deliberately empty body from one whose author forgot to indent it.
+private[crypto] struct Sha2Narrow
+end Sha2Narrow
 
-        self.used = 0
-        self.total = 0
-        self.dlen = dlen
-    end start
+private[crypto] struct Sha2Wide
+end Sha2Wide
 
-    update(*self, data: []const u8)
-        var bs = self.block_len()
+impl Compression for Sha2Narrow
+    type W = u32
 
-        for i in 0..<data.len
-            self.block[self.used] = data[i]
-            self.used += 1
-            self.total += 1
+    block_bytes() -> usize = 64
+    word_bytes() -> usize = 4
 
-            if self.used == bs
-                self.compress()
-                self.used = 0
-    end update
+    compress(h: *[8]u32, block: []const u8) = sha2_compress(h, block)
 
-    // One block, in place. The schedule is sized for the longer of the two round counts and only
-    // the first `rounds` entries are ever read.
-    compress(*self)
-        var wl = self.word_len()
-        var n = T.word_rounds()
-        var w = [T.zero(); 80]
+impl Compression for Sha2Wide
+    type W = u64
 
-        for i in 0..<16usize
-            var v = T.zero()
+    block_bytes() -> usize = 128
+    word_bytes() -> usize = 8
 
-            for j in 0..<wl do v = shift_in(v, self.block[i * wl + j])
-
-            w[i] = v
-
-        for i in 16..<n
-            w[i] = w[i - 16] + w[i - 15].ssig0() + w[i - 7] + w[i - 2].ssig1()
-
-        var a = self.h[0]
-        var b = self.h[1]
-        var c = self.h[2]
-        var d = self.h[3]
-        var e = self.h[4]
-        var f = self.h[5]
-        var g = self.h[6]
-        var t = self.h[7]
-
-        for i in 0..<n
-            var t1 = t + e.bsig1() + ch(e, f, g) + T.round_key(i) + w[i]
-            var t2 = a.bsig0() + maj(a, b, c)
-
-            t = g
-            g = f
-            f = e
-            e = d + t1
-            d = c
-            c = b
-            b = a
-            a = t1 + t2
-
-        self.h[0] += a
-        self.h[1] += b
-        self.h[2] += c
-        self.h[3] += d
-        self.h[4] += e
-        self.h[5] += f
-        self.h[6] += g
-        self.h[7] += t
-    end compress
-
-    // Appends the one bit, the zeroes, and the message length in bits, then publishes as much of
-    // the state as this digest is defined to publish. The length field is two words wide but never
-    // needs more than eight bytes of it, so the high half is left at the zero the padding wrote.
-    finish(*self, digest: []u8) -> Result[unit, Fault]
-        if self.dlen == 0 then return Err(NotStarted)
-        if digest.len < self.dlen then return Err(DigestTooSmall)
-
-        var bs = self.block_len()
-        var lb = self.len_bytes()
-        var nbits = self.total * 8
-
-        self.block[self.used] = 0x80
-        self.used += 1
-
-        if self.used + lb > bs
-            while self.used < bs
-                self.block[self.used] = 0
-                self.used += 1
-
-            self.compress()
-            self.used = 0
-
-        while self.used < bs - 8
-            self.block[self.used] = 0
-            self.used += 1
-
-        for i in 0..<8usize
-            self.block[bs - 1 - i] = u8(nbits >> (i * 8))
-
-        self.compress()
-
-        var wl = self.word_len()
-
-        for i in 0..<8usize
-            var v = self.h[i]
-
-            for j in 0..<wl
-                var at = i * wl + j
-
-                if at < self.dlen then digest[at] = top_byte(v)
-
-                v = v << 8
-
-        Ok(())
-    end finish
-end Sha
+    compress(h: *[8]u64, block: []const u8) = sha2_compress(h, block)
 
 // A hasher for one of the four digests.
 //
-// **The genericity stops here, deliberately.** `Sha[T]` above is one implementation serving two word
-// widths, and that is worth having — but it is a fact about how SHA-2 is *written*, not something a
-// caller should have to know. A public generic would drag its bound into the public surface with it,
-// and `Word` declares `bits`, `rounds` and `k`: names general enough that the standard library
-// claiming them would collide with the next program that wanted one. So the four widths are four
-// ordinary types, and the trait behind them is the module's own business.
+// **The genericity stops here, deliberately.** `Sha[C]` is one implementation serving every hash in
+// this module, and that is worth having — but it is a fact about how they are *written*, not
+// something a caller should have to know. A public generic would drag its bound into the public
+// surface with it, and `Compression` and `Word` declare names general enough that the standard
+// library claiming them would collide with the next program that wanted one. So the four widths are
+// four ordinary types, and the traits behind them are the module's own business.
 //
 // Each is `update` as often as you like, then `finish` into storage the caller owns. Copying a
 // hasher copies the hash in progress, so a common prefix can be hashed once and finished several
 // ways.
 struct Sha224
-    private[crypto] inner: Sha[u32]
+    private[crypto] inner: Sha[Sha2Narrow]
 
     update(*self, data: []const u8) = self.inner.update(data)
     finish(*self, digest: []u8) -> Result[unit, Fault] = self.inner.finish(digest)
 
 struct Sha256
-    private[crypto] inner: Sha[u32]
+    private[crypto] inner: Sha[Sha2Narrow]
 
     update(*self, data: []const u8) = self.inner.update(data)
     finish(*self, digest: []u8) -> Result[unit, Fault] = self.inner.finish(digest)
 
 struct Sha384
-    private[crypto] inner: Sha[u64]
+    private[crypto] inner: Sha[Sha2Wide]
 
     update(*self, data: []const u8) = self.inner.update(data)
     finish(*self, digest: []u8) -> Result[unit, Fault] = self.inner.finish(digest)
 
 struct Sha512
-    private[crypto] inner: Sha[u64]
+    private[crypto] inner: Sha[Sha2Wide]
 
     update(*self, data: []const u8) = self.inner.update(data)
     finish(*self, digest: []u8) -> Result[unit, Fault] = self.inner.finish(digest)
-
-private[crypto] started[T: Word](iv: [8]T, dlen: usize) -> Sha[T]
-    var s: Sha[T]
-    s.start(iv, dlen)
-    s
 
 new_sha224() -> Sha224 = Sha224(started(iv224, 28))
 new_sha256() -> Sha256 = Sha256(started(iv256, 32))

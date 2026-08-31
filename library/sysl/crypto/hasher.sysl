@@ -1,0 +1,171 @@
+module sysl.crypto
+@no_alloc
+
+import sysl.math.Bits
+import sysl.slices.copy
+
+// The half of a Merkle–Damgård hash that does not care which hash it is.
+//
+// SHA-1 and the four SHA-2 digests differ in their compression function and in nothing else that a
+// caller can see. They agree on the shape around it: a message is buffered into fixed-size blocks,
+// each full block is compressed into a running state, and the tail is padded with a one bit, zeros,
+// and the message length in bits written big-endian into the end of the last block. So the
+// buffering, the padding and the publication are written **once**, here, and what varies is reached
+// through the `Compression` bound.
+//
+// **What varies per *digest* rather than per compression travels as an argument**, because SHA-224
+// and SHA-256 are one compression started from different initial values and truncated differently,
+// as are SHA-384 and SHA-512. That is `start`'s two parameters and the whole of their reason.
+
+enum Fault
+    NotStarted
+    DigestTooSmall
+
+    describe(self) -> string = self match
+        NotStarted -> "this hasher was never given its initial values"
+        DigestTooSmall -> "the digest does not fit in the space provided"
+end Fault
+
+// The two directions of one byte, and the pair is symmetric now that a conversion may be written at
+// a type parameter: `T(b)` builds a word out of a byte and `u8(x)` takes one back out, both resolved
+// once the instantiation says what the width is. Bytes arrive most significant first, so a word is
+// built by shifting each one in from the bottom.
+private[crypto] shift_in[T: Word](x: T, b: u8) -> T = (x << 8) | T(b)
+
+// The shift amount is converted because `Bits.width()` answers a `u32` while `Shr` on a `[T: Word]`
+// body shifts by `T` — a width is a count of bit positions and not a value of the type it measures,
+// which is the same reason `rotate_left` takes one.
+private[crypto] top_byte[T: Word](x: T) -> u8 = u8(x >> T(T.width() - 8))
+
+// Choose: wherever `x` has a one bit take `y`'s bit, elsewhere take `z`'s.
+//
+// **SHA-1 uses this and `maj` below as two of its four round functions**, published as
+// `(x & y) | (~x & z)` and `(x & y) | (x & z) | (y & z)` — written with `|` where these use `^`, and
+// agreeing with them, because in each case no two terms can have a bit set at once.
+private[crypto] ch[T: BitAnd + BitXor + Not](x: T, y: T, z: T) -> T = (x & y) ^ (~x & z)
+
+// Majority: each output bit is whichever value at least two of the three inputs agree on.
+private[crypto] maj[T: BitAnd + BitXor](x: T, y: T, z: T) -> T = (x & y) ^ (x & z) ^ (y & z)
+
+// One compression function, and the sizes that go with it.
+//
+// **`W` is an associated type rather than a parameter**, which is what keeps the genericity off this
+// module's public surface: `Sha[C]` names one thing, and the width it works at is C's business. It
+// is also the only arrangement that can hold SHA-1 and SHA-2 together at all, since both compress
+// 32-bit words and the width is therefore not what tells them apart.
+//
+// **The state is eight words for every member, and SHA-1 uses five of them.** A state sized per
+// compression would need a length this language cannot yet take from a trait, and the three unused
+// words cost twelve bytes in a value that is already a hundred and twenty; `finish` publishes
+// `dlen` bytes and never reaches them.
+//
+// The sizes are members rather than arithmetic on `W` because **an associated type reaches no static
+// member** — `C::W.width()` is refused — and stating them is no worse: they are two facts about a
+// standard rather than something derivable from a width, which SHA-1 demonstrates by sharing
+// SHA-256's block while being a different hash.
+private[crypto] trait Compression
+    type W: Word
+
+    // Bytes to a block, and bytes to a word.
+    block_bytes() -> usize
+    word_bytes() -> usize
+
+    // One block into the state, in place.
+    compress(h: *[8]Self::W, block: []const u8)
+
+// A hash in progress: the state, the partial block behind it, and how much has gone in.
+//
+// **It is reached only through the five wrappers**, which are ordinary structs, so a hasher is a
+// value and copying one is starting another from the same point. A public generic would have
+// dragged `Compression` and `Word` onto the module's surface — bounds declaring `block_bytes`,
+// `compress` and `round_key`, which are names general enough that the standard library claiming them
+// would collide with the next program that wanted one.
+private[crypto] struct Sha[C: Compression]
+    h: [8]C::W
+
+    // Sized for the widest block any member uses, which is SHA-512's 128 bytes. `block_bytes` says
+    // how much of it is live.
+    block: [128]u8
+    used: usize
+    total: u64
+
+    // How many bytes of the state this digest publishes, and zero until `start` fills it in — which
+    // is what makes a hasher nobody started answer `NotStarted` rather than a plausible digest over
+    // whatever the initial values happened to be.
+    dlen: usize
+
+    start(*self, iv: [8]C::W, dlen: usize)
+        copy(self.h[..], iv[..])
+
+        self.used = 0
+        self.total = 0
+        self.dlen = dlen
+    end start
+
+    update(*self, data: []const u8)
+        var bs = C.block_bytes()
+
+        for i in 0..<data.len
+            self.block[self.used] = data[i]
+            self.used += 1
+            self.total += 1
+
+            if self.used == bs
+                C.compress(&self.h, self.block[0..<bs])
+                self.used = 0
+    end update
+
+    // Appends the one bit, the zeroes, and the message length in bits, then publishes as much of
+    // the state as this digest is defined to publish.
+    //
+    // **The length field is eight bytes for every member here**, SHA-512's included: it is defined
+    // as sixteen there, and `total` is a `u64`, so the high eight are the zeroes the padding already
+    // wrote and a message long enough to disagree cannot be counted in the first place.
+    finish(*self, digest: []u8) -> Result[unit, Fault]
+        if self.dlen == 0 then return Err(NotStarted)
+        if digest.len < self.dlen then return Err(DigestTooSmall)
+
+        var bs = C.block_bytes()
+        var wl = C.word_bytes()
+        var nbits = self.total * 8
+
+        self.block[self.used] = 0x80
+        self.used += 1
+
+        // Where the length will not fit under the padding, this block goes out full of zeroes and
+        // the length lands in the next one.
+        if self.used + 8 > bs
+            while self.used < bs
+                self.block[self.used] = 0
+                self.used += 1
+
+            C.compress(&self.h, self.block[0..<bs])
+            self.used = 0
+
+        while self.used < bs - 8
+            self.block[self.used] = 0
+            self.used += 1
+
+        for i in 0..<8usize
+            self.block[bs - 1 - i] = u8(nbits >> (i * 8))
+
+        C.compress(&self.h, self.block[0..<bs])
+
+        for i in 0..<8usize
+            var v = self.h[i]
+
+            for j in 0..<wl
+                var at = i * wl + j
+
+                if at < self.dlen then digest[at] = top_byte(v)
+
+                v = v << 8
+
+        Ok(())
+    end finish
+end Sha
+
+private[crypto] started[C: Compression](iv: [8]C::W, dlen: usize) -> Sha[C]
+    var s: Sha[C]
+    s.start(iv, dlen)
+    s
