@@ -69,7 +69,7 @@ object AstCodec {
    * conflict**, and that is the case the rule above is written for: read dev's number, take the one
    * after it, and do not assume a clean merge means the versions agree.
    */
-  val Version: Int = 52
+  val Version: Int = 53
 
   private val Magic = "sysl-ast"
 
@@ -250,6 +250,7 @@ object AstCodec {
       opt(m.reads)(ns => list(ns)(sref))
       opt(m.writes)(ns => list(ns)(sref))
       list(m.borrows)(sref)
+      bool(m.isStatic)
     }
 
     private def variant(v: EnumVariantDecl): Unit = {
@@ -733,7 +734,7 @@ object AstCodec {
       at(MethodDecl(sref(), opt(recv()), bool(), list(sref()), list(param()), opt(typ()),
         list(stmt()), bounds(), tdefaults(), vis(), bool(), bool(),
         crossing = list(sref()), reads = opt(list(sref())), writes = opt(list(sref())),
-        borrows = list(sref())))
+        borrows = list(sref()), isStatic = bool()))
 
     private def variant(): EnumVariantDecl =
       at(EnumVariantDecl(sref(), opt(expr()), list(param())))

@@ -401,11 +401,47 @@ trait DeclParser extends ExprParser {
    */
   protected lazy val member: PackratParser[MethodDecl] =
     at(
-      ident ~ opt(boundedTypeParams) >> { case name ~ tps =>
-        methodTail(name, tps.getOrElse(TypeParams.none)) |
-          (if tps.isEmpty then propertyTail(name) else failure("a property takes no type parameters"))
-      },
+      staticProperty |
+        (ident ~ opt(boundedTypeParams) >> { case name ~ tps =>
+          methodTail(name, tps.getOrElse(TypeParams.none)) |
+            (if tps.isEmpty then propertyTail(name)
+             else failure("a property takes no type parameters"))
+        }),
     )
+
+  /** `static count -> int` — a property of the **type** rather than of a value
+   * (`reference/declarations.md § A static property`), read as `Type.count` with no parentheses.
+   *
+   * **A property has nowhere to say `self`, which is why this needs a word at all.** A member's
+   * receiver is written in its parameter list, and a property is *"a method with the parameter list
+   * left off"* — so the one thing that distinguishes an instance member from an associated one
+   * cannot be spelled, and every property is an instance member by construction. `static` is what
+   * says otherwise.
+   *
+   * **The word is the language's own, already reserved and already meaning this.** `static val` in
+   * an entry file says a binding belongs to the module rather than to that file's body; this says a
+   * member belongs to the type rather than to a value of it. So no reserved word is added, the
+   * highlighting grammar needs no entry, and `reference/lexical.md`'s count does not move.
+   *
+   * **Inferring it from the body was refused.** "A property that never names `self` is static" would
+   * make a member's reachability depend on its body, so deleting a `self.` from an expression would
+   * silently move the member from the value to the type and break every call site. What a member is
+   * has to be said.
+   *
+   * It takes no type parameters, for the reason an ordinary property does not: there is nothing at
+   * the read to solve them from, a read having no arguments and no receiver.
+   */
+  protected lazy val staticProperty: PackratParser[MethodDecl] =
+    (op("static") ~> ident) ~ opt(boundedTypeParams) >> { case name ~ tps =>
+      if tps.nonEmpty then failure("a property takes no type parameters")
+      else
+        (op("->") ~> (opaqueRef | typeRef)) ~ funcBody <~ endName(name) ^^ {
+          case ret ~ body =>
+            MethodDecl(name, None, isProperty = true, Nil, Nil, Some(ret), body, isStatic = true)
+        } | err(s"'static $name' declares a property of the type, which has a result and no " +
+          s"parameter list — 'static $name -> T'. A member with a parameter list is an associated " +
+          "function already, reached the same way and called with '()'")
+    }
 
   protected def methodTail(name: String, generics: TypeParams): Parser[MethodDecl] =
     (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> resultRef) ~ whereOn(generics) ~

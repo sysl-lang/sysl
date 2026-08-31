@@ -494,6 +494,19 @@ case class MethodDecl(
       * restate what is there and go stale the moment the body changed.
       */
     borrows: List[String] = Nil,
+    /** `static count -> int` — a property of the **type** rather than of a value
+      * (`reference/declarations.md § A static property`), read as `Type.count`.
+      *
+      * A property has no parameter list, so it has nowhere to say `self` and is an instance member
+      * by construction; this is the word that says otherwise. `static` is the one the language
+      * already spends on the same idea one scope out — `static val` in an entry file says a binding
+      * belongs to the module rather than to the body — so nothing new is reserved.
+      *
+      * **`recvMode` is where it takes effect and is the whole of the mechanism**: a static property
+      * answers `None` there, so everything that dispatches on a receiver treats it as the associated
+      * function it is, with no second case to write.
+      */
+    isStatic: Boolean = false,
 ) extends Positioned {
 
   /** The mode this member takes its receiver in, or `None` for an associated function — which is the
@@ -504,7 +517,13 @@ case class MethodDecl(
    * a vtable slot, the object-safety rule — asks here instead, and a property is then the instance
    * member it is rather than a shape each of those has to special-case.
    */
-  def recvMode: Option[RecvMode] = receiver.orElse(Option.when(isProperty)(RecvMode.ByValue))
+  def recvMode: Option[RecvMode] =
+    receiver.orElse(Option.when(isProperty && !isStatic)(RecvMode.ByValue))
+
+  /** Whether this member is reached through its **type** rather than through a value — an associated
+    * function, or a static property. The two differ only in whether the call site writes `()`.
+    */
+  def isAssociated: Boolean = recvMode.isEmpty
 }
 
 /** The calling convention a definition is entered under, where that is not the ordinary one

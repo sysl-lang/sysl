@@ -24,10 +24,28 @@ case class ReadOnlyProperty(of: String, where: String, viaBound: Boolean)
 
 trait MemberExprAnalysis extends ExprSupport {
 
+  /** Whether `Type.name` names a **static property** — a member of the type read without
+   * parentheses (`reference/declarations.md § A static property`).
+   *
+   * Asked of the *written* name rather than of a resolved type, because that is what the readings
+   * below have in hand, and a static property is reached through a type's name exactly as an
+   * associated function is.
+   */
+  protected def staticPropertyNamed(written: String, f: String): Boolean =
+    typeKey(written).flatMap(k => memberDecls.get((k, f))).exists(_.isStatic)
+
   /** `receiver.name` in all its readings. */
   protected def fieldExpr(expr: Field, expected: Option[Type]): TExpr = expr match
     case f: Field if throughModule(f).isDefined =>
       analyzeValueAt(throughModule(f).get, expected)
+
+    /** A **static property** is an associated function the reader writes no `()` after, so it is
+      * analyzed as the call it is and nothing below this line has to know it exists. That is the
+      * whole of the lowering: `recvMode` already answers `None` for one, so every pass that
+      * dispatches on a receiver has been treating it as associated since it was parsed.
+      */
+    case Field(Ident(written), f) if lookupOpt(written).isEmpty && staticPropertyNamed(written, f) =>
+      analyzeValueAt(Call(expr, Nil), expected)
 
     case Field(Ident(written), f) if lookupOpt(written).isEmpty && typeKey(written).exists(enumDecls.contains) =>
       enumMember(typeKey(written).get, written, f, expected)

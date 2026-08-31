@@ -137,7 +137,7 @@ trait Hoisting extends HoistMembers {
         // A property carries its receiver without writing one, so the reading below — no receiver
         // and a body, which for a method means a default with nothing to work on — is not what a
         // property with a body is. That one is a default property, and it is allowed.
-        if m.receiver.isEmpty && !m.isProperty && m.body.nonEmpty then
+        if m.isAssociated && !m.isStatic && m.body.nonEmpty then
           at(m.pos)(err(s"'${t.name}.${m.name}' has no receiver, so a default body has no value to " +
             "work on — give it a 'self' parameter or drop the body"))
         // No implementation could supply one either, so the trait is where it is worth saying so.

@@ -248,7 +248,7 @@ trait MemberLowering extends TypeResolution {
       // type an `impl` may be written for and not something that can stand in call position, and a
       // block matching a shape is for a whole family at once. Such a member would be registered and
       // never callable, which is worth saying at the declaration.
-      if m.receiver.isEmpty && !m.isProperty && !reachableName(home.key) then
+      if m.isAssociated && !reachableName(home.key) then
         err(s"'${m.name}' has no receiver, and '${home.label}' is not a name a call could reach it " +
           "through — give it a 'self' parameter")
 
