@@ -773,11 +773,19 @@ trait Hoisting extends HoistMembers {
   protected def checkAssocBounds(): Unit = {
     for (owner, member, bound, ty, pos, scope) <- assocChecks.toList do
       currentPos = pos
-      recover(()) {
+      // **The question is asked in the terms the block was written in, not in whatever the walk was
+      // last reading** — the same reason `boundChecks` is drained under `b.scope`. The bound itself
+      // is resolved, but answering it walks the supertraits of whatever the supplied type is
+      // bounded by, and *those* are held as written: a `type Size = F` under an `F: Float` reaches
+      // `Ord` through `Float`'s own supers, and a short name means what the file that wrote it saw.
+      // Asked in the program's scope instead, a program declaring an `Ord` of its own answers with
+      // that one and the library is told its `Magnitude` is unimplementable. `LibraryMoveTests` is
+      // where that showed, being the suite whose programs deliberately shadow the library's names.
+      inScope(scope)(recover(()) {
         if !satisfies(bound, ty) then
-          inScope(scope)(err(s"trait '${qn(owner)}' asks that its associated type '$member' " +
-            s"implement '${showBound(bound, ty)}', and ${show(ty)} does not"))
-      }
+          err(s"trait '${qn(owner)}' asks that its associated type '$member' " +
+            s"implement '${showBound(bound, ty)}', and ${show(ty)} does not")
+      })
     assocChecks.clear()
   }
 

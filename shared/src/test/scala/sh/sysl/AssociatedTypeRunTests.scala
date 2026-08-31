@@ -562,6 +562,32 @@ class AssociatedTypeRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "7\n"
   }
 
+  /** …and asked in the terms the **block** was written in, not the program's.
+   *
+   * Holding the question until every `impl` is registered means asking it somewhere else, and the
+   * bound is only half resolved: answering it walks the supertraits of whatever the supplied type
+   * is *bounded by*, and those are held as written. `sysl.math.Magnitude`'s `type Size: Ord` on a
+   * `type Size = F` under an `F: Float` reaches `Ord` through `Float`'s own supers — so asked in the
+   * program's scope, a program that declares an `Ord` of its own answers with **that** one, and the
+   * library is told its own `Magnitude` is unimplementable.
+   *
+   * The `abs()` is what makes the program reach `Magnitude` at all; the shadowing trait is what
+   * makes the scope matter.
+   */
+  "a supplied type is held to its bound in the terms the impl was written in" in {
+    val src =
+      """import sysl.math.complex.Complex
+        |trait Ord
+        |    rank(self) -> int
+        |struct Tier
+        |    n: int
+        |impl Ord for Tier
+        |    rank(self) -> int = self.n
+        |print(Tier(3).rank(), Complex(3.0, 4.0).abs())""".stripMargin
+
+    run(src) shouldBe "3 5\n"
+  }
+
   /** A projection asked while the `impl` blocks are still being hoisted — card `0384`.
    *
    * A **non-generic** type is instantiated eagerly, so that it is emitted whether or not anything
