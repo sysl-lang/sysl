@@ -7,6 +7,89 @@ copy -- correct a mistake there and regenerate, rather than editing this file. V
 `MAJOR.MINOR.PATCH`; while the leading zero stands the language is still moving, and a release may
 change what an existing program means. Where it does, the release says so.
 
+## 0.0.95 — 2026-08-31
+
+Five cards, and four of them are one feature seen from four sides: an **associated type** is a thing
+the compiler had never been asked much of, and writing `sysl.crypto` over one properly asked.
+
+### A scalar may sit on the left of an operator
+
+`z * 2.0` compiled and `2.0 * z` did not. The orphan rule looked only at an `impl`'s **subject**, so
+`impl Mul[Point, Point] for real` — which names `Point` in the trait's argument list and `real` in
+the `for` — had no home in any module, including the one declaring `Point`. It now counts the
+trait's arguments too, which is the shape Rust widened to in RFC 2451.
+
+```sysl
+struct Point
+    x: real
+    y: real
+
+impl Mul[real] for Point
+    mul(self, k: real) -> Point = Point(self.x * k, self.y * k)
+
+impl Mul[Point, Point] for real
+    mul(self, p: Point) -> Point = Point(p.x * self, p.y * self)
+
+val p = Point(1.0, 2.0)
+
+print(p * 2.0, 2.0 * p)
+```
+
+`sysl.math.complex` takes the eight blocks this makes writable — `Mul`, `Add`, `Sub` and `Div` at
+`real` and at `f32` — so `2.0 * z`, `1.0 - z` and `2.0 / z` all work. An `impl` may not be written
+for a bare type parameter, which is why it is two blocks per operator rather than one generic block.
+
+**The built-in keeps everything it had.** `real` is a member of `Mul` whatever anybody writes, and
+only the argument list tells the two apart: `2.0 * 3.0` is still the machine's multiply and
+`5.0.mul(2.0)` still reaches the member the compiler provides. A block that names nothing local
+anywhere — `impl Mul[real, real] for real` — is refused exactly as it was.
+
+**And a derived subtype may now be given an operator at an argument list its base has not.** That
+follows from the same rule and had been a documented ceiling: `type Stamp = new i64` with an
+`impl Add[Span] for Stamp` is the timeline shape a struct has been able to describe for a while. What
+the base *has* still cannot be replaced — `impl Add for Stamp`, writing no arguments, is refused as
+before.
+
+Card `0385`.
+
+### Three fixes to associated types
+
+**A bound on an associated type is about that type, not about the implementer.** `type W: Add` asked
+whether the *supplied* type could be added to the *implementing* one, because `Add`'s `Rhs = Self`
+and `Out = Self` defaults were filled from the wrong side. It went unseen because it needs a bound
+that is both on an associated type and parameterised, and the library had none. Card `0383`.
+
+**A struct field may name an associated type of a type whose `impl` appears later.** A non-generic
+type is instantiated before any `impl` is hoisted, so `struct Sha256 { inner: Sha[Sha2Narrow] }` —
+whose parameter's own field is `[8]C::W` — was told `Sha2Narrow` implemented no trait declaring a
+`W`, three lines above the block that plainly supplies it. A generic holder was unaffected. Card
+`0384`.
+
+**And such a bound is answered once every `impl` is registered.** It was checked at the block that
+supplied it, so an `impl` writing `type W = u32` under a `type W: Word` was refused by a module whose
+next file writes `impl Word for u32`. Reordering the two files compiled the same program. Card
+`0386`.
+
+### `sysl.crypto` is one hash
+
+SHA-1 and the four SHA-2 digests differ in their compression function and in nothing a caller can
+see: they agree on the buffering, on the padding, and on how the digest is published. That agreement
+was written twice, because SHA-1's five 32-bit words did not fit a generic whose parameter is the
+width. It is now written once, over a trait whose `W` is an **associated** type — which is what lets
+two hashes at one width be two implementations.
+
+**The public surface is byte-for-byte what it was**: `sha1` through `sha512`, `hmac1` through
+`hmac512`, the five hasher structs and `verify`. Nothing outside the module could name the shared
+half before and nothing can now.
+
+Card `0382`.
+
+### Also
+
+The installation page and the org profile now say `brew trust sysl-lang/tap`, which Homebrew
+requires and checks *after* the download verifies — so an install without it fails at the end with a
+message that reads like a defect in the formula.
+
 ## 0.0.94 — 2026-08-30
 
 ### A pkg-config module's name is not yours to choose, so the rule stopped pretending it was
