@@ -322,18 +322,22 @@ trait HoistImpl extends ImplTarget {
           s"produces it the result 'some ${a.bounds.headOption.fold("Trait")(_.show)}' and let the " +
           "body say what it is"))
 
-    // What the trait asked of the type supplying it, held to here for a written binding. A `some`
-    // one is held to the same bounds once its body has been analyzed, which is the only moment its
-    // type exists (`settleOpaqueResults`).
+    // What the trait asked of the type supplying it, for a written binding. A `some` one is held to
+    // the same bounds once its body has been analyzed, which is the only moment its type exists
+    // (`settleOpaqueResults`).
+    //
+    // **The question is held until every `impl` is registered**, for the reason a required trait's
+    // is: the block making the *supplied* type a member of that bound may be written below this
+    // one. `impl Compression for Sha1C` writing `type W = u32` under a `type W: Word` was refused
+    // by a module that implements `Word` for `u32` in its next file — and compiled once the two
+    // files were reordered, which is an answer depending on the order they arrived in.
     for
       a  <- tr.assocs
       ty <- writtenAssoc.get(a.name)
       b  <- assocBoundsOf(bound, a, ty)
-      if !satisfies(b, ty)
     do
-      at(impl.assocs.find(_.name == a.name).flatMap(_.pos).orElse(impl.pos))(
-        err(s"trait '${qn(tr.name)}' asks that its associated type '${a.name}' implement " +
-          s"'${showBound(b, ty)}', and ${show(ty)} does not"))
+      assocChecks += ((tr.name, a.name, b, ty,
+        impl.assocs.find(_.name == a.name).flatMap(_.pos).orElse(impl.pos), currentScope))
 
     traitImpls((impl.traitName, home.key)) =
       already :+ TraitImpl(impl, written, wkey, home.alt, home.tparams,

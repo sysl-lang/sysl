@@ -762,6 +762,25 @@ trait Hoisting extends HoistMembers {
     superChecks.clear()
   }
 
+  /** Holds every supplied associated type to what its trait asked of it, once every `impl` is
+   * registered and the question can be answered.
+   *
+   * It waits for the reason `checkImplSupers` waits, and the two are the same question one step
+   * apart: that one asks whether the *implementing* type is a member of a required trait, and this
+   * asks whether the type the block **chose** is a member of the bound the trait wrote on the
+   * associated type. Either answer may be supplied by a block written below.
+   */
+  protected def checkAssocBounds(): Unit = {
+    for (owner, member, bound, ty, pos, scope) <- assocChecks.toList do
+      currentPos = pos
+      recover(()) {
+        if !satisfies(bound, ty) then
+          inScope(scope)(err(s"trait '${qn(owner)}' asks that its associated type '$member' " +
+            s"implement '${showBound(bound, ty)}', and ${show(ty)} does not"))
+      }
+    assocChecks.clear()
+  }
+
   /** Holds every `override` to there being something for it to override (`reference/traits.md § override — when the overlap is deliberate`), once every
    * `impl` is registered and the question can be answered.
    *

@@ -262,6 +262,18 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
    */
   protected val superChecks = mutable.ListBuffer.empty[(String, String, Type.Bound, Type, Option[Pos])]
 
+  /** Every associated type an `impl` block supplied, with the bound the trait asked of it and the
+   * position to report against. Held for the reason a required trait is: the implementation that
+   * makes the supplied type a member of that bound may be written below the block supplying it.
+   *
+   * `sysl.crypto` is what found it — `impl Compression for Sha1C` writes `type W = u32` under a
+   * `type W: Word`, and `impl Word for u32` is in the module's next file. Asked at the block, the
+   * answer was that `uint` does not implement `Word`, in a module that implements it four lines
+   * further on; the two files reordered, the same program compiled.
+   */
+  protected val assocChecks =
+    mutable.ListBuffer.empty[(String, String, Type.Bound, Type, Option[Pos], Scope)]
+
   /** Every block marked `override`, with the type it is for and the promise it makes, waiting to be
    * asked whether anything more general actually covers that type (`reference/traits.md § override — when the overlap is deliberate`).
    *

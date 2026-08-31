@@ -278,6 +278,11 @@ trait ProgramWalk extends OpaqueResults with DropReturnCheck {
     // question about the same table and so waits for the same moment.
     checkImplSupers()
 
+    // And whether each associated type an `impl` supplied is a member of what its trait asked of
+    // it, which is that question one step over: the block making the *supplied* type a member may
+    // be written below the block that chose it.
+    checkAssocBounds()
+
     // And whether each block marked `override` has something to override, which waits for the same
     // moment and for the same reason: the block being replaced may be hoisted after it.
     checkOverrides()

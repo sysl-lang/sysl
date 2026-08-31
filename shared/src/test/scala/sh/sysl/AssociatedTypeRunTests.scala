@@ -533,6 +533,35 @@ class AssociatedTypeRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
+  /** What the trait asked of the associated type, answered once every block is registered rather
+   * than at the block that chose it — card `0386`.
+   *
+   * `checkImplSupers` already holds the question about the type an `impl` is **for**, because the
+   * block supplying a required trait may be written below the one that needs it. The same is true
+   * one step over, of the type a block **chose**, and that question was being asked inline — so
+   * `sysl.crypto`'s `impl Compression for Sha1C`, writing `type W = u32` under a `type W: Word`,
+   * was refused by a module whose next file writes `impl Word for u32`. Reordering the two files
+   * compiled the same program, which is what makes it a defect rather than a rule.
+   */
+  "a bound on an associated type may be met by a block written below" in {
+    val src =
+      """trait Mine
+        |    tag(self) -> int
+        |trait Holder
+        |    type W: Mine
+        |    one(self) -> Self::W
+        |struct N
+        |    v: u32
+        |impl Holder for N
+        |    type W = u32
+        |    one(self) -> u32 = self.v
+        |impl Mine for u32
+        |    tag(self) -> int = 7
+        |print(N(3).one().tag())""".stripMargin
+
+    run(src) shouldBe "7\n"
+  }
+
   /** A projection asked while the `impl` blocks are still being hoisted — card `0384`.
    *
    * A **non-generic** type is instantiated eagerly, so that it is emitted whether or not anything
