@@ -210,8 +210,11 @@ object Signature {
     val args = if m.variadic then all :+ "..." else all
 
     // A property is called without parentheses, so writing an empty pair would document a call the
-    // language refuses. It keeps its receiver, which is what says it is not an associated value.
-    if m.isProperty && m.params.isEmpty then s"${m.name}$tps${retText(m.retType)}"
+    // language refuses. An instance property keeps its receiver, which is what says it is not an
+    // associated value; a **static** one has none, so the word is the only thing that says a reader
+    // writes `Type.name` rather than `value.name` — and that is the whole of what a caller needs.
+    if m.isProperty && m.params.isEmpty then
+      s"${if m.isStatic then "static " else ""}${m.name}$tps${retText(m.retType)}"
     else s"${m.name}$tps(${args.mkString(", ")})${retText(m.retType)}"
 
   /** How the receiver is spelled for each mode. */

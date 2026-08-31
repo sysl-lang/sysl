@@ -108,7 +108,10 @@ trait AbstractMethods extends FuncAddress {
       case Some((tr, self, m)) =>
         reported {
           val fname = s"${tr.name}.$mname"
-          if m.isProperty then
+          // A **static** property is not that case: it belongs to the type, so `T.count` is the
+          // read and there is no value to reach it on. It arrives here because a read with no
+          // parentheses is analyzed as the call it is, exactly as a concrete one is.
+          if m.isProperty && !m.isStatic then
             err(s"'$mname' is a property of '${tr.show}' — read it on a value, as 'value.$mname'")
           if m.receiver.isDefined then
             err(s"'$mname' is a method of '${tr.show}' — call it on a value of '${a.name}', not on " +
@@ -132,6 +135,12 @@ trait AbstractMethods extends FuncAddress {
    */
   protected def boundAssociated(a: Type.Abstract, mname: String): Option[String] =
     boundMember(a, mname).filter(_._3.recvMode.isEmpty).map(_._1.show)
+
+  /** Whether a bound reaches a **static property** of that name — the one associated member a read
+   * resolves rather than being told to put parentheses after.
+   */
+  protected def boundStaticProperty(a: Type.Abstract, mname: String): Boolean =
+    boundMember(a, mname).exists(_._3.isStatic)
 
   /** The diagnostic for `T.f(…)` that no bound licenses, which is the associated-function half of
    * `unlicensed`: with a trait declaring one of that name the fix is the bound, and naming it is

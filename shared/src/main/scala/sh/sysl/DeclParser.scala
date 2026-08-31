@@ -435,13 +435,30 @@ trait DeclParser extends ExprParser {
     (op("static") ~> ident) ~ opt(boundedTypeParams) >> { case name ~ tps =>
       if tps.nonEmpty then failure("a property takes no type parameters")
       else
-        (op("->") ~> (opaqueRef | typeRef)) ~ funcBody <~ endName(name) ^^ {
-          case ret ~ body =>
-            MethodDecl(name, None, isProperty = true, Nil, Nil, Some(ret), body, isStatic = true)
-        } | err(s"'static $name' declares a property of the type, which has a result and no " +
-          s"parameter list — 'static $name -> T'. A member with a parameter list is an associated " +
-          "function already, reached the same way and called with '()'")
+        // The refusal is raised on the *lookahead* rather than after the form, because an `err`
+        // written after an alternative that got further along the line is never reached — a
+        // `Failure` at the later position outranks an `Error` back here. A missing body must stay
+        // an ordinary `Failure` for the same reason in reverse: `staticPropertySig` is tried below
+        // this in a trait's body, and an `Error` here would abort the alternation before it.
+        guard(op("(")) ~> err(s"'static $name' declares a property of the type, which has a result " +
+          s"and no parameter list — 'static $name -> T'. A member with a parameter list is an " +
+          "associated function already, reached the same way and called with '()'") |
+          (op("->") ~> (opaqueRef | typeRef)) ~ funcBody <~ endName(name) ^^ {
+            case ret ~ body =>
+              MethodDecl(name, None, isProperty = true, Nil, Nil, Some(ret), body, isStatic = true)
+          }
     }
+
+  /** `static lowest -> int` in a **trait's** body — the requirement, with no body to answer it.
+   *
+   * It stands to `staticProperty` exactly as `propertySig` stands to `propertyTail`, and it is a
+   * rule of its own for the same reason: a trait's member is a signature, and the body every other
+   * spelling of this form insists on is the one thing it must not have.
+   */
+  protected lazy val staticPropertySig: PackratParser[MethodDecl] =
+    at((op("static") ~> ident) ~ (op("->") ~> (opaqueRef | typeRef)) ^^ { case name ~ ret =>
+      MethodDecl(name, None, isProperty = true, Nil, Nil, Some(ret), Nil, isStatic = true)
+    })
 
   protected def methodTail(name: String, generics: TypeParams): Parser[MethodDecl] =
     (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> resultRef) ~ whereOn(generics) ~
@@ -735,7 +752,7 @@ trait DeclParser extends ExprParser {
    */
   protected lazy val traitMember: PackratParser[MethodDecl] =
     memberAttrs ~ (noVisibility ~> noOverride ~>
-      (setter | setterSig | member | methodSig | propertySig)) ^^ { case as ~ m =>
+      (setter | setterSig | member | staticPropertySig | methodSig | propertySig)) ^^ { case as ~ m =>
       attributedMember(m, as)
     }
     // A trait's body holds nothing but members, so an annotation above one needs no commit of the

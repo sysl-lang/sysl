@@ -137,9 +137,19 @@ trait Hoisting extends HoistMembers {
         // A property carries its receiver without writing one, so the reading below — no receiver
         // and a body, which for a method means a default with nothing to work on — is not what a
         // property with a body is. That one is a default property, and it is allowed.
-        if m.isAssociated && !m.isStatic && m.body.nonEmpty then
-          at(m.pos)(err(s"'${t.name}.${m.name}' has no receiver, so a default body has no value to " +
-            "work on — give it a 'self' parameter or drop the body"))
+        if m.isAssociated && m.body.nonEmpty then
+          // A static property is the same case and cannot take the same advice: a property has no
+          // parameter list, so there is nowhere for it to say `self`, and the only way out is to
+          // drop the body. Every implementing type would otherwise inherit one constant, which is
+          // the mistake the receiverless rule exists to catch.
+          at(m.pos)(err(
+            if m.isStatic then
+              s"'${t.name}.${m.name}' is a property of the type, so a default body would give every " +
+                "implementation the same value — drop the body and let each one supply it"
+            else
+              s"'${t.name}.${m.name}' has no receiver, so a default body has no value to " +
+                "work on — give it a 'self' parameter or drop the body",
+          ))
         // No implementation could supply one either, so the trait is where it is worth saying so.
         // A defaulted parameter is caught by this too, since carrying a default means having one.
         //

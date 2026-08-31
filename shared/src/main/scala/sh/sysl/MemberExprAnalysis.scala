@@ -237,6 +237,9 @@ trait MemberExprAnalysis extends ExprSupport {
   protected def typeMember(ty: Type, written: String, f: String): TExpr = ty match
     // Reported rather than raised, because the abstract pass drops an ordinary complaint: this
     // one is about what a bound licenses, which is exactly what that pass is for.
+    // A static property is the one associated member a *read* resolves: it belongs to the type, so
+    // `T.count` is the whole of the form and there is nothing to add parentheses to.
+    case a: Type.Abstract if boundStaticProperty(a, f) => callBoundAssociated(a, f, Nil)
     case a: Type.Abstract =>
       boundAssociated(a, f) match
         case Some(tr) =>
@@ -246,6 +249,7 @@ trait MemberExprAnalysis extends ExprSupport {
         case None => callBoundAssociated(a, f, Nil)
     case concrete =>
       memberDecls.get((memberKey(concrete, f)._1, f)) match
+        case Some(m) if m.isStatic => callAssociated(memberKey(concrete, f)._1, f, Nil, None)
         case Some(m) if m.recvMode.isEmpty =>
           err(s"'$f' is an associated function of '${show(concrete)}' — call it with '$written.$f()'")
         case Some(_) =>
@@ -763,6 +767,13 @@ trait MemberExprAnalysis extends ExprSupport {
     val chosen = pickOverload(ty, base, f, Nil, via)
 
     memberDecls.get((base, chosen)) match
+      // A static property belongs to the type, so it takes no receiver and the lowered function has
+      // no parameter for one to arrive in. The mirror of the refusal a *type* gets for an instance
+      // property, and it says which of the two the reader wanted rather than that the name is
+      // unknown — the name is right and the thing on the left of the dot is not.
+      case Some(m) if m.isStatic =>
+        err(s"'$f' is a property of the type '${show(ty)}' rather than of a value of it — read it " +
+          s"as '${Modules.bare(memberKey(ty, f)._1)}.$f'")
       case Some(m) if m.isProperty =>
         // A property that reads itself calls itself, and there is no reading under which that is
         // what was meant: the value a property computes is not the property, and there is no `super`

@@ -89,7 +89,7 @@ trait CallAnalysis extends OperatorCalls {
     val chosen = pickAssociated(tname, mname, written, via)
 
     memberDecls.get((tname, chosen)) match
-      case Some(m) if m.receiver.isEmpty && !m.isProperty =>
+      case Some(m) if m.isAssociated =>
         checkMemberVisible(tname, chosen, m)
         // A member's default is written in its type's file, so the type's key is the scope it is
         // read in — and it is a top-level declaration, which a member key is not.

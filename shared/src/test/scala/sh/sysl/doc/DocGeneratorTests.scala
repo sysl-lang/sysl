@@ -160,6 +160,16 @@ class DocGeneratorTests extends AnyFreeSpec with Matchers {
 
       m.of(ApiModel.Kind.Type).head.members.head.signature shouldBe "len -> int"
     }
+
+    /** A static property has no receiver, so the two forms would otherwise render identically —
+      * and a caller writes `S.zero` for one and `value.len` for the other. The word is the whole of
+      * what distinguishes them on the page.
+      */
+    "a static property keeps the word, which is the only thing saying it is read on the type" in {
+      val m = only("module m\n\nstruct S\n    v: int\n    static zero -> int = 0")
+
+      m.of(ApiModel.Kind.Type).head.members.head.signature shouldBe "static zero -> int"
+    }
   }
 
   "the model groups a module's declarations" - {
