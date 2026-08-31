@@ -139,10 +139,11 @@ trait DeclParser extends ExprParser {
   protected lazy val funcDecl: PackratParser[Stmt] =
     opt(callConv) ~ ident ~ opt(boundedTypeParams) >> { case conv ~ name ~ tps =>
       val tp = tps.getOrElse(TypeParams.none)
-      (op("(") ~> paramList <~ op(")")) ~ opt(op("->") ~> resultRef) ~ funcBody <~ endName(name) ^^ {
-        case ((params, variadic)) ~ ret ~ body =>
-          FuncDecl(name, tp.names, params, ret, body, tp.bounds, variadic, tdefaults = tp.defaults,
-                   tvalues = tp.values, tpacks = tp.packs, conv = conv)
+      (op("(") ~> paramList <~ op(")")) ~ opt(op("->") ~> resultRef) ~ whereOn(tp) ~ funcBody <~
+        endName(name) ^^ {
+        case ((params, variadic)) ~ ret ~ tpw ~ body =>
+          FuncDecl(name, tpw.names, params, ret, body, tpw.bounds, variadic, tdefaults = tpw.defaults,
+                   tvalues = tpw.values, tpacks = tpw.packs, conv = conv)
       }
     }
 
@@ -263,7 +264,8 @@ trait DeclParser extends ExprParser {
       // reached furthest — so the sentence below, raised back at the declaration, would lose to it
       // and a struct with a mistake in its body would be reported as having no body. Neither guard
       // consumes, so both are asked at the same position and at most one of them can succeed.
-      noPacks(tp, "a struct") ~> (opt(guard(newline ~ indent)) ~ opt(guard(onNextLine(softEnd)))) >> {
+      noPacks(tp, "a struct") ~> whereOn(tp) >> { tp =>
+      (opt(guard(newline ~ indent)) ~ opt(guard(onNextLine(softEnd)))) >> {
         case Some(_) ~ _ =>
           (newline ~> indent ~> skipNewlines ~> rep1sep(structItem, newlines) <~ skipNewlines <~ dedent) <~
             endName(name) ^^ { items =>
@@ -299,6 +301,7 @@ trait DeclParser extends ExprParser {
           err(s"'struct $name' declares no fields — a struct's body is indented under it, a type " +
             s"with no fields at all is written 'struct $name' closed by 'end $name', and one with " +
             s"no layout of its own is written 'opaque struct $name'")
+      }
       }
     }
 
@@ -405,10 +408,11 @@ trait DeclParser extends ExprParser {
     )
 
   protected def methodTail(name: String, generics: TypeParams): Parser[MethodDecl] =
-    (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> resultRef) ~ funcBody <~ endName(name) ^^ {
-      case (recv, params, variadic) ~ ret ~ body =>
-        MethodDecl(name, recv, isProperty = false, generics.names, params, ret, body, generics.bounds,
-          generics.defaults, variadic = variadic, tvalues = generics.values, tpacks = generics.packs)
+    (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> resultRef) ~ whereOn(generics) ~
+      funcBody <~ endName(name) ^^ {
+      case (recv, params, variadic) ~ ret ~ g ~ body =>
+        MethodDecl(name, recv, isProperty = false, g.names, params, ret, body, g.bounds,
+          g.defaults, variadic = variadic, tvalues = g.values, tpacks = g.packs)
     }
 
   /** A property takes the same `funcBody` a method does, so `name -> T` may be answered by an
@@ -496,12 +500,14 @@ trait DeclParser extends ExprParser {
       case name ~ tps ~ under ~ derives =>
       val tp = tps.getOrElse(TypeParams.none)
 
-      noPacks(tp, "an enum") ~> (newline ~> indent ~> skipNewlines ~> rep1sep(enumItem, newlines) <~ skipNewlines <~ dedent) <~ endName(name) ^^ {
+      noPacks(tp, "an enum") ~> whereOn(tp) >> { tp =>
+      (newline ~> indent ~> skipNewlines ~> rep1sep(enumItem, newlines) <~ skipNewlines <~ dedent) <~ endName(name) ^^ {
         items =>
           val variants = items.collect { case Left(v)  => v }
           val members  = items.collect { case Right(m) => m }
           EnumDecl(name, tp.names, under, variants, members, tp.bounds, tdefaults = tp.defaults,
                    tvalues = tp.values, deriving = derives)
+      }
       }
     }
 
@@ -599,6 +605,23 @@ trait DeclParser extends ExprParser {
   protected lazy val withinKw: Parser[Unit] = softWord("within")
   protected lazy val whereKw: Parser[Unit]  = softWord("where")
 
+  /** An optional `where` clause folded into the parameter list it bounds, or a refusal naming the
+   * parameter it could not bound (`reference/generics.md § A bound may be written out of line`).
+   *
+   * **The check is here rather than in the analyzer because the declaration's own list is the whole
+   * of what decides it**, and the parser holds both at the moment the clause is read — so the caret
+   * lands on the clause, which is what has to change.
+   */
+  protected def whereOn(tp: TypeParams): Parser[TypeParams] =
+    opt(whereBounds) >> {
+      case None => success(tp)
+      case Some(clause) =>
+        tp.whereUnknown(clause) match {
+          case Some(why) => err(why)
+          case None      => success(tp.withWhere(clause))
+        }
+    }
+
   /** A contextual keyword: an identifier spelled exactly `word`, matched where the grammar wants the
    * keyword but the word must stay a legal identifier everywhere else (the `sync` of `&sync T`).
    */
@@ -627,18 +650,19 @@ trait DeclParser extends ExprParser {
   protected lazy val traitDecl: PackratParser[Stmt] =
     op("trait") ~> ident ~ opt(boundedTypeParams) ~ opt(op(":") ~> rep1sep(boundRef, op("+"))) >> {
       case name ~ tps ~ supers =>
-        val tp = tps.getOrElse(TypeParams.none)
+        val tp0 = tps.getOrElse(TypeParams.none)
         val body =
           (newline ~> indent ~> skipNewlines ~> rep1sep(traitItem, newlines) <~ skipNewlines <~ dedent) <~
             endName(name)
 
-        def decl(items: List[Either[AssocDecl, MethodDecl]]) =
+        def decl(tp: TypeParams)(items: List[Either[AssocDecl, MethodDecl]]) =
           TraitDecl(name, tp.names, items.collect { case Right(m) => m }, tp.bounds,
             supers.getOrElse(Nil), tdefaults = tp.defaults,
             assocs = items.collect { case Left(a) => a })
 
-        noPacks(tp, "a trait") ~>
-          (if supers.isEmpty then body ^^ decl else opt(body) ^^ (m => decl(m.getOrElse(Nil))))
+        noPacks(tp0, "a trait") ~> whereOn(tp0) >> { tp =>
+          if supers.isEmpty then body ^^ decl(tp) else opt(body) ^^ (m => decl(tp)(m.getOrElse(Nil)))
+        }
     }
 
   /** One line of a trait body: an associated type, or a member. The associated type is tried first
@@ -727,10 +751,12 @@ trait DeclParser extends ExprParser {
       case ov ~ (tps ~ ((tname, targs)) ~ forType) =>
         val tp = tps.getOrElse(TypeParams.none)
 
-        (implBody | success(Nil)) <~ endTypeRef(forType) ^^ { items =>
-          ImplDecl(tname, forType, items.collect { case Right(m) => m }, tp.names, tp.bounds, targs,
-                   tp.defaults, ov, tp.values, tp.packs,
-                   assocs = items.collect { case Left(a) => a })
+        whereOn(tp) >> { tp =>
+          (implBody | success(Nil)) <~ endTypeRef(forType) ^^ { items =>
+            ImplDecl(tname, forType, items.collect { case Right(m) => m }, tp.names, tp.bounds, targs,
+                     tp.defaults, ov, tp.values, tp.packs,
+                     assocs = items.collect { case Left(a) => a })
+          }
         }
     }
 

@@ -447,6 +447,12 @@ trait SyslParserBase extends PackratParsers {
   protected def boundedTypeParams: Parser[TypeParams]
   protected def boundRef: Parser[BoundRef]
 
+  /** `where T: Display + Eq` — the same bounds, written after a signature instead of inside its
+   * `[…]` list. Declared here because the declaration forms that read it and the rule that parses
+   * it are in sibling traits, exactly as `boundedTypeParams` is.
+   */
+  protected def whereBounds: Parser[List[WhereBound]]
+
   /** A name that may be reached through the module it belongs to: `File`, `std.fs.File`, and the
    * `[int, string]` an applied generic one carries.
    */

@@ -18,11 +18,55 @@ case class TypeParams(
     values: Map[String, TypeRef] = Map.empty,
     valueDefaults: Map[String, Expr] = Map.empty,
     packs: Set[String] = Set.empty,
-)
+) {
+
+  /** The same list with a `where` clause's bounds folded in.
+    *
+    * **A parameter may be bounded in both places and the two combine**, which is what every language
+    * carrying the form does: `[T: Display] … where T: Eq` asks for both, in the order they were
+    * written. Refusing the mixture would be a rule a reader has to be told rather than one they
+    * would guess, and the clause exists for readability rather than to take the bracket's job away.
+    *
+    * A value parameter carries no bound — its `: usize` is the type its argument must have — so a
+    * clause naming one is refused by `whereUnknown` below along with a name the declaration does not
+    * have at all.
+    */
+  def withWhere(clause: List[WhereBound]): TypeParams =
+    copy(bounds = clause.foldLeft(bounds) { (acc, w) =>
+      acc.updated(w.name, acc.getOrElse(w.name, Nil) ::: w.bounds)
+    })
+
+  /** The first name a `where` clause bounds that this declaration cannot bound, and why — either it
+    * declares no such parameter, or the one it declares stands for a value.
+    *
+    * Answered here rather than in the analyzer because the declaration's own parameter list is the
+    * whole of what decides it, and the parser has both in hand at the moment the clause is read.
+    */
+  def whereUnknown(clause: List[WhereBound]): Option[String] = {
+    val takes =
+      if names.isEmpty then "it takes none"
+      else "it takes " + names.map(n => s"'$n'").mkString(", ")
+
+    clause.collectFirst {
+      case w if values.contains(w.name) =>
+        s"'${w.name}' stands for a value rather than a type, and a value implements no trait — " +
+          "its 'const' declaration is where the type its argument must have is written"
+      case w if !names.contains(w.name) =>
+        s"this declaration has no type parameter '${w.name}', so a 'where' clause has nothing to " +
+          s"bound — $takes"
+    }
+  }
+}
 
 object TypeParams {
   val none: TypeParams = TypeParams(Nil)
 }
+
+/** One `T: Display + Eq` of a `where` clause, before the clause is folded into a declaration's
+  * bounds. Kept as its own shape rather than as a pair so that the fold below has something to name
+  * when it reports a parameter the declaration does not have.
+  */
+case class WhereBound(name: String, bounds: List[BoundRef])
 
 /** One entry of a `[…]` parameter list, before the list is folded into `TypeParams`. The two shapes
   * are kept apart here rather than in maps because the grammar reading them is what tells them

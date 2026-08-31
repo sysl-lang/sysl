@@ -306,6 +306,33 @@ trait TypeParser extends ExprParser {
       case n ~ bs ~ d => TypeParamSpec(n, bs.getOrElse(Nil), d)
     }
 
+  /** `where T: Display + Eq, U: Ord` — the bounds of a generic declaration, written after its
+   * signature instead of inside its `[…]` list (`reference/generics.md § A bound may be written
+   * out of line`).
+   *
+   * **It is pure syntax over the bracket list and lowers to exactly the same bounds.** Nothing
+   * downstream learns that a clause was written: `TypeParams.withWhere` folds it into the same map
+   * `[T: Display]` fills, so inference, coherence and every diagnostic are unchanged. What it buys
+   * is that a signature's parameters and its requirements stop being interleaved, which is the whole
+   * of the case for it and is why Rust, Swift and Kotlin all have one.
+   *
+   * **`where` is a contextual word and was already one** — `type Even = new int where is_even`
+   * introduces a constrained subtype's predicate (`reference/types.md`). The two cannot collide,
+   * because one follows a type inside a `type` declaration and this follows a signature, and a
+   * program may still name a function `where`.
+   *
+   * A **value** parameter takes no clause: its `: usize` is the type its argument must have rather
+   * than a bound, and a value implements no trait. `TypeParams.whereUnknown` refuses that along with
+   * a name the declaration does not have.
+   */
+  protected lazy val whereBounds: Parser[List[WhereBound]] =
+    softWord("where") ~> commaList1(
+      ident ~ (op(":") ~> rep1sep(boundRef, op("+")) | err(
+        "a 'where' clause names a type parameter and what it must implement, as " +
+          "'where T: Display' — the ':' is what separates the two",
+      )) ^^ { case n ~ bs => WhereBound(n, bs) },
+    )
+
   protected lazy val boundRef: Parser[BoundRef] =
     at(qualifiedName ~ opt(typeArgs) ^^ { case n ~ args => BoundRef(n, args.getOrElse(Nil)) })
 }
