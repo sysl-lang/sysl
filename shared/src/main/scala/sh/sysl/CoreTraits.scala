@@ -322,6 +322,35 @@ object CoreTraits {
    */
   val closed: Set[String] = Set("Integer")
 
+  /** Whether the compiler provides `traitName` for **some** type in the family `bound` closes.
+   *
+   * A blanket `impl` is filed under its bound's key rather than under any type's, so it has one
+   * member name to serve a whole family — and `builtin` above answers about one type at a time.
+   * Asking it about the block's own parameter answers `false` for every trait, because a type
+   * parameter is not a numeric type, which is how a blanket came to take the *plain* member name
+   * and shadow the compiler's own for every width at once (card `0389`).
+   *
+   * **It is `exists` rather than `forall`, and that is the whole of the decision.** `Neg` and
+   * `Signed` are provided for the signed integers and not the unsigned ones, so a blanket
+   * implementing one of them would be a second implementation at `i8` and a first at `u8` — and one
+   * key carries one suffix. The conservative answer is the only safe one: a suffix nothing needed
+   * leaves a plain name unclaimed, where a plain name wrongly taken hides an operation the compiler
+   * owns, in programs that never mention the block.
+   *
+   * The witnesses are written out rather than derived, so that a second closed family cannot be
+   * added without someone saying which types answer for it.
+   */
+  def familyProvides(traitName: String, bound: String): Boolean =
+    witnesses(bound).exists(builtin(traitName, _))
+
+  /** The types that answer for a closed family, chosen so that every axis `builtin` distinguishes
+   * has one on each side of it. For the integers that axis is the **sign** and nothing else — no row
+   * above asks about a width — so a signed one and an unsigned one are exact rather than a sample.
+   */
+  private def witnesses(bound: String): List[Type] = bound match
+    case "Integer" => List(Type.Int, Type.Byte)
+    case _         => Nil
+
   /** The library function a built-in's `Hash` goes through, and the type its receiver widens to.
    *
    * Everything whose value is one whole number arrives at the same mixer, widened to 64 bits, which

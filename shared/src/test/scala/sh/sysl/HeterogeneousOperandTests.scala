@@ -583,6 +583,57 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
             |    mul(self, o: V[T]) -> V[T] = V(self.x * o.x)""".stripMargin) should
         include("differs only in what it gives back")
     }
+
+    /** A **blanket** over the integers on the left, which is the shape that covers every width at
+     * once -- and the one that took the compiler's own member name for all of them (card `0389`).
+     *
+     * A blanket is filed under its *bound's* key rather than under any type's, so the question
+     * "does the compiler already provide this?" was asked of a subject that is `Type.Unknown` and
+     * answered no. The member then went in unsuffixed, and `5.mul(2)` -- an integer's own
+     * multiplication, reached by name -- stopped compiling in every program, whether or not it
+     * mentioned this block. **The operator never broke**, which is why the by-name spelling is
+     * asserted here beside it rather than instead of it.
+     */
+    "a blanket over the integers on the left covers every width, and hides none of their own" in {
+      run("""struct Ticks
+            |    n: long
+            |end Ticks
+            |impl Mul[long] for Ticks
+            |    mul(self, k: long) -> Ticks = Ticks(self.n * k)
+            |impl[N: Integer] Mul[Ticks, Ticks] for N
+            |    mul(self, t: Ticks) -> Ticks = t * long(self)
+            |val t = Ticks(7)
+            |var w: u8 = 3
+            |var m: i16 = 4
+            |print((2 * t).n, (w * t).n, (m * t).n, (t * 5).n)
+            |print(5.mul(2), 6.add(1))""".stripMargin) shouldBe "14 21 28 35\n10 7\n"
+    }
+
+    /** The other half of the same predicate, and a hole nobody had noticed: a blanket writing **no**
+     * arguments is the implementation the compiler already provides, exactly as `impl Mul for int`
+     * is -- and it was accepted, because that refusal asked about the subject too, and a blanket has
+     * no subject to ask.
+     *
+     * **The refusal names the family rather than the block's parameter.** `'N' already implements`
+     * sends a reader after what `N` is, and `N` is the thing they just wrote.
+     */
+    "a blanket over the integers that writes no arguments is the one the compiler provides" in {
+      val e = err("""impl[N: Integer] Mul for N
+                    |    mul(self, rhs: N) -> N = rhs""".stripMargin)
+
+      e should include("every type in 'sysl.Integer' already implements 'sysl.Mul'")
+      e should include("the compiler provides it")
+    }
+
+    // `Neg` is provided for the signed integers and not the unsigned ones, so the family is asked
+    // with `exists` rather than `forall`: one key carries one suffix, and the conservative answer is
+    // the only safe one. A plain name left unclaimed at `u8` costs nothing, where a plain name
+    // wrongly taken at `i8` hides an operation the compiler owns.
+    "a trait provided for only half the family is still the compiler's" in {
+      err("""impl[N: Integer] Neg for N
+            |    neg(self) -> N = self""".stripMargin) should
+        include("already implements 'sysl.Neg'")
+    }
   }
 
   "a result is not a selector" - {

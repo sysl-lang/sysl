@@ -45,6 +45,28 @@ trait HoistImpl extends ImplTarget {
     val (bound, written) = implBound(impl, tr)
     val outer            = target.copy(outer = tr.tparams.zip(bound.args).toMap)
 
+    // **Whether the compiler already provides this trait for what the block is written for**, which
+    // is one question for a type written out and a different one for a blanket. Both uses below are
+    // about the same thing — the unsuffixed member name being somebody's already — and a blanket
+    // reached neither, so a block over the whole integer family was read as the *first*
+    // implementation its types have and took the plain name for every width at once (card `0389`).
+    //
+    // **The family is read out of `blanketBounds` rather than off the subject, because a blanket has
+    // no subject here to read it off.** `implTarget` answers `Type.Unknown` for one — its members
+    // are made real per receiver, so there is no one instantiation to be — and asking an `Unknown`
+    // whether the compiler provides `Mul` for it is a question with only one answer. The key the
+    // block is filed under is the bound's, which is what that table is keyed by.
+    //
+    // **Spelled, not named** — `blanketBounds` holds the bound's resolved name, and every question
+    // `CoreTraits` answers is asked in spellings. `closedBound` itself goes through `Library.spelling`
+    // to decide the bound closes a family, so reading the name straight out of the table and handing
+    // it over answers `false` for every trait and leaves this exactly as broken as it was.
+    val familyKey    = blanketBounds.get(outer.key)
+    val closedFamily = familyKey.flatMap(Library.spelling)
+
+    val provides = Library.spelling(impl.traitName).exists(sp =>
+      CoreTraits.builtin(sp, ty) || closedFamily.exists(CoreTraits.familyProvides(sp, _)))
+
     // A built-in's memberships come from the compiler (`reference/expressions.md § Operator
     // dispatch`), so an `impl` for one is not adding a capability but competing with the one that
     // is already there — and the operator would keep lowering to its native instruction whatever
@@ -56,7 +78,7 @@ trait HoistImpl extends ImplTarget {
     // its discriminant, so there is one thing equality could mean. The rule is the same and the
     // reader is different — somebody who wrote the enum four lines up is owed why their own type is
     // on the compiler's side of this line, not only that it is.
-    if written.isEmpty && Library.spelling(impl.traitName).exists(CoreTraits.builtin(_, ty)) then
+    if written.isEmpty && provides then
       val because = ty match
         case e: Type.Enum if e.simple =>
           " — no variant of it carries anything, so its value is its discriminant and '==' is that " +
@@ -64,7 +86,13 @@ trait HoistImpl extends ImplTarget {
             "something for it to be about"
         case _ => " — the compiler provides it"
 
-      err(s"'${outer.label}' already implements '${qn(impl.traitName)}'$because")
+      // **A blanket's label is its type PARAMETER**, which names nothing a reader can act on: told
+      // that `'N' already implements 'sysl.Mul'` they go looking for what `N` is, and `N` is the
+      // thing they just wrote. The family is what already implements it, so the family is what the
+      // refusal names.
+      val subject = familyKey.fold(s"'${outer.label}'")(f => s"every type in '${qn(f)}'")
+
+      err(s"$subject already implements '${qn(impl.traitName)}'$because")
 
     // A **closed** trait names a family rather than a promise, so there is nothing for a block to
     // supply: it declares no member, and an `impl` of it could only be a claim to belong to the
@@ -272,7 +300,7 @@ trait HoistImpl extends ImplTarget {
     // suffix for the reason every other second implementation does: the unsuffixed name is already
     // somebody's. A block that wrote no arguments never reaches here, having been refused above as
     // the one the compiler already provides.
-    val provided = written.nonEmpty && Library.spelling(impl.traitName).exists(CoreTraits.builtin(_, ty))
+    val provided = written.nonEmpty && provides
     val floor    = already.length + (if provided then 2 else 1)
 
     def heldByAnother(a: String) =
