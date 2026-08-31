@@ -129,7 +129,14 @@ trait OpaqueResults extends AbstractBodies {
             err(s"'${job.member}' promises 'some ${ref.show}' and its body yields ${show(ty)}, " +
               s"which does not implement '${showBound(b, ty)}'")
 
-        for b <- job.asked if !satisfies(b, ty) do
+        // The trait's bounds on the associated type were resolved with `Self` left abstract, since
+        // the type they are about is what this pass works out. Now it is known, it goes in — a
+        // `type W: Add` asks whether the settled type is an `Add[<it>, <it>]`, not an `Add[Self, Self]`.
+        for
+          asked <- job.asked
+          b = Type.Bound(asked.name, asked.args.map(substParams(_, selfBinding(ty))))
+          if !satisfies(b, ty)
+        do
           err(s"the associated type '${job.assoc}' must implement '${showBound(b, ty)}', and the " +
             s"body of '${job.member}' — which is what settles it — yields ${show(ty)}, which does not")
       }))

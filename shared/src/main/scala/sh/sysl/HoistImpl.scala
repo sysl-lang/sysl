@@ -328,7 +328,7 @@ trait HoistImpl extends ImplTarget {
     for
       a  <- tr.assocs
       ty <- writtenAssoc.get(a.name)
-      b  <- assocBoundsOf(bound, a, subject)
+      b  <- assocBoundsOf(bound, a, ty)
       if !satisfies(b, ty)
     do
       at(impl.assocs.find(_.name == a.name).flatMap(_.pos).orElse(impl.pos))(
@@ -389,7 +389,10 @@ trait HoistImpl extends ImplTarget {
       m              <- opaqueMembers.get(aname)
       promised       <- m.retType.collect { case SomeType(bs) => bs }
     do
-      opaqueJobs += OpaqueJob(fname, fd, promised, assocBoundsOf(bound, decl, subject), home.label,
+      // `Self` in these bounds is the associated type, which a `some` result does not have yet —
+      // its body has not been analyzed. It is left abstract and `checkOpaque` puts the settled type
+      // in, which is the same moment it holds the type to them.
+      opaqueJobs += OpaqueJob(fname, fd, promised, assocBoundsOf(bound, decl, abstractSelf), home.label,
         DeclParser.sourceName(m.name), aname, currentScope, m.pos)
 
     // A generic block's members are checkable before anything instantiates them, against the bounds

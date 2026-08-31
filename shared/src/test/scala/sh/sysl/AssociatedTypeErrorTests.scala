@@ -505,4 +505,61 @@ class AssociatedTypeErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("supplies the associated type rather than bounding it")
     }
   }
+
+  /** A **parameterised** bound on an associated type, which card `0383` fixed and which a fix of that
+    * shape can quietly lose: widening the bound to whatever the implementation supplies would make
+    * every positive case pass and be no check at all. These two say the arguments are still compared,
+    * and that the defaults are filled from the associated type rather than the implementing one.
+    */
+  "a parameterised bound on an associated type is still a bound" - {
+
+    /** **`string` is not the negative it looks like**, which cost this test a rewrite: `+` on two
+      * strings is concatenation, so `string` implements `Add` and a `type W = string` is accepted and
+      * should be. A struct with no blocks of its own is what genuinely cannot add.
+      */
+    "a type that cannot add is refused as the associated type of a 'type W: Add'" in {
+      err(
+        """trait Holder
+          |    type W: Add
+          |    one(self) -> Self::W
+          |struct Plain
+          |    v: int
+          |struct S
+          |    v: Plain
+          |impl Holder for S
+          |    type W = Plain
+          |    one(self) -> Plain = self.v
+          |print(1)""".stripMargin,
+      ) should include("associated type 'W' implement")
+    }
+
+    /** **The diagnostic named the wrong type, and that is what made the bug expensive to read.** It
+      * asked for `Add[S, S]` — the implementing type — where the bound is about `W`, so the message
+      * accused the program of something no program could ever have satisfied.
+      *
+      * **What it should say now is `Add` and nothing else**, which is `showBound` doing its job
+      * rather than a weaker assertion: arguments a default would have supplied are hidden, because a
+      * reader who wrote `Add` should not be told to write `Add[Plain, Plain]`. So the bare name *is*
+      * the evidence — it can only be bare once the arguments are `[Plain, Plain]`, and `[S, S]` is
+      * exactly what the old behaviour had to print, being nothing a default would give.
+      */
+    "and the refusal names the associated type's own arguments, not the implementing type's" in {
+      val msg = err(
+        """trait Holder
+          |    type W: Add
+          |    one(self) -> Self::W
+          |struct Plain
+          |    v: int
+          |struct S
+          |    v: Plain
+          |impl Holder for S
+          |    type W = Plain
+          |    one(self) -> Plain = self.v
+          |print(1)""".stripMargin,
+      )
+
+      msg should include("implement 'sysl.Add', and Plain does not")
+      msg should not include "Add[S, S]"
+    }
+  }
 }

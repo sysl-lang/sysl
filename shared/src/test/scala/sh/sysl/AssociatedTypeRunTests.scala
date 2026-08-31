@@ -474,4 +474,62 @@ class AssociatedTypeRunTests extends AnyFreeSpec with RunSupport {
       run(src) shouldBe "i w\n"
     }
   }
+
+  /** A bound on an associated type that is **parameterised**, which is card `0383`.
+   *
+   * `Add` is declared `Add[Rhs = Self, Out = Self]`, so a bound writing it bare leaves two arguments
+   * to be filled from defaults that name `Self` — and `Self` in a bound is the thing the bound is
+   * written on. On an associated type that is the associated type; it was the *implementing* type,
+   * so `type W = u32` inside `impl Holder for N` asked whether `uint` implements `Add[N, N]`.
+   *
+   * **Nothing caught it because the two halves have to meet.** A bound has to be on an associated
+   * type *and* be parameterised, and the only bounded associated type anywhere — `sysl.math`'s
+   * `type Size: Ord` — is bounded by a trait that takes no parameters, so no default was ever filled
+   * on this path.
+   */
+  "a bound on an associated type may be parameterised" - {
+
+    "a bare Add fills its defaults from the associated type, not from the implementing type" in {
+      val src =
+        """trait Holder
+          |    type W: Add
+          |    one(self) -> Self::W
+          |struct N
+          |    v: u32
+          |impl Holder for N
+          |    type W = u32
+          |    one(self) -> u32 = self.v
+          |sum[H: Holder](h: H) -> H::W = h.one() + h.one()
+          |print(sum(N(21)))""".stripMargin
+
+      run(src) shouldBe "42\n"
+    }
+
+    /** Five parameterised bounds at once, at both widths — the shape `sysl.crypto` would be written
+      * over. Every one of the five leaves two arguments to be filled from a `Self` default, so this is
+      * the case that would have reported five separate refusals naming the implementing type.
+      */
+    "several parameterised bounds at once, at two widths" in {
+      val src =
+        """trait Word
+          |    type W: Add + Sub + Mul + BitAnd + BitXor
+          |    seed(self) -> Self::W
+          |struct Narrow
+          |    v: u32
+          |struct Wide
+          |    v: u64
+          |impl Word for Narrow
+          |    type W = u32
+          |    seed(self) -> u32 = self.v
+          |impl Word for Wide
+          |    type W = u64
+          |    seed(self) -> u64 = self.v
+          |mixed[T: Word](t: T) -> T::W
+          |    val x = t.seed()
+          |    (x + x) ^ (x & x)
+          |print(mixed(Narrow(3)), mixed(Wide(3)))""".stripMargin
+
+      run(src) shouldBe "5 5\n"
+    }
+  }
 }

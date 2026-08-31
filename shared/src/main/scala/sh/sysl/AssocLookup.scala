@@ -46,15 +46,31 @@ trait AssocLookup { this: TraitLookup =>
 
   /** The bounds an associated type carries — what a generic caller reaching one may do with it.
    *
-   * They are the trait's, resolved in the trait's own terms: `Self` is the subject being asked
-   * about, and the trait's own parameters are whatever this bound applied it to. Read in the trait's
-   * scope for the reason a held-as-written bound always is — a short name means what the trait's
-   * file imported, and resolving it where the question was asked reaches whatever that module
-   * happens to see.
+   * They are the trait's, resolved in the trait's own terms: the trait's own parameters are whatever
+   * this bound applied it to. Read in the trait's scope for the reason a held-as-written bound
+   * always is — a short name means what the trait's file imported, and resolving it where the
+   * question was asked reaches whatever that module happens to see.
+   *
+   * **`self` is the ASSOCIATED TYPE, not the type implementing the trait**, and that is the whole of
+   * card `0383`. A bound asks something of the thing it is written on — `abstractSubst` says so in as
+   * many words for an ordinary parameter, and every other caller of `resolveBound` passes
+   * `selfBinding(arg)` for the type the bound is being asked *of*. This passed the subject, so a
+   * trait's `type W: Add` filled `Add`'s `Rhs = Self` and `Out = Self` defaults from the implementing
+   * type: `impl Holder for N` with `type W = u32` asked whether `uint` implements `Add[N, N]`, which
+   * nothing does.
+   *
+   * **It went unseen because it needs a bound that is BOTH on an associated type and parameterised.**
+   * `trait Ord` takes no parameters, and `sysl.math.Magnitude`'s `type Size: Ord` was the only
+   * bounded associated type in the library, in the guides, in the suite and in the org — so the
+   * defaults that carry `Self` were never filled on this path at all.
+   *
+   * The caller says what stands for the associated type: the written binding where there is one, the
+   * projection itself where the answer is abstract, and `abstractSelf` for a `some` result, whose
+   * type is not known until its body has been analyzed and which `checkOpaque` substitutes into.
    */
-  protected def assocBoundsOf(b: Type.Bound, ad: AssocDecl, subject: Type): List[Type.Bound] =
+  protected def assocBoundsOf(b: Type.Bound, ad: AssocDecl, self: Type): List[Type.Bound] =
     traitDecls.get(b.name).toList.flatMap { d =>
-      val subst = d.tparams.zip(b.args).toMap ++ selfBinding(subject)
+      val subst = d.tparams.zip(b.args).toMap ++ selfBinding(self)
 
       ad.bounds.map(ref => inScope(scopeFor(b.name))(resolveBound(ref, subst)))
     }
@@ -73,7 +89,12 @@ trait AssocLookup { this: TraitLookup =>
       .flatMap(b => traitClosure(b, selfBinding(a)))
       .flatMap(b => traitDecls.get(b.name).toList.flatMap(_.assocs).find(_.name == member).map((b, _)))
       .headOption
-      .map((b, ad) => Type.Abstract(s"${a.name}::$member", assocBoundsOf(b, ad, a)))
+      // The bounds are the projection's own, so `Self` inside them is the projection — passed
+      // bound-free, which is the same stand-in `abstractSubst` uses to break the walk back around.
+      .map((b, ad) =>
+        val name = s"${a.name}::$member"
+
+        Type.Abstract(name, assocBoundsOf(b, ad, Type.Abstract(name, Nil))))
       .orElse(blanketAssoc(a, member))
 
   /** The same question answered by a **blanket** block, for a parameter whose bound is the family
