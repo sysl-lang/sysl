@@ -174,8 +174,8 @@ trait HoistImpl extends ImplTarget {
 
     // On a **generic** subject a defaulted argument list is not one promise but one per
     // instantiation, since the trait's own default names the type being asked about. A written
-    // argument built out of that same type at *one* instantiation would coincide with the default
-    // there and nowhere else, which is a choice between implementations rather than a lookup — so
+    // argument that *is* that same type at one instantiation would coincide with the default there
+    // and nowhere else, which is a choice between implementations rather than a lookup — so
     // `impl[T] Mul[Box[int]] for Box[T]` is refused here, where the block that would need choosing
     // between is the one being read.
     //
@@ -191,8 +191,18 @@ trait HoistImpl extends ImplTarget {
     // a second block at the same operands is caught by the argument-list comparison, and one
     // differing only in its result by the rule that a result is not a selector. Both wait until
     // there are two blocks, which is what this one now does too.
+    //
+    // **What can coincide with the defaulted argument is a type of the SUBJECT'S OWN KIND, and
+    // nothing else** — which is why the argument is asked for its owner key rather than searched for
+    // a mention of one. `Box[int]` *is* a `Box` and collides with a defaulted `Box[T]` at `T = int`;
+    // `Box[Pair[T]]` merely **contains** a `Pair` and is a `Box`, so against a subject of `Pair[T]`
+    // there is no instantiation at which the two are one type and nothing to choose between.
+    // Containment is not overlap, and reading it as overlap refused a scalar on the left for every
+    // generic subject — `impl[F: Float] Mul[Vector[Complex[F]], Vector[Complex[F]]] for Complex[F]`,
+    // which is the shape `linalg` needs and the shape `sysl.math.complex` already ships one type
+    // parameter in, where the subject is `real` and this check never ran at all.
     if outer.tparams.nonEmpty && tr.tdefaults.values.exists(mentionsSelf) then
-      for a <- written if mentionsKey(a, outer.key) && a != subject do
+      for a <- written if ownerKey(a) == outer.key && a != subject do
         err(s"'${show(a)}' is ${aOrAn(outer.label)}, and a '${qn(impl.traitName)}' whose arguments " +
           s"default names the type it is written for — so at one ${outer.label} this block and a " +
           "defaulted one would promise the same thing")
@@ -507,17 +517,6 @@ trait HoistImpl extends ImplTarget {
     else
       s" — a trait's members become the type's, so a second '${tr.methods.head.name}' at these " +
         "arguments would have a call no way to say which was meant"
-
-  /** Whether a type is built out of one particular owner key — what tells an argument that names the
-   * type an `impl` is written for from one that names something else.
-   */
-  protected def mentionsKey(t: Type, key: String): Boolean = t match
-    case n: Type.Named       => n.base == key || n.targs.exists(mentionsKey(_, key))
-    case Type.Ptr(inner)     => mentionsKey(inner, key)
-    case Type.Ref(inner, _)  => mentionsKey(inner, key)
-    case Type.Array(_, elem) => mentionsKey(elem, key)
-    case Type.Slice(elem, _) => mentionsKey(elem, key)
-    case _                   => false
 
   /** `a Box`, `an Adder` — the article a diagnostic needs when it names a type in running prose. */
   protected def aOrAn(label: String): String =

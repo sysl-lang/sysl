@@ -530,6 +530,47 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
         include("would promise the same thing")
     }
 
+    /** A scalar on the left of a **generic** subject, which is what `0385` was for and what the
+     * containment reading of this rule took back: `Box[Pair[T]]` is a `Box`, so against a subject of
+     * `Pair[T]` it is not the subject at any instantiation and there is nothing to choose between.
+     *
+     * It is the shape `linalg` needs -- `Complex[F] * Vector[Complex[F]]` -- and the shape
+     * `sysl.math.complex` already ships one type parameter in, where the subject is `real` and this
+     * check never ran at all.
+     */
+    "a scalar on the left of a generic subject, whose argument is built out of the subject" in {
+      run("""struct Box[T]
+            |    v: T
+            |end Box
+            |struct Pair[T]
+            |    a: T
+            |    b: T
+            |end Pair
+            |impl[T: Mul] Mul[T] for Pair[T]
+            |    mul(self, k: T) -> Pair[T] = Pair(self.a * k, self.b * k)
+            |impl[T: Mul] Mul[Box[Pair[T]], Box[Pair[T]]] for Pair[T]
+            |    mul(self, b: Box[Pair[T]]) -> Box[Pair[T]] = Box(b.v * self.a)
+            |val p = Pair(2, 3)
+            |val q = p * Box(Pair(4, 5))
+            |print(q.v.a, q.v.b)""".stripMargin) shouldBe "8 10\n"
+    }
+
+    // The mirror of it, which **passed before this rule was narrowed** and is here for what it
+    // pins rather than for what it caught: the subject is the *element* and so is not generic, so
+    // the check above never ran on it at all. It is the other half of what a package writes.
+    "the container on both sides, with the element type as the subject" in {
+      run("""struct Vec[T: Mul]
+            |    a: T
+            |    b: T
+            |end Vec
+            |impl[T: Mul] Mul[T] for Vec[T]
+            |    mul(self, k: T) -> Vec[T] = Vec(self.a * k, self.b * k)
+            |impl Mul[Vec[int], Vec[int]] for int
+            |    mul(self, v: Vec[int]) -> Vec[int] = v * self
+            |val v = Vec(2, 3)
+            |print((4 * v).a, (v * 4).b)""".stripMargin) shouldBe "8 12\n"
+    }
+
     // And a real collision on a generic subject is still caught — by the rule that a result is not a
     // selector, which is where it belonged all along.
     "two generic blocks agreeing on the operands are still refused" in {
