@@ -146,7 +146,14 @@ trait OperatorCalls extends MethodCalls {
     // argument but the result the implementation supplies.
     val rhs            = tr.args.take(math.max(0, tr.args.length - 1)).headOption
 
-    if CoreTraits.builtin(spelling, ty) then None
+    // A built-in keeps its instruction **unless a block was written at these very arguments**, which
+    // is the whole of what card `0385` changes here. `impl Mul[Point, Point] for real` is the block
+    // that puts a scalar on the left of an operator, and nothing but the argument list tells it from
+    // the multiplication the machine does: `2.0 * 3.0` asks about `Mul[real, real]`, finds no block
+    // written at it, and lowers to `fmul` exactly as before. A block at the built-in's *own*
+    // arguments cannot exist to be found — `hoistImpl` refuses one, and coherence refuses it again
+    // for having no home.
+    if CoreTraits.builtin(spelling, ty) && !writtenImplAt(tr, ty) then None
     else
       ty match
         case a: Type.Abstract =>

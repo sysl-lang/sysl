@@ -103,6 +103,44 @@ class ComplexTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       ) shouldBe "4+4i 2+4i 6+8i 1.5+2i\n"
     }
 
+    /** The scalar on the **left**, which card `0385` is what makes writable: the coherence rule
+      * looked only at an `impl`'s subject, so `real` being the library's settled it and the
+      * `Complex` in the trait's argument list was never consulted. Until then `z * 2.0` was legal
+      * and `2.0 * z` was a block nobody could write in any module, this one included.
+      *
+      * Multiplication and addition commute, so those two are the mirror of the blocks above and are
+      * asserted equal to them. Subtraction and division do not, and are the cases worth reading:
+      * `1.0 - z` is not `z - 1.0`, and `2.0 / z` is a whole complex quotient rather than a scaling.
+      */
+    "and the same four over a real on the left" in {
+      run(
+        """var a = Complex(3.0, 4.0)
+          |print(1.0 + a, 1.0 - a, 2.0 * a, 2.0 / a)""".stripMargin
+      ) shouldBe "4+4i -2-4i 6+8i 0.24-0.32i\n"
+    }
+
+    "the two that commute agree with the right-hand form, and the two that do not disagree" in {
+      run(
+        """var a = Complex(3.0, 4.0)
+          |print(2.0 * a == a * 2.0, 1.0 + a == a + 1.0, 1.0 - a == a - 1.0, 2.0 / a == a / 2.0)""".stripMargin
+      ) shouldBe "true true false false\n"
+    }
+
+    // At `f32` as well, for the reason every identity in this suite is run at both widths — and here
+    // it is also what says the two blocks per operator are two rather than one that happens to fit.
+    "and at binary32, which is the other block" in {
+      run(
+        """var a = Complex(3.0f32, 4.0f32)
+          |print(2.0f32 * a, 1.0f32 - a)""".stripMargin
+      ) shouldBe "6+8i -2-4i\n"
+    }
+
+    // The compiler's own multiplication is unmoved by the block beside it: `real` is a member of
+    // `Mul` whatever anybody writes, and only the argument list tells the two apart.
+    "and the machine's own arithmetic is untouched by either block" in {
+      run("print(2.0 * 3.0, 2.0.mul(3.0), 7 << 2)") shouldBe "6 6 28\n"
+    }
+
     "equality compares both parts" in {
       run(
         """var a = Complex(3.0, 4.0)

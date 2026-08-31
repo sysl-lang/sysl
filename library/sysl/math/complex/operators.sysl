@@ -22,10 +22,15 @@ import sysl.math.Magnitude
 // the arithmetic -- and `library/core.md § What is in it` keeps `Eq` and `Ord` independent traits
 // precisely so that a type can have the one without the other. There is nothing to opt out of.
 //
-// **There is no scalar on the left.** `2.0 * z` would need an `impl Mul[Complex[F]] for F`, which is
-// an implementation of a library trait for a built-in written by the module that owns neither -- and
-// it would be one implementation per width rather than one generic block, since `F` is a parameter
-// and not a type an `impl` may be written for. `z * 2.0` is the same product.
+// **A scalar on the left is two blocks per operator, one at each float width.** `2.0 * z` needs an
+// `impl Mul[Complex[real], Complex[real]] for real`, and an `impl` may not be written for a bare
+// type parameter -- so `F` cannot be the subject and `real` and `f32` write their own, exactly as
+// `ops.sysl` writes `Zero` and `One` one block per width. They are at the bottom of this file.
+//
+// It was not writable at all until sysl 0.0.95: the coherence rule looked only at an `impl`'s
+// SUBJECT, so `real` being the library's settled it and the `Complex` in the trait's argument list
+// was never consulted. The block a scalar on the left needs had no home in any module, including
+// this one, which declares the type it is about.
 
 /** The two identities, which `Float` itself requires and which a generic body reaches through a bound
  * rather than through the type's own members. `zero` is where an accumulator starts and `one` is
@@ -177,3 +182,36 @@ private scaled_by_im[F: Float](z: Complex[F], w: Complex[F]) -> Complex[F] =
     val d = w.re * r + w.im
 
     Complex((z.re * r + z.im) / d, (z.im * r - z.re) / d)
+
+// The scalar on the left, at each width. Each is the mirror of the block above it and computes
+// nothing of its own: multiplication and addition commute, so those forward to the complex operand,
+// and the two that do not are one line each.
+//
+// **The member each of these gives `real` is `mul.2` rather than `mul`**, because the compiler
+// already provides `real`'s own multiplication under the plain name. That is the ordinary suffix a
+// second implementation of one trait takes; what is unusual is only that the first implementation
+// is the machine's and is in no table.
+
+impl Mul[Complex[real], Complex[real]] for real
+    mul(self, z: Complex[real]) -> Complex[real] = z * self
+
+impl Mul[Complex[f32], Complex[f32]] for f32
+    mul(self, z: Complex[f32]) -> Complex[f32] = z * self
+
+impl Add[Complex[real], Complex[real]] for real
+    add(self, z: Complex[real]) -> Complex[real] = z + self
+
+impl Add[Complex[f32], Complex[f32]] for f32
+    add(self, z: Complex[f32]) -> Complex[f32] = z + self
+
+impl Sub[Complex[real], Complex[real]] for real
+    sub(self, z: Complex[real]) -> Complex[real] = Complex(self - z.re, -z.im)
+
+impl Sub[Complex[f32], Complex[f32]] for f32
+    sub(self, z: Complex[f32]) -> Complex[f32] = Complex(self - z.re, -z.im)
+
+impl Div[Complex[real], Complex[real]] for real
+    div(self, z: Complex[real]) -> Complex[real] = Complex(self, 0.0) / z
+
+impl Div[Complex[f32], Complex[f32]] for f32
+    div(self, z: Complex[f32]) -> Complex[f32] = Complex(self, 0.0) / z

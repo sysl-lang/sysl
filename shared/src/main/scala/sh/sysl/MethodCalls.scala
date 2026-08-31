@@ -231,6 +231,13 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
       args: List[Expr],
       subject: String,
       via: Set[String] = Set.empty,
+      /** Whether the **compiler** supplies a member of this name for this type as well — which is a
+        * candidate with no row in any table, since `5.0.mul(2.0)` is answered by the instruction
+        * rather than by a block. It matters only where a block was written for a built-in at *other*
+        * arguments, which coherence began to allow at card `0385`: without it that block is the one
+        * candidate and takes every call, including the ones the machine has an instruction for.
+        */
+      provided: Boolean = false,
   )(
       params: String => Option[List[Type]],
   ): String =
@@ -262,12 +269,16 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
         // file reaching one of them has said which by what it imported.
         val cands = all.filter(reachable(owner, _, via))
 
-        if cands.isEmpty then outOfScope(owner, mname, all, subject)
+        // With a compiler-supplied member of this name there is always something left, and it is the
+        // one no import can reach or fail to reach.
+        if cands.isEmpty then
+          if provided then return mname else outOfScope(owner, mname, all, subject)
 
         // One survivor is the whole answer, and it is the ordinary case once two libraries have each
         // implemented something for a built-in: the arguments are never consulted, which is what
-        // makes a nullary `zero()` resolvable at all.
-        if cands.length == 1 then return cands.head
+        // makes a nullary `zero()` resolvable at all. It is **not** the whole answer where the
+        // compiler supplies one too, since then there are two and only the arguments say which.
+        if cands.length == 1 && !provided then return cands.head
 
         val supplied = args.map(probeType)
         val from = s"'$mname' comes from ${quantity(cands.length, "implementation")} of one trait on $subject"
@@ -296,6 +307,11 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
         }
 
         if fits.length == 1 then return fits.head
+
+        // No written block takes these arguments, and the compiler has a member of this name: that
+        // is the ordinary call the instruction answers, and the plain name is what reaches it —
+        // nothing is filed under it, so the built-in path below picks the call up as it always did.
+        if fits.isEmpty && provided then return mname
 
         // Nothing has settled it. Which complaint that is depends on what is left standing: several
         // **traits** is a use that reached more than one of them, and no argument could have told
@@ -370,7 +386,8 @@ trait MethodCalls extends FuncAddress with VectorMethods with AbstractMethods {
       args: List[Expr],
       via: Set[String],
   ): String =
-    pickOverload(base, mname, args, show(rty), via)(c =>
+    pickOverload(base, mname, args, show(rty), via,
+      provided = CoreTraits.declaring(mname).exists(CoreTraits.builtin(_, rty)))(c =>
       probe(funcInsts(memberFuncName(rty, c))._1.tail.map(_._2)))
 
   /** `Type.f(…)` — an associated function, which has no receiver to drop off the front. */

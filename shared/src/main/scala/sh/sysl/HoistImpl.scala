@@ -230,7 +230,7 @@ trait HoistImpl extends ImplTarget {
     // Last of the checks about the block as a whole, because every one above it is more specific:
     // a block with no home is often also one the library has already written, and being told which
     // implementation already covers the type is the more useful half of that.
-    checkCoherence(impl, outer.label)
+    checkCoherence(impl)
 
     // The first implementation of a trait for a type files its members under the names they were
     // written with; each one after it under names that differ, since a type's members are one
@@ -255,7 +255,15 @@ trait HoistImpl extends ImplTarget {
     // finds, so two would be a silent choice rather than an ambiguity anything could speak to.
     val callTrait = (0 to Type.Fn.maxArity).exists(n => traitKey(Type.Fn.base(n)).contains(impl.traitName))
 
-    val floor = if already.isEmpty then 1 else already.length + 1
+    // **The compiler's own membership occupies the unsuffixed name even though it is in no table**,
+    // which is what `5.0.mul(2.0)` resolves through. So a block written for a built-in at *other*
+    // arguments — `impl Mul[Point, Point] for real`, which is what puts a scalar on the left of an
+    // operator (card `0385`) — is the second implementation whatever `already` holds, and takes a
+    // suffix for the reason every other second implementation does: the unsuffixed name is already
+    // somebody's. A block that wrote no arguments never reaches here, having been refused above as
+    // the one the compiler already provides.
+    val provided = written.nonEmpty && Library.spelling(impl.traitName).exists(CoreTraits.builtin(_, ty))
+    val floor    = already.length + (if provided then 2 else 1)
 
     def heldByAnother(a: String) =
       !callTrait && tr.methods.exists(tm =>

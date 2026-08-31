@@ -270,33 +270,58 @@ trait ImplTarget extends ImplConformance {
   }
 
   /** Where an `impl` may be written (`reference/traits.md § Where an impl may live`): **the module
-   * that declares the trait, or one that declares a type named in the subject**, and nowhere else.
+   * that declares the trait, or one that declares a type the block names** — in the subject or among
+   * the trait's own arguments — and nowhere else.
    *
    * An `impl` is unnamed, so resolving a bound means *searching* for one — and this is the rule that
    * bounds the search to two modules, both of which anything naming the trait and the type already
    * depends on. What it forbids is the case with no home, a foreign trait for a foreign type, where
    * two unrelated modules could each supply a different implementation and no rule picks one.
    *
+   * **The arguments count as of card `0385`, and until then the rule looked at the subject alone.**
+   * A trait that takes arguments is a family of promises, and a block naming a local type in one of
+   * them is as anchored as one naming it in the subject — the module that declares `Point` is the
+   * only module that would ever write `impl Mul[Point, Point] for real`, and it is exactly the block
+   * a scalar on the *left* of an operator needs. Refusing it made `z * 2.0` legal and `2.0 * z` a
+   * thing nobody could write anywhere, including in `sysl.math.complex`, which is the library's own
+   * module for the type it is about. Rust widened the same rule for the same reason and to the same
+   * shape (RFC 2451), which is how `num-complex` has `2.0 * z`.
+   *
+   * **What still has no home is unchanged, and that is what says coherence was not switched off.**
+   * A block naming nothing local anywhere — `impl Mul[real, real] for real` in a program — is
+   * refused exactly as before, and so is one whose only local name is the trait's, since the trait's
+   * *declarer* was always the other way in. Rust's further restriction on uncovered parameters has
+   * nothing to bite on here: an `impl` for a bare type parameter is already refused outright unless
+   * the parameter carries a bound the compiler closes, so the blanket that restriction exists to
+   * forbid cannot be written in the first place.
+   *
    * The library is a module of its own for this purpose even though its declarations are keyed under
    * the root like a rootless program's, so which file a declaration came from is what decides rather
    * than the key — `Stdlib.owns`. A program at the project root is therefore as foreign to `Eq` as
    * any named module is.
    */
-  protected def checkCoherence(impl: ImplDecl, label: String): Unit = {
+  protected def checkCoherence(impl: ImplDecl): Unit = {
     val home     = if libraryOwns(impl, currentModule) then None else Some(currentModule)
     val declarer = declaringModule(impl.traitName)
-    val subject  = subjectHomes(impl.forType)
+    val subject  = subjectHomes(impl.forType) ++ impl.traitArgs.flatMap(subjectHomes)
 
     if home != declarer && !subject(home) then
       err(s"an 'impl' may be written only in the module that declares the trait or in one that " +
-        s"declares a type named in the subject, and '${qn(impl.traitName)}' ${whose(declarer)} " +
-        s"while ${subjectPhrase(subject, label)} — so this one has no home. A trait of your own, or " +
-        "a type of your own in what it is written for, gives it one")
+        s"declares a type the block names, and '${qn(impl.traitName)}' ${whose(declarer)} " +
+        s"while ${subjectPhrase(subject)} — so this one has no home. A trait of your own, or " +
+        "a type of your own in what it is written for or in the trait's arguments, gives it one")
   }
 
-  protected def subjectPhrase(homes: Set[Option[String]], label: String): String =
-    if homes == Set(None) then s"nothing in '$label' is declared outside the library"
-    else s"'$label' names only what ${homes.toList.map(whose).sorted.mkString(" and ")}"
+  /** What the block names, and where those names live.
+   *
+   * It stopped naming the **subject** at card `0385`, when the trait's arguments began to count: a
+   * phrase reading "nothing in 'real' is declared outside the library" would be answering a
+   * narrower question than the rule asks, and a reader would go looking at the `for` type when the
+   * fix is as likely to be an argument.
+   */
+  protected def subjectPhrase(homes: Set[Option[String]]): String =
+    if homes == Set(None) then s"nothing this block names is declared outside the library"
+    else s"it names only what ${homes.toList.map(whose).sorted.mkString(" and ")}"
 
   /** Every module the **subject** of an `impl` belongs to: its own where it is a declared type, and
    * every one its parts belong to where it is composed (`reference/traits.md § Where an impl may

@@ -190,6 +190,19 @@ trait TraitLookup extends MemberVisibility with AssocLookup {
   protected def implAt(tr: Type.Bound, key: String, subject: Type, targs: List[Type]): Option[TraitImpl] =
     implsOf(tr.name, key).find(ti => suppliedBound(ti, tr.name, subject, targs).key == tr.key)
 
+  /** Whether a **written** `impl` covers this type at exactly these arguments, by any of the keys a
+   * member lookup climbs.
+   *
+   * It is `satisfies` with the compiler's own memberships left out, which is the question operator
+   * dispatch has to ask of a built-in: `real` is a member of `Mul` whatever anybody writes, so
+   * asking whether it implements the trait says nothing about whether a *block* was written at the
+   * pair in hand. `impl Mul[Point, Point] for real` is that block (card `0385`), and `Mul[real,
+   * real]` is not one and never can be.
+   */
+  protected def writtenImplAt(tr: Type.Bound, subject: Type): Boolean =
+    (List(memberOwner(subject)) ::: shapeOwners(subject) ::: blanketOwners(subject))
+      .exists((key, targs) => implAt(tr, key, subject, targs).isDefined)
+
   /** The whole argument list an implementation was written at, found from the arguments a *use*
    * supplies rather than from all of them (`library/core.md § Walking a type of your own`).
    *

@@ -302,7 +302,12 @@ trait MemberLowering extends TypeResolution {
         // dispatch`), and member lookup would find a member of the same name first — so an `impl`
         // of some *other* trait may not quietly take `5.add` over from the `Add` the type is
         // already a member of.
-        for tr <- CoreTraits.declaring(m.name) if CoreTraits.builtin(tr, ty) do
+        // A **second** implementation is left out, exactly as it is from the composed-member check
+        // above and for the same reason: its members carry a suffix, so `real.mul.2` is a name the
+        // built-in `mul` was never under and cannot be hidden by. That is what lets a scalar sit on
+        // the left of an operator — `impl Mul[Point, Point] for real` (card `0385`) — while a block
+        // that would take the plain name over is refused as it always was.
+        for tr <- CoreTraits.declaring(m.name) if home.alt.isEmpty && CoreTraits.builtin(tr, ty) do
           err(s"'${m.name}' is how '$tr' is implemented for ${show(ty)}, and the compiler provides " +
             s"that — a member of this name would hide it")
 

@@ -320,13 +320,39 @@ class MultipleImplementationTests extends AnyFreeSpec with RunSupport with Codeg
             |    mul(self, k: int) -> int = self""".stripMargin) should include("the compiler provides")
     }
 
-    // A second argument list is not a way in either, and it never reaches that rule: `Mul` is the
-    // library's and so is `int`, so a program has nowhere to write the block at all (`02`).
-    "and a second argument list does not open one" in {
-      err("""struct C
+    // **A second argument list IS a way in, as of card `0385`, and this test asserted the opposite
+    // until then.** The rule it was written against looked only at an `impl`'s subject, so `int`
+    // being the library's settled it and the local `C` in the argument list was never consulted —
+    // which made `k * c` writable and `c * k` a thing nobody could write in any module, including
+    // the one declaring `C`. Coherence now counts the trait's arguments, and this is the block a
+    // scalar on the left of an operator needs.
+    "and a second argument list is how a scalar gets on the left" in {
+      run("""struct C
             |    v: int
-            |impl Mul[C] for int
-            |    mul(self, c: C) -> int = self""".stripMargin) should include("so this one has no home")
+            |impl Mul[C, C] for int
+            |    mul(self, c: C) -> C = C(self * c.v)
+            |print((3 * C(5)).v)""".stripMargin) shouldBe "15\n"
+    }
+
+    // The built-in keeps everything it had, and the block is reached only at its own argument list:
+    // `3 * 5` is still the machine's multiply, and `5.mul(2)` still reaches the member the compiler
+    // provides rather than the one the block wrote. That is what the `.2` suffix on the block's
+    // member is for — the unsuffixed name was already somebody's.
+    "and the built-in keeps its own pair, by the operator and by name" in {
+      run("""struct C
+            |    v: int
+            |impl Mul[C, C] for int
+            |    mul(self, c: C) -> C = C(self * c.v)
+            |print(3 * 5)
+            |print(5.mul(2))
+            |print(4.mul(C(6)).v)""".stripMargin) shouldBe "15\n10\n24\n"
+    }
+
+    // And a block naming nothing local anywhere is refused exactly as it was, which is what says
+    // coherence was widened rather than switched off.
+    "but a block that names nothing of its own still has no home" in {
+      err("""impl Mul[real, real] for real
+            |    mul(self, k: real) -> real = self""".stripMargin) should include("so this one has no home")
     }
   }
 
