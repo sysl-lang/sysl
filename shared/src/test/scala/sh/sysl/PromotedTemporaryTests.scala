@@ -17,6 +17,11 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class PromotedTemporaryTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
+  private val triple =
+    """triple(n: int) -> [3]int = [n, n + 1, n + 2]
+      |
+      |""".stripMargin
+
   private val sink =
     """trait Sink
       |    take(self, xs: []const int) -> int
@@ -160,6 +165,143 @@ class PromotedTemporaryTests extends AnyFreeSpec with CodegenSupport with RunSup
         |
         |print(total(1, 2, 3))
         |""".stripMargin) shouldBe "6\n"
+  }
+
+  /** **Every other temporary is the same case**, which is card `0394`. A call answering a `[N]T`
+   * puts it in a frame slot exactly as a literal does, so a view of it that gets out has the same
+   * nowhere to go and the same answer — and until this it was refused with a sentence naming a
+   * field of a value and a parameter passed by value, neither of which is what the reader wrote.
+   *
+   * `sha256(data)[..]` handed to something that keeps it is the shape it was found from
+   * (`slate-language/slate`, `crypto.sysl`), where binding the call to a `val` first was accepted
+   * and the direct form was not — two spellings of one frame slot.
+   */
+  "a view of any other temporary array that escapes is given storage of its own" - {
+
+    "stored into module storage, and read after the frame that made it is gone" in {
+      run(triple +
+        """static var kept: []const int = []
+          |
+          |fill()
+          |    kept = triple(7)[..]
+          |
+          |fill()
+          |print(kept.len, kept[0], kept[2])
+          |""".stripMargin) shouldBe "3 7 9\n"
+    }
+
+    // The card's own reduction: nothing of the slice is really returned, since the callee copies —
+    // but a call's result is conservatively taken to view every argument, so this is an escape and
+    // the temporary is what has to move.
+    "handed to a callee whose result is returned, which is the reduction the card was written from" in {
+      run(triple +
+        """keep(xs: []const int) -> []const int = xs
+          |
+          |copied() -> []const int = keep(triple(7)[..])
+          |
+          |var s = copied()
+          |print(s.len, s[0], s[2])
+          |""".stripMargin) shouldBe "3 7 9\n"
+    }
+
+    "through a trait object, which is where the literal form was found" in {
+      run(sink + triple +
+        """var a = Adder(10)
+          |val d: &Sink = a
+          |
+          |print(d.take(triple(7)[..]))
+          |""".stripMargin) shouldBe "13\n"
+    }
+
+    // A field of a *temporary* is a temporary: there is no declaration under it either, so the
+    // aggregate question a field of a named value raises is not the one being asked. That one is
+    // still refused, in `EscapeErrorTests`.
+    "a field of a temporary struct is the same case" in {
+      run(
+        """struct Frame
+          |    cells: [3]int
+          |
+          |framed(n: int) -> Frame = Frame([n, n + 1, n + 2])
+          |
+          |static var kept: []const int = []
+          |
+          |fill()
+          |    kept = framed(4).cells[..]
+          |
+          |fill()
+          |print(kept.len, kept[0], kept[2])
+          |""".stripMargin) shouldBe "3 4 6\n"
+    }
+
+    /** The buffer is a second holder of whatever the temporary counted, so it takes a count the way
+     * a promoted declaration does. Nothing about the shape says whether that was done: the strings
+     * read back correctly either way until something else has reused the storage, which is what the
+     * churn below is for.
+     */
+    "and elements that carry counts are still theirs after the frame and the heap have moved on" in {
+      run(
+        """pair(n: int) -> [2]string
+          |    var a = s"alpha${n}"
+          |    var b = s"beta${n}"
+          |
+          |    [a, b]
+          |
+          |static var kept: []const string = []
+          |
+          |fill()
+          |    kept = pair(1)[..]
+          |
+          |fill()
+          |
+          |var i = 0
+          |
+          |while i < 100000
+          |    var junk = str(i)
+          |
+          |    if junk.len == 0 then exit(1)
+          |
+          |    i += 1
+          |
+          |print(kept[0], kept[1])
+          |""".stripMargin) shouldBe "alpha1 beta1\n"
+    }
+
+    /** The cost, stated where it can be seen — and the message names the call, since that is what
+     * the reader has on the line rather than a name they chose.
+     */
+    "a module that gave the allocator up is refused, and told which temporary it was" in {
+      val e = err(
+        """@no_alloc
+          |
+          |triple(n: int) -> [3]int = [n, n + 1, n + 2]
+          |
+          |static var kept: []const int = []
+          |
+          |fill()
+          |    kept = triple(7)[..]
+          |
+          |fill()
+          |print(kept.len)
+          |""".stripMargin)
+
+      e should include("'triple' answered with")
+      e should include("'@no_alloc'")
+    }
+
+    /** What must **not** have changed, and the instrument that says so: a slice of a call's answer
+     * that stays in the frame is the ordinary case, and it still costs no allocator at all.
+     */
+    "a temporary whose view does not escape still needs no allocator" in {
+      run(
+        """@no_alloc
+          |
+          |triple(n: int) -> [3]int = [n, n + 1, n + 2]
+          |
+          |count(xs: []const int) -> usize = xs.len
+          |
+          |print(count(triple(7)[..]))
+          |""".stripMargin) shouldBe "3\n"
+    }
   }
 
   /** A partial slice of a literal has no declaration either, and is **not** promoted — the escape is

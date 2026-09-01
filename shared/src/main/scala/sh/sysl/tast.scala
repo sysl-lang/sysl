@@ -39,6 +39,23 @@ sealed trait TExpr extends Positioned {
         case s: Type.Struct if i >= 0 && i < s.fields.length => s.fields(i)._2
         case _                                               => t
     case _ => ty
+
+  /** Whether this names **storage** — somewhere with an address of its own — rather than a value
+   * that has just been computed.
+   *
+   * It is what tells a temporary from a place, and two passes need the same answer: codegen gives a
+   * computed value a slot before it can reach into one, and escape analysis moves a temporary to the
+   * heap rather than refusing a view of it that gets out. Two definitions of this could disagree
+   * without anything failing to compile, so there is one.
+   *
+   * **An index is a place whatever its receiver is**, since an element of a computed array is
+   * reached through the slot that array is materialized into. A **field** is one only where its
+   * receiver is: `f().x` is part of a value nobody has a name for.
+   */
+  def isPlace: Boolean = this match
+    case _: TLoad | _: TGlobal | _: TDeref | _: TIndex => true
+    case TField(receiver, _, _)                        => receiver.isPlace
+    case _                                             => false
 }
 
 /** An integer, `char`, or simple-enum constant — anything whose value is one whole number. */

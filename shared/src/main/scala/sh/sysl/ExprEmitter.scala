@@ -215,6 +215,28 @@ trait ExprEmitter extends ArithEmitter {
       if slice.pos.exists(promotedTemps) =>
       genExpr(TBufFill(value, TIntLit(n, Type.usize), sliceTy))
 
+    // Any **other** whole temporary array whose view escapes: the value the frame just computed is
+    // written into a buffer instead of into the slot it would otherwise have had, and the view
+    // counts against that buffer. A call answering a `[N]T` is the shape this exists for — card
+    // `0394` — and it is the same three steps a promoted *declaration* takes (`Codegen`'s
+    // `TVarDecl` for a promoted array), which is what says this is a lowering and not a new idea.
+    //
+    // The two literal forms above are the same case done better: they are built straight into the
+    // buffer rather than produced and copied, which is worth the two lines it costs. Everything
+    // else has no such form, so the value is made and moved.
+    //
+    // The retain is the one that path takes and for the same reason: the value is still the
+    // statement's to release, and the buffer is a second holder of whatever it counts.
+    case slice @ TSlice(base, None, None, _, sliceTy: Type.Slice)
+      if slice.pos.exists(promotedTemps) =>
+      val Type.Array(n, elem) = base.ty: @unchecked
+      val v                   = genExpr(base)
+      val (box, data)         = genBuffer(elem, Val.Int(n))
+
+      retainValue(base.ty, v)
+      emit(Inst.Store(base.ty.lty, v, data, Access.Plain))
+      bufferView(sliceTy, box, data, Val.Int(n))
+
     case TSlice(base, lo, hi, inclusive, sliceTy) =>
       genSlice(base, lo, hi, inclusive, sliceTy)
 

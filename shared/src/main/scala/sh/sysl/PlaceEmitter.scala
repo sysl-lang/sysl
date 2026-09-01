@@ -55,11 +55,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * data register. So a volatile field is reached by walking to its address instead — which is only
    * possible when the receiver has one.
    */
-  protected def hasAddress(e: TExpr): Boolean = e match
-    case _: TLoad | _: TGlobal | _: TDeref => true
-    case _: TIndex                         => true
-    case TField(receiver, _, _)            => hasAddress(receiver)
-    case _                                 => false
+  protected def hasAddress(e: TExpr): Boolean = e.isPlace
 
   /** The address of a place, as a `ptr` register or an existing slot name. Every place bottoms
    * out either in a local's stack slot or in a pointer the program already holds, so this walks

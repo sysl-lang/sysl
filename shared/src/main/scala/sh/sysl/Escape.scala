@@ -123,7 +123,7 @@ private class Escape(program: TProgram) {
           walks.collect { case (Some(n), _, w) if w.promoted.nonEmpty => n -> w.promoted.toSet }.toMap,
           walks.collectFirst { case (None, _, w) => w.promoted.toSet }.getOrElse(Set.empty),
           walks.flatMap(_._3.why.toList),
-          walks.flatMap(_._3.temps.toList).toSet,
+          walks.flatMap(_._3.temps.keys).toSet,
         ),
       )
   }
@@ -207,16 +207,19 @@ private class Escape(program: TProgram) {
     walk.gotOut
   }
 
-  /** What frame-owned storage a value may view: the local arrays it roots at by name, and whether
-   * it also views frame storage this pass cannot name.
+  /** What frame-owned storage a value may view: the local arrays it roots at by name, the
+   * temporaries it roots at by position, and whether it also views frame storage this pass cannot
+   * name.
    *
    * The distinction is what decides promotion from diagnostic. A view rooted at a plain local array
-   * has somewhere to move the storage to; one rooted at a field of a local struct, or at an array
-   * parameter the caller passed by value, does not — promoting the first would be
-   * `reference/memory.md § What happens when a slice escapes`'s unspecified "promotion of
-   * aggregates", and the second is storage this frame was handed rather than storage it made.
+   * has somewhere to move the storage to, and so does one rooted at a **temporary** — a value the
+   * frame computed and nobody named, which is nobody else's to move either. One rooted at a field of
+   * a **named** local struct, or at an array parameter the caller passed by value, does not:
+   * promoting the first would be `reference/memory.md § What happens when a slice escapes`'s
+   * unspecified "promotion of aggregates", and the second is storage this frame was handed rather
+   * than storage it made.
    */
-  private case class View(named: Set[String], anonymous: Boolean, temps: Set[Pos] = Set.empty) {
+  private case class View(named: Set[String], anonymous: Boolean, temps: Map[Pos, String] = Map.empty) {
     def nonEmpty: Boolean = named.nonEmpty || anonymous || temps.nonEmpty
     def ++(o: View): View = View(named ++ o.named, anonymous || o.anonymous, temps ++ o.temps)
   }
@@ -225,9 +228,31 @@ private class Escape(program: TProgram) {
     val none: View                = View(Set.empty, anonymous = false)
     val unnamed: View             = View(Set.empty, anonymous = true)
     def of(name: String): View    = View(Set(name), anonymous = false)
-    def temp(at: Pos): View       = View(Set.empty, anonymous = false, temps = Set(at))
+
+    /** A temporary, and what to call it in the sentence a promotion of it is explained by — the
+     * one thing a reader has to recognise, since there is no name they wrote to give back to them.
+     */
+    def temp(at: Pos, what: String): View = View(Set.empty, anonymous = false, temps = Map(at -> what))
     def any(vs: Iterable[View]): View = vs.foldLeft(none)(_ ++ _)
   }
+
+  /** What a promotion is *about*, for the two readers that have to say something about one. A named
+   * array is given back in the reader's own word for it; a temporary has no such word, so it carries
+   * the phrase that names it instead — and only the named case can be asked whether a declaration
+   * wanted a boundary of its own, because only a declaration can have asked.
+   */
+  private enum Subject:
+    case Named(name: String)
+    case Temp(what: String)
+
+  /** What to call a temporary in the one sentence a reader is given about it. There is no name they
+   * wrote, so the sentence has to hand back something they can find on the line: the literal they
+   * see, or the call whose answer they sliced.
+   */
+  private def describe(base: TExpr): String = base match
+    case _: TArrayLit | _: TArrayFill => "an array literal"
+    case TCall(name, _, _, _)         => s"the array '$name' answered with"
+    case _                            => "a temporary array"
 
   /** One function's worth of tracking: which of its locals may hold a view that dies with the
    * frame, which arrays those views root at, and the first escape that has nowhere to be promoted.
@@ -246,9 +271,9 @@ private class Escape(program: TProgram) {
     val promoted = mutable.Set.empty[String]
 
     /** The temporaries this body must give storage of their own — a full-range slice of an array
-     * literal that got out, by the position of the slice.
+     * this frame computed and nobody named, by the position of the slice, with what to call it.
      */
-    val temps = mutable.Set.empty[Pos]
+    val temps = mutable.Map.empty[Pos, String]
 
     /** Why each of them moved, in the order the escapes were found. */
     val why = mutable.ListBuffer.empty[String]
@@ -258,7 +283,7 @@ private class Escape(program: TProgram) {
      * module that declared `no alloc` has nowhere to promote into, so what is silent everywhere else
      * is a diagnostic there.
      */
-    val sites = mutable.ListBuffer.empty[(String, Option[Pos], String)]
+    val sites = mutable.ListBuffer.empty[(Subject, Option[Pos], String)]
 
     /** Whether any confined view left the frame at all, promotable or not. This is what a parameter
      * summary asks — "does the callee let this outlive the call" is a yes/no, and the roots that
@@ -280,14 +305,23 @@ private class Escape(program: TProgram) {
     private def views(e: TExpr): View = if !carriesView(e.ty) then View.none else viewsValue(e)
 
     private def viewsValue(e: TExpr): View = e match
-      // A **whole** array literal, viewed. It has no declaration to promote, so it was refused
+      // A **whole** temporary array, viewed. It has no declaration to promote, so it was refused
       // outright until card `0314`; what it is instead is a temporary this frame made, which is
       // exactly the thing promotion exists for. The escape gives it storage of its own — which is
-      // what an array literal written where a `[]T` is expected already gets — and the element
-      // views are still walked, since what the literal was *filled with* may be the frame's.
-      case slice @ TSlice(base @ (_: TArrayLit | _: TArrayFill), None, None, _, _)
-        if slice.pos.isDefined =>
-        views(base) ++ View.temp(slice.pos.get)
+      // what an array literal written where a `[]T` is expected already gets — and the base's own
+      // views are still walked, since what the temporary was *built from* may be the frame's.
+      //
+      // **What makes it a temporary is having no address of its own** (`TExpr.isPlace`), which is
+      // the same question codegen asks before giving a computed value a slot. `0314` read that as
+      // the two array literal forms because those were the shapes a `...T` pack produced; card
+      // `0394` is the rest of it — a call's returned `[N]u8` sits in a frame slot exactly as a
+      // literal does, and `sha256(data)[..]` handed to something that keeps it was refused with
+      // advice a reader could not act on. Storage with an address is left to `arrayRoot` below,
+      // which is what keeps a field of a *named* value and an array a caller passed by value
+      // refused: those are somebody else's to move, and a temporary is nobody's.
+      case slice @ TSlice(base, None, None, _, _)
+        if slice.pos.isDefined && base.ty.isInstanceOf[Type.Array] && !base.isPlace =>
+        views(base) ++ View.temp(slice.pos.get, describe(base))
       case TSlice(base, _, _, _, _) =>
         base.ty match
           // A view of a `*T` region is the programmer's problem, like every `*T` — it is
@@ -512,17 +546,17 @@ private class Escape(program: TProgram) {
 
       for name <- v.named if !promoted(name) do
         why += Diagnostic.explain(s"'$name' is promoted to the heap, because this view of it $how", at.pos)
-        sites += ((name, at.pos, how))
+        sites += ((Subject.Named(name), at.pos, how))
 
       promoted ++= v.named
 
       // A temporary is promoted like a named array and is reported like one under `no alloc`, since
       // what it costs there is the same allocation. It has no name a reader wrote, so it is named
       // for what it is.
-      for pos <- v.temps if !temps(pos) do
-        why += Diagnostic.explain(s"an array literal is given storage of its own, because this view " +
+      for (pos, what) <- v.temps if !temps.contains(pos) do
+        why += Diagnostic.explain(s"$what is given storage of its own, because this view " +
           s"of it $how", Some(pos))
-        sites += (("an array literal", Some(pos), how))
+        sites += ((Subject.Temp(what), Some(pos), how))
 
       temps ++= v.temps
       gotOut = true
@@ -568,9 +602,12 @@ private class Escape(program: TProgram) {
 
     if !narrowed then Nil
     else
-      w.sites.toList.map((name, pos, how) =>
+      w.sites.toList.map((subject, pos, how) =>
         Diagnostic(
-          s"this view of ${if name == "an array literal" then name else s"'$name'"} $how, so the " +
+          s"this view of ${subject match
+              case Subject.Named(name) => s"'$name'"
+              case Subject.Temp(what)  => what
+            } $how, so the " +
             s"array would move to the heap to outlive the frame — " +
             s"and ${if theirs then "this module's '@tests' file" else "this module"} declared '@no_alloc', " +
             "so there is nothing to move it into. Keep the view inside the frame, or take the storage " +
@@ -597,7 +634,7 @@ private class Escape(program: TProgram) {
     val asked = alignedArrays(stmts)
 
     w.sites.toList.collect {
-      case (name, pos, how) if asked.contains(name) =>
+      case (Subject.Named(name), pos, how) if asked.contains(name) =>
         Diagnostic(
           s"this view of '$name' $how, so the array would move to the heap to outlive the frame — " +
             s"and '$name' asked to begin on a ${asked(name)}-byte boundary, which is the allocator's " +
