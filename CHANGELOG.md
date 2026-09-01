@@ -7,6 +7,137 @@ copy -- correct a mistake there and regenerate, rather than editing this file. V
 `MAJOR.MINOR.PATCH`; while the leading zero stands the language is still moving, and a release may
 change what an existing program means. Where it does, the release says so.
 
+## 0.0.97 — 2026-08-31
+
+Three cards, all additive. Two of them are ways of writing something the
+language had no spelling for; the third is a flag a build no longer needs.
+
+### A bound may be written out of line, with `where`
+
+```sysl
+show[T](x: T) -> string where T: Display = str(x)
+
+print(show(42))
+```
+
+The form Rust, Swift and Kotlin all have. A bracket list is one place to put a
+bound and it is not always the readable one: a declaration with several
+parameters and several bounds pushes its parameter list, its result and its
+body off to the right, and what the reader came for — what the function
+*takes* — is the part that moves.
+
+**It is pure syntax over what the brackets already express.** A clause is
+folded into the same bound map `[T: Display]` fills, so inference, coherence
+and every diagnostic are untouched — nothing downstream learns a clause was
+written. It goes at the end of the header line, on a function, a member, a
+struct, an enum, a trait and an `impl`.
+
+The two may be mixed, which is what makes the choice per-bound rather than
+per-declaration — the short obvious constraint stays in the brackets, and the
+long one that would crowd the signature goes below it:
+
+```sysl
+same[T: Eq](a: T, b: T) -> string where T: Display =
+    if a == b then str(a) else "different"
+```
+
+`where` was **already** a contextual word — it introduces a constrained
+subtype's predicate, `type Even = new int where value % 2 == 0` — so no keyword
+was added and a program may still name a function `where`. The two cannot
+collide: one follows a type inside a `type` declaration, the other follows a
+signature.
+
+A clause may only bound a parameter the declaration actually declares, and a
+value parameter is the case that reads as though it ought to work and cannot —
+`[const N: usize]` already states a type, and a value implements no trait:
+
+```
+error: this declaration has no type parameter 'U', so a 'where' clause has
+nothing to bound — it takes 'T'
+
+error: 'N' stands for a value rather than a type, and a value implements no
+trait — its 'const' declaration is where the type its argument must have is
+written
+```
+
+### A property may belong to the type
+
+```sysl
+struct Temp
+    n: int
+
+    static freezing -> int = 32
+
+print(Temp.freezing)
+```
+
+**A property had nowhere to say `self`.** A member's receiver is written in its
+parameter list, and a property is a method with that list left off — so the one
+thing separating an instance member from an associated one could not be
+spelled, and every property was an instance member by construction. `static` is
+what says otherwise, and it is read on the type with no parentheses.
+
+**What the form is for is a bound.** A type parameter is not a value, so a fact
+*about the type* — a zero, a width, a limit — has nowhere to arrive from unless
+a bound can carry it:
+
+```sysl
+trait Bounded
+    static lowest -> int
+
+struct Age
+    n: int
+
+impl Bounded for Age
+    static lowest -> int = 18
+
+lowest_of[T: Bounded]() -> int = T.lowest
+
+print(lowest_of[Age]())
+```
+
+`lowest_of` never mentions `Age`, and there is no value of it anywhere in the
+program.
+
+Reading one on a value is refused, in the words the mirror case uses. A trait's
+static property carries no body — the rule every receiverless trait member
+already has, since a default would give every implementation the same constant —
+and it gets a refusal of its own, because a property cannot take the advice to
+add a `self` parameter.
+
+`static` is not a new word either: it is the same one that makes a binding in an
+entry file belong to the module rather than to that file's body, and the two are
+told apart by what follows it.
+
+### A `headers` requirement may name its environment variable
+
+```
+requires {
+  headers {
+    pico_sdk = { note = "the pico-sdk's headers", env = "PICO_SDK_PATH" }
+  }
+}
+```
+
+A consumer with that variable set needs no `--include-path` flag.
+
+**The manifest still may not carry a path, and this does not weaken that.** A
+variable's *name* is the same string on every machine in the world — it is what
+the pico-sdk's own CMake reads — so it is a property of the library's ecosystem
+rather than of whoever happens to be building.
+
+An `env` is consulted **only** where no flag named that requirement, so it can
+turn a refusal into a success and never one success into another. An empty
+variable counts as unset, since `PICO_SDK_PATH=` is somebody clearing it rather
+than naming a root. It folds in a dependency's needs as well — a program
+depending on `pico2` never writes that requirement down itself, which is the
+case it exists for.
+
+### Nothing else changes
+
+No keyword was added, nothing was renamed, and nothing was removed. Every
+program that compiled under 0.0.96 compiles here.
+
 ## 0.0.96 — 2026-08-31
 
 Two cards, and together they are the other half of 0.0.95's headline. A scalar may sit on the left
