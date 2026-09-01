@@ -113,11 +113,15 @@ class TraitDefaultErrorTests extends AnyFreeSpec with CodegenSupport {
   }
 
   "what a trait may declare" - {
-    "a default on something with no receiver has nothing to work on" in {
+    // An **associated function** may carry one — see `TraitDefaultRunTests`. A property of the
+    // *type* may not, and the reason is its own rather than a receiver rule: it has no parameter
+    // list and no receiver, so nothing is available to vary the value it would hand every
+    // implementation.
+    "a default on a property of the type would be one value for everybody" in {
       err(
         """trait Maker
-          |    make() -> int = 1""".stripMargin
-      ) should include("no receiver")
+          |    static size -> int = 1""".stripMargin
+      ) should include("would give every implementation the same value")
     }
 
     // A member declaring type parameters of its own is ordinary now, default body and all — it

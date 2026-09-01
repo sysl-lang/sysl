@@ -134,21 +134,23 @@ trait Hoisting extends HoistMembers {
       for m <- t.methods do recordMemberAccess(key, m.name, Visibility.Public, s"${t.name}.${m.name}")
       if libraryOffers(t, currentModule) then libraryNames(t.name) = key
       for m <- t.methods do
-        // A property carries its receiver without writing one, so the reading below — no receiver
-        // and a body, which for a method means a default with nothing to work on — is not what a
-        // property with a body is. That one is a default property, and it is allowed.
-        if m.isAssociated && m.body.nonEmpty then
-          // A static property is the same case and cannot take the same advice: a property has no
-          // parameter list, so there is nowhere for it to say `self`, and the only way out is to
-          // drop the body. Every implementing type would otherwise inherit one constant, which is
-          // the mistake the receiverless rule exists to catch.
+        // **An ASSOCIATED FUNCTION may carry a default, exactly as a method may.** It is the same
+        // inheritance and the same escape from it: the body is hoisted onto every implementing type
+        // that left the member out, and one that wants its own says `override`. This used to be
+        // refused, on the reading that a body with no receiver has nothing to work on — which is
+        // false of a constant and false of `Self.other()`, and the reason underneath it, that every
+        // implementation would inherit one value, is the reason a default *works* rather than an
+        // objection to one. It is also not what told the two cases apart: a defaulted method with a
+        // receiver hands every implementation one constant just as surely.
+        //
+        // What is refused is a **static property**, and its reason is its own: a property has no
+        // parameter list and no receiver, so a default there is a value with nothing available to
+        // vary it — an implementation could only take it or replace it whole, and the trait is the
+        // wrong place to write a constant every type shares.
+        if m.isAssociated && m.isStatic && m.body.nonEmpty then
           at(m.pos)(err(
-            if m.isStatic then
-              s"'${t.name}.${m.name}' is a property of the type, so a default body would give every " +
-                "implementation the same value — drop the body and let each one supply it"
-            else
-              s"'${t.name}.${m.name}' has no receiver, so a default body has no value to " +
-                "work on — give it a 'self' parameter or drop the body",
+            s"'${t.name}.${m.name}' is a property of the type, so a default body would give every " +
+              "implementation the same value — drop the body and let each one supply it",
           ))
         // No implementation could supply one either, so the trait is where it is worth saying so.
         // A defaulted parameter is caught by this too, since carrying a default means having one.

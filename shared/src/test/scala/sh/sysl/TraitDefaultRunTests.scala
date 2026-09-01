@@ -12,6 +12,82 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class TraitDefaultRunTests extends AnyFreeSpec with RunSupport {
 
+  /** **An associated function carries a default like any other member**, which is what lets a trait
+   * made of them grow: `Compression` in `sysl.crypto` gained one fact — which end of a word goes
+   * first — without editing the three implementations for which the answer was already the common
+   * one.
+   *
+   * It was refused until then, on the reading that a body with no receiver has nothing to work on.
+   * The bodies below are what settles that: a constant needs nothing, and one calling `Self.width()`
+   * has as much to work on as any method.
+   */
+  "a receiverless member" - {
+
+    "may carry a default, which an implementation inherits" in {
+      run(
+        """trait Endian
+          |    little() -> bool = false
+          |    width() -> usize
+          |struct Big
+          |end Big
+          |impl Endian for Big
+          |    width() -> usize = 4
+          |show[E: Endian]() = print(E.little(), E.width())
+          |show[Big]()""".stripMargin) shouldBe "false 4\n"
+    }
+
+    "and an implementation that wants its own says 'override'" in {
+      run(
+        """trait Endian
+          |    little() -> bool = false
+          |    width() -> usize
+          |struct Big
+          |end Big
+          |struct Small
+          |end Small
+          |impl Endian for Big
+          |    width() -> usize = 4
+          |impl Endian for Small
+          |    override little() -> bool = true
+          |    width() -> usize = 8
+          |show[E: Endian]() = print(E.little(), E.width())
+          |show[Big]()
+          |show[Small]()""".stripMargin) shouldBe "false 4\ntrue 8\n"
+    }
+
+    // The claim the old refusal denied outright: a receiverless body may name the trait's other
+    // members through `Self`, and is materialized per implementing type so each answers its own.
+    "whose body may reach the trait's other members through 'Self'" in {
+      run(
+        """trait Sized
+          |    width() -> usize
+          |    doubled() -> usize = Self.width() * 2
+          |struct Word
+          |end Word
+          |struct Half
+          |end Half
+          |impl Sized for Word
+          |    width() -> usize = 4
+          |impl Sized for Half
+          |    width() -> usize = 2
+          |show[T: Sized]() = print(T.width(), T.doubled())
+          |show[Word]()
+          |show[Half]()""".stripMargin) shouldBe "4 8\n2 4\n"
+    }
+
+    // A default is reached through the type as an inherent member too, not only through a bound —
+    // which is what says it was hoisted onto the type rather than resolved at the bound.
+    "and the default is the type's own member afterwards" in {
+      run(
+        """trait Endian
+          |    little() -> bool = false
+          |struct Big
+          |end Big
+          |impl Endian for Big
+          |print(Big.little())""".stripMargin) shouldBe "false\n"
+    }
+  }
+
   "inheriting" - {
     "an impl may leave out a method the trait supplies a body for" in {
       val src =
