@@ -7,6 +7,152 @@ copy -- correct a mistake there and regenerate, rather than editing this file. V
 `MAJOR.MINOR.PATCH`; while the leading zero stands the language is still moving, and a release may
 change what an existing program means. Where it does, the release says so.
 
+## 0.0.98 — 2026-09-01
+
+Four cards, all additive. Two are refusals that were drawn wider than their
+reasons; two are the standard library growing what a protocol asks for by name.
+
+### A temporary array moves to the heap, like the array literal that already did
+
+```sysl
+import sysl.crypto.sha256
+
+static var fingerprint: []const u8 = []
+
+record(data: []const u8)
+    fingerprint = sha256(data)[..]
+
+record("abc".bytes)
+
+print(fingerprint.len, fingerprint[0], fingerprint[31])
+```
+
+A view of a local array that gets out of its frame moves the array to the heap
+— that has always been so, and it is what lets a function return a slice of
+something it declared. An array with **no declaration** had nowhere to move,
+so a view of one that escaped was refused. Since 0.0.86 an array *literal* was
+promoted too; this is the rest of it.
+
+What makes something a temporary is having no address of its own: a call's
+returned `[N]u8`, a field of one, an array literal. It is nowhere yet, so it
+is nobody's to move, so it is this frame's.
+
+**Binding it to a name first always worked**, which is what says the refusal
+bought nothing:
+
+```sysl
+val d = sha256(data)
+
+collected(d[..])          // accepted, and always was
+collected(sha256(data)[..])   // refused until now — one frame slot, two spellings
+```
+
+What stays refused is storage that really is somebody else's: an array a
+caller passed **by value**, and a field of a **named** struct on the frame,
+where moving the field alone or the struct with it is a choice the reference
+leaves unspecified.
+
+`--explain-escapes` and the `@no_alloc` refusal now name *which* temporary
+moved — the call whose answer was sliced — rather than calling everything an
+array literal.
+
+### An associated function may carry a default
+
+```sysl
+trait Sized
+    width() -> usize
+    doubled() -> usize = Self.width() * 2
+
+struct Word
+end Word
+
+impl Sized for Word
+    width() -> usize = 4
+
+show[T: Sized]() = print(T.width(), T.doubled())
+
+show[Word]()
+```
+
+A trait member with no receiver was refused a default body, on the reading
+that a body with no receiver has nothing to work on. That is false of a
+constant and false of the body above, and the reason underneath it — that
+every implementation would otherwise inherit one value — is what a default
+*is* rather than an objection to one. It was not what told the two cases
+apart either: a defaulted method **with** a receiver hands every
+implementation one constant just as surely, and always compiled.
+
+What it cost is the property defaults exist for: **a trait can grow**. Four
+traits in the standard library are made entirely of receiverless members, so
+none could gain one without editing every implementation.
+
+Inheritance and replacement are the ordinary rules — leave the member out to
+take the trait's body, write `override` to supply your own.
+
+A **static property** is still refused, and its reason is its own rather than
+anything about receivers: it has no parameter list and no receiver, so nothing
+is available to vary the value it would hand every implementation.
+
+### `sysl.crypto` grows MD5
+
+```sysl
+import sysl.crypto.md5
+import sysl.encoding.hex_string
+
+print(hex_string(md5("abc".bytes)))
+```
+
+**MD5 is broken and has been since 2004**, and a chosen-prefix collision has
+been buildable since 2007 — a pair of colliding X.509 certificates was
+constructed to show it. Nothing may be signed with it and no content address
+may be one.
+
+It is here because a client does not always get to choose. PostgreSQL's `md5`
+authentication answers a salt with `md5(md5(password + user) + salt)`, and a
+client that cannot compute one cannot log in to an older server at all. HTTP
+Digest, a `Content-MD5` header and an S3 `ETag` are the same shape. `sha1` has
+been here on the same terms, for the WebSocket handshake.
+
+`new_md5` streams and `hmacmd5` keys, like the five digests beside it. It
+shares every line of the buffering and the padding with them; what it does
+differently is write its length field and its digest least significant byte
+first, which is the member `Compression` gained — using the defaults this
+release allows, so the three compressions already answering the common way
+needed no edit.
+
+### …and PBKDF2 and HKDF
+
+```sysl
+import sysl.crypto.pbkdf2_hmac256
+import sysl.encoding.hex_string
+
+var key: []u8 = [0; 32]
+
+pbkdf2_hmac256("password".bytes, "salt".bytes, 4096, key).expect("a key this can produce")
+
+print(hex_string(key))
+```
+
+**They answer different questions and are not alternatives.** PBKDF2 is for a
+**password** — little entropy, so the only thing to be done is make each guess
+expensive, which is what the iteration count buys and the only thing it buys.
+HKDF is for a secret already unguessable but not uniform, such as a
+Diffie-Hellman result: it condenses that once and spreads it into as many keys
+as a protocol names.
+
+`pbkdf2_hmac1` through `pbkdf2_hmac512`, and `hkdf1` through `hkdf512` with an
+`_expand` beside each. The output goes into storage the caller owns, like
+everything else in the module, so nothing here needs an allocator.
+
+**HKDF-Extract has no function of its own because it already has one**: it
+*is* HMAC with the salt as the key, so `hmac256(salt, ikm)` is it, and only
+the expansion has a name — which is the half TLS 1.3 leans on. An absent salt
+needs no special case either: HMAC pads a short key with zeroes, so an empty
+salt is the zero key the standard names.
+
+The vectors are RFC 6070's, RFC 7914 §11's and RFC 5869's appendix, and MD5's
+are RFC 1321's own seven plus RFC 2202's six.
+
 ## 0.0.97 — 2026-08-31
 
 Three cards, all additive. Two of them are ways of writing something the
