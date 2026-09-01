@@ -797,3 +797,140 @@ what_an_md5_hasher_refuses()
 
     assert_eq(why(unstarted.finish(out[..])), "this hasher was never given its initial values")
 end what_an_md5_hasher_refuses
+
+
+// -- key derivation ------------------------------------------------------------------------------
+//
+// **The vectors are the standards' own** -- RFC 6070's for PBKDF2-HMAC-SHA-1, RFC 7914 §11's for
+// SHA-256, and RFC 5869's appendix for HKDF -- and none of them came out of this implementation read
+// back. What they are really pinning is the two counters, which is where a derivation goes wrong
+// silently: PBKDF2's block index is four bytes big-endian counting from one, and HKDF's is one byte
+// counting from one, and a key built with either of those wrong is a fine-looking key that agrees
+// with nobody.
+
+// The bytes a caller derived, as hex, so a vector reads as one line.
+private derived_1(password: string, salt: string, c: u32, n: usize) -> string
+    var out: []u8 = [0; n]
+
+    pbkdf2_hmac1(password.bytes, salt.bytes, c, out).expect("a key of a length this can produce")
+
+    hex_string(out)
+end derived_1
+
+private derived_256(password: string, salt: string, c: u32, n: usize) -> string
+    var out: []u8 = [0; n]
+
+    pbkdf2_hmac256(password.bytes, salt.bytes, c, out).expect("a key of a length this can produce")
+
+    hex_string(out)
+end derived_256
+
+// RFC 5869's appendix gives its inputs as runs of bytes, which is what these three build.
+private run_of(from: u8, n: usize) -> []u8
+    var m: []u8 = [0; n]
+
+    for i in 0..<n do m[i] = from + u8(i)
+
+    m
+end run_of
+
+@test("RFC 6070's PBKDF2 vectors")
+the_pbkdf2_vectors()
+    assert_eq(derived_1("password", "salt", 1, 20), "0c60c80f961f0e71f3a9b524af6012062fe037a6")
+    assert_eq(derived_1("password", "salt", 2, 20), "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957")
+    assert_eq(derived_1("password", "salt", 4096, 20), "4b007901b765489abead49d926f721d065a429c1")
+
+    // The one whose key is longer than a digest, so the block counter has to advance -- and whose
+    // password and salt are both longer than a block, so the key schedule hashes them first.
+    assert_eq(derived_1("passwordPASSWORDpassword", "saltSALTsaltSALTsaltSALTsaltSALTsalt", 4096, 25),
+        "3d2eec4fe41c849b80c8d83662c0e44a8b291a964cf2f07038")
+
+    // RFC 6070's fifth case is 16,777,216 iterations. It is left out deliberately: it would add
+    // minutes to every run of this suite to test the same three lines the four above already do.
+end the_pbkdf2_vectors
+
+@test("PBKDF2 over SHA-256, where a key spans blocks")
+pbkdf2_over_sha256()
+    assert_eq(derived_256("password", "salt", 1, 32),
+        "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")
+
+    // Forty bytes is a digest and a quarter, so the second block is asked for and truncated -- the
+    // case a counter that started at zero, or an unadvanced one, gets wrong.
+    assert_eq(derived_256("password", "salt", 4096, 40),
+        "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134af7ad98c1b458ce3f")
+end pbkdf2_over_sha256
+
+@test("RFC 5869's HKDF vectors")
+the_hkdf_vectors()
+    var okm: []u8 = [0; 42]
+
+    // A.1 -- SHA-256 with a salt and info.
+    hkdf256(run_of(0, 13), repeated(0x0b, 22), run_of(0xf0, 10), okm).expect("a key this can produce")
+    assert_eq(hex_string(okm),
+        "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")
+
+    // A.3 -- neither a salt nor an info, which is the standard's own default and not a special case:
+    // HMAC pads a short key with zeroes, so an absent salt *is* the zero key the standard names.
+    hkdf256(pattern(0), repeated(0x0b, 22), pattern(0), okm).expect("a key this can produce")
+    assert_eq(hex_string(okm),
+        "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8")
+
+    // A.4 -- the same shape over SHA-1, which is the other digest an existing protocol names here.
+    hkdf1(run_of(0, 13), repeated(0x0b, 11), run_of(0xf0, 10), okm).expect("a key this can produce")
+    assert_eq(hex_string(okm),
+        "085a01ea1b10f36933068b56efa5ad81a4f14b822f5b091568a9cdd4f155fda2c22e422478d305f3f896")
+end the_hkdf_vectors
+
+// A.2, whose inputs are all longer than a block and whose output is 82 bytes -- three chained
+// blocks, so it is the vector that proves the chain rather than the first block.
+@test("HKDF over inputs and an output that span blocks")
+hkdf_across_blocks()
+    var okm: []u8 = [0; 82]
+
+    hkdf256(run_of(0x60, 0x50), run_of(0, 0x50), run_of(0xb0, 0x50), okm).expect("a key this can produce")
+    assert_eq(hex_string(okm),
+        "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c" +
+        "65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87")
+end hkdf_across_blocks
+
+// **Extract has no function of its own because it already has one**: HKDF-Extract is HMAC with the
+// salt as the key, so the one-shot must agree with `hmac256` followed by the expansion. That is what
+// licenses the docstring telling a caller to reach for `hmac256` when they need the halves apart --
+// TLS 1.3 does -- rather than this module growing five more names.
+@test("the one-shot is extract then expand, and extract is HMAC")
+hkdf_extract_is_hmac()
+    val salt = run_of(0, 13)
+    val ikm = repeated(0x0b, 22)
+    val info = run_of(0xf0, 10)
+    val prk = hmac256(salt, ikm)
+
+    assert_eq(hex_string(prk), "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5")
+
+    var one_shot: []u8 = [0; 42]
+    var in_halves: []u8 = [0; 42]
+
+    hkdf256(salt, ikm, info, one_shot).expect("a key this can produce")
+    hkdf256_expand(prk[..], info, in_halves).expect("a key this can produce")
+
+    assert_eq(hex_string(one_shot), hex_string(in_halves))
+end hkdf_extract_is_hmac
+
+@test("what a derivation refuses")
+what_a_derivation_refuses()
+    var out: []u8 = [0; 20]
+
+    // RFC 8018 asks for at least one iteration, and zero is a caller's arithmetic being wrong rather
+    // than a request for an unstretched key.
+    assert_eq(why(pbkdf2_hmac1("password".bytes, "salt".bytes, 0, out)),
+        "a derivation needs at least one iteration")
+
+    // HKDF's counter is one byte, so 255 digests is all there is -- 8160 bytes over SHA-256, and one
+    // more than that is the refusal rather than a short key.
+    var far_too_much: []u8 = [0; 8161]
+    var the_most: []u8 = [0; 8160]
+
+    assert_eq(why(hkdf256(pattern(0), repeated(0x0b, 22), pattern(0), far_too_much)),
+        "more key was asked for than this derivation can produce")
+    assert(hkdf256(pattern(0), repeated(0x0b, 22), pattern(0), the_most).is_ok(),
+        "255 blocks is what the counter can reach")
+end what_a_derivation_refuses

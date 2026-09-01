@@ -18,18 +18,43 @@ import sysl.slices.copy
 // **Generic over the compression rather than over the word width**, which is what lets one
 // implementation serve SHA-1 as well as the four SHA-2 digests: they compress differently and are
 // keyed identically, and `Compression` is the axis they differ on.
-private[crypto] hmac[C: Compression](proto: Sha[C], key: []const u8, msg: []const u8,
-        tag: []u8) -> Result[unit, Fault]
+// A keyed hash in progress: both halves of the construction, each with its pad already in it.
+//
+// **It is a value, so copying one is keying another with the same key** — which is the same thing
+// `Sha` promises one line down the module and is what makes a derivation affordable. PBKDF2 runs
+// tens of thousands of HMACs under one password, and the pad work is a hash of a block each way;
+// keying once and copying per iteration halves the work rather than being a micro-optimization.
+//
+// It is also what lets a message arrive in **pieces**, which is the whole reason it exists as a
+// type: `sysl.crypto`'s derivations hash a salt and a counter, or a chaining block and a label and
+// a counter, and a one-shot `hmac` cannot say that without a parameter per piece.
+private[crypto] struct Hmac[C: Compression]
+    private inner: Sha[C]
+    private outer: Sha[C]
+
+    update(*self, data: []const u8) = self.inner.update(data)
+
+    finish(*self, tag: []u8) -> Result[unit, Fault]
+        var n = self.inner.dlen
+        var id: [64]u8
+
+        if tag.len < n then return Err(DigestTooSmall)
+
+        self.inner.finish(id[0..<n])?
+        self.outer.update(id[0..<n])
+        self.outer.finish(tag[0..<n])
+end Hmac
+
+// The key schedule: a key longer than a block is replaced by its own digest, a shorter one is padded
+// with zeroes, and the two pads go into the two hashers.
+private[crypto] keyed[C: Compression](proto: Sha[C], key: []const u8) -> Result[Hmac[C], Fault]
     var bs = C.block_bytes()
     var n = proto.dlen
 
     if n == 0 then return Err(NotStarted)
-    if tag.len < n then return Err(DigestTooSmall)
 
     var k: [128]u8
 
-    // A key longer than a block is replaced by its own digest; a shorter one is padded with the
-    // zeroes `k` already holds.
     if key.len > bs
         var h = proto
         var kd: [64]u8
@@ -49,18 +74,20 @@ private[crypto] hmac[C: Compression](proto: Sha[C], key: []const u8, msg: []cons
         opad[i] = k[i] ^ 0x5c
 
     var inner = proto
-    var id: [64]u8
-
-    inner.update(ipad[0..<bs])
-    inner.update(msg)
-    inner.finish(id[0..<n])?
-
     var outer = proto
 
+    inner.update(ipad[0..<bs])
     outer.update(opad[0..<bs])
-    outer.update(id[0..<n])
-    outer.finish(tag[0..<n])
-end hmac
+
+    Ok(Hmac(inner, outer))
+end keyed
+
+private[crypto] hmac[C: Compression](proto: Sha[C], key: []const u8, msg: []const u8,
+        tag: []u8) -> Result[unit, Fault]
+    var h = keyed(proto, key)?
+
+    h.update(msg)
+    h.finish(tag)
 
 /** HMAC-MD5, answering a sixteen-byte tag. A key longer than a block is replaced by its own digest;
  * a shorter one is padded with zeroes.
