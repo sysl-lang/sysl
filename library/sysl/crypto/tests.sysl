@@ -658,3 +658,142 @@ the_sha1_avalanche()
     assert_eq(after, "616cf0fe9a77fa3cf594fe6c8c2206ea2038fe1f")
     assert(apart(before, after) > 30, "one flipped bit moved too little of the digest")
 end the_sha1_avalanche
+
+
+// -- MD5 ---------------------------------------------------------------------------------------
+//
+// **The vectors are RFC 1321's own**, from its appendix, and the boundary lengths below are checked
+// against a second implementation rather than against this one read back. What they are really
+// testing is `Compression.little_endian`: MD5 shares every line of the buffering and the padding
+// with the five digests above and differs only in which end of a word goes first, in the length
+// field and in the digest. Getting that backwards produces a hash that is stable, plausible, and
+// agrees with nobody -- so the lengths that straddle a block boundary are the ones that matter.
+
+// The same bytes in two pieces, divided wherever the caller says.
+private md5_split(data: []const u8, at: usize) -> string
+    var h = new_md5()
+    var out: [16]u8
+
+    h.update(data[0..<at])
+    h.update(data[at..<data.len])
+    h.finish(out[..]).expect("a digest buffer sized from the hasher itself")
+
+    hex_string(out[..])
+end md5_split
+
+// RFC 1321's last vector: the ten digits, eight times over.
+private digits80() -> []const u8 =
+    "12345678901234567890123456789012345678901234567890123456789012345678901234567890".bytes
+
+@test("the vectors RFC 1321 publishes")
+the_md5_vectors()
+    assert_eq(hex_string(md5("".bytes)), "d41d8cd98f00b204e9800998ecf8427e")
+    assert_eq(hex_string(md5("a".bytes)), "0cc175b9c0f1b6a831c399e269772661")
+    assert_eq(hex_string(md5(abc())), "900150983cd24fb0d6963f7d28e17f72")
+    assert_eq(hex_string(md5("message digest".bytes)), "f96b697d7cb7938d525a2f31aaf161d0")
+    assert_eq(hex_string(md5("abcdefghijklmnopqrstuvwxyz".bytes)), "c3fcd3d76192e4007dfb496cca67e13b")
+    assert_eq(hex_string(md5("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".bytes)),
+        "d174ab98d277d9f5a5611c2c9f419d9f")
+    assert_eq(hex_string(md5(digits80())), "57edf4a22be3c955ac49da2e2107b67a")
+end the_md5_vectors
+
+// 55 is the last length whose padding and length field fit in one block and 56 is the first that
+// does not, so the pair either side of each is where a length written from the wrong end shows up.
+@test("MD5 padding at every boundary")
+md5_padding_at_every_boundary()
+    assert_eq(hex_string(md5(pattern(0))), "d41d8cd98f00b204e9800998ecf8427e")
+    assert_eq(hex_string(md5(pattern(1))), "8666683506aacd900bbd5a74ac4edf68")
+    assert_eq(hex_string(md5(pattern(54))), "eb5acae65a800805a13648f23dea0327")
+    assert_eq(hex_string(md5(pattern(55))), "52c0e574e1198de5fe3f8f11440dcb1b")
+    assert_eq(hex_string(md5(pattern(56))), "46c9907fc908ee68b1e7b8e71286a518")
+    assert_eq(hex_string(md5(pattern(63))), "a62f6d59e837867693f042f5b8f5a236")
+    assert_eq(hex_string(md5(pattern(64))), "7160b8fb5e9e4023d549c3971fbaeead")
+    assert_eq(hex_string(md5(pattern(65))), "70bd662e7aefbda85a0f7244167b7897")
+    assert_eq(hex_string(md5(pattern(119))), "e84905d4214f4d1ca56c2cdcc152b143")
+    assert_eq(hex_string(md5(pattern(120))), "e3eb5a6c8669ea01a8c185b8abc8a5dc")
+    assert_eq(hex_string(md5(pattern(128))), "10b2da1a82f16d99a81a7203fe9f02cb")
+    assert_eq(hex_string(md5(pattern(200))), "4c79b81ac94bad7a875519ce6b964c66")
+end md5_padding_at_every_boundary
+
+// The thousand-byte chunk is the point, as it is for SHA-1: 1000 is not a multiple of 64, so every
+// one of the thousand `update` calls lands at a different offset within the block.
+@test("MD5 over a million bytes, in a thousand pieces")
+md5_a_million_bytes()
+    assert_eq(streamed(new_md5().inner, repeated(97, 1000), 1000), "7707d6ae4e027c70eea2a935c2296f21")
+end md5_a_million_bytes
+
+@test("MD5 streams, and copying a hasher copies the hash in progress")
+the_md5_hasher()
+    var p200 = pattern(200)
+    val whole = hex_string(md5(p200))
+
+    assert_eq(one_at_a_time(new_md5().inner, abc()), hex_string(md5(abc())))
+    assert_eq(md5_split(p200, 0), whole)
+    assert_eq(md5_split(p200, 64), whole)
+    assert_eq(md5_split(p200, 100), whole)
+    assert_eq(md5_split(p200, 200), whole)
+
+    // Copying a started hasher starts another from the same point, which is what `hmac` rests on.
+    var h = new_md5()
+    var out: [16]u8
+
+    h.update(abc())
+
+    var g = h
+
+    g.update(abc())
+    g.update(abc())
+    g.finish(out[..]).expect("a digest buffer sized from the hasher itself")
+
+    assert_eq(hex_string(out[..]), "97ac82a5b825239e782d0339e2d7b910")
+end the_md5_hasher
+
+// RFC 2202's other half, which is HMAC-MD5. It is the same construction the five above use, so what
+// this really checks is that a sixteen-byte digest is keyed correctly by an implementation written
+// for twenty and sixty-four.
+@test("RFC 2202's keyed-hash vectors for MD5")
+md5_keyed_hashing()
+    assert_eq(hex_string(hmacmd5(repeated(0x0b, 16), "Hi There".bytes)), "9294727a3638bb1c13f48ef8158bfc9d")
+    assert_eq(hex_string(hmacmd5("Jefe".bytes, "what do ya want for nothing?".bytes)),
+        "750c783e6ab0b503eaa86e310a5db738")
+    assert_eq(hex_string(hmacmd5(repeated(0xaa, 16), repeated(0xdd, 50))), "56be34521d144c88dbb8c733f0e8b3f6")
+    assert_eq(hex_string(hmacmd5(counting(25), repeated(0xcd, 50))), "697eaf0aca3a3aea3a75164746ffaa79")
+
+    // The two cases whose key is longer than a block, so the key is replaced by its own digest.
+    var long_key = repeated(0xaa, 80)
+
+    assert_eq(hex_string(hmacmd5(long_key, "Test Using Larger Than Block-Size Key - Hash Key First".bytes)),
+        "6b1ab7fe4bd7bf8f0b62e6ce61b9d0cd")
+    assert_eq(hex_string(hmacmd5(long_key,
+        "Test Using Larger Than Block-Size Key and Larger Than One Block-Size Data".bytes)),
+        "6f630fad67cda0ee1fb1f562db3aa53e")
+end md5_keyed_hashing
+
+@test("one flipped bit moves almost every nibble of an MD5 digest")
+the_md5_avalanche()
+    var m = pattern(64)
+    val before = hex_string(md5(m))
+
+    m[0] = m[0] ^ 1
+
+    val after = hex_string(md5(m))
+
+    assert_eq(before, "7160b8fb5e9e4023d549c3971fbaeead")
+    assert_eq(after, "424009976d38c23429d318ee1dd950d8")
+    assert(apart(before, after) > 24, "one flipped bit moved too little of the digest")
+end the_md5_avalanche
+
+@test("what an MD5 hasher refuses")
+what_an_md5_hasher_refuses()
+    var h = new_md5()
+    var small: [8]u8
+
+    h.update(abc())
+
+    assert_eq(why(h.finish(small[..])), "the digest does not fit in the space provided")
+
+    var unstarted: Sha[Md5C]
+    var out: [16]u8
+
+    assert_eq(why(unstarted.finish(out[..])), "this hasher was never given its initial values")
+end what_an_md5_hasher_refuses

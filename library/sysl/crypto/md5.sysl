@@ -1,0 +1,160 @@
+module sysl.crypto
+@no_alloc
+
+import sysl.math.Bits
+
+// MD5 — here for the protocols that still ask for it, and not for anything a new program chooses.
+//
+// **It is broken for every purpose that rests on a collision being hard to find.** A collision has
+// been buildable since 2004 and a *chosen-prefix* one since 2007, cheaply enough that a pair of
+// colliding X.509 certificates was built and demonstrated; nothing may be signed with it, and no
+// content address or deduplication key may be one. `sha256` is what all of those want.
+//
+// What it is here for is the wire, where a client has no say. PostgreSQL's `md5` authentication
+// answers a server's salt with `md5(md5(password + user) + salt)`, and a client that cannot compute
+// one cannot log in to an older server at all. HTTP Digest, a `Content-MD5` header and an S3 `ETag`
+// are the same case. None of those is a claim that a document is what it says it is — the server
+// picked the algorithm and the program is answering — which is why one this broken still serves
+// them, and why nothing else should follow.
+//
+// **Everything but the compression below is shared with SHA-1 and SHA-2**, in `hasher.sysl`: the
+// same 64-byte block, the same one bit and zeroes, the same eight-byte length field. What differs
+// is which end of a word goes first, which is `Compression.little_endian`.
+
+// One constant per round: the first thirty-two bits of the fractional part of the absolute sine of
+// the round number, counting from one. A table rather than an expression because sysl has no
+// compile-time sine and because the published numbers are what a reader checks against.
+private val k5: [64]u32 = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+        0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+        0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+        0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+        0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+        0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+        0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+        0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+    ]
+
+// How far the round's result is rotated, four amounts repeated four times each — one group per
+// quarter, the way the four round functions are.
+private val s5: [64]u32 = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ]
+
+// The published initial values, in the first four of the eight words `Sha` carries. The other four
+// are zero and are never read: `finish` publishes sixteen bytes, which is exactly these four.
+private val iv5: [8]u32 = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0, 0, 0, 0]
+
+// MD5's compression, and the empty struct that carries it.
+private[crypto] struct Md5C
+end Md5C
+
+impl Compression for Md5C
+    type W = u32
+
+    block_bytes() -> usize = 64
+    word_bytes() -> usize = 4
+
+    // **The one that is not like the others.** The length field and the digest are written least
+    // significant byte first, and so is the block read below — a hash that is right about every
+    // round and wrong about this is stable, plausible and agrees with nobody.
+    little_endian() -> bool = true
+
+    compress(h: *[8]u32, block: []const u8)
+        var m: [16]u32
+
+        for i in 0..<16usize
+            var v = 0u32
+
+            // The bytes go in from the top, so the last one read ends up least significant.
+            for j in 0..<4usize do v = v | (u32(block[i * 4 + j]) << u32(j * 8))
+
+            m[i] = v
+
+        var a = h[0]
+        var b = h[1]
+        var c = h[2]
+        var d = h[3]
+
+        for i in 0..<64usize
+            // The four round functions, and which word of the block each round reads. `ch` is the
+            // module's own and is the published `(x & y) | (~x & z)` — `hasher.sysl` says why the
+            // two forms agree — so rounds one and two are one function with its arguments turned.
+            var f = 0u32
+            var g = 0usize
+
+            if i < 16
+                f = ch(b, c, d)
+                g = i
+            elif i < 32
+                f = ch(d, b, c)
+                g = (5 * i + 1) % 16
+            elif i < 48
+                f = b ^ c ^ d
+                g = (3 * i + 5) % 16
+            else
+                f = c ^ (b | ~d)
+                g = (7 * i) % 16
+
+            var t = a + f + k5[i] + m[g]
+
+            a = d
+            d = c
+            c = b
+            b = b + t.rotate_left(s5[i])
+
+        h[0] += a
+        h[1] += b
+        h[2] += c
+        h[3] += d
+    end compress
+
+/** An MD5 hash in progress. **MD5 is broken** -- see `md5` for what that does and does not rule out.
+ */
+// It is an ordinary struct like the five hashers beside it, so **copying one is starting another
+// from the same point**, which is what `hmac` is written in terms of. `update` may be called as
+// often as you like and `finish` writes into storage the caller owns.
+struct Md5
+    private[crypto] inner: Sha[Md5C]
+
+    update(*self, data: []const u8) = self.inner.update(data)
+    finish(*self, digest: []u8) -> Result[unit, Fault] = self.inner.finish(digest)
+
+/** A hasher ready for its first `update`.
+ *
+ * **MD5 is broken.** Reach for `new_sha256` unless a wire protocol names this one; see `md5`.
+ */
+new_md5() -> Md5 = Md5(started(iv5, 16))
+
+/** The digest of one slice of bytes, sixteen bytes long.
+ *
+ * **MD5 is broken, and has been since 2004.** A collision is buildable, and a chosen-prefix
+ * collision has been since 2007 -- a pair of colliding X.509 certificates was built to show it. So
+ * this digest says nothing about a document nobody could have substituted: it must not carry a
+ * signature, a certificate, a content address or a deduplication key. **`sha256` is what all of
+ * those want.**
+ *
+ * It is in this module for the protocols that name it and give a client no say. PostgreSQL's `md5`
+ * authentication answers a salt with `md5(md5(password + user) + salt)`; HTTP Digest, a
+ * `Content-MD5` header and an S3 `ETag` are the same shape. Where an attacker gains nothing from a
+ * second document with the same digest, MD5 is adequate; everywhere else it is not, and there is no
+ * third case.
+ */
+md5(data: []const u8) -> [16]u8
+    var s = new_md5()
+    var out: [16]u8
+
+    s.update(data)
+    s.finish(out[0..<16]).expect("a digest buffer sized from the hasher itself")
+    out

@@ -70,6 +70,17 @@ private[crypto] trait Compression
     block_bytes() -> usize
     word_bytes() -> usize
 
+    // Which end of a word goes first, in the length the padding writes and in the digest that
+    // comes out. **It is the whole of what MD5 does differently from the four beside it** —
+    // everything else here, the buffering and the one bit and the zeroes, is the same shape. The
+    // word *loading* is not asked about, because a compression reads its own block and MD5's does
+    // it the other way round where it stands.
+    //
+    // It is a required member rather than a default one, which is the trait's own style for
+    // `block_bytes` and `word_bytes` and for the same reason: three facts about a standard, each
+    // written where a reader of that standard is looking.
+    little_endian() -> bool
+
     // One block into the state, in place.
     compress(h: *[8]Self::W, block: []const u8)
 
@@ -151,8 +162,12 @@ private[crypto] struct Sha[C: Compression]
             self.block[self.used] = 0
             self.used += 1
 
+        var le = C.little_endian()
+
         for i in 0..<8usize
-            self.block[bs - 1 - i] = u8(nbits >> (i * 8))
+            var at = if le then bs - 8 + i else bs - 1 - i
+
+            self.block[at] = u8(nbits >> (i * 8))
 
         C.compress(&self.h, self.block[0..<bs])
 
@@ -162,9 +177,10 @@ private[crypto] struct Sha[C: Compression]
             for j in 0..<wl
                 var at = i * wl + j
 
-                if at < self.dlen then digest[at] = top_byte(v)
+                if at < self.dlen
+                    digest[at] = if le then u8(v) else top_byte(v)
 
-                v = v << 8
+                v = if le then v >> 8 else v << 8
 
         Ok(())
     end finish
