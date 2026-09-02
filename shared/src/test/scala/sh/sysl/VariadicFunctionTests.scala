@@ -144,6 +144,42 @@ class VariadicFunctionTests extends AnyFreeSpec with CodegenSupport with RunSupp
       run(src) shouldBe "42\n"
     }
 
+    // The other half of the rule that lets `&f` into a tail at all: what a caller may write, the
+    // callee may name. A C library's callback setter is the case it exists for -- every one of
+    // libcurl's twenty-one callbacks is registered through `curl_easy_setopt`'s ellipsis -- and
+    // reading the address back as an integer and `ptr_cast`ing it was the workaround this removes.
+    "a function address survives the round trip, and is callable at the other end" in {
+      val src =
+        """doubler(n: int) -> int = n * 2
+          |apply(x: int, ...) -> int
+          |    var ap: va_list
+          |    va_start(ap)
+          |    var f: *extern(int) -> int = va_arg(ap)
+          |    va_end(ap)
+          |    f(x)
+          |end apply
+          |print(apply(21, &doubler))""".stripMargin
+
+      run(src) shouldBe "42\n"
+    }
+
+    // Reading it at a pointer's width and converting is what the workaround did, and it has to keep
+    // working: it is the only spelling available to a body that wants the address as a number.
+    "and reads back as an address, which is the same value" in {
+      val src =
+        """doubler(n: int) -> int = n * 2
+          |address(n: int, ...) -> usize
+          |    var ap: va_list
+          |    va_start(ap)
+          |    var a: usize = va_arg(ap)
+          |    va_end(ap)
+          |    a
+          |end address
+          |print(address(1, &doubler) == usize(&doubler))""".stripMargin
+
+      run(src) shouldBe "true\n"
+    }
+
     "a variadic function calls and is called like any other" in {
       val src =
         s"""$sumInts
@@ -419,6 +455,7 @@ class VariadicFunctionTests extends AnyFreeSpec with CodegenSupport with RunSupp
           |f(1, 2)""".stripMargin
 
       err(src) should include("a variadic argument cannot be read as string")
+      err(src) should include("a raw pointer, or the address of a function")
     }
   }
 

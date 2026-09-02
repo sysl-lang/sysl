@@ -481,11 +481,16 @@ trait SpecialForms extends Closures {
    * promotion produced would read the wrong bytes — C's most common varargs mistake, and one worth
    * a diagnostic rather than a wrong answer. Nothing is lost: read it at the promoted width and
    * convert, which is what C's own callee has to do anyway.
+   *
+   * **This list and `CallCore.variadicArg`'s are one rule read in two directions**, so a type a
+   * caller may write into a tail is a type the callee may name — including a `Type.CFn`, which is
+   * how a C library's callback setter takes a function and is a pointer-width value like any other
+   * once it is in the tail.
    */
   private def vaArgType(ty: Type): Type = ty match
-    case i: Type.Integer if i.bits >= 32  => ty
-    case f: Type.Floating if f.bits == 64 => ty
-    case Type.Char | _: Type.Ptr          => ty
+    case i: Type.Integer if i.bits >= 32          => ty
+    case f: Type.Floating if f.bits == 64         => ty
+    case Type.Char | _: Type.Ptr | _: Type.CFn    => ty
     case i: Type.Integer =>
       err(s"a variadic argument is promoted to at least 32 bits, so it cannot be read as " +
         s"${show(i)} — read it as ${if i.signed then "'int'" else "'uint'"} and convert")
@@ -494,5 +499,5 @@ trait SpecialForms extends Closures {
         "read it as 'real' and convert")
     case other =>
       err(s"a variadic argument cannot be read as ${show(other)} — it may be an integer, a real, " +
-        "a char, or a raw pointer")
+        "a char, a raw pointer, or the address of a function")
 }
