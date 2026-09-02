@@ -649,7 +649,7 @@ class CAbiTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |var f: u8 = 0
             |print(report(&f, ()))""".stripMargin) should include(
         "a unit cannot be passed to '...' — a variadic argument must be an integer, a float, a " +
-          "char, or a raw pointer")
+          "char, a raw pointer, or the address of a function")
     }
 
     // And a *sysl* variadic callee still refuses one, because it is the callee's own walk that would
