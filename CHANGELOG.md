@@ -7,6 +7,117 @@ copy -- correct a mistake there and regenerate, rather than editing this file. V
 `MAJOR.MINOR.PATCH`; while the leading zero stands the language is still moving, and a release may
 change what an existing program means. Where it does, the release says so.
 
+## 0.0.99 — 2026-09-02
+
+Three cards, all additive, and all three came out of writing `sysl-lang/curl` —
+a libcurl binding, which is the first thing in the org to register a sysl
+callback through a variadic C function and the first whose suite needs a server
+that deliberately does not answer.
+
+### A variadic tail carries the address of a function, in both directions
+
+```sysl
+private on_write(p: *u8, size: usize, nmemb: usize, user: *u8) -> usize = size * nmemb
+
+c.setopt(h, c.OPT_WRITEFUNCTION, &on_write)
+```
+
+`curl_easy_setopt(CURL *, CURLoption, ...)` is how all twenty-one of libcurl's
+`CURLOPT_*FUNCTION` options are set, and until now `&on_write` could not be
+written there:
+
+```
+error: a *extern(*byte, usize, usize, *byte) -> usize cannot be passed to '...' — a variadic
+argument must be an integer, a float, a char, or a raw pointer
+```
+
+**The bytes were already right; only the check refused.** A code pointer is the
+width of a data pointer and goes in the same register, and C's own variadic
+rules take one exactly as they take a `void *` — so the workaround was to throw
+the type away and pass the address as a `*u8`, which compiled, linked, and
+fetched a page through the real library.
+
+That workaround is what makes this worth fixing rather than documenting. A
+`ptr_cast` to `*u8` erases the signature, so a callback registered with the
+wrong arity or the wrong parameter types stops being a compile error anywhere —
+on the one option class where getting it wrong corrupts the stack at run time
+instead of failing to link.
+
+`usize(&f)` is accepted for the same reason and was the same omission wearing a
+different hat: `ptr_cast` already answered an address for a function, and the
+conversion table simply had no row for one.
+
+**And what may be written into a tail is what may be read back out of one**, so
+a callee names the signature rather than reading a number and casting it:
+
+```sysl
+doubler(n: int) -> int = n * 2
+
+apply(x: int, ...) -> int
+    var ap: va_list
+
+    va_start(ap)
+
+    var f: *extern(int) -> int = va_arg(ap)
+
+    va_end(ap)
+
+    f(x)
+
+print(apply(21, &doubler))
+```
+
+That half was found by grepping for other places pinning the refusal text this
+change moved: the write rule and the read rule are one rule in two directions
+and had gone out of step. Both messages now say the same thing, and a test
+asserts the wording so they cannot drift apart again quietly.
+
+### `sleep` and `nanosleep`
+
+```sysl
+import sysl.posix.time.{monotonic, sleep}
+import sysl.time.*
+
+val t0 = monotonic()
+
+sleep(50.ms)
+
+print(whole_millis(monotonic() - t0) >= 50)
+```
+
+**Nothing in the library made a thread wait for a length of time**, which
+`sysl.time.units`' own opening docstring had been advertising with `sleep(5.ms)`
+since it was written. What the library had instead was a spin: `Mutex` says in a
+comment that a contended lock spins *because there is no wait queue*, `Channel`
+inherits the same, and curl's suite was burning a core on an `Atomic[int]` to
+hold a server open.
+
+It is in **`sysl.posix.time`**, beside `now` and `monotonic`, for the reason
+that module exists at all: a capability requirement is module-wide, so a `sleep`
+written beside `Duration` would take the whole calendar away from every
+freestanding program that only wanted to add two durations. `sysl-lang/pico2`
+has a `sleep(d: Duration)` of its own over the SDK's timer, so the same line
+reads the same on a board and on a host.
+
+**A signal cuts a wait short, and `sleep` carries on.** `nanosleep(2)` returns
+early with `EINTR` and the time still owed, so a wait written as one call is
+quietly shorter than it asked for whenever anything arrives — which is exactly
+when a test that depends on it starts looking flaky. `sleep` re-enters with the
+remainder until nothing is left, and answers nothing.
+
+`nanosleep` is the other half and is two differences rather than one. It counts
+**nanoseconds**, where a `Duration` counts microseconds and so cannot name a
+wait shorter than one; and it **answers what was still owed**, which is what
+lets a program with a handler installed tell "the wait finished" from "something
+happened".
+
+```sysl
+var left = nanosleep(2_000_000)
+
+while left > 0
+    left = nanosleep(left)
+```
+
 ## 0.0.98 — 2026-09-01
 
 Four cards, all additive. Two are refusals that were drawn wider than their
