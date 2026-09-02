@@ -967,8 +967,14 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
    * handed over as written is read back as garbage — so the widening happens here, in the tree,
    * where it is something a test can see rather than a detail of the emitter.
    *
-   * What may always cross is what C can name on the other side: an integer, a float, a `char`, or a
-   * raw pointer.
+   * What may always cross is what C can name on the other side: an integer, a float, a `char`, a
+   * raw pointer, or the address of a function.
+   *
+   * A **`*extern`** is in that list because it is a pointer everywhere it matters — its `lty` is
+   * `LType.Ptr`, it occupies one general-purpose register, and a C library's variadic setter is the
+   * ordinary way one is registered (`curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, f)`). It is a
+   * distinct type from `Ptr` because there is no value at the end of it to read through, which is a
+   * statement about dereferencing rather than about how it travels.
    *
    * An **aggregate** crosses to a *foreign* callee and not to a sysl one, and the asymmetry is not
    * an oversight. C allows a struct in a variadic tail and hands it over under exactly the
@@ -985,7 +991,7 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
       t.ty match
         case i: Type.Integer if i.bits < 32   => convert(t, Type.Integer(32, i.signed))
         case f: Type.Floating if f.bits < 64  => convert(t, Type.Real)
-        case _: Type.Integer | _: Type.Floating | Type.Char | _: Type.Ptr => t
+        case _: Type.Integer | _: Type.Floating | Type.Char | _: Type.Ptr | _: Type.CFn => t
         case other if CAbi.aggregate(other) && foreign => t
         case other if CAbi.aggregate(other) =>
           err(s"a ${show(other)} cannot be passed to a sysl function's '...' — a walk over the tail " +
@@ -993,7 +999,7 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
             "takes it because C says which registers it arrives in")
         case other =>
           err(s"a ${show(other)} cannot be passed to '...' — a variadic argument must be an " +
-            "integer, a float, a char, or a raw pointer")
+            "integer, a float, a char, a raw pointer, or the address of a function")
   }
 
   /** Enforces a generic function's trait bounds against the type arguments a call resolved to. For

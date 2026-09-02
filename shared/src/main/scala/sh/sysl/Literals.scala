@@ -396,6 +396,16 @@ trait Literals extends TypeResolution {
             err(s"an address is read as 'usize' or 'isize' rather than as ${show(i)} — a fixed " +
               "width is not an address's width on every target")
           true
+        // The address of a function is an address, and `ptr_cast` already accepts one — so refusing
+        // it here made the number reachable in two steps and not in one, which is an inconsistency
+        // rather than a position. `*extern` is a type of its own because there is no value at the
+        // end of it to read through; that is about dereferencing, not about whether it has an
+        // address. Card 0399.
+        case (_: Type.CFn, i: Type.Integer) =>
+          if !i.pointerWidth then
+            err(s"an address is read as 'usize' or 'isize' rather than as ${show(i)} — a fixed " +
+              "width is not an address's width on every target")
+          true
         case _ => false
 
       if !allowed then

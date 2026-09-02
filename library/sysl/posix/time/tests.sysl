@@ -2,7 +2,7 @@ module sysl.posix.time
 @requires(posix)
 @tests
 
-import sysl.time.{Resolution, parse_timestamp, since}
+import sysl.time.{Resolution, parse_timestamp, since, whole_micros, whole_millis, millis, micros}
 import sysl.time.tzif.{parse, offset_at, is_dst_at}
 
 // What `sysl.posix.time` claims, asserted in sysl.
@@ -193,3 +193,70 @@ local_zone_agrees_with_libc()
             assert_eq(offset_at(z, t).unwrap().minutes, local_offset(t).minutes)
         Err(e) -> ()
 end local_zone_agrees_with_libc
+
+// ## Waiting
+//
+// **The clock is the oracle, because a wait can only be checked against one.** Every assertion here
+// is a lower bound plus a generous upper one: a machine under load may sleep far longer than it was
+// asked, and a test that pinned an upper bound tightly would be a test that reddens when something
+// else is busy rather than when this is wrong.
+
+@test("a sleep takes at least as long as it was asked for")
+sleep_waits()
+    val t0 = monotonic()
+
+    sleep(millis(50))
+
+    val took = monotonic() - t0
+
+    // **The lower bound is the whole claim.** A `nanosleep` whose remainder was dropped returns
+    // early, and this is what notices -- the wait still *happens*, so nothing else would.
+    assert(whole_millis(took) >= 50, s"slept ${whole_millis(took)}ms, wanted at least 50")
+
+    // Loose, and deliberately: it is here to catch a unit error of a thousand, not to police the
+    // scheduler. A microseconds-for-nanoseconds slip would land at 50 microseconds or at 50 seconds.
+    assert(whole_millis(took) < 5000, s"slept ${whole_millis(took)}ms, which is not 50ms late")
+
+@test("a sleep of zero or of a negative duration returns at once")
+sleep_zero()
+    val t0 = monotonic()
+
+    sleep(millis(0))
+    sleep(micros(-1000))
+
+    assert(whole_millis(monotonic() - t0) < 1000)
+
+@test("nanosleep answers zero when nothing interrupted it")
+nanosleep_completes()
+    // **Zero is the whole point of the return value**: it is what a caller's retry loop tests, so a
+    // shim that answered the elapsed time instead would loop forever and this is what says so.
+    assert_eq(nanosleep(2000000), 0)
+
+@test("nanosleep waits, and it waits in NANOseconds")
+nanosleep_unit()
+    val t0 = monotonic()
+
+    nanosleep(30000000)
+
+    val took = whole_millis(monotonic() - t0)
+
+    // 30,000,000ns is 30ms. Read as microseconds it would be 30 seconds, and as milliseconds it
+    // would be eight hours -- so the upper bound is what pins the unit, and it is the only place
+    // in this file where an upper bound is doing real work.
+    assert(took >= 30, s"waited ${took}ms, wanted at least 30")
+    assert(took < 3000, s"waited ${took}ms — that is not nanoseconds")
+
+@test("nanosleep of zero or less returns at once and answers zero")
+nanosleep_zero()
+    assert_eq(nanosleep(0), 0)
+    assert_eq(nanosleep(-5), 0)
+
+@test("sleep reaches a resolution finer than a millisecond")
+sleep_sub_milli()
+    val t0 = monotonic()
+
+    sleep(micros(1500))
+
+    // The claim is that the argument is not being rounded to whole milliseconds on the way down --
+    // which a shim taking `usleep` or a millisecond count would do, and which no test above sees.
+    assert(whole_micros(monotonic() - t0) >= 1500)

@@ -1,7 +1,7 @@
 module sysl.posix.time
 @requires(posix)
 
-import sysl.time.{Instant, Duration, micros}
+import sysl.time.{Instant, Duration, micros, whole_micros}
 
 // Reading the two clocks the host keeps, which is the one thing `sysl.time` deliberately cannot do.
 //
@@ -59,6 +59,7 @@ import sysl.time.{Instant, Duration, micros}
 //   - **the 32-bit worry.** `x86-linux` was the target to watch, because a 32-bit glibc `time_t` is
 //     not a `long` unless `_TIME_BITS=64` says so, and two `long`s is then not that structure. The
 //     shim reads the header, so whoever measures i386's calling convention inherits nothing here.
+private[sysl] extern "sysl_posix_time_nanosleep" c_nanosleep(nanos: long) -> long
 private[sysl] extern "sysl_posix_time_realtime_us" c_realtime_us() -> long
 private[sysl] extern "sysl_posix_time_monotonic_us" c_monotonic_us() -> long
 
@@ -83,3 +84,49 @@ now() -> Instant = Instant(c_realtime_us())
  * a measurement wants this one.
  */
 monotonic() -> Duration = micros(c_monotonic_us())
+
+// ## Waiting
+//
+// **`sysl.time` cannot carry these for the reason the header of this file gives about `now`**:
+// `nanosleep(2)` is asking an operating system for something, and a capability requirement is
+// module-wide. `sysl-lang/pico2` has a `sleep` of its own over the SDK's `sleep_us`, with this
+// signature, so the same line reads the same on a board and on a host — which is the point of the
+// `Duration` rather than a count in a unit the caller has to remember.
+
+/** Wait for `d`, however many attempts that takes.
+ *
+ * **A signal cuts a wait short, and this one carries on.** `nanosleep(2)` returns early with `EINTR`
+ * and the time still owed, so a wait written as one call is a wait that is quietly shorter than it
+ * asked for whenever anything arrives -- which is exactly when a test that depends on it starts
+ * looking flaky. This retries with the remainder until nothing is left.
+ *
+ * **It answers nothing, because there is nothing left to say**: it returns when the time has passed.
+ * A caller that wants to *know* it was interrupted wants `nanosleep` below.
+ *
+ *     sleep(50.ms)
+ *
+ * A duration of zero or less returns at once rather than yielding, which is not the same thing --
+ * `sleep(0.s)` is not a way to offer the processor to something else.
+ */
+sleep(d: Duration)
+    var left = whole_micros(d) * 1000
+
+    while left > 0
+        left = c_nanosleep(left)
+
+/** Wait for `nanos` nanoseconds, and answer how many were still owed when it stopped.
+ *
+ * **Zero means the whole time passed.** Anything else is what a signal interrupted, and handing it
+ * back rather than swallowing it is the difference from `sleep`: a program with a handler installed
+ * can tell "the wait finished" from "something happened", which one call to `sleep` cannot.
+ *
+ *     var left = nanosleep(2_000_000)
+ *
+ *     while left > 0 && !cancelled()
+ *         left = nanosleep(left)
+ *
+ * **Nanoseconds, where `sleep` takes a `Duration`, and that is what this is for.** A `Duration`
+ * counts microseconds, so it cannot name a wait shorter than one -- and `nanosleep(2)` can. Reach
+ * for `sleep` unless you need the resolution or the remainder.
+ */
+nanosleep(nanos: long) -> long = c_nanosleep(nanos)

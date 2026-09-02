@@ -11,6 +11,21 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class RawStorageRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
+  // Card 0399. `ptr_cast(&f)` already answered an address, so `usize(&f)` refusing made the number
+  // reachable in two steps and not in one.
+  "the address of a function is an address" - {
+    "'usize' reads one, and it is the same number 'ptr_cast' gives" in {
+      run("""f(n: int) -> int = n
+            |val a = usize(&f)
+            |val b: *u8 = ptr_cast(&f)
+            |print(a == usize(b), a != 0)""".stripMargin) shouldBe "true true\n"
+    }
+
+    "a fixed width is refused, exactly as it is for a data pointer" in {
+      err("f(n: int) -> int = n\nprint(u32(&f))") should include("is read as 'usize' or 'isize'")
+    }
+  }
+
   "'sizeof' answers what the compiler already measures" - {
     "scalars are their own width" in {
       run("print(sizeof(u8), sizeof(int), sizeof(i64), sizeof(real), sizeof(bool), sizeof(char))") shouldBe

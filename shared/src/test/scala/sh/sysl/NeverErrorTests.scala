@@ -247,6 +247,27 @@ class NeverErrorTests extends AnyFreeSpec with CodegenSupport {
       err(src) should include("a &Inner cannot be passed to '...'")
     }
 
+    // A `*extern` is a pointer everywhere it matters — one general-purpose register, `LType.Ptr` —
+    // and registering a callback through a variadic setter is the ordinary way a C library takes
+    // one. `curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, f)` is the shape, and it was refused until
+    // 0399: the workaround was `ptr_cast` to a `*u8`, which erased the signature and left the
+    // arity and parameter types checked by nothing.
+    "carries the address of a function" in {
+      ir("""extern setopt(h: *u8, opt: int, ...) -> int
+           |cb(p: *u8, n: usize) -> usize = n
+           |var h: *u8 = null
+           |print(setopt(h, 1, &cb))""".stripMargin)
+    }
+
+    // The same address through a *sysl* variadic callee is refused for the reason every non-scalar
+    // is: the tail is read back with a walk, and this one is here to pin that the widening above
+    // did not accidentally open that door too.
+    "and a sysl variadic callee still takes it, since it is one register" in {
+      ir("""f(n: int, ...) -> int = n
+           |cb(p: *u8) -> unit = ()
+           |print(f(1, &cb))""".stripMargin)
+    }
+
     // A *simple* enum is an integer wearing a name, and C's promotions have nothing to say about a
     // name — where a data enum is a tag and a payload, an aggregate like any other.
     "carries no simple enum, though it carries a data one" in {
@@ -285,7 +306,7 @@ class NeverErrorTests extends AnyFreeSpec with CodegenSupport {
 
     "says what it would have taken" in {
       err("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p, true))") should
-        include("must be an integer, a float, a char, or a raw pointer")
+        include("must be an integer, a float, a char, a raw pointer, or the address of a function")
     }
 
     // The tail is the extern's alone: a sysl function's arity is fixed, so an extra argument to
