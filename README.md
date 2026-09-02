@@ -17,8 +17,8 @@ A modern, ref-counted, general-purpose systems language.
 > **Status: specified in writing, and it runs.** This repository is a clean reimplementation of the
 > sysl language — not a port of the earlier prototype, which survives only as a source of lessons.
 > Every rule is written down before it is implemented, one feature at a time, and the compiler builds
-> programs to native binaries through LLVM today: see [`guide/`](guide/) for complete ones, and the
-> [tour](https://sysl.sh/tour/) to learn the language.
+> programs to native binaries through LLVM today: see the [tour](https://sysl.sh/tour/) to learn the
+> language, and [`library/`](library/) for the standard library it ships with.
 
 ## What sysl is
 
@@ -37,7 +37,9 @@ owns.
 - **[The reference](https://sysl.sh/reference/)** — every construct written down once, in its own
   place, with the rules complete rather than the ones a beginner needs first. This is the
   specification: where a rule has an edge, the edge is shown as a program that the suite runs.
-- **[`guide/`](guide/)** — complete working programs at the size where the choices start to matter.
+- **[`library/`](library/)** — the standard library, written in sysl, with its own `@test` functions
+  beside what they test. `sysl.regex` is written as a literate module, which is the largest worked
+  example of the format in the tree.
 
 The site lives in **[sysl-lang/sysl.sh](https://github.com/sysl-lang/sysl.sh)**, which drives this
 compiler as a published dependency. That is deliberate rather than incidental: a website documents
@@ -50,7 +52,13 @@ established that the reference documents every language feature and every piece 
 documents saying the same thing is one that goes stale, and the reference is the one with a test
 suite behind it. The chapters are in the history: `git show b12e60c3:design/13-modules.md`.
 
-What stays here is `guide/`, which is checked against `dev` on every run.
+**And there used to be a `guide/` directory** — programs written to *force a language decision*
+rather than to demonstrate a finished one. Every finding they made is discharged, and the set was
+retired on 2026-09-02 once the last two had somewhere better to be: `ring` is
+[`sysl.container.ring`](library/sysl/container/ring/) in the standard library and `slab` is the
+[`slab`](https://github.com/sysl-lang/slab) package. What the programs decided is in the
+[reference](https://sysl.sh/reference/); `git show 2de44a5f:guide/README.md` is the set's own account
+of itself.
 
 ## Building
 
@@ -62,11 +70,11 @@ sbt syslJVM/test        # run the test suite
 sbt syslJVM/run         # run the CLI
 ```
 
-To see the language run end to end — source, through the compiler, to a native binary, run one of
-the guide programs:
+To see the language run end to end — source, through the compiler, to a native binary — point the
+CLI at any project directory:
 
 ```bash
-sbt "syslJVM/run run guide/ring"
+sbt "syslJVM/run run path/to/project"
 ```
 
 Anything after a `--` goes to the program rather than to sysl, which is what a `main(args: []string)`
@@ -159,8 +167,8 @@ A program's own unit tests are `@test` functions written beside what they test, 
 what runs them ([`@test`](https://sysl.sh/reference/attributes/)):
 
 ```bash
-sbt "syslJVM/run test guide/ring"                  # every @test under a directory
-sbt "syslJVM/run test guide/ring --filter empty"   # the ones whose name holds this
+sbt "syslJVM/run test path/to/project"                  # every @test under a directory
+sbt "syslJVM/run test path/to/project --filter empty"   # the ones whose name holds this
 ```
 
 A test passes by returning; `@test(should_trap)` is for the ones whose subject is a check that

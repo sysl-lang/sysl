@@ -226,8 +226,17 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * standard module at all: RFC 6455 publishes a key and the accept value a server must answer with,
    * and a browser will not open a socket against any other answer. Every other digest in that module
    * is there to be chosen; this one is there because a wire protocol names it.
+   *
+   * Raised to **649** when `sysl.container.ring` arrived: fourteen cases for the bounded ring the
+   * `guide/ring` program was retired into, which is the module `Channel` now keeps its values in
+   * rather than in four fields of its own.
+   *
+   * **Nineteen of the thirty-three were drift, and that is the sixth time this comment has recorded
+   * it** — the tree was at 635 against a floor of 616 before a line of the ring was written, which is
+   * most of a module's worth going unnoticed. Measured with the command this comment prescribes
+   * rather than added to the number above it.
    */
-  private val floor = 616
+  private val floor = 649
 
   /** The library, compiled as a **test build of itself**.
    *

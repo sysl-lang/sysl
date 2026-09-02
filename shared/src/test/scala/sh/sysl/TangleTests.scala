@@ -21,6 +21,14 @@ class TangleTests extends AnyFreeSpec with Matchers {
 
   private def source(text: String): Source = Source(s"tangle${Literate.Extension}", text)
 
+  /** A literate source that really is on disk, which is what the three cases below need: what they
+    * assert is the *command*, and a command reads a file. `sysl.regex` is the library's own literate
+    * module — five files of it — and it took over from `guide/slab` when the guide set was retired.
+    */
+  private def literateFile: Option[String] =
+    StdRoot.root.map(root => s"$root/sysl/regex/vm${Literate.Extension}")
+
+
   private def ran(cfg: Config): String = {
     val out    = new java.io.ByteArrayOutputStream
     val notes  = new java.io.ByteArrayOutputStream
@@ -40,9 +48,11 @@ class TangleTests extends AnyFreeSpec with Matchers {
   }
 
   "the prose goes and the program stays" in {
-    val path = s"guide/slab/slab${Literate.Extension}"
+    val found = literateFile
 
-    assume(isFile(path), s"$path is not reachable from the test working directory")
+    assume(found.isDefined, "the library is not reachable from the test working directory")
+
+    val path = found.get
 
     val out = ran(Config(command = "tangle", file = path))
 
@@ -69,9 +79,11 @@ class TangleTests extends AnyFreeSpec with Matchers {
   "what it prints is what the compiler reads" in {
     // The command exists to answer exactly this question, so the two must not be separately
     // computed -- what is asserted is that the driver hands over the reader's own output.
-    val path = s"guide/slab/slab${Literate.Extension}"
+    val found = literateFile
 
-    assume(isFile(path), s"$path is not reachable from the test working directory")
+    assume(found.isDefined, "the library is not reachable from the test working directory")
+
+    val path = found.get
 
     val out = ran(Config(command = "tangle", file = path))
 
@@ -81,11 +93,13 @@ class TangleTests extends AnyFreeSpec with Matchers {
   }
 
   "it writes to a file when it is asked to" in {
-    val path = s"guide/slab/slab${Literate.Extension}"
+    val found = literateFile
 
-    assume(isFile(path), s"$path is not reachable from the test working directory")
+    assume(found.isDefined, "the library is not reachable from the test working directory")
 
-    val out = s"${createTempDirectory("sysl-tangle-")}/slab.sysl"
+    val path = found.get
+
+    val out = s"${createTempDirectory("sysl-tangle-")}/vm.sysl"
 
     ran(Config(command = "tangle", file = path, output = Some(out)))
     readFile(out).linesIterator.filter(_.trim.nonEmpty).toList should not be empty

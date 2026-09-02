@@ -18,7 +18,8 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
 
   // The whole reason the clauses are attributes rather than grammar. An attribute's name arrives as
   // an ordinary identifier, so nothing here is reserved — and it is the code that *provides* a
-  // capability that wants the words most, which is why `guide/slab` is what reports the change.
+  // capability that wants the words most: the slab allocator that reported this change calls its
+  // own function `alloc`, and could not while the clause was the two words `no alloc`.
   "the words the clauses used to spend are ordinary names" - {
 
     "a function may be called 'alloc', which is what an allocator calls its own" in {

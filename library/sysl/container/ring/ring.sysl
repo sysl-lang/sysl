@@ -1,0 +1,244 @@
+module sysl.container.ring
+@no_alloc
+
+import sysl.slices.as_mut_ptr
+
+/** A queue of a **fixed** capacity, laid over storage the caller supplies, cheap to take from at
+ * either end and needing no allocator at all.
+ *
+ * **The reason this exists beside `Deque` is the storage, not the shape.** A `Deque[T]` is the same
+ * ring with a growth path under it, so it owns its elements and needs a heap to widen them. This one
+ * cannot grow: its capacity is the length of the slice it was handed, a full ring answers rather than
+ * doubles, and `@no_alloc` on this file is the whole of the claim. That is what makes it reachable
+ * from a program that has given the heap up -- a board, an interrupt handler, a signal handler --
+ * which is where a bounded queue is wanted most and where `Deque` cannot go.
+ *
+ * ```
+ * var slots: [8]int = [0; 8]
+ * var r = ring(slots[..])
+ *
+ * r.push_back(1)
+ * r.push_back(2)
+ * r.pop_front()                      // Some(1)
+ * ```
+ *
+ * **The storage is a `*T` and a count rather than a `[]T`, and that is the crossing rule rather than
+ * a preference.** A view owns its elements through a count that is not atomic, so a struct holding
+ * one may not reach another concurrency domain at all -- which would refuse every ring embedded in
+ * something a thread is handed, one line before the first `push_back`. A raw pointer carries no
+ * count, so it crosses; what it costs is the same trust `*p` already asks for, and `sysl.posix.
+ * threads.Channel` is a ring of exactly this shape for exactly this reason. The caller writes a
+ * slice at `ring(...)` and never sees the pointer.
+ *
+ * **The storage has to outlive the ring**, which is the one thing this type asks of a caller that
+ * `Deque` does not: a module-level `static var`, a local of a scope that outlives every holder, or a
+ * region something else owns. It is the same contract `channel(slots[..])` already has.
+ *
+ * **The length is not rounded to a power of two**, unlike `Deque`'s, because the capacity is the
+ * caller's number rather than one this file chose -- a program that asked for six slots gets six.
+ * So wrapping is a compare and a subtract instead of a mask, which is what `seat` below is.
+ */
+struct Ring[T]
+
+    // Where the storage is and how much of it there is. Both are fixed for the ring's life.
+    private slots: *T
+    private room: usize
+
+    // The live run inside it: `head` is the next slot to be read and `live` the number of values
+    // that follow it. Two indices alone cannot tell a full ring from an empty one, since `head ==
+    // tail` means both -- which is the classic ring's one unused slot, and a count is what buys it
+    // back.
+    private head: usize
+    private live: usize
+
+    /** How many values the ring can hold at once, which is the storage it was given. */
+    capacity(self) -> usize = self.room
+
+    /** How many values are in it. */
+    len(self) -> usize = self.live
+
+    is_empty(self) -> bool = self.live == 0
+
+    /** Whether the next `push_back` will be refused, which is the question a bounded queue is asked
+     * that a growing one never is.
+     */
+    is_full(self) -> bool = self.live == self.room
+
+    /** Which slot the `i`th value from the front actually lives in. Every accessor goes through this,
+     * which is what keeps the wrapping in one place instead of at each end.
+     *
+     * It is a compare rather than a `%` because `i` is never past the capacity at any call: `head`
+     * is below `room` and `i` below `live`, so the sum is below twice `room` and one subtraction
+     * lands it.
+     */
+    private seat(self, i: usize) -> usize
+        var at = self.head + i
+
+        if at >= self.room then at -= self.room
+
+        at
+    end seat
+
+    /** The `i`th value from the front. Past the end is a mistake in the program rather than a
+     * question, so it panics -- the bargain `Buf` and `Deque` make, and `get` is the total form for
+     * a caller that is really asking.
+     */
+    at(self, i: usize) -> T
+        if i >= self.live then past_end(i, self.live)
+
+        self.slots[self.seat(i)]
+
+    /** The `i`th value from the front, or nothing where there is no such value. */
+    get(self, i: usize) -> Option[T] =
+        if i >= self.live then None else Some(self.slots[self.seat(i)])
+
+    set(*self, i: usize, v: T)
+        if i >= self.live then past_end(i, self.live)
+
+        self.slots[self.seat(i)] = v
+
+    first(self) -> Option[T] = if self.live == 0 then None else Some(self.slots[self.head])
+
+    last(self) -> Option[T] =
+        if self.live == 0 then None else Some(self.slots[self.seat(self.live - 1)])
+
+    /** Adds to the back, and answers whether there was room. **A `false` is an ordinary answer**
+     * rather than a broken caller: a bounded queue being full is the state it exists to have, which
+     * is why this reports instead of panicking and why `Deque`'s `push_back` -- which cannot fail --
+     * returns nothing.
+     */
+    push_back(*self, v: T) -> bool
+        if self.live == self.room then return false
+
+        self.slots[self.seat(self.live)] = v
+        self.live += 1
+        true
+    end push_back
+
+    /** Adds to the front, stepping `head` backwards into the space behind it. Answers whether there
+     * was room, exactly as `push_back` does.
+     */
+    push_front(*self, v: T) -> bool
+        if self.live == self.room then return false
+
+        self.head = if self.head == 0 then self.room - 1 else self.head - 1
+        self.slots[self.head] = v
+        self.live += 1
+        true
+    end push_front
+
+    /** Takes from the front. Nothing moves but `head`, which is the whole point of a ring. */
+    pop_front(*self) -> Option[T]
+        if self.live == 0 then return None
+
+        val v = self.slots[self.head]
+
+        self.head = self.seat(1)
+        self.live -= 1
+        Some(v)
+    end pop_front
+
+    /** Takes from the back. Nothing moves but `live`. */
+    pop_back(*self) -> Option[T]
+        if self.live == 0 then return None
+
+        self.live -= 1
+        Some(self.slots[self.seat(self.live)])
+
+    /** Adds to the back, **dropping the oldest value to make room** where the ring is full, and
+     * answers whatever was dropped.
+     *
+     * This is the operation that makes a ring a ring rather than a bounded queue, and it is the one
+     * a caller cannot write out of the members above without a `pop_front` that is wrong when the
+     * ring is not full. What it is for is a fixed window over an unbounded stream -- the last `n`
+     * log lines, the last `n` samples, a scrollback -- where the newest value matters and the oldest
+     * is what a bounded queue would have refused the newest for.
+     *
+     * A ring with **no storage at all** drops what it was given, which is the honest answer rather
+     * than an edge case: there is no slot for the value, so it is evicted at once.
+     */
+    overwrite(*self, v: T) -> Option[T]
+        if self.room == 0 then return Some(v)
+
+        var out: Option[T] = None
+
+        if self.live == self.room
+            out = Some(self.slots[self.head])
+            self.head = self.seat(1)
+            self.live -= 1
+
+        self.slots[self.seat(self.live)] = v
+        self.live += 1
+        out
+    end overwrite
+
+    /** Forgets every value. The storage is the caller's and is left exactly as it was -- what is
+     * reset is where the ring believes its elements are, which is the whole of its state.
+     */
+    clear(*self)
+        self.head = 0
+        self.live = 0
+
+    /** A walk from the front to the back. */
+    walk(self) -> RingCursor[T] = RingCursor(self.slots, self.room, self.head, self.live, 0)
+end Ring
+
+/** Subscripting reaches the bounds-checked members rather than the storage, so `r[i]` counts from the
+ * **front** of the ring and cannot read a slot the ring is not currently using.
+ */
+impl[T] Index[usize, T] for Ring[T]
+    index(self, i: usize) -> T = self.at(i)
+
+impl[T] IndexSet[usize, T] for Ring[T]
+    index_set(*self, i: usize, v: T) = self.set(i, v)
+
+/** Builds an empty ring over storage the caller supplies.
+ *
+ * A function rather than an associated `new`, because the element type is inferred from the slots and
+ * there is no receiver for it to be read off: `ring(slots[..])` says everything, where
+ * `Ring[int].new(...)` would say the element type twice.
+ *
+ * **The slice is read here and not kept**, for the reason the `slots` field gives: what is stored is
+ * its address and its length.
+ */
+ring[T](slots: []T) -> Ring[T] = Ring(as_mut_ptr(slots), slots.len, 0, 0)
+
+// The report an out-of-range index makes. It is written out of `prints` and `printi` rather than
+// through an f-string because building a string makes heap storage, which is exactly what this
+// module has promised not to do (`reference/modules.md § Capabilities are a module property`).
+private past_end(i: usize, n: usize) -> never
+    prints("panic: index ")
+    printi(long(i))
+    prints(" past the ")
+    printi(long(n))
+    prints(" elements of a Ring\n")
+    exit(1)
+end past_end
+
+// ------------------------------------------------------------------------------------- walking
+
+/** A walk from the front to the back. It holds the storage rather than the ring, so pushing onto the
+ * ring while a cursor is live leaves the cursor reading the run it started on.
+ */
+struct RingCursor[T]
+    slots: *T
+    room: usize
+    head: usize
+    count: usize
+    at: usize
+
+impl[T] Iterate for RingCursor[T]
+    type Item = T
+
+    next(*self) -> Option[T]
+        if self.at >= self.count then return None
+
+        var seat = self.head + self.at
+
+        if seat >= self.room then seat -= self.room
+
+        val v = self.slots[seat]
+
+        self.at += 1
+        Some(v)
+    end next

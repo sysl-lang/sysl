@@ -3,7 +3,7 @@ module sysl.posix.threads
 @requires(posix)
 
 import sysl.sync.*
-import sysl.slices.as_mut_ptr
+import sysl.container.ring.{Ring, ring}
 
 /** A bounded queue two threads hand values across, and the one place the language's rule about what
  * may leave a concurrency domain is enforced on a *value* rather than on an address
@@ -48,28 +48,26 @@ struct Channel[T]
     // this struct that nothing outside can see, so a program has nothing to do with the flag.
     private held: i32
 
-    // The ring, and where the live run inside it starts and how long it is. `head` is the next slot
-    // to be read and `live` the number of values in it, which is what tells a full ring from an
-    // empty one — two indices alone cannot, since `head == tail` means both.
+    // The values, in a bounded ring over the storage the caller supplied. It is `sysl.container.
+    // ring.Ring` rather than four fields of this struct, which it was until the ring became a type
+    // of its own: what a channel adds to a ring is the lock and the closed flag, and nothing about
+    // the wrapping was ever this module's.
     //
-    // **The storage is a `*T` and a count rather than a `[]T`, and that is the crossing rule rather
-    // than a preference.** A view owns its elements through a count that is not atomic, so a struct
-    // holding one may not reach another domain at all — which would refuse the channel at the
+    // **A `Ring[T]` holds a `*T` and a count rather than a `[]T`, and that is the crossing rule
+    // rather than a preference.** A view owns its elements through a count that is not atomic, so a
+    // struct holding one may not reach another domain at all — which would refuse the channel at the
     // `spawn` that shares it, one line before the first `send`. A raw pointer carries no count, so
     // it crosses; what it costs is the same trust `*p` already asks for, and it is the trust every
     // other thing in this module already asks (`spawn` takes a `*T`, `Mutex.lock` gives one back).
     // The caller writes a slice at `channel(…)` and never sees the pointer.
-    private slots: *T
-    private room: usize
-    private head: usize
-    private live: usize
+    private ring: Ring[T]
 
     // One once `close` has been called. An `i32` rather than a `bool` because it is read outside the
     // lock — `is_closed` is a hint a waiter checks — and `Atomic`'s widths are the machine's.
     private closed: i32
 
     /** How many values the channel can hold at once, which is the storage it was given. */
-    capacity(*self) -> usize = self.room
+    capacity(*self) -> usize = self.ring.capacity()
 
     /** How many values are waiting to be taken. Read under the lock, so it is a fact rather than a
      * hint — of the moment it was read, which is all any such number can be.
@@ -77,7 +75,7 @@ struct Channel[T]
     len(*self) -> usize
         self.take_lock()
 
-        var n = self.live
+        var n = self.ring.len()
 
         self.drop_lock()
         n
@@ -111,15 +109,7 @@ struct Channel[T]
     private push(*self, value: T) -> bool
         self.take_lock()
 
-        var free = self.live < self.room
-
-        if free
-            var at = self.head + self.live
-
-            if at >= self.room then at -= self.room
-
-            self.slots[at] = value
-            self.live += 1
+        var free = self.ring.push_back(value)
 
         self.drop_lock()
         free
@@ -127,15 +117,7 @@ struct Channel[T]
     private pop(*self) -> Option[T]
         self.take_lock()
 
-        var out: Option[T] = None
-
-        if self.live > 0
-            out = Some(self.slots[self.head])
-            self.head += 1
-
-            if self.head >= self.room then self.head = 0
-
-            self.live -= 1
+        var out = self.ring.pop_front()
 
         self.drop_lock()
         out
@@ -205,5 +187,5 @@ end Channel
  * has with whatever `state` points at — a module-level `static var`, or a local of a `main` that
  * joins before it returns.
  */
-channel[T](slots: []T) -> Channel[T] = Channel(0, as_mut_ptr(slots), slots.len, 0, 0, 0)
+channel[T](slots: []T) -> Channel[T] = Channel(0, ring(slots), 0)
 

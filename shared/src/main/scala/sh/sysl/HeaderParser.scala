@@ -59,7 +59,7 @@ trait HeaderParser extends AttrParser {
    * they take the notation sysl already uses for that — the one `@test` and `@tailrec` are written
    * in. What it buys is the whole reason to prefer it: **no word is spent.** `alloc` was a reserved
    * word, which took the most natural name in an allocator away from the code that provides one, and
-   * `guide/slab` had to call its function `take`. Every name here arrives through `attrWord`, which
+   * the slab allocator had to call its function `take`. Every name here arrives through `attrWord`, which
    * matches an ordinary identifier, so `alloc`, `no`, `requires` and `link` are all available to a
    * program again.
    *

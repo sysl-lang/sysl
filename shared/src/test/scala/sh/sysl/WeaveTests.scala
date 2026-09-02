@@ -14,12 +14,20 @@ import org.scalatest.matchers.should.Matchers
  * quote, so what is asserted instead is the property: **the code in the rendered document is exactly
  * the program the compiler reads, in order.**
  *
- * It is asked of the two real literate guides and of the five-file `sysl.regex` as well as of the
- * small cases, because the small cases are the ones somebody thought of.
+ * It is asked of the five-file `sysl.regex` — the library's own literate module, and the tree's only
+ * literate source since the guide set was retired — as well as of the small cases, because the small
+ * cases are the ones somebody thought of.
  */
 class WeaveTests extends AnyFreeSpec with Matchers {
 
   private def source(text: String): Source = Source(s"weave${Literate.Extension}", text)
+
+  /** A literate source that really is on disk, which is what the driver cases below need: what they
+    * assert is the *command*, and a command reads a file.
+    */
+  private def literateFile: Option[String] =
+    StdRoot.root.map(root => s"$root/sysl/regex/vm${Literate.Extension}")
+
 
   private def rendered(text: String): String =
     Weave.render(source(text)) match
@@ -207,13 +215,6 @@ class WeaveTests extends AnyFreeSpec with Matchers {
   }
 
   "the round trip holds" - {
-    "for the guide program written this way" in {
-      val path = s"guide/slab/slab${Literate.Extension}"
-
-      assume(isFile(path), s"$path is not reachable from the test working directory")
-      roundTrips(Source(path, readFile(path)))
-    }
-
     "for the library module written this way" in {
       // `sysl.regex` is five literate files, so this is also the multi-file case: every one of them
       // is rendered and every one has to hold its own program.
@@ -245,17 +246,19 @@ class WeaveTests extends AnyFreeSpec with Matchers {
   }
 
   "a document is named for the source it came from" in {
-    Weave.documentName(s"slab${Literate.Extension}") shouldBe "slab.html"
+    Weave.documentName(s"vm${Literate.Extension}") shouldBe "vm.html"
     // Its directories are dropped, so a nested tree lands flat rather than rebuilding itself under
     // the output directory.
-    Weave.documentName(s"guide/slab/slab${Literate.Extension}") shouldBe "slab.html"
+    Weave.documentName(s"library/sysl/regex/vm${Literate.Extension}") shouldBe "vm.html"
   }
 
   "the driver writes what the renderer rendered" - {
     "to standard output when there is nowhere else" in {
-      val path = s"guide/slab/slab${Literate.Extension}"
+      val found = literateFile
 
-      assume(isFile(path), s"$path is not reachable from the test working directory")
+      assume(found.isDefined, "the library is not reachable from the test working directory")
+
+      val path = found.get
 
       val out = ran(Config(command = "weave", file = path))
 
@@ -264,11 +267,13 @@ class WeaveTests extends AnyFreeSpec with Matchers {
     }
 
     "to a file when it is asked to" in {
-      val path = s"guide/slab/slab${Literate.Extension}"
+      val found = literateFile
 
-      assume(isFile(path), s"$path is not reachable from the test working directory")
+      assume(found.isDefined, "the library is not reachable from the test working directory")
 
-      val out = s"${createTempDirectory("sysl-weave-")}/slab.html"
+      val path = found.get
+
+      val out = s"${createTempDirectory("sysl-weave-")}/vm.html"
 
       ran(Config(command = "weave", file = path, output = Some(out)))
       readFile(out) should include(s"""class="language-${Weave.Language}"""")

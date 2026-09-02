@@ -360,7 +360,7 @@ class AssertTests extends AnyFreeSpec with Matchers with CodegenSupport with Run
    *
    * A body is analyzed once for each set of arguments, so the condition is settled against the types
    * that were actually chosen — which is the only moment `sizeof(T)` is a number. This is what
-   * `guide/slab` wanted and had to write as a `require`: a runtime branch for a fact that was known
+   * the slab allocator wanted and had to write as a `require`: a runtime branch for a fact known
    * at the call.
    */
   "inside a generic body, settled once per instantiation" - {

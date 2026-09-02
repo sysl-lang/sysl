@@ -90,9 +90,9 @@ class LinkDirectiveTests extends AnyFreeSpec with Matchers with RunSupport with 
     }
   }
 
-  // `link` is a soft keyword and has to stay one: `guide/slab` declares a function called `link` —
-  // the pointer threading a free block — and reserving the word would break it. This is the pair of
-  // tests that holds the grammar to it.
+  // `link` is a soft keyword and has to stay one: `sysl-lang/slab` declares a function called
+  // `link` — the pointer threading a free block — and reserving the word would break it. This is the
+  // pair of tests that holds the grammar to it.
   "'link' is still an ordinary name everywhere else" - {
 
     "a function may be called it, and called" in {

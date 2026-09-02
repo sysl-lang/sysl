@@ -1,0 +1,255 @@
+module sysl.container.ring
+@tests
+
+/** What the ring promises. The interesting failures are all in the wrapping -- an index that is
+ * correct while the run happens to start at zero and wrong once it does not -- so most of these
+ * arrange for the ring to be wrapped before they assert anything.
+ *
+ * **A full ring is asserted beside a ring with one slot left**, everywhere it comes up, because
+ * `push_back` answering `false` is the whole of what a bounded queue adds and a test that only ever
+ * fills one cannot tell a refusal from a ring that never accepted anything.
+ */
+
+@test("a fresh ring is empty, and knows how much room it was given")
+ring_fresh_is_empty()
+    var slots: [4]int = [0; 4]
+    var r = ring(slots[..])
+
+    assert_eq(r.capacity(), 4)
+    assert_eq(r.len(), 0)
+    assert(r.is_empty())
+    assert(!r.is_full())
+    assert_eq(r.first(), None)
+    assert_eq(r.last(), None)
+    assert_eq(r.pop_front(), None)
+    assert_eq(r.pop_back(), None)
+end ring_fresh_is_empty
+
+@test("pushing on the back reads back in order")
+push_back_is_a_queue()
+    var slots: [4]int = [0; 4]
+    var r = ring(slots[..])
+
+    assert(r.push_back(1))
+    assert(r.push_back(2))
+    assert(r.push_back(3))
+
+    assert_eq(r.len(), 3)
+    assert_eq(r.first(), Some(1))
+    assert_eq(r.last(), Some(3))
+    assert_eq(r[0], 1)
+    assert_eq(r[2], 3)
+end push_back_is_a_queue
+
+/** The end a bounded queue has that a growing one does not: the answer at the boundary, and the
+ * ring being unchanged by the push it refused.
+ */
+@test("a full ring refuses a push and keeps what it had")
+push_back_refuses_when_full()
+    var slots: [3]int = [0; 3]
+    var r = ring(slots[..])
+
+    assert(r.push_back(1))
+    assert(r.push_back(2))
+    assert(!r.is_full())
+    assert(r.push_back(3))
+    assert(r.is_full())
+
+    assert(!r.push_back(4))
+    assert_eq(r.len(), 3)
+    assert_eq(r.last(), Some(3))
+end push_back_refuses_when_full
+
+@test("pushing on the front reverses the order and wraps head past zero")
+push_front_prepends()
+    var slots: [3]int = [0; 3]
+    var r = ring(slots[..])
+
+    assert(r.push_front(1))
+    assert(r.push_front(2))
+    assert(r.push_front(3))
+
+    assert_eq(r.len(), 3)
+    assert_eq(r[0], 3)
+    assert_eq(r[2], 1)
+    assert(!r.push_front(4))
+end push_front_prepends
+
+@test("taking from the back answers the newest value")
+pop_back_is_a_stack()
+    var slots: [4]int = [0; 4]
+    var r = ring(slots[..])
+
+    assert(r.push_back(1))
+    assert(r.push_back(2))
+
+    assert_eq(r.pop_back(), Some(2))
+    assert_eq(r.pop_back(), Some(1))
+    assert_eq(r.pop_back(), None)
+    assert(r.is_empty())
+end pop_back_is_a_stack
+
+/** The case every index in the type has to survive, and the one a ring that has only ever been
+ * pushed onto never reaches: the live run starting part-way along the storage and crossing its end.
+ */
+@test("a wrapped run reads back in order from either end")
+wrapped_run_reads_in_order()
+    var slots: [4]int = [0; 4]
+    var r = ring(slots[..])
+
+    for i in 1..<4
+        assert(r.push_back(i))
+
+    assert_eq(r.pop_front(), Some(1))
+    assert_eq(r.pop_front(), Some(2))
+
+    // head is at 2 now, so these two land in slots 0 and 1 and the run crosses the end.
+    assert(r.push_back(4))
+    assert(r.push_back(5))
+
+    assert_eq(r.len(), 3)
+    assert_eq(r[0], 3)
+    assert_eq(r[1], 4)
+    assert_eq(r[2], 5)
+    assert_eq(r.first(), Some(3))
+    assert_eq(r.last(), Some(5))
+end wrapped_run_reads_in_order
+
+@test("setting through a subscript writes the slot the ring is using")
+set_writes_the_live_slot()
+    var slots: [4]int = [0; 4]
+    var r = ring(slots[..])
+
+    assert(r.push_back(1))
+    assert(r.push_back(2))
+    assert_eq(r.pop_front(), Some(1))
+    assert(r.push_back(3))
+
+    r[0] = 20
+    r[1] = 30
+
+    assert_eq(r[0], 20)
+    assert_eq(r[1], 30)
+end set_writes_the_live_slot
+
+@test("an index past the live run answers nothing rather than a stale slot")
+get_is_the_total_form()
+    var slots: [4]int = [0; 4]
+    var r = ring(slots[..])
+
+    assert(r.push_back(1))
+
+    assert_eq(r.get(0), Some(1))
+    assert_eq(r.get(1), None)
+    assert_eq(r.get(4), None)
+    assert_eq(r.get(99), None)
+end get_is_the_total_form
+
+/** The operation the members above cannot be composed into, and the reason the type is called a
+ * ring: the window slides rather than the push failing.
+ */
+@test("overwriting drops the oldest value once the ring is full")
+overwrite_slides_the_window()
+    var slots: [3]int = [0; 3]
+    var r = ring(slots[..])
+
+    assert_eq(r.overwrite(1), None)
+    assert_eq(r.overwrite(2), None)
+    assert_eq(r.overwrite(3), None)
+    assert(r.is_full())
+
+    assert_eq(r.overwrite(4), Some(1))
+    assert_eq(r.overwrite(5), Some(2))
+
+    assert_eq(r.len(), 3)
+    assert_eq(r[0], 3)
+    assert_eq(r[1], 4)
+    assert_eq(r[2], 5)
+end overwrite_slides_the_window
+
+@test("a ring with no storage evicts what it was given")
+overwrite_on_an_empty_region()
+    var slots: [1]int = [0]
+    var r = ring(slots[0..<0])
+
+    assert_eq(r.capacity(), 0)
+    assert(r.is_empty())
+    assert(r.is_full())
+    assert(!r.push_back(1))
+    assert_eq(r.overwrite(7), Some(7))
+    assert_eq(r.len(), 0)
+end overwrite_on_an_empty_region
+
+@test("clearing forgets the run without touching the storage")
+clear_forgets_the_run()
+    var slots: [4]int = [0; 4]
+    var r = ring(slots[..])
+
+    assert(r.push_back(1))
+    assert(r.push_back(2))
+    r.clear()
+
+    assert(r.is_empty())
+    assert_eq(r.len(), 0)
+    assert_eq(r.pop_front(), None)
+
+    // The storage is the caller's and was left alone, which is what makes it reusable.
+    assert_eq(slots[0], 1)
+
+    assert(r.push_back(9))
+    assert_eq(r[0], 9)
+end clear_forgets_the_run
+
+@test("walking answers the live run, front to back, across the wrap")
+walking_reads_the_live_run()
+    var slots: [4]int = [0; 4]
+    var r = ring(slots[..])
+
+    for i in 1..<4
+        assert(r.push_back(i))
+
+    assert_eq(r.pop_front(), Some(1))
+    assert(r.push_back(4))
+
+    var seen = 0
+    var n = 0
+
+    for v in r.walk()
+        seen = seen * 10 + v
+        n += 1
+
+    assert_eq(n, 3)
+    assert_eq(seen, 234)
+end walking_reads_the_live_run
+
+@test("a ring of one slot is a ring")
+one_slot_is_a_ring()
+    var slots: [1]int = [0]
+    var r = ring(slots[..])
+
+    assert(r.push_back(1))
+    assert(r.is_full())
+    assert(!r.push_back(2))
+    assert_eq(r.overwrite(2), Some(1))
+    assert_eq(r.first(), Some(2))
+    assert_eq(r.pop_front(), Some(2))
+    assert(r.is_empty())
+end one_slot_is_a_ring
+
+/** Emptying and refilling repeatedly is what walks `head` all the way round the storage, so this is
+ * the check that no index calculation is only correct for the first lap.
+ */
+@test("head walks the whole storage over many laps")
+many_laps_stay_in_order()
+    var slots: [3]int = [0; 3]
+    var r = ring(slots[..])
+
+    for i in 0..<20
+        assert(r.push_back(i))
+        assert(r.push_back(i + 100))
+        assert_eq(r.pop_front(), Some(i))
+        assert_eq(r.pop_front(), Some(i + 100))
+        assert(r.is_empty())
+
+    assert_eq(r.len(), 0)
+end many_laps_stay_in_order
