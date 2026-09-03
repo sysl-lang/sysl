@@ -243,6 +243,22 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
         withClue(t.name)(Conditional.defined(t).intersect(Set("android", "linux")).size should be <= 1)
     }
 
+    // A libc family rather than a capability, which is the distinction the symbol exists to make: a
+    // BSD and a glibc system are both `posix`, and every OS gate in `library/sysl/fs` is about where
+    // the two disagree rather than about what the machine can do. Asserted against `Os.bsd` from both
+    // sides so that an operating system added without an answer there cannot pass by defaulting.
+    "'bsd' is exactly the BSD libcs, and is narrower than 'posix'" in {
+      for t <- Target.all do withClue(t.name)(Conditional.defined(t).contains("bsd") shouldBe t.os.bsd)
+
+      Conditional.defined(Target.aarch64MacOS) should contain("bsd")
+      Conditional.defined(Target.aarch64Linux) should not contain "bsd"
+      Conditional.defined(Target.aarch64Android) should not contain "bsd"
+
+      // Narrower, and the point of it: everything that is `bsd` is `posix`, and the converse fails
+      // on the two glibc systems. A gate that meant "not glibc" and wrote `posix` would take them.
+      for t <- Target.all if t.os.bsd do withClue(t.name)(Conditional.defined(t) should contain("posix"))
+    }
+
     // The equation `reference/modules.md § Platform selection` rests on: a directory selects on
     // what an operating system alone settles, so every symbol a `__<os>__` folder may name has to
     // be one a `#if` names too. A new operating system is where that could quietly come apart,
@@ -251,6 +267,9 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
       Conditional.directorySymbols should contain("android")
       Conditional.directorySymbols.subsetOf(Conditional.symbols) shouldBe true
       Conditional.osDefined(Os.Android) shouldBe Set("android", "hosted", "posix")
+
+      Conditional.directorySymbols should contain("bsd")
+      Conditional.osDefined(Os.MacOS) shouldBe Set("macos", "hosted", "posix", "bsd")
     }
 
     "every symbol is true of at least one target in the registry" in {

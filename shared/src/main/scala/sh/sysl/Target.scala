@@ -402,6 +402,24 @@ enum Os {
   def inherentCapabilities: Set[String] =
     Option.when(this != Os.Freestanding)(Capability.Os).toSet ++
       Option.when(this == Os.MacOS || this == Os.Linux || this == Os.Android)(Capability.Posix)
+
+  /** Whether this is a **BSD**, which is a question about the libc rather than about the kernel and
+   * is why it is not a capability (`Conditional.osDefined` turns it into the `bsd` symbol).
+   *
+   * **The library's OS gates were asking this and saying `macos`**, which was true while macOS was
+   * the only BSD here and was never what any of them meant. Every one of the five is a place where
+   * a BSD libc and glibc disagree and nothing about Darwin is involved: `__error` against
+   * `__errno_location`, `ENOTEMPTY` at 66 against 39, `ENAMETOOLONG` at 63 against 36, and
+   * `mode_t` at sixteen bits against thirty-two for both `mkdir` and `chmod`.
+   *
+   * **What that cost is a trap rather than untidiness, and only one of the five would have said
+   * anything.** A FreeBSD added as a bare `Os` routes into the glibc branch at all five: the errno
+   * accessor fails loudly at the link, and the other four are silent — a wrong `ENOTEMPTY` makes
+   * `DirectoryNotEmpty` simply never match, and a `mode_t` at the wrong width appears to work on
+   * most ABIs. So the symbol is corrected before the target exists rather than after, which is the
+   * order that makes adding one a `case` here instead of an audit of five files.
+   */
+  def bsd: Boolean = this == Os.MacOS
 }
 
 /** What a call hands a C function whose parameter is a `va_list` (`reference/ffi.md § Variadic

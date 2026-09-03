@@ -45,7 +45,7 @@ object Conditional {
    * build with nothing said, and silently missing code is the one failure this feature cannot have.
    */
   lazy val symbols: Set[String] =
-    Os.values.map(osSymbol).toSet ++ Cpu.values.map(cpuSymbol).toSet ++ Set(Hosted, Posix)
+    Os.values.map(osSymbol).toSet ++ Cpu.values.map(cpuSymbol).toSet ++ Set(Hosted, Posix, Bsd)
 
   /** The symbols that are **true** for a target. Everything in [[symbols]] and not in here is false;
    * everything in neither is a mistake.
@@ -73,7 +73,8 @@ object Conditional {
 
     Set(osSymbol(os)) ++
       Option.when(machine(Capability.Os))(Hosted) ++
-      Option.when(machine(Capability.Posix))(Posix)
+      Option.when(machine(Capability.Posix))(Posix) ++
+      Option.when(os.bsd)(Bsd)
 
   /** Every symbol a **directory** may select on — the operating systems, plus the two environment
    * facts that are answerable without a processor.
@@ -84,7 +85,7 @@ object Conditional {
    * what `#if` and the C preprocessor are for.
    */
   lazy val directorySymbols: Set[String] =
-    Os.values.map(osSymbol).toSet ++ Set(Hosted, Posix)
+    Os.values.map(osSymbol).toSet ++ Set(Hosted, Posix, Bsd)
 
   /** The source as this target sees it, or the first thing wrong with its directives.
    *
@@ -238,6 +239,17 @@ object Conditional {
    * write it, not a replacement for being able to.
    */
   private val Posix = "posix"
+
+  /** A libc family rather than a capability, which is why it is read off `Os.bsd` and not off
+   * `inherentCapabilities` — a BSD and a glibc system are both `posix`, and every one of the
+   * library's OS gates is about the difference between them rather than about what the machine can
+   * do. `Os.bsd` carries the argument and the list of what it costs to get wrong.
+   *
+   * It is in `directorySymbols` as well as here, because the two vocabularies are one equation: a
+   * `#if bsd` and a `__bsd__` folder have to mean the same thing or the file that reads one is
+   * gated differently from the folder that holds the other.
+   */
+  private val Bsd = "bsd"
 
   private val Words = Set("if", "elif", "else", "endif")
 
