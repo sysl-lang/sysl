@@ -1,0 +1,234 @@
+module sysl.unicode
+@tests
+
+// What `sysl.unicode` promises, asserted in sysl.
+//
+// **The option bits in `map.sysl` are pinned here rather than by a `c const` block**, which is what
+// that file's comment means by saying the tests are what keep them honest. Nothing in `library/`
+// reads a C header, so the numbers are written in sysl -- and a bit that moved would make one of
+// these assertions produce the wrong text rather than quietly meaning something else. `Compose` is
+// pinned by NFC composing, `Decompose` by NFD not, `Compat` by a ligature coming apart under NFKC
+// and staying together under NFC, and `Casefold` by `ß` folding to `ss`.
+
+// -- what a character is --------------------------------------------------------------------------
+
+// The mapping the ASCII one could not do, which is the whole reason this module exists.
+@test("case mapping answers for characters outside ASCII")
+case_beyond_ascii()
+    assert_eq(to_upper('é'), 'É')
+    assert_eq(to_lower('É'), 'é')
+    assert_eq(to_upper('ж'), 'Ж')
+    assert_eq(to_lower('Ж'), 'ж')
+
+// Total, which is what lets a caller walk a whole string through it without asking first.
+@test("case mapping leaves a character it has no mapping for alone")
+case_is_total()
+    assert_eq(to_upper('日'), '日')
+    assert_eq(to_upper('1'), '1')
+    assert_eq(to_upper('!'), '!')
+    assert_eq(to_upper('\u{301}'), '\u{301}')
+
+// Titlecase is a third answer rather than a synonym for uppercase, and the characters that exist to
+// show it are the digraphs.
+// The answer most languages give for `ß` is `SS`, which is *full* casing and cannot come out of a
+// `char -> char` signature. The simple mapping has one character to give and gives the capital sharp
+// s, which is the one fact about this module most likely to surprise somebody -- so it is asserted
+// rather than left to the doc comment, and both directions are, since round-tripping is what makes
+// it the right answer for a mapping that has to be one character wide.
+@test("the simple uppercase of a sharp s is the capital sharp s")
+sharp_s_maps_to_capital_sharp_s()
+    assert_eq(to_upper('ß'), 'ẞ')
+    assert_eq(to_lower('ẞ'), 'ß')
+    assert_eq(fold("ß"), "ss")
+
+// **A character outside ASCII can map into it**, which is why `sysl.text.Ascii` is still the right
+// tool for a protocol identifier and this module is not. The Kelvin sign lowercases to a plain `k`
+// and the dotless `ı` uppercases to `I`, so two identifiers that were not equal compare equal once
+// either is case-mapped -- the shape a spoofing check exists to prevent. Pinned here because it is a
+// property of the mapping rather than of any caller, and because a reader deciding which of the two
+// to reach for needs it to be a fact rather than a caution.
+@test("case mapping can carry a character into the ASCII range")
+case_mapping_reaches_into_ascii()
+    assert_eq(to_lower(char(0x212au32)), 'k')
+    assert_eq(to_upper(char(0x131u32)), 'I')
+    assert_eq(to_lower(char(0x130u32)), 'i')
+    // The micro sign goes the other way, out of Latin-1 and into Greek.
+    assert_eq(to_upper(char(0xb5u32)), 'Μ')
+
+@test("titlecase differs from uppercase where the database says so")
+title_is_not_upper()
+    assert_eq(to_title('ǳ'), 'ǲ')
+    assert_eq(to_upper('ǳ'), 'Ǳ')
+    assert_eq(to_title('a'), 'A')
+
+@test("a category is the database's own")
+category_is_the_databases()
+    assert_eq(category('A'), Category.Lu)
+    assert_eq(category('a'), Category.Ll)
+    assert_eq(category('ǲ'), Category.Lt)
+    assert_eq(category('1'), Category.Nd)
+    assert_eq(category(' '), Category.Zs)
+    assert_eq(category('!'), Category.Po)
+    assert_eq(category('日'), Category.Lo)
+
+// A code point nothing has been assigned to answers `Cn` rather than failing, which is the database's
+// own answer and is what makes `category` total.
+@test("an unassigned code point is Cn")
+unassigned_is_cn()
+    assert_eq(category(char(0x0378u32)), Category.Cn)
+
+// `is_upper` and `is_lower` are not `category(c) == Lu` and `== Ll`, and writing them that way is
+// the obvious mistake -- it was made here first and this case is what found it. The database's own
+// test is *cased and already upper*, which cuts across the categories in both directions: a Roman
+// numeral is `Nl`, a circled letter is `So`, and both are upper; a titlecase digraph is `Lt` and is
+// neither.
+@test("upper and lower are cased-ness, not a category")
+case_predicates_are_not_categories()
+    assert(is_upper('A') && !is_upper('a'))
+    assert(is_lower('a') && !is_lower('A'))
+    assert(is_upper(char(0x2160u32)) && category(char(0x2160u32)) == Category.Nl)
+    assert(is_upper(char(0x24b6u32)) && category(char(0x24b6u32)) == Category.So)
+    assert(is_lower(char(0xaau32)) && category(char(0xaau32)) == Category.Lo)
+    assert(!is_upper(char(0x1c5u32)) && !is_lower(char(0x1c5u32)))
+
+@test("the predicates read the category")
+predicates_read_the_category()
+    assert(is_alpha('é') && is_alpha('日') && !is_alpha('1'))
+    // `Nd` and nothing else: a superscript two is a number and is not a digit.
+    assert(is_digit('1') && is_digit('٣') && !is_digit('²'))
+    // Exactly `White_Space`: the separator categories, the five ASCII controls, the next-line
+    // control, and the non-breaking space -- which is a space and is the one people forget.
+    assert(is_space(' ') && is_space('\n') && is_space('\t') && !is_space('a'))
+    assert(is_space(char(0xa0u32)) && is_space(char(0x85u32)) && is_space(char(0x3000u32)))
+    assert(!is_space(char(0u32)) && !is_space(char(0x200bu32)))
+    assert(is_mark(char(0x0301u32)) && !is_mark('a'))
+
+// The surrogates are the range UTF-8 may not carry, and saying so is what this answers.
+//
+// **It is asked of a `u32` because it cannot be asked of a `char`.** `char(0xd800)` traps -- the
+// first version of this case was written that way and died with exit status 133 and no message,
+// which is the conversion's bounds check doing its job. A `char` is valid by construction, so the
+// question only exists one level below it.
+@test("validity excludes the surrogates")
+validity_excludes_surrogates()
+    assert(is_valid(u32('a')))
+    assert(is_valid(u32('日')))
+    assert(!is_valid(0xd800u32))
+    assert(!is_valid(0xdfffu32))
+    assert(!is_valid(0x110000u32))
+    assert(is_valid(0x10ffffu32))
+
+// A version rather than a particular version: what is pinned is that there is one and that it reads
+// like a version, since a program storing normalized text has to be able to record which database
+// normalized it.
+@test("the database says which version it is")
+version_is_reported()
+    val v = unicode_version()
+
+    assert(v.len >= 5)
+    assert(is_digit(char(u32(v.bytes[0]))))
+
+// -- normalization and folding --------------------------------------------------------------------
+
+// The operation two strings go through before `==` between them means what a reader thinks: the same
+// text typed on two machines is routinely two different sequences of code points.
+@test("NFC composes and NFD decomposes")
+normalize_round_trips()
+    val composed = "é"
+    val decomposed = normalize(Form.Nfd, composed)
+
+    assert_eq(decomposed.len, 3)
+    assert_eq(composed.len, 2)
+    assert_eq(normalize(Form.Nfc, decomposed), composed)
+    assert_eq(normalize(Form.Nfd, decomposed), decomposed)
+
+// The compatibility forms throw information away, which is why they are for matching rather than for
+// storing -- and it is what tells `Nfkc` apart from `Nfc`.
+@test("the compatibility forms take a ligature apart and the canonical ones do not")
+compat_differs_from_canonical()
+    assert_eq(normalize(Form.Nfkc, "ﬁ"), "fi")
+    assert_eq(normalize(Form.Nfkd, "ﬁ"), "fi")
+    assert_eq(normalize(Form.Nfc, "ﬁ"), "ﬁ")
+    assert_eq(normalize(Form.Nfkc, "²"), "2")
+
+// Normalizing already-normal text is the identity, which is what makes it safe to run over anything.
+@test("normalizing is idempotent and leaves plain text alone")
+normalize_is_idempotent()
+    assert_eq(normalize(Form.Nfc, "hello"), "hello")
+    assert_eq(normalize(Form.Nfc, ""), "")
+    assert_eq(normalize(Form.Nfc, normalize(Form.Nfc, "héllo")), normalize(Form.Nfc, "héllo"))
+
+// **Folding is not lowercasing**, and the two assertions that differ are the whole reason it is a
+// function of its own: folding may make a string longer.
+@test("folding is the comparison key, and may change a string's length")
+fold_is_not_lowercase()
+    assert_eq(fold("Straße"), "strasse")
+    assert_eq(fold("ﬁt"), "fit")
+    assert_eq(fold("HÉLLO"), "héllo")
+    // Folding is what makes these two the same text, and nothing that maps character for character
+    // could: one is seven characters and the other six, so no per-character mapping has anywhere to
+    // put the difference. The contrast against `sysl.text`'s `to_lower` is asserted there rather
+    // than here -- `sysl.text` imports this module, so a test file beside this one may not import it
+    // back.
+    assert(fold("STRASSE") == fold("straße"))
+    assert_eq(grapheme_count("STRASSE".bytes), 7)
+    assert_eq(grapheme_count("straße".bytes), 6)
+
+@test("folding an empty string is empty")
+fold_of_empty()
+    assert_eq(fold(""), "")
+
+// -- grapheme clusters ----------------------------------------------------------------------------
+
+// The third answer to *how long is this text*, and the one a person would give. `s.len` is bytes and
+// a `Chars` walk is code points; neither is what a cursor or a field width should move by.
+@test("a grapheme cluster is what a person calls a character")
+graphemes_count_perceived_characters()
+    // `e` and a combining acute: two code points, one cluster.
+    assert_eq(grapheme_count("e\u{301}".bytes), 1)
+    assert_eq("e\u{301}".len, 3)
+    assert_eq(grapheme_count("héllo".bytes), 5)
+    assert_eq(grapheme_count("".bytes), 0)
+    // A flag is two regional indicators and one cluster.
+    assert_eq(grapheme_count("\u{1f1e8}\u{1f1e6}".bytes), 1)
+
+// The sequences a person reads as one thing and the encoding spells as many, which is the whole
+// reason the algorithm carries state: a zero-width joiner binds what is on either side of it, and a
+// regional indicator pairs with the one before it only if that one was not already paired.
+@test("a joined sequence and a pair of flags are one cluster each")
+graphemes_join_and_pair()
+    // A woman, a zero-width joiner, a laptop: eleven bytes, three code points, one cluster.
+    assert_eq(grapheme_count("\u{1f469}\u{200d}\u{1f4bb}".bytes), 1)
+    // Two flags side by side: four regional indicators, and the pairing has to be got right or this
+    // is one cluster or four rather than two.
+    assert_eq(grapheme_count("\u{1f1e8}\u{1f1e6}\u{1f1ec}\u{1f1e7}".bytes), 2)
+    assert_eq(grapheme_count("\u{1f1e8}\u{1f1e6}\u{1f1ec}\u{1f1e7} flags".bytes), 8)
+
+// The clusters are views onto the bytes they were made over, so a walk allocates nothing and each
+// piece can be read where it lies.
+@test("the walk answers the clusters in order")
+graphemes_answer_in_order()
+    var g = graphemes_of("e\u{301}x".bytes)
+
+    assert_eq(g.next(), Some("e\u{301}".bytes))
+    assert_eq(g.next(), Some("x".bytes))
+    assert_eq(g.next(), None)
+
+// A cursor's offset is what a program driving the walk by hand needs, since a `for` walks a copy.
+@test("the cursor reports where it is")
+graphemes_report_their_offset()
+    var g = graphemes_of("e\u{301}x".bytes)
+
+    assert_eq(g.offset, 0)
+    g.next()
+    assert_eq(g.offset, 3)
+    g.next()
+    assert_eq(g.offset, 4)
+
+// Bytes that are not text are the case a `string` cannot produce and a caller's own buffer can. The
+// walk stays total over them rather than stopping, which is what `Chars` does one level down.
+@test("a malformed byte does not stop the walk")
+graphemes_survive_malformed_bytes()
+    val bad: []const u8 = [u8('a'), 255, u8('b')]
+
+    assert_eq(grapheme_count(bad), 3)

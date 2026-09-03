@@ -1,0 +1,218 @@
+module sysl.unicode
+
+/** What the Unicode Character Database says about a character, and the operations over text that
+ * only that database can answer.
+ *
+ * **Everything here is a property of a *character*, and nothing in this file allocates.** A caller
+ * that wants the same operation over a whole string is in `map.sysl` beside this one, which is the
+ * same split `sysl.text` draws between `find.sysl` and `edit.sysl` and for the same reason: a
+ * program that only asks what a character is should not link an allocator on account of a
+ * `normalize` it never calls.
+ *
+ * ==Why this is in the standard library rather than in a package==
+ *
+ * Case mapping, case folding, normalization and grapheme segmentation are properties of *strings*.
+ * A language whose `to_upper` is ASCII-only has a `string` type that is Unicode in its storage and
+ * ASCII in its operations, and every program that meets a name with an accent in it has to go and
+ * find a binding. Done once here, every sysl program gets it.
+ *
+ * ==Where the data comes from==
+ *
+ * `utf8proc.c` beside this file, vendored -- the same library Julia's `Base` uses behind its own
+ * string functions, for exactly this set. `README.md` records the version, its checksum, and the
+ * five lines this copy carries on top of it.
+ *
+ * ==What is deliberately NOT here: display width==
+ *
+ * utf8proc answers it and this module does not expose it, because `sysl.text.char_columns` already
+ * does, out of tables of its own. Two answers to one question in one standard library is worse than
+ * either of them, and the tables are the half that has to agree.
+ *
+ * **Which one stays is decided by who pays.** `sysl.text.columns` is what places a diagnostic's
+ * caret, so it is reached by programs that never asked for anything Unicode -- including on a board,
+ * where it links about four kilobytes of ranges today and would link three hundred through here.
+ * A program reaches `to_upper` by deciding to uppercase a string, so what it pulls in is a cost it
+ * opted into. Width is inherited; case mapping is asked for.
+ */
+
+/** A character's General_Category, as the two-letter abbreviations the database itself uses.
+ *
+ * The order is the database's own, which is what lets the C answer be read straight into it: a
+ * `utf8proc_category` result is this enum's discriminant and the conversion is a cast rather than a
+ * table. `Cn` is first because an unassigned code point is category zero.
+ */
+enum Category derives Display
+    Cn
+    Lu
+    Ll
+    Lt
+    Lm
+    Lo
+    Mn
+    Mc
+    Me
+    Nd
+    Nl
+    No
+    Pc
+    Pd
+    Ps
+    Pe
+    Pi
+    Pf
+    Po
+    Sm
+    Sc
+    Sk
+    So
+    Zs
+    Zl
+    Zp
+    Cc
+    Cf
+    Cs
+    Co
+end Category
+
+private[sysl] extern "utf8proc_toupper" c_toupper(c: int) -> int
+private[sysl] extern "utf8proc_tolower" c_tolower(c: int) -> int
+private[sysl] extern "utf8proc_totitle" c_totitle(c: int) -> int
+private[sysl] extern "utf8proc_category" c_category(c: int) -> int
+private[sysl] extern "utf8proc_isupper" c_isupper(c: int) -> int
+private[sysl] extern "utf8proc_islower" c_islower(c: int) -> int
+private[sysl] extern "utf8proc_codepoint_valid" c_valid(c: int) -> bool
+private[sysl] extern "utf8proc_unicode_version" c_unicode_version() -> *u8
+
+/** The character `c` maps to in uppercase, or `c` where the database gives no mapping.
+ *
+ * **This is *simple* case mapping, one character in and one out**, which is what a `char -> char`
+ * signature can promise and all that most text needs. The mappings that change a string's *length*
+ * -- `ﬃ` uppercasing to `FFI` -- are *special* casing, and a caller who wants them wants `fold` in
+ * `map.sysl`, which is the operation defined to produce them.
+ *
+ * **`ß` is the one worth knowing about, because the simple answer is not the famous one.** Full
+ * casing gives `SS`, which is what most languages' `upper` answers and what a reader expects; the
+ * simple mapping has one character to give and gives `ẞ`, U+1E9E, the capital sharp s. It round
+ * trips -- `to_lower('ẞ')` is `'ß'` -- which `SS` could not. `fold` is where `ss` comes from, and
+ * comparing is what a caller wanting it was doing.
+ *
+ * `to_upper('é')` is `'É'`, which is the whole point of this module: the ASCII answer was `'é'`.
+ */
+to_upper(c: char) -> char = char(u32(c_toupper(int(u32(c)))))
+
+/** The other direction, and everything `to_upper` says applies to it unchanged. */
+to_lower(c: char) -> char = char(u32(c_tolower(int(u32(c)))))
+
+/** The titlecase form, which is not the same question as uppercase and differs for exactly the
+ * characters that exist to be a first letter: `ǳ` titlecases to `ǲ` and uppercases to `Ǳ`.
+ */
+to_title(c: char) -> char = char(u32(c_totitle(int(u32(c)))))
+
+/** Whether `c` is *cased and already upper*, which is a different question from
+ * `category(c) == Category.Lu` and is nearly always the one a caller means.
+ *
+ * **The two disagree in both directions, which is why this is a function rather than a comparison.**
+ * `Ⅰ`, the Roman numeral, is `Nl` and answers yes; the circled `Ⓐ` is `So` and answers yes; a
+ * titlecase digraph is `Lt` and answers no although it is not lower either. The test the database
+ * supports is *has a lowercase mapping, has no uppercase one, and is not titlecase* -- which is what
+ * a caller asking "do I need to uppercase this?" is asking.
+ */
+is_upper(c: char) -> bool = c_isupper(int(u32(c))) != 0
+
+/** The other direction, and everything `is_upper` says applies to it: `ª` is `Lo` and answers yes,
+ * because the database gives it an uppercase mapping and no lowercase one.
+ */
+is_lower(c: char) -> bool = c_islower(int(u32(c))) != 0
+
+/** Whether `c` is a letter in any of the five senses the database distinguishes, which is the test
+ * an identifier scanner and a word splitter both want and neither can write out of ASCII.
+ */
+is_alpha(c: char) -> bool = category(c) match
+    Category.Lu -> true
+    Category.Ll -> true
+    Category.Lt -> true
+    Category.Lm -> true
+    Category.Lo -> true
+    _ -> false
+
+/** Whether `c` is a decimal digit -- `Nd`, so the Arabic-Indic and Devanagari digits answer yes
+ * along with `0` through `9`, and a superscript `²` does not.
+ */
+is_digit(c: char) -> bool = category(c) == Category.Nd
+
+/** Whether `c` is a space of some kind, which is the three separator categories plus the control
+ * characters a line of text is broken on. `Zs` alone would leave out `\n` and `\t`, which is not
+ * what anybody trimming a line means.
+ *
+ * **This is exactly the database's `White_Space` property**, arrived at from the categories rather
+ * than from a table of its own: `Zs` holds the spaces including the non-breaking one, `Zl` and `Zp`
+ * the two separators, and what is left over is `U+0009` through `U+000D` and `U+0085`, the next-line
+ * control -- six characters the database files under `Cc`, where the rest of the controls are not
+ * spaces at all. Six comparisons is a smaller thing to keep right than a table.
+ */
+is_space(c: char) -> bool = category(c) match
+    Category.Zs -> true
+    Category.Zl -> true
+    Category.Zp -> true
+    _ -> (u32(c) >= 9 && u32(c) <= 13) || u32(c) == 0x85
+
+/** Whether `c` is a mark -- a combining accent, a spacing mark, an enclosing mark. A caller
+ * measuring or segmenting text is asking this to find the characters that belong to the one before
+ * them.
+ */
+is_mark(c: char) -> bool = category(c) match
+    Category.Mn -> true
+    Category.Mc -> true
+    Category.Me -> true
+    _ -> false
+
+/** What `c` is, as the database's own General_Category.
+ *
+ * An unassigned code point answers `Cn`, which is the database's answer rather than a failure: the
+ * question *what is this character* has an answer for every code point, and for most of them it is
+ * *nothing yet*.
+ */
+category(c: char) -> Category
+    val n = c_category(int(u32(c)))
+
+    // The C enum and this one are written in one order on purpose, so this is the cast the ordering
+    // was chosen to allow. A value outside it cannot arise -- `utf8proc_category` answers one of
+    // thirty -- and `Cn` is what an unassigned character already answers, so a hypothetical
+    // twenty-nine is not silently turned into something a caller would act on.
+    if n < 0 || n > 29 then Category.Cn else Category::Val(n)
+end category
+
+/** Whether a number is a code point Unicode allows to be encoded at all -- which excludes the
+ * surrogates and everything above `U+10FFFF`.
+ *
+ * **It takes a `u32` rather than a `char`, and that is the whole point of it.** A `char` is a valid
+ * scalar value by construction: `char(0xd800)` does not produce an invalid character, it **traps**,
+ * in the same runtime-safety category as a bounds check. So a `char` overload could only ever answer
+ * `true`, and the caller who needs this question answered is holding a number that has not been made
+ * into a character yet -- a field out of a binary format, a `\u` escape being decoded, an index
+ * arriving from somewhere else. Asking here is how they find out before the conversion traps.
+ */
+is_valid(code: u32) -> bool = c_valid(int(code))
+
+/** The version of the Unicode Character Database this module answers from, as the standard writes
+ * it -- `"17.0.0"` and so on.
+ *
+ * It is here because a program that stores normalized text has to be able to say which version
+ * normalized it: normalization is stable across versions for characters that were already assigned,
+ * and says nothing about ones that were not.
+ */
+unicode_version() -> string
+    // Not `sysl.text.from_cstring`, and the reason is layering rather than taste: `sysl.text`
+    // imports this module for its case mapping, so this module may not import it back. The walk is
+    // four lines and the bytes are ASCII digits and dots, so there is nothing for a validation to
+    // find.
+    val p = c_unicode_version()
+    var n: usize = 0
+
+    while p[n] != 0
+        n += 1
+
+    // The pointer is into utf8proc's own constant storage, which outlives the program, so the copy
+    // `str_cast` makes of the run is the only thing that has to own anything.
+    str_cast(p[0..<n])
+end unicode_version

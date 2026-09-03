@@ -1,0 +1,139 @@
+module sysl.unicode
+
+import sysl.slices.{as_ptr, as_mut_ptr}
+
+/** The operations that answer with a whole new string, and so need an allocator -- the half
+ * `unicode.sysl` does not hold.
+ *
+ * **The file boundary is the allocator**, which is `sysl.text`'s own split between `find.sysl` and
+ * `edit.sysl` re-drawn here. A program asking what a character is links nothing from this file.
+ *
+ * ==Everything here is one pass over a buffer of code points==
+ *
+ * utf8proc answers all four of these through the same two calls: `utf8proc_decompose` writes code
+ * points into a caller's buffer under a set of options, and `utf8proc_reencode` walks that buffer
+ * composing, ordering and re-encoding in place. Asking `decompose` for a buffer of zero length is
+ * how it reports the length it wants, so the shape is measure, allocate, fill, re-encode -- and no
+ * function in this module ever asks C to allocate. `utf8proc_map`, which would have, is not compiled
+ * into this copy at all; `README.md` says why.
+ *
+ * **Re-encoding in place is safe by construction, which is worth stating because it looks unsafe.**
+ * The buffer holds one `i32` per code point and UTF-8 spells a code point in at most four bytes, so
+ * the encoder is always writing behind the reader. utf8proc's own `utf8proc_map` does the same
+ * thing over the same buffer.
+ */
+
+/** The option bits `utf8proc_decompose` and `utf8proc_reencode` take, as `utf8proc.h` writes them.
+ *
+ * **They are written here rather than read out of the header**, which is the standard library's
+ * house style -- nothing in `library/` uses a `c const` block, and every C-facing constant in it is
+ * a number in a sysl file. What keeps them honest is the tests beside this module rather than the
+ * compiler: `normalize(Nfc, ...)` composing pins `Compose`, `normalize(Nfkc, ...)` folding a
+ * ligature pins `Compat`, and `fold("ß") == "ss"` pins `Casefold`. A bit that moved would redden
+ * one of them rather than quietly meaning something else.
+ */
+private const Stable: int = 2
+private const Compat: int = 4
+private const Compose: int = 8
+private const Decompose: int = 16
+private const Casefold: int = 1024
+
+/** Which normal form to put text into.
+ *
+ * The four are two questions crossed: whether to compose (`C`) or decompose (`D`), and whether to
+ * apply the compatibility mappings (`K`) that turn `ﬁ` into `fi` and `²` into `2`. `Nfc` is what
+ * text on the wire and in a filename should be; `Nfd` is what a program comparing base letters
+ * separately from their accents wants; the two `K` forms are for matching rather than for storing,
+ * because they throw information away.
+ */
+enum Form derives Display
+    Nfc
+    Nfd
+    Nfkc
+    Nfkd
+end Form
+
+private[sysl] extern "utf8proc_decompose" c_decompose(s: *u8, len: isize, out: *i32, cap: isize,
+                                                      options: int) -> isize
+private[sysl] extern "utf8proc_reencode" c_reencode(buf: *i32, len: isize, options: int) -> isize
+
+/** The options one form asks for. `Stable` is on for all four: it is what says that a code point
+ * unassigned when this version of the database was cut is left alone rather than being normalized
+ * by a rule that did not exist for it.
+ */
+private options_of(f: Form) -> int = f match
+    Form.Nfc -> Stable | Compose
+    Form.Nfd -> Stable | Decompose
+    Form.Nfkc -> Stable | Compose | Compat
+    Form.Nfkd -> Stable | Decompose | Compat
+end options_of
+
+/** `s` put into the normal form `f`.
+ *
+ * `normalize(Form.Nfc, "e\u{301}")` is `"é"` as one code point, and `normalize(Form.Nfd, "é")` is
+ * the letter and the accent as two. That is the operation two strings have to go through before
+ * `==` between them means what a reader thinks it means: the same text typed on two machines is
+ * routinely two different sequences of code points, and nothing about comparing bytes will say so.
+ */
+normalize(f: Form, s: string) -> string = mapped(s, options_of(f))
+
+/** `s` case-folded, which is the comparison key for *is this the same text ignoring case* and is
+ * not the same operation as lowercasing.
+ *
+ * **Folding may change a string's length, and that is the point of it**: `fold("ß")` is `"ss"` and
+ * `fold("ﬁ")` is `"fi"`, so `fold(a) == fold(b)` answers yes where `to_lower(a) == to_lower(b)`
+ * answers no. Lowercasing is for showing text to somebody; folding is for deciding whether two
+ * pieces of text are the same one.
+ *
+ * The result is composed (`Nfc`), so folding is idempotent and two strings that fold alike compare
+ * alike without a normalization pass of their own.
+ */
+fold(s: string) -> string = mapped(s, Stable | Compose | Casefold)
+
+/** Measure, allocate, fill, re-encode -- the one pass every function above is.
+ *
+ * **The empty string is answered without asking C anything.** `as_ptr` of an empty view is null,
+ * and there is no reason to hand a null to a library to have it agree there was nothing to do.
+ *
+ * **A refusal answers `s` unchanged rather than an error.** Every *negative* answer utf8proc can
+ * give here reports malformed UTF-8, and a `string` is well-formed by construction --
+ * `reference/strings.md` makes that the type's invariant -- so the branch is unreachable rather
+ * than merely unlikely. Making it a `Result` would put a `?` at every call site to carry a failure
+ * that cannot arrive.
+ *
+ * **Zero is not a refusal and is not treated as one.** It is a run that normalizes to nothing, which
+ * no option this module sets can produce today and which the code has no reason to rule out: the
+ * buffer is one slot, `reencode` answers zero, and the empty string falls out of the same line every
+ * other answer does.
+ */
+private mapped(s: string, options: int) -> string
+    if s.len == 0 then return s
+
+    val bytes = s.bytes
+    val src = as_ptr(bytes)
+    val want = c_decompose(src, isize(bytes.len), null, 0, options)
+
+    if want < 0 then return s
+
+    // One `i32` per code point, which is also room for the UTF-8 `reencode` writes back over it,
+    // plus the slot utf8proc terminates with.
+    var slots: []i32 = [0; usize(want) + 1]
+    val dst = as_mut_ptr(slots)
+
+    if c_decompose(src, isize(bytes.len), dst, want, options) != want then return s
+
+    val n = c_reencode(dst, want, options)
+
+    if n < 0 then return s
+
+    // `reencode` wrote UTF-8 into the front of the same storage, so the answer is the first `n`
+    // bytes of it read as bytes rather than as code points.
+    //
+    // **`str_cast` copies**, which is what makes reading them through a raw pointer safe: slicing a
+    // `*u8` names bytes without taking any hold on them, so a string that *aliased* this run would
+    // dangle the moment `slots` went. `reference/strings.md § Validity` is where that is stated, and
+    // it is worth knowing rather than guessing at -- the shape looks exactly like the unsafe one.
+    val text: *u8 = ptr_cast(dst)
+
+    str_cast(text[0..<usize(n)])
+end mapped
