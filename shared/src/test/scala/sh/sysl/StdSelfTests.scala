@@ -235,8 +235,18 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * it** — the tree was at 635 against a floor of 616 before a line of the ring was written, which is
    * most of a module's worth going unnoticed. Measured with the command this comment prescribes
    * rather than added to the number above it.
+   *
+   * Raised to **675** when `sysl.unicode` arrived with 21 of its own and `sysl.text`'s one case
+   * about ASCII case mapping became three: two about Unicode case mapping, and one contrasting it
+   * with folding, which is the file that can name both. Like `sysl.fs`'s and
+   * `sysl.posix.net`'s they depend on the library's own C, and on far more of it than any of those:
+   * the whole Unicode Character Database is vendored beside the module, so a build that stopped
+   * compiling `utf8proc.c` or stopped linking it fails here rather than quietly collecting fewer
+   * tests. **The drift was three**, measured before a case was written -- 652 against a floor of
+   * 649 -- and taken exactly, so what the number now proves is that all twenty-three new cases are
+   * collected.
    */
-  private val floor = 649
+  private val floor = 675
 
   /** The library, compiled as a **test build of itself**.
    *

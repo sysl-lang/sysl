@@ -304,6 +304,47 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
         out should include("hello=5 same")
       }
 
+      // **The Unicode Character Database, on a board.** utf8proc is 2.3 MB of C and about 330 KB of
+      // tables, vendored beside `sysl.unicode`, and the argument for putting it in the standard
+      // library rather than in a package rests on it reaching every target rather than only a hosted
+      // one. Nothing below a run says that it does: the tables are `const` data the linker has to
+      // place, the lookup is three levels of indirection through them, and a copy compiled for the
+      // wrong pointer width would produce a plausible wrong character rather than a failure.
+      //
+      // `to_upper` per character allocates nothing, which is what makes this the case worth running
+      // here — the caller-buffer path is the whole design, and a board is where "no allocator was
+      // needed" stops being a claim about the source. `é` is chosen because it is exactly what the
+      // ASCII mapping this replaced could not do: two bytes in, two bytes out, and different ones.
+      // **The micro:bit is excluded, and the exclusion is the most informative thing here.** Its
+      // nRF51 has 256 KB of flash and the database is about 330 KB, so the link fails with
+      // `section '.text' will not fit in region 'FLASH': overflowed by 82180 bytes` -- which is not
+      // a defect in anything, it is the size of the Unicode Character Database against the size of
+      // that part. A board wanting case mapping needs a part with room for it; the other five here
+      // have it. That number is also the answer to *what does this cost*, measured on the one
+      // machine where the answer is a hard limit rather than a preference.
+      if b.name != "microbit" then
+        "maps case out of the Unicode database, which the board has to have linked" in {
+          val src = List(
+            Source("p.sysl",
+              """import board.*
+                |import sysl.unicode.{to_upper, category, Category}
+                |
+                |val w = console()
+                |
+                |var b: [4]u8
+                |val n = encode_utf8(to_upper('\u{e9}'), b[0..<4])
+                |
+                |w.write(b[0..<n])
+                |if category('\u{e9}') == Category.Ll then w.write(" Ll".bytes) else w.write(" ??".bytes)
+                |""".stripMargin),
+            boardModule(b))
+
+          val (status, out) = bootUnderQemu(b, src, 20)
+
+          withClue(s"the board said: '$out'")(status shouldBe 0)
+          out should include("\u00c9 Ll")
+        }
+
       // A `long` is sixty-four bits on a machine whose registers are thirty-two, so every division
       // rendering it performs is a call to a compiler-rt builtin rather than an instruction. That is
       // ordinary — it is what C does here too — but it is the one thing in the library that needs

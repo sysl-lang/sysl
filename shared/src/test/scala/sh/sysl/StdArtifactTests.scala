@@ -720,6 +720,76 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
       // renderer itself pulls in is the library's business and changes with it.
       kept.length should be < 12
     }
+
+    /* The Unicode Character Database is the largest thing in the library by a long way -- utf8proc's
+     * tables are about 330 KB of the 350 KB object beside `sysl.unicode` -- and the argument for
+     * putting it in a module every program links rests entirely on the case above generalising to
+     * it. `sysl.text`'s `to_upper` used to be ASCII, and its doc comment refused a Unicode table on
+     * the grounds that `sysl.text` is what places a diagnostic's caret so every program would carry
+     * one. That inference is what these two cases refute and pin: what a program links is decided by
+     * the functions it calls, not by the modules it drags in. */
+
+    "and carries no Unicode tables for a program that maps no case" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val (kept, size) = linkedSymbols("print(1)\n")
+
+      assume(kept.nonEmpty || size > 0, "nm not available")
+
+      // Not one of utf8proc's twenty-four exported symbols, and not the tables either -- both carry
+      // the same prefix, so one substring is the whole query.
+      kept.count(_.contains("utf8proc")) shouldBe 0
+
+      // The tables are 330 KB, so a binary that carried them could not be this small. The bound is
+      // generous on purpose: what is being denied is a third of a megabyte, and pinning the actual
+      // figure would make every unrelated library change edit this line.
+      size should be < 200000L
+    }
+
+    "and carries them for a program that does" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val (kept, size) = linkedSymbols("import sysl.text.to_upper\nprint(to_upper(\"h\\u{e9}llo\"))\n")
+
+      assume(kept.nonEmpty || size > 0, "nm not available")
+
+      // The other half of the claim, and the half that makes the first one evidence rather than a
+      // measurement of nothing: the same link *does* carry the mapping when something calls it, so
+      // the absence above is dead-stripping and not a build that never compiled the C at all.
+      kept.count(_.contains("utf8proc_toupper")) shouldBe 1
+      size should be > 200000L
+    }
+  }
+
+  /** One program linked against the standard module, as the symbols that survived and the bytes it
+   * came to.
+   *
+   * It is the body the case above had inline, lifted because three cases now want it. `nm` rather
+   * than a byte count is still the claim -- the size is a consequence and drifts with the library --
+   * but the two Unicode cases want both, since what they deny is a third of a megabyte and a symbol
+   * count alone would not say whether the tables came anyway under some other name.
+   */
+  private def linkedSymbols(program: String): (List[String], Long) = {
+    val obj = createTempFile("sysl-std-", ".o")
+    val exe = createTempFile("sysl-std-", "")
+    val cs  = StdNative.objects()
+
+    Toolchain.compileObject(artifact._1, obj, Target.default) match
+      case Left(err) => fail(s"the standard module library did not assemble: $err")
+      case Right(_)  => ()
+
+    Toolchain.build(linked(program), exe, Target.default, obj :: cs) match
+      case Left(err) => fail(s"the program did not link: $err")
+      case Right(_)  => ()
+
+    val listed = exec(List("nm", exe))
+    val size   = fileSize(exe)
+
+    deleteFile(obj)
+    deleteFile(exe)
+    StdNative.clean(cs)
+
+    (if listed.exitCode == 0 then listed.stdout.linesIterator.toList else Nil, size)
   }
 
   /* Everything above builds the artifact in memory, which is the half that can be checked without a

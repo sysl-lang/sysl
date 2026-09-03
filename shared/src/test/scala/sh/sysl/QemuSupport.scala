@@ -66,6 +66,27 @@ trait QemuSupport extends Matchers {
   protected case class Board(name: String, target: Target, qemu: String, machine: List[String],
                              startup: String, bsp: String, script: String)
 
+  /** The library's own C, compiled for one board and **kept for the rest of the run**.
+   *
+   * A real compilation puts these objects on the link line (`NativeSources`), and this harness did
+   * not until `library/sysl/unicode` arrived -- every `.c` in the library had sat under a
+   * `__posix__` folder a freestanding target never selects, so the omission was invisible and the
+   * whole tier failed at `undefined symbol: utf8proc_toupper` the moment a program here called into
+   * it. Building them the same way a compilation does is what keeps the two from drifting again.
+   *
+   * **Memoized per target because the database is 2.3 MB of C** and there are five distinct targets
+   * across the boards but sixty-odd cases: compiling it once per case is the same object built
+   * eleven times over. Nothing is discarded, since these are temporaries of a test run and the
+   * process is short-lived.
+   */
+  private val libraryObjects = collection.mutable.Map.empty[String, NativeSources.Built]
+
+  protected def libraryC(t: Target): NativeSources.Built =
+    libraryObjects.synchronized(libraryObjects.getOrElseUpdate(t.triple,
+      NativeSources.build(NativeSources.of(StdRoot.root.toList, t.os), t) match
+        case Left(err)    => fail(s"the library's own C did not compile for ${t.triple}:\n$err")
+        case Right(built) => built))
+
   protected val boards: List[Board] = List(
     Board("virt", Target.riscv32Freestanding, "qemu-system-riscv32",
       List("-M", "virt", "-bios", "none", "-nographic", "-kernel"),
@@ -385,8 +406,24 @@ trait QemuSupport extends Matchers {
 
       withClue(s"compiling ${board.bsp}:\n${sup.stderr}")(sup.exitCode shouldBe 0)
 
+      // **The library's own C, compiled for the board.** A real `sysl build` puts these objects on
+      // the link line (`NativeSources`), and this harness did not — which was invisible for as long
+      // as every `.c` in `library/` sat under a `__posix__` folder a freestanding target never
+      // selects. `library/sysl/unicode/utf8proc.c` is the first that does not, and the whole tier
+      // failed at `undefined symbol: utf8proc_toupper` the moment a program here called into it.
+      // Building them the same way a compilation does is what keeps the two from drifting again.
+      val native = libraryC(t)
+
+      // **`--gc-sections`, which this link did not have and a real one always has.** An object named
+      // on a command line is linked entire, so putting the library's C here handed every board the
+      // whole Unicode database: the micro:bit's 256 KB of flash overflowed by 80,644 bytes on the
+      // *"boots, runs, and reports what it returned"* case, whose program is two `putc` calls.
+      // `Toolchain.deadStrip` is the same flag a compilation gets, paired with the
+      // `-ffunction-sections` `NativeSources` already compiles with — and the scripts `KEEP` their
+      // vector table and name an `ENTRY`, so nothing a board needs is reachable only by luck.
       val link = exec(Seq(cc, s"--target=${t.triple}", "-nostdlib", "-fuse-ld=lld",
-        "-T", s"$boot/${board.script}", start, prog, bsp, "-o", image))
+        "-Wl,--gc-sections", "-T", s"$boot/${board.script}", start, prog, bsp)
+        ++ native.objects ++ Seq("-o", image))
 
       withClue(s"linking the image:\n${link.stderr}")(link.exitCode shouldBe 0)
 
