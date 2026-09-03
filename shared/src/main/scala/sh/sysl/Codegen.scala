@@ -173,7 +173,16 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // runtime, whose own spelling of `malloc` is the one its code calls, or by an earlier `extern`,
     // since two declarations may name one symbol under different sysl names. A module may not
     // declare one symbol twice.
-    val declared = mutable.Set(Llvm.trap.name) ++
+    //
+    // **An `@export` in this same compilation counts as declaring it**, and that is the seam case
+    // rather than an oddity (`reference/ffi.md § A module may supply another module's extern`). One
+    // module declares `sysl_wall_us` and another defines it; the library is lowered whole, so both
+    // land here, and a `declare` beside the `define` of one symbol is `invalid redefinition of
+    // function` out of LLVM. The definition is the stronger statement and is the one to keep — a
+    // caller reaching the `extern` resolves to it exactly as the linker would have.
+    val defined = program.funcs.flatMap(_.exported).toSet
+
+    val declared = mutable.Set(Llvm.trap.name) ++ defined ++
       (if heap then Set(mallocSym, freeSym) else Set.empty) ++
       (if usesSnprintf then Set("snprintf") else Set.empty) ++
       (if program.entryPoint && program.tests.nonEmpty then Set("strcmp") else Set.empty)

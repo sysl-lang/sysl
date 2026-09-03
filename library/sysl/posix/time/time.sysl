@@ -32,10 +32,17 @@ import sysl.time.{Instant, Duration, micros, whole_micros}
 // supplies a module of its own with these two function names, in its own package, and a program picks
 // its clock by which one it imports.
 //
-// What that gives up is a program that compiles unchanged against both. The shape that would buy it
-// is a declared symbol in capability-free `sysl.time` that host and board alike link an
-// implementation of -- `sysl.harness`'s `attach` one layer down -- and it is not built here because
-// nothing yet needs it twice. The names above are chosen so that adding it later moves no caller.
+// **That used to give up a program compiling unchanged against both, and it no longer does.** The
+// shape this paragraph described as unbuilt -- a symbol declared in capability-free `sysl.time` that
+// host and board alike link an implementation of -- is built: `sysl.time.now` and
+// `sysl.time.monotonic` are it, `library/sysl/time/clock.sysl` carries the argument, and the two
+// `@export`s at the foot of this file are what answer it on a host. The names above are unchanged, as
+// that paragraph promised, so nothing that imported this module has moved.
+//
+// **Both spellings are right and neither is deprecated.** A program that is only ever going to run on
+// a host imports this module and calls `now` directly, which needs no seam and no linker cooperation.
+// A program that wants to move imports `sysl.time` instead and lets whatever it is linked against
+// decide.
 
 // **Nothing here transcribes a C structure, and nothing here names a clock by number.** Both of
 // those were done in sysl until the library could carry C, and both were the same mistake in
@@ -130,3 +137,45 @@ sleep(d: Duration)
  * for `sleep` unless you need the resolution or the remainder.
  */
 nanosleep(nanos: long) -> long = c_nanosleep(nanos)
+
+// ## Answering `sysl.time`'s seam
+//
+// `sysl.time` declares `sysl_wall_us` and `sysl_monotonic_us` and defines neither, so a program that
+// writes the portable `sysl.time.now()` needs somebody to. On a host that is this module, and these
+// two lines are the whole of it (`library/sysl/time/clock.sysl` carries the argument).
+//
+// **Nothing here changes for a caller.** `now` and `monotonic` above are the same functions they
+// were, imported and called the same way, and a host program that names this module directly needs
+// none of this. What the seam adds is the *other* spelling, for a program that wants to move.
+//
+// **There is no `#if posix` around these and none is needed, which is worth stating because the
+// instinct to add one is right about the danger and wrong about who already handles it.** The danger
+// is real: a `define` costs what a `declare` does not, so an unconditional body calling
+// `clock_gettime` reaching a freestanding link would fail naming a symbol that target has never had.
+//
+// What answers it is this file's own header. `@requires(posix)` is a property of the whole module, so
+// a target that does not provide `posix` does not compile this module at all -- there is no
+// declaration to gate, and a `#if` would be a second statement of a claim the header already makes.
+// Measured rather than reasoned about: with the guard removed, `sysl build-c --target
+// thumbv7em-freestanding` over a program calling `sysl.time.now()` emits a byte-identical archive,
+// with `sysl_wall_us` undefined and `clock_gettime` nowhere in it.
+//
+// So a freestanding program that asks the time and links no supplier fails at the link naming
+// `sysl_wall_us`, which is the diagnostic it should get: the board is what has a clock to offer, and
+// this module is not on that board.
+
+/** Answers `sysl.time`'s wall-clock seam. **Call `now` instead** -- this exists to be linked, not to
+ * be called, and it is public only because an `@export` may not be `private`: a private declaration
+ * promises every caller is inside its module and an export promises the opposite, so the compiler
+ * refuses a definition making both claims.
+ *
+ * The name says what it is for rather than what it reads, so that it does not compete with anything
+ * a program would reach for -- and a package answering the same seam on a board writes the same two
+ * lines with its own chip behind them.
+ */
+@export("sysl_wall_us")
+supply_wall_us() -> long = c_realtime_us()
+
+/** Answers `sysl.time`'s monotonic seam. **Call `monotonic` instead**, for the reason above. */
+@export("sysl_monotonic_us")
+supply_monotonic_us() -> long = c_monotonic_us()

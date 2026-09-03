@@ -47,14 +47,66 @@ object Reachability {
    * dependencies means: everything here is the program's own.
    */
   def prune(program: TProgram, own: Option[Set[String]] = None): TProgram = {
-    val entries = entryPoints(program, own)
-    val roots   = List(program.main, program.vals, program.vtables, program.entry, entries)
-    val live    = reachedFrom(roots, program.funcs, program.vtables).calls ++ entries.map(_.name)
+    val live = walk(program, entryPoints(program, own)).live
 
     program.copy(
       externs = program.externs.filter(e => live(e.name)),
       funcs = program.funcs.filter(f => live(f.name)),
     )
+  }
+
+  /** What one walk of a program answered: everything it can arrive at, and the **suppliers** it had
+   * to add roots for to get there.
+   */
+  private case class Walked(live: Set[String], suppliers: Set[String])
+
+  /** The walk, and the one root kind that cannot be decided before it has run.
+   *
+   * **An `@export` whose symbol answers an `extern` the program actually calls is a root**
+   * (`reference/ffi.md § A module may supply another module's extern`). It is the fifth kind, and it
+   * is the only one that is not a property of the function alone: the other four are decided by what
+   * a declaration carries, so `entryPoints` can answer them before anything is walked, while this one
+   * is decided by what the *rest of the program* turned out to need.
+   *
+   * **What it is for is a seam.** A capability-free module declares a symbol and defines nothing —
+   * `sysl.time`'s clock is the worked example — and whoever links the program defines it: the
+   * standard library on a host, a package binding an RTC chip on a board. The consumer imports the
+   * *declaring* module and calls `now()`; it never names the supplier, which is the whole point,
+   * since naming one is naming the chip. So `contributing`'s question — did the program reach the
+   * supplier's module? — answers **no** for precisely the case the seam exists to serve, and would
+   * prune the definition the program is about to fail to link without.
+   *
+   * **The narrowness is what keeps `0111` intact.** The rule this does not weaken is that a
+   * dependency's root reaches a consumer only where the consumer reaches its module, and the case
+   * that cost was a package carrying a test application whose `@export("main")` fought the
+   * consumer's own. Nothing declares `extern "main"`, so no live extern symbol answers to it and the
+   * supplier rule never fires there. A supplier is kept exactly when something in the program is
+   * already going to ask the linker for that symbol — which is the accounting an archive member gets,
+   * arrived at from the other side.
+   *
+   * **It is a fixpoint because a supplier has a body**, and that body may call an extern of its own
+   * that some further module supplies. Both sets only ever grow and both are bounded by the program's
+   * own declarations, so it settles; in practice one extra round does it, and the round after that is
+   * what proves nothing more was found.
+   */
+  private def walk(program: TProgram, entries: List[TFunc]): Walked = {
+    val bySymbol = program.funcs.filter(_.exported.isDefined).groupBy(_.exported.get)
+    val extra    = mutable.LinkedHashSet.empty[TFunc]
+
+    var live = Set.empty[String]
+    var more = true
+
+    while more do
+      val roots = List(program.main, program.vals, program.vtables, program.entry, entries, extra.toList)
+
+      live = reachedFrom(roots, program.funcs, program.vtables).calls ++
+        entries.map(_.name) ++ extra.map(_.name)
+
+      val wanted = program.externs.collect { case e if live(e.name) => e.symbol }.toSet
+
+      more = wanted.toList.flatMap(s => bySymbol.getOrElse(s, Nil)).foldLeft(false)((grew, f) => extra.add(f) || grew)
+
+    Walked(live, extra.map(_.name).toSet)
   }
 
   /** The functions that are roots because **nothing in the program names them**, whatever the walk
@@ -102,6 +154,11 @@ object Reachability {
    * `contributing` is the whole of it, and **the standard library is inside it**: it is handed to a
    * compilation exactly as a `--lib` root is, so the first `impl Drop` in `library/` would otherwise
    * have been emitted into every program that links it.
+   *
+   * **There is a FIFTH kind and it is not here, because it cannot be**: a function supplying a symbol
+   * some `extern` the program calls has declared. That one is decided by what the walk found rather
+   * than by what the declaration carries, so it lives in `walk`, which is also where the argument for
+   * it is — including why it does not reopen what `contributing` closed.
    */
   def entryPoints(program: TProgram, own: Option[Set[String]] = None): List[TFunc] = {
     val contributes = contributing(program, own)
@@ -123,8 +180,9 @@ object Reachability {
    */
   def exports(program: TProgram, own: Option[Set[String]]): List[TFunc] = {
     val contributes = contributing(program, own)
+    val supplies    = walk(program, entryPoints(program, own)).suppliers
 
-    program.funcs.filter(f => f.exported.isDefined && contributes(f.name))
+    program.funcs.filter(f => f.exported.isDefined && (contributes(f.name) || supplies(f.name)))
   }
 
   /** Whether the module a function is in contributes roots to this compilation at all.
