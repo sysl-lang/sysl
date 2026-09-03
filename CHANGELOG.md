@@ -7,6 +7,97 @@ copy -- correct a mistake there and regenerate, rather than editing this file. V
 `MAJOR.MINOR.PATCH`; while the leading zero stands the language is still moving, and a release may
 change what an existing program means. Where it does, the release says so.
 
+## 0.0.100 — 2026-09-03
+
+Two cards, both additive, and both about a program saying what it means rather
+than what the machine it happens to be on is called.
+
+### A program may read a clock without naming one
+
+```sysl
+import sysl.time.{now, monotonic, since, whole_micros, Instant}
+
+val y2020 = Instant(1577836800000000)
+
+print(whole_micros(since(now(), y2020)) > 0, whole_micros(monotonic()) >= 0)
+```
+
+```
+true true
+```
+
+That program names no capability, no chip and no package, and it is the same
+source on a laptop and on a board. `sysl.time` declares `sysl_wall_us` and
+`sysl_monotonic_us` and defines neither, so what supplies the numbers is
+whatever the program is linked against: `sysl.posix.time` on a host, over
+`clock_gettime`, and a package binding an RTC chip over I²C on a board. Moving
+between the two is a change to `package.hocon` rather than to any line of the
+program.
+
+`sysl.time` still asks for no capability — an `extern` is a name and a signature
+— so the calendar goes on running on a bare machine, which is the whole reason
+the clock could not simply be added to it.
+
+**Both spellings are right and neither is deprecated.** A program that is only
+ever going to run on a host imports `sysl.posix.time` and calls `now` directly,
+which needs no linker cooperation at all.
+
+#### The compiler had to learn one thing for that to work
+
+An `@export` is a reachability root only where the program reaches its module,
+which is the rule that stops a package's own test application from putting a
+second `main` in every consumer. A seam is exactly the case that rule excludes:
+the consumer imports the module that *declares* the symbol and never names the
+supplier, because naming one is naming the chip. So the definition was pruned
+and the program then failed at the link, against a name no line of it contains.
+
+**A function supplying a symbol an `extern` the program actually calls is now a
+root.** It is the accounting an archive member already gets, arrived at from the
+other side — the definition is taken because something is going to ask for that
+name, and left out otherwise.
+
+The narrowness is what leaves the old rule intact. Nothing declares
+`extern "main"`, so no live symbol answers to it and a package carrying its own
+program still cannot reach a consumer. A supplier of a symbol your program never
+calls is still dropped. And two modules claiming one symbol is refused naming
+both, rather than left to the linker to report against a name that appears in no
+sysl file.
+
+#### Where the declaration is compiled is where the seam is decided
+
+On a hosted target the standard library arrives prebuilt and was compiled whole,
+so its own supplier is already bound and a package cannot displace it — you get
+the host clock without asking, which is what a host program wants. Where a board
+is served there is no such artifact: `sysl build-c` and every freestanding target
+compile the library from source into your program, so the declaration and the
+supplier meet in one compilation and the package's definition answers.
+**Overriding a clock is something a board does and not something a host does.**
+
+### `bsd`, which is what five of the library's OS gates always meant
+
+`library/sysl/fs` had five `#if macos` gates and not one of them was about macOS.
+Each is a place where a BSD libc and glibc disagree: `errno` reached through
+`__error` against `__errno_location`, `ENOTEMPTY` at 66 against 39,
+`ENAMETOOLONG` at 63 against 36, and `mode_t` at sixteen bits against thirty-two
+for both `mkdir` and `chmod`. The symbol had been lying since it was written, and
+nothing noticed because macOS was the only BSD sysl targets.
+
+`bsd` joins `hosted` and `posix` as a derived symbol, and a `__bsd__` directory
+selects on it as well. It is deliberately **not** a capability: a BSD and a glibc
+system are both POSIX, and every one of these gates is about the libc rather than
+about what the machine can do.
+
+**It costs nothing today and is the whole of the fix later.** `#if macos` and
+`#if bsd` select identically on the targets that exist, so this release changes
+no behaviour anywhere. What it changes is what a *second* BSD would do: added as
+a bare operating system, it would route into the glibc branch at all five sites,
+and exactly one of them says anything — the `errno` accessor fails at the link,
+while a wrong `ENOTEMPTY` merely stops matching and a `mode_t` at the wrong width
+appears to work on most ABIs.
+
+`platform.sysl`'s `os()` ladder still says `macos`, and is right to: that one is
+about the operating system.
+
 ## 0.0.99 — 2026-09-02
 
 Three cards, all additive, and all three came out of writing `sysl-lang/curl` —
