@@ -1,6 +1,7 @@
 module sysl.text
 
 import sysl.buf.{Buf, buf}
+import sysl.unicode.{to_upper as unicode_upper, to_lower as unicode_lower}
 
 // The operations that make new text -- the half `find.sysl` does not hold.
 //
@@ -149,7 +150,7 @@ replace_all(s: string, old: string, new: string) -> string
     b.finish()
 end replace_all
 
-/** ASCII case conversion.
+/** Unicode case conversion.
  *
  * **It walks characters rather than bytes, and that is what keeps it safe.** A byte map would be
  * the faster loop and would need a way to put a raw byte into a builder -- which is the one thing
@@ -158,42 +159,51 @@ end replace_all
  * through `push_char` instead means every way in still carries the UTF-8 guarantee and no unchecked
  * primitive is named here at all. The decode and re-encode that costs is the right price for that.
  *
- * It works because `Ascii for char` is **total**: a character outside the range comes back as
- * itself, so a multi-byte character is re-encoded to exactly the bytes it arrived as. The buffer is
- * sized to the input for the same reason -- no ASCII case change alters a character's width, and
- * nothing else is changed at all.
+ * It works because `sysl.unicode.to_upper` is **total**: a character the database gives no mapping
+ * for comes back as itself, so text that has no case is re-encoded to exactly the bytes it arrived
+ * as.
  *
- * **IT IS ASCII AND ITS NAME DOES NOT SAY SO, WHICH IS THE ONE THING TO KNOW BEFORE CALLING IT.**
- * `Ascii` is named for the range it answers over; this is a fully general word over a per-character
- * call into it, so `to_upper("héllo")` is `HéLLO` and the `é` is untouched. That is total rather
- * than wrong -- text outside the range comes back as itself, never a wrong mapping and never a
- * refusal -- but the caller who did nothing and got `HéLLO` is real, and this is where they are
- * owed the sentence.
+ * **~~IT IS ASCII AND ITS NAME DOES NOT SAY SO~~ -- IT IS UNICODE NOW, AND THE PARAGRAPH THAT USED
+ * TO BE HERE IS THE REASON THIS ONE IS.** `to_upper("héllo")` was `HéLLO`, the `é` untouched,
+ * because the mapping was `Ascii for char`; it is `HÉLLO`. What changed is not this function but
+ * what is underneath it: the Unicode Character Database is in the standard library now, as
+ * `sysl.unicode`, and this is a walk over its per-character mapping.
  *
- * **A Unicode case table belongs in a package rather than here**, and the reason is a measurement:
- * the *simple* mapping alone is about 1,357 range entries, roughly 16KB, against the 499 entries
- * `sysl.text.width` already carries -- and `sysl.text` is not optional, being what places a
- * diagnostic's caret, so every freestanding program would link it. Above the simple mapping sit
- * *special* casing, where `ß` uppercases to `SS` and the result is longer than the input, and
- * *locale-sensitive* casing, which needs a notion of locale this library does not have.
- * `reference/strings.md § Granularity` already puts the table above this layer; card `0320` is
- * where the size was measured rather than estimated.
+ * **~~A Unicode case table belongs in a package rather than here~~ -- IT IS HERE, AND THE
+ * MEASUREMENT THAT SAID OTHERWISE WAS ANSWERING A QUESTION ABOUT THE MODULE.** Card `0320` costed
+ * the simple mapping at about 1,357 range entries and roughly 16KB, and refused it on the grounds
+ * that `sysl.text` is not optional -- it is what places a diagnostic's caret -- so every
+ * freestanding program would link the table. That inference is the false step. The library is one
+ * archive with an object per C file, an archive member is pulled in only to resolve a symbol
+ * something already referenced, and the link runs `-dead_strip` over `-ffunction-sections`; so what
+ * a program links is decided by the functions it calls and not by the modules it drags in. A
+ * program that never calls `to_upper` links no table, and `StdArtifactTests` pins exactly that.
+ *
+ * What is still true, and is what `sysl.unicode` says rather than this: the mapping is the *simple*
+ * one, character for character. *Special* casing, where a character uppercases to more than one and
+ * the result is longer than its input, is `sysl.unicode.fold`'s -- and that is the operation a
+ * caller comparing two strings wanted anyway. The case that surprises people is `ß`, which most
+ * languages uppercase to `SS`: the simple mapping gives `ẞ`, and `sysl.unicode.to_upper` says why.
+ * *Locale-sensitive* casing needs a notion of locale this library does not have.
  */
 to_upper(s: string) -> string
+    // A hint rather than a bound: a simple mapping may change a character's width in either
+    // direction -- `ſ` uppercases to the one-byte `S` and `ɐ` to the three-byte `Ɐ` -- so the
+    // builder grows if it has to, exactly as it would from any other guess.
     var b = str_builder_with_capacity(s.len)
 
-    for c in s.chars do b.push_char(c.to_upper())
+    for c in s.chars do b.push_char(unicode_upper(c))
 
     b.finish()
 end to_upper
 
-/** The other direction, and everything `to_upper` says applies to it unchanged -- including that its
- * name promises more than ASCII: `to_lower("HÉLLO")` is `hÉllo`.
+/** The other direction, and everything `to_upper` says applies to it unchanged: `to_lower("HÉLLO")`
+ * is `héllo`.
  */
 to_lower(s: string) -> string
     var b = str_builder_with_capacity(s.len)
 
-    for c in s.chars do b.push_char(c.to_lower())
+    for c in s.chars do b.push_char(unicode_lower(c))
 
     b.finish()
 end to_lower
