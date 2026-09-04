@@ -43,7 +43,7 @@ SUITES=$REPO/shared/src/test/scala
 
 HEAVY_HEAP=32g;  HEAVY_AGENTS=1     # a suite that builds for every target, on its own -- 24g was
                                     # not enough as of 2026-09-04; see below
-LIGHT_HEAP=16g;  LIGHT_AGENTS=3     # 3 x 16g = the same 48 GB ceiling, redistributed -- see below
+LIGHT_HEAP=16g;  LIGHT_AGENTS=2     # 2 x 16g = 32 GB, lowered from 3 on 2026-09-04; see below
 LIMIT=900                           # seconds per group; the groups take 15-75s
 OOM_GRACE=60                        # after an agent announces an OOM -- see `attempt_group`
 
@@ -84,7 +84,34 @@ OOM_GRACE=60                        # after an agent announces an OOM -- see `at
 # sbt sat waiting on a 32 MB corpse until `LIMIT` cut it. So a hand-run of a heavy suite needs its
 # own watchdog; the gate has one and a bare `testOnly` does not.
 #
-# One agent on a 64 GB machine, so 32g is safe on its own. LIGHT is untouched at 3 x 16g.
+# One agent on a 64 GB machine, so 32g is safe on its own.
+#
+# **WHY LIGHT IS NOW 2 x 16g RATHER THAN 3, measured 2026-09-04 on the same day HEAVY went to 32g.**
+# The gate was killed by the machine **three times, at the same place each time**: entering
+# `chunk-0`, which is the first group to run the full `syslNative` test binary at the light
+# settings. Every run got all six heavy groups green first, and the `doc` group with them — 350
+# tests, 0 failed — so the ask that fails is 3 x 16g and the ask that survives, repeatedly, is
+# HEAVY's 1 x 32g.
+#
+# **The 48 GB ceiling stopped being affordable rather than stopping being correct.** It was measured
+# on 2026-08-22 against a library that has since grown, and the same growth is what pushed HEAVY
+# from 24g to 32g in the paragraph above — an agent that used to want 4.3 GB wants more now, so
+# three of them reach for the ceiling together where they used to sit well under it. 2 x 16g is 32
+# GB, the same peak the heavy groups demonstrably survive on this machine.
+#
+# **What it costs is wall clock and nothing else**, spread over the 43 chunks — the chunks are
+# independent, so two agents finish the same work in about half again the time.
+#
+# **The diagnosis took three runs because the first two attributions were wrong**, and both were
+# guesses that fitted the evidence rather than things anybody had shown: `ConditionalTests` (it was
+# green every time) and desktop memory pressure (freeing ~22 GB of compressor got the run seven
+# groups further and it died in the same place). What settled it was reading which groups had
+# **finished** — the summary names them — rather than reasoning about which one looked expensive.
+#
+# **If the light chunks now pass with room to spare, sample the peak and write it here**, so that
+# 3 x 12g can be judged rather than guessed at. `ps -axo rss,comm | grep sysl-test` every second
+# during a chunk is the whole measurement, and the note above about measuring suites one at a time
+# says why a group-level number cannot answer it.
 
 mkdir -p "$LOGS"
 SUMMARY=$LOGS/summary.txt
