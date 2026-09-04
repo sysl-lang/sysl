@@ -41,7 +41,8 @@ REPO=${0:a:h}
 LOGS=$REPO/target/gate
 SUITES=$REPO/shared/src/test/scala
 
-HEAVY_HEAP=24g;  HEAVY_AGENTS=1     # a suite that builds for every target, on its own
+HEAVY_HEAP=32g;  HEAVY_AGENTS=1     # a suite that builds for every target, on its own -- 24g was
+                                    # not enough as of 2026-09-04; see below
 LIGHT_HEAP=16g;  LIGHT_AGENTS=3     # 3 x 16g = the same 48 GB ceiling, redistributed -- see below
 LIMIT=900                           # seconds per group; the groups take 15-75s
 OOM_GRACE=60                        # after an agent announces an OOM -- see `attempt_group`
@@ -62,6 +63,28 @@ OOM_GRACE=60                        # after an agent announces an OOM -- see `at
 # collector scans the stack conservatively, so garbage that a stack word happens to look like a
 # pointer to cannot be proven dead; a fresh process is then the only thing that reclaims it, which is
 # exactly what this script provides and why it works at all.
+#
+# **WHY HEAVY IS 32g RATHER THAN 24g, measured 2026-09-04.** `ConditionalTests` produced no verdict
+# twice in one gate and was recorded `TIMEOUT/KILLED`. Re-run alone on a box with no other JVM and no
+# orphaned agent, at 24g and one agent, it reproduced rather than passing -- so it is the ceiling and
+# not contention, which is the reading the retry mechanism exists to rule out:
+#
+#     [ScalaNative GC|Error] Out of heap space grow heap
+#       at Heap_exitWithOutOfMemory / LargeAllocator_Alloc
+#       at scala.collection.mutable.HashMap.growTable
+#       at scala.util.parsing.combinator.PackratParsers$$anon$3.apply
+#
+# It dies growing the **packrat memo table**, which is the parser's and scales with what it parses --
+# and this suite parses the standard library once per target. RSS sampled every 15 s ran 2.0 -> 16.2
+# -> a plateau near 18.0 -> 20.5 GB. Immix grows by x1.414 and has no shrink path, so the grow from
+# ~17 GB asks for ~24 and overshoots. At 32g the same suite passes: **90 tests, 0 failed, 12:01**.
+#
+# **The failure presents as a HANG rather than as an OOM**, which is why the summary says
+# `TIMEOUT/KILLED` and not `oom`. `Heap_exitWithOutOfMemory` printed and the process did not exit --
+# sbt sat waiting on a 32 MB corpse until `LIMIT` cut it. So a hand-run of a heavy suite needs its
+# own watchdog; the gate has one and a bare `testOnly` does not.
+#
+# One agent on a 64 GB machine, so 32g is safe on its own. LIGHT is untouched at 3 x 16g.
 
 mkdir -p "$LOGS"
 SUMMARY=$LOGS/summary.txt
