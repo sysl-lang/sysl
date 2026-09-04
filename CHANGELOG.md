@@ -7,6 +7,76 @@ copy -- correct a mistake there and regenerate, rather than editing this file. V
 `MAJOR.MINOR.PATCH`; while the leading zero stands the language is still moving, and a release may
 change what an existing program means. Where it does, the release says so.
 
+## 0.0.102 — 2026-09-04
+
+Five standard-library modules, and one behaviour change worth reading first.
+
+### `sysl.text`'s `trim` on a `string` is Unicode now
+
+**This changes what an existing program does.** `trim`, `trim_start` and `trim_end` on a **`string`**
+receiver decode and test the Unicode whitespace property, where they walked bytes with
+`Ascii.is_space` before — so a no-break space, an ideographic space and the next-line control are
+removed where they used to survive.
+
+Every ASCII input answers exactly as it did; the set only widened. What changes is a program that was
+deliberately *not* trimming a `U+00A0` because it wanted to keep it.
+
+The **`[]const u8`** receiver is untouched and stays ASCII, byte for byte. A byte is not a character
+— a no-break space is `0xc2 0xa0`, and neither of those is a space on its own — and a wire format
+wants the ASCII answer. A caller who wants the old behaviour on text has `s.bytes.trim()`.
+
+`columns` and `char_columns` are **unchanged**, so nothing that lays out a diagnostic moves. The
+grapheme-cluster walk is a new function beside them rather than a replacement.
+
+### `sysl.text` — comparing and measuring
+
+- `eq_fold`, `starts_with_fold`, `ends_with_fold`, `contains_fold` compare through
+  `sysl.unicode.fold`, which is the operation `to_lower(a) == to_lower(b)` gets wrong: `"STRASSE"`
+  and `"straße"` are the same word and lowercase to two different strings.
+- `cluster_columns` and `grapheme_columns` measure a grapheme cluster at a time, so a joined family
+  emoji is two columns rather than the eight its code points come to.
+
+### `sysl.math.bigint` and `sysl.math.decimal`
+
+Integers with no width — sign and magnitude over 32-bit limbs, schoolbook multiply, Knuth's algorithm
+D, `pow`, and text in any base from 2 to 36 — and exact decimal arithmetic over them.
+
+A `Decimal` is a coefficient and a scale, so `0.1 + 0.2` is `0.3` and stays `0.3` over a million
+rows. The scale is part of the value: `1.50` and `1.5` compare equal and render differently, which is
+what a price quoted to the cent needs. Division takes a scale and a `Rounding`, `HalfEven` by
+default.
+
+### `sysl.log`
+
+A `Record`, a `Sink` trait of one method, `text` and `json` renderings, and the four level names over
+a threshold. `log_at` takes the instant and `log` reads the clock, so the module is usable on a board
+with no clock at all; the threshold is an atomic so a filtered `debug` costs a relaxed load rather
+than a lock.
+
+### `sysl.encoding` — UUIDs
+
+`v4` and `v7`, RFC 9562. A v7 puts a millisecond timestamp in the high 48 bits, so ids made in
+sequence sort in sequence — which is what a database key should be. `v4_of` is the constructor for a
+value that must be **unguessable**, since `sysl.rand` is PCG32 and a v4 built from it is not.
+
+### `sysl.path` — globs
+
+`matches(pattern, p)` is Go's `filepath.Match` plus a globstar, over bytes and allocating nothing.
+A leading `.` is hidden from every wildcard, which is what keeps a tool driven by `**` out of
+somebody's `.git`. `sysl.fs.walk(root).matching(pattern)` filters a walk by one.
+
+### A variant that carries nothing is constant data
+
+The one compiler change, and it is what `sysl.log` needed. `Option[T] = None` in module storage was a
+*computed* initializer — filled by the program's prologue — which is invisible on a hosted target and
+fatal on a bare one, where an `@export` reaching such a slot was refused outright. A module-level slot
+may now start out unset and be laid into the object file, so a module holding one is reachable from a
+freestanding `build-c` archive.
+
+A dataless variant of a *simple* enum was never affected: that enum lowers to its discriminant. What
+did not fold was the empty variant of an enum whose other variants carry something, which is exactly
+`Option`'s `None`.
+
 ## 0.0.101 — 2026-09-04
 
 One card, and it is the one that makes a `string` in sysl mean the same thing
