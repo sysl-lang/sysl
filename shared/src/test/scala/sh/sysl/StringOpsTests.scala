@@ -272,25 +272,44 @@ class StringOpsTests extends AnyFreeSpec with RunSupport {
 
   "case conversion" - {
 
-    "converts the ASCII letters and nothing else" in {
+    "converts the ASCII letters, which is where it started" in {
       run("""print(to_upper("hello, world! 42"), to_lower("HELLO, WORLD! 42"))""") shouldBe
         "HELLO, WORLD! 42 hello, world! 42\n"
     }
 
-    // The property that makes it safe to do at all: only bytes below 128 change, and those are
-    // never part of a multi-byte sequence — so a character outside ASCII is re-encoded as itself.
-    "a character outside ASCII passes through untouched" in {
-      run("""print(to_upper("héllo"), to_lower("HÉLLO"))""") shouldBe "HéLLO hÉllo\n"
+    // **These two asserted the OPPOSITE until `sysl.unicode` arrived**, and the paragraph that stood
+    // here is the reason they are worth keeping rather than deleting: *"only bytes below 128 change,
+    // and those are never part of a multi-byte sequence — so a character outside ASCII is
+    // re-encoded as itself"*. That was a true description of an ASCII map under a fully general
+    // name, and `to_upper("héllo")` answered `HéLLO`. It is a walk over the Unicode Character
+    // Database now.
+    "a character outside ASCII is mapped rather than passed through" in {
+      run("""print(to_upper("héllo"), to_lower("HÉLLO"))""") shouldBe "HÉLLO héllo\n"
     }
 
     // Stronger than comparing the text: the result is a `string` like any other, so it still walks
-    // as the same characters and has the same byte length it started with.
-    "and what comes out is still well-formed, with its widths intact" in {
+    // as the same characters.
+    //
+    // **The byte length is no longer part of the claim, and that is the change rather than an
+    // omission.** An ASCII map cannot alter a character's width, so `u.len == s.len` held by
+    // construction; a Unicode one can in either direction — `ſ` uppercases to the one-byte `S` and
+    // `ɐ` to the three-byte `Ɐ`. What survives is the character *count*, which is what the property
+    // was really about: nine characters in, nine out, still well-formed.
+    "and what comes out is still well-formed, with its character count intact" in {
       run("""var s = "héllo-→-𝄞"
             |var u = to_upper(s)
             |var n = 0
             |for _ in u.chars do n += 1
-            |print(u, n, u.len == s.len)""".stripMargin) shouldBe "HéLLO-→-𝄞 9 true\n"
+            |var m = 0
+            |for _ in s.chars do m += 1
+            |print(u, n, n == m)""".stripMargin) shouldBe "HÉLLO-→-𝄞 9 true\n"
+    }
+
+    // The one that is genuinely surprising, and it is here rather than only in the library's own
+    // tests because this is the tier that runs a compiled program: full casing gives `SS`, and the
+    // simple mapping a `char -> char` signature can promise gives the capital sharp s.
+    "a sharp s uppercases to the capital sharp s, not to SS" in {
+      run("""print(to_upper("straße"))""") shouldBe "STRAẞE\n"
     }
 
     "an empty string converts to an empty string" in {

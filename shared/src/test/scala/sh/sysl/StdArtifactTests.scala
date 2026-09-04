@@ -768,20 +768,10 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
      * argument for putting the Unicode database in the standard library at all rests on it getting
      * there. Two claims, and the second is the one that cannot be read off the source. */
 
-    "is the database and nothing POSIX" in {
-      val carried = Std.cSources(Os.Freestanding).map(s => Project.basename(s.name))
-
-      // The walk takes a `.c` beside a module whatever the target, so this one comes through.
-      carried should contain("utf8proc.c")
-
-      // And the platform folders do not, which is the same walk refusing what this target has no
-      // libc for. Naming them individually would go stale; what is asserted is that nothing from a
-      // selector directory survived.
-      Std.cSources(Os.Freestanding).map(_.name).filter(_.contains("__posix__")) shouldBe empty
-
-      // The host takes both, which is what makes the line above a selection rather than an absence.
-      Std.cSources(Target.default.os).map(_.name).count(_.contains("__posix__")) should be > 0
-    }
+    /* **Which files the walk carries per machine is `OsDirectoryTests`' claim and is deliberately
+     * not restated here.** That suite asserts both lists by name, a rule stated twice is a rule that
+     * will disagree with itself, and this one is about something it cannot see: that the C which
+     * reaches a bare target actually *compiles* for one and asks a C library for nothing. */
 
     "compiles for a bare target, with nothing from a C library left undefined" in {
       assume(Toolchain.clangAvailable, "clang not available")

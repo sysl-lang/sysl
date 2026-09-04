@@ -405,13 +405,23 @@ class OsDirectoryTests extends LibraryCliSupport {
 
     // The same question asked of the tree that ships, which is the one the card was filed about: the
     // library's shims are POSIX and must reach a hosted build and no other.
+    //
+    // **`bare shouldBe empty` STOOD HERE AND WAS RIGHT UNTIL THE LIBRARY CARRIED C THAT IS NOT A
+    // SHIM.** Every `.c` in `library/` sat under a `__posix__` folder, so a freestanding machine took
+    // none of them and the claim could be written as *nothing at all*. `library/sysl/unicode` is the
+    // Unicode Character Database, which is not a shim for anything and belongs on every target — so
+    // the claim narrows to the one it always meant: **the POSIX shims stay off a bare machine, and
+    // what does reach one is named.**
+    //
+    // The narrower form is also the stronger test. `empty` would go on passing if the selection
+    // broke in the direction of taking nothing, and this cannot.
     "which is what keeps the library's own shims off a bare machine" in {
-      val bare   = Std.cSources(Os.Freestanding).map(s => Project.basename(s.name))
+      val bare   = Std.cSources(Os.Freestanding).map(s => Project.basename(s.name)).sorted
       val hosted = Std.cSources(Os.Linux).map(s => Project.basename(s.name)).sorted
 
-      bare shouldBe empty
+      bare shouldBe List("utf8proc.c")
       hosted shouldBe List("clock.c", "dirent.c", "dirs.c", "meta.c", "net.c", "sleep.c", "spawn.c",
-        "stackguard.c", "stat.c", "termios.c", "zone.c")
+        "stackguard.c", "stat.c", "termios.c", "utf8proc.c", "zone.c")
 
       // And macOS sees the same files, which is the deduplication itself: before this they were
       // two directories of identical copies, and a build could only ever have seen one of them.
