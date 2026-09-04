@@ -115,11 +115,10 @@ object ApiModel {
           .sortBy(s => (s.kind.ordinal, s.name.toLowerCase, s.line))
 
       // The module's own doc comment is the one at the top of a file that nothing adopted — the
-      // `above` rule ends an association at a blank line precisely so this can exist. Where more
-      // than one file has one, the first by module-relative path wins, so which file is "the"
-      // header does not depend on directory order.
-      val header =
-        us.sortBy(_.source.name).flatMap(unit => moduleDoc(unit)).headOption
+      // `above` rule ends an association at a blank line precisely so this can exist. WHICH file
+      // may carry it is `headlineFile`'s rule, and a module whose headline file has none has no
+      // summary rather than borrowing a sibling's.
+      val header = headlineFiles(name, us).flatMap(unit => moduleDoc(unit)).headOption
 
       Module(
         name = name,
@@ -128,6 +127,49 @@ object ApiModel {
         capabilities = us.flatMap(_.capabilities.map(capabilityText)).distinct.sorted,
       )
     }.sortBy(_.name)
+  }
+
+  /** The files of a module that may carry its headline: the one **named for the module's last path
+   * segment**, and no other.
+   *
+   * `sysl.path` is `path.sysl`, `sysl.math.bigint` is `bigint.sysl`, `sysl.regex` is `regex.lsysl` —
+   * a literate module is a module, so both suffixes count. A module whose headline file is absent,
+   * or carries no unclaimed doc comment, has **no** summary.
+   *
+   * **A rule rather than an order, and that is the whole point.** This used to be "the first file by
+   * path that has one", which cannot be wrong loudly: `sysl` is fourteen files and `check.sysl` sorts
+   * first, so the prelude's index row read *"What a program does when something it was sure of turns
+   * out not to hold"* — a sentence about `assert` and `panic`, standing for the module a newcomer
+   * meets first. Nothing failed, because nothing could: a sibling's sentence is well-formed prose
+   * about the right module's neighbourhood. **A blank row is a defect somebody can see; a plausible
+   * wrong one is not**, which is why the absent case is left blank rather than filled in.
+   *
+   * **The library follows this rule for 23 of its 34 modules and no library anywhere uses an index
+   * file**, which is what chose it over a `module.sysl` convention that would have had to be invented
+   * for every module at once. Where the eponymous file exists it holds real declarations, so the
+   * headline sits above code rather than alone in a file that exists only to carry prose.
+   *
+   * **A module of ONE file is its own headline file, whatever it is called.** There is no ambiguity
+   * to resolve there and nothing to borrow from, so the rule has nothing to do — and applying it
+   * anyway would silently drop the summary of `sysl doc <one file>`, which is a whole usage rather
+   * than an edge.
+   */
+  private def headlineFiles(module: String, us: List[Program]): List[Program] = us match
+    case _ :: Nil => us
+    // Sorted so that a module carrying both `x.sysl` and `x.lsysl` — which nothing does, and which
+    // the format permits — answers the same way every time rather than by directory order.
+    case several  => several.filter(u => stem(u.source.name) == module.split('.').last)
+                            .sortBy(_.source.name)
+
+  /** A file's name with its directory and its one extension taken off: `lib/sysl/path/glob.sysl` is
+   * `glob`. Both separators are handled because a `Source` carries the path the driver walked, and
+   * on Windows that is a backslash.
+   */
+  private def stem(path: String): String = {
+    val base = path.replace('\\', '/').split('/').last
+    val dot  = base.lastIndexOf('.')
+
+    if dot > 0 then base.substring(0, dot) else base
   }
 
   /** A capability clause as a reader would write it.

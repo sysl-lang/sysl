@@ -3,60 +3,61 @@ module sysl.log
 import sysl.sync.{SpinLock, Ordering}
 import sysl.time.{Instant, instant_text, now, us_per_milli}
 
-// Structured logging: a level, a message, a few named fields, and somewhere for them to go.
-//
-// **Every server wants one and every package writes one**, which is the argument for it being here
-// rather than in a package: a program that depends on three libraries should not link three loggers
-// and configure them separately. Go, Python and Rust all ship the interface in the standard library
-// for the same reason, and leave the interesting sinks outside it.
-//
-// ## The shape
-//
-// A **`Record`** is what happened: when, how bad, what about, and a handful of named strings. A
-// **`Sink`** is where it goes -- one method, taking the record by pointer. **`text`** and **`json`**
-// are two renderings, each writing into a `Writer`, and a sink is what chooses between them. That
-// is the whole of the module; everything else people want from a logger is a sink somebody writes.
-//
-// ```
-// info("listening", [("port", "8080"), ("tls", "on")])
-// ```
-//
-// ## What it costs, and where
-//
-// **A record holds strings the caller rendered**, which is the one decision here that shows up at
-// every call site. The alternative -- a list of `&Display` -- would put a trait object in every
-// record and an allocation behind every field. What a caller writes instead is
-// `("port", str(port))`, which does allocate, and the cost is paid where the value is
-// actually wanted.
-//
-// **A filtered call still evaluates its arguments, and that is the one thing to know before putting
-// a `debug` in a loop.** sysl evaluates a call's arguments before the call, so the `str` above
-// runs whether or not the threshold admits the record -- `log` compares the level and returns
-// without building a `Record`, and it never sees the work that was done to reach it. `enabled` is
-// the guard for that case and is why it exists:
-//
-// ```
-// if enabled(Level.Debug) then debug("state", [("queue", str(queue.len()))])
-// ```
-//
-// A call whose fields are literals, or one with no fields at all, costs nothing when filtered.
-//
-// **The time is an `Instant`**, which is a count of microseconds and nothing else. Rendering it as a
-// date is the calendar's job and `text` is the only thing here that asks for one, so a program whose
-// sink calls `json` links no calendar code at all -- the millisecond count is arithmetic.
-//
-// **`log_at` takes the instant and `log` reads the clock**, which is what makes the module usable on
-// a board with no clock at all: `sysl.time.now` reaches a seam the application supplies, and a
-// program that has nothing to supply calls `log_at` with whatever its own counter says.
-//
-// ## What is deliberately not here
-//
-// **Child loggers, contexts, rotation, colours, asynchronous delivery.** Each is a sink, and each is
-// a policy somebody disagrees with. A sink is one method; writing the one you want is a dozen lines
-// and does not require this module to have guessed.
-//
-// **A formatting language.** The message is a string and the fields are strings; a caller wanting
-// interpolation has `f"..."` and knows what it costs.
+/** Structured logging: a level, a message, a few named fields, and somewhere for them to go.
+ *
+ * **Every server wants one and every package writes one**, which is the argument for it being here
+ * rather than in a package: a program that depends on three libraries should not link three loggers
+ * and configure them separately. Go, Python and Rust all ship the interface in the standard library
+ * for the same reason, and leave the interesting sinks outside it.
+ *
+ * ## The shape
+ *
+ * A **`Record`** is what happened: when, how bad, what about, and a handful of named strings. A
+ * **`Sink`** is where it goes -- one method, taking the record by pointer. **`text`** and **`json`**
+ * are two renderings, each writing into a `Writer`, and a sink is what chooses between them. That
+ * is the whole of the module; everything else people want from a logger is a sink somebody writes.
+ *
+ * ```
+ * info("listening", [("port", "8080"), ("tls", "on")])
+ * ```
+ *
+ * ## What it costs, and where
+ *
+ * **A record holds strings the caller rendered**, which is the one decision here that shows up at
+ * every call site. The alternative -- a list of `&Display` -- would put a trait object in every
+ * record and an allocation behind every field. What a caller writes instead is
+ * `("port", str(port))`, which does allocate, and the cost is paid where the value is
+ * actually wanted.
+ *
+ * **A filtered call still evaluates its arguments, and that is the one thing to know before putting
+ * a `debug` in a loop.** sysl evaluates a call's arguments before the call, so the `str` above
+ * runs whether or not the threshold admits the record -- `log` compares the level and returns
+ * without building a `Record`, and it never sees the work that was done to reach it. `enabled` is
+ * the guard for that case and is why it exists:
+ *
+ * ```
+ * if enabled(Level.Debug) then debug("state", [("queue", str(queue.len()))])
+ * ```
+ *
+ * A call whose fields are literals, or one with no fields at all, costs nothing when filtered.
+ *
+ * **The time is an `Instant`**, which is a count of microseconds and nothing else. Rendering it as a
+ * date is the calendar's job and `text` is the only thing here that asks for one, so a program whose
+ * sink calls `json` links no calendar code at all -- the millisecond count is arithmetic.
+ *
+ * **`log_at` takes the instant and `log` reads the clock**, which is what makes the module usable on
+ * a board with no clock at all: `sysl.time.now` reaches a seam the application supplies, and a
+ * program that has nothing to supply calls `log_at` with whatever its own counter says.
+ *
+ * ## What is deliberately not here
+ *
+ * **Child loggers, contexts, rotation, colours, asynchronous delivery.** Each is a sink, and each is
+ * a policy somebody disagrees with. A sink is one method; writing the one you want is a dozen lines
+ * and does not require this module to have guessed.
+ *
+ * **A formatting language.** The message is a string and the fields are strings; a caller wanting
+ * interpolation has `f"..."` and knows what it costs.
+ */
 
 /** How bad it is. The order is the severity order, which is what the threshold compares on -- so a
  * level added between two of these would change what an existing threshold admits.

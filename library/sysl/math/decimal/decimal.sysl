@@ -6,45 +6,46 @@ import sysl.math.bigint.{BigInt, abs, add as add_big, cmp as cmp_big, div_rem, f
                          sub as sub_big, to_string as big_text, zero as big_zero}
 import sysl.text.{Ascii, from_utf8_unchecked}
 
-// Exact decimal arithmetic: an integer coefficient and a scale, so `0.1 + 0.2` is `0.3`.
-//
-// **A general-purpose language without one makes every financial program wrong in the same way.**
-// `real` is binary floating point, and a tenth is not representable in binary any more than a third
-// is in decimal -- so `0.1 + 0.2` is `0.30000000000000004`, a total of a million transactions is out
-// by cents, and no amount of care at the call site fixes it. PostgreSQL's `numeric`, Java's
-// `BigDecimal` and Python's `decimal` are all this type. It belongs in the library rather than in a
-// package for the reason `sysl.log` does: a program that does not find one here writes its own, and
-// two of them in one process is two rounding policies that disagree about money.
-//
-// ## The representation
-//
-// A **coefficient**, which is a `BigInt`, and a **scale**, which is how many digits of it are after
-// the point. `12.340` is a coefficient of `12340` at a scale of 3, and `1234` at a scale of 2 is the
-// same *number* written to fewer places.
-//
-// **The scale is part of the value and is not normalized away.** `1.50` and `1.5` compare equal and
-// render differently, which is what a program handling money needs: a price quoted to the cent is
-// quoted to the cent whether or not the cent happens to be zero, and a total that rendered as `1.5`
-// where every other row said `1.50` would be a bug report. `Hash` is over the normalized form so
-// that the two still hash alike, which is what `Eq` obliges it to do.
-//
-// **The scale is never negative.** Every operation here produces one that is zero or more, and the
-// two that take a scale from the caller refuse a negative. A negative scale would mean a
-// coefficient standing for a multiple of ten and would make the rendering a second case for no
-// gain -- `1500` at a scale of zero says the same thing.
-//
-// ## What it costs
-//
-// **Everything is `BigInt` arithmetic, so everything allocates**, and adding two values at different
-// scales additionally multiplies one coefficient by a power of ten. That is the price of being exact
-// and it is not small; a program adding a million rows should keep them at one scale, where the
-// alignment is free.
-//
-// **Addition, subtraction and multiplication are exact and never round.** A sum's scale is the
-// larger of its operands' and a product's is the sum of theirs, so a product of two prices at two
-// decimal places has four. Division is the operation that cannot be exact -- a third has no finite
-// decimal expansion -- so it is the one that takes a scale and a rounding mode, and it is the only
-// place in the module where a digit is ever discarded.
+/** Exact decimal arithmetic: an integer coefficient and a scale, so `0.1 + 0.2` is `0.3`.
+ *
+ * **A general-purpose language without one makes every financial program wrong in the same way.**
+ * `real` is binary floating point, and a tenth is not representable in binary any more than a third
+ * is in decimal -- so `0.1 + 0.2` is `0.30000000000000004`, a total of a million transactions is out
+ * by cents, and no amount of care at the call site fixes it. PostgreSQL's `numeric`, Java's
+ * `BigDecimal` and Python's `decimal` are all this type. It belongs in the library rather than in a
+ * package for the reason `sysl.log` does: a program that does not find one here writes its own, and
+ * two of them in one process is two rounding policies that disagree about money.
+ *
+ * ## The representation
+ *
+ * A **coefficient**, which is a `BigInt`, and a **scale**, which is how many digits of it are after
+ * the point. `12.340` is a coefficient of `12340` at a scale of 3, and `1234` at a scale of 2 is the
+ * same *number* written to fewer places.
+ *
+ * **The scale is part of the value and is not normalized away.** `1.50` and `1.5` compare equal and
+ * render differently, which is what a program handling money needs: a price quoted to the cent is
+ * quoted to the cent whether or not the cent happens to be zero, and a total that rendered as `1.5`
+ * where every other row said `1.50` would be a bug report. `Hash` is over the normalized form so
+ * that the two still hash alike, which is what `Eq` obliges it to do.
+ *
+ * **The scale is never negative.** Every operation here produces one that is zero or more, and the
+ * two that take a scale from the caller refuse a negative. A negative scale would mean a
+ * coefficient standing for a multiple of ten and would make the rendering a second case for no
+ * gain -- `1500` at a scale of zero says the same thing.
+ *
+ * ## What it costs
+ *
+ * **Everything is `BigInt` arithmetic, so everything allocates**, and adding two values at different
+ * scales additionally multiplies one coefficient by a power of ten. That is the price of being exact
+ * and it is not small; a program adding a million rows should keep them at one scale, where the
+ * alignment is free.
+ *
+ * **Addition, subtraction and multiplication are exact and never round.** A sum's scale is the
+ * larger of its operands' and a product's is the sum of theirs, so a product of two prices at two
+ * decimal places has four. Division is the operation that cannot be exact -- a third has no finite
+ * decimal expansion -- so it is the one that takes a scale and a rounding mode, and it is the only
+ * place in the module where a digit is ever discarded.
+ */
 
 /** How to resolve a division that does not come out exactly.
  *

@@ -29,6 +29,20 @@ class DocGeneratorTests extends AnyFreeSpec with Matchers {
     ms.head
   }
 
+  /** The one module made of these files, each given the name a `Source` would carry — which is the
+   * whole of what the headline rule reads.
+   */
+  private def named(files: (String, String)*): ApiModel.Module = {
+    val ms = ApiModel.build(files.toList.map { (name, src) =>
+      SyslParser.parse(src, name) match
+        case Right(p) => p
+        case Left(e)  => fail(e)
+    })
+
+    ms.length shouldBe 1
+    ms.head
+  }
+
   /** The Markdown of the one module in `src`. */
   private def page(src: String): String = MarkdownWriter.modulePage(only(src)).text
 
@@ -285,6 +299,91 @@ class DocGeneratorTests extends AnyFreeSpec with Matchers {
 
     "an undocumented declaration says so rather than pretending" in {
       only("module m\n\nf() -> int = 1").symbols.head.documented shouldBe false
+    }
+  }
+
+  /** Which file of a multi-file module speaks for it.
+   *
+   * The rule is the file **named for the module's last path segment**, and these are the cases that
+   * separate it from the collection order it replaced — an order under which `sysl`'s index row
+   * described `check.sysl`, its alphabetically first file, and nothing anywhere failed.
+   */
+  "a module's headline comes from the file named for it" - {
+
+    "the eponymous file's prose is the module's, and a sibling's is not" in {
+      named(
+        "glob.sysl" -> "module m.path\n\n/** Matching a path against a pattern. */\n\nf() -> int = 1",
+        "path.sysl" -> "module m.path\n\n/** Path handling decided by the string alone. */\n\ng() -> int = 2",
+      ).summary shouldBe "Path handling decided by the string alone."
+    }
+
+    "and the answer does not depend on which file was collected first" in {
+      // The same two units the other way round. Under the rule this replaced the first by path won,
+      // so `glob.sysl` answered here and `path.sysl` answered above.
+      named(
+        "path.sysl" -> "module m.path\n\n/** Path handling decided by the string alone. */\n\ng() -> int = 2",
+        "glob.sysl" -> "module m.path\n\n/** Matching a path against a pattern. */\n\nf() -> int = 1",
+      ).summary shouldBe "Path handling decided by the string alone."
+    }
+
+    "a headline file with no prose leaves the summary BLANK rather than borrowing a sibling's" in {
+      // This is the case the rule exists for. A borrowed sentence is well-formed prose about the
+      // right module's neighbourhood, so it cannot be seen to be wrong; an empty summary can.
+      named(
+        "check.sysl" -> "module m\n\n/** What a program does when an assumption does not hold. */\n\nf() -> int = 1",
+        "m.sysl"     -> "module m\n\ng() -> int = 2",
+      ).summary shouldBe ""
+    }
+
+    "and so does a module with no file named for it at all" in {
+      named(
+        "bytes.sysl" -> "module m.io\n\n/** Reading from memory and writing to it. */\n\nf() -> int = 1",
+        "read.sysl"  -> "module m.io\n\n/** Reading from a descriptor. */\n\ng() -> int = 2",
+      ).summary shouldBe ""
+    }
+
+    "a module of ONE file is its own headline file, whatever it is called" in {
+      // There is no ambiguity to resolve and nothing to borrow from, so the rule has nothing to do.
+      // Applying it anyway would drop the summary of `sysl doc <one file>`, which is a whole usage.
+      named("anything.sysl" -> "module m\n\n/** About this module. */\n\nf() -> int = 1")
+        .summary shouldBe "About this module."
+    }
+
+    "a literate file may be the headline file, since a literate module is a module" in {
+      // The fixture is a real literate document rather than sysl under an `.lsysl` name, because
+      // `SyslParser` tangles by the source's name before it parses anything: plain sysl in a
+      // `.lsysl` file is a document with no indented program in it, contributes no module, and would
+      // have made this pass for the wrong reason — which is how it first failed.
+      val literate =
+        """m.regex — the matcher
+          |=====================
+          |
+          |    module m.regex
+          |
+          |    /** Matching text against a pattern. */
+          |
+          |    g() -> int = 2
+          |""".stripMargin
+
+      named(
+        "vm.sysl"     -> "module m.regex\n\n/** The backtracking machine. */\n\nf() -> int = 1",
+        "regex.lsysl" -> literate,
+      ).summary shouldBe "Matching text against a pattern."
+    }
+
+    "the deepest segment is what names the file, not the whole dotted path" in {
+      named(
+        "other.sysl"           -> "module m.math.bigint\n\n/** Something else. */\n\nf() -> int = 1",
+        "m.math.bigint.sysl"   -> "module m.math.bigint\n\n/** The whole path, which is not the rule. */\n\ng() -> int = 2",
+        "bigint.sysl"          -> "module m.math.bigint\n\n/** Integers with no width. */\n\nh() -> int = 3",
+      ).summary shouldBe "Integers with no width."
+    }
+
+    "a directory in front of the name does not stop it matching" in {
+      named(
+        "a.sysl"                     -> "module m.path\n\n/** Something else. */\n\nf() -> int = 1",
+        "lib/sysl/path/path.sysl"    -> "module m.path\n\n/** Path handling. */\n\ng() -> int = 2",
+      ).summary shouldBe "Path handling."
     }
   }
 

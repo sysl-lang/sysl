@@ -4,43 +4,44 @@ import sysl.time.{Instant, Offset, us_per_second}
 import sysl.encoding.get_u32_be
 import sysl.text.from_utf8
 
-// Reading a zone out of the bytes of a TZif file (RFC 8536), which is what the IANA time zone
-// database is distributed as.
-//
-// **This module asks for no capability, and that is the whole reason it is a module of its own.** A
-// zone by name lives in a file, and reading a file needs an operating system -- so a decoder written
-// beside `sysl.fs` would take the whole of `sysl.time` down with it, exactly as a `now()` written
-// beside `Instant` would have. What is here is the *decoding*, which is arithmetic over bytes
-// somebody else supplied; `sysl.posix.time.zone_data` is what fetches them on a host.
-//
-// **The split is not bookkeeping — it is what makes a zone reachable on a bare machine.** A board
-// with an RTC can carry one zone's bytes in flash, the zone it was deployed in, and resolve local
-// time with no filesystem anywhere. Weld the decoder to the file reading and a target with no
-// operating system gets nothing at all.
-//
-// ## Nothing is copied, and nothing is allocated
-//
-// A `Zone` is a handful of offsets **into the caller's bytes**, and every lookup reads the packed
-// arrays where they lie. That is what lets a zone be used with no allocator: the storage is the file,
-// which the caller already has, and this adds a few words beside it.
-//
-// The cost is the ordinary one for a borrowed view: **the bytes must outlive the `Zone`.** A `Zone`
-// whose buffer has been released reads freed memory, exactly as any slice would.
-//
-// ## What is decoded and what is skipped
-//
-// A lookup needs three of the file's arrays -- the transition times, the type index for each, and the
-// types themselves -- and the designations for a name. **Leap seconds are skipped**, because POSIX
-// time ignores them by definition and `Instant` counts the same way, so a table of them describes a
-// timeline this library does not have. The standard/wall and UT/local indicators are skipped for the
-// same reason they exist: they matter to somebody re-interpreting a POSIX `TZ` string, and nothing
-// here does that.
-//
-// **The version 2+ block is the one read**, where the file has one -- its transition times are 8
-// bytes, and a 4-byte time runs out in 2038. A version 1 file is still read, from its only block.
-// The footer's `TZ` string, which extrapolates past the last transition, is **not** read: a lookup
-// past the end answers with the last type, which is what the table says and is right until a zone
-// changes its rules again.
+/** Reading a zone out of the bytes of a TZif file (RFC 8536), which is what the IANA time zone
+ * database is distributed as.
+ *
+ * **This module asks for no capability, and that is the whole reason it is a module of its own.** A
+ * zone by name lives in a file, and reading a file needs an operating system -- so a decoder written
+ * beside `sysl.fs` would take the whole of `sysl.time` down with it, exactly as a `now()` written
+ * beside `Instant` would have. What is here is the *decoding*, which is arithmetic over bytes
+ * somebody else supplied; `sysl.posix.time.zone_data` is what fetches them on a host.
+ *
+ * **The split is not bookkeeping — it is what makes a zone reachable on a bare machine.** A board
+ * with an RTC can carry one zone's bytes in flash, the zone it was deployed in, and resolve local
+ * time with no filesystem anywhere. Weld the decoder to the file reading and a target with no
+ * operating system gets nothing at all.
+ *
+ * ## Nothing is copied, and nothing is allocated
+ *
+ * A `Zone` is a handful of offsets **into the caller's bytes**, and every lookup reads the packed
+ * arrays where they lie. That is what lets a zone be used with no allocator: the storage is the file,
+ * which the caller already has, and this adds a few words beside it.
+ *
+ * The cost is the ordinary one for a borrowed view: **the bytes must outlive the `Zone`.** A `Zone`
+ * whose buffer has been released reads freed memory, exactly as any slice would.
+ *
+ * ## What is decoded and what is skipped
+ *
+ * A lookup needs three of the file's arrays -- the transition times, the type index for each, and the
+ * types themselves -- and the designations for a name. **Leap seconds are skipped**, because POSIX
+ * time ignores them by definition and `Instant` counts the same way, so a table of them describes a
+ * timeline this library does not have. The standard/wall and UT/local indicators are skipped for the
+ * same reason they exist: they matter to somebody re-interpreting a POSIX `TZ` string, and nothing
+ * here does that.
+ *
+ * **The version 2+ block is the one read**, where the file has one -- its transition times are 8
+ * bytes, and a 4-byte time runs out in 2038. A version 1 file is still read, from its only block.
+ * The footer's `TZ` string, which extrapolates past the last transition, is **not** read: a lookup
+ * past the end answers with the last type, which is what the table says and is right until a zone
+ * changes its rules again.
+ */
 
 /** A zone, as a view of the bytes it was decoded from. */
 struct Zone
