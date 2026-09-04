@@ -241,3 +241,115 @@ relative_to_round_trips()
 
         assert_eq(normalize(join(base, rel)), normalize(p))
 end relative_to_round_trips
+
+// -- glob matching --------------------------------------------------------------------------------
+//
+// Every case below is one the DECIDED semantics names, and the negative half is what makes the
+// positive half mean anything: a matcher that answered `true` for everything would pass a suite of
+// positive cases alone.
+
+@test("a star matches within one component and not across a separator")
+glob_star()
+    assert(matches("*.sysl", "main.sysl"))
+    assert(matches("*", "main.sysl"))
+    assert(!matches("*.sysl", "src/main.sysl"))
+    assert(!matches("*.sysl", "main.rs"))
+
+@test("a star matches nothing at all as readily as something")
+glob_star_empty()
+    assert(matches("a*b", "ab"))
+    assert(matches("*", ""))
+
+@test("a question mark is one byte and not a separator")
+glob_question()
+    assert(matches("?.sysl", "a.sysl"))
+    assert(!matches("?.sysl", "ab.sysl"))
+    assert(!matches("a?b", "a/b"))
+
+@test("a class matches one byte from its set, and a negated one from outside it")
+glob_class()
+    assert(matches("[abc].sysl", "b.sysl"))
+    assert(!matches("[abc].sysl", "d.sysl"))
+    assert(matches("[a-z].sysl", "q.sysl"))
+    assert(!matches("[a-z].sysl", "Q.sysl"))
+    assert(matches("[!a-z].sysl", "Q.sysl"))
+    assert(!matches("[!a-z].sysl", "q.sysl"))
+
+@test("both spellings of a negated class are taken")
+glob_class_negation_spellings()
+    // Shells write `!` and Go writes `^`, and a person who learned one should not have to learn the
+    // other to use this.
+    assert(matches("[^a-z]", "Q"))
+    assert(matches("[!a-z]", "Q"))
+
+@test("a class may hold a closing bracket, written first")
+glob_class_bracket()
+    assert(matches("[]a]", "]"))
+    assert(matches("[]a]", "a"))
+    assert(!matches("[]a]", "b"))
+
+@test("a backslash makes the next byte a literal")
+glob_escape()
+    assert(matches("\\*.sysl", "*.sysl"))
+    assert(!matches("\\*.sysl", "main.sysl"))
+    assert(matches("a\\[b", "a[b"))
+
+@test("a globstar covers whole components, including none at all")
+glob_globstar()
+    assert(matches("a/**/b", "a/b"))
+    assert(matches("a/**/b", "a/x/b"))
+    assert(matches("a/**/b", "a/x/y/b"))
+    assert(!matches("a/**/b", "a/x/y"))
+    assert(matches("**", "a/b/c"))
+    assert(matches("src/**", "src/a/b.sysl"))
+
+    // Zero components is what makes a globstar read as *at any depth* rather than as *at least one
+    // directory down*, so the idiom matches a file at the top as well as one below. bash and every
+    // doublestar library answer the same, and it is what somebody typing it means.
+    assert(matches("**" + "/" + "*.sysl", "top.sysl"))
+    assert(matches("**" + "/" + "*.sysl", "src/deep/low.sysl"))
+    assert(!matches("**" + "/" + "*.sysl", "notes.md"))
+
+@test("two stars that are not a whole component are ordinary stars")
+glob_not_a_globstar()
+    // `a**b` is a star followed by a star, and neither crosses a separator -- so this must behave
+    // exactly as `a*b` does rather than reaching into a subdirectory.
+    assert(matches("a**b", "axyzb"))
+    assert(!matches("a**b", "ax/yb"))
+
+@test("a leading dot is hidden from every wildcard")
+glob_hidden()
+    assert(!matches("*", ".hidden"))
+    assert(!matches("?hidden", ".hidden"))
+    assert(!matches("[.]hidden", ".hidden"))
+    assert(!matches("a/*", "a/.hidden"))
+
+    // …and is reached by writing it, which is the whole of the escape hatch.
+    assert(matches(".*", ".hidden"))
+    assert(matches("a/.*", "a/.hidden"))
+
+@test("a globstar does not descend into a hidden directory")
+glob_hidden_components()
+    // This is the case the rule exists for: a tool driven by a globstar must not walk somebody's
+    // `.git`.
+    assert(!matches("**", ".git/config"))
+    assert(!matches("a/**/b", "a/.x/b"))
+    assert(matches("**", "src/config"))
+
+@test("a malformed pattern matches nothing and says so when asked")
+glob_malformed()
+    assert(!is_valid_pattern("[abc"))
+    assert(!is_valid_pattern("a\\"))
+    assert(!matches("[abc", "a"))
+    assert(!matches("a\\", "a"))
+
+    assert(is_valid_pattern("[abc]"))
+    assert(is_valid_pattern("[]]"))
+    assert(is_valid_pattern("a\\\\"))
+    assert(is_valid_pattern("**"))
+
+@test("a pattern with no wildcard in it is an equality test")
+glob_literal()
+    assert(matches("src/main.sysl", "src/main.sysl"))
+    assert(!matches("src/main.sysl", "src/main.sysll"))
+    assert(!matches("src/main.sysl", "src/main.sys"))

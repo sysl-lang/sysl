@@ -2,7 +2,7 @@ module sysl.fs
 @requires(os)
 
 import sysl.buf.{Buf, buf}
-import sysl.path.{join, relative_to}
+import sysl.path.{join, matches, relative_to}
 
 // Walking a directory tree, and the two operations that are a walk with a leaf action.
 //
@@ -109,6 +109,39 @@ struct Walk
      */
     skip_dir(*self) = self.pruned = true
 
+    /** The same walk, reporting only the entries whose path matches a glob.
+     *
+     * ```
+     * for e in walk(".").matching("**")           // every file below here
+     * for e in walk("src").matching("*.sysl")     // the ones directly in src
+     * ```
+     *
+     * The pattern that reaches one extension at any depth is two stars, a separator and `*.sysl`,
+     * and it cannot be written in a doc comment -- a block comment in sysl nests, and those are the
+     * characters that open and close one. `sysl.path.matches` carries the whole grammar in a
+     * comment written with `//`, where they mean nothing.
+     *
+     * **The pattern is matched against the path RELATIVE TO THE ROOT**, which is what makes a
+     * pattern portable between one caller walking `.` and another walking `/home/ed/project`. It is
+     * `sysl.path.relative_to`'s answer, so it is normalized -- a walk of `"./src"` reports
+     * `"./src/a.sysl"` and matches it as `"a.sysl"`.
+     *
+     * **The root itself never matches.** Its relative path is `"."`, which no pattern here matches,
+     * since a leading dot is hidden from every wildcard. That is the answer a caller wants: a walk
+     * filtered by `*.sysl` is asking for files rather than for the directory it started in.
+     *
+     * **It filters and does not prune.** Every directory is still descended into, because a
+     * directory whose own name does not match may hold a file whose path does -- which is the whole
+     * point of a pattern with a separator in it. A caller that wants whole subtrees skipped wants
+     * `skip_dir`, which is a decision about where to go rather than about what to report, and the
+     * two compose: drive the walk by hand, prune what you do not want to enter, and ask `matches`
+     * yourself.
+     *
+     * **An `Err` passes through unfiltered**, since a directory that could not be read is not an
+     * entry with a path to test and losing it would turn a permission failure into an empty result.
+     */
+    matching(self, pattern: string) -> Matching = Matching(self, self.root, pattern)
+
     /** A directory opened and pushed, so that the walk has somewhere to go next. */
     private open(*self, dir: string, depth: usize, m: Meta) -> Result[unit, IoError]
         val names = entries(dir)?
@@ -205,5 +238,35 @@ impl Iterate for Walk
                 Ok(_) -> ()
     end next
 end Walk
+
+/** A walk with a glob over it -- what `Walk.matching` answers, and not a thing to construct.
+ *
+ * It holds the root separately from the walk because the walk's own is private to it and the
+ * pattern is matched against a relative path. That is one string per filtered walk rather than per
+ * entry, since `relative_to` is what allocates here and it allocates once per entry either way.
+ */
+struct Matching
+    private inner: Walk
+    private root: string
+    private pattern: string
+
+impl Iterate for Matching
+    type Item = Result[Entry, IoError]
+
+    next(*self) -> Option[Result[Entry, IoError]]
+        loop
+            val item = self.inner.next() match
+                None -> return None
+                Some(got) -> got
+
+            val e = item match
+                Err(err) -> return Some(Err(err))
+                Ok(got) -> got
+
+            relative_to(e.path, self.root) match
+                Some(rel) -> if matches(self.pattern, rel) then return Some(Ok(e))
+                None -> ()
+    end next
+end Matching
 
 #endif

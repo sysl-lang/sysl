@@ -3,7 +3,7 @@ module sysl.fs
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.path.join
+import sysl.path.{join, relative_to}
 
 // The tree walk, and the two properties everything else in the file rests on: a parent is reported
 // before what is under it, and a symbolic link is reported without being followed.
@@ -222,3 +222,104 @@ walk_of_nothing_reports()
 
     assert(w.next().is_none(), "the walk carried on past a root it could not read")
 end walk_of_nothing_reports
+
+// -- filtering a walk by a glob -------------------------------------------------------------------
+
+/** Every path a filtered walk reported, relative to the root it was given -- which is what the
+ * pattern was matched against, so an assertion written this way says what the caller wrote.
+ */
+private matched(dir: string, pattern: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for item in walk(dir).matching(pattern)
+        out.push(relative_to(item.unwrap().path, dir).unwrap())
+
+    out
+end matched
+
+/** The tree `populate` makes, plus a hidden directory with a file in it and a file of another
+ * extension, which is what a filter is for.
+ */
+private populate_mixed(dir: string)
+    make_dir_all(join(dir, "src/deep")).unwrap()
+    make_dir_all(join(dir, ".git")).unwrap()
+    write_text(join(dir, "top.sysl"), "1").unwrap()
+    write_text(join(dir, "notes.md"), "2").unwrap()
+    write_text(join(dir, "src/mid.sysl"), "3").unwrap()
+    write_text(join(dir, "src/deep/low.sysl"), "4").unwrap()
+    write_text(join(dir, ".git/config"), "5").unwrap()
+end populate_mixed
+
+@test("a filtered walk reports only what the pattern matches")
+walk_matching_filters()
+    val dir = scratch("matching")
+
+    populate_mixed(dir)
+
+    val top = matched(dir, "*.sysl")
+
+    assert_eq(top.len(), 1)
+    assert_eq(top.at(0), "top.sysl")
+
+    ignore(remove_dir_all(dir))
+end walk_matching_filters
+
+@test("a globstar reaches every depth, and stops at a hidden directory")
+walk_matching_globstar()
+    val dir = scratch("matchdeep")
+
+    populate_mixed(dir)
+
+    // Two stars, a separator and the extension -- assembled rather than written, since the literal
+    // would open a nested block comment above and there is no reason to write it two different ways
+    // in one file.
+    val deep = matched(dir, "**" + "/" + "*.sysl")
+
+    // All three `.sysl` files, `top.sysl` included: a globstar covers zero components as readily as
+    // several, so the pattern reads as *at any depth* rather than as *at least one directory down*.
+    // That is what bash and every doublestar library answer, and it is what somebody typing it
+    // means. Not `notes.md`, and nothing under `.git`.
+    assert_eq(deep.len(), 3)
+    assert(has(deep, "top.sysl"))
+    assert(has(deep, "src/mid.sysl"))
+    assert(has(deep, "src/deep/low.sysl"))
+    assert(!has(deep, "notes.md"))
+    assert(!has(deep, ".git/config"))
+
+    ignore(remove_dir_all(dir))
+end walk_matching_globstar
+
+@test("the root itself is never reported by a filtered walk")
+walk_matching_skips_root()
+    val dir = scratch("matchroot")
+
+    populate_mixed(dir)
+
+    // The root's path relative to itself is `.`, and a leading dot is hidden from every wildcard --
+    // so a caller asking for everything gets the tree and not the directory it named.
+    val all = matched(dir, "**")
+
+    assert(!has(all, "."))
+    assert(has(all, "src"))
+    assert(has(all, "top.sysl"))
+    assert(!has(all, ".git"))
+
+    ignore(remove_dir_all(dir))
+end walk_matching_skips_root
+
+@test("a filter descends into a directory whose own name does not match")
+walk_matching_does_not_prune()
+    val dir = scratch("matchdescend")
+
+    populate_mixed(dir)
+
+    // `src` does not match `*.sysl` at any depth, and `src/deep/low.sysl` does -- so a filter that
+    // pruned what it did not report would find nothing here. That is the difference between this
+    // and `skip_dir`, and it is the case that tells them apart.
+    val deep = matched(dir, "src/deep/*.sysl")
+
+    assert_eq(deep.len(), 1)
+    assert_eq(deep.at(0), "src/deep/low.sysl")
+
+    ignore(remove_dir_all(dir))
+end walk_matching_does_not_prune

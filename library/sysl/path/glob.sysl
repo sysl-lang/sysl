@@ -1,0 +1,280 @@
+module sysl.path
+
+// Matching a path against a shell-style pattern -- what a build tool, a test runner and a `--exclude`
+// flag all want, and what nothing in the library answered until now.
+//
+// **It is Go's `filepath.Match` plus `**`**, which is the set almost every tool implements and the
+// one a person writing `**/*.sysl` expects. The grammar is small enough to state:
+//
+// | | |
+// |---|---|
+// | `*` | any run of bytes not containing `/` |
+// | `?` | one byte that is not `/` |
+// | `[abc]`, `[a-z]` | one byte from the set |
+// | `[!a-z]`, `[^a-z]` | one byte not from it -- both spellings, since shells write `!` and Go writes `^` |
+// | `**` | a run of zero or more whole components, and only as a whole component |
+// | `\x` | the byte `x`, whatever it would otherwise mean |
+//
+// **A leading `.` is hidden from `*`, `?` and a class**, which is the shell's rule and the safe
+// default for anything walking a tree: `*.sysl` does not match `.hidden.sysl`, `**/*.c` does not
+// descend into `.git`, and a pattern that means to reach them says so with a literal dot. The
+// alternative -- matching them silently -- makes every tool that uses this walk somebody's `.git`
+// and their editor's backup files, and the tool's author finds out from a bug report.
+//
+// **It matches BYTES and allocates nothing.** A pattern and a path are both UTF-8, and UTF-8 is
+// self-synchronizing, so a literal run in a pattern cannot match starting anywhere but at a
+// character boundary -- the same argument `sysl.text`'s searches make. What that does *not* buy is
+// `?` counting characters: `?` is one byte, so it matches one ASCII character and one *third* of a
+// three-byte one. That is the honest behaviour of a byte matcher and it is what Go's does; a caller
+// matching non-ASCII names writes `*` rather than counting.
+//
+// ## What is deliberately not here
+//
+// **Brace expansion, `{a,b}`.** It is a different operation: `*` and `?` narrow one pattern, and a
+// brace turns one pattern into several. A caller wanting it loops over the alternatives, which is
+// what the expansion would have done anyway and is visible where it happens.
+//
+// **Windows separators.** This module is POSIX and says so in its own first paragraph; a backslash
+// here is the escape character, and it cannot be both.
+//
+// **A compiled form.** `matches` walks the pattern each time, which is a few nanoseconds and is
+// bounded by the pattern's length -- except through `**`, which backtracks over components and is
+// quadratic in a pattern with several of them. Every implementation accepts that; a pattern
+// pathological enough to notice is one nobody writes.
+
+/** Whether `p` matches `pattern`.
+ *
+ * ```
+ * matches("*.sysl", "main.sysl")    // true
+ * matches("*.sysl", "src/x.sysl")   // false -- `*` does not cross a separator
+ * matches("**", "src/a/b.sysl")     // true -- `**` covers whole components
+ * matches("*.sysl", ".hidden.sysl") // false -- a leading dot is not matched by `*`
+ * ```
+ *
+ * **The whole path is matched, not a prefix of it**, so a pattern has to account for every
+ * component. That is what makes `**` necessary rather than convenient: `*.sysl` against
+ * `src/x.sysl` is `false`, and the pattern that means *anywhere* is two stars, a separator and
+ * `*.sysl`.
+ *
+ * **That last pattern cannot be written inside this comment, which is a fact about the lexer rather
+ * than about globs.** A block comment in sysl **nests**, so a `/` followed by a `*` opens one and a
+ * `*` followed by a `/` closes one -- and a glob pattern is made of exactly those characters. The
+ * module's own comment is written with `//`, where neither means anything, and that is where the
+ * table spells every form out.
+ *
+ * **A malformed pattern matches nothing rather than reporting anything.** An unclosed `[` and a
+ * trailing `\` are the two, and both answer `false` for every path -- which is what a filter wants,
+ * since the alternative is a `Result` at a call site whose whole shape is a `bool`.
+ * `is_valid_pattern` is for the caller who took the pattern from a person and wants to say so
+ * before running a walk that will silently find nothing.
+ */
+matches(pattern: string, p: string) -> bool
+    if !is_valid_pattern(pattern) then return false
+
+    match_at(pattern.bytes, 0, p.bytes, 0)
+end matches
+
+/** Whether `pattern` is one `matches` can act on: every `[` closed, and no `\` at the end.
+ *
+ * It says nothing about whether the pattern will match anything, which is a different question and
+ * has no answer without a path. What it is for is telling a person who typed a pattern that they
+ * left a bracket open, rather than letting them read an empty result as "nothing here".
+ */
+is_valid_pattern(pattern: string) -> bool
+    val pat = pattern.bytes
+    var i: usize = 0
+
+    while i < pat.len
+        if pat[i] == u8('\\')
+            if i + 1 >= pat.len then return false
+            i += 2
+        elif pat[i] == u8('[')
+            class_end(pat, i) match
+                None -> return false
+                Some(next) -> i = next
+        else
+            i += 1
+
+    true
+end is_valid_pattern
+
+/** Whether the byte at `i` begins a component -- the first byte, or the one after a separator.
+ *
+ * It is asked of both the pattern and the path, and for the same reason each time: `**` is a
+ * component rather than a wildcard, and the dot rule is about a component's first byte.
+ */
+private component_start(b: []const u8, i: usize) -> bool = i == 0 || b[i - 1] == separator()
+
+/** Whether the pattern has `**` at `i` as a whole component, which is what makes it a globstar
+ * rather than two ordinary stars -- the second of which could match nothing the first did not.
+ */
+private is_globstar(pat: []const u8, i: usize) -> bool
+    if !component_start(pat, i) then return false
+    if i + 1 >= pat.len || pat[i + 1] != u8('*') then return false
+
+    i + 2 == pat.len || pat[i + 2] == separator()
+end is_globstar
+
+/** Whether no component of `s` from `at` begins with a dot -- what a trailing `**` is allowed to
+ * cover, and the rule that keeps `**` out of `.git`.
+ */
+private no_hidden(s: []const u8, at: usize) -> bool
+    var i = at
+
+    while i < s.len
+        if component_start(s, i) && s[i] == u8('.') then return false
+        i += 1
+
+    true
+end no_hidden
+
+/** The pattern from `pi` against the path from `si`.
+ *
+ * **The loop consumes what it can and recurses where it has to branch**, which is the shape every
+ * backtracking glob has: a literal, a `?`, a class and an escape each decide in one step, and `*`
+ * and `**` are the two that have to try more than one extent.
+ */
+private match_at(pat: []const u8, pi0: usize, s: []const u8, si0: usize) -> bool
+    var pi = pi0
+    var si = si0
+
+    while pi < pat.len
+        val c = pat[pi]
+
+        if c == u8('*') && is_globstar(pat, pi)
+            // Everything left, provided no component of it is hidden.
+            if pi + 2 >= pat.len then return no_hidden(s, si)
+
+            // `a/**/b` matches `a/b`, so the run of components `**` covers may be empty -- which is
+            // what makes it different from a single star between separators, and is the case a
+            // reader checks first.
+            val rest = pi + 3
+
+            if match_at(pat, rest, s, si) then return true
+
+            var k = si
+
+            loop
+                // One more whole component, refused where it is hidden for the same reason `*`
+                // refuses one: a walk driven by `**/*.c` must not descend into `.git`.
+                if k >= s.len || s[k] == u8('.') then return false
+
+                while k < s.len && s[k] != separator()
+                    k += 1
+
+                if k >= s.len then return false
+
+                k += 1
+
+                if match_at(pat, rest, s, k) then return true
+        elif c == u8('*')
+            // A `*` may not match the dot that begins a component, but it may match nothing at all
+            // and let the rest of the pattern meet the dot literally -- which is how `.*` reaches a
+            // hidden name.
+            if si < s.len && s[si] == u8('.') && component_start(s, si)
+                return match_at(pat, pi + 1, s, si)
+
+            var k = si
+
+            loop
+                if match_at(pat, pi + 1, s, k) then return true
+                if k >= s.len || s[k] == separator() then return false
+
+                k += 1
+        elif c == u8('?')
+            if si >= s.len || s[si] == separator() then return false
+            if s[si] == u8('.') && component_start(s, si) then return false
+
+            pi += 1
+            si += 1
+        elif c == u8('[')
+            if si >= s.len || s[si] == separator() then return false
+            if s[si] == u8('.') && component_start(s, si) then return false
+
+            class_at(pat, pi, s[si]) match
+                None -> return false
+                Some(answer) ->
+                    if !answer.0 then return false
+
+                    pi = answer.1
+                    si += 1
+        elif c == u8('\\')
+            if pi + 1 >= pat.len then return false
+            if si >= s.len || s[si] != pat[pi + 1] then return false
+
+            pi += 2
+            si += 1
+        else
+            if si >= s.len || s[si] != c then return false
+
+            pi += 1
+            si += 1
+
+    si == s.len
+end match_at
+
+/** Whether `ch` is in the class starting at `at`, and where the class ends -- or `None` where it is
+ * not closed.
+ *
+ * **A `]` immediately after the `[` or the negation is a member rather than the end**, which is how
+ * every shell and POSIX itself spell a class containing a bracket. There is no other way to write
+ * one, since `\]` inside a class is an extension rather than the rule.
+ */
+private class_at(pat: []const u8, at: usize, ch: u8) -> Option[(bool, usize)]
+    var i = at + 1
+    var negate = false
+
+    if i < pat.len && (pat[i] == u8('!') || pat[i] == u8('^'))
+        negate = true
+        i += 1
+
+    var hit = false
+    var first = true
+
+    while i < pat.len && (pat[i] != u8(']') || first)
+        first = false
+
+        var lo = pat[i]
+
+        if lo == u8('\\')
+            i += 1
+
+            if i >= pat.len then return None
+
+            lo = pat[i]
+
+        i += 1
+
+        if i + 1 < pat.len && pat[i] == u8('-') && pat[i + 1] != u8(']')
+            i += 1
+
+            var hi = pat[i]
+
+            if hi == u8('\\')
+                i += 1
+
+                if i >= pat.len then return None
+
+                hi = pat[i]
+
+            i += 1
+
+            if ch >= lo && ch <= hi then hit = true
+        elif ch == lo
+            hit = true
+
+    if i >= pat.len then return None
+
+    Some((hit != negate, i + 1))
+end class_at
+
+/** Where the class starting at `at` ends, for a validity check that has no byte to test against.
+ *
+ * It is `class_at` with the membership taken out rather than a second parser: the two would
+ * otherwise disagree about which `]` closes a class, and a pattern `is_valid_pattern` accepted and
+ * `matches` could not read is the one failure this pair exists to rule out.
+ */
+private class_end(pat: []const u8, at: usize) -> Option[usize] =
+    class_at(pat, at, 0) match
+        Some(answer) -> Some(answer.1)
+        None -> None
