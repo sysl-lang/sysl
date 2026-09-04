@@ -800,9 +800,12 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
 
       built.scratch.foreach(Project.discard)
 
+      // A line is `U __aeabi_uidiv` -- the type letter and then the name -- so the name is the last
+      // field rather than the whole line.
       val undefined = listed match
-        case Right(r) if r.exitCode == 0 => r.stdout.linesIterator.map(_.trim).filter(_.nonEmpty).toList
-        case _                           => cancel("llvm-nm not available")
+        case Right(r) if r.exitCode == 0 =>
+          r.stdout.linesIterator.map(_.trim).filter(_.nonEmpty).map(_.split("\\s+").last).toList
+        case _ => cancel("llvm-nm not available")
 
       // Compiler-rt's division helpers are the whole of it -- this processor has no divide
       // instruction, so a 32-bit division is a call, and the toolchain supplies them. Anything else
