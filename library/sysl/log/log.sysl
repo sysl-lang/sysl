@@ -26,17 +26,17 @@ import sysl.time.{Instant, instant_text, now, us_per_milli}
 // **A record holds strings the caller rendered**, which is the one decision here that shows up at
 // every call site. The alternative -- a list of `&Display` -- would put a trait object in every
 // record and an allocation behind every field. What a caller writes instead is
-// `("port", port.to_string())`, which does allocate, and the cost is paid where the value is
+// `("port", str(port))`, which does allocate, and the cost is paid where the value is
 // actually wanted.
 //
 // **A filtered call still evaluates its arguments, and that is the one thing to know before putting
-// a `debug` in a loop.** sysl evaluates a call's arguments before the call, so the `to_string` above
+// a `debug` in a loop.** sysl evaluates a call's arguments before the call, so the `str` above
 // runs whether or not the threshold admits the record -- `log` compares the level and returns
 // without building a `Record`, and it never sees the work that was done to reach it. `enabled` is
 // the guard for that case and is why it exists:
 //
 // ```
-// if enabled(Level.Debug) then debug("state", [("queue", queue.len().to_string())])
+// if enabled(Level.Debug) then debug("state", [("queue", str(queue.len()))])
 // ```
 //
 // A call whose fields are literals, or one with no fields at all, costs nothing when filtered.
@@ -66,7 +66,6 @@ enum Level derives Display
     Info
     Warn
     Error
-end Level
 
 /** One named string on a record. A pair rather than a struct, because that is all it is and a tuple
  * of two strings already compares, orders, hashes and renders.
@@ -140,7 +139,7 @@ level() -> Level = Level::Val(int(atomic_load(&threshold, Ordering.Relaxed)))
  * of the work of rendering its fields.
  *
  * ```
- * if enabled(Level.Debug) then debug("state", [("queue", queue.len().to_string())])
+ * if enabled(Level.Debug) then debug("state", [("queue", str(queue.len()))])
  * ```
  */
 enabled(l: Level) -> bool = Level::Pos(l) >= int(atomic_load(&threshold, Ordering.Relaxed))
@@ -159,7 +158,6 @@ set_sink(s: *Sink)
     guard.lock()
     current = Some(s)
     guard.unlock()
-end set_sink
 
 /** Records go back to where they went before anything was installed -- standard error on a hosted
  * target, and nowhere at all on one with no operating system.
@@ -168,7 +166,6 @@ clear_sink()
     guard.lock()
     current = None
     guard.unlock()
-end clear_sink
 
 /** A record at `l`, timestamped `t`, delivered if the threshold admits it.
  *
@@ -202,7 +199,7 @@ error(message: string, fields: []const Field) = log(Level.Error, message, fields
 /** One record, one line, meant for a person: the time, the level, the message, then the fields.
  *
  * ```
- * 2026-09-04 11:02:31.000000 Z INFO listening port=8080 tls=on
+ * 2026-09-04 11:02:31 Z INFO  listening port=8080 tls=on
  * ```
  *
  * **This is the rendering that reaches the calendar**, through `sysl.time`'s own `Display` for an
@@ -343,7 +340,6 @@ private default_deliver(r: *Record)
     text(r, stderr())
 #endif
     ()
-end default_deliver
 
 /** The level as it is written on a line for a person -- padded to five so that a column of them
  * lines up, which is the one piece of formatting a plain-text log is worth doing.
@@ -378,7 +374,6 @@ private write_quoted(s: string, out: *Writer)
     out.write("\"".bytes)
     write_escaped(s, out)
     out.write("\"".bytes)
-end write_quoted
 
 /** The inside of a JSON string: the two characters JSON reserves, the five it names, and `\u00xx`
  * for every other control character.
