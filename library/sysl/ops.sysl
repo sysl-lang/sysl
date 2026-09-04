@@ -203,6 +203,54 @@ impl[T: Eq] Eq for []T
 impl[const N: usize, T: Eq] Eq for [N]T
     eq(self, rhs: Self) -> bool = self[..] == rhs[..]
 
+/** Lexicographic, first element first, and a shorter sequence ordering before a longer one it is a
+ * prefix of -- which is the rule a string already follows and the one a tuple's `Ord` follows over
+ * its parts.
+ *
+ * The ladder is the tuple's and is written for the same reason: deciding a position takes **two**
+ * comparisons, since this one is less, or it is greater, or the two agree and the next position
+ * decides. All-tied then falls through to the lengths, so `[1, 2]` is less than `[1, 2, 3]` and two
+ * equal sequences are not less than each other.
+ */
+impl[T: Ord] Ord for []T
+    lt(self, rhs: Self) -> bool
+        val n = if self.len < rhs.len then self.len else rhs.len
+
+        for i in 0..<n
+            if self[i] < rhs[i] then return true
+            if rhs[i] < self[i] then return false
+
+        self.len < rhs.len
+    end lt
+
+/** Every array of an orderable element, delegating to the slice exactly as `Eq` does. Two arrays of
+ * one type have one length, so the length test the slice ends on can never decide here.
+ */
+impl[const N: usize, T: Ord] Ord for [N]T
+    lt(self, rhs: Self) -> bool = self[..] < rhs[..]
+
+/** Mixed with the same FNV prime the tuple's hash uses, so that position matters: `[1, 2]` and
+ * `[2, 1]` are different keys, where a plain XOR would make them one.
+ *
+ * **An array is hashable and a SLICE IS NOT, which is a decision rather than an omission.** A hash
+ * is a promise about a key, and a slice is a view: putting one in a table leaves the storage behind
+ * it reachable and writable by whoever owns it, so the key can change under the table and the entry
+ * is then unfindable. An array is a value and copies, so it has no such owner to be surprised by.
+ * A caller holding a slice it means as a key hashes something it owns -- a `string`, or an array
+ * built from the elements.
+ */
+impl[const N: usize, T: Hash] Hash for [N]T
+    hash(self) -> u64
+        val xs = self[..]
+
+        var h = 0xcbf29ce484222325u64
+
+        for i in 0..<xs.len
+            h = h * 0x100000001b3u64 ^ xs[i].hash()
+
+        hash_u64(h)
+    end hash
+
 /** The elements between brackets, written straight through to wherever they are going. Each element
  * gets a plain specifier, because the field a specifier describes is the whole slice and not its
  * parts (`library/core.md § A specifier is the whole value's field`).
