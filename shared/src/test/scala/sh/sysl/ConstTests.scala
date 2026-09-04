@@ -314,7 +314,55 @@ class ConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pa
     }
 
     "declared at a type that is not a scalar" in {
-      err("struct P\n    x: int\nend P\nconst p: P = 1") should include("is not")
+      err("enum Mode\n    On\n    Off\nend Mode\nconst m: Mode = 1") should include("is not")
+    }
+
+    /** An AGGREGATE is refused for being storage, and is pointed at the `val` that holds it.
+     *
+     * **The message a reader used to get was about constancy and was misleading**: an aggregate
+     * initializer folds to nothing, so the refusal fired at the fold — *"the value of 'zeros' is
+     * not a constant expression"* — about an expression a `val` one keyword away lays into the
+     * object file as constant data. `ModuleStorage.isStatic` answers `true` for all three of these
+     * shapes, which is why `sysl.encoding.nil` is a `val` and links on a freestanding target.
+     *
+     * The fix is an ordering: the declared type is resolved before the value is folded, so the rule
+     * that was always the right answer is the one that gets to speak.
+     */
+    "declared at an aggregate type, which is storage rather than a value" in {
+      val cases = List(
+        "an array literal" -> "const zeros: [3]u8 = [0, 0, 0]",
+        "an array fill"    -> "const zeros: [16]u8 = [0; 16]",
+        "a struct over an array" ->
+          "struct Id\n    raw: [16]u8\nend Id\nconst nil: Id = Id([0; 16])",
+        "a tuple"          -> "const pair: (int, int) = (1, 2)",
+      )
+
+      for (what, src) <- cases do
+        withClue(s"$what: ") {
+          val message = err(s"$src\nprint(1)")
+
+          message should include("is storage")
+          message should include("write")
+          message should include("'val'")
+          // The old wording made a claim about constancy that the neighbouring `val` contradicts,
+          // and this is what says it has stopped being made.
+          message should not include "not a constant expression"
+        }
+    }
+
+    /** And the `val` really does hold what the `const` would not, which is the half a diagnostic
+     * test cannot show: advice nothing compiles is advice that can rot (`sysl.sh`'s CLAUDE.md makes
+     * the same point about an `error` block on a page).
+     */
+    "and the 'val' the refusal names compiles and holds the value" in {
+      run(
+        """struct Id
+          |    raw: [16]u8
+          |end Id
+          |val nil: Id = Id([0; 16])
+          |print(nil.raw[0], nil.raw[15])
+          |""".stripMargin,
+      ) shouldBe "0 0\n"
     }
 
     "divided by zero where the compiler is the one dividing" in {

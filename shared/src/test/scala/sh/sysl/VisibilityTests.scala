@@ -852,15 +852,17 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
     // The other three are still refused a step earlier, and are asserted here rather than only where
     // the refusals live so that the next form to become constant-able shows up in this block too.
     "while a 'const' naming a type that is not one is refused before the question arises" in {
+      // The two halves of the scalar rule read differently now: a struct is **storage**, and is
+      // told which keyword holds it, where an enum is simply not a scalar. Both are refused a step
+      // before visibility is looked at, which is what this case is about.
       val declared = List(
-        "Point" -> "struct Point\n    x: int",
-        "Mode"  -> "enum Mode\n    On\n    Off",
+        "Point" -> ("struct Point\n    x: int", "a constant is a scalar, and Point is storage"),
+        "Mode"  -> ("enum Mode\n    On\n    Off", "a constant is a scalar, and Mode is not"),
       )
 
-      for (named, base) <- declared do
+      for (named, (base, expected)) <- declared do
         withClue(s"a const of '$named': ") {
-          err(s"$base\nconst c: $named = 5\nprint(1)") should
-            include(s"a constant is a scalar, and $named is not")
+          err(s"$base\nconst c: $named = 5\nprint(1)") should include(expected)
         }
 
       withClue("a const of 'Tag': ") {

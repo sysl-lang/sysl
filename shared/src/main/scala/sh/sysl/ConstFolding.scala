@@ -82,6 +82,18 @@ trait ConstFolding extends ImportResolution {
     inDecl(key)(resolveType(decl.typ, Map.empty)) match
       case t @ (_: Type.Integer | _: Type.Floating | Type.Bool | Type.Char | Type.Str) => t
       case c: Type.Constrained => at(decl.pos)(constrainedConst(c, qn(key)))
+
+      // **An aggregate is named as STORAGE and pointed at `val`**, because a reader who has just
+      // been told a constant is a scalar has no way to know that the same initializer is legal one
+      // keyword away. It is: `ModuleStorage.isStatic` answers `true` for an array literal, an array
+      // fill and a struct over static arguments, so `val nil: Uuid = Uuid(ZEROS)` is laid straight
+      // into the object file and links on a freestanding target. The two spellings are not a
+      // constancy disagreement — they are a value and storage, which is the distinction this says
+      // out loud.
+      case other @ (_: Type.Array | _: Type.Vector | _: Type.Struct) =>
+        at(decl.pos)(err(s"a constant is a scalar, and ${show(other)} is storage — write " +
+          s"'${qn(key)}' as a 'val', which is laid into the object file as constant data"))
+
       case other =>
         at(decl.pos)(err(s"a constant is a scalar, and ${show(other)} is not — '${qn(key)}'"))
   })
@@ -139,10 +151,18 @@ trait ConstFolding extends ImportResolution {
 
     constsInProgress += key
     try
+      // **The declared type is resolved BEFORE the value is folded, and the order is the whole of
+      // what a reader sees.** An aggregate initializer folds to nothing, so with the fold first the
+      // refusal was always *"the value of 'x' is not a constant expression"* — a claim about
+      // constancy, about an expression a `val` three lines away lays into the object file as
+      // constant data. `constType`'s own rule was the right answer and was unreachable, because the
+      // fold failed before anything asked what the type was.
+      val ty = constType(key)
+
       val value = inDecl(key)(fold(decl.value).getOrElse(
         at(decl.value.pos)(err(s"the value of '${qn(key)}' is not a constant expression"))))
 
-      checkFits(value, constType(key), s"'${qn(key)}'", decl.pos)
+      checkFits(value, ty, s"'${qn(key)}'", decl.pos)
       value
     finally constsInProgress -= key
   })
