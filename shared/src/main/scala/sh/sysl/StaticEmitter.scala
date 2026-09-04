@@ -105,6 +105,22 @@ trait StaticEmitter extends StringEmitter {
     // A trait pointer is two words, so its empty value is not the one-word `null`.
     case TNullLit(ty) => if ty.lty == ir.LType.Ptr then ir.Val.Null else ir.Val.Zero
 
+    // A variant that carries nothing is a tag and a payload region nothing will read, which is
+    // constant data whatever the payload's type is — including one no *value* of this type could be
+    // written for, since `None` at a trait pointer has no null to name and does not need one.
+    //
+    // **A dataless variant of a SIMPLE enum never reaches this**: that enum lowers to its
+    // discriminant, so the initializer is a `TIntLit` long before here. What arrives is the empty
+    // variant of an enum whose *other* variants carry something, which is `Option`'s `None` and is
+    // the shape a module-level slot that starts out unset has.
+    case TEnumNew(en, variant, _) if !variant.carries =>
+      if variant.tag == 0 then ir.Val.Zero
+      else
+        val (unit, count) = layout.payloadArea(en)
+
+        ir.Val.Agg(List(ir.Arg(ir.LType.I(32), ir.Val.Int(variant.tag)),
+                        ir.Arg(ir.LType.Arr(count, unit), ir.Val.Zero)))
+
     case other => sys.error(s"unreachable constant ${other.getClass.getSimpleName}")
 
   /** Whether a constant is every bit zero, which is the one thing `zeroinitializer` may stand for.

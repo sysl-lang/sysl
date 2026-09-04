@@ -213,5 +213,17 @@ trait ModuleStorage extends ModuleFiles {
     case _: TNullLit                                      => true
     case TCast(_: TIntLit, (_: Type.Ptr) | (_: Type.CFn)) => true
 
+    // A variant that carries nothing is a tag and a region nothing reads, so it is laid into the
+    // object file exactly as a struct of constants is. `None` is what this is for and is why it
+    // matters: a module-level slot that starts out unset — a sink nobody has installed, a handle
+    // nobody has opened — is `Option[T] = None`, and without this it was an *initializer*, which is
+    // what shuts a module out of a freestanding `@export` (`reference/modules.md § val — a thing`).
+    //
+    // **A variant that carries something is not admitted**, even where its arguments are constants:
+    // the payload region is a union written as an array, so filling one means knowing which bytes a
+    // variant's fields land on, and that is `CallEmitter`'s store-through-a-pointer rather than
+    // anything this file could spell.
+    case TEnumNew(_, variant, _) if !variant.carries => true
+
     case _ => false
 }
