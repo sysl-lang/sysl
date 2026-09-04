@@ -66,26 +66,48 @@ trait QemuSupport extends Matchers {
   protected case class Board(name: String, target: Target, qemu: String, machine: List[String],
                              startup: String, bsp: String, script: String)
 
-  /** The library's own C, compiled for one board and **kept for the rest of the run**.
+  /** The library's own C, compiled for one board, **archived**, and kept for the rest of the run.
    *
-   * A real compilation puts these objects on the link line (`NativeSources`), and this harness did
-   * not until `library/sysl/unicode` arrived -- every `.c` in the library had sat under a
-   * `__posix__` folder a freestanding target never selects, so the omission was invisible and the
-   * whole tier failed at `undefined symbol: utf8proc_toupper` the moment a program here called into
-   * it. Building them the same way a compilation does is what keeps the two from drifting again.
+   * A real compilation puts this C on the link line, and this harness did not until
+   * `library/sysl/unicode` arrived -- every `.c` in the library had sat under a `__posix__` folder a
+   * freestanding target never selects, so the omission was invisible and the whole tier failed at
+   * `undefined symbol: utf8proc_toupper` the moment a program here called into it.
    *
-   * **Memoized per target because the database is 2.3 MB of C** and there are five distinct targets
-   * across the boards but sixty-odd cases: compiling it once per case is the same object built
-   * eleven times over. Nothing is discarded, since these are temporaries of a test run and the
-   * process is short-lived.
+   * **An ARCHIVE and not a list of objects, which is what a real link is handed and is the whole of
+   * why this works.** A named object is linked entire, so passing the objects put 330 KB of Unicode
+   * tables into every board image -- the micro:bit overflowed its flash by 80,644 bytes on a program
+   * whose whole text is two `putc` calls. `-Wl,--gc-sections` looks like the answer and is not: it
+   * fixed the size and hung `mps2-an505` outright, because these images are placed by a linker
+   * script and reached through a vector table, and section garbage collection over that is a
+   * different question from the one a hosted link answers. An archive member is pulled in only to
+   * resolve a symbol something already left undefined, which is exactly the selection wanted and
+   * needs nothing from the link line.
+   *
+   * **Memoized per target because the database is 2.3 MB of C**: five distinct targets across the
+   * boards against sixty-odd cases. Nothing is discarded, these being temporaries of a short-lived
+   * test process.
    */
-  private val libraryObjects = collection.mutable.Map.empty[String, NativeSources.Built]
+  private val libraryArchives = collection.mutable.Map.empty[String, String]
 
-  protected def libraryC(t: Target): NativeSources.Built =
-    libraryObjects.synchronized(libraryObjects.getOrElseUpdate(t.triple,
-      NativeSources.build(NativeSources.of(StdRoot.root.toList, t.os), t) match
+  protected def libraryC(t: Target): String =
+    libraryArchives.synchronized(libraryArchives.getOrElseUpdate(t.triple, {
+      val ar = Toolchain.findAr(None) match
+        case Right(path) => path
+        case Left(why)   => cancel(why)
+
+      val built = NativeSources.build(NativeSources.of(StdRoot.root.toList, t.os), t) match
         case Left(err)    => fail(s"the library's own C did not compile for ${t.triple}:\n$err")
-        case Right(built) => built))
+        case Right(built) => built
+
+      val out = createTempFile("sysl-qemu-lib-", ".a")
+
+      Toolchain.archive(built.objects, out, ar) match
+        case Left(err) => fail(s"the library's own C did not archive for ${t.triple}:\n$err")
+        case Right(_)  => ()
+
+      built.scratch.foreach(Project.discard)
+      out
+    }))
 
   protected val boards: List[Board] = List(
     Board("virt", Target.riscv32Freestanding, "qemu-system-riscv32",
@@ -414,16 +436,10 @@ trait QemuSupport extends Matchers {
       // Building them the same way a compilation does is what keeps the two from drifting again.
       val native = libraryC(t)
 
-      // **`--gc-sections`, which this link did not have and a real one always has.** An object named
-      // on a command line is linked entire, so putting the library's C here handed every board the
-      // whole Unicode database: the micro:bit's 256 KB of flash overflowed by 80,644 bytes on the
-      // *"boots, runs, and reports what it returned"* case, whose program is two `putc` calls.
-      // `Toolchain.deadStrip` is the same flag a compilation gets, paired with the
-      // `-ffunction-sections` `NativeSources` already compiles with — and the scripts `KEEP` their
-      // vector table and name an `ENTRY`, so nothing a board needs is reachable only by luck.
+      // The archive goes last, after everything that might leave one of its symbols undefined --
+      // which is the ordinary rule for an archive on a link line and is why the order here matters.
       val link = exec(Seq(cc, s"--target=${t.triple}", "-nostdlib", "-fuse-ld=lld",
-        "-Wl,--gc-sections", "-T", s"$boot/${board.script}", start, prog, bsp)
-        ++ native.objects ++ Seq("-o", image))
+        "-T", s"$boot/${board.script}", start, prog, bsp, native, "-o", image))
 
       withClue(s"linking the image:\n${link.stderr}")(link.exitCode shouldBe 0)
 

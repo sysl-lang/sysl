@@ -761,6 +761,59 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  "the standard module's own C, for a machine with no operating system" - {
+
+    /* `library/sysl/unicode/utf8proc.c` is the first `.c` in the library that is **not** under a
+     * `__posix__` folder, so it is the first that a freestanding build has to carry — and the
+     * argument for putting the Unicode database in the standard library at all rests on it getting
+     * there. Two claims, and the second is the one that cannot be read off the source. */
+
+    "is the database and nothing POSIX" in {
+      val carried = Std.cSources(Os.Freestanding).map(s => Project.basename(s.name))
+
+      // The walk takes a `.c` beside a module whatever the target, so this one comes through.
+      carried should contain("utf8proc.c")
+
+      // And the platform folders do not, which is the same walk refusing what this target has no
+      // libc for. Naming them individually would go stale; what is asserted is that nothing from a
+      // selector directory survived.
+      Std.cSources(Os.Freestanding).map(_.name).filter(_.contains("__posix__")) shouldBe empty
+
+      // The host takes both, which is what makes the line above a selection rather than an absence.
+      Std.cSources(Target.default.os).map(_.name).count(_.contains("__posix__")) should be > 0
+    }
+
+    "compiles for a bare target, with nothing from a C library left undefined" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val bare  = Target.thumbv6mFreestanding
+      val built = NativeSources.build(NativeSources.of(StdRoot.root.toList, bare.os), bare) match
+        case Left(err)    => fail(s"the library's C did not compile for ${bare.triple}:\n$err")
+        case Right(built) => built
+
+      // **`llvm-nm` rather than `nm`, and it is found beside the `llvm-ar` a library build already
+      // needs.** The host's `nm` cannot read an object for another architecture, and a tool that
+      // fails is indistinguishable from one that found nothing -- which is the trap the compiler's
+      // own file records under picking a tool that knows the architecture.
+      val listed =
+        Toolchain.findAr(None).map(ar => exec(List(ar.replace("llvm-ar", "llvm-nm"), "-u") ::: built.objects))
+
+      built.scratch.foreach(Project.discard)
+
+      val undefined = listed match
+        case Right(r) if r.exitCode == 0 => r.stdout.linesIterator.map(_.trim).filter(_.nonEmpty).toList
+        case _                           => cancel("llvm-nm not available")
+
+      // Compiler-rt's division helpers are the whole of it -- this processor has no divide
+      // instruction, so a 32-bit division is a call, and the toolchain supplies them. Anything else
+      // here would be a libc name, which is the thing that would stop this reaching a board.
+      for name <- undefined do
+        withClue(s"$name should not be needed on a bare target: ") {
+          name should startWith("__aeabi_")
+        }
+    }
+  }
+
   /** One program linked against the standard module, as the symbols that survived and the bytes it
    * came to.
    *

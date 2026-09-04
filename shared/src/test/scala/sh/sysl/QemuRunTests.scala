@@ -322,6 +322,10 @@ class QemuRunTests extends AnyFreeSpec with QemuSupport {
       // that part. A board wanting case mapping needs a part with room for it; the other five here
       // have it. That number is also the answer to *what does this cost*, measured on the one
       // machine where the answer is a hard limit rather than a preference.
+      //
+      // **It is the only case that pays anything**, because the library's C reaches these links as
+      // an archive: a board program that calls into the database pulls the member in, and every
+      // other program on every board links exactly what it did before.
       if b.name != "microbit" then
         "maps case out of the Unicode database, which the board has to have linked" in {
           val src = List(
