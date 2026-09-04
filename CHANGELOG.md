@@ -7,6 +7,120 @@ copy -- correct a mistake there and regenerate, rather than editing this file. V
 `MAJOR.MINOR.PATCH`; while the leading zero stands the language is still moving, and a release may
 change what an existing program means. Where it does, the release says so.
 
+## 0.0.101 — 2026-09-04
+
+One card, and it is the one that makes a `string` in sysl mean the same thing
+in storage and in operations.
+
+### `sysl.unicode` — the Unicode Character Database, in the standard library
+
+```sysl
+import sysl.text.{to_upper, to_lower}
+
+print(to_upper("héllo"), to_lower("HÉLLO"))
+```
+
+```
+HÉLLO héllo
+```
+
+That was `HéLLO hÉllo` in 0.0.100. A sysl `string` has always been UTF-8, and
+until this release nothing in the library knew what the bytes *meant*:
+`to_upper` mapped `a`–`z` and left everything else alone, so a name with an
+accent in it came back exactly as it went in and a program that wanted
+otherwise had to go and find a binding.
+
+`sysl.unicode` is that data, in the library, answering out of **utf8proc
+2.11.0** — Unicode 17.0.0 — vendored beside the module. It carries case
+mapping, case folding, the four normal forms, grapheme segmentation and
+`General_Category`, and `sysl.text.to_upper` and `to_lower` are walks over it.
+
+```sysl
+import sysl.unicode.{fold, normalize, Form, grapheme_count, category, Category}
+
+print(fold("Straße"), fold("ﬁt"))
+print(normalize(Form.Nfd, "é").len, normalize(Form.Nfc, "é").len)
+print(grapheme_count("e\u{301}x".bytes), grapheme_count("\u{1f469}\u{200d}\u{1f4bb}".bytes))
+print(category('ǲ'))
+```
+
+```
+strasse fit
+3 2
+2 1
+Lt
+```
+
+**`fold` is the operation a caller comparing two strings actually wanted**, and
+it is not lowercasing: it may change a string's length, which is how `STRASSE`
+and `straße` come to be the same text. **`normalize` is what makes `==` mean
+what a reader thinks it means** — the same text typed on two machines is
+routinely two different sequences of code points. **A grapheme cluster is the
+third answer to how long text is**, and the one a person would give.
+
+#### It costs nothing to a program that does not call it
+
+That is the claim the argument rests on, and the reason a Unicode table had been
+refused three times before. `sysl.text` is not optional — it is what places a
+diagnostic's caret — so the reasoning was that every freestanding program would
+link 330 KB of tables.
+
+What a program links is decided by the functions it calls, not by the modules it
+names. The library is one archive with an object per C file, an archive member
+is pulled in only to resolve a symbol something already referenced, and the link
+dead-strips. `StdArtifactTests` pins both halves: a program printing an int
+carries no utf8proc symbol and stays under 200 KB, and one calling `to_upper`
+carries `utf8proc_toupper` and goes over it.
+
+#### And it reaches a board
+
+The vendored copy carries five added lines that make its malloc-using surface
+optional, so it compiles for a freestanding target with no libc at all — at
+`thumbv6m-none-eabi` the object's only undefined symbol is `__aeabi_uidivmod`.
+Five emulated boards in the suite now uppercase `é` out of the database and read
+the answer back off a UART.
+
+The sixth is excluded, and the exclusion is the most informative thing there:
+330 KB of tables do not go into the micro:bit's 256 KB of flash, which is the
+honest answer to what this costs where the answer is a hard limit.
+
+#### What is deliberately not here
+
+**Display width.** `sysl.text.char_columns` has answered it from 499 UCD ranges
+since before this module existed, and two answers to one question in one
+standard library is worse than either. Which one stays is decided by who pays:
+`columns` is reached by programs that never asked for anything Unicode, so its
+cost is inherited; `to_upper` is reached by deciding to uppercase a string, so
+its cost is opted into.
+
+**ASCII case mapping is still `sysl.text.Ascii`, unchanged, and is still the
+right tool for a protocol identifier.** Unicode case mapping carries characters
+*into* the ASCII range — the Kelvin sign lowercases to a plain `k` — which is
+the shape a spoofing check exists to prevent.
+
+#### One behaviour change to know about
+
+**`to_upper` and `to_lower` answer differently for text outside ASCII, which is
+the point of the release** — `to_upper("héllo")` was `HéLLO` and is `HÉLLO`. If a
+program depended on the old answer it was depending on a limitation.
+
+`to_upper("straße")` is `"STRAẞE"`, not `"STRASSE"`. The mapping is the *simple*
+one, character for character, which is what a `char -> char` signature can
+promise; the capital sharp s is what the database gives, and it round-trips
+where `SS` could not. A caller who wanted `SS` was comparing two strings, and
+`fold` is that operation.
+
+**For a protocol identifier, reach for `sysl.text.Ascii`, which is unchanged.**
+An HTTP header name, a scheme and a hostname label are ASCII by definition, and
+Unicode case mapping carries characters *into* that range — the Kelvin sign
+lowercases to a plain `k` — which is the shape a spoofing check exists to
+prevent.
+
+#### There is no compiler change in this release
+
+Not one line under `shared/src/main/`. The whole of it is the standard library
+and the tests: the compiler is what it was in 0.0.100.
+
 ## 0.0.100 — 2026-09-03
 
 Two cards, both additive, and both about a program saying what it means rather
