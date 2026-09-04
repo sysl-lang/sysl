@@ -759,6 +759,65 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
       kept.count(_.contains("utf8proc_toupper")) shouldBe 1
       size should be > 200000L
     }
+
+    /* `sysl.text.columns` is the case the whole embedded argument turns on, so it gets a case of its
+     * own rather than being covered by `print(1)`. It is what places a diagnostic's caret, so a board
+     * program links it without having asked for anything Unicode -- and `sysl.text.width` now also
+     * holds `grapheme_columns`, which segments and therefore does reach the database. The two live in
+     * one file and must not link as one. */
+
+    "and carries none for a program that measures columns" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val (kept, size) = linkedSymbols("import sysl.text.columns\nprint(columns(\"hi\".bytes))\n")
+
+      assume(kept.nonEmpty || size > 0, "nm not available")
+
+      kept.count(_.contains("utf8proc")) shouldBe 0
+      size should be < 200000L
+    }
+
+    "and carries them for a program that measures grapheme clusters" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val program = "import sysl.text.grapheme_columns\nprint(grapheme_columns(\"hi\".bytes))\n"
+      val (kept, size) = linkedSymbols(program)
+
+      assume(kept.nonEmpty || size > 0, "nm not available")
+
+      // Segmentation is `utf8proc_grapheme_break_stateful` over `utf8proc_iterate`, so the pair is
+      // what a cluster walk pulls in and the case above denies.
+      kept.count(_.contains("utf8proc_grapheme_break_stateful")) shouldBe 1
+      size should be > 200000L
+    }
+
+    /* Trimming a `string` decodes and asks the database what is whitespace; trimming BYTES walks
+     * `Ascii.is_space` and asks nothing. Both are `sysl.text.Search`, and the second is the receiver
+     * a program reading a wire format uses -- so a board program that trims a buffer must not link
+     * the tables on account of the other implementation existing. */
+
+    "and carries them for a program that trims a string" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val (kept, size) = linkedSymbols("import sysl.text.Search\nprint(\"  hi  \".trim())\n")
+
+      assume(kept.nonEmpty || size > 0, "nm not available")
+
+      kept.count(_.contains("utf8proc_category")) shouldBe 1
+      size should be > 200000L
+    }
+
+    "and carries none for a program that trims bytes" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val program = "import sysl.text.Search\nprint(\"  hi  \".bytes.trim().len)\n"
+      val (kept, size) = linkedSymbols(program)
+
+      assume(kept.nonEmpty || size > 0, "nm not available")
+
+      kept.count(_.contains("utf8proc")) shouldBe 0
+      size should be < 200000L
+    }
   }
 
   "the standard module's own C, for a machine with no operating system" - {

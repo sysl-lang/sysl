@@ -470,3 +470,113 @@ real_non_finite()
     assert_eq(shortest(real.infinity()), "inf")
     assert_eq(shortest(-real.infinity()), "-inf")
     assert_eq(shortest(real.nan()), "nan")
+
+// -- trimming a string, which is Unicode, against trimming bytes, which is not ---------------------
+//
+// The two receivers deliberately answer differently and the pair of cases below is the whole of the
+// claim: a `string` is text and a `[]const u8` is not, so the same operation asks a character
+// question of the first and a byte question of the second.
+
+@test("a string trims Unicode whitespace")
+trim_unicode()
+    // A no-break space, an ideographic space and the next-line control -- none of them ASCII, all of
+    // them whitespace, and none removed by the byte walk this used to be.
+    assert_eq("\u{a0}\u{3000}hi\u{85}\u{a0}".trim(), "hi")
+
+@test("a string trims the ASCII whitespace too")
+trim_ascii_through_string()
+    // The old behaviour still holds: widening the set did not narrow it.
+    assert_eq("  hi\t\n".trim(), "hi")
+    assert_eq("  hi  ".trim_start(), "hi  ")
+    assert_eq("  hi  ".trim_end(), "  hi")
+
+@test("a string with nothing to trim is returned whole")
+trim_nothing()
+    assert_eq("hi".trim(), "hi")
+    assert_eq("".trim(), "")
+
+@test("a string of nothing but whitespace trims to nothing")
+trim_everything()
+    assert_eq("\u{a0} \u{3000}".trim(), "")
+
+@test("bytes trim ASCII whitespace and leave the rest")
+trim_bytes_stay_ascii()
+    // The two bytes of a no-break space are 0xc2 0xa0, and neither is a space on its own -- so the
+    // byte receiver takes the trailing ASCII space and leaves the pair, ending at four bytes where
+    // the same text as a `string` trims to two.
+    val s = "\u{a0}hi "
+    var b = s.bytes
+
+    assert_eq(b.trim().len, 4)
+    assert_eq(s.trim().len, 2)
+
+// -- comparing text without regard to case --------------------------------------------------------
+//
+// Every case here is one where folding and lowercasing disagree, which is the whole reason these
+// exist: `to_lower(a) == to_lower(b)` is the spelling everybody reaches for first and it is wrong.
+
+@test("folding compares text lowercasing cannot")
+eq_fold_sharp_s()
+    assert(eq_fold("STRASSE", "straße"))
+    assert(!(to_lower("STRASSE") == to_lower("straße")))
+
+@test("folding decomposes a ligature")
+eq_fold_ligature()
+    assert(eq_fold("ﬁle", "file"))
+
+@test("folding is ordinary case-insensitivity as well")
+eq_fold_ascii()
+    assert(eq_fold("HÉLLO", "héllo"))
+    assert(!eq_fold("hello", "hallo"))
+
+@test("a fold comparison at either end and in the middle")
+fold_prefixes()
+    assert(starts_with_fold("STRASSENBAHN", "straße"))
+    assert(ends_with_fold("die STRASSE", "straße"))
+    assert(contains_fold("eine STRASSE hier", "straße"))
+    assert(!contains_fold("eine STRASSE hier", "gasse"))
+
+// -- columns, counted a cluster at a time ---------------------------------------------------------
+//
+// `columns` and `grapheme_columns` agree about text and disagree about emoji, and each case below
+// names which of the two is right for its input.
+
+@test("a combining mark joins the letter before it")
+cluster_combining()
+    // Both answers are 1: the mark is zero-width per code point as well as being part of the
+    // cluster, so this is the case where the cheap walk is already right.
+    assert_eq(grapheme_columns("e\u{301}".bytes), 1)
+    assert_eq(columns("e\u{301}".bytes), 1)
+
+@test("a flag is two columns")
+cluster_flag()
+    // Two regional indicators, drawn as one flag. The per-code-point sum lands on 2 as well, and by
+    // a different route -- the database rates a lone indicator narrow -- so the cluster rule has to
+    // put it back, or this would answer 1.
+    assert_eq(grapheme_columns("\u{1f1e8}\u{1f1e6}".bytes), 2)
+
+@test("a joined emoji sequence is one glyph, not four")
+cluster_zwj()
+    // Four emoji at two columns each and three joiners at nothing: the per-code-point sum is 8 and
+    // a terminal draws two. This is the case the cluster walk exists for.
+    val family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}"
+
+    assert_eq(grapheme_columns(family.bytes), 2)
+    assert_eq(columns(family.bytes), 8)
+
+@test("a skin tone modifies rather than adding")
+cluster_skin_tone()
+    assert_eq(grapheme_columns("\u{1f44d}\u{1f3fd}".bytes), 2)
+
+@test("a variation selector widens a text-presentation character")
+cluster_presentation()
+    // U+2764 is one column on its own and two when asked to be drawn as an emoji, and what asks is
+    // a code point that measures zero -- so no sum over code points can reach the second answer.
+    assert_eq(columns("\u{2764}".bytes), 1)
+    assert_eq(grapheme_columns("\u{2764}\u{fe0f}".bytes), 2)
+
+@test("cluster columns over ordinary text is the ordinary answer")
+cluster_plain()
+    assert_eq(grapheme_columns("abc".bytes), 3)
+    assert_eq(grapheme_columns("世界".bytes), 4)
+    assert_eq(grapheme_columns("".bytes), 0)

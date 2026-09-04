@@ -1,7 +1,7 @@
 module sysl.text
 
 import sysl.buf.{Buf, buf}
-import sysl.unicode.{to_upper as unicode_upper, to_lower as unicode_lower}
+import sysl.unicode.{to_upper as unicode_upper, to_lower as unicode_lower, fold}
 
 // The operations that make new text -- the half `find.sysl` does not hold.
 //
@@ -202,3 +202,45 @@ to_lower(s: string) -> string
 
     b.finish()
 end to_lower
+
+/** Whether two strings are the same text ignoring case, which is what a caller comparing a header
+ * name, a filename, a scheme or a keyword actually wants.
+ *
+ * **`to_lower(a) == to_lower(b)` is the obvious spelling and it is wrong**, because simple case
+ * mapping is one character in and one out and case *folding* is not. `"STRASSE"` and `"straße"` are
+ * the same word and lowercase to `"strasse"` and `"straße"`, which differ; folded, both are
+ * `"strasse"`. The ligature `"ﬁ"` and the letters `"fi"` go the same way. Folding is the operation
+ * Unicode defines for exactly this question and nothing else answers it.
+ *
+ * **It allocates two strings, and a caller in a loop should not use it.** Each call folds both
+ * sides; a caller comparing one needle against many haystacks folds the needle once with
+ * `sysl.unicode.fold` and compares against `fold(h)` itself. That is the same advice `to_upper`
+ * gives about building a string per call, and it is why this is a free function rather than an
+ * operator: `==` on two strings is a byte comparison and stays one.
+ *
+ * **The folded form is composed**, so two strings that fold alike compare alike with no separate
+ * normalization pass -- `sysl.unicode.fold` says why.
+ *
+ * **There is no locale in it.** The one common casualty is Turkish, where a dotless `ı` and an `i`
+ * are different letters and this reports them as the same; a program that has to make that
+ * distinction has a notion of locale that this library does not.
+ */
+eq_fold(a: string, b: string) -> bool = fold(a) == fold(b)
+
+/** Whether `s` starts with `prefix`, ignoring case, and everything `eq_fold` says applies.
+ *
+ * **Both sides are folded before the comparison rather than either being folded alone**, which is
+ * what makes it right at the boundary: folding can change a string's length, so a prefix folded
+ * against an unfolded haystack would be looking for bytes that are not there.
+ */
+starts_with_fold(s: string, prefix: string) -> bool = fold(s).starts_with(fold(prefix))
+
+/** The other end, and it is `starts_with_fold`'s claim read backwards. */
+ends_with_fold(s: string, suffix: string) -> bool = fold(s).ends_with(fold(suffix))
+
+/** Whether `needle` occurs anywhere in `s`, ignoring case.
+ *
+ * This is the one a search box wants, and it is the one where folding rather than lowercasing shows
+ * up most often in practice: a user typing `strasse` expects to find `Straße`.
+ */
+contains_fold(s: string, needle: string) -> bool = fold(s).contains(fold(needle))

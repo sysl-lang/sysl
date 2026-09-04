@@ -1,5 +1,7 @@
 module sysl.text
 
+import sysl.unicode.{is_space as unicode_space}
+
 /** Searching text and trimming it -- the half of the operations that makes no new bytes.
  *
  * **Everything here is allocation-free, and that is what the file boundary is drawn on.** A search
@@ -191,9 +193,16 @@ trait Search
 
     // --- Trimming, which answers with a view of the receiver rather than a copy. ---
 
-    /** ASCII whitespace off the front, the back, or both.
+    /** ASCII whitespace off the front, the back, or both -- which is the answer for a receiver of
+     * BYTES, and is not what a `string` gives.
      *
-     * **Trimming a `string` cannot land mid-character**, which is what makes it safe to answer with
+     * **The trait's own answer is byte for byte, and `string` replaces all three.** A byte is not a
+     * character, so a run of bytes has no Unicode whitespace in it to find: a non-breaking space is
+     * `0xc2 0xa0`, and neither of those is a space on its own. `impl Search for string` overrides
+     * these with a walk over characters, testing `sysl.unicode.is_space`; what is left here is what
+     * a wire format wants, where the ASCII answer is the specified one.
+     *
+     * **Trimming cannot land mid-character either way**, which is what makes it safe to answer with
      * a slice: every whitespace byte is ASCII, so every byte removed is a whole character and every
      * bound left behind is one the receiver already had.
      */
@@ -275,6 +284,63 @@ impl Search for string
     view(self) -> []const u8 = self.bytes
 
     slice(self, lo: usize, hi: usize) -> string = self[lo..<hi]
+
+    /** Whitespace off the front, over **Unicode** rather than ASCII: a non-breaking space, an
+     * ideographic space and a next-line control are all removed, and the trait's byte walk removes
+     * none of them.
+     *
+     * **A `string` is text, so the question has a character-level answer and the byte-level one is
+     * merely cheaper.** `Ascii.is_space` covers `U+0009` to `U+000D` and `U+0020` and stops there,
+     * which was the whole of sysl's `trim` by accident of ordering rather than by decision — the
+     * database that answers the rest arrived after these were written. The `[]const u8` receiver
+     * keeps the byte walk, because bytes are not characters and a wire format wants the ASCII
+     * answer.
+     *
+     * **What it costs is a decode**, a few nanoseconds per byte, and the table `is_space` reads.
+     * A program that never trims a `string` links neither.
+     *
+     * **No locale enters into it**, here or anywhere else in this module: the library has no notion
+     * of one, and the whitespace property is not locale-sensitive in any case. Casing is where that
+     * bites, and `to_upper` says so.
+     */
+    override trim_start(self) -> string
+        var w = chars_of(self.bytes)
+        var i: usize = 0
+
+        loop
+            w.next() match
+                Some(c) ->
+                    if !unicode_space(c) then break
+                    i = w.offset
+                None -> break
+
+        self[i..<self.len]
+    end trim_start
+
+    /** The other end, walked forwards.
+     *
+     * **There is no backwards decoder here and it would buy nothing.** UTF-8 is self-synchronizing,
+     * so stepping back over a character is possible — but the trim has to look at every character
+     * from the end until it finds one that is not a space, and in the common case where nothing is
+     * trimmed that is one step either way. What decides it is that a forward walk is the decoder
+     * this module already has, and a second one would be a second thing to keep right.
+     */
+    override trim_end(self) -> string
+        var w = chars_of(self.bytes)
+        var n: usize = 0
+
+        loop
+            w.next() match
+                Some(c) -> if !unicode_space(c) then n = w.offset
+                None -> break
+
+        self[0..<n]
+    end trim_end
+
+    /** Both ends. It is the two walks rather than one because the second runs over what the first
+     * left, which is the shorter string and is what a caller would have written by hand.
+     */
+    override trim(self) -> string = self.trim_start().trim_end()
 
 /** Bytes that are not text, or not yet: what a program reads off a socket or a file before it knows
  * whether it is UTF-8. The same operations answer the same way, which is the point of the trait --

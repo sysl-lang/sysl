@@ -1,5 +1,7 @@
 module sysl.text
 
+import sysl.unicode.graphemes_of
+
 /** How much room text takes on a terminal, which is a different question from how many bytes it is
  * and from how many characters it is.
  *
@@ -56,6 +58,67 @@ columns(text: []const u8) -> usize
 
     n
 end columns
+
+/** How many terminal columns one **grapheme cluster** occupies -- the answer `grapheme_columns`
+ * sums, and the one that is right for an emoji sequence where a per-code-point sum is not.
+ *
+ * **A cluster is as wide as the character it starts with.** Everything after the first is there to
+ * modify it -- a combining accent, a variation selector, a skin tone, a second regional indicator,
+ * whatever a zero-width joiner attached -- and a terminal draws the whole cluster in the base
+ * character's cell or pair of cells. So a family emoji is two columns rather than the eight its
+ * four emoji and three joiners come to, and a thumb with a skin tone is two rather than four.
+ *
+ * **Two things widen a cluster past what its first character is worth, and both say *draw this as
+ * an emoji*.** `U+FE0F`, the variation selector, turns a text-presentation character into an emoji
+ * one: `❤` is one column and `❤️` is two, and the difference is a code point that measures zero.
+ * And a **regional indicator** is a letter that is never drawn alone -- a pair of them is one flag,
+ * two columns, where the database rates each as narrow because on its own it is a boxed letter.
+ * `U+FE0E` is the opposite request and needs no rule, since what it applies to is already narrow.
+ *
+ * **What this does NOT do is decide anything a terminal disagrees with.** Emoji width is the one
+ * corner of the question where terminals genuinely differ -- a keycap sequence is one column here
+ * and two in some -- and no table settles it. This is the rule the majority implement.
+ */
+cluster_columns(cluster: []const u8) -> usize
+    var n: usize = 0
+    var first = true
+    var emoji = false
+
+    for c in chars_of(cluster)
+        if first
+            n = char_columns(c)
+            first = false
+
+            if u32(c) >= 0x1f1e6 && u32(c) <= 0x1f1ff then emoji = true
+        elif u32(c) == 0xfe0f
+            emoji = true
+
+    if emoji && n < 2 then 2 else n
+end cluster_columns
+
+/** How many terminal columns a run of UTF-8 occupies, counted a **grapheme cluster** at a time.
+ *
+ * **This and `columns` answer the same question and disagree about emoji.** `columns` sums what
+ * each code point is worth, which is right for text and for a combining accent -- a mark measures
+ * zero, so `e` and an acute come to one either way -- and wrong for a sequence a terminal draws as
+ * one glyph: a family emoji joined with zero-width joiners is four emoji at two columns each, and
+ * it occupies two. `cluster_columns` carries the rule and the cases.
+ *
+ * **`columns` is the one to reach for by default, and this is the one to reach for when the text
+ * might hold emoji.** The reason is a cost rather than a preference. Segmenting text into clusters
+ * needs the Unicode Character Database -- 330 KB of tables -- and `columns` needs 499 ranges of its
+ * own and nothing else. `columns` is what lays out a diagnostic's caret and a table of numbers, on
+ * a board as much as on a workstation; a program that measures user-supplied text with emoji in it
+ * has asked for the database and gets it. `library/unicode.md` is where that trade is stated in
+ * full, and `StdArtifactTests` pins that calling `columns` alone does not link the tables.
+ */
+grapheme_columns(text: []const u8) -> usize
+    var n: usize = 0
+
+    for g in graphemes_of(text) do n += cluster_columns(g)
+
+    n
+end grapheme_columns
 
 /** Whether `u` falls inside one of a table's ranges.
  *
