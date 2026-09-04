@@ -7,6 +7,78 @@ copy -- correct a mistake there and regenerate, rather than editing this file. V
 `MAJOR.MINOR.PATCH`; while the leading zero stands the language is still moving, and a release may
 change what an existing program means. Where it does, the release says so.
 
+## 0.0.103 — 2026-09-04
+
+Three cards, and two behaviour changes to read before the features.
+
+### An array and a slice gained traits, and a `Uuid`'s hash value changed with them
+
+**This changes what an existing program computes.** Both halves are widenings — nothing that compiled
+stops compiling — and they are here rather than under the features because a widening is invisible to
+the suite that produced it and to a consumer's suite alike, unless that consumer wrote a test pinning
+the old answer as a decision.
+
+- `[N]T` implements `Ord` and `Hash`, and `[]T` implements `Ord`. A package that had written its own
+  blanket implementation for either now has two, and is refused rather than shadowing — `override
+  impl` is what says the replacement was meant.
+- **`sysl.encoding.Uuid` hashes to a different number.** It derives `Hash` now, and the derived mixer
+  folds the elements' hashes where the block it replaces folded the raw bytes. A hash value has never
+  been a promise here — nothing persists one across versions — but a program that stored one will not
+  find it again. Its **ordering is unchanged**, which its own tests pin, including the one asserting
+  that a v7 sorts by time.
+
+### A `const` of an aggregate type is refused with different words
+
+The rule has not moved: a constant is a scalar and an aggregate is a `val`. What changed is that the
+refusal now says so and names the keyword to write, where it used to make a claim about constancy
+that the neighbouring `val` contradicts. A program grepping for the old text will not find it.
+
+### An array orders and hashes, and a slice orders
+
+`impl[T: Ord] Ord for []T`, `impl[const N: usize, T: Ord] Ord for [N]T` and
+`impl[const N: usize, T: Hash] Hash for [N]T` join the `Eq` rows they belong beside, so a struct
+wrapping an array can derive all three where it could derive only equality.
+
+Ordering is **lexicographic, first element first**, with a shorter sequence ordering before a longer
+one it is a prefix of — the rule a `string` already follows and the one a tuple's `Ord` follows over
+its parts. Hashing folds the elements' hashes in order, so `[1, 2]` and `[2, 1]` are different keys.
+
+**A slice deliberately has no `Hash`.** A hash is a promise about a key and a slice is a view: putting
+one in a table leaves the storage reachable and writable by whoever owns it, so the key can change
+under the table and the entry becomes unfindable. An array is a value and copies, so it has no such
+owner. A caller holding a slice it means as a key hashes something it owns.
+
+`sysl.encoding.Uuid` now derives `Eq`, `Ord` and `Hash` instead of spelling two of them out.
+`sysl.math.bigint.BigInt` keeps its hand-written blocks and now says why: its fields are a sign and a
+little-endian magnitude, so a structural comparison would order every positive before every negative
+and then decide on the least significant limb.
+
+### A `const` of an aggregate type says which rule it is applying
+
+`const zeros: [16]u8 = [0; 16]` was refused with *"the value of 'zeros' is not a constant
+expression"* — a claim about an expression that a `val` one keyword away lays into the object file as
+constant data. It now reads:
+
+    a constant is a scalar, and [16]u8 is storage — write 'zeros' as a 'val', which is laid into
+    the object file as constant data
+
+`const` is narrower than a static `val` on purpose and that has not changed: a constant is a folded
+value that can stand in a type, answered before any type table exists, where a `val` is storage. The
+declared type is simply resolved before the value is folded now, so the rule that was always the right
+answer is the one that gets to speak. A scalar `const` whose value is genuinely not constant still
+gets the old message, which is the case it was written for.
+
+### A module's headline comes from the file named for it
+
+The generated API index described twenty of its thirty-five modules with nothing at all, and several
+of the rest with a sibling file's sentence — `sysl` by `check.sysl`'s account of assertions,
+`sysl.unicode` by the grapheme walker, `sysl.fs` by its error type. `sysl-doc` now takes a module's
+summary from the file named for the module's last path segment and from no other, and a module whose
+headline file has none gets a blank row rather than a borrowed sentence.
+
+Eleven modules gained a file holding their headline and nothing else. All thirty-five now describe
+themselves.
+
 ## 0.0.102 — 2026-09-04
 
 Five standard-library modules, and one behaviour change worth reading first.
