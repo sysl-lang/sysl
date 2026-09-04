@@ -43,7 +43,8 @@ SUITES=$REPO/shared/src/test/scala
 
 HEAVY_HEAP=32g;  HEAVY_AGENTS=1     # a suite that builds for every target, on its own -- 24g was
                                     # not enough as of 2026-09-04; see below
-LIGHT_HEAP=16g;  LIGHT_AGENTS=2     # 2 x 16g = 32 GB, lowered from 3 on 2026-09-04; see below
+LIGHT_HEAP=18g;  LIGHT_AGENTS=2     # 2 x 18g = 36 GB; agents lowered from 3 and heap raised
+                                    # from 16g, both on 2026-09-04 -- see below
 LIMIT=900                           # seconds per group; the groups take 15-75s
 OOM_GRACE=60                        # after an agent announces an OOM -- see `attempt_group`
 
@@ -108,10 +109,28 @@ OOM_GRACE=60                        # after an agent announces an OOM -- see `at
 # groups further and it died in the same place). What settled it was reading which groups had
 # **finished** — the summary names them — rather than reasoning about which one looked expensive.
 #
-# **If the light chunks now pass with room to spare, sample the peak and write it here**, so that
-# 3 x 12g can be judged rather than guessed at. `ps -axo rss,comm | grep sysl-test` every second
-# during a chunk is the whole measurement, and the note above about measuring suites one at a time
-# says why a group-level number cannot answer it.
+# **THEY DID NOT PASS WITH ROOM TO SPARE, AND THE ANSWER IS THE OPPOSITE WAY ROUND: THE HEAP GOES
+# UP, NOT THE AGENT COUNT BACK UP.** The paragraph this replaces asked for the peak so that 3 x 12g
+# could be judged rather than guessed at. It was sampled across a full gate on 2026-09-04, and what
+# it showed is that 16g is itself marginal now:
+#
+#   - **nine of the 43 chunks announced an OOM at 16g and every one passed alone at 32g** --
+#     chunk-0, 2, 3, 7, 8, 10, 12, 13 and 33. `RETRIED-OK`, `failed=0`, so the retry mechanism was
+#     carrying nine chunks rather than the one or two it exists for;
+#   - a single agent under a **16g** heap was seen at **17.5 GB resident**, so heap plus the
+#     runtime's own overhead is about **1.1x** the cap and an agent at the ceiling is really asking
+#     the machine for a sixth again as much;
+#   - the largest concurrent total of all `sysl-test` processes at any point was **42.1 GB**.
+#
+# So 3 x 12g is answered: it would give each agent *less* room than the setting that is already
+# OOMing, and buy a third agent with it. 2 x 18g is 36 GB projected resident and leaves the ceiling
+# near 44 GB alone -- the smallest rise that is certainly affordable, chosen over 2 x 20g for that
+# reason. A chunk that still wants more has the retry, which demonstrably works.
+#
+# **The sampler counts PROCESSES rather than agents and cannot separate a light chunk from a
+# retry-alone one** -- it read `n=2` during a heavy group configured `agents=1` -- so the per-agent
+# and total figures above are phase maxima rather than a clean light peak. The nine-chunk count is
+# the load-bearing evidence and needs no sampler at all: it is read off `summary.txt`.
 
 mkdir -p "$LOGS"
 SUMMARY=$LOGS/summary.txt
