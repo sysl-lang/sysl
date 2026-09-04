@@ -1,0 +1,198 @@
+module sysl.log
+@tests
+
+import sysl.buf.{Buf, buf, byte_sink}
+import sysl.text.{Search, from_utf8_unchecked}
+import sysl.time.Instant
+
+// What `sysl.log` claims, asserted in sysl.
+//
+// **Every case renders into a `ByteSink` and compares the bytes**, because the whole of what this
+// module produces is text: a logger whose output is not compared against a literal is a logger
+// nothing has read. The two renderings are asserted separately, since a sink chooses between them
+// and a program may link only one.
+
+/** A fixed instant, so every rendered line is a literal a reader can check.
+ *
+ * 1 757 000 551 000 ms since the epoch, which is 2025-09-04 15:42:31 UTC.
+ */
+private const AT: long = 1757000551000 * 1000
+
+private rendered_text(l: Level, message: string, fields: []const Field) -> string
+    var r = Record(Instant(AT), l, message, fields)
+    var sink = byte_sink()
+    var w: *Writer = &sink
+
+    text(&r, w)
+    from_utf8_unchecked(sink.text())
+end rendered_text
+
+private rendered_json(l: Level, message: string, fields: []const Field) -> string
+    var r = Record(Instant(AT), l, message, fields)
+    var sink = byte_sink()
+    var w: *Writer = &sink
+
+    json(&r, w)
+    from_utf8_unchecked(sink.text())
+end rendered_json
+
+// -- the two renderings ---------------------------------------------------------------------------
+
+@test("a text line is the time, the level, the message and the fields")
+text_line()
+    assert_eq(rendered_text(Level.Info, "listening", [("port", "8080")]),
+              "2025-09-04 15:42:31 Z INFO  listening port=8080\n")
+
+@test("a text line pads the level so a column of them lines up")
+text_pads_level()
+    // The one piece of formatting a plain-text log is worth doing, and the reason it is a rule
+    // rather than a coincidence: `INFO` and `WARN` are four characters and `DEBUG` is five.
+    assert(rendered_text(Level.Warn, "m", []).contains(" WARN  m"))
+    assert(rendered_text(Level.Debug, "m", []).contains(" DEBUG m"))
+    assert(rendered_text(Level.Error, "m", []).contains(" ERROR m"))
+
+@test("a text value with a space in it is quoted, and one without is not")
+text_quotes_when_it_has_to()
+    assert(rendered_text(Level.Info, "m", [("a", "one two")]).contains("a=\"one two\""))
+    assert(rendered_text(Level.Info, "m", [("a", "one")]).contains("a=one"))
+
+    // The empty value would otherwise leave `a=` with nothing after it, which reads as a truncated
+    // line rather than as an empty string.
+    assert(rendered_text(Level.Info, "m", [("a", "")]).contains("a=\"\""))
+
+@test("a json line is an object with the time in milliseconds")
+json_line()
+    assert_eq(rendered_json(Level.Info, "listening", [("port", "8080")]),
+              "{\"time\":1757000551000,\"level\":\"info\",\"message\":\"listening\"," +
+              "\"fields\":{\"port\":\"8080\"}}\n")
+
+@test("json names the level in lower case")
+json_level_names()
+    assert(rendered_json(Level.Debug, "m", []).contains("\"level\":\"debug\""))
+    assert(rendered_json(Level.Warn, "m", []).contains("\"level\":\"warn\""))
+    assert(rendered_json(Level.Error, "m", []).contains("\"level\":\"error\""))
+
+@test("json with no fields is an empty object rather than a missing key")
+json_no_fields()
+    assert(rendered_json(Level.Info, "m", []).contains("\"fields\":{}"))
+
+@test("json escapes what JSON reserves and what it names")
+json_escapes()
+    val out = rendered_json(Level.Info, "a\"b\\c\nd\te", [])
+
+    assert(out.contains("\\\"") && out.contains("\\\\") && out.contains("\\n") && out.contains("\\t"))
+
+@test("json escapes a control character no name covers")
+json_escapes_control()
+    // U+0001 has no short name, so it has to come out as `` -- which is the branch a suite
+    // that only tests newline and tab never enters.
+    assert(rendered_json(Level.Info, "a\u{1}b", []).contains("\\u0001"))
+
+@test("json passes a multi-byte character through whole")
+json_keeps_utf8()
+    // Escaping is over bytes, and the claim that makes that right is that no continuation byte can
+    // look like something to escape. A character above ASCII is the case that would break it.
+    assert(rendered_json(Level.Info, "héllo", []).contains("héllo"))
+
+// -- the threshold --------------------------------------------------------------------------------
+
+@test("the threshold admits its own level and everything above it")
+threshold_admits()
+    set_level(Level.Warn)
+
+    assert(!enabled(Level.Debug))
+    assert(!enabled(Level.Info))
+    assert(enabled(Level.Warn))
+    assert(enabled(Level.Error))
+
+    set_level(Level.Info)
+    assert_eq(level(), Level.Info)
+end threshold_admits
+
+// -- a sink ---------------------------------------------------------------------------------------
+
+@test("an installed sink is handed every record the threshold admits")
+sink_receives()
+    var buffer = byte_sink()
+    var w: *Writer = &buffer
+    var sink = json_sink(w)
+
+    set_level(Level.Info)
+    set_sink(&sink)
+
+    info("one", [("k", "v")])
+    debug("dropped", [])
+    error("two", [])
+
+    clear_sink()
+
+    val out = from_utf8_unchecked(buffer.text())
+
+    // The `debug` is below the threshold and never reached the sink -- which is the claim that
+    // matters, since a logger that renders and then discards has paid for the record anyway.
+    assert_eq(count_lines(out), 2)
+    assert(out.contains("\"message\":\"one\""))
+    assert(out.contains("\"level\":\"error\""))
+    assert(!out.contains("dropped"))
+end sink_receives
+
+@test("a record may be timestamped by the caller, which is what a board does")
+sink_log_at()
+    var buffer = byte_sink()
+    var w: *Writer = &buffer
+    var sink = json_sink(w)
+
+    set_level(Level.Info)
+    set_sink(&sink)
+
+    log_at(Instant(AT), Level.Info, "fixed", [])
+
+    clear_sink()
+
+    assert(from_utf8_unchecked(buffer.text()).contains("\"time\":1757000551000"))
+end sink_log_at
+
+@test("clearing the sink stops delivery to it")
+sink_cleared()
+    var buffer = byte_sink()
+    var w: *Writer = &buffer
+    var sink = json_sink(w)
+
+    set_level(Level.Info)
+    set_sink(&sink)
+    clear_sink()
+
+    // Whatever the default does with this, it does not reach the buffer -- which is the half of
+    // `clear_sink` a test can see without capturing standard error.
+    info("gone", [])
+
+    assert_eq(buffer.text().len, 0)
+end sink_cleared
+
+@test("a writer sink renders the human form where it was not asked for JSON")
+sink_text_rendering()
+    var buffer = byte_sink()
+    var w: *Writer = &buffer
+    var sink = writer_sink(w)
+
+    set_level(Level.Info)
+    set_sink(&sink)
+
+    log_at(Instant(AT), Level.Warn, "careful", [])
+
+    clear_sink()
+
+    assert_eq(from_utf8_unchecked(buffer.text()), "2025-09-04 15:42:31 Z WARN  careful\n")
+end sink_text_rendering
+
+/** How many lines a run of output holds, which is what the delivery tests count rather than parsing
+ * the JSON they are not testing.
+ */
+private count_lines(s: string) -> usize
+    var n: usize = 0
+
+    for b in s.bytes
+        if b == u8('\n') then n += 1
+
+    n
+end count_lines

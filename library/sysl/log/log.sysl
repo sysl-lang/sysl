@@ -1,0 +1,437 @@
+module sysl.log
+
+import sysl.sync.{SpinLock, Ordering}
+import sysl.time.{Instant, instant_text, now, us_per_milli}
+
+// Structured logging: a level, a message, a few named fields, and somewhere for them to go.
+//
+// **Every server wants one and every package writes one**, which is the argument for it being here
+// rather than in a package: a program that depends on three libraries should not link three loggers
+// and configure them separately. Go, Python and Rust all ship the interface in the standard library
+// for the same reason, and leave the interesting sinks outside it.
+//
+// ## The shape
+//
+// A **`Record`** is what happened: when, how bad, what about, and a handful of named strings. A
+// **`Sink`** is where it goes -- one method, taking the record by pointer. **`text`** and **`json`**
+// are two renderings, each writing into a `Writer`, and a sink is what chooses between them. That
+// is the whole of the module; everything else people want from a logger is a sink somebody writes.
+//
+// ```
+// info("listening", [("port", "8080"), ("tls", "on")])
+// ```
+//
+// ## What it costs, and where
+//
+// **A record holds strings the caller rendered**, which is the one decision here that shows up at
+// every call site. The alternative -- a list of `&Display` -- would put a trait object in every
+// record and an allocation behind every field. What a caller writes instead is
+// `("port", port.to_string())`, which does allocate, and the cost is paid where the value is
+// actually wanted.
+//
+// **A filtered call still evaluates its arguments, and that is the one thing to know before putting
+// a `debug` in a loop.** sysl evaluates a call's arguments before the call, so the `to_string` above
+// runs whether or not the threshold admits the record -- `log` compares the level and returns
+// without building a `Record`, and it never sees the work that was done to reach it. `enabled` is
+// the guard for that case and is why it exists:
+//
+// ```
+// if enabled(Level.Debug) then debug("state", [("queue", queue.len().to_string())])
+// ```
+//
+// A call whose fields are literals, or one with no fields at all, costs nothing when filtered.
+//
+// **The time is an `Instant`**, which is a count of microseconds and nothing else. Rendering it as a
+// date is the calendar's job and `text` is the only thing here that asks for one, so a program whose
+// sink calls `json` links no calendar code at all -- the millisecond count is arithmetic.
+//
+// **`log_at` takes the instant and `log` reads the clock**, which is what makes the module usable on
+// a board with no clock at all: `sysl.time.now` reaches a seam the application supplies, and a
+// program that has nothing to supply calls `log_at` with whatever its own counter says.
+//
+// ## What is deliberately not here
+//
+// **Child loggers, contexts, rotation, colours, asynchronous delivery.** Each is a sink, and each is
+// a policy somebody disagrees with. A sink is one method; writing the one you want is a dozen lines
+// and does not require this module to have guessed.
+//
+// **A formatting language.** The message is a string and the fields are strings; a caller wanting
+// interpolation has `f"..."` and knows what it costs.
+
+/** How bad it is. The order is the severity order, which is what the threshold compares on -- so a
+ * level added between two of these would change what an existing threshold admits.
+ */
+enum Level derives Display
+    Debug
+    Info
+    Warn
+    Error
+end Level
+
+/** One named string on a record. A pair rather than a struct, because that is all it is and a tuple
+ * of two strings already compares, orders, hashes and renders.
+ */
+type Field = (string, string)
+
+/** Something that happened, as the sink is handed it.
+ *
+ * **The fields are a view rather than a copy**, so a caller may build them in an array on its own
+ * stack and the record borrows them for the length of the call. A sink that wants to keep a record
+ * has to copy what it needs, which is the same promise `Writer.write` makes about its bytes and for
+ * the same reason.
+ */
+struct Record
+    time: Instant
+    level: Level
+    message: string
+    fields: []const Field
+
+/** Where a record goes.
+ *
+ * One method, taking the record by pointer so that nothing is copied and a sink may be written
+ * under `no alloc`. A UART sink is a dozen lines:
+ *
+ * ```
+ * struct Uart
+ * end Uart
+ *
+ * impl Sink for Uart
+ *     write(*self, r: *Record) = json(r, uart_writer())
+ * ```
+ */
+trait Sink
+    write(*self, r: *Record)
+
+// The three pieces of module state, and they are the reason this module is a singleton at all.
+//
+// **A logger that has to be passed to everything is a logger nothing logs to.** The whole value of
+// a standard one is that a library five levels down can say something without its caller having
+// arranged for it, and that means a global. What that costs is the lock below and the fact that two
+// programs in one process would share it, which is not a thing that happens.
+//
+// **They are `var`s over literals**, so they are laid into the image rather than filled by an
+// initializer -- which is what keeps this module usable on a freestanding target, where there is no
+// loader to run one.
+
+private var threshold: i32 = 1
+private var current: Option[*Sink] = None
+private var guard: SpinLock = SpinLock(0)
+
+/** Records below this level are discarded before anything is built. `Level.Info` to begin with,
+ * which is what a program that has said nothing about it wants.
+ *
+ * **The threshold is an atomic rather than something the lock protects**, which is the one place
+ * this module cares about the difference. A filtered call reads it and returns, so putting it under
+ * the lock would make a `debug` in a hot loop -- the exact call the threshold exists to make cheap
+ * -- cost an uncontended lock and, worse, serialize against every other thread doing the same. A
+ * relaxed load is one instruction and the only thing a program gives up is knowing whether a call
+ * already in flight when `set_level` ran used the old value or the new one, which nothing can
+ * usefully depend on.
+ *
+ * It is held as the level's position rather than as a `Level`, since that is what an atomic
+ * operates on and the ordering of the enum is the ordering being compared.
+ */
+set_level(l: Level) = atomic_store(&threshold, i32(Level::Pos(l)), Ordering.Relaxed)
+
+/** What the threshold is now. */
+level() -> Level = Level::Val(int(atomic_load(&threshold, Ordering.Relaxed)))
+
+/** Whether a record at `l` would be written, which is the guard a caller in a hot path puts in front
+ * of the work of rendering its fields.
+ *
+ * ```
+ * if enabled(Level.Debug) then debug("state", [("queue", queue.len().to_string())])
+ * ```
+ */
+enabled(l: Level) -> bool = Level::Pos(l) >= int(atomic_load(&threshold, Ordering.Relaxed))
+
+/** Where records go from now on.
+ *
+ * **The pointer is borrowed and the caller keeps the sink alive.** That is a raw pointer rather than
+ * a counted box on purpose: a box needs an allocator, and this module is meant to work where there
+ * is none. The sink a program installs is nearly always module storage or something that lives as
+ * long as `main`, which is exactly the case where a count would be paid for nothing.
+ *
+ * Passing a pointer to something that then goes out of scope is the one way to misuse this, and it
+ * is the same shape as any other borrowed pointer in the language.
+ */
+set_sink(s: *Sink)
+    guard.lock()
+    current = Some(s)
+    guard.unlock()
+end set_sink
+
+/** Records go back to where they went before anything was installed -- standard error on a hosted
+ * target, and nowhere at all on one with no operating system.
+ */
+clear_sink()
+    guard.lock()
+    current = None
+    guard.unlock()
+end clear_sink
+
+/** A record at `l`, timestamped `t`, delivered if the threshold admits it.
+ *
+ * **This is the one to call where there is no clock**, and `log` is this with `sysl.time.now()` in
+ * front of it. A freestanding program that has not supplied the clock seam links this and nothing
+ * from `sysl.time` but the `Instant` type.
+ */
+log_at(t: Instant, l: Level, message: string, fields: []const Field)
+    if Level::Pos(l) < int(atomic_load(&threshold, Ordering.Relaxed)) then return
+
+    var r = Record(t, l, message, fields)
+
+    deliver(&r)
+end log_at
+
+/** A record at `l`, timestamped now. */
+log(l: Level, message: string, fields: []const Field) = log_at(now(), l, message, fields)
+
+/** What a program is doing, in detail nobody wants by default. */
+debug(message: string, fields: []const Field) = log(Level.Debug, message, fields)
+
+/** Something worth knowing that is not a problem. */
+info(message: string, fields: []const Field) = log(Level.Info, message, fields)
+
+/** Something that will be a problem if it keeps happening. */
+warn(message: string, fields: []const Field) = log(Level.Warn, message, fields)
+
+/** Something that did not work. */
+error(message: string, fields: []const Field) = log(Level.Error, message, fields)
+
+/** One record, one line, meant for a person: the time, the level, the message, then the fields.
+ *
+ * ```
+ * 2026-09-04 11:02:31.000000 Z INFO listening port=8080 tls=on
+ * ```
+ *
+ * **This is the rendering that reaches the calendar**, through `sysl.time`'s own `Display` for an
+ * `Instant`. A sink that only ever calls `json` links none of it.
+ *
+ * A value with a space in it is quoted, and one without is not -- which keeps the common line
+ * readable and keeps a value with a space in it parseable, which is the whole of what a logfmt-like
+ * format promises.
+ */
+text(r: *Record, out: *Writer)
+    val plain = FormatSpec(0, -1, false)
+
+    r.time.display(out, plain)
+    out.write(" ".bytes)
+    out.write(name_of(r.level).bytes)
+    out.write(" ".bytes)
+    out.write(r.message.bytes)
+
+    for f in r.fields
+        out.write(" ".bytes)
+        out.write(f.0.bytes)
+        out.write("=".bytes)
+
+        if needs_quoting(f.1)
+            out.write("\"".bytes)
+            write_escaped(f.1, out)
+            out.write("\"".bytes)
+        else
+            out.write(f.1.bytes)
+
+    out.write("\n".bytes)
+end text
+
+/** One record, one JSON object, meant for a machine.
+ *
+ * ```
+ * {"time":1757000551000,"level":"info","message":"listening","fields":{"port":"8080"}}
+ * ```
+ *
+ * **The time is epoch milliseconds**, which is what every log pipeline reads and is arithmetic
+ * rather than a calendar -- so this rendering pulls in no date code at all. The fields are an object
+ * rather than an array of pairs, because that is what a query language expects; a repeated key is
+ * therefore the caller's problem, exactly as it is in every other logger.
+ *
+ * The level is lowercase, which is the convention every JSON logger follows.
+ */
+json(r: *Record, out: *Writer)
+    val plain = FormatSpec(0, -1, false)
+
+    out.write("{\"time\":".bytes)
+    display_int(r.time.us / us_per_milli, out, plain)
+    out.write(",\"level\":\"".bytes)
+    out.write(lower_name_of(r.level).bytes)
+    out.write("\",\"message\":".bytes)
+    write_quoted(r.message, out)
+    out.write(",\"fields\":{".bytes)
+
+    var first = true
+
+    for f in r.fields
+        if !first then out.write(",".bytes)
+
+        first = false
+
+        write_quoted(f.0, out)
+        out.write(":".bytes)
+        write_quoted(f.1, out)
+
+    out.write("}}\n".bytes)
+end json
+
+/** The record handed to whatever is installed, under the lock.
+ *
+ * **The lock is held across the write rather than only across the read of the slot.** Two threads
+ * whose lines interleave produce output that is worse than either line missing, and a sink is not
+ * required to be atomic -- most write a byte at a time into a descriptor. What it costs is that a
+ * slow sink serializes the threads logging to it, which is the trade every logger makes and the
+ * reason an asynchronous sink is a thing somebody writes.
+ *
+ * It is a `SpinLock` rather than a `Mutex` because this module asks for no capability: a mutex
+ * blocks, blocking needs a scheduler, and a scheduler is exactly what a freestanding target has not
+ * got.
+ */
+private deliver(r: *Record)
+    guard.lock()
+
+    current match
+        Some(s) -> s.write(r)
+        None -> default_deliver(r)
+
+    guard.unlock()
+end deliver
+
+/** A sink over any `Writer`, rendering each record with one of the two renderings.
+ *
+ * **This is the sink nearly every program wants, and it is here because it is the one that composes
+ * with everything else the library already has**: a file is a `Writer`, standard error is a
+ * `Writer`, a buffer is a `Writer`, and a UART on a board is a `Writer` the moment somebody has
+ * written one. What is left for a program to write itself is a sink that does something other than
+ * render a record and hand it to a stream -- batching, filtering, sending it somewhere.
+ *
+ * **It holds a borrowed pointer**, so whatever it writes into has to outlive it, exactly as
+ * `set_sink` says of the sink itself.
+ */
+struct WriterSink
+    private out: *Writer
+    private as_json: bool
+
+impl Sink for WriterSink
+    write(*self, r: *Record) = if self.as_json then json(r, self.out) else text(r, self.out)
+
+/** A sink writing the human rendering into `out`. */
+writer_sink(out: *Writer) -> WriterSink = WriterSink(out, false)
+
+/** A sink writing the JSON rendering into `out`, which is what a program feeding a log pipeline
+ * installs.
+ */
+json_sink(out: *Writer) -> WriterSink = WriterSink(out, true)
+
+#if hosted
+/** The default, as a sink a program can install explicitly -- which is what it wants after having
+ * installed something else and wanting the default back with a different rendering.
+ *
+ * `clear_sink` reaches the same output without going through a sink at all, so a program that only
+ * wants the default never names this.
+ */
+stderr_sink() -> WriterSink = writer_sink(stderr())
+#endif
+
+/** Where a record goes when nothing has been installed.
+ *
+ * Standard error where there is an operating system to have one, and nowhere otherwise -- a
+ * freestanding program that has installed no sink has said, by omission, that it has nowhere to put
+ * a log line, and inventing one for it would mean naming a peripheral this module cannot know about.
+ */
+private default_deliver(r: *Record)
+#if hosted
+    text(r, stderr())
+#endif
+    ()
+end default_deliver
+
+/** The level as it is written on a line for a person -- padded to five so that a column of them
+ * lines up, which is the one piece of formatting a plain-text log is worth doing.
+ */
+private name_of(l: Level) -> string = l match
+    Level.Debug -> "DEBUG"
+    Level.Info -> "INFO "
+    Level.Warn -> "WARN "
+    Level.Error -> "ERROR"
+
+/** The level as JSON writes it. Not padded: a value in a machine-read format is the value. */
+private lower_name_of(l: Level) -> string = l match
+    Level.Debug -> "debug"
+    Level.Info -> "info"
+    Level.Warn -> "warn"
+    Level.Error -> "error"
+
+/** Whether a value has to be quoted on a text line -- anything with a space, a quote or a control
+ * character in it, and the empty string, which would otherwise leave `key=` with nothing after it.
+ */
+private needs_quoting(v: string) -> bool
+    if v.len == 0 then return true
+
+    for b in v.bytes
+        if b <= u8(' ') || b == u8('"') || b == u8('\\') then return true
+
+    false
+end needs_quoting
+
+/** A JSON string, quotes and all. */
+private write_quoted(s: string, out: *Writer)
+    out.write("\"".bytes)
+    write_escaped(s, out)
+    out.write("\"".bytes)
+end write_quoted
+
+/** The inside of a JSON string: the two characters JSON reserves, the five it names, and `\u00xx`
+ * for every other control character.
+ *
+ * **It escapes bytes rather than characters**, which is right for UTF-8: every byte that has to be
+ * escaped is below `0x20` or is one of two ASCII punctuation marks, and no continuation byte of a
+ * multi-byte character can be either -- so a multi-byte character passes through whole, which is
+ * what JSON wants.
+ */
+private write_escaped(s: string, out: *Writer)
+    val hex = "0123456789abcdef".bytes
+    val b = s.bytes
+    var esc: [6]u8
+    var run: usize = 0
+    var i: usize = 0
+
+    esc[0] = u8('\\')
+    esc[1] = u8('u')
+    esc[2] = u8('0')
+    esc[3] = u8('0')
+
+    while i < b.len
+        val c = b[i]
+
+        // The overwhelmingly common case, and the reason this writes runs rather than bytes: a
+        // message with nothing to escape in it reaches the sink as one `write`.
+        if c >= 0x20 && c != u8('"') && c != u8('\\')
+            i += 1
+            continue
+
+        if i > run then out.write(b[run..<i])
+
+        if c == u8('"')
+            out.write("\\\"".bytes)
+        elif c == u8('\\')
+            out.write("\\\\".bytes)
+        elif c == u8('\n')
+            out.write("\\n".bytes)
+        elif c == u8('\r')
+            out.write("\\r".bytes)
+        elif c == u8('\t')
+            out.write("\\t".bytes)
+        elif c == 8
+            out.write("\\b".bytes)
+        elif c == 12
+            out.write("\\f".bytes)
+        else
+            esc[4] = hex[usize(c >> 4)]
+            esc[5] = hex[usize(c & 0xf)]
+            out.write(esc[0..<6])
+
+        i += 1
+        run = i
+
+    if run < b.len then out.write(b[run..<b.len])
+end write_escaped
