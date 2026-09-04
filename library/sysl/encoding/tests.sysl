@@ -2,6 +2,8 @@ module sysl.encoding
 @tests
 
 import sysl.text.from_utf8_unchecked
+import sysl.rand.rng
+import sysl.time.Instant
 
 // What `sysl.encoding` claims, asserted in sysl.
 //
@@ -236,3 +238,138 @@ binary_refuses_a_short_slice()
     assert(!put_u32_be(three, 1))
     assert(!put_u64_be(seven, 1))
 end binary_refuses_a_short_slice
+
+// -- UUIDs ----------------------------------------------------------------------------------------
+//
+// The version and variant bits are the whole of what makes sixteen bytes a UUID, and getting one of
+// them wrong produces a value that renders perfectly and is rejected by the next system to read it.
+// So every constructor below is asserted on both, and the text form is asserted against a value
+// whose bytes are known rather than only against itself.
+
+@test("a v4 says it is a v4")
+uuid_v4_bits()
+    var g = rng(1, 1)
+    val u = v4(&g)
+
+    assert_eq(u.version(), 4)
+    assert_eq(u.variant(), 1)
+
+@test("a v7 says it is a v7 and carries the millisecond it was made in")
+uuid_v7_bits()
+    var g = rng(2, 1)
+
+    // 1 700 000 000 000 ms since the epoch, which is 2023-11-14 and is inside the 48-bit field with
+    // room to spare -- the field runs to the year 10889.
+    val ms: long = 1700000000000
+    val u = v7(Instant(ms * 1000), &g)
+
+    assert_eq(u.version(), 7)
+    assert_eq(u.variant(), 1)
+
+    var back: long = 0
+
+    for i in 0..<6
+        back = back * 256 + long(u.to_bytes()[i])
+
+    assert_eq(back, ms)
+
+@test("v7 orders by time, which is the whole reason it exists")
+uuid_v7_orders()
+    var g = rng(3, 1)
+
+    val early = v7(Instant(1700000000000 * 1000), &g)
+    val late = v7(Instant(1700000001000 * 1000), &g)
+
+    assert(early < late)
+    assert(!(late < early))
+
+@test("two draws from one generator differ")
+uuid_v4_distinct()
+    var g = rng(4, 1)
+
+    assert(v4(&g) != v4(&g))
+
+@test("the text form is thirty-six lowercase characters with hyphens in four places")
+uuid_text_shape()
+    var raw: [16]u8
+
+    for i in 0..<16
+        raw[i] = u8(i)
+
+    // 00 01 02 ... 0f, chosen so that BOTH stamped bytes visibly move: byte 6 goes 0x06 -> 0x46 and
+    // byte 8 goes 0x08 -> 0x88. A fixture whose byte 8 already had `10` on top would pass with the
+    // variant stamp deleted.
+    val u = v4_of(raw)
+    val s = to_string(u)
+
+    assert_eq(s.len, 36)
+    assert_eq(s, "00010203-0405-4607-8809-0a0b0c0d0e0f")
+    assert_eq(u.to_bytes()[6], 0x46)
+    assert_eq(u.to_bytes()[8], 0x88)
+    assert_eq(u.to_bytes()[7], 0x07)
+
+@test("the text form reads back to the same bytes")
+uuid_round_trip()
+    var g = rng(5, 1)
+    val u = v4(&g)
+
+    parse(to_string(u)) match
+        Some(back) -> assert_eq(back, u)
+        None -> assert(false)
+
+@test("parsing accepts either case of digit")
+uuid_parse_case()
+    val lower = parse("00112233-4455-4677-a899-aabbccddeeff")
+    val upper = parse("00112233-4455-4677-A899-AABBCCDDEEFF")
+
+    lower match
+        Some(a) -> upper match
+            Some(b) -> assert_eq(a, b)
+            None -> assert(false)
+        None -> assert(false)
+
+@test("parsing refuses anything but the thirty-six character form")
+uuid_parse_refuses()
+    // Too short, too long, a hyphen in the wrong place, a digit that is not one, and the
+    // unhyphenated 32-character spelling -- which is a different format rather than a sloppy one.
+    assert(parse("").is_none())
+    assert(parse("00112233-4455-4677-a899-aabbccddeef").is_none())
+    assert(parse("00112233-4455-4677-a899-aabbccddeefff").is_none())
+    assert(parse("001122334-455-4677-a899-aabbccddeeff").is_none())
+    assert(parse("00112233-4455-4677-a899-aabbccddeefg").is_none())
+    assert(parse("001122334455467 7a899aabbccddeeff").is_none())
+
+@test("the nil UUID is sixteen zero bytes and says so")
+uuid_nil()
+    assert(nil.is_nil())
+    assert_eq(to_string(nil), "00000000-0000-0000-0000-000000000000")
+    assert_eq(nil.version(), 0)
+
+    var g = rng(6, 1)
+
+    assert(!v4(&g).is_nil())
+
+@test("bytes go in and come out unchanged")
+uuid_of_bytes()
+    var raw: [16]u8
+
+    for i in 0..<16
+        raw[i] = u8(255 - i)
+
+    // `of_bytes` writes no version and no variant, so a value from elsewhere survives the round trip
+    // exactly -- including one whose version this library does not generate.
+    val u = of_bytes(raw)
+
+    for i in 0..<16
+        assert_eq(u.to_bytes()[i], raw[i])
+
+@test("equal UUIDs hash alike and unequal ones order")
+uuid_eq_hash_ord()
+    val a = of_bytes([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    val b = of_bytes([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    val c = of_bytes([2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+
+    assert_eq(a, b)
+    assert_eq(a.hash(), b.hash())
+    assert(a < c)
+    assert(a.hash() != c.hash())
