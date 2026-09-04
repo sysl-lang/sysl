@@ -820,6 +820,63 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  /** The same claim for the modules that carry no C at all.
+   *
+   * `sysl.unicode` is the interesting case because its cost is a third of a megabyte of tables, and
+   * the two cases above are about that. These are about the ordinary case, which is every other
+   * module a batch adds: a program that does not call one links none of its code either, and the
+   * evidence is a symbol that is not in the binary rather than a size that did not move. A pure-sysl
+   * module is a few kilobytes, so a byte count says nothing about it.
+   */
+  "a program links no code from a standard-library module it does not call" - {
+
+    /* Each pair is one module: the symbol a caller's program carries, and its absence from
+     * `print(1)`. The name is the lowered one -- `<module>$<function>` -- read off `nm` rather than
+     * composed, since `Library.key` answers for the root module and these are submodules. */
+
+    val cases = List(
+      ("sysl.encoding$v4",
+       "import sysl.encoding.v4\nimport sysl.rand.rng\n\nvar g = rng(1, 1)\n\nprint(v4(&g).version())\n"),
+      ("sysl.path$matches",
+       "import sysl.path.matches\nprint(matches(\"*.sysl\", \"a.sysl\"))\n"),
+      // `log_at` rather than `info`: the four level names are one-liners that inline into the call,
+      // so a symbol for one is not in the binary even where the module plainly is.
+      ("sysl.log$log_at",
+       "import sysl.log.info\ninfo(\"up\", [])\n"),
+      ("sysl.math.bigint$from_int",
+       "import sysl.math.bigint.from_int\nprint(from_int(7))\n")
+    )
+
+    for (symbol, program) <- cases do
+      s"and does link ${symbol.split('$').head} when it calls it" in {
+        assume(Toolchain.clangAvailable, "clang not available")
+
+        val (kept, size) = linkedSymbols(program)
+
+        assume(kept.nonEmpty || size > 0, "nm not available")
+
+        // The half that makes the absence below evidence: the symbol IS reachable, so a link that
+        // does not carry it is one where dead-stripping worked rather than one where the module
+        // never compiled.
+        withClue(s"$symbol should be in a program that calls it: ") {
+          kept.count(_.contains(symbol)) shouldBe 1
+        }
+      }
+
+    "and links none of them for a program that prints an integer" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val (kept, size) = linkedSymbols("print(1)\n")
+
+      assume(kept.nonEmpty || size > 0, "nm not available")
+
+      for (symbol, _) <- cases do
+        withClue(s"$symbol should have been dropped: ") {
+          kept.exists(_.contains(symbol)) shouldBe false
+        }
+    }
+  }
+
   "the standard module's own C, for a machine with no operating system" - {
 
     /* `library/sysl/unicode/utf8proc.c` is the first `.c` in the library that is **not** under a

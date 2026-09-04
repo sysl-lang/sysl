@@ -245,8 +245,15 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * tests. **The drift was three**, measured before a case was written -- 652 against a floor of
    * 649 -- and taken exactly, so what the number now proves is that all twenty-three new cases are
    * collected.
+   *
+   * Raised to **765** for a batch of five modules: `sysl.log` (14), `sysl.math.bigint` (20),
+   * `sysl.math.decimal` (18), `sysl.encoding`'s UUIDs (11), `sysl.path`'s globs (16), `sysl.fs`'s
+   * pattern filter (4) and `sysl.text`'s Unicode trims, fold comparisons and cluster widths (12).
+   * The runner collected **770** with the floor at 675, so the whole of the difference is these
+   * ninety-five and the drift was **zero** -- which is what makes taking a five-case margin here a
+   * margin rather than a guess.
    */
-  private val floor = 675
+  private val floor = 765
 
   /** The library, compiled as a **test build of itself**.
    *
