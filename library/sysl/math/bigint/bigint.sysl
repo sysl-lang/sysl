@@ -1,0 +1,369 @@
+module sysl.math.bigint
+
+import sysl.buf.{Buf, buf}
+
+// Integers with no width: sign and magnitude, the magnitude a run of 32-bit limbs.
+//
+// **A general-purpose language without arbitrary precision makes a whole class of program wrong in
+// the same way** -- a hash reduced modulo something, a factorial, a cryptographic exponent, an
+// identifier that outgrew 64 bits. Go ships `math/big` and Rust does not, and this takes Go's side:
+// the alternative is a package that every serious program ends up depending on anyway, and a
+// standard library is where a type everybody has to agree on belongs.
+//
+// ## The representation
+//
+// A `BigInt` is a **sign** and a **magnitude**, and the magnitude is a view of `u32` limbs written
+// **least significant first** with no leading zeros. Zero is the empty magnitude and a clear sign,
+// so there is exactly one representation of it and nothing has to remember whether it is negative.
+//
+// **Limbs are 32 bits and the arithmetic is done in 64.** That is what makes every carry, borrow and
+// partial product exact without asking the language for a wider type or a carry flag: a product of
+// two limbs is at most `(2^32 - 1)^2`, which fits a `u64` with room for two more limbs of carry.
+// Sixty-four-bit limbs would halve the work and would need a 128-bit product, which is a different
+// conversation.
+//
+// ## What it costs
+//
+// **Every operation that grows allocates**, and the docstrings say so where it is not obvious.
+// There is no in-place arithmetic and no reuse of a caller's buffer: a `BigInt` is a value that
+// copies, which is what makes `a + b * c` mean what it looks like, and the cost of that is one
+// allocation per operation. A program doing this in a loop is doing something a big-integer library
+// is not the fastest way to do.
+//
+// **Multiplication is schoolbook and division is Knuth's algorithm D.** Both are quadratic.
+// Karatsuba, Toom-Cook and a Barrett or Montgomery reduction are all improvements that fit behind
+// this same surface, and none of them changes an answer -- so they are work somebody does when a
+// program is slow rather than decisions this module has to make now. What this is for is money,
+// identifiers, checksums and the occasional exact computation, none of which is GMP's territory.
+//
+// ## What is deliberately not here
+//
+// **Modular exponentiation, primality, a gcd.** Each is a real function with real subtleties -- a
+// constant-time `mod_pow` is a different function from a fast one -- and none is needed by anything
+// this library ships. They belong here eventually and belong here written on purpose.
+//
+// **Bit operations.** `and`, `or` and a shift over a sign-and-magnitude number mean whatever a
+// two's-complement reading of an infinite-width value means, which is a decision rather than an
+// implementation, and nothing has asked.
+
+/** An integer of no fixed width.
+ *
+ * **The magnitude is a view, so a `BigInt` costs a retain to copy rather than a copy of its limbs.**
+ * That is what makes passing one around cheap and is the reason the limbs are never written through:
+ * every operation builds a new magnitude, so two values may share one and neither can see the other
+ * change.
+ */
+struct BigInt
+    private[bigint] minus: bool
+    private[bigint] mag: []const u32
+
+    /** Whether this is zero, which is the one value with an empty magnitude. */
+    is_zero(self) -> bool = self.mag.len == 0
+
+    /** `-1`, `0` or `1`, which is the comparison against zero written as a number -- what a caller
+     * switching on the three cases wants, and what `cmp` answers for a pair.
+     */
+    sign(self) -> int
+        if self.mag.len == 0 then
+            0
+        elif self.minus then
+            -1
+        else
+            1
+    end sign
+
+    /** How many limbs the magnitude takes, which is the closest thing to a size this type has.
+     *
+     * It is here because a program deciding whether a value still fits somewhere has no other way to
+     * ask, and because a test asserting that a result was normalized has to be able to see the
+     * leading zeros are gone.
+     */
+    limbs(self) -> usize = self.mag.len
+
+    /** The value as a `long`, or `None` where it does not fit.
+     *
+     * **`None` rather than a truncation**, because a big integer that has outgrown 64 bits is
+     * exactly the case this type exists for and silently wrapping it would defeat the purpose. The
+     * most negative `long` is representable and is the one asymmetry: its magnitude is one larger
+     * than the largest positive.
+     */
+    to_long(self) -> Option[long]
+        if self.mag.len == 0 then return Some(0)
+        if self.mag.len > 2 then return None
+
+        var m = u64(self.mag[0])
+
+        if self.mag.len == 2 then m = m | u64(self.mag[1]) << 32
+
+        if self.minus
+            // `-(2^63)` has magnitude `2^63`, which is one past what a positive `long` holds.
+            if m > 0x8000000000000000u64 then return None
+            if m == 0x8000000000000000u64 then return Some(-9223372036854775807 - 1)
+
+            Some(0 - long(m))
+        else
+            if m > 0x7fffffffffffffffu64 then return None
+
+            Some(long(m))
+    end to_long
+end BigInt
+
+/** Zero, which is the empty magnitude. */
+zero() -> BigInt = BigInt(false, [])
+
+/** One. */
+one() -> BigInt = from_int(1)
+
+/** The value `n` names.
+ *
+ * The most negative `long` is the case worth knowing about: its magnitude cannot be reached by
+ * negating it, since that value has no positive counterpart, so the conversion goes through the
+ * unsigned reading of the bits.
+ */
+from_int(n: long) -> BigInt
+    if n == 0 then return zero()
+
+    val negative = n < 0
+    val m = if negative then 0u64 - u64(n) else u64(n)
+    var out: Buf[u32] = buf()
+
+    out.push(u32(m & 0xffffffffu64))
+
+    if m >> 32 != 0 then out.push(u32(m >> 32))
+
+    BigInt(negative, out.view())
+end from_int
+
+impl From[long] for BigInt
+    from(value: long) -> BigInt = from_int(value)
+
+impl Zero for BigInt
+    zero() -> BigInt = zero()
+
+impl One for BigInt
+    one() -> BigInt = one()
+
+/** The same magnitude with the other sign, and zero unchanged -- there being no negative zero here
+ * to produce.
+ */
+negate(x: BigInt) -> BigInt = if x.is_zero() then x else BigInt(!x.minus, x.mag)
+
+impl Neg for BigInt
+    neg(self) -> BigInt = negate(self)
+
+/** The magnitude, as a value of this type. */
+abs(x: BigInt) -> BigInt = if x.minus then BigInt(false, x.mag) else x
+
+/** `-1`, `0` or `1` as `a` is below, equal to or above `b`.
+ *
+ * A negative is below every positive, and between two negatives the *larger magnitude* is the
+ * smaller number -- which is the one place sign-and-magnitude needs a thought that two's complement
+ * does not.
+ */
+cmp(a: BigInt, b: BigInt) -> int
+    val sa = a.sign()
+    val sb = b.sign()
+
+    if sa != sb then return if sa < sb then -1 else 1
+    if sa == 0 then return 0
+
+    val m = cmp_mag(a.mag, b.mag)
+
+    if a.minus then 0 - m else m
+end cmp
+
+impl Eq for BigInt
+    eq(self, rhs: BigInt) -> bool = cmp(self, rhs) == 0
+
+impl Ord for BigInt
+    lt(self, rhs: BigInt) -> bool = cmp(self, rhs) < 0
+
+impl Hash for BigInt
+    /** FNV-1a over the limbs with the sign mixed in, which is the same mixer `sysl.encoding.Uuid`
+     * and `hash_str` use over a run of bytes.
+     *
+     * **Equal values hash alike because the representation is canonical**: leading zeros are trimmed
+     * and zero is never negative, so two `BigInt`s that compare equal hold identical limbs and an
+     * identical sign. Nothing here has to normalize first.
+     */
+    hash(self) -> u64
+        var h = if self.minus then 0xcbf29ce484222326u64 else 0xcbf29ce484222325u64
+
+        for limb in self.mag
+            h = (h ^ u64(limb)) * 0x100000001b3u64
+
+        h
+    end hash
+
+/** `a + b`. Allocates the result's limbs.
+ *
+ * Two values of the same sign add their magnitudes and keep it; two of different signs subtract the
+ * smaller magnitude from the larger and take the larger one's sign, which is where a zero result
+ * comes from and is why the sign is dropped when the magnitudes cancel.
+ */
+add(a: BigInt, b: BigInt) -> BigInt
+    if a.is_zero() then return b
+    if b.is_zero() then return a
+
+    if a.minus == b.minus then return BigInt(a.minus, add_mag(a.mag, b.mag))
+
+    val m = cmp_mag(a.mag, b.mag)
+
+    if m == 0 then return zero()
+    if m > 0 then BigInt(a.minus, sub_mag(a.mag, b.mag)) else BigInt(b.minus, sub_mag(b.mag, a.mag))
+end add
+
+impl Add for BigInt
+    /** Allocates: the sum's limbs are new storage, since neither operand's may be written through.
+     * `string`'s `+` says the same thing about its bytes and for the same reason.
+     */
+    add(self, rhs: BigInt) -> BigInt = add(self, rhs)
+
+/** `a - b`, which is `a + (-b)` and is written as that rather than as a second carry loop. */
+sub(a: BigInt, b: BigInt) -> BigInt = add(a, negate(b))
+
+impl Sub for BigInt
+    sub(self, rhs: BigInt) -> BigInt = sub(self, rhs)
+
+/** `a * b`, schoolbook. Allocates.
+ *
+ * The sign is the sign of the product and the magnitudes multiply, with the one special case every
+ * sign-and-magnitude implementation has: a zero result must not be negative, and here it cannot be,
+ * because a zero operand returns early.
+ */
+mul(a: BigInt, b: BigInt) -> BigInt
+    if a.is_zero() || b.is_zero() then return zero()
+
+    BigInt(a.minus != b.minus, mul_mag(a.mag, b.mag))
+end mul
+
+impl Mul for BigInt
+    mul(self, rhs: BigInt) -> BigInt = mul(self, rhs)
+
+/** `a` raised to `n`, by repeated squaring. Allocates once per squaring and once per set bit.
+ *
+ * **A negative exponent has no integer answer and gives one**, since `x^-1` is not an integer for
+ * any `x` but 1 and -1; a caller wanting a rational wants a rational. `pow(x, 0)` is one, including
+ * for `x` of zero, which is the convention every language and every algebra text takes.
+ */
+pow(a: BigInt, n: usize) -> BigInt
+    if n == 0 then return one()
+
+    var result = one()
+    var base = a
+    var k = n
+
+    while k > 0
+        if k & 1 == 1 then result = mul(result, base)
+
+        k = k >> 1
+
+        if k > 0 then base = mul(base, base)
+
+    result
+end pow
+
+// -- the magnitude, which is where the arithmetic actually is --------------------------------------
+//
+// Everything below works on `[]const u32` in little-endian limb order with no leading zeros, and
+// knows nothing about signs. Keeping the two apart is what makes each half readable: a sign rule is
+// three lines of case analysis and a carry loop is a carry loop.
+
+/** `-1`, `0` or `1` as `a` is below, equal to or above `b`, both being normalized -- so the longer
+ * is the larger, and equal lengths are decided from the top limb down.
+ */
+private[bigint] cmp_mag(a: []const u32, b: []const u32) -> int
+    if a.len != b.len then return if a.len < b.len then -1 else 1
+
+    var i = a.len
+
+    while i > 0
+        i -= 1
+
+        if a[i] != b[i] then return if a[i] < b[i] then -1 else 1
+
+    0
+end cmp_mag
+
+/** `a + b`, carrying in 64 bits so that the sum of two limbs and a carry cannot overflow. */
+private[bigint] add_mag(a: []const u32, b: []const u32) -> []const u32
+    val long_side = if a.len >= b.len then a else b
+    val short_side = if a.len >= b.len then b else a
+    var out: Buf[u32] = buf()
+    var carry: u64 = 0
+
+    for i in 0..<long_side.len
+        var s = u64(long_side[i]) + carry
+
+        if i < short_side.len then s += u64(short_side[i])
+
+        out.push(u32(s & 0xffffffffu64))
+        carry = s >> 32
+
+    if carry != 0 then out.push(u32(carry))
+
+    trimmed(out)
+end add_mag
+
+/** `a - b`, where `a >= b`. The caller is what guarantees that, which is why this is private: a
+ * borrow out of the top would wrap silently and produce a number rather than a complaint.
+ */
+private[bigint] sub_mag(a: []const u32, b: []const u32) -> []const u32
+    var out: Buf[u32] = buf()
+    var borrow: u64 = 0
+
+    for i in 0..<a.len
+        // The borrow is folded into what is being taken away rather than applied afterwards, so the
+        // two cases below are one comparison each and nothing can go below zero mid-expression --
+        // these are unsigned, and `x - y` where `y` is the larger wraps rather than complaining.
+        val take = (if i < b.len then u64(b[i]) else 0u64) + borrow
+        val cur = u64(a[i])
+
+        if cur >= take
+            out.push(u32(cur - take))
+            borrow = 0
+        else
+            out.push(u32(cur + 0x100000000u64 - take))
+            borrow = 1
+
+    trimmed(out)
+end sub_mag
+
+/** `a * b`, one limb of `b` against all of `a` at a time.
+ *
+ * The accumulator is 64 bits, which is exactly enough: a limb times a limb is at most
+ * `(2^32 - 1)^2`, and adding the running carry and the limb already sitting in the answer keeps it
+ * under `2^64`. That is the whole reason limbs are half a word.
+ */
+private[bigint] mul_mag(a: []const u32, b: []const u32) -> []const u32
+    var out: Buf[u32] = buf()
+
+    for i in 0..<(a.len + b.len)
+        out.push(0)
+
+    for i in 0..<a.len
+        var carry: u64 = 0
+
+        for j in 0..<b.len
+            val at = i + j
+            val t = u64(a[i]) * u64(b[j]) + u64(out.at(at)) + carry
+
+            out.set(at, u32(t & 0xffffffffu64))
+            carry = t >> 32
+
+        out.set(i + b.len, u32(carry))
+
+    trimmed(out)
+end mul_mag
+
+/** The buffer as a magnitude, with the leading zeros dropped -- the one invariant every function
+ * here relies on and the one place it is established.
+ */
+private[bigint] trimmed(b: Buf[u32]) -> []const u32
+    var n = b.len()
+
+    while n > 0 && b.at(n - 1) == 0
+        n -= 1
+
+    b.view()[0..<n]
+end trimmed

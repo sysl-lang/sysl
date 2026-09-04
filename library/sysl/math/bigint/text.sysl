@@ -1,0 +1,160 @@
+module sysl.math.bigint
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Ascii, from_utf8_unchecked}
+
+// Reading a big integer and writing one, in any base from 2 to 36.
+//
+// **Both directions work a CHUNK at a time rather than a digit at a time**, and the chunk is the
+// largest power of the base that fits in a limb -- `10^9` for base ten, `2^31` for binary. So
+// rendering divides the whole magnitude by a billion and gets nine digits out of the remainder with
+// ordinary machine arithmetic, and reading multiplies by a billion and adds nine digits at a time.
+// The digit-at-a-time version of either is a full pass over the limbs per digit, which for a
+// thousand-digit number is a thousand passes rather than a hundred and twelve.
+//
+// **Rendering is still quadratic**, and no chunking fixes that: each division is a pass over what is
+// left. A subquadratic conversion is a divide-and-conquer algorithm with its own recursion, and it
+// belongs behind this same surface if a program ever needs it.
+
+/** The digits, in the order their values run. Lower case, which is what every language emits and
+ * what `parse` accepts either of.
+ */
+private const DIGITS: string = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+/** `x` in base ten. */
+to_string(x: BigInt) -> string = to_string_radix(x, 10)
+
+impl Display for BigInt
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(to_string(self), out, fmt)
+
+/** `x` written in `base`, with a leading `-` where it is negative and no `+` where it is not.
+ *
+ * **A base outside 2 to 36 traps**, since there is no digit to write past `z` and a caller asking
+ * for base 37 has a mistake rather than an unusual requirement. Zero is `"0"` in every base.
+ *
+ * Allocates the answer, and a working buffer the size of the answer.
+ */
+to_string_radix(x: BigInt, base: int) -> string
+    if base < 2 || base > 36 then panic("sysl.math.bigint: a base runs from 2 to 36")
+    if x.is_zero() then return "0"
+
+    val alphabet = DIGITS.bytes
+    val (chunk, per) = chunk_of(base)
+    var digits: Buf[u8] = buf()
+    var mag = x.mag
+
+    // Every chunk emits `per` digits whether it needed them or not, which pads the most significant
+    // one with zeros; stripping them afterwards is one loop and is simpler than deciding, inside
+    // the loop, whether this is the last chunk.
+    while mag.len > 0
+        val (q, r) = short_divide(mag, chunk)
+        var value = if r.len == 0 then 0u64 else u64(r[0])
+
+        for _ in 0..<per
+            digits.push(alphabet[usize(value % u64(base))])
+            value = value / u64(base)
+
+        mag = q
+
+    var n = digits.len()
+
+    while n > 1 && digits.at(n - 1) == u8('0')
+        n -= 1
+
+    var out: Buf[u8] = buf()
+
+    if x.minus then out.push(u8('-'))
+
+    var i = n
+
+    while i > 0
+        i -= 1
+        out.push(digits.at(i))
+
+    // Every byte written is an ASCII digit, a letter or a hyphen, so the result is valid UTF-8 by
+    // construction and there is nothing for a validating pass to find.
+    from_utf8_unchecked(out.view())
+end to_string_radix
+
+/** The value `s` names in base ten, or `None`. */
+parse(s: string) -> Option[BigInt] = parse_radix(s, 10)
+
+/** The value `s` names in `base`, or `None` where it names none.
+ *
+ * An optional `+` or `-` and then at least one digit, in either case. Nothing else: no underscores,
+ * no `0x` prefix, no leading or trailing space. A caller reading a number out of a document trims
+ * and strips before it gets here, because what a document allows is the document's business.
+ *
+ * **`"-0"` parses to zero and renders as `"0"`**, which is the one input that does not round trip
+ * and could not: there is no negative zero in this representation, which is what makes equality and
+ * hashing straightforward everywhere else.
+ */
+parse_radix(s: string, base: int) -> Option[BigInt]
+    if base < 2 || base > 36 then return None
+
+    val b = s.bytes
+    var i: usize = 0
+    var minus = false
+
+    if i < b.len && (b[i] == u8('-') || b[i] == u8('+'))
+        minus = b[i] == u8('-')
+        i += 1
+
+    if i >= b.len then return None
+
+    val (chunk, per) = chunk_of(base)
+    var mag = empty()
+
+    while i < b.len
+        var acc: u32 = 0
+        var mult: u32 = 1
+        var k = 0
+
+        while k < per && i < b.len
+            val d = b[i].digit_value(base)?
+
+            acc = acc * u32(base) + u32(d)
+            mult = mult * u32(base)
+            i += 1
+            k += 1
+
+        mag = mul_add_small(mag, mult, acc)
+
+    if mag.len == 0 then Some(zero()) else Some(BigInt(minus, mag))
+end parse_radix
+
+/** The largest power of `base` that fits in a limb, and how many digits that is.
+ *
+ * It is computed rather than tabled because a table of thirty-five entries is a table to get wrong,
+ * and this runs once per conversion against a loop that runs once per chunk.
+ */
+private chunk_of(base: int) -> (u32, int)
+    var chunk = u64(base)
+    var per = 1
+
+    while chunk * u64(base) < 0x100000000u64
+        chunk = chunk * u64(base)
+        per += 1
+
+    (u32(chunk), per)
+end chunk_of
+
+/** `mag * m + add`, both of which fit a limb -- the one operation reading a number needs and the
+ * only place in this module where a magnitude grows by arithmetic rather than by a full multiply.
+ */
+private mul_add_small(mag: []const u32, m: u32, add: u32) -> []const u32
+    var out: Buf[u32] = buf()
+    var carry = u64(add)
+
+    for i in 0..<mag.len
+        val t = u64(mag[i]) * u64(m) + carry
+
+        out.push(u32(t & 0xffffffffu64))
+        carry = t >> 32
+
+    while carry != 0
+        out.push(u32(carry & 0xffffffffu64))
+        carry = carry >> 32
+
+    trimmed(out)
+end mul_add_small

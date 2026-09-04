@@ -1,0 +1,320 @@
+module sysl.math.decimal
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, abs, add as add_big, cmp as cmp_big, div_rem, from_int as big_of,
+                         mul as mul_big, negate, one as big_one, parse as parse_big, pow,
+                         sub as sub_big, to_string as big_text, zero as big_zero}
+import sysl.text.{Ascii, from_utf8_unchecked}
+
+// Exact decimal arithmetic: an integer coefficient and a scale, so `0.1 + 0.2` is `0.3`.
+//
+// **A general-purpose language without one makes every financial program wrong in the same way.**
+// `real` is binary floating point, and a tenth is not representable in binary any more than a third
+// is in decimal -- so `0.1 + 0.2` is `0.30000000000000004`, a total of a million transactions is out
+// by cents, and no amount of care at the call site fixes it. PostgreSQL's `numeric`, Java's
+// `BigDecimal` and Python's `decimal` are all this type, and the slate `pg` package had to grow its
+// own before this existed, which is the evidence the library was short one.
+//
+// ## The representation
+//
+// A **coefficient**, which is a `BigInt`, and a **scale**, which is how many digits of it are after
+// the point. `12.340` is a coefficient of `12340` at a scale of 3, and `1234` at a scale of 2 is the
+// same *number* written to fewer places.
+//
+// **The scale is part of the value and is not normalized away.** `1.50` and `1.5` compare equal and
+// render differently, which is what a program handling money needs: a price quoted to the cent is
+// quoted to the cent whether or not the cent happens to be zero, and a total that rendered as `1.5`
+// where every other row said `1.50` would be a bug report. `Hash` is over the normalized form so
+// that the two still hash alike, which is what `Eq` obliges it to do.
+//
+// **The scale is never negative.** Every operation here produces one that is zero or more, and the
+// two that take a scale from the caller refuse a negative. A negative scale would mean a
+// coefficient standing for a multiple of ten and would make the rendering a second case for no
+// gain -- `1500` at a scale of zero says the same thing.
+//
+// ## What it costs
+//
+// **Everything is `BigInt` arithmetic, so everything allocates**, and adding two values at different
+// scales additionally multiplies one coefficient by a power of ten. That is the price of being exact
+// and it is not small; a program adding a million rows should keep them at one scale, where the
+// alignment is free.
+//
+// **Addition, subtraction and multiplication are exact and never round.** A sum's scale is the
+// larger of its operands' and a product's is the sum of theirs, so a product of two prices at two
+// decimal places has four. Division is the operation that cannot be exact -- a third has no finite
+// decimal expansion -- so it is the one that takes a scale and a rounding mode, and it is the only
+// place in the module where a digit is ever discarded.
+
+/** How to resolve a division that does not come out exactly.
+ *
+ * `HalfEven` is the default and is what money code should use: rounding halves consistently up
+ * biases a long run of sums upward, and rounding them to the nearest even value does not. It is what
+ * IEEE 754 does with binary floating point and what accountants call banker's rounding.
+ */
+enum Rounding derives Display
+    /** To the nearest, and a tie to the even digit. The default, and the one without a bias. */
+    HalfEven
+
+    /** To the nearest, and a tie away from zero -- what most people mean by "round" and what a
+     * schoolbook teaches. It biases a long run of sums away from zero.
+     */
+    HalfUp
+
+    /** Toward zero: the digits past the scale are dropped. Truncation. */
+    Down
+
+    /** Away from zero, whenever anything at all was dropped. */
+    Up
+
+    /** Toward negative infinity, so a positive value truncates and a negative one grows. */
+    Floor
+
+    /** Toward positive infinity, which is `Floor` read the other way. */
+    Ceiling
+end Rounding
+
+/** A number written in decimal, exactly.
+ *
+ * The value is the coefficient divided by ten to the scale, and both halves are what a caller
+ * reading the type wants to be able to see: `coefficient` and `scale` are how a program storing one
+ * in a database column or sending one over a wire takes it apart.
+ */
+struct Decimal
+    private[decimal] coef: BigInt
+    private[decimal] places: i32
+
+    /** The integer the value is a scaled copy of. `12.340` answers `12340`. */
+    coefficient(self) -> BigInt = self.coef
+
+    /** How many digits of the coefficient are after the point. Never negative. */
+    scale(self) -> int = int(self.places)
+
+    /** Whether the value is zero, at whatever scale it is written to. */
+    is_zero(self) -> bool = self.coef.is_zero()
+
+    /** `-1`, `0` or `1`, which the scale cannot affect: a positive power of ten does not change a
+     * sign.
+     */
+    sign(self) -> int = self.coef.sign()
+end Decimal
+
+/** Zero, at a scale of zero. */
+zero() -> Decimal = Decimal(big_zero(), 0)
+
+/** One, at a scale of zero. */
+one() -> Decimal = Decimal(big_one(), 0)
+
+/** The whole number `n`, at a scale of zero. */
+from_int(n: long) -> Decimal = Decimal(big_of(n), 0)
+
+/** `coef` divided by ten to the `scale` -- the constructor a program reading a database column
+ * reaches for, since that is exactly how such a column is stored.
+ *
+ * **A negative scale traps**, which is the module's one representation rule enforced at the one
+ * place a caller could break it.
+ */
+of(coef: BigInt, scale: int) -> Decimal
+    if scale < 0 then panic("sysl.math.decimal: a scale is zero or more")
+
+    Decimal(coef, i32(scale))
+end of
+
+impl From[long] for Decimal
+    from(value: long) -> Decimal = from_int(value)
+
+/** The same value with the other sign. */
+negated(d: Decimal) -> Decimal = Decimal(negate(d.coef), d.places)
+
+impl Neg for Decimal
+    neg(self) -> Decimal = negated(self)
+
+/** The magnitude. */
+magnitude(d: Decimal) -> Decimal = Decimal(abs(d.coef), d.places)
+
+/** `a + b`, exactly, at the larger of the two scales.
+ *
+ * **The result's scale is the larger and never smaller**, which is what makes addition exact: a
+ * value at two places and one at four have a sum that needs four, and truncating it to two would be
+ * a rounding nobody asked for.
+ */
+add(a: Decimal, b: Decimal) -> Decimal
+    val s = if a.places > b.places then a.places else b.places
+
+    Decimal(add_big(lifted(a, s), lifted(b, s)), s)
+end add
+
+impl Add for Decimal
+    /** Allocates: the coefficients are `BigInt`s and so is the sum. Where the scales differ it also
+     * allocates the power of ten one of them is lifted by.
+     */
+    add(self, rhs: Decimal) -> Decimal = add(self, rhs)
+
+/** `a - b`, exactly, at the larger of the two scales. */
+sub(a: Decimal, b: Decimal) -> Decimal
+    val s = if a.places > b.places then a.places else b.places
+
+    Decimal(sub_big(lifted(a, s), lifted(b, s)), s)
+end sub
+
+impl Sub for Decimal
+    sub(self, rhs: Decimal) -> Decimal = sub(self, rhs)
+
+/** `a * b`, exactly, at the SUM of the two scales.
+ *
+ * That is what exactness costs and it is worth expecting: two prices at two places multiply to a
+ * value at four, and a program that wants two back asks for them with `rescale`. Anything else would
+ * be rounding a product without being told how.
+ */
+mul(a: Decimal, b: Decimal) -> Decimal = Decimal(mul_big(a.coef, b.coef), a.places + b.places)
+
+impl Mul for Decimal
+    mul(self, rhs: Decimal) -> Decimal = mul(self, rhs)
+
+/** `a / b` to `scale` places, rounded by `mode`.
+ *
+ * **Division is the one operation here that takes a scale, because it is the one that cannot be
+ * exact.** A third has no finite decimal expansion, so there is no scale a quotient "naturally" has
+ * and any choice this module made for the caller would be wrong for somebody. `divide(a, b, 2,
+ * Rounding.HalfEven)` says what is wanted and says how the digits that do not fit are resolved.
+ *
+ * **Division by zero traps**, as it does for a `BigInt` and for a machine integer.
+ */
+divide(a: Decimal, b: Decimal, scale: int, mode: Rounding) -> Decimal
+    if scale < 0 then panic("sysl.math.decimal: a scale is zero or more")
+    if b.is_zero() then panic("sysl.math.decimal: division by zero")
+
+    // The value is `a.coef * 10^b.places / (b.coef * 10^a.places)`, and the answer wanted is that
+    // times `10^scale`. Whichever side the surplus power of ten lands on, it is applied to one
+    // operand rather than to both -- so a division at a large scale costs one multiplication.
+    val lift = int(b.places) + scale - int(a.places)
+    var num = a.coef
+    var den = b.coef
+
+    if lift >= 0 then num = mul_big(num, ten_to(lift)) else den = mul_big(den, ten_to(0 - lift))
+
+    Decimal(rounded_quotient(num, den, mode), i32(scale))
+end divide
+
+impl Div for Decimal
+    /** `Rounding.HalfEven` at the larger of the two scales, which is what an operator has to pick
+     * for a caller who did not say -- and is why `divide` exists and is the one to reach for.
+     */
+    div(self, rhs: Decimal) -> Decimal =
+        divide(self, rhs, if self.places > rhs.places then int(self.places) else int(rhs.places),
+               Rounding.HalfEven)
+
+/** The same value written to `scale` places, rounded by `mode` where digits have to go.
+ *
+ * Growing the scale is exact and needs no mode; shrinking it discards digits and is where the mode
+ * is read. `rescale(d, d.scale(), mode)` is `d`.
+ */
+rescale(d: Decimal, scale: int, mode: Rounding) -> Decimal
+    if scale < 0 then panic("sysl.math.decimal: a scale is zero or more")
+
+    val diff = scale - int(d.places)
+
+    if diff == 0 then return d
+    if diff > 0 then return Decimal(mul_big(d.coef, ten_to(diff)), i32(scale))
+
+    Decimal(rounded_quotient(d.coef, ten_to(0 - diff), mode), i32(scale))
+end rescale
+
+/** The same value with every trailing zero taken off the coefficient, and the scale reduced to
+ * match -- so `1.500` becomes `1.5` and `150` at a scale of zero is left alone.
+ *
+ * **It is what `Hash` is over**, since two values that compare equal have to hash alike and `1.50`
+ * equals `1.5`. A program rendering a value should NOT normalize first: the scale is the number of
+ * places it was quoted to, and dropping it is throwing information away.
+ */
+normalized(d: Decimal) -> Decimal
+    if d.coef.is_zero() then return Decimal(big_zero(), 0)
+
+    var c = d.coef
+    var s = int(d.places)
+    val ten = big_of(10)
+
+    while s > 0
+        val (q, r) = div_rem(c, ten)
+
+        if !r.is_zero() then break
+
+        c = q
+        s -= 1
+
+    Decimal(c, i32(s))
+end normalized
+
+/** `-1`, `0` or `1` as `a` is below, equal to or above `b`, **ignoring the scale**: `1.50` and `1.5`
+ * are the same number and compare equal.
+ *
+ * Both are lifted to the larger scale and their coefficients compared, which is exact and is the
+ * only comparison that could be.
+ */
+cmp(a: Decimal, b: Decimal) -> int
+    val s = if a.places > b.places then a.places else b.places
+
+    cmp_big(lifted(a, s), lifted(b, s))
+end cmp
+
+impl Eq for Decimal
+    eq(self, rhs: Decimal) -> bool = cmp(self, rhs) == 0
+
+impl Ord for Decimal
+    lt(self, rhs: Decimal) -> bool = cmp(self, rhs) < 0
+
+impl Hash for Decimal
+    /** Over the normalized form, which is what makes `1.50` and `1.5` -- equal by `cmp` -- hash
+     * alike. The scale is mixed in as well as the coefficient, since after normalization two
+     * different numbers cannot share both.
+     */
+    hash(self) -> u64
+        val n = normalized(self)
+
+        n.coef.hash() * 0x100000001b3u64 ^ hash_u64(u64(u32(n.places)))
+    end hash
+
+/** The coefficient `a` would have at scale `s`, which is a multiplication by a power of ten and is
+ * exact -- `s` is never below `a`'s own scale at any call site here.
+ */
+private lifted(a: Decimal, s: i32) -> BigInt
+    if a.places == s then return a.coef
+
+    mul_big(a.coef, ten_to(int(s) - int(a.places)))
+end lifted
+
+/** Ten to the `n`, as a `BigInt`. */
+private[decimal] ten_to(n: int) -> BigInt = pow(big_of(10), usize(n))
+
+/** `num / den` rounded to a whole number by `mode`.
+ *
+ * **The decision is over `2 * |remainder|` against `|den|`**, which is how a half is compared
+ * without a division: twice the remainder equalling the divisor *is* the tie, exceeding it is above
+ * the half, and falling short is below. Doing it the obvious way -- dividing the remainder by the
+ * divisor -- would need the very fractional arithmetic this function is implementing.
+ */
+private rounded_quotient(num: BigInt, den: BigInt, mode: Rounding) -> BigInt
+    val (q, r) = div_rem(num, den)
+
+    if r.is_zero() then return q
+
+    // The quotient truncates toward zero and the remainder carries the numerator's sign, so the
+    // question in every mode below is whether to step one further AWAY from zero.
+    val positive = num.sign() * den.sign() > 0
+    val twice = cmp_big(mul_big(abs(r), big_of(2)), abs(den))
+    val away = mode match
+        Rounding.Down -> false
+        Rounding.Up -> true
+        Rounding.Floor -> !positive
+        Rounding.Ceiling -> positive
+        Rounding.HalfUp -> twice >= 0
+        Rounding.HalfEven -> twice > 0 || (twice == 0 && odd(q))
+
+    if !away then return q
+
+    val step = if positive then big_one() else negate(big_one())
+
+    add_big(q, step)
+end rounded_quotient
+
+/** Whether a `BigInt` is odd, which is the one bit `HalfEven` turns on. */
+private odd(x: BigInt) -> bool = !div_rem(x, big_of(2)).1.is_zero()

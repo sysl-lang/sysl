@@ -1,0 +1,275 @@
+module sysl.math.bigint
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+
+// What `sysl.math.bigint` claims, asserted in sysl.
+//
+// **Division is checked two ways and NEITHER is enough on its own.** Two hundred generated pairs
+// against `a == q * b + r` say the algorithm is consistent over inputs nobody chose, and named
+// values say the answers are the right ones -- a broken multiply that a broken divide undoes would
+// satisfy the identity and fail `100!`.
+//
+// **What generated pairs do NOT reach is the add-back, and this was measured rather than assumed.**
+// Knuth's algorithm D corrects an over-large digit guess twice: a loop that tightens it, and an
+// add-back for the one case the loop still gets wrong. The add-back fires about twice in every
+// `2^32` digits, so two hundred pairs of a few limbs each have a chance of about one in three
+// million of entering it -- and deleting the branch outright leaves all two hundred green. It is
+// `div_correction_vectors` that reaches it, with an input constructed to, and that case fails the
+// moment the branch is removed.
+//
+// The general lesson is the compiler's own: a fixture drawn from the common case exercises the
+// common path, and a rare branch needs an input built for it.
+
+/** A magnitude of `limbs` random limbs, built through the module's own constructor rather than
+ * through arithmetic -- so a defect in `mul` cannot quietly shape the input that is meant to find
+ * it.
+ */
+private random_big(g: *Rng, limbs: usize, minus: bool) -> BigInt
+    var out: Buf[u32] = buf()
+
+    for _ in 0..<limbs
+        out.push(g.next_u32())
+
+    val mag = trimmed(out)
+
+    if mag.len == 0 then zero() else BigInt(minus, mag)
+end random_big
+
+// -- construction and the two ends of the conversion -----------------------------------------------
+
+@test("a machine integer goes in and comes back")
+from_and_to_long()
+    assert_eq(from_int(0).to_long().unwrap(), 0)
+    assert_eq(from_int(1).to_long().unwrap(), 1)
+    assert_eq(from_int(-1).to_long().unwrap(), -1)
+    assert_eq(from_int(9223372036854775807).to_long().unwrap(), 9223372036854775807)
+
+    // The most negative `long` is the asymmetric one: its magnitude has no positive counterpart, so
+    // the conversion cannot go through negating it.
+    val most: long = -9223372036854775807 - 1
+
+    assert_eq(from_int(most).to_long().unwrap(), most)
+end from_and_to_long
+
+@test("a value past what a long holds answers None rather than wrapping")
+to_long_refuses()
+    // `2^63` is one past the largest positive, and `-(2^63) - 1` one past the most negative.
+    assert(parse("9223372036854775808").unwrap().to_long().is_none())
+    assert(parse("-9223372036854775809").unwrap().to_long().is_none())
+    assert(parse("340282366920938463463374607431768211456").unwrap().to_long().is_none())
+
+@test("zero has one representation and it is not negative")
+zero_is_canonical()
+    assert(zero().is_zero())
+    assert_eq(zero().sign(), 0)
+    assert_eq(zero().limbs(), 0)
+
+    // Every route to zero has to arrive at the same value, or equality and hashing stop agreeing.
+    assert_eq(negate(zero()), zero())
+    assert_eq(sub(from_int(7), from_int(7)), zero())
+    assert_eq(mul(from_int(-7), zero()), zero())
+    assert_eq(parse("-0").unwrap(), zero())
+    assert_eq(to_string(parse("-0").unwrap()), "0")
+
+// -- arithmetic ------------------------------------------------------------------------------------
+
+@test("addition and subtraction over the four sign combinations")
+add_sub_signs()
+    val a = from_int(7)
+    val b = from_int(3)
+
+    assert_eq(add(a, b).to_long().unwrap(), 10)
+    assert_eq(add(a, negate(b)).to_long().unwrap(), 4)
+    assert_eq(add(negate(a), b).to_long().unwrap(), -4)
+    assert_eq(add(negate(a), negate(b)).to_long().unwrap(), -10)
+    assert_eq(sub(b, a).to_long().unwrap(), -4)
+
+@test("addition carries across limbs")
+add_carries()
+    // `2^32 - 1` plus one is where a single limb runs out, and `2^64 - 1` plus one is where two do.
+    assert_eq(to_string(add(parse("4294967295").unwrap(), one())), "4294967296")
+    assert_eq(to_string(add(parse("18446744073709551615").unwrap(), one())), "18446744073709551616")
+
+@test("subtraction borrows across limbs")
+sub_borrows()
+    assert_eq(to_string(sub(parse("4294967296").unwrap(), one())), "4294967295")
+    assert_eq(to_string(sub(parse("18446744073709551616").unwrap(), one())), "18446744073709551615")
+
+@test("multiplication of two values that each need two limbs")
+mul_wide()
+    val a = parse("12345678901234567890").unwrap()
+    val b = parse("98765432109876543210").unwrap()
+
+    assert_eq(to_string(mul(a, b)), "1219326311370217952237463801111263526900")
+    assert_eq(mul(a, negate(b)).sign(), -1)
+    assert_eq(mul(negate(a), negate(b)), mul(a, b))
+
+@test("a factorial, which is the multiply asserted against a number nobody could have guessed")
+mul_factorial()
+    var f = one()
+
+    for i in 1..<101
+        f = mul(f, from_int(long(i)))
+
+    assert_eq(to_string(f),
+        "933262154439441526816992388562667004907159682643816214685929638952175999932299156089414639" +
+        "76156518286253697920827223758251185210916864000000000000000000000000")
+end mul_factorial
+
+@test("powers, including the two conventions at a zero exponent")
+powers()
+    assert_eq(to_string(pow(from_int(2), 128)), "340282366920938463463374607431768211456")
+    assert_eq(pow(from_int(7), 0), one())
+    assert_eq(pow(zero(), 0), one())
+    assert_eq(pow(zero(), 5), zero())
+    assert_eq(to_string(pow(from_int(-3), 3)), "-27")
+    assert_eq(to_string(pow(from_int(-3), 4)), "81")
+
+// -- division ---------------------------------------------------------------------------------------
+
+@test("division by one limb, which takes the short path")
+div_short()
+    val (q, r) = div_rem(parse("340282366920938463463374607431768211456").unwrap(), from_int(1000000007))
+
+    assert_eq(to_string(q), "340282364538961911690641225597")
+    assert_eq(to_string(r), "279632277")
+
+@test("division truncates toward zero and the remainder takes the dividend's sign")
+div_signs()
+    // The rule C, Go, Rust and sysl's own `/` on machine integers all follow, and the one that makes
+    // `a == q * b + r` hold. A floored division would answer -4 and 1 for the first of these.
+    assert_eq(div(from_int(-7), from_int(2)).to_long().unwrap(), -3)
+    assert_eq(rem(from_int(-7), from_int(2)).to_long().unwrap(), -1)
+    assert_eq(div(from_int(7), from_int(-2)).to_long().unwrap(), -3)
+    assert_eq(rem(from_int(7), from_int(-2)).to_long().unwrap(), 1)
+    assert_eq(div(from_int(-7), from_int(-2)).to_long().unwrap(), 3)
+    assert_eq(rem(from_int(-7), from_int(-2)).to_long().unwrap(), -1)
+
+@test("a dividend smaller than the divisor is a zero quotient and itself")
+div_smaller()
+    val (q, r) = div_rem(from_int(3), from_int(1000))
+
+    assert(q.is_zero())
+    assert_eq(r.to_long().unwrap(), 3)
+
+@test("division satisfies a == q*b + r over generated pairs")
+div_identity()
+    var g = rng(20260904, 1)
+
+    for n in 0..<200
+        val minus_a = n % 3 == 0
+        val minus_b = n % 5 == 0
+        val a = random_big(&g, 1 + usize(n % 7), minus_a)
+        var b = random_big(&g, 1 + usize(n % 4), minus_b)
+
+        if b.is_zero() then b = one()
+
+        val (q, r) = div_rem(a, b)
+
+        assert_eq(add(mul(q, b), r), a)
+        assert(cmp(abs(r), abs(b)) < 0)
+
+        // The remainder's sign is the dividend's, or it is zero. Nothing else is admissible, and
+        // getting this wrong still satisfies the identity above.
+        if !r.is_zero() then assert_eq(r.sign(), a.sign())
+end div_identity
+
+@test("the quotient guess is corrected, on inputs built to force each correction")
+div_correction_vectors()
+    // Hacker's Delight's own vectors for `divmnu`, which is the same algorithm. The first two make
+    // the tightening loop run; the third forces the add-back, which is the branch two hundred
+    // generated pairs never enter.
+    val a1 = parse("39614081257132168796771975168").unwrap()
+    val b1 = parse("9223372036854775809").unwrap()
+
+    assert_eq(to_string(div(a1, b1)), "4294967295")
+    assert_eq(to_string(rem(a1, b1)), "9223372032559808513")
+
+    val a2 = parse("39614081275578912861891592192").unwrap()
+    val b2 = parse("9223372041149743103").unwrap()
+
+    assert_eq(to_string(div(a2, b2)), "4294967295")
+    assert_eq(to_string(rem(a2, b2)), "9223372036854775807")
+
+    // The add-back case. Delete the branch and this one alone goes red.
+    val a3 = parse("2596108815186156682096451392634880").unwrap()
+    val b3 = parse("39614081257132168796771975169").unwrap()
+
+    assert_eq(to_string(div(a3, b3)), "65534")
+    assert_eq(to_string(rem(a3, b3)), "39614081257132168796771909634")
+end div_correction_vectors
+
+@test("multiplication and division undo each other over generated pairs")
+mul_div_round_trip()
+    var g = rng(777, 3)
+
+    for n in 0..<100
+        val a = random_big(&g, 1 + usize(n % 5), false)
+        var b = random_big(&g, 1 + usize(n % 3), false)
+
+        if b.is_zero() then b = one()
+
+        assert_eq(div(mul(a, b), b), a)
+end mul_div_round_trip
+
+// -- comparison, hashing, text ---------------------------------------------------------------------
+
+@test("ordering puts every negative below every positive, and orders negatives by magnitude")
+ordering()
+    val big = parse("340282366920938463463374607431768211456").unwrap()
+
+    assert(cmp(negate(big), from_int(-1)) < 0)
+    assert(cmp(from_int(-1), zero()) < 0)
+    assert(cmp(zero(), from_int(1)) < 0)
+    assert(cmp(from_int(1), big) < 0)
+    assert(negate(big) < from_int(-1))
+    assert(big > from_int(1))
+    assert_eq(cmp(big, big), 0)
+
+@test("equal values hash alike and different ones do not")
+hashing()
+    val a = parse("340282366920938463463374607431768211456").unwrap()
+    val b = parse("340282366920938463463374607431768211456").unwrap()
+
+    assert_eq(a.hash(), b.hash())
+    assert(a.hash() != negate(a).hash())
+    assert(a.hash() != add(a, one()).hash())
+
+@test("text goes out and comes back in every base the module takes")
+text_round_trip()
+    var g = rng(31415, 9)
+
+    for n in 0..<40
+        val x = random_big(&g, 1 + usize(n % 5), n % 2 == 0)
+
+        for base in 2..<37
+            assert_eq(parse_radix(to_string_radix(x, base), base).unwrap(), x)
+end text_round_trip
+
+@test("the written forms are the ones a reader expects")
+text_forms()
+    assert_eq(to_string(zero()), "0")
+    assert_eq(to_string(from_int(-42)), "-42")
+    assert_eq(to_string_radix(parse("255").unwrap(), 16), "ff")
+    assert_eq(to_string_radix(parse("255").unwrap(), 2), "11111111")
+    assert_eq(to_string_radix(parse("-255").unwrap(), 16), "-ff")
+    assert_eq(to_string_radix(parse("340282366920938463463374607431768211455").unwrap(), 16),
+              "ffffffffffffffffffffffffffffffff")
+
+@test("parsing takes a sign and either case of digit, and refuses everything else")
+parse_refuses()
+    assert_eq(parse("+7").unwrap().to_long().unwrap(), 7)
+    assert_eq(parse_radix("FF", 16).unwrap().to_long().unwrap(), 255)
+    assert_eq(parse_radix("ff", 16).unwrap().to_long().unwrap(), 255)
+
+    assert(parse("").is_none())
+    assert(parse("-").is_none())
+    assert(parse(" 7").is_none())
+    assert(parse("7 ").is_none())
+    assert(parse("1_000").is_none())
+    assert(parse("0x10").is_none())
+    assert(parse_radix("2", 2).is_none())
+    assert(parse_radix("7", 1).is_none())
+    assert(parse_radix("7", 37).is_none())

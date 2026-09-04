@@ -1,0 +1,226 @@
+module sysl.math.bigint
+
+import sysl.buf.{Buf, buf}
+import sysl.math.Bits
+
+// Division, which is the one operation here that is an algorithm rather than a loop.
+//
+// **It is Knuth's algorithm D** (*The Art of Computer Programming*, volume 2, §4.3.1), which is what
+// every big-integer library implements and is worth naming because the reader deserves somewhere to
+// check it against. Its shape is the long division everybody learns, with one addition: guessing
+// each quotient digit from the top two limbs of the running remainder, and correcting the guess.
+//
+// **Why the guess needs correcting at all** is the part that reads as unmotivated and is not. A
+// digit guessed from the top limb alone can be too large by two; guessed from the top *two* limbs
+// against the divisor's top limb, and with the divisor normalized so its top bit is set, it is too
+// large by at most one and too small never. So the loop below tightens it with a second test, and
+// the add-back afterwards catches the one remaining case -- which is rare enough that a suite over
+// small values never enters it, and is why the tests here run over generated pairs instead.
+//
+// **Normalization is the shift**, and it is what makes that bound hold: the divisor's top bit has to
+// be set for the estimate to be within one, so both operands are shifted left by the divisor's
+// leading zero count and the remainder is shifted back at the end. The quotient is unaffected --
+// scaling both operands by the same power of two does not change it.
+
+/** `(quotient, remainder)` for two magnitudes, `b` non-empty.
+ *
+ * The remainder is always less than `b`, which for magnitudes is the whole of what division
+ * promises. Signs are the caller's business and are applied by `div_rem` above this.
+ */
+private[bigint] divmod_mag(a: []const u32, b: []const u32) -> ([]const u32, []const u32)
+    if cmp_mag(a, b) < 0 then return (empty(), a)
+    if b.len == 1 then return short_divide(a, b[0])
+
+    val n = b.len
+    val m = a.len - n
+    val shift = int(b[n - 1].leading_zeros())
+    var v = shifted_left(b, shift, n)
+    var u = shifted_left(a, shift, a.len + 1)
+    var q: Buf[u32] = buf()
+
+    for i in 0..<(m + 1)
+        q.push(0)
+
+    val vn1 = u64(v.at(n - 1))
+    val vn2 = u64(v.at(n - 2))
+    var j = m + 1
+
+    while j > 0
+        j -= 1
+
+        val top = u64(u.at(j + n)) << 32 | u64(u.at(j + n - 1))
+        var qhat = top / vn1
+        var rhat = top % vn1
+
+        // Tighten the estimate. The first test is the one that matters when the top limbs happen to
+        // be equal, where the division above answers `2^32` exactly; the second is the two-limb
+        // refinement, and it is written second so that the first has already ruled out the overflow
+        // its own multiplication would otherwise have.
+        loop
+            if qhat >= 0x100000000u64 || qhat * vn2 > (rhat << 32 | u64(u.at(j + n - 2)))
+                qhat -= 1
+                rhat += vn1
+
+                if rhat < 0x100000000u64 then continue
+
+            break
+
+        // Multiply the divisor by the guess and take it off the running remainder, one limb at a
+        // time, carrying the product and borrowing the difference in the same pass.
+        var borrow: u64 = 0
+        var carry: u64 = 0
+
+        for i in 0..<n
+            val p = qhat * u64(v.at(i)) + carry
+
+            carry = p >> 32
+
+            val take = (p & 0xffffffffu64) + borrow
+            val cur = u64(u.at(j + i))
+
+            if cur >= take
+                u.set(j + i, u32(cur - take))
+                borrow = 0
+            else
+                u.set(j + i, u32(cur + 0x100000000u64 - take))
+                borrow = 1
+
+        val take = carry + borrow
+        val cur = u64(u.at(j + n))
+        var overshot = false
+
+        if cur >= take
+            u.set(j + n, u32(cur - take))
+        else
+            u.set(j + n, u32(cur + 0x100000000u64 - take))
+            overshot = true
+
+        // The one case the estimate can still get wrong, and it is rare -- Knuth puts it at about
+        // two in `2^32`. The subtraction went below zero, so the guess was one too large: put the
+        // divisor back and count one less.
+        if overshot
+            qhat -= 1
+
+            var c: u64 = 0
+
+            for i in 0..<n
+                val s = u64(u.at(j + i)) + u64(v.at(i)) + c
+
+                u.set(j + i, u32(s & 0xffffffffu64))
+                c = s >> 32
+
+            u.set(j + n, u32((u64(u.at(j + n)) + c) & 0xffffffffu64))
+
+        q.set(j, u32(qhat & 0xffffffffu64))
+
+    (trimmed(q), shifted_right(u, shift, n))
+end divmod_mag
+
+/** Division by one limb, which is the ordinary short division and is not worth normalizing for:
+ * every partial dividend fits a `u64` on its own.
+ */
+private[bigint] short_divide(a: []const u32, d: u32) -> ([]const u32, []const u32)
+    var q: Buf[u32] = buf()
+
+    for i in 0..<a.len
+        q.push(0)
+
+    var rem: u64 = 0
+    var i = a.len
+
+    while i > 0
+        i -= 1
+
+        val cur = rem << 32 | u64(a[i])
+
+        q.set(i, u32(cur / u64(d)))
+        rem = cur % u64(d)
+
+    var r: Buf[u32] = buf()
+
+    if rem != 0 then r.push(u32(rem))
+
+    (trimmed(q), r.view())
+end short_divide
+
+/** `x` shifted left by `shift` bits into `width` limbs, which is more limbs than `x` has where the
+ * shift needs somewhere to go.
+ *
+ * A shift of zero is the case to be careful about rather than the fast path: `>> (32 - shift)` at
+ * zero is a shift by the whole width, which is undefined. The guard is what the `if` is for.
+ */
+private shifted_left(x: []const u32, shift: int, width: usize) -> Buf[u32]
+    var out: Buf[u32] = buf()
+
+    for i in 0..<width
+        var low: u32 = 0
+        var high: u32 = 0
+
+        if i < x.len then low = x[i] << u32(shift)
+        if shift > 0 && i > 0 && i - 1 < x.len then high = x[i - 1] >> u32(32 - shift)
+
+        out.push(low | high)
+
+    out
+end shifted_left
+
+/** The first `n` limbs of `u` shifted back down by `shift`, which undoes what normalization did to
+ * the remainder. The quotient needs no such undoing -- scaling both operands leaves it alone.
+ */
+private shifted_right(u: Buf[u32], shift: int, n: usize) -> []const u32
+    var out: Buf[u32] = buf()
+
+    for i in 0..<n
+        var low = u.at(i) >> u32(shift)
+
+        if shift > 0 && i + 1 < n then low = low | u.at(i + 1) << u32(32 - shift)
+
+        out.push(low)
+
+    trimmed(out)
+end shifted_right
+
+/** The empty magnitude, which is zero. It is a function rather than a constant because an array
+ * literal is not a constant expression and a module-level `val` would be storage a freestanding
+ * program has to have filled.
+ */
+private[bigint] empty() -> []const u32
+    var out: Buf[u32] = buf()
+
+    out.view()
+end empty
+
+/** `(quotient, remainder)` with the signs applied.
+ *
+ * **The quotient truncates toward zero and the remainder takes the DIVIDEND's sign**, which is what
+ * C, Go, Rust and sysl's own `/` and `%` on machine integers all do, and is what makes
+ * `a == q * b + r` hold. It is not the floored division a mathematician would write, and the
+ * difference shows on exactly the cases with a negative operand: `-7 / 2` is `-3` with a remainder
+ * of `-1`, rather than `-4` with a remainder of `1`.
+ *
+ * **Division by zero traps**, as it does on a machine integer, rather than answering a `Result`.
+ * That is the language's own answer for the same mistake and there is no reason for this type to
+ * disagree with it -- a caller that cannot rule out a zero divisor checks for one.
+ */
+div_rem(a: BigInt, b: BigInt) -> (BigInt, BigInt)
+    if b.is_zero() then panic("sysl.math.bigint: division by zero")
+    if a.is_zero() then return (zero(), zero())
+
+    val (qm, rm) = divmod_mag(a.mag, b.mag)
+    val q = if qm.len == 0 then zero() else BigInt(a.minus != b.minus, qm)
+    val r = if rm.len == 0 then zero() else BigInt(a.minus, rm)
+
+    (q, r)
+end div_rem
+
+/** `a / b`, truncating toward zero. */
+div(a: BigInt, b: BigInt) -> BigInt = div_rem(a, b).0
+
+impl Div for BigInt
+    div(self, rhs: BigInt) -> BigInt = div(self, rhs)
+
+/** `a % b`, taking the dividend's sign. */
+rem(a: BigInt, b: BigInt) -> BigInt = div_rem(a, b).1
+
+impl Rem for BigInt
+    rem(self, rhs: BigInt) -> BigInt = rem(self, rhs)
