@@ -288,10 +288,30 @@ class SliceRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     e should include("write 'override impl'")
   }
 
-  // Ordering was deliberately not supplied: nothing needed it, and a lexicographic `<` is a
-  // separate claim from an element-wise `==`.
-  "a slice still has no ordering" in {
-    err(buf + "print(buf[0..<3] < buf[1..<4])") should include("'<' is not defined for []byte")
+  // Ordering is lexicographic, first element first -- the rule a `string` already follows and the
+  // one a tuple's `Ord` follows over its parts. This suite carried the opposite claim until an
+  // array and a slice were given `Ord`, so the assertion is replaced rather than deleted: what the
+  // absence used to pin is now what the presence has to mean.
+  "a slice orders on its first differing element" in {
+    run(buf + "print(buf[0..<3] < buf[1..<4], buf[1..<4] < buf[0..<3])") shouldBe "true false\n"
+  }
+
+  // The half a differing-element test cannot reach: two sequences that never differ, one of which
+  // simply stops. Length decides only once the shared prefix is exhausted, which is the opposite
+  // order from `Eq`, where the length is what is tested first.
+  "a prefix orders before the slice that extends it" in {
+    run(buf + "print(buf[0..<3] < buf[0..<4], buf[0..<4] < buf[0..<3])") shouldBe "true false\n"
+  }
+
+  // And hashing is where the two part company, deliberately. A hash is a promise about a key and a
+  // slice is a view: the storage stays reachable and writable by whoever owns it, so a key could
+  // change under the table and the entry become unfindable. An array is a value and copies, which
+  // is why `[N]T` has the block and `[]T` does not.
+  "a slice still has no hash, which is a decision rather than an omission" in {
+    val e = err(buf + "print(buf[0..<3].hash())")
+
+    e should include("has no method 'hash'")
+    e should include("[]byte")
   }
 
   "a bound past the end stops the program" in {
