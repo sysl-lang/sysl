@@ -7,6 +7,105 @@ copy -- correct a mistake there and regenerate, rather than editing this file. V
 `MAJOR.MINOR.PATCH`; while the leading zero stands the language is still moving, and a release may
 change what an existing program means. Where it does, the release says so.
 
+## 0.0.104 — 2026-09-05
+
+**a sanitizer run stops being served from cache, and --link-path carries an rpath**
+
+Two toolchain fixes, both found by writing bindings against the compiler rather than by testing it —
+and the first is a **behaviour change** that anybody checking a package with a sanitizer wants to
+know about before they read another green run.
+
+### Behaviour change: a sanitizer run rebuilds, because the build's environment is now part of the cache key
+
+**`sysl run` and `sysl test` cache the executable they built, and the key did not include the
+environment.** Everything in it was settled by the command line and the source tree; the one input
+that is neither was missing. So this, which is the recipe for checking a binding:
+
+```
+sysl test .                                          # an ordinary run, cached
+SYSL_EXTRA_CFLAGS="-fsanitize=address" sysl test .   # served the SAME binary
+```
+
+replayed the **uninstrumented** executable the first run had left in the slot, ran it, and reported
+green having looked at nothing. Touching a file did not help — the key is over content — and neither
+did anything else short of clearing the cache, which nobody had a reason to do.
+
+**A sanitizer is the worst possible place for a stale answer, because its whole output is an
+absence.** A wrong number gets noticed. A clean run looks exactly like a clean run.
+
+The key now carries `SYSL_EXTRA_CFLAGS` — which also decides the `sanitize_*` attributes the IR is
+marked with, so it changes what is *compiled* and not only the command line — plus the five variables
+that name a cross toolchain (`WASI_SDK_PATH`, `ANDROID_NDK_ROOT`, `ANDROID_NDK_HOME`, `ANDROID_HOME`,
+`ANDROID_SDK_ROOT`), each of which selects a different compiler and sysroot.
+
+**What this costs is one rebuild the first time you change the variable**, and nothing after that:
+the key is over the value, so the second sanitizer run is free exactly as the second ordinary run is.
+A variable that is not set contributes nothing, so no cache entry anybody already has is invalidated
+by upgrading.
+
+**`SYSL_LIB` is deliberately not in it.** It names where the library source *is*, and the key already
+carries that library's fingerprint — its contents. Adding the path would make two identical trees at
+two paths miss each other's entry for no gain.
+
+**If you have run a sanitizer over a package under an earlier release, that result is worth nothing
+and should be taken again.** `nm -u <binary> | grep -c asan` was the only way to tell, and it is
+still worth running.
+
+### `--link-path` now emits an rpath, so a dylib with an `@rpath` install name loads
+
+A shared library whose install name is `@rpath/libfoo.dylib` — which is what CMake writes for any
+library given a `SOVERSION`, so it is the ordinary case rather than an exotic one — linked cleanly
+and then died at startup:
+
+```
+dyld: Library not loaded: @rpath/libwebview.0.12.dylib
+      Reason: no LC_RPATH's found
+```
+
+which reads as a missing library sitting exactly where it was said to be. `--link-path DIR` emitted
+`-L DIR` and nothing else, and a sysl program cannot pass a raw linker flag, so there was no way to
+say the other half from inside sysl at all. `sysl-lang/webview` had to work around it in its Homebrew
+formula by overriding the install name.
+
+`--link-path DIR` now emits `-Wl,-rpath,DIR` beside the `-L`, with the directory made absolute —
+an rpath is read by the loader in whatever directory the program is eventually *run* from, so a
+relative one would name a place nobody meant.
+
+**This is a place sysl deliberately does something clang and rustc do not, and that was measured
+rather than assumed.** A `libfoo.dylib` at an `@rpath` install name, linked with the search-path flag
+alone, dies at startup under both, with zero `LC_RPATH` in either binary; rustc has an opt-in
+(`-C rpath`, off by default) and clang has none. The reason sysl answers differently is that
+`--link-path` is not `-L`: clang's `-L` sits on a line the writer is composing, next to the
+`-Wl,-rpath` they would add themselves, while sysl composes the whole line and the writer never sees
+it. A directory named to sysl is the only thing anybody gets to say about where the library is.
+
+**Two things it deliberately does not do.** A directory a `pkg-config` probe answered with gets no
+rpath — a `.pc` file supplies its own where the library wants one, and a second guessed one would
+override a decision the library had already made. And a **freestanding** target gets none: `wasm-ld`
+and `ld.lld` both accept `-rpath` for a bare-metal link without complaint, and what they would write
+is a run-time search path for a dynamic loader that does not exist on such a machine.
+
+### Not in this release, because it was already in 0.0.103
+
+The three standard-library gates that say *"BSD libc, not glibc"* — `__error` against
+`__errno_location`, `ENOTEMPTY` at 66 against 39, and a 16-bit `mode_t` — were switched to a derived
+`bsd` symbol in **0.0.103**, along with `Os.bsd` and `bsd`'s place in the closed `#if` vocabulary.
+This is stated because the work was queued again for this release and turned out to be done; there is
+no FreeBSD target and this release does not claim one.
+
+### The one thing worth knowing that is not a change at all
+
+**A method can already name the box it was called through, and the receiver is `&self`.** It has been
+in the language for a long time and neither of the two org bindings that needed it used it — both
+invented a two-type split instead, a private owning handle carrying the destructor plus a copyable
+value holding a `&` to it. `&self` hands the method the box, so a value it constructs takes a *share*
+rather than a second owner: one type, one `impl Drop`, and the resource outliving everything that
+kept a share of it.
+
+`reference/declarations.md` now says so with a worked example, and `reference/memory.md`'s destructor
+section points at it — the person who needs it is reading about destructors rather than about
+receivers, which is most of why it went unread.
+
 ## 0.0.103 — 2026-09-04
 
 Three cards, and two behaviour changes to read before the features.
