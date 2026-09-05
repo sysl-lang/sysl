@@ -388,17 +388,34 @@ object Project {
    * A path that resolves to the root has no last segment and so has no name; `a.out` is the same
    * fallback the driver has always used for a name it could not work out.
    */
-  def nameOf(path: String): String = {
-    val absolute = if path.startsWith("/") || path.startsWith("\\") then path
-                   else s"${getCurrentDirectory}/$path"
+  def nameOf(path: String): String = segmentsOf(path).lastOption.getOrElse("a.out")
 
-    val resolved = absolute.split("[/\\\\]").foldLeft(List.empty[String]) {
+  /** The same path written from the root, with `.` and `..` resolved away.
+   *
+   * **It exists because a path that is only ever *read* and one that is *written down* want
+   * different things**, and the difference is invisible until the second kind appears. A `-I` or a
+   * `-L` is consumed by the command it is on, so the working directory it is relative to is the one
+   * that is current — nothing can go wrong. An **rpath** is consumed by the dynamic loader, later,
+   * in whatever directory the program is eventually run from, so a relative one names a place
+   * nobody meant. `--link-path ../build` would bake `../build` into the executable and resolve it
+   * against the *user's* cwd at launch.
+   *
+   * Purely textual, deliberately: no `realpath`, so a symlink is left as the caller wrote it. What
+   * this is for is making a path independent of *when* it is read, and resolving symlinks would
+   * additionally make it independent of what the filesystem does later — a different promise, and
+   * one a build has no business making on somebody's behalf.
+   */
+  def absolute(path: String): String = s"/${segmentsOf(path).mkString("/")}"
+
+  private def segmentsOf(path: String): List[String] = {
+    val rooted = if path.startsWith("/") || path.startsWith("\\") then path
+                 else s"${getCurrentDirectory}/$path"
+
+    rooted.split("[/\\\\]").foldLeft(List.empty[String]) {
       case (segments, "" | ".") => segments
       case (segments, "..")     => segments.dropRight(1)
       case (segments, segment)  => segments :+ segment
     }
-
-    resolved.lastOption.getOrElse("a.out")
   }
 
   /** The directory an output path sits in, where it names one — the default standard-module path

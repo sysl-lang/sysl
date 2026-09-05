@@ -323,7 +323,73 @@ object Toolchain {
    * write down. Nothing here validates it: whatever it says goes to clang, and clang answers for it.
    */
   private[sysl] def extraFlags: List[String] =
-    envVar("SYSL_EXTRA_CFLAGS").toList.flatMap(_.split(" ").toList.filter(_.nonEmpty))
+    variable("SYSL_EXTRA_CFLAGS").toList.flatMap(_.split(" ").toList.filter(_.nonEmpty))
+
+  /** The environment a build reads, which is the process's unless a caller has said otherwise.
+   *
+   * **A suite cannot set an environment variable**, and what card `0415` is about is precisely what
+   * happens when one changes between two runs — so without a seam here the fix would be asserted on
+   * a helper rather than on the thing that was broken. `RunCache.usingCache` is the same shape and
+   * exists for the same reason.
+   *
+   * **Per thread**, matching `RunCache`'s: suites run beside each other driving one compiler, and a
+   * process-wide override would reach a neighbour's build.
+   *
+   * An installed override **replaces** the process environment rather than adding to it, so a test
+   * asking about an unset variable gets an unset variable however the developer's shell is
+   * configured. That is the difference between a hermetic test and one that passes here.
+   */
+  private val overriddenEnv = new ThreadLocal[Option[Map[String, String]]] {
+    override def initialValue(): Option[Map[String, String]] = None
+  }
+
+  private def variable(name: String): Option[String] =
+    overriddenEnv.get.map(_.get(name)).getOrElse(envVar(name))
+
+  private[sysl] def usingEnvironment[T](vars: Map[String, String])(body: => T): T = {
+    val saved = overriddenEnv.get
+
+    overriddenEnv.set(Some(vars))
+    try body
+    finally overriddenEnv.set(saved)
+  }
+
+  /** Every environment variable that can change the bytes a build produces, as `NAME=value` for the
+   * ones that are set — what `RunCache`'s key has to carry so that two environments cannot share an
+   * entry (card `0415`).
+   *
+   * **The rest of that key is settled by the command line and the source tree, and this is the half
+   * that is not.** It was missing, and the failure was as bad as a cache failure gets: a run under
+   * `SYSL_EXTRA_CFLAGS="-fsanitize=address"` over an unchanged tree was handed back the
+   * **uninstrumented** binary the previous ordinary run had left in the slot, ran it, and reported
+   * green. So the one workflow the org file prescribes for checking a binding — *set the variable,
+   * re-run `sysl test .`* — answered about a binary the variable had never reached.
+   *
+   * **A stale answer is the only failure a cache can have, and a sanitizer is where it costs most**,
+   * because a sanitizer's whole output is an absence. A wrong number would have been noticed.
+   *
+   * The list is what this file reads and nothing wider:
+   *
+   *   - **`SYSL_EXTRA_CFLAGS`** — spliced into every clang, and it also decides `sanitizerAttrs`,
+   *     so it changes the *IR* as well as the command line.
+   *   - **the toolchain locators** — `WASI_SDK_PATH` and the four Android variables. They name which
+   *     clang and which sysroot a cross build gets, which is a different compiler producing
+   *     different bytes.
+   *
+   * **`SYSL_LIB` is deliberately absent, and leaving it out is the more correct answer rather than
+   * an omission.** It names where the library source *is*, and the key already carries that
+   * library's **fingerprint** — its contents. Adding the path would make two identical trees at two
+   * paths miss each other's entry for no gain, which is a cache that rebuilds more and proves
+   * nothing extra. `SYSL_NO_CACHE` is absent for a different reason: it turns the cache off rather
+   * than selecting an entry in it.
+   *
+   * A variable that is not set contributes nothing, so an ordinary build's key is exactly what it
+   * was before this existed and no entry anybody has is invalidated by adding it.
+   */
+  private[sysl] def buildEnvironment: List[String] =
+    List("SYSL_EXTRA_CFLAGS", "WASI_SDK_PATH", "ANDROID_NDK_ROOT", "ANDROID_NDK_HOME",
+         "ANDROID_HOME", "ANDROID_SDK_ROOT")
+      .flatMap(name => variable(name).map(v => s"$name=$v"))
 
   /** The LLVM function attribute each `-fsanitize=` name needs on the IR sysl generates.
    *
@@ -534,7 +600,7 @@ object Toolchain {
    * is the whole of it and there is no `--sysroot` for sysl to pass.
    */
   private def wasiClang: Either[String, String] =
-    wasiClangIn(envVar("WASI_SDK_PATH"))
+    wasiClangIn(variable("WASI_SDK_PATH"))
       .flatMap(cc => Either.cond(runs(cc), cc, s"cannot run '$cc', which is wasi-sdk's clang"))
 
   /** The path resolution behind `wasiClang`, taking its directory rather than reading it, so that
@@ -577,8 +643,8 @@ object Toolchain {
    * that is not deprecated.
    */
   private def androidClang: Either[String, String] =
-    androidClangIn(envVar("ANDROID_NDK_ROOT").orElse(envVar("ANDROID_NDK_HOME")),
-                   envVar("ANDROID_HOME").orElse(envVar("ANDROID_SDK_ROOT")))
+    androidClangIn(variable("ANDROID_NDK_ROOT").orElse(variable("ANDROID_NDK_HOME")),
+                   variable("ANDROID_HOME").orElse(variable("ANDROID_SDK_ROOT")))
       .flatMap(cc => Either.cond(runs(cc), cc, s"cannot run '$cc', which is the NDK's clang"))
 
   /** The path resolution behind `androidClang`, taking its two directories rather than reading them,
@@ -729,8 +795,46 @@ object Toolchain {
                                 cc: String = "clang"): List[String] =
     List(cc, s"--target=${target.triple}", "-Wno-override-module", flag(level)) ::: extraFlags :::
       machineFlags(target) ::: linkerFlags(target) ::: deadStrip(target) :::
-      paths.linkFlags ::: List(ll) ::: objects ::: archives ::: libraryFlags(links, target) :::
-      paths.probedLinkFlags ::: List("-o", exe)
+      paths.linkFlags ::: rpathFlags(target, paths) ::: List(ll) ::: objects ::: archives :::
+      libraryFlags(links, target) ::: paths.probedLinkFlags ::: List("-o", exe)
+
+  /** A run-time search path for each directory `--link-path` named, so that a shared library found
+   * at link time is found again at load time (card `0414`).
+   *
+   * ==Why the flag implies this, when `-L` does not==
+   *
+   * **Neither clang nor rustc adds an rpath from a search-path flag, and that was measured rather
+   * than assumed** — a `libfoo.dylib` whose install name is `@rpath/libfoo.dylib`, linked with `-L`
+   * alone, links cleanly under both and then dies at startup with `Library not loaded ... no
+   * LC_RPATH's found`. rustc has an opt-in for it (`-C rpath`, off by default) and clang has none.
+   * So the analogy argues the other way and is worth stating: this is a place sysl deliberately
+   * does something a C or Rust driver does not.
+   *
+   * **The reason it is right here is that `--link-path` is not `-L`.** `-L` is one flag of a
+   * command line the writer is composing, next to the `-Wl,-rpath` they would add themselves; sysl
+   * composes the whole line and the writer never sees it, so a directory named to sysl is the only
+   * thing they get to say about where the library is. Left at `-L` the flag answers half the
+   * question and the other half is unreachable — a sysl program cannot pass a raw linker flag —
+   * which is what card `0414` was filed on: `sysl-lang/webview` could be linked and could not be
+   * run, and the fix had to be made in the *Homebrew formula* by overriding the install name.
+   *
+   * A `pkg_config` probe's directories are deliberately **not** here. A probe answers with its own
+   * `-Wl,-rpath` where the library wants one, which `probedLinkFlags` carries through untouched —
+   * so adding a second, guessed one would override a decision the library's own `.pc` file had
+   * already made.
+   *
+   * Absolute, via `Project.absolute`, because an rpath is read by the loader in whatever directory
+   * the program is run from rather than the one it was built in.
+   *
+   * **Not on a freestanding target, and that is about meaning rather than about breakage.** Both
+   * `wasm-ld` and `ld.lld` accept `-rpath` for a bare-metal link without complaint — checked, since
+   * the guard would otherwise read as defensive — and what they write is a run-time search path for
+   * a dynamic loader that does not exist on such a machine. There is nothing to find it, so there
+   * is nothing to say.
+   */
+  private def rpathFlags(target: Target, paths: SearchPaths): List[String] =
+    if target.os == Os.Freestanding then Nil
+    else paths.link.map(d => s"-Wl,-rpath,${Project.absolute(d)}")
 
   /** What a target needs said to the **linker** beyond its triple, which today is WebAssembly's and
    * nobody else's.

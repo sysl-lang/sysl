@@ -609,6 +609,12 @@ private[sysl] def execute(asked: Config): Int = {
                                                    target.os).flatten),
       // An artifact named with `--lib` has no source to hash, so it is hashed as bytes.
       artifacts.map(a => s"$a:${fingerprintOfFile(a)}").mkString("\u0000"),
+      // **The environment that reaches the toolchain** (`Toolchain.buildEnvironment`, card `0415`).
+      // Everything else in this key is settled by the command line and the source tree; this is the
+      // half that is not, and it was missing — so an `SYSL_EXTRA_CFLAGS="-fsanitize=address"` run
+      // over an unchanged tree was handed back the *uninstrumented* binary the previous ordinary
+      // run had left in the slot, and reported green having looked at nothing.
+      Toolchain.buildEnvironment.mkString(" "),
       paths.toString,
       archives.mkString("\u0000"),
     )))

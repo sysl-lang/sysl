@@ -236,6 +236,97 @@ class LinkCommandTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  /** `--link-path` names a directory at the link **and at load time** (card `0414`).
+   *
+   * **The bug it fixes is a program that links and then will not start.** A shared library whose
+   * install name is `@rpath/libfoo.dylib` — which is what CMake writes for any library given a
+   * `SOVERSION`, so it is the common case rather than an exotic one — needs the program to carry an
+   * `LC_RPATH` for the loader to have anywhere to look. `-L` does not write one, so the link is
+   * clean and the run dies with `Library not loaded ... no LC_RPATH's found`, naming a library
+   * sitting exactly where it was said to be.
+   *
+   * **This is a place sysl deliberately differs from clang, and the analogy was measured rather than
+   * assumed**: `libfoo.dylib` at an `@rpath` install name, linked with the search-path flag alone,
+   * dies at startup under **clang** and under **rustc** alike, with zero `LC_RPATH` in either
+   * binary; rustc has an opt-in (`-C rpath`) and clang has none. What makes sysl's answer different
+   * is that `--link-path` is not `-L`: sysl composes the whole link line and a program has no way to
+   * pass a raw linker flag, so a directory named to sysl is the only thing anybody gets to say about
+   * where the library is. Left at `-L` the other half is unreachable, which is what `sysl-lang/webview`
+   * had to work around in its **Homebrew formula**.
+   */
+  "a run-time search path for what --link-path named" - {
+
+    def withPaths(dirs: String*): List[String] =
+      Toolchain.linkCommand("prog.ll", List("std.syslib"), "prog", Target.x86_64Linux,
+        Toolchain.defaultOptimization, List("m"), Nil, SearchPaths(link = dirs.toList))
+
+    "is emitted beside the -L, so a dylib found at the link is found again at load" in {
+      withPaths("/opt/pfx/lib") should contain("-Wl,-rpath,/opt/pfx/lib")
+    }
+
+    "is one per directory, in the order they were given" in {
+      withPaths("/first", "/second").filter(_.startsWith("-Wl,-rpath")) shouldBe
+        List("-Wl,-rpath,/first", "-Wl,-rpath,/second")
+    }
+
+    // An rpath is read by the loader in whatever directory the program is *run* from, which is not
+    // the one it was built in — so a relative one names a place nobody meant. `-L` has no such
+    // problem, because the command it is on is running now. This is the whole reason `--link-path`
+    // cannot simply hand the string through twice.
+    "is absolute even where a relative directory was named" in {
+      val said = withPaths("build/lib").filter(_.startsWith("-Wl,-rpath"))
+
+      said should have length 1
+      said.head should startWith("-Wl,-rpath,/")
+      said.head should endWith("/build/lib")
+      said.head should not include "/./"
+    }
+
+    // The probe answers with its own rpath where the library's `.pc` file wanted one, and
+    // `probedLinkFlags` carries that through untouched. Adding a second, guessed one would be
+    // overriding a decision the library itself had already made.
+    "is not emitted for a directory a pkg-config probe answered with" in {
+      val probed = SearchPaths(probedLibs = List("-L/opt/probed/lib", "-lcairo"))
+      val cmd    = Toolchain.linkCommand("prog.ll", Nil, "prog", Target.aarch64Linux, paths = probed)
+
+      cmd should contain("-L/opt/probed/lib")
+      cmd.filter(_.startsWith("-Wl,-rpath")) shouldBe empty
+    }
+
+    // **About meaning rather than about breakage**, which is worth stating because the guard would
+    // otherwise read as defensive: `wasm-ld` and `ld.lld` both accept `-rpath` for a bare-metal link
+    // without a word — checked — and what they write is a run-time search path for a dynamic loader
+    // that does not exist on such a machine. There is nothing to find it, so there is nothing to say.
+    "is not emitted for a freestanding target, which has no loader to read one" in {
+      for t <- Target.all.filter(_.os == Os.Freestanding) do
+        withClue(t.name) {
+          Toolchain.linkCommand("prog.ll", Nil, "prog", t, Toolchain.defaultOptimization, Nil, Nil,
+                                SearchPaths(link = List("/opt/pfx/lib")))
+            .filter(_.startsWith("-Wl,-rpath")) shouldBe empty
+        }
+    }
+
+    // Every hosted target has a loader and every one of them gets it, so adding a row to the
+    // registry is a decision here rather than whichever arm a match happened to reach.
+    "is emitted for every target that is not freestanding" in {
+      for t <- Target.all.filterNot(_.os == Os.Freestanding) do
+        withClue(t.name) {
+          Toolchain.linkCommand("prog.ll", Nil, "prog", t, Toolchain.defaultOptimization, Nil, Nil,
+                                SearchPaths(link = List("/opt/pfx/lib")))
+            .should(contain("-Wl,-rpath,/opt/pfx/lib"))
+        }
+    }
+
+    // What a build with no such flag pays, which is what every build in this repository is: nothing.
+    "is absent altogether when no --link-path was given" in {
+      for t <- Target.all do
+        withClue(t.name) {
+          Toolchain.linkCommand("prog.ll", Nil, "prog", t)
+            .filter(_.startsWith("-Wl,-rpath")) shouldBe empty
+        }
+    }
+  }
+
   // A program with no library to link against still gets what it asked for: a directive resolves
   // what the *program's own* externs name, not only what the standard module's do.
   "a link with no archives still asks for the mathematics on Linux" in {

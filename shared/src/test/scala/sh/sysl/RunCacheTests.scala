@@ -222,6 +222,88 @@ class RunCacheTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  /** **The environment that reaches the toolchain is part of the key** (card `0415`).
+   *
+   * Everything else in the key is settled by the command line and the source tree; this was the half
+   * that was not, and it was missing. The org file's own recipe for checking a binding is *set
+   * `SYSL_EXTRA_CFLAGS="-fsanitize=address"`, re-run `sysl test .`* — over an unchanged tree that
+   * replayed the **uninstrumented** binary the previous ordinary run had left in the slot, and
+   * reported green having looked at nothing.
+   *
+   * **A sanitizer is the worst place a cache can be stale, because its whole output is an absence.**
+   * A wrong number would have been noticed on sight; a clean run is what a clean run looks like.
+   *
+   * `-fno-omit-frame-pointer` stands in for the sanitizer here: it reaches every clang the build
+   * drives exactly as `-fsanitize=address` does, and costs the suite no runtime to link.
+   *
+   * **`-g` was the obvious stand-in and it is the wrong one**, which is worth a sentence because the
+   * failure looks like the fix being broken: on Darwin the driver runs `dsymutil` after the link, so
+   * a `-g` build writes a `prog.dSYM` **beside the executable in the cache slot** and the entry count
+   * comes back one too high. Anything that counts what a build left on disk wants a flag that leaves
+   * one file.
+   */
+  "the extra clang flags" - {
+
+    "are part of the key, so a run under a new value builds again" in withCache { cache =>
+      {
+        val root = program("""print(21 * 2)""")
+
+        ran(Config(command = "run", file = root)) shouldBe "42\n"
+        entries(cache) shouldBe 1
+
+        Toolchain.usingEnvironment(Map("SYSL_EXTRA_CFLAGS" -> "-fno-omit-frame-pointer")) {
+          ran(Config(command = "run", file = root)) shouldBe "42\n"
+        }
+
+        entries(cache) shouldBe 2
+      }
+    }
+
+    // The key is over the flags' *value*, not over the fact that an environment was consulted — so
+    // the second run of a sanitizer build is still free, which is what makes the fix affordable.
+    "and the same value twice is still one build" in withCache { cache =>
+      {
+        val root = program("""print(21 * 2)""")
+
+        Toolchain.usingEnvironment(Map("SYSL_EXTRA_CFLAGS" -> "-fno-omit-frame-pointer")) {
+          ran(Config(command = "run", file = root)) shouldBe "42\n"
+          ran(Config(command = "run", file = root)) shouldBe "42\n"
+        }
+
+        entries(cache) shouldBe 1
+      }
+    }
+
+    // A variable that is not set contributes nothing, so adding this to the key invalidated no entry
+    // anybody already had — the ordinary build's key is exactly what it was.
+    "contribute nothing to the key when nothing is set" in {
+      Toolchain.usingEnvironment(Map.empty)(Toolchain.buildEnvironment) shouldBe empty
+    }
+
+    "and are named with their value, so two settings cannot share an entry" in {
+      Toolchain.usingEnvironment(Map("SYSL_EXTRA_CFLAGS" -> "-fno-omit-frame-pointer"))(Toolchain.buildEnvironment)
+        .shouldBe(List("SYSL_EXTRA_CFLAGS=-fno-omit-frame-pointer"))
+    }
+
+    /** **`SYSL_LIB` is deliberately not in it, and that is the more correct answer rather than an
+     * omission.** It names where the library source *is*, and the key already carries that library's
+     * fingerprint — its contents. Including the path would make two identical trees at two paths
+     * miss each other's entry for no gain.
+     */
+    "and 'SYSL_LIB' is not among them, because the library's contents are already in the key" in {
+      Toolchain.usingEnvironment(Map("SYSL_LIB" -> "/somewhere"))(Toolchain.buildEnvironment) shouldBe empty
+    }
+
+    // The four Android variables and WASI's name a cross toolchain — a different compiler and a
+    // different sysroot, so different bytes from the same source.
+    "and a cross toolchain's location is in the key too, since it decides which compiler answers" in {
+      Toolchain.usingEnvironment(Map("ANDROID_HOME" -> "/sdk"))(Toolchain.buildEnvironment)
+        .shouldBe(List("ANDROID_HOME=/sdk"))
+      Toolchain.usingEnvironment(Map("WASI_SDK_PATH" -> "/wasi"))(Toolchain.buildEnvironment)
+        .shouldBe(List("WASI_SDK_PATH=/wasi"))
+    }
+  }
+
   /** `build` writes a binary somebody named and is expected to have built it; `build-c` and
    * `build-lib` write artifacts for somebody else's toolchain. None of them is something a reader
    * would want quietly skipped, so none of them consults this.

@@ -33,6 +33,11 @@ import io.github.edadma.cross_platform.*
  *     `--std-lib`, the library's own fingerprint, or the from-source build `--no-std-lib` asks for.
  *   - the **search paths** and the **link line**, which decide what the C compiler and the linker do
  *     with input this key has otherwise covered.
+ *   - the **environment that reaches the toolchain** (`Toolchain.buildEnvironment`) — the extra
+ *     clang flags, and the variables naming a cross toolchain. This is the only part of the key
+ *     that is neither the command line nor the tree, and it was **missing until card `0415`**: a
+ *     run under `SYSL_EXTRA_CFLAGS="-fsanitize=address"` over an unchanged tree replayed the
+ *     uninstrumented binary the previous ordinary run had left in the slot and reported green.
  *
  * **What is deliberately NOT in it: the program's own arguments.** `sysl run p -- a b` and
  * `sysl run p -- c d` are one binary run twice, which is the whole point.
