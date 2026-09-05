@@ -7,6 +7,94 @@ copy -- correct a mistake there and regenerate, rather than editing this file. V
 `MAJOR.MINOR.PATCH`; while the leading zero stands the language is still moving, and a release may
 change what an existing program means. Where it does, the release says so.
 
+## 0.0.105 — 2026-09-05
+
+**a start offset on every search, and Horspool under the ones over bytes**
+
+A library release: every search in `sysl.text` and `sysl.slices` now takes a place to start, and the
+ones over bytes stopped being the naive scan. Nothing about the compiler moved, so a program that
+does not search compiles to exactly what it did.
+
+### `from` names a place to start, and the answer is an offset in the whole receiver
+
+Walking every occurrence of something meant cutting the haystack up and adding the offset back on,
+at every call site that did it. `sysl.text.Search` and `sysl.slices` now carry a `_from` form of
+every search instead:
+
+```sysl
+import sysl.text.Search
+
+val s = "abcabcabc"
+var at = s.index_of("abc")
+
+while at.is_some()
+    val k = at.unwrap()
+
+    print(k)
+    at = s.index_of_from("abc", k + 1)
+```
+
+```
+0
+3
+6
+```
+
+The new members are `index_of_from`, `last_index_of_from`, `index_of_byte_from` and
+`last_index_of_byte_from` on `sysl.text.Search` — so they are there for a `string` and for a
+`[]const u8` alike, since they are trait defaults over `view()` — and `index_of_from` and
+`last_index_of_from` in `sysl.slices`. They read as **one rule**: the search is over `self[from..]`,
+and what comes back is an offset into the receiver rather than into the suffix.
+
+**A backward search given a `from` looks at that same suffix, and answers with the *last* occurrence
+in it.** It does not run downwards from `from`. That is the half worth reading twice, because the
+other convention is the one some libraries pick — and it is what makes the forward and backward forms
+say the same thing about which elements are being looked at.
+
+**A `from` past the end answers `None` rather than trapping**, which is the whole reason `k + 1` above
+is safe to write at the last occurrence with no bound test of its own. The length itself *is* a
+position, which is where the empty needle is still found.
+
+`sysl.text`'s own `split` and `replace_all` are written on it now, which is what the form is for.
+
+### The searches over bytes are Boyer-Moore-Horspool
+
+`index_of`, `last_index_of` and `count_of` were the naive O(n·m) scan, with a line in the file saying
+a sub-linear one might replace them one day. It has. A needle of two bytes or more is looked for by
+aligning its **last** byte and, on a mismatch, shifting the window by however far that byte's own last
+occurrence in the needle is from the end — so the common case reads a fraction of the haystack.
+
+Over a megabyte in which the needle's first byte occurs four thousand times:
+
+| | before | after |
+|---|---|---|
+| `index_of` | 478 µs | **35 µs** |
+| `count_of` | 491 µs | **34 µs** |
+
+**Nothing observable changed.** The offsets, the empty-needle conventions and the non-overlapping
+count are exactly what they were. What says so is a differential test in `library/sysl/text/tests.sysl`:
+two thousand random haystacks over a three-letter alphabet, at lengths that fall on both sides of the
+threshold, compared against a scan written out longhand in the test file — sharing no helper with the
+implementation, so it can fail for the interesting reason — plus a counter asserting that both paths
+were actually reached, since a differential test that only ever ran one of them would be agreeing with
+itself.
+
+**The shift table is 256 bytes on the stack, so `sysl.text.find` still allocates nothing** and is
+still reachable under `@no_alloc`. A shift is capped at 255 rather than widened to a machine word: a
+shift shorter than the ideal one is still correct, so the cap costs a needle longer than 255 bytes a
+few extra windows and costs every other needle nothing.
+
+**Below 32 bytes of haystack the naive scan is still the faster answer and is still what runs.** That
+crossing was measured rather than reasoned about, and it is a good deal lower than the table's fixed
+cost suggests — 256 adjacent byte writes are a handful of vector stores rather than 256 of anything,
+and a window the shift skips costs nothing where the scan's costs a bounds-checked load and a branch.
+A one-byte needle never builds a table at all.
+
+### Upgrading
+
+`brew upgrade sysl`. There is nothing to change in a program: every existing call means what it meant,
+and the `_from` members are additions.
+
 ## 0.0.104 — 2026-09-05
 
 **a sanitizer run stops being served from cache, and --link-path carries an rpath**
