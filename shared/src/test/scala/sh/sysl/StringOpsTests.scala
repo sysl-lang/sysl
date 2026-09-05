@@ -17,7 +17,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * offset these return is always safe to slice at. `s[a..b]` traps on a mid-codepoint bound, so a
  * test that slices at a returned offset is checking that claim rather than restating it.
  */
-class StringOpsTests extends AnyFreeSpec with RunSupport {
+class StringOpsTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
   private val importing = "import sysl.text.*\n\n"
 
@@ -75,6 +75,106 @@ class StringOpsTests extends AnyFreeSpec with RunSupport {
     "counting is non-overlapping, so it agrees with replacing" in {
       run("""print("aaa".count_of("aa"), "aaaa".count_of("aa"), "abcabc".count_of("bc"))
             |print("abc".count_of("z"), "abc".count_of(""))""".stripMargin) shouldBe "1 2 2\n0 0\n"
+    }
+  }
+
+  /** The offsets, which are one rule across the whole family: `from` names a place to **start**, so
+   * the search is over `self[from..]` and the answer is an offset in the whole receiver — and a
+   * backward search given a `from` therefore looks at that same suffix and answers with the *last*
+   * occurrence in it, rather than running downwards from `from`. That is the half a reader is most
+   * likely to guess the other way round, which is why it has a case of its own here.
+   */
+  "finding from an offset" - {
+
+    "walks the occurrences without cutting the haystack up" in {
+      run("""var s = "abcabcabc"
+            |print(s.index_of_from("abc", 1).unwrap(), s.index_of_from("abc", 4).unwrap())
+            |print(s.index_of_from("abc", 7).is_none())""".stripMargin) shouldBe "3 6\ntrue\n"
+    }
+
+    "and the backward one answers the last occurrence in the same suffix" in {
+      run("""var s = "abcabcabc"
+            |print(s.last_index_of_from("abc", 0).unwrap(), s.last_index_of_from("abc", 4).unwrap())
+            |print(s.index_of_byte_from(u8('c'), 3).unwrap(), s.last_index_of_byte_from(u8('c'), 3).unwrap())""".stripMargin) shouldBe
+        "6 6\n5 8\n"
+    }
+
+    // The bound test a caller would otherwise have to write at the last occurrence before asking for
+    // the next one. A `from` past the end is not a position, so it is `None` rather than a trap —
+    // and `h.len` **is** a position, which is where the empty needle is still found.
+    "an offset past the end answers nothing rather than trapping" in {
+      run("""var s = "abcabc"
+            |print(s.index_of_from("abc", 9999).is_none(), s.last_index_of_from("abc", 9999).is_none())
+            |print(s.index_of_byte_from(u8('a'), 9999).is_none(), s.index_of_from("", 9999).is_none())
+            |print(s.index_of_from("", 3).unwrap(), s.last_index_of_from("", 3).unwrap())""".stripMargin) shouldBe
+        "true true\ntrue true\n3 6\n"
+    }
+
+    // The same surface on the other receiver, which is what says the offsets are trait defaults
+    // rather than something written twice.
+    "and it is the same code over bytes" in {
+      run("""var b = "abcabcabc".bytes
+            |print(b.index_of_from("abc".bytes, 1).unwrap(), b.last_index_of_from("abc".bytes, 4).unwrap())""".stripMargin) shouldBe
+        "3 6\n"
+    }
+  }
+
+  /** The sub-linear search, asserted where it can be told apart from the naive one it replaced.
+   *
+   * `find.sysl`'s header says the searches are Boyer-Moore-Horspool for a needle of two bytes or
+   * more, and that below `sublinear_floor` the naive scan is still what runs. So a short haystack
+   * and a long one are **two different functions answering**, and the library's own differential
+   * test compares them against a scan written out longhand. What is left for this tier is what a
+   * program can be watched doing rather than assert about itself: the same answers over a haystack
+   * the threshold definitely divides, and reaching the fast path costing no allocator.
+   */
+  "the sub-linear search" - {
+
+    // 900 bytes of one letter is over the threshold in every case, so every answer here comes from
+    // the shifting search — and they are the answers the short fixtures above give for the same
+    // shapes, which is the point of asserting them twice.
+    "agrees with the short-haystack answers on a haystack long enough to shift through" in {
+      run("""var hay: [900]u8
+            |for i in 0..<hay.len do hay[i] = u8('a')
+            |var h = hay[..]
+            |print(h.count_of("aa".bytes), h.count_of("aaa".bytes))
+            |print(h.index_of("aaa".bytes).unwrap(), h.last_index_of("aaa".bytes).unwrap())
+            |print(h.index_of("aab".bytes).is_none(), h.last_index_of("b".bytes).is_none())""".stripMargin) shouldBe
+        "450 300\n0 897\ntrue true\n"
+    }
+
+    // The last window is the one the shift arithmetic reaches last, and an off-by-one in it answers
+    // `None` here while passing everything shorter.
+    "finds a needle in the last window, from either direction" in {
+      run("""var hay: [800]u8
+            |for i in 0..<hay.len do hay[i] = u8('x')
+            |hay[797] = u8('y')
+            |hay[798] = u8('z')
+            |hay[799] = u8('w')
+            |var h = hay[..]
+            |print(h.index_of("yzw".bytes).unwrap(), h.last_index_of("yzw".bytes).unwrap())
+            |print(h.last_index_of_from("yzw".bytes, 797).unwrap(), h.last_index_of_from("yzw".bytes, 798).is_none())""".stripMargin) shouldBe
+        "797 797\n797 true\n"
+    }
+
+    // `find.sysl`'s first claim is that nothing in it needs an allocator, and a shift table is the
+    // first thing in that file to want scratch storage of its own. A `[256]u8` local is what keeps
+    // the claim true: `@no_alloc` is checked against the call graph, so a table promoted to the heap
+    // would be refused here rather than merely being slower.
+    "and it allocates nothing, which the shift table is the first thing to threaten" in {
+      ir("""@no_alloc
+           |
+           |import sysl.text.*
+           |
+           |look(h: []const u8, n: []const u8) -> usize
+           |    h.index_of(n).unwrap_or(0) + h.last_index_of(n).unwrap_or(0) + h.count_of(n)
+           |
+           |var hay: [400]u8
+           |
+           |for i in 0..<hay.len do hay[i] = u8(97 + i % 3)
+           |
+           |print(look(hay[..], "cab".bytes))
+           |""".stripMargin) should include("@main")
     }
   }
 

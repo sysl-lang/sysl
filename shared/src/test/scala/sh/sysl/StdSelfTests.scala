@@ -252,8 +252,15 @@ class StdSelfTests extends AnyFreeSpec with Matchers {
    * The runner collected **770** with the floor at 675, so the whole of the difference is these
    * ninety-five and the drift was **zero** -- which is what makes taking a five-case margin here a
    * margin rather than a guess.
+   *
+   * Raised to **787** for the start offsets and the sub-linear search: nine in `sysl.text` — the
+   * `_from` family at every edge, the overlapping counts on both sides of the threshold where the
+   * naive scan hands over to Horspool, and a differential run of two thousand random haystacks
+   * against a scan written out longhand in the test file — and two in `sysl.slices`. Measured with
+   * the `grep` above before a case was written: it read **776** against a floor of 765, so the drift
+   * was the eleven the margin above was, and the number here is the tree's exact count again.
    */
-  private val floor = 765
+  private val floor = 787
 
   /** The library, compiled as a **test build of itself**.
    *

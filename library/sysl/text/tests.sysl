@@ -3,6 +3,7 @@ module sysl.text
 
 import sysl.buf.byte_sink
 import sysl.math.Float
+import sysl.rand.rng
 import sysl.unicode.fold
 
 // What `sysl.text` promises, asserted in sysl.
@@ -582,3 +583,207 @@ cluster_plain()
     assert_eq(grapheme_columns("abc".bytes), 3)
     assert_eq(grapheme_columns("世界".bytes), 4)
     assert_eq(grapheme_columns("".bytes), 0)
+
+// -- searching, and searching from an offset -------------------------------------------------------
+
+// `_from` is one rule across the whole family and the tests are written to say so: it names a place
+// to START, so the search is over `self[from..]` and the answer is an offset in the whole receiver.
+// A backward `_from` therefore looks at the same suffix as a forward one and differs only in which
+// end it answers from -- which is the half a reader is most likely to guess the other way round.
+
+@test("a search from an offset walks the occurrences without cutting the haystack up")
+searching_from_an_offset()
+    val s = "abcabcabc"
+
+    assert_eq(s.index_of_from("abc", 0).unwrap(), 0)
+    assert_eq(s.index_of_from("abc", 1).unwrap(), 3)
+    assert_eq(s.index_of_from("abc", 4).unwrap(), 6)
+    assert(s.index_of_from("abc", 7).is_none(), "there is no fourth occurrence")
+
+@test("the offsets at the edges answer rather than trapping")
+searching_from_the_edges()
+    val s = "abcabc"
+
+    assert(s.index_of_from("abc", s.len).is_none(), "nothing but the empty needle is at the end")
+    assert(s.index_of_from("abc", s.len + 1).is_none(), "a from past the end is not a position")
+    assert(s.index_of_from("abc", 9999).is_none(), "and neither is one far past it")
+    assert(s.last_index_of_from("abc", 9999).is_none(), "backwards from past the end is the same")
+    assert(s.index_of_byte_from(u8('a'), 9999).is_none(), "and so is the byte search")
+    assert(s.last_index_of_byte_from(u8('a'), 9999).is_none(), "at both ends")
+
+@test("the empty needle is found at from, and at the end going backwards")
+searching_for_nothing()
+    val s = "abcdef"
+
+    assert_eq(s.index_of_from("", 0).unwrap(), 0)
+    assert_eq(s.index_of_from("", 4).unwrap(), 4)
+    assert_eq(s.index_of_from("", s.len).unwrap(), 6)
+    assert(s.index_of_from("", s.len + 1).is_none(), "past the end there is not even nothing")
+    assert_eq(s.last_index_of_from("", 4).unwrap(), 6)
+
+@test("a needle longer than what is left is not there")
+searching_for_too_much()
+    val s = "abcdef"
+
+    assert(s.index_of("abcdefg").is_none(), "longer than the haystack")
+    assert(s.index_of_from("def", 4).is_none(), "longer than what from leaves")
+    assert(s.last_index_of_from("def", 4).is_none(), "and the same backwards")
+
+@test("a needle at the very end is found from either direction")
+searching_at_the_end()
+    val s = "xxxxxxyz"
+
+    assert_eq(s.index_of("yz").unwrap(), 6)
+    assert_eq(s.last_index_of("yz").unwrap(), 6)
+    assert_eq(s.index_of_from("yz", 6).unwrap(), 6)
+    assert_eq(s.last_index_of_from("yz", 6).unwrap(), 6)
+
+@test("the backward search from an offset answers the LAST occurrence in that suffix")
+searching_backwards_from_an_offset()
+    val s = "abcabcabc"
+
+    assert_eq(s.last_index_of_from("abc", 0).unwrap(), 6)
+    assert_eq(s.last_index_of_from("abc", 4).unwrap(), 6)
+    assert(s.last_index_of_from("abc", 7).is_none(), "the suffix from 7 is too short to hold it")
+    assert_eq(s.index_of_byte_from(u8('c'), 3).unwrap(), 5)
+    assert_eq(s.last_index_of_byte_from(u8('c'), 3).unwrap(), 8)
+
+@test("overlapping occurrences are counted the way replace_all finds them")
+counting_overlaps()
+    assert_eq("aaa".count_of("aa"), 1)
+    assert_eq("aaaa".count_of("aa"), 2)
+    assert_eq("aaaaa".count_of("aa"), 2)
+    assert_eq("abababa".count_of("aba"), 2)
+
+// Long enough to be over `sublinear_floor`, which is the whole point: the same four claims asserted
+// on the other side of the threshold, where a different function answers them.
+@test("and the same counts hold over a haystack long enough to shift through")
+counting_overlaps_at_length()
+    var hay: [900]u8
+
+    for i in 0..<hay.len
+        hay[i] = u8('a')
+
+    assert_eq(hay[..].count_of("aa".bytes), 450)
+    assert_eq(hay[..].count_of("aaa".bytes), 300)
+    assert_eq(hay[..].index_of("aaa".bytes).unwrap(), 0)
+    assert_eq(hay[..].last_index_of("aaa".bytes).unwrap(), 897)
+
+// The three references below are written out longhand on purpose. A differential test whose two
+// sides share a helper is a test that cannot fail for the interesting reason, so these share
+// nothing with `find.sysl` -- no `matches_at`, no early break in the inner loop, and the backward
+// one walks FORWARDS keeping the last hit, which is the opposite of what it is checking.
+
+private ref_find(h: []const u8, n: []const u8, from: usize) -> Option[usize]
+    if from > h.len then return None
+    if n.len == 0 then return Some(from)
+
+    var i = from
+
+    while i + n.len <= h.len
+        var ok = true
+        var j: usize = 0
+
+        while j < n.len
+            if h[i + j] != n[j] then ok = false
+
+            j += 1
+
+        if ok then return Some(i)
+
+        i += 1
+
+    None
+end ref_find
+
+private ref_rfind(h: []const u8, n: []const u8, from: usize) -> Option[usize]
+    if from > h.len then return None
+    if n.len == 0 then return Some(h.len)
+
+    var best: Option[usize] = None
+    var i = from
+
+    while i + n.len <= h.len
+        var ok = true
+        var j: usize = 0
+
+        while j < n.len
+            if h[i + j] != n[j] then ok = false
+
+            j += 1
+
+        if ok then best = Some(i)
+
+        i += 1
+
+    best
+end ref_rfind
+
+private ref_count(h: []const u8, n: []const u8) -> usize
+    if n.len == 0 then return 0
+
+    var found: usize = 0
+    var i: usize = 0
+
+    while i + n.len <= h.len
+        var ok = true
+        var j: usize = 0
+
+        while j < n.len
+            if h[i + j] != n[j] then ok = false
+
+            j += 1
+
+        if ok
+            found += 1
+            i += n.len
+        else
+            i += 1
+
+    found
+end ref_count
+
+// The corroboration that could actually fail: two thousand random haystacks over a three-letter
+// alphabet, so that a needle of two to five letters really does occur, at lengths that fall on both
+// sides of `sublinear_floor` -- and a counter asserting the fast path was reached at all, because a
+// differential test that only ever ran the naive scan would agree with itself.
+@test("the sub-linear search answers exactly what a naive scan does, over random inputs")
+horspool_agrees_with_a_naive_scan()
+    var g = rng(20260905, 1)
+    var hay: [640]u8
+    var ned: [8]u8
+    var fast_cases: usize = 0
+    var slow_cases: usize = 0
+    var hits: usize = 0
+
+    for _ in 0..<2000
+        val hlen = usize(g.below(u64(hay.len))) + 1
+        val nlen = usize(g.below(5)) + 1
+
+        for i in 0..<hlen
+            hay[i] = u8(97 + g.below(3))
+
+        for i in 0..<nlen
+            ned[i] = u8(97 + g.below(3))
+
+        val h = hay[0..<hlen]
+        val n = ned[0..<nlen]
+        val from = usize(g.below(u64(hlen) + 2))
+
+        // `from` runs one past the length on purpose, so the subtraction is guarded rather than
+        // assumed -- on a `usize` it would wrap rather than go negative.
+        if nlen >= 2 && from <= hlen && hlen - from >= sublinear_floor
+            fast_cases += 1
+        else
+            slow_cases += 1
+
+        assert_eq(h.index_of_from(n, from), ref_find(h, n, from), "index_of_from")
+        assert_eq(h.last_index_of_from(n, from), ref_rfind(h, n, from), "last_index_of_from")
+        assert_eq(h.count_of(n), ref_count(h, n), "count_of")
+
+        if h.index_of(n).is_some() then hits += 1
+
+    assert(fast_cases > 100, "the sub-linear path was never reached, so nothing was compared")
+    assert(slow_cases > 100, "and the scan below the threshold was never reached either")
+    assert(hits > 100, "the needle was never found, so only the absent case was compared")
+end horspool_agrees_with_a_naive_scan
