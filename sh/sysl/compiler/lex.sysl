@@ -149,6 +149,9 @@ lex_documented(src: Source) -> Result[Lexed, Diagnostic]
     // `Newline` before it; this is what tells it from an identical line further down.
     var started = false
 
+    // Where the last line's content ran out, which is where the `Newline` that ends it is written.
+    var line_end: usize = 0
+
     loop
         if at_line_head
             // A line's indentation is measured at its first non-blank character, **comment or not**.
@@ -173,7 +176,7 @@ lex_documented(src: Source) -> Result[Lexed, Diagnostic]
                 return Err(error(point(margin),
                     "only tabs or spaces (but not both on a given line) may be used for indentation"))
 
-            emit_dent(&out, lay.line(ind.columns), point(s.offset), started)
+            emit_dent(&out, lay.line(ind.columns), point(line_end), point(s.offset), started)
 
             started = true
             at_line_head = false
@@ -183,6 +186,12 @@ lex_documented(src: Source) -> Result[Lexed, Diagnostic]
             if s.at_end() then break
 
             if s.at_line_end()
+                // **The newline that ends a statement is positioned where that statement ran out**,
+                // not where the next line begins: a value left off after an `=` is missing at the
+                // end of the line the `=` is on, and a caret on the line below points at code the
+                // reader wrote correctly.
+                line_end = s.offset
+
                 if ends_the_statement(&s, &lay, &out) then at_line_head = true
 
                 continue
@@ -216,20 +225,20 @@ end lex_documented
 // not a lexical error. It closes the innermost block and carries on at the nearest level below it,
 // exactly as the bootstrap does, and what goes wrong is reported by whichever rule the line then
 // fails to satisfy.
-private emit_dent(out: *Buf[Spanned[Tok]], d: Dent, at: Span, started: bool)
+private emit_dent(out: *Buf[Spanned[Tok]], d: Dent, ended: Span, at: Span, started: bool)
     d match
         Same ->
-            if started then out.push(Spanned(Newline, at))
+            if started then out.push(Spanned(Newline, ended))
         Deeper ->
-            if started then out.push(Spanned(Newline, at))
+            if started then out.push(Spanned(Newline, ended))
 
             out.push(Spanned(Indent, at))
-        Shallower(levels) -> close_levels(out, levels, at, started)
-        Ragged(levels) -> close_levels(out, levels, at, started)
+        Shallower(levels) -> close_levels(out, levels, ended, at, started)
+        Ragged(levels) -> close_levels(out, levels, ended, at, started)
 end emit_dent
 
-private close_levels(out: *Buf[Spanned[Tok]], levels: usize, at: Span, started: bool)
-    if started then out.push(Spanned(Newline, at))
+private close_levels(out: *Buf[Spanned[Tok]], levels: usize, ended: Span, at: Span, started: bool)
+    if started then out.push(Spanned(Newline, ended))
 
     for _ in 0..<levels
         out.push(Spanned(Dedent, at))

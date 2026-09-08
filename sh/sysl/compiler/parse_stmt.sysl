@@ -621,10 +621,19 @@ private parse_return(p: *Parser, start: Span) -> Stmt
 
     var value: Option[Expr] = None
 
-    if can_begin_expr(p.peek()) then value = Some(parse_result_value(p))
+    if begins_expr_here(p) then value = Some(parse_result_value(p))
 
     stmt(start.to(p.just_taken()), Return(value))
 end parse_return
+
+// Whether an expression begins at the cursor, asked where the token after it can be looked at.
+//
+// **A label begins one only when a loop follows it**, which is the whole difference from
+// `can_begin_expr`: without it `break 'a 'b` reads the second label as the value the break carries
+// and is answered with a complaint about a `for` nobody was writing.
+begins_expr_here(p: *Parser) -> bool = p.peek() match
+    Label(_) -> p.kw_at(1, "for") || p.kw_at(1, "while") || p.kw_at(1, "loop") || p.kw_at(1, "do")
+    t -> can_begin_expr(t)
 
 // A `'name` label, as written after `break` and `continue`.
 private accept_label(p: *Parser) -> Option[string] = p.peek() match
@@ -639,7 +648,7 @@ private parse_break(p: *Parser, start: Span) -> Stmt
     val label = accept_label(p)
     var value: Option[Expr] = None
 
-    if can_begin_expr(p.peek()) then value = Some(lift_placeholders(parse_expr(p)))
+    if begins_expr_here(p) then value = Some(lift_placeholders(parse_expr(p)))
 
     stmt(start.to(p.just_taken()), Break(label, value))
 end parse_break
