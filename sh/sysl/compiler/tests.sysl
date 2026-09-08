@@ -1,0 +1,47 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.read_text
+import sysl.text.Search
+
+// What the driver says and answers, asserted through `run_cli` rather than the terminal.
+
+// **A closure captures by value, so the buffer is reached through a pointer**: `lines` itself
+// captured would be a copy filled and thrown away, and the test would read an empty one.
+said(args: []string) -> (Buf[string], int)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line: string) -> sink.push(line))
+
+    (lines, code)
+
+@test("--version answers the version and exits fine")
+version_is_answered()
+    val (lines, code) = said(["sysl", "--version"])
+
+    assert_eq(code, Fine)
+    assert_eq(lines.len(), 1)
+    assert_eq(lines.at(0), s"sysl ${Version}")
+
+@test("no arguments is a misuse, and the usage is said")
+nothing_is_a_misuse()
+    val (lines, code) = said(["sysl"])
+
+    assert_eq(code, Misused)
+    assert_eq(lines.at(0), usage())
+
+@test("a command the compiler cannot carry out yet is named back, and is a misuse")
+an_unknown_command_is_named()
+    val (lines, code) = said(["sysl", "build"])
+
+    assert_eq(code, Misused)
+    assert(lines.at(0).contains("`build`"), "the command is named in the refusal")
+
+// **The version in `main.sysl` is the one in `package.hocon`.** A bump made in one place and not
+// the other fails here rather than shipping a binary that misreports itself.
+@test("the version here is the manifest's")
+version_matches_the_manifest()
+    val manifest = read_text("package.hocon").unwrap()
+
+    assert(manifest.contains(s"version = \"${Version}\""), "package.hocon names the same version")
